@@ -137,6 +137,17 @@ def _int(value):
     return int(value, 0) if isinstance(value, str) else value
 
 
+def _validate_csv_header(header, required, optional=()):
+    header = header or []
+    missing = [field for field in required if field not in header]
+    if missing:
+        raise ValueError(f"CSV header is missing required fields: {', '.join(missing)}")
+    # DictReader would silently overwrite the first value of a repeated column.
+    duplicates = [field for field in (*required, *optional) if header.count(field) > 1]
+    if duplicates:
+        raise ValueError(f"CSV header has duplicated columns: {', '.join(duplicates)}")
+
+
 def load_streams(source, skip_report=None):
     """Stream rows (source, offset, size, width, height, frames) in archive order."""
     lower = source.lower()
@@ -150,10 +161,7 @@ def load_streams(source, skip_report=None):
     elif os.path.isfile(source) and lower.endswith(".csv"):
         with open(source, encoding="utf-8", newline="") as fh:
             reader = csv.DictReader(fh)
-            header = reader.fieldnames or []
-            missing = [f for f in REPORT_FIELDS if f not in header]
-            if missing:
-                raise ValueError(f"CSV header is missing required fields: {', '.join(missing)}")
+            _validate_csv_header(reader.fieldnames, REPORT_FIELDS)
             rows = list(reader)
         label, start = "row {i}", 2
     else:
@@ -197,10 +205,7 @@ def load_pins(path):
         return pins
     with open(path, encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
-        header = reader.fieldnames or []
-        missing = [f for f in ("offset", "path") if f not in header]
-        if missing:
-            raise ValueError(f"CSV header is missing required fields: {', '.join(missing)}")
+        _validate_csv_header(reader.fieldnames, ("offset", "path"), ("source",))
         for j, row in enumerate(reader, start=2):
             try:
                 offset = _int(row["offset"])

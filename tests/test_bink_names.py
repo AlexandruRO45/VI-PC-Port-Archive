@@ -477,16 +477,16 @@ class TestReportErrors(unittest.TestCase):
 
     def write(self, tmp, name, text):
         path = os.path.join(tmp, name)
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         return path
 
-    def run_cli(self, source, tmp):
+    def run_cli(self, source, tmp, *args):
         xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
         out = os.path.join(tmp, "names.csv")
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            code = names_mod.main([source, "--mount", xml, "--out", out])
+            code = names_mod.main([source, "--mount", xml, "--out", out, *args])
         return code, err.getvalue(), out
 
     def test_bad_sources_are_rejected(self):
@@ -544,6 +544,26 @@ class TestReportErrors(unittest.TestCase):
                 code = names_mod.main([source, "--mount", xml, "--pins", pins_dir, "--out", out])
             self.assertEqual(code, 1)
             self.assertIn(pins_dir, err.getvalue())
+            self.assertFalse(os.path.exists(out))
+
+    def test_duplicate_stream_columns_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.write(tmp, "index.csv", "source,offset,size,width,height,frames,offset\n"
+                                "a.rpf,0,0x100,1280,720,100,16\n")
+            code, err, out = self.run_cli(source, tmp)
+            self.assertEqual(code, 1)
+            self.assertIn(source, err)
+            self.assertIn("duplicated columns: offset", err)
+            self.assertFalse(os.path.exists(out))
+
+    def test_duplicate_pin_columns_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.write(tmp, "index.json", '{"streams": []}')
+            pins = self.write(tmp, "pins.csv", "offset,path,source,source\n0,a/b.bk2,a.rpf,b.rpf\n")
+            code, err, out = self.run_cli(source, tmp, "--pins", pins)
+            self.assertEqual(code, 1)
+            self.assertIn(pins, err)
+            self.assertIn("duplicated columns: source", err)
             self.assertFalse(os.path.exists(out))
 
     def test_empty_sources_are_accepted(self):
