@@ -107,7 +107,7 @@ int imgatomic_oracle_self_test() {
     };
     EXPECT(imgatomic_bad_pixels(correct.data(), 2, 2) == 0);
     for (std::size_t pixel = 0; pixel < correct.size(); pixel += 4) {
-        for (std::size_t channel = 1; channel < 4; ++channel) {
+        for (std::size_t channel = 0; channel < 4; ++channel) {
             auto wrong = correct;
             wrong[pixel + channel] = 0.0f;
             EXPECT(imgatomic_bad_pixels(wrong.data(), 2, 2) == 1);
