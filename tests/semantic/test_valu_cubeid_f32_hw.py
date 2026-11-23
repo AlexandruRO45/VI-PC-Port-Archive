@@ -456,5 +456,45 @@ class TestVCubeidF32RegisterAliasing(unittest.TestCase):
         self.assertEqual(support.mrt0_words(spv)[0], f32_to_bits(0.0))
 
 
+@dataclasses.dataclass(frozen=True)
+class CubeIdStatusFlags:
+    face_id: float
+    is_positive_axis: bool
+    major_axis: str
+
+
+def compute_status_flags(x: float, y: float, z: float) -> CubeIdStatusFlags:
+    fid = ref_cubeid(x, y, z)
+    int_id = int(fid)
+    axis_map = {0: "X", 1: "X", 2: "Y", 3: "Y", 4: "Z", 5: "Z"}
+    return CubeIdStatusFlags(
+        face_id=fid,
+        is_positive_axis=(int_id % 2 == 0),
+        major_axis=axis_map[int_id],
+    )
+
+
+class TestVCubeidF32ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and classification."""
+
+    def test_positive_axis_flags(self):
+        flags = compute_status_flags(4.0, 1.0, 0.5)
+        self.assertEqual(flags.face_id, 0.0)
+        self.assertTrue(flags.is_positive_axis)
+        self.assertEqual(flags.major_axis, "X")
+
+    def test_negative_axis_flags(self):
+        flags = compute_status_flags(-4.0, 1.0, 0.5)
+        self.assertEqual(flags.face_id, 1.0)
+        self.assertFalse(flags.is_positive_axis)
+        self.assertEqual(flags.major_axis, "X")
+
+    def test_z_axis_flags(self):
+        flags = compute_status_flags(0.5, 1.0, -2.5)
+        self.assertEqual(flags.face_id, 5.0)
+        self.assertFalse(flags.is_positive_axis)
+        self.assertEqual(flags.major_axis, "Z")
+
+
 if __name__ == "__main__":
     unittest.main()
