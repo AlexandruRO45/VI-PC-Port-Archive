@@ -137,6 +137,17 @@ class TestLdsAddU32Aliasing(unittest.TestCase):
         mem = L.run(body, lanes=1)
         self.assertEqual(L.out(mem, 0, 0), 10 + 0x40)
 
+class TestLdsAddU32BoundariesAndNegative(unittest.TestCase):
+    def test_unsigned_wrap_at_2_pow_32(self):
+        rtns, fin = L.run_chain([("ds_add_u32", 0x40, 0, (0xFFFFFFFF,))], {0x40: 0xFFFFFFFF})
+        self.assertEqual(fin[0x40], 0xFFFFFFFE)
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(Exception):
+            L.translate(["ds_add_u32 v0"])
+        with self.assertRaises(Exception):
+            L.translate(["ds_add_u32_bad_opcode v0, v1"])
+
 
 if __name__ == "__main__":
     unittest.main()
