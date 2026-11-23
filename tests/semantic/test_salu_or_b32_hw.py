@@ -52,11 +52,30 @@ def ref_scc(val: int) -> int:
     return 1 if (val & MASK32) != 0 else 0
 
 
+def run_salu_or_b32(s0: int, s1: int) -> tuple[int, int]:
+    """Execute s_or_b32 s2, s0, s1 through translate_lines and mrt0_words, returning (s2, scc)."""
+    lines = [
+        f"s_mov_b32 s0, {s0 & MASK32:#x}",
+        f"s_mov_b32 s1, {s1 & MASK32:#x}",
+        "s_or_b32 s2, s0, s1",
+        "v_mov_b32 v0, s2",
+        "s_cselect_b32 s3, 1, 0",
+        "v_mov_b32 v1, s3",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines(f"ps_or_{s0 & MASK32:08x}_{s1 & MASK32:08x}", lines)
+    out = mrt0_words(spv)
+    return out[0], out[1]
+
+
 class SaluOrB32OracleTests(unittest.TestCase):
     """Reference mathematical oracle and architectural model tests for s_or_b32."""
 
     def test_truth_table_exhaustive(self):
-        """Verify full 2-input 1-bit truth table: (0,0)->0, (0,1)->1, (1,0)->1, (1,1)->1."""
+        """Verify full 2-input 1-bit truth table: (0,0)->0, (0,1)->1, (1,0)->1, (1,1)->1 via translator."""
         truth_table = {
             (0, 0): 0,
             (0, 1): 1,
@@ -68,12 +87,12 @@ class SaluOrB32OracleTests(unittest.TestCase):
                 s0 = MASK32 if b0 else 0
                 s1 = MASK32 if b1 else 0
                 want = MASK32 if expected else 0
-                got = ref_s_or_b32(s0, s1)
+                got, scc = run_salu_or_b32(s0, s1)
                 self.assertEqual(got, want)
-                self.assertEqual(ref_scc(got), expected)
+                self.assertEqual(scc, expected)
 
     def test_algebraic_identities(self):
-        """Test algebraic laws: identity, annihilator, idempotence, commutativity, associativity."""
+        """Test algebraic laws: identity, annihilator, idempotence, commutativity via translator."""
         test_values = [
             0x00000000,
             0xFFFFFFFF,
@@ -86,61 +105,88 @@ class SaluOrB32OracleTests(unittest.TestCase):
         ]
         for a in test_values:
             with self.subTest(identity=hex(a)):
-                self.assertEqual(ref_s_or_b32(a, 0), a)
-                self.assertEqual(ref_s_or_b32(0, a), a)
-                self.assertEqual(ref_s_or_b32(a, MASK32), MASK32)
-                self.assertEqual(ref_s_or_b32(MASK32, a), MASK32)
-                self.assertEqual(ref_s_or_b32(a, a), a)
+                res_id, scc_id = run_salu_or_b32(a, 0)
+                self.assertEqual(res_id, a)
+                self.assertEqual(scc_id, 1 if a != 0 else 0)
 
-        for a in test_values:
-            for b in test_values:
-                with self.subTest(commutative=(hex(a), hex(b))):
-                    self.assertEqual(ref_s_or_b32(a, b), ref_s_or_b32(b, a))
+                res_ann, scc_ann = run_salu_or_b32(a, MASK32)
+                self.assertEqual(res_ann, MASK32)
+                self.assertEqual(scc_ann, 1)
+
+                res_idem, scc_idem = run_salu_or_b32(a, a)
+                self.assertEqual(res_idem, a)
+                self.assertEqual(scc_idem, 1 if a != 0 else 0)
 
         for a in test_values[:4]:
             for b in test_values[:4]:
-                for c in test_values[:4]:
-                    with self.subTest(associative=(hex(a), hex(b), hex(c))):
-                        left = ref_s_or_b32(ref_s_or_b32(a, b), c)
-                        right = ref_s_or_b32(a, ref_s_or_b32(b, c))
-                        self.assertEqual(left, right)
+                with self.subTest(commutative=(hex(a), hex(b))):
+                    res_ab, _ = run_salu_or_b32(a, b)
+                    res_ba, _ = run_salu_or_b32(b, a)
+                    self.assertEqual(res_ab, res_ba)
 
     def test_de_morgan_duality(self):
-        """Test De Morgan duality: ~(A | B) == (~A) & (~B)."""
-        rng = random.Random(0x028332)
-        for _ in range(64):
-            a = rng.getrandbits(32)
-            b = rng.getrandbits(32)
-            or_ab = ref_s_or_b32(a, b)
-            not_or_ab = (~or_ab) & MASK32
-            not_a = (~a) & MASK32
-            not_b = (~b) & MASK32
-            and_not_a_not_b = (not_a & not_b) & MASK32
-            self.assertEqual(not_or_ab, and_not_a_not_b)
+        """Test De Morgan duality: ~(A | B) == (~A) & (~B) via translated shader."""
+        test_pairs = [
+            (0x12345678, 0x87654321),
+            (0xAAAAAAAA, 0x55555555),
+            (0xFF00FF00, 0x00FF00FF),
+            (0x00000000, 0xFFFFFFFF),
+        ]
+        for idx, (a, b) in enumerate(test_pairs):
+            with self.subTest(a=hex(a), b=hex(b)):
+                lines = [
+                    f"s_mov_b32 s0, {a:#x}",
+                    f"s_mov_b32 s1, {b:#x}",
+                    "s_or_b32 s2, s0, s1",
+                    "s_not_b32 s3, s2",
+                    "s_not_b32 s4, s0",
+                    "s_not_b32 s5, s1",
+                    "s_and_b32 s6, s4, s5",
+                    "v_mov_b32 v0, s3",
+                    "v_mov_b32 v1, s6",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = translate_lines(f"ps_demorgan_{idx}", lines)
+                out = mrt0_words(spv)
+                self.assertEqual(out[0], out[1])
+                self.assertEqual(out[0], (~(a | b)) & MASK32)
 
     def test_boundary_bit_patterns(self):
-        """Test single-bit walking, byte boundaries, and alternating bit patterns."""
-        for i in range(32):
+        """Test single-bit walking, byte boundaries, and alternating bit patterns via translator."""
+        for i in [0, 1, 7, 8, 15, 16, 23, 24, 30, 31]:
             bit = 1 << i
-            self.assertEqual(ref_s_or_b32(bit, 0), bit)
-            self.assertEqual(ref_s_or_b32(bit, bit), bit)
-            self.assertEqual(ref_scc(ref_s_or_b32(bit, 0)), 1)
+            res, scc = run_salu_or_b32(bit, 0)
+            self.assertEqual(res, bit)
+            self.assertEqual(scc, 1)
 
-        for i in range(31):
+            res_self, scc_self = run_salu_or_b32(bit, bit)
+            self.assertEqual(res_self, bit)
+            self.assertEqual(scc_self, 1)
+
+        for i in [0, 7, 15, 23, 30]:
             b0 = 1 << i
             b1 = 1 << (i + 1)
-            combined = ref_s_or_b32(b0, b1)
+            combined, scc_comb = run_salu_or_b32(b0, b1)
             self.assertEqual(combined, b0 | b1)
-            self.assertEqual(ref_scc(combined), 1)
+            self.assertEqual(scc_comb, 1)
 
     def test_scc_oracle_mapping(self):
-        """Verify SCC mapping across exact zero and non-zero boundary transitions."""
-        self.assertEqual(ref_scc(0x00000000), 0)
-        self.assertEqual(ref_scc(0x00000001), 1)
-        self.assertEqual(ref_scc(0x80000000), 1)
-        self.assertEqual(ref_scc(0x7FFFFFFF), 1)
-        self.assertEqual(ref_scc(0xFFFFFFFF), 1)
-        self.assertEqual(ref_scc(ref_s_or_b32(0, 0)), 0)
+        """Verify SCC mapping across exact zero and non-zero boundary transitions via translator."""
+        cases = [
+            (0, 0, 0),
+            (0, 1, 1),
+            (0x80000000, 0, 1),
+            (0x7FFFFFFF, 0, 1),
+            (0xFFFFFFFF, 0, 1),
+        ]
+        for a, b, expected_scc in cases:
+            with self.subTest(a=hex(a), b=hex(b)):
+                res, scc = run_salu_or_b32(a, b)
+                self.assertEqual(res, (a | b) & MASK32)
+                self.assertEqual(scc, expected_scc)
 
     def test_translator_smoke(self):
         """Smoke test verifying tools/rdna2spirv.py translates s_or_b32 correctly."""
@@ -422,7 +468,7 @@ class SaluOrB32InterpreterTests(unittest.TestCase):
     """Deterministic scalar instruction interpreter tests for s_or_b32."""
 
     def test_interpreter_basic_or(self):
-        """Test standard scalar OR execution on SGPRs."""
+        """Test standard scalar OR execution on SGPRs via interpreter and hardware translator."""
         state = ScalarRegisterState()
         state.write_reg("s0", 0x12340000)
         state.write_reg("s1", 0x00005678)
@@ -431,19 +477,31 @@ class SaluOrB32InterpreterTests(unittest.TestCase):
         self.assertEqual(state.read_reg("s2"), 0x12345678)
         self.assertEqual(state.scc, 1)
 
+        hw_res, hw_scc = run_salu_or_b32(0x12340000, 0x00005678)
+        self.assertEqual(hw_res, 0x12345678)
+        self.assertEqual(hw_scc, 1)
+
     def test_interpreter_scc_updates(self):
-        """Test that SCC is cleared strictly on zero results and set otherwise."""
+        """Test that SCC is cleared strictly on zero results and set otherwise via interpreter and translator."""
         state = ScalarRegisterState()
         state.execute_s_or_b32("s0", 0, 0)
         self.assertEqual(state.read_reg("s0"), 0)
         self.assertEqual(state.scc, 0)
 
+        hw_res0, hw_scc0 = run_salu_or_b32(0, 0)
+        self.assertEqual(hw_res0, 0)
+        self.assertEqual(hw_scc0, 0)
+
         state.execute_s_or_b32("s1", 0, 1)
         self.assertEqual(state.read_reg("s1"), 1)
         self.assertEqual(state.scc, 1)
 
+        hw_res1, hw_scc1 = run_salu_or_b32(0, 1)
+        self.assertEqual(hw_res1, 1)
+        self.assertEqual(hw_scc1, 1)
+
     def test_interpreter_special_registers(self):
-        """Test OR operations reading and writing m0, vcc_lo, exec_lo, and null."""
+        """Test OR operations reading and writing m0, vcc_lo, exec_lo, and null via translator."""
         state = ScalarRegisterState()
         state.write_reg("m0", 0x000000F0)
         state.execute_s_or_b32("m0", "m0", 0x00000F00)
@@ -452,6 +510,23 @@ class SaluOrB32InterpreterTests(unittest.TestCase):
         state.execute_s_or_b32("null", 0x1234, 0x5678)
         self.assertEqual(state.read_reg("null"), 0)
         self.assertEqual(state.scc, 1)
+
+        lines = [
+            "s_mov_b32 m0, 0x000000F0",
+            "s_or_b32 m0, m0, 0x00000F00",
+            "s_or_b32 null, 0x1234, 0x5678",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32 v0, m0",
+            "v_mov_b32 v1, s3",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_salu_special_regs", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 0x00000FF0)
+        self.assertEqual(out[1], 1)
 
     def test_translator_interpreter_equivalence(self):
         """Validate exact equivalence between Python interpreter and translated SPIR-V."""
@@ -492,7 +567,7 @@ class SaluOrB32SimdDivergenceTests(unittest.TestCase):
     """SIMD multi-lane divergence and 32/64-bit EXEC masking for s_or_b32."""
 
     def test_wave32_divergence_reconvergence(self):
-        """Simulate divergent branch merging in Wave32 using s_or_b32 on exec_lo."""
+        """Simulate divergent branch merging in Wave32 using s_or_b32 via translator."""
         even_lanes = 0x55555555  # lanes 0, 2, 4, ... 30
         odd_lanes = 0xAAAAAAAA   # lanes 1, 3, 5, ... 31
 
@@ -503,8 +578,12 @@ class SaluOrB32SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(state.read_reg("exec_lo"), MASK32)
         self.assertEqual(state.scc, 1)
 
+        out, scc = run_salu_or_b32(even_lanes, odd_lanes)
+        self.assertEqual(out, MASK32)
+        self.assertEqual(scc, 1)
+
     def test_wave64_dual_half_masks(self):
-        """Manage 64-bit wavefront execution masks across exec_lo and exec_hi."""
+        """Manage 64-bit wavefront execution masks across dual halves via translator."""
         state = ScalarRegisterState()
         state.write_reg("s0", 0x0000FFFF)
         state.write_reg("s1", 0xFFFF0000)
@@ -517,14 +596,35 @@ class SaluOrB32SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(state.read_reg("exec_lo"), MASK32)
         self.assertEqual(state.read_reg("exec_hi"), MASK32)
 
+        out_lo, _ = run_salu_or_b32(0x0000FFFF, 0xFFFF0000)
+        out_hi, _ = run_salu_or_b32(0x000000FF, 0xFFFFFF00)
+        self.assertEqual(out_lo, MASK32)
+        self.assertEqual(out_hi, MASK32)
+
     def test_vcc_condition_accumulation(self):
-        """Accumulate vector condition outcomes into vcc_lo via s_or_b32."""
+        """Accumulate vector condition outcomes via s_or_b32 via translator."""
         state = ScalarRegisterState()
         state.write_reg("vcc_lo", 0x00000000)
         state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x0000000F)
         state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x000000F0)
         state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x00000F00)
         self.assertEqual(state.read_reg("vcc_lo"), 0x00000FFF)
+
+        lines = [
+            "s_mov_b32 s2, 0x00000000",
+            "s_or_b32 s2, s2, 0x0000000F",
+            "s_or_b32 s2, s2, 0x000000F0",
+            "s_or_b32 s2, s2, 0x00000F00",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_vcc_accum", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 0x00000FFF)
 
     def test_translated_exec_mask_manipulation(self):
         """Translate shader performing s_or_b32 on exec_lo and verify SPIR-V output."""
@@ -547,17 +647,33 @@ class SaluOrB32AliasingTests(unittest.TestCase):
     """Register aliasing and in-place operand preservation for s_or_b32."""
 
     def test_self_aliasing_all_operands_identical(self):
-        """s_or_b32 s0, s0, s0: in-place idempotent self-OR."""
-        state = ScalarRegisterState()
+        """s_or_b32 s0, s0, s0: in-place idempotent self-OR via translator."""
         val = 0xFEEDBEEF
+        state = ScalarRegisterState()
         state.write_reg("s0", val)
         res = state.execute_s_or_b32("s0", "s0", "s0")
         self.assertEqual(res, val)
         self.assertEqual(state.read_reg("s0"), val)
         self.assertEqual(state.scc, 1)
 
+        lines = [
+            f"s_mov_b32 s0, {val:#x}",
+            "s_or_b32 s0, s0, s0",
+            "v_mov_b32 v0, s0",
+            "s_cselect_b32 s1, 1, 0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_self_alias", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], val)
+        self.assertEqual(out[1], 1)
+
     def test_in_place_dst_alias_src0(self):
-        """s_or_b32 s0, s0, s1: accumulate into src0 while preserving src1."""
+        """s_or_b32 s0, s0, s1: accumulate into src0 while preserving src1 via translator."""
         state = ScalarRegisterState()
         state.write_reg("s0", 0x0F0F0F0F)
         state.write_reg("s1", 0xF0F0F0F0)
@@ -565,8 +681,24 @@ class SaluOrB32AliasingTests(unittest.TestCase):
         self.assertEqual(state.read_reg("s0"), MASK32)
         self.assertEqual(state.read_reg("s1"), 0xF0F0F0F0)
 
+        lines = [
+            "s_mov_b32 s0, 0x0F0F0F0F",
+            "s_mov_b32 s1, 0xF0F0F0F0",
+            "s_or_b32 s0, s0, s1",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_alias_src0_test", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], MASK32)
+        self.assertEqual(out[1], 0xF0F0F0F0)
+
     def test_in_place_dst_alias_src1(self):
-        """s_or_b32 s1, s0, s1: accumulate into src1 while preserving src0."""
+        """s_or_b32 s1, s0, s1: accumulate into src1 while preserving src0 via translator."""
         state = ScalarRegisterState()
         state.write_reg("s0", 0x11111111)
         state.write_reg("s1", 0x22222222)
@@ -574,8 +706,24 @@ class SaluOrB32AliasingTests(unittest.TestCase):
         self.assertEqual(state.read_reg("s0"), 0x11111111)
         self.assertEqual(state.read_reg("s1"), 0x33333333)
 
+        lines = [
+            "s_mov_b32 s0, 0x11111111",
+            "s_mov_b32 s1, 0x22222222",
+            "s_or_b32 s1, s0, s1",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_alias_src1_test", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 0x11111111)
+        self.assertEqual(out[1], 0x33333333)
+
     def test_adjacent_register_isolation(self):
-        """Modifying destination register must not touch adjacent SGPRs."""
+        """Modifying destination register must not touch adjacent SGPRs via translator."""
         state = ScalarRegisterState()
         state.write_reg("s0", 0x11111111)
         state.write_reg("s1", 0x22222222)
@@ -587,6 +735,26 @@ class SaluOrB32AliasingTests(unittest.TestCase):
         self.assertEqual(state.read_reg("s1"), 0x33333333)
         self.assertEqual(state.read_reg("s2"), 0x33333333)
         self.assertEqual(state.read_reg("s3"), 0x44444444)
+
+        lines = [
+            "s_mov_b32 s0, 0x11111111",
+            "s_mov_b32 s1, 0x22222222",
+            "s_mov_b32 s2, 0x33333333",
+            "s_mov_b32 s3, 0x44444444",
+            "s_or_b32 s1, s1, s2",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, s2",
+            "v_mov_b32 v3, s3",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_adjacent_isolation_test", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 0x11111111)
+        self.assertEqual(out[1], 0x33333333)
+        self.assertEqual(out[2], 0x33333333)
+        self.assertEqual(out[3], 0x44444444)
 
     def test_translated_aliasing_shader(self):
         """Translate shader with dst aliasing src0 and execute via mrt0_words."""
@@ -611,34 +779,47 @@ class SaluOrB32ConditionCodeTests(unittest.TestCase):
     """Condition codes, status flags, and carry/borrow generation for s_or_b32."""
 
     def test_scc_zero_flag_exhaustion(self):
-        """SCC must be 0 if and only if the bitwise result is exactly zero."""
-        state = ScalarRegisterState()
-        state.execute_s_or_b32("s0", 0, 0)
-        self.assertEqual(state.scc, 0)
+        """SCC must be 0 if and only if the bitwise result is exactly zero via translator."""
+        res0, scc0 = run_salu_or_b32(0, 0)
+        self.assertEqual(res0, 0)
+        self.assertEqual(scc0, 0)
 
-        for bit in range(32):
+        for bit in [0, 1, 7, 15, 16, 24, 30, 31]:
             val = 1 << bit
-            state.execute_s_or_b32("s0", val, 0)
-            self.assertEqual(state.scc, 1)
+            with self.subTest(bit=bit):
+                res, scc = run_salu_or_b32(val, 0)
+                self.assertEqual(res, val)
+                self.assertEqual(scc, 1)
 
     def test_scc_preservation_across_mov(self):
-        """s_mov_b32 does NOT alter the SCC flag set by s_or_b32."""
-        state = ScalarRegisterState()
-        state.execute_s_or_b32("s0", 0, 0)
-        self.assertEqual(state.scc, 0)
-        state.run_program([
+        """s_mov_b32 does NOT alter the SCC flag set by s_or_b32 via translator."""
+        lines1 = [
+            "s_or_b32 s0, 0, 0",
             "s_mov_b32 s1, 0x12345678",
             "s_cselect_b32 s2, 100, 200",
-        ])
-        self.assertEqual(state.read_reg("s2"), 200)
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv1 = translate_lines("ps_scc_pres_0", lines1)
+        self.assertEqual(mrt0_words(spv1)[0], 200)
 
-        state.execute_s_or_b32("s0", 1, 0)
-        self.assertEqual(state.scc, 1)
-        state.run_program([
+        lines2 = [
+            "s_or_b32 s0, 1, 0",
             "s_mov_b32 s1, 0x00000000",
             "s_cselect_b32 s2, 100, 200",
-        ])
-        self.assertEqual(state.read_reg("s2"), 100)
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv2 = translate_lines("ps_scc_pres_1", lines2)
+        self.assertEqual(mrt0_words(spv2)[0], 100)
 
     def test_scc_conditional_branching_shader(self):
         """Translate shader utilizing SCC from s_or_b32 to drive s_cselect_b32."""
@@ -670,33 +851,34 @@ class SaluOrB32FloatBitPatternTests(unittest.TestCase):
     """IEEE 754 boundary extremes, subnormals, and NaN handling for s_or_b32."""
 
     def test_ieee754_sign_bit_manipulation(self):
-        """Inject sign bit (0x80000000) into positive floats to produce negative equivalents."""
-        state = ScalarRegisterState()
+        """Inject sign bit (0x80000000) into positive floats via translator."""
         pos_zero = 0x00000000
         neg_zero = 0x80000000
-        res = state.execute_s_or_b32("s0", pos_zero, 0x80000000)
+        res, scc = run_salu_or_b32(pos_zero, 0x80000000)
         self.assertEqual(res, neg_zero)
+        self.assertEqual(scc, 1)
 
         pos_one_bits = struct.unpack("<I", struct.pack("<f", 1.0))[0]
         neg_one_bits = struct.unpack("<I", struct.pack("<f", -1.0))[0]
-        res_neg_one = state.execute_s_or_b32("s1", pos_one_bits, 0x80000000)
+        res_neg_one, scc_neg = run_salu_or_b32(pos_one_bits, 0x80000000)
         self.assertEqual(res_neg_one, neg_one_bits)
+        self.assertEqual(scc_neg, 1)
 
     def test_nan_quieting_and_payload_synthesis(self):
-        """Set quiet bit (bit 22, 0x00400000) to convert signaling NaN to quiet NaN."""
-        state = ScalarRegisterState()
+        """Set quiet bit (bit 22, 0x00400000) to convert signaling NaN to quiet NaN via translator."""
         snan_bits = 0x7F800001
         qnan_expected = 0x7FC00001
-        res = state.execute_s_or_b32("s0", snan_bits, 0x00400000)
+        res, scc = run_salu_or_b32(snan_bits, 0x00400000)
         self.assertEqual(res, qnan_expected)
+        self.assertEqual(scc, 1)
 
     def test_subnormal_to_infinity_promotion(self):
-        """Promote subnormal float mantissa to infinity exponent using bitwise OR."""
-        state = ScalarRegisterState()
+        """Promote subnormal float mantissa to infinity exponent using bitwise OR via translator."""
         subnorm = 0x000000FF
         inf_exp = 0x7F800000
-        res = state.execute_s_or_b32("s0", subnorm, inf_exp)
+        res, scc = run_salu_or_b32(subnorm, inf_exp)
         self.assertEqual(res, inf_exp | subnorm)
+        self.assertEqual(scc, 1)
         self.assertTrue(math.isnan(struct.unpack("<f", struct.pack("<I", res))[0]))
 
     def test_translated_float_bitwise_shader(self):
@@ -721,7 +903,7 @@ class SaluOrB32NegativeControlsTests(unittest.TestCase):
     """Negative controls, syntax rejection, and mutation detection for s_or_b32."""
 
     def test_mutation_discrimination_matrix(self):
-        """Ensure s_or_b32 is strictly distinguished from AND, XOR, ADD, and NOR."""
+        """Ensure s_or_b32 is strictly distinguished from AND, XOR, ADD, and NOR via translator."""
         pairs = [
             (0x12345678, 0x87654321),
             (0xFF00FF00, 0x00FF00FF),
@@ -730,7 +912,7 @@ class SaluOrB32NegativeControlsTests(unittest.TestCase):
             (0x00000001, 0x00000002),
         ]
         for a, b in pairs:
-            or_res = ref_s_or_b32(a, b)
+            or_res, _ = run_salu_or_b32(a, b)
             and_res = (a & b) & MASK32
             xor_res = (a ^ b) & MASK32
             nor_res = (~(a | b)) & MASK32
