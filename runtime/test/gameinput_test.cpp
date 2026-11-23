@@ -481,6 +481,14 @@ void test_raw_hid(IGameInput* input) {
     check(g_raw.closes == 1 && rt::gameinput::connected_count() == 0, "raw hid: unplugging closes the HID device");
     check(rdev->CreateRawDeviceReport(2, GameInputRawOutputReport, &none) == E_NOTIMPL,
           "raw hid: no raw I/O once the pad is gone");
+    const GameInputDeviceInfo* gone = rdev->GetDeviceInfo();
+    check(!(gone->supportedInput & GameInputKindRawDeviceReport) && gone->inputReportCount == 0 &&
+              !gone->inputReportInfo && gone->outputReportCount == 0 && !gone->outputReportInfo &&
+              gone->featureReportCount == 0 && !gone->featureReportInfo,
+          "raw hid: and its info no longer offers raw reports");
+    check(gone != ri && (ri->supportedInput & GameInputKindRawDeviceReport) && ri->inputReportCount == 1 && in &&
+              in->id == 1 && in->size == 3,
+          "raw hid: the info a title read before the unplug stays whole");
     rdev->Release();
     pdev->Release();
     rt::gameinput::set_hid_backend(nullptr);
@@ -1644,6 +1652,79 @@ void test_info_during_reconnect(IGameInput*) {
     reader.join();
     std::printf("reconnect info: %ld reads over 200 reconnects, %ld inconsistent\n", reads.load(), bad.load());
     check(reads.load() > 0 && bad.load() == 0, "reconnect info: a title reading the info across 200 reconnects sees it whole");
+
+    // The same pad coming back changed: another name (a new mapping for its GUID) and no force-feedback motor. Each
+    // read must see one whole version: a name that is one of the two, intact, and a motor count that matches its table.
+    const SDL_GUID guid = SDL_GetJoystickGUIDForID(wheel.id);
+    char* mapping = SDL_GetGamepadMappingForGUID(guid);
+    std::string renamed_mapping;
+    const std::string renamed = shown + " (renamed)";
+    if (mapping) {
+        std::string m = mapping;
+        const size_t a = m.find(','), b = a == std::string::npos ? a : m.find(',', a + 1);
+        if (b != std::string::npos) renamed_mapping = m.substr(0, a + 1) + renamed + m.substr(b);
+    }
+    const std::string original_mapping = mapping ? mapping : "";
+    SDL_free(mapping);
+    check(!renamed_mapping.empty(), "reconnect info: the wheel has a mapping to rename");
+    const auto whole = [&](const GameInputDeviceInfo* i, int* which) {
+        const GameInputString* dn = i->displayName;
+        if (!dn || !dn->data || std::strlen(dn->data) != dn->sizeInBytes) return false;
+        const std::string seen(dn->data, dn->sizeInBytes);
+        *which = seen == shown ? 0 : seen == renamed ? 1 : -1;
+        const auto* motor = static_cast<const GameInputForceFeedbackMotorInfo*>(i->forceFeedbackMotorInfo);
+        const bool ff = (i->forceFeedbackMotorCount == 1 && motor && motor->isConstantEffectSupported &&
+                         motor->maxSimultaneousEffects == 8) ||
+                        (i->forceFeedbackMotorCount == 0 && !motor);
+        return *which >= 0 && ff && std::memcmp(&i->deviceId, &first.deviceId, sizeof first.deviceId) == 0 &&
+               i->controllerAxisCount == first.controllerAxisCount && i->controllerAxisInfo &&
+               i->controllerAxisInfo[0].mappedInputKinds == GameInputKindGamepad && i->gamepadInfo;
+    };
+    stop = false;
+    reads = 0;
+    bad = 0;
+    std::atomic<long> seen_renamed{0};
+    std::thread changed_reader([&] {
+        while (!stop.load()) {
+            int which = -1;
+            bad += !whole(dev->GetDeviceInfo(), &which);
+            seen_renamed += which == 1;
+            ++reads;
+        }
+    });
+    for (int n = 0; n < 200 && !renamed_mapping.empty(); ++n) {
+        detach(wheel);
+        rt::gameinput::poll();
+        const bool changed = n % 2 == 0;  // even steps rename the wheel and drop its motor; the last is the original
+        SDL_AddGamepadMapping(changed ? renamed_mapping.c_str() : original_mapping.c_str());
+        g_fake_open = !changed;
+        attach(wheel, name, 0x046D, 0xC24F, false);
+        rt::gameinput::poll();
+    }
+    stop = true;
+    changed_reader.join();
+    std::printf("reconnect info: %ld reads over 200 changed reconnects, %ld inconsistent, %ld renamed\n", reads.load(),
+                bad.load(), seen_renamed.load());
+    check(reads.load() > 0 && bad.load() == 0 && seen_renamed.load() > 0,
+          "reconnect info: across 200 reconnects changing the name and the motor, every read sees one whole version");
+
+    // One more renamed, motorless reconnect: the title's new info says so, and the info it read before is untouched.
+    detach(wheel);
+    rt::gameinput::poll();
+    if (!renamed_mapping.empty()) SDL_AddGamepadMapping(renamed_mapping.c_str());
+    g_fake_open = false;
+    attach(wheel, name, 0x046D, 0xC24F, false);
+    rt::gameinput::poll();
+    const GameInputDeviceInfo* now = dev->GetDeviceInfo();
+    check(now != info && now->displayName && now->displayName->data && renamed == now->displayName->data &&
+              now->forceFeedbackMotorCount == 0 && !now->forceFeedbackMotorInfo,
+          "reconnect info: a pad back with another name and no motor publishes a new info that says so");
+    check(info->displayName && info->displayName->data && shown == info->displayName->data &&
+              info->displayName->sizeInBytes == shown.size() && info->forceFeedbackMotorCount == 1 &&
+              info->forceFeedbackMotorInfo,
+          "reconnect info: the info a title held from before still has the old name and motor, whole");
+    if (!original_mapping.empty()) SDL_AddGamepadMapping(original_mapping.c_str());
+    g_fake_open = true;
 
     detach(wheel);
     rt::gameinput::poll();

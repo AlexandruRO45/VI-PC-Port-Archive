@@ -39,10 +39,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -442,6 +444,31 @@ bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endle
     return true;
 }
 
+// What GetDeviceInfo hands the title (RT-732): a copy of a device's info and of every table it points at, never changed
+// once published. The title reads the info with no lock, so a reconnect that changes anything (a new name, a motor
+// that went away, raw I/O gained or lost) publishes a new view instead of rewriting the one a reader may be in, and old
+// views are kept for the process, as devices are, so a pointer the title still holds stays whole and valid.
+struct InfoTables {  // plain data, zero-filled before it is filled, so publish_view compares it bytewise
+    GameInputDeviceInfo info;  // up to the first pointer field; the pointers are the view's own, set after the compare
+    uint32_t present;          // which of the pointer fields below are set (kView* bits)
+    GameInputControllerAxisInfo axis[kAxisCount];
+    GameInputControllerButtonInfo button[kButtonCount];
+    GameInputGamepadInfo gamepad;
+    GameInputUiNavigationInfo ui;
+    GameInputMotionInfo motion;
+    GameInputForceFeedbackMotorInfo ff_motor;
+    GameInputHapticFeedbackMotorInfo haptic_motor[kHapticMotors];  // waveformInfo null here
+    GameInputHapticWaveformInfo haptic_waveform[kHapticMotors];
+};
+struct InfoView {
+    InfoTables t;
+    std::string name;
+    std::vector<GameInputRawDeviceReportInfo> raw_in, raw_out, raw_feature;
+    GameInputHapticFeedbackMotorInfo haptic_motor[kHapticMotors];  // t.haptic_motor pointing at t.haptic_waveform
+    GameInputString display_name;
+    GameInputDeviceInfo info;  // t.info with its pointers into this view: what GetDeviceInfo returns
+};
+
 class Device final : public IGameInputDevice {
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
@@ -459,7 +486,11 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override { return release_floor(refs_); }
 
-    const GameInputDeviceInfo* STDMETHODCALLTYPE GetDeviceInfo() override { return &info; }
+    // A pad's published view; an aggregate never publishes one, its info is final before a title sees it.
+    const GameInputDeviceInfo* STDMETHODCALLTYPE GetDeviceInfo() override {
+        const InfoView* v = view.load(std::memory_order_acquire);
+        return v ? &v->info : &info;
+    }
     uint32_t STDMETHODCALLTYPE GetDeviceStatus() override { return status.load(); }
     void STDMETHODCALLTYPE GetBatteryState(GameInputBatteryState* state) override;
     HRESULT STDMETHODCALLTYPE CreateForceFeedbackEffect(uint32_t motorIndex, const void* params, void** effect) override;
@@ -487,7 +518,9 @@ public:
     void STDMETHODCALLTYPE ReleaseExclusiveRawDeviceAccess() override {}
 
     // Shared state, under g().mu unless noted.
-    GameInputDeviceInfo info{};
+    GameInputDeviceInfo info{};  // the shim's own copy; the title reads the view publish_view makes of it
+    std::atomic<const InfoView*> view{nullptr};
+    std::vector<std::unique_ptr<InfoView>> views;  // every view published, kept: a title may still read any of them
     std::string name;
     GameInputString display_name{};
     GameInputControllerAxisInfo axis_info[kAxisCount]{};
@@ -1124,9 +1157,8 @@ void id_bytes(const std::string& identity, const SDL_GUID& guid, uint32_t twin, 
     id_bytes(twin ? "t:" + std::to_string(twin) + ":" + identity : identity, guid, out);
 }
 
-// Overwrites dst with src only when they differ. GetDeviceInfo hands the title a pointer into the device, which it
-// reads without the state lock, so a reconnect must never leave a field zeroed while it is rebuilt (RT-732): the new
-// value is built off to the side, and a pad that comes back unchanged writes nothing at all.
+// Overwrites dst with src only when they differ, so a pad that comes back unchanged writes nothing. The title never
+// reads these copies (it reads the published view), but the shim's unlocked readers of d->info do.
 template <class T>
 void publish(T& dst, const T& src) {
     if (std::memcmp(&dst, &src, sizeof(T)) != 0) dst = src;
@@ -1194,15 +1226,20 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
     i.controllerButtonInfo = d->button_info;
     i.gamepadInfo = &d->gamepad_info;
     i.uiNavigationInfo = &d->ui_info;
-    // The name is reassigned only when it changed: a new buffer would free the one displayName points at.
+    // The title reads its own copy of the name (publish_view), so the shim's may be reassigned.
     const char* n = SDL_GetGamepadName(p);
     const char* name = n ? n : "Gamepad";
     if (d->name != name) d->name = name;
     uint32_t points = 0;
     for (unsigned char c : d->name) points += (c & 0xC0) != 0x80;
-    publish(d->display_name, GameInputString{static_cast<uint32_t>(d->name.size()), points, d->name.c_str()});
+    GameInputString dn{};
+    dn.sizeInBytes = static_cast<uint32_t>(d->name.size());
+    dn.codePointCount = points;
+    dn.data = d->name.c_str();
+    publish(d->display_name, dn);
     i.displayName = &d->display_name;
-    // The raw report fields are open_raw's, which runs next and corrects them; until then they keep what they had.
+    // The raw report fields are open_raw's, which runs next, corrects them and publishes the view; until then they
+    // keep what they had.
     const GameInputDeviceInfo& old = d->info;
     i.supportedInput |= old.supportedInput & GameInputKindRawDeviceReport;
     i.inputReportCount = old.inputReportCount;
@@ -1232,18 +1269,115 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
 // Raw HID (RT-175): opens the pad's HID device with the current backend and builds the report tables from its report
 // descriptor. A pad the backend cannot open, or whose descriptor cannot be read or declares no report, gets no raw
 // I/O: no GameInputKindRawDeviceReport, no report tables, and E_NOTIMPL from the raw device calls. Under g().mu.
-// The raw report fields of d->info, from the report tables (empty tables: no raw I/O). Under g().mu and hid_mu.
+// Publishes d->info, and every table it points at, as the device's new view, unless it equals the current one. Every
+// change to d->info ends here (open_pad: fill_info, then open_raw; close_pad: close_raw). Under g().mu.
+void publish_view(Device* d) {
+    enum : uint32_t {
+        kAxes = 1, kButtons = 2, kGamepad = 4, kUi = 8, kMotion = 16, kFf = 32, kHaptic = 64, kName = 128
+    };
+    const GameInputDeviceInfo& s = d->info;
+    auto v = std::make_unique<InfoView>();
+    InfoTables& t = v->t;
+    std::memset(&t, 0, sizeof t);
+    std::memcpy(&t.info, &s, offsetof(GameInputDeviceInfo, inputReportInfo));
+    const uint32_t axes = std::min(s.controllerAxisCount, kAxisCount);
+    const uint32_t buttons = std::min(s.controllerButtonCount, kButtonCount);
+    const uint32_t haptic = std::min(s.hapticFeedbackMotorCount, kHapticMotors);
+    if (s.controllerAxisInfo) t.present |= kAxes, std::memcpy(t.axis, s.controllerAxisInfo, axes * sizeof t.axis[0]);
+    if (s.controllerButtonInfo)
+        t.present |= kButtons, std::memcpy(t.button, s.controllerButtonInfo, buttons * sizeof t.button[0]);
+    if (s.gamepadInfo) t.present |= kGamepad, std::memcpy(&t.gamepad, s.gamepadInfo, sizeof t.gamepad);
+    if (s.uiNavigationInfo) t.present |= kUi, std::memcpy(&t.ui, s.uiNavigationInfo, sizeof t.ui);
+    if (s.motionInfo) t.present |= kMotion, std::memcpy(&t.motion, s.motionInfo, sizeof t.motion);
+    if (s.forceFeedbackMotorInfo)
+        t.present |= kFf, std::memcpy(&t.ff_motor, s.forceFeedbackMotorInfo, sizeof t.ff_motor);
+    if (s.hapticFeedbackMotorInfo) {
+        t.present |= kHaptic;
+        const auto* hm = static_cast<const GameInputHapticFeedbackMotorInfo*>(s.hapticFeedbackMotorInfo);
+        for (uint32_t m = 0; m < haptic; ++m) {
+            std::memcpy(&t.haptic_motor[m], &hm[m], sizeof hm[m]);
+            t.haptic_motor[m].waveformInfo = nullptr;
+            t.haptic_motor[m].waveformCount = hm[m].waveformInfo ? std::min(hm[m].waveformCount, 1u) : 0;
+            if (t.haptic_motor[m].waveformCount)
+                std::memcpy(&t.haptic_waveform[m], hm[m].waveformInfo, sizeof t.haptic_waveform[m]);
+        }
+    }
+    if (s.displayName && s.displayName->data) {
+        t.present |= kName;
+        v->name.assign(s.displayName->data, s.displayName->sizeInBytes);
+    }
+    const auto table = [](const GameInputRawDeviceReportInfo* r, uint32_t n) {
+        return r ? std::vector<GameInputRawDeviceReportInfo>(r, r + n) : std::vector<GameInputRawDeviceReportInfo>{};
+    };
+    v->raw_in = table(s.inputReportInfo, s.inputReportCount);
+    v->raw_out = table(s.outputReportInfo, s.outputReportCount);
+    v->raw_feature = table(s.featureReportInfo, s.featureReportCount);
+    using Table = std::vector<GameInputRawDeviceReportInfo>;
+    const auto same = [](const Table& a, const Table& b) {
+        return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof a[0]) == 0);
+    };
+    if (const InfoView* cur = d->view.load(std::memory_order_relaxed)) {
+        // Equal views write nothing; a padding byte that differs only costs a view.
+        if (std::memcmp(&cur->t, &t, sizeof t) == 0 && cur->name == v->name && same(cur->raw_in, v->raw_in) &&
+            same(cur->raw_out, v->raw_out) && same(cur->raw_feature, v->raw_feature))
+            return;
+    }
+    GameInputDeviceInfo& i = v->info;
+    std::memset(&i, 0, sizeof i);
+    std::memcpy(&i, &t.info, offsetof(GameInputDeviceInfo, inputReportInfo));
+    i.inputReportCount = static_cast<uint32_t>(v->raw_in.size());
+    i.outputReportCount = static_cast<uint32_t>(v->raw_out.size());
+    i.featureReportCount = static_cast<uint32_t>(v->raw_feature.size());
+    i.inputReportInfo = v->raw_in.empty() ? nullptr : v->raw_in.data();
+    i.outputReportInfo = v->raw_out.empty() ? nullptr : v->raw_out.data();
+    i.featureReportInfo = v->raw_feature.empty() ? nullptr : v->raw_feature.data();
+    i.controllerAxisCount = (t.present & kAxes) ? axes : 0;
+    i.controllerAxisInfo = (t.present & kAxes) ? t.axis : nullptr;
+    i.controllerButtonCount = (t.present & kButtons) ? buttons : 0;
+    i.controllerButtonInfo = (t.present & kButtons) ? t.button : nullptr;
+    if (t.present & kGamepad) i.gamepadInfo = &t.gamepad;
+    if (t.present & kUi) i.uiNavigationInfo = &t.ui;
+    if (t.present & kMotion) i.motionInfo = &t.motion;
+    if (t.present & kFf) i.forceFeedbackMotorInfo = &t.ff_motor;
+    else i.forceFeedbackMotorCount = 0;
+    if (t.present & kHaptic) {
+        for (uint32_t m = 0; m < haptic; ++m) {
+            v->haptic_motor[m] = t.haptic_motor[m];
+            if (t.haptic_motor[m].waveformCount) v->haptic_motor[m].waveformInfo = &t.haptic_waveform[m];
+        }
+        i.hapticFeedbackMotorInfo = v->haptic_motor;
+        i.hapticFeedbackMotorCount = haptic;
+    } else {
+        i.hapticFeedbackMotorCount = 0;
+    }
+    if (t.present & kName) {
+        v->display_name.sizeInBytes = static_cast<uint32_t>(v->name.size());
+        v->display_name.codePointCount = s.displayName->codePointCount;
+        v->display_name.data = v->name.c_str();
+        i.displayName = &v->display_name;
+    }
+    const InfoView* out = v.get();
+    d->views.push_back(std::move(v));
+    d->view.store(out, std::memory_order_release);
+}
+
+// The raw report fields of d->info, from the report tables while the HID device is open (none without one), then the
+// view. Under g().mu and hid_mu.
 void publish_raw_info(Device* d) {
     GameInputDeviceInfo i = d->info;
     i.supportedInput &= ~static_cast<uint32_t>(GameInputKindRawDeviceReport);
     if (d->hid) i.supportedInput |= GameInputKindRawDeviceReport;
-    i.inputReportCount = static_cast<uint32_t>(d->raw_in.size());
-    i.inputReportInfo = d->raw_in.empty() ? nullptr : d->raw_in.data();
-    i.outputReportCount = static_cast<uint32_t>(d->raw_out.size());
-    i.outputReportInfo = d->raw_out.empty() ? nullptr : d->raw_out.data();
-    i.featureReportCount = static_cast<uint32_t>(d->raw_feature.size());
-    i.featureReportInfo = d->raw_feature.empty() ? nullptr : d->raw_feature.data();
+    const auto set = [d](const std::vector<GameInputRawDeviceReportInfo>& t, uint32_t* count,
+                         const GameInputRawDeviceReportInfo** info) {
+        const bool any = d->hid && !t.empty();
+        *count = any ? static_cast<uint32_t>(t.size()) : 0;
+        *info = any ? t.data() : nullptr;
+    };
+    set(d->raw_in, &i.inputReportCount, &i.inputReportInfo);
+    set(d->raw_out, &i.outputReportCount, &i.outputReportInfo);
+    set(d->raw_feature, &i.featureReportCount, &i.featureReportInfo);
     publish(d->info, i);
+    publish_view(d);
 }
 
 void open_raw(Device* d, const char* path) {
@@ -1289,10 +1423,12 @@ void open_raw(Device* d, const char* path) {
     publish_raw_info(d);
 }
 
+// Under g().mu. An unplugged pad's info no longer offers raw reports; the tables stay for readings a title holds.
 void close_raw(Device* d) {
     std::lock_guard lock(d->hid_mu);
     if (d->hid) d->hid_backend->close(d->hid);
     d->hid = nullptr;
+    publish_raw_info(d);
 }
 
 // Drains the input reports pending since the last poll; the newest one the pad declares goes into snap. With none
