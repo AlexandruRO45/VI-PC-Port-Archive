@@ -114,7 +114,7 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
     index_path = os.path.join(spirv_dir, "index.json")
     if pair is None and not os.path.isfile(index_path):
         return
-    with open(index_path, encoding="utf-8") as f:
+    with open(index_path, encoding="utf-8-sig") as f:
         index = json.load(f)
     if not isinstance(index, dict):
         raise ValueError(f"{index_path}: translation index must be a JSON object")

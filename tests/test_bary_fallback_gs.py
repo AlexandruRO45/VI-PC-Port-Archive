@@ -725,6 +725,20 @@ class TestMainAndCLI(unittest.TestCase):
                         self.assertEqual(out, "")
                         self.assertEqual(err, f"{index_path}: index entry {name!r} must be a JSON object\n")
 
+    def test_main_accepts_utf8_bom_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = os.path.join(tmp, "index.json")
+            payload = {"ps_bom": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+            with open(index_path, "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump(payload, f)
+            self.assertTrue(Path(index_path).read_bytes().startswith(b"\xef\xbb\xbf"))
+
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools):
+                code, out, err = self._call_main(["bary_fallback_gs.py", tmp])
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertEqual(out.splitlines(), [os.path.join(tmp, "ps_bom.bary_gs.spv")])
+
     def test_cli_subprocess_isolated_mode(self):
         def run_cli(*args):
             return subprocess.run(
