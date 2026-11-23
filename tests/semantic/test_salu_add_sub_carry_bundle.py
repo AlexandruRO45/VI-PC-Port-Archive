@@ -376,6 +376,16 @@ class TestSSubbU32AST(unittest.TestCase):
         expr = SSubbU32Expr(10, 5, 1)
         self.assertEqual(expr.eval(), (4, 0))
 
+class TestSSubbU32ChainingAndPropagation(unittest.TestCase):
+    def test_64bit_sub_chain(self) -> None:
+        # 64-bit subtraction: A - B
+        a_lo, a_hi = 0x00000000, 0x00000005
+        b_lo, b_hi = 0x00000001, 0x00000002
+        r_lo, bout = ref_s_sub_u32(a_lo, b_lo)
+        r_hi, bout2 = ref_s_subb_u32(a_hi, b_hi, bout)
+        self.assertEqual((r_lo, r_hi), (0xFFFFFFFF, 2))
+        self.assertEqual(bout2, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
