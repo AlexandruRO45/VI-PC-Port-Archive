@@ -439,6 +439,9 @@ using namespace rt::process;
 #define COMMAND_LINE(dll) \
     {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
+#define THREAD_DESCRIPTION(dll) \
+    {dll, "SetThreadDescription", reinterpret_cast<void*>(&::SetThreadDescription)}, \
+    {dll, "GetThreadDescription", reinterpret_cast<void*>(&::GetThreadDescription)}
 }  // namespace
 
 SHIM_TABLE(process,
@@ -460,4 +463,7 @@ SHIM_TABLE(process,
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
+    THREAD_DESCRIPTION("kernel32.dll"),
+    THREAD_DESCRIPTION("kernelbase.dll"),
+    THREAD_DESCRIPTION("api-ms-win-core-processthreads-l1-1-3.dll"),
 );

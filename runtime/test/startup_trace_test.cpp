@@ -40,6 +40,27 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_failed;
 }
 
+void test_thread_description() {
+    for (const char* dll : {"kernel32.dll", "kernelbase.dll", "api-ms-win-core-processthreads-l1-1-3.dll"}) {
+        const auto set = reinterpret_cast<decltype(&SetThreadDescription)>(rt::shims::find(dll, "SetThreadDescription"));
+        const auto get = reinterpret_cast<decltype(&GetThreadDescription)>(rt::shims::find(dll, "GetThreadDescription"));
+        check(set && get, std::string(dll) + " binds both thread description imports");
+        if (!set || !get) continue;
+
+        const HANDLE current = GetCurrentThread();
+        for (const std::wstring& name : {std::wstring(L"worker \u00e9\u4e2d"), std::wstring(1024, L'\u4e2d')}) {
+            PWSTR actual = nullptr;
+            check(SUCCEEDED(set(current, name.c_str())), "set thread description");
+            check(SUCCEEDED(get(current, &actual)) && actual && name == actual, "round-trip entire UTF-16 description");
+            LocalFree(actual);
+        }
+        PWSTR actual = nullptr;
+        check(FAILED(set(nullptr, L"bad handle")), "set rejects a null thread handle");
+        check(FAILED(get(nullptr, &actual)), "get rejects a null thread handle");
+        LocalFree(actual);
+    }
+}
+
 struct Import {
     const char* dll;
     const char* name;
@@ -282,6 +303,7 @@ void test_trace(const fs::path& dir) {
 int wmain() {
     try {
         const fs::path dir = test_dir();
+        test_thread_description();
         test_disabled_is_silent();
         test_existing_file_is_kept(dir);
         test_trace(dir);
