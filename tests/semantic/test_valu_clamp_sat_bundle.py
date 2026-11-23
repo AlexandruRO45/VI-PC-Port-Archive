@@ -205,6 +205,31 @@ class TestValuAddF32AST(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertAlmostEqual(bits_to_f32(words[0]), 1.0, places=6)
 
+class TestValuAddF32ScalarExecution(unittest.TestCase):
+    """Stage 3: Scalar execution tests for v_add_f32 clamp and omod."""
+
+    def test_add_sgpr_source_clamped(self):
+        lines = [
+            "s_mov_b32 s0, 0x3f400000",  # 0.75
+            "v_mov_b32 v0, 0x3f000000",  # 0.5
+            "v_add_f32_e64 v1, v0, s0 clamp",  # 0.5 + 0.75 = 1.25 -> 1.0
+            "exp mrt0, v1, v1, v1, v1 done",
+            "s_endpgm",
+        ]
+        words = support.mrt0_words(support.translate_lines(next_test_id("ps_add_sgpr"), lines))
+        self.assertAlmostEqual(bits_to_f32(words[0]), 1.0, places=6)
+
+    def test_add_aliasing_dst_src0(self):
+        lines = [
+            "v_mov_b32 v0, 0x3f400000",  # 0.75
+            "v_mov_b32 v1, 0x3f000000",  # 0.5
+            "v_add_f32_e64 v0, v0, v1 clamp",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        words = support.mrt0_words(support.translate_lines(next_test_id("ps_add_alias"), lines))
+        self.assertAlmostEqual(bits_to_f32(words[0]), 1.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
