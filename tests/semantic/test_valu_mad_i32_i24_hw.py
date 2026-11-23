@@ -273,5 +273,101 @@ class TestMadI32I24ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.machine.vgprs[5], 0xFFFF_FFFE)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDWave:
+    def __init__(self, wave_size: int = 64):
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.sgprs: List[int] = [0] * 106
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        return bool(self.exec_mask & (1 << lane_id))
+
+    def step(self, insn: VMadI32I24Instruction):
+        for lane in range(self.wave_size):
+            if not self.is_lane_active(lane):
+                continue
+            # Read src0
+            if isinstance(insn.src0, LiteralOperand):
+                val_s0 = insn.src0.value & MASK32
+            elif insn.src0.op_type == OperandType.VGPR:
+                val_s0 = self.vgprs[insn.src0.index][lane] & MASK32
+            else:
+                val_s0 = self.sgprs[insn.src0.index] & MASK32
+
+            # Read src1
+            if isinstance(insn.src1, LiteralOperand):
+                val_s1 = insn.src1.value & MASK32
+            elif insn.src1.op_type == OperandType.VGPR:
+                val_s1 = self.vgprs[insn.src1.index][lane] & MASK32
+            else:
+                val_s1 = self.sgprs[insn.src1.index] & MASK32
+
+            # Read src2
+            if isinstance(insn.src2, LiteralOperand):
+                val_s2 = insn.src2.value & MASK32
+            elif insn.src2.op_type == OperandType.VGPR:
+                val_s2 = self.vgprs[insn.src2.index][lane] & MASK32
+            else:
+                val_s2 = self.sgprs[insn.src2.index] & MASK32
+
+            res = ref_mad_i32_i24(val_s0, val_s1, val_s2, clamp=insn.clamp)
+            self.vgprs[insn.dst.index][lane] = res & MASK32
+
+
+class TestMadI32I24SIMDDivergence(unittest.TestCase):
+    def test_wave32_alternating_exec(self):
+        wave = SIMDWave(wave_size=32)
+        wave.exec_mask = 0x5555_5555  # Even lanes active
+        for lane in range(32):
+            wave.vgprs[0][lane] = 0xDEAD_BEEF
+            wave.vgprs[1][lane] = 2
+            wave.vgprs[2][lane] = 3
+            wave.vgprs[3][lane] = 4
+
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        wave.step(insn)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[0][lane], 10)
+            else:
+                self.assertEqual(wave.vgprs[0][lane], 0xDEAD_BEEF)
+
+    def test_wave64_divergence(self):
+        wave = SIMDWave(wave_size=64)
+        wave.exec_mask = 0xFFFF_FFFF_0000_0000  # Top 32 lanes active
+        for lane in range(64):
+            wave.vgprs[10][lane] = 0xCAFE_0000
+            wave.vgprs[1][lane] = lane
+            wave.vgprs[2][lane] = 2
+            wave.vgprs[3][lane] = 1
+
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 10),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        wave.step(insn)
+
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[10][lane], 0xCAFE_0000)
+        for lane in range(32, 64):
+            expected = ref_mad_i32_i24(lane, 2, 1)
+            self.assertEqual(wave.vgprs[10][lane], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
