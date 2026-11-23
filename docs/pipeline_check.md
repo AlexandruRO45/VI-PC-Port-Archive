@@ -317,8 +317,17 @@ not for the deeper trees. With the linked 8 MB, the same 26 and 28 create their 
 reserve put back to 1 MB all 54 overflow again.
 
 Not measured: other AMD GPU families, other vendors' Windows drivers, and a corpus translated with
-`--wave64-emulate`. The runtime will need the same care for the threads it creates pipelines on: a game thread's
-stack is whatever the title asked for.
+`--wave64-emulate`.
+
+**The runtime.** The D3D12 shim creates a pipeline on the thread that asks for it
+(`runtime/shims/d3d12_vulkan_device.cpp`), so there the compiler runs on a game thread. The entry thread has 8 MB
+from `run_entry` (`runtime/shims/process_shim.h`). A thread the game starts with `dwStackSize` 0, a thread-pool
+thread and a `std::thread` of the shims get the reserve in `gta6rt.exe`'s header, because the game's `CreateThread`
+is Windows' own. `gta6rt` is therefore linked with the same 8 MB (`GTA6RT_STACK` in `runtime/CMakeLists.txt`, and
+the loader's `cl` line in `scripts/build_runtime.ps1`). The CTest `gta6rt_stack` reads the header, and
+`run_tiny_game_stack` asks Windows from inside a program the loader runs: the entry thread and a thread created
+with `dwStackSize` 0 both report 8 MB. Not covered: a thread the title creates with an explicit smaller size keeps
+that size. Which threads the game creates pipelines on is not known without its executable.
 
 ## Build-stage batches (BUILD-1030)
 

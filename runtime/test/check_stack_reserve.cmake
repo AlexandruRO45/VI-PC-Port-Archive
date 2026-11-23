@@ -2,7 +2,8 @@
 #
 # Fails unless the PE header of TOOL reserves at least WANT bytes of stack (SizeOfStackReserve). On Windows that
 # reserve is the stack of the main thread and of every thread created without a size of its own, std::thread
-# included, so it is what a driver's compiler runs on in vk_pipeline_check (BUILD-1457). Only the header is read.
+# included, so it is what a driver's compiler runs on in vk_pipeline_check, and in gta6rt on every game thread but
+# the entry thread (BUILD-1457). Only the header is read.
 
 # A little-endian unsigned integer of `bytes` bytes at `offset` in `file`.
 function(read_le file offset bytes out)
@@ -25,6 +26,10 @@ endfunction()
 
 if(NOT EXISTS "${TOOL}")
   message(FATAL_ERROR "no such file: ${TOOL}")
+endif()
+# if(<number> LESS <not a number>) is false, so a missing or misspelt WANT would pass every file.
+if(NOT "${WANT}" MATCHES "^[1-9][0-9]*$")
+  message(FATAL_ERROR "WANT must be a number of bytes greater than 0, got \"${WANT}\"")
 endif()
 read_le("${TOOL}" 0 2 dos_magic)
 if(NOT dos_magic EQUAL 23117)        # "MZ"

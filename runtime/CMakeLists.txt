@@ -125,7 +125,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # GTA6RT_HOST_BASE keeps the loader's own image off the default x64 EXE base (0x140000000), where a mapped EXE
   # without relocations wants to go. Windows moves the EXE with ASLR anyway; Wine loads it at its preferred base.
   set(GTA6RT_HOST_BASE /BASE:0x10000000000)
-  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
+  # BUILD-1457: a thread that asks for no stack size gets the reserve in this program's PE header, 1 MB by default:
+  # a thread the game starts with dwStackSize 0, a thread-pool thread, a std::thread of the shims. The D3D12 shim
+  # creates Vulkan pipelines on the calling thread, the driver compiles there, and AMD's Windows compiler (26.11.2)
+  # overflows 1 MB on some of the game's shaders (docs/pipeline_check.md, "Stack reserve"). run_entry already gives
+  # the entry thread 8 MB (shims/process_shim.h); this is the same number for the others. Keep it in step with
+  # scripts/build_runtime.ps1.
+  set(GTA6RT_STACK 8388608)
+  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
   target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
@@ -1051,6 +1058,12 @@ if(BUILD_TESTING)
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
+    # BUILD-1457: the stack a game thread gets. gta6rt_stack reads SizeOfStackReserve from the built loader (nothing
+    # is run); run_tiny_game_stack asks Windows, on the entry thread and on a thread created with dwStackSize 0.
+    add_test(NAME gta6rt_stack COMMAND "${CMAKE_COMMAND}"
+             "-DTOOL=$<TARGET_FILE:gta6rt>" "-DWANT=${GTA6RT_STACK}"
+             -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
+    add_test(NAME run_tiny_game_stack COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 stack)
     # GAME: is the game folder, absolute, when gta6rt is given a bare image name or `--game-dir .`.
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"

@@ -77,6 +77,22 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertRegex(lines[0], rf"/Fe:vk_pipeline_check\.exe /link (\S+ )*/STACK:{reserve}( |$)")
 
+    def test_the_loader_gets_the_stack_reserve_cmake_gives_it(self):
+        """BUILD-1457, the loader's side: a game thread with the default stack size gets the reserve in gta6rt.exe's
+        header, and the driver compiles a pipeline's shaders on the thread that creates it. CMake links gta6rt with
+        /STACK:<GTA6RT_STACK>; the fallback has to pass the same number, and it is the number run_entry gives the
+        entry thread, so every game thread that asks for no size has the same room."""
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        reserve = re.search(r"set\(GTA6RT_STACK (\d+)\)", cmake).group(1)
+        self.assertGreaterEqual(int(reserve), 8 * 1024 * 1024)
+        self.assertRegex(cmake, r"target_link_options\(gta6rt PRIVATE [^)]*/STACK:\$\{GTA6RT_STACK\}\)")
+        lines = [line for line in self.body.splitlines() if "/Fe:gta6rt.exe" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertRegex(lines[0], rf"/Fe:gta6rt\.exe /link (\S+ )*/STACK:{reserve}( |$)")
+        shim = (ROOT / "runtime" / "shims" / "process_shim.h").read_text(encoding="utf-8")
+        megabytes = re.search(r"run_entry\(void\* entry, std::size_t stack_bytes = (\d+)u << 20\);", shim).group(1)
+        self.assertEqual(int(megabytes) << 20, int(reserve))
+
     def test_build_cmd_sets_utf8_codepage_for_ninja_showincludes(self):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("chcp 65001 >nul", text)
