@@ -249,8 +249,8 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     return true;
 }
 
-// What the destination holds after `c` (or, resolved = false, after a refused one): the source's clear values inside
-// the resolved area of the resolved plane, its own everywhere else.
+// What the destination holds after `c`: the source's clear values inside the resolved area of the resolved plane,
+// its own everywhere else. (A refused one cannot be read back: see the loop over `refused` at the end of run().)
 Planes expected_planes(const Case& c, bool resolved = true) {
     Planes out;
     out.close = S_OK;
@@ -467,10 +467,13 @@ int main() {
         for (const Case& c : refused) {
             Planes p;
             if (!resolve_and_read(ours.p, c, p, true)) return 1;
-            if (p.close != E_INVALIDARG || !same_planes(p, expected_planes(c, false), false, c.plane)) {
-                std::fprintf(stderr, "refused %s %s rect %d: Close 0x%08lx, destination %s\n", c.name,
-                             mode_name(c.mode), int(c.rect), p.close,
-                             same_planes(p, expected_planes(c, false), false, c.plane) ? "kept" : "changed");
+            // The layer refuses the whole list (ExecuteCommandLists reports `nothing was submitted`), and the
+            // destination's clear and its read-back copy are in that same list, so the destination cannot be
+            // observed here: the read-back keeps whatever the heap held. Only the refusal is checked; what a
+            // refused resolve leaves in the destination needs a clear and a copy in an earlier submission.
+            if (p.close != E_INVALIDARG) {
+                std::fprintf(stderr, "refused %s %s rect %d: Close 0x%08lx, the device has no such mode\n", c.name,
+                             mode_name(c.mode), int(c.rect), p.close);
                 ++failures;
             }
             ++refusals;
@@ -560,7 +563,7 @@ int main() {
     const bool need_host = !hostwine::host_is_wine();
     if (need_host && !references) std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
     if (run_failed || failures || validation_errors || (need_host && (!references || !matched))) return 1;
-    std::printf("depth/stencil resolves: %u host comparisons matched, %u refusals kept the destination, %u modes the "
+    std::printf("depth/stencil resolves: %u host comparisons matched, %u refusals, %u modes the "
                 "device lacks were refused; %u edge MIN/MAX pairs differ%s\n", matched, refusals, lacking, edges,
                 edge_skipped ? " (edge cases skipped: no glslangValidator at build time)" : "");
     return 0;
