@@ -16,6 +16,7 @@ import ast
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -26,10 +27,12 @@ PENDING = {"tools/shader_disasm.py"}
 CALLS = {"run", "check_output", "Popen", "call", "check_call"}
 
 
-def tracked_python():
-    out = subprocess.run(["git", "-C", ROOT, "ls-files", "*.py"], capture_output=True, text=True,
-                         errors="replace", check=True).stdout
-    return [f for f in out.split() if f.startswith(CHECKED) and f not in PENDING]
+def tracked_python(root=ROOT):
+    # NUL-separated and as bytes: a path with a space or a non-ASCII letter stays one whole path (git quotes those
+    # in its default output, and splitting on whitespace cuts them).
+    out = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.py"], capture_output=True, check=True).stdout
+    files = [f.decode("utf-8", "surrogateescape") for f in out.split(b"\0") if f]
+    return [f for f in files if f.startswith(CHECKED) and f not in PENDING]
 
 
 def decodes_text(call):
@@ -65,6 +68,20 @@ class SubprocessTextErrorsTest(unittest.TestCase):
         self.assertTrue(files, "no tracked Python files found under " + ", ".join(CHECKED))
         bad = [hit for f in files for hit in missing_errors(f)]
         self.assertEqual(bad, [], "text-mode calls without errors=:\n" + "\n".join(bad))
+
+    def test_paths_with_spaces_and_non_ascii_letters_are_listed_whole(self):
+        names = ["tools/plain.py", "tools/with space.py", "tools/é.py"]
+        with tempfile.TemporaryDirectory() as root:
+            try:
+                subprocess.run(["git", "-C", root, "init", "-q"], check=True, capture_output=True)
+            except (OSError, subprocess.CalledProcessError) as e:
+                self.skipTest(f"git unavailable: {e}")
+            for name in names:
+                os.makedirs(os.path.join(root, os.path.dirname(name)), exist_ok=True)
+                with open(os.path.join(root, name), "w", encoding="utf-8") as f:
+                    f.write("")
+            subprocess.run(["git", "-C", root, "add", "--", *names], check=True, capture_output=True)
+            self.assertEqual(sorted(tracked_python(root)), sorted(names))
 
     def test_the_check_sees_a_missing_errors(self):
         # Negative control: the checker flags exactly the call that lacks errors=.
