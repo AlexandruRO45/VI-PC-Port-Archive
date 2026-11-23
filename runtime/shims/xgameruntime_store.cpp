@@ -9,8 +9,8 @@
 //
 // Offline the game is owned: the game license is active, not a trial; a package's license is acquirable and valid;
 // there are no add-on licenses, no products in any query and no package updates. Everything that needs the store
-// service or a store UI (purchases, consumables, tokens, collections ids, downloads) fails before starting, so no
-// XAsyncBlock waits, and logs once. License-changed and license-lost callbacks are never called: nothing changes.
+// service or a store UI fails offline. Consumables, tokens and user IDs complete asynchronously with E_FAIL;
+// other unimplemented operations fail before starting and log once. License-changed and license-lost callbacks are never called: nothing changes.
 //
 // XStoreGameLicense's layout is measured on the retail executable (docs/runtime_imports.md): the title's
 // XStoreQueryGameLicenseResult call passes a 104-byte stack buffer and reads the SKU id as a C string at +0x00, the
@@ -136,7 +136,7 @@ template <int Slot> HRESULT STDMETHODCALLTYPE unknown_slot(void*) {
 // ---- Async: every served *Async completes at once on the title's queue ----
 
 const char kProductsIdentity = 0, kLicenseIdentity = 0, kCanAcquireIdentity = 0, kGameLicenseIdentity = 0,
-           kAddOnsIdentity = 0, kUpdatesIdentity = 0;
+           kAddOnsIdentity = 0, kUpdatesIdentity = 0, kOfflineIdentity = 0;
 
 size_t result_size(const void* identity) {
     if (identity == &kProductsIdentity) return sizeof(XStoreProductQueryHandle);
@@ -154,7 +154,7 @@ HRESULT CALLBACK store_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::Begin:
         return XAsyncSchedule(data->async, 0);
     case XAsyncOp::DoWork:
-        XAsyncComplete(data->async, S_OK, result_size(identity));
+        XAsyncComplete(data->async, identity == &kOfflineIdentity ? E_FAIL : S_OK, result_size(identity));
         return S_OK;
     case XAsyncOp::GetResult:
         if (!data->buffer || data->bufferSize < result_size(identity)) return E_INVALIDARG;
@@ -183,6 +183,34 @@ HRESULT begin(XStoreContextHandle context, XAsyncBlock* async, const char* ident
     if (!async) return E_POINTER;
     if (!live(g_contexts, context)) return E_INVALIDARG;
     return XAsyncBegin(async, const_cast<char*>(identity), identity, name, store_provider);
+}
+
+// Service-backed calls complete on the queue even when the store is unavailable.
+HRESULT STDMETHODCALLTYPE store_consumable_async(void*, XStoreContextHandle c, const char* id, XAsyncBlock* a) {
+    if (!id) return E_INVALIDARG;
+    return begin(c, a, &kOfflineIdentity, "XStoreQueryConsumableBalanceRemainingAsync");
+}
+HRESULT STDMETHODCALLTYPE store_fulfill_async(void*, XStoreContextHandle c, const char* id, uint32_t, GUID, XAsyncBlock* a) {
+    if (!id) return E_INVALIDARG;
+    return begin(c, a, &kOfflineIdentity, "XStoreReportConsumableFulfillmentAsync");
+}
+HRESULT STDMETHODCALLTYPE store_user_id_async(void*, XStoreContextHandle c, const char* ticket, const char* user, XAsyncBlock* a) {
+    if (!ticket || !user) return E_INVALIDARG;
+    return begin(c, a, &kOfflineIdentity, "XStoreGetUserIdAsync");
+}
+HRESULT STDMETHODCALLTYPE store_token_async(void*, XStoreContextHandle c, const char** ids, size_t count, const char*, XAsyncBlock* a) {
+    if (count && !ids) return E_INVALIDARG;
+    return begin(c, a, &kOfflineIdentity, "XStoreQueryLicenseTokenAsync");
+}
+HRESULT STDMETHODCALLTYPE store_consumable_result(void*, XAsyncBlock* a, void* out) {
+    if (!out) return E_POINTER;
+    return XAsyncGetResult(a, &kOfflineIdentity, 0, out, nullptr);
+}
+HRESULT STDMETHODCALLTYPE store_offline_result_size(void*, XAsyncBlock* a, size_t* size) {
+    return XAsyncGetResultSize(a, size);
+}
+HRESULT STDMETHODCALLTYPE store_offline_string_result(void*, XAsyncBlock* a, size_t size, char* out) {
+    return XAsyncGetResult(a, &kOfflineIdentity, size, out, nullptr);
 }
 
 // ---- IXStoreImpl (slots 3-69), IXStoreImpl2-6 (70-83) ----
@@ -422,19 +450,19 @@ const void* const kStoreVtable[] = {
     FN(store_addons_async),                  // 30 XStoreQueryAddOnLicensesAsync
     FN(store_addons_count),                  // 31 XStoreQueryAddOnLicensesResultCount
     FN(store_addons_result),                 // 32 XStoreQueryAddOnLicensesResult
-    FN(offline_failure<33>),                 // 33 XStoreQueryConsumableBalanceRemainingAsync
-    FN(offline_failure<34>),                 // 34 XStoreQueryConsumableBalanceRemainingResult
-    FN(offline_failure<35>),                 // 35 XStoreReportConsumableFulfillmentAsync
-    FN(offline_failure<36>),                 // 36 XStoreReportConsumableFulfillmentResult
-    FN(offline_failure<37>),                 // 37 XStoreGetUserCollectionsIdAsync
-    FN(offline_failure<38>),                 // 38 XStoreGetUserCollectionsIdResultSize
-    FN(offline_failure<39>),                 // 39 XStoreGetUserCollectionsIdResult
-    FN(offline_failure<40>),                 // 40 XStoreGetUserPurchaseIdAsync
-    FN(offline_failure<41>),                 // 41 XStoreGetUserPurchaseIdResultSize
-    FN(offline_failure<42>),                 // 42 XStoreGetUserPurchaseIdResult
-    FN(offline_failure<43>),                 // 43 XStoreQueryLicenseTokenAsync
-    FN(offline_failure<44>),                 // 44 XStoreQueryLicenseTokenResultSize
-    FN(offline_failure<45>),                 // 45 XStoreQueryLicenseTokenResult
+    FN(store_consumable_async),                 // 33 XStoreQueryConsumableBalanceRemainingAsync
+    FN(store_consumable_result),                 // 34 XStoreQueryConsumableBalanceRemainingResult
+    FN(store_fulfill_async),                 // 35 XStoreReportConsumableFulfillmentAsync
+    FN(store_consumable_result),                 // 36 XStoreReportConsumableFulfillmentResult
+    FN(store_user_id_async),                 // 37 XStoreGetUserCollectionsIdAsync
+    FN(store_offline_result_size),                 // 38 XStoreGetUserCollectionsIdResultSize
+    FN(store_offline_string_result),                 // 39 XStoreGetUserCollectionsIdResult
+    FN(store_user_id_async),                 // 40 XStoreGetUserPurchaseIdAsync
+    FN(store_offline_result_size),                 // 41 XStoreGetUserPurchaseIdResultSize
+    FN(store_offline_string_result),                 // 42 XStoreGetUserPurchaseIdResult
+    FN(store_token_async),                 // 43 XStoreQueryLicenseTokenAsync
+    FN(store_offline_result_size),                 // 44 XStoreQueryLicenseTokenResultSize
+    FN(store_offline_string_result),                 // 45 XStoreQueryLicenseTokenResult
     FN(unknown_slot<46>),                    // 46 (unknown in the docs)
     FN(unknown_slot<47>),                    // 47 (unknown in the docs)
     FN(unknown_slot<48>),                    // 48 (unknown in the docs)

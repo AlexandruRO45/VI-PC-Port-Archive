@@ -80,6 +80,14 @@ using Register = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, XTaskQueueHandle, vo
 using Unregister = bool(STDMETHODCALLTYPE*)(void*, Handle, XTaskQueueRegistrationToken, bool);
 using NoArgs = HRESULT(STDMETHODCALLTYPE*)(void*);
 
+using FulfillAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, uint32_t, GUID, XAsyncBlock*);
+using UserIdAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, const char*, XAsyncBlock*);
+using TokenAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char**, size_t, const char*, XAsyncBlock*);
+using ConsumableResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void*);
+using ResultSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
+using StringResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, char*);
+void CALLBACK on_async(XAsyncBlock* block) { ++*static_cast<int*>(block->context); }
+
 int g_callbacks = 0;
 void CALLBACK on_change(void*) { ++g_callbacks; }
 bool CALLBACK on_product(void*, void*) {
@@ -170,6 +178,47 @@ int main() {
               !at<IsValid>(store, 16)(store, products),
           "the query has no products and no further pages");
     at<Close>(store, 19)(store, products);
+
+    // Each service operation starts successfully and delivers its offline failure to the callback.
+    XTaskQueueHandle queue = nullptr;
+    check(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue) == S_OK,
+          "create manual queue");
+    const int slots[] = {33, 35, 37, 40, 43};
+    for (int slot_index : slots) {
+        int called = 0;
+        XAsyncBlock block{};
+        block.queue = queue;
+        block.context = &called;
+        block.callback = on_async;
+        HRESULT start = E_FAIL;
+        const char* ids[] = {"product"};
+        if (slot_index == 33) start = at<CtxIdAsync>(store, 33)(store, context, "product", &block);
+        if (slot_index == 35) start = at<FulfillAsync>(store, 35)(store, context, "product", 1, GUID{}, &block);
+        if (slot_index == 37 || slot_index == 40)
+            start = at<UserIdAsync>(store, slot_index)(store, context, "ticket", "publisher", &block);
+        if (slot_index == 43) start = at<TokenAsync>(store, 43)(store, context, ids, 1, "custom", &block);
+        char label[100];
+        std::snprintf(label, sizeof(label), "slot %d starts", slot_index);
+        check(start == S_OK, label);
+        if (start != S_OK) continue;
+        XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0);
+        XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0);
+        std::snprintf(label, sizeof(label), "slot %d callback and offline status", slot_index);
+        check(called == 1 && XAsyncGetStatus(&block, false) == E_FAIL, label);
+        if (slot_index == 33 || slot_index == 35) {
+            char result[64]{};
+            std::snprintf(label, sizeof(label), "slot %d result", slot_index + 1);
+            check(at<ConsumableResult>(store, slot_index + 1)(store, &block, result) == E_FAIL, label);
+        } else {
+            size_t size = 0;
+            std::snprintf(label, sizeof(label), "slot %d result size", slot_index + 1);
+            check(at<ResultSize>(store, slot_index + 1)(store, &block, &size) == E_FAIL, label);
+            char result[64]{};
+            std::snprintf(label, sizeof(label), "slot %d result", slot_index + 2);
+            check(at<StringResult>(store, slot_index + 2)(store, &block, sizeof(result), result) == E_FAIL, label);
+        }
+    }
+    XTaskQueueCloseHandle(queue);
 
     // ---- what needs the service fails before starting ----
     check(at<NoArgs>(store, 49)(store) == E_FAIL, "XStoreShowPurchaseUIAsync is not available offline");
