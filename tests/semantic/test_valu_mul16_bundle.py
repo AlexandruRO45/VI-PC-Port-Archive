@@ -88,5 +88,26 @@ class VMulLoU16OracleTests(unittest.TestCase):
         self.assertEqual(ref_mul_lo_u16(1234, 1), 1234)
         self.assertEqual(ref_mul_lo_u16(1234, 0), 0)
 
+@dataclasses.dataclass
+class Mul16AstNode:
+    opcode: str
+    dst: str
+    src0: str
+    src1: str
+    src2: Optional[str] = None
+
+    def emit_asm(self) -> str:
+        if self.src2 is not None:
+            return f"{self.opcode} {self.dst}, {self.src0}, {self.src1}, {self.src2}"
+        return f"{self.opcode} {self.dst}, {self.src0}, {self.src1}"
+
+
+class VMulLoU16AstTests(unittest.TestCase):
+    """AST modeling for v_mul_lo_u16."""
+
+    def test_ast_emission(self):
+        node = Mul16AstNode("v_mul_lo_u16", "v0", "v1", "v2")
+        self.assertEqual(node.emit_asm(), "v_mul_lo_u16 v0, v1, v2")
+
 if __name__ == "__main__":
     unittest.main()
