@@ -177,17 +177,49 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
         info->ContextRecord->Rip == 0x140CC2936ull) {
         static std::atomic<int> skipped_format{0};
         if (skipped_format.fetch_add(1) < 64) {
-            std::fprintf(stderr, "[rt] format-int3: rbp=%p r13=%p r14=%p\n",
+            std::fprintf(stderr, "[rt] format-int3: rbp=%p r10=%p r13=%p r14=%p rsi=%p rdi=%p\n",
                          reinterpret_cast<void*>(info->ContextRecord->Rbp),
+                         reinterpret_cast<void*>(info->ContextRecord->R10),
                          reinterpret_cast<void*>(info->ContextRecord->R13),
-                         reinterpret_cast<void*>(info->ContextRecord->R14));
+                         reinterpret_cast<void*>(info->ContextRecord->R14),
+                         reinterpret_cast<void*>(info->ContextRecord->Rsi),
+                         reinterpret_cast<void*>(info->ContextRecord->Rdi));
             __try {
-                const auto* d = reinterpret_cast<const std::uint64_t*>(info->ContextRecord->R14);
-                std::fprintf(stderr, "[rt] format-desc: %016llx %016llx %016llx %016llx\n",
-                             static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1]),
-                             static_cast<unsigned long long>(d[2]), static_cast<unsigned long long>(d[3]));
+                const auto rsp = static_cast<std::uint64_t>(info->ContextRecord->Rsp);
+                const auto caller_rsi = *reinterpret_cast<const std::uint64_t*>(rsp + 0x48);
+                const auto holder = caller_rsi ? *reinterpret_cast<const std::uint64_t*>(caller_rsi + 0x60) : 0;
+                const auto holder_vt = holder ? *reinterpret_cast<const std::uint64_t*>(holder) : 0;
+                std::fprintf(stderr, "[rt] format-object: caller_rsi=%p holder=%p holder_vtable=%p\n",
+                             reinterpret_cast<void*>(caller_rsi), reinterpret_cast<void*>(holder),
+                             reinterpret_cast<void*>(holder_vt));
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                std::fprintf(stderr, "[rt] format-desc: unreadable\n");
+                std::fprintf(stderr, "[rt] format-object: unreadable\n");
+            }
+            __try {
+                const auto* st = reinterpret_cast<const std::uint64_t*>(info->ContextRecord->Rsp);
+                std::fprintf(stderr, "[rt] format-stack-raw:");
+                for (int i = 0; i < 10; ++i) std::fprintf(stderr, " %016llx", static_cast<unsigned long long>(st[i]));
+                std::fprintf(stderr, "\n");
+                for (int i = 0; i < 14; ++i) {
+                    const std::uint64_t a = st[i];
+                    if (a < 0x10000) continue;
+                    HMODULE holder = nullptr;
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           reinterpret_cast<LPCSTR>(a), &holder) &&
+                        holder) {
+                        char name[MAX_PATH] = {};
+                        GetModuleFileNameA(holder, name, MAX_PATH);
+                        const char* slash = std::strrchr(name, '\\');
+                        std::fprintf(stderr, "[rt] format-frame %d: %s+0x%llx\n", i, slash ? slash + 1 : name,
+                                     static_cast<unsigned long long>(a - reinterpret_cast<std::uint64_t>(holder)));
+                    } else if (a >= 0x140000000ull && a < 0x150000000ull) {
+                        std::fprintf(stderr, "[rt] format-frame %d: game+0x%llx\n", i,
+                                     static_cast<unsigned long long>(a - 0x140000000ull));
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                std::fprintf(stderr, "[rt] format-stack-raw: unreadable\n");
             }
             info->ContextRecord->Rip += 1;
             return EXCEPTION_CONTINUE_EXECUTION;
