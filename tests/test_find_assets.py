@@ -1,10 +1,15 @@
 import io
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from tools import find_assets
+TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import find_assets  # noqa: E402
 
 
 class TestFindAssets(unittest.TestCase):
@@ -15,7 +20,7 @@ class TestFindAssets(unittest.TestCase):
 
         (assets / "char" / "cs_alpha.obj").write_bytes(b"x" * (2 * 1024))
         (assets / "char" / "cs_big.obj").write_bytes(b"x" * (2 * 1024 * 1024))
-        (assets / "char" / "hair_01.obj").write_bytes(b"x" * (20 * 1024))
+        (assets / "char" / "hair_01.OBJ").write_bytes(b"x" * (20 * 1024))
         (assets / "map" / "s01_w02.obj").write_bytes(b"x" * (4 * 1024))
         (assets / "random.obj").write_bytes(b"x" * 1024)
 
@@ -29,7 +34,7 @@ class TestFindAssets(unittest.TestCase):
             output = out.getvalue()
             self.assertEqual(code, 0)
             self.assertIn("Found 2 matching .obj models", output)
-            self.assertLess(output.index("cs_big.obj"), output.index("hair_01.obj"))
+            self.assertLess(output.index("cs_big.obj"), output.index("hair_01.OBJ"))
 
     def test_category_filter_and_top_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -71,4 +76,3 @@ class TestFindAssets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
