@@ -127,5 +127,18 @@ class VCvtPkrtzF16F32OracleTests(unittest.TestCase):
         self.assertEqual(ref_cvt_pkrtz_f16_f32(0.0, -0.0), 0x80000000)
         self.assertEqual(ref_cvt_pkrtz_f16_f32(-0.0, 0.0), 0x00008000)
 
+class VCvtPkrtzF16F32AstTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = PackedInstructionAST(
+            mnemonic="v_cvt_pkrtz_f16_f32",
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.VGPR, index=2),
+        )
+        self.assertEqual(ast.mnemonic, "v_cvt_pkrtz_f16_f32")
+        self.assertEqual(ast.dst.index, 0)
+        self.assertEqual(ast.src0.index, 1)
+        self.assertEqual(ast.src1.index, 2)
+
 if __name__ == '__main__':
     unittest.main()
