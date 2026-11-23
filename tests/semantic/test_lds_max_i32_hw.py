@@ -419,6 +419,51 @@ class TestRegisterAliasing(unittest.TestCase):
         mem = run_cs_lds(instructions)
         self.assertEqual(mem.get(0), 42)
 
+@dataclass
+class IntegerStatusFlags:
+    zero: bool = False
+    negative: bool = False
+
+
+def classify_integer_status(val: int) -> IntegerStatusFlags:
+    val &= MASK32
+    return IntegerStatusFlags(
+        zero=(val == 0),
+        negative=bool(val & SIGN_BIT),
+    )
+
+
+class TestConditionCodesAndStatus(unittest.TestCase):
+    def test_vcc_and_scc_preservation(self):
+        # LDS atomic max does not modify VCC or SCC
+        interp = ScalarLDSInterpreter()
+        interp.regs.scc = 1
+        interp.regs.vcc = 0x123456789ABCDEF0
+        interp.regs.vgprs[0] = 0
+        interp.regs.vgprs[1] = 10
+
+        insn = DSMaxI32Instruction(
+            vaddr=Operand.vgpr(0),
+            vdata=Operand.vgpr(1),
+        )
+        interp.step(insn)
+
+        self.assertEqual(interp.regs.scc, 1)
+        self.assertEqual(interp.regs.vcc, 0x123456789ABCDEF0)
+
+    def test_status_flag_classification(self):
+        s_zero = classify_integer_status(0)
+        self.assertTrue(s_zero.zero)
+        self.assertFalse(s_zero.negative)
+
+        s_neg = classify_integer_status(0xFFFFFFFF)
+        self.assertFalse(s_neg.zero)
+        self.assertTrue(s_neg.negative)
+
+        s_pos = classify_integer_status(42)
+        self.assertFalse(s_pos.zero)
+        self.assertFalse(s_pos.negative)
+
 
 if __name__ == "__main__":
     unittest.main()
