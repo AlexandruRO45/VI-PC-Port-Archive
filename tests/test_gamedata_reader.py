@@ -397,6 +397,59 @@ class Run(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("not a directory", r.stderr)
 
+    def test_recover_fragments_tail_only_sections_comments_and_gaps(self):
+        # Synthetic start-truncated XML with: broken leading item, comment/CDATA decoys, gap-damaged item,
+        # intact prefix items, and complete trailing sibling sections before the closing root tag.
+        payload = (
+            b'oken value="0"/></Item>'
+            b'<!-- <Item><id value="999"/></Item> -->'
+            b'<![CDATA[<Item><id value="998"/></Item>]]>'
+            b'<Item><id value="1"/><name>alpha</name></Item>'
+            b'<Item><id value="2"/><broken'
+            b'<Item><id value="3"/><name>beta</name></Item>'
+            b'<Item><id value="4"/></Item>'
+            b'</PrefixSection>'
+            b'<TrailingMap><Item key="k1"><v value="10"/></Item></TrailingMap>'
+            b'<Enabled value="true"/>'
+            b'</CSyntheticTail>'
+        )
+        reader = R.Reader(root_handlers={}, type_handlers={})
+        tag, sections, items = reader.recover(payload, root_hint="CSyntheticTail")
+        self.assertEqual(tag, "CSyntheticTail")
+        self.assertEqual(sections, {"TrailingMap": {"k1": {"v": 10}}, "Enabled": True})
+        # Item 2's broken opener is skipped without dropping intact items 3 and 4; TrailingMap is not double-counted.
+        self.assertEqual([it["id"] for it in items], [1, 3, 4])
+
+    def test_recover_fragments_rootless_and_tail_cut(self):
+        rootless = b'</broken><Item><tag>one</tag></Item><Item><tag>two</tag></Item><Item><tag>cut'
+        tag, sections, items = R.recover_fragments(rootless)
+        self.assertEqual((tag, sections), ("", {}))
+        self.assertEqual(items, [{"tag": "one"}, {"tag": "two"}])
+
+        # A standalone tail-only file without root_hint detects its unmatched closing root tag automatically.
+        tail_only = b'x="1"/></Item><Item><v value="5"/></Item></Head><Flag value="false"/></CStandalone>'
+        tag2, secs2, items2 = R.recover_fragments(tail_only)
+        self.assertEqual(tag2, "CStandalone")
+        self.assertEqual(secs2, {"Flag": False})
+        self.assertEqual(items2, [{"v": 5}])
+
+    def test_cli_recover_writes_recovered_json_and_preserves_default(self):
+        default_run = R.run([self.dir], reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual(default_run["recovered_documents"], 0)
+
+        with open(os.path.join(self.dir, "frag.xml"), "wb") as f:
+            f.write(b'</broken><Item><v value="7"/></Item><Item><v value="8"/></Item><Item><v')
+        out = os.path.join(self.tmp.name, "out_recover")
+        r = self._cli(self.dir, "--recover", "--out", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("2 documents read, 2 roots, 2 not well-formed", r.stdout)
+        self.assertIn("recovered: 1 payloads (0 sections, 2 items)", r.stdout)
+        self.assertIn("wrote 3 JSON files", r.stdout)
+        rec_path = os.path.join(out, "recovered_fragment_frag.xml.json")
+        self.assertTrue(os.path.isfile(rec_path))
+        with open(rec_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"$recovered": True, "root": None, "sections": {}, "items": [{"v": 7}, {"v": 8}]})
+
 
 if __name__ == "__main__":
     unittest.main()

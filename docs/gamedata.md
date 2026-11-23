@@ -1181,6 +1181,7 @@ The keys are plain text, not joaat hashes, and a loader can index each section b
 | `PropDirtDefinitions/Item/Color0Lookup`, `Color1Lookup`, `Color2Lookup` | `CannedColors` | 9 of 9 each |
 | weather data `PedDirtDefinition` (see the weather document) | `DirtDefinitions` | 1 of 1 |
 | weather data `DirtCannedColor` | none | 0 of 1 |
+| `MaterialDataList/Item/vehicleDirtControl` (402 recovered entries; 99 non-empty) | `VehDirtControls` | 99 of 99 (4 of 5 keys) |
 
 So every dirt preset gets its colour from the canned table, and one weather selects a ped dirt preset. The
 weather's `DirtCannedColor` is a single non-numeric token that matches no canned-colour key, even as a
@@ -1434,6 +1435,31 @@ On the 1.0.2.1 carve of `common.rpf` the run takes about 5 s, with 0 conversion 
 The 7 roots missing from the 118 occur only in documents that are not well-formed. Counts only: the JSON that
 `--out` writes is the game's data and stays local. `tests/test_gamedata_reader.py` checks every convention,
 both dispatch tables, that streaming equals a whole-tree conversion, and the CLI, on synthetic XML.
+
+### Recovering subtrees from the 8 non-well-formed payloads (`--recover`)
+
+```
+python -I tools/gamedata_reader.py <work>/common --recover   # also extract intact trailing sections and <Item>s
+```
+
+The 8 payloads that fail whole-document parsing (7 start-truncated tail-only documents plus 1 unattributed 64 KiB
+fragment) still hold complete trailing sibling sections and `<Item>` subtrees. `recover_fragments` (and
+`--recover`) recovers complete sibling sections immediately preceding `</Root>` and outermost well-formed `<Item>`
+records from the remaining prefix without guessing or repairing cut bounds (skipping comments, CDATA, and
+gap-corrupted `<Item>` spans). Measured over the 1.0.2.1 `common.rpf` carve (`8` payloads recovered: `16`
+trailing sections and `1,054` prefix `<Item>`s, raising observed `type` classes from `317` to `323` over `8,012`
+typed elements):
+
+| Root / payload | Inflated B (streams) | Complete trailing sections | Recovered prefix `<Item>`s | Measured schema notes |
+|---|---:|---:|---:|---|
+| `CAimUpperBodyDataBlock` | 1,813 (1) | 0 | 2 | `AimIkData` entries (13 scalar fields each: yaw/pitch limits, scales, weights) |
+| `CFiringPatternInfoManager` | 208,240 (4) | 1 (`FiringPatternSets`, 76 keyed entries) | 77 | `Infos` firing-pattern entries (62 with `Name`) plus nested burst/timeline items inside the cut leading entry |
+| `CSceneTerrainAnalyzerMgrDataInstance` | 45,187 (1) | 0 | 57 | `TerrainAnalyzerData` entries: 52 probe-set items plus 5 nested `Groups`/`GroupTolerances` items |
+| `CDrivingStyleCollection` | 16,793 (1) | 1 (`AircraftPIDMap`, 22 keyed entries) | 2 | 2 trailing `ModelMatchMap` entries before `AircraftPIDMap` |
+| `Witnesses__Informations` | 13,500 (1) | 14 (`ScoringData` + 13 scalar config fields) | 5 | 4 `Personalities` (`OnFoot`/`InVehicle`) items + 1 entry before `</Personalities>` |
+| `rage__fragTuneStruct` | 92,990 (2) | 0 | 80 | `BreakPresets` items (57 distinct fields, 91 XML comments) |
+| `MaterialDataList` | 264,139 (5) | 0 | 402 | Material items (31 distinct child fields; 1 entry spans an unread gap at stream boundary `131,072`). 99 entries set `vehicleDirtControl` (99/99 resolve to 4 of 5 `VehDirtControls` keys) and 13 of 24 `CSnowTrackData` `PhysicsMaterials` match `name` |
+| unattributed 64 KiB fragment | 65,536 (1) | 0 | 429 | 428 `{modelName, tags}` records + 1 leading nested tag `<Item>` |
 
 ## Next step
 

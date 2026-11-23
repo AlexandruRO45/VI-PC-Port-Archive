@@ -20,12 +20,13 @@ generic value of a sub-element). Everything else takes the generic conversion. T
 ``iterparse`` and each top-level field is converted and dropped as soon as it ends, so memory is bounded by the largest
 field, not the document.
 
-    python -I tools/gamedata_reader.py <carve_dir or .xml> [...] [--root TAG] [--out DIR]
+    python -I tools/gamedata_reader.py <carve_dir or .xml> [...] [--root TAG] [--out DIR] [--recover]
 
 prints counts only: documents read, roots, the elements each convention covered, ``type`` classes seen, and
-documents that are not well-formed XML (tail-only or truncated carves), with the reason. ``--out DIR`` writes one JSON
-file per document: those files hold the game's data and stay on the local machine (CONTRIBUTING.md). Standard
-library only.
+documents that are not well-formed XML (tail-only or truncated carves), with the reason. ``--recover`` also extracts
+complete trailing sibling sections and ``<Item>`` subtrees from payloads that fail whole-document parsing without
+fabricating broken elements. ``--out DIR`` writes one JSON file per document: those files hold the game's data and
+stay on the local machine (CONTRIBUTING.md). Standard library only.
 Usage: `python -I tools/gamedata_reader.py --help` lists the options.
 """
 import argparse
@@ -49,6 +50,11 @@ GROUPS = {"vector2_array": 2, "vec3v_array": 3, "matrix33": 3, "matrix34": 3}
 INT = re.compile(r"[-+]?\d+")
 HEX = re.compile(r"0x[0-9A-Fa-f]+")
 FLOAT = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?f?|[-+]?(inf|nan)", re.I)
+_XML_TOKEN_RE = re.compile(
+    rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>|<(/?)([A-Za-z_][\w.:-]*)([^<>]*)>",
+    re.S,
+)
+_TAIL_CLOSE_RE = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
 
 ROOT_HANDLERS = {}
 TYPE_HANDLERS = {}
@@ -253,6 +259,123 @@ class Reader:
             value = self._typed_object(t, value)
         return root.tag, t, self.with_attributes(attrib, value)
 
+    def recover(self, data, root_hint=""):
+        """Extract complete sibling sections and ``<Item>`` subtrees from truncated/fragment XML."""
+        return recover_fragments(data, reader=self, root_hint=root_hint)
+
+
+def _trailing_root_span(body: bytes, root_hint: str) -> tuple[str, int]:
+    """Return ``(root_tag, body_end)`` when ``body`` ends with an unmatched closing root tag."""
+    if root_hint:
+        m_close = re.search(rb"</" + re.escape(root_hint.encode("ascii", "replace")) + rb">\s*$", body)
+        if m_close:
+            return root_hint, m_close.start()
+        return root_hint, len(body)
+    m_tail = _TAIL_CLOSE_RE.search(body)
+    if m_tail:
+        tag_bytes = m_tail.group(1)
+        if not re.search(rb"<" + re.escape(tag_bytes) + rb"(?:[\s>/])", body):
+            return tag_bytes.decode("ascii", "replace"), m_tail.start()
+    return "", len(body)
+
+
+def _trailing_siblings(body: bytes, body_end: int, tokens: list, reader: Reader) -> tuple[dict, int]:
+    """Recover complete top-level sibling elements immediately preceding ``</Root>``."""
+    stack = []
+    first_complete = body_end
+    for tok in reversed(tokens):
+        name = tok.group(2)
+        if name is None:
+            continue
+        slash, rest = tok.group(1), tok.group(3)
+        if slash:
+            stack.append(name)
+        elif rest.rstrip().endswith(b"/"):
+            if not stack:
+                first_complete = tok.start()
+        else:
+            if not stack or stack[-1] != name:
+                break
+            stack.pop()
+            if not stack:
+                first_complete = tok.start()
+    if first_complete >= body_end:
+        return {}, body_end
+    span = body[first_complete:body_end]
+    try:
+        wrap = ET.fromstring(b"<_recover>" + span + b"</_recover>")
+    except ET.ParseError:
+        return {}, body_end
+    sections = reader.children(list(wrap))
+    return (sections if isinstance(sections, dict) else {"$items": sections}), first_complete
+
+
+def _recover_prefix_items(body: bytes, prefix_end: int, tokens: list, reader: Reader) -> list:
+    """Recover outermost well-formed ``<Item>...</Item>`` subtrees within ``body[:prefix_end]``."""
+    items = []
+    tag_tokens = [tok for tok in tokens if tok.end() <= prefix_end and tok.group(2) is not None]
+    i = 0
+    while i < len(tag_tokens):
+        tok = tag_tokens[i]
+        slash, name, rest = tok.group(1), tok.group(2), tok.group(3)
+        if name != b"Item" or slash:
+            i += 1
+            continue
+        if rest.rstrip().endswith(b"/"):
+            try:
+                items.append(reader.convert(ET.fromstring(tok.group(0))))
+            except ET.ParseError:
+                pass
+            i += 1
+            continue
+        depth = 1
+        j = i + 1
+        while j < len(tag_tokens) and depth > 0:
+            nxt = tag_tokens[j]
+            if nxt.group(2) == b"Item":
+                if nxt.group(1):
+                    depth -= 1
+                elif not nxt.group(3).rstrip().endswith(b"/"):
+                    depth += 1
+            if depth == 0:
+                break
+            j += 1
+        if depth == 0:
+            try:
+                items.append(reader.convert(ET.fromstring(body[tok.start():tag_tokens[j].end()])))
+                i = j + 1
+                continue
+            except ET.ParseError:
+                pass
+        # Unclosed or gap-corrupted <Item>: step past this opener so inner/subsequent intact items survive.
+        i += 1
+    return items
+
+
+def recover_fragments(data: bytes, reader: Reader | None = None, root_hint: str = "") -> tuple[str, dict, list]:
+    """Recover complete trailing sibling sections and ``<Item>`` subtrees from non-well-formed XML."""
+    reader = reader or Reader()
+    body = data[len(BOM):] if data.startswith(BOM) else data
+    root_tag, body_end = _trailing_root_span(body, root_hint)
+    tokens = list(_XML_TOKEN_RE.finditer(body, 0, body_end))
+    sections, prefix_end = ({}, body_end)
+    if body_end < len(body):
+        sections, prefix_end = _trailing_siblings(body, body_end, tokens, reader)
+    items = _recover_prefix_items(body, prefix_end, tokens, reader)
+    return root_tag, sections, items
+
+
+def _unique_json_path(out_dir: str, stem: str, written_names: set) -> str:
+    """Choose a case-insensitively unique JSON output filename inside ``out_dir``."""
+    os.makedirs(out_dir, exist_ok=True)
+    filename = f"{stem}.json"
+    suffix = 2
+    while filename.casefold() in written_names:
+        filename = f"{stem}_{suffix}.json"
+        suffix += 1
+    written_names.add(filename.casefold())
+    return os.path.join(out_dir, filename)
+
 
 def documents(targets):
     """XML payloads of carve directories (index.json) or .xml files, as gamedata_xml.load_documents yields them."""
@@ -260,38 +383,44 @@ def documents(targets):
     return gx.load_documents(targets)
 
 
-def run(targets, root_filter=None, out_dir=None, reader=None):
+def run(targets, root_filter=None, out_dir=None, reader=None, recover=False):
     """Read every document; returns a summary of counts (no names of entries, no values)."""
     reader = reader or Reader()
     roots, failed, read = Counter(), Counter(), 0
+    recovered = recovered_sections = recovered_items = 0
     written_names = set()
     for n, doc in enumerate(documents(targets)):
         hint = doc.get("root_hint")
         if root_filter and hint != root_filter:
             continue
+        name = doc.get("offset_hex") or doc.get("name") or str(n)
         try:
             tag, _, value = reader.read(doc["data"])
         except (ET.ParseError, LookupError, ValueError) as e:
             # Unsupported encodings and malformed content arrays fail outside ET.ParseError too.
             failed[str(e).split(":")[0]] += 1
+            if recover:
+                rtag, sections, items = recover_fragments(doc["data"], reader=reader, root_hint=hint or "")
+                if sections or items:
+                    recovered += 1
+                    recovered_sections += len(sections)
+                    recovered_items += len(items)
+                    if out_dir:
+                        path = _unique_json_path(out_dir, f"recovered_{rtag or 'fragment'}_{name}", written_names)
+                        with open(path, "w", encoding="utf-8", newline="\n") as f:
+                            json.dump({"$recovered": True, "root": rtag or None,
+                                       "sections": sections, "items": items}, f, indent=1, default=str)
             continue
         read += 1
         roots[tag] += 1
         if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-            name = doc.get("offset_hex") or doc.get("name") or str(n)
-            stem = f"{tag}_{name}"
-            filename = f"{stem}.json"
-            suffix = 2
-            # Another input can have the same basename or carve offset. Keep existing names on ordinary reruns.
-            while filename.casefold() in written_names:
-                filename = f"{stem}_{suffix}.json"
-                suffix += 1
-            written_names.add(filename.casefold())
-            with open(os.path.join(out_dir, filename), "w", encoding="utf-8", newline="\n") as f:
+            path = _unique_json_path(out_dir, f"{tag}_{name}", written_names)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(value, f, indent=1, default=str)
     return {"documents": read, "roots": len(roots), "per_root_documents": dict(roots),
             "not_well_formed": sum(failed.values()), "parse_errors": dict(failed),
+            "recovered_documents": recovered, "recovered_sections": recovered_sections,
+            "recovered_items": recovered_items,
             "elements_by_convention": dict(reader.stats), "type_classes": len(reader.types),
             "typed_elements": sum(reader.types.values()),
             "registered": {"roots": len(reader.root_handlers), "types": len(reader.type_handlers)}}
@@ -302,12 +431,14 @@ def main(argv=None):
     ap.add_argument("targets", nargs="+", help="rpf9_carve.py directories (with index.json) or .xml files")
     ap.add_argument("--root", help="only documents with this root tag")
     ap.add_argument("--out", help="write one JSON file per document here (game data: keep it local)")
+    ap.add_argument("--recover", action="store_true",
+                    help="extract complete sibling sections and <Item> subtrees from non-well-formed XML")
     a = ap.parse_args(argv)
     if a.out and os.path.exists(a.out) and not os.path.isdir(a.out):
         print(f"ERROR: --out {a.out} exists and is not a directory", file=sys.stderr)
         return 2
     try:
-        s = run(a.targets, a.root, a.out)
+        s = run(a.targets, a.root, a.out, recover=a.recover)
     except FileNotFoundError as e:
         print(f"ERROR: {e} does not exist", file=sys.stderr)
         return 2
@@ -318,14 +449,18 @@ def main(argv=None):
         return 2
     print(f"{s['documents']} documents read, {s['roots']} roots, {s['not_well_formed']} not well-formed "
           f"{s['parse_errors'] or ''}".rstrip())
+    if a.recover:
+        print(f"recovered: {s['recovered_documents']} payloads ({s['recovered_sections']} sections, "
+              f"{s['recovered_items']} items)")
     print("elements by convention:", ", ".join(f"{k} {v}" for k, v in sorted(s["elements_by_convention"].items())))
     print(f"type classes: {s['type_classes']} ({s['typed_elements']} typed elements); registered handlers: "
           f"{s['registered']['roots']} roots, {s['registered']['types']} types")
+    total_read = s["documents"] + (s["recovered_documents"] if a.recover else 0)
     if a.out:
-        print(f"wrote {s['documents']} JSON files to {a.out} (game data: keep them local)")
-    if not s["documents"] and s["not_well_formed"]:
-        # Nothing parsed. A corpus with some truncated tails still reads the rest and stays 0; a run that read
-        # nothing at all cannot tell "no documents here" from "every document was broken", so the exit code says it.
+        print(f"wrote {total_read} JSON files to {a.out} (game data: keep them local)")
+    if not total_read and s["not_well_formed"]:
+        # Nothing parsed (or recovered with --recover). A corpus with some truncated tails still reads the rest
+        # and stays 0; a run that read nothing at all exits 1.
         print(f"ERROR: no document could be read; {s['not_well_formed']} not well-formed", file=sys.stderr)
         return 1
     return 0
