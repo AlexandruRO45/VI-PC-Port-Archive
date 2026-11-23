@@ -492,8 +492,12 @@ def _read_carved(path, max_inflate):
     return data if len(data) <= max_inflate else None
 
 
-def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
-    """Scan an RPF9 archive, or every carved file in a directory."""
+def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None, on_archive=None):
+    """Scan an RPF9 archive, or every carved file in a directory.
+
+    ``on_archive(path, rows)`` optionally receives the rows of each archive reached in a directory scan.
+    Continuation files already consumed by a carved resource are not reconsidered as archives.
+    """
     if directory_files is not None or os.path.isdir(path):
         rows, stats = [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
         if directory_files is None:
@@ -509,6 +513,8 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                 head = f.read(4)
             if head == b"9FPR":
                 more, sub = scan_rpf(p, start, limit, max_inflate, collect)
+                if on_archive is not None:
+                    on_archive(p, more)
                 rows.extend(more)
                 stats["files"] += 1
                 stats["scanned_bytes"] += sub["scanned_bytes"]

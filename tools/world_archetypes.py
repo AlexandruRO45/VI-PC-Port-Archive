@@ -115,6 +115,15 @@ def member_table(b, struct_hash):
     return sorted(((h, m[0], m[1]) for h, m in structs[struct_hash][1].items()), key=lambda t: (t[1], t[0]))
 
 
+def _archive_resources(path, rows):
+    """Read accepted archive rows with the existing complete-resource assembler."""
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        for row in rows:
+            res = WC.assemble(m, row["offset"], len(m))
+            if res and res.get("complete"):
+                yield row, res["data"]
+
+
 def iter_resources(path, start=None, limit=None):
     """Yield (row, data) for every validated 0x7a resource: an RPF9 window, a carved file or a folder."""
     magic = b""
@@ -123,14 +132,32 @@ def iter_resources(path, start=None, limit=None):
             magic = f.read(4)
     if magic == b"9FPR":
         rows, _ = WI.scan_rpf(path, start, limit)
-        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
-            for r in rows:
-                res = WC.assemble(m, r["offset"], len(m))
-                if res and res.get("complete"):
-                    yield r, res["data"]
+        yield from _archive_resources(path, rows)
         return
-    rows, _ = WI.scan_path(path, start, limit)
-    for r in rows:
+    archives = []
+
+    def on_archive(name, selected):
+        if selected:
+            archives.append((name, selected))
+
+    rows, _ = WI.scan_path(path, start, limit, on_archive=on_archive)
+    archive_iter = iter(archives)
+    current_archive = next(archive_iter, None)
+    row_iter = iter(rows)
+    for r in row_iter:
+        if current_archive is not None and r is current_archive[1][0]:
+            p, selected = current_archive
+            # scan_path appends each archive's rows as one contiguous group. Consume the group once while
+            # retaining its position among carved resources, and map the archive only once for all its rows.
+            for _ in range(len(selected) - 1):
+                next(row_iter)
+            source = os.path.relpath(p, path).replace("\\", "/")
+            for row, data in _archive_resources(p, selected):
+                # Source keys must distinguish resources within an archive and equal offsets in different
+                # archives. This virtual child of a regular file cannot name a carved file in the same tree.
+                yield dict(row, file=f"{source}/{row['offset']:012x}"), data
+            current_archive = next(archive_iter, None)
+            continue
         p = os.path.join(path, r["file"]) if os.path.isdir(path) else path
         with open(p, "rb") as f:
             yield r, f.read(WI.CAP + 1)
