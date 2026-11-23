@@ -445,6 +445,24 @@ class TestSwizzleSearchCliAndRender(unittest.TestCase):
             self.assertFalse(preview.exists())
 
     @unittest.skipUnless(HAVE_NUMPY, "numpy required")
+    def test_score_only_no_fitting_layout_reports_the_problem(self):
+        """A score-only search must also fail when there are no candidate layouts."""
+        with tempfile.TemporaryDirectory() as td:
+            blob = Path(td) / "synthetic.bin"
+            cases = [(32, []), (2048, ["--tile", "512", "--widths", "48"])]
+            for size, args in cases:
+                with self.subTest(size=size, args=args):
+                    blob.write_bytes(bytes(size))
+                    result = subprocess.run(
+                        [sys.executable, "-I", str(TOOL), str(blob), *args],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("no layout", result.stderr.lower())
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+    @unittest.skipUnless(HAVE_NUMPY, "numpy required")
     def test_cli_successful_search_output(self):
         """CLI on valid synthetic buffer must exit 0 and print formatted scores and bit sequences."""
         with tempfile.TemporaryDirectory() as td:
