@@ -121,6 +121,30 @@ def safe_subpath(base_dir: str, rel: str) -> str | None:
     return real_target
 
 
+def dds_source_any_case(base_dir: str, stem: str) -> str | None:
+    """The .dds file a "<stem>.dds" preview points at, or the sibling whose suffix differs only in case.
+
+    The texture catalog keeps the on-disk name ("tex.DDS"), but the preview URL always ends in lowercase ".png",
+    so the handler rebuilds the source as "<stem>.dds"; on a case-sensitive filesystem that names no file.
+    """
+    folder, name = os.path.split(stem)
+    dds_rel = os.path.join(folder, name + ".dds") if folder else name + ".dds"
+    dds_cand = safe_subpath(base_dir, dds_rel)
+    if dds_cand is None:
+        return None
+    if os.path.isfile(dds_cand):
+        return dds_cand
+    try:
+        entries = os.listdir(os.path.dirname(dds_cand))
+    except OSError:
+        return None
+    wanted = name.lower() + ".dds"
+    for entry in entries:
+        if entry.lower() == wanted:
+            return safe_subpath(base_dir, os.path.join(folder, entry) if folder else entry)
+    return None
+
+
 class StudioHandler(http.server.BaseHTTPRequestHandler):
     models_dir: str = ""
     textures_dir: str = ""
@@ -196,13 +220,13 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if not os.path.isfile(tpath) and rel.lower().endswith(".png"):
-                # Try matching .dds file if png requested
+                # Try matching .dds file if png requested, whatever case its suffix has on disk
                 stem = os.path.splitext(rel)[0]
-                dds_cand = safe_subpath(self.textures_dir, stem + ".dds")
-                if dds_cand is None:
+                if safe_subpath(self.textures_dir, stem + ".dds") is None:
                     self.send_error(403, "Forbidden")
                     return
-                if os.path.isfile(dds_cand) and dds_png:
+                dds_cand = dds_source_any_case(self.textures_dir, stem)
+                if dds_cand and dds_png:
                     try:
                         png_bytes = dds_png.dds_file_to_png_bytes(dds_cand, max_size=1024)
                         self.send_response(200)
