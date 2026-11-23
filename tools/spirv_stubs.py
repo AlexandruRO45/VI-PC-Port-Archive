@@ -10,6 +10,7 @@ Emits binary SPIR-V 1.0 directly with the standard library (no external spirv-as
 
 Every inter-stage varying emitted by tools/rdna2spirv.py is a 32-bit vec4 float, so a single stub per
 unique location set matches every shader with that interface.
+A missing input path is a usage error: one `ERROR:` line to stderr and exit 2 (no traceback).
 """
 import json
 import os

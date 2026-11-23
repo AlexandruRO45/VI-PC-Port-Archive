@@ -22,6 +22,7 @@ inverseBindMatrices count differs from its joint count exits nonzero. Structural
 problems also exit nonzero with a one-line ``ERROR:`` message.
 
 Only the standard library is used, and the input is read, never modified.
+A missing input path is a usage error: one `ERROR:` line to stderr and exit 2 (no traceback).
 """
 from __future__ import annotations
 

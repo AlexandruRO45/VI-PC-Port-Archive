@@ -44,6 +44,7 @@ no thunk reaches. Text by default, --json for JSON. --out DIR writes both, as <i
 Exit status 1 when an image (or the class table) can't be read, or an image is cut off before the end of its
 sections (the report of what is there is still written); 0 otherwise. Reads the files only; never runs them.
 Standard library only.
+A missing input path is a usage error: one `ERROR:` line to stderr and exit 2 (no traceback).
 """
 from __future__ import annotations
 
