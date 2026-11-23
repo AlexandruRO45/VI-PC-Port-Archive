@@ -312,5 +312,23 @@ class TestLshlrevBoundaryAndExtremes(unittest.TestCase):
                 self.assertEqual(words[1], exp_hi)
 
 
-if __name__ == '__main__':
+class TestLshlrevNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: negative controls, syntax rejection, and mutation detection for v_lshlrev_b64."""
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_lshlrev_bad_nop", ["v_lshlrev_b64 v[0:1]", "s_endpgm"])
+
+    def test_syntax_rejection_single_register_dst(self):
+        # 64-bit operation requires pair destination v[0:1]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_lshlrev_bad_dst", ["v_lshlrev_b64 v0, 4, v[2:3]", "s_endpgm"])
+
+    def test_mutation_detection_wrong_direction(self):
+        # Oracle detects divergence if shift right is used instead of left
+        right_shift = lambda sh, v: ((v >> (sh & 63)) & MASK32, (v >> (sh & 63) >> 32) & MASK32)
+        self.assertNotEqual(v_lshlrev_b64_oracle(4, 0x10), right_shift(4, 0x10))
+
+
+if __name__ == "__main__":
     unittest.main()
