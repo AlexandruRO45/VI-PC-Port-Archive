@@ -425,6 +425,12 @@ public:
         ++count_;
     }
 
+    // Items not destroyed yet. For tests.
+    std::size_t size() {
+        std::lock_guard lock(mutex_);
+        return count_;
+    }
+
     // Drains all items with ticket <= current_ticket in O(k), invoking vkDestroy* outside the lock.
     // Uses a stack-local batch vector so concurrent drain() calls from multiple queues never race.
     void drain(std::uint64_t current_ticket, VkDevice device, const VulkanDeviceFunctions& vk) {
@@ -1234,6 +1240,9 @@ public:
         deletion_queue_.drain(current_ticket, device_, vk);
     }
 
+    // Vulkan objects of released resources still waiting for the submissions made before their release. For tests.
+    std::size_t deferred_destructions() { return deletion_queue_.size(); }
+
     // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
     // monotonic even when another queue completes first; global tickets are retired in order.
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
@@ -1474,6 +1483,7 @@ public:
         auto& vk = context_.vk;
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
+        context_.holds().run_released();  // resources released while that work was held go now (D3D-203)
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
@@ -2005,6 +2015,7 @@ private:
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
         std::string label;
+        std::uint64_t place = 0;  // QueueHolds::held_added(): given back once the operation has run or is dropped
     };
 
     bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
@@ -2025,8 +2036,8 @@ private:
             waits_.clear();
             wait_values_.clear();
         }
+        op.place = context_.holds().held_added();
         held_.push_back(std::move(op));
-        context_.holds().held_changed(1);
     }
 
     // Runs one held operation as the call would have, with its own waits and none of the ones queued since.
@@ -2059,15 +2070,17 @@ private:
 
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
 
-    // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
+    // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held). An
+    // operation counts as gone for the releases parked behind it (QueueHolds::after_held) only once it has run, so
+    // what it names stays until its submission is recorded.
     bool release_ready() override {
         std::lock_guard state(state_mutex_);
         bool released = false;
         while (!held_.empty() && (context_.is_device_lost() || ready(held_.front()))) {
             Deferred op = std::move(held_.front());
             held_.pop_front();
-            context_.holds().held_changed(-1);
             if (!context_.is_device_lost()) run(op);
+            context_.holds().held_removed(op.place);
             released = true;
         }
         return released;
@@ -2083,8 +2096,8 @@ private:
             }
             std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work waiting on it; "
                                  "that work is dropped\n");
+            context_.holds().held_removed(it->place);
             it = held_.erase(it);
-            context_.holds().held_changed(-1);
         }
     }
 
@@ -2100,7 +2113,7 @@ private:
         std::fprintf(stderr, "[rt] d3d12: queue destroyed with %zu held operation(s) never submitted: waits for a "
                              "fence value (%llu) that no Signal reached; the fence was never signaled\n",
                      held_.size(), static_cast<unsigned long long>(value));
-        context_.holds().held_changed(-static_cast<std::int64_t>(held_.size()));
+        for (const Deferred& op : held_) context_.holds().held_removed(op.place);
         held_.clear();
     }
 

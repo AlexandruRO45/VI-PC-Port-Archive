@@ -3,8 +3,12 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <functional>
 #include <mutex>
+#include <set>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -27,6 +31,13 @@ namespace leonida {
 // Signal) releases the ready batches itself, after it has released its own queue's lock: recording a held batch
 // costs what its own ExecuteCommandLists would have. Only one thread releases at a time; a thread that finds
 // another one releasing leaves a note and that one takes another pass, so no caller waits for another's recording.
+//
+// Deferred releases (D3D-203). A held batch is replayed only when it is released, against the resources it names
+// by ID, so a resource the application releases meanwhile must stay whole (ID, binding, Vulkan objects) until then:
+// the retirement tickets of the deletion queue only know submitted work. after_held() parks such a release until
+// every operation held at that moment, on any queue, has been submitted or dropped, whatever order the queues get
+// there in; operations held later do not delay it. The parked releases then run on the thread that released the
+// last of those operations, once it holds no queue lock (run_released()).
 template<class Semaphore>
 class QueueHolds {
 public:
@@ -94,16 +105,75 @@ public:
         pump_ready();
     }
 
-    // Held operations over all queues, for the cheap "is there anything to do" test.
-    void held_changed(std::int64_t delta) { held_.fetch_add(delta, std::memory_order_acq_rel); }
+    // A held operation was added: returns its place, which held_removed() gives back once the operation has run or
+    // was dropped. Places increase in the order operations are held, over all queues.
+    std::uint64_t held_added() {
+        std::lock_guard lock(mutex_);
+        const std::uint64_t place = ++last_place_;
+        outstanding_.insert(place);
+        held_.fetch_add(1, std::memory_order_acq_rel);
+        return place;
+    }
+
+    // The operation at `place` has been submitted (or failed when it was replayed) or was dropped. The releases that
+    // waited for it and for nothing still held become ready; run_released() runs them.
+    void held_removed(std::uint64_t place) {
+        std::lock_guard lock(mutex_);
+        outstanding_.erase(place);
+        held_.fetch_sub(1, std::memory_order_acq_rel);
+        const std::uint64_t oldest = outstanding_.empty() ? UINT64_MAX : *outstanding_.begin();
+        while (!parked_.empty() && parked_.front().last < oldest) {
+            ready_.push_back(std::move(parked_.front().release));
+            parked_.pop_front();
+        }
+        if (!ready_.empty()) released_.store(true, std::memory_order_release);
+    }
+
     bool any_held() const { return held_.load(std::memory_order_acquire) > 0; }
 
+    // Parks `release` until every operation held now has been submitted or dropped. False when nothing is held: the
+    // caller releases at once, and that common case costs one atomic load.
+    template<class Release>
+    bool after_held(Release&& release) {
+        if (!any_held()) return false;
+        std::lock_guard lock(mutex_);
+        if (outstanding_.empty()) return false;
+        parked_.push_back({last_place_, std::function<void()>(std::forward<Release>(release))});
+        return true;
+    }
+
+    // Runs, on this thread, the releases whose operations are gone. Call with no queue lock held.
+    void run_released() {
+        if (!released_.load(std::memory_order_acquire)) return;
+        std::vector<std::function<void()>> run;
+        {
+            std::lock_guard lock(mutex_);
+            run.swap(ready_);
+            released_.store(false, std::memory_order_release);
+        }
+        for (auto& release : run) release();
+    }
+
+    // Releases not run yet (parked or ready). For tests.
+    std::size_t parked() const {
+        std::lock_guard lock(mutex_);
+        return parked_.size() + ready_.size();
+    }
+
     // Releases every held operation that has become ready, in dependency order: a release can submit a Signal
-    // that makes another queue's front ready, so passes repeat until one finds nothing new.
+    // that makes another queue's front ready, so passes repeat until one finds nothing new. Then runs the releases
+    // that waited for what was submitted (or dropped), unless this is a nested call from a release on this thread.
     void pump_ready() {
-        if (!any_held()) return;
-        dirty_.store(true, std::memory_order_release);
-        if (in_pump()) return;  // a release on this thread submitted a Signal: the running pass will go again
+        if (any_held()) {
+            dirty_.store(true, std::memory_order_release);
+            if (in_pump()) return;  // a release on this thread submitted a Signal: the running pass will go again
+            pump_held();
+        }
+        if (!in_pump()) run_released();
+    }
+
+private:
+    void pump_held() {
         for (;;) {
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
@@ -121,7 +191,11 @@ public:
         }
     }
 
-private:
+    struct Parked {
+        std::uint64_t last;  // the last place held when it was parked
+        std::function<void()> release;
+    };
+
     static bool& in_pump() {
         static thread_local bool pumping = false;
         return pumping;
@@ -132,12 +206,17 @@ private:
         return holders_;
     }
 
-    mutable std::mutex mutex_;  // leaf: fences_ and holders_
+    mutable std::mutex mutex_;  // leaf: fences_, holders_ and the places and releases below
     std::mutex pump_mutex_;     // one releasing thread; held across release_ready(), so detach() waits for it
     std::unordered_map<Semaphore, std::uint64_t> fences_;
     std::vector<Holder*> holders_;
     std::atomic<std::int64_t> held_{0};
     std::atomic<bool> dirty_{false};
+    std::uint64_t last_place_ = 0;
+    std::set<std::uint64_t> outstanding_;  // places of the operations still held
+    std::deque<Parked> parked_;            // in place order
+    std::vector<std::function<void()>> ready_;
+    std::atomic<bool> released_{false};  // ready_ is not empty
 };
 
 }  // namespace leonida

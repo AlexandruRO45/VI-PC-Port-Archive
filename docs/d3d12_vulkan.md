@@ -2181,22 +2181,55 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   others; a fence released while operations wait for it drops them and says so; a Signal value that is not above
   the fence's (Vulkan timelines only increase) is still dropped with a note, as before. Failures of a held
   `ExecuteCommandLists` (what the call would have returned) are printed when it is released, not returned from the
-  call. Not covered: sparse `UpdateTileMappings` while a queue holds work still submits at once, and the resources a
-  held batch names must stay alive until its fence signals (the layer does not pin them; the deferred-destruction
-  tickets only know submitted work, D3D-203). Facts from vkd3d-proton (LGPL, approach only, nothing copied): it keeps
-  a CPU-side virtual value and pending signals per fence and blocks the queue's submission thread until a signal that
-  satisfies a wait has been submitted, so Vulkan never sees a wait without a submitted signal; a satisfied wait stays
-  satisfied. It also maps virtual fence values to physical timeline values so a D3D12 `Signal` of a lower value works;
-  the layer does not yet (the value is dropped with a note). Resources are `VK_SHARING_MODE_EXCLUSIVE` and every
-  D3D12 queue is in the graphics family, so no ownership transfer is needed; with dedicated compute/transfer families
-  they would need `CONCURRENT` (vkd3d-proton does that, because D3D12 gives no information for transfers).
-  Measured: `d3d12_queue_handover_test` runs 358 cases on the layer (371 on the RTX 5070 Laptop, which gives three
-  queues per type) and 369 on the host runtime: three-stage chains (produce, relay, consume) over all 27 queue type
-  assignments and all 6 submission orders (consumer first among them), two producers (texture from one queue, buffer
-  from another) with one consumer, a chain released by a CPU `Signal`, a CPU `Signal` before and after the `Wait`,
-  a never-signaled fence and a fence released while a batch waits; results compared byte for byte, sync validation
-  clean. With holding disabled the same test fails 236 cases on the layer and validation reports
+  call. Not covered: sparse `UpdateTileMappings` while a queue holds work still submits at once. The resources a held
+  batch names are kept until it has been submitted (next item, D3D-203). Facts from vkd3d-proton (LGPL, approach
+  only, nothing copied): it keeps a CPU-side virtual value and pending signals per fence and blocks the queue's
+  submission thread until a signal that satisfies a wait has been submitted, so Vulkan never sees a wait without a
+  submitted signal; a satisfied wait stays satisfied. It also maps virtual fence values to physical timeline values
+  so a D3D12 `Signal` of a lower value works; the layer does not yet (the value is dropped with a note). Resources
+  are `VK_SHARING_MODE_EXCLUSIVE` and every D3D12 queue is in the graphics family, so no ownership transfer is
+  needed; with dedicated compute/transfer families they would need `CONCURRENT` (vkd3d-proton does that, because
+  D3D12 gives no information for transfers). Measured: `d3d12_queue_handover_test` runs 358 cases on the layer (371
+  on the RTX 5070 Laptop, which gives three queues per type; 372 with the D3D-203 case below on an RTX 3060, driver
+  617.14, which gives three as well) and 369 on the host runtime: three-stage chains (produce, relay, consume) over
+  all 27 queue type assignments and all 6 submission orders (consumer first among them), two producers (texture from
+  one queue, buffer from another) with one consumer, a chain released by a CPU `Signal`, a CPU `Signal` before and
+  after the `Wait`, a never-signaled fence and a fence released while a batch waits; results compared byte for byte,
+  sync validation clean. With holding disabled the same test fails 236 cases on the layer and validation reports
   `VUID-vkCmdDraw-None-09600`.
+- **Deferred destruction across queues** (`DeferredDeletionQueue` and `VulkanContext::defer_destroy` in
+  `src/vulkan_backend.h`, `src/retire_tickets.h`, `QueueHolds::after_held` in `src/queue_holds.h`; tests
+  `retire_tickets_test`, `queue_holds_test`, `d3d12_queue_handover_test`). A resource the application releases is
+  not destroyed under the GPU: its Vulkan objects (image, buffer, memory, views, acceleration structure, bindless
+  slot) go to a deletion queue with a retirement ticket. Every submission, on any queue (`vkQueueSubmit`,
+  `vkQueueBindSparse`), takes the next device-wide ticket, recorded with its queue's progress timeline and value.
+  Queues complete out of submission order, so only the completed *prefix* counts (D3D-97 follow-up): a ticket is
+  retired once its own timeline value and those of every earlier ticket are reached (or their queue was found idle
+  when it was destroyed). A release waits for the ticket after the last one submitted before it as well, since a
+  submission that has already resolved the resource may be between recording and `vkQueueSubmit`. Each
+  `ExecuteCommandLists` destroys what is retired before it records; the device destroys the rest after
+  `vkDeviceWaitIdle`. Work a queue holds on the CPU (previous item) is not a submission yet and names resources by
+  ID (the `ID3D12Resource` pointer), resolved only when it is replayed: a ticket cannot cover it, and a resource
+  destroyed meanwhile made the replay fail (`result 2`, unresolved resource) or, with its address reused, resolve
+  to another resource. So a resource whose last reference goes while any queue holds work stays whole (registered,
+  Vulkan objects alive, its address not reused) until every operation held at that moment, on any queue, has been
+  submitted or dropped (D3D-203); operations held later do not delay it. Then it is destroyed as usual, on the
+  thread that released the last of those operations once that thread holds no queue lock, and its Vulkan objects
+  take tickets after those submissions. An operation dropped because its fence was released, its queue destroyed or
+  the device lost counts as gone. Cost: one atomic load per final `Release` while nothing is held. While something
+  is held, a release waits for the held operations of every queue, not only those that name the resource, because a
+  batch also reaches resources through descriptors that name none; a fence nobody signals therefore keeps such
+  resources until its queue is destroyed. Measured (RTX 3060, driver 617.14, `LEONIDA_VK_VALIDATION=1` with sync
+  validation, 0 messages): queue A holds a copy of a texture and a buffer to a readback buffer behind a `Wait` the
+  CPU signals last; queue B's later work completes four times and the two resources are released in between: both
+  kept, nothing destroyed; the CPU `Signal` submits A's batch and destroys them (2 Vulkan objects waiting), the
+  readback matches byte for byte, and two submissions on B after A completed destroy the objects. Without the
+  keeping, the same case finds both destroyed before the `Signal` and the released batch fails with `result 2`. The
+  never-signaled-fence and released-fence cases also check that a resource only the dropped batch names is kept and
+  then destroyed with it. Not covered: a default-heap buffer is a range of the GPU address arena, and the range goes
+  back to the arena (to be zero-filled by the CPU for the next buffer placed there) when the resource is destroyed,
+  not when the GPU is done with it; heaps, pipeline states and query heaps are destroyed at once, as D3D12 lets the
+  layer require of the application.
 - `SetEventOnCompletion(value, hEvent)`: a small wait thread calls `vkWaitSemaphores` and `SetEvent`. Reuse one
   thread with a condition variable; do not create a thread per fence.
 - `GetCompletedValue` is `vkGetSemaphoreCounterValue`; CPU `Signal` is `vkSignalSemaphore`.

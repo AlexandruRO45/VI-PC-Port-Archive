@@ -302,6 +302,9 @@ if(BUILD_TESTING)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
+  # Releases parked while queues hold work (runtime/src/queue_holds.h, D3D-203): pure stdlib, no Vulkan instance.
+  add_executable(queue_holds_test test/queue_holds_test.cpp)
+  add_test(NAME queue_holds COMMAND queue_holds_test)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
