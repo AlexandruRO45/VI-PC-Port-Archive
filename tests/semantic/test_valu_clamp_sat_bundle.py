@@ -244,6 +244,29 @@ class TestValuAddF32SIMDDivergence(unittest.TestCase):
         hw = run_binary_f32("v_add_f32", 0.8, 0.6, omod="div:2")
         self.assertAlmostEqual(hw, 0.7, places=6)
 
+class TestValuAddF32BoundaryExtremes(unittest.TestCase):
+    """Stage 5: IEEE 754 boundary extremes and saturation for v_add_f32."""
+
+    def test_add_inf_clamping(self):
+        # inf + 1.0 = inf -> clamped to 1.0
+        hw = run_binary_f32("v_add_f32", float("inf"), 1.0, clamp=True)
+        self.assertEqual(hw, 1.0)
+
+    def test_add_neg_inf_clamping(self):
+        # -inf + 1.0 = -inf -> clamped to 0.0
+        hw = run_binary_f32("v_add_f32", float("-inf"), 1.0, clamp=True)
+        self.assertEqual(hw, 0.0)
+
+    def test_add_signed_zeros_clamped(self):
+        # -0.0 + -0.0 = -0.0 -> clamped to 0.0
+        hw = run_binary_f32("v_add_f32", -0.0, -0.0, clamp=True)
+        self.assertEqual(hw, 0.0)
+
+    def test_add_subnormal_clamped(self):
+        # 1e-40 (subnormal) + 0.5 = ~0.5 -> clamped remains ~0.5
+        hw = run_binary_f32("v_add_f32", 1e-40, 0.5, clamp=True)
+        self.assertAlmostEqual(hw, 0.5, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
