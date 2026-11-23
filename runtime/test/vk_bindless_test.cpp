@@ -107,6 +107,7 @@ std::uint32_t probe_depth(std::span<const std::uint32_t> table, const Descriptor
 } // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // as vk_compute_test: keep every line check.py reads
     if (argc < 3) {
         std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv | ps_imgatomic.spv>\n");
         return 2;

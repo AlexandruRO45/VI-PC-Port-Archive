@@ -138,6 +138,7 @@ static bool read_mesh(const char* path, uint32_t stride, std::vector<uint8_t>& v
 }
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // as vk_compute_test: keep every line check.py reads
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h [clip-test-s0 clip-test-s1]]\n"
                              "       vk_harness ms.spv fs.spv out.raw --mesh-group-readback X Y Z\n");

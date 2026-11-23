@@ -52,6 +52,7 @@ std::vector<std::uint32_t> read_spv(const char* path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // as vk_compute_test: keep every line check.py reads
     if (argc != 8 && argc != 10) {
         std::fprintf(stderr, "usage: vk_sampler_test <vs.spv> <fs.spv> <out.raw> <s0> <s1> <s2> <s3> [<base> <last>]\n");
         return 2;

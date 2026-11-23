@@ -677,6 +677,10 @@ static int run(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    // Unbuffered, so check.py gets every result line even when the process ends without the C runtime's
+    // final flush: piped, stdout is fully buffered, and 5 of 450 piped runs on an RTX 5080 (NVIDIA 621.24)
+    // exited 0 with an empty stdout while stderr (unbuffered) still had the device line.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     // GPU-assisted validation reports what the shader did when the queue finishes, after the words were judged.
     return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
 }

@@ -83,6 +83,7 @@ static int cube_alpha_self_test() {
 }
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // as vk_compute_test: keep every line check.py reads
     if (argc == 2 && std::strcmp(argv[1], "--self-test-cube-alpha") == 0)
         return cube_alpha_self_test();
     const uint32_t W = 64, H = 64, TW = 8;
