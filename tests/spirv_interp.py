@@ -318,10 +318,12 @@ def run(spvasm):
             val[res] = (get(args[1]) >> get(args[2])) & ((1 << get(args[3])) - 1)
         elif op == "OpBitCount":
             val[res] = bin(get(args[1]) & M32).count("1")
-        elif op == "OpConvertUToF":
-            val[res] = f32(float(get(args[1])))
+        elif op == "OpConvertUToF":                       # a 32-bit integer is exact in binary64: no rounding there
+            val[res] = (float if float_bits(args[0]) == 64 else f32)(float(get(args[1])))
         elif op == "OpConvertSToF":
-            val[res] = f32(float(s32(get(args[1]))))
+            val[res] = (float if float_bits(args[0]) == 64 else f32)(float(s32(get(args[1]))))
+        elif op == "OpFConvert":                          # f32 -> f64 is exact; f64 -> f32 rounds to nearest even
+            val[res] = float(get(args[1])) if float_bits(args[0]) == 64 else f32(get(args[1]))
         elif op == "OpConvertFToU":
             x = get(args[1]); val[res] = 0 if math.isnan(x) or x <= 0 else M32 if x >= 2**32 else int(x)
         elif op == "OpConvertFToS":

@@ -7367,7 +7367,8 @@ class Gen:
                 word = self.tmp()
                 self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
                 self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
-        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
+        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_mul_f64", "v_fma_f64",
+                    "v_min_f64", "v_max_f64", "v_cvt_i32_f64", "v_cvt_u32_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
                 lo, hi = self.f64_source_words(sv, op)
@@ -7389,6 +7390,35 @@ class Gen:
                 r = self.tmp()
                 self.emit(f"{r} = OpFConvert %float {x}")
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            elif op in ("v_cvt_i32_f64", "v_cvt_u32_f64"):
+                # Truncate toward zero; out-of-range values and infinities saturate, NaN gives 0 (RDNA2 ISA,
+                # V_CVT_I32_F64 / V_CVT_U32_F64). As for the f32 forms, the raw SPIR-V conversion only ever sees an
+                # in-range operand: an out-of-range OpConvertFToS/U is undefined.
+                if mods:
+                    raise Unsupported(op + " modifier")
+                x = f64(a[1])
+                signed = op == "v_cvt_i32_f64"
+                low_bound, high_bound = (-2147483649.0, 2147483648.0) if signed else (-1.0, 4294967296.0)
+                above, below, in_range, nan, safe, converted, sat_hi, sat, result = (self.tmp() for _ in range(9))
+                self.emit(f"{above} = OpFOrdGreaterThan %bool {x} {self.dconst(low_bound)}")
+                self.emit(f"{below} = OpFOrdLessThan %bool {x} {self.dconst(high_bound)}")
+                self.emit(f"{in_range} = OpLogicalAnd %bool {above} {below}")
+                self.emit(f"{safe} = OpSelect %double {in_range} {x} {self.dconst(0.0)}")
+                if signed:
+                    as_int = self.tmp()
+                    self.emit(f"{as_int} = OpConvertFToS %int {safe}")
+                    self.emit(f"{converted} = OpBitcast %uint {as_int}")
+                    low_sat = self.cu(0x80000000)
+                    high_sat = self.cu(0x7FFFFFFF)
+                else:
+                    self.emit(f"{converted} = OpConvertFToU %uint {safe}")
+                    low_sat = self.cu(0)
+                    high_sat = self.cu(0xFFFFFFFF)
+                self.emit(f"{nan} = OpIsNan %bool {x}")
+                self.emit(f"{sat_hi} = OpSelect %uint {below} {low_sat} {high_sat}")
+                self.emit(f"{sat} = OpSelect %uint {nan} {self.cu(0)} {sat_hi}")
+                self.emit(f"{result} = OpSelect %uint {in_range} {converted} {sat}")
+                self.dst(a[0], result)
             else:
                 if op == "v_add_f64":
                     x, y = f64(a[1]), f64(a[2])
@@ -7404,6 +7434,23 @@ class Gen:
                         self.emit(f"{n2} = OpCompositeConstruct %v2uint_d {mlo} {mhi}")
                         self.emit(f"{rd} = OpBitcast %double {n2}")
                         r = rd
+                elif op == "v_mul_f64":
+                    x, y = f64(a[1]), f64(a[2])
+                    r = self.tmp()
+                    self.emit(f"{r} = OpFMul %double {x} {y}")
+                elif op == "v_fma_f64":
+                    # One rounding (fused), as V_FMA_F64 does.
+                    x, y, z = f64(a[1]), f64(a[2]), f64(a[3])
+                    r = self.tmp()
+                    self.emit(f"{r} = OpExtInst %double %glsl Fma {x} {y} {z}")
+                elif op in ("v_min_f64", "v_max_f64"):
+                    # As v_min_f32 / v_max_f32: a NaN operand gives the other one, and S0 (with its payload) when
+                    # S1 is NaN. NMin/NMax alone allow any NaN when both are.
+                    x, y = f64(a[1]), f64(a[2])
+                    m, nan_y, r = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{m} = OpExtInst %double %glsl {'NMax' if op == 'v_max_f64' else 'NMin'} {x} {y}")
+                    self.emit(f"{nan_y} = OpIsNan %bool {y}")
+                    self.emit(f"{r} = OpSelect %double {nan_y} {x} {m}")
                 elif op == "v_rcp_f64":
                     x = f64(a[1])
                     r = self.tmp()
@@ -7418,6 +7465,15 @@ class Gen:
                     self.emit(f"{r} = OpExtInst %double %glsl Sqrt {x}")
                 # VOP3 f64 ops carry HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
                 self.dst_f64(a[0], r, mods, op)
+        elif op == "v_cvt_f64_f32":
+            # Every f32 is exact in binary64, so the conversion never rounds. Source modifiers apply to the f32
+            # operand (src_f); omod/clamp to the double result, as for the other VOP3 f64 ops.
+            if ins["op"].endswith(("_dpp", "_sdwa")):
+                raise Unsupported(op + " operands")
+            self.uses_f64 = True
+            r = self.tmp()
+            self.emit(f"{r} = OpFConvert %double {self.src_f(a[1])}")
+            self.dst_f64(a[0], r, mods, op)
         elif op in ("v_cmp_class_f64", "v_cmpx_class_f64"):
             self.cmp_class_f64(op, a, exec_only=op == "v_cmpx_class_f64", mods=mods)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):

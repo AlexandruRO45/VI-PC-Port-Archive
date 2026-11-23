@@ -396,6 +396,10 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
               "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
               "ps_f64_round": (0xc12af665, 0x3fe7ffff, 0xbfffffff, 0xc12af666),
+              # v_fma/mul/max_f64, v_cvt_{f64_i32,f64_u32,f64_f32,i32_f64} (.asm headers; w0 of ps_f64_alu is 0 if
+              # the driver rounds GLSL Fma twice)
+              "ps_f64_alu": (0x3c300000, 0xc00b0000, 0x40000000, 0x7fffffff),
+              "ps_f64_cvt": (0xbff00000, 0xffe00000, 0xa0000000, 0x80000000),
               "ps_outmods_f16": (0xaaaa3c00, 0xaaaa3e00, 0x7c000000, 0x3c000000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
               "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),

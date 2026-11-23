@@ -1300,6 +1300,8 @@ def run_suite(a, work: str) -> int:
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
                 "ps_f64_mods": (0x40040000, 0x3FF00000, 0x3FE40000, 0x3FF00000),   # needs shaderFloat64
                 "ps_f64_round": (0xC12AF665, 0x3FE7FFFF, 0xBFFFFFFF, 0xC12AF666),  # needs shaderFloat64
+                "ps_f64_alu": (0x3C300000, 0xC00B0000, 0x40000000, 0x7FFFFFFF),    # needs shaderFloat64
+                "ps_f64_cvt": (0xBFF00000, 0xFFE00000, 0xA0000000, 0x80000000),    # needs shaderFloat64
                 "ps_outmods_f16": (0xAAAA3C00, 0xAAAA3E00, 0x7C000000, 0x3C000000),
                 # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)
                 "ps_f16_med3_opsel": (0xAAAA4100, 0xAAAA4200, 0xAAAA3E00, 0x40005555),
