@@ -431,5 +431,40 @@ class TestPieces(unittest.TestCase):
         self.assertEqual(M.parse_shader_hashes(None), frozenset())
 
 
+class TestArgumentRanges(unittest.TestCase):
+    """A numeric option whose value the run cannot honour is refused before any input is read."""
+
+    CANNOT_HONOUR = [(["--top", "0"], "--top"), (["--top", "-3"], "--top"),
+                     (["--embeddings", "-1"], "--embeddings"),
+                     (["--header-offset", "-64"], "--header-offset"),
+                     (["--descriptor-offset", "-1"], "--descriptor-offset")]
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            return M.main(["blas.bin", "manifest.json", *argv]), out.getvalue(), err.getvalue()
+
+    def test_a_value_the_run_cannot_honour_is_a_usage_error(self):
+        # Without the check each of these runs: --top 0 and a negative top printed one candidate anyway
+        # (max(1, a.top)), a negative embeddings cap matched nothing, and a negative offset read from
+        # the end of the file.
+        for argv, option in self.CANNOT_HONOUR:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit, msg=argv) as caught:
+                    M.main(["blas.bin", "manifest.json", *argv])
+            self.assertEqual(caught.exception.code, 2, argv)
+            self.assertIn(option, err.getvalue(), argv)
+            self.assertEqual(out.getvalue(), "", argv)
+
+    def test_a_value_the_run_can_honour_still_reaches_the_inputs(self):
+        # These parse, so the missing synthetic inputs are what stops the run (exit 2, one error line).
+        for argv in (["--top", "1"], ["--embeddings", "0"],
+                     ["--header-offset", "0", "--descriptor-offset", "0"]):
+            status, out, err = self.run_main(argv)
+            self.assertEqual(status, 2, argv)
+            self.assertTrue(err.startswith("error: "), (argv, err))
+
+
 if __name__ == "__main__":
     unittest.main()
