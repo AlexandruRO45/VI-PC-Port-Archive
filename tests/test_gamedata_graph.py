@@ -20,6 +20,7 @@ TOOLS = os.path.join(ROOT, "tools")
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 import gamedata_graph as gg  # noqa: E402
+import report_paths  # noqa: E402
 
 ALPHA = (
     b'<?xml version="1.0" encoding="utf-8"?>\n'
@@ -214,6 +215,7 @@ class GamedataGraphTest(unittest.TestCase):
             self.assertEqual(f.read(), ALPHA)
 
     def test_json_over_directory_mode_xml_hardlink_is_refused(self):
+        self.assertIs(gg.same_report_path, report_paths.same_report_path)
         directory = os.path.join(self.root, "dir")
         os.makedirs(directory)
         xml_path = os.path.join(directory, "a.xml")

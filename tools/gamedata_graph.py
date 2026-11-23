@@ -48,6 +48,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import gamedata_xml as gx  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 MANIFEST_ROOTS = ("CDataFileMgr__ContentChangeSetDef", "CDataFileMgr__ContentDef")
 MANIFEST_ROOT_SET = frozenset(MANIFEST_ROOTS)
@@ -599,7 +600,7 @@ def main() -> int:
             for target in args.targets:
                 is_dir = os.path.isdir(target)
                 source = os.path.join(target, "index.json") if is_dir else target
-                if gx.same_report_path(args.json, source):
+                if same_report_path(args.json, source):
                     parser.error(f"--json would overwrite the input {source}")
                 if is_dir and os.path.isfile(args.json):
                     root = os.path.normcase(os.path.abspath(target))
@@ -607,7 +608,7 @@ def main() -> int:
                     if dest.endswith(".bin") and dest.startswith(root + os.sep):
                         parser.error(f"--json would overwrite an input file: {args.json}")
                     for path in gx.input_files([target]):
-                        if gx.same_report_path(args.json, path):
+                        if same_report_path(args.json, path):
                             parser.error(f"--json would overwrite the input {path}")
 
         documents = list(gx.load_documents(args.targets))
