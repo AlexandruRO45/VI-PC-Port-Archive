@@ -1631,7 +1631,7 @@ int main(int argc, char** argv) {
             if (const std::string miss = check_missing_module_feature(meta); !miss.empty()) {
                 // No module was attempted, so only the pipeline skip is counted.
                 record_skip(name, stage, miss);
-                ++done;
+                complete_module(k);
                 continue;
             }
             // Enter before reading the module: creation can also enter the driver. Hold until its pipeline and
