@@ -30,7 +30,7 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
 from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import LANE_MASK_RUNS, lane_mask_problem   # vs_lane_mask: a VS that reads its lane (SHADER-302)
+from check import LANE_MASK_RUNS, device_info, lane_mask_problem, lane_mask_skip   # vs_lane_mask (SHADER-302)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
@@ -1533,6 +1533,9 @@ def run_suite(a, work: str) -> int:
         elif name == "vs_lane_mask":
             # The VS reads its subgroup lane for a mask in user SGPR s2 (SHADER-302), as check.py checks.
             raw = os.path.join(raw_dir, f"{name}.raw")
+            if skip := lane_mask_skip(device_info()):   # no vertex subgroups and not MoltenVK (KosmicKrisp)
+                results.append((name, None, skip))
+                continue
             for sgprs, want in LANE_MASK_RUNS:
                 env = dict(gfx_env or os.environ, VKH_SGPRS=sgprs)
                 rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, os.path.join(spirv_dir, "ps_flat.spv"), raw],

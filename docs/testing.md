@@ -459,7 +459,9 @@ function". With `--no-vertex-subgroups` the VS computes the lane at entry from a
 Metal compiles in a vertex function (`docs/design.md`, "Vertex shaders without subgroups"). `make_game.py` and
 `run_gpu_tests.py` ask `tools/vk_subgroup_info.py` (`vertex_in_supported_stages`) and turn the flag on where it is
 false. `LEONIDA_NO_VERTEX_SUBGROUPS=1` or `0` forces it on or off; `build.py` takes only `1`. The GPU test for it is
-`vs_lane_mask` (drawn with `ps_flat`): on a Mac it passes with the flag and fails without it.
+`vs_lane_mask` (drawn with `ps_flat`): on a Mac it passes with the flag and fails without it. KosmicKrisp has no
+vertex subgroups either, but it lowers the ballot and the scan through the SIMD lane id, which a Metal vertex function
+can't declare, so the runners skip `vs_lane_mask` on a driver without vertex subgroups that isn't MoltenVK.
 
 The D3D12 tests' shaders (`generated/*_shaders` in the runtime build) are translated by CMake through `build.py`, so
 nothing asks the device there: for a Windows build that runs under Wine on a Mac, set `LEONIDA_NO_VERTEX_SUBGROUPS=1`

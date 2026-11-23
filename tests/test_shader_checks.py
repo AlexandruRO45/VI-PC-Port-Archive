@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime" / "test" / "shaders"))
@@ -1098,6 +1099,48 @@ class LaneMaskFrames(unittest.TestCase):
 
     def test_runs_cover_both_choices(self):
         self.assertEqual(sorted(w for _, w in check.LANE_MASK_RUNS), [0x101, 0x202])
+
+
+class LaneMaskSkip(unittest.TestCase):
+    """vs_lane_mask is skipped only where the vertex stage has no subgroups and the driver isn't MoltenVK (KosmicKrisp
+    lowers the flag's ballot and scan through the SIMD lane id, #6160); everywhere else it runs."""
+
+    def test_which_devices_skip(self):
+        for info, skips in (({"vertex_in_supported_stages": False, "driver_id": 14}, False),   # MoltenVK: the flag
+                            ({"vertex_in_supported_stages": False, "driver_id": 28}, True),    # KosmicKrisp
+                            ({"vertex_in_supported_stages": True, "driver_id": 4}, False),     # NVIDIA, AMD, Intel
+                            ({}, False)):                                                      # no answer: run
+            with self.subTest(info=info):
+                skip = check.lane_mask_skip(info)
+                self.assertEqual(skip is not None, skips)
+                if skips:
+                    self.assertIsInstance(skip, check.Skip)
+                    self.assertIn("driver ID 28", skip)
+
+    def test_skip_comes_before_the_harness_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for n in ("vs_lane_mask", "ps_flat"):
+                Path(tmp, n + ".spv").touch()
+            kk = {"vertex_in_supported_stages": False, "driver_id": 28}
+            with patch.object(check, "device_info", return_value=kk), \
+                    patch.object(check, "run", side_effect=AssertionError("vk_harness must not run")):
+                self.assertIsInstance(check.lane_mask_test("tools", tmp), check.Skip)
+
+    def test_device_info_reads_the_last_json_line(self):
+        out = '{"vertex_in_supported_stages": false, "driver_id": 28}\n[mesa] some driver log\n'
+        check._DEVICE_INFO.clear()
+        try:
+            with patch.object(check.subprocess, "run", return_value=SimpleNamespace(stdout=out, returncode=0)):
+                self.assertEqual(check.device_info(), {"vertex_in_supported_stages": False, "driver_id": 28})
+        finally:
+            check._DEVICE_INFO.clear()
+        check._DEVICE_INFO.clear()
+        try:
+            with patch.object(check.subprocess, "run", return_value=SimpleNamespace(stdout='{"error": "x"}\n',
+                                                                                  returncode=1)):
+                self.assertEqual(check.device_info(), {})
+        finally:
+            check._DEVICE_INFO.clear()
 
 
 if __name__ == "__main__":

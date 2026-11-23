@@ -1550,11 +1550,45 @@ def lane_mask_problem(data, want):
     return f"{len(wrong)} of {len(px)} pixels differ from {want:#x}, e.g. {hex(wrong[0][0]) if wrong else 'no pixels'}"
 
 
+VK_DRIVER_ID_MOLTENVK = 14
+_DEVICE_INFO = []
+
+
+def device_info():
+    """tools/vk_subgroup_info.py's answer for the device the tests run on (cached), {} when it can't tell."""
+    if not _DEVICE_INFO:
+        info = {}
+        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "tools", "vk_subgroup_info.py")
+        try:
+            r = subprocess.run([sys.executable, "-I", tool], capture_output=True, text=True, timeout=60)
+            # A driver may log to stdout after the JSON line, so take the last line that is a JSON object.
+            line = next((ln for ln in reversed(r.stdout.splitlines()) if ln.lstrip().startswith("{")), "")
+            info = json.loads(line) if line else {}
+        except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+            pass
+        _DEVICE_INFO.append(info if isinstance(info, dict) and "error" not in info else {})
+    return _DEVICE_INFO[0]
+
+
+def lane_mask_skip(info):
+    """A Skip for vs_lane_mask on a driver whose vertex stage has no subgroup operations and that is not MoltenVK,
+    else None. Such a driver owes no vertex-stage group operations (VUID-RuntimeSpirv-None-06343); MoltenVK's
+    SPIRV-Cross still compiles --no-vertex-subgroups' ballot and scan to simd_ballot / simd_prefix_exclusive_sum, but
+    KosmicKrisp (Mesa) lowers them through the SIMD lane id, which a Metal vertex function can't declare, so the
+    pipeline fails there with the flag or without it (#6160). `info` is tools/vk_subgroup_info.py's answer."""
+    if info.get("vertex_in_supported_stages") is False and info.get("driver_id") != VK_DRIVER_ID_MOLTENVK:
+        return Skip(f"SKIP (no vertex-stage subgroups on driver ID {info.get('driver_id')}, not MoltenVK, whose "
+                    "ballot and scan lowering is the one vs_lane_mask needs)")
+    return None
+
+
 def lane_mask_test(tools, spirv):
     """vs_lane_mask with ps_flat under each LANE_MASK_RUNS mask: the VS must build and pick by its lane's bit."""
     for n in ("vs_lane_mask", "ps_flat"):
         if not os.path.isfile(os.path.join(spirv, n + ".spv")):
             return f"missing {n}.spv"
+    if skip := lane_mask_skip(device_info()):
+        return skip
     for sgprs, want in LANE_MASK_RUNS:
         with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
             raw = Path(tmp) / "pixels.raw"
