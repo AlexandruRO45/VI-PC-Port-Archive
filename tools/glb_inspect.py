@@ -272,7 +272,7 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             issues.append(f"sampler[{sampler_index}] input accessor is missing")
         elif input_count is None or input_count == 0:
             issues.append(f"sampler[{sampler_index}] input accessor has no keyframes")
-        if input_accessor is not None and "max" in input_accessor and duration is None:
+        if input_count and input_accessor is not None and "max" in input_accessor and duration is None:
             issues.append(f"sampler[{sampler_index}] input accessor max does not declare a finite duration")
         if input_type is not None and input_type != "SCALAR":
             issues.append(f"sampler[{sampler_index}] input accessor type is {input_type}, expected SCALAR")
