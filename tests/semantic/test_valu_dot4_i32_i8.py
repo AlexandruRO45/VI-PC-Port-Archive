@@ -194,5 +194,67 @@ class TestValuDot4I32I8AST(unittest.TestCase):
         )
         self.assertEqual(instr.disasm(), "v_dot4_i32_i8 v4, s0, v1, 0x100 clamp")
 
+class ScalarMachineState:
+    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
+        self.vgprs: list[int] = [0] * num_vgprs
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.scc: int = 0
+        self.vcc: int = 0
+
+    def read_operand(self, op: Operand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.kind == OperandKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        return op.value & MASK32
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    def step(self, instr: VDot4I32I8Instruction, state: ScalarMachineState) -> int:
+        s0 = state.read_operand(instr.src0)
+        s1 = state.read_operand(instr.src1)
+        s2 = state.read_operand(instr.src2)
+        res = ref_dot4_i32_i8(s0, s1, s2, clamp=instr.clamp)
+        if instr.dst.kind == OperandKind.VGPR:
+            state.write_vgpr(instr.dst.index, res)
+        return res
+
+
+class TestValuDot4I32I8ScalarInterpreter(unittest.TestCase):
+    """Stage 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_step_all_vgprs(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(1, pack_i8(1, 2, 3, 4))
+        state.write_vgpr(2, pack_i8(5, 6, 7, 8))
+        state.write_vgpr(3, 500)
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        res = ScalarInterpreter().step(instr, state)
+        self.assertEqual(res, 570)
+        self.assertEqual(state.vgprs[0], 570)
+
+    def test_scalar_step_sgpr_and_imm_operands(self) -> None:
+        state = ScalarMachineState()
+        state.sgprs[0] = pack_i8(-1, 2, -3, -4)
+        state.write_vgpr(1, pack_i8(5, -6, -7, 8))
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(2),
+            src0=Operand.sgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.imm(100),
+        )
+        # -1*5 + 2*(-6) + (-3)*(-7) + (-4)*8 = -5 - 12 + 21 - 32 = -28. + 100 = 72.
+        res = ScalarInterpreter().step(instr, state)
+        self.assertEqual(res, 72)
+        self.assertEqual(state.vgprs[2], 72)
+
 if __name__ == "__main__":
     unittest.main()
