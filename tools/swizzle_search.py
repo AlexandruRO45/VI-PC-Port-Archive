@@ -168,6 +168,12 @@ def main(argv=None):
     except OSError as e:  # a missing or unreadable input: one ERROR line, as the other tools do
         print(f"ERROR: cannot read {a.blob}: {e.strerror or e}", file=sys.stderr)
         return 2
+    if a.out is not None:
+        try:
+            import PIL  # noqa: F401
+        except ModuleNotFoundError:
+            print("ERROR: --out requires Pillow (pip install Pillow)", file=sys.stderr)
+            return 1
     try:
         res = search(data, a.bpe, a.tile, widths, a.tiles)
     except ModuleNotFoundError as e:

@@ -607,6 +607,7 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
             nested_out = root / "nested" / "sub" / "preview.png"
 
             with mock.patch.object(self.mod, "search", return_value=[(1.0, 64, "xyxy")]), \
+                 mock.patch.dict(sys.modules, {"PIL": mock.MagicMock()}), \
                  mock.patch.object(self.mod, "render") as mock_render:
                 rc = self.mod.main([str(blob), "--bpe", "8", "--tile", "128", "--widths", "64", "--out", str(nested_out)])
             self.assertIn(rc, (0, None))
@@ -615,6 +616,7 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
 
             err = io.StringIO()
             with mock.patch.object(self.mod, "search", return_value=[(1.0, 64, "xyxy")]), \
+                 mock.patch.dict(sys.modules, {"PIL": mock.MagicMock()}), \
                  mock.patch.object(self.mod, "render", side_effect=PermissionError("denied")), \
                  mock.patch.object(sys, "stderr", err):
                 rc_err = self.mod.main([str(blob), "--bpe", "8", "--tile", "128", "--widths", "64", "--out", str(nested_out)])
@@ -643,6 +645,7 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
             bad_ext_out = root / "preview.unrecognized"
             err = io.StringIO()
             with mock.patch.object(self.mod, "search", return_value=[(1.0, 64, "xyxy")]), \
+                 mock.patch.dict(sys.modules, {"PIL": mock.MagicMock()}), \
                  mock.patch.object(self.mod, "render", side_effect=ValueError("unknown file extension: .unrecognized")), \
                  mock.patch.object(sys, "stderr", err):
                 rc = self.mod.main([str(blob), "--bpe", "8", "--tile", "128", "--widths", "64", "--out", str(bad_ext_out)])
@@ -666,9 +669,10 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
             root = Path(td)
             blob = root / "blob.bin"
             blob.write_bytes(bytes(512))
-            out = root / "preview.png"
+            out_dir = root / "nested" / "output"
+            out = out_dir / "preview.png"
             err = io.StringIO()
-            with mock.patch.object(self.mod, "search", return_value=[(1.0, 64, "xyxy")]), \
+            with mock.patch.object(self.mod, "search", return_value=[(1.0, 64, "xyxy")]) as mock_search, \
                  mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}), \
                  mock.patch.object(sys, "stderr", err):
                 rc = self.mod.main([str(blob), "--bpe", "8", "--tile", "128", "--widths", "64", "--out", str(out)])
@@ -676,6 +680,8 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
             self.assertIn("ERROR: --out requires Pillow (pip install Pillow)", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
             self.assertFalse(out.exists())
+            self.assertFalse(out_dir.exists())
+            mock_search.assert_not_called()
 
     def test_missing_numpy_reports_error_without_traceback(self):
         with tempfile.TemporaryDirectory() as td:
