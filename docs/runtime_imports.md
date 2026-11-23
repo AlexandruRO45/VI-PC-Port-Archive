@@ -162,7 +162,7 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XGameStreamingImpl` and `XLauncherImpl` from xgameruntime-docs' layout; for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -204,6 +204,17 @@ connectivity (level None), the port and URL security-information queries fail wi
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
+
+`XGameStreamingImpl` (`IXGameStreamingImpl`..`3`, slots 3-34) and `XLauncherImpl` (slots 3-5)
+(`runtime/shims/xgameruntime_streaming.cpp`) answer as a console nobody streams from and with no shell. The slot order
+is xgameruntime-docs'; `libHttpClient.GDK.dll` has thunks for the same classes, but its calls were not re-read for this
+table. `XGameStreamingIsStreaming` is false, the client count 0, every connection state Disconnected, and a
+connection-state registration returns a token that never fires; each call that names a client fails with
+`HRESULT_FROM_WIN32(ERROR_NOT_FOUND)` and clears the outputs whose type is known; touch-control updates succeed and do
+nothing; `XGameStreamingSetResolution` and `XLaunchUri` fail with `ERROR_NOT_SUPPORTED` (the URI is not logged); the
+screen-timeout deferral hands out a handle. Four further slots (35-38) that xgameruntime-docs does not list answer 0
+and log once. `XGameStreamingClientId`'s size is not in the pages read; on x64 it takes one register either way.
+`xgameruntime_streaming_test` calls each slot.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
