@@ -114,6 +114,16 @@ So 90% of the unread bytes look like compressed or encrypted data, with no zlib 
 The rest is lower-entropy structure worth a look with a hex editor at the listed offsets. The list holds offsets
 and sizes only; keep the index in your work folder like the carved files.
 
+`scripts/carve_all.ps1 -Game <package folder> -Out <carve folder>` does a whole-package carve with this walker: it
+runs `python -I tools/rpf9_carve.py` on every `.rpf` under `-Game`, smallest archive first, writing each archive to
+`<Out>\<name>`, where `<name>` is the archive's path under `-Game` without its `.rpf` extension, its separators
+replaced by `_`. It skips an archive whose `index.json` is already there, so an interrupted run continues where it
+stopped. Two archives that would map to one folder are an error before anything is carved, and a failed carve stops
+the run. After carving it checks every index's `summary` (non-negative integers; `compressed_bytes` and
+`unread_bytes` inside `span`; `bink2_files` at most `files`) and writes `<Out>\coverage.json`, one row per archive
+with files, Bink 2 files, span, the readable and unread fractions of the span, and the inflated bytes, then prints
+those rows as a table. It is a research tool: the build does not use it.
+
 The walker advances by `len(chunk)`, not by the 1 MiB read request. A short final slice used to make `p`
 overshoot EOF, so `used` exceeded the real stream size and every trailing stream was skipped; the regression
 test `tests/test_rpf9_carve.py` builds a two-stream archive to keep that fixed.
