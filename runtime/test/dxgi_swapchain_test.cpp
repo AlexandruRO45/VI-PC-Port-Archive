@@ -482,6 +482,14 @@ int main() {
     if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&factory))) || !factory)
         return fail("create_dxgi_factory");
 
+    {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        auto* rejected = reinterpret_cast<IDXGISwapChain*>(0x1);
+        const HRESULT hr = factory->CreateSwapChain(nullptr, &desc, &rejected);
+        if (hr != DXGI_ERROR_INVALID_CALL || rejected != nullptr)
+            return fail("CreateSwapChain null device must clear the output");
+    }
+
     // Host-measured on Windows 11: MakeWindowAssociation takes DXGI_MWA_NO_WINDOW_CHANGES, DXGI_MWA_NO_ALT_ENTER
     // and DXGI_MWA_NO_PRINT_SCREEN together or alone; any other bit is DXGI_ERROR_INVALID_CALL.
     {

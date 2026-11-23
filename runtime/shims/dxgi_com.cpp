@@ -1399,8 +1399,8 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE CreateSwapChain(IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) override {
+        if (out) *out = nullptr;
         if (!out || !device || !desc) return DXGI_ERROR_INVALID_CALL;
-        *out = nullptr;
         DXGI_SWAP_CHAIN_DESC1 desc1{};
         desc1.Width = desc->BufferDesc.Width;
         desc1.Height = desc->BufferDesc.Height;
