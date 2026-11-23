@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -92,17 +93,6 @@ def component_path(
     return sidecar
 
 
-def protect_model_exports(db: sqlite3.Connection, drawable_hash: int, output: Path) -> None:
-    """Keep an existing GLB for any physical variant of this drawable intact."""
-    key = f"{drawable_hash:016X}"
-    paths = db.execute("""
-        SELECT DISTINCT e.glb_path FROM models AS m JOIN model_exports AS e ON e.model_id = m.id
-        WHERE m.murmur64 = ? AND e.glb_path IS NOT NULL
-    """, (key,))
-    if any(same_report_path(output, path) for path, in paths):
-        raise ValueError(f"output would replace an indexed GLB for drawable {key}")
-
-
 def texture_path(db: sqlite3.Connection, asset_key: int) -> Path:
     """Return the unique ready external TTPF DDS for the exact 64-bit asset key."""
     key = f"{asset_key:016X}"
@@ -112,3 +102,16 @@ def texture_path(db: sqlite3.Connection, asset_key: int) -> Path:
         WHERE asset_key = ? AND status = 'ready' AND dds_path IS NOT NULL
     """, (key,), f"{label} ready TTPF DDS")
     return _existing_export(value, ".dds", label)
+
+
+def protect_indexed_glbs(db: sqlite3.Connection, output: Path) -> None:
+    """Refuse to replace indexed source geometry, including sources outside the kit."""
+    # The producer stores resolved, normcase paths. Check a direct match before probing
+    # other paths, which may be on offline volumes. Hard links still need samefile.
+    paths = db.execute("""
+        SELECT DISTINCT glb_path FROM model_exports WHERE glb_path IS NOT NULL
+        ORDER BY glb_path = ? DESC
+    """, (os.path.normcase(os.path.realpath(output)),))
+    for path, in paths:
+        if same_report_path(output, path):
+            raise ValueError(f"output would replace an indexed GLB: {path}")
