@@ -22,7 +22,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 1
+          # The history a pull request's commits add, without the blobs main already has.
+          fetch-depth: 0
+          filter: blob:none
       - name: No game data tracked
         run: |
           bad=$(git ls-files -z | grep -ziE '\.(rpf|ttpf|xvd|msixvc|dxbc|fssm|spv|spvasm|dds|bk2|awc|r9modeldata|obj|glb|ogg|wav|exe|dll)$' | tr '\0' '\n' || true)
@@ -33,3 +35,9 @@ jobs:
           fi
       - name: No game data under another name
         run: python3 -I scripts/check_no_game_data.py
+      # A file added in one commit and deleted in a later one is not in the tree above, but a merge keeps it in
+      # main's history. The checkout is the merge commit: HEAD^1 is the base, so this is every file version the
+      # merge would bring in.
+      - name: No game data in the pull request's commits
+        if: github.event_name == 'pull_request'
+        run: python3 -I scripts/check_no_game_data.py --commits HEAD^1..HEAD

@@ -2,6 +2,7 @@
 
     python3 -I scripts/check_no_game_data.py            # every file `git ls-files` lists
     python3 -I scripts/check_no_game_data.py PATH...    # only these files
+    python3 -I scripts/check_no_game_data.py --commits BASE..HEAD   # every file version those commits add
 
 The extension check in .github/workflows/no-game-data.yml misses a renamed file: a DDS saved as .bin, an executable
 as .txt. This reads the first bytes of each file and matches the magic numbers of the package's formats and the
@@ -17,6 +18,10 @@ under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb
 7-Zip, Zstandard and RAR files, which it can't open, archives that fail to open and archives over the budget are
 reported as archives that can't be checked.
 
+A file a pull request adds in one commit and deletes in a later one is gone from its last tree but stays in the
+history a merge brings into main. `--commits BASE..HEAD` checks every file version reachable from HEAD and not from
+BASE (`git rev-list --objects`), so those are caught too.
+
 Prints one line per match, `<path>: <format>` (`<format> in <archive> (<member>)` for a match inside an archive), and
 exits 1 if there is any. Standard library only, no game files.
 """
@@ -28,6 +33,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 import zlib
 
@@ -238,6 +244,33 @@ def tracked_files(root):
     return [os.path.join(root, p) for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
+def commit_blobs(root, rev_range):
+    """[(blob id, path)] of every file version reachable from the end of `rev_range` and not from its start."""
+    objects = subprocess.run(["git", "rev-list", "--objects", rev_range], cwd=root, check=True,
+                             capture_output=True).stdout
+    listing = subprocess.run(["git", "cat-file", "--batch-check=%(objecttype) %(objectname) %(rest)"], cwd=root,
+                             input=objects, check=True, capture_output=True).stdout
+    blobs = []
+    for line in listing.decode("utf-8", "surrogateescape").splitlines():
+        kind, blob, path = (line.split(" ", 2) + [""])[:3]
+        if kind == "blob":
+            blobs.append((blob, path))
+    return blobs
+
+
+def check_commits(root, rev_range):
+    """[(label, format)] for every file version the commits in `rev_range` add that starts like game data."""
+    found = []
+    for blob, path in commit_blobs(root, rev_range):
+        with tempfile.TemporaryFile() as f:  # spooled to disk: classify_open seeks, and a blob can be large
+            subprocess.run(["git", "cat-file", "blob", blob], cwd=root, check=True, stdout=f)
+            f.seek(0)
+            name = classify_open(f, read_head_from(f))
+        if name:
+            found.append((f"{path} (blob {blob[:12]})", name))
+    return found
+
+
 def check(paths):
     """[(path, format)] for every regular file in `paths` that starts like game data."""
     found = []
@@ -259,10 +292,15 @@ def display(path):
 
 
 def main(argv):
-    paths = argv or tracked_files(os.getcwd())
-    found = check(paths)
+    if argv[:1] == ["--commits"]:
+        if len(argv) != 2:
+            print("usage: check_no_game_data.py --commits BASE..HEAD", file=sys.stderr)
+            return 2
+        found = [(printable(label), name) for label, name in check_commits(os.getcwd(), argv[1])]
+    else:
+        found = [(display(path), name) for path, name in check(argv or tracked_files(os.getcwd()))]
     for path, name in found:
-        print(f"{display(path)}: {name}")
+        print(f"{path}: {name}")
     if found:
         print(f"{len(found)} file(s) start like game data. Remove them; see CONTRIBUTING.md.", file=sys.stderr)
         return 1

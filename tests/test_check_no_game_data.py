@@ -250,6 +250,35 @@ class CheckNoGameData(unittest.TestCase):
         self.assertIn("renamed.txt: FSSM shader", result.stdout)
         self.assertNotIn("untracked.bin", result.stdout)
 
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_commits_mode_finds_a_file_deleted_again(self):
+        def git(*args):
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                            "-c", "init.defaultBranch=main", *args], cwd=self.dir, check=True, capture_output=True)
+
+        git("init", "-q", self.dir)
+        self.write("notes.txt", b"plain text\n")
+        git("add", "notes.txt")
+        git("commit", "-q", "-m", "base")
+        git("switch", "-q", "-c", "topic")
+        self.write("texture.bin", b"DDS " + bytes(12))
+        git("add", "texture.bin")
+        git("commit", "-q", "-m", "add")
+        git("rm", "-q", "texture.bin")
+        git("commit", "-q", "-m", "remove")
+        git("switch", "-q", "main")
+        git("merge", "-q", "--no-ff", "-m", "merge", "topic")  # like the pull request's merge commit
+
+        result = run([], cwd=self.dir)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)  # gone from the tree
+        result = run(["--commits", "HEAD^1..HEAD"], cwd=self.dir)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("texture.bin (blob ", result.stdout)
+        self.assertIn("DDS texture", result.stdout)
+        result = run(["--commits", "HEAD^1..HEAD^1"], cwd=self.dir)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(run(["--commits"], cwd=self.dir).returncode, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
