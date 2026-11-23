@@ -191,6 +191,41 @@ class Step(unittest.TestCase):
         want = X.brute_force([(None, 0xFF, quad)], o, d)
         self.assertTrue(same_hit(hit, want), (hit, want))
 
+    def test_quad_prim_leaf_steps_its_second_triangle(self):
+        # The console's form of a pair: one TRI0 pointer to the leaf, no TRI1 child, and QUAD_PRIM in the leaf's
+        # flags byte; the traversal steps the same leaf again as TRI1 (the public XDXR traversal, docs/bvh.md 7a).
+        quad = [[[0, 0, 0], [1, 0, 0], [1, 1, 0]], [[0, 0, 0], [1, 1, 0], [0, 1, 0]]]
+        data, info = X.build_blas(quad, pair=True)
+        console = bytearray(data)
+        root = X.ptr_offset(info["root"])
+        kids = list(struct.unpack_from("<4I", console, root))
+        self.assertEqual(sum(X.ptr_type(k) == X.TRI1 for k in kids if k != X.INVALID), 1)
+        kids = [X.INVALID if k != X.INVALID and X.ptr_type(k) == X.TRI1 else k for k in kids]
+        struct.pack_into("<4I", console, root, *kids)
+        o, d = [0.2, 0.7, -1.0], [0.0, 0.0, 1.0]             # through the second triangle only
+        want = X.brute_force([(None, 0xFF, quad)], o, d)
+        for flag, expect_hit in ((0, False), (X.LEAF_FLAG_QUAD_PRIM, True)):
+            leaf = bytearray(console)
+            gif = struct.unpack_from("<I", leaf, info["elements"] + 48)[0]
+            struct.pack_into("<I", leaf, info["elements"] + 48, gif | flag)
+            mem = X.Memory()
+            mem.place(0x1000, bytes(leaf))
+            stats = {"steps": 0}
+            hit = X.trace(mem, 0x1000, o, d, stats=stats)
+            with self.subTest(flag=flag):
+                if expect_hit:
+                    self.assertIsNotNone(hit, "QUAD_PRIM leaf: the second triangle was never stepped")
+                    self.assertEqual(hit["primitive"], 1)
+                    self.assertTrue(same_hit(hit, want), (hit, want))
+                else:
+                    self.assertIsNone(hit)                    # without the flag nothing reaches the second triangle
+        # Leonida's own form (a TRI1 child, no flag) is unchanged: no extra step
+        mem = X.Memory()
+        mem.place(0x1000, data)
+        stats = {"steps": 0}
+        self.assertEqual(X.trace(mem, 0x1000, o, d, stats=stats)["primitive"], 1)
+        self.assertEqual(stats["steps"], 1 + sum(1 for k in struct.unpack_from("<4I", data, root) if k != X.INVALID))
+
     def test_box_step_sorts_and_culls(self):
         # four triangles: three stacked on the ray at z = 3, 1, 2 and one off to the side
         tris = [[[0, 0, z], [1, 0, z], [0, 1, z]] for z in (3.0, 1.0, 2.0)] + [[[10, 0, 1], [11, 0, 1], [10, 1, 1]]]

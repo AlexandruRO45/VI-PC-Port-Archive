@@ -61,6 +61,13 @@ REMAP_IDENTITY = 1 | (2 << 2)
 # vertex slots per triangle node type (Read3Verts); slot 4 overlaps the leaf metadata, so TRI2/TRI3 are not emitted
 TRI_VERTS = {TRI0: (0, 1, 2), TRI1: (1, 3, 2), TRI2: (2, 3, 4), TRI3: (2, 4, 0)}
 
+# internal bits of a leaf's GeometryIndexAndFlags low byte (D3D12XBOX_RAYTRACING_GEOMETRY_FLAG_INTERNAL_FLAG_*):
+# QUAD_PRIM marks a leaf holding a second triangle (PrimitiveIndex2). The console builder reaches such a leaf through
+# one TRI0 pointer, and the traversal then steps the same leaf again as TRI1, hit or miss (docs/bvh.md 7a).
+# FLIP_TRI1 only changes the face culling of that TRI1 step, which trace() does not model.
+LEAF_FLAG_FLIP_TRI1 = 0x40
+LEAF_FLAG_QUAD_PRIM = 0x80
+
 FLT_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
 HALF_MAX = 65504.0
 HALF_MIN_NORMAL = 2.0 ** -14
@@ -572,6 +579,8 @@ def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst, stats=None):
             continue
         if stats is not None:
             stats["steps"] += 1
+        if ptr_type(p) == TRI0 and mem.u32(bvh_va + ptr_offset(p) + 48)[0] & LEAF_FLAG_QUAD_PRIM:
+            stack.append(p | TRI1)          # the pair's second triangle is the next step, as on the console
         r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
         if r is None:
             continue
