@@ -3069,4 +3069,20 @@ if(WIN32 AND MSVC)
     endif()
     target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
   endforeach()
+  # A program handed a build path as a string macro (LEONIDA_TEST_*_SPV="<build>/generated/x.spv": the sources are read as
+  # UTF-8 with /utf-8) holds UTF-8 bytes, but a narrow path is read in the active code page by std::filesystem::path,
+  # fopen and ifstream. In a build folder with a non-ASCII character that names no file, and every such test fails
+  # (TEST-1982). A manifest that sets the program's active code page to UTF-8 makes the two agree (Windows 10 1903 and
+  # later; the d3d12 tests pass under Wine 9.0 in such a folder). Only programs that are given such a macro get it:
+  # the loader tests check the ANSI code page behaviour and keep the system's.
+  foreach(_target IN LISTS _gta6rt_targets)
+    get_target_property(_type ${_target} TYPE)
+    if(NOT _type STREQUAL "EXECUTABLE")
+      continue()
+    endif()
+    get_target_property(_defs ${_target} COMPILE_DEFINITIONS)
+    if(_defs AND "${_defs}" MATCHES "(^|;)LEONIDA_[A-Z0-9_]+=\"")
+      target_sources(${_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/utf8_acp.manifest)
+    endif()
+  endforeach()
 endif()

@@ -220,6 +220,12 @@ runtime/build/windows` takes a folder made by hand like a Windows build). CMake 
 looked up only inside the SDK folder, so a Windows SDL3 for the GameInput shim is passed as `-DSDL3_DIR=<its
 cmake folder>` (`CMAKE_PREFIX_PATH` is not searched here).
 
+A build folder with a non-ASCII character in its path (`~/Spiele/Läuft/build`) works. The `d3d12_*` test programs that
+are given a build path as a compiled-in string (the test shaders, `LEONIDA_TEST_*_SPV`) carry a manifest that sets
+their active code page to UTF-8 (`runtime/cmake/utf8_acp.manifest`, TEST-1982), so the narrow UTF-8 path names the file
+they open; without it 14 of the 35 tests that read such a path failed with "Path not found". Wine needs a UTF-8
+locale (`LANG=C.UTF-8`) to start a program from such a folder at all.
+
 ### Proton's wine
 
 Proton's wine runs the suite against the D3D12 a Proton game gets: the prefix's vkd3d-proton and DXVK. Start any
