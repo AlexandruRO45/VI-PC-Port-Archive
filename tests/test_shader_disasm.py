@@ -484,12 +484,19 @@ VCC_LISTS = [X8, X4, X8 + ", " + X4, X4]
 # Knows s_nop 0, s_endpgm and v_mov_b32 v1, s1; reports every other word as llvm-mc does an invalid one.
 FAKE_MC = r'''import sys
 names = {"0000 80bf": "s_nop 0", "0000 81bf": "s_endpgm", "0102 027e": "v_mov_b32_e32 v1, s1"}
-data = bytes(int(t, 16) for t in sys.stdin.read().split())
+pos = []   # (line, column) of each input byte, as llvm-mc reports a warning's position
+for ln, line in enumerate(sys.stdin.read().split("\n"), 1):
+    col = 0
+    for tok in line.split(" "):
+        if tok:
+            pos.append((ln, col + 1, int(tok, 16)))
+        col += len(tok) + 1
+data = bytes(b for _, _, b in pos)
 for i in range(0, len(data), 4):
     w = data[i:i + 4]
     name = names.get(w[:2].hex() + " " + w[2:].hex())
     if name is None:
-        print(f"<stdin>:1:{5 * i + 1}: warning: invalid instruction encoding", file=sys.stderr)
+        print(f"<stdin>:{pos[i][0]}:{pos[i][1]}: warning: invalid instruction encoding", file=sys.stderr)
     else:
         print(f"\t{name} ; encoding: [{','.join(f'0x{b:02x}' for b in w)}]")
 '''
@@ -506,19 +513,27 @@ class VccTupleFallbackTest(unittest.TestCase):
             self.assertIn(regs, line)
         self.assertEqual(insns[0]["args"][0]["k"], "slist")
 
-    def test_tuples_into_vcc_take_the_python_decoder_line(self):
+    def fake_run(self, text=None):
+        import shader_disasm
         with tempfile.TemporaryDirectory() as d:
             fake = os.path.join(d, "fake_mc.py")
             with open(fake, "w") as f:
                 f.write(FAKE_MC)
-            import shader_disasm
-            old = shader_disasm.MC
+            old = shader_disasm.MC, shader_disasm._mc_text
             shader_disasm.MC = [sys.executable, fake]
+            shader_disasm._mc_text = text or old[1]
             try:
-                asm, bad, _ = shader_disasm.disasm(VCC_CODE, "gfx1013")
+                return shader_disasm.disasm(VCC_CODE, "gfx1013")[:2]
             finally:
-                shader_disasm.MC = old
-        self.check(asm, bad)
+                shader_disasm.MC, shader_disasm._mc_text = old
+
+    def test_tuples_into_vcc_take_the_python_decoder_line(self):
+        self.check(*self.fake_run())
+
+    def test_input_in_short_lines(self):
+        """The warnings' offsets come from their line and column, so input split into lines (#4210) still splices."""
+        self.check(*self.fake_run(lambda code: "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + 8])
+                                                           for i in range(0, len(code), 8))))
 
     def test_with_real_llvm_mc(self):
         mc = os.environ.get("LLVM_MC")

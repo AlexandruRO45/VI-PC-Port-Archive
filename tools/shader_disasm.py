@@ -101,7 +101,17 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
 
 
 NOP = b"\x00\x00\x80\xbf"   # s_nop 0
-INVALID_AT = re.compile(r"<stdin>:\d+:(\d+): warning: invalid instruction encoding")
+INVALID_AT = re.compile(r"<stdin>:(\d+):(\d+): warning: invalid instruction encoding")
+
+
+def _invalid_offsets(text: str, err: str) -> set:
+    """Byte offsets of the words llvm-mc reported invalid, from each warning's line and column in its input."""
+    lines = text.split("\n")
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line.split()))
+    return {starts[int(ln) - 1] + len(lines[int(ln) - 1][:int(col) - 1].split())
+            for ln, col in INVALID_AT.findall(err)}
 
 
 def _vcc_tuple_fallback(code: bytes, mcpu: str, wave32: bool):
@@ -118,8 +128,7 @@ def _vcc_tuple_fallback(code: bytes, mcpu: str, wave32: bool):
         n = len(ins["enc"]) // 2
         patched[pc:pc + n] = NOP * (n // 4)
     asm, _, err = _llvm_mc(bytes(patched), mcpu)
-    # Byte i of the input is at column 5*i+1 of its one line; llvm-mc skips 4 bytes per invalid word.
-    invalid = {(int(m.group(1)) - 1) // 5 for m in INVALID_AT.finditer(err)}
+    invalid = _invalid_offsets(_mc_text(bytes(patched)), err)   # llvm-mc skips 4 bytes per invalid word
     out, at, skip_to, placed = [], 0, 0, 0
     for line in asm.splitlines(keepends=True):
         enc = line.partition("; encoding: [")[2]
@@ -140,8 +149,12 @@ def _vcc_tuple_fallback(code: bytes, mcpu: str, wave32: bool):
     return "".join(out), len(invalid), err
 
 
+def _mc_text(code: bytes) -> str:
+    return " ".join(f"0x{b:02x}" for b in code)
+
+
 def _llvm_mc(code: bytes, mcpu: str):
-    text = " ".join(f"0x{b:02x}" for b in code)
+    text = _mc_text(code)
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
                            input=text, capture_output=True, text=True, errors="replace",
