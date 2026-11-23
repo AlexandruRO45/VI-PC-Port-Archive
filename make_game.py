@@ -1485,7 +1485,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     # so pack pools go under ttpf_pack/<pack>/).
     pools = []
     try:
-        for root, _, files in os.walk(game, onerror=scan_failed) if os.path.isdir(game) else ():
+        for root, _, files in os.walk(game, onerror=scan_failed) if is_folder(game) else ():
             pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
     except OSError as error:
         fail(f"assets: cannot list {error.filename or game} to find the texture pools: {error.strerror or error}")
@@ -1558,6 +1558,15 @@ def mark(path: str, what: str) -> None:
         f.write(f"{what} finished\n")
 
 
+def is_folder(path: str) -> bool:
+    """os.path.isdir that tells "not there" (False) from "cannot look" (raises OSError): isdir answers False for both,
+    so a parent folder that cannot be traversed would pass for a missing, empty one."""
+    try:
+        return stat.S_ISDIR(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
 def scan_failed(error: OSError) -> None:
     """os.walk onerror: a folder that cannot be listed must not pass for an empty one."""
     raise error
@@ -1567,7 +1576,7 @@ def pending_xma(xma_dir: str) -> list:
     """The XMA2 streams (.xma.wav) under xma_dir that have no decoded .wav next to them yet.
     Raises OSError when a sub-folder cannot be listed: an incomplete list would pass for a finished decode."""
     todo = []
-    if not os.path.isdir(xma_dir):
+    if not is_folder(xma_dir):
         return todo
     for root, _, files in os.walk(xma_dir, onerror=scan_failed):
         for f in files:

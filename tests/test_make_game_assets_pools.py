@@ -32,6 +32,19 @@ def deny_listing(blocked):
     return mock.patch.object(os, "scandir", scandir)
 
 
+def deny_stat(blocked):
+    """Patch os.stat so looking at `blocked` raises PermissionError, as a path under a folder that cannot be traversed
+    does; os.path.isdir turns that into False, "not there"."""
+    real = os.stat
+
+    def stat(path, *a, **k):
+        if os.path.abspath(os.fspath(path)) == os.path.abspath(blocked):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real(path, *a, **k)
+
+    return mock.patch.object(os, "stat", stat)
+
+
 class AssetsPoolsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -133,6 +146,19 @@ class AssetsPoolsTest(unittest.TestCase):
         self.assertIn("Permission denied", err.getvalue())
         run.assert_not_called()   # no export ran on a partial list of pools
 
+    def test_game_folder_that_cannot_be_checked_fails_instead_of_having_no_pools(self):
+        self.pool("data/ttdb/A/pool.ttpf")
+        err = io.StringIO()
+        with deny_stat(self.game), mock.patch.object(make_game, "log", lambda *a: None), \
+                mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+                mock.patch.object(make_game, "run") as run, \
+                mock.patch.object(make_game.shutil, "which", lambda n: None), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            make_game.assets(self.game, self.work, False, 1)
+        self.assertNotEqual(caught.exception.code, 0)
+        self.assertIn("Permission denied", err.getvalue())
+        run.assert_not_called()
+
 
 class UnlistableFolderTest(unittest.TestCase):
     """A sub-folder that cannot be listed fails the stage; it must not pass for one without pools or streams."""
@@ -152,6 +178,22 @@ class UnlistableFolderTest(unittest.TestCase):
         self.assertNotEqual(caught.exception.code, 0)
         self.assertIn("bank0", err.getvalue())
         run.assert_not_called()
+
+    def test_xma_folder_that_cannot_be_checked_is_not_a_finished_decode(self):
+        xma = os.path.join(self.tmp.name, "xma")
+        os.makedirs(xma)
+        with open(os.path.join(xma, "a.xma.wav"), "wb"):
+            pass
+        err = io.StringIO()
+        with deny_stat(xma), mock.patch.object(make_game, "run") as run, \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            make_game.decode_xma("ffmpeg", xma, 1)
+        self.assertNotEqual(caught.exception.code, 0)
+        self.assertIn("Permission denied", err.getvalue())
+        run.assert_not_called()
+
+    def test_a_missing_xma_folder_has_nothing_pending(self):
+        self.assertEqual(make_game.pending_xma(os.path.join(self.tmp.name, "nowhere")), [])
 
 
 if __name__ == "__main__":
