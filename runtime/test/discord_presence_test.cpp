@@ -287,11 +287,10 @@ int main() {
     check(leonida::JsonReader(payload).parse(root), "RPC payload is valid escaped JSON");
     const auto* args = root.find("args");
     const auto* activity = args ? args->find("activity") : nullptr;
-    check(activity && activity->find("type") && activity->find("type")->number == 0, "activity type is Playing");
-    check(activity && activity->find("name") && activity->find("name")->string == "Grand Theft Auto VI", "activity name matches");
+    check(activity && activity->object.size() == 1, "only the details activity field is supplied");
     check(activity && activity->find("details") && activity->find("details")->string == "A \"quoted\" \\ place", "details is resolved text");
-    check(payload.find("xbs_logo_480") != std::string::npos && payload.find("Leonida") != std::string::npos &&
-          payload.find("https://github.com/ItsNotRexed/Leonida") != std::string::npos, "image and repository button match");
+    check(activity && !activity->find("name") && !activity->find("type") && !activity->find("assets") &&
+          !activity->find("buttons"), "Discord application defaults are not overridden");
     check(activity_payload(std::nullopt, 123, 8).find("\"activity\":null") != std::string::npos, "clear sends a null activity");
     rpc_tests();
     hook_tests(config);

@@ -2265,11 +2265,6 @@ def package_discord_presence(game: str, out: str, image: str, profile: str | Non
     """Generate one optional user setting; keep verified hook data in the runtime's internal profile."""
     destination = os.path.join(out, "discord_presence.json")
     internal = os.path.join(out, "leonida", "presence_profile.json")
-    logo = os.path.join(game, "xbs_logo_480.png")
-    if os.path.isfile(logo):
-        copied_logo = os.path.join(out, "xbs_logo_480.png")
-        if not os.path.exists(copied_logo) or not os.path.samefile(logo, copied_logo):
-            shutil.copy2(logo, copied_logo)
     settings = None
     if os.path.exists(destination):
         try:
@@ -2319,8 +2314,6 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         if os.path.isfile(os.path.join(out, "leonida")):
             fail("runtime: the internal leonida profile path must be a directory")
         destinations.append(os.path.join("leonida", "presence_profile.json"))
-    if os.path.isfile(os.path.join(game, "xbs_logo_480.png")):
-        destinations.append("xbs_logo_480.png")
     if os.name == "nt":
         destinations.extend(("Play.ps1", "Play.cmd"))
     if work is not None:
@@ -2341,7 +2334,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         build = cross_build_runtime(jobs)
     else:
         log("runtime: building")
-        run([windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        run([windows_powershell(), "-NoProfile", "-File",
              os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs)])
         build = os.path.join(ROOT, "runtime", "build")
     artifacts = [os.path.join(build, name) for name in RUNTIME_FILES]
@@ -2367,7 +2360,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
                     '& (Join-Path $PSScriptRoot "gta6rt.exe") --run $image --overlay '
                     '(Join-Path $PSScriptRoot "overlay") -- @GameArguments\nexit $LASTEXITCODE\n')
         with open(os.path.join(out, "Play.cmd"), "w", encoding="utf-8", newline="\n") as f:
-            f.write('@echo off\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Play.ps1" %*\n')
+            f.write('@echo off\npowershell.exe -NoProfile -File "%~dp0Play.ps1" %*\n')
     if work is not None:
         shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.

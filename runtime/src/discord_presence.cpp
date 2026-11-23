@@ -225,10 +225,7 @@ std::optional<std::string> resolve(const Config& config, const Snapshot& snapsho
     return out;
 }
 std::string activity_payload(const std::optional<std::string>& details, uint32_t pid, uint64_t nonce) {
-    const std::string activity = details ?
-        "{\"type\":0,\"name\":\"Grand Theft Auto VI\",\"details\":" + quote(*details) +
-        ",\"assets\":{\"large_image\":\"xbs_logo_480\",\"large_text\":\"Grand Theft Auto VI\"},"
-        "\"buttons\":[{\"label\":\"Leonida\",\"url\":\"https://github.com/ItsNotRexed/Leonida\"}]}" : "null";
+    const std::string activity = details ? "{\"details\":" + quote(*details) + "}" : "null";
     return "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + std::to_string(pid) +
            ",\"activity\":" + activity + "},\"nonce\":" + quote(std::to_string(nonce)) + "}";
 }

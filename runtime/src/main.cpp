@@ -171,7 +171,14 @@ int wmain(int argc, wchar_t** argv) {
         if (!discord_config.empty()) {
             try {
                 auto config = leonida::discord_presence::load_config(discord_config);
-                if (!config.application_id.empty()) {
+                if (!config.application_id.empty() &&
+                    MessageBoxW(nullptr,
+                        L"Enable Discord Rich Presence for this run?\n\n"
+                        L"Discord receives the current activity description and may share it with other users "
+                        L"according to your Discord activity privacy settings. Local IPC does not make this private.\n\n"
+                        L"Enable only if the configured descriptions are non-sensitive and you are allowed to share them. "
+                        L"No artwork or catalogue files are uploaded. Choose No to keep playing without presence.",
+                        L"Discord Rich Presence", MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES) {
                     discord = std::make_unique<leonida::discord_presence::Bridge>(std::move(config));
                     discord->install(main_module.base, main_module.size, image);
                     std::fprintf(stderr, "[rt] presence: local Discord bridge enabled\n");

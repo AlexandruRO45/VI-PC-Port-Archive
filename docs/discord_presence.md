@@ -1,9 +1,24 @@
-# Local Discord Rich Presence
+# Optional Discord Rich Presence
 
 The runtime observes attempted Xbox presence updates, resolves their IDs using a verified local catalogue, and
 sends the resolved sentence to the Discord desktop client over local IPC. It never contacts Xbox Live or Rockstar.
-The activity is Playing, named **Grand Theft Auto VI**, with the resolved sentence in `details`, image asset
-`xbs_logo_480`, and a **Leonida** button linking to https://github.com/ItsNotRexed/Leonida.
+The only activity field supplied is `details`. The user's Application ID selects their Discord application;
+name, icon and other application defaults are left to Discord. No assets, buttons or hard-coded game name are sent.
+
+## Privacy and informed opt-in
+
+Local IPC describes the transport to the desktop client, not the visibility of the activity. Discord can publish
+the description to other users according to the user's Discord activity privacy settings. An Application ID is
+not consent by itself: before installing the hook or connecting to Discord, the runtime asks whether to enable
+sharing for this run. The default is No. Declining or closing the prompt leaves the game running without presence.
+Blank IDs do not show the prompt and never connect. Approval is not saved across game runs.
+
+Only use descriptions you authored or have permission to share, and which contain no sensitive information.
+Do not supply protected game-derived catalogue text. No image is read, copied, uploaded or referenced by this
+integration; use only your own artwork on your Discord application page. Catalogue files, raw presence/token IDs,
+SCIDs and game binaries are not sent to Discord. After opt-in, the selected resolved description is sent as
+`details`; it may be visible externally. The integration cannot determine the rights or sensitivity of text a
+user supplies, so no protected catalogue or extraction step is bundled.
 
 ## Optional user setting
 
@@ -20,9 +35,10 @@ A missing file, missing field or blank ID leaves presence disabled. Invalid sett
 missing/invalid hook profile do not prevent game startup. Rebuilds preserve an entered ID and its formatting.
 There are no setup comments, hashes, hook RVAs or catalogues in this user-facing file.
 
-The builder copies `xbs_logo_480.png` from the user's game package into the output when available. The package is
-never modified. Discord requires this image registered on the user's application under the asset key
-`xbs_logo_480`; it cannot display a local PNG directly. The application name should be Grand Theft Auto VI.
+No icon file is copied to the output. The game package is never modified. The application name and default
+application icon come from the user's Discord application page. The generated Play.cmd invokes PowerShell
+without changing its execution policy; user and system policies remain in force. If policy blocks Play.ps1,
+it is not bypassed. The runtime can also be invoked directly with its normal --run and --overlay arguments.
 
 ## Internal profile
 
@@ -49,7 +65,8 @@ activity before the runtime's explicit ExitProcess call. No game-service guard o
 ## Validation and limits
 
 Synthetic tests cover packaging, migration, optional user settings, profile loading, resolution, IPC and the
-native observer ABI. Actual retail gameplay and Discord rendering remain unverified. Native Windows is the
+native observer ABI. The consent prompt is compiled and statically reviewed, not automated in the synthetic
+suite. Actual retail gameplay and Discord rendering remain unverified. Native Windows is the
 integration target; Wine host-Discord IPC is unverified.
 
 ```powershell

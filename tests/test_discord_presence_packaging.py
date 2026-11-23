@@ -29,7 +29,7 @@ class PackagingTest(unittest.TestCase):
             setup = json.loads(config.read_text(encoding="utf-8"))
             self.assertEqual(setup, {"richpresence_application_id": ""})
             self.assertFalse((output / "leonida" / "presence_profile.json").exists())
-            self.assertEqual((output / logo.name).read_bytes(), logo.read_bytes())
+            self.assertFalse((output / logo.name).exists())
             setup["richpresence_application_id"] = "123456789012345678"
             with config.open("w", encoding="utf-8", newline="\n") as stream:
                 json.dump(setup, stream)
@@ -90,6 +90,9 @@ class PackagingTest(unittest.TestCase):
                 self.assertIn("--run $image --overlay", launcher)
                 self.assertIn("@GameArguments", launcher)
                 self.assertTrue((output / "Play.cmd").is_file())
+                command = (output / "Play.cmd").read_text(encoding="utf-8")
+                self.assertNotIn("ExecutionPolicy", command)
+                self.assertNotIn("Bypass", command)
             profile["image_sha256"] = "0" * 64
             with config.open("w", encoding="utf-8", newline="\n") as stream:
                 json.dump(profile, stream)
