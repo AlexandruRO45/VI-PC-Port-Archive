@@ -505,5 +505,18 @@ class TestSFlbitI32B32ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.scc, 1)  # SCC preserved
 
 
+class TestSFlbitI32B32Bounds(unittest.TestCase):
+    """Bit scanning boundary and edge cases for s_flbit_i32_b32."""
+
+    def test_all_powers_of_two(self):
+        for b in range(32):
+            self.assertEqual(ref_flbit_i32_b32(1 << b), 31 - b)
+
+    def test_full_masks(self):
+        self.assertEqual(ref_flbit_i32_b32(0xFFFFFFFF), 0)
+        self.assertEqual(ref_flbit_i32_b32(0x0000FFFF), 16)
+        self.assertEqual(ref_flbit_i32_b32(0x000000FF), 24)
+
+
 if __name__ == "__main__":
     unittest.main()
