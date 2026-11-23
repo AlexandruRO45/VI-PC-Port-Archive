@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "instance_lists.py")
@@ -317,6 +318,18 @@ class ArchiveTests(unittest.TestCase):
                     self.assertNotIn("<lambda>", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
                     self.assertEqual(r.stdout, "")
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(previous)
+            with mock.patch.object(il, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    il.write_json_report(path, {})
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), previous)
 
 
 if __name__ == "__main__":
