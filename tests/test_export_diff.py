@@ -122,7 +122,8 @@ class VsModelTest(unittest.TestCase):
         self.assertEqual((pred.clip_count, pred.cull_count), (2, 1))
         self.assertEqual(export_diff.vs_structure(pred), sorted([
             "BuiltIn %out_pos Position", "BuiltIn %out_clip ClipDistance", "Array %out_clip 2",
-            "BuiltIn %out_cull CullDistance", "Array %out_cull 1"]))
+            "BuiltIn %out_cull CullDistance", "Array %out_cull 1",
+            "Distance pos1.0 -> clip[0]", "Distance pos1.1 -> clip[1]", "Distance pos1.2 -> cull[0]"]))
 
     def test_misc_vector_shifts_to_pos2(self):
         shape = export_diff.VsShape(self.svs(clip=1, misc=("rtai",)), True)
@@ -199,15 +200,82 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual((a.listing, a.dxbc, a.expected, a.refusals), (b.listing, b.dxbc, b.expected, b.refusals))
         self.assertNotEqual(export_diff.generate(7, 3).listing, export_diff.generate(7, 4).listing)
 
+    def test_generated_ps_refusal_is_exercised(self):
+        cases = [export_diff.generate(1, i) for i in range(100)]
+        refusals = [case for case in cases if case.stage == "ps" and case.refusals]
+        self.assertTrue(refusals, "seeded runs must generate an export past the declared target count")
+        self.assertEqual(export_diff.run_case(refusals[0])[0], "skip")
+        self.assertTrue(any(case.stage == "ps" and not case.refusals for case in cases))
+
     def test_compare_catches_swap(self):
         spvasm = self.sparse_module()
         self.assertIsNone(export_diff.compare(spvasm, ["Location %out_mrt0 0", "Location %out_mrt2 2"]))
         message = export_diff.compare(spvasm, ["Location %out_mrt0 0", "Location %out_mrt2 1"])
         self.assertIn("%out_mrt2", message)
 
+    def test_distance_store_indices_are_compared(self):
+        import re
+        svs = [export_diff.Osg1Element(export_diff.D3D_NAME["clip"], 0, 0, 0x3, 0)]
+        case = export_diff.make_case("vs_distance_indices", "vs", export_diff.VsShape(svs, True),
+                                     [export_diff.VsExport("pos", 1, (1, 1, 0, 0))])
+        spvasm = support.translate_lines(case.name, case.listing, dxbc=case.dxbc)
+        self.assertIsNone(export_diff.compare(spvasm, case.expected))
+        swapped = re.sub(r"(%out_clip %c)([01])", lambda m: m[1] + str(1 - int(m[2])), spvasm)
+        self.assertNotEqual(spvasm, swapped)
+        self.assertIn("Distance", export_diff.compare(swapped, case.expected))
+
+    def test_distance_store_source_is_compared(self):
+        svs = [export_diff.Osg1Element(export_diff.D3D_NAME["cull"], 0, 0, 0x1, 0)]
+        case = export_diff.make_case("vs_distance_source", "vs", export_diff.VsShape(svs, True),
+                                     [export_diff.VsExport("pos", 1, (1, 0, 0, 0))])
+        spvasm = support.translate_lines(case.name, case.listing, dxbc=case.dxbc)
+        self.assertIsNone(export_diff.compare(spvasm, case.expected))
+        changed = spvasm.replace("OpLoad %uint %reg_v4", "OpLoad %uint %reg_v5")
+        self.assertNotEqual(spvasm, changed)
+        self.assertIn("Distance", export_diff.compare(changed, case.expected))
+
+    def test_translator_distance_index_mutant_is_detected(self):
+        from unittest import mock
+        svs = [export_diff.Osg1Element(export_diff.D3D_NAME["clip"], 0, 0, 0x3, 0)]
+        case = export_diff.make_case("vs_mutated_distance", "vs", export_diff.VsShape(svs, True),
+                                     [export_diff.VsExport("pos", 1, (1, 1, 0, 0))])
+        original = export_diff.rdna2spirv.pos_export_layout
+
+        def swapped_indices(osg1, insns):
+            mapping, misc, clip, cull = original(osg1, insns)
+            for components in mapping.values():
+                for comp, (kind, idx) in components.items():
+                    if kind == "clip" and clip == 2:
+                        components[comp] = (kind, 1 - idx)
+            return mapping, misc, clip, cull
+
+        self.assertEqual(export_diff.run_case(case)[0], "match")
+        with mock.patch.object(export_diff.rdna2spirv, "pos_export_layout", side_effect=swapped_indices):
+            status, detail = export_diff.run_case(case)
+        self.assertEqual(status, "mismatch")
+        self.assertIn("Distance", detail)
+
+    def test_off_distance_component_has_no_store(self):
+        svs = [export_diff.Osg1Element(export_diff.D3D_NAME["clip"], 0, 0, 0x3, 0)]
+        case = export_diff.make_case("vs_distance_off", "vs", export_diff.VsShape(svs, True),
+                                     [export_diff.VsExport("pos", 1, (0, 1, 0, 0))])
+        spvasm = support.translate_lines(case.name, case.listing, dxbc=case.dxbc)
+        self.assertIsNone(export_diff.compare(spvasm, case.expected))
+        self.assertEqual([ln for ln in export_diff.module_structure(spvasm) if ln.startswith("Distance ")],
+                         ["Distance pos1.1 -> clip[1]"])
+
     def test_self_test_canaries(self):
         self.assertEqual(export_diff.main(["--self-test"]), 0)
         self.assertTrue(any("clip/cull" in name for name in export_diff.CANARIES))
+        self.assertIn("distance index", export_diff.CANARIES)
+
+    def test_model_output_lines_are_canonical(self):
+        self.assertEqual(export_diff.structure_lines({"%out_mrt7": 7, "%out_mrt0": 0}),
+                         ["Location %out_mrt0 0", "Location %out_mrt7 7"])
+
+    def test_compressed_colour_operand_order(self):
+        line = export_diff.export_line(self.E("mrt", 2, False, True))
+        self.assertEqual(line, "exp mrt2 v0, v0, v1, v1 compr")
 
     def test_happy_run_contract(self):
         self.assertIn(export_diff.main(["--programs", "5", "--seed", "1"]), (0, 1))

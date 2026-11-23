@@ -3,8 +3,8 @@ r"""FUZZ-114: differential fuzzer for VS/PS export shapes (standard library only
 Generates seeded vertex- and pixel-shader programs from the export shapes compilers emit and compares the structure
 of the translated module with a model of the packing rules in docs/design.md ("Inputs and outputs"):
 
-  * the model, here: output locations and built-ins, the ClipDistance/CullDistance arrays, expected refusals
-  * tools/rdna2spirv.py through tests/semantic/support.py: the translated SPIR-V's OpDecorate lines and arrays
+  * the model, here: output locations and built-ins, ClipDistance/CullDistance arrays and stores, expected refusals
+  * tools/rdna2spirv.py through tests/semantic/support.py: the translated SPIR-V's decorations, arrays and stores
 
 Shapes: a pixel shader's declared SV_Target set (consecutive, sparse or none, with or without an OSG1), `exp mrtK`
 in any order (plain, with gated components, or compressed) and an optional `exp mrtz` (x on or off, compressed or
@@ -191,7 +191,7 @@ def vs_model(shape, exports):
 
 
 def vs_structure(prediction):
-    """The vertex-shader module's output decorations and distance array lengths the translated module must carry."""
+    """Vertex outputs, including the source component and destination of each distance store."""
     lines = []
     if prediction.position:
         lines.append("BuiltIn %out_pos Position")
@@ -203,6 +203,8 @@ def vs_structure(prediction):
         lines.append("BuiltIn %out_layer Layer")
     if prediction.viewport:
         lines.append("BuiltIn %out_viewport ViewportIndex")
+    lines += [f"Distance pos{pos}.{comp} -> {kind}[{idx}]"
+              for pos, comp, kind, idx in prediction.distances]
     return sorted(lines + structure_lines({f"%out_param{n}": n for n in prediction.params}))
 
 
@@ -227,7 +229,9 @@ def export_line(e):
         else:
             operands = "v0, v1, v2, v3"
         return f"exp mrt{e.index} {operands}"
-    operands = ", ".join(f"v{c}" if on else "off" for c, on in enumerate(e.comps))
+    # Distinct registers identify which pos export and component produced a distance store.
+    offset = 4 * e.index if e.kind == "pos" else 0
+    operands = ", ".join(f"v{offset + c}" if on else "off" for c, on in enumerate(e.comps))
     return f"exp {'pos' if e.kind == 'pos' else 'param'}{e.index} {operands}"
 
 
@@ -242,7 +246,11 @@ def make_case(name, stage, shape, exports):
         prediction = vs_model(shape, exports)
         expected = vs_structure(prediction)
         dxbc = osg1_dxbc(shape.svs) if shape.has_osg1 else support.STUB_DXBC
-    lines = [f"v_mov_b32_e32 v{c}, {float(1 << c)!r}" for c in range(4)]
+    registers = set(range(4))
+    if stage == "vs":
+        registers.update(4 * e.index + c for e in exports if e.kind == "pos"
+                         for c, on in enumerate(e.comps) if on)
+    lines = [f"v_mov_b32_e32 v{c}, {float(1 << c)!r}" for c in sorted(registers)]
     instructions = [export_line(e) for e in exports]
     if instructions:
         instructions[-1] += " done vm"
@@ -284,6 +292,8 @@ def generate(seed, index):
     has_osg1 = rng.random() > 0.15
     targets = sorted(rng.sample(range(8), rng.randint(1, 8))) if has_osg1 and rng.random() > 0.1 else []
     indices = list(range(len(targets))) if targets else sorted(rng.sample(range(8), rng.randint(1, 8)))
+    if targets and len(targets) < 8 and rng.random() < 0.2:
+        indices.append(len(targets))     # a legal mrt index, but past the declared SV_Target count
     exports = []
     for k in indices:
         if rng.random() < 0.3:
@@ -300,13 +310,35 @@ def generate(seed, index):
 
 # ---- the comparator --------------------------------------------------------------------------------------------------
 def module_structure(spvasm):
-    """What the translated module declares for its outputs, in the models' canonical form."""
+    """Output declarations and distance stores, in the models' canonical form."""
     lines = [f"Location {var} {n}" for var, n in re.findall(r"OpDecorate (%out_\S+) Location (\d+)", spvasm)]
     lines += [f"BuiltIn {var} {built_in}" for var, built_in in re.findall(r"OpDecorate (%out_\S+) BuiltIn (\S+)", spvasm)]
     for array, var in (("arr_clip", "%out_clip"), ("arr_cull", "%out_cull")):
         found = re.search(rf"%{array} = OpTypeArray %float %c(\d+)", spvasm)
         if found:
             lines.append(f"Array {var} {found.group(1)}")
+    # Follow each output access chain through its store's OpSelect to the register read for that export.
+    # The generated posN source registers are disjoint, so the register itself identifies (N, component).
+    sources, pointers = {}, {}
+    for line in spvasm.splitlines():
+        line = line.strip()
+        read = re.fullmatch(r"(%\w+) = OpLoad %uint %reg_v(\d+)", line)
+        cast = re.fullmatch(r"(%\w+) = OpBitcast %float (%\w+)", line)
+        select = re.fullmatch(r"(%\w+) = OpSelect %float %\w+ (%\w+) %\w+", line)
+        chain = re.fullmatch(r"(%\w+) = OpAccessChain %_ptr_Output_float %out_(clip|cull) %c([0-9a-f]+)", line)
+        store = re.fullmatch(r"OpStore (%\w+) (%\w+)", line)
+        if read:
+            reg = int(read[2])
+            sources[read[1]] = f"pos{reg // 4}.{reg % 4}"
+        elif cast:
+            sources[cast[1]] = sources.get(cast[2], "unknown")
+        elif select:
+            sources[select[1]] = sources.get(select[2], "unknown")
+        elif chain:
+            pointers[chain[1]] = (chain[2], int(chain[3], 16))
+        elif store and store[1] in pointers:
+            kind, idx = pointers[store[1]]
+            lines.append(f"Distance {sources.get(store[2], 'unknown')} -> {kind}[{idx}]")
     return sorted(lines)
 
 
@@ -339,7 +371,7 @@ def run_case(case):
 
 
 # ---- canaries --------------------------------------------------------------------------------------------------------
-CANARIES = ("clip/cull swap", "sparse location", "compr depth", "misc shift")
+CANARIES = ("clip/cull swap", "sparse location", "compr depth", "misc shift", "distance index")
 
 
 def self_test():
@@ -368,7 +400,12 @@ def self_test():
     shifted = make_case("vs_canary_shift", "vs", VsShape(clip_cull[:1] + [Osg1Element(D3D_NAME["rtai"], 0, 1, 0x1, 0)],
                                                          True), both)
     canary(CANARIES[3], shifted, ["BuiltIn %out_pos Position", "BuiltIn %out_layer Layer",
-                                  "BuiltIn %out_clip ClipDistance", "Array %out_clip 1"])
+                                   "BuiltIn %out_clip ClipDistance", "Array %out_clip 1"])
+    clip_pair = make_case("vs_canary_indices", "vs", VsShape([
+        Osg1Element(D3D_NAME["clip"], 0, 0, 0x3, 0)], True),
+        [VsExport("pos", 1, (1, 1, 0, 0))])
+    canary(CANARIES[4], clip_pair, [line.replace("Distance pos1.1 -> clip[1]", "Distance pos1.1 -> clip[0]")
+                                    for line in clip_pair.expected])
     return missed
 
 
