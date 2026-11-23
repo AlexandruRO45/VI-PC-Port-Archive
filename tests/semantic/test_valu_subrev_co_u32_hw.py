@@ -514,3 +514,38 @@ class TestSubrevCoU32Translator(unittest.TestCase):
                 words = self._run_ps(lines)
                 self.assertEqual(words[0], exp_d)
                 self.assertEqual(words[3], exp_b)
+
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+class TestSubrevCoU32NegativeAndMutation(unittest.TestCase):
+    def test_rejection_missing_operands(self) -> None:
+        lines = [
+            "v_subrev_co_u32 v0, vcc_lo, v1",  # Missing src1
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_subrev_co_bad", lines)
+
+    def test_mutation_detection_inverted_subtraction(self) -> None:
+        # Mutation: mistakenly computing src0 - src1 instead of src1 - src0
+        mutated_oracle = lambda s0, s1: ((s0 - s1) & M32, 1 if s0 < s1 else 0)
+        d_mut, b_mut = mutated_oracle(10, 25)
+        d_real, b_real = ref_subrev_co_u32(10, 25)
+        self.assertNotEqual(d_mut, d_real)
+        self.assertNotEqual(b_mut, b_real)
+
+    def test_mutation_detection_inverted_borrow_condition(self) -> None:
+        # Mutation: borrow if src1 > src0 instead of src1 < src0
+        mutated_borrow = lambda s0, s1: 1 if s1 > s0 else 0
+        self.assertNotEqual(mutated_borrow(25, 10), ref_subrev_co_u32(25, 10)[1])
+
+    def test_mutation_detection_clamp_wrong_saturation(self) -> None:
+        # Mutation: saturating to 0xFFFFFFFF instead of 0 on borrow
+        mutated_clamp = lambda s0, s1: (0xFFFFFFFF if s1 < s0 else (s1 - s0) & M32)
+        d_real, _ = ref_subrev_co_u32(50, 20, clamp=True)
+        self.assertNotEqual(mutated_clamp(50, 20), d_real)
+
+
+if __name__ == "__main__":
+    unittest.main()
