@@ -384,6 +384,33 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(p_verify.returncode, 1)
         self.assertIn("problem(s)", p_verify.stdout)
 
+    def test_cli_verify_preserves_filenames_on_ascii_stdout(self):
+        names = ["cafè.bin", "café.bin"]
+        for name in names:
+            with open(os.path.join(self.pkg, name), "wb") as f:
+                f.write(b"synthetic payload")
+        created = self.run_cli("create", self.pkg, "--out", self.out_manifest)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        for name in names:
+            os.unlink(os.path.join(self.pkg, name))
+
+        launcher = (
+            "import runpy, sys; sys.stdout.reconfigure(encoding='ascii'); "
+            "runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+        )
+        verified = subprocess.run(
+            [sys.executable, "-I", "-c", launcher, TOOL, "verify", self.pkg,
+             "--manifest", self.out_manifest],
+            capture_output=True, text=True, encoding="ascii",
+        )
+        self.assertEqual(verified.returncode, 1, verified.stderr)
+        self.assertEqual(verified.stderr, "")
+        self.assertEqual(verified.stdout.splitlines(), [
+            r"MISSING   caf\xe8.bin",
+            r"MISSING   caf\xe9.bin",
+            "2 problem(s)",
+        ])
+
     def test_cli_rejects_invalid_game_directories(self):
         # Start with a valid empty manifest, which would otherwise verify even if the scan never ran.
         empty = os.path.join(self.tmp.name, "empty")
