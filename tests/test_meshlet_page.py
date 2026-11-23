@@ -4,6 +4,8 @@
 
 Every byte here is built by the test. No game file, value or name is used.
 """
+import contextlib
+import io
 import json
 import math
 import os
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -745,6 +748,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn(f"cannot write {out}", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_an_unreadable_input_directory_is_an_error_not_a_silent_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "carve")
+            os.mkdir(bad)
+            real = os.scandir
+
+            def scandir(path):
+                if os.fspath(path) == bad:
+                    raise PermissionError(13, "Permission denied", bad)
+                return real(path)
+
+            err = io.StringIO()
+            with unittest.mock.patch("os.scandir", side_effect=scandir):
+                with contextlib.redirect_stderr(err):
+                    rc = mp.main([bad])
+
+        self.assertEqual(rc, 2)
+        self.assertTrue(err.getvalue().startswith("error: "), err.getvalue())
+        self.assertIn(os.path.basename(bad), err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
     def test_neighbor_counts_keep_malformed_page_positions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
