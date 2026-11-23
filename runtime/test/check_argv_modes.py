@@ -16,10 +16,14 @@ import tempfile
 
 
 def run(executable, command, cwd, environment):
-    result = subprocess.run(
-        command, executable=executable, cwd=cwd, env=environment,
-        capture_output=True, timeout=15,
-    )
+    try:
+        result = subprocess.run(
+            command, executable=executable, cwd=cwd, env=environment,
+            capture_output=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return {"command": command, "exit_code": None, "lines": [], "stdout": "", "stderr": "",
+                "error": "child exceeded 15 seconds"}
     output = result.stdout.decode("utf-8", "replace")
     return {
         "command": command,
@@ -47,8 +51,12 @@ def main():
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("this native MSVC startup comparison requires Windows")
-    loader = args.loader.resolve(strict=True)
-    fixtures = args.fixtures.resolve(strict=True)
+    try:
+        loader = args.loader.resolve(strict=True)
+        fixtures = args.fixtures.resolve(strict=True)
+    except FileNotFoundError as exc:
+        parser.error(f"not found: {exc.filename}")
+    args.work_dir.mkdir(parents=True, exist_ok=True)
     work_dir = args.work_dir.resolve(strict=True)
     rows = []
     failures = []
@@ -94,7 +102,9 @@ def main():
                     mapped = run(loader, mapped_command, root, environment)
                     problems = []
                     for route, result in (("native", native), ("mapped", mapped)):
-                        if result["exit_code"] != 0 or entry_count(result["lines"]) is None:
+                        if "error" in result:
+                            problems.append(f"{route}: {result['error']}")
+                        elif result["exit_code"] != 0 or entry_count(result["lines"]) is None:
                             problems.append(f"{route} did not complete its fixture")
                     expected = 0 if mode == "noargs" else 3
                     if mode == "expand" and case in ("plain", "quoted", "space"):
