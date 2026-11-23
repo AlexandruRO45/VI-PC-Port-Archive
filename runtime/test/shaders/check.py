@@ -205,6 +205,11 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           ("cs_oob_tail", [0, 0, 0x5eed0010, 0, 0xbeef0000, 0xeeeeeeee, 0, 0x5eed0010]),
           # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
           ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed000c, 0, 0xbeef0000, 0xbeef0001])]
+# cs_dot4_neg.asm: VOP3P neg_lo / neg_hi on v_dot4_i32_i8 (the FSPX programs' instruction, assembled for gfx1030
+# through its "; mcpu:" line). The rule is measured on gfx1036 and pinned by tests/semantic/test_dot4_i8_neg.py;
+# these words are the same program on a Vulkan GPU, derived in the .asm header. Needs #7293's translation.
+DOT4_NEG = [("cs_dot4_neg", [0x00000040, 0xFFFFFF40, 0x00000240, 0x00000140,
+                             0xFFFFFD40, 0x00000440, 0x7FFFFFFF, 0x80000040])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
@@ -1780,6 +1785,8 @@ def main():
                                            require_wave64=name not in WAVE32_DUMPS and not W64_EMULATED,
                                            expected_words=want, needs_32_lanes=name in WAVE32_LANE_DUMPS)))
     for name, want in BOUNDS:
+        results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
+    for name, want in DOT4_NEG:
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))

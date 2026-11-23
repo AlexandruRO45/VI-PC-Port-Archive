@@ -86,6 +86,21 @@ def asm_mattr(path):
     return None
 
 
+def asm_mcpu(path):
+    """llvm-mc's -mcpu for a fixture: gfx1013, or a "; mcpu: <cpu>" leading comment for one whose instruction the
+    game's target lacks (v_dot4_i32_i8 and global_atomic_csub are GFX10.3)."""
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith(";"):
+            break
+        m = re.match(r";\s*mcpu:\s*(\S+)", s)
+        if m:
+            return m.group(1)
+    return "gfx1013"
+
+
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
@@ -158,7 +173,7 @@ def translate_tests(work, names):
         if shift and n.startswith("cs_"):
             raw = shift_user_data(raw, shift)
         mattr = asm_mattr(asm_path)
-        cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        cmd = MC + ["-triple=amdgcn--amdpal", f"-mcpu={asm_mcpu(asm_path)}"]
         if n in CLIP_CASES:
             cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[n]}")
         if mattr:

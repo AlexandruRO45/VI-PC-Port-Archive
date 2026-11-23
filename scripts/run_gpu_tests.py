@@ -96,17 +96,24 @@ def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
         raw = source.read()
-    cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+    mcpu = "gfx1013"   # asm_mcpu: a "; mcpu:" header for a fixture the game's gfx1013 target cannot assemble
+    mattr = None
     for ln in raw.splitlines():
         s = ln.strip()
         if not s:
             continue
         if not s.startswith(";"):
             break
+        m = re.match(r";\s*mcpu:\s*(\S+)", s)
+        if m:
+            mcpu = m.group(1)
         m = re.match(r";\s*mattr:\s*(\S+)", s)
         if m:
-            cmd.append(f"-mattr={m.group(1)}")
+            mattr = m.group(1)
             break
+    cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", f"-mcpu={mcpu}"]
+    if mattr:
+        cmd.append(f"-mattr={mattr}")
     if name in CLIP_CASES:
         cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[name]}")
     cmd.append("-show-encoding")
