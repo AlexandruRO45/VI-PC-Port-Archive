@@ -85,7 +85,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
-                "cs_mask_vgpr_exec", "cs_w32_permlane_fi")
+                "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -115,6 +115,12 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # 64-bit scalar data ops and v_mad_u64_u32 (derivations in cs_w32_salu64.asm)
             # more ops with CPU-only checks until now (derivations in cs_w32_misc_ext.asm)
             # ops merged on 2026-11-22 with CPU-only checks (derivations in cs_w32_new_ops.asm)
+            # plain 8/16-bit MUBUF stores, one crossing a dword (cs_w32_buffer_store_sub.asm)
+            ("cs_w32_buffer_store_sub", [0x1122AB44, 0xCDEF7788, 0x34AABBCC, 0xDDDDDD12, 0x0102035A, 0x05061234, 0xAB, 0xFFFFCDEF]),
+            # 8/16-bit MUBUF d16 loads and stores (cs_w32_buffer_sub16.asm)
+            ("cs_w32_buffer_sub16", [0xBEEF00AA, 0x00AA1234, 0xBEEFFFAA, 0xFFAA1234, 0xBEEF8899, 0x88991234, 0x1122CD44, 0xABCD7788]),
+            # ds_cmpst_f32 and buffer_atomic_fcmpswap: float compare (cs_w32_fcmpswap.asm)
+            ("cs_w32_fcmpswap", [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000]),
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
             ("cs_w32_misc_ext", [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
@@ -337,6 +343,8 @@ CVT_F32_SAT_CASES = (
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
+# v_pk_mul_lo_u16 with a constant operand (cs_pk_mul_lo_const.asm), measured natively on RDNA2 (gfx1036); lanes 0 and 1.
+PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
@@ -371,6 +379,8 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
+              # exp mrt0 done (no vm) with every lane on, EXEC off afterwards: written (.asm header, measured on gfx1036)
+              "ps_exp_color_mask": (0x40000000, 0x40800000, 0x40000000, 0x40800000),
               "ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_mul_legacy_denorm": (0, 0, 0, 0x80000000),
               "ps_mul_legacy_denorm_mods": (0, 0, 0, 0x40400000),
@@ -932,19 +942,32 @@ def shader_features(spirv, name):
         return set()
 
 
+def shader_fma_mode(spirv, name):
+    """How the translator emitted fused multiply-adds for a shader ('glsl', 'khr' or 'exact'), or '' if unrecorded.
+
+    Older indexes have no field: callers must fall back to the capability and LEONIDA_FMA as before.
+    """
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            mode = json.load(f).get(name, {}).get("fma") or ""
+            return mode if mode in ("glsl", "khr", "exact") else ""
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
 def judge_fma_fused(words, khr, exact=False):
-    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr and --fma exact (SHADER-497: the single rounding
-    built from plain f32 ops) every word must be exact fused; under --fma glsl each of the 7 f32 words may be either
-    fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the f16 round-to-odd word out[7] must
-    always be exact 0x00007351."""
+    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr every word must be exact fused; under --fma glsl
+    each of the 7 f32 words may be either fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the
+    f16 round-to-odd word out[7] must always be exact 0x00007351."""
     if not words or len(words) < 8:
         return False, "missing out[0..7] dump"
     if khr or exact:
         label = "OpFmaKHR" if khr else "--fma exact"
         for i, (got, want) in enumerate(zip(words, FMA_FUSED)):
             if got != want:
-                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} ({label})"
-        return True, f"8/8 fused exact ({label})"
+                return False, (f"word {i}: got {got:#010x}, want fused {want:#010x} "
+                               "(single-rounded FMA: OpFmaKHR or --fma exact)")
+        return True, "8/8 fused exact (single-rounded FMA: OpFmaKHR or --fma exact)"
     if words[7] != FMA_FUSED[7]:
         return False, f"word 7 (f16): got {words[7]:#010x}, want {FMA_FUSED[7]:#010x}"
     n_split = 0
@@ -965,9 +988,16 @@ def fma_fused_test(tools, spirv):
     """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr and --fma exact, fused-or-split f32 under
     --fma glsl)."""
     shader = os.path.join(spirv, "cs_fma_fused.spv")
-    khr = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
-           or os.environ.get("LEONIDA_FMA") == "khr")
-    exact = os.environ.get("LEONIDA_FMA") == "exact"
+    # --fma exact also guarantees single rounding (built from NoContraction ops), but records no KHR capability.
+    # Without the index field a fresh shell cannot tell it from the default GLSL Fma (TEST-1147).
+    mode = shader_fma_mode(spirv, "cs_fma_fused")
+    if mode:
+        # A recorded mode is authoritative: a stale LEONIDA_FMA from the build shell must not override it.
+        strict = mode in ("khr", "exact")
+    else:
+        # An older index has no mode field: capability and environment are the only remaining signals.
+        strict = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
+                  or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
                     env=dict(os.environ, **FMA_FUSED_ENV))
     if code == UNSUPPORTED:
@@ -979,7 +1009,7 @@ def fma_fused_test(tools, spirv):
     if not m:
         return failure(code, out, 2)
     words = [int(x) for x in m.group(1).split()]
-    ok, detail = judge_fma_fused(words, khr=khr, exact=exact)
+    ok, detail = judge_fma_fused(words, khr=strict)
     return "" if ok else detail
 
 
@@ -1718,6 +1748,8 @@ def main():
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
+    results.append(("cs_pk_mul_lo_const", compute_test(tools, spirv, "cs_pk_mul_lo_const", "1", "dump",
+                                                       expected_words=PK_MUL_LO_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
