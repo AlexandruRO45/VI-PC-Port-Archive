@@ -190,6 +190,26 @@ class TestSLshrB32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x01234567)
 
+def ref_s_ashr_i32(src: int, shift: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_ashr_i32 -> (result, scc)."""
+    sh = shift & 31
+    val = src & MASK32
+    sval = val - 0x100000000 if val & 0x80000000 else val
+    res = (sval >> sh) & MASK32
+    scc = 1 if res != 0 else 0
+    return res, scc
+
+
+class TestSAshrI32Oracle(unittest.TestCase):
+    def test_positive_numbers(self) -> None:
+        self.assertEqual(ref_s_ashr_i32(0x1000, 4), (0x0100, 1))
+
+    def test_negative_sign_extension(self) -> None:
+        # 0x80000000 >> 4 = 0xF8000000
+        self.assertEqual(ref_s_ashr_i32(0x80000000, 4), (0xF8000000, 1))
+        # -1 (0xFFFFFFFF) >> any = -1 (0xFFFFFFFF)
+        self.assertEqual(ref_s_ashr_i32(0xFFFFFFFF, 10), (0xFFFFFFFF, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
