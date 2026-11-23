@@ -78,6 +78,18 @@ class ExeChecklist(unittest.TestCase):
         self.assertEqual(docs[2]["text"], "the same note in the docs' prose spelling.")
         self.assertEqual(docs[3]["text"], "the plural spelling is a note too.")
 
+    def test_a_marker_inside_a_sentence_or_a_table_row_is_prose(self):
+        with open(os.path.join(self.root, "docs", "demo.md"), "a", encoding="utf-8", newline="\n") as f:
+            f.write("| `v_demo` | written without the console (**Assumption**: not a note) |\n"
+                    "| **Unverified:** nothing | `v_other` |\n"
+                    "\n"
+                    "A sentence that carries an **Assumption:** after its start is not a note either.\n"
+                    "\n"
+                    "- **A list item** whose next sentence says **Unverified:** this is not a note of its own.\n")
+        docs = [n for n in ec.collect(self.root) if n["file"] == "docs/demo.md"]
+        self.assertEqual([(n["line"], n["kind"]) for n in docs],
+                         [(6, "VERIFY"), (9, "ASSUMPTION"), (12, "UNVERIFIED"), (14, "ASSUMPTION")])
+
     def test_called_notes_come_first(self):
         report = os.path.join(self.root, "x.gdk_calls.json")
         with open(report, "w", encoding="utf-8") as f:
