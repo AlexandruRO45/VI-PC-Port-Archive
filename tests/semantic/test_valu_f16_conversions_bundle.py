@@ -182,6 +182,14 @@ class TestVCvtF32F16AST(unittest.TestCase):
         self.assertEqual(expr.eval(0x4000), 0x40000000)  # 2.0
         self.assertEqual(expr.eval(0x3800), 0x3F000000)  # 0.5
 
+class TestVCvtF32F16SIMD(unittest.TestCase):
+    def test_simd_lane_divergence(self) -> None:
+        # Lanes test divergent powers of 2
+        f16_inputs = [0x3C00 + (l << 6) for l in range(32)]
+        for l in range(32):
+            f32_bits = ref_v_cvt_f32_f16(f16_inputs[l])
+            self.assertAlmostEqual(bits_to_float(f32_bits), f16_bits_to_float(f16_inputs[l]), places=4)
+
 
 if __name__ == "__main__":
     unittest.main()
