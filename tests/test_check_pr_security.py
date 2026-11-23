@@ -517,6 +517,59 @@ class PinnedTags(ScanTest):
         self.assertEqual(findings, [])
 
 
+BOM = chr(0xFEFF)
+
+
+class AfterTheFullRun(ScanTest):
+    """The false positives and misses a run over every open pull request found (#8319, LaugeM's comment)."""
+
+    def test_a_byte_order_mark_is_listed_not_blocked(self):
+        self.assertEqual(self.scan({"tools/x.py": BOM + "print(1)\n"}), [])  # one at the start of a file is normal
+        for text in ("x = 1\n# a " + BOM + " in a comment\n", BOM + BOM + "param()\n", "s = '" + BOM + "<xml/>'\n"):
+            self.assertEqual(self.rules({"scripts/x.ps1": text}), {(cps.REVIEW, "byte-order-mark")}, repr(text))
+
+    def test_quoting_a_download_pipe_or_a_forbidden_domain_in_docs_and_tests_is_listed(self):
+        pipe = CURL + " -fsSL https://example.invalid/i" + PIPE_SH
+        domain = "BANNED = ['auth.xbox" + "live.com']"
+        for path, line, rule in (("docs/install.md", pipe, "download-piped-to-shell"),
+                                 ("tests/test_x.py", "x = '" + pipe + "'", "download-piped-to-shell"),
+                                 ("tests/test_x.py", domain, "online-service")):
+            self.assertIn((cps.REVIEW, rule), self.rules({path: line + "\n"}), path)
+            self.assertNotIn((cps.BLOCK, rule), self.rules({path: line + "\n"}), path)
+        self.assertIn((cps.BLOCK, "download-piped-to-shell"), self.rules({"scripts/x.sh": pipe + "\n"}))
+        self.assertIn((cps.BLOCK, "online-service"), self.rules({"tools/x.py": domain + "\n"}))
+
+    def test_the_offline_shims_may_name_network_apis(self):
+        line = "if (!WinHttpConnect(session, host, port, 0)) return nullptr;\n"
+        self.assertEqual(self.scan({"runtime/shims/winhttp_offline.cpp": line}), [])
+        self.assertIn((cps.REVIEW, "network-call"), self.rules({"runtime/shims/new_shim.cpp": line}))
+
+    def test_agent_instructions_under_other_names_are_listed(self):
+        for path in ("tests/semantic/MASTER_PROMPT.md", "docs/agent_directives.md", "tools/system_message.txt"):
+            self.assertIn((cps.REVIEW, "agent-instructions-file"), self.rules({path: "Do the thing.\n"}), path)
+        self.assertEqual(self.scan({"tools/prompt_builder.py": "x = 1\n"}), [])
+
+    def readme(self, lines=40):
+        return "".join("Line %d of the readme.\n" % i for i in range(lines))
+
+    def test_emptying_or_deleting_a_top_level_doc_is_listed(self):
+        base = {"README.md": self.readme()}
+        self.assertEqual(self.rules({"README.md": "Moved.\n"}, base_changes=base), {(cps.REVIEW, "doc-wipe")})
+        self.assertEqual(self.rules({"README.md": None}, base_changes=base), {(cps.REVIEW, "doc-wipe")})
+        self.assertEqual(self.scan({"README.md": self.readme() + "One more line.\n"}, base_changes=base), [])
+        self.assertEqual(self.scan({"docs/notes.md": "Moved.\n"}, base_changes={"docs/notes.md": self.readme()}), [])
+
+    def test_a_top_level_doc_linking_a_new_site_is_listed(self):
+        base = {"README.md": "See https://github.com/x/y and https://www.khronos.org/vulkan/.\n"}
+        found = self.scan({"README.md": base["README.md"] + "We moved to https://new-home.example.invalid/join.\n"},
+                          base_changes=base)
+        self.assertEqual([(f.level, f.rule) for f in found], [(cps.REVIEW, "new-link-host")])
+        self.assertIn("new-home.example.invalid", found[0].message)
+        same = base["README.md"] + "Also https://khronos.org/spir/ and https://github.com/a/b.\n"
+        self.assertEqual(self.scan({"README.md": same}, base_changes=base), [])
+        self.assertEqual(self.scan({"docs/x.md": "See https://new-home.example.invalid/.\n"}), [])
+
+
 class OtherScanners(ScanTest):
     """Gitleaks's report is read back, kept only on added lines, and can't point outside the export."""
 

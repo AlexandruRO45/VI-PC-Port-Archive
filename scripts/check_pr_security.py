@@ -99,7 +99,9 @@ STARTUP_HOOKS = (  # (pattern on the lower-case path, level, why)
 # Files coding agents read as instructions. Most contributors here are agents, so an edit to these steers all of them.
 AGENT_INSTRUCTIONS = re.compile(
     r"^(agents\.md|claude\.md|gemini\.md|contributing\.md|\.cursorrules|\.windsurfrules|\.clinerules|"
-    r"\.github/copilot-instructions\.md|\.github/(instructions|prompts)/.*|\.cursor/.*|\.claude/.*)$|(^|/)agents\.md$")
+    r"\.github/copilot-instructions\.md|\.github/(instructions|prompts)/.*|\.cursor/.*|\.claude/.*)$|(^|/)agents\.md$|"
+    # an instruction file under another name, anywhere (tests/semantic/MASTER_PROMPT.md, agent_directives.md)
+    r"(^|/)[^/]*(prompt|instruction|directive|system[-_]?message)[^/]*\.(md|mdc|txt|ya?ml|json)$")
 
 # This check, the other checks it backs up, and who reviews them.
 SECURITY_CHECKS = (
@@ -112,7 +114,8 @@ SECURITY_CHECKS = (
 # Line rules: (rule, level, pattern, message). A pattern is matched against one added line at a time.
 
 HIDDEN_BIDI = re.compile("[\u202a-\u202e\u2066-\u2069]")
-HIDDEN_ZERO_WIDTH = re.compile("[\u200b\u200c\u200d\u2060\u180e\u00ad]|(?<=.)\ufeff")
+HIDDEN_ZERO_WIDTH = re.compile("[\u200b\u200c\u200d\u2060\u180e\u00ad]")
+HIDDEN_BOM = re.compile("\ufeff")  # listed, not blocked: a BOM changes no meaning
 
 DOWNLOAD = r"(?:\bcurl\b|\bwget\b|\biwr\b|\birm\b|Invoke-WebRequest|Invoke-RestMethod|DownloadString|DownloadData)"
 SHELLS = r"(?:sudo\s+(?:-\S+\s+)*)?(?:(?:ba|z|da|k|fi)?sh|pwsh|powershell|python[\d.]*|perl|ruby|node|iex|Invoke-Expression|cmd)\b"
@@ -353,6 +356,9 @@ def check_text(where, text):
             found.append(Finding(where, number, BLOCK, "hidden-unicode",
                                  "an invisible or bidirectional control character changes what the text appears to "
                                  "say", line))
+        elif HIDDEN_BOM.search(line):
+            found.append(Finding(where, number, REVIEW, "byte-order-mark",
+                                 "a byte-order mark (an invisible character) in the text", line))
         for rule, level, pattern, message in TEXT_RULES:
             if pattern.search(line):
                 found.append(Finding(where, number, level, rule, message, line))
@@ -609,6 +615,20 @@ def check_path(status, old_mode, new_mode, path, head_bytes):
     return found
 
 
+# Rules that documentation and tests trip by quoting what they warn about or reject (a page explaining why the
+# install doesn't pipe a download into a shell; a test that the forbidden domains are refused). There they are listed.
+QUOTED_IN_PROSE = ("download-piped-to-shell", "download-then-run", "online-service")
+
+# The runtime's shims that implement network APIs by refusing every connection: they name those APIs on purpose.
+OFFLINE_SHIMS = ("runtime/shims/winhttp_offline.cpp", "runtime/shims/xgameruntime_offline.cpp")
+
+
+def is_doc_or_test(path):
+    lower = path.lower()
+    return lower.endswith((".md", ".rst", ".txt")) or lower.startswith(("docs/", "tests/")) or "/tests/" in lower or \
+        "/test/" in lower or lower.startswith("runtime/test/")
+
+
 def check_line(path, number, text):
     """Findings for one added line of a text file."""
     found = []
@@ -619,7 +639,14 @@ def check_line(path, number, text):
     if HIDDEN_ZERO_WIDTH.search(text):
         level = REVIEW if path.lower().startswith("docs/i18n/") else BLOCK
         found.append(Finding(path, number, level, "hidden-unicode",
-                             "an invisible character (zero-width, soft hyphen or BOM) hides what the line says", text))
+                             "an invisible character (zero-width or soft hyphen) hides what the line says", text))
+    # One byte-order mark at the start of a file is how some editors save it. Anywhere else it is listed, not
+    # blocked: it is invisible, but unlike the characters above it can't split a name or reorder a line.
+    rest = text[1:] if number == 1 and text.startswith(chr(0xFEFF)) else text
+    if HIDDEN_BOM.search(rest):
+        found.append(Finding(path, number, REVIEW, "byte-order-mark",
+                             "a byte-order mark inside the file (an invisible character); usually an editor's doing",
+                             text))
     found += lookalike_findings(path, number, text)
     found += gitmodules_findings(path, number, text)
     rules = list(ALL_TEXT_RULES)
@@ -632,6 +659,10 @@ def check_line(path, number, text):
             if rule == "network-call" and re.search(r"127\.0\.0\.1|\blocalhost\b|\[::1\]", text) and \
                     not re.search(r"https?://(?!127\.0\.0\.1|localhost|\[::1\])", text):
                 continue
+            if rule == "network-call" and path in OFFLINE_SHIMS:
+                continue
+            if level == BLOCK and rule in QUOTED_IN_PROSE and is_doc_or_test(path):
+                level, message = REVIEW, message + " (listed, not blocked, in documentation and tests, which quote it)"
             found.append(Finding(path, number, level, rule, message, text))
     return found
 
@@ -671,6 +702,40 @@ def export_changed(repo, base, head, out_dir):
     return written
 
 
+# The documents every reader starts from: the repository's top folder, and the docs index.
+TOP_DOC = re.compile(r"^[^/]+\.(md|rst|txt)$|^docs/readme\.md$|^licen[cs]e", re.I)
+LINK_HOST = re.compile(r"(?i)\b(?:https?://|www\.)((?:[a-z0-9-]+\.)+[a-z]{2,})")
+KNOWN_LINK_HOSTS = frozenset(("github.com", "docs.github.com", "gist.github.com"))
+
+
+def link_hosts(text):
+    hosts = set()
+    for match in LINK_HOST.finditer(text):
+        host = match.group(1).lower()
+        hosts.add(host[4:] if host.startswith("www.") else host)
+    return hosts
+
+
+def doc_wipe(repo, old, new, status, path, old_sha):
+    """A top-level document the change deletes, or empties or replaces (half or more of its lines removed)."""
+    if status not in ("M", "D") or not TOP_DOC.match(path):
+        return []
+    before = blob(repo, old_sha).decode("utf-8", "replace").count("\n")
+    if before < 20:
+        return []
+    if status == "D":
+        removed = before
+    else:
+        counts = git(repo, "diff", "--numstat", "--no-renames", "--no-ext-diff", "--no-textconv", old, new, "--",
+                     ":(literal)" + path).decode("utf-8", "replace").split()
+        removed = int(counts[1]) if len(counts) >= 2 and counts[1].isdigit() else 0
+    if removed * 2 < before:
+        return []
+    return [Finding(path, None, REVIEW, "doc-wipe",
+                    "removes %d of the %d lines of a top-level document; check it isn't being emptied or replaced"
+                    % (removed, before))]
+
+
 def scan(repo, base, head, check_tags=False, action_remote=ACTION_REMOTE, messages=True, external=None):
     """(findings, number of files looked at).
 
@@ -682,12 +747,14 @@ def scan(repo, base, head, check_tags=False, action_remote=ACTION_REMOTE, messag
     pins = []
     added = {}  # path -> {line number: text}
     entries = changed_files(repo, old, new)
-    for status, old_mode, new_mode, _old_sha, new_sha, path in entries:
+    for status, old_mode, new_mode, old_sha, new_sha, path in entries:
         gone = status == "D"
         is_blob = new_mode not in ("160000",) and not gone
         size = blob_size(repo, new_sha) if is_blob else 0
         head_bytes = blob(repo, new_sha)[:8192] if is_blob else b""
         findings += check_path(status, old_mode, new_mode, path, head_bytes)
+        if old_mode in ("100644", "100755"):
+            findings += doc_wipe(repo, old, new, status, path, old_sha)
         if gone or not is_blob or new_mode == "120000" or b"\0" in head_bytes:
             continue
         if size > MAX_SCAN_BYTES:
@@ -695,8 +762,19 @@ def scan(repo, base, head, check_tags=False, action_remote=ACTION_REMOTE, messag
                                     "a text file over %d MiB that this check does not read" % (MAX_SCAN_BYTES >> 20)))
             continue
         per_rule = {}
+        # A top-level document that starts linking another site (a "the project moved to ..." notice, say) is listed:
+        # every reader and every agent starts from these files.
+        top_doc = bool(TOP_DOC.match(path))
+        hosts_before = KNOWN_LINK_HOSTS
+        if top_doc and status == "M" and old_mode in ("100644", "100755"):
+            hosts_before = hosts_before | link_hosts(blob(repo, old_sha).decode("utf-8", "replace"))
         for number, text in added_lines(repo, old, new, path):
             added.setdefault(path, {})[number] = text
+            if top_doc:
+                for host in sorted(link_hosts(text) - hosts_before):
+                    findings.append(Finding(path, number, REVIEW, "new-link-host",
+                                            "a top-level document links %s, a site it didn't link before" % host,
+                                            text))
             if is_workflow(path) and not text.lstrip().startswith("#"):
                 pin = PINNED_USE.match(text)
                 if pin:
