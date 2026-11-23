@@ -541,6 +541,9 @@ int32_t CompareStringEx(const char16_t*, uint32_t flags, const char16_t* a, int3
 int32_t CompareStringW(uint32_t, uint32_t flags, const char16_t* a, int32_t na, const char16_t* b, int32_t nb) {
     return compare(flags, a, na, b, nb);
 }
+int32_t CompareStringOrdinal(const char16_t* a, int32_t na, const char16_t* b, int32_t nb, int ignore_case) {
+    return compare(ignore_case ? 1 : 0, a, na, b, nb);
+}
 uint32_t GetUserDefaultLCID() { return 0x409; }
 int IsValidLocale(uint32_t, uint32_t) { return 1; }
 
@@ -790,7 +793,7 @@ Exports kernel32_crt_exports() {
         K(LeaveCriticalSection), K(DeleteCriticalSection), K(InitOnceBeginInitialize), K(InitOnceComplete),
         K(InitOnceExecuteOnce), K(InterlockedPushEntrySList), K(InterlockedFlushSList), K(GetACP), K(GetOEMCP),
         K(GetConsoleCP), K(IsValidCodePage), K(GetCPInfo), K(MultiByteToWideChar), K(WideCharToMultiByte),
-        K(GetStringTypeW), K(LCMapStringEx), K(LCMapStringW), K(CompareStringEx), K(CompareStringW),
+        K(GetStringTypeW), K(LCMapStringEx), K(LCMapStringW), K(CompareStringEx), K(CompareStringW), K(CompareStringOrdinal),
         K(GetUserDefaultLCID), K(IsValidLocale), K(GetCommandLineW), K(GetEnvironmentStringsW),
         K(FreeEnvironmentStringsW), K(GetEnvironmentVariableA), K(SetEnvironmentVariableA),
         K(SetEnvironmentVariableW), K(GetStartupInfoW), K(SetLastError), K(GetFileType), K(SetStdHandle),

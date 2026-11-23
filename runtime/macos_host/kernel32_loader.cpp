@@ -29,12 +29,16 @@ int DeleteFileW(const char16_t* path) {
     if (unlink(to_host_path(narrow(path).c_str()).c_str()) == 0) return 1;
     return set_last_error(errno == ENOENT ? 2 : 5), 0;
 }
+int DeleteFileA(const char* path) {
+    if (unlink(to_host_path(path).c_str()) == 0) return 1;
+    return set_last_error(errno == ENOENT ? 2 : 5), 0;
+}
 
 }  // namespace
 
 #define K(name) EXPORT("kernel32.dll", name)
 Exports kernel32_loader_exports() {
-    return {K(GetEnvironmentVariableW), K(FlushInstructionCache), K(DisableThreadLibraryCalls), K(TlsFree), K(DeleteFileW)};
+    return {K(GetEnvironmentVariableW), K(FlushInstructionCache), K(DisableThreadLibraryCalls), K(TlsFree), K(DeleteFileW), K(DeleteFileA)};
 }
 
 }  // namespace host

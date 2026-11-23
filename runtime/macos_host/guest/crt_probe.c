@@ -52,5 +52,12 @@ int main(void) {
         strcmp(word, "ok") || used != 12 || sscanf("", "%d", &used) != EOF)
         return 13;
     DeleteFileW(L"crt_probe.tmp");
+    char tmp[MAX_PATH], name[MAX_PATH];
+    DWORD info = 1;
+    if (CompareStringOrdinal(L"abc", -1, L"ABC", -1, TRUE) != CSTR_EQUAL ||
+        CompareStringOrdinal(L"abc", 3, L"abd", 3, FALSE) != CSTR_LESS_THAN || !GetHandleInformation(f, &info) || info ||
+        !GetTempPathA(MAX_PATH, tmp) || !GetTempFileNameA(tmp, "crt", 0, name) ||
+        GetFileAttributesA(name) == INVALID_FILE_ATTRIBUTES || !DeleteFileA(name))
+        return 14;
     return 0;
 }

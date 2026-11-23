@@ -44,9 +44,41 @@ uint32_t attributes(const struct stat& st) {
 }
 template <typename T> void put(uint8_t* p, size_t off, T v) { std::memcpy(p + off, &v, sizeof v); }
 
+int GetHandleInformation(HANDLE, uint32_t* flags) {  // no handle is inheritable or protected here
+    if (flags) *flags = 0;
+    return 1;
+}
+// <path>\<3 prefix chars><hex>.TMP; with unique == 0 a free name is picked and the file created, as on Windows.
+uint32_t GetTempFileNameA(const char* path, const char* prefix, uint32_t unique, char* out) {
+    std::string base = path;
+    if (!base.empty() && base.back() != '\\' && base.back() != '/') base += '\\';
+    base += std::string(prefix).substr(0, 3);
+    for (uint32_t u = unique ? unique : (static_cast<uint32_t>(getpid()) & 0xFFFF) | 1, tries = 0; tries < 0x10000; ++u, ++tries) {
+        u &= 0xFFFF;
+        if (!u) continue;
+        char name[PATH_MAX];
+        std::snprintf(name, sizeof name, "%s%X.TMP", base.c_str(), unique ? unique : u);
+        if (!unique) {
+            const int fd = open(to_host_path(name).c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+            if (fd < 0) {
+                if (errno == EEXIST) continue;
+                return failed(), 0;
+            }
+            close(fd);
+        }
+        std::strcpy(out, name);  // the caller's buffer is MAX_PATH, as on Windows
+        return unique ? unique : u;
+    }
+    return failed(), 0;
+}
 uint32_t GetFileAttributesW(const char16_t* name) {
     struct stat st;
     if (stat(path_of(name).c_str(), &st) != 0) return failed(), 0xFFFFFFFFu;
+    return attributes(st);
+}
+uint32_t GetFileAttributesA(const char* name) {
+    struct stat st;
+    if (stat(to_host_path(name).c_str(), &st) != 0) return failed(), 0xFFFFFFFFu;
     return attributes(st);
 }
 int GetFileAttributesExW(const char16_t* name, int32_t, uint8_t* out) {  // WIN32_FILE_ATTRIBUTE_DATA
@@ -244,7 +276,7 @@ int FindClose(HANDLE h) {
 #define K(name) EXPORT("kernel32.dll", name)
 Exports kernel32_file_exports() {
     return {
-        K(GetFileAttributesW), K(GetFileAttributesExW), K(CreateDirectoryW), K(CreateDirectoryExW), K(CopyFileW),
+        K(GetFileAttributesW), K(GetFileAttributesExW), K(GetHandleInformation), K(GetFileAttributesA), K(GetTempFileNameA), K(CreateDirectoryW), K(CreateDirectoryExW), K(CopyFileW),
         K(MoveFileExW), K(SetFilePointerEx), K(GetFileSizeEx), K(GetFileSize), K(GetFileTime), K(SetEndOfFile), K(FlushFileBuffers), K(GetFileInformationByHandle),
         K(GetFileInformationByHandleEx), K(GetCurrentDirectoryW), K(SetCurrentDirectoryW), K(GetFullPathNameW),
         K(GetFinalPathNameByHandleW), K(SetFileInformationByHandle), K(FindFirstFileExW), K(FindFirstFileW),
