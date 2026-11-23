@@ -1281,8 +1281,21 @@ interpreter that quiets the NaN. That form is left out unless `--known` (`class-
 ```
 python -I tools/fmisc_diff.py --programs 3000 --seed 11 --max-ops 8
 python -I tools/fmisc_diff.py --oracle hw --programs 500 --seed 1
+python -I tools/fmisc_diff.py --oracle hw,vk --programs 600 --seed 11 --max-ops 8 [--wave 64]
 python -I tests/test_fmisc_diff.py
 ```
+
+`--oracle hw,vk` also runs the translated programs on a real Vulkan GPU (`tools/vk_fuzz_run.py`: llvm-mc for gfx1013,
+`rdna2spirv.py`, `runtime/build/vk_compute_test`, `LEONIDA_VK_DEVICE`, `--build DIR`) as one wave of 32 or, with
+`--wave 64`, 64 identical lanes (the lane masks as 64-bit pairs; the hardware kernels run in the same wave size), and
+judges lane 0's four words against the hardware's, not the reference's: the interpreter cannot see a driver's denormal,
+NaN and rounding rules. The seeds are computed from the buffer fill at run time (`--vk-constants` keeps them as
+literals), because the AMD Windows driver (26.10.1) folds an ordered compare of a literal NaN to true in a wave32
+pipeline (`v_cmp_lt_f32 vcc_lo, -10.0, NaN`, fine in wave64 and on the RTX 5080; with run-time operands it is right).
+Differences are `denormal` (the reference declines the program for a denormal: f32 denormals are left to the driver),
+`omod_neg_zero` (an output modifier made the hardware's -0 a +0, the translated -0 stayed; #1281) and `mismatch`,
+which fails the run. Seeds 11 to 13, 600 programs each, up to 8 ops: Radeon gfx1036 wave32 597 match, 3 omod_neg_zero;
+wave64 593 match, 3 denormal, 4 omod_neg_zero; RTX 5080 wave32 595 match, 3 omod_neg_zero, 2 denormal; no mismatch.
 
 ### binary64 VALU on the CPU and Vulkan (`tools/f64_diff.py`, FUZZ-55)
 
