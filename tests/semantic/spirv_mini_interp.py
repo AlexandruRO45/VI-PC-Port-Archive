@@ -489,7 +489,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             in_body = True
             first_fn = res
             continue
-        if op in _IGNORED:
+        if op in _IGNORED or op in (
+            "OpDecorationGroup", "OpGroupDecorate", "OpGroupMemberDecorate", "OpMemberName",
+        ):
             continue
         if op == "OpTypeInt":
             bits = int(a[0])

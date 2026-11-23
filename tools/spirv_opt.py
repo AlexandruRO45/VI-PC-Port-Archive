@@ -27,8 +27,8 @@ Every transform is strictly sound:
     Dead overwritten-store elimination stays strictly intra-block.
   - Constant folding only replaces an instruction when an existing module OpConstant /
     OpConstantTrue / OpConstantFalse already matches the result type and value.
-  - Pure DCE uses an explicit allowlist of side-effect-free opcodes and drops any
-    OpDecorate / OpName lines that reference deleted SSA IDs.
+  - Pure DCE uses an explicit allowlist of side-effect-free opcodes and removes
+    deleted SSA IDs from direct decorations, names, and group applications.
 
 As a module:
     from spirv_opt import optimize
@@ -1032,6 +1032,8 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 continue
             if op == "OpDecorate" and args:
                 decorated_ids.add(args[0])
+            elif op == "OpGroupDecorate" and len(args) >= 2:
+                decorated_ids.update(args[1:])
             elif op == "OpTypeInt" and res and len(args) >= 2:
                 try:
                     w, s = int(args[0]), int(args[1])
@@ -1101,7 +1103,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
         opt_funcs[start] = new_body
         all_deleted.update(deleted)
 
-    # Reassemble module, dropping OpDecorate / OpName lines that target deleted SSA IDs.
+    # Reassemble module, dropping annotations for deleted SSA IDs while retaining live group targets.
     out: list[str] = []
     func_map = {start: (end, opt_funcs[start]) for start, end in func_ranges}
     i = 0
@@ -1114,12 +1116,23 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
             continue
         raw = lines[i]
         if all_deleted:
-            stripped = raw.lstrip()
-            if stripped.startswith(("OpDecorate ", "OpName ")):
-                toks = stripped.split(None, 2)
-                if len(toks) >= 2 and toks[1] in all_deleted:
+            toks = raw.split(None, 2)
+            if len(toks) >= 2 and toks[0] in ("OpDecorate", "OpName"):
+                if toks[1] in all_deleted:
                     i += 1
                     continue
+            elif len(toks) >= 2 and toks[0] == "OpGroupDecorate":
+                # Group operands are IDs, so the first semicolon starts a comment, never a string operand.
+                code, semi, comment = raw.partition(";")
+                args = code.split()[1:]
+                targets = [target for target in args[1:] if target not in all_deleted]
+                if len(targets) != len(args) - 1:
+                    if not targets:
+                        i += 1
+                        continue
+                    raw = _format_inst(None, "OpGroupDecorate", [args[0], *targets])
+                    if semi:
+                        raw += " ;" + comment
         out.append(raw)
         i += 1
     return "\n".join(out) + ("\n" if spvasm.endswith("\n") else "")
