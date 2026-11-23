@@ -131,7 +131,10 @@ class EndToEnd(unittest.TestCase):
         for i in range(first, last + 1):
             if "UMax {xa} {ya}" in lines[i]:
                 return i + 1
-        self.skipTest("v_sad_u8's UMax line moved")
+        # A failure, not a skip: a skipped test protects nothing and CI stays green.
+        self.fail("no line containing 'UMax {xa} {ya}' in the v_sad_u8 branch of tools/rdna2spirv.py: "
+                  "if the line was renamed or reformatted, update the marker in that branch, or change "
+                  "the marker in EndToEnd.umax_line to match the new line")
 
     def run_tool(self, extra):
         line = self.umax_line()
