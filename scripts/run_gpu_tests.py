@@ -39,6 +39,7 @@ from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import run_readback
+from check import MRT_EXPORTS, mrt_exports_test
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
@@ -585,6 +586,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               SIGNED_MIP_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
+DRAWN_WITH.update({name: "vs_ids.asm" for name in MRT_EXPORTS})
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -1200,6 +1202,9 @@ def run_suite(a, work: str) -> int:
                 with open(raw, "rb") as f:
                     problem, covered = texoff_problem(f.read(), msg, name=name)
                 results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
+        elif name in MRT_EXPORTS:
+            problem, detail = mrt_exports_test(a.build, spirv_dir, name)
+            results.append((name, None if isinstance(problem, Skip) else not problem, problem or detail))
         elif name in OTHER_HARNESS:
             results.append((name, None, f"SKIP (run by {OTHER_HARNESS[name]})"))
         elif name.startswith("ps_"):

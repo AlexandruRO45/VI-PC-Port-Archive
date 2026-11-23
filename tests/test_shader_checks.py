@@ -57,6 +57,38 @@ def cvt_answer(env, wrong_for=None):
     return 0, "out[0..7] = " + " ".join(map(str, words + [0xEEEEEEEE] * 6)) + "\n"
 
 
+class MrtExportChecks(unittest.TestCase):
+    color0 = struct.pack("<4f", 1, 2, 3, 4)
+    color1 = struct.pack("<4f", 4, 3, 2, 1)
+
+    def draw(self, case, plane1, plane0=None):
+        def harness(_tool, _vs, _fs, raw, width, height, *, env):
+            self.assertEqual(env["VKH_MRT1"], "1")
+            self.assertEqual((width, height), ("8", "8"))
+            raw.write_bytes(self.color0 * 64 if plane0 is None else plane0)
+            if plane1 is not None:
+                Path(str(raw) + ".mrt1").write_bytes(plane1)
+            return 0, ""
+
+        with patch.object(check, "run", side_effect=harness):
+            return check.mrt_exports_test("tools", "spirv", "ps_mrt_exports_" + case)
+
+    def test_second_image_required_even_with_a_correct_first_image(self):
+        self.assertIn("missing MRT1", self.draw("write", None)[0])
+        self.assertIn("MRT1: got 1008 bytes", self.draw("write", self.color1 * 63)[0])
+        self.assertIn("MRT1 (7,7)", self.draw("write", self.color1 * 63 + self.color0)[0])
+
+    def test_mixed_mask_reports_every_bucket_without_assuming_a_value(self):
+        plane1 = struct.pack("<4f", -2, -2, -2, -2) + bytes(16) + self.color1 + self.color0 * 61
+        problem, detail = self.draw("masked", plane1)
+        self.assertFalse(problem)
+        self.assertIn("1 clear, 1 zero, 1 export color, 61 other", detail)
+
+    def test_mixed_mask_still_requires_the_first_export(self):
+        problem, _ = self.draw("masked", bytes(1024), plane0=self.color0 * 63 + bytes(16))
+        self.assertIn("MRT0 (7,7)", problem)
+
+
 class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, fmt=(0, GOOD_FMT)):
         def harness(_tool, shader, *args, env=None):

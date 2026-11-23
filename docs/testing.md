@@ -117,6 +117,14 @@ python -I scripts/run_gpu_tests.py --build runtime/build/linux     # Windows: th
 Add `--require-pass` when verifying a specific path: an all-skipped run exits 1 instead of 0.
 Skips still appear as `SKIP`, and individual skips are allowed if at least one test passes and none fail.
 
+Use `--filter ps_mrt_exports` to draw into two 8×8 RGBA32F images. The controls check every channel of both
+images after a write and after a fragment discard. In the mixed-mask case (#3988), all lanes export MRT0
+before EXEC is cleared for MRT1. The runner checks MRT0 and reports the MRT1 pixel counts separately.
+The translated shader selects an uninitialized MRT1 value for these lanes, so the reported bits can vary by implementation.
+Comparing them with the original RDNA2 instructions requires a native two-target measurement.
+To save both images from a direct `vk_harness` draw, set `VKH_MRT1=1`. The output path contains MRT0
+(cleared to −1 in each channel) and the adjacent `<out.raw>.mrt1` contains MRT1 (cleared to −2).
+
 A GPU test program that runs longer than 120 seconds is killed and counted as a failure, so a hung driver does
 not stall the suite. `LEONIDA_GPU_TEST_TIMEOUT` sets the limit in seconds for both `check.py` and
 `run_gpu_tests.py`; `0` turns the limit off.

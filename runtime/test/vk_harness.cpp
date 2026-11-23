@@ -4,6 +4,8 @@
 //   vk_harness <vs.spv> <fs.spv> <out.raw> [width height [clip-test-s0 clip-test-s1]]
 //   vk_harness <ms.spv> <fs.spv> <out.raw> --mesh-group-readback X Y Z
 // The latter captures one full-screen triangle per mesh workgroup, in Vulkan rasterization order.
+//   VKH_MRT1=1                   also binds color target 1 and writes it to <out.raw>.mrt1. The two RGBA32F
+//                                targets start at -1.0 and -2.0 respectively in every channel.
 //
 // Push constants follow the contract in docs/design.md: s0..s31, then the heap base lo/hi. They are zero unless
 //   VKH_SGPRS=w0,w1,...          sets s0, s1, ... (decimal or 0x hex)
@@ -41,6 +43,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -536,23 +539,28 @@ int main(int argc, char** argv) {
         return 0;
     };
     const VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
-    VkImage img;
-    VkImageView views[2]{};
-    if (attachment(fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                   VK_IMAGE_ASPECT_COLOR_BIT, img, views[0])) return 1;
-    VkAttachmentDescription attachments[2]{};
-    auto& ad = attachments[0];
-    ad.format = fmt; ad.samples = VK_SAMPLE_COUNT_1_BIT; ad.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    ad.storeOp = VK_ATTACHMENT_STORE_OP_STORE; ad.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    ad.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; ad.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    ad.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    const char* mrt1 = std::getenv("VKH_MRT1");
+    const uint32_t color_count = mrt1 && !std::strcmp(mrt1, "1") ? 2 : 1;
+    VkImage colors[2]{};
+    VkImageView views[3]{};                    // color targets, then optional stencil
+    VkAttachmentDescription attachments[3]{};
+    VkAttachmentReference color_refs[2]{};
+    for (uint32_t i = 0; i < color_count; ++i) {
+        if (attachment(fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT, colors[i], views[i])) return 1;
+        auto& ad = attachments[i];
+        ad.format = fmt; ad.samples = VK_SAMPLE_COUNT_1_BIT; ad.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        ad.storeOp = VK_ATTACHMENT_STORE_OP_STORE; ad.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        ad.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; ad.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ad.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        color_refs[i] = {i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    }
     VkSubpassDescription sd{}; sd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sd.colorAttachmentCount = 1; sd.pColorAttachments = &ar;
-    VkAttachmentReference stencil_ref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    sd.colorAttachmentCount = color_count; sd.pColorAttachments = color_refs;
+    VkAttachmentReference stencil_ref{color_count, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     if (group_readback) {
         LOADI(vkGetPhysicalDeviceFormatProperties);
-        auto& ds = attachments[1];
+        auto& ds = attachments[color_count];
         for (auto format : {VK_FORMAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
             VkFormatProperties fp;
             vkGetPhysicalDeviceFormatProperties(pd, format, &fp);
@@ -565,7 +573,7 @@ int main(int argc, char** argv) {
         VkImage stencil;
         VkImageAspectFlags aspects = VK_IMAGE_ASPECT_STENCIL_BIT;
         if (ds.format != VK_FORMAT_S8_UINT) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
-        if (attachment(ds.format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, aspects, stencil, views[1])) return 1;
+        if (attachment(ds.format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, aspects, stencil, views[color_count])) return 1;
         ds.samples = VK_SAMPLE_COUNT_1_BIT;
         ds.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ds.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         ds.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ds.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -573,7 +581,7 @@ int main(int argc, char** argv) {
         sd.pDepthStencilAttachment = &stencil_ref;
     }
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpi.attachmentCount = group_readback ? 2 : 1; rpi.pAttachments = attachments; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
+    rpi.attachmentCount = color_count + group_readback; rpi.pAttachments = attachments; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
     VkSubpassDependency copy_dep{0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     rpi.dependencyCount = 1; rpi.pDependencies = &copy_dep;
@@ -649,9 +657,10 @@ int main(int argc, char** argv) {
     rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
+    VkPipelineColorBlendAttachmentState cba[2]{};
+    for (auto& color : cba) color.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    cb.attachmentCount = color_count; cb.pAttachments = cba;
     // The push-constant block (pc_bytes, checked against the device limit above).
     const VkShaderStageFlags pcs = (mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
                                    VK_SHADER_STAGE_FRAGMENT_BIT | (gs_path ? VK_SHADER_STAGE_GEOMETRY_BIT : 0) |
@@ -787,7 +796,8 @@ int main(int argc, char** argv) {
         CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &cpipe));
     }
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = VkDeviceSize(W) * H * 16; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const VkDeviceSize plane_bytes = VkDeviceSize(W) * H * 16;
+    bi.size = plane_bytes * color_count; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VkBuffer buf; CHECK(vkCreateBuffer(dev, &bi, nullptr, &buf));
     VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, buf, &br);
     VkMemoryAllocateInfo bai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -981,8 +991,9 @@ int main(int argc, char** argv) {
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
-    VkClearValue clears[2]{};
-    for (float& c : clears[0].color.float32) c = -1;   // marks untouched pixels
+    VkClearValue clears[3]{};
+    for (uint32_t i = 0; i < color_count; ++i)
+        for (float& c : clears[i].color.float32) c = -static_cast<float>(i + 1);   // identifies an untouched target
     if (clip_shifts) {
         const float shifts[] = {float(std::atof(argv[6])), float(std::atof(argv[7]))};
         std::memcpy(pc, shifts, sizeof(shifts));
@@ -1079,7 +1090,10 @@ int main(int argc, char** argv) {
     }
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
-    vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    for (uint32_t i = 0; i < color_count; ++i) {
+        reg.bufferOffset = i * plane_bytes;
+        vkCmdCopyImageToBuffer(cmd, colors[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    }
     // Make the image copy and any shader writes to the heap visible to the host after the queue wait.
     VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     readback.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1091,10 +1105,14 @@ int main(int argc, char** argv) {
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
     void* p; CHECK(vkMapMemory(dev, bmem, 0, bi.size, 0, &p));
-    std::ofstream output(argv[3], std::ios::binary);
-    output.write(static_cast<const char*>(p), std::streamsize(bi.size));
-    output.close();
-    if (!output) { std::fprintf(stderr, "failed to write %s\n", argv[3]); return 1; }
+    for (uint32_t i = 0; i < color_count; ++i) {
+        std::string path = argv[3];
+        if (i == 1) path += ".mrt1";
+        std::ofstream output(path, std::ios::binary);
+        output.write(static_cast<const char*>(p) + i * plane_bytes, std::streamsize(plane_bytes));
+        output.close();
+        if (!output) { std::fprintf(stderr, "failed to write %s\n", path.c_str()); return 1; }
+    }
     if (const char* dump = std::getenv("VKH_HEAP_DUMP"); dump && *dump && heap_map) {
         std::ofstream hf(dump, std::ios::binary);
         hf.write(static_cast<const char*>(heap_map), heap_bytes);

@@ -425,7 +425,8 @@ TEXTURE_CONSTANTS = {
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
+MRT_EXPORTS = ("ps_mrt_exports_write", "ps_mrt_exports_discard", "ps_mrt_exports_masked")
+PIXEL_TESTS = sorted((*PIXEL_BITS, *MRT_EXPORTS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
                       "ps_texoff_forms",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
                       "ps_mandelbrot"))
@@ -1104,6 +1105,50 @@ def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     return list(struct.iter_unpack(fmt, data)), out
 
 
+def mrt_exports_test(tools, spirv, name):
+    """Check both RGBA32F images. The masked second export is an observation, without a hardware reference."""
+    width, height = 8, 8
+    color = (0x3f800000, 0x40000000, 0x40400000, 0x40800000)  # (1, 2, 3, 4)
+    clear = ((0xbf800000,) * 4, (0xc0000000,) * 4)             # -1 on MRT0, -2 on MRT1
+    expected = clear if name == "ps_mrt_exports_discard" else (color, color[::-1])
+    env = dict(os.environ, VKH_MRT1="1")
+    sg = subgroup_size(spirv, name)
+    if sg:
+        env["VKH_SUBGROUP_SIZE"] = str(sg)
+    with tempfile.TemporaryDirectory(prefix="leonida-mrt-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
+                        os.path.join(spirv, name + ".spv"), raw, str(width), str(height), env=env)
+        if code == UNSUPPORTED:
+            reason = re.search(r"unsupported: .*", out)
+            return Skip(reason.group(0) if reason else "unsupported device"), ""
+        if code:
+            return out.strip() or f"vk_harness exited {code}", ""
+        for target, path in enumerate((raw, Path(str(raw) + ".mrt1"))):
+            if not path.is_file():
+                return f"missing MRT{target} readback", ""
+            data = path.read_bytes()
+            if len(data) != width * height * 16:
+                return f"MRT{target}: got {len(data)} bytes, expected {width * height * 16}", ""
+            pixels = struct.iter_unpack("<4I", data)
+            if target == 1 and name == "ps_mrt_exports_masked":
+                counts = collections.Counter(pixels)
+                retained, zero, exported = (counts[p] for p in (clear[1], (0,) * 4, expected[1]))
+                other = width * height - retained - zero - exported
+                detail = (f"MRT0: {width * height} pixels exact; MRT1 observed (no reference): "
+                          f"{retained} clear, {zero} zero, {exported} export color, {other} other")
+                if other:
+                    example = next(p for p in counts if p not in (clear[1], (0,) * 4, expected[1]))
+                    detail += " (e.g. " + " ".join(f"{word:08x}" for word in example) + ")"
+                return "", detail
+            for i, pixel in enumerate(pixels):
+                if pixel != expected[target]:
+                    got = " ".join(f"{word:08x}" for word in pixel)
+                    want = " ".join(f"{word:08x}" for word in expected[target])
+                    return f"MRT{target} ({i % width},{i // width}): got {got}, expected {want}", ""
+    return "", f"MRT0 and MRT1: {width * height} RGBA pixels each exact"
+
+
 def texture_constant_test(tools, spirv, name):
     """Compare every pixel returned through vk_texture_test with the fixture reference."""
     expected = TEXTURE_CONSTANTS[name]
@@ -1431,6 +1476,8 @@ def pixel_test(tools, spirv, name):
         return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback / --f16-interp-fallback)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
+    if name in MRT_EXPORTS:
+        return mrt_exports_test(tools, spirv, name)[0]
     if name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
         return texoff_test(tools, spirv, name)
     if name == "ps_interp_f16_high" and BARY_FALLBACK and not F16_HALVES:   # with F16_HALVES it reads decoded halves
