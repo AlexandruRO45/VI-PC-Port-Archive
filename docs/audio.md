@@ -132,9 +132,11 @@ exporter verifies that the skip ends on a packet boundary and that the repeated 
 packets for that channel group, then writes each verified overlap once. Each descriptor channel becomes one Ogg
 Opus file, named by `export_stems` after all of the bank's ordinary streams: `<id>.ogg`, or `<id>~2.ogg`, `~3`, ...
 when an ordinary stream or an earlier channel already has that id, so neither file overwrites the other and the
-stream names stay the ones `awc_manifest.py` reports (synthetic tests in `tests/test_awc_music_names.py`; how
-often real banks repeat an id this way has not been counted). Invalid repeat counts or payloads reject that music
-descriptor so independent streams can still export.
+stream names stay the same. A channel without Opus packets writes no file and takes no name. `awc_manifest.py`
+takes the names from the same function (`awc_opus.bank_stems`): it lists one row per stream and per channel, and a
+row whose id an earlier row already has notes `awc_opus exports it as <id>~N` (synthetic tests in
+`tests/test_awc_music_names.py`; how often real banks repeat an id this way has not been counted). Invalid repeat
+counts or payloads reject that music descriptor so independent streams can still export.
 The chunk size gives the distance between blocks. The final block may use fewer bytes. The channel table and
 all declared subblocks must fit within their own block and the `0x55` tag's data range.
 

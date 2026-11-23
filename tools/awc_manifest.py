@@ -19,7 +19,8 @@ the tag's rate field; PCM and XMA use `declared_samples / sample_rate`. notes fl
 look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
 A streamed-music descriptor contributes one row per channel group; `channels` is the packet channel count read
 from the Opus TOC stereo bit, and `declared_samples`/`duration_s` are per channel (the descriptor stores the
-interleaved count). `data_offset`/`size` is the shared data tag.
+interleaved count). `data_offset`/`size` is the shared data tag. Every stream and channel gets its own row, even
+when an earlier row in the bank has the same id; such a row's notes give the name awc_opus exports it under.
 """
 import argparse
 import csv
@@ -116,16 +117,8 @@ def _bank_rows(path: str, bank: str) -> list:
     else:                                                    # older parser: streams + attribute
         streams = parsed
         music = getattr(awc_opus.parse_awc, "music", [])
-    bank_size, rows = len(d), []
-    # A bank can hold two streams with the same id: list both, and note the name awc_opus exports the later
-    # one under, instead of letting it replace the first row.
-    for s, stem in zip(streams, awc_opus.export_stems([s["id"] for s in streams])):
-        row = _row(bank, s["id"], s["codec"], s["channels"], s["rate"], s["samples"], s["data"], bank_size,
-                   False)
-        if stem != row["stream"]:
-            note = f"same id as an earlier stream in this bank; awc_opus exports it as {stem}"
-            row["notes"] = "; ".join(x for x in (row["notes"], note) if x)
-        rows.append(row)
+    bank_size = len(d)
+    music_rows = []
     for mus, data in music or []:
         try:
             channels = awc_opus.music_channels(d, mus, data, collect_packets=False)
@@ -136,14 +129,29 @@ def _bank_rows(path: str, bank: str) -> list:
             print(f"awc_manifest: warning: {bank}: ignored malformed streamed-music descriptor",
                   file=sys.stderr)
             continue
-        for cid, samples, rate, codec, _packets, packet_channels in channels:
-            row = _row(bank, cid, codec, packet_channels, rate, samples, data, bank_size, True)
-            same = next((i for i, r in enumerate(rows) if r["stream"] == row["stream"]), None)
-            if same is None:
-                rows.append(row)
-            else:   # as before: a streamed-music channel replaces a row with its id
-                rows[same] = row
+        music_rows += [(channel, data) for channel in channels]
+    # A bank can hold two streams, two streamed-music channels, or a stream and a channel with the same id: list
+    # every one, and note the name awc_opus exports a later one under (awc_opus.bank_stems), instead of letting
+    # it replace the first row.
+    stream_stems, music_stems = awc_opus.bank_stems([s["id"] for s in streams],
+                                                    [channel for channel, _data in music_rows])
+    rows = []
+    for s, stem in zip(streams, stream_stems):
+        row = _row(bank, s["id"], s["codec"], s["channels"], s["rate"], s["samples"], s["data"], bank_size,
+                   False)
+        rows.append(_note_stem(row, stem, "an earlier stream"))
+    for ((cid, samples, rate, codec, _packets, packet_channels), data), stem in zip(music_rows, music_stems):
+        row = _row(bank, cid, codec, packet_channels, rate, samples, data, bank_size, True)
+        rows.append(_note_stem(row, stem, "an earlier stream or streamed-music channel"))
     return rows
+
+
+def _note_stem(row: dict, stem, earlier: str) -> dict:
+    """Add the exported name to a row whose id an earlier row in the bank already has."""
+    if stem is not None and stem != row["stream"]:
+        note = f"same id as {earlier} in this bank; awc_opus exports it as {stem}"
+        row["notes"] = "; ".join(x for x in (row["notes"], note) if x)
+    return row
 
 
 def collect(src: str, *, out: str | None = None):

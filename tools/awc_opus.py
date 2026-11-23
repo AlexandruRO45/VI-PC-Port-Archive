@@ -341,6 +341,21 @@ def bank_output_dir(path, out_dir):
     return os.path.join(out_dir, name)
 
 
+def bank_stems(stream_ids, channels):
+    """(stream stems, channel stems) for one bank, as export_bank names its files.
+
+    `channels` are music_channels() tuples from every descriptor in bank order, with or without packets. A
+    channel is written only when it holds Opus packets (packet channels > 0, the same in both music_channels
+    modes) and its stem is then named after every stream, so a repeated id gets the next `~N` and the stream
+    stems stay export_stems(stream_ids). A channel that is not written gets None. awc_manifest notes the same
+    stems."""
+    stream_ids = list(stream_ids)
+    written = [channel[0] for channel in channels if channel[5]]
+    stems = export_stems(stream_ids + written)
+    music = iter(stems[len(stream_ids):])
+    return stems[:len(stream_ids)], [next(music) if channel[5] else None for channel in channels]
+
+
 def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
     with open(path, "rb") as f:
         d = f.read()
@@ -348,13 +363,13 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
     od = bank_output_dir(path, out_dir)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
-    # Streamed-music channels share the bank's file names with the ordinary streams. They are named after
-    # every stream, so the stream stems stay the ones awc_manifest and awc_shorts report, and a channel whose
-    # id repeats a stream's or an earlier channel's gets the next `~N` stem instead of overwriting that file.
-    channels = [channel for mus, data in music for channel in music_channels(d, mus, data) if channel[4]]
-    stems = export_stems([s["id"] for s in streams] + [channel[0] for channel in channels])
-    stream_stems, music_stems = stems[:len(streams)], stems[len(streams):]
+    # Streamed-music channels share the bank's file names with the ordinary streams (bank_stems): a channel
+    # whose id repeats a stream's or an earlier channel's gets the next `~N` stem instead of overwriting it.
+    channels = [channel for mus, data in music for channel in music_channels(d, mus, data)]
+    stream_stems, music_stems = bank_stems([s["id"] for s in streams], channels)
     for (cid, samples, rate, codec, pk, packet_channels), stem in zip(channels, music_stems):
+        if stem is None:
+            continue
         n48 = samples * 48000 // rate if rate else 0
         write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, packet_channels, cid, n48, pre_skip=pre_skip)
         counts["music"] += 1
