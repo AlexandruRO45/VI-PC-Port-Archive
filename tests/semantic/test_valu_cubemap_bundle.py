@@ -173,5 +173,30 @@ class VCubeIdScalarInterpreterTests(unittest.TestCase):
         res = oracle_cubeid_f32(x, y, z)
         self.assertEqual(res, 4.0)
 
+class VCubeIdSimdDivergenceTests(unittest.TestCase):
+    def test_cubeid_exec_mask_divergence(self):
+        wave = WavefrontSimdState(lane_count=32)
+        wave.exec_mask = 0x55555555  # Even lanes active
+        vectors = [
+            (1.0, 0.0, 0.0),  # face 0
+            (-1.0, 0.0, 0.0), # face 1
+            (0.0, 1.0, 0.0),  # face 2
+            (0.0, -1.0, 0.0), # face 3
+            (0.0, 0.0, 1.0),  # face 4
+            (0.0, 0.0, -1.0), # face 5
+        ]
+        for i in range(32):
+            wave.set_vgpr(i, 3, -999.0)
+            if (wave.exec_mask >> i) & 1:
+                vec = vectors[i % len(vectors)]
+                wave.set_vgpr(i, 3, oracle_cubeid_f32(vec[0], vec[1], vec[2]))
+
+        for i in range(32):
+            if (0x55555555 >> i) & 1:
+                expected_face = float(i % len(vectors))
+                self.assertEqual(wave.get_vgpr(i, 3), expected_face)
+            else:
+                self.assertEqual(wave.get_vgpr(i, 3), -999.0)
+
 if __name__ == "__main__":
     unittest.main()
