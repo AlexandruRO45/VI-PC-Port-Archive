@@ -635,6 +635,10 @@ def main():
     try:
         if a.negative_control:
             return negative_control(oracle, family, rng)
+        if explicit is not None and not fmts:
+            print(f"hardware oracle unavailable: --formats {a.formats!r} selects no formats supported by {family}",
+                  file=sys.stderr)
+            return 77
         paths = ("mubuf", "mtbuf") if a.path == "both" else (a.path,)
         total = bad = known = 0
         for path in paths:
