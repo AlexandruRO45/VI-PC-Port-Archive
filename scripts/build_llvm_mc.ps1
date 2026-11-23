@@ -37,8 +37,12 @@ $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualS
 if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
 $jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
+# As in build_runtime.ps1: CMake and Ninja come from the newest install with the "C++ CMake tools" component, which
+# can be an older one beside the compiler's (VS 2022 next to VS 2026).
+$cmakeVs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath
+if (-not $cmakeVs) { $cmakeVs = $vs }
 
-$cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
+$cmakeDir = Join-Path $cmakeVs "Common7\IDE\CommonExtensions\Microsoft\CMake"
 $cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
 $ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
 if (-not ((Test-Path $cmake) -and (Test-Path $ninja))) {

@@ -39,12 +39,16 @@ $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
 $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+# The newest install with the C++ tools can lack the "C++ CMake tools" component that an older one beside it has
+# (VS 2026 next to VS 2022). Take CMake and Ninja from the newest install that has both; the compiler stays $vs's.
+$cmakeVs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath
+if (-not $cmakeVs) { $cmakeVs = $vs }
 
 $src = Join-Path $root "runtime"
 $out = Join-Path $src "build"
 New-Item -ItemType Directory -Force $out | Out-Null
 
-$cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
+$cmakeDir = Join-Path $cmakeVs "Common7\IDE\CommonExtensions\Microsoft\CMake"
 # Skip MSYS/devkitPro cmake on PATH (docs/design.md): native Windows builds advertise Visual Studio + Ninja generators.
 $cmake = Find-BuildTool (Join-Path $cmakeDir "CMake\bin\cmake.exe") "cmake" {
     param($p)

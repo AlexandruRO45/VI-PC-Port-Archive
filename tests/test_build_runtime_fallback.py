@@ -108,10 +108,12 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         lookup_end = text.index("$cfg = if")
         snippet = text[helpers_start:helpers_end] + "\n" + text[lookup_start:lookup_end]
 
-        def run_probe(vs_dir: Path, path_dirs: list[Path]) -> tuple[str, str]:
+        def run_probe(vs_dir: Path, path_dirs: list[Path], cmake_vs_dir: Path | None = None) -> tuple[str, str]:
+            # $cmakeVs is the install the script takes CMake tools from: the compiler's own unless another has them.
             ps = (
                 "$ErrorActionPreference = 'Stop'\n"
                 "$vs = $env:LEONIDA_VS_DIR\n"
+                f"$cmakeVs = '{cmake_vs_dir or vs_dir}'\n"
                 + snippet
                 + "\nWrite-Output \"CMAKE=$cmake\"\nWrite-Output \"NINJA=$ninja\"\n"
             )
@@ -175,6 +177,22 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             cmake, ninja = run_probe(vs_full, [native_cmake_dir, native_ninja_dir])
             self.assertEqual(Path(cmake).resolve(), vs_cmake.resolve())
             self.assertEqual(Path(ninja).resolve(), vs_ninja.resolve())
+
+            # 5) The newest VS (the compiler) has no CMake tools but an older one beside it does (VS 2026 next to
+            #    VS 2022): its CMake + Ninja win over PATH, and the PATH fallback is not needed.
+            cmake, ninja = run_probe(vs_empty, [native_cmake_dir, native_ninja_dir], cmake_vs_dir=vs_full)
+            self.assertEqual(Path(cmake).resolve(), vs_cmake.resolve())
+            self.assertEqual(Path(ninja).resolve(), vs_ninja.resolve())
+
+    def test_cmake_tools_come_from_the_newest_install_that_has_them(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        query = next(line for line in text.splitlines() if line.startswith("$cmakeVs = "))
+        self.assertIn("Microsoft.VisualStudio.Component.VC.CMake.Project", query)
+        self.assertIn("Microsoft.VisualStudio.Component.VC.Tools.x86.x64", query)
+        self.assertIn("if (-not $cmakeVs) { $cmakeVs = $vs }", text)
+        self.assertIn('$cmakeDir = Join-Path $cmakeVs "Common7', text)
+        # The compiler environment still comes from the newest install.
+        self.assertIn('$vcvars = Join-Path $vs "VC', text)
 
 if __name__ == "__main__":
     unittest.main()
