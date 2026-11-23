@@ -238,6 +238,28 @@ class ScanTest(unittest.TestCase):
             self.assertEqual(bvh_groups.main([self.rpf, "--start", str(10 ** 9)]), 2)
         self.assertIn("bvh_groups:", se.getvalue())
 
+    def test_uses_shared_same_report_path_and_catches_folding_volume_case_alias(self):
+        import report_paths
+        from unittest import mock
+        self.assertIs(bvh_groups.same_report_path, report_paths.same_report_path)
+        folded = os.path.join(os.path.dirname(self.rpf), os.path.basename(self.rpf).upper())
+        with (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath),
+              mock.patch.object(report_paths, "_resolved_key", side_effect=str),
+              mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+              mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe,
+              contextlib.redirect_stderr(io.StringIO()) as se):
+            self.assertEqual(bvh_groups.main([self.rpf, "--json", folded]), 2)
+            self.assertIn("bvh_groups: --json would replace the archive", se.getvalue())
+        self.assertGreaterEqual(probe.call_count, 1)
+
+    def test_refuses_relative_alias_of_archive(self):
+        sub = os.path.join(self.tmp.name, "sub")
+        os.makedirs(sub, exist_ok=True)
+        alias = os.path.join(sub, "..", os.path.basename(self.rpf))
+        with contextlib.redirect_stderr(io.StringIO()) as se:
+            self.assertEqual(bvh_groups.main([self.rpf, "--json", alias]), 2)
+        self.assertIn("bvh_groups: --json would replace the archive", se.getvalue())
+
     def test_empty_archive(self):
         empty = os.path.join(self.tmp.name, "e.rpf")
         open(empty, "wb").close()
