@@ -25,6 +25,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 from typing import Callable, Optional, TextIO
 
@@ -104,9 +105,13 @@ def _cache_key(abs_path: str) -> str:
     return os.path.normcase(os.path.realpath(abs_path))
 
 
-def _change_time(path: str, st: os.stat_result) -> int:
+_FILETIME_UNIX_EPOCH = 116444736000000000  # 100 ns intervals from 1601-01-01 to 1970-01-01
+
+
+def _change_time(path: str, st: os.stat_result) -> Optional[int]:
     # st_ctime on windows is creation time, so a rewrite with the old mtime put back wouldn't show up.
-    # NTFS ChangeTime moves on any write or metadata change, same job as ctime on linux
+    # NTFS ChangeTime moves on any write or metadata change, same job as ctime on linux. Where windows has no
+    # ChangeTime (FAT, exFAT) there is nothing to fall back to: the file is not cached (None).
     if os.name != "nt":
         return st.st_ctime_ns
     try:
@@ -118,15 +123,20 @@ def _change_time(path: str, st: os.stat_result) -> int:
         k32.GetFileInformationByHandleEx.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong)
         with open(path, "rb") as f:
             if k32.GetFileInformationByHandleEx(msvcrt.get_osfhandle(f.fileno()), 0, info, ctypes.sizeof(info)):
-                return info[3] or st.st_ctime_ns  # FAT has no change time
+                if info[3] > 0:
+                    return (info[3] - _FILETIME_UNIX_EPOCH) * 100  # unix ns, comparable with st_mtime_ns
     except (OSError, AttributeError, ImportError):
         pass
-    return st.st_ctime_ns
+    return None
 
 
-def _cache_stamp(path: str, st: os.stat_result) -> list[int]:
-    # file id (st_dev, st_ino) catches a file swapped for another one with the same size and times
-    return [st.st_size, st.st_mtime_ns, _change_time(path, st), st.st_dev, st.st_ino]
+def _cache_stamp(path: str, st: os.stat_result) -> Optional[list[int]]:
+    # file id (st_dev, st_ino) catches a file swapped for another one with the same size and times.
+    # None when the change time can't be read: such a file is hashed every run and never stored.
+    change = _change_time(path, st)
+    if change is None:
+        return None
+    return [st.st_size, st.st_mtime_ns, change, st.st_dev, st.st_ino]
 
 
 def load_cache(path: str) -> dict[str, dict]:
@@ -146,9 +156,10 @@ def save_cache(path: str, entries: dict[str, dict]) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
+    # a fresh name, created exclusively: an existing <cache>.tmp is never truncated and two runs never share one
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        with open(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"version": CACHE_VERSION, "files": dict(sorted(entries.items()))}, f, indent=1)
         os.replace(tmp, path)
     except BaseException:
@@ -342,6 +353,29 @@ def verify_manifest(
         raise ManifestError(f"{manifest_path} lists no files, but {target_dir} holds {len(have)}")
     untracked = sorted(set(have.keys()) - set(want.keys()))
 
+    if cache_path is not None:
+        # writing the cache over the manifest or a package file would replace it; a hard link or another alias
+        # that realpath doesn't resolve is caught by comparing the files themselves. walk() left the cache path
+        # out of `have`, so a listed file named as the cache is checked by its place in the target.
+        inside = os.path.relpath(os.path.abspath(cache_path), os.path.abspath(target_dir))
+        if not inside.startswith(os.pardir) and not os.path.isabs(inside) and inside.replace(os.sep, "/") in want:
+            raise ManifestError(f"--cache {cache_path} is a file the manifest lists")
+        protected = [manifest_path, *have.values()]
+        if any(_cache_key(cache_path) == _cache_key(p) for p in protected):
+            raise ManifestError(f"--cache {cache_path} is the manifest or a file of the target")
+        try:
+            cache_st = os.stat(cache_path)
+        except OSError:
+            cache_st = None
+        if cache_st is not None:
+            for p in protected:
+                try:
+                    same = os.path.samestat(cache_st, os.stat(p))
+                except OSError:
+                    continue
+                if same:
+                    raise ManifestError(f"--cache {cache_path} is the same file as {p}")
+
     cache = load_cache(cache_path) if cache_path is not None else {}
     kept: dict[str, dict] = {}  # what gets saved, only files that passed this run so the cache doesn't pile up
     stamps: dict[str, list[int]] = {}
@@ -378,7 +412,7 @@ def verify_manifest(
             stamp = _cache_stamp(abs_p, st)
             key = _cache_key(abs_p)
             hit = cache.get(key)
-            if hit is not None and hit["stamp"] == stamp and hit["sha256"] == expected_sha256:
+            if stamp is not None and hit is not None and hit["stamp"] == stamp and hit["sha256"] == expected_sha256:
                 kept[key] = hit
                 cached_files += 1
                 cached_bytes += actual_size
@@ -407,7 +441,7 @@ def verify_manifest(
                 after = _cache_stamp(abs_p, os.stat(abs_p))
             except OSError:
                 after = None
-            if after == stamps[rel] and time.time_ns() - after[1] > RACY_WINDOW_NS:
+            if after is not None and after == stamps[rel] and time.time_ns() - after[1] > RACY_WINDOW_NS:
                 kept[_cache_key(abs_p)] = {"stamp": after, "sha256": expected_hash}
         return rel, size, "OK", None
 

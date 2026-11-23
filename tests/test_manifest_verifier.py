@@ -976,6 +976,64 @@ class TestVerifyCache(unittest.TestCase):
         with open(self.cache, "rb") as f:
             self.assertNotIn(b"\r\n", f.read())
 
+    def test_cache_that_is_the_manifest_or_a_target_file_is_refused(self) -> None:
+        # Writing the cache there would replace the manifest (exit 0) or a package file.
+        for target in (self.manifest, os.path.join(self.game, "a.bin")):
+            with self.subTest(target=target):
+                with open(target, "rb") as f:
+                    before = f.read()
+                with self.assertRaises(mv.ManifestError):
+                    mv.verify_manifest(self.game, self.manifest, cache_path=target)
+                with open(target, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_a_hard_link_to_the_manifest_or_a_target_file_is_refused(self) -> None:
+        for target in (self.manifest, os.path.join(self.game, "a.bin")):
+            with self.subTest(target=target):
+                alias = os.path.join(self.tmp.name, "alias.json")
+                if os.path.exists(alias):
+                    os.remove(alias)
+                try:
+                    os.link(target, alias)
+                except OSError as err:
+                    self.skipTest(f"no hard links here: {err}")
+                with open(target, "rb") as f:
+                    before = f.read()
+                with self.assertRaisesRegex(mv.ManifestError, "same file"):
+                    mv.verify_manifest(self.game, self.manifest, cache_path=alias)
+                with open(target, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_saving_never_touches_an_existing_tmp_file(self) -> None:
+        bystanders = {}
+        for name in ("cache.json.tmp", ".cache.json.tmp", "cache.tmp"):
+            path = os.path.join(self.tmp.name, name)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(name)
+            bystanders[path] = name
+        self.verify()
+        self.assertEqual(self.cached_names(), {"a.bin", "b.bin"})  # the cache was written
+        for path, text in bystanders.items():
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), text)
+        stray = [n for n in os.listdir(self.tmp.name)
+                 if n.endswith(".tmp") and os.path.join(self.tmp.name, n) not in bystanders]
+        self.assertEqual(stray, [])
+
+    def test_no_change_time_means_no_cache_entry(self) -> None:
+        # Windows FAT/exFAT have no ChangeTime, and st_ctime there is the creation time, which a same-size rewrite
+        # with the mtime set back leaves unchanged. Such files are hashed every run instead.
+        with patch.object(mv, "_change_time", return_value=None):
+            self.verify()
+            calls = []
+            real = mv.sha256_file
+            with patch.object(mv, "sha256_file", side_effect=lambda p, *a, **k: calls.append(p) or real(p, *a, **k)):
+                report = self.verify()
+        self.assertEqual((report.passed, report.cached, len(calls)), (True, 0, 2))
+        if os.path.exists(self.cache):  # nothing to keep: no cache file, or an empty one
+            with open(self.cache, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["files"], {})
+
 
 if __name__ == "__main__":
     unittest.main()
