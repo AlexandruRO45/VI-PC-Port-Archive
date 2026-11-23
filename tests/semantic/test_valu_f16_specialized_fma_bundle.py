@@ -503,5 +503,22 @@ class TestVFmaMixhiF16SIMDAndIEEE(unittest.TestCase):
         res_inf = ref_v_fma_mixhi_f16(0x7F800000, 0x40000000, 0x3F000000)
         self.assertEqual(res_inf >> 16, 0x7C00)
 
+class TestVFmaMixhiF16Translation(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        lines = [
+            "v_mov_b32 v0, 0x3f800000",
+            "v_mov_b32 v1, 0x40000000",
+            "v_mov_b32 v2, 0x3f000000",
+            "v_fma_mixhi_f16 v3, v0, v1, v2",
+            "exp mrt0, v3, v3, v3, v3 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_v_fma_mixhi_f16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] >> 16, 0x4100)
+
 if __name__ == "__main__":
     unittest.main()
