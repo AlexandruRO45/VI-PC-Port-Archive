@@ -181,5 +181,61 @@ class TestVDivScaleF32ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.vcc, 0)
 
 
+class WaveDivState:
+    def __init__(self, wave_size: int = 64) -> None:
+        self.wave_size = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vcc_mask: int = 0
+        self.vgprs: list[dict[int, int]] = [{i: 0 for i in range(256)} for _ in range(wave_size)]
+
+    def read_lane_f32(self, lane: int, op: Operand) -> float:
+        if op.reg_type == RegType.IMM:
+            return float(op.index_or_val)
+        elif op.reg_type == RegType.VGPR:
+            return bits_to_f32(self.vgprs[lane][int(op.index_or_val)])
+        raise ValueError(f"Unsupported operand: {op}")
+
+    def write_lane_f32(self, lane: int, idx: int, val: float) -> None:
+        if (self.exec_mask >> lane) & 1:
+            self.vgprs[lane][idx] = f32_to_bits(val)
+
+def step_simd_div_scale_f32(wave: WaveDivState, instr: Instruction) -> None:
+    if instr.opcode != "v_div_scale_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            numer = wave.read_lane_f32(lane, instr.src0)
+            denom = wave.read_lane_f32(lane, instr.src1)
+            sel = wave.read_lane_f32(lane, instr.src2)
+            val, vcc = ref_div_scale_f32(numer, denom, sel)
+            wave.write_lane_f32(lane, int(instr.dst.index_or_val), val)
+            if vcc:
+                wave.vcc_mask |= (1 << lane)
+            else:
+                wave.vcc_mask &= ~(1 << lane)
+
+
+class TestVDivScaleF32SIMD(unittest.TestCase):
+    """SIMD multi-lane divergence and scaling exponent boundaries for v_div_scale_f32."""
+
+    def test_simd_multi_lane_divergence(self):
+        wave = WaveDivState(wave_size=32)
+        wave.exec_mask = 0x0000FFFF
+        for lane in range(32):
+            wave.vgprs[lane][1] = f32_to_bits(10.0)
+            wave.vgprs[lane][2] = f32_to_bits(2.0)
+            wave.vgprs[lane][3] = f32_to_bits(10.0)
+            wave.vgprs[lane][0] = f32_to_bits(999.0)
+
+        instr = Instruction("v_div_scale_f32", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_simd_div_scale_f32(wave, instr)
+
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 10.0)
+            else:
+                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 999.0)
+
+
 if __name__ == "__main__":
     unittest.main()
