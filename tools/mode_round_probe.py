@@ -238,8 +238,10 @@ def main(argv=None):
         if c["ok"] != c["total"] or not t["all_ok"]:
             mismatches += 1
         t_ok = sum(info["ok"] for info in t["ops"].values())
+        t_diffs = sum(info["rne_rtz_diffs"] for info in t["ops"].values())
+        t_inputs = sum(info["inputs"] for info in t["ops"].values())
         print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
-              f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
+              f"{t_ok}/{len(t['ops'])} f16 transcendentals, {t_diffs}/{t_inputs} RNE/RTZ diffs")
         for op, info in t["ops"].items():
             if not info["ok"]:
                 print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "

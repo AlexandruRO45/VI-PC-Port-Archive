@@ -141,9 +141,13 @@ class FakeModeOracle:
 class SummaryLineTests(unittest.TestCase):
     """The per-wave summary line reports what the oracle returned, not a fixed '7/7 ... 0/65536'."""
 
+    ALL_INPUTS = 7 * 65536   # the seven ops, every f16 input of each
+
     def run_main(self, oracle):
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(runner, "open_oracle", return_value=oracle),              mock.patch.object(hw_asm, "family", return_value="gfx10"),              mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+        with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+             mock.patch.object(hw_asm, "family", return_value="gfx10"), \
+             mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
             rc = probe.main(["--waves", "32"])
         return rc, out.getvalue(), err.getvalue()
 
@@ -151,13 +155,14 @@ class SummaryLineTests(unittest.TestCase):
         rc, out, err = self.run_main(FakeModeOracle())
         self.assertEqual(rc, 0, err)
         self.assertIn(f"{len(probe.CASES)}/{len(probe.CASES)} f16/f64 RNE/RTZ cases exact", out)
-        self.assertIn("7/7 f16 transcendentals 0/65536 RNE/RTZ diffs", out)
+        self.assertIn(f"7/7 f16 transcendentals, 0/{self.ALL_INPUTS} RNE/RTZ diffs", out)
 
     def test_mode_dependent_transcendental_is_reported(self):
         rc, out, err = self.run_main(FakeModeOracle(bad_op="v_sin_f16_e32", diffs=3))
         self.assertEqual(rc, 1, err)
         self.assertNotIn("7/7 f16 transcendentals", out)
-        self.assertIn("6/7 f16 transcendentals 0/65536 RNE/RTZ diffs", out)
+        # The aggregate counts the bad op's diffs too, not a fixed 0.
+        self.assertIn(f"6/7 f16 transcendentals, 3/{self.ALL_INPUTS} RNE/RTZ diffs", out)
         self.assertIn("v_sin_f16_e32: 3/65536 RNE/RTZ diffs", out)
 
 

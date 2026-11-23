@@ -142,7 +142,10 @@ class SummaryLineTests(unittest.TestCase):
 
     def run_main(self, oracle):
         out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle),              unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"),              unittest.mock.patch.object(probe, "probe_two_comp", return_value=self.TWO_OK),              redirect_stdout(out), redirect_stderr(err):
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), \
+             unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"), \
+             unittest.mock.patch.object(probe, "probe_two_comp", return_value=self.TWO_OK), \
+             redirect_stdout(out), redirect_stderr(err):
             rc = probe.main(["--waves", "32"])
         return rc, out.getvalue(), err.getvalue()
 
