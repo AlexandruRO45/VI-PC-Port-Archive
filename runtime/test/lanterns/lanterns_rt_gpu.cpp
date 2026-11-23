@@ -15,13 +15,14 @@ constexpr unsigned kRtTile = 8;
 
 }  // namespace
 
-bool load_rt_shader(const std::filesystem::path& dir, std::vector<std::uint8_t>& out) {
-    out = read_file(dir / "cs_lanterns_rt_shadow.dxbc");
+bool load_rt_shader(const std::filesystem::path& dir, std::vector<std::uint8_t>& out, const char* name) {
+    out = read_file(dir / name);
     CHECK(out.size() > 64);
     return true;
 }
 
-bool RtShadows::create(Gpu& gpu, const std::vector<std::uint8_t>& shader, const Scene& scene, unsigned masked) {
+bool RtShadows::create(Gpu& gpu, const std::vector<std::uint8_t>& shader, const Scene& scene, unsigned masked, bool opaque) {
+    opaque_ = opaque;
     gpu_ = &gpu;
     device_ = gpu.device();
     queue_ = gpu.queue();
@@ -183,7 +184,7 @@ bool RtShadows::build(const Scene& scene, unsigned masked) {
     std::uint64_t scratch = 0;
     for (unsigned m = 0; m < kRtMeshes; ++m) {
         geometry[m].Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-        geometry[m].Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        geometry[m].Flags = opaque_ ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
         geometry[m].Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
         geometry[m].Triangles.VertexCount = UINT(scene.meshes[m].vertices.size());
         geometry[m].Triangles.VertexBuffer = {geometry_->GetGPUVirtualAddress() + vb_off[m], sizeof(Vertex)};

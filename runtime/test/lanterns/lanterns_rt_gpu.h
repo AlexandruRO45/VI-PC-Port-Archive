@@ -14,7 +14,9 @@
 
 namespace lanterns {
 
-bool load_rt_shader(const std::filesystem::path& dir, std::vector<std::uint8_t>& out);
+// Stage 11's shader by default; stage 23 loads cs_lanterns_rt_alpha.dxbc.
+bool load_rt_shader(const std::filesystem::path& dir, std::vector<std::uint8_t>& out,
+                    const char* name = "cs_lanterns_rt_shadow.dxbc");
 
 // traced: the TLAS as drawn; masked: one instance's mask 0; swapped: kRtSwapA and kRtSwapB name each other's BLAS;
 // stall: a self-referencing BVH only the step cap ends; overflow: one whose stack grows by three a step (see build).
@@ -30,7 +32,8 @@ struct RtSizes {
 class RtShadows {
 public:
     // masked: the TLAS instance whose mask is 0 in the control TLAS.
-    bool create(Gpu& gpu, const std::vector<std::uint8_t>& shader, const Scene& scene, unsigned masked);
+    // opaque false builds the BLASes from non-opaque geometry, as a title's alpha-tested meshes are (stage 23).
+    bool create(Gpu& gpu, const std::vector<std::uint8_t>& shader, const Scene& scene, unsigned masked, bool opaque = true);
     // Traces the Gpu's last frame through one of the TLASes or fixtures (RtRun). Both buffers are poisoned first.
     bool run(const Scene& scene, RtRun which, std::vector<std::uint32_t>& pixels, std::vector<std::uint32_t>& steps);
     const RtSizes& sizes() const { return sizes_; }
@@ -51,6 +54,7 @@ private:
     Ref<ID3D12Fence> fence_;
     RtSizes sizes_;
     std::uint64_t fence_value_ = 0, heap_cpu_ = 0, heap_gpu_ = 0;
+    bool opaque_ = true;
     bool first_run_ = true;
 };
 

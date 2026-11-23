@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20|22|24 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20|22|23|24 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -67,6 +67,10 @@
 // Stage 24: local X and Y thread IDs. A compute shader with a 16x8 local size (four wave32 waves) on a 2x3 grid writes,
 // per lane, its own grid position and that of its point mirror in the group, read through LDS after the barrier
 // (lanterns_xy.h). Every word must be exact; with X and Y swapped the words move.
+//
+// Stage 23: alpha-tested ray-traced shadows. Stage 11's scene and traversal, with the BLASes built from non-opaque
+// geometry and a hit counting only where its barycentrics (from image_bvh_intersect_ray) fall on the triangle's opaque
+// side of u + 2v = 1; compared with stage 11's opaque traversal of the same frame (lanterns_rt.h).
 //
 // Stage 22: a G-buffer round trip. A fullscreen pixel shader writes six targets (RGBA8 IDs, RGB10A2 codes, RG16F motion,
 // sRGB albedo, RGBA16F emissive, more RGBA8 IDs), every export packed as half floats; a compute pass reads them back
@@ -1077,6 +1081,78 @@ int stage24(const std::filesystem::path& shader_dir, const std::filesystem::path
     return 0;
 }
 
+int stage23(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    lanterns::Shaders shaders;
+    std::vector<std::uint8_t> solid_shader, alpha_shader;
+    if (!lanterns::load_shaders(shader_dir, 9, shaders) || !lanterns::load_rt_shader(shader_dir, solid_shader) ||
+        !lanterns::load_rt_shader(shader_dir, alpha_shader, "cs_lanterns_rt_alpha.dxbc"))
+        return 1;
+    const lanterns::Scene scene = lanterns::stage11();
+    std::vector<std::uint32_t> cut, solid, steps, steps_solid;
+    {
+        lanterns::Gpu gpu;
+        lanterns::RtShadows rt_alpha, rt_solid;   // non-opaque BLASes with the alpha test; stage 11's opaque ones
+        std::vector<Color> albedo;
+        if (!gpu.create(scene, shaders, DXGI_FORMAT_R8G8B8A8_UNORM) || !gpu.submit_frame(scene, true, 0) ||
+            !gpu.finish_frame(albedo))
+            return 1;
+        if (!rt_alpha.create(gpu, alpha_shader, scene, 1, false) || !rt_solid.create(gpu, solid_shader, scene, 1)) {
+            std::fprintf(stderr, "lanterns: stage 23 BLOCKED before tracing (see the line above)\n");
+            return 1;
+        }
+        if (!rt_alpha.run(scene, lanterns::RtRun::traced, cut, steps) ||
+            !rt_solid.run(scene, lanterns::RtRun::traced, solid, steps_solid) || !gpu.idle())
+            return 1;
+    }
+    const auto tris = lanterns::rt_triangles(scene);
+    const auto ref = lanterns::rt_reference(scene, tris, true), ref_solid = lanterns::rt_reference(scene, tris);
+    const std::vector<Color> frame = lanterns::unpack_rgba8(cut), frame_solid = lanterns::unpack_rgba8(solid);
+    const lanterns::Comparison c = lanterns::compare_textured(frame, ref), cs = lanterns::compare_textured(frame_solid, ref_solid);
+    const auto single = [](const lanterns::TexturedReference& r, std::size_t i) {
+        return r.certain[i] && lanterns::detail::same(r.bounds[i].lo, r.bounds[i].hi);
+    };
+    unsigned exact = 0, singles = 0, unfinished = 0, poisoned = 0, expected = 0, changed = 0, still = 0, kept = 0;
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        for (const auto* v : {&cut, &solid, &steps, &steps_solid}) poisoned += (*v)[i] == lanterns::kRtPoison;
+        unfinished += cut[i] == lanterns::kRtUnfinished || solid[i] == lanterns::kRtUnfinished;
+        if (!single(ref, i)) continue;
+        ++singles;
+        exact += lanterns::detail::same(frame[i], ref.bounds[i].lo);
+        // The cut-outs against the opaque traversal: exactly the pixels whose expected colour differs must differ.
+        if (!single(ref_solid, i)) continue;
+        if (!lanterns::detail::same(ref.bounds[i].lo, ref_solid.bounds[i].lo)) ++expected, changed += cut[i] != solid[i];
+        else ++still, kept += cut[i] == solid[i];
+    }
+    std::printf("lanterns: alpha-tested frame: %u of %u single-colour pixels exact, %u of %u certain pixels within bounds, "
+                "%u of %u uncertain within bounds; opaque frame: %u of %u certain pixels within bounds; %u rays left "
+                "unfinished, %u poisoned words left\n", exact, singles, c.certain_exact, c.certain, c.uncertain_plausible,
+                c.uncertain, cs.certain_exact, cs.certain, unfinished, poisoned);
+    if (!c.pass()) report("alpha-tested frame", c);
+    if (!cs.pass()) report("opaque frame", cs);
+    std::printf("lanterns: against the opaque traversal, the cut-outs changed %u of %u predicted pixels and kept %u of %u "
+                "predicted unchanged\n", changed, expected, kept, still);
+    lanterns::Reference shown;
+    shown.color.resize(frame.size());
+    shown.candidates.resize(frame.size());
+    std::vector<std::uint8_t> states(frame.size());
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        for (int k = 0; k < 4; ++k) shown.color[i][k] = (ref.bounds[i].lo[k] + ref.bounds[i].hi[k]) / 2;
+        states[i] = !lanterns::within(frame[i], ref.bounds[i]) ? 2 : single(ref, i) ? 3 : 1;
+    }
+    if (!dump(out_dir, "stage23-frame", frame, shown, &states) || !dump(out_dir, "stage23-opaque", frame_solid, shown, &states))
+        return 1;
+    if (!c.pass() || !cs.pass() || exact != singles || unfinished || poisoned || expected < 300 || changed != expected ||
+        kept != still) {
+        std::fprintf(stderr, "lanterns: stage 23 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 23: PASS, alpha-tested shadow rays through non-opaque BLASes, a hit counting only where its "
+                "barycentrics from image_bvh_intersect_ray give u + 2v < 1: %u of %u single-colour pixels exact, and "
+                "against the opaque traversal the cut-outs changed %u of %u predicted pixels and kept %u of %u\n",
+                exact, singles, changed, expected, kept, still);
+    return 0;
+}
+
 int stage22(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
     const lanterns::Scene scene = lanterns::stage1();
     lanterns::Shaders shaders;
@@ -1185,9 +1261,10 @@ int main(int argc, char** argv) {
     case 11: return stage11(shader_dir, out_dir);
     case 20: return stage20(shader_dir, out_dir);
     case 22: return stage22(shader_dir, out_dir);
+    case 23: return stage23(shader_dir, out_dir);
     case 24: return stage24(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20|22|24 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20|22|23|24 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }

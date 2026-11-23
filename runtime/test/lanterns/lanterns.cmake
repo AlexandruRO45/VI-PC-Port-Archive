@@ -63,7 +63,8 @@ elseif(LEONIDA_TEST_LANTERNS)
                       ${_lanterns_src}/shaders/cs_lanterns_rt_shadow.asm
                       ${_lanterns_src}/shaders/cs_lanterns_samplers.asm
                       ${_lanterns_src}/shaders/cs_lanterns_xy.asm
-                      ${_lanterns_src}/shaders/ps_lanterns_gbuf6.asm ${_lanterns_src}/shaders/cs_lanterns_gbuf_decode.asm)
+                      ${_lanterns_src}/shaders/ps_lanterns_gbuf6.asm ${_lanterns_src}/shaders/cs_lanterns_gbuf_decode.asm
+                      ${_lanterns_src}/shaders/cs_lanterns_rt_alpha.asm)
     get_filename_component(_lanterns_spirv_tools ${LEONIDA_SPIRV_AS} DIRECTORY)
     file(TO_NATIVE_PATH "${_lanterns_spirv_tools}" _lanterns_spirv_tools)
     add_custom_command(
@@ -79,7 +80,7 @@ elseif(LEONIDA_TEST_LANTERNS)
     add_dependencies(lanterns lanterns_shaders)
     if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING)
       # One test per stage (the runner gives each its own output folder under --out).
-      foreach(_stage 1 3 5 6 8 9 10 11 20 22 24)
+      foreach(_stage 1 3 5 6 8 9 10 11 20 22 23 24)
         add_test(NAME lanterns_stage${_stage}
                  COMMAND $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/run_lanterns.py
                          --gta6rt $<TARGET_FILE:gta6rt> --guest $<TARGET_FILE:lanterns>

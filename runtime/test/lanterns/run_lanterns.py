@@ -43,6 +43,7 @@ folder:
             the second control (two instances swap BLAS references) | frame
   stage 20: the probe card (rows POINT, LINEAR, comparison, plain depth sample; a cell per probe); sheet: card | reference
   stage 22: the sRGB albedo target of the 6-target run; sheet: target | reference / target | mask
+  stage 23: the alpha-tested shadows; sheet: frame | reference / the opaque traversal | mask
   stage 24: the 32x24 grid (own word left, mirror word right in each cell); sheet: grid | reference
 """
 import argparse
@@ -117,6 +118,11 @@ PASS_LINES = {
          rf"decoded lighting {N} of {N} exact; with 5 targets the sixth stayed clear at {N} of {N} pixels",
          lambda i, n1, c, n2, m, n3, e, n4, a, n5, ax, l, n6, s, n7: n1 == n2 == n3 == n4 == n5 == n6 == 196608
          and i == c == m == e == a == l == 196608 and 0 <= ax <= a and s == n7 == 98304),
+    23: (rf"Lanterns stage 23: PASS, alpha-tested shadow rays through non-opaque BLASes, a hit counting only where its "
+         rf"barycentrics from image_bvh_intersect_ray give u \+ 2v < 1: {N} of {N} single-colour pixels exact, and "
+         rf"against the opaque traversal the cut-outs changed {N} of {N} predicted pixels and kept {N} of {N}",
+         lambda a, b, changed, predicted, kept, still: a == b and changed == predicted and predicted >= 300
+         and kept == still),
     24: (rf"Lanterns stage 24: PASS, a 16x8 local size \(four wave32 waves, local X in v0 and local Y in v1\) on a 2x3 "
          rf"grid: {N} of {N} positions exact, and {N} of {N} point-mirror words read through LDS after the barrier",
          lambda a, b, c, d: a == b == c == d == 768),
@@ -366,6 +372,8 @@ PANELS = {
     20: {"main": [["stage20-probes.gpu"]], "sheet": [["stage20-probes.gpu", "stage20-probes.ref"]]},
     22: {"main": [["stage22-albedo.gpu"]],
          "sheet": [["stage22-albedo.gpu", "stage22-albedo.ref"], ["stage22-albedo.gpu", "stage22-albedo:mask"]]},
+    23: {"main": [["stage23-frame.gpu"]],
+         "sheet": [["stage23-frame.gpu", "stage23-frame.ref"], ["stage23-opaque.gpu", "stage23-frame:mask"]]},
     24: {"main": [["stage24-grid.gpu"]], "sheet": [["stage24-grid.gpu", "stage24-grid.ref"]]},
 }
 

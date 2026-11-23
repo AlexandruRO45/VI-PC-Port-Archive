@@ -50,6 +50,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [11](#stage-11-ray-traced-shadows-through-blastlas) | One shadow ray per pixel through a TLAS over two BLASes, walked with `image_bvh_intersect_ray` | Masking one instance or swapping two BLAS references changes the predicted pixels; a stalled BVH stops at the step cap |
 | [20](#stage-20-samplers-held-as-literals) | A compute shader samples through three samplers it builds from immediates, as the console compiles static samplers | A POINT sampler made LINEAR, or the comparison bits cleared, changes the predicted samples |
 | [22](#stage-22-a-g-buffer-round-trip) | Five and six G-buffer targets written through packed half exports, then decoded by a compute pass | A binary16 target in place of the RGBA8 IDs, or UNORM in place of sRGB, breaks the predicted values |
+| [23](#stage-23-alpha-tested-ray-traced-shadows) | Stage 11's shadow rays through non-opaque BLASes, a hit counting only on the opaque side of its barycentrics | u and v swapped in the shader moves the predicted shadows |
 | [24](#stage-24-local-x-and-y-thread-ids) | A compute shader with a 16x8 local size reads local X and local Y | X and Y swapped moves every predicted word |
 
 ## Stage 1
@@ -387,6 +388,26 @@ code). The sRGB part follows #4251, which checks the sRGB formats the game uses.
 
 ```
 Lanterns stage 22: PASS, G-buffers of 5 and 6 targets written through packed half-float exports: byte IDs 196608 of 196608 pixels exact (RGBA8, read back by a truncating x255 decode), 10-bit codes 196608 of 196608, signed RG16F motion 196608 of 196608, RGBA16F emissive 196608 of 196608, sRGB albedo 196608 of 196608 within one code (178702 exact), decoded lighting 196608 of 196608 exact; with 5 targets the sixth stayed clear at 98304 of 98304 pixels
+```
+
+## Stage 23: alpha-tested ray-traced shadows
+
+The title's foliage and fences are alpha-tested in its ray-traced shadows: the BLASes are built from non-opaque
+geometry, and a hit counts only where the surface is opaque at the hit. `cs_lanterns_rt_alpha` is stage 11's shader
+with that test. The barycentrics `image_bvh_intersect_ray` returns (u = i_num / t_denom, weighing the triangle's
+second vertex, v = j_num / t_denom, its third, as D3D12 defines them) must give u + 2v < 1; the rest of every triangle
+is cut out, and the traversal goes on past a hit there. The rule is not symmetric in u and v, so it also checks that the
+two words come back in D3D12's order (the translator reads the node's vertices and applies the leaf's remap byte; see
+[bvh.md](bvh.md)).
+
+How the check works. `lanterns_rt.h` traces the same rays on the CPU and applies the same rule. A hit within 0.01 of
+u + 2v = 1, or of a triangle edge, leaves its pixel undecided. Every single-colour pixel must be exact. The same frame
+is also traced with stage 11's opaque BLASes and shader: exactly the pixels the cut-outs are predicted to light must
+differ, and no other. Mutation that fails: u and v swapped in the shader (1,766 single-colour pixels wrong, 522 of
+1,159 predicted changes).
+
+```
+Lanterns stage 23: PASS, alpha-tested shadow rays through non-opaque BLASes, a hit counting only where its barycentrics from image_bvh_intersect_ray give u + 2v < 1: 96750 of 96750 single-colour pixels exact, and against the opaque traversal the cut-outs changed 1159 of 1159 predicted pixels and kept 95449 of 95449
 ```
 
 ## Stage 24: local X and Y thread IDs

@@ -32,6 +32,9 @@ inline std::array<float, 3> rt_light() { return {float_bits(0x3f0b81cbu), float_
 constexpr float kRtBias = 0.02f, kRtMax = 64.0f;
 constexpr std::uint32_t kRtLit = 256, kRtShadowed = 96;
 constexpr double kRtBaryMargin = 0.01;
+// Stage 23's alpha test: a hit counts only where its barycentrics give u + 2v < 1 (u weighs the triangle's second
+// vertex, v its third, as D3D12 defines them). Within kRtAlphaMargin of that line the CPU leaves the hit undecided.
+constexpr double kRtAlphaMargin = 0.01;
 constexpr std::uint32_t kRtStepCap = 2048;              // the traversal loop's bound (cs_lanterns_rt_shadow: s17)
 constexpr std::uint32_t kRtUnfinished = 0xffff00ffu;    // magenta: a ray still tracing when the cap ends the loop
 
@@ -121,8 +124,9 @@ inline std::vector<Triangle> rt_triangles(const Scene& scene, int skip = -1, boo
     return out;
 }
 
-// 0 free, 1 blocked, 2 undecided: a ray from o towards the light against every triangle (Moller-Trumbore in double).
-inline int rt_occlusion(const std::vector<Triangle>& tris, const double o[3], const double d[3]) {
+// 0 free, 1 blocked, 2 undecided: a ray from o towards the light against every triangle (Moller-Trumbore in double:
+// u and v are D3D12's barycentrics of the triangle's vertices in index order). alpha: stage 23's cut-outs apply.
+inline int rt_occlusion(const std::vector<Triangle>& tris, const double o[3], const double d[3], bool alpha = false) {
     bool maybe = false;
     for (const Triangle& t : tris) {
         const double e1[3] = {t[3] - t[0], t[4] - t[1], t[5] - t[2]}, e2[3] = {t[6] - t[0], t[7] - t[1], t[8] - t[2]};
@@ -136,13 +140,21 @@ inline int rt_occlusion(const std::vector<Triangle>& tris, const double o[3], co
         const double tt = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) / det;
         const double m = kRtBaryMargin;
         if (u < -m || v < -m || u + v > 1 + m || tt < -1e-3 || tt > kRtMax + 1e-3) continue;
-        if (u > m && v > m && u + v < 1 - m && tt > 1e-3 && tt < kRtMax - 1e-3) return 1;
+        const bool inside = u > m && v > m && u + v < 1 - m && tt > 1e-3 && tt < kRtMax - 1e-3;
+        if (alpha) {
+            const double a = u + 2 * v;
+            if (a > 1 + kRtAlphaMargin) continue;   // cut out wherever on this triangle the ray crosses
+            if (inside && a < 1 - kRtAlphaMargin) return 1;
+            maybe = true;
+            continue;
+        }
+        if (inside) return 1;
         maybe = true;
     }
     return maybe ? 2 : 0;
 }
 
-inline TexturedReference rt_reference(const Scene& scene, const std::vector<Triangle>& tris) {
+inline TexturedReference rt_reference(const Scene& scene, const std::vector<Triangle>& tris, bool alpha = false) {
     const auto light = rt_light();
     const double d[3] = {light[0], light[1], light[2]};
     unsigned degenerate = 0;
@@ -159,13 +171,13 @@ inline TexturedReference rt_reference(const Scene& scene, const std::vector<Tria
         }
         // Undecided if any origin within the slack decides differently: the centre and the box's corners. The slack
         // is the rebuilt position's (position_slack) plus 1e-3 for the decoded normal's offset.
-        int state = rt_occlusion(tris, o, d);
+        int state = rt_occlusion(tris, o, d, alpha);
         const auto ps = position_slack(scene, site);
         const double slack[3] = {ps[0] + 1e-3, ps[1] + 1e-3, ps[2] + 1e-3};
         for (int c = 0; c < 8 && state != 2; ++c) {
             const double oc[3] = {o[0] + (c & 1 ? slack[0] : -slack[0]), o[1] + (c & 2 ? slack[1] : -slack[1]),
                                   o[2] + (c & 4 ? slack[2] : -slack[2])};
-            if (rt_occlusion(tris, oc, d) != state) state = 2;
+            if (rt_occlusion(tris, oc, d, alpha) != state) state = 2;
         }
         const std::uint32_t f_lo = state == 0 ? kRtLit : kRtShadowed, f_hi = state == 1 ? kRtShadowed : kRtLit;
         for (int k = 0; k < 3; ++k) {
