@@ -31,6 +31,8 @@ RUNNER_SKIPS = {
         # One-line wrapper around _check_random_graphs(), which the runner already calls; listing it would run
         # the 18,000-graph sweep twice.
         "test_random_graphs",
+        # The same for _check_unwrapped_guards() (the 18,000 graphs again, with the known-%pc guards dropped).
+        "test_unwrapped_guards",
         # Dead on upstream/main at 16282101: its four S.depth() asserts run nowhere.  PR #3122 adds the call;
         # drop this entry once that merges and the runner calls test_depth() first.
         "test_depth",

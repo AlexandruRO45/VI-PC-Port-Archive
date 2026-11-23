@@ -373,6 +373,8 @@ class Gen:
                                   # single defining plain v_mov of it); valid I/J sources (SHADER-177)
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
+        self.pc_may_end = set()   # blocks ending in a conditional branch with no block after them: when the branch
+                                  # isn't taken, %pc is past the end, which `succ` doesn't list
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
@@ -15293,6 +15295,18 @@ def assemble(gen):
                      else (None, None))
     if nesting is not None:
         gen.nesting = nesting
+    if tree is not None and ms:
+        # A guard that every path reaches with %pc already naming its block is always taken, so its items go in
+        # unguarded: the join of an if/else, or the block after a skipped s_sendmsg, at the top level then runs
+        # in uniform control flow, as on the hardware. The same abstract interpretation of %pc as the emulated
+        # wave64 tree (wave64_emulate_opt), over what each block stores in %pc: its successors, or past the end.
+        # AMD's Windows driver 24.10.24 (gfx1036) crashes in vkCreateGraphicsPipelines on a mesh shader with any
+        # barrier inside a selection construct, even one whose condition is a push constant (ms_wave_info_s3).
+        # Mesh shaders only: the other stages compile on that driver, and their output stays as it was.
+        end = cfg_structure.END
+        out_pcs = {b: frozenset(s or (end,)) | ({end} if b in gen.pc_may_end else frozenset())
+                   for b, s in enumerate(gen.succ)}
+        tree = wave64_emulate_opt._unwrap_known_pc_guards(tree, out_pcs, 0)
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
     if gen.emulate:
         gen.control_flow = "emulated wave64 structured" if gen.emulate_plan is not None else "emulated wave64 rounds"
@@ -17043,6 +17057,8 @@ def translate(path):
                     marks0, body0 = len(g.x_marks), len(g.body)
                     cond = branch_condition(g, op)
                     alt = g.cu(fall) if fall is not None else g.cu(len(blocks))   # past the end = default -> done
+                    if fall is None:
+                        g.pc_may_end.add(n)
                     r = g.tmp()
                     g.emit(f"{r} = OpSelect %uint {cond} {g.cu(tgt)} {alt}")
                     g.emit(f"OpStore %pc {r}")

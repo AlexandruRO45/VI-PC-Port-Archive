@@ -159,6 +159,52 @@ def test_random_graphs():
     _check_random_graphs()
 
 
+def _check_unwrapped_guards():
+    """The native translator drops the guards that %pc already satisfies (wave64_emulate_opt's
+    _unwrap_known_pc_guards over what each block stores in %pc). The unwrapped tree must run exactly the blocks the
+    graph does, and the same ones as the tree it came from when some blocks may also leave %pc past the end (a
+    conditional branch with no block after it, which `succ` doesn't list)."""
+    import wave64_emulate_opt as W
+    rng = random.Random(20261123)
+    checked = dropped = 0
+    for case in range(20000):
+        succ = random_graph(rng)
+        tree = S.structure(succ)
+        if tree is None:
+            continue
+        for with_end in (False, True):
+            may_end = {b for b in range(len(succ)) if with_end and succ[b] and rng.random() < 0.2}
+            ends = [list(s) + [S.END] if b in may_end else list(s) for b, s in enumerate(succ)]
+            out_pcs = {b: frozenset(s or (S.END,)) for b, s in enumerate(ends)}
+            flat = W._unwrap_known_pc_guards(tree, out_pcs, 0)
+            assert sorted(blocks_in(flat)) == sorted(blocks_in(tree)), f"blocks lost or duplicated: {succ}"
+            dropped += repr(tree).count("'guard'") - repr(flat).count("'guard'")
+            for seed in range(6):
+                got = S.run(flat, chooser(ends, seed), 200)
+                assert got == S.run(tree, chooser(ends, seed), 200), \
+                    f"graph {succ} (may end {may_end}) seed {seed}: unwrapped ran {got}"
+                if not may_end:
+                    assert got == walk(succ, chooser(succ, seed), 200), f"graph {succ} seed {seed}: ran {got}"
+            checked += 1
+    # The ms_wave_info_s3 shape: 0 skips 1 (the wave that doesn't send) or runs it; 2 is the join every path reaches.
+    assert W._unwrap_known_pc_guards(S.structure([[2, 1], [2], []]), {0: {1, 2}, 1: {2}, 2: {S.END}}, 0) == \
+        [("block", 0), ("guard", 1, [("block", 1)]), ("block", 2)]
+    # Then a second if (2 -> 3 or 4): 3 keeps its guard, the join 4 doesn't need one.
+    assert W._unwrap_known_pc_guards(S.structure([[2, 1], [2], [3, 4], [4], []]),
+                                     {0: {1, 2}, 1: {2}, 2: {3, 4}, 3: {4}, 4: {S.END}}, 0) == \
+        [("block", 0), ("guard", 1, [("block", 1)]), ("block", 2), ("guard", 3, [("block", 3)]), ("block", 4)]
+    # Block 2 may end the program instead (an early exit): 4 runs only when %pc says so.
+    assert W._unwrap_known_pc_guards(S.structure([[2, 1], [2], [3, 4], [4], []]),
+                                     {0: {1, 2}, 1: {2}, 2: {3, 4, S.END}, 3: {4}, 4: {S.END}}, 0)[-1] == \
+        ("guard", 4, [("block", 4)])
+    assert checked > 5000 and dropped > 5000, (checked, dropped)
+    return checked, dropped
+
+
+def test_unwrapped_guards():
+    _check_unwrapped_guards()
+
+
 def test_depth():
     assert S.depth([("block", 0)]) == 0
     assert S.depth([("block", 0), ("loop", 1, [("block", 1), ("guard", 2, [("block", 2)])])]) == 2
@@ -252,5 +298,7 @@ if __name__ == "__main__":
     test_shapes()
     test_deep_sequential_chains_stay_flat_and_iterative()
     structured, refused, loops, split_ok, split_cap = _check_random_graphs()
+    checked, dropped = _check_unwrapped_guards()
     print(f"ok: {structured} graphs structured and run, {refused} irreducible "
-          f"({split_ok} split-structured, {split_cap} capped), {loops} with loops")
+          f"({split_ok} split-structured, {split_cap} capped), {loops} with loops; "
+          f"{checked} run again with {dropped} known-%pc guards dropped")
