@@ -2866,11 +2866,14 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `LEONIDA_PRESENTX_RESUME_SLOT`) routes just that slot, 19..127, and logs the first call with the slot and the three
   argument words; every other slot keeps the refusal. With `LEONIDA_CAPTURE=<dir>` a routed `PresentX` creates no
   window and no swapchain: the plane count (0-2), the plane array, each `ppResources` and each resource's vtable are
-  checked with `VirtualQuery` before they are read; the resource must be a single-sample 2D BGRA8/RGBA8 texture created
-  with `D3D12_HEAP_FLAG_ALLOW_DISPLAY` (assumed to be in `PRESENT`). Each plane with `ResourceCount >= 1` copies
+  checked with `VirtualQuery` before they are read; the resource must be one of this layer's resources (it must
+  answer the private layer `Resource` tag, so a foreign object with an executable vtable is refused before any
+  `ID3D12Resource` method is called), a single-sample 2D BGRA8/RGBA8 texture created with
+  `D3D12_HEAP_FLAG_ALLOW_DISPLAY` (assumed to be in `PRESENT`). Each plane with `ResourceCount >= 1` copies
   `ppResources[0]` through a committed readback buffer on the presenting queue and writes
   `present-<n>-plane-<m>.ppm` (P6, RGB; `n` counts routed presents including blanks, `m` is the plane). A malformed
-  call returns `E_INVALIDARG` with one log line and never faults; a zero-plane present writes nothing and returns
+  call returns `E_INVALIDARG` with one log line and never faults; refusal lines are throttled per distinct message
+  (one per 250 ms) so a mis-routed slot cannot flood stderr; a zero-plane present writes nothing and returns
   `S_OK`. Without `LEONIDA_CAPTURE` a routed present is accepted and dropped. Both variables are read once, at the
   first call past the public chain, so the path is inert when they are unset.
 - *Plane composition* (M7). *Fact* (public MIT sample, Xbox-GDK-Samples `Samples/Graphics/HDR10/DeviceResources.cpp` and

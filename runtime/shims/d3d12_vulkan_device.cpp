@@ -12,6 +12,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_object_tags.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
@@ -1642,8 +1643,9 @@ private:
 class Resource final
     : public Child<Resource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource> {
 public:
-    // {9b3e5f12-7c48-4d0e-a6b1-2f8d4c7e9a35}
-    static constexpr GUID kTag{0x9b3e5f12, 0x7c48, 0x4d0e, {0xa6, 0xb1, 0x2f, 0x8d, 0x4c, 0x7e, 0x9a, 0x35}};
+    // {9b3e5f12-7c48-4d0e-a6b1-2f8d4c7e9a35}, shared with presentx_capture.cpp so the capture guard and this object
+    // cannot drift.
+    static constexpr GUID kTag = kLeonidaResourceTag;
 
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags)

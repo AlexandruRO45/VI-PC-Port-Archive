@@ -3,8 +3,9 @@
 // names a queue slot past the public ID3D12CommandQueue chain; the routing itself lives in d3d12_xs_device.cpp.
 //
 // LEONIDA_CAPTURE=<dir> makes a routed PresentX write present-<n>-plane-<m>.ppm instead of presenting: no window,
-// no swapchain, no presenter. Every pointer the call passes is validated with VirtualQuery before it is read, and a
-// malformed call returns E_INVALIDARG with one log line, never a fault.
+// no swapchain, no presenter. Every pointer the call passes is validated with VirtualQuery before it is read, the
+// resource must answer the layer's private Resource tag, and a malformed call returns E_INVALIDARG with one
+// throttled log line, never a fault.
 #pragma once
 
 #include <d3d12.h>
@@ -28,8 +29,9 @@ bool presentx_capture_enabled();
 
 // A routed PresentX. With capture off it returns S_OK without reading `planes` (a routed present is accepted and
 // dropped: no window and no swapchain are created). With capture on it validates the plane array and every resource
-// pointer, copies each plane's first resource through `device` and `queue`, and writes one PPM per plane.
-// E_INVALIDARG for a malformed call (logged once), E_FAIL for a device, queue or file failure.
+// pointer, requires each resource to answer the layer's private Resource tag, copies each plane's first resource
+// through `device` and `queue`, and writes one PPM per plane. E_INVALIDARG for a malformed call (logged once per
+// distinct message per 250 ms), E_FAIL for a device, queue or file failure.
 HRESULT presentx_capture_present(ID3D12Device* device, ID3D12CommandQueue* queue, UINT plane_count,
                                  const XboxPresentPlaneParameters* planes);
 
