@@ -27,6 +27,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
@@ -245,13 +246,13 @@ def main(argv=None):
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    out_abs = os.path.abspath(a.out)
-    try:
-        if os.path.exists(a.out) and os.path.samefile(a.archive, a.out):
-            raise ValueError(f"output {a.out!r} is the input archive")
-    except (OSError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+    if os.path.isdir(a.out):
+        print(f"ERROR: output {a.out!r} is a directory", file=sys.stderr)
         return 2
+    if same_report_path(a.archive, a.out):
+        print(f"ERROR: output {a.out!r} is the input archive", file=sys.stderr)
+        return 2
+    out_abs = os.path.abspath(a.out)
     progress = None
     if not a.quiet:
         progress = lambda text: print(f"  {text}", file=sys.stderr, flush=True)

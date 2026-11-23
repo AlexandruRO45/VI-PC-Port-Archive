@@ -379,6 +379,41 @@ class NamesTest(unittest.TestCase):
             with open(arc, "rb") as f:
                 self.assertEqual(f.read(), original)
 
+    def test_refuses_output_that_is_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            make_archive(arc)
+            folder = os.path.join(tmp, "out_folder")
+            os.makedirs(folder)
+            p = self.run_tool(arc, folder, "--quiet")
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("is a directory", p.stderr)
+
+    def test_refuses_output_aliasing_input_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            make_archive(arc)
+            with open(arc, "rb") as f:
+                original = f.read()
+
+            cases = [
+                ("relative", os.path.join(tmp, ".", "tiny.rpf")),
+            ]
+            hardlink = os.path.join(tmp, "link.rpf")
+            try:
+                os.link(arc, hardlink)
+                cases.append(("hardlink", hardlink))
+            except (OSError, NotImplementedError, AttributeError):
+                pass
+
+            for name, out in cases:
+                with self.subTest(case=name):
+                    p = self.run_tool(arc, out, "--quiet")
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertIn("input archive", p.stderr)
+                    with open(arc, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
     def test_publish_creates_nested_parent_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             arc = os.path.join(tmp, "tiny.rpf")
