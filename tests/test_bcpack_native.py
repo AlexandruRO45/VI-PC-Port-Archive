@@ -136,14 +136,15 @@ def _bc7_cells():
     return VALID_BC7_CELLS
 
 
-def make_lanes(rng, codec, nblocks):
+def make_lanes(rng, codec, nblocks, clean=None, bc7_cells=None):
     widths = bcpack.LANE_WIDTHS[codec]
     per_block = 1 if codec in (1, 4) else 2
     n = nblocks * per_block
     lanes = [_rand_lane(rng, n, w) for w in widths]
     # A clean chunk stays inside itself and keeps BC6H/BC7 anchor indices and BC7 p-bits consistent, so it
     # decodes; the others mostly exercise refusals.
-    clean = rng.random() < 0.5
+    if clean is None:
+        clean = rng.random() < 0.5
     far = not clean and rng.random() < 0.2
     if codec in (1, 3, 4, 5) and (clean or rng.random() < 0.9):
         lanes[1] = [0] * n
@@ -171,9 +172,9 @@ def make_lanes(rng, codec, nblocks):
                 lanes[15][2 * i] = rng.randrange(14) if rng.random() < 0.97 else rng.randrange(32)
                 lanes[15][2 * i + 1] = rng.randrange(32)
         else:
-            cells = _bc7_cells()
+            cells = bc7_cells or _bc7_cells()
             for i in range(nblocks):
-                if rng.random() < 0.97:
+                if bc7_cells or rng.random() < 0.97:
                     lanes[15][2 * i], lanes[15][2 * i + 1] = rng.choice(cells)
                 else:
                     lanes[15][2 * i], lanes[15][2 * i + 1] = rng.randrange(32), rng.randrange(32)
@@ -196,6 +197,40 @@ def corrupt(rng, raw):
     return bytes(data)
 
 
+# The BC7 (mode, rotation) pairs with a channel swap: modes 4 and 5, rotation 1-3.
+BC7_ROTATIONS = [(mode, rot) for mode in (4, 5) for rot in (1, 2, 3)]
+
+
+def bc7_rotation_cases():
+    """Fixed BC7 chunks, one per rotated (mode, rotation) pair, that every block uses and Python decodes.
+
+    The seeded chunks reach rotated blocks only by chance (one chunk at the default seed), so a broken channel swap
+    could pass; these make it a deterministic check whatever --seed is.
+    """
+    table = bptc.load_bc7(None)
+    cfg, rank_of = table["config"], table["rank_of"]
+    rng = random.Random(7186)
+    cases = []
+    for mode, rot in BC7_ROTATIONS:
+        cells = [(a, b) for a, b in _bc7_cells() if cfg[rank_of[a * 16 + b]][0] == mode
+                 and cfg[rank_of[a * 16 + b]][2] == rot]
+        for _ in range(200):
+            nblocks = rng.choice((4, 16, 33))
+            lanes = make_lanes(rng, 7, nblocks, clean=True, bc7_cells=cells)
+            # A swap of two all-zero channels changes nothing, so every endpoint lane (R, G, B, A: lanes 2-5 for
+            # one subset) gets full-range deltas. Modes 4 and 5 have no p-bits, so the chunk stays clean.
+            for lane in (2, 3, 4, 5):
+                lanes[lane] = [rng.randrange(1 << bcpack.LANE_WIDTHS[7][lane]) for _ in range(2 * nblocks)]
+            raw = encode(rng, lanes, 7)
+            out = python_decode(7, nblocks * 16, raw, False)
+            if out[0] == STATUS_OK:
+                cases.append((7, nblocks * 16, raw))
+                break
+        else:
+            raise AssertionError(f"no decodable BC7 mode {mode} rotation {rot} chunk; widen the generator")
+    return cases
+
+
 def make_cases(seed, chunks):
     """(codec, out_size, raw) chunks: valid ones, corrupted ones, wrong sizes and unsupported codecs."""
     rng = random.Random(seed)
@@ -211,7 +246,7 @@ def make_cases(seed, chunks):
             if k % 6 == 0:
                 cases.append((codec, nblocks * bb + rng.choice((-bb, bb, bb // 2)), raw))
     cases += [(2, 16, b""), (0, 8, b"\x00"), (8, 16, b"")]
-    return cases
+    return cases + bc7_rotation_cases()
 
 
 # --- Both decoders ----------------------------------------------------------------------------------------------------
