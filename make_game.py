@@ -349,15 +349,20 @@ def match_version(game: str):
     return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
-def manifest_presence(game: str, version: dict) -> tuple[int, list[str], list[str]]:
+def manifest_presence(game: str, version: dict) -> tuple[int, list[str], list[str], list[str]]:
     """How much of a version's manifest the folder holds, from names and sizes only: (files present with the
-    manifest's size, the names that are missing or not a regular file, the names with another size)."""
-    matched, missing, wrong = 0, [], []
+    manifest's size, the names that are missing or not a regular file, the names with another size, and
+    "name (reason)" for each file whose metadata can't be read). As in probe_mismatches(), only a name that is not
+    there counts as missing: a file that exists but can't be read (permissions, a drive error) is listed apart."""
+    matched, missing, wrong, unreadable = 0, [], [], []
     for rel, info in version["files"].items():
         try:
             st = os.stat(os.path.join(game, *rel.split("/")))
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             missing.append(rel)
+            continue
+        except OSError as error:
+            unreadable.append(f"{rel} ({error.strerror or error})")
             continue
         if not stat.S_ISREG(st.st_mode):
             missing.append(rel)
@@ -365,26 +370,34 @@ def manifest_presence(game: str, version: dict) -> tuple[int, list[str], list[st
             wrong.append(rel)
         else:
             matched += 1
-    return matched, missing, wrong
+    return matched, missing, wrong, unreadable
 
 
 def partial_version_message(game: str, version: dict) -> str | None:
     """The message for a folder that holds at least half of a version's manifest files with their sizes but misses
     a probe file, so it is an incomplete copy of that version rather than another game. None below half."""
     total = len(version["files"])
-    matched, missing, wrong = manifest_presence(game, version)
+    matched, missing, wrong, unreadable = manifest_presence(game, version)
     if not total or not matched or 2 * matched < total:
         return None
     files = version["files"]
-    lines = [f"This looks like an incomplete copy of {version['title']} {version['version']}: {matched} of {total} "
-             f"manifest files are present with matching sizes."]
+    name = f"{version['title']} {version['version']}"
+    head = f"an incomplete copy of {name}" if missing or wrong else f"{name}, but not every file could be checked"
+    lines = [f"This looks like {head}: {matched} of {total} manifest files are present with matching sizes."]
     if missing:
         lines.append(f"{len(missing)} file(s) missing ({sum(files[n]['size'] for n in missing):,} bytes):")
         lines += [f"  missing  {n}" for n in missing]
     if wrong:
         lines.append(f"{len(wrong)} file(s) with another size (still being copied or downloaded?):")
         lines += [f"  wrong size  {n} (expected {files[n]['size']:,} bytes)" for n in wrong]
-    lines.append(f"Finish the download or copy of version {version['version']} into {game}, then build again.")
+    if unreadable:
+        lines.append(f"Cannot read file metadata for {len(unreadable)} file(s) (not counted as missing):")
+        lines += [f"  cannot read  {n}" for n in unreadable]
+    if missing or wrong:
+        lines.append(f"Finish the download or copy of version {version['version']} into {game}, then build again.")
+    if unreadable:
+        lines.append("Make those files readable for this user (check their permissions and the drive), then build "
+                     "again.")
     return "\n".join(lines)
 
 

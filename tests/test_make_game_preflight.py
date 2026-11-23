@@ -210,6 +210,27 @@ class PartialVersionMatchTest(PreflightTestBase):
         err = self.assert_fails(make_game.load_version, self.game, match="7 of 8 manifest files")
         self.assertIn("  missing  appdata0.rpf", err)
 
+    def test_a_probe_that_cannot_be_read_is_not_reported_as_missing(self):
+        # A file whose metadata can't be read exists: it is listed apart, as probe_mismatches() does, and the
+        # message does not say to finish a download that is not unfinished.
+        for name in self.FILES:
+            self.write(name)
+        blocked = os.path.join(self.game, "appdata0.rpf")
+        real_stat = os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            if os.fspath(path) == blocked:
+                raise PermissionError(13, "Permission denied", blocked)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(make_game.os, "stat", fake_stat):
+            err = self.assert_fails(make_game.load_version, self.game, match="7 of 8 manifest files")
+        self.assertIn("  cannot read  appdata0.rpf (Permission denied)", err)
+        self.assertNotIn("missing  appdata0.rpf", err)
+        self.assertNotIn("file(s) missing", err)
+        self.assertNotIn("incomplete copy", err)
+        self.assertNotIn("Finish the download", err)
+
     def test_a_complete_copy_still_loads(self):
         for name in self.FILES:
             self.write(name)
