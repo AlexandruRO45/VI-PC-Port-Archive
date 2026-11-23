@@ -14,7 +14,12 @@
 //   - The default adapter, as before, when the Vulkan device has no LUID or that adapter gives no D3D12 device.
 #pragma once
 
+#if !defined(LEONIDA_HOST_ADAPTER_DXGI_ONLY) && (defined(VK_VERSION_1_0) || __has_include(<vulkan/vulkan.h>))
+#define LEONIDA_HOST_ADAPTER_HAS_VULKAN 1
 #include "vk_test_device.h"
+#else
+#define LEONIDA_HOST_ADAPTER_HAS_VULKAN 0
+#endif
 
 #include <windows.h>
 #include <d3d12.h>
@@ -67,6 +72,7 @@ inline IDXGIAdapter1* named(IDXGIFactory1* factory, const std::string& needle) {
     }
 }
 
+#if LEONIDA_HOST_ADAPTER_HAS_VULKAN
 // The adapter for one pass of a test's `for (const bool warp : {false, true})` loop, with a reference the caller
 // releases (null: the default adapter), and the name the test prints for it. False when the pass has no adapter: no
 // WARP on this PC, or LEONIDA_HOST_ADAPTER=warp on the hardware pass.
@@ -109,5 +115,6 @@ inline bool reference(IDXGIFactory4* factory, const vktest::Device& vk, bool war
     name = "the default adapter";
     return true;
 }
+#endif
 
 }  // namespace hostadapter

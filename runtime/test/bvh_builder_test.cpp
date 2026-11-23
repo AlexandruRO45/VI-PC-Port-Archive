@@ -16,7 +16,8 @@
 //                                      dxcompiler.dll and dxil.dll on PATH)
 //   LEONIDA_BVH_DEVICE=vulkan         (optional: the Vulkan-backed ID3D12Device from #119 instead of a PC device)
 //
-// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip). Nothing from the DLL is written to disk.
+// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip); without a PC D3D12 device it
+// prints "SKIP (...)" and exits 77. Nothing from the DLL is written to disk.
 //
 // The exports are C++ members (demangled): XboxBvhBuilder::XboxBvhBuilder(ID3D12Device11*, bool) and ~XboxBvhBuilder().
 // sizeof(XboxBvhBuilder) is not exported, so the object lives in a large buffer filled with a sentinel, and the
@@ -258,17 +259,18 @@ UINT first_hardware_vendor() {
     return vendor;
 }
 
-ID3D12Device* create_pc_device(bool warp) {
-    IDXGIFactory4* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return nullptr;
+using CreateD3D12DeviceFn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+
+ID3D12Device* select_pc_device(bool warp, IDXGIFactory4* factory,
+                               CreateD3D12DeviceFn create_device = &D3D12CreateDevice) {
+    if (!factory) return nullptr;
     IDXGIAdapter1* adapter = nullptr;
     if (warp) {
         factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
     } else {
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, &adapter)) && adapter; ++i) {
             DXGI_ADAPTER_DESC1 d{};
-            adapter->GetDesc1(&d);
-            if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) break;
+            if (SUCCEEDED(adapter->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) break;
             adapter->Release();
             adapter = nullptr;
         }
@@ -276,13 +278,54 @@ ID3D12Device* create_pc_device(bool warp) {
     ID3D12Device* device = nullptr;
     if (adapter) {
         DXGI_ADAPTER_DESC1 d{};
-        adapter->GetDesc1(&d);
-        std::printf("adapter: %ls\n", d.Description);
-        D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
+        if (SUCCEEDED(adapter->GetDesc1(&d))) std::printf("adapter: %ls\n", d.Description);
+        if (FAILED(create_device(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)))) device = nullptr;
         adapter->Release();
     }
+    return device;
+}
+
+ID3D12Device* create_pc_device(bool warp) {
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || !factory) return nullptr;
+    ID3D12Device* const device = select_pc_device(warp, factory);
     factory->Release();
     return device;
+}
+
+// Skips (77) when no PC D3D12 device is available, unless an earlier check already failed.
+int handle_missing_pc_device() {
+    std::printf("SKIP (no PC D3D12 device; LEONIDA_BVH_DEVICE=vulkan runs on the Vulkan-backed device)\n");
+    return g_failures ? 1 : 77;
+}
+
+HRESULT WINAPI stub_reject_device(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void** out) {
+    if (out) *out = nullptr;
+    return E_NOINTERFACE;
+}
+
+int run_self_test() {
+    check(select_pc_device(false, nullptr, &stub_reject_device) == nullptr,
+          "null DXGI factory yields no PC D3D12 device");
+    IDXGIFactory4* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && factory) {
+        check(select_pc_device(false, factory, &stub_reject_device) == nullptr,
+              "hardware path returns nullptr when D3D12CreateDevice fails");
+        check(select_pc_device(true, factory, &stub_reject_device) == nullptr,
+              "WARP path returns nullptr when D3D12CreateDevice fails");
+        factory->Release();
+    }
+    const int saved_failures = g_failures;
+    g_failures = 0;
+    const int skip_rc = handle_missing_pc_device();
+    g_failures = 1;
+    const int fail_rc = handle_missing_pc_device();
+    g_failures = saved_failures;
+    check(skip_rc == 77, "missing PC device returns SKIP code 77");
+    check(fail_rc == 1, "missing PC device preserves prior failures with exit code 1");
+    std::printf("bvh_builder_test --self-test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
+                g_failures == 1 ? "" : "s");
+    return g_failures ? 1 : 0;
 }
 
 void print_slot_hits(const void* proxy) {
@@ -733,8 +776,22 @@ auto module_tls_index(const M& m, long) -> decltype(m.tls_slot, uint32_t()) { re
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep every line if the DLL takes the process down
+    if (argc > 1) {
+        if (argc == 2) {
+            if (std::strcmp(argv[1], "--self-test") == 0) return run_self_test();
+            if (std::strcmp(argv[1], "--self-test-null-skip") == 0) {
+                IDXGIFactory4* factory = nullptr;
+                CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+                ID3D12Device* const pc = select_pc_device(true, factory, &stub_reject_device);
+                if (factory) factory->Release();
+                return pc ? 1 : handle_missing_pc_device();
+            }
+        }
+        std::fprintf(stderr, "usage: bvh_builder_test [--self-test]\n");
+        return 2;
+    }
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
@@ -819,7 +876,8 @@ int main() {
                 warp = true;
             }
             pc = create_pc_device(warp);
-            check(pc != nullptr, "PC D3D12 device created");
+            if (!pc) return handle_missing_pc_device();
+            check(true, "PC D3D12 device created");
         }
         if (!pc) return 1;
         if (!on_vulkan) {

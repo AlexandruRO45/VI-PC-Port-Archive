@@ -960,6 +960,7 @@ if(BUILD_TESTING)
       add_dependencies(fsr_dispatch_test gta6rt_tls_host)
       add_test(NAME fsr_dispatch COMMAND fsr_dispatch_test)
       set_tests_properties(fsr_dispatch PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME fsr_dispatch_selftest COMMAND fsr_dispatch_test --self-test)
 
       # Optional: skips unless LEONIDA_GAME_DIR is set. Constructs the package's XboxBvhBuilder on the device proxy.
       add_executable(bvh_builder_test
@@ -977,6 +978,7 @@ if(BUILD_TESTING)
       add_dependencies(bvh_builder_test gta6rt_tls_host)
       add_test(NAME bvh_builder COMMAND bvh_builder_test)
       set_tests_properties(bvh_builder PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME bvh_builder_selftest COMMAND bvh_builder_test --self-test)
     endif()
 
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE_AUDIO are set.

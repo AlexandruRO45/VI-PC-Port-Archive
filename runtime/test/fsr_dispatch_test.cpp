@@ -4,9 +4,12 @@
 //
 //   LEONIDA_GAME_DIR=<package root>   (contains amd_fidelityfx_upscaler_xbox.dll)
 //   LEONIDA_FSR_WARP=1                (optional: use the WARP adapter instead of the default hardware adapter)
+//   LEONIDA_HOST_ADAPTER=<name|warp>  (optional: match a PC adapter by case-insensitive substring, or "warp";
+//                                      an unmatched or non-D3D12 adapter fails instead of skipping)
 //   LEONIDA_FSR_DEVICE=vulkan         (optional: use the Vulkan-backed ID3D12Device instead of a PC device)
 //
-// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip). Nothing from the DLL is written to disk.
+// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip); without a PC D3D12 device on the
+// default/WARP path it prints "SKIP (...)" and exits 77. Nothing from the DLL is written to disk.
 //
 // Steps, each one only if the previous worked:
 //   1. map: the console imports bind to the shims and nothing is unimplemented
@@ -36,6 +39,7 @@
 #include <dxgi1_6.h>
 
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -44,6 +48,7 @@
 #include <filesystem>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "../shims/d3d12_xs_device.h"
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -52,6 +57,8 @@
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
 #include "ffx_api_min.h"
+#define LEONIDA_HOST_ADAPTER_DXGI_ONLY
+#include "host_adapter.h"
 
 namespace {
 
@@ -573,32 +580,271 @@ void* symbol(rt::Module& m, const char* name) {
     return it == m.exports.end() ? nullptr : it->second;
 }
 
-// The PC device to wrap: the first hardware adapter, or WARP.
-ID3D12Device* create_pc_device(bool warp) {
-    IDXGIFactory4* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return nullptr;
-    IDXGIAdapter1* adapter = nullptr;
-    if (warp) {
+using CreateD3D12DeviceFn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+
+enum class PcDeviceStatus { ok, missing, adapter_mismatch };
+
+struct PcDeviceSelection {
+    ID3D12Device* device = nullptr;
+    PcDeviceStatus status = PcDeviceStatus::missing;
+    std::string adapter_name;
+};
+
+bool try_create_on_adapter(IDXGIAdapter1* adapter, CreateD3D12DeviceFn create_device, PcDeviceSelection& out) {
+    if (!adapter) return false;
+    ID3D12Device* device = nullptr;
+    const HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
+    if (FAILED(hr) || !device) return false;
+    out.device = device;
+    out.status = PcDeviceStatus::ok;
+    out.adapter_name = hostadapter::description(adapter);
+    return true;
+}
+
+// Selects a feature-level 12.0 PC device: LEONIDA_FSR_WARP=1 chooses WARP, LEONIDA_HOST_ADAPTER chooses a named
+// adapter or "warp" (failing on mismatch), and otherwise the first usable hardware adapter is picked.
+PcDeviceSelection select_pc_device(bool force_warp, const std::string& host_needle, IDXGIFactory4* factory,
+                                   CreateD3D12DeviceFn create_device = &D3D12CreateDevice) {
+    PcDeviceSelection out;
+    const bool explicit_host = !force_warp && !host_needle.empty();
+    if (!factory) {
+        out.status = explicit_host ? PcDeviceStatus::adapter_mismatch : PcDeviceStatus::missing;
+        return out;
+    }
+    if (force_warp || (explicit_host && host_needle == "warp")) {
+        IDXGIAdapter1* adapter = nullptr;
         factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
-    } else {
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-            DXGI_ADAPTER_DESC1 d{};
-            adapter->GetDesc1(&d);
-            if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) break;
-            adapter->Release();
-            adapter = nullptr;
+        const bool ok = try_create_on_adapter(adapter, create_device, out);
+        if (adapter) adapter->Release();
+        if (!ok) out.status = explicit_host ? PcDeviceStatus::adapter_mismatch : PcDeviceStatus::missing;
+        return out;
+    }
+    if (explicit_host) {
+        IDXGIAdapter1* adapter = hostadapter::named(factory, host_needle);
+        const bool ok = try_create_on_adapter(adapter, create_device, out);
+        if (adapter) adapter->Release();
+        if (!ok) out.status = PcDeviceStatus::adapter_mismatch;
+        return out;
+    }
+    for (UINT i = 0;; ++i) {
+        IDXGIAdapter1* adapter = nullptr;
+        if (FAILED(factory->EnumAdapters1(i, &adapter)) || !adapter) break;
+        DXGI_ADAPTER_DESC1 d{};
+        const bool hardware = SUCCEEDED(adapter->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
+        const bool ok = hardware && try_create_on_adapter(adapter, create_device, out);
+        adapter->Release();
+        if (ok) return out;
+    }
+    out.status = PcDeviceStatus::missing;
+    return out;
+}
+
+PcDeviceSelection create_pc_device(bool force_warp, const std::string& host_needle) {
+    IDXGIFactory4* factory = nullptr;
+    const HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    const PcDeviceSelection sel =
+        select_pc_device(force_warp, host_needle, SUCCEEDED(hr) ? factory : nullptr, &D3D12CreateDevice);
+    if (factory) factory->Release();
+    if (sel.device) std::printf("adapter: %s\n", sel.adapter_name.c_str());
+    return sel;
+}
+
+// Handles a null PC device: explicit LEONIDA_HOST_ADAPTER failures fail; missing host D3D12 devices skip (77)
+// unless an earlier check already failed.
+int handle_missing_pc_device(PcDeviceStatus status, const std::string& host_needle) {
+    if (status == PcDeviceStatus::adapter_mismatch) {
+        std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter, or no D3D12 device on it\n",
+                     host_needle.c_str());
+        check(false, "PC D3D12 device created for LEONIDA_HOST_ADAPTER=" + host_needle);
+        return 1;
+    }
+    std::printf("SKIP (no PC D3D12 device; LEONIDA_FSR_DEVICE=vulkan runs on the Vulkan-backed device)\n");
+    return g_failures ? 1 : 77;
+}
+
+struct RestoreHostAdapterEnv {
+    bool existed = false;
+    std::string value;
+
+    RestoreHostAdapterEnv() {
+        SetLastError(ERROR_SUCCESS);
+        const DWORD size = GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", nullptr, 0);
+        existed = size != 0 || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+        if (size) {
+            value.resize(size);
+            value.resize(GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", value.data(), size));
         }
     }
-    ID3D12Device* device = nullptr;
-    if (adapter) {
-        DXGI_ADAPTER_DESC1 d{};
-        adapter->GetDesc1(&d);
-        std::printf("adapter: %ls\n", d.Description);
-        D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
-        adapter->Release();
+
+    ~RestoreHostAdapterEnv() { SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", existed ? value.c_str() : nullptr); }
+};
+
+unsigned g_stub_calls = 0;
+DXGI_ADAPTER_DESC1 g_stub_desc{};
+ID3D12Device* const kFakeDevice = reinterpret_cast<ID3D12Device*>(uintptr_t{0x1234});
+
+HRESULT WINAPI stub_reject_device(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void** out) {
+    ++g_stub_calls;
+    if (out) *out = nullptr;
+    return E_NOINTERFACE;
+}
+
+HRESULT WINAPI stub_accept_device(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFIID iid, void** out) {
+    ++g_stub_calls;
+    if (!adapter || level != D3D_FEATURE_LEVEL_12_0 || iid != __uuidof(ID3D12Device) || !out) return E_INVALIDARG;
+    IDXGIAdapter1* adapter1 = nullptr;
+    if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&adapter1))) || !adapter1) return E_NOINTERFACE;
+    std::memset(&g_stub_desc, 0, sizeof(g_stub_desc));
+    adapter1->GetDesc1(&g_stub_desc);
+    adapter1->Release();
+    *out = kFakeDevice;
+    return S_OK;
+}
+
+std::string mixed_case(const std::string& text) {
+    std::string out = text;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const auto ch = static_cast<unsigned char>(out[i]);
+        out[i] = char(i % 2 == 0 ? std::toupper(ch) : std::tolower(ch));
     }
-    factory->Release();
-    return device;
+    return out;
+}
+
+bool child_exits_with(const wchar_t* flag, DWORD expected_exit) {
+    std::vector<wchar_t> executable(32768);
+    const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (!length || length == executable.size()) return false;
+    std::wstring command = L"\"" + std::wstring(executable.data(), length) + L"\" " + flag;
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(executable.data(), command.data(), nullptr, nullptr, FALSE, 0,
+                        nullptr, nullptr, &startup, &process)) {
+        std::fprintf(stderr, "CreateProcessW failed (%lu)\n", GetLastError());
+        return false;
+    }
+    CloseHandle(process.hThread);
+    const DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+    DWORD code = 0;
+    const bool exited = wait == WAIT_OBJECT_0 && GetExitCodeProcess(process.hProcess, &code);
+    if (wait == WAIT_TIMEOUT) TerminateProcess(process.hProcess, 2);
+    CloseHandle(process.hProcess);
+    if (!exited || code != expected_exit) {
+        std::fwprintf(stderr, L"%ls: expected exit %lu, got %lu (wait %#lx)\n", flag, expected_exit, code, wait);
+        return false;
+    }
+    return true;
+}
+
+int run_self_test() {
+    RestoreHostAdapterEnv restore;
+
+    {
+        const PcDeviceSelection none = select_pc_device(false, "", nullptr, &stub_reject_device);
+        check(!none.device && none.status == PcDeviceStatus::missing, "null DXGI factory skips cleanly");
+        const PcDeviceSelection bad = select_pc_device(false, "rtx", nullptr, &stub_reject_device);
+        check(!bad.device && bad.status == PcDeviceStatus::adapter_mismatch,
+              "null DXGI factory with LEONIDA_HOST_ADAPTER fails as mismatch");
+    }
+
+    IDXGIFactory4* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && factory) {
+        g_stub_calls = 0;
+        const PcDeviceSelection def_miss = select_pc_device(false, "", factory, &stub_reject_device);
+        check(!def_miss.device && def_miss.status == PcDeviceStatus::missing,
+              "default path reports missing when no adapter creates a D3D12 device");
+
+        const PcDeviceSelection warp_miss = select_pc_device(true, "", factory, &stub_reject_device);
+        check(!warp_miss.device && warp_miss.status == PcDeviceStatus::missing,
+              "LEONIDA_FSR_WARP=1 reports missing when WARP fails");
+
+        g_stub_calls = 0;
+        const PcDeviceSelection bad_name =
+            select_pc_device(false, "leonida_nonexistent_adapter_xxx", factory, &stub_reject_device);
+        check(!bad_name.device && bad_name.status == PcDeviceStatus::adapter_mismatch && g_stub_calls == 0,
+              "unmatched LEONIDA_HOST_ADAPTER fails as mismatch without calling D3D12CreateDevice");
+
+        const PcDeviceSelection warp_name_miss = select_pc_device(false, "warp", factory, &stub_reject_device);
+        check(!warp_name_miss.device && warp_name_miss.status == PcDeviceStatus::adapter_mismatch,
+              "LEONIDA_HOST_ADAPTER=warp fails as mismatch when WARP cannot create a D3D12 device");
+
+        IDXGIAdapter1* first = nullptr;
+        if (SUCCEEDED(factory->EnumAdapters1(0, &first)) && first) {
+            const std::string name = hostadapter::description(first);
+            first->Release();
+            if (!name.empty()) {
+                check(SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", mixed_case(name).c_str()) != FALSE,
+                      "SetEnvironmentVariableA sets mixed-case LEONIDA_HOST_ADAPTER");
+                const std::string needle = hostadapter::wanted();
+                g_stub_calls = 0;
+                const PcDeviceSelection matched_fail = select_pc_device(false, needle, factory, &stub_reject_device);
+                check(!matched_fail.device && matched_fail.status == PcDeviceStatus::adapter_mismatch &&
+                          g_stub_calls == 1,
+                      "matched LEONIDA_HOST_ADAPTER whose D3D12CreateDevice fails does not fall back or skip");
+            }
+        }
+
+        std::vector<std::string> hw_names;
+        for (UINT i = 0;; ++i) {
+            IDXGIAdapter1* a = nullptr;
+            if (FAILED(factory->EnumAdapters1(i, &a)) || !a) break;
+            DXGI_ADAPTER_DESC1 d{};
+            if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+                const std::string desc = hostadapter::description(a);
+                if (!desc.empty()) hw_names.push_back(desc);
+            }
+            a->Release();
+        }
+        if (!hw_names.empty()) {
+            const PcDeviceSelection hw_def = select_pc_device(false, "", factory, &stub_accept_device);
+            check(hw_def.device == kFakeDevice && hw_def.status == PcDeviceStatus::ok &&
+                      !(g_stub_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE),
+                  "default selection picks a hardware adapter");
+            for (const std::string& hw : hw_names) {
+                if (SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", mixed_case(hw).c_str()) == FALSE) {
+                    check(false, "SetEnvironmentVariableA sets hardware adapter");
+                    continue;
+                }
+                const PcDeviceSelection picked =
+                    select_pc_device(false, hostadapter::wanted(), factory, &stub_accept_device);
+                check(picked.device == kFakeDevice && picked.status == PcDeviceStatus::ok &&
+                          picked.adapter_name == hw,
+                      "LEONIDA_HOST_ADAPTER selects matching hardware adapter: " + hw);
+            }
+        }
+
+        IDXGIAdapter1* warp_adapter = nullptr;
+        if (SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp_adapter))) && warp_adapter) {
+            const std::string warp_desc = hostadapter::description(warp_adapter);
+            warp_adapter->Release();
+            check(SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", "WaRp") != FALSE,
+                  "SetEnvironmentVariableA sets LEONIDA_HOST_ADAPTER=WaRp");
+            const PcDeviceSelection by_env =
+                select_pc_device(false, hostadapter::wanted(), factory, &stub_accept_device);
+            check(by_env.device == kFakeDevice && by_env.status == PcDeviceStatus::ok &&
+                      by_env.adapter_name == warp_desc,
+                  "LEONIDA_HOST_ADAPTER=WaRp selects WARP adapter");
+            const PcDeviceSelection by_flag =
+                select_pc_device(true, "leonida_nonexistent_adapter_xxx", factory, &stub_accept_device);
+            check(by_flag.device == kFakeDevice && by_flag.status == PcDeviceStatus::ok &&
+                      by_flag.adapter_name == warp_desc,
+                  "LEONIDA_FSR_WARP=1 selects WARP ahead of LEONIDA_HOST_ADAPTER");
+        }
+        factory->Release();
+    }
+
+    const int saved_failures = g_failures;
+    g_failures = 1;
+    check(handle_missing_pc_device(PcDeviceStatus::missing, "") == 1,
+          "missing PC device does not mask prior failures with SKIP");
+    g_failures = saved_failures;
+
+    check(child_exits_with(L"--self-test-null-skip", 77), "null PC device exits with SKIP code 77");
+    check(child_exits_with(L"--self-test-bad-adapter", 1), "unmatched LEONIDA_HOST_ADAPTER exits with FAIL code 1");
+
+    std::printf("fsr_dispatch_test --self-test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
+                g_failures == 1 ? "" : "s");
+    return g_failures ? 1 : 0;
 }
 
 void print_slot_hits(const void* proxy) {
@@ -622,8 +868,34 @@ auto module_tls_index(const M& m, long) -> decltype(m.tls_slot, uint32_t()) { re
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep every line if the DLL takes the process down
+    if (argc > 1) {
+        if (argc == 2) {
+            if (std::strcmp(argv[1], "--self-test") == 0) return run_self_test();
+            if (std::strcmp(argv[1], "--self-test-null-skip") == 0) {
+                IDXGIFactory4* factory = nullptr;
+                CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+                g_stub_calls = 0;
+                const PcDeviceSelection sel = select_pc_device(false, "", factory, &stub_reject_device);
+                if (factory) factory->Release();
+                return sel.device ? 1 : handle_missing_pc_device(sel.status, "");
+            }
+            if (std::strcmp(argv[1], "--self-test-bad-adapter") == 0) {
+                RestoreHostAdapterEnv restore;
+                if (!SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", "leonida_nonexistent_adapter_xxx")) return 2;
+                const std::string needle = hostadapter::wanted();
+                const PcDeviceSelection sel = create_pc_device(false, needle);
+                if (sel.device) {
+                    sel.device->Release();
+                    return 3;
+                }
+                return handle_missing_pc_device(sel.status, needle);
+            }
+        }
+        std::fprintf(stderr, "usage: fsr_dispatch_test [--self-test]\n");
+        return 2;
+    }
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
@@ -739,11 +1011,15 @@ int main() {
 #else
             check(false, "LEONIDA_FSR_DEVICE=vulkan needs a build with the Vulkan SDK (gta6rt_d3d12_com)");
 #endif
+            check(pc != nullptr, "Vulkan-backed D3D12 device created");
+            if (!pc) return 1;
         } else {
-            pc = create_pc_device(env("LEONIDA_FSR_WARP") == "1");
+            const std::string host_needle = hostadapter::wanted();
+            const PcDeviceSelection sel = create_pc_device(env("LEONIDA_FSR_WARP") == "1", host_needle);
+            if (!sel.device) return handle_missing_pc_device(sel.status, host_needle);
+            pc = sel.device;
+            check(true, "PC D3D12 device created");
         }
-        check(pc != nullptr, on_vulkan ? "Vulkan-backed D3D12 device created" : "PC D3D12 device created");
-        if (!pc) return 1;
         void* proxy = nullptr;
         const HRESULT hr = rt::d3d12_xs::create_device_proxy(pc, __uuidof(ID3D12Device), &proxy);
         check(SUCCEEDED(hr) && proxy, "Xbox-ABI device proxy created");
