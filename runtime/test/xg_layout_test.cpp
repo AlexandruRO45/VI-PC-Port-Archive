@@ -209,12 +209,48 @@ int main() {
         XgResourceLayout tiled3d_layout{};
         CHECK(compute_resource_layout(d3d_tiled, tiled3d_layout));
         CHECK(tiled3d_layout.plane[0].mip_layout[0].size_bytes == 4u * kTileAlignment);
+        // Each 32x32x16 64 KiB tile covers 16 Z slices -> one Z slice across 2x2 tiles is 4 * 65536 / 16 = 16384 B.
+        CHECK(tiled3d_layout.plane[0].mip_layout[0].slice_2d_size_bytes == (4u * kTileAlignment) / 16u);
         std::vector<std::byte> tiled3d_res(static_cast<std::size_t>(tiled3d_layout.size_bytes), std::byte{0});
         std::vector<std::byte> linear3d_buf(64u * 64u * 16u * 4u, std::byte{0x5A});
         CHECK(!copy_into_subresource(d3d_tiled, tiled3d_layout, tiled3d_res.data(), 0, 0, linear3d_buf.data(),
                                      64u * 4u, 64u * 64u * 4u));
         CHECK(!copy_from_subresource(d3d_tiled, tiled3d_layout, linear3d_buf.data(), 0, 0, tiled3d_res.data(),
                                      64u * 4u, 64u * 64u * 4u));
+
+        // Single-tile 3D volume (16x8x4 RGBA8) for 64 KiB (depth 16 -> 4096 B/slice) and 4 KiB (depth 8 -> 512 B/slice).
+        XgResourceDesc d3d_small = d3d_tiled;
+        d3d_small.width = 16;
+        d3d_small.height = 8;
+        d3d_small.depth_or_array_size = 4;
+        XgResourceLayout small64k{};
+        CHECK(compute_resource_layout(d3d_small, small64k));
+        CHECK(small64k.plane[0].mip_layout[0].size_bytes == kTileAlignment);
+        CHECK(small64k.plane[0].mip_layout[0].slice_2d_size_bytes == kTileAlignment / 16u);
+        d3d_small.layout = kLayoutSw4KbS;
+        XgResourceLayout small4k{};
+        CHECK(compute_resource_layout(d3d_small, small4k));
+        CHECK(small4k.plane[0].mip_layout[0].size_bytes == kSmallTileAlignment);
+        CHECK(small4k.plane[0].mip_layout[0].slice_2d_size_bytes == kSmallTileAlignment / 8u);
+
+        // DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM (89) is a 4-byte format; MSAA 4x tiled succeeds while 2x/8x tiled
+        // and 4 KiB MSAA are rejected to match resource_tiling.h.
+        XgResourceLayout fmt89{};
+        CHECK(compute_resource_layout(make_2d(128, 128, 1, 1, 89, kLayoutSw64KbD), fmt89));
+        CHECK(fmt89.plane[0].bytes_per_element == 4);
+
+        auto msaa = make_2d(128, 128, 1, 1, 28, kLayoutSw64KbD);
+        msaa.sample_count = 4;
+        XgResourceLayout msaa4{};
+        CHECK(compute_resource_layout(msaa, msaa4));
+        CHECK(msaa4.plane[0].mip_layout[0].size_bytes == 4u * kTileAlignment);  // 64x64 tile -> 2x2 tiles
+        msaa.sample_count = 2;
+        CHECK(!compute_resource_layout(msaa, msaa4));
+        msaa.sample_count = 8;
+        CHECK(!compute_resource_layout(msaa, msaa4));
+        msaa.sample_count = 4;
+        msaa.layout = kLayoutSw4KbS;
+        CHECK(!compute_resource_layout(msaa, msaa4));
 
         // Two-plane depth-stencil.
         const auto ds = make_2d(128, 128, 1, 1, 20 /* D32_FLOAT_S8X24_UINT */, kLayoutSw64KbD);

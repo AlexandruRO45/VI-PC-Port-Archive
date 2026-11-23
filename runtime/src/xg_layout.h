@@ -197,7 +197,7 @@ constexpr FormatInfo dxgi_format_info(std::uint32_t dxgi_format) {
     case 33: case 34: case 35: case 36: case 37: case 38:  // R16G16_*
     case 39: case 41: case 42: case 43:                    // R32_TYPELESS, R32_FLOAT, R32_UINT, R32_SINT
     case 67:                                                // R9G9B9E5_SHAREDEXP
-    case 87: case 88: case 90: case 91: case 92: case 93:  // B8G8R8A8_*, B8G8R8X8_*
+    case 87: case 88: case 89: case 90: case 91: case 92: case 93:  // B8G8R8A8_*, R10G10B10_XR_BIAS_A2, B8G8R8X8_*
         return {4, 1, 1, 0, false};
 
     // 32-bit depth only
@@ -400,10 +400,11 @@ inline bool compute_resource_layout(const XgResourceDesc& desc, XgResourceLayout
         plane.base_alignment_bytes = plane_align;
         plane.bytes_per_element = bpe;
 
+        if (!use_linear && use_4kb && samples != 1u) return false;
         const TileShape tile_shape =
             use_linear ? TileShape{1, 1, 1}
                        : (use_4kb ? small_tile_shape(is_3d, bpe)
-                                  : element_tile_shape(is_3d, bpe, samples == 4 ? 4u : 1u));
+                                  : element_tile_shape(is_3d, bpe, samples));
         if (!tile_shape.width || !tile_shape.height || !tile_shape.depth) return false;
 
         std::uint64_t slice_cursor = 0;
@@ -446,18 +447,20 @@ inline bool compute_resource_layout(const XgResourceDesc& desc, XgResourceLayout
                 const std::uint64_t tiles_x = detail::ceil_div(elem_w, tile_shape.width);
                 const std::uint64_t tiles_y = detail::ceil_div(elem_h, tile_shape.height);
                 const std::uint64_t tiles_z = is_3d ? detail::ceil_div(mip_d, tile_shape.depth) : 1u;
-                std::uint64_t pad_w = 0, pad_h = 0, pitch = 0, slice2d = 0, mip_size = 0;
+                std::uint64_t pad_w = 0, pad_h = 0, pitch = 0, tile_layer_bytes = 0, mip_size = 0;
                 const std::uint64_t tile_bytes = use_4kb ? kSmallTileAlignment : kTileAlignment;
                 if (!detail::checked_mul(tiles_x, tile_shape.width, pad_w) ||
                     !detail::checked_mul(tiles_y, tile_shape.height, pad_h) ||
                     !detail::checked_mul(pad_w, bpe, pitch) ||
-                    !detail::checked_mul(tiles_x, tiles_y, slice2d) ||
-                    !detail::checked_mul(slice2d, tile_bytes, slice2d) ||
-                    !detail::checked_mul(slice2d, is_3d ? tiles_z : 1u, mip_size) ||
+                    !detail::checked_mul(tiles_x, tiles_y, tile_layer_bytes) ||
+                    !detail::checked_mul(tile_layer_bytes, tile_bytes, tile_layer_bytes) ||
+                    !detail::checked_mul(tile_layer_bytes, is_3d ? tiles_z : 1u, mip_size) ||
                     !detail::align_up(slice_cursor, tile_bytes, slice_cursor)) {
                     return false;
                 }
                 if (pad_w > 0xffffffffu || pad_h > 0xffffffffu || pitch > 0xffffffffu) return false;
+                // A 3D tile spans tile_shape.depth Z slices, so one 2D Z slice is tile_layer_bytes / tile_shape.depth.
+                const std::uint64_t slice2d = is_3d ? (tile_layer_bytes / tile_shape.depth) : tile_layer_bytes;
                 ml.offset_bytes = slice_cursor;
                 ml.size_bytes = mip_size;
                 ml.slice_2d_size_bytes = slice2d;
