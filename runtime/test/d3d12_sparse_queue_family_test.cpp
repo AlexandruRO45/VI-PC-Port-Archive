@@ -53,6 +53,17 @@ static ComPtr<ID3D12CommandQueue> make_queue(ID3D12Device* dev, D3D12_COMMAND_LI
     ok(dev->CreateCommandQueue(&desc, IID_PPV_ARGS(&q)), "CreateCommandQueue");
     return q;
 }
+// The layer gives each live D3D12 queue its own VkQueue. A GPU whose graphics family exposes fewer VkQueues than
+// the test needs (Intel UHD 770) answers E_OUTOFMEMORY: that is a missing capability, not a failure. Any other
+// error stays a failure. Returns false when the queue is unavailable for that reason.
+static bool try_queue(ID3D12Device* dev, D3D12_COMMAND_LIST_TYPE type, ComPtr<ID3D12CommandQueue>& out) {
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    desc.Type = type;
+    const HRESULT hr = dev->CreateCommandQueue(&desc, IID_PPV_ARGS(&out));
+    if (hr == E_OUTOFMEMORY) return false;
+    ok(hr, "CreateCommandQueue");
+    return true;
+}
 struct CopyList {
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
@@ -154,8 +165,22 @@ int main() {
         }
         std::puts("LEONIDA Vulkan-layer test; independent D3D12 API surface, direct->copy->compute queues");
         auto direct = make_queue(device.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
-        auto copy = make_queue(device.Get(), D3D12_COMMAND_LIST_TYPE_COPY);
-        auto compute = make_queue(device.Get(), D3D12_COMMAND_LIST_TYPE_COMPUTE);
+        ComPtr<ID3D12CommandQueue> copy, compute;
+        if (!try_queue(device.Get(), D3D12_COMMAND_LIST_TYPE_COPY, copy) ||
+            !try_queue(device.Get(), D3D12_COMMAND_LIST_TYPE_COMPUTE, compute)) {
+            // Fewer Vulkan queues than the three-queue cross-queue cases need. Sparse binding itself does not need
+            // them (UpdateTileMappings works on any queue), so still check the byte-exact mapping on the one queue
+            // there is, then skip the cross-queue cases, as d3d12_queue_wait does.
+            std::puts("SINGLE_QUEUE: no independent Vulkan queue for COPY/COMPUTE; checking the DIRECT queue alone");
+            const bool pass = run_case(device.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT, direct.Get(), direct.Get(),
+                                       direct.Get(), "LAYER_MAP_DIRECT_ONLY");
+            if (!pass || FAILED(device->GetDeviceRemovedReason())) {
+                std::puts("LAYER_FINAL FAIL");
+                return 1;
+            }
+            std::puts("SKIP cross-queue cases: fewer than three independent Vulkan queues");
+            return 77;
+        }
         bool all_pass = true;
         all_pass &= run_case(device.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT,
                              direct.Get(), copy.Get(), compute.Get(), "LAYER_MAP_DIRECT_COPY_COMPUTE");
