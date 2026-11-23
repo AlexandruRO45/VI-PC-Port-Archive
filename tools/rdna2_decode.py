@@ -354,7 +354,8 @@ def _format_ds_swizzle(offset16: int) -> str:
 def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
     """Number of address VGPRs for an MIMG instruction."""
     if name in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
-        return 11 if name == "image_bvh_intersect_ray" else 12
+        base = 11 if name == "image_bvh_intersect_ray" else 12
+        return base - 3 if a16 else base
     if name == "image_get_resinfo":
         return 1
     if name == "image_get_lod":

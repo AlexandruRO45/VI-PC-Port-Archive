@@ -13519,13 +13519,12 @@ class Gen:
         (copysign(inf, k*det), k*det, k*b_i, k*b_j), i and j chosen by the node type's byte of the triangle-ID word
         at +60 (AMD GPURT; 0x09 is RADV's v, w). A NaN anywhere in the ray, or an infinite origin, gives
         (inf, 1, 0, 0). Consumers divide by .y: t = T/det and the barycentrics b/det."""
-        if "a16" in mods:
-            raise Unsupported(op + " a16")
+        a16 = "a16" in mods
         is64 = op.startswith("image_bvh64")
         self.uses_bvh = True
         vd = a[0]
         regs = self.addr_regs(a[1])
-        need = 12 if is64 else 11
+        need = (9 if is64 else 8) if a16 else (12 if is64 else 11)
         if len(regs) < need or vd["k"] != "vgpr":
             raise Unsupported(op + " operands")
         desc = self.sgpr_words(a[2], 4)
@@ -13579,8 +13578,21 @@ class Gen:
         f = lambda r: self.tof(ld(r))
         tmax = f(rest[0])
         org = [f(r) for r in rest[1:4]]
-        dirv = [f(r) for r in rest[4:7]]
-        inv = [f(r) for r in rest[7:10]]
+        if a16:
+            # RDNA2 a16 packs the 6 f16 components (ray_dir.xyz, ray_inv_dir.xyz) across 3 VGPRs:
+            # rest[4] = (dir.x, dir.y), rest[5] = (dir.z, inv.x), rest[6] = (inv.y, inv.z).
+            h = []
+            for r in rest[4:7]:
+                v2 = T()
+                e(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {ld(r)}")
+                for c in range(2):
+                    x = T()
+                    e(f"{x} = OpCompositeExtract %float {v2} {c}")
+                    h.append(x)
+            dirv, inv = h[:3], h[3:]
+        else:
+            dirv = [f(r) for r in rest[4:7]]
+            inv = [f(r) for r in rest[7:10]]
         INF, ONE, NEGINF = (self.tof(self.cu(x)) for x in (0x7F800000, 0x3F800000, 0xFF800000))
         out = lambda k, v: self.dst({"k": "vgpr", "r": vd["r"] + k, "n": 1}, v)
 
