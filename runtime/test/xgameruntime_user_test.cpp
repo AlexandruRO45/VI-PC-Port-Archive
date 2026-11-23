@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -193,6 +194,44 @@ int main(int argc, char** argv) {
         check(at<Unregister>(user, 34)(user, queued, wait), "unregister before queued dispatch");
         while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
         check(result.calls == 1, "queued callback suppressed after unregister");
+    }
+    // Hold a running callback on another thread while unregister is called.
+    for (bool wait : {false, true}) {
+        struct Gate { HANDLE entered; HANDLE release; } gate{
+            CreateEventW(nullptr, TRUE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        HANDLE started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE returned = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        auto gated_callback = [](void* ctx, XUserLocalId, uint32_t) {
+            auto* g = static_cast<Gate*>(ctx);
+            SetEvent(g->entered);
+            WaitForSingleObject(g->release, INFINITE);
+        };
+        XTaskQueueRegistrationToken gated{};
+        check(at<Register>(user, 33)(user, manual, &gate, gated_callback, &gated) == S_OK,
+              "register gated callback");
+        rt::shims::xgameruntime_user_raise_change_for_test(0);
+        std::thread dispatch([&] { XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0); });
+        const bool entered = WaitForSingleObject(gate.entered, 5000) == WAIT_OBJECT_0;
+        check(entered, "callback is running on dispatch thread");
+        bool unregister_result = false;
+        std::thread unregister_thread([&] {
+            SetEvent(started);
+            unregister_result = at<Unregister>(user, 34)(user, gated, wait);
+            SetEvent(returned);
+        });
+        const bool began = WaitForSingleObject(started, 5000) == WAIT_OBJECT_0;
+        const DWORD before_release = WaitForSingleObject(returned, wait ? 200 : 5000);
+        check(began && entered && (wait ? before_release == WAIT_TIMEOUT : before_release == WAIT_OBJECT_0),
+              wait ? "unregister with wait blocks while callback runs" :
+                     "unregister without wait returns while callback runs");
+        SetEvent(gate.release);
+        dispatch.join();
+        unregister_thread.join();
+        check(unregister_result == wait, "unregister reports whether callback completed");
+        CloseHandle(returned);
+        CloseHandle(started);
+        CloseHandle(gate.release);
+        CloseHandle(gate.entered);
     }
     struct SelfUnregister { void* user; Unregister unregister; XTaskQueueRegistrationToken token; int calls; } self{user, at<Unregister>(user, 34), {}, 0};
     auto self_callback = [](void* ctx, XUserLocalId, uint32_t) {
