@@ -354,5 +354,22 @@ class TestInterpP2F32SIMDAndCentroid(unittest.TestCase):
         self.assertEqual(res, f32_to_bits(6.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p2_f32 Rejection & Hardware Translator
+# ------------------------------------------------------------------------------
+
+class TestInterpP2F32HardwareTranslator(unittest.TestCase):
+    def test_hardware_translator_execution(self):
+        prog = [
+            "v_interp_p1_f32 v2, v0, attr0.x",
+            "v_interp_p2_f32 v2, v1, attr0.x clamp",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_interp_p2_hw", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
+
 if __name__ == '__main__':
     unittest.main()
