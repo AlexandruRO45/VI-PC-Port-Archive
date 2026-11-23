@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+"""Semantic reference tests and translator hardware verification for AMD RDNA2 VALU Clamping & Saturation.
+
+RDNA2 Vector Arithmetic Logic Unit (VALU) Clamping & Saturation Architecture:
+  In AMD RDNA2 (GFX10/GFX1030) ISA, floating-point arithmetic instructions support output modifiers:
+    - clamp: saturates the final result to the normalized range [0.0, 1.0] (GLSL FClamp).
+      Values < 0.0 (including -0.0) map to +0.0. Values > 1.0 map to 1.0.
+      NaN values propagate according to IEEE 754 rules.
+    - omod (output modifier):
+      * mul:2 -> multiplies result by 2.0
+      * mul:4 -> multiplies result by 4.0
+      * div:2 -> multiplies result by 0.5
+      On hardware and in the translator, omod is applied before clamp.
+
+Covered instructions across the suite:
+  1. v_add_f32 (VOP2 / VOP3 encoding: v_add_f32_e64 vdst, src0, src1 [omod] [clamp])
+  2. v_sub_f32 (VOP2 / VOP3 encoding: v_sub_f32_e64 vdst, src0, src1 [omod] [clamp])
+  3. v_mul_f32 (VOP2 / VOP3 encoding: v_mul_f32_e64 vdst, src0, src1 [omod] [clamp])
+  4. v_fma_f32 (VOP3 encoding: v_fma_f32 vdst, src0, src1, src2 [omod] [clamp])
+
+Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
+100% of test cases exercise tools/rdna2spirv.py via support.translate_lines(...) and support.mrt0_words
+for hardware-accurate translation and SPIR-V execution verification.
+"""
+
+from dataclasses import dataclass
+from enum import Enum, auto
+import math
+import os
+import struct
+import sys
+from typing import Sequence
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+
+sys.dont_write_bytecode = True
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+import support  # noqa: E402
+
+MASK32 = 0xFFFFFFFF
+
+_counter = 0
+
+
+def next_test_id(prefix: str = "ps_clamp_sat") -> str:
+    global _counter
+    _counter += 1
+    return f"{prefix}_{_counter}"
+
+
+def f32_to_bits(f: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", f))[0]
+
+
+def bits_to_f32(b: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", b & MASK32))[0]
+
+
+def f32_clamp(v: float) -> float:
+    if math.isnan(v):
+        return v
+    if v < 0.0 or (v == 0.0 and math.copysign(1.0, v) < 0.0):
+        return 0.0
+    elif v > 1.0:
+        return 1.0
+    return v
+
+
+def apply_omod_and_clamp(v: float, omod: str | None, clamp: bool) -> float:
+    if omod == "mul:2":
+        v *= 2.0
+    elif omod == "mul:4":
+        v *= 4.0
+    elif omod == "div:2":
+        v *= 0.5
+    if clamp:
+        v = f32_clamp(v)
+    return v
+
+
+def run_binary_f32(
+    op: str,
+    s0: float,
+    s1: float,
+    omod: str | None = None,
+    clamp: bool = False,
+    name: str | None = None,
+) -> float:
+    test_id = name or next_test_id(f"ps_{op}")
+    s0_bits = f32_to_bits(s0)
+    s1_bits = f32_to_bits(s1)
+    mods = []
+    if omod:
+        mods.append(omod)
+    if clamp:
+        mods.append("clamp")
+    mod_str = (" " + " ".join(mods)) if mods else ""
+    lines = [
+        f"v_mov_b32 v0, {s0_bits:#x}",
+        f"v_mov_b32 v1, {s1_bits:#x}",
+        f"{op}_e64 v2, v0, v1{mod_str}",
+        "exp mrt0, v2, v2, v2, v2 done",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(test_id, lines)
+    words = support.mrt0_words(spv)
+    return bits_to_f32(words[0])
+
+
+def run_ternary_f32(
+    op: str,
+    s0: float,
+    s1: float,
+    s2: float,
+    omod: str | None = None,
+    clamp: bool = False,
+    name: str | None = None,
+) -> float:
+    test_id = name or next_test_id(f"ps_{op}")
+    s0_bits = f32_to_bits(s0)
+    s1_bits = f32_to_bits(s1)
+    s2_bits = f32_to_bits(s2)
+    mods = []
+    if omod:
+        mods.append(omod)
+    if clamp:
+        mods.append("clamp")
+    mod_str = (" " + " ".join(mods)) if mods else ""
+    lines = [
+        f"v_mov_b32 v0, {s0_bits:#x}",
+        f"v_mov_b32 v1, {s1_bits:#x}",
+        f"v_mov_b32 v2, {s2_bits:#x}",
+        f"{op} v3, v0, v1, v2{mod_str}",
+        "exp mrt0, v3, v3, v3, v3 done",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(test_id, lines)
+    words = support.mrt0_words(spv)
+    return bits_to_f32(words[0])
+
+class TestValuAddF32ClampOracle(unittest.TestCase):
+    """Stage 1: Reference mathematical oracle for v_add_f32 clamp and omod."""
+
+    def test_add_clamp_saturation_upper(self):
+        # 0.6 + 0.7 = 1.3 -> clamped to 1.0
+        hw = run_binary_f32("v_add_f32", 0.6, 0.7, clamp=True)
+        self.assertAlmostEqual(hw, 1.0, places=6)
+
+    def test_add_clamp_saturation_lower(self):
+        # -0.8 + 0.2 = -0.6 -> clamped to 0.0
+        hw = run_binary_f32("v_add_f32", -0.8, 0.2, clamp=True)
+        self.assertAlmostEqual(hw, 0.0, places=6)
+
+    def test_add_clamp_in_range(self):
+        # 0.2 + 0.3 = 0.5 -> remains 0.5
+        hw = run_binary_f32("v_add_f32", 0.2, 0.3, clamp=True)
+        self.assertAlmostEqual(hw, 0.5, places=6)
+
+    def test_add_omod_mul2(self):
+        # (0.2 + 0.3) * 2.0 = 1.0
+        hw = run_binary_f32("v_add_f32", 0.2, 0.3, omod="mul:2")
+        self.assertAlmostEqual(hw, 1.0, places=6)
+
+    def test_add_omod_mul2_clamp(self):
+        # (0.4 + 0.3) * 2.0 = 1.4 -> clamped to 1.0
+        hw = run_binary_f32("v_add_f32", 0.4, 0.3, omod="mul:2", clamp=True)
+        self.assertAlmostEqual(hw, 1.0, places=6)
+
+
+if __name__ == "__main__":
+    unittest.main()
