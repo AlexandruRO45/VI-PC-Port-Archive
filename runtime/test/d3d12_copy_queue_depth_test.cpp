@@ -1,8 +1,9 @@
-// Depth and stencil copies on a COPY queue, on the Vulkan shim and native D3D12. On a GPU with a transfer-only Vulkan
-// family the layer puts COPY queues there, where Vulkan allows a copy into or out of a depth or stencil aspect only
-// with VK_KHR_maintenance10 and the format's *_COPY_ON_TRANSFER_QUEUE feature
-// (VUID-vkCmdCopyBufferToImage-commandBuffer-07739 and its siblings). Each case writes known texels, copies them on
-// the COPY queue (or on DIRECT around it) and reads them back; a case the layer refuses must leave the device usable.
+// Depth and stencil copies on COPY and COMPUTE queues, on the Vulkan shim and native D3D12. On a GPU with a
+// transfer-only Vulkan family the layer puts COPY queues there, and COMPUTE queues on an async-compute family; neither
+// has graphics. There Vulkan allows a copy between a buffer and a depth or stencil aspect only with
+// VK_KHR_maintenance10 and the format's *_COPY_ON_{TRANSFER,COMPUTE}_QUEUE feature
+// (VUID-vkCmdCopyBufferToImage-commandBuffer-07739 and its siblings). Each case writes known texels, copies them on the
+// queue under test (or on DIRECT around it) and reads them back; a case the layer refuses must leave the device usable.
 // No game data. LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "../shims/d3d12_com.h"
 
@@ -27,23 +28,25 @@ constexpr UINT row_pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;  // every plane's
 enum class Outcome { matched, refused, failed };
 
 enum class Case {
-    depth_upload,      // footprint -> D32 depth on COPY
-    stencil_upload,    // footprint -> D32S8 stencil plane on COPY
-    depth_readback,    // D32 depth -> footprint on COPY (uploaded on DIRECT)
-    depth_to_depth,    // D32 -> D32 on COPY (uploaded and read back on DIRECT): vkCmdCopyImage, no buffer
-    depth_to_colour,   // D32 -> R32_FLOAT on COPY: staged image -> buffer -> image by the layer
+    depth_upload,      // footprint -> D32 depth on the queue under test
+    stencil_upload,    // footprint -> D32S8 stencil plane
+    depth_readback,    // D32 depth -> footprint (uploaded on DIRECT)
+    depth_to_depth,    // D32 -> D32 (uploaded and read back on DIRECT): vkCmdCopyImage, no buffer
+    depth_to_colour,   // D32 -> R32_FLOAT: staged image -> buffer -> image by the layer
 };
 
 const char* name(Case c) {
     switch (c) {
-    case Case::depth_upload: return "depth upload on COPY";
-    case Case::stencil_upload: return "stencil upload on COPY";
-    case Case::depth_readback: return "depth readback on COPY";
-    case Case::depth_to_depth: return "depth texture copy on COPY";
-    case Case::depth_to_colour: return "depth to colour copy on COPY";
+    case Case::depth_upload: return "depth upload";
+    case Case::stencil_upload: return "stencil upload";
+    case Case::depth_readback: return "depth readback";
+    case Case::depth_to_depth: return "depth texture copy";
+    case Case::depth_to_colour: return "depth to colour copy";
     }
     return "?";
 }
+
+const char* name(D3D12_COMMAND_LIST_TYPE type) { return type == D3D12_COMMAND_LIST_TYPE_COPY ? "COPY" : "COMPUTE"; }
 
 struct Event {
     HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -111,9 +114,9 @@ void transition(ID3D12GraphicsCommandList& list, ID3D12Resource* resource, D3D12
     list.ResourceBarrier(1, &barrier);
 }
 
-// Three steps, each on its own queue: DIRECT (before), COPY (the copy under test), DIRECT (after), with the
-// textures in COMMON between them (copy_between).
-Outcome run(ID3D12Device& device, Case c, bool layer) {
+// Three steps, each on its own queue: DIRECT (before), `tested` (COPY or COMPUTE: the copy under test), DIRECT
+// (after), with the textures in COMMON between them (copy_between).
+Outcome run(ID3D12Device& device, Case c, D3D12_COMMAND_LIST_TYPE tested, bool layer) {
     ComPtr<ID3D12Resource> a, b, upload, readback;
     EXPECT(texture(device, c, a));
     if (c == Case::depth_to_depth || c == Case::depth_to_colour) EXPECT(texture(device, c, b, c == Case::depth_to_colour));
@@ -129,14 +132,13 @@ Outcome run(ID3D12Device& device, Case c, bool layer) {
         }
     upload->Unmap(0, nullptr);
 
-    ComPtr<ID3D12CommandQueue> direct, copy;
-    const D3D12_COMMAND_QUEUE_DESC direct_desc{}, copy_desc{D3D12_COMMAND_LIST_TYPE_COPY};
+    ComPtr<ID3D12CommandQueue> direct, other;
+    const D3D12_COMMAND_QUEUE_DESC direct_desc{}, other_desc{tested};
     EXPECT(SUCCEEDED(device.CreateCommandQueue(&direct_desc, IID_PPV_ARGS(&direct))));
-    EXPECT(SUCCEEDED(device.CreateCommandQueue(&copy_desc, IID_PPV_ARGS(&copy))));
+    EXPECT(SUCCEEDED(device.CreateCommandQueue(&other_desc, IID_PPV_ARGS(&other))));
     ComPtr<ID3D12CommandAllocator> allocators[3];
     ComPtr<ID3D12GraphicsCommandList> lists[3];
-    const D3D12_COMMAND_LIST_TYPE types[3] = {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COPY,
-                                              D3D12_COMMAND_LIST_TYPE_DIRECT};
+    const D3D12_COMMAND_LIST_TYPE types[3] = {D3D12_COMMAND_LIST_TYPE_DIRECT, tested, D3D12_COMMAND_LIST_TYPE_DIRECT};
     for (int i = 0; i < 3; ++i) {
         EXPECT(SUCCEEDED(device.CreateCommandAllocator(types[i], IID_PPV_ARGS(&allocators[i]))));
         EXPECT(SUCCEEDED(device.CreateCommandList(0, types[i], allocators[i].Get(), nullptr, IID_PPV_ARGS(&lists[i]))));
@@ -157,7 +159,7 @@ Outcome run(ID3D12Device& device, Case c, bool layer) {
         if (dst_texture) transition(list, dst.pResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         if (src_texture) transition(list, src.pResource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     };
-    // The copy under test, on COPY.
+    // The copy under test, on the tested queue.
     switch (c) {
     case Case::depth_upload:
     case Case::stencil_upload:
@@ -175,7 +177,7 @@ Outcome run(ID3D12Device& device, Case c, bool layer) {
         break;
     }
     }
-    // The readback, on DIRECT, unless COPY did it.
+    // The readback, on DIRECT, unless the tested queue did it.
     if (c != Case::depth_readback) {
         ID3D12Resource* result = b ? b.Get() : a.Get();
         copy_between(*lists[2].Get(), to_readback, subresource(result, plane));
@@ -184,7 +186,7 @@ Outcome run(ID3D12Device& device, Case c, bool layer) {
 
     ComPtr<ID3D12Fence> fence;
     EXPECT(SUCCEEDED(device.CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))));
-    ID3D12CommandQueue* queues[3] = {direct.Get(), copy.Get(), direct.Get()};
+    ID3D12CommandQueue* queues[3] = {direct.Get(), other.Get(), direct.Get()};
     for (UINT i = 0; i < 3; ++i) {
         if (i) EXPECT(SUCCEEDED(queues[i]->Wait(fence.Get(), i)));
         ID3D12CommandList* batch[] = {lists[i].Get()};
@@ -196,7 +198,7 @@ Outcome run(ID3D12Device& device, Case c, bool layer) {
     EXPECT(WaitForSingleObject(event.handle, 15000) == WAIT_OBJECT_0);
     EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
     // The layer refuses a batch it cannot run (ExecuteCommandLists has no result; the shim records it).
-    if (layer && rt::d3d12::last_execute_result(copy.Get()) != leonida::ReplayResult::success) return Outcome::refused;
+    if (layer && rt::d3d12::last_execute_result(other.Get()) != leonida::ReplayResult::success) return Outcome::refused;
 
     EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
     bool same = true;
@@ -206,8 +208,8 @@ Outcome run(ID3D12Device& device, Case c, bool layer) {
             std::memcpy(&bits, static_cast<const std::uint8_t*>(mapped) + y * row_pitch + x * texel_bytes(c),
                         texel_bytes(c));
             if (bits != texel_bits(c, x, y)) {
-                std::fprintf(stderr, "%s, %s: texel (%u,%u) read %#x, wrote %#x\n", layer ? "layer" : "native",
-                             name(c), x, y, bits, texel_bits(c, x, y));
+                std::fprintf(stderr, "%s, %s on %s: texel (%u,%u) read %#x, wrote %#x\n", layer ? "layer" : "native",
+                             name(c), name(tested), x, y, bits, texel_bits(c, x, y));
                 same = false;
             }
         }
@@ -228,6 +230,8 @@ ComPtr<ID3D12Device> native_device() {
     }
 }
 
+const char* outcome(Outcome o) { return o == Outcome::matched ? "matched" : o == Outcome::refused ? "refused" : "FAILED"; }
+
 }  // namespace
 
 int main() {
@@ -237,65 +241,70 @@ int main() {
         return 77;
     }
     const auto* info = rt::d3d12::vulkan_device_info(vulkan.Get());
-    const bool dedicated_copy = info && !info->copy_queues.empty() && info->copy_family != info->queue_family;
-    std::printf("COPY queues on Vulkan family %u, graphics family %u%s\n", info ? info->copy_family : 0u,
-                info ? info->queue_family : 0u, dedicated_copy ? "" : " (no separate copy family)");
-    // What the layer must do, from the GPU's own answers (not the layer's): on a family with graphics every case runs;
-    // on one without, a copy with a buffer runs only with maintenance10 and the format's feature for that aspect, and
-    // is refused otherwise. vkCmdCopyImage (depth_to_depth) has no such rule and always runs.
-    bool off_graphics = false, compute_family = false;
-    const auto families = info ? reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
-                                     info->get_instance_proc(info->instance, "vkGetPhysicalDeviceQueueFamilyProperties"))
-                               : nullptr;
-    if (families) {
+    if (!info) {
+        std::puts("Vulkan device info unavailable");
+        return 77;
+    }
+    std::vector<VkQueueFamilyProperties> queues;
+    if (const auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+            info->get_instance_proc(info->instance, "vkGetPhysicalDeviceQueueFamilyProperties"))) {
         std::uint32_t count = 0;
         families(info->physical, &count, nullptr);
-        std::vector<VkQueueFamilyProperties> queues(count);
+        queues.resize(count);
         families(info->physical, &count, queues.data());
-        if (info->copy_family < count) {
-            off_graphics = !(queues[info->copy_family].queueFlags & VK_QUEUE_GRAPHICS_BIT);
-            compute_family = (queues[info->copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
-        }
     }
-    const auto format_properties = info ? reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
-                                              info->get_instance_proc(info->instance, "vkGetPhysicalDeviceFormatProperties2"))
-                                        : nullptr;
-    const auto has_feature = [&](VkFormat format, bool stencil_aspect) {
-#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
-        if (!info->maintenance10 || !format_properties) return false;
-        VkFormatProperties3 features{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
-        VkFormatProperties2 properties{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &features};
-        format_properties(info->physical, format, &properties);
-        const VkFormatFeatureFlags2 bit =
-            stencil_aspect ? (compute_family ? VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR
-                                             : VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR)
-                           : (compute_family ? VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR
-                                             : VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR);
-        return (features.optimalTilingFeatures & bit) != 0;
-#else
-        (void)format, (void)stencil_aspect;
-        return false;
-#endif
-    };
-    const auto expected = [&](Case c) {
-        if (!off_graphics || c == Case::depth_to_depth) return Outcome::matched;
-        const bool runs = stencil(c) ? has_feature(VK_FORMAT_D32_SFLOAT_S8_UINT, true)
-                                     : has_feature(VK_FORMAT_D32_SFLOAT, false);
-        return runs ? Outcome::matched : Outcome::refused;
-    };
-    const auto outcome = [](Outcome o) {
-        return o == Outcome::matched ? "matched" : o == Outcome::refused ? "refused" : "FAILED";
-    };
+    const auto format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
+        info->get_instance_proc(info->instance, "vkGetPhysicalDeviceFormatProperties2"));
     const auto native = native_device();
     int failures = 0;
-    for (const Case c : {Case::depth_upload, Case::stencil_upload, Case::depth_readback, Case::depth_to_depth,
-                         Case::depth_to_colour}) {
-        const Outcome ours = run(*vulkan.Get(), c, true), want = expected(c);
-        const Outcome host = native ? run(*native.Get(), c, false) : Outcome::matched;
-        std::printf("%-30s layer: %s (expected %s)%s%s\n", name(c), outcome(ours), outcome(want),
-                    native ? ", native D3D12: " : "", native ? outcome(host) : "");
-        if (ours != want || host != Outcome::matched) ++failures;
+    bool any_off_graphics = false;
+    for (const D3D12_COMMAND_LIST_TYPE tested : {D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_COMPUTE}) {
+        // The Vulkan family the layer runs this D3D12 queue type on: COMPUTE without a family of its own shares the
+        // graphics one.
+        const std::uint32_t family = tested == D3D12_COMMAND_LIST_TYPE_COPY ? info->copy_family
+                                     : info->compute_family < queues.size() ? info->compute_family
+                                                                            : info->queue_family;
+        const VkQueueFlags flags = family < queues.size() ? queues[family].queueFlags : VK_QUEUE_GRAPHICS_BIT;
+        const bool off_graphics = !(flags & VK_QUEUE_GRAPHICS_BIT), compute_family = (flags & VK_QUEUE_COMPUTE_BIT) != 0;
+        any_off_graphics = any_off_graphics || off_graphics;
+        std::printf("%s queues on Vulkan family %u (%s), graphics family %u\n", name(tested), family,
+                    off_graphics ? (compute_family ? "compute, no graphics" : "transfer only") : "has graphics",
+                    info->queue_family);
+        // What the layer must do, from the GPU's own answers (not the layer's): on a family with graphics every case
+        // runs; on one without, a copy with a buffer runs only with maintenance10 and the format's feature for that
+        // aspect on that kind of family, and is refused otherwise. vkCmdCopyImage (depth_to_depth) always runs.
+        const auto has_feature = [&](VkFormat format, bool stencil_aspect) {
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+            if (!info->maintenance10 || !format_properties) return false;
+            VkFormatProperties3 features{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+            VkFormatProperties2 properties{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &features};
+            format_properties(info->physical, format, &properties);
+            const VkFormatFeatureFlags2 bit =
+                stencil_aspect ? (compute_family ? VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR
+                                                 : VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR)
+                               : (compute_family ? VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR
+                                                 : VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR);
+            return (features.optimalTilingFeatures & bit) != 0;
+#else
+            (void)format, (void)stencil_aspect;
+            return false;
+#endif
+        };
+        const auto expected = [&](Case c) {
+            if (!off_graphics || c == Case::depth_to_depth) return Outcome::matched;
+            const bool runs = stencil(c) ? has_feature(VK_FORMAT_D32_SFLOAT_S8_UINT, true)
+                                         : has_feature(VK_FORMAT_D32_SFLOAT, false);
+            return runs ? Outcome::matched : Outcome::refused;
+        };
+        for (const Case c : {Case::depth_upload, Case::stencil_upload, Case::depth_readback, Case::depth_to_depth,
+                             Case::depth_to_colour}) {
+            const Outcome ours = run(*vulkan.Get(), c, tested, true), want = expected(c);
+            const Outcome host = native ? run(*native.Get(), c, tested, false) : Outcome::matched;
+            std::printf("  %-8s %-22s layer: %s (expected %s)%s%s\n", name(tested), name(c), outcome(ours),
+                        outcome(want), native ? ", native D3D12: " : "", native ? outcome(host) : "");
+            if (ours != want || host != Outcome::matched) ++failures;
+        }
     }
     if (failures) return 1;
-    return dedicated_copy ? 0 : 77;
+    return any_off_graphics ? 0 : 77;  // without a family lacking graphics the rule under test never applies
 }
