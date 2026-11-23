@@ -23,7 +23,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
+from file_mode import discard_staged, published_mode  # noqa: E402
 
 
 
@@ -499,10 +499,7 @@ def write_report(path, text):
         os.replace(tmp, path)
     except BaseException:
         if tmp is not None:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            discard_staged(tmp)     # it may carry a read-only destination's mode by now
         raise
 
 

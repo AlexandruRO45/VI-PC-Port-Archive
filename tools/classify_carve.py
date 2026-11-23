@@ -24,7 +24,7 @@ from collections import defaultdict
 from statistics import median_low
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
+from file_mode import discard_staged, published_mode  # noqa: E402
 
 
 def classify(r):
@@ -66,6 +66,23 @@ def entry(v):
 USAGE = "usage: python -I classify_carve.py <work>\\carve"
 
 
+def publish_report(root, report, out):
+    """Write the report beside its destination and swap it in, so a run that fails or is interrupted while writing
+    leaves the previous report as it was instead of a truncated one. The result keeps the previous report's
+    permission bits, or gets the usual ones for a new file."""
+    fd, temp = tempfile.mkstemp(dir=root, prefix=".types-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(out, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp, published_mode(report))                             # mkstemp creates 0600
+        os.replace(temp, report)
+    except BaseException:
+        discard_staged(temp)        # it may carry a read-only destination's mode by now
+        raise
+
+
 def main():
     if sys.argv[1:] in (["-h"], ["--help"]):
         print(USAGE)
@@ -104,20 +121,7 @@ def main():
         per[name] = {k: entry(v) for k, v in sorted(c.items(), key=lambda kv: -kv[1][1])}
     top = sorted(total.items(), key=lambda kv: -kv[1][1])
     out = {"overall": {k: entry(v) for k, v in top}, "per_archive": per}
-    fd, temp = tempfile.mkstemp(dir=root, prefix=".types-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(out, f, indent=1)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(temp, published_mode(report))                             # mkstemp creates 0600
-        os.replace(temp, report)
-    except BaseException:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
-        raise
+    publish_report(root, report, out)
     print(f"{'class':24} {'files':>10} {'GiB':>8}")
     for k, v in top[:25]:
         print(f"{k:24} {v[0]:>10} {v[1] / 2**30:8.2f}")

@@ -39,3 +39,21 @@ def published_mode(path):
         return stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:
         return new_file_mode(os.path.dirname(os.path.abspath(path)))
+
+
+def discard_staged(path):
+    """Remove a staging file that may already carry the destination's read-only bits.
+
+    A writer gives its staging file the destination's mode just before os.replace(). When the destination is
+    read-only, that replace fails on Windows, and the staging file now has the read-only bit too, so the cleanup
+    unlink fails and strands a temp beside the report. Clear the bit first. This runs in a failure path that is
+    already raising, so a cleanup error must not replace the real one: both steps ignore OSError.
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    try:
+        os.unlink(path)
+    except OSError:
+        pass

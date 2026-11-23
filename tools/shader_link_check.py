@@ -15,7 +15,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
+from file_mode import discard_staged, published_mode  # noqa: E402
 from spirv_interface import (Address, Declaration, InterfaceError, NumericType,  # noqa: E402
                              StageInterface, reflect_module)
 
@@ -228,7 +228,7 @@ def write_report(path: Path, doc):
         os.replace(temporary, path)
     finally:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            discard_staged(temporary)   # a failed replace can leave it read-only; unlink would mask the error
 
 
 def ensure_report_is_separate(output, inputs):

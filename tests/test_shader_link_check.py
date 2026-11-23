@@ -573,3 +573,18 @@ class CommandLineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class PublishTest(unittest.TestCase):
+    def test_failed_replace_of_a_read_only_report_leaves_no_temporary(self):
+        # os.replace onto a read-only destination fails on Windows, and the staged report already carries the
+        # destination's read-only bit, so unlink() would fail too (and mask the replace error).
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "report.json"
+            link.write_report(out, {"status": "ok"})
+            os.chmod(out, 0o444)
+            self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+            with patch.object(link.os, "replace", side_effect=PermissionError(13, "read-only")):
+                with self.assertRaises(OSError):
+                    link.write_report(out, {"status": "new"})
+            self.assertEqual(sorted(os.listdir(tmp)), ["report.json"])

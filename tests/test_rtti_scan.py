@@ -646,6 +646,32 @@ class RttiScanCoreTest(unittest.TestCase):
         finally:
             os.umask(old)
 
+    def test_failed_replace_of_a_read_only_report_removes_the_read_only_temp(self):
+        # os.replace onto a read-only destination fails on Windows, and by then the staging file carries the
+        # destination's read-only bit too: a plain unlink strands it beside the report.
+        from unittest import mock
+
+        out = os.path.join(self.tmp.name, "ro.rtti.json")
+        rtti_scan.write_report(out, '{"previous": true}')
+        os.chmod(out, 0o444)
+        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".rtti-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(rtti_scan.os, "replace", side_effect=PermissionError(13, "read-only")), \
+                mock.patch.object(rtti_scan.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                rtti_scan.write_report(out, '{"new": true}')
+        self.assertEqual(len(made_writable), 1)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"previous": true}')
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["ro.rtti.json"])
+
     def test_new_report_is_writable(self):
         # On Windows os.chmod only sets the read-only flag: a new report must not come out read-only.
         out = os.path.join(self.tmp.name, "w.rtti.json")
