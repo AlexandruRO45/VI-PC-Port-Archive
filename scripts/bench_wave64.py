@@ -65,10 +65,13 @@ def run(tools, spv, groups, reps, driver, emulate):
     out = r.stdout + r.stderr
     m = re.search(r"bench ms: median=([\d.]+) min=([\d.]+) max=([\d.]+)", out)
     h = re.search(r"bench out fnv1a: (\w+)", out)
+    mm = re.search(r"\b(\d+) mismatches\b", out)
     dev = re.search(r"device: (.*) \(subgroup", out)
-    if r.returncode or not m or not h or "0 mismatches" not in out:
-        why = f"exit {r.returncode}" if r.returncode else "no 'bench ms' / 'bench out fnv1a' line (rebuild vk_compute_test)"
+    if r.returncode or not m or not h or not mm:
+        why = f"exit {r.returncode}" if r.returncode else "no 'bench ms' / 'bench out fnv1a' / mismatches line (rebuild vk_compute_test)"
         return None, why + ": " + (out.strip().splitlines()[-1:] or ["no output"])[0], None
+    if mm.group(1) != "0":
+        return None, f"the harness reported {mm.group(1)} mismatches: " + (out.strip().splitlines()[-1:] or ["no output"])[0], None
     return (float(m.group(1)), float(m.group(2))), h.group(1), dev.group(1) if dev else "?"
 
 
