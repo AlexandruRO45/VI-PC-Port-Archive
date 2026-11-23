@@ -73,7 +73,7 @@ BcpackHistory? history = null;
 if (historyPath is not null)
 {
     try { history = BcpackHistory.Load(historyPath); }
-    catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException)
+    catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
     {
         Console.WriteLine($"--history {historyPath}: {e.Message}");
         return 2;

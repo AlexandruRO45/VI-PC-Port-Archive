@@ -1056,7 +1056,7 @@ All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing de
    `DecodeTexturePreview` take it next to `allowProvisional`:
    `rpf9dump ttpf <pool.ttpf> <out> --history <dir> [--allow-provisional]`. Unlike the Python
    decoder, which reads a codec's table when it first decodes that codec, `rpf9dump` reads every
-   BC1-BC5 table before the first texture and exits 2 on a malformed or missing one. Self-calibrated
+   BC1-BC5 table before the first texture and exits 2 on a malformed table or a missing path (a folder without a `bcN.json` keeps that codec's built-in table). Self-calibrated
    tables only hold provisional entries, so they change the output only with `--allow-provisional`.
    What is left: `bc6h.json` / `bc7.json` are ignored until the BC6H/BC7 rebuilders land in
    `TtpfReader` ("Next step" 1, ASSET-315).
