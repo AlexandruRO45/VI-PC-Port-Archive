@@ -132,5 +132,30 @@ class VMulLoU16SimdBoundaryTests(unittest.TestCase):
     def test_max_u16_boundary(self):
         self.assertEqual(ref_mul_lo_u16(0xFFFF, 0xFFFF), 1)
 
+class VMulLoU16TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution and negative mutation controls for v_mul_lo_u16."""
+
+    def test_spirv_translation_execution(self):
+        lines = [
+            "v_mov_b32 v0, 15",
+            "v_mov_b32 v1, 20",
+            "v_mul_lo_u16 v2, v0, v1",
+            "v_mov_b32 v0, v2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mul_lo_u16_bundle_int", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0] & 0xFFFF, 300)
+
+    def test_negative_mutation_contrast(self):
+        a, b = 10, 20
+        res_mul = ref_mul_lo_u16(a, b)
+        res_add = u16(a + b)
+        self.assertNotEqual(res_mul, res_add)
+
 if __name__ == "__main__":
     unittest.main()
