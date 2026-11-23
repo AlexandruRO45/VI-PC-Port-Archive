@@ -769,5 +769,76 @@ class TestSIMDInterpreter64(unittest.TestCase):
         self.assertEqual(conflicts[0], [0, 1])
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing64(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(65536)
+        self.interp = ScalarDSInterpreter64()
+
+    def test_vaddr_preservation_non_returning(self) -> None:
+        # Non-returning ds_max_src2_f64 must never overwrite vaddr
+        state = ScalarThreadState64(lds=self.lds)
+        state.set_vgpr32(5, 0x80)
+        self.lds.write_qword(0x80, ONE_F64)
+        self.lds.write_qword(0x88, TEN_F64)
+
+        inst = DSMaxSrc2F64Instruction(
+            vaddr=RegisterOperand(5, count=1),
+            offset0=0,
+            offset1=1,
+        )
+
+        self.interp.execute(state, inst)
+
+        # v5 must strictly remain 0x80
+        self.assertEqual(state.get_vgpr32(5), 0x80)
+        self.assertEqual(self.lds.read_qword(0x80), TEN_F64)
+
+    def test_all_vgprs_isolated(self) -> None:
+        state = ScalarThreadState64(lds=self.lds)
+        for i in range(256):
+            state.set_vgpr32(i, 0x55550000 + i)
+
+        addr = 0x20
+        state.set_vgpr32(10, addr)
+        self.lds.write_qword(addr, TWO_F64)
+        self.lds.write_qword(addr + 8, THREE_F64)
+
+        inst = DSMaxSrc2F64Instruction(
+            vaddr=RegisterOperand(10, count=1),
+            offset0=0,
+            offset1=1,
+        )
+
+        self.interp.execute(state, inst)
+
+        for i in range(256):
+            if i == 10:
+                self.assertEqual(state.get_vgpr32(i), addr)
+            else:
+                self.assertEqual(state.get_vgpr32(i), 0x55550000 + i)
+
+    def test_location_aliasing_same_offset(self) -> None:
+        # When offset0 == offset1, Location A and B alias to the exact same cell
+        state = ScalarThreadState64(lds=self.lds)
+        state.set_vgpr32(0, 0x100)
+        self.lds.write_qword(0x100, HALF_F64)
+
+        inst = DSMaxSrc2F64Instruction(
+            vaddr=RegisterOperand(0, count=1),
+            offset0=0,
+            offset1=0,
+        )
+
+        res = self.interp.execute(state, inst)
+        self.assertEqual(res, HALF_F64)
+        self.assertEqual(self.lds.read_qword(0x100), HALF_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
