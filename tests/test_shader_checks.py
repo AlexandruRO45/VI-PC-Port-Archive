@@ -975,6 +975,29 @@ class SamplerMipChecks(unittest.TestCase):
         self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
 
 
+class MeshGradientChecks(unittest.TestCase):
+    def test_nan_in_each_channel_fails(self):
+        frame = bytearray().join(struct.pack("<4f", (x + .5) / 64, (y + .5) / 64, .5, 1)
+                                 for y in range(64) for x in range(64))
+
+        def draw(cmd, **kwargs):
+            Path(cmd[3]).write_bytes(frame)
+            return check.subprocess.CompletedProcess(cmd, 0, "", "subgroup 64..64")
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(check.subprocess, "run", draw):
+            for name in ("fs_passthru", "ms_w64x_ballot", "ms_wave_info_s3"):
+                Path(folder, name + ".spv").touch()
+            for name in ("ms_w64x_ballot", "ms_wave_info_s3"):
+                self.assertEqual(check.mesh_w64x_test(folder, folder, name), "")
+                for channel in range(4):
+                    with self.subTest(name=name, channel=channel):
+                        offset = 16 * 4095 + 4 * channel
+                        saved = frame[offset:offset + 4]
+                        struct.pack_into("<f", frame, offset, float("nan"))
+                        self.assertIn("1 of 4096", check.mesh_w64x_test(folder, folder, name))
+                        frame[offset:offset + 4] = saved
+
+
 class FmaFusedChecks(unittest.TestCase):
     """cs_fma_fused: strict single-rounded words under --fma khr, fused-or-split f32 under --fma glsl (Mesa RADV)."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
