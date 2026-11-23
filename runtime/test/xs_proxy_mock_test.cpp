@@ -187,7 +187,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
         // The description lives on the caller's stack only for the call, so it is copied while the call is active.
-        if (slot == 18 && a2) std::memcpy(&m->srv, reinterpret_cast<const void*>(a2), sizeof(m->srv));
+        if (slot == 18 && a2 > 0xFFFF) std::memcpy(&m->srv, reinterpret_cast<const void*>(a2), sizeof(m->srv));
         switch (slot) {
             case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
