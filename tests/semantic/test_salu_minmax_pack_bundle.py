@@ -175,5 +175,39 @@ class SMinI32TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_min_i32", ["s_min_i32 s0, s1"])
 
+# -----------------------------------------------------------------------------
+# Opcode 2: s_min_u32
+# -----------------------------------------------------------------------------
+def oracle_min_u32(s0: int, s1: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_min_u32: returns (result_u32, scc)."""
+    xu = s0 & MASK32
+    yu = s1 & MASK32
+    val = xu if xu < yu else yu
+    scc = 1 if xu < yu else 0
+    return val, scc
+
+
+class SMinU32OracleTests(unittest.TestCase):
+    def test_min_u32_basic(self):
+        # min(10, 20) = 10, SCC = 1
+        res, scc = oracle_min_u32(10, 20)
+        self.assertEqual(res, 10)
+        self.assertEqual(scc, 1)
+
+    def test_min_u32_unsigned_comparison(self):
+        # 0xFFFFFFFF (4294967295) vs 10: unsigned min is 10
+        res, scc = oracle_min_u32(0xFFFFFFFF, 10)
+        self.assertEqual(res, 10)
+        self.assertEqual(scc, 0)  # 0xFFFFFFFF < 10 is False unsigned
+
+        res, scc = oracle_min_u32(10, 0xFFFFFFFF)
+        self.assertEqual(res, 10)
+        self.assertEqual(scc, 1)  # 10 < 0xFFFFFFFF is True unsigned
+
+    def test_min_u32_ties(self):
+        res, scc = oracle_min_u32(100, 100)
+        self.assertEqual(res, 100)
+        self.assertEqual(scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
