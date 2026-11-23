@@ -948,6 +948,19 @@ class PackIndexValidationTest(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(rd(out), b"previous complete output")
 
+    def test_pack_refuses_an_out_that_names_a_source_file(self):
+        """pack reads the index and every block; an --out naming one of them replaced the file it had just read."""
+        block_path = os.path.join(self.extracted, self.index["entries"][0]["file"])
+        for target in (self.index_path, block_path):
+            with self.subTest(target=os.path.relpath(target, self.extracted)):
+                before = rd(target)
+                with self.assertRaises(ValueError) as error:
+                    saves.pack(self.extracted, target)
+                self.assertIn(target, str(error.exception))
+                self.assertIn("would replace it", str(error.exception))
+                self.assertNotIn("invalid JSON", str(error.exception))
+                self.assertEqual(rd(target), before, "the source file changed")
+
     def test_valid_editable_metadata_still_round_trips(self):
         self.index["header"]["note"] = "extra metadata is ignored"
         self.index["entries"][0]["hash"] = "0X" + self.index["entries"][0]["hash"]
