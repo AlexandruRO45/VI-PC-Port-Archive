@@ -32,6 +32,7 @@ import hashlib
 import json
 import math
 import os
+from pathlib import PurePosixPath, PureWindowsPath
 import re
 import shutil
 import statistics
@@ -261,7 +262,20 @@ def model_name_index(entries: list[tuple[str, dict]], world_names) -> dict[int, 
     return index
 
 
-def resolve_placement(index, arch: int, key_hex) -> tuple[tuple[str, dict] | None, str]:
+def _drawable_source(source, lod, item):
+    """An rpf9dump source address survives export-local OBJ renumbering."""
+    offset = item.get("Offset")
+    drawable = item.get("Drawable")
+    if type(offset) is not int or offset < 0 or "Drawable" not in item:
+        return None
+    if drawable is not None and (type(drawable) is not int or drawable < 0):
+        return None
+    if type(lod) is not int or not isinstance(item.get("Name"), str):
+        return None
+    return source, offset, drawable, lod, item["Name"].lower()
+
+
+def resolve_placement(index, arch: int, key_hex, *, require_unique=False) -> tuple[tuple[str, dict] | None, str]:
     """Pick the exported model for one entity. Returns (model or None, outcome)."""
     cands = index.get(arch)
     if not cands:
@@ -276,8 +290,10 @@ def resolve_placement(index, arch: int, key_hex) -> tuple[tuple[str, dict] | Non
         good = [c for c in cands if c[2] == key]
         if not good:
             return None, "key_mismatch"
-        return (good[0][0], good[0][1]), "placed"
-    return (cands[0][0], cands[0][1]), "placed_unverified"
+        cands = good
+    if require_unique and len(cands) > 1:
+        return None, "ambiguous_model"
+    return (cands[0][0], cands[0][1]), "placed" if key is not None else "placed_unverified"
 
 
 INSTANCING_MODES = ("gpu", "nodes", "bake")
@@ -557,7 +573,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
     """``build_world --placements`` with shared geometry: memory holds about 100 bytes per placement plus the
     models of the chunk being written, not a copy of every placed model."""
     counts = _placement_counts()
-    for outcome in ("placed", "placed_unverified", "unresolved_archetype", "key_mismatch", "model_not_loadable",
+    for outcome in ("placed", "placed_unverified", "unresolved_archetype", "key_mismatch", "ambiguous_model", "model_not_loadable",
                     "degenerate_scale", "mirrored"):
         counts[outcome] = 0
     index = model_name_index(entries, _get_world_names())
@@ -576,7 +592,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
                 v = row.get(src)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0:
                     dst.setdefault(lvl, array.array("d")).append(float(v))
-        found, outcome = resolve_placement(index, row["_arch"], row.get("key"))
+        found, outcome = resolve_placement(index, row["_arch"], row.get("key"), require_unique=True)
         if found is None:
             counts[outcome] += 1
             continue
@@ -1422,6 +1438,7 @@ def build_world(
     limit: int | None = None,
     jobs: int = 1,
     base_color_param: str | None = None,
+    extra_assets=(),
     placements: str | None = None,
     lod_levels=DEFAULT_LOD_LEVELS,
     region=None,
@@ -1486,9 +1503,18 @@ def build_world(
     glb_mod = _get_glb_writer()
     dds_mod = _get_dds_png() if textures else None
 
+    if extra_assets and placements is None:
+        raise ValueError("--extra-assets requires --placements")
     manifests = discover_model_manifests(assets_dir)
     if not manifests and limit != 0:
         raise ValueError(f"No readable model manifests found in {assets_dir}; output left unchanged")
+    for root in extra_assets:
+        extra = discover_model_manifests(root)
+        if not extra:
+            raise ValueError(f"No readable model manifests found in {root}")
+        manifests.extend(extra)
+    manifests = sorted({os.path.realpath(path) for path in manifests})
+    source_entries = {}
     entries: list[tuple[str, dict]] = []
     for mpath in manifests:
         data = _load_json_dict(mpath)
@@ -1498,14 +1524,39 @@ def build_world(
         if not isinstance(items, list):
             continue
         models_dir = os.path.dirname(mpath)
+        source = None
+        src = data.get("src")
+        if placements is not None and isinstance(src, str):
+            for path_type in (PureWindowsPath, PurePosixPath):
+                path = path_type(src)
+                if path.is_absolute():
+                    source = path
+                    break
+        lod = data.get("Lod", 0)
         for item in items:
-            if isinstance(item, dict):
-                entries.append((models_dir, item))
+            if not isinstance(item, dict):
+                continue
+            identity = _drawable_source(source, lod, item) if source is not None else None
+            if identity is not None:
+                previous = source_entries.get(identity)
+                if previous is not None:
+                    old_dir, old = entries[previous]
+                    if (not os.path.isfile(os.path.join(old_dir, str(old.get("File"))))
+                            and os.path.isfile(os.path.join(models_dir, str(item.get("File"))))):
+                        entries[previous] = (models_dir, item)
+                    continue
+                source_entries[identity] = len(entries)
+            entries.append((models_dir, item))
 
     if limit is not None:
         entries = entries[:limit]
 
     ttpf_index = index_ttpf_textures(assets_dir) if textures else {}
+
+    if textures:
+        for root in extra_assets:
+            for key, path in index_ttpf_textures(root).items():
+                ttpf_index.setdefault(key, path)
 
     if placements is not None and instancing != "bake":
         return _build_instanced_world(
@@ -1552,10 +1603,10 @@ def build_world(
         index = model_name_index(entries, _get_world_names())
         cache: dict[tuple[str, str], dict | None] = {}
         used: set[tuple[str, str]] = set()
-        for outcome in ("placed", "placed_unverified", "unresolved_archetype", "key_mismatch", "model_not_loadable"):
+        for outcome in ("placed", "placed_unverified", "unresolved_archetype", "key_mismatch", "ambiguous_model", "model_not_loadable"):
             placement_stats[outcome] = 0
         for row in rows:
-            found, outcome = resolve_placement(index, row["_arch"], row.get("key"))
+            found, outcome = resolve_placement(index, row["_arch"], row.get("key"), require_unique=True)
             if found is None:
                 placement_stats[outcome] += 1
                 continue
@@ -1834,6 +1885,8 @@ def main(argv: list[str] | None = None) -> int:
         "assets_dir",
         help="Path to a models/ dir, an archive dir, or a full <work>\\assets tree.",
     )
+    ap.add_argument("--extra-assets", action="append", default=[], metavar="ROOT",
+                    help="Additional model export root for placements (repeatable).")
     ap.add_argument(
         "--out",
         required=True,
@@ -1949,6 +2002,7 @@ def main(argv: list[str] | None = None) -> int:
             jobs=args.jobs,
             base_color_param=args.base_color_param,
             placements=args.placements,
+            extra_assets=args.extra_assets,
             lod_levels=lod_levels,
             region=args.region,
             instancing=args.instancing,

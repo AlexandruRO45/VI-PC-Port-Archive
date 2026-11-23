@@ -581,7 +581,19 @@ coordinates. It covers points 3 and 4 of *What a runtime needs*, and approximate
 MINX,MINY,MAXX,MAXY` bounds the RAGE world X/Y. `world.json` then has `"layout": "placements"` and a
 `stats.placements` block: `rows`, `malformed`, `other_lod_level`, `outside_region`, `selected`, `placed`,
 `placed_unverified` (no key in the row), `key_mismatch`, `unresolved_archetype` (no exported model has that name),
-`model_not_loadable`, `degenerate_scale`, `mirrored` and `distinct_models`.
+`ambiguous_model` (multiple candidates survive the name/key checks), `model_not_loadable`, `degenerate_scale`,
+`mirrored` and `distinct_models`.
+
+Pass `--extra-assets ROOT` once per additional cached export. Each OBJ is read relative to its own manifest.
+For exports of the same package, equal absolute archive paths (`src`), resource offsets, drawable offsets,
+export LOD and model names identify repeat observations. Keep exports from different package versions separate.
+Rows without a complete source address remain separate candidates. An ambiguous placement is skipped in all
+three instancing modes.
+
+On a private CPU-only `--lod-sets --no-textures` run, one export placed 1,488 of 75,551 rows. Adding two
+windows with no complementary matches gave the same count. Adding a complementary export and its repeat
+placed 1,663 rows using 1,501 distinct models (+175 placements, +63 models). The other 73,888 rows had
+unresolved archetypes.
 
 `--max-tex-size` limits the longest edge of embedded DDS previews to 512 pixels by default.
 When shrinking a DDS tagged sRGB, the converter averages RGB in linear light, weights each texel by its

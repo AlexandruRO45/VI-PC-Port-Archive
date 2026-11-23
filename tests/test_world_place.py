@@ -12,6 +12,7 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -235,6 +236,44 @@ class PlacedBuildTest(unittest.TestCase):
         write_entities(ents, rows, extra_lines)
         doc = world_build.build_world(assets, os.path.join(tmp, "world"), textures=False, placements=ents, **kw)
         return doc
+
+    def test_independent_export_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            roots = []
+            for window, records in enumerate((
+                [("shared", 512, None), ("conflict", 640, 0)],
+                [("unique", 128, None), ("shared", 512, None), ("conflict", 640, 1)],
+            )):
+                root = base / str(window)
+                root.mkdir()
+                items = []
+                for local_index, (name, offset, drawable) in enumerate(records):
+                    filename = f"{local_index}.obj"
+                    obj = UNIT_BOX_OBJ.replace("v 1 ", "v 7 ") if name == "unique" else UNIT_BOX_OBJ
+                    (root / filename).write_text(obj, encoding="utf-8", newline="\n")
+                    items.append(dict(Name=name, File=filename, Offset=offset, Drawable=drawable))
+                manifest = dict(src="/archives/levels.rpf", Items=items)
+                (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+                roots.append(str(root))
+            # The matching row in window 1 still has the shared OBJ under its own local index.
+            (base / "0" / "0.obj").unlink()
+            ents = str(base / "p.jsonl")
+            rows = [entity(name, (0, 0, 0)) for name in ("shared", "unique", "conflict")]
+            rows.append(entity("conflict", (0, 0, 0), key=False))
+            write_entities(ents, rows)
+            for mode in world_build.INSTANCING_MODES:
+                for first, second in (roots, roots[::-1]):
+                    out = base / "world"
+                    args = [first, "--extra-assets", second, "--extra-assets", first, "--placements", ents,
+                            "--instancing", mode, "--no-textures", "--out", str(out)]
+                    with self.subTest(mode=mode, first=first), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(world_build.main(args), 0)
+                        doc = json.loads((out / "world.json").read_text())
+                        self.assertEqual(max(c["bounds"][3] for c in doc["chunks"]), 7)
+                        stats = doc["stats"]["placements"]
+                        self.assertEqual((stats["placed"], stats["distinct_models"], stats["ambiguous_model"]),
+                                         (2, 2, 2))
 
     def test_counts_and_bounds(self):
         rows = [
