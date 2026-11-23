@@ -38,3 +38,5 @@ printf 'LIBRARY vulkan-1.dll\nEXPORTS\n  vkGetInstanceProcAddr\n' > "$OUT/vulkan
 "$LLVM/llvm-dlltool" -m i386:x86-64 -d "$OUT/vulkan-1.def" -l "$OUT/vulkan-1.lib"
 $CL -I"$VKH" /c guest/vk_clear.c /Fo"$OUT/vk_clear.obj"
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/vk_clear.obj" "$OUT/vulkan-1.lib" user32.lib /out:"$OUT/vk_clear.exe"
+$CL /c guest/cpuid_probe.c /Fo"$OUT/cpuid_probe.obj"
+"$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/cpuid_probe.obj" /out:"$OUT/cpuid_probe.exe"

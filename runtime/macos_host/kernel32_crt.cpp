@@ -625,6 +625,12 @@ int32_t CreateDXGIFactory1(const void*, void** out) {
     return static_cast<int32_t>(0x887A0004);  // DXGI_ERROR_UNSUPPORTED
 }
 
+// d3d12.dll's own debug layer does not exist here (d3d12.lib imports it as ordinal 102).
+int32_t D3D12GetDebugInterface(const void*, void** out) {
+    *out = nullptr;
+    return static_cast<int32_t>(0x80004002);  // E_NOINTERFACE
+}
+
 // advapi32: there are no Windows security tokens here, so no privilege is ever held.
 int OpenProcessToken(HANDLE, uint32_t, HANDLE*) { return set_last_error(5 /* ERROR_ACCESS_DENIED */), 0; }
 int OpenThreadToken(HANDLE, uint32_t, int32_t, HANDLE*) { return set_last_error(1008 /* ERROR_NO_TOKEN */), 0; }
@@ -653,7 +659,7 @@ Exports kernel32_crt_exports() {
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
         K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
         K(SetEvent), K(ResetEvent), K(AreFileApisANSI), K(FormatMessageA), K(LocalFree), K(GetTempPathW),
-        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(ExitThread), K(FreeLibraryAndExitThread),
+        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(ExitThread), K(FreeLibraryAndExitThread),
         K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),
     };
 }

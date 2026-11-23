@@ -7,6 +7,7 @@
 #include "host.h"
 
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <limits.h>
 #include <signal.h>
 #include <strings.h>
@@ -15,6 +16,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -93,9 +96,15 @@ std::string to_host_path(const char* p) {  // ponytail: no drive letters
     return s;
 }
 
+// Every TEB ever made, so the fault handler can tell whether gs still points at one without touching memory.
+// ponytail: fixed 1024 slots; threads past that fault-report with whatever gs they had.
+uint8_t* g_tebs[1024];
+std::atomic<int> g_teb_count{0};
+
 uint8_t* make_teb() {
     auto* teb = static_cast<uint8_t*>(aligned_alloc(0x1000, kTebSize));
     if (!teb) fail("out of memory");
+    if (int i = g_teb_count.fetch_add(1); i < 1024) g_tebs[i] = teb;
     std::memset(teb, 0, kTebSize);
     pthread_t self = pthread_self();
     auto* top = static_cast<uint8_t*>(pthread_get_stackaddr_np(self));
@@ -136,6 +145,10 @@ namespace {
 void on_fault(int sig, siginfo_t* info, void* uc) {
     auto& ss = static_cast<ucontext_t*>(uc)->uc_mcontext->__ss;
     uint64_t rip = ss.__rip, base = reinterpret_cast<uint64_t>(g_image);
+    uint8_t* teb;  // a fault in guest code, or in host code called without HostGs: libc needs its own gs back
+    __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));
+    for (int i = 0, n = std::min(g_teb_count.load(), 1024); i < n; ++i)
+        if (g_tebs[i] == teb) _thread_set_tsd_base(teb_at<uint64_t>(teb, kTebHostGs));
     std::fprintf(stderr, "host: signal %d at rip=0x%llx", sig, rip);
     if (g_image && rip >= base && rip < base + 0x10000000) std::fprintf(stderr, " (image+0x%llx)", rip - base);
     std::fprintf(stderr, " addr=%p rsp=0x%llx [rsp]=0x%llx\n", info->si_addr, ss.__rsp,
@@ -313,11 +326,9 @@ uint8_t* load_pe(const char* path) {
         uint32_t lookup = rd<uint32_t>(image + d) ? rd<uint32_t>(image + d) : rd<uint32_t>(image + d + 16);
         auto* iat = reinterpret_cast<uint64_t*>(image + rd<uint32_t>(image + d + 16));
         for (auto* t = reinterpret_cast<uint64_t*>(image + lookup); *t; ++t, ++iat) {
-            if (*t >> 63) {
-                missing.push_back(dll + "!#" + std::to_string(*t & 0xffff));
-                continue;
-            }
-            std::string key = dll + "!" + reinterpret_cast<char*>(image + (*t & 0x7fffffff) + 2);
+            // By ordinal ("d3d12.dll!#102", as d3d12.lib imports) or by name.
+            std::string key = *t >> 63 ? dll + "!#" + std::to_string(*t & 0xffff)
+                                       : dll + "!" + reinterpret_cast<char*>(image + (*t & 0x7fffffff) + 2);
             auto it = g_exports.find(key);
             if (it == g_exports.end()) {
                 missing.push_back(key);
@@ -366,6 +377,16 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: macos_host <image.exe> [guest arguments...]\n");
         return 64;
+    }
+    // Rosetta runs AVX/AVX2/FMA/F16C/BMI but only reports them in CPUID when started with this variable; without it
+    // the guest CRT's __isa_available check picks its SSE paths.
+    if (!getenv("ROSETTA_ADVERTISE_AVX")) {
+        char self[PATH_MAX];
+        uint32_t size = sizeof self;
+        if (_NSGetExecutablePath(self, &size) == 0) {
+            setenv("ROSETTA_ADVERTISE_AVX", "1", 1);
+            execv(self, argv);  // falls through on failure: the guest still runs, without AVX in CPUID
+        }
     }
     for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports, &kernel32_file_exports, &d3d12_serialize_exports, &seh_exports})
         for (auto& [name, fn] : (*list)()) g_exports[name] = fn;

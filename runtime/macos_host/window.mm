@@ -38,7 +38,9 @@ void* CreateWindowExW(uint32_t, const char16_t*, const char16_t* title, uint32_t
         start_app();
         if (w <= 0 || w == INT32_MIN) w = 1280;  // CW_USEDEFAULT
         if (h <= 0 || h == INT32_MIN) h = 720;
-        NSWindow* win = [[NSWindow alloc] initWithContentRect:NSMakeRect(200, 200, w, h)
+        // Win32 sizes are pixels; AppKit's are points, two pixels each on a Retina screen.
+        CGFloat pts = [[NSScreen mainScreen] backingScaleFactor];
+        NSWindow* win = [[NSWindow alloc] initWithContentRect:NSMakeRect(200, 200, w / pts, h / pts)
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                               NSWindowStyleMaskMiniaturizable
                                                       backing:NSBackingStoreBuffered
@@ -46,9 +48,8 @@ void* CreateWindowExW(uint32_t, const char16_t*, const char16_t* title, uint32_t
         [win setReleasedWhenClosed:NO];
         [win setTitle:[NSString stringWithUTF8String:narrow(title).c_str()]];
         CAMetalLayer* layer = [CAMetalLayer layer];
-        CGFloat scale = [win backingScaleFactor];
-        layer.contentsScale = scale;
-        layer.drawableSize = CGSizeMake(w * scale, h * scale);
+        layer.contentsScale = [win backingScaleFactor];
+        layer.drawableSize = CGSizeMake(w, h);
         NSView* view = [win contentView];
         [view setLayer:layer];
         [view setWantsLayer:YES];
@@ -96,12 +97,39 @@ int TranslateMessage(const Msg*) { return 0; }
 int64_t DispatchMessageW(const Msg*) { return 0; }
 int64_t DefWindowProcW(void*, uint32_t, uint64_t, int64_t) { return 0; }
 int GetClientRect(void* hwnd, int32_t* rect) {
-    NSRect r = [[static_cast<Window*>(hwnd)->window contentView] bounds];
+    CGSize px = static_cast<Window*>(hwnd)->layer.drawableSize;  // pixels, as Win32 counts
     rect[0] = rect[1] = 0;
-    rect[2] = static_cast<int32_t>(r.size.width);
-    rect[3] = static_cast<int32_t>(r.size.height);
+    rect[2] = static_cast<int32_t>(px.width);
+    rect[3] = static_cast<int32_t>(px.height);
     return 1;
 }
+
+// Window and client rect are the same here: CreateWindowExW and SetWindowPos size the content view, AppKit adds
+// the title bar outside it.
+uint16_t RegisterClassW(const void*) { return 1; }
+int UnregisterClassW(const char16_t*, void*) { return 1; }
+int AdjustWindowRect(int32_t*, uint32_t, int) { return 1; }
+int AdjustWindowRectEx(int32_t*, uint32_t, int, uint32_t) { return 1; }
+int32_t GetWindowLongW(void*, int32_t index) { return index == -16 ? 0x00CF0000 : 0; }  // GWL_STYLE: WS_OVERLAPPEDWINDOW
+int SetWindowPos(void* hwnd, void*, int32_t, int32_t, int32_t cx, int32_t cy, uint32_t flags) {
+    auto* w = static_cast<Window*>(hwnd);
+    @autoreleasepool {
+        if (!(flags & 0x1)) {  // SWP_NOSIZE
+            CGFloat scale = [w->window backingScaleFactor];
+            [w->window setContentSize:NSMakeSize(cx / scale, cy / scale)];
+            w->layer.drawableSize = CGSizeMake(cx, cy);
+        }
+        if (flags & 0x40) [w->window makeKeyAndOrderFront:nil];  // SWP_SHOWWINDOW
+    }
+    return 1;
+}
+int UpdateWindow(void*) { return 1; }
+int IsIconic(void* hwnd) { return [static_cast<Window*>(hwnd)->window isMiniaturized]; }
+// ponytail: no foreground window, so tests skip reading the screen back through GDI (GetPixel) and DXGI outputs.
+void* GetForegroundWindow() { return nullptr; }
+void* GetProcessWindowStation() { return nullptr; }  // callers treat "unknown" as interactive
+void* MonitorFromWindow(void*, uint32_t) { return reinterpret_cast<void*>(1); }
+int GetMonitorInfoW(void*, void*) { return 0; }  // no monitor details: the SDR white level falls back to its default
 
 }  // namespace
 
@@ -110,7 +138,10 @@ void* metal_layer_for_window(void* hwnd) { return hwnd ? (__bridge void*)static_
 #define U(name) EXPORT("user32.dll", name)
 Exports user32_exports() {
     return {U(RegisterClassExW), U(CreateWindowExW), U(ShowWindow), U(DestroyWindow), U(PeekMessageW),
-            U(TranslateMessage), U(DispatchMessageW), U(DefWindowProcW), U(GetClientRect), U(LoadCursorW)};
+            U(TranslateMessage), U(DispatchMessageW), U(DefWindowProcW), U(GetClientRect), U(LoadCursorW),
+            U(RegisterClassW), U(UnregisterClassW), U(AdjustWindowRect), U(AdjustWindowRectEx), U(GetWindowLongW),
+            U(SetWindowPos), U(UpdateWindow), U(IsIconic), U(GetForegroundWindow), U(GetProcessWindowStation),
+            U(MonitorFromWindow), U(GetMonitorInfoW)};
 }
 
 }  // namespace host
