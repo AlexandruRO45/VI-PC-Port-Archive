@@ -34,16 +34,32 @@ struct Pseudo {
 
 namespace {
 
+// The loader's immortal state, in one heap block published by a namespace-scope dynamic initialiser. A
+// function-local dynamic static ("static auto* x = new T") is guarded by an _Init_thread_header ($TSS) check, and
+// the boot chain runs on threads whose TLS array the loader replaced (runtime/src/pe_loader.cpp, "Windows replaces
+// a thread's TLS array ... when some thread loads a DLL with static TLS"), where that guard can be skipped and left
+// set: the pointer then stays null and the next caller dereferences it — seen as a page fault at the names lookup
+// below. Namespace-scope initialisation runs in the CRT's single-threaded _initterm before any boot thread, so no
+// thread guard is ever involved.
+//
 // Intentionally immortal: mapped-DLL DLL_PROCESS_DETACH and earlier atexit handlers can call GetProcAddress or
-// FreeLibrary on pseudo-handles during process teardown, after normal statics would have been destroyed.
+// FreeLibrary on pseudo-handles during process teardown, after normal statics would have been destroyed. Nothing
+// here is ever deleted, so the immortality contract of the statics it replaces is kept.
+struct Immortal {
+    std::mutex mutex;                                 // loader_mutex(): guards pseudos and host_names
+    std::deque<Pseudo> pseudos;                       // a deque never moves its elements, so handed-out handles stay valid
+    std::map<HMODULE, std::string> host_names;
+    std::mutex not_served_mutex;                      // get_proc_address's once-per-name "not served" log
+    std::set<std::string> not_served;
+};
+Immortal* const immortal = new Immortal;
+
 std::mutex& loader_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
+    return immortal->mutex;
 }
 
-std::deque<Pseudo>& pseudos() {   // a deque never moves its elements, so handed-out handles stay valid
-    static auto* d = new std::deque<Pseudo>;
-    return *d;
+std::deque<Pseudo>& pseudos() {
+    return immortal->pseudos;
 }
 
 std::string lower_ascii(std::string s) {
@@ -93,8 +109,8 @@ std::string module_name(std::string path) {
 
 std::string host_module_name(HMODULE module) {
     std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
+    auto& names = immortal->host_names;
+    if (auto it = names.find(module); it != names.end()) return it->second;
 
     std::vector<wchar_t> path(MAX_PATH);
     for (;;) {
@@ -102,7 +118,7 @@ std::string host_module_name(HMODULE module) {
         if (!length) return {};
         if (length < path.size()) {
             const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
+            names.emplace(module, name);
             return name;
         }
         if (path.size() == 32768) return {};
@@ -240,10 +256,8 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
             IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
         if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
         {
-            static auto* m = new std::mutex;
-            static auto* seen = new std::set<std::string>;
-            std::lock_guard lock(*m);
-            if (seen->insert(p->dll + "!" + what).second)
+            std::lock_guard lock(immortal->not_served_mutex);
+            if (immortal->not_served.insert(p->dll + "!" + what).second)
                 std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
         }
         SetLastError(ERROR_PROC_NOT_FOUND);
