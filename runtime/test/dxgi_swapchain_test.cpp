@@ -1154,17 +1154,23 @@ int main() {
                     const HRESULT nc = SUCCEEDED(chain_hr)
                         ? native_chain->GetContainingOutput(native_containing.GetAddressOf()) : chain_hr;
                     const HRESULT ss = sc->GetContainingOutput(shim_containing.GetAddressOf());
-                    std::printf("OUTPUT_PROBE native enum=%08lx/%d chain=%08lx containing=%08lx/%d; "
+                    const bool enum_matches = ne == se && bool(native_enum) == bool(shim_enum);
+                    const bool containing_matches = FAILED(chain_hr) ||
+                        (nc == ss && bool(native_containing) == bool(shim_containing));
+                    if (!enum_matches || !containing_matches) {
+                        std::printf("OUTPUT_PROBE native enum=%08lx/%d chain=%08lx containing=%08lx/%d; "
                                 "shim enum=%08lx/%d containing=%08lx/%d\n",
                                 static_cast<unsigned long>(ne), bool(native_enum), static_cast<unsigned long>(chain_hr),
                                 static_cast<unsigned long>(nc), bool(native_containing), static_cast<unsigned long>(se), bool(shim_enum),
                                 static_cast<unsigned long>(ss), bool(shim_containing));
+                    }
                     native_chain.Reset();
                     if (native_window) DestroyWindow(native_window);
-                    if (SUCCEEDED(chain_hr) &&
-                        (ne != se || nc != ss || bool(native_enum) != bool(shim_enum) ||
-                         bool(native_containing) != bool(shim_containing)))
+                    if (!enum_matches || !containing_matches)
                         return fail("output queries differ from native DXGI on the same adapter");
+                    if (FAILED(chain_hr))
+                        std::printf("Native GetContainingOutput comparison skipped: swap chain setup failed (0x%08lx)\n",
+                                    static_cast<unsigned long>(chain_hr));
                 }
                 host_adapter->Release();
                 host_factory->Release();
@@ -1255,6 +1261,8 @@ int main() {
             ++our_output_count;
             out_i->Release();
         }
+        if (sc->GetContainingOutput(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("SwapChain::GetContainingOutput(nullptr) should return DXGI_ERROR_INVALID_CALL");
         if (our_output_count == 0) {
             IDXGIOutput* containing = nullptr;
             if (sc->GetContainingOutput(&containing) != DXGI_ERROR_UNSUPPORTED || containing)
@@ -1435,8 +1443,6 @@ int main() {
             }
 
             // SwapChain::GetContainingOutput validation and monitor lookup.
-            if (sc->GetContainingOutput(nullptr) != DXGI_ERROR_INVALID_CALL)
-                return fail("SwapChain::GetContainingOutput(nullptr) should return DXGI_ERROR_INVALID_CALL");
             IDXGIOutput* containing = nullptr;
             if (FAILED(sc->GetContainingOutput(&containing)) || !containing)
                 return fail("SwapChain::GetContainingOutput failed");
