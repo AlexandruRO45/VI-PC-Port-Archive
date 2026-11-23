@@ -472,11 +472,18 @@ def hw_kernel(arch, case, fmt_override=None):
 
 
 def run_hw(oracle, cases, a, quiet=False, fmt_override=None):
-    """Run every case natively and judge it against the model. Returns (stats, mismatching cases, {index: words})."""
+    """Run every case natively and judge it against the model. Returns (stats, mismatching cases, {index: words}).
+    Raises RuntimeError when the runner's answer is not one result per kernel (a list of ints or a str)."""
     kernels = [hw_kernel(oracle.arch, c, fmt_override(c) if fmt_override else None) for c in cases]
+    results = oracle.run(kernels)
+    if results is None or len(results) != len(kernels):
+        raise RuntimeError(f"the hardware runner returned {0 if results is None else len(results)} results "
+                           f"for {len(kernels)} kernels")
     stats = {}
     failed, words = [], {}
-    for c, got in zip(cases, oracle.run(kernels)):
+    for c, got in zip(cases, results):
+        if got is None or not isinstance(got, (str, list)):
+            raise RuntimeError(f"{c.name}: the hardware runner returned {got!r}, not words or a rejection")
         st = stats.setdefault(c.wave, {"cases": 0, "match": 0, "mismatch": 0, "rejected": 0})
         st["cases"] += 1
         if isinstance(got, str):
@@ -675,9 +682,13 @@ def main() -> int:
             print("translator: " + summary)
             code = 1 if failed else 0
         if hw_oracle:
-            if a.negative_control:
-                return max(code, negative_control(hw_oracle, cases, a))
-            stats, failed_cases, _ = run_hw(hw_oracle, cases, a)
+            try:
+                if a.negative_control:
+                    return max(code, negative_control(hw_oracle, cases, a))
+                stats, failed_cases, _ = run_hw(hw_oracle, cases, a)
+            except RuntimeError as e:
+                print(f"harness error: {e}", file=sys.stderr)
+                return 2
             for wave, st in sorted(stats.items()):
                 print(f"image_load wave{wave} hw: " + ", ".join(f"{k} {v}" for k, v in st.items()))
             if "translator" in backends:

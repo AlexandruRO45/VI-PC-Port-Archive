@@ -216,6 +216,51 @@ def test_run_hw_names_a_misaligned_texture(capsys):
     assert "not 256-byte aligned" in capsys.readouterr().out
 
 
+class MalformedOracle(ModelOracle):
+    """The model's answers with the result list itself damaged: truncated, padded, None entries or None."""
+    def __init__(self, cases, mangle):
+        super().__init__(cases)
+        self.mangle = mangle
+
+    def run(self, kernels, words=4):
+        return self.mangle(super().run(kernels, words))
+
+
+MALFORMED = {
+    "truncated": lambda r: r[:-1],
+    "extra": lambda r: r + [r[0]],
+    "empty": lambda r: [],
+    "none_list": lambda r: None,
+    "none_entry": lambda r: r[:1] + [None] + r[2:],
+    "int_entry": lambda r: r[:1] + [0] + r[2:],
+}
+
+
+@pytest.mark.parametrize("kind", MALFORMED)
+def test_run_hw_rejects_a_malformed_result_list(kind):
+    cases = imf.make_cases(4, 1, list(imf.FORMATS))
+    with pytest.raises(RuntimeError, match="hardware runner returned"):
+        imf.run_hw(MalformedOracle(cases, MALFORMED[kind]), cases, Args())
+
+
+@pytest.mark.parametrize("kind", ["truncated", "none_entry"])
+def test_negative_control_rejects_a_malformed_result_list(kind):
+    cases = imf.make_cases(4, 1, list(imf.FORMATS))
+    with pytest.raises(RuntimeError, match="hardware runner returned"):
+        imf.negative_control(MalformedOracle(cases, MALFORMED[kind]), cases, Args())
+
+
+@pytest.mark.parametrize("negative", [False, True])
+def test_main_exits_2_on_a_malformed_result_list(monkeypatch, capsys, negative):
+    monkeypatch.setattr(runner, "open_oracle", lambda **_kw: MalformedOracle(
+        imf.make_cases(4, 1, list(imf.FORMATS)), MALFORMED["truncated"]))
+    argv = ["image_fuzz.py", "--oracle", "hw", "--programs", "4", "--seed", "1"]
+    monkeypatch.setattr(sys, "argv", argv + (["--negative-control"] if negative else []))
+    assert imf.main() == 2
+    err = capsys.readouterr().err
+    assert "harness error: the hardware runner returned 3 results for 4 kernels" in err
+
+
 @pytest.mark.parametrize("programs,seed", [(8, 1), (120, 2)])
 def test_negative_control_passes_on_a_hardware_that_follows_the_model(capsys, programs, seed):
     cases = imf.make_cases(programs, seed, list(imf.FORMATS))
