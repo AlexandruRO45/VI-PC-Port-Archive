@@ -148,6 +148,17 @@ class FmaMixLiteralTest(unittest.TestCase):
             self.run_ps(listing(program(0x00000000, words=words, text=text)),
                         blob(program(0x40400001, words=words, text=text)))
 
+    def test_llvm23_full_literal_with_the_same_low_half_is_refused(self):
+        # LLVM 23.1.6 prints these two f32 literals as lit(0x40800000) and lit(0x40400000).
+        # Both annotations carry the same cut literal (zero), but the text names 4.0 and the blob holds 3.0.
+        words = "01 00 20 cc ff 04 02 02"
+        printed = program(0, words=words, text="v_fma_mix_f32 v1, lit(0x40800000), v2, 0")
+        stored = program(0x40400000, words=words)
+        for invalid, error in ((False, r"v_fma_mix_f32 at 0x104"),
+                               (True, "reachable instruction with normalized encoding")):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(rdna2spirv.Unsupported, error):
+                self.run_ps(listing(printed, invalid=invalid), blob(stored))
+
 
 if __name__ == "__main__":
     unittest.main()
