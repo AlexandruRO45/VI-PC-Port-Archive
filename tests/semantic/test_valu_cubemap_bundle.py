@@ -279,5 +279,12 @@ class VCubeScSimdDivergenceTests(unittest.TestCase):
         for i in range(16, 32):
             self.assertEqual(wave.get_vgpr(i, 4), 111.0)
 
+class VCubeScEdgeCasesTests(unittest.TestCase):
+    def test_cubesc_boundary_negation(self):
+        # -Z major ray: (2.5, 1.0, -5.0) -> sc = -x = -2.5
+        self.assertEqual(oracle_cubesc_f32(2.5, 1.0, -5.0), -2.5)
+        # +X major ray: (5.0, 1.0, 2.5) -> sc = -z = -2.5
+        self.assertEqual(oracle_cubesc_f32(5.0, 1.0, 2.5), -2.5)
+
 if __name__ == "__main__":
     unittest.main()
