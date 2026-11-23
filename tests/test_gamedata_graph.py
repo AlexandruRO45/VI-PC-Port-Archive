@@ -353,6 +353,25 @@ class GamedataGraphTest(unittest.TestCase):
         self.assertEqual(gg.classify_target("../Item[@key='X']"),
                          ("relative/locator", "../Item[@key='X']", "relative_locator"))
 
+    def test_json_over_carve_dir_bin_hardlink_is_refused(self):
+        self.add(ALPHA)
+        self.finish()
+        bin_path = os.path.join(self.carve, f"{self.rows[0]['off']:012x}.bin")
+        with open(bin_path, "rb") as f:
+            content = f.read()
+        alias = os.path.join(self.root, "alias.json")
+        try:
+            os.link(bin_path, alias)
+        except OSError:
+            self.skipTest("hard links unsupported on this filesystem")
+
+        r = self.run_tool(self.carve, "--json", alias)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite an input file", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(bin_path, "rb") as f:
+            self.assertEqual(f.read(), content)
+
 
 INHERIT = (
     b'<Root><Sets>'

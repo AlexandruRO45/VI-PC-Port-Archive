@@ -599,11 +599,22 @@ def main() -> int:
             if gx.same_report_path(args.json, source):
                 parser.error(f"--json would overwrite the input {source}")
             if os.path.isdir(target) and os.path.isfile(args.json):
-                root = os.path.normcase(os.path.abspath(target))
-                dest = os.path.normcase(os.path.abspath(args.json))
-                if os.path.dirname(dest) == root or dest.startswith(root + os.sep):
-                    if dest.endswith(".bin"):
-                        parser.error(f"--json would overwrite an input file: {args.json}")
+                try:
+                    entries = os.scandir(target)
+                except OSError:
+                    entries = None
+                if entries is not None:
+                    with entries:
+                        for entry in entries:
+                            if not entry.name.lower().endswith(".bin"):
+                                continue
+                            try:
+                                if not entry.is_file():
+                                    continue
+                            except OSError:
+                                continue
+                            if gx.same_report_path(args.json, entry.path):
+                                parser.error(f"--json would overwrite an input file: {args.json}")
 
     try:
         documents = list(gx.load_documents(args.targets))
