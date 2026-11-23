@@ -219,6 +219,7 @@ public:
 
     ~SwapChain() {
         unregister_buffers();
+        swapchain_.destroy();
         if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
         if (device_) device_->Release();

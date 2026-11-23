@@ -129,12 +129,15 @@ public:
         }
     }
 
-    ~VulkanSwapchain() {
+    ~VulkanSwapchain() { destroy(); }
+
+    void destroy() {
         destroy_swapchain();
-        if (blit_pool_) fn_.destroy_cmd_pool(device_, blit_pool_, nullptr);
-        if (surface_) fn_.destroy_surface(instance_, surface_, nullptr);
-        if (acquire_fence_) fn_.destroy_fence(device_, acquire_fence_, nullptr);
-        if (blit_fence_) fn_.destroy_fence(device_, blit_fence_, nullptr);
+        if (blit_pool_) { fn_.destroy_cmd_pool(device_, blit_pool_, nullptr); blit_pool_ = VK_NULL_HANDLE; }
+        if (surface_) { fn_.destroy_surface(instance_, surface_, nullptr); surface_ = VK_NULL_HANDLE; }
+        if (acquire_fence_) { fn_.destroy_fence(device_, acquire_fence_, nullptr); acquire_fence_ = VK_NULL_HANDLE; }
+        if (blit_fence_) { fn_.destroy_fence(device_, blit_fence_, nullptr); blit_fence_ = VK_NULL_HANDLE; }
+        blit_cmd_ = VK_NULL_HANDLE;
     }
 
     VulkanSwapchain(const VulkanSwapchain&) = delete;
