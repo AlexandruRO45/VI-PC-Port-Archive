@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextvars
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -610,34 +611,47 @@ def unregister_live_process(proc) -> None:
         _live_procs.discard(proc)
 
 
+def terminate_process(proc, *, group: bool = False) -> None:
+    """Stop a live command, including its Windows tree or a session it started on POSIX."""
+    try:
+        if proc.poll() is not None:
+            return
+        if os.name == "nt" and proc.pid:
+            # PowerShell → cmd → cmake is a tree; terminate() alone leaves grandchildren.
+            result = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode and proc.poll() is None:
+                proc.kill()
+            return
+        if group:
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            if group:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+    except (OSError, AttributeError):
+        try:
+            proc.kill()
+        except (OSError, AttributeError):
+            pass
+
+
 def kill_live_processes() -> None:
-    """Terminate every subprocess started for board capture (including Windows child trees)."""
+    """Terminate every subprocess started for board capture."""
     with _live_procs_lock:
         procs = list(_live_procs)
         _live_procs.clear()
     for proc in procs:
-        try:
-            if proc.poll() is not None:
-                continue
-            if os.name == "nt" and proc.pid:
-                # PowerShell → cmd → cmake is a tree; terminate() alone leaves grandchildren.
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            else:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        except (OSError, ProcessLookupError, AttributeError):
-            try:
-                proc.kill()
-            except (OSError, ProcessLookupError, AttributeError):
-                pass
+        terminate_process(proc)
 
 
 def run_setup(default_jobs: int | None = None, default_overlap: bool = True) -> SetupConfig:

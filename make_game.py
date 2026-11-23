@@ -61,6 +61,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
     sys.exit("ERROR: Python 3.12 or newer is needed: https://www.python.org/downloads/")
@@ -75,6 +76,7 @@ from replace_retry import replace as replace_retry  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
+HEADLESS_COMMANDS = ContextVar("headless_commands", default=None)
 WINDOWS_ONLY = ("runtime",)   # off Windows: the clang-cl + xwin cross-build, or --runtime-build
 CROSS_TOOLS = ("clang-cl", "lld-link", "llvm-lib", "llvm-rc", "llvm-mt")
 CROSS_VARS = {"C_COMPILER": "clang-cl", "CXX_COMPILER": "clang-cl", "LINKER": "lld-link", "AR": "llvm-lib",
@@ -239,6 +241,62 @@ def below_normal() -> None:
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)
 
 
+class HeadlessCommands:
+    """Track subprocesses for one parallel build and close the launch race on interruption."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = set()
+        self.cancelled = False
+
+    def start(self, args, **options):
+        with self.lock:
+            if self.cancelled:
+                raise RuntimeError("build interrupted")
+            proc = subprocess.Popen(args, start_new_session=os.name != "nt", **options)
+            self.active.add(proc)
+            return proc
+
+    def forget(self, proc):
+        with self.lock:
+            self.active.discard(proc)
+
+    def stop(self):
+        with self.lock:
+            self.cancelled = True
+            procs = list(self.active)
+        for proc in procs:
+            leonida_tui.terminate_process(proc, group=os.name != "nt")
+
+
+def run_build_command(args, commands, **options) -> int:
+    if commands is None:
+        return subprocess.run(args, **options).returncode
+    stdin_data = options.pop("input", None)
+    timeout = options.pop("timeout", None)
+    if stdin_data is not None:
+        if options.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used")
+        options["stdin"] = subprocess.PIPE
+    if options.pop("capture_output", False):
+        if options.get("stdout") is not None or options.get("stderr") is not None:
+            raise ValueError("stdout and stderr arguments may not both be used with capture_output")
+        options.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = commands.start(args, **options)
+    try:
+        with proc:
+            try:
+                proc.communicate(stdin_data, timeout=timeout)
+            except BaseException:
+                leonida_tui.terminate_process(proc, group=os.name != "nt")
+                raise
+        if commands.cancelled:
+            raise RuntimeError("build interrupted")
+        return proc.returncode
+    finally:
+        commands.forget(proc)
+
+
 def run(args: list, hint: str = "", check: bool = True, **kw) -> int:
     """Run a command, logging it. A non-zero exit stops the build unless check is False; returns the exit code."""
     log("  " + " ".join(os.path.basename(str(a)) if i == 0 else str(a) for i, a in enumerate(args)))
@@ -259,10 +317,10 @@ def run(args: list, hint: str = "", check: bool = True, **kw) -> int:
         if check and code != 0:
             fail(f"{os.path.basename(str(args[0]))} exited with {code}" + (f". {hint}" if hint else ""))
         return code
-    r = subprocess.run([str(a) for a in args], **kw)
-    if check and r.returncode != 0:
-        fail(f"{os.path.basename(str(args[0]))} exited with {r.returncode}" + (f". {hint}" if hint else ""))
-    return r.returncode
+    code = run_build_command([str(a) for a in args], HEADLESS_COMMANDS.get(), **kw)
+    if check and code != 0:
+        fail(f"{os.path.basename(str(args[0]))} exited with {code}" + (f". {hint}" if hint else ""))
+    return code
 
 
 def py(tool: str, *args) -> None:
@@ -1045,8 +1103,9 @@ def ensure_submodule() -> None:
         fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). "
              f"Download the project with: {clone}")
     log("fetching third_party/rpf9-explorer")
-    r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
-    if r.returncode == 0 and os.path.isdir(core):
+    code = run_build_command([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"],
+                             HEADLESS_COMMANDS.get())
+    if code == 0 and os.path.isdir(core):
         return
     fail("fetching third_party/rpf9-explorer failed. Check your network connection, then run "
          "\"git submodule update --init --recursive\" in this folder and build again.")
@@ -1681,12 +1740,14 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
     board = leonida_tui.current_board()
     stage = leonida_tui.current_stage()
     popen_kw = leonida_tui.capture_popen_kwargs() if board is not None else {}
+    commands = HEADLESS_COMMANDS.get()
+    start = commands.start if commands is not None else subprocess.Popen
     procs: dict[int, object] = {}
     pumps: dict[int, threading.Thread] = {}
     bad = []
     try:
         for i in todo:
-            procs[i] = subprocess.Popen(
+            procs[i] = start(
                 [sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}",
                  "--no-asm", *extra], **popen_kw)
         if board is not None:
@@ -1702,6 +1763,8 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
                 if code is None:
                     continue
                 del procs[i]
+                if commands is not None:
+                    commands.forget(p)
                 if i in pumps:
                     pumps[i].join(timeout=30)
                     del pumps[i]
@@ -1713,6 +1776,12 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
     except BaseException:
         _stop_procs(list(procs.values()))
         raise
+    finally:
+        if commands is not None:
+            for proc in procs.values():
+                commands.forget(proc)
+    if commands is not None and commands.cancelled:
+        raise RuntimeError("build interrupted")
     if bad:
         # An older index describes the corpus from the run before: keeping it would make the next run take the
         # failed translation as finished. The next successful --merge writes it again.
@@ -2015,15 +2084,16 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
     progress = Progress("assets: XMA2 decode", len(todo), every_s=5.0)
+    commands = HEADLESS_COMMANDS.get()
 
     def one(src: str) -> bool:
         dst = src[:-8] + ".wav"
         tmp = dst + ".part"
         # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
-        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
-                           stdin=subprocess.DEVNULL)
+        code = run_build_command([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
+                                 commands, stdin=subprocess.DEVNULL)
         progress.tick()
-        if r.returncode == 0 and os.path.isfile(tmp):
+        if code == 0 and os.path.isfile(tmp):
             replace_retry(tmp, dst)
             return True
         if os.path.isfile(tmp):
@@ -2471,10 +2541,19 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
     if not work_items and "pipelines" not in stages:
         return
 
+    commands = HeadlessCommands() if leonida_tui.current_board() is None else None
+
+    def invoke(name, fn):
+        token = HEADLESS_COMMANDS.set(commands)
+        try:
+            _invoke_stage(name, fn)
+        finally:
+            HEADLESS_COMMANDS.reset(token)
+
     failed = False
     ex = ThreadPoolExecutor(max_workers=max(1, len(work_items) + (1 if "pipelines" in stages else 0)))
     try:
-        futures = {name: ex.submit(_invoke_stage, name, fn) for name, fn in work_items}
+        futures = {name: ex.submit(invoke, name, fn) for name, fn in work_items}
 
         def wait(name: str) -> bool:
             """True when the stage finished cleanly. Marks the build failed on error."""
@@ -2495,7 +2574,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
                 # on disk is enough only when this run is not rebuilding it.
                 runtime_ok = wait("runtime") if "runtime" in futures else True
                 if runtime_ok:
-                    futures["pipelines"] = ex.submit(_invoke_stage, "pipelines", fn_pipelines)
+                    futures["pipelines"] = ex.submit(invoke, "pipelines", fn_pipelines)
 
         for name, fut in list(futures.items()):
             try:
@@ -2507,6 +2586,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
     except KeyboardInterrupt:
         # Default ThreadPoolExecutor.__exit__ waits for workers; a worker blocked in
         # readline()/cmake would ignore Ctrl+C forever. Kill children and abandon workers.
+        if commands is not None:
+            commands.stop()
         leonida_tui.kill_live_processes()
         try:
             ex.shutdown(wait=False, cancel_futures=True)

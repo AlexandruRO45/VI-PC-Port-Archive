@@ -4,7 +4,12 @@
 """
 import os
 import sys
+import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import Future
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,6 +69,63 @@ class StageBoardTest(unittest.TestCase):
             before = len(lines)
             board.complete("runtime")
         self.assertEqual(len(lines), before)
+
+
+class InterruptedBuildTest(unittest.TestCase):
+    def assert_stage_stops_its_child(self, stage, start_child):
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            script = scratch / "rdna2spirv.py"
+            script.write_text(
+                "from pathlib import Path\n"
+                "import time\n"
+                "folder = Path(__file__).parent\n"
+                "(folder / 'started').touch()\n"
+                "deadline = time.monotonic() + 10\n"
+                "while not (folder / 'release').exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+                "(folder / 'finished').touch()\n",
+                encoding="utf-8", newline="\n",
+            )
+            stage_done = threading.Event()
+
+            def build(*args, **kwargs):
+                try:
+                    start_child(script)
+                finally:
+                    stage_done.set()
+
+            def interrupt(future, *args, **kwargs):
+                deadline = time.monotonic() + 5
+                while not (scratch / "started").exists():
+                    self.assertLess(time.monotonic(), deadline, "the synthetic stage child did not start")
+                    time.sleep(0.01)
+                raise KeyboardInterrupt
+
+            with mock.patch.object(make_game, stage, build), mock.patch.object(Future, "result", interrupt), \
+                    mock.patch.object(make_game, "TOOLS", str(scratch)), \
+                    mock.patch.object(make_game, "translator_digest", return_value="synthetic"), \
+                    mock.patch.object(make_game, "log"):
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        make_game.run_build_stages(
+                            [stage], game=directory, work=directory, out=directory, v={}, wav=False, jobs=1,
+                            runtime_build=None, emulate=False, keep_emulated=False, fallbacks=(),
+                        )
+                    self.assertTrue(stage_done.wait(4), "the interrupted stage is still waiting on its child")
+                    self.assertFalse((scratch / "finished").exists(), "the child ran to completion")
+                finally:
+                    (scratch / "release").touch()
+                    stage_done.wait(5)
+
+    def test_headless_interrupt_stops_an_assets_command(self):
+        self.assert_stage_stops_its_child("assets", lambda script: make_game.run([sys.executable, "-I", script]))
+
+    def test_headless_interrupt_stops_a_shader_shard(self):
+        def translate(script):
+            make_game.translate(str(script.parent / "disasm"), str(script.parent / "spirv"), 1)
+
+        self.assert_stage_stops_its_child("shaders", translate)
 
 
 if __name__ == "__main__":
