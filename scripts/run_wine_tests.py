@@ -29,7 +29,6 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -159,8 +158,6 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
         return "fail", f"executable not in the artifact: {command[0]}"
     if failed_setups:
         return "fail", "failed fixture setup: " + ", ".join(failed_setups)
-    if wine_session.starts_x_server(wine):  # each test gets an X server of its own: the last one's Wine must go first
-        print(wine_session.stop_wineserver(wine), flush=True)
     argv = list(wine) + [exe]
     for a in command[1:]:
         mapped = map_path(a, args.windows_root, args.root)
@@ -191,17 +188,16 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
         if ctest_timeout > 0:
             timeout = min(timeout, ctest_timeout)
     start = time.monotonic()
+    # wine_session.run: the output goes through a file and the wait is on the process, since a wineserver the test
+    # leaves behind keeps a pipe open; with an xvfb-run --wine (an X server per test) the prefix is stopped before and
+    # after the test.
     try:
-        proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        out = (e.stdout or b"").decode("utf-8", "replace")
-        return "fail", f"timed out after {timeout} s\n{out}"
+        code, out = wine_session.run(argv, timeout, cwd=cwd, env=env)
     except OSError as e:                  # a mistyped --wine, or a missing one: report the test, do not abort the run
         return "fail", f"could not start {argv[0]}: {e.strerror or e}"
+    if code is None:
+        return "fail", f"timed out after {timeout} s\n{out}"
     elapsed = time.monotonic() - start
-    out = proc.stdout.decode("utf-8", "replace")
-    code = proc.returncode
     if code < 0:
         # A negative return code is a host-signal termination (e.g. SIGSEGV), not a process exit code:
         # report it as a failure before SKIP_RETURN_CODE or WILL_FAIL can reinterpret it.
@@ -228,7 +224,7 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
 
 
 def positive_seconds(text: str) -> float:
-    """--timeout: a finite value greater than 0, so subprocess.run never gets a bad timeout to raise on."""
+    """--timeout: a finite value greater than 0, so a run never gets a bad timeout to raise on."""
     try:
         value = float(text)
     except ValueError:
@@ -307,9 +303,9 @@ def main() -> int:
     results = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
     names = [test.get("name", "?") for test in tests]
-    if wine_session.wine_binary(wine):
-        # Wine left from a run under another X server can make the first Vulkan call of every test here hang.
-        print(wine_session.stop_wineserver(wine), flush=True)
+    # Wine left from a run under another X server can make the first Vulkan call of every test here hang. A --wine
+    # with no wine in it (nor WINELOADER) gets a WARNING line: nothing was stopped.
+    print(wine_session.stop_wineserver(wine), flush=True)
     with DriveMap(args.windows_root, args.root, prefix) as drive:
         print(drive.note, flush=True)
         for index in order:

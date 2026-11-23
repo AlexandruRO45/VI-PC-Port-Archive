@@ -110,10 +110,46 @@ class StopWineserverTest(Dummies):
         self.assertEqual(self.calls(), ["wineserver -k", "wineserver -w"])
         self.assertIn("did not return", note)
 
-    def test_a_command_without_wine_stops_nothing(self):
+    def test_a_command_without_wine_stops_nothing_and_warns(self):
         note = session.stop_wineserver([sys.executable], self.env)
         self.assertEqual(self.calls(), [])
-        self.assertIn("no wine", note)
+        self.assertTrue(note.startswith("WARNING: no wine"), note)
+
+    def test_a_server_still_there_after_k_and_w_is_not_called_gone(self):
+        # A wineserver of another Wine build cannot end this prefix's server: -k and -w return, its socket stays.
+        (self.dir / "prefix").mkdir()
+        root = self.dir / "tmp"
+        with mock.patch.object(session, "SERVER_ROOT", str(root)):
+            socket = Path(session.server_socket(self.env))
+            socket.parent.mkdir(parents=True)
+            socket.touch()
+            note = session.stop_wineserver([self.wine], self.env)
+            self.assertTrue(note.startswith("WARNING"), note)
+            self.assertNotIn("gone", note)
+            socket.unlink()  # the control: once the socket is gone, so is the server
+            self.assertIn("gone", session.stop_wineserver([self.wine], self.env))
+
+
+class WineBinaryTest(unittest.TestCase):
+    def test_wrappers_named_after_wine_count_and_wineserver_does_not(self):
+        for word in ("wine", "/usr/bin/wine64", "/usr/bin/wine-stable", "wine-staging", "/opt/x/wine64-devel"):
+            with self.subTest(word=word):
+                self.assertEqual(session.wine_binary(["xvfb-run", "-a", word], env={}), word)
+        for command in (["wineserver", "-k"], ["winecfg"], ["xvfb-run", "-a", "proton-ge"]):
+            with self.subTest(command=command):
+                self.assertIsNone(session.wine_binary(command, env={}))
+
+    def test_proton_run_names_protons_own_wine(self):
+        with tempfile.TemporaryDirectory() as folder:
+            proton = Path(folder) / "proton"
+            wine = Path(folder) / "files" / "bin" / "wine"
+            wine.parent.mkdir(parents=True)
+            proton.touch()
+            wine.touch()
+            self.assertEqual(session.wine_binary(["xvfb-run", "-a", str(proton), "run"], env={}), str(wine))
+
+    def test_wineloader_names_the_wine_of_a_wrapper_with_another_name(self):
+        self.assertEqual(session.wine_binary(["my-runner"], env={"WINELOADER": "/opt/w/bin/wine"}), "/opt/w/bin/wine")
 
 
 class RunTest(Dummies):
@@ -166,6 +202,18 @@ class CheckTinyFrameTest(Dummies):
         self.assertEqual([call.split()[0] for call in self.calls()], ["wine"])
 
 
+class CheckTinyFrameProbeTest(unittest.TestCase):
+    def test_a_probe_that_never_exits_fails_before_the_run(self):
+        argv = ["check_tiny_frame.py", "gta6rt.exe", "tiny_frame.exe", "--probe", "d3d12_com_test.exe",
+                "--runner", "wine"]
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), \
+                mock.patch.object(tiny.wine_session, "run", return_value=(None, "")) as run:
+            self.assertEqual(tiny.main(), 1)
+        self.assertEqual(run.call_count, 1)  # the loader was not started
+        self.assertIn("FAIL: the probe d3d12_com_test.exe did not exit", out.getvalue())
+
+
 class RunWineTestsTest(Dummies):
     """run_wine_tests.py stops the prefix once before the tests (each test then runs under the same X server)."""
 
@@ -186,10 +234,31 @@ class RunWineTestsTest(Dummies):
         self.assertEqual([call.split()[0] + (" " + call.split()[1] if call.startswith("wineserver") else "")
                           for call in self.calls()], ["wineserver -k", "wineserver -w", "wine", "wine"])
 
-    def test_with_an_xvfb_run_wine_each_test_is_preceded_by_a_stop(self):
+    def test_with_an_xvfb_run_wine_each_test_runs_between_two_stops(self):
         self.assertEqual(self.run_main(f"{self.xvfb_run} -a {self.wine}"), 0)
         names = [call.split()[0] for call in self.calls()]
-        self.assertEqual(names, ["wineserver", "wineserver"] + ["wineserver", "wineserver", "xvfb-run", "wine"] * 2)
+        stop = ["wineserver", "wineserver"]
+        self.assertEqual(names, stop + (stop + ["xvfb-run", "wine"] + stop) * 2)
+
+    def test_a_test_that_leaves_a_process_holding_its_output_passes_in_time(self):
+        # As Wine leaves wineserver: the program exits at once, a child it started keeps its output open.
+        artifact = self.dir / "artifact"
+        artifact.mkdir()
+        (artifact / "leaves.py").write_text(
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            "print('done', flush=True)\n", encoding="utf-8")
+        listing = self.dir / "ctest.json"
+        listing.write_text(json.dumps({"tests": [{"name": "leaves", "command": ["D:/win/root/artifact/leaves.py"]}]}),
+                           encoding="utf-8")
+        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", "D:/win/root", "--root", str(self.dir),
+                "--wine", self.wine, "--timeout", "10"]
+        out = io.StringIO()
+        started = time.monotonic()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
+            rwt.main()
+        self.assertLess(time.monotonic() - started, 9)
+        self.assertIn("[PASS] leaves", out.getvalue())
 
 
 if __name__ == "__main__":

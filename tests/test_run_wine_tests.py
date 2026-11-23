@@ -122,7 +122,7 @@ class RunTestTest(unittest.TestCase):
         missing = self.command_for(self.artifact / "missing.exe")
         for command in (built, missing, None):
             with self.subTest(command=command), \
-                    mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                    mock.patch.object(rwt.wine_session, "run", wraps=rwt.wine_session.run) as launch:
                 status, detail = self.run_entry(ctest_entry("disabled", command, {"DISABLED": True}))
                 launch.assert_not_called()
                 self.assertEqual(status, "skip", detail)
@@ -187,7 +187,7 @@ class RunTestTest(unittest.TestCase):
     def test_malformed_ctest_environment_fails_before_launch(self) -> None:
         command = self.command_for(self.exiting(0))
         props = {"ENVIRONMENT": ["missing_equals"]}
-        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+        with mock.patch.object(rwt.wine_session, "run", wraps=rwt.wine_session.run) as launch:
             status, detail = self.run_entry(ctest_entry("bad_environment", command, props))
         launch.assert_not_called()
         self.assertEqual(status, "fail", detail)
@@ -241,10 +241,10 @@ class RunTestTest(unittest.TestCase):
     def test_a_signal_termination_fails_even_with_success_overrides(self):
         # The mocked negative returncode keeps the test portable across Windows and POSIX.
         exe = self.exiting(0)
-        fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
+        fake = (-11, "usage: gta6rt")
         for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]},
                       {"SKIP_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
-            with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
+            with self.subTest(props=props), mock.patch.object(rwt.wine_session, "run", return_value=fake):
                 entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
                 status, detail = self.run_entry(entry)
                 self.assertEqual(status, "fail")
@@ -269,11 +269,10 @@ class RunTestTest(unittest.TestCase):
         for timeout in (0, "20"):
             with self.subTest(timeout=timeout):
                 entry = ctest_entry("bounded", self.command_for(exe), {"TIMEOUT": timeout})
-                result = rwt.subprocess.CompletedProcess([], 0, stdout=b"")
-                with mock.patch.object(rwt.subprocess, "run", return_value=result) as run:
+                with mock.patch.object(rwt.wine_session, "run", return_value=(0, "")) as run:
                     status, detail = self.run_entry(entry)
                 self.assertEqual(status, "pass", detail)
-                self.assertEqual(run.call_args.kwargs["timeout"], self.args.timeout)
+                self.assertEqual(run.call_args.args[1], self.args.timeout)
 
     def test_an_unstartable_wine_fails_the_test_instead_of_aborting_the_run(self):
         status, detail = rwt.run_test(ctest_entry("ok", self.command_for(self.exiting(0))), self.args,

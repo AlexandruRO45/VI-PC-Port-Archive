@@ -104,7 +104,11 @@ def main():
     # wine_session.run: output through a file, the wait on the process, and with an xvfb-run runner the prefix's
     # Wine stopped around each run, since Wine left on another X server can hang the next Vulkan call.
     if options.probe:
-        code, _ = wine_session.run([*options.runner, options.probe], timeout)
+        code, output = wine_session.run([*options.runner, options.probe], timeout)
+        if code is None:
+            print(output)
+            print(f"FAIL: the probe {os.path.basename(options.probe)} did not exit within {timeout} s; it was killed")
+            return 1
         if code == SKIP:
             print("SKIP: no usable Vulkan device (the probe test skipped)")
             return SKIP
