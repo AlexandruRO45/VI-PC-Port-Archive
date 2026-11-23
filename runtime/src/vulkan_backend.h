@@ -464,11 +464,13 @@ public:
             release_fn = bindless_release_fn_;
             release_user = bindless_release_user_;
             const std::size_t mask = pending_.size() - 1;
-            while (count_ > 0 && pending_[head_].ticket <= current_ticket) {
-                to_destroy.push_back(pending_[head_]);
-                head_ = (head_ + 1) & mask;
-                --count_;
+            std::size_t next = head_;
+            while (to_destroy.size() < count_ && pending_[next].ticket <= current_ticket) {
+                to_destroy.push_back(pending_[next]);
+                next = (next + 1) & mask;
             }
+            head_ = next;  // only remove items once every batch allocation has succeeded
+            count_ -= to_destroy.size();
             if (count_ == 0) {
                 head_ = 0;
                 tail_ = 0;
