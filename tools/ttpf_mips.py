@@ -1317,6 +1317,11 @@ def analyze(pool, index, *, allow_bcpack=True):
         return out
     span = pool.span(index, d["base"])
     out["allocation_span"] = span
+    if span is None:
+        # A malformed or truncated pool can have a descriptor but no allocation span. The cubemap path used to
+        # reach validate_chunk_metadata(start + None) here and raise TypeError instead of a one-line ERROR.
+        out["blocked"] = "no allocation span"
+        return out
     allowed = ({0, 8} | bcpack.SUPPORTED_REBUILD_CODECS) if allow_bcpack else {0, 8}
 
     if d["dimension"] == 1 and d["depth"] == 1:

@@ -2948,5 +2948,22 @@ class BcFastDecodeParityTest(unittest.TestCase):
                                  _float_bits(_ref_block_means(want, bw, bh, pw, ph)))
 
 
+class NoAllocationSpan(unittest.TestCase):
+    """A malformed pool with a descriptor but no span gives a blocked result, not a TypeError traceback."""
+
+    class StubPool:
+        def descriptor(self, index):
+            return {"width": 64, "height": 64, "format": 71, "mips": 1, "non_tail": 0,
+                    "depth": 6, "mode": 18, "base": 1, "meta": True, "extra": True}
+
+        def span(self, index, base):
+            return None
+
+    def test_cubemap_analyze_reports_no_span(self):
+        result = ttpf.analyze(self.StubPool(), 0)
+        self.assertEqual(result["blocked"], "no allocation span")
+        self.assertIsNone(result["allocation_span"])
+
+
 if __name__ == "__main__":
     unittest.main()
