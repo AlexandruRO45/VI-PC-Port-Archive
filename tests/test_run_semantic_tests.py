@@ -51,6 +51,39 @@ class RunnerTest(unittest.TestCase):
             code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 0, out)
             self.assertIn("2 files, 4 tests, 0 files failed", out)
+            self.assertIn("0 tests skipped", out)
+
+    def test_parallel_summary_counts_all_skipped(self):
+        skipped = "import unittest\nclass T(unittest.TestCase):\n    @unittest.skip('optional')\n    def test_skip(self): pass\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_skipped.py": skipped})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("1 tests skipped", out)
+
+    def test_parallel_summary_counts_skips_even_in_failed_files(self):
+        skipped = "import unittest\nclass S(unittest.TestCase):\n    @unittest.skip('optional')\n    def test_skip(self): pass\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS + skipped,
+                        "test_f.py": FAIL + skipped})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 1, out)
+            self.assertIn("2 tests skipped", out)
+
+    def test_test_output_cannot_override_unittest_summary(self):
+        printed = "import unittest\nclass T(unittest.TestCase):\n    def test_print(self): print('OK')\n    @unittest.skip('optional')\n    def test_skip(self): pass\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_printed.py": printed})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("1 tests skipped", out)
+
+    def test_parallel_summary_reports_unknown_skip_count_on_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_crash.py": "import os\nos._exit(2)\n"})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 1, out)
+            self.assertIn("skip count unknown", out)
 
     def test_a_failure_or_import_error_is_reported_and_fails_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:

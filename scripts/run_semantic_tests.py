@@ -33,12 +33,15 @@ def test_modules(directory):
 
 
 def run_module(directory, module, verbose):
-    """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
+    """Return exit code, test count, skipped count (or None), and output for a module."""
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
     p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        errors="replace")
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
+    summaries = re.findall(r"^Ran \d+ tests? in [^\n]*\n\s*\n(?:OK|FAILED)(?: \(([^\n]*)\))?$", p.stdout, re.M)
+    skip = re.search(r"(?:^|, )skipped=(\d+)(?:,|$)", summaries[-1]) if summaries else None
+    skipped = int(skip.group(1)) if skip else (0 if summaries else None)
+    return p.returncode, int(ran.group(1)) if ran else 0, skipped, p.stdout
 
 
 def main(argv=None):
@@ -57,12 +60,16 @@ def main(argv=None):
         return 1
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
-    start, total, failed = time.monotonic(), 0, []
+    start, total, skipped, unknown_skips, failed = time.monotonic(), 0, 0, 0, []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
         jobs = {pool.submit(run_module, directory, m, a.verbose): m for m in modules}
         for job in concurrent.futures.as_completed(jobs):
-            code, ran, out = job.result()
+            code, ran, module_skips, out = job.result()
             total += ran
+            if module_skips is None:
+                unknown_skips += 1
+            else:
+                skipped += module_skips
             if code:
                 failed.append(jobs[job])
                 print(f"==== FAILED: {jobs[job]}\n{out}", flush=True)
@@ -70,6 +77,9 @@ def main(argv=None):
                 print(f"==== {jobs[job]}\n{out}", flush=True)
     took = time.monotonic() - start
     summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
+    summary += f", {skipped} tests skipped"
+    if unknown_skips:
+        summary += f" (skip count unknown for {unknown_skips} files)"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
     return 1 if failed else 0
 
