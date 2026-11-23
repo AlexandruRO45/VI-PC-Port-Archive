@@ -140,6 +140,25 @@ What moved between `917e9b9` and `e293917`:
   the [ASSET-430 re-count](#full-archive-re-count-at-16134b0-asset-430) distinguishes already
   fixed mesh index handling, the short secondary palette, and failed drawable validation.
 
+##### Measured reject classes at `e293917`
+
+The 71 `levels.rpf` rejects were classified by re-running recovery with an instrumented copy of
+`Rpf9ModelRecovery.TryResource` that records which check drops each candidate (the same method used
+for the `917e9b9` classification), over all 235,330 `levels.rpf` candidates. The instrumented run
+reproduces the release counts exactly (235,259 recovered, 71 rejected) and yields three classes:
+
+| Class | Count | Mechanism |
+|---|---:|---|
+| Large-mesh index buffers | 64 | The system/graphics split is found, but `RageModelDecoder.Decode` rejects the drawable because a mesh has more than 65,535 triangles or vertex references; the recovery loop keeps requesting continuation blocks until the archive ends and reports no continuation. |
+| Short secondary LOD palette | 1 | `LooksLikeFragment` is true but the ordinary extent probe cannot complete (`MetadataComplete == false` on the first block), leaving the system/graphics split ambiguous; the declared-split fragment probe resolves it. |
+| Extent probe returns null | 6 | Single-block candidates pass `LooksLikeResource` but `ProbeRequiredExtents` returns null (inconsistent drawable/fragment layout); `Rpf9TextureRecovery` recovers none of them, so they are not texture dictionaries. |
+
+Re-running `Rpf9ModelRecovery.RecoverAtOffsets` on the 71 `levels.rpf` offsets recovers 64 at
+`7ef5c51` and 65 at `16134b0`, leaving the 6 above. The 64 are recovered by upstream
+[rpf9-explorer#18](https://github.com/breadbbbb/rpf9-explorer/pull/18) and the 1 by
+[rpf9-explorer#26](https://github.com/breadbbbb/rpf9-explorer/pull/26); the 6 remain rejected at
+`16134b0`.
+
 Method checks: sharded 4 MiB `FindCandidateOffsets` was verified exact-equal against the
 single-threaded scan on `packs.rpf` (`26,389 == 26,389`), and `tools/rpf9dump models` end-to-end
 OBJ + manifest export was spot-checked on `story000_restofworld.rpf` (`ok=3 fail=0 skip=0`) and
