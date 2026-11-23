@@ -285,10 +285,10 @@ class CliTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def run_cli(self, path):
+    def run_cli(self, path, *args):
         out = os.path.join(self.tmp.name, "out", "archetypes.json")
         with redirect_stdout(io.StringIO()):
-            self.assertEqual(WA.main([path, "--out", out, "--check-extents"]), 0)
+            self.assertEqual(WA.main([path, "--out", out, "--check-extents", *args]), 0)
         with open(out, "rb") as f:
             raw = f.read()
         self.assertNotIn(b"\r\n", raw)
@@ -309,6 +309,36 @@ class CliTest(unittest.TestCase):
             with open(os.path.join(folder, name), "wb") as f:
                 f.write(data)
         self.check(self.run_cli(folder))
+
+    def test_interior_coverage_counts_declared_record_ends(self):
+        path = os.path.join(self.tmp.name, "resource.bin")
+        full = build([(WA.MAPTYPES, 16, []), (BASE, 16, []), (MLO, 16, [])],
+                     [(WA.MAPTYPES, bytes(16)), (BASE, bytes(16)), (MLO, bytes(48))])
+        table = WI._ptr(WI._u64(full, 0x38), len(full))
+        block = table + 32
+        start = WI._ptr(WI._u64(full, block + 8), len(full))
+        for available, missing in ((-1, 3), (0, 3), (31, 2), (47, 1), (48, 0)):
+            with self.subTest(available=available):
+                with open(path, "wb") as f:
+                    f.write(full[:start + available])
+                default = self.run_cli(path)
+                report = self.run_cli(path, "--interior-coverage")
+                counts = report["summary"].pop("interior_coverage")
+                self.assertEqual(report, default)
+                self.assertEqual(counts, {"complete_blocks": int(not missing), "unknown_blocks": 0,
+                                          "incomplete_blocks": int(bool(missing)),
+                                          "records_past_available_bytes": missing,
+                                          "resources_without_declared_interiors": 0})
+        for field, fmt, value, expected in ((0, "<I", BASE, "resources_without_declared_interiors"),
+                                            (4, "<I", 17, "unknown_blocks"),
+                                            (8, "<Q", 0x60000100, "unknown_blocks")):
+            data = bytearray(full)
+            struct.pack_into(fmt, data, block + field, value)
+            with open(path, "wb") as f:
+                f.write(data)
+            counts = self.run_cli(path, "--interior-coverage")["summary"]["interior_coverage"]
+            self.assertEqual(counts[expected], 1)
+            self.assertEqual(sum(counts.values()), 1)
 
     def test_rpf9_window(self):
         defs, m = scene()

@@ -107,6 +107,36 @@ def parse_archetypes(b):
     return out
 
 
+def count_interior_coverage(b, structs, coverage):
+    """Count CMloArchetypeDef blocks in one validated CMapTypes resource's complete block table."""
+    table = WI._ptr(WI._u64(b, 0x38), len(b))
+    mlo = joaat_cs("CMloArchetypeDef")
+    stride = structs.get(mlo, (0, {}))[0]
+    declared = False
+    for i in range(WI._u16(b, 0x4C)):
+        o = table + 16 * i
+        if WI._u32(b, o) != mlo:
+            continue
+        size = WI._u32(b, o + 4)
+        if size == 0:
+            continue
+        declared = True
+        ptr = WI._u64(b, o + 8)
+        if not stride or size % stride or ptr >> 28 != 5:
+            coverage["unknown_blocks"] += 1
+            continue
+        start = ptr & 0x0fffffff
+        records = size // stride
+        available = min(size, max(0, len(b) - start)) // stride
+        coverage["records_past_available_bytes"] += records - available
+        if available < records:
+            coverage["incomplete_blocks"] += 1
+        else:
+            coverage["complete_blocks"] += 1
+    if not declared:
+        coverage["resources_without_declared_interiors"] += 1
+
+
 def member_table(b, struct_hash):
     """[(member hash, offset, type)] of one struct, sorted by offset (for the docs table)."""
     structs, _ = schema(b)
@@ -233,10 +263,14 @@ def check_extents(maps, defs):
     return out
 
 
-def run(path, start=None, limit=None, extents=False):
+def run(path, start=None, limit=None, extents=False, interior_coverage=False):
     defs, maps, resources = {}, [], []
     stats = {"resources": 0, "maptypes": 0, "archetype_resources": 0, "archetypes": 0, "kinds": {},
              "asset_types": {}, "names": 0, "names_with_differing_boxes": 0}
+    if interior_coverage:
+        stats["interior_coverage"] = {"resources_without_declared_interiors": 0, "complete_blocks": 0,
+                                      "incomplete_blocks": 0, "records_past_available_bytes": 0,
+                                      "unknown_blocks": 0}
     schemas = {}
     for row, data in iter_resources(path, start, limit):
         stats["resources"] += 1
@@ -249,6 +283,8 @@ def run(path, start=None, limit=None, extents=False):
         structs, _ = schema(data)
         if MAPTYPES in structs:
             stats["maptypes"] += 1
+            if interior_coverage and WI.parse_resource(data) is not None:
+                count_interior_coverage(data, structs, stats["interior_coverage"])
         found = parse_archetypes(data)
         if not found:
             continue
@@ -286,6 +322,8 @@ def main(argv=None):
     ap.add_argument("--out", default=os.path.join("reports", "world_archetypes.json"))
     ap.add_argument("--check-extents", action="store_true",
                     help="also compare each map's entitiesExtents with its transformed archetype boxes")
+    ap.add_argument("--interior-coverage", action="store_true",
+                    help="count complete, incomplete and unclassifiable MLO blocks in validated CMapTypes resources")
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error("no such file or folder: %s" % a.path)
@@ -300,7 +338,7 @@ def main(argv=None):
         os.makedirs(out_dir, exist_ok=True)
     except OSError as e:
         ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
-    doc = run(a.path, a.start, a.limit, a.check_extents)
+    doc = run(a.path, a.start, a.limit, a.check_extents, a.interior_coverage)
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
     try:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:

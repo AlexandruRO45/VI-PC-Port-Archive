@@ -250,6 +250,13 @@ from +0xb8. `CTimeArchetypeDef` (`76b0c56c`) did not occur in the measured windo
 member names below, are case-sensitive joaat. `tools/world_archetypes.py` finds every field by hash in the
 resource's own member table.
 
+Pass `--interior-coverage` to include aggregate counts for the validated CMapTypes resources delivered by the
+reader. A resource with no nonempty MLO block counts as `resources_without_declared_interiors`. For a system
+block with a known stride, `records_past_available_bytes` counts records whose declared end exceeds the bytes
+read. The archetype parser skips the entire incomplete block, even if some records fit. An unsupported pointer
+segment, missing stride or nonintegral record count puts the block in `unknown_blocks`. Resources outside the
+scan or rejected before parsing have unknown coverage.
+
 | Field | Hash | Offset | Type | Meaning |
 |---|---|---:|---|---|
 | `lodDist` | `bf74dfa7` | +0x38 | f32 | default LOD distance (an entity's `lodDist` of -1 uses it) |
