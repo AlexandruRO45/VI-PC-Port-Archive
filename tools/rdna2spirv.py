@@ -579,6 +579,68 @@ class Gen:
             return list(mods)
         return [m for m in mods if m not in cls._DPP_MODS and not m.startswith(cls._DPP_PREFIXES)]
 
+    _SDWA_UNUSED = ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE")
+
+    def _validate_bit_misc_valu(self, op, raw_op, a, mods, arity, *,
+                                allow_e32=True, allow_e64=True,
+                                allow_sdwa=False, allow_dpp=False,
+                                dst_vgpr_count=1):
+        """Validate arity, encoding suffix, modifiers, and single-dword integer operands
+        for 32-bit bit/misc VALU instructions."""
+        if len(a) != arity:
+            raise Unsupported(f"{op} arity")
+        if raw_op.endswith("_sdwa"):
+            if not allow_sdwa:
+                raise Unsupported(f"{op} encoding")
+            for m in mods:
+                if ":" not in m:
+                    raise Unsupported(f"{op} modifiers")
+                k, v = m.split(":", 1)
+                if k in ("dst_sel", "src0_sel"):
+                    if v not in self.SDWA_SEL:
+                        raise Unsupported(f"{op} modifiers")
+                elif k == "dst_unused":
+                    if v not in self._SDWA_UNUSED:
+                        raise Unsupported(f"{op} modifiers")
+                else:
+                    raise Unsupported(f"{op} modifiers")
+        elif raw_op.endswith("_dpp"):
+            if not allow_dpp:
+                raise Unsupported(f"{op} encoding")
+            if self.non_dpp_mods(raw_op, mods):
+                raise Unsupported(f"{op} modifiers")
+        elif raw_op.endswith("_e32"):
+            if not allow_e32:
+                raise Unsupported(f"{op} encoding")
+            if mods:
+                raise Unsupported(f"{op} modifiers")
+        elif raw_op.endswith("_e64"):
+            if not allow_e64:
+                raise Unsupported(f"{op} encoding")
+            if mods:
+                raise Unsupported(f"{op} modifiers")
+        else:
+            if mods:
+                raise Unsupported(f"{op} modifiers")
+        orig = (self.cur_ins["args"]
+                if self.cur_ins is not None and len(self.cur_ins.get("args", ())) == len(a)
+                else a)
+        is_sdwa = raw_op.endswith("_sdwa")
+        for idx, (arg, orig_arg) in enumerate(zip(a, orig)):
+            if idx < dst_vgpr_count:
+                if arg.get("k") != "vgpr" or arg.get("n", 1) != 1:
+                    raise Unsupported(f"{op} destination")
+                if arg.get("neg") or arg.get("abs") or arg.get("sext") or \
+                        orig_arg.get("neg") or orig_arg.get("abs") or orig_arg.get("sext"):
+                    raise Unsupported(f"{op} destination modifiers")
+            else:
+                if arg.get("n", 1) != 1 or orig_arg.get("n", 1) != 1:
+                    raise Unsupported(f"{op} operand width")
+                if arg.get("neg") or arg.get("abs") or orig_arg.get("neg") or orig_arg.get("abs"):
+                    raise Unsupported(f"{op} source modifiers")
+                if not is_sdwa and (arg.get("sext") or orig_arg.get("sext")):
+                    raise Unsupported(f"{op} source modifiers")
+
     @staticmethod
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
@@ -7360,6 +7422,8 @@ class Gen:
             self.cmp_class(a, exec_only=op.startswith("v_cmpx_"), ty=op.rsplit("_", 1)[1], mods=mods)
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
+            if op in ("v_ffbl_b32", "v_ffbh_u32"):
+                self._validate_bit_misc_valu(op, ins["op"], a, mods, 2, allow_sdwa=True, allow_dpp=True)
             x = self.lane_mask_word(a[1]) if op == "s_flbit_i32_b32" and self.holds_lane_mask(a[1]) else self.src_u(a[1])
             r = self.tmp()
             if op in ("v_ffbl_b32", "s_ff1_i32_b32"):
@@ -7471,14 +7535,16 @@ class Gen:
             self.emit(f"{r} = OpIAdd %uint {cnt} {acc}")
             self.dst(a[0], r)
         elif op == "v_bfrev_b32":
+            self._validate_bit_misc_valu(op, ins["op"], a, mods, 2, allow_sdwa=True, allow_dpp=True)
             x = self.src_u(a[1])
             r = self.tmp()
             self.emit(f"{r} = OpBitReverse %uint {x}")
             self.dst(a[0], r)
         elif op == "v_bfm_b32":
+            self._validate_bit_misc_valu(op, ins["op"], a, mods, 3, allow_e32=False)
             w, o = self.src_u(a[1]), self.src_u(a[2])
-            width = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
-            offset = None if "sdwa_sel" in a[2] else self.imm_val(a[2])
+            width = self.imm_val(a[1])
+            offset = self.imm_val(a[2])
             if width is not None:
                 bits = (1 << (width & 31)) - 1
                 if offset is not None:
@@ -8098,8 +8164,7 @@ class Gen:
                 r = r2
             self.dst(a[0], r)
         elif op == "v_lerp_u8":
-            if "clamp" in mods:
-                raise Unsupported(op + " clamp")
+            self._validate_bit_misc_valu(op, ins["op"], a, mods, 4, allow_e32=False)
             x, y, z = (self.src_u(t) for t in a[1:4])
             # Per byte, x + y = 2*(x & y) + (x ^ y). Clear each low bit before the shift so the
             # next byte cannot leak in. An odd sum rounds up only when the corresponding bit of z is 1.
@@ -8152,6 +8217,7 @@ class Gen:
                 self.dst(a[0], r)
         elif op == "v_swap_b32":
             # exchange two VGPRs (active lanes only, through dst)
+            self._validate_bit_misc_valu(op, ins["op"], a, mods, 2, allow_e64=False, dst_vgpr_count=2)
             x, y = self.src_u(a[0]), self.src_u(a[1])
             xc, yc = self.tmp(), self.tmp()
             self.emit(f"{xc} = OpCopyObject %uint {x}")
@@ -8200,6 +8266,8 @@ class Gen:
         elif op in ("v_ffbh_i32", "s_flbit_i32"):
             # bit position counted from the MSB of the first bit that differs from the sign bit; -1 if none.
             # s_flbit_i32 is the scalar form (it does not write SCC).
+            if op == "v_ffbh_i32":
+                self._validate_bit_misc_valu(op, ins["op"], a, mods, 2, allow_sdwa=True, allow_dpp=True)
             x = self.as_int(self.lane_mask_word(a[1]) if op == "s_flbit_i32" and self.holds_lane_mask(a[1])
                             else self.src_u(a[1]))
             f, none, sub, r = (self.tmp() for _ in range(4))
@@ -8962,6 +9030,7 @@ class Gen:
             self.f16_out(a[0], r, dhi, fract=fn == "Fract",
                          mode=op not in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_exp_f16", "v_log_f16"))  # GFX10: f16 ops keep the other half
         elif op == "v_not_b32":
+            self._validate_bit_misc_valu(op, ins["op"], a, mods, 2, allow_sdwa=True, allow_dpp=True)
             x = self.src_u(a[1])
             r = self.tmp()
             self.emit(f"{r} = OpNot %uint {x}")
