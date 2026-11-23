@@ -288,6 +288,29 @@ class TestValuAddF32NegativeControls(unittest.TestCase):
         spv = support.translate_lines(next_test_id("ps_spv_add_clamp"), lines)
         self.assertIn("FClamp", spv)
 
+class TestValuSubF32ClampOracle(unittest.TestCase):
+    """Stage 7: Reference mathematical oracle for v_sub_f32 clamp and omod."""
+
+    def test_sub_clamp_underflow(self):
+        # 0.2 - 0.9 = -0.7 -> clamped to 0.0
+        hw = run_binary_f32("v_sub_f32", 0.2, 0.9, clamp=True)
+        self.assertAlmostEqual(hw, 0.0, places=6)
+
+    def test_sub_clamp_in_range(self):
+        # 0.9 - 0.4 = 0.5 -> 0.5
+        hw = run_binary_f32("v_sub_f32", 0.9, 0.4, clamp=True)
+        self.assertAlmostEqual(hw, 0.5, places=6)
+
+    def test_sub_omod_mul2(self):
+        # (0.8 - 0.3) * 2.0 = 1.0
+        hw = run_binary_f32("v_sub_f32", 0.8, 0.3, omod="mul:2")
+        self.assertAlmostEqual(hw, 1.0, places=6)
+
+    def test_sub_omod_div2_clamp(self):
+        # (1.5 - 0.1) * 0.5 = 0.7 -> clamped in range remains 0.7
+        hw = run_binary_f32("v_sub_f32", 1.5, 0.1, omod="div:2", clamp=True)
+        self.assertAlmostEqual(hw, 0.7, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
