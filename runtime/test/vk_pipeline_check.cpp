@@ -41,10 +41,16 @@
 //                 reads it.
 //   --skip-file F modules named in F (one per line) are not compiled: each is reported as MODULE CRASH and counted
 //                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
-//                 after a crash, so the next run checks everything else instead of dying on the same module.
+//                 after a crash, so the next run checks everything else instead of dying on the same module. A line
+//                 may add a TAB and the reason to print (default: "killed the driver in an earlier run").
+//   --module-timeout SEC  give up on a module that has been in the driver (shader module or pipeline creation) for
+//                 more than SEC seconds (default 0: wait forever). A compile that never returns can't be cancelled, so
+//                 the watchdog saves the cache, leaves only the timed-out modules in --inflight-file, prints MODULE
+//                 TIMEOUT and ends the process with exit status 3; make_game.py then skips them like a crash. Not
+//                 with --isolate.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] raises SIGNAL (default SIGFPE)
-//                 just before the pipeline of a matching module is created. For testing --isolate and the
-//                 pipelines stage's retry.
+//                 just before the pipeline of a matching module is created; SIGNAL HANG sleeps there instead, as a
+//                 compiler that never returns. For testing --isolate, --module-timeout and the pipelines stage's retry.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
@@ -533,6 +539,7 @@ struct SimulatedCrash {
     bool enabled = false;
     std::string pattern;
     int sig = SIGFPE;
+    bool hang = false;   // SIGNAL HANG: never return, as a driver compile that hangs
 };
 
 int signal_from_name(std::string n) {
@@ -557,7 +564,12 @@ SimulatedCrash read_simulated_crash() {
     std::string v = env;
     const size_t colon = v.rfind(':');
     if (colon != std::string::npos) {
-        if (const int sig = signal_from_name(v.substr(colon + 1))) {
+        std::string what = v.substr(colon + 1);
+        for (char& ch : what) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        if (what == "HANG") {
+            c.hang = true;
+            v.resize(colon);
+        } else if (const int sig = signal_from_name(v.substr(colon + 1))) {
             c.sig = sig;
             v.resize(colon);
         }
@@ -646,7 +658,7 @@ int main(int argc, char** argv) {
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
-            "[--skip-file F]\n");
+            "[--skip-file F] [--module-timeout SEC]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
@@ -657,6 +669,7 @@ int main(int argc, char** argv) {
     size_t large_module_bytes = 4 * 1024 * 1024;
     unsigned large_parallel = 0;   // 0 = by the memory budget
     double slow = 30.0;
+    double module_timeout = 0.0;   // --module-timeout: 0 = wait for the driver forever
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
     size_t isolate_batch = 256;
@@ -701,6 +714,8 @@ int main(int argc, char** argv) {
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
+        else if (a == "--module-timeout")
+            valid = number(module_timeout) && std::isfinite(module_timeout) && module_timeout >= 0.0;
         else if (a == "--cache-feedback") cache_feedback = true;
         else if (a == "--isolate") isolate = true;
         else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
@@ -733,6 +748,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--isolate cannot be combined with --stats\n");
         return 2;
     }
+    if (isolate && module_timeout > 0) {   // a timed-out child would be bisected, waiting the timeout at each split
+        std::fprintf(stderr, "--isolate cannot be combined with --module-timeout\n");
+        return 2;
+    }
 #ifdef _WIN32
     if (isolate) {
         std::fprintf(stderr, "--isolate is not supported on Windows (it needs fork/waitpid); run without it\n");
@@ -740,7 +759,7 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    std::set<std::string> skip_names;   // --skip-file: modules that killed the driver in an earlier run
+    std::map<std::string, std::string> skip_names;   // --skip-file: name -> why it isn't compiled again
     if (!skip_path.empty()) {
         std::ifstream sf(skip_path);
         if (!sf) {
@@ -749,7 +768,10 @@ int main(int argc, char** argv) {
         }
         for (std::string line; std::getline(sf, line);) {
             while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-            if (!line.empty()) skip_names.insert(line);
+            if (line.empty()) continue;
+            const size_t tab = line.find('\t');
+            if (tab == std::string::npos) skip_names[line] = "killed the driver in an earlier run";
+            else skip_names[line.substr(0, tab)] = line.substr(tab + 1);
         }
     }
 
@@ -1367,6 +1389,11 @@ int main(int argc, char** argv) {
     const SimulatedCrash sim_crash = read_simulated_crash();
     auto maybe_simulate_crash = [&](const std::string& name) {   // test hook, see the header
         if (sim_crash.enabled && name.find(sim_crash.pattern) != std::string::npos) {
+            if (sim_crash.hang) {
+                std::fprintf(stderr, "simulating a hung compile before the pipeline of %s\n", name.c_str());
+                std::fflush(nullptr);
+                for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+            }
             std::fprintf(stderr, "simulating signal %d before the pipeline of %s\n", sim_crash.sig, name.c_str());
             std::fflush(nullptr);
             std::raise(sim_crash.sig);
@@ -1378,14 +1405,14 @@ int main(int argc, char** argv) {
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
-            if (skip_names.count(name)) {   // --skip-file: it killed the driver in an earlier run
+            if (const auto skipped = skip_names.find(name); skipped != skip_names.end()) {   // --skip-file
                 {
                     std::lock_guard<std::mutex> g(mu);
                     auto& st = stats[stage];
                     st.pipes_bad++;
                     st.crash_skipped++;
-                    std::printf("MODULE CRASH %s (%s, killed the driver in an earlier run; not retried)\n",
-                                name.c_str(), stage.c_str());
+                    std::printf("MODULE CRASH %s (%s, %s; not retried)\n", name.c_str(), stage.c_str(),
+                                skipped->second.c_str());
                 }
                 ++done;
                 continue;
@@ -1693,6 +1720,27 @@ int main(int argc, char** argv) {
             if (watch_cv.wait_for(g, std::chrono::seconds(5), [&] { return all_done; })) break;
             const auto now = std::chrono::steady_clock::now();
             write_inflight();   // --inflight-file: the modules compiling right now
+            if (module_timeout > 0) {   // --module-timeout: a compile that never returns ends the process
+                std::string timed_out;
+                for (const auto& [tid, job] : inflight) {
+                    const double s = std::chrono::duration<double>(now - job.since).count();
+                    if (s <= module_timeout) continue;
+                    std::printf("MODULE TIMEOUT %s (%s still in the driver after %.0fs)\n", job.name.c_str(),
+                                job.phase, s);
+                    timed_out += job.name + '\t' + job.phase + '\n';
+                }
+                if (!timed_out.empty()) {
+                    // Only the timed-out modules: the others were still making progress.
+                    if (!inflight_path.empty())
+                        if (const auto error = write_pipeline_cache_file(inflight_path, timed_out.data(), timed_out.size()))
+                            std::fprintf(stderr, "in-flight snapshot save to %s failed: %s\n", inflight_path.c_str(),
+                                         error.message().c_str());
+                    g.unlock();
+                    save_cache(false);   // keep what finished; the hung compile can't be cancelled
+                    std::fflush(nullptr);
+                    std::_Exit(3);
+                }
+            }
             for (auto& [tid, job] : inflight) {
                 const double s = std::chrono::duration<double>(now - job.since).count();
                 if (s > 60 && int(s) % 60 < 5)

@@ -1815,10 +1815,25 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
+    if checker_supports(exe, "--module-timeout"):
+        # A compile the driver never finishes (Apple's Metal compiler on some compute modules) would otherwise stop
+        # the stage for good: the checker gives up on it and exits PIPELINE_TIMEOUT_EXIT, and it is skipped below.
+        base += ["--module-timeout", str(PIPELINE_MODULE_TIMEOUT)]
     # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     crashed: "list[str]" = []
+    why_skipped: "dict[str, str]" = {}   # a reason for the skip file's line, for the modules that timed out
+
+    def skip_modules(found: "list[str]", why: str = "") -> None:
+        # A crashed module's line is its name; a timed-out one adds TAB and why, which only a checker that has
+        # --module-timeout (and so reads the reason) is ever given.
+        crashed.extend(found)
+        for n in found:
+            if why:
+                why_skipped[n] = why
+        with open(skip, "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(n + (f"\t{why_skipped[n]}" if n in why_skipped else "") + "\n" for n in crashed))
 
     def check_range(start: int = 0, count: "int | None" = None) -> int:
         selection = ["--start", str(start), "--count", str(count)] if count is not None else []
@@ -1833,6 +1848,17 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                      "and report-file access in the output above")
             if code in (0, 1, 2) or interrupted(code):
                 return code
+            if code == PIPELINE_TIMEOUT_EXIT:
+                # The checker names only the modules it gave up on; compiling one alone again would hang again.
+                timed_out = list(dict.fromkeys(n for n in read_names(inflight)
+                                               if n not in crashed and (allowed is None or n in allowed)))
+                if not timed_out:
+                    fail("vk_pipeline_check gave up on a compile but named no module; report it")
+                for n in timed_out:
+                    log(f"pipelines: {n} was still compiling after {PIPELINE_MODULE_TIMEOUT} s (the driver hangs on "
+                        "it); checking the rest without it")
+                skip_modules(timed_out, f"did not finish within {PIPELINE_MODULE_TIMEOUT} s in an earlier run")
+                continue
             suspects = list(dict.fromkeys(n for n in read_names(inflight)
                                           if n not in crashed and (allowed is None or n in allowed)))
             # Even the last in-flight module can be innocent after other heavy compiles in the batch.
@@ -1855,9 +1881,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                      "and report it if it keeps happening")
             for n in suspects:
                 log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
-            crashed.extend(suspects)
-            with open(skip, "w", encoding="utf-8", newline="\n") as f:
-                f.write("".join(n + "\n" for n in crashed))
+            skip_modules(suspects)
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
 
@@ -1876,8 +1900,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         code = 1
     drop(inflight)
     if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
-            if crashed else ""
+        why = f"; {len(crashed)} module(s) took the driver down or never finished and were counted as failed: " \
+            + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     log("pipelines: done")
 
@@ -1885,6 +1909,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
 # 10 minutes since the last cache checkpoint, plus loading the cache).
 PIPELINE_CRASH_RETRIES = 5
+# --module-timeout for vk_pipeline_check: seconds one module may spend in the driver. The slowest compiles seen that do
+# finish are minutes (Apple M2 Max, MoltenVK: 457 s for a --f64-soft compute shader); a hung one never returns.
+PIPELINE_MODULE_TIMEOUT = 1800
+PIPELINE_TIMEOUT_EXIT = 3   # vk_pipeline_check's exit status after --module-timeout gave up on a module
 PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
 
 

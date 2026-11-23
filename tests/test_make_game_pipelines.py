@@ -251,6 +251,60 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertNotIn("--skip-file", self.calls[0])
         self.assertTrue(any("has no --inflight-file" in m for m in logs), logs)
 
+    def test_the_checker_gets_the_module_timeout(self):
+        failed, _ = self.stage(lambda args, n: 0)
+        self.assertIsNone(failed)
+        args = self.calls[0]
+        self.assertIn("--module-timeout", args)
+        self.assertEqual(args[args.index("--module-timeout") + 1], str(make_game.PIPELINE_MODULE_TIMEOUT))
+
+    def test_a_timed_out_module_is_skipped_without_compiling_it_alone_again(self):
+        # Exit 3: the checker gave up on a compile that never returned and left only that module in the in-flight
+        # file. Trying it alone, as for a crash, would hang again, so it goes straight into the skip file.
+        def script(args, n):
+            self.assertFalse(self.is_probe(args), "a timed-out module must not be retried alone")
+            if n == 1:
+                self.inflight_is("c_mod")
+                return make_game.PIPELINE_TIMEOUT_EXIT
+            with open(self.skip, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "c_mod\tdid not finish within %d s in an earlier run\n"
+                                 % make_game.PIPELINE_MODULE_TIMEOUT)
+            return 1   # the skipped module counts as failed
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, logs = self.stage(script)
+        self.assertIsNotNone(failed)
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(any("c_mod was still compiling after" in m for m in logs), logs)
+        self.assertIn("never finished", err.getvalue())
+        self.assertIn("c_mod", err.getvalue())
+
+    def test_a_crash_after_a_timeout_keeps_both_lines(self):
+        def script(args, n):
+            if self.is_probe(args):
+                return ABORT
+            if n == 1:
+                self.inflight_is("c_mod")
+                return make_game.PIPELINE_TIMEOUT_EXIT
+            if n == 2:
+                self.inflight_is("a_mod")
+                return ABORT
+            with open(self.skip, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "c_mod\tdid not finish within %d s in an earlier run\na_mod\n"
+                                 % make_game.PIPELINE_MODULE_TIMEOUT)
+            return 1
+        with mock.patch("sys.stderr", io.StringIO()):
+            failed, _ = self.stage(script)
+        self.assertIsNotNone(failed)
+
+    def test_a_timeout_that_names_no_module_stops_the_stage(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, _ = self.stage(lambda args, n: make_game.PIPELINE_TIMEOUT_EXIT)
+        self.assertIsNotNone(failed)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("named no module", err.getvalue())
+
     def test_support_is_read_from_the_usage_line(self):
         new = "usage: vk_pipeline_check <spirv dir> ... [--inflight-file F] [--skip-file F]\n"
         old = "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--isolate [--isolate-batch N]]\n"
