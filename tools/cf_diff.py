@@ -463,7 +463,7 @@ def run_case(name, body, wave, structured=True):
         if SPIRV_VAL:
             bad = _spirv_val(spv, tmp)
             if bad:
-                return ("mismatch", f"spirv-val: {bad}")
+                return ("mismatch", bad)
     if bool(getattr(gen, "wave64", False)) != (wave == 64):
         return ("mismatch", f"translator detected wave{64 if gen.wave64 else 32}, the program is wave{wave}")
     try:
@@ -497,8 +497,10 @@ def _spirv_val(spv, tmp):
                 ["spirv-val", "--target-env", "vulkan1.2", sv]):
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
-            return (cmd[0] + ": " + (r.stderr or r.stdout).strip().splitlines()[0]) if (r.stderr or r.stdout) \
-                else f"{cmd[0]} exited with {r.returncode}"
+            diagnostic = (r.stderr.strip() or r.stdout.strip()).splitlines()
+            if diagnostic:
+                return f"{cmd[0]}: {diagnostic[0]}"
+            return f"{cmd[0]} exited with {r.returncode}"
     return None
 
 

@@ -65,6 +65,29 @@ def test_a_single_program_run_exits_like_the_suite(statuses, code, capsys, monke
     assert ("no program ran: every one was skipped" in capsys.readouterr().out) == (code == 2)
 
 
+@pytest.mark.parametrize("selection, failing_tool, stdout, stderr, diagnostic", [
+    (["--program", "0"], "spirv-val", "\t", " \n ", "spirv-val exited with 7"),
+    (["--programs", "1"], "spirv-val", "\t", " \n ", "spirv-val exited with 7"),
+    (["--program", "0"], "spirv-as", "\n error: parse failed\n", "\t", "spirv-as: error: parse failed"),
+    (["--program", "0"], "spirv-val", "secondary output", "\n error: invalid module\nmore\n",
+     "spirv-val: error: invalid module"),
+])
+def test_validator_failure_keeps_the_mismatch_verdict(selection, failing_tool, stdout, stderr, diagnostic,
+                                                      capsys, monkeypatch):
+    def run(cmd, **kwargs):
+        if cmd[0] == failing_tool:
+            return subprocess.CompletedProcess(cmd, 7, stdout, stderr)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(cf_diff, "SPIRV_VAL", False)
+    monkeypatch.setattr(cf_diff.shutil, "which", lambda tool: tool)
+    monkeypatch.setattr(cf_diff.subprocess, "run", run)
+    assert cf_diff.main([*selection, "--wave", "32", "--spirv-val"]) == 1
+    captured = capsys.readouterr()
+    assert diagnostic in captured.out
+    assert captured.err == ""
+
+
 def test_generation_is_deterministic():
     assert cf_diff.program_for(5, 3, 32, 3) == cf_diff.program_for(5, 3, 32, 3)
     assert cf_diff.program_for(5, 3, 32, 3) != cf_diff.program_for(5, 4, 32, 3)
