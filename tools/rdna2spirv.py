@@ -583,11 +583,22 @@ class Gen:
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
         A select bit of 1 reads the high half of that source; the last bit sends the result to the high half.
-        No modifier means all zeros."""
-        sel = next((m for m in mods if m.startswith("op_sel:")), None)
-        if sel is None:
+        No modifier means all zeros. Rejects duplicate, malformed, non-binary, or over-long ``op_sel:`` modifiers."""
+        opsel_mods = [m for m in mods if m.startswith("op_sel:")]
+        if not opsel_mods:
             return [0] * nsrc, 0
-        bits = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0] * (nsrc + 1)
+        if len(opsel_mods) > 1:
+            raise Unsupported("op_sel")
+        sel = opsel_mods[0]
+        if not (sel.startswith("op_sel:[") and sel.endswith("]")):
+            raise Unsupported("op_sel")
+        inner = sel[len("op_sel:["):-1]
+        if not inner:
+            raise Unsupported("op_sel")
+        items = [x.strip() for x in inner.split(",")]
+        if len(items) > nsrc + 1 or any(x not in ("0", "1") for x in items):
+            raise Unsupported("op_sel")
+        bits = [int(x) for x in items] + [0] * (nsrc + 1 - len(items))
         return bits[:nsrc], bits[nsrc]
 
     def u16_half(self, u, hi=0):
