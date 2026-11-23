@@ -649,7 +649,8 @@ class Analysis:
                 pass
             return
         if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "ds_add", "ds_sub", "ds_inc", "ds_dec",
-                          "ds_min", "ds_max", "ds_and", "ds_or", "ds_xor", "ds_cmpst", "ds_wrxchg", "ds_mskor")):
+                          "ds_min", "ds_max", "ds_and", "ds_or", "ds_xor", "ds_cmpst", "ds_wrxchg", "ds_mskor",
+                          "ds_wrap")):
             if op.startswith(("global_atomic", "flat_atomic")):
                 if "glc" in mods:
                     data_op = a[2] if len(a) > 2 else None

@@ -4830,11 +4830,18 @@ class Gen:
             if d is not None:
                 self.dst(d, cur)
         elif op in ("ds_cmpst_rtn_f32", "ds_cmpst_f32"):
-            # ds_cmpst_b32's operands (DATA = the compare value, DATA2 = the new one), compared as binary32. A CAS
-            # loop, so lds_ptr as the other CAS-loop LDS atomics (lds_access's merge assumes a single-block access).
+            # ds_cmpst_b32's operands (DATA = the compare value, DATA2 = the new one), compared as binary32.
+            # Uses float_cmpswap_loop inside lds_access so SHADER-309 bounds checking applies.
+            if len(a) != (4 if rtn else 3) or any(x["k"] != "vgpr" or x.get("n", 1) != 1 for x in a):
+                raise Unsupported(op + " operands")
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
-            p = self.lds_ptr(self.src_u(ad), off)
-            old = self.float_cmpswap_loop(p, self.src_u(src), self.src_u(cmp_), sc)
+            addr, cmp_u, src_u = self.src_u(ad), self.src_u(cmp_), self.src_u(src)
+
+            def cmpst_f32_cas(p):
+                res = self.float_cmpswap_loop(p, src_u, cmp_u, sc)
+                return res if d is not None else None
+
+            old = self.lds_access(addr, off, cmpst_f32_cas)  # bounds-checked when lds_bound is set (SHADER-309)
             if d is not None:
                 self.dst(d, old)
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
@@ -4906,6 +4913,87 @@ class Gen:
             old = self.lds_access(addr, off, cas)        # bounds-checked when lds_bound is set (SHADER-309)
             if d is not None:
                 self.dst(d, old)
+        elif op == "ds_wrap_rtn_b32":
+            # RDNA2 ISA DS_WRAP_RTN_B32:
+            #   old = M[A]; M[A] = (old >= DATA0) ? (old - DATA0) : (old + DATA1); return old
+            # Unsigned 32-bit comparison, 32-bit wrapping arithmetic, via Workgroup-scope CAS loop.
+            if len(a) != 4 or any(x["k"] != "vgpr" or x.get("n", 1) != 1 for x in a):
+                raise Unsupported(op + " operands")
+            d, ad, d0_op, d1_op = a[0], a[1], a[2], a[3]
+            addr = self.src_u(ad)
+            d0 = self.src_u(d0_op)
+            d1 = self.src_u(d1_op)
+
+            def wrap_cas(p):
+                entry_lbl = self.current_label_placeholder()
+                lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
+                init = self.tmp()
+                self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
+                self.emit(f"OpBranch {lbl_hdr}")
+                self.emit(f"{lbl_hdr} = OpLabel")
+                cur, got, ge, sub_v, add_v, new_u, done = (self.tmp() for _ in range(7))
+                self.emit(f"{cur} = OpPhi %uint {init} {entry_lbl} {got} {lbl_cont}")
+                self.emit(f"{ge} = OpUGreaterThanEqual %bool {cur} {d0}")
+                self.emit(f"{sub_v} = OpISub %uint {cur} {d0}")
+                self.emit(f"{add_v} = OpIAdd %uint {cur} {d1}")
+                self.emit(f"{new_u} = OpSelect %uint {ge} {sub_v} {add_v}")
+                self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new_u} {cur}")
+                self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+                self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+                self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+                self.emit(f"{lbl_cont} = OpLabel")
+                self.emit(f"OpBranch {lbl_hdr}")
+                self.emit(f"{lbl_exit} = OpLabel")
+                return cur
+
+            old = self.lds_access(addr, off, wrap_cas)   # bounds-checked when lds_bound is set (SHADER-309)
+            self.dst(d, old)
+        elif op in ("ds_mskor_b64", "ds_mskor_rtn_b64"):
+            # RDNA2 ISA DS_MSKOR[_RTN]_B64:
+            #   old = M64[A]; M64[A] = (old & ~DATA0) | DATA1; [return old]
+            # Per-dword Workgroup-scope CAS loop avoids Int64Atomics and prevents tearing between & and |
+            # within each 32-bit word (matches ds_and/or/xor_b64's two-dword layout).
+            if len(a) != (4 if rtn else 3):
+                raise Unsupported(op + " operands")
+            d, ad, msk, dat = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
+            if ad["k"] != "vgpr" or ad.get("n", 1) != 1 \
+                    or msk["k"] != "vgpr" or msk.get("n") != 2 \
+                    or dat["k"] != "vgpr" or dat.get("n") != 2 \
+                    or (d is not None and (d["k"] != "vgpr" or d.get("n") != 2)):
+                raise Unsupported(op + " operands")
+            addr = self.src_u(ad)
+            m_vals = [self.load_reg("vgpr", msk["r"] + w) for w in range(2)]
+            d_vals = [self.load_reg("vgpr", dat["r"] + w) for w in range(2)]
+            olds = []
+            for w in range(2):
+                inv = self.tmp()
+                self.emit(f"{inv} = OpNot %uint {m_vals[w]}")
+                dv = d_vals[w]
+
+                def mskor64_cas(p, inv=inv, dv=dv):
+                    entry_lbl = self.current_label_placeholder()
+                    lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
+                    init = self.tmp()
+                    self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
+                    self.emit(f"OpBranch {lbl_hdr}")
+                    self.emit(f"{lbl_hdr} = OpLabel")
+                    cur, got, masked, new_u, done = (self.tmp() for _ in range(5))
+                    self.emit(f"{cur} = OpPhi %uint {init} {entry_lbl} {got} {lbl_cont}")
+                    self.emit(f"{masked} = OpBitwiseAnd %uint {cur} {inv}")
+                    self.emit(f"{new_u} = OpBitwiseOr %uint {masked} {dv}")
+                    self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new_u} {cur}")
+                    self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+                    self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+                    self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+                    self.emit(f"{lbl_cont} = OpLabel")
+                    self.emit(f"OpBranch {lbl_hdr}")
+                    self.emit(f"{lbl_exit} = OpLabel")
+                    return cur if d is not None else None
+
+                olds.append(self.lds_access(addr, off + 4 * w, mskor64_cas))
+            if d is not None:
+                for w in range(2):
+                    self.dst({"k": "vgpr", "r": d["r"] + w, "n": 1}, olds[w])
         else:
             raise Unsupported(op)
         self.emit(f"OpBranch {lbl_end}")
