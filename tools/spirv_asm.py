@@ -7,6 +7,7 @@ words in memory.
 Grammar tables in tools/spirv_asm_tables.py are derived from Khronos Group
 SPIRV-Headers (MIT License): spirv.core.grammar.json and
 extinst.glsl.std.450.grammar.json.
+The inline DebugPrintf opcode comes from extinst.nonsemantic.debugprintf.grammar.json.
 
 As a module:
     from spirv_asm import assemble
@@ -48,7 +49,6 @@ TARGET_ENV_VERSION = {
 _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemorySemantics"))
 _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
-    # Khronos extinst.nonsemantic.debugprintf.grammar.json defines one opcode.
     "NonSemantic.DebugPrintf": {"DebugPrintf": 1},
 }
 
