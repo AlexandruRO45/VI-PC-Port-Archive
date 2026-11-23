@@ -652,6 +652,22 @@ class PropRuleTests(unittest.TestCase):
         passing = sorted((p for p in parsed if prop.qualifies(p)), key=prop.rank)
         self.assertEqual([p["File"] for p in passing], ["h.obj", "i.obj", "g.obj"])  # 900 and 1100 tie; name breaks it
 
+    def test_pick_decodes_the_exported_obj_filename(self):
+        import first_light_prop as prop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "café.obj").write_text("vt 0 0\n", encoding="utf-8", newline="\n")
+            manifest = '{\n  "Items": [\n' + self.item(r"café.obj") + "\n  ]\n}\n"
+            (root / "manifest.json").write_text(manifest, encoding="utf-8", newline="\n")
+            self.assertEqual([row["File"] for row in prop.pick(tmp)], ["café.obj"])
+
+    def test_the_stream_decodes_escaped_backslash_and_quote_in_a_filename(self):
+        import first_light_prop as prop
+
+        text = '{\n  "Items": [\n' + self.item(r"a\\b\"c.obj") + "\n  ]\n}\n"
+        self.assertEqual([p["File"] for p in prop.stream_items(text.splitlines(True))], ['a\\b"c.obj'])
+
     def test_a_reindented_or_compact_manifest_is_a_format_error(self):
         import first_light_prop as prop
 

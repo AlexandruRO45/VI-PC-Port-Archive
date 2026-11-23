@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 
@@ -65,7 +66,7 @@ def stream_items(lines):
                 array = key
                 item[key] = []
             elif key in SCALARS:
-                item[key] = value.strip('"') if key == "File" else {"true": True, "false": False}.get(value, value)
+                item[key] = json.loads(value) if key == "File" else {"true": True, "false": False}.get(value, value)
                 if key in ("Meshes", "Verts", "Tris"):
                     item[key] = int(value)
     if seen_content and not seen_items:
@@ -149,4 +150,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())
