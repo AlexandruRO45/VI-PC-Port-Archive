@@ -5,6 +5,8 @@ work/
 /assets/*
 !/assets/logo.png
 carve/
+/models/
+/textures/
 *.rpf
 *.ttpf
 *.xvd
