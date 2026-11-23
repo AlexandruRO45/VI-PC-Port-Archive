@@ -9,6 +9,7 @@ fast, and contain zero game data.
 from collections import namedtuple
 import functools
 import io
+import hashlib
 import json
 import os
 import re
@@ -209,6 +210,66 @@ class GameCheckTest(PreflightTestBase):
             self.assertEqual(res["version"], "9.9.9.9")
             self.assertIn("all files present", stdout_buf.getvalue())
             self.assertIn("Executable found.", stdout_buf.getvalue())
+
+    def synthetic_with_exe(self, tmp, exe_bytes=b"x" * 256, **manifest):
+        """A minimal game folder whose executable is `exe_bytes`, plus the manifest keys the caller records."""
+        manifest_dir = os.path.join(tmp, "manifests")
+        game_dir = os.path.join(tmp, "game")
+        os.makedirs(manifest_dir)
+        os.makedirs(game_dir)
+        v_info = {
+            "title": "Synthetic Exe Identity",
+            "version": "9.9.9.9",
+            "expected_exe": "test_game.exe",
+            "files": {"MicrosoftGame.Config": {"size": 16}, "Catalog000.bin": {"size": 32},
+                      "appdata0.rpf": {"size": 64}},
+            **manifest,
+        }
+        with open(os.path.join(manifest_dir, "custom.json"), "w", encoding="utf-8") as f:
+            json.dump(v_info, f)
+        for rel, info in v_info["files"].items():
+            with open(os.path.join(game_dir, rel), "wb") as f:
+                f.truncate(info["size"])
+        with open(os.path.join(game_dir, "test_game.exe"), "wb") as f:
+            f.write(exe_bytes)
+        return manifest_dir, game_dir
+
+    def test_check_accepts_an_executable_of_the_recorded_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_dir, game_dir = self.synthetic_with_exe(tmp, expected_exe_size=256)
+            stdout_buf = io.StringIO()
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch("sys.stdout", stdout_buf):
+                    make_game.check(game_dir, full=False)
+            self.assertIn("Executable found.", stdout_buf.getvalue())
+
+    def test_check_rejects_an_executable_of_a_different_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_dir, game_dir = self.synthetic_with_exe(tmp, expected_exe_size=512)
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                self.assert_fails(make_game.check, game_dir, full=False,
+                                  match="test_game.exe is 256 bytes, the manifest has 512.")
+
+    def test_full_check_reports_a_matching_executable_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe_bytes = b"x" * 256
+            manifest_dir, game_dir = self.synthetic_with_exe(
+                tmp, exe_bytes, expected_exe_size=256, expected_exe_sha256=hashlib.sha256(exe_bytes).hexdigest())
+            stdout_buf = io.StringIO()
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch.object(make_game, "py"):
+                    with mock.patch("sys.stdout", stdout_buf):
+                        make_game.check(game_dir, full=True)
+            self.assertIn("Executable found and its sha256 matches.", stdout_buf.getvalue())
+
+    def test_full_check_rejects_a_different_executable_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_dir, game_dir = self.synthetic_with_exe(
+                tmp, expected_exe_size=256, expected_exe_sha256="0" * 64)
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch.object(make_game, "py"):
+                    self.assert_fails(make_game.check, game_dir, full=True,
+                                      match="test_game.exe has sha256")
 
     def test_check_missing_files_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

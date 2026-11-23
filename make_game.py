@@ -1053,6 +1053,27 @@ def ensure_submodule() -> None:
          "\"git submodule update --init --recursive\" in this folder and build again.")
 
 
+def exe_mismatch(version: dict, exe: str, full: bool) -> str:
+    """Why `exe` is not the executable the manifest describes, or "" when it is or the manifest does not say.
+
+    `expected_exe_size` and `expected_exe_sha256` are optional: a copy bought before the executable shipped has no
+    such file, and the runtime stage can still be built from it. When the manifest records them, a different size
+    fails either way (a truncated copy cannot be run); the hash is compared only with --full, the mode that reads
+    every file.
+    """
+    size = version.get("expected_exe_size")
+    if size is not None:
+        actual = os.path.getsize(exe)
+        if actual != size:
+            return f"{version['expected_exe']} is {actual} bytes, the manifest has {size}."
+    digest = version.get("expected_exe_sha256")
+    if full and digest:
+        actual = file_sha256(exe)
+        if actual != digest:
+            return f"{version['expected_exe']} has sha256 {actual[:12]}, the manifest has {digest[:12]}."
+    return ""
+
+
 def check(game: str, full: bool) -> dict:
     if not os.path.isdir(game):
         h = xvd_header(game) if os.path.isfile(game) else None
@@ -1071,9 +1092,16 @@ def check(game: str, full: bool) -> dict:
     if full:
         py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
     exe = os.path.join(game, v["expected_exe"])
-    log(f"check: all files present{' and hashes match' if full else ''}. "
-        + ("Executable found." if os.path.isfile(exe) else
-           f"{v['expected_exe']} is not in the folder: the runtime stage can be built but not run."))
+    present = "all files present" + (" and hashes match" if full else "")
+    if not os.path.isfile(exe):
+        log(f"check: {present}. "
+            f"{v['expected_exe']} is not in the folder: the runtime stage can be built but not run.")
+        return v
+    why = exe_mismatch(v, exe, full)
+    if why:
+        fail(f"{why} Use an unmodified {v['expected_exe']} from version {v['version']}.")
+    log(f"check: {present}. Executable found"
+        + (" and its sha256 matches." if full and v.get("expected_exe_sha256") else "."))
     return v
 
 
