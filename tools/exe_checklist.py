@@ -5,8 +5,9 @@
 The runtime and the docs mark what was written without the executable: `// ASSUMPTION ...` or `// ... UNVERIFIED`
 comments in runtime/src and runtime/shims (C++), and `**VERIFY:**`, `**ASSUMPTION:**` or `**UNVERIFIED:**` notes in
 docs/*.md, in any case (the prose spelling `**Assumption**`, `**Unverified:**` counts too; a bold term followed by
-a dash defines it and is not a note). This collects them with their file and line, the whole comment block or list
-item each starts, so the first look at the executable (scripts/first_look.ps1) has one list to work through.
+a dash defines it and is not a note, and a marker that does not start its line or that sits in a table row is prose,
+not a note). This collects them with their file and line, the whole comment block or list item each starts, so the
+first look at the executable (scripts/first_look.ps1) has one list to work through.
 
 --gdk-calls takes gdk_runtime_calls.py's JSON for the executable (its --out file or its --json output, one image or
 several). A shim note then says whether the executable calls a runtime class that file serves: "called" items are
