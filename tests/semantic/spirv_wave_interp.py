@@ -117,6 +117,21 @@ def _f32_pack(x):
         return F(0xFF800000 if math.copysign(1.0, x) < 0 else 0x7F800000)
 
 
+def _int_to_f32(v):
+    """An integer rounded once to binary32, to nearest with ties to even. float(v) first would round a 64-bit
+    value to binary64 and then again to binary32, which can give the other neighbour: 2**62 + 2**38 + 1 lands on
+    the midpoint 2**62 + 2**38 and ties down to 2**62. Every 32-bit value is exact in binary64, so this changes
+    nothing for them."""
+    n = abs(v)
+    drop = n.bit_length() - 24                  # bits below a binary32 significand
+    if drop > 0:
+        q, r, half = n >> drop, n & ((1 << drop) - 1), 1 << (drop - 1)
+        if r > half or (r == half and q & 1):
+            q += 1
+        n = q << drop                           # at most 24 significant bits, so float() below is exact
+    return _f32_pack(float(-n if v < 0 else n))
+
+
 def _wrap_input(v):
     if isinstance(v, float):
         return _f32_pack(v)
@@ -874,7 +889,7 @@ class _Wave:
             if op == "OpConvertSToF":
                 bw = m.bits(m.id_type.get(a[1], a[0])) if m.types.get(m.id_type.get(a[1]), ("",))[0] == "int" else 32
                 v = _signed(v, bw)
-            return _f32_pack(float(v))
+            return _int_to_f32(v)
         if op.startswith("OpF") or op == "OpExtInst" and not self._int_ext(a):
             raise UnsupportedConstruct(f"{op}: float arithmetic is not modelled here")
         if op == "OpExtInst":
