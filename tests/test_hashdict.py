@@ -4,6 +4,7 @@ lookup CLI, case-insensitivity, and collision handling.
     python -I tests/test_hashdict.py
 """
 import errno
+import contextlib
 import io
 import json
 import os
@@ -427,6 +428,23 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertIn("is one of the inputs", p.stderr)
         with open(index, "rb") as f:
             self.assertEqual(f.read(), before)
+
+    def test_out_goes_through_the_shared_report_path_guard(self):
+        # The guard used to compare --out with os.path.samefile only when --out existed, which cannot answer
+        # for a report path that does not exist yet. tools/report_paths.same_report_path does, and it is the
+        # one guard every report writer shares (BUILD-589).
+        import report_paths
+        out = os.path.join(self.dir, "another_name.json")
+        with mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe, \
+                mock.patch.object(sys, "argv", [TOOL, self.carve_dir, "--out", out]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            result = hashdict.main()
+        self.assertEqual(result, 2)
+        self.assertIn("is one of the inputs", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+        self.assertGreaterEqual(probe.call_count, 1)
+        self.assertIs(hashdict.same_report_path, report_paths.same_report_path)
 
     def assert_carved_blob_preserved(self, output, blob):
         with open(blob, "rb") as f:
