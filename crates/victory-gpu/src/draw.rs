@@ -609,7 +609,28 @@ impl State {
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| {
+                if u.kind == ResourceType::Cbv {
+                    return true;
+                }
+                // On hosts whose shader-visible view heap is capped below the
+                // title's (e.g. NVIDIA's 1,000,000-descriptor limit), any table
+                // entry past the mirrored region must be remapped into dynamic
+                // slots; otherwise the shader reads into the dynamic scratch
+                // region or past the end of the host heap.
+                let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                else {
+                    return false;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some(heap) = self.heap_of(handle) else {
+                    return false;
+                };
+                match (heap.host(), heap.index(handle)) {
+                    (Some(host), Some(index)) => !host.is_sampler() && !host.in_range(index),
+                    _ => false,
+                }
+            })
             .map(|u| u.slot)
             .collect();
         fresh.sort_unstable();
