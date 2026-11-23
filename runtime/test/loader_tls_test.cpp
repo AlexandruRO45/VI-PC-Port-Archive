@@ -768,7 +768,7 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
 
 // ---- Hand-built TLS callback fixtures -------------------------------------------------------------------------------
 //
-// Both images below are assembled from constants only: no game data, no compiler-produced bytes. The callback table in
+// The images below are assembled from constants only: no game data, no compiler-produced bytes. The callback table in
 // IMAGE_TLS_DIRECTORY64 has no length field, so run_callbacks() follows it until a zero entry, checking every entry
 // against the mapped image before calling it. Each callback is a short x64 stub that records the (base, reason,
 // reserved) it was called with and appends its id to a shared log, making the exact call order observable.
@@ -787,11 +787,15 @@ constexpr uint32_t kStubRva[3] = {kSynthTextRva + 0x100, kSynthTextRva + 0x140, 
 constexpr uint32_t kTableRva = kSynthTextRva + 0x200;   // terminated: three entries plus a zero entry
 constexpr uint32_t kLastTableRva = kSynthTextRva + 0xFE8;  // unterminated: last entry is the image's final 8 bytes
 
+// The three table shapes: a normal terminated table, one missing its terminator, and one whose second entry is a
+// virtual address outside the mapped image (the entry VALUE check, distinct from the entry RANGE check).
+enum class CallbackTableKind { Terminated, Unterminated, BadEntryValue };
+
 struct CallbackState {
     uint32_t count;
     uint32_t order[8];
     uint64_t base[3];
-    uint64_t reason[3];
+    uint32_t reason[3];  // PIMAGE_TLS_CALLBACK's reason parameter is a DWORD; only EDX is defined in the x64 ABI
     uint64_t reserved[3];
 };
 static CallbackState g_callback_state;
@@ -808,16 +812,16 @@ void emit_u64(std::vector<uint8_t>& c, uint64_t v) {
     for (int i = 0; i < 8; ++i) c.push_back(static_cast<uint8_t>(v >> (8 * i)));
 }
 
-// movabs rax, state; mov [rax+base], rcx; mov [rax+reason], rdx; mov [rax+reserved], r8;
+// movabs rax, state; mov [rax+base], rcx; mov [rax+reason], edx; mov [rax+reserved], r8;
 // mov ecx, [rax]; mov dword [rax+rcx*4+order], id; inc dword [rax]; ret
 void emit_callback_stub(std::vector<uint8_t>& c, uint64_t state_va, uint32_t slot, uint32_t id) {
     const uint32_t base_off = static_cast<uint32_t>(offsetof(CallbackState, base)) + slot * 8;
-    const uint32_t reason_off = static_cast<uint32_t>(offsetof(CallbackState, reason)) + slot * 8;
+    const uint32_t reason_off = static_cast<uint32_t>(offsetof(CallbackState, reason)) + slot * 4;
     const uint32_t reserved_off = static_cast<uint32_t>(offsetof(CallbackState, reserved)) + slot * 8;
     const uint32_t order_off = static_cast<uint32_t>(offsetof(CallbackState, order));
     emit_u8(c, 0x48); emit_u8(c, 0xB8); emit_u64(c, state_va);
     emit_u8(c, 0x48); emit_u8(c, 0x89); emit_u8(c, 0x88); emit_u32(c, base_off);
-    emit_u8(c, 0x48); emit_u8(c, 0x89); emit_u8(c, 0x90); emit_u32(c, reason_off);
+    emit_u8(c, 0x89); emit_u8(c, 0x90); emit_u32(c, reason_off);  // reason is DWORD: EDX, no REX.W
     emit_u8(c, 0x4C); emit_u8(c, 0x89); emit_u8(c, 0x80); emit_u32(c, reserved_off);
     emit_u8(c, 0x8B); emit_u8(c, 0x08);
     emit_u8(c, 0xC7); emit_u8(c, 0x84); emit_u8(c, 0x88); emit_u32(c, order_off); emit_u32(c, id);
@@ -826,7 +830,7 @@ void emit_callback_stub(std::vector<uint8_t>& c, uint64_t state_va, uint32_t slo
 }
 
 // The image has no relocations, so its VAs are image_base + RVA and the loader must map it at image_base.
-std::vector<uint8_t> make_synthetic_tls_image(uint64_t image_base, bool terminated) {
+std::vector<uint8_t> make_synthetic_tls_image(uint64_t image_base, CallbackTableKind kind) {
     std::vector<uint8_t> bytes(kSynthFileSize, 0);
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
     dos->e_magic = IMAGE_DOS_SIGNATURE;
@@ -853,6 +857,7 @@ std::vector<uint8_t> make_synthetic_tls_image(uint64_t image_base, bool terminat
     sec->SizeOfRawData = kSynthTextSize;
     sec->Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
 
+    const bool terminated = kind != CallbackTableKind::Unterminated;
     // Callback-only TLS: no data template. AddressOfIndex is written by load() before protect_sections().
     auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(bytes.data() + kTlsDirRva - kSynthTextRva + kSynthTextRaw);
     tls->AddressOfIndex = image_base + kTlsIndexRva;
@@ -867,6 +872,7 @@ std::vector<uint8_t> make_synthetic_tls_image(uint64_t image_base, bool terminat
     const uint32_t table_rva = terminated ? kTableRva : kLastTableRva;
     auto* table = reinterpret_cast<uint64_t*>(bytes.data() + table_rva - kSynthTextRva + kSynthTextRaw);
     for (uint32_t i = 0; i < 3; ++i) table[i] = image_base + kStubRva[i];
+    if (kind == CallbackTableKind::BadEntryValue) table[1] = image_base + kSynthImageSize + 0x100;
     if (terminated) table[3] = 0;
     return bytes;
 }
@@ -881,7 +887,7 @@ bool order_is(const uint32_t* expected, uint32_t n) {
 void test_three_callbacks(const fs::path& dir) {
     std::printf("\n-- synthetic TLS image with three callbacks --\n");
     const uint64_t image_base = leonida_test::free_image_base(0x181000000);
-    const auto bytes = make_synthetic_tls_image(image_base, true);
+    const auto bytes = make_synthetic_tls_image(image_base, CallbackTableKind::Terminated);
     const fs::path path = dir / "synthetic_tls_three_callbacks.bin";
     write_file(path, bytes.data(), bytes.size());
 
@@ -916,7 +922,7 @@ void test_three_callbacks(const fs::path& dir) {
 void test_unterminated_callback_table(const fs::path& dir) {
     std::printf("\n-- synthetic TLS image without a callback-table terminator --\n");
     const uint64_t image_base = leonida_test::free_image_base(0x182000000);
-    const auto bytes = make_synthetic_tls_image(image_base, false);
+    const auto bytes = make_synthetic_tls_image(image_base, CallbackTableKind::Unterminated);
     const fs::path path = dir / "synthetic_tls_unterminated.bin";
     write_file(path, bytes.data(), bytes.size());
 
@@ -927,12 +933,34 @@ void test_unterminated_callback_table(const fs::path& dir) {
     bool threw = false;
     try {
         loader.run_tls_callbacks(m, DLL_PROCESS_ATTACH);
-    } catch (const std::exception&) {
+    } catch (const std::runtime_error&) {
         threw = true;  // the documented corrupt-TLS-directory path; the message is deliberately not checked
     }
     check(threw, "the missing terminator fails with a C++ exception, not an out-of-bounds read");
     const uint32_t ordered[3] = {1, 2, 3};
     check(order_is(ordered, 3), "the bounded failure happens after all three entries, in order");
+}
+
+void test_callback_entry_outside_image(const fs::path& dir) {
+    std::printf("\n-- synthetic TLS image with a callback entry outside the image --\n");
+    const uint64_t image_base = leonida_test::free_image_base(0x183000000);
+    const auto bytes = make_synthetic_tls_image(image_base, CallbackTableKind::BadEntryValue);
+    const fs::path path = dir / "synthetic_tls_bad_entry_value.bin";
+    write_file(path, bytes.data(), bytes.size());
+
+    reset_callback_state();
+    rt::Loader loader(dir);
+    rt::Module& m = loader.load(path);
+    check(order_is(nullptr, 0), "load() of the bad-entry image runs no TLS callback");
+    bool threw = false;
+    try {
+        loader.run_tls_callbacks(m, DLL_PROCESS_ATTACH);
+    } catch (const std::runtime_error&) {
+        threw = true;  // rva_in rejects the entry value; the message is deliberately not checked
+    }
+    check(threw, "an out-of-image entry fails with a controlled runtime_error");
+    const uint32_t only_first[1] = {1};
+    check(order_is(only_first, 1), "only the callback before the bad entry runs");
 }
 
 void print_result() {
@@ -972,6 +1000,7 @@ int main(int argc, char** argv) {
         test_orphan_slot_generation_reuse(tls_dll);
         test_three_callbacks(temp.path);
         test_unterminated_callback_table(temp.path);
+        test_callback_entry_outside_image(temp.path);
 
         // The --run path calls cleanup_tls_clones() before ExitProcess because atexit never runs there.
         std::printf("\n-- explicit clone cleanup (the ExitProcess path) --\n");
