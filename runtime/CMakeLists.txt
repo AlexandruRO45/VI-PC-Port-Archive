@@ -463,6 +463,10 @@ if(BUILD_TESTING)
   # vk_pipeline_check's isolate summary stage set: pure stdlib, no Vulkan device.
   add_executable(pipeline_summary_test test/pipeline_summary_test.cpp)
   add_test(NAME pipeline_summary COMMAND pipeline_summary_test)
+  # QueueHolds::remove_fence must drop a hold created between a pending() decision and hold().
+  add_executable(queue_holds_release_test test/queue_holds_release_test.cpp)
+  target_link_libraries(queue_holds_release_test PRIVATE Threads::Threads)
+  add_test(NAME queue_holds_release COMMAND queue_holds_release_test)
   # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
   add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
   add_test(NAME xdxr_descs COMMAND xdxr_descs_test)

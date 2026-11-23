@@ -1944,6 +1944,7 @@ public:
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
             std::lock_guard state(state_mutex_);
+            context_.holds().begin_hold();
             if (!must_hold()) {
                 result = execute_now(lists);
             } else if (context_.is_device_lost()) {
@@ -1958,6 +1959,7 @@ public:
                 held = true;
             }
             drain_pins(retired);
+            context_.holds().end_hold();
         }
         retired.clear();
         if (held) context_.holds().pump_ready();  // a Signal may have been submitted since the check
@@ -1972,6 +1974,7 @@ public:
         std::vector<std::shared_ptr<void>> retired;
         {
             std::lock_guard state(state_mutex_);
+            context_.holds().begin_hold();
             if (must_hold()) {
                 Deferred op;
                 op.kind = Deferred::Kind::signal;
@@ -1983,6 +1986,7 @@ public:
                 ok = submit(VK_NULL_HANDLE, fence, value);
             }
             drain_pins(retired);
+            context_.holds().end_hold();
         }
         retired.clear();
         context_.holds().pump_ready();  // this Signal, or the hold above, may have made a held batch ready

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -59,16 +60,25 @@ public:
     // from inside a release: the releasing thread already holds the lock, and what it is releasing cannot
     // reference a fence whose last reference it is dropping, since that reference is the one it holds.
     void remove_fence(Semaphore semaphore) {
+        // A queue can have called pending() and still be about to count its hold. Wait for those windows to close:
+        // otherwise the hold would appear after the drop below and later be submitted with a destroyed semaphore.
         {
-            std::lock_guard lock(mutex_);
-            fences_.erase(semaphore);
+            std::unique_lock reservation(reservation_mutex_);
+            reservation_cv_.wait(reservation, [this] { return hold_reservations_ == 0; });
         }
-        if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
-        {
+        // Drop while the fence is still registered. Until it is erased, pending() still says these waits are
+        // unsatisfied, so a concurrent pump_ready() cannot release them into a submission with a destroyed handle.
+        // Not from inside a release: the releasing thread already holds pump_mutex_, and what it releases cannot
+        // name a fence whose last reference it is dropping.
+        if (!in_pump() && held_.load(std::memory_order_acquire) != 0) {
             std::lock_guard pump(pump_mutex_);
             in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
             in_pump() = false;
+        }
+        {
+            std::lock_guard lock(mutex_);
+            fences_.erase(semaphore);
         }
         pump_ready();
     }
@@ -151,6 +161,21 @@ public:
         pump_ready();
     }
 
+    // Bracket a pending() decision and the hold it may create. Both calls are made with the queue's own lock held;
+    // remove_fence() waits for every open bracket before it drops holds, so a decision made before the removal
+    // cannot turn into a hold after it.
+    void begin_hold() {
+        std::lock_guard lock(reservation_mutex_);
+        ++hold_reservations_;
+    }
+    void end_hold() {
+        {
+            std::lock_guard lock(reservation_mutex_);
+            --hold_reservations_;
+        }
+        reservation_cv_.notify_all();
+    }
+
     // Held operations over all queues, for the cheap "is there anything to do" test.
     void held_changed(std::int64_t delta) { held_.fetch_add(delta, std::memory_order_acq_rel); }
     bool any_held() const { return held_.load(std::memory_order_acquire) > 0; }
@@ -223,6 +248,9 @@ private:
 
     mutable std::mutex mutex_;  // leaf: fences_, holders_ and barriers_
     std::mutex pump_mutex_;     // one releasing thread; held across release_ready(), so detach() waits for it
+    std::mutex reservation_mutex_;  // leaf: guards hold_reservations_
+    std::condition_variable reservation_cv_;
+    unsigned hold_reservations_ = 0;
     std::unordered_map<Semaphore, std::uint64_t> fences_;
     std::vector<Holder*> holders_;
     std::deque<Barrier> barriers_;
