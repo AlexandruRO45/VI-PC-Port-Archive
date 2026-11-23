@@ -295,7 +295,114 @@ class TestSaluBrevB32AST(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_salu_instruction("s_brev_b32 s106, s0")
 
+# --- Section 3: Deterministic Scalar Instruction Interpreter ---
+
+class ScalarRegisterFile:
+    """RDNA2 Scalar Register File model (106 SGPRs: s0..s105, plus SCC)."""
+
+    def __init__(self) -> None:
+        self.sgprs: List[int] = [0] * 106
+        self.scc: int = 0
+
+    def read_sgpr(self, idx: int) -> int:
+        if not (0 <= idx < 106):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < 106):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def read_operand(self, op: OperandAST) -> int:
+        if op.kind == OperandKind.SGPR:
+            assert op.reg_idx is not None
+            return self.read_sgpr(op.reg_idx)
+        return op.value & MASK32
+
+
+class SaluInterpreter:
+    """Deterministic Scalar ALU instruction interpreter for s_brev_b32."""
+
+    def __init__(self, reg_file: Optional[ScalarRegisterFile] = None) -> None:
+        self.reg_file = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def execute(self, inst: InstructionAST) -> int:
+        if inst.mnemonic != "s_brev_b32":
+            raise ValueError(f"Unsupported instruction mnemonic: {inst.mnemonic}")
+        src_val = self.reg_file.read_operand(inst.src0)
+        res = ref_s_brev_b32(src_val)
+        assert inst.dst.reg_idx is not None
+        self.reg_file.write_sgpr(inst.dst.reg_idx, res)
+        # Note: SCC is preserved unmodified per RDNA2 ISA specification
+        return res
+
+
+class TestSaluBrevB32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter tests."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = SaluInterpreter(self.rf)
+
+    def test_single_bit_patterns(self) -> None:
+        for bit in range(32):
+            self.rf.write_sgpr(0, 1 << bit)
+            inst = parse_salu_instruction("s_brev_b32 s1, s0")
+            res = self.interp.execute(inst)
+            expected = 1 << (31 - bit)
+            self.assertEqual(res, expected)
+            self.assertEqual(self.rf.read_sgpr(1), expected)
+
+    def test_complement_single_bit_patterns(self) -> None:
+        for bit in range(32):
+            val = MASK32 ^ (1 << bit)
+            self.rf.write_sgpr(0, val)
+            inst = parse_salu_instruction("s_brev_b32 s1, s0")
+            res = self.interp.execute(inst)
+            expected = MASK32 ^ (1 << (31 - bit))
+            self.assertEqual(res, expected)
+            self.assertEqual(self.rf.read_sgpr(1), expected)
+
+    def test_alternating_bit_patterns(self) -> None:
+        patterns = [
+            (0xAAAAAAAA, 0x55555555),
+            (0x55555555, 0xAAAAAAAA),
+            (0xCCCCCCCC, 0x33333333),
+            (0x33333333, 0xCCCCCCCC),
+            (0xF0F0F0F0, 0x0F0F0F0F),
+            (0x0F0F0F0F, 0xF0F0F0F0),
+            (0xFF00FF00, 0x00FF00FF),
+            (0x00FF00FF, 0xFF00FF00),
+            (0xFFFF0000, 0x0000FFFF),
+            (0x0000FFFF, 0xFFFF0000),
+        ]
+        for src, expected in patterns:
+            with self.subTest(src=hex(src)):
+                self.rf.write_sgpr(2, src)
+                inst = parse_salu_instruction("s_brev_b32 s3, s2")
+                res = self.interp.execute(inst)
+                self.assertEqual(res, expected)
+                self.assertEqual(self.rf.read_sgpr(3), expected)
+
+    def test_immediate_and_literal_operands(self) -> None:
+        inst_imm = parse_salu_instruction("s_brev_b32 s10, 0")
+        res = self.interp.execute(inst_imm)
+        self.assertEqual(res, 0)
+
+        inst_lit = parse_salu_instruction("s_brev_b32 s11, 0x80000000")
+        res = self.interp.execute(inst_lit)
+        self.assertEqual(res, 1)
+
+    def test_translator_cross_validation(self) -> None:
+        cases = [0x12345678, 0x89ABCDEF, 0xA5A5A5A5, 0x5A5A5A5A]
+        for c in cases:
+            self.rf.write_sgpr(0, c)
+            inst = parse_salu_instruction("s_brev_b32 s1, s0")
+            interp_res = self.interp.execute(inst)
+            hw_res = run_salu_brev_ps(c)
+            self.assertEqual(interp_res, hw_res)
+
 
 if __name__ == "__main__":
     unittest.main()
-
