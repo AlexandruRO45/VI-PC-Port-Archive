@@ -187,10 +187,10 @@ class ViewerServer(http.server.ThreadingHTTPServer):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Serve the map viewer on 127.0.0.1.")
     ap.add_argument("--world", help="exported world directory (omit to show test terrain)")
     ap.add_argument("--port", type=port_number, default=8765,
-                    help="0 asks the OS for a free port; the bound port is printed")
+                    help="listening port (default: %(default)s); 0 asks the OS for a free port; the bound port is printed")
     a = ap.parse_args()
     if a.world is not None and not os.path.isdir(a.world):
         ap.error(f"--world is not a directory: {a.world}")
