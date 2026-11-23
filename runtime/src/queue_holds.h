@@ -34,8 +34,8 @@ public:
     struct Holder {
         // Releases the held operations at the front of the queue whose waits are satisfied. True if any was.
         virtual bool release_ready() = 0;
-        // Drops the held operations that wait on `semaphore` (its fence is gone), reporting each, and forgets the
-        // semaphore wherever else the queue would still use it (a held Signal, a Wait not yet attached).
+        // Forgets `semaphore` (its fence is gone) wherever the queue would still use it: a Wait not yet attached, a
+        // held operation's Wait (counted as reached, so the operation runs in order, D3D-496) and a held Signal.
         virtual void discard_waiting_on(Semaphore semaphore) = 0;
 
     protected:
@@ -47,8 +47,9 @@ public:
         fences_[semaphore] = initial;
     }
 
-    // The fence is released: held batches waiting on it can never run, so they are dropped and reported. Every
-    // queue is asked, held work or not: a Wait not yet attached to a submission names the fence too.
+    // The fence is released: a Wait on it counts as reached from now on, as on the host runtime, so held batches
+    // waiting on it go on (D3D-496) once their other waits are met. Every queue is asked, held work or not: a Wait
+    // not yet attached to a submission names the fence too. pump_ready() below releases what became ready.
     void remove_fence(Semaphore semaphore) {
         {
             std::lock_guard lock(mutex_);

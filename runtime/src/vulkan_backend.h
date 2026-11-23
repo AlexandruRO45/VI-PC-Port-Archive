@@ -2082,9 +2082,12 @@ private:
         return released;
     }
 
-    // Holder: the fence is released, so what waits on it can never run. Its semaphore is retired once the submissions
-    // made so far have completed (VulkanFence), so none after may use it either: a Wait not yet attached to a
-    // submission counts as reached, as a released fence does for the CPU, and a held Signal of it signals nothing.
+    // Holder: the fence is released. Its semaphore is retired once the submissions made so far have completed
+    // (VulkanFence), so none after may use it: a Wait on it counts as reached, as a released fence does for the CPU,
+    // whether it is not yet attached to a submission or carried by a held operation, and a held Signal of it signals
+    // nothing. The host runtime lets a queue waiting on a released fence go on (D3D-496), so a held operation is not
+    // dropped: only that wait is taken off it, and remove_fence's pump_ready releases it in order once its other
+    // waits are met.
     void discard_waiting_on(VkSemaphore semaphore) override {
         std::lock_guard state(state_mutex_);
         for (std::size_t i = 0; i < waits_.size();) {
@@ -2097,16 +2100,15 @@ private:
         }
         for (Deferred& op : held_)
             if (op.kind == Deferred::Kind::signal && op.fence == semaphore) op.fence = VK_NULL_HANDLE;
-        for (auto it = held_.begin(); it != held_.end();) {
-            if (std::find(it->waits.begin(), it->waits.end(), semaphore) == it->waits.end()) {
-                ++it;
-                continue;
+        for (Deferred& op : held_)
+            for (std::size_t i = 0; i < op.waits.size();) {
+                if (op.waits[i] != semaphore) {
+                    ++i;
+                    continue;
+                }
+                op.waits.erase(op.waits.begin() + std::ptrdiff_t(i));
+                op.wait_values.erase(op.wait_values.begin() + std::ptrdiff_t(i));
             }
-            std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work waiting on it; "
-                                 "that work is dropped\n");
-            it = held_.erase(it);
-            context_.holds().held_changed(-1);
-        }
     }
 
     // A queue destroyed with held work: the fence it waits on was never signaled. Reported, not waited for; nothing

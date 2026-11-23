@@ -2178,7 +2178,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   destroyed with held operations reports them once (stderr: `queue destroyed with N held operation(s) never
   submitted: waits for a fence value (V) that no Signal reached`) and goes on without waiting; a fence nobody signals
   holds back only the queues that wait for it (and those that wait for what they would have signaled), never the
-  others; a fence released while operations wait for it drops them and says so. Its semaphore is not destroyed at
+  others; a fence released while operations wait for it lets them go on, as the host runtime does (D3D-496): the
+  released fence's wait is taken off each held operation, which then runs in queue order once its other waits are
+  met (case "fence released while a batch waits", layer and host). Its semaphore is not destroyed at
   once (D3D-486): an application may release a fence right after asking a queue to Signal or Wait for it, so the
   semaphore goes through the deferred-deletion tickets once every submission made before the release has completed,
   and no later one uses it: a `Wait` for it not yet attached to a batch counts as reached (on the host runtime the
