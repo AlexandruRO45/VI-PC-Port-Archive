@@ -1284,6 +1284,10 @@ if(TARGET Vulkan::Headers)
                "-DWANT=${LEONIDA_PIPELINE_CHECK_STACK}"
                -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
     endif()
+    # Mocked Vulkan handles and a host allocation failure, with no GPU.
+    add_executable(depth24_collect_test test/depth24_collect_test.cpp)
+    target_link_libraries(depth24_collect_test PRIVATE Vulkan::Headers)
+    add_test(NAME depth24_collect COMMAND depth24_collect_test)
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
     # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).

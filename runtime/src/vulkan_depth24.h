@@ -152,9 +152,13 @@ public:
                     continue;
                 }
             }
+            constexpr std::size_t max_spares = 4;
+            const auto reuse_count = std::min(retired_[i].chunks.size(), max_spares - spare_.size());
+            // Reserve before copying handles so an allocation failure leaves ownership with the retired batch.
+            spare_.reserve(spare_.size() + reuse_count);
             for (auto& chunk : retired_[i].chunks) {
                 chunk.used = 0;
-                if (spare_.size() < 4) spare_.push_back(chunk);
+                if (spare_.size() < max_spares) spare_.push_back(chunk);
                 else destroy(chunk);
             }
             retired_[i].chunks.clear();
