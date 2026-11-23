@@ -235,5 +235,26 @@ class DecodeXmaStdinTest(unittest.TestCase):
                 self.assertEqual(f.read(), "b''")
 
 
+class DecodeXmaStagingTest(unittest.TestCase):
+    def test_failed_concurrent_decode_cannot_remove_successful_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            src = os.path.join(folder, "stream.xma.wav")
+            open(src, "wb").close()
+
+            def ffmpeg(cmd, **kwargs):
+                with open(cmd[-1], "wb") as f:
+                    f.write(cmd[0].encode("ascii"))
+                if cmd[0] == "successful":
+                    make_game.decode_xma("failing", folder)
+                return subprocess.CompletedProcess(cmd, int(cmd[0] == "failing"))
+
+            with mock.patch.object(make_game.subprocess, "run", ffmpeg), \
+                    mock.patch.object(make_game, "log"):
+                make_game.decode_xma("successful", folder)
+            self.assertEqual(sorted(os.listdir(folder)), ["stream.wav", "stream.xma.wav"])
+            with open(os.path.join(folder, "stream.wav"), "rb") as f:
+                self.assertEqual(f.read(), b"successful")
+
+
 if __name__ == "__main__":
     unittest.main()

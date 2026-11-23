@@ -41,6 +41,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1632,15 +1633,15 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
 
     def one(src: str) -> bool:
         dst = src[:-8] + ".wav"
-        tmp = dst + ".part"
-        # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
-        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
-                           stdin=subprocess.DEVNULL)
-        if r.returncode == 0 and os.path.isfile(tmp):
-            os.replace(tmp, dst)
-            return True
-        if os.path.isfile(tmp):
-            os.remove(tmp)
+        # Each decode owns its staging file, on the same filesystem as the destination.
+        with tempfile.TemporaryDirectory(prefix=".xma-", dir=os.path.dirname(dst)) as staging:
+            tmp = os.path.join(staging, "stream.wav")
+            # No stdin: ffmpeg otherwise reads key commands and can suspend a background build.
+            r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
+                               stdin=subprocess.DEVNULL)
+            if r.returncode == 0 and os.path.isfile(tmp):
+                os.replace(tmp, dst)
+                return True
         return False
 
     todo = sorted(todo)
