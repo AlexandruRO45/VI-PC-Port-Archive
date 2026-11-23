@@ -89,8 +89,12 @@ def main(argv=None) -> int:
         ap.error("--thresholds must be within 1..255")
     if a.json and same_file(a.dds, a.json):
         ap.error("--json names the input texture; writing it would replace the DDS")
-    with open(a.dds, "rb") as fh:
-        width, height, rgba = dds_png.decode_dds(fh.read())
+    try:
+        with open(a.dds, "rb") as fh:
+            width, height, rgba = dds_png.decode_dds(fh.read())
+    except (OSError, ValueError) as e:  # DdsError is a ValueError: a missing, empty or non-DDS texture
+        print(f"ERROR: {a.dds}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+        return 2
     counts = channel_counts(width, height, rgba, thresholds)
     print(f"{width}x{height}")
     for name, row in counts.items():
