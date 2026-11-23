@@ -98,6 +98,103 @@ def embeddings(signature, counts, cap, ordered=True):
     return out
 
 
+# The fields of a manifest item this tool reads (model_geometries, describe, main); everything else is dropped
+# while the manifest is streamed, so a 5.1 GB levels.rpf manifest needs a few hundred MB, not 20 GB (BUILD-1222).
+ITEM_FIELDS = ("Offset", "File", "Name", "MeshTris", "MeshModels", "MeshGeoms", "MeshShaders")
+CHUNK = 1 << 20
+
+
+def _slim(item):
+    out = {k: item[k] for k in ITEM_FIELDS if k in item}
+    materials = item.get("Materials")
+    if isinstance(materials, list):   # positions matter (MeshShaders indexes them); only "Shader" is read
+        out["Materials"] = [{"Shader": m["Shader"]} if isinstance(m, dict) and "Shader" in m else {} for m in materials]
+    return out
+
+
+def read_items(path):
+    """The manifest's Items, each cut down to the fields this tool reads, without loading the whole file.
+
+    A `rpf9dump models` manifest is one JSON object whose "Items" array is almost all of it. The object is read
+    in 1 MB chunks: other top-level members are decoded and dropped, and each item is decoded on its own and
+    slimmed before the next one is read. Raises ValueError for anything that isn't such an object.
+    """
+    dec = json.JSONDecoder()
+    with open(path, encoding="utf-8") as f:
+        buf, pos, eof = "", 0, False
+
+        def more():
+            nonlocal buf, pos, eof
+            chunk = f.read(CHUNK)
+            if not chunk:
+                eof = True
+                return False
+            buf, pos = buf[pos:] + chunk, 0
+            return True
+
+        def skip_ws():
+            nonlocal pos
+            while True:
+                while pos < len(buf) and buf[pos] in " \t\r\n":
+                    pos += 1
+                if pos < len(buf) or not more():
+                    return
+
+        def expect(chars):
+            nonlocal pos
+            skip_ws()
+            if pos >= len(buf) or buf[pos] not in chars:
+                found = buf[pos] if pos < len(buf) else "end of file"
+                raise ValueError("%s is not a manifest object: expected %s, found %r" % (path, " or ".join(chars), found))
+            pos += 1
+            return buf[pos - 1]
+
+        def value(complete_scalar=False):
+            nonlocal pos
+            skip_ws()
+            while True:
+                try:
+                    obj, end = dec.raw_decode(buf, pos)
+                except json.JSONDecodeError as e:
+                    if eof or not more():
+                        raise ValueError("%s: %s" % (path, e)) from None
+                    continue
+                # A number at the very end of the buffer may continue in the next chunk.
+                if complete_scalar and end == len(buf) and not eof and more():
+                    continue
+                pos = end
+                return obj
+
+        expect("{")
+        items = None
+        skip_ws()
+        if buf[pos:pos + 1] == "}":
+            return []
+        while True:
+            key = value()
+            if not isinstance(key, str):
+                raise ValueError("%s is not a manifest object: a member name is not a string" % path)
+            expect(":")
+            if key == "Items":
+                items = []
+                expect("[")
+                skip_ws()
+                if buf[pos:pos + 1] == "]":
+                    pos += 1
+                else:
+                    while True:
+                        item = value()
+                        if not isinstance(item, dict):
+                            raise ValueError("%s: an entry of Items is not an object" % path)
+                        items.append(_slim(item))
+                        if expect(",]") == "]":
+                            break
+            else:
+                value(complete_scalar=True)
+            if expect(",}") == "}":
+                return items or []
+
+
 def model_geometries(item):
     """[(mesh index, model, geometry, triangles, shader hash or None)] for one manifest item, in mesh order.
 
@@ -253,9 +350,7 @@ def main(argv=None):
     try:
         with open(a.dehydrated, "rb") as f:
             src = f.read()
-        with open(a.manifest, encoding="utf-8") as f:
-            manifest = json.load(f)
-        items = manifest.get("Items") or []
+        items = read_items(a.manifest)
         if not items:
             raise ValueError("%s has no Items: the export found no model in its window, so there is nothing to match "
                              "the BLAS against" % a.manifest)

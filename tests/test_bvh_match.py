@@ -242,5 +242,64 @@ class TestPieces(unittest.TestCase):
         self.assertEqual(M.parse_shader_hashes(None), frozenset())
 
 
+class TestStreamedManifest(unittest.TestCase):
+    """BUILD-1222: the manifest is streamed, so only the fields main() reads are kept per item."""
+
+    def write(self, text):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = os.path.join(directory.name, "manifest.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return path
+
+    def small_chunks(self):
+        old = M.CHUNK
+        M.CHUNK = 7   # every token, number and item then crosses a chunk boundary somewhere
+        self.addCleanup(setattr, M, "CHUNK", old)
+
+    def test_items_match_a_full_load_reduced_to_the_fields_read(self):
+        rows = [item(0x1234567, "a.obj", [2, 3], [0xDEADBEEF, 0x12]), item(0x40, "b.obj", [1])]
+        rows[0]["Bounds"] = [1.5, -2.25e10, 3]           # fields the tool never reads are dropped
+        rows[1]["Name"] = "drawable \"quoted\" é"
+        text = json.dumps({"Count": 2, "Scan": {"Start": 0, "Length": 123456789}, "Items": rows, "Tail": [1, 2]},
+                          indent=1)
+        path = self.write(text)
+        self.small_chunks()
+        got = M.read_items(path)
+        self.assertEqual(len(got), 2)
+        for slim, full in zip(got, rows):
+            self.assertNotIn("Bounds", slim)
+            self.assertNotIn("Tris", slim)
+            for key in M.ITEM_FIELDS:
+                self.assertEqual(slim[key], full[key], key)
+            self.assertEqual(M.model_geometries(slim), M.model_geometries(full))
+        self.assertEqual(got[0]["Materials"], [{"Shader": "DEADBEEF"}, {"Shader": "00000012"}])
+
+    def test_empty_and_missing_items(self):
+        self.small_chunks()
+        self.assertEqual(M.read_items(self.write('{"Count": 0, "Items": []}')), [])
+        self.assertEqual(M.read_items(self.write('{"Count": 0}')), [])
+        self.assertEqual(M.read_items(self.write("{}")), [])
+
+    def test_a_broken_manifest_is_a_value_error(self):
+        self.small_chunks()
+        for text in ('[{"Offset": 1}]', '{"Items": [{"Offset": 1}', '{"Items": [1, 2]}', '{"Items": [{"Offset": 1},]}',
+                     ""):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                M.read_items(self.write(text))
+
+    def test_main_reports_a_broken_manifest_in_one_line(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        path = self.write('{"Items": [{"Offset": 1}')
+        blas = os.path.join(os.path.dirname(path), "blas.bin")
+        with open(blas, "wb") as f:
+            f.write(src)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(M.main([blas, path]), 2)
+        self.assertIn("error", err.getvalue().lower())
+
+
 if __name__ == "__main__":
     unittest.main()
