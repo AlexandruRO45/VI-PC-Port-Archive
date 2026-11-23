@@ -31,8 +31,9 @@ def tag(typ, offset, size):
     return (typ << 56) | (size << 28) | offset
 
 
-def build_music_bank(toc: int, samples: int, rate: int = 48000, *, duplicate_toc: int | None = None) -> bytes:
-    """One descriptor and one block, with one packet subblock per channel."""
+def build_music_bank(toc: int, samples: int, rate: int = 48000, *, duplicate_toc: int | None = None,
+                     packets: int = 1) -> bytes:
+    """One descriptor and one block, with one packet subblock per channel holding `packets` 20 ms packets."""
     tocs = (toc,) if duplicate_toc is None else (toc, duplicate_toc)
     desc = bytearray(12 + 16 * len(tocs))
     struct.pack_into("<III", desc, 0, 1, 2048 * (1 + len(tocs)), len(tocs))
@@ -43,9 +44,11 @@ def build_music_bank(toc: int, samples: int, rate: int = 48000, *, duplicate_toc
         struct.pack_into("<H", desc, channel + 10, rate)
         desc[channel + 12] = 0x0B
         struct.pack_into("<I", data, 24 * i + 4, 1)
-        subblock = 2048 * (i + 1)
-        struct.pack_into("<H", data, subblock, 1)
-        data[subblock + 2] = packet
+        pos = 2048 * (i + 1)
+        for _ in range(packets):
+            struct.pack_into("<H", data, pos, 1)
+            data[pos + 2] = packet
+            pos += 3
     header = 16 + 4 + 2 * 8
     out = bytearray(b"ADAT" + struct.pack("<III", 0, 1, header))
     out += struct.pack("<I", 0x1234 | (2 << 29))
@@ -118,6 +121,23 @@ class ShortsTest(unittest.TestCase):
         body = 27 + data[26]
         self.assertEqual(data[body:body + 8], b"OpusHead")
         self.assertEqual(struct.unpack_from("<I", data, body + 12)[0], 32000)
+
+    def test_duration_and_selection_use_the_48khz_domain_count(self):
+        # Two 20 ms packets = 1920 declared frames. For streams declared at 32/28 kHz that count is
+        # already in the 48 kHz granule domain, so the duration is 1920/48000; the old frames/rate was
+        # 1.5x too large at 32 kHz and 1.714x at 28 kHz, misplacing the --min/--max-seconds selection.
+        for rate, old_window in ((32000, (0.05, 0.07)), (28000, (0.055, 0.08))):
+            path = os.path.join(self.tmp.name, f"rate{rate // 1000}k.awc")
+            with open(path, "wb") as f:
+                f.write(build_music_bank(0x08, 1920, rate=rate, packets=2))
+            rows = shorts.export_bank(path, self.out, 0.03, 0.05)
+            self.assertEqual(len(rows), 1)
+            self.assertAlmostEqual(rows[0]["duration_s"], 0.04, places=6)
+            # The old frames/rate duration (0.06 at 32 kHz, 0.068571 at 28 kHz) would select in this window.
+            self.assertEqual(shorts.export_bank(path, self.out, *old_window), [])
+            with open(os.path.join(self.out, rows[0]["file"]), "rb") as f:
+                _channels, granule = ogg_head_and_last_granule(f.read())
+            self.assertEqual(granule, 1920)   # both packets kept; the trim aims at the declared count
 
     def test_duplicate_selected_channels_keep_both_packet_streams(self) -> None:
         path = os.path.join(self.tmp.name, "duplicate.awc")

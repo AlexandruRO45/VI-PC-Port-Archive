@@ -3,9 +3,10 @@
     python -I tools/awc_shorts.py <bank.awc | directory> <out dir> [--min-seconds 5] [--max-seconds 60] [--jobs N]
 
 Uses `tools/awc_opus.py` for the AWC parse and packet collection. A streamed-music channel is selected
-when its decoded duration is inside the requested range. The descriptor's sample count is interleaved
-across the Opus packet channels, so the packet channel count is read from the TOC stereo bit and the
-per-channel frame count is `samples / packet_channels`. The output is
+when its decoded duration is inside the requested range. The duration is the per-channel frame count of
+the descriptor (already divided by the packet channel count for stereo packets), taken in the 48 kHz
+granule domain for streams declared at 32/48/28 kHz, as `tools/awc_opus.py` `end_length` documents,
+divided by 48000. The output is
 `<out>/<bank>/<stream id>.ogg` plus `<out>/shorts.csv`. Later selected channels with the same ID use
 `<stream id>~2.ogg`, `<stream id>~3.ogg`, and so on. Directory scans preserve the input subdirectories.
 
@@ -45,7 +46,9 @@ def short_channels(d: bytes, mus, data, min_seconds: float, max_seconds: float):
         else:
             packet_channels = (2 if any(packet[0] & 0x04 for packet in packets) else 1)
             frames = samples // packet_channels if packet_channels > 1 else samples
-        duration = frames / rate
+        # The descriptor count at 32/48/28 kHz is already in the 48 kHz granule domain (awc.end_length),
+        # so dividing by the declared rate would report 1.5x (32 kHz) or 1.714x (28 kHz) too much.
+        duration = awc.end_length(frames, rate) / 48000
         if min_seconds <= duration <= max_seconds:
             selected.append((cid, frames, rate, packets, packet_channels, duration))
     return selected
