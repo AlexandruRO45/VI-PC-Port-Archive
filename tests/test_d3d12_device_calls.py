@@ -1,10 +1,11 @@
 """Unit tests for tools/d3d12_device_calls.py on an x86-64 image assembled here byte by byte.
 
-The image imports D3D12XboxCreateDevice from d3d12_xs.dll and has eight .pdata functions: two creator calls (through
+The image imports D3D12XboxCreateDevice from d3d12_xs.dll and has ten .pdata functions: two creator calls (through
 the import thunk with the out-pointer a global, and `call [rip+IAT]` with it a stack slot), calls through the device
 global and a copy of it (`call [vtable+disp]`, `call reg`, a CFG-style dispatch with the method in rax and the
-device in rdx, a tail jump), an unrelated object's vtable call, the device passed to another function, and an
-indexed vtable call no slot can be read from. No game files.
+device in rdx, a guard-check stub that ends in `jmp rax`, a tail jump), a method in rax handed to a helper that only
+returns (not a slot: #7998's review), an unrelated object's vtable call, the device passed to another function, and
+an indexed vtable call no slot can be read from. No game files.
 
     python -I tests/test_d3d12_device_calls.py
 """
@@ -36,7 +37,7 @@ IAT = IDATA_RVA + 0x60          # D3D12XboxCreateDevice's address-table slot
 DEVICE = DATA_RVA + 0x00        # the creator's out-pointer
 COPY = DATA_RVA + 0x08          # a global the device is copied to
 OTHER = DATA_RVA + 0x10         # an unrelated object
-GUARD = DATA_RVA + 0x18         # the dispatch routine's pointer
+GUARD = DATA_RVA + 0x18         # the dispatch routine's pointer (to a `jmp rax` stub)
 
 
 class Asm:
@@ -76,6 +77,23 @@ def build_image():
 
     thunk = a.here
     a.rip(b"\xff\x25", IAT)                              # jmp [rip+IAT]
+    funcs_extra = {}
+    while len(a.code) % 16:
+        a.raw(b"\xcc")
+    funcs_extra["jmp_rax"] = a.here                      # a CFG no-op dispatch routine
+    a.raw(b"\xff\xe0")                                   # jmp rax
+    while len(a.code) % 16:
+        a.raw(b"\xcc")
+    funcs_extra["guard_check"] = a.here                  # a guard check, then the dispatch
+    a.raw(b"\x49\x89\xc3")                               # mov r11,rax
+    a.raw(b"\x49\xc1\xeb\x09")                           # shr r11,9
+    a.raw(b"\xa8\x0f")                                   # test al,0xf
+    a.raw(b"\x75\x02")                                   # jne +2
+    a.raw(b"\xff\xe0")                                   # jmp rax
+    while len(a.code) % 16:
+        a.raw(b"\xcc")
+    funcs_extra["ret_helper"] = a.here                   # an ordinary helper that only returns
+    a.raw(b"\xc3")
 
     begin("create")
     a.rip(b"\x4c\x8d\x0d", DEVICE)                       # lea r9,[rip+DEVICE]
@@ -134,6 +152,22 @@ def build_image():
     a.raw(b"\xc3")
     end("passed")
 
+    begin("guarded")                                     # slot 60 through the guard-check stub, call rel32
+    a.rip(b"\x48\x8b\x0d", DEVICE)                       # mov rcx,[rip+DEVICE]
+    a.raw(b"\x48\x8b\x01")                               # mov rax,[rcx]
+    a.raw(b"\x48\x8b\x80\xe0\x01\x00\x00")               # mov rax,[rax+0x1e0]
+    a.rel(b"\xe8", funcs_extra["guard_check"])           # call guard_check
+    a.raw(b"\xc3")
+    end("guarded")
+
+    begin("helper")                                      # method in rax, call to a helper that only returns
+    a.rip(b"\x48\x8b\x0d", DEVICE)                       # mov rcx,[rip+DEVICE]
+    a.raw(b"\x48\x8b\x01")                               # mov rax,[rcx]
+    a.raw(b"\x48\x8b\x80\x08\x01\x00\x00")               # mov rax,[rax+0x108]
+    a.rel(b"\xe8", funcs_extra["ret_helper"])            # call ret_helper
+    a.raw(b"\xc3")
+    end("helper")
+
     begin("indexed")                                     # call [rax+rdx*8]: no slot
     a.rip(b"\x48\x8b\x0d", DEVICE)                       # mov rcx,[rip+DEVICE]
     a.raw(b"\x48\x8b\x01")                               # mov rax,[rcx]
@@ -172,9 +206,10 @@ def build_image():
     buf[IDATA_RVA + 0xD0:IDATA_RVA + 0xD0 + 13] = b"d3d12_xs.dll\0"
 
     buf[TEXT_RVA:TEXT_RVA + len(a.code)] = a.code
+    struct.pack_into("<Q", buf, GUARD, IMAGE_BASE + funcs_extra["jmp_rax"])
     for i, (begin_rva, end_rva) in enumerate(sorted(funcs.values())):
         struct.pack_into("<III", buf, PDATA_RVA + 12 * i, begin_rva, end_rva, 0)
-    return bytes(buf), {k: v[0] for k, v in funcs.items()}
+    return bytes(buf), {**{k: v[0] for k, v in funcs.items()}, **funcs_extra}
 
 
 class DeviceCallsTest(unittest.TestCase):
@@ -188,14 +223,34 @@ class DeviceCallsTest(unittest.TestCase):
 
     def test_known_sites_are_counted_exactly(self):
         slots = self.slots()
-        self.assertEqual(sorted(slots), [14, 26, 48, 119])
-        self.assertEqual(self.r["sites"], 4)
+        self.assertEqual(sorted(slots), [14, 26, 48, 60, 119])
+        self.assertEqual(self.r["sites"], 5)
         for slot in slots.values():
             self.assertEqual(slot["sites"], 1)
         self.assertEqual((slots[14]["calls"], slots[14]["this_rcx"]), (1, 1))
         self.assertEqual((slots[48]["calls"], slots[48]["this_rcx"]), (1, 1))
         self.assertEqual((slots[26]["calls"], slots[26]["this_rdx"]), (1, 1))
         self.assertEqual((slots[119]["tail_jumps"], slots[119]["calls"], slots[119]["this_rcx"]), (1, 0, 1))
+        self.assertEqual((slots[60]["calls"], slots[60]["this_rcx"]), (1, 1))   # through the guard-check stub
+
+    def test_a_method_in_rax_needs_a_verified_dispatch_routine(self):
+        self.assertNotIn(33, self.slots())                  # the helper that only returns
+        self.assertEqual(self.r["unresolved"]["dispatch_calls_to_unverified_targets"], 1)
+        # shdann's case on #7998: the dispatch site of slot 26 retargeted to the helper that only returns.
+        data = bytearray(self.data)
+        start, stop = self.funcs["dispatch"], self.funcs["stack"]
+        site = data.index(b"\xff\x15", start, stop)
+        patch = Asm(site)
+        patch.rel(b"\xe8", self.funcs["ret_helper"])
+        patch.raw(b"\x90")
+        data[site:site + 6] = patch.code
+        r = ddc.scan(bytes(data))
+        self.assertEqual([s["slot"] for s in r["slots"]], [14, 48, 60, 119])
+        self.assertEqual(r["unresolved"]["dispatch_calls_to_unverified_targets"], 2)
+        # A pointer to a routine that writes rax before its jmp rax isn't a dispatch routine either.
+        data = bytearray(self.data)
+        struct.pack_into("<Q", data, GUARD, IMAGE_BASE + self.funcs["ret_helper"])
+        self.assertNotIn(26, {s["slot"] for s in ddc.scan(bytes(data))["slots"]})
 
     def test_the_unrelated_vtable_call_is_not_counted(self):
         self.assertNotIn(3, self.slots())
@@ -211,6 +266,7 @@ class DeviceCallsTest(unittest.TestCase):
     def test_unresolved_sites_are_reported_not_guessed(self):
         self.assertEqual(self.r["unresolved"], {
             "vtable_loads_without_matched_call": 1,      # the indexed call
+            "dispatch_calls_to_unverified_targets": 1,   # the helper that only returns
             "device_passed_to_other_calls": 1,
             "device_stored_to_non_stack_memory": 0,
             "creator_calls_out_not_followed": 0,
@@ -260,8 +316,8 @@ class DeviceCallsTest(unittest.TestCase):
             self.assertEqual(outputs[0], outputs[1])
             text, raw = outputs[0]
             self.assertNotIn("0x", text)
-            self.assertIn("4 site(s) across 4 slot(s)", text)
-            self.assertEqual(json.loads(raw)["sites"], 4)
+            self.assertIn("5 site(s) across 5 slot(s)", text)
+            self.assertEqual(json.loads(raw)["sites"], 5)
 
     def test_cli_refuses_a_missing_image(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):

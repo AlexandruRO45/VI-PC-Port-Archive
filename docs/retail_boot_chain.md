@@ -114,17 +114,21 @@ It writes `<exe>.device_calls.txt` (slot numbers and counts only) and `.json` (t
 local follow-up; don't paste that part) into the `--out` folder. The method, in its docstring: it finds the
 `D3D12XboxCreateDevice` call sites, follows the out-pointer in `r9` to the global or stack slot it fills and the
 globals the device is copied to, and counts per slot the `mov vtable,[device]` → `call [vtable+disp]` (or
-`call reg`, or a dispatch routine with the method in `rax`) sites, with `disp / 8` as the slot. Per slot it shows
+`call reg`, or a call to a dispatch routine with the method in `rax`) sites, with `disp / 8` as the slot. A
+dispatch routine counts only when its code reaches `jmp rax` or `call rax` without writing `rax`, calling or
+returning first; a call to any other target with a method in `rax` is reported as not resolved. Per slot it shows
 calls and tail jumps, whether the device is in `rcx` or in `rdx` (the return-buffer form of §3.1), and an
 argument-count estimate. Slots 0-43 carry the PC method names, which the console keeps where measured (8, 9, 14, 26,
 36); past 43 only the slots `runtime/shims/d3d12_xs_device.h` and §3 name are named.
 
 What it doesn't see, and says so: the device reached through an object member, a function parameter or a getter's
 return value; a vtable load whose call is behind an unconditional jump (a call two paths share is counted once);
-an indexed method load. The report counts the vtable loads with no matched call, the calls that are handed the
-device (not followed into), and the stores of the device to non-stack memory, so each slot's count is a lower bound.
+an indexed method load. The report counts the vtable loads with no matched call, the calls with a method in `rax`
+to a target that isn't a verified dispatch routine, the calls that are handed the device (not followed into), and
+the stores of the device to non-stack memory, so each slot's count is a lower bound.
 
 On the 1.0.2.1 executable it finds one `D3D12XboxCreateDevice` call site writing a global, 83 call sites across
-42 slots, the `rdx` form at slots 25, 26 and 108 only, and 12 sites it reports as not resolved. Every device slot
+42 slots, all of them the `call [vtable+disp]` form (none through a dispatch routine), the `rdx` form at slots 25,
+26 and 108 only, and 12 sites it reports as not resolved. Every device slot
 the chain above reached (8, 26, 48, 73, 133) is among them; slots like 49, 55, 57, 61, 70, 71, 74, 81, 86, 101,
 108, 119, 127 and 132 are called but have no name in this repository yet.

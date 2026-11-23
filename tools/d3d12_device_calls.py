@@ -19,7 +19,11 @@ How it follows the device (x86-64 images only):
    survive calls; other memory doesn't), and stores to another global, which becomes a device global too. Every
    function that references a device global is walked again until no new global turns up.
 4. A device call is `mov v,[dev]` (the vtable) then `call [v+disp]`, or `mov m,[v+disp]` then `call m`, or a direct
-   call to a dispatch routine with the method in rax (the CFG and retpoline form). The slot is disp / 8. A `jmp`
+   call to a dispatch routine with the method in rax (the CFG form). The routine must be verified: the target (for
+   `call [rip+p]`, the code the file's pointer p holds) reaches `jmp rax` or `call rax` within DISPATCH_WINDOW
+   instructions without writing rax, calling or leaving first (conditional branches are allowed, not followed), as
+   `_guard_dispatch_icall_nop` (`jmp rax`) and a guard check that ends in `jmp rax` do. A call to any other target
+   with a method in rax is reported as not resolved, never as a slot. The slot is disp / 8. A `jmp`
    in place of the call is a tail jump. Which register holds the device at the call is recorded: rcx is the usual
    `this`; rdx is the console's return-buffer form, where rcx holds the buffer (docs/retail_boot_chain.md §3.1).
    The argument count, `this` included, is an estimate: the highest of rcx/rdx/r8/r9 (xmm1-3) written since the
@@ -27,7 +31,8 @@ How it follows the device (x86-64 images only):
 
 What it reports as not resolved, never guessing a slot: a vtable load from the device not followed by a call the
 patterns above match (an indexed or unaligned method load, a method pointer compared or stored, or a call behind an
-unconditional jump, which is not followed: a call two paths share is counted once), a call with the
+unconditional jump, which is not followed: a call two paths share is counted once), a direct call with a method in
+rax whose target isn't a verified dispatch routine, a call with the
 device in an argument register that isn't a vtable call (the device handed to another function, which is not
 followed into), the device stored to non-stack memory (followed only within the function), and creator calls whose
 out-pointer isn't followed. Devices reached only through those paths (a member of an object, a function parameter,
@@ -63,6 +68,7 @@ from report_paths import same_report_path  # noqa: E402
 RBP = 5
 CREATORS = ("D3D12XboxCreateDevice", "D3D12CreateDevice")
 NO_PDATA_WINDOW = 512       # bytes walked from a reference that no .pdata entry covers
+DISPATCH_WINDOW = 16        # instructions a dispatch routine may take before its `jmp rax` / `call rax`
 MAX_ROUNDS = 16             # rounds of "walk every function that references a device global"
 
 PC_DEVICE = (
@@ -146,13 +152,43 @@ class Census:
                 if i is not None and i.op == 0xFF and i.base == RIP and i.target == target:
                     self.thunks[source] = self.creators[target]
         self.holders: set[int] = set()
+        self.dispatchers: dict[int, bool] = {}      # code rva -> verified dispatch routine
         self.reset()
+
+    def code_pointer(self, rva: int) -> int | None:
+        """The code RVA the 8-byte pointer at `rva` holds in the file, or None."""
+        at = self.img.offset(rva, 8)
+        if at is None:
+            return None
+        target = self.img.word(at) - self.img.image_base
+        return target if self.code.view(target)[0] is not None else None
+
+    def is_dispatcher(self, rva: int | None) -> bool:
+        """Whether the code at `rva` reaches `jmp rax` or `call rax` within DISPATCH_WINDOW instructions without
+        writing rax, calling, returning or jumping elsewhere first."""
+        if rva is None:
+            return False
+        if rva not in self.dispatchers:
+            ok, at = False, rva
+            for _ in range(DISPATCH_WINDOW):
+                i = self.code.decode(at)
+                if i is None:
+                    break
+                if i.op == 0xFF and i.mod == 3 and i.rm == RAX and i.reg & 7 in (2, 4):
+                    ok = True
+                    break
+                if i.is_call() or i.ends_flow() or i.op in (0xC3, 0xC2, 0xCC) or RAX in writes(i):
+                    break
+                at = i.end
+            self.dispatchers[rva] = ok
+        return self.dispatchers[rva]
 
     def reset(self) -> None:
         self.sites: dict[int, dict] = {}            # call rva -> site
         self.creator_calls: dict[int, dict] = {}    # call rva -> {"import", "out"}
         self.vtable_loads: dict[int, bool] = {}     # load rva -> a call used it
         self.passed: set[int] = set()               # calls that got the device in an argument register
+        self.unverified: set[int] = set()           # direct calls with a method in rax to an unverified target
         self.stored: set[int] = set()               # stores of the device to non-stack memory
         self.new_holders: set[int] = set()
         self.undecodable = 0
@@ -206,7 +242,12 @@ class Census:
                 elif indirect and mod == 3 and i.rm in meth:
                     slot, vload = meth[i.rm]                           # call reg
                 elif (op in (0xE8, 0xE9) or (indirect and base == RIP)) and RAX in meth:
-                    slot, vload = meth[RAX]                            # dispatch routine, method in rax
+                    target = i.target if op in (0xE8, 0xE9) else self.code_pointer(i.target)
+                    if self.is_dispatcher(target):
+                        slot, vload = meth[RAX]                        # dispatch routine, method in rax
+                    elif not (i.target in self.thunks or (indirect and i.target in self.creators)):
+                        self.unverified.add(i.rva)
+                        self.vtable_loads[meth[RAX][1]] = True         # reported here, not as an unused load
                 creator = None
                 if indirect and base == RIP and i.target in self.creators:
                     creator = self.creators[i.target]
@@ -232,7 +273,8 @@ class Census:
                     self.sites[i.rva] = {"rva": i.rva, "slot": slot, "kind": "jmp" if tail else "call",
                                          "this": this, "args": args}
                     self.vtable_loads[vload] = True
-                elif creator is None and not (indirect and mod != 3 and base in vt) and dev & {RCX, RDX, 8, 9}:
+                elif (creator is None and not (indirect and mod != 3 and base in vt) and i.rva not in self.unverified
+                      and dev & {RCX, RDX, 8, 9}):
                     self.passed.add(i.rva)
                 for r in VOLATILE:
                     forget(r)
@@ -395,6 +437,7 @@ def scan(data: bytes) -> dict:
         "slots": table,
         "unresolved": {
             "vtable_loads_without_matched_call": unused,
+            "dispatch_calls_to_unverified_targets": len(c.unverified),
             "device_passed_to_other_calls": len(c.passed),
             "device_stored_to_non_stack_memory": len(c.stored),
             "creator_calls_out_not_followed": sum(1 for r in c.creator_calls.values()
@@ -429,6 +472,8 @@ def to_text(file: str, r: dict) -> str:
     u = r["unresolved"]
     lines.append("not resolved (no slot guessed):")
     lines.append(f"  device vtable loads with no matched call: {u['vtable_loads_without_matched_call']}")
+    lines.append(f"  direct calls with a method in rax to a target not verified as a dispatch routine: "
+                 f"{u['dispatch_calls_to_unverified_targets']}")
     lines.append(f"  calls given the device in an argument register (not followed into): "
                  f"{u['device_passed_to_other_calls']}")
     lines.append(f"  stores of the device to non-stack memory (followed in the function only): "
