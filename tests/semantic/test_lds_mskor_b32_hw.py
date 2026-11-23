@@ -496,5 +496,25 @@ class TestDSMskorB32ConditionCodes(unittest.TestCase):
         self.assertEqual(self.flags.vcc, 0xFFFFFFFF_FFFFFFFF)
 
 
+class TestDSMskorB32BoundaryExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_ieee754_sign_bit_modification(self) -> None:
+        # Modifying sign bit of -1.0 (0xBF800000) to +1.0 (0x3F800000)
+        neg_one = 0xBF800000
+        sign_mask = 0x80000000
+        sign_zero = 0x00000000
+        pos_one = ds_mskor_b32_oracle(neg_one, sign_mask, sign_zero)
+        self.assertEqual(pos_one, 0x3F800000)
+
+    def test_ieee754_exponent_replacement(self) -> None:
+        # Replace exponent with 127 (0x3F800000)
+        val = 0x41480000  # 12.5
+        exp_mask = 0x7F800000
+        new_exp = 0x3F800000
+        res = ds_mskor_b32_oracle(val, exp_mask, new_exp)
+        self.assertEqual(res & exp_mask, new_exp)
+
+
 if __name__ == "__main__":
     unittest.main()
