@@ -2,7 +2,8 @@
 // Usage: vk_compute_test cs.spv groups expect [--require-wave64]
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
 //            "workgroup_yz": pass 2x3x4 for groups; check the Y/Z histogram (cs_workgroup_yz.asm)
-//            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
+//            "exec64", "wavemask", "bvh", "bvh16": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm, cs_bvh16.asm;
+//            anything else prints out[0..7]
 //   VKC_BENCH=N (env): dispatch N more times after the checked one and print the median / min / max wall time of one
 //   dispatch (submit to queue idle) as "bench ms: median=.. min=.. max=.. n=..". The buffer is not cleared in between.
 //   VKC_OUT_WORDS=N (env): make the output buffer at least N words (default groups * 64), so a single group can
@@ -327,7 +328,8 @@ static int run(int argc, char** argv) {
     }
     // "bvh" writes its nodes at heap offsets 0x100 to 0x264 below, past the 256 bytes one group's 64 words give: the
     // shader then read them through the device address outside the buffer (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
-    const bool bvh = !std::strcmp(argv[3], "bvh");
+    const bool bvh16 = !std::strcmp(argv[3], "bvh16");   // the same scene with a BOX16 root (cs_bvh16.asm)
+    const bool bvh = bvh16 || !std::strcmp(argv[3], "bvh");
     if (bvh && words < 0x280 / sizeof(uint32_t)) words = 0x280 / sizeof(uint32_t);
     const VkDeviceSize bytes = words * sizeof(uint32_t);
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -362,15 +364,27 @@ static int run(int argc, char** argv) {
         std::printf("heap file: %s at 0x%llx (%zu bytes)\n", heap_file_path.c_str(),
                     static_cast<unsigned long long>(heap_file_at), heap_file.size());
     }
-    if (!std::strcmp(argv[3], "bvh")) {
+    if (bvh) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
         // triangle at z=10 (node 0x40, addr 0x200), a triangle at z=5 (node 0x48, addr 0x240), a box the ray
         // misses, and a box with a NaN min.x that RDNA2 still enters at t = 0 (SHADER-650). Node id = address >> 3 | type.
         auto f32 = [&](uint32_t at, float v) { std::memcpy(static_cast<char*>(map) + at, &v, 4); };
         auto u32 = [&](uint32_t at, uint32_t v) { std::memcpy(static_cast<char*>(map) + at, &v, 4); };
         u32(0x100, 0x40); u32(0x104, 0x48); u32(0x108, 0x60); u32(0x10C, 0x68);
-        const float boxes[4][6] = {{0, 0, 10, 1, 1, 10}, {0, 0, 5, 1, 1, 5}, {5, 0, 0, 6, 1, 1}, {NAN, 0, 0, 1, 1, 1}};
-        for (int i = 0; i < 4; i++) for (int c = 0; c < 6; c++) f32(0x110 + 24 * i + 4 * c, boxes[i][c]);
+        if (bvh16) {
+            // BOX16 (cs_bvh16.asm): six halves per child at 0x110 + 12 i, min.x|min.y<<16, min.z|max.x<<16,
+            // max.y|max.z<<16. The same boxes, except that the z=5 child's max.x is +inf (0x7c00, what the XDXR
+            // builder writes past the half range; the hit distance does not change) and box 0x68's NaN min.x is a
+            // half NaN (0x7e00), entered at t = 0 like the float one (SHADER-650).
+            const uint32_t halves[4][3] = {{0x00000000u, 0x3c004900u, 0x49003c00u},     // (0,0,10)-(1,1,10)
+                                           {0x00000000u, 0x7c004500u, 0x45003c00u},     // (0,0,5)-(+inf,1,5)
+                                           {0x00004500u, 0x46000000u, 0x3c003c00u},     // (5,0,0)-(6,1,1)
+                                           {0x00007e00u, 0x3c000000u, 0x3c003c00u}};    // (NaN,0,0)-(1,1,1)
+            for (int i = 0; i < 4; i++) for (int w = 0; w < 3; w++) u32(0x110 + 12 * i + 4 * w, halves[i][w]);
+        } else {
+            const float boxes[4][6] = {{0, 0, 10, 1, 1, 10}, {0, 0, 5, 1, 1, 5}, {5, 0, 0, 6, 1, 1}, {NAN, 0, 0, 1, 1, 1}};
+            for (int i = 0; i < 4; i++) for (int c = 0; c < 6; c++) f32(0x110 + 24 * i + 4 * c, boxes[i][c]);
+        }
         const float tri[2][9] = {{0, 0, 10, 1, 0, 10, 0, 1, 10}, {0, 0, 5, 1, 0, 5, 0, 1, 5}};
         for (int t = 0; t < 2; t++) for (int c = 0; c < 9; c++) f32(0x200 + 0x40 * t + 4 * c, tri[t][c]);
         // Triangle-ID word at node +60: byte 0 (TRI0) = 0x09 returns vertex 1's and vertex 2's weights, what a
@@ -642,7 +656,7 @@ static int run(int argc, char** argv) {
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
     }
-    if (!std::strcmp(argv[3], "bvh")) {
+    if (bvh) {
         const uint32_t want[8] = {0x68, 0x48, 0x40, 0xFFFFFFFFu, 0xC1200000u, 0xBF800000u, 0xBE800000u, 0xBE800000u};
         for (int i = 0; i < 8; i++) if (out[i] != want[i]) { if (!bad) first_bad = i; bad++; }
         std::printf("bvh out = %08x %08x %08x %08x | %08x %08x %08x %08x\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);

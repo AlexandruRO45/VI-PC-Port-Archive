@@ -883,8 +883,8 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
             results.append((name, rc == 0, verdict_line(rc, msg)))
-        elif name in ("cs_bvh", "cs_bvh32"):   # the 64-bit and the 32-bit node pointer: one scene, the same words
-            rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
+        elif name in ("cs_bvh", "cs_bvh32", "cs_bvh16"):   # 64- and 32-bit node pointers, a BOX16 root: the same words
+            rc, msg = run_cmd([vk_compute, spv, "1", "bvh16" if name == "cs_bvh16" else "bvh"], env=cs_env)
             results.append((name, rc == 0, verdict_line(rc, msg)))
         elif name in STORE_WORDS:
             # TEST-184: image atomics (cs_imgatomic, cs_imgatomic3d) and image_get_resinfo (cs_resinfo). vk_store_test
