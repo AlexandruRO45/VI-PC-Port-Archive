@@ -314,7 +314,7 @@ fragment stage either: on an RX 6800 (RDNA2) with AMD's Windows driver 26.11.2 t
 be requested for pixel shaders (they run at the 64-wide default), and the tier C pixel fixtures are a `SKIP` too
 (2026-11-22, [d3d12_vulkan.md](d3d12_vulkan.md), "Subgroup size"). Where the fragment stage is listed, as on an
 RX 9070 XT with the same driver (same section), the tier C pixel fixtures run: there all of them pass, and only the
-vertex and geometry ones are a `SKIP` (2026-11-24).
+vertex and geometry ones are a `SKIP` (2026-11-23).
 
 Build and run it on Linux with RADV, pinned to one GPU (`LEONIDA_VK_DEVICE`, see "Choosing the GPU"):
 
