@@ -34,6 +34,26 @@ TEXTURE_FORMATS = {
     ".webp": "WebP Image",
 }
 
+# Every file response carries X-Content-Type-Options: nosniff, so a browser runs a script or applies a stylesheet only
+# when its Content-Type says so. mimetypes reads the Windows registry after its own table, and some machines map .js
+# to text/plain there; pin the types the viewer's pages load so nosniff never blocks them.
+_PINNED_TYPES = {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css",
+}
+
+
+def _guess_type(path: str, default: str) -> str:
+    pinned = _PINNED_TYPES.get(os.path.splitext(path)[1].lower())
+    return pinned or mimetypes.guess_type(path)[0] or default
+
+
+def is_texture_name(path: str) -> bool:
+    """True when path ends in one of the TEXTURE_FORMATS extensions, the only files /textures/ serves: anything else
+    in the folder (an .html or .svg from a third-party pack) would run in the gallery's origin."""
+    return os.path.splitext(path)[1].lower() in TEXTURE_FORMATS
+
 
 def categorize_model(name: str, folder: str = "") -> str:
     combined = f"{folder}/{name}".lower()
@@ -185,7 +205,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(403, "Forbidden")
                 return
             if os.path.isfile(vpath):
-                mime = mimetypes.guess_type(vpath)[0] or "application/javascript"
+                mime = _guess_type(vpath, "application/javascript")
                 self._send_file(vpath, mime)
             else:
                 self.send_error(404, "Vendor file not found")
@@ -209,9 +229,14 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             if tpath is None:
                 self.send_error(403, "Forbidden")
                 return
+            # Both the name asked for and the file it resolves to (a link inside the folder) must be a texture.
+            # Same 404 whether or not the file exists.
+            if not (is_texture_name(rel) and is_texture_name(tpath)):
+                self.send_error(404, "Texture not found")
+                return
 
             if not os.path.isfile(tpath) and rel.lower().endswith(".png"):
-                # Try matching .dds file if png requested
+                # Try matching .dds file if png requested; .dds is in TEXTURE_FORMATS
                 stem = os.path.splitext(rel)[0]
                 dds_cand = safe_subpath(self.textures_dir, stem + ".dds")
                 if dds_cand is None:
@@ -222,6 +247,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                         png_bytes = dds_png.dds_file_to_png_bytes(dds_cand, max_size=1024)
                         self.send_response(200)
                         self.send_header("Content-Type", "image/png")
+                        self.send_header("X-Content-Type-Options", "nosniff")
                         self.send_header("Content-Length", str(len(png_bytes)))
                         self.send_header("Cache-Control", "max-age=86400")
                         self.end_headers()
@@ -231,7 +257,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                         pass
 
             if os.path.isfile(tpath):
-                mime = mimetypes.guess_type(tpath)[0] or "application/octet-stream"
+                mime = _guess_type(tpath, "application/octet-stream")
                 self._send_file(tpath, mime)
             else:
                 self.send_error(404, "Texture not found")
@@ -247,7 +273,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, "Forbidden")
             return
         if os.path.isfile(vfile):
-            mime = mimetypes.guess_type(vfile)[0] or "application/octet-stream"
+            mime = _guess_type(vfile, "application/octet-stream")
             if mime.startswith("text/"):
                 mime += "; charset=utf-8"
             self._send_file(vfile, mime)
@@ -297,6 +323,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", mime)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
@@ -318,6 +345,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("Content-Type", content_type)
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(size))
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()

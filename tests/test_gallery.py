@@ -584,6 +584,75 @@ class TestGalleryServer(unittest.TestCase):
                         self.assertEqual(status, 403)
                 opened.assert_not_called()
 
+    def test_textures_serve_only_texture_formats(self) -> None:
+        # A page or an SVG dropped into the textures folder by a third-party pack would run in the gallery's origin.
+        for name in ("x.html", "x.svg", "X.HTM", "x.png.html", "x.js"):
+            with open(os.path.join(self.textures_dir, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write("<script>alert(1)</script>")
+        _, _, missing_body = _memory_get("/textures/missing.html")
+        for name in ("x.html", "x.svg", "X.HTM", "x.png.html", "x.js", "missing.html", "missing.svg"):
+            with self.subTest(name=name):
+                status, _, body = _memory_get("/textures/" + urllib.parse.quote(name))
+                self.assertEqual(status, 404)
+                self.assertNotIn(b"<script>", body)
+                self.assertEqual(body, missing_body)          # an existing file answers like a missing one
+
+    def test_a_texture_name_linked_to_a_page_is_not_served(self) -> None:
+        with open(os.path.join(self.textures_dir, "page.html"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("<script>alert(1)</script>")
+        try:
+            os.symlink(os.path.join(self.textures_dir, "page.html"), os.path.join(self.textures_dir, "page.png"))
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"cannot create symlink here: {exc}")
+        status, _, body = _memory_get("/textures/page.png")
+        self.assertEqual(status, 404)
+        self.assertNotIn(b"<script>", body)
+
+    @staticmethod
+    def _headers(head: str) -> dict:
+        fields = {}
+        for line in head.split("\r\n")[1:]:
+            name, _, value = line.partition(":")
+            fields.setdefault(name.strip().lower(), []).append(value.strip())
+        return fields
+
+    def test_file_responses_say_nosniff(self) -> None:
+        for target, content_type, prefix in (
+            ("/textures/test_tex.png", "image/png", b"\x89PNG"),
+            ("/textures/inside.png", "image/png", b"\x89PNG"),      # .png -> .dds fallback, decoded
+            ("/api/dds/inside.dds", "image/png", b"\x89PNG"),
+            ("/models/test_car.glb", "model/gltf-binary", b"glTF"),
+            ("/vendor/three.min.js", "text/javascript", b"// three"),
+            ("/app.js", "text/javascript; charset=utf-8", b"console.log"),
+            ("/", "text/html; charset=utf-8", b"<!DOCTYPE html>"),
+        ):
+            with self.subTest(target=target):
+                status, head, body = _memory_get(target)
+                fields = self._headers(head)
+                self.assertEqual(status, 200)
+                self.assertEqual(fields.get("x-content-type-options"), ["nosniff"])
+                self.assertEqual(fields.get("content-type"), [content_type])
+                self.assertTrue(body.startswith(prefix), body[:40])
+
+    def test_scripts_keep_a_script_type_when_the_registry_says_text_plain(self) -> None:
+        # Some Windows registries map .js to text/plain; with nosniff a browser would refuse to run the viewer's
+        # vendor scripts.
+        real_guess = gallery.mimetypes.guess_type
+        def registry(path, *args, **kwargs):
+            if path.lower().endswith((".js", ".css")):
+                return ("text/plain", None)
+            return real_guess(path, *args, **kwargs)
+        with open(os.path.join(self.viewer_dir, "style.css"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("body {}\n")
+        with mock.patch.object(gallery.mimetypes, "guess_type", side_effect=registry):
+            for target, content_type in (("/vendor/three.min.js", "text/javascript"),
+                                         ("/app.js", "text/javascript; charset=utf-8"),
+                                         ("/style.css", "text/css; charset=utf-8")):
+                with self.subTest(target=target):
+                    status, head, _ = _memory_get(target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(self._headers(head).get("content-type"), [content_type])
+
     def test_missing_valid_paths_return_404(self) -> None:
         host = f"127.0.0.1:{self.port}"
         for target in ("/vendor/missing.js", "/models/missing.glb", "/textures/missing.png", "/missing.js"):
