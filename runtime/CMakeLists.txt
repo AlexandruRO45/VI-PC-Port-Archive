@@ -875,6 +875,9 @@ if(BUILD_TESTING)
   # Which SPIR-V modules declare a storage image or buffer they may write (src/spirv_stores.h), on hand-built words.
   add_executable(spirv_stores_test test/spirv_stores_test.cpp)
   add_test(NAME spirv_stores COMMAND spirv_stores_test)
+  # Which SPIR-V modules declare optional Vulkan extension capabilities (src/spirv_ext_caps.h), on hand-built words.
+  add_executable(spirv_ext_caps_test test/spirv_ext_caps_test.cpp)
+  add_test(NAME spirv_ext_caps COMMAND spirv_ext_caps_test)
   add_executable(shader_fixture_path_test test/shader_fixture_path_test.cpp)
   add_test(NAME shader_fixture_path COMMAND shader_fixture_path_test)
   add_executable(resource_tiling_test test/resource_tiling_test.cpp)
@@ -1605,6 +1608,15 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_vulkan_device COMMAND d3d12_vulkan_device_test)
+
+    # Preflight refusal of optional SPIR-V extension capabilities and OPTIONS3::BarycentricsSupported.
+    add_executable(d3d12_ext_caps_test test/d3d12_ext_caps_test.cpp)
+    target_link_libraries(d3d12_ext_caps_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_ext_caps_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_ext_caps_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_ext_caps COMMAND d3d12_ext_caps_test)
+    set_tests_properties(d3d12_ext_caps PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     add_executable(d3d12_buffer_tiles_test test/d3d12_buffer_tiles_test.cpp)
     target_link_libraries(d3d12_buffer_tiles_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

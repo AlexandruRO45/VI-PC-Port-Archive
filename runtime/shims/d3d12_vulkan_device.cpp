@@ -26,6 +26,7 @@
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
+#include "../src/spirv_ext_caps.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
@@ -3354,6 +3355,21 @@ public:
                          pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
             return E_NOTIMPL;
         }
+        // Optional Vulkan extension capabilities declared in SPIR-V (src/spirv_ext_caps.h) must be enabled on the
+        // device before vkCreateShaderModule (VUID-VkShaderModuleCreateInfo-pCode-08740 / clock VUIDs).
+        for (const Stage& stage : stages) {
+            if (!stage.entry) continue;
+            const auto ext_caps = leonida::scan_spirv_ext_caps(stage.words);
+            if (const char* missing = leonida::missing_spirv_ext_cap(
+                    ext_caps, device_.info.fragment_shader_barycentric, device_.info.fragment_shader_interlock,
+                    device_.info.shader_subgroup_clock, device_.info.shader_device_clock)) {
+                std::fprintf(stderr,
+                             "[rt] d3d12: %s (%s) requires %s; the device does not have it enabled, so the pipeline "
+                             "is refused\n",
+                             stage.entry->name.c_str(), stage.name, missing);
+                return E_NOTIMPL;
+            }
+        }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -3776,6 +3792,16 @@ public:
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
             return E_FAIL;
+        }
+        const auto ext_caps = leonida::scan_spirv_ext_caps(words);
+        if (const char* missing = leonida::missing_spirv_ext_cap(
+                ext_caps, device_.info.fragment_shader_barycentric, device_.info.fragment_shader_interlock,
+                device_.info.shader_subgroup_clock, device_.info.shader_device_clock)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12: %s (cs) requires %s; the device does not have it enabled, so the pipeline is "
+                         "refused\n",
+                         entry->name.c_str(), missing);
+            return E_NOTIMPL;
         }
 
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -7149,7 +7175,7 @@ public:
             opts->CastingFullyTypedFormatSupported = FALSE;
             opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
             opts->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
-            opts->BarycentricsSupported = FALSE;
+            opts->BarycentricsSupported = state_.info.fragment_shader_barycentric ? TRUE : FALSE;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS4: {
