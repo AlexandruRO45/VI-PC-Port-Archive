@@ -409,3 +409,41 @@ class TestOrB32SIMDAndProperties(unittest.TestCase):
             "v_or_b32 v0, v2, v1",
         ])
         self.assertEqual(val_ab, val_ba)
+
+
+# ------------------------------------------------------------------------------
+# v_or_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestOrB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(TypeError):
+            VOrB32Instruction(
+                dst=RegisterOperand(OperandType.SGPR, 0),
+                src0=RegisterOperand(OperandType.VGPR, 1),
+                src1=RegisterOperand(OperandType.VGPR, 2),
+            )
+
+    def test_boundary_extremes_hardware(self):
+        val_zeroes, _ = run_shader("ps_or_zeroes", [
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_or_b32 v0, v1, v2",
+        ])
+        self.assertEqual(val_zeroes, 0)
+
+        val_alt, _ = run_shader("ps_or_alt", [
+            "v_mov_b32 v1, 0x55555555",
+            "v_mov_b32 v2, 0xAAAAAAAA",
+            "v_or_b32 v0, v1, v2",
+        ])
+        self.assertEqual(val_alt, 0xFFFFFFFF)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        val, spv = run_shader("ps_or_lowering", [
+            "v_mov_b32 v1, 0x0000FFFF",
+            "v_mov_b32 v2, 0xFFFF0000",
+            "v_or_b32 v0, v1, v2",
+        ])
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertEqual(val, 0xFFFFFFFF)
