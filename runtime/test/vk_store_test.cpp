@@ -1,6 +1,6 @@
 // Headless Vulkan test for translated typed image stores and loads (runtime/test/shaders/cs_imgstore.asm and
 // cs_imgload.asm).
-// Usage: vk_store_test cs.spv [load|load-d16|words|words64]
+// Usage: vk_store_test cs.spv [load|load-d16|words|words64|signed-zero]
 // The shader builds three T#s (word1 FORMAT = 56 rgba8 unorm, 20 r32 uint, 21 r32 sint) and stores to three 8x8
 // images. The translator picks the float / uint / sint view (set 0, bindings 8 / 9 / 10 for 2D) from the FORMAT
 // field, and the bindless index from the descriptor hash table (binding 2). As in the runtime, each image has its
@@ -19,6 +19,7 @@
 // 27, where 64-bit image atomics address their image (VK_EXT_shader_image_atomic_int64; without it the tool exits
 // 77). They are filled with (i + 1) << 32 | (0xfffffff0 + i) mod 2^32 and (0x100 + i) << 32 | (0xffffff00 + i), and
 // printed after the other three as 64-bit words ("wide" and "wide3d").
+// "signed-zero" checks three direct float stores and all remaining RGBA32 guard words (SHADER-605).
 // LEONIDA_VK_VALIDATION=1 runs every mode under VK_LAYER_KHRONOS_validation; an error then fails the run.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
@@ -72,7 +73,10 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
 }
 
 static int run(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|words64]\n"); return 2; }
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|words64|signed-zero]\n");
+        return 2;
+    }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -159,24 +163,42 @@ static int run(int argc, char** argv) {
     // "words64": the same, with the two r64 uint images of the 64-bit image atomics.
     const bool wide_mode = argc > 2 && !std::strcmp(argv[2], "words64");
     const bool words_mode = wide_mode || (argc > 2 && !std::strcmp(argv[2], "words"));
+    const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
+    const bool signed_zero = argc > 2 && !std::strcmp(argv[2], "signed-zero");
+    if (signed_zero) {
+        LOADI(vkGetPhysicalDeviceProperties2);
+        VkPhysicalDeviceFloatControlsProperties controls{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        properties.pNext = &controls;
+        vkGetPhysicalDeviceProperties2(pd, &properties);
+        if (!controls.shaderSignedZeroInfNanPreserveFloat32) {
+            std::printf("unsupported: shaderSignedZeroInfNanPreserveFloat32=0\n");
+            return 77;
+        }
+    }
     const bool filled = load_mode || words_mode;
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (code.size() < 20 || code.size() % 4) { std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]); return 1; }
-    if (filled) {
-        // Typed image_load fetches through the sampled arrays, so it must not need a feature Intel Xe-LP lacks
-        // (SHADER-151). shaderStorageImageReadWithoutFormat stays off; a module declaring it would be invalid here.
-        std::vector<uint32_t> words(code.size() / 4);
-        std::memcpy(words.data(), code.data(), code.size());
-        for (std::size_t i = 5; i < words.size() && (words[i] >> 16);) {
-            const uint32_t op = words[i] & 0xffff, count = words[i] >> 16;
-            // OpCapability (17) StorageImageReadWithoutFormat (55; spirv/unified1/spirv.h)
-            if (op == 17 && count == 2 && i + 1 < words.size() && words[i + 1] == 55) {
-                std::printf("FAILED: the module declares StorageImageReadWithoutFormat\n");
-                return 1;
-            }
-            i += count;
-        }
+    using leonida::vk_test::spirv_declares_capability;
+    const bool dynamic_sampled = spirv_declares_capability(code.data(), code.size(),
+        leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
+    if (dynamic_sampled && !have.shaderSampledImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderSampledImageArrayDynamicIndexing\n");
+        return 77;
+    }
+    f2.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
+    const bool dynamic_storage = spirv_declares_capability(code.data(), code.size(),
+        leonida::vk_test::spv_storage_image_array_dynamic_indexing);
+    if (dynamic_storage && !have.shaderStorageImageArrayDynamicIndexing) {
+        std::printf("unsupported: shaderStorageImageArrayDynamicIndexing\n");
+        return 77;
+    }
+    f2.features.shaderStorageImageArrayDynamicIndexing = dynamic_storage;
+    // Typed image_load fetches through the sampled arrays without StorageImageReadWithoutFormat (55, SHADER-151).
+    if (filled && spirv_declares_capability(code.data(), code.size(), 55)) {
+        std::printf("FAILED: the module declares StorageImageReadWithoutFormat\n");
+        return 1;
     }
     f2.features.shaderInt64 = VK_TRUE;
     f2.pNext = &f12;
@@ -251,7 +273,10 @@ static int run(int argc, char** argv) {
     // T#s exactly as the shader builds them (cs_imgstore.asm): word0 = 0x1000 * (k + 1), word1 = FORMAT << 20,
     // words 2..7 = 0x11 * (k + 1).
     const uint32_t fmts[3] = {56, 20, 21};
-    const VkFormat vkf[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT};
+    const VkFormat compact_formats[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT};
+    const VkFormat rgba32_formats[3] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT,
+                                        VK_FORMAT_R32G32B32A32_SINT};
+    const VkFormat* vkf = signed_zero ? rgba32_formats : compact_formats;
     std::vector<uint32_t> table(1 + 16 * 10 + 10, 0);
     table[0] = 15;
     for (uint32_t k = 0; k < 3; k++) {
@@ -459,8 +484,9 @@ static int run(int argc, char** argv) {
     cpi.layout = pl;
     VkPipeline pipe; CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
 
+    const uint32_t image_words = W * W * (signed_zero ? 4 : 1);
     VkBuffer rb[3]; void* rbp[3];
-    for (int k = 0; k < 3; k++) CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb[k], &rbp[k]));
+    for (int k = 0; k < 3; k++) CHECK(make_buffer(image_words * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb[k], &rbp[k]));
     // Load and words modes: what the uint and sint images hold before the dispatch, texel (x, y) at i = 8y + x.
     // The last row of the D16 fixture ("load-d16" only) exercises both sides of each 16-bit boundary.
     struct PackedLoad { uint32_t u; int32_t s, sum; };
@@ -469,14 +495,18 @@ static int run(int argc, char** argv) {
         {0, 32768, 32767}, {0, -32768, -32768}, {0, -32769, -32768}, {65536, -32769, 32767},
     };
     static_assert(sizeof(boundary) / sizeof(boundary[0]) == W);
-    VkBuffer fill[2]{}; void* fillp[2]{};
-    if (filled) {
-        for (int j = 0; j < 2; j++)
-            CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &fill[j], &fillp[j]));
-        for (uint32_t i = 0; i < W * W; i++) {
+    // Load/words modes seed the integer images. The signed-zero probe seeds every component of all three images.
+    const int first_fill = signed_zero ? 0 : filled ? 1 : 3;
+    VkBuffer fill[3]{};
+    for (int k = first_fill; k < 3; ++k) {
+        void* mapped;
+        CHECK(make_buffer(image_words * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &fill[k], &mapped));
+        auto* words = static_cast<uint32_t*>(mapped);
+        for (uint32_t i = 0; i < image_words; ++i) {
             const bool edge = packed_load && i / W == W - 1;
-            static_cast<uint32_t*>(fillp[0])[i] = edge ? boundary[i % W].u : 100 + i;
-            static_cast<int32_t*>(fillp[1])[i] = edge ? boundary[i % W].s : -2 * int32_t(i);
+            if (signed_zero) words[i] = 0x39000000u + k * image_words + i;
+            else if (k == 1) words[i] = edge ? boundary[i % W].u : 100 + i;
+            else words[i] = static_cast<uint32_t>(edge ? boundary[i % W].s : -2 * int32_t(i));
         }
     }
     // The volume's fill and its read-back, used in words mode.
@@ -501,7 +531,7 @@ static int run(int argc, char** argv) {
         ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         ib[k].srcQueueFamilyIndex = ib[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        if (filled && k > 0) {   // filled by a copy first
+        if (k >= first_fill) {   // filled by a copy first
             ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         }
     }
@@ -533,17 +563,17 @@ static int run(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &vol_ib);
     }
-    if (filled) {
-        for (int k = 1; k < 3; k++) {
+    if (first_fill < 3) {
+        for (int k = first_fill; k < 3; k++) {
             VkBufferImageCopy bic{};
             bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
-            vkCmdCopyBufferToImage(cmd, fill[k - 1], img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+            vkCmdCopyBufferToImage(cmd, fill[k], img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
             ib[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
             ib[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         }
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
-                             nullptr, 0, nullptr, 2, ib + 1);
+                             nullptr, 0, nullptr, 3 - first_fill, ib + first_fill);
     }
     // words64: the r64 images get their fills, then GENERAL for the dispatch.
     VkImageMemoryBarrier wide64_ib[2]{};
@@ -575,9 +605,11 @@ static int run(int argc, char** argv) {
     vkCmdDispatch(cmd, 1, 1, 1);
     for (int k = 0; k < 3; k++) {
         ib[k].oldLayout = VK_IMAGE_LAYOUT_GENERAL; ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        ib[k].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT; ib[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        ib[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        ib[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     }
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 3, ib);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 3, ib);
     for (int k = 0; k < 3; k++) {
         VkBufferImageCopy bic{};
         bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
@@ -614,6 +646,22 @@ static int run(int argc, char** argv) {
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
 
+    if (signed_zero) {
+        constexpr uint32_t neg = 0x80000000;
+        constexpr uint32_t stores[] = {neg, 0, 0, 0, neg, 0x3f800000, 0, 0, neg, neg, 0, 0};
+        const uint32_t total = 3 * image_words;
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < total; ++i) {
+            const uint32_t expected = i < 12 ? stores[i] : 0x39000000u + i;
+            const uint32_t actual = static_cast<const uint32_t*>(rbp[i / image_words])[i % image_words];
+            if (actual != expected) {
+                std::printf("word %u: expected %08x, observed %08x\n", i, expected, actual);
+                ++bad;
+            }
+        }
+        std::printf("%u/%u words exact\n", total - bad, total);
+        return bad ? 1 : 0;
+    }
     if (words_mode) {
         const char* names[3] = {"uint", "sint", "volume"};
         const void* words[3] = {rbp[1], rbp[2], vol_rbp};
