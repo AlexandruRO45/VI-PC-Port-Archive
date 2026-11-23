@@ -189,6 +189,36 @@ class Freshness(unittest.TestCase):
         got = self.collect(self.base("0" * 16, pd.code_digest()))
         self.assertEqual(got["test_progress_dashboard.py"], ("partial", "revalidation_required"))
 
+    def test_test_edited_during_the_run_needs_revalidation(self):
+        changed = "tests/test_changed.py"
+        unchanged = "tests/test_unchanged.py"
+        original = b"# original test\n"
+        with (
+            tempfile.TemporaryDirectory() as root,
+            mock.patch.object(pd, "ROOT", root),
+            mock.patch.object(pd, "code_digest", return_value="unchanged code"),
+            mock.patch.object(pd, "git_info", return_value={}),
+        ):
+            Path(root, "tests").mkdir()
+            changed_path = Path(root, changed)
+            changed_path.write_bytes(original)
+            Path(root, unchanged).write_bytes(original)
+
+            def run_test(rel, timeout):
+                if rel == changed:
+                    changed_path.write_bytes(b"# edited during the run\n")
+                return {"test": rel, "result": "pass"}
+
+            with mock.patch.object(pd, "run_one_test", side_effect=run_test):
+                cached = pd.run_unit_tests([changed, unchanged], jobs=1, timeout=10)
+            expected = {
+                "test_changed.py": ("partial", "revalidation_required"),
+                "test_unchanged.py": ("verified", "current"),
+            }
+            self.assertEqual(self.collect(cached), expected)
+            changed_path.write_bytes(original)
+            self.assertEqual(self.collect(cached), expected)
+
     def test_changed_tools_need_revalidation(self):
         got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), "0" * 16))
         self.assertEqual(got["test_progress_dashboard.py"], ("partial", "revalidation_required"))

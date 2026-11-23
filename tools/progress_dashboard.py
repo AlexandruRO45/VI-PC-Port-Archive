@@ -304,10 +304,14 @@ def code_digest():
 
 def run_unit_tests(files, jobs, timeout):
     before = code_digest()
+    test_digests = {test: file_digest(test) for test in files}
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         results = list(pool.map(lambda f: run_one_test(f, timeout), files))
     for r in results:
-        r["digest"] = file_digest(r["test"])
+        test = r["test"]
+        r["digest"] = test_digests[test]
+        if file_digest(test) != r["digest"]:
+            r["changed_during_run"] = True
     g = git_info()
     after = code_digest()
     return {"ran_at": iso(now_utc()), "commit": g.get("head"), "modified_files": g.get("modified_files"),
@@ -335,6 +339,8 @@ def collect_unit(col, out_dir, args):
         test = r["test"]
         if r["result"] != "pass":
             fresh = "failed"
+        elif r.get("changed_during_run"):
+            fresh = "revalidation_required"
         elif not r.get("digest") or data.get("code_digest") is None:
             fresh = "unknown"
         elif code_same and file_digest(test) == r["digest"]:
