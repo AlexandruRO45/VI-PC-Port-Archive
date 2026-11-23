@@ -78,6 +78,19 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unreachable.reason, /could not be loaded/);
 });
 
+test('HTTP error responses abort the unread world manifest body', async () => {
+    for (const [status, reason] of [[404, /not found/], [503, /HTTP 503/]]) {
+        let signal;
+        const world = await loadWorld(async (_url, options) => {
+            signal = options.signal;
+            return { ok: false, status, json() { assert.fail('must not read the error body'); } };
+        });
+        assert.equal(world.test, true);
+        assert.match(world.reason, reason);
+        assert.equal(signal.aborted, true, `HTTP ${status} left the request active`);
+    }
+});
+
 test('a stalled world manifest falls back to generated terrain at the startup deadline', async t => {
     for (const phase of ['headers', 'body']) {
         await t.test(phase, async () => {

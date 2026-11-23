@@ -101,8 +101,11 @@ async function loadWorld() {
   let response, world;
   try {
     response = await fetch("world/world.json", { cache: "no-store", signal: controller.signal });
-    if (response.status === 404) return testWorld("world/world.json was not found.");
-    if (!response.ok) return testWorld(`world/world.json returned HTTP ${response.status}.`);
+    if (!response.ok) {
+      controller.abort();  // Stop receiving the unread body before clearing the deadline.
+      return testWorld(response.status === 404 ? "world/world.json was not found."
+                                              : `world/world.json returned HTTP ${response.status}.`);
+    }
     world = await response.json();
   } catch {
     if (controller.signal.aborted) return testWorld("world/world.json download timed out.");
