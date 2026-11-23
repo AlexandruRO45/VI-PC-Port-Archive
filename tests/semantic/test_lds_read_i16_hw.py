@@ -347,5 +347,25 @@ class TestDSReadI16SIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), 0xDEADBEEF)
 
 
+class TestDSReadI16RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_vdst_aliases_vaddr(self) -> None:
+        # vdst and vaddr both use v1
+        # Address 0x40 must be read before being overwritten by the sign-extended value
+        self.lds.write_dword(0x40, 0x8000)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+
+        inst = DSReadInstruction(DSOpcode.DS_READ_I16, vdst=VGPR(1), vaddr=VGPR(1))
+        val = self.interp.execute(self.state, inst)
+        self.assertEqual(val, 0xFFFF8000)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(1)), 0xFFFF8000)
+
+
 if __name__ == "__main__":
     unittest.main()
