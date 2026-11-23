@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,25 @@ class F64DiffTests(unittest.TestCase):
     def test_exit_2_for_invalid_cli(self):
         self.assertEqual(self.command("--ops", "v_not_real_f64").returncode, 2)
         self.assertEqual(self.command("--programs", "-1").returncode, 2)
+
+    def test_generated_f64_literals_are_one_dword(self):
+        # An f64 ISA literal supplies bits 63:32 in every form (docs/design.md, "f64 literal sources"); a VOP3
+        # instruction carries one literal dword, so a 64-bit hexadecimal operand is not encodable.
+        for op in fd.BASE:
+            for seed in range(8):
+                setup, body, _, _ = fd.make_case(random.Random(seed), op)
+                for line in setup + body:
+                    for token in re.findall(r"0x[0-9a-fA-F]+", line):
+                        with self.subTest(op=op, seed=seed, token=token):
+                            self.assertLessEqual(int(token, 16), 0xFFFFFFFF)
+
+    def test_frexp_literal_source_matches_the_translator(self):
+        # 15 match / 1 mismatch before the literal-width fix: the generated 64-bit operand was read as the
+        # complete word by the reference but as one literal dword by the translator.
+        for op in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64"):
+            result = self.command("--ops", op, "--programs", "20", "--seed", "3")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("0 mismatch", result.stdout)
 
     def test_reference_rounds_all_four_binary64_modes(self):
         half_ulp = Fraction(1, 1 << 53)
