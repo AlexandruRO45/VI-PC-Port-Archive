@@ -259,6 +259,39 @@ int main() {
     std::printf("INFO GPU fill of arena page -> readback -> CPU view of P%u reads 0x%02x\n", phys[2],
                 r1[2 * kPageSize]);
 
+    // --- Pages written on both sides, failed uploads and new GPU halves ------------------------------------------
+    {
+        // A page the CPU wrote since its last upload is not read back over: its writes would be lost.
+        r1[2 * kPageSize] = 0x33;
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(!gpu_half.record_readback(cb, p2)); }));
+        EXPECT(r1[2 * kPageSize] == 0x33);
+        // A failed upload leaves its pages dirty: P2 with a page the store does not have fails as a whole.
+        auto taken = store.take_dirty();
+        EXPECT(taken.size() == 1 && taken[0] == phys[2]);
+        taken.push_back(5000);
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(!gpu_half.record_upload(cb, taken)); }));
+        const auto again = store.take_dirty();
+        EXPECT(again.size() == 1 && !again.empty() && again[0] == phys[2]);
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, again)); }));
+        // A CPU write between recording a readback and finishing it drops the readback.
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_readback(cb, p2)); }));
+        r1[2 * kPageSize + 1] = 0x44;
+        EXPECT(!gpu_half.finish_readback(p2));
+        EXPECT(r1[2 * kPageSize] == 0x33 && r1[2 * kPageSize + 1] == 0x44);
+        const auto written = store.take_dirty();
+        EXPECT(written.size() == 1);
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, written)); }));
+        // A page with no GPU half is not read back; a new GPU half is marked dirty, so its first upload gives it
+        // the CPU half's contents instead of whatever its pool page held.
+        std::vector<PhysicalPage> fresh;
+        EXPECT(store.allocate(1, fresh));
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(!gpu_half.record_readback(cb, fresh)); }));
+        EXPECT(gpu_half.gpu_page(fresh[0]) != kNoPage);
+        const auto first = store.take_dirty();
+        EXPECT(first.size() == 1 && !first.empty() && first[0] == fresh[0]);
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, first)); }));
+    }
+
     // --- Unmapping a view leaves the other mapping alone ----------------------------------------------------------
     const PhysicalPage none[1]{PhysicalPageStore::kUnmapped};
     EXPECT(store.map(r2 + 2 * kPageSize, none));

@@ -60,13 +60,17 @@ device-local, so `runtime/src/xbox_physical.h` gives each physical page two halv
 - **CPU to GPU**: clean pages are read-only in every view. The first write faults, a vectored exception handler marks
   the page dirty and makes that view writable, and the write resumes. `take_dirty()` lists the dirty pages and
   write-protects them again; `record_upload` copies them into their GPU halves ahead of the title's commands on the
-  same queue.
-- **GPU to CPU**: only on request (readbacks, query results), with `record_readback` then `finish_readback`.
+  same queue, after earlier GPU work on it. An upload that fails leaves its pages dirty. A new GPU half is marked
+  dirty, so its first upload gives it the CPU half's contents.
+- **GPU to CPU**: only on request (readbacks, query results), with `record_readback` then `finish_readback`. A page
+  the CPU wrote since its last upload is not read back (the readback would overwrite those writes), and a readback
+  is dropped if the CPU writes one of its pages before it finishes.
 
 `runtime/test/vk_xbox_physical_test.cpp` (Windows only) checks a page mapped at two VAs, CPU writes read back through
-the arena after one upload, and a GPU fill read through a CPU view. Measured on the GTX 1660 SUPER (median of 8): the
-first write to a clean page costs 3.5 µs (fault and unprotect), `take_dirty` of 256 pages 0.24 ms, and an upload of
-256 dirty pages (16 MiB: copy to staging, GPU copy, wait) 9.3 ms, about 1.8 GB/s (8.0 to 10.6 ms over the runs).
+the arena after one upload, a GPU fill read through a CPU view, and the refusals above. Measured on the GTX 1660
+SUPER (median of 8): the first write to a clean page costs 3.7 µs (fault and unprotect), `take_dirty` of 256 pages
+0.25 ms, and an upload of 256 dirty pages (16 MiB: copy to staging, GPU copy, wait) 8.7 ms, about 1.9 GB/s (7.8 to
+9.3 ms over the runs).
 
 The staging buffer is used from offset 0 by every record call, so a command buffer holds one upload or readback,
 and it completes before the next one is recorded. A ring per frame in flight lifts that once the device proxy drives
@@ -81,4 +85,12 @@ it.
 - Wiring `xbox_physical.h` to `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages[Scatter]` once a call site shows
   their arguments.
 - Freeing physical pages: `PhysicalPageStore` commits pages but has no free yet, so its capacity only fills.
+- Pages both sides write: uploads and readbacks copy whole 64 KiB pages, so a page the CPU and the GPU both write
+  between two syncs loses one side's writes (a GPU-written resource sharing a page with a CPU-written object is
+  overwritten by the next upload). A readback of a CPU-written page is refused rather than lose the CPU's writes;
+  the other direction needs the GPU-written ranges tracked, or uploads of only the CPU-written bytes. Needed before
+  wiring.
+- Writes by the kernel: dirty tracking sees user-mode writes through the fault handler, so `ReadFile`, overlapped
+  I/O or `recv` into a clean page fails with `ERROR_NOACCESS` instead of marking it dirty. The I/O shims would mark
+  the target pages dirty and writable first. Whether `MEM_WRITE_WATCH` can apply to section views is not checked.
 - The `XALLOC_ATTRIBUTES` layout that tells `XMemAlloc` to hand out physical pages is not public.

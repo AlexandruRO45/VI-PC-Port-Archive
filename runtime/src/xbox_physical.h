@@ -152,17 +152,21 @@ public:
         std::unique_lock lock(mutex_);
         std::vector<PhysicalPage> out;
         for (PhysicalPage p = 0; p < capacity_; ++p) {
-            if (!dirty_[p].exchange(0, std::memory_order_acq_rel)) continue;
+            if (!dirty_[p].load(std::memory_order_relaxed) || !dirty_[p].exchange(0, std::memory_order_acq_rel))
+                continue;
             out.push_back(p);
             protect_views(p, PAGE_READONLY);
         }
         return out;
     }
 
-    // Marks pages dirty without a write (a GPU-to-CPU readback, or a test).
+    // Marks an allocated page dirty without a write: a new GPU half, an upload that failed, or a test.
     void mark_dirty(PhysicalPage p) {
-        if (p < capacity_) dirty_[p].store(1, std::memory_order_release);
+        if (allocated(p)) dirty_[p].store(1, std::memory_order_release);
     }
+
+    // Whether the CPU wrote `p` since it was last taken.
+    bool dirty(PhysicalPage p) const { return p < capacity_ && dirty_[p].load(std::memory_order_acquire); }
 
     // Whether `p` was allocated (its CPU half is committed).
     bool allocated(PhysicalPage p) const {
@@ -317,52 +321,67 @@ public:
         if (staging_memory_) free_(device_, staging_memory_, nullptr);
     }
 
-    // The GPU half of `p`, allocated on first use (kNoPage if the pool is out of memory).
+    // The GPU half of `p`, allocated on first use (kNoPage if the pool is out of memory). A new GPU half holds
+    // whatever its pool page held, so `p` is marked dirty: the next upload gives it the CPU half's contents.
     PageId gpu_page(PhysicalPage p) {
-        if (!store_.allocated(p)) return kNoPage;
-        auto it = gpu_.find(p);
-        if (it != gpu_.end()) return it->second;
-        std::vector<PageId> one;
-        if (!pool_.allocate(1, one)) return kNoPage;
-        gpu_.emplace(p, one[0]);
-        return one[0];
+        bool created = false;
+        const PageId gpu = half(p, created);
+        if (created) store_.mark_dirty(p);
+        return gpu;
     }
 
-    // CPU -> GPU: copies the CPU halves of `pages` into their GPU halves, recorded into `cb` before the title's
-    // commands; a barrier makes them visible to everything after. The staging copy happens now, on the CPU.
+    // CPU -> GPU: copies the CPU halves of `pages` (as take_dirty() returned them) into their GPU halves, recorded
+    // into `cb` before the title's commands. Barriers order the copies after earlier GPU work on the queue and make
+    // them visible to everything after. The staging copy happens now, on the CPU. On failure the pages are marked
+    // dirty again, so their writes are uploaded by a later call.
     bool record_upload(VkCommandBuffer cb, std::span<const PhysicalPage> pages) {
         if (pages.empty()) return true;
         std::vector<Target> targets;
-        if (!resolve(pages, targets) || !ensure_staging(pages.size() * kPageSize)) return false;
+        if (!resolve(pages, targets, false) || !ensure_staging(pages.size() * kPageSize)) {
+            for (PhysicalPage p : pages) store_.mark_dirty(p);
+            return false;
+        }
         readback_.clear();  // the staging data it was waiting for is overwritten
+        std::map<VkBuffer, std::vector<VkBufferCopy>> copies;
         for (std::size_t i = 0; i < pages.size(); ++i) {
             std::memcpy(staging_map_ + i * kPageSize, store_.data(pages[i]), kPageSize);
-            const VkBufferCopy region{i * kPageSize, targets[i].offset, kPageSize};
-            copy_(cb, staging_, targets[i].buffer, 1, &region);
+            copies[targets[i].buffer].push_back({i * kPageSize, targets[i].offset, kPageSize});
         }
-        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        barrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0,
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0,
+                 nullptr);
+        for (const auto& [buffer, regions] : copies)
+            copy_(cb, staging_, buffer, std::uint32_t(regions.size()), regions.data());
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr, 0,
                  nullptr);
         uploaded_ += pages.size();
         return true;
     }
 
-    // GPU -> CPU, step 1: copy the GPU halves into staging (after the GPU work that wrote them).
+    // GPU -> CPU, step 1: copy the GPU halves into staging (after the GPU work that wrote them). Refused for a page
+    // the CPU wrote since its last upload (the readback would overwrite those writes) and for a page with no GPU
+    // half yet (the GPU never wrote it).
     bool record_readback(VkCommandBuffer cb, std::span<const PhysicalPage> pages) {
         if (pages.empty()) return true;
+        for (PhysicalPage p : pages)
+            if (store_.dirty(p)) return false;
         std::vector<Target> sources;
-        if (!resolve(pages, sources) || !ensure_staging(pages.size() * kPageSize)) return false;
+        if (!resolve(pages, sources, true) || !ensure_staging(pages.size() * kPageSize)) return false;
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         barrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0,
                  nullptr);
-        for (std::size_t i = 0; i < pages.size(); ++i) {
-            const VkBufferCopy region{sources[i].offset, i * kPageSize, kPageSize};
-            copy_(cb, sources[i].buffer, staging_, 1, &region);
-        }
+        std::map<VkBuffer, std::vector<VkBufferCopy>> copies;
+        for (std::size_t i = 0; i < pages.size(); ++i)
+            copies[sources[i].buffer].push_back({sources[i].offset, i * kPageSize, kPageSize});
+        for (const auto& [buffer, regions] : copies)
+            copy_(cb, buffer, staging_, std::uint32_t(regions.size()), regions.data());
         VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -372,10 +391,17 @@ public:
     }
 
     // GPU -> CPU, step 2, once that work is complete: the CPU halves take the GPU data. `pages` must be the last
-    // record_readback's, with no upload recorded since; each readback is finished once.
+    // record_readback's, with no upload recorded since; each readback is finished once. Refused, and dropped, if
+    // the CPU wrote one of the pages meanwhile.
     bool finish_readback(std::span<const PhysicalPage> pages) {
         if (readback_.empty() || !std::equal(pages.begin(), pages.end(), readback_.begin(), readback_.end()))
             return false;
+        for (PhysicalPage p : pages) {
+            if (store_.dirty(p)) {
+                readback_.clear();
+                return false;
+            }
+        }
         for (std::size_t i = 0; i < pages.size(); ++i)
             std::memcpy(store_.data(pages[i]), staging_map_ + i * kPageSize, kPageSize);
         readback_.clear();
@@ -390,15 +416,30 @@ private:
         VkDeviceSize offset;
     };
 
-    // Each page's GPU half as a buffer and offset, so a failure records nothing.
-    bool resolve(std::span<const PhysicalPage> pages, std::vector<Target>& out) {
+    // The GPU half of `p`; `created` says whether it was allocated now.
+    PageId half(PhysicalPage p, bool& created) {
+        created = false;
+        if (!store_.allocated(p)) return kNoPage;
+        auto it = gpu_.find(p);
+        if (it != gpu_.end()) return it->second;
+        std::vector<PageId> one;
+        if (!pool_.allocate(1, one)) return kNoPage;
+        gpu_.emplace(p, one[0]);
+        created = true;
+        return one[0];
+    }
+
+    // Each page's GPU half as a buffer and offset, so a failure records nothing. `existing`: only pages that have
+    // a GPU half already.
+    bool resolve(std::span<const PhysicalPage> pages, std::vector<Target>& out, bool existing) {
         out.clear();
         if (!ok()) return false;
         for (PhysicalPage p : pages)
-            if (!store_.allocated(p)) return false;
+            if (!store_.allocated(p) || (existing && !gpu_.count(p))) return false;
         out.reserve(pages.size());
         for (PhysicalPage p : pages) {
-            const PageId gpu = gpu_page(p);
+            bool created = false;
+            const PageId gpu = half(p, created);
             const VkBuffer buffer = gpu ? access(pool_.memory(gpu)) : VK_NULL_HANDLE;
             if (!buffer) return false;
             out.push_back({buffer, PagePool::offset(gpu)});
