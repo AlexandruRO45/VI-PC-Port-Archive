@@ -27,6 +27,10 @@ _WINDOWS_RESERVED_DEVICES = frozenset({
 
 
 def _is_reserved_segment(seg: str) -> bool:
+    # Win32 strips trailing dots and spaces, and ntpath.isreserved rejects them on Python 3.13+;
+    # reject them here too so Python 3.12 and POSIX match (e.g. "model.glb.", "model.glb ", "sub.").
+    if seg.endswith((".", " ")):
+        return True
     # Spaces before an extension do not make a device into a normal filename:
     # Windows treats e.g. "NUL .glb" as NUL (as does ntpath.isreserved in Python 3.13+).
     stem = seg.split(".", 1)[0].rstrip(" ").upper()

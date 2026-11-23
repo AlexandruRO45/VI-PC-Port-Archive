@@ -140,6 +140,19 @@ class SafeWorldPathTest(unittest.TestCase):
                             self.assertIsNone(self.resolve(prefix + urllib.parse.quote(name, safe="")))
                 realpath.assert_not_called()
 
+    def test_trailing_dots_and_spaces_are_refused_without_isreserved(self):
+        # Win32 strips trailing dots/spaces and ntpath.isreserved rejects them on Python 3.13+;
+        # the fallback must refuse them on Python 3.12 and POSIX before touching the filesystem.
+        rel_paths = ("ok.bin.", "ok.bin ", "ok.bin..", "model.glb. ", "sub./inner.bin",
+                     "sub /inner.bin", ".../ok.bin")
+        with mock.patch.object(serve.os.path, "isreserved", None, create=True):
+            with mock.patch.object(serve.os.path, "realpath",
+                                   side_effect=AssertionError("trailing dot/space path reached realpath")) as realpath:
+                for rel in rel_paths:
+                    with self.subTest(rel=rel):
+                        self.assertIsNone(self.resolve("/world/" + urllib.parse.quote(rel, safe="/")))
+                realpath.assert_not_called()
+
     def test_device_like_regular_filenames_still_resolve(self):
         for name in ("COM10.glb", "LPT10.json", "COM\u2074.glb", "COM1_mesh.glb", "console.glb",
                      "my.CON", "input.CONIN$"):
@@ -293,6 +306,22 @@ class HandlerTest(unittest.TestCase):
                         with self.subTest(method=method, target=target):
                             status, _, _ = raw_request(self.port, target, method=method)
                             self.assertEqual(status, 403)
+                opened.assert_not_called()
+
+    def test_trailing_dots_and_spaces_get_403_without_opening_them(self):
+        targets = ("/world/model.glb.", "/world/model.glb%20", "/world/ok.bin..",
+                   "/world/sub./inner.bin", "/world/.../ok.bin")
+        with mock.patch.object(serve.os.path, "isreserved", None, create=True):
+            with mock.patch("builtins.open",
+                            side_effect=AssertionError("trailing dot/space path reached open")) as opened:
+                for method in ("GET", "HEAD"):
+                    for target in targets:
+                        with self.subTest(method=method, target=target):
+                            status, head, body = raw_request(self.port, target, method=method)
+                            self.assertEqual(status, 403)
+                            self.assertIn("cache-control: no-store", head.lower())
+                            self.assertNotIn(b"glTF", body)
+                            self.assertNotIn(b"world-bytes", body)
                 opened.assert_not_called()
 
     def test_the_viewer_page_itself_is_served(self):
