@@ -1344,8 +1344,11 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    loaded from memory, and 1,041 could not be followed (0.14%, all but 63 in heap-indexing shaders). That holds for
    the 18,066 shaders whose `SFI0` sets either heap-indexing bit as much as for the 6,964 that set neither. The
    heap-indexing shaders add a base read with a run-time offset (the heap index): for example `s10` in CS, `s23` in
-   MS and `s15` in PS for the resource heap, and a separate base for the sampler heap (`s11` in CS, `s24` in MS,
-   `s16` in PS). For compute this is settled: every base lies below the shader's `COMPUTE_PGM_RSRC2` `USER_SGPR`
+   MS and `s15` in PS for the resource heap. A separate sampler-heap base (`s11` in CS, `s24` in MS, `s16` in PS) is
+   **inferred**, not measured: every S# load through those three has a static offset (1,907 in CS, 2,593 in MS,
+   64,994 in PS), so they are told apart from descriptor-table pointers only by the shaders' `SFI0` sampler-indexing
+   bit. The only S# loads with a run-time offset are in the 1,043 PS that index only the sampler heap (`s11`: 1,105,
+   `s10`: 284). For compute this is settled: every base lies below the shader's `COMPUTE_PGM_RSRC2` `USER_SGPR`
    count, so it is user data. **The graphics stages' user count is measured too:** the FSSM header word `u32[0xD4]`
    (whose bit 5 is the wave size) holds the user-SGPR count in bits 20:16 (`fssm_header.user_sgpr_count()`). In
    all 2,689 compute blobs it equals `COMPUTE_PGM_RSRC2` `USER_SGPR` (`u32[0x138]` bits 5:1). Over all 26,503
