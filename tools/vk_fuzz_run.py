@@ -123,8 +123,17 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
                 f.write(compute_header(path))
             names.append(name)
             results.append(None)
-        subprocess.run([sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), disasm, "--out", spirv],
-                       capture_output=True, text=True)
+        if not any(names):
+            return results
+        tr = subprocess.run([sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), disasm, "--out", spirv],
+                            capture_output=True, text=True)
+        tr_error = None
+        if tr.returncode:
+            tr_lines = [ln.strip() for ln in (tr.stderr or "").splitlines() if ln.strip()]
+            if not tr_lines:
+                tr_lines = [ln.strip() for ln in (tr.stdout or "").splitlines() if ln.strip()]
+            detail = tr_lines[-1][:120] if tr_lines else f"exit {tr.returncode}"
+            tr_error = f"translator: {detail}"
         index = {}
         index_path = os.path.join(spirv, "index.json")
         if os.path.isfile(index_path):
@@ -135,7 +144,7 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
                 continue
             spv = os.path.join(spirv, name + ".spv")
             if name not in index or not os.path.isfile(spv):
-                results[i] = "translator: not translated"
+                results[i] = tr_error or "translator: not translated"
                 continue
             dump = os.path.join(work, name + ".bin")
             env = dict(os.environ, VKC_OUT_WORDS=str(words * wave), VKC_DUMP=dump)

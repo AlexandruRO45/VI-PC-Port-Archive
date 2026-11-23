@@ -89,6 +89,66 @@ class ProgramText(unittest.TestCase):
             leftovers = [p for p in Path(tmp).iterdir() if p.name.startswith("vk_fuzz_")]
             self.assertEqual(leftovers, [])
 
+    def test_run_programs_reports_translator_setup_error(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_exe = Path(tmp) / ("vk_compute_test.exe" if os.name == "nt" else "vk_compute_test")
+            fake_exe.write_bytes(b"")
+            mc_ok = subprocess.CompletedProcess(["llvm-mc"], 0, "\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n", "")
+            tr_err = subprocess.CompletedProcess(
+                ["python"], 2, "",
+                "ERROR: spirv-as not found; install SPIRV-Tools (spirv-as, spirv-val) and put it on PATH\n",
+            )
+            with mock.patch("mc_command.mc_command", return_value=["llvm-mc"]), \
+                 mock.patch("mc_command.run", return_value=mc_ok), \
+                 mock.patch.object(R.subprocess, "run", return_value=tr_err) as sub_run:
+                res = R.run_programs([["s_nop 0"]], words=4, wave=32, build=tmp, work_parent=tmp)
+            self.assertEqual(len(res), 1)
+            self.assertIn("spirv-as not found", res[0])
+            self.assertTrue(res[0].startswith("translator: "), res[0])
+            self.assertEqual(sub_run.call_count, 1)  # rdna2spirv only; vk_compute_test not run
+
+    def test_run_programs_reports_translator_crash_and_exit_code_fallback(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_exe = Path(tmp) / ("vk_compute_test.exe" if os.name == "nt" else "vk_compute_test")
+            fake_exe.write_bytes(b"")
+            mc_bad = subprocess.CompletedProcess(["llvm-mc"], 1, "", "error: bad mnemonic\n")
+            mc_ok = subprocess.CompletedProcess(["llvm-mc"], 0, "\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n", "")
+            tr_tb = subprocess.CompletedProcess(
+                ["python"], 1, "",
+                "Traceback (most recent call last):\n  File 'x.py', line 1\nRuntimeError: boom\n",
+            )
+            with mock.patch("mc_command.mc_command", return_value=["llvm-mc"]), \
+                 mock.patch("mc_command.run", side_effect=[mc_bad, mc_ok]), \
+                 mock.patch.object(R.subprocess, "run", return_value=tr_tb):
+                res = R.run_programs([["bad_op"], ["s_nop 0"]], words=4, wave=32, build=tmp, work_parent=tmp)
+            self.assertEqual(res[0], "llvm-mc: error: bad mnemonic")
+            self.assertEqual(res[1], "translator: RuntimeError: boom")
+
+            tr_silent = subprocess.CompletedProcess(["python"], 3, "", "")
+            with mock.patch("mc_command.mc_command", return_value=["llvm-mc"]), \
+                 mock.patch("mc_command.run", return_value=mc_ok), \
+                 mock.patch.object(R.subprocess, "run", return_value=tr_silent):
+                res = R.run_programs([["s_nop 0"]], words=4, wave=32, build=tmp, work_parent=tmp)
+            self.assertEqual(res, ["translator: exit 3"])
+
+    def test_run_programs_skips_translator_when_all_programs_fail_llvm_mc(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_exe = Path(tmp) / ("vk_compute_test.exe" if os.name == "nt" else "vk_compute_test")
+            fake_exe.write_bytes(b"")
+            mc_bad = subprocess.CompletedProcess(["llvm-mc"], 1, "", "error: invalid instruction\n")
+            with mock.patch("mc_command.mc_command", return_value=["llvm-mc"]), \
+                 mock.patch("mc_command.run", return_value=mc_bad), \
+                 mock.patch.object(R.subprocess, "run") as sub_run:
+                res = R.run_programs([["bad_op"]], words=4, wave=32, build=tmp, work_parent=tmp)
+            self.assertEqual(res, ["llvm-mc: error: invalid instruction"])
+            sub_run.assert_not_called()
+
     def test_judge_counts_skips_and_mismatches(self):
         import unittest.mock as mock
         obs = ["v_mov_b32 v8, v1", "v_mov_b32 v9, v2", "v_mov_b32 v10, v3", "v_mov_b32 v11, v4"]
