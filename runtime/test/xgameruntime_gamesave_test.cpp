@@ -4,6 +4,7 @@
 // game data, nothing online.
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -308,6 +309,44 @@ int main() {
         at<Close>(save, 24)(save, du);
         at<Close>(save, 17)(save, dc);
         check(at<ByName>(save, 10)(save, provider, device) == S_OK, "DeleteContainer removes it");
+    }
+
+    // ---- saves written before the escape: unescaped names, through Win32 ----
+    {
+        const auto old_dir = root / L"local-user" / L"old";
+        std::filesystem::create_directories(old_dir);
+        std::ofstream(old_dir / L"story", std::ios::binary) << "plain";
+        std::ofstream(old_dir / L"data.", std::ios::binary) << "dotted";
+        Handle oc = nullptr, ou = nullptr;
+        check(at<Create>(save, 16)(save, provider, "old", &oc) == S_OK, "a container saved before the escape opens");
+        const char* onames[] = {"story", "data."};
+        std::vector<uint64_t> obuf(64);
+        auto* oout = reinterpret_cast<Blob*>(obuf.data());
+        uint32_t ocount = 2;
+        check(at<Read>(save, 20)(save, oc, onames, &ocount, obuf.size() * 8, oout) == S_OK && ocount == 2 &&
+                  oout[0].info.size == 5 && std::memcmp(oout[0].data, "plain", 5) == 0 && oout[1].info.size == 6 &&
+                  std::memcmp(oout[1].data, "dotted", 6) == 0,
+              "its blobs \"story\" and \"data.\" read back, byte for byte");
+        check(at<Create>(save, 23)(save, oc, nullptr, &ou) == S_OK &&
+                  at<Write>(save, 25)(save, ou, "data.", reinterpret_cast<const uint8_t*>("fresh"), 5) == S_OK &&
+                  at<Write>(save, 25)(save, ou, "NUL.sav", reinterpret_cast<const uint8_t*>("device"), 6) == S_OK &&
+                  at<Submit>(save, 27)(save, ou) == S_OK,
+              "an update writes \"data.\" again, and \"NUL.sav\"");
+        at<Close>(save, 24)(save, ou);
+        ocount = 1;
+        check(at<Read>(save, 20)(save, oc, onames + 1, &ocount, obuf.size() * 8, oout) == S_OK && ocount == 1 &&
+                  oout[0].info.size == 5 && std::memcmp(oout[0].data, "fresh", 5) == 0,
+              "\"data.\" then reads what the update wrote");
+        const std::filesystem::path unescaped(L"\\\\?\\" + (old_dir / L"NUL.sav").lexically_normal().wstring());
+        std::ofstream(unescaped, std::ios::binary) << "older";
+        Seen oseen;
+        check(at<EnumBlobs>(save, 18)(save, oc, &oseen, on_blob) == S_OK &&
+                  std::count(oseen.names.begin(), oseen.names.end(), "NUL.sav") == 1,
+              "a blob under both spellings is listed once");
+        std::filesystem::remove(unescaped, ec);
+        at<Close>(save, 17)(save, oc);
+        check(at<ByName>(save, 10)(save, provider, "old") == S_OK && !std::filesystem::exists(old_dir),
+              "DeleteContainer removes it");
     }
 
     // ---- async provider, XGameSaveFiles ----

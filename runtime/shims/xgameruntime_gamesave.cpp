@@ -151,7 +151,8 @@ bool decode_name(std::string_view encoded, std::string& out) {
         out += static_cast<char>(hi << 4 | lo);
         i += 2;
     }
-    return storage_name(out) == encoded;   // one spelling per name
+    const std::string base = encode_name(out);
+    return escape_reserved(base) == encoded || base == encoded;   // one spelling per name, or the one before the escape
 }
 
 // XGameSaveCreateContainer's rule: at most 256 characters; a path part (up to the last '/') of [A-Za-z0-9_/], then a
@@ -208,11 +209,24 @@ struct XGameSaveProvider {
     std::string config_id;
     uint64_t serial = 0;
 };
+// Saved before the escape: encode_name() through Win32, which drops a trailing '.' and opens a device name's device.
+fs::path resolve_container_dir(const fs::path& user_dir, std::string_view name) {
+    const fs::path stored = user_dir / widen(storage_name(name)), legacy = user_dir / widen(encode_name(name));
+    std::error_code ec;
+    return !fs::is_directory(stored, ec) && fs::is_directory(legacy, ec) ? legacy : stored;
+}
+
+fs::path resolve_blob_path(const fs::path& dir, std::string_view name) {
+    const fs::path stored = dir / widen(storage_name(name)), legacy = dir / widen(encode_name(name));
+    std::error_code ec;
+    return !fs::is_regular_file(stored, ec) && fs::is_regular_file(legacy, ec) ? legacy : stored;
+}
+
 struct XGameSaveContainer {
     fs::path user_dir;   // the provider's, copied: a container outlives a closed provider safely
     std::string name;
     uint64_t serial = 0;
-    fs::path dir() const { return user_dir / widen(storage_name(name)); }
+    fs::path dir() const { return resolve_container_dir(user_dir, name); }
 };
 struct Op {
     bool write;
@@ -261,8 +275,10 @@ std::vector<BlobFile> list_blobs(const fs::path& dir) {
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(dir, ec)) {
         if (!e.is_regular_file(ec)) continue;
+        const std::string file = narrow(e.path().filename().wstring());
         std::string name;
-        if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
+        if (!decode_name(file, name)) continue;
+        if (file != storage_name(name) && fs::is_regular_file(dir / widen(storage_name(name)), ec)) continue;
         out.push_back({name, static_cast<uint64_t>(e.file_size(ec)), e.path()});
     }
     std::sort(out.begin(), out.end(), [](const BlobFile& a, const BlobFile& b) { return a.name < b.name; });
@@ -314,8 +330,10 @@ std::vector<ContainerRecord> list_containers(const fs::path& user_dir, std::stri
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(user_dir, ec)) {
         if (!e.is_directory(ec)) continue;
+        const std::string file = narrow(e.path().filename().wstring());
         std::string name;
-        if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
+        if (!decode_name(file, name)) continue;
+        if (file != storage_name(name) && fs::is_directory(user_dir / widen(storage_name(name)), ec)) continue;
         if (name.compare(0, prefix.size(), prefix) != 0) continue;
         out.push_back(describe(name, e.path()));
     }
@@ -386,7 +404,7 @@ HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32
         for (const BlobFile& b : list_blobs(dir)) wanted.push_back(b.name);
     }
     for (const std::string& name : wanted) {
-        std::ifstream f(dir / widen(storage_name(name)), std::ios::binary);
+        std::ifstream f(resolve_blob_path(dir, name), std::ios::binary);
         if (!f) return E_GS_BLOB_NOT_FOUND;
         out.push_back({name, std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>())});
     }
@@ -427,8 +445,12 @@ HRESULT commit(XGameSaveUpdate* u) {
     for (const auto& [temp, final_path] : renames)
         if (!MoveFileExW(temp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
             return E_GS_OUT_OF_LOCAL_STORAGE;
-    for (const auto& [name, op] : u->ops)
-        if (!op.write) fs::remove(dir / widen(storage_name(name)), ec);
+    for (const auto& [name, op] : u->ops) {
+        if (op.write) continue;
+        fs::remove(dir / widen(storage_name(name)), ec);
+        if (encode_name(name).back() != '.')   // "a." was saved as "a", which blob "a" may own
+            fs::remove(resolve_blob_path(dir, name), ec);
+    }
     if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
     return S_OK;
 }
@@ -472,6 +494,7 @@ HRESULT delete_container(XGameSaveProviderHandle p, const char* name) {
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
     std::error_code ec;
     fs::remove_all(p->user_dir / widen(storage_name(name)), ec);
+    if (!ec) fs::remove_all(resolve_container_dir(p->user_dir, name), ec);
     return ec ? E_FAIL : S_OK;
 }
 
@@ -690,7 +713,7 @@ HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, 
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
-    const fs::path dir = p->user_dir / widen(storage_name(name));
+    const fs::path dir = resolve_container_dir(p->user_dir, name);
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) return S_OK;
     const ContainerRecord c = describe(name, dir);
