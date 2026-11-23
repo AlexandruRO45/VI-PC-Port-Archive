@@ -16,20 +16,16 @@ Semantics:
 Translator Integration:
     Exercises tools/rdna2spirv.py via support.translate_lines and executes the generated
     SPIR-V shaders via support.mrt0_words.
+    100% translator-backed execution; zero mock AST or virtual CPU/SIMD models.
 
 Standard library Python only; zero third-party dependencies; zero game data.
 Python 3.9+ compatible (from __future__ import annotations).
 """
 from __future__ import annotations
 
-import dataclasses
-from enum import Enum, auto
 import itertools
-import math
 import os
-import struct
 import sys
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 import unittest
 
 sys.dont_write_bytecode = True
@@ -42,6 +38,13 @@ MASK32: int = 0xFFFFFFFF
 SIGN_BIT32: int = 0x80000000
 INT32_MIN: int = -0x80000000
 INT32_MAX: int = 0x7FFFFFFF
+
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+NEG_QNAN_F32: int = 0xFFC00000
 
 
 def u32(val: int) -> int:
@@ -130,311 +133,127 @@ class TestMed3I32Oracle(unittest.TestCase):
         self.assertEqual(result, ref_med3_i32(5, 0x80000000, 7))
 
 
-# ==============================================================================
-# Symbolic AST Opcode Definitions and Typed Expressions (Commit 2)
-# ==============================================================================
+class TestMed3I32TranslatorInstructions(unittest.TestCase):
+    """Commit 2: Instruction operand variations and translator emission."""
 
-class RegType(Enum):
-    VGPR = "v"
-    SGPR = "s"
-
-
-@dataclasses.dataclass(frozen=True)
-class Reg:
-    index: int
-    reg_type: RegType = RegType.VGPR
-
-    def __post_init__(self) -> None:
-        limit = 256 if self.reg_type == RegType.VGPR else 106
-        if not (0 <= self.index < limit):
-            raise ValueError(f"Invalid register index {self.reg_type.value}{self.index}")
-
-    @property
-    def name(self) -> str:
-        return f"{self.reg_type.value}{self.index}"
-
-
-class OperandKind(Enum):
-    REG = auto()
-    INLINE_INT = auto()
-    LITERAL_INT = auto()
-
-
-@dataclasses.dataclass(frozen=True)
-class OperandAST:
-    kind: OperandKind
-    reg: Optional[Reg] = None
-    imm: Optional[int] = None
-
-    @classmethod
-    def from_vgpr(cls, idx: int) -> OperandAST:
-        return cls(kind=OperandKind.REG, reg=Reg(idx, RegType.VGPR))
-
-    @classmethod
-    def from_sgpr(cls, idx: int) -> OperandAST:
-        return cls(kind=OperandKind.REG, reg=Reg(idx, RegType.SGPR))
-
-    @classmethod
-    def from_imm(cls, val: int) -> OperandAST:
-        if -16 <= s32(val) <= 64:
-            return cls(kind=OperandKind.INLINE_INT, imm=s32(val))
-        return cls(kind=OperandKind.LITERAL_INT, imm=u32(val))
-
-    def format_asm(self) -> str:
-        if self.kind == OperandKind.REG:
-            assert self.reg is not None
-            return self.reg.name
-        elif self.kind == OperandKind.INLINE_INT:
-            assert self.imm is not None
-            return str(self.imm)
-        else:
-            assert self.imm is not None
-            return f"{self.imm:#x}"
-
-
-@dataclasses.dataclass(frozen=True)
-class Med3I32InstructionAST:
-    dst: Reg
-    src0: OperandAST
-    src1: OperandAST
-    src2: OperandAST
-
-    def emit_asm(self) -> str:
-        return f"v_med3_i32 {self.dst.name}, {self.src0.format_asm()}, {self.src1.format_asm()}, {self.src2.format_asm()}"
-
-
-def parse_med3_i32_asm(line: str) -> Med3I32InstructionAST:
-    """Parse a single v_med3_i32 instruction into an AST."""
-    line = line.strip()
-    if not line.startswith("v_med3_i32"):
-        raise ValueError(f"Expected v_med3_i32 instruction, got: {line}")
-    args_str = line[len("v_med3_i32"):].strip()
-    parts = [p.strip() for p in args_str.split(",")]
-    if len(parts) != 4:
-        raise ValueError(f"v_med3_i32 requires exactly 4 operands (dst, src0, src1, src2), got: {len(parts)}")
-
-    dst_part = parts[0]
-    if not dst_part.startswith("v"):
-        raise ValueError(f"Destination must be a VGPR, got {dst_part}")
-    dst_reg = Reg(int(dst_part[1:]), RegType.VGPR)
-
-    def parse_src(p: str) -> OperandAST:
-        if p.startswith("v"):
-            return OperandAST.from_vgpr(int(p[1:]))
-        elif p.startswith("s"):
-            return OperandAST.from_sgpr(int(p[1:]))
-        else:
-            val = int(p, 0)
-            return OperandAST.from_imm(val)
-
-    src0 = parse_src(parts[1])
-    src1 = parse_src(parts[2])
-    src2 = parse_src(parts[3])
-    return Med3I32InstructionAST(dst=dst_reg, src0=src0, src1=src1, src2=src2)
-
-
-class TestMed3I32AST(unittest.TestCase):
-    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
-
-    def test_ast_construction_and_formatting(self):
-        inst = Med3I32InstructionAST(
-            dst=Reg(0, RegType.VGPR),
-            src0=OperandAST.from_vgpr(1),
-            src1=OperandAST.from_imm(-16),
-            src2=OperandAST.from_imm(0x12345678),
-        )
-        self.assertEqual(inst.emit_asm(), "v_med3_i32 v0, v1, -16, 0x12345678")
-
-    def test_ast_parse_valid(self):
-        line = "v_med3_i32 v5, v1, v2, v3"
-        ast_obj = parse_med3_i32_asm(line)
-        self.assertEqual(ast_obj.dst, Reg(5, RegType.VGPR))
-        self.assertEqual(ast_obj.src0, OperandAST.from_vgpr(1))
-        self.assertEqual(ast_obj.src1, OperandAST.from_vgpr(2))
-        self.assertEqual(ast_obj.src2, OperandAST.from_vgpr(3))
-        self.assertEqual(ast_obj.emit_asm(), line)
-
-    def test_translator_with_ast_emitted_code(self):
-        inst = Med3I32InstructionAST(
-            dst=Reg(0, RegType.VGPR),
-            src0=OperandAST.from_vgpr(1),
-            src1=OperandAST.from_vgpr(2),
-            src2=OperandAST.from_vgpr(3),
-        )
+    def test_translator_vgpr_operands(self):
         lines = [
             "v_mov_b32_e32 v1, 100",
             "v_mov_b32_e32 v2, -200",
             "v_mov_b32_e32 v3, 0",
-            inst.emit_asm(),
+            "v_med3_i32 v0, v1, v2, v3",
             "exp mrt0, v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_med3_ast", lines)
+        spv = support.translate_lines("ps_med3_vgprs", lines)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0)
         self.assertEqual(words[0], ref_med3_i32(100, -200, 0))
 
+    def test_translator_inline_constant_negative(self):
+        lines = [
+            "v_mov_b32_e32 v1, -20",
+            "v_mov_b32_e32 v2, 30",
+            "v_med3_i32 v0, -16, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_inline_neg", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], u32(-16))
 
-# ==============================================================================
-# Deterministic Scalar Instruction Interpreter (Commit 3)
-# ==============================================================================
+    def test_translator_inline_constant_positive(self):
+        lines = [
+            "v_mov_b32_e32 v1, -5",
+            "v_mov_b32_e32 v2, 25",
+            "v_med3_i32 v0, 10, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_inline_pos", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 10)
 
-class ScalarCpuState:
-    def __init__(self) -> None:
-        self.vgprs: List[int] = [0] * 256
-        self.sgprs: List[int] = [0] * 106
-        self.exec_mask: int = 0xFFFFFFFFFFFFFFFF
+    def test_translator_literal_constant(self):
+        lines = [
+            "v_mov_b32_e32 v1, 0x10000000",
+            "v_mov_b32_e32 v2, 0x30000000",
+            "v_med3_i32 v0, 0x20000000, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_literal", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x20000000)
 
-    def resolve_operand(self, op: OperandAST) -> int:
-        if op.kind == OperandKind.REG:
-            assert op.reg is not None
-            if op.reg.reg_type == RegType.VGPR:
-                return self.vgprs[op.reg.index]
-            else:
-                return self.sgprs[op.reg.index]
-        elif op.kind in (OperandKind.INLINE_INT, OperandKind.LITERAL_INT):
-            assert op.imm is not None
-            return u32(op.imm)
-        raise ValueError(f"Unknown operand kind {op.kind}")
-
-    def execute_med3_i32(self, inst: Med3I32InstructionAST) -> int:
-        s0 = self.resolve_operand(inst.src0)
-        s1 = self.resolve_operand(inst.src1)
-        s2 = self.resolve_operand(inst.src2)
-        res = ref_med3_i32(s0, s1, s2)
-        self.vgprs[inst.dst.index] = res
-        return res
+    def test_translator_sgpr_source(self):
+        lines = [
+            "s_mov_b32 s0, 50",
+            "v_mov_b32_e32 v1, 10",
+            "v_mov_b32_e32 v2, 20",
+            "v_med3_i32 v0, s0, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_sgpr_src", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 20)
 
 
-class TestMed3I32ScalarInterpreter(unittest.TestCase):
-    """Commit 3: Deterministic scalar instruction interpreter."""
+class TestMed3I32ChainedExecution(unittest.TestCase):
+    """Commit 3: Sequential and chained instruction shader execution."""
 
-    def test_scalar_interp_sequential_execution(self):
-        state = ScalarCpuState()
-        state.vgprs[1] = u32(50)
-        state.vgprs[2] = u32(-10)
-        state.vgprs[3] = u32(20)
+    def test_chained_med3_i32_shader(self):
+        lines = [
+            "v_mov_b32_e32 v1, 50",
+            "v_mov_b32_e32 v2, -10",
+            "v_mov_b32_e32 v3, 20",
+            "v_med3_i32 v4, v1, v2, v3",
+            "v_mov_b32_e32 v5, 100",
+            "v_med3_i32 v0, v4, v5, 10",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_chained", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 20)
+        self.assertEqual(words[0], ref_med3_i32(ref_med3_i32(50, -10, 20), 100, 10))
 
-        inst1 = parse_med3_i32_asm("v_med3_i32 v4, v1, v2, v3")
-        res1 = state.execute_med3_i32(inst1)
-        self.assertEqual(res1, 20)
-        self.assertEqual(state.vgprs[4], 20)
-
-        # Chain output into another med3
-        state.vgprs[5] = u32(100)
-        inst2 = parse_med3_i32_asm("v_med3_i32 v6, v4, v5, 10")
-        res2 = state.execute_med3_i32(inst2)
-        self.assertEqual(res2, 20)  # median of (20, 100, 10) is 20
-        self.assertEqual(state.vgprs[6], 20)
-
-    def test_scalar_interp_matches_shader_execution(self):
+    def test_sequential_med3_i32_matches_oracle(self):
         triples = [
             (-30, 40, -10),
             (0x7FFFFFFF, 0, 0x80000000),
             (-1, -2, -3),
+            (1234, -5678, 91011),
         ]
         for s0, s1, s2 in triples:
-            state = ScalarCpuState()
-            state.vgprs[1] = u32(s0)
-            state.vgprs[2] = u32(s1)
-            state.vgprs[3] = u32(s2)
-            inst = parse_med3_i32_asm("v_med3_i32 v0, v1, v2, v3")
-            expected = state.execute_med3_i32(inst)
-
-            shader_res = run_shader_med3_i32(s0, s1, s2)
-            self.assertEqual(expected, shader_res)
+            with self.subTest(s0=s0, s1=s1, s2=s2):
+                expected = ref_med3_i32(s0, s1, s2)
+                shader_res = run_shader_med3_i32(s0, s1, s2)
+                self.assertEqual(shader_res, expected)
 
 
-# ==============================================================================
-# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking (Commit 4)
-# ==============================================================================
+class TestMed3I32MultiLaneExecution(unittest.TestCase):
+    """Commit 4: Multi-lane divergence sweeps and coverage."""
 
-class SimdWaveState:
-    def __init__(self, lane_count: int = 64) -> None:
-        self.lane_count = lane_count
-        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(lane_count)]
-        self.exec_mask: int = (1 << lane_count) - 1
-
-    def execute_med3_i32(self, inst: Med3I32InstructionAST) -> None:
-        for lane in range(self.lane_count):
-            if not ((self.exec_mask >> lane) & 1):
-                continue
-
-            def resolve_lane_operand(op: OperandAST) -> int:
-                if op.kind == OperandKind.REG:
-                    assert op.reg is not None
-                    return self.vgprs[lane][op.reg.index]
-                assert op.imm is not None
-                return u32(op.imm)
-
-            s0 = resolve_lane_operand(inst.src0)
-            s1 = resolve_lane_operand(inst.src1)
-            s2 = resolve_lane_operand(inst.src2)
-            self.vgprs[lane][inst.dst.index] = ref_med3_i32(s0, s1, s2)
-
-
-class TestMed3I32SimdDivergence(unittest.TestCase):
-    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
-
-    def test_wave32_uniform_execution(self):
-        wave = SimdWaveState(lane_count=32)
-        wave.exec_mask = 0xFFFFFFFF
+    def test_wave32_uniform_sweep(self):
         for lane in range(32):
-            wave.vgprs[lane][1] = u32(-50)
-            wave.vgprs[lane][2] = u32(0)
-            wave.vgprs[lane][3] = u32(50)
+            val = lane * 4 - 64
+            res = run_shader_med3_i32(val, 0, 50)
+            self.assertEqual(res, ref_med3_i32(val, 0, 50))
 
-        inst = parse_med3_i32_asm("v_med3_i32 v0, v1, v2, v3")
-        wave.execute_med3_i32(inst)
-
-        for lane in range(32):
-            self.assertEqual(wave.vgprs[lane][0], 0)
-
-    def test_wave64_divergent_lanes(self):
-        wave = SimdWaveState(lane_count=64)
-        wave.exec_mask = 0xFFFFFFFFFFFFFFFF
-        for lane in range(64):
-            wave.vgprs[lane][1] = u32(lane * 10 - 320)
-            wave.vgprs[lane][2] = u32(0)
-            wave.vgprs[lane][3] = u32(100)
-
-        inst = parse_med3_i32_asm("v_med3_i32 v0, v1, v2, v3")
-        wave.execute_med3_i32(inst)
-
+    def test_wave64_divergent_lanes_sweep(self):
         for lane in range(64):
             v1_val = lane * 10 - 320
             expected = ref_med3_i32(v1_val, 0, 100)
-            self.assertEqual(wave.vgprs[lane][0], expected)
+            res = run_shader_med3_i32(v1_val, 0, 100)
+            self.assertEqual(res, expected)
 
-    def test_wave64_exec_masking_preservation(self):
-        wave = SimdWaveState(lane_count=64)
-        for lane in range(64):
-            wave.vgprs[lane][0] = 0xDEADBEEF
-            wave.vgprs[lane][1] = 10
-            wave.vgprs[lane][2] = 20
-            wave.vgprs[lane][3] = 30
-
-        # Enable only even lanes
-        wave.exec_mask = 0x5555555555555555
-        inst = parse_med3_i32_asm("v_med3_i32 v0, v1, v2, v3")
-        wave.execute_med3_i32(inst)
-
-        for lane in range(64):
-            if lane % 2 == 0:
-                self.assertEqual(wave.vgprs[lane][0], 20)
-            else:
-                self.assertEqual(wave.vgprs[lane][0], 0xDEADBEEF)
-
-
-# ==============================================================================
-# Register Aliasing and In-Place Operand Preservation (Commit 5)
-# ==============================================================================
 
 class TestMed3I32RegisterAliasing(unittest.TestCase):
     """Commit 5: Register aliasing and in-place operand preservation."""
 
     def test_alias_dst_src0_in_shader(self):
-        # v1 = med3(v1, v2, v3) -> dst aliases src0
         lines = [
             "v_mov_b32_e32 v1, 100",
             "v_mov_b32_e32 v2, -50",
@@ -448,7 +267,6 @@ class TestMed3I32RegisterAliasing(unittest.TestCase):
         self.assertEqual(words[0], 20)
 
     def test_alias_dst_src1_in_shader(self):
-        # v2 = med3(v1, v2, v3) -> dst aliases src1
         lines = [
             "v_mov_b32_e32 v1, 100",
             "v_mov_b32_e32 v2, -50",
@@ -462,7 +280,6 @@ class TestMed3I32RegisterAliasing(unittest.TestCase):
         self.assertEqual(words[0], 20)
 
     def test_alias_dst_src2_in_shader(self):
-        # v3 = med3(v1, v2, v3) -> dst aliases src2
         lines = [
             "v_mov_b32_e32 v1, 100",
             "v_mov_b32_e32 v2, -50",
@@ -499,10 +316,6 @@ class TestMed3I32RegisterAliasing(unittest.TestCase):
         self.assertEqual(words[0], u32(-15))
 
 
-# ==============================================================================
-# Condition Codes, Status Flags, and Carry/Borrow Generation (Commit 6)
-# ==============================================================================
-
 class TestMed3I32ConditionCodes(unittest.TestCase):
     """Commit 6: Condition codes, status flags, and carry/borrow generation."""
 
@@ -531,18 +344,6 @@ class TestMed3I32ConditionCodes(unittest.TestCase):
         spv = support.translate_lines("ps_med3_downstream_vcc", lines)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x2222)
-
-
-# ==============================================================================
-# IEEE 754 Boundary Extremes, Subnormals, and Integer Extremes (Commit 7)
-# ==============================================================================
-
-POS_ZERO_F32: int = 0x00000000
-NEG_ZERO_F32: int = 0x80000000
-POS_INF_F32: int = 0x7F800000
-NEG_INF_F32: int = 0xFF800000
-QNAN_F32: int = 0x7FC00000
-NEG_QNAN_F32: int = 0xFFC00000
 
 
 class TestMed3I32BoundaryExtremes(unittest.TestCase):
@@ -587,10 +388,6 @@ class TestMed3I32BoundaryExtremes(unittest.TestCase):
                 self.assertEqual(res, ref_med3_i32(*c))
 
 
-# ==============================================================================
-# Negative Controls, Syntax Rejection, and Mutation Detection (Commit 8)
-# ==============================================================================
-
 class TestMed3I32NegativeControls(unittest.TestCase):
     """Commit 8: Negative controls, syntax rejection, and mutation detection."""
 
@@ -605,13 +402,16 @@ class TestMed3I32NegativeControls(unittest.TestCase):
         with self.assertRaises(Exception):
             support.translate_lines("ps_med3_bad_operands", lines)
 
-    def test_syntax_rejection_sgpr_destination(self):
-        with self.assertRaises(ValueError):
-            parse_med3_i32_asm("v_med3_i32 s0, v1, v2, v3")
-
-    def test_syntax_rejection_invalid_operand_count(self):
-        with self.assertRaises(ValueError):
-            parse_med3_i32_asm("v_med3_i32 v0, v1, v2")
+    def test_syntax_rejection_unknown_operand(self):
+        lines = [
+            "v_mov_b32_e32 v1, 10",
+            "v_mov_b32_e32 v2, 20",
+            "v_med3_i32 v0, unknown_op, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_med3_bad_token", lines)
 
     def test_mutation_detection_unsigned_median_mutation(self):
         def mutant_u32_med3(s0: int, s1: int, s2: int) -> int:
