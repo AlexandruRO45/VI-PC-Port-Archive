@@ -2637,6 +2637,63 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     return hr;
 }
 
+// Device slot 133 places a resource at a virtual address: (va, desc, initial_state, clear_value, riid, out), the
+// shape of the console's CreatePlacedResourceX. Measured locally at a title's call sites: riid is ID3D12Resource, va is
+// the start of a range the title has just reserved for physical pages, desc is a 56-byte D3D12_RESOURCE_DESC with
+// Xbox bits in Flags above the PC flags, and initial_state is all ones, which is no PC state. The PC has no call that
+// puts a resource at a caller's address, so this creates a committed DEFAULT-heap resource from the cleaned
+// description: the PC flags only, slot 76's layout rule, COMMON for a buffer or an all-ones state, and the clear value
+// only for a render target or depth texture. The resource is not backed by the memory at va: what the title writes
+// there does not reach it. Backing it needs the physical-page mapper; until then this gets the title past the call.
+constexpr std::uint32_t kPcResourceFlags = 0x3FF;  // D3D12_RESOURCE_FLAG_* up to USE_TIGHT_ALIGNMENT (0x200)
+
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
+                                       std::uint32_t initial_state, const D3D12_CLEAR_VALUE* clear_value,
+                                       const IID* riid, void** out) {
+    note_slot(133);
+    if (out) *out = nullptr;
+    if (!xbox_desc) return E_INVALIDARG;
+    if (!riid || !out) return E_POINTER;
+
+    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
+    const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    const auto state = (buffer || initial_state == 0xFFFFFFFFu) ? D3D12_RESOURCE_STATE_COMMON
+                                                                 : static_cast<D3D12_RESOURCE_STATES>(initial_state);
+    const bool clearable =
+        !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+
+    static std::atomic<unsigned> calls{0};
+    const unsigned call = calls.fetch_add(1, std::memory_order_relaxed);
+    if (call < 8)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 CreatePlacedResourceX #%u va=0x%llx dimension=%d flags=0x%x -> 0x%x "
+                     "width=0x%llx height=%u layout=0x%x state=0x%x\n",
+                     call, static_cast<unsigned long long>(va), static_cast<int>(pc_desc.Dimension), xbox_flags,
+                     static_cast<unsigned>(pc_desc.Flags), static_cast<unsigned long long>(pc_desc.Width),
+                     pc_desc.Height, static_cast<unsigned>(pc_desc.Layout), initial_state);
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                     D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, state,
+                                               clearable ? clear_value : nullptr, *riid, out);
+}
+
+// Slot 74: the retail title calls it once with (pointer, u32, pointer) (kapitche, issue 7231). The PC slot 74 is
+// ID3D12Device9::ShaderCacheControl(kinds, control), which reads the first word as a flags value and returns
+// E_INVALIDARG, and the title then stops on an int3. The words are not measured: nothing is written through the
+// pointers, the PC device is not called, and the call succeeds.
+std::uint64_t proxy_slot74(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3) {
+    static std::atomic<bool> logged{false};
+    bool expected = false;
+    if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 74 (pointer, u32, pointer) returns S_OK; words 0x%llx 0x%llx 0x%llx\n",
+                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(a3));
+    return hr_to_u64(S_OK);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2668,6 +2725,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                   reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 74) {
+        note_slot(Slot);
+        return proxy_slot74(a1, a2, a3);
     } else if constexpr (Slot == 13) {
         return hr_to_u64(proxy_check_feature_support(self, a1, a2, a3, a4, a5));
     } else if constexpr (Slot == 75) {
@@ -3094,10 +3154,10 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 13 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 ||
-        slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 ||
-        slot == 46 || slot == 50 || slot == 56 || slot == 62 || slot == 67 || slot == 70 || slot == 75 || slot == 76 ||
-        slot == 86 || slot == 101 || slot == 108 || slot == 127 || slot == 133)
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 13 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||
+        slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 ||
+        slot == 56 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 ||
+        slot == kCreateCommittedResource3X || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
