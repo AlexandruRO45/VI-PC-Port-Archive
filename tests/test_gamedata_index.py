@@ -443,5 +443,87 @@ class BuildRowsReadCountTest(unittest.TestCase):
                          [0x1000, 0x2000])
 
 
+BAD_INDEXES = [
+    ("empty object", {}),
+    ("list of an empty object", [{}]),
+    ("list of an int", [1]),
+    ("a string", "x"),
+    ("files is an int", {"files": 5}),
+    ("row has no off", {"files": [{}]}),
+    ("row off is a string", {"files": [{"off": "x"}]}),
+    ("row off is a bool", {"files": [{"off": True}]}),
+    ("row is not an object", {"files": [1]}),
+]
+
+# CLI -> exit code it gives a bad carve index today: one stderr line, no traceback.
+# content_definitions.py counts the folder as a failed input and prints no stderr line at all.
+BAD_INDEX_CLIS = [
+    ("timecycle_pairs.py", 2),
+    ("gamedata_index.py", 2),
+    ("gamedata_blobs.py", 1),
+    ("gamedata_xml.py", 2),
+    ("text_tables.py", 2),
+    ("script_qtable.py", 1),
+    ("psin_psch.py", 1),
+    ("veh_spawn_intensities.py", 2),
+    ("content_definitions.py", 1),
+]
+
+
+class DirectorySourceShapeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def write_index(self, doc):
+        with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f)
+
+    def test_wrong_shapes_raise_value_error_naming_index_json(self):
+        for name, doc in BAD_INDEXES:
+            with self.subTest(name):
+                self.write_index(doc)
+                with self.assertRaises(ValueError) as caught:
+                    T.DirectorySource(self.dir)
+                message = str(caught.exception)
+                self.assertIn(os.path.join(self.dir, "index.json"), message)
+                self.assertIn("not an rpf9_carve index", message)
+
+    def test_minimal_valid_index_still_loads(self):
+        self.write_index({"files": [{"off": 0x2000}, {"off": 0x1000, "stored": 4}]})
+        source = T.DirectorySource(self.dir)
+        self.assertEqual([r["off"] for r in source.rows], [0x1000, 0x2000])
+        self.assertEqual(source.summary, {})
+
+    def test_empty_files_list_loads(self):
+        self.write_index({"files": [], "summary": {"x": 1}})
+        source = T.DirectorySource(self.dir)
+        self.assertEqual(source.rows, [])
+        self.assertEqual(source.summary, {"x": 1})
+
+    def test_malformed_json_stays_a_value_error(self):
+        with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("{")
+        with self.assertRaises(ValueError):
+            T.DirectorySource(self.dir)
+
+    def test_cli_callers_report_a_wrong_shaped_index_on_one_line(self):
+        tools_dir = os.path.join(ROOT, "tools")
+        self.write_index({})
+        for tool, code in BAD_INDEX_CLIS:
+            with self.subTest(tool):
+                result = subprocess.run([sys.executable, "-I", os.path.join(tools_dir, tool), self.dir],
+                                        cwd=ROOT, capture_output=True, text=True, timeout=60)
+                self.assertNotIn("Traceback", result.stderr, result.stderr)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                lines = result.stderr.strip().splitlines()
+                if tool == "content_definitions.py":
+                    self.assertEqual(lines, [])
+                else:
+                    self.assertEqual(len(lines), 1, result.stderr)
+                    self.assertIn("index.json", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()

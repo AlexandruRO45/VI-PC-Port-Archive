@@ -195,8 +195,24 @@ class DirectorySource:
 
     def __init__(self, directory: str):
         self.directory = directory
-        with open(os.path.join(directory, "index.json"), encoding="utf-8") as f:
+        index_path = os.path.join(directory, "index.json")
+        with open(index_path, encoding="utf-8") as f:
             self.index = json.load(f)
+        reason = None
+        if not isinstance(self.index, dict):
+            reason = "top level is not an object"
+        elif not isinstance(self.index.get("files"), list):
+            reason = "no 'files' list"
+        else:
+            for i, row in enumerate(self.index["files"]):
+                if not isinstance(row, dict):
+                    reason = f"row {i} is not an object"
+                elif not isinstance(row.get("off"), int) or isinstance(row["off"], bool):
+                    reason = f"row {i} has no integer 'off'"
+                if reason:
+                    break
+        if reason:
+            raise ValueError(f"{index_path}: not an rpf9_carve index ({reason})")
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
 
     def read(self, row: dict) -> bytes:
