@@ -760,3 +760,23 @@ class TestCmpxClassF16NegativeAndTranslator(unittest.TestCase):
     def test_spirv_opcode_lowering_hardware(self):
         _, spv = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=True, test_id="lowering")
         self.assertIn("OpStore %active", spv)
+
+
+# ------------------------------------------------------------------------------
+# v_cmpx_class_f32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+class TestCmpxClassF32Oracle(unittest.TestCase):
+    def test_oracle_cmpx_matches_hardware(self):
+        val_match, _ = run_cmp_shader("f32", 0x3F800000, CLASS_POS_NORMAL, is_cmpx=True, test_id="cmpx_match")
+        self.assertEqual(val_match, 1)
+
+        val_mismatch, _ = run_cmp_shader("f32", 0x3F800000, CLASS_NEG_INF, is_cmpx=True, test_id="cmpx_mismatch")
+        self.assertEqual(val_mismatch, 0)
+
+    def test_cmpx_identity_hardware(self):
+        val_all, _ = run_cmp_shader("f32", 0x7F800000, CLASS_ALL, is_cmpx=True, test_id="cmpx_id_all")
+        self.assertEqual(val_all, 1)
+
+        val_zero, _ = run_cmp_shader("f32", 0x7F800000, 0, is_cmpx=True, test_id="cmpx_id_zero")
+        self.assertEqual(val_zero, 0)
