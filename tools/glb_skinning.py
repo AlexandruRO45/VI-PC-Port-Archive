@@ -23,6 +23,7 @@ problems also exit nonzero with a one-line ``ERROR:`` message.
 
 Only the standard library is used, and the input is read, never modified.
 A missing input path is a usage error: one `ERROR:` line to stderr and exit 2 (no traceback).
+Usage: `python -I tools/glb_skinning.py --help` lists the options.
 """
 from __future__ import annotations
 
