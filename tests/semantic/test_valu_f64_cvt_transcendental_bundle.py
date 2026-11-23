@@ -652,6 +652,28 @@ class VSqrtF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 0, res)
         self.assertEqual(wave.get_f64(0, 0), f64_to_u64(12.0))
 
+class VSqrtF64SimdIeeeTests(unittest.TestCase):
+    def test_sqrt_f64_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x0F0F0F0F
+        for i in range(32):
+            wave.set_f64(i, 0, 0x5555AAAA5555AAAA)
+            if (wave.exec_mask >> i) & 1:
+                sq = float(i * i)
+                wave.set_f64(i, 0, oracle_sqrt_f64(f64_to_u64(sq)))
+        for i in range(32):
+            if (0x0F0F0F0F >> i) & 1:
+                self.assertEqual(wave.get_f64(i, 0), f64_to_u64(float(i)))
+            else:
+                self.assertEqual(wave.get_f64(i, 0), 0x5555AAAA5555AAAA)
+
+    def test_sqrt_f64_subnormal_precision(self):
+        # Square of 2^-500 is 2^-1000, which is a small positive normal float64
+        val = 2.0**-500
+        sq_val = val * val
+        res = oracle_sqrt_f64(f64_to_u64(sq_val))
+        self.assertEqual(u64_to_f64(res), val)
+
 
 if __name__ == "__main__":
     unittest.main()
