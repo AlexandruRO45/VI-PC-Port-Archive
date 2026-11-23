@@ -42,6 +42,7 @@ CAUGHT = [
     ("shader.txt", b"XBCH" + (3).to_bytes(4, "little") + bytes(8), "XBCH shader container"),
     ("shader2.txt", b"FSSM" + bytes(12), "FSSM shader"),
     ("container.txt", b"DXBC" + bytes(12), "DXBC container"),
+    ("payload.bin", b"FSPX" + bytes(12), "FSPX shader payload"),
     ("module.txt", bytes.fromhex("03022307") + bytes(12), "SPIR-V module"),
     ("module_be.txt", bytes.fromhex("07230203") + bytes(12), "SPIR-V module"),
     ("texture.png.txt", b"DDS " + (124).to_bytes(4, "little") + bytes(8), "DDS texture"),
@@ -76,6 +77,8 @@ PASSED = [
     ("mz.txt", b"MZ is not enough on its own\n"),
     ("metadata.txt", b"METADATA ADAT later in the line\n"),
     ("bones.md", b"# SKEL_HEAD, MoVE and SCRP name formats; none of them starts this file\n"),
+    ("fspx_note.md", b"The FidelityFX ACCC part is an FSPX payload; this file starts with text.\n"),
+    ("fspx_short.bin", b"FSP"),  # three bytes of the magic, not four
     ("riff.bin", b"RIFF" + bytes(4) + b"AVI LIST"),
     ("empty.txt", b""),
     ("mz_past_end.txt", pe_header(0x80)[:0x40]),  # e_lfanew points past the end of the file
