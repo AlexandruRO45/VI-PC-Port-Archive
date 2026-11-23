@@ -677,6 +677,19 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
             self.assertNotIn("Traceback", err.getvalue())
             self.assertFalse(out.exists())
 
+    def test_missing_numpy_reports_error_without_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            blob = root / "blob.bin"
+            blob.write_bytes(bytes(512))
+            err = io.StringIO()
+            with mock.patch.object(self.mod, "search", side_effect=ModuleNotFoundError("No module named 'numpy'", name="numpy")), \
+                 mock.patch.object(sys, "stderr", err):
+                rc = self.mod.main([str(blob), "--bpe", "8", "--tile", "128", "--widths", "64"])
+            self.assertEqual(rc, 1)
+            self.assertIn("ERROR: search requires numpy (pip install numpy)", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
 
 def test_preview_with_no_fitting_layout_reports_the_problem(tmp_path=None):
     """Module-level compatibility wrapper for pytest with tmp_path fixture."""

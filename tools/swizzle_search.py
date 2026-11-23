@@ -168,7 +168,13 @@ def main(argv=None):
     except OSError as e:  # a missing or unreadable input: one ERROR line, as the other tools do
         print(f"ERROR: cannot read {a.blob}: {e.strerror or e}", file=sys.stderr)
         return 2
-    res = search(data, a.bpe, a.tile, widths, a.tiles)
+    try:
+        res = search(data, a.bpe, a.tile, widths, a.tiles)
+    except ModuleNotFoundError as e:
+        if e.name == "numpy":
+            print("ERROR: search requires numpy (pip install numpy)", file=sys.stderr)
+            return 1
+        raise
     for s, w, seq in res[:8]:
         print(f"score {s:7.2f}  width {w:5}  bits(low->high) {seq}")
     if a.out is not None:
@@ -182,6 +188,11 @@ def main(argv=None):
             rc = render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
             if isinstance(rc, int) and rc != 0:
                 return rc
+        except ModuleNotFoundError as e:
+            if e.name == "numpy":
+                print("ERROR: --out requires numpy (pip install numpy)", file=sys.stderr)
+                return 1
+            raise
         except (OSError, ValueError) as e:
             detail = getattr(e, "strerror", None) or str(e)
             print(f"ERROR: cannot write {a.out}: {detail}", file=sys.stderr)
