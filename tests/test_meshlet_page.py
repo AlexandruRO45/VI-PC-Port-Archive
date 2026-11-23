@@ -4,6 +4,7 @@
 
 Every byte here is built by the test. No game file, value or name is used.
 """
+import io
 import json
 import math
 import os
@@ -13,12 +14,15 @@ import sys
 import tempfile
 import unittest
 import zlib
+from contextlib import redirect_stderr
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "meshlet_page.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import meshlet_page as mp  # noqa: E402
+import report_paths  # noqa: E402
 
 
 def pad16(buf):
@@ -921,6 +925,21 @@ class CliTests(unittest.TestCase):
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
             self.assertFalse(os.path.exists(manifest))
+
+    def test_json_with_an_equivalent_unicode_input_name_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "caf\u00e9.bin")
+            output = os.path.join(tmp, "cafe\u0301.bin")
+            original = page(block(4))
+            with open(source, "wb") as f:
+                f.write(original)
+            stderr = io.StringIO()
+            with (patch.object(report_paths, "case_insensitive_volume", return_value=True),
+                  redirect_stderr(stderr)):
+                self.assertEqual(mp.main([source, "--json", output, "--quiet"]), 2)
+            self.assertIn("would overwrite the input", stderr.getvalue())
+            with open(source, "rb") as f:
+                self.assertEqual(f.read(), original)
 
     def test_json_over_carve_dir_manifest_or_payload_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

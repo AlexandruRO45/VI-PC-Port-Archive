@@ -76,6 +76,11 @@ import struct
 import sys
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from report_paths import same_report_path  # noqa: E402
+
 BLOCK_MAGIC = 0x3063
 OTHER_BLOCK_MAGIC = 0x4042
 HEADER_SIZE = 0x60
@@ -766,7 +771,7 @@ def iter_inputs(paths, existing_report=None):
                         if len(head) == 4 and (head in (b"\x63\x30\x00\x00", b"\x42\x40\x00\x00") or head[3] & 0x80):
                             data = head + fh.read()
                             if is_mesh_page(data):
-                                if existing_report and same_output_path(existing_report, full):
+                                if existing_report and same_report_path(existing_report, full):
                                     raise PageError(f"--json would overwrite the input {full}")
                                 yield os.path.relpath(full, path), data
         elif path.lower().endswith(".rpf"):
@@ -890,23 +895,14 @@ def draw_binding(system, graphics, geometry):
     return {"vertex_block": vertex, "meshlet_group": index, "vertices": count}
 
 
-def same_output_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def is_scanned_input(path, input_path):
     """True when a report path is one of the files the scan reads: writing it would destroy the input."""
-    if same_output_path(path, input_path):
+    if same_report_path(path, input_path):
         return True
     if not os.path.isdir(input_path):
         return False
     # Reserved even before the carve writes it: other tools read <input>/index.json as the carve manifest.
-    if same_output_path(path, os.path.join(input_path, "index.json")):
+    if same_report_path(path, os.path.join(input_path, "index.json")):
         return True
     if not os.path.isfile(path):
         return False
