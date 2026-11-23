@@ -352,6 +352,10 @@ def main(argv=None):
     ap.add_argument("--limit", type=byte_count, help="number of bytes to scan")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
+    if not os.path.exists(a.source):
+        # BUILD-1046: a missing input is one ERROR line, not the raw "[Errno 2] ..." text the scan raises.
+        print(f"ERROR: {a.source}: does not exist", file=sys.stderr)
+        return 2
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.out):
