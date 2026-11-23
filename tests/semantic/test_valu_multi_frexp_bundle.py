@@ -545,5 +545,24 @@ class VFrexpMantF64SimdDivergenceTests(unittest.TestCase):
                 self.assertEqual(wave.get_vgpr(i, 2), 0xAAAAAAAA)
                 self.assertEqual(wave.get_vgpr(i, 3), 0xBBBBBBBB)
 
+class VFrexpMantF64TranslatorTests(unittest.TestCase):
+    def test_frexp_mant_f64_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0x3FF00000",
+            "v_frexp_mant_f64 v[2:3], v[0:1]",
+            "exp mrt0 v2, v3, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_mant_f64_exec", lines)
+        res = mrt0_words(spv)
+        self.assertEqual(res[0], 0x00000000)
+        self.assertEqual(res[1], 0x3FE00000)
+
+    def test_frexp_mant_f64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_frexp_mant_f64", ["v_frexp_mant_f64 v0, v[0:1]"])
+
+
 if __name__ == "__main__":
     unittest.main()
