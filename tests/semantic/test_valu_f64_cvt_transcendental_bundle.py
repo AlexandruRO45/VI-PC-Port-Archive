@@ -221,6 +221,23 @@ class VCvtF32F64SimdIeeeTests(unittest.TestCase):
         # Value smaller than float32 min subnormal underflows to 0.0
         self.assertEqual(oracle_cvt_f32_f64(f64_to_u64(1e-50)), F32_POS_ZERO)
 
+class VCvtF32F64TranslatorTests(unittest.TestCase):
+    def test_cvt_f32_f64_translation(self):
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(3.141592653589793) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(3.141592653589793) >> 32) & MASK32:#010x}",
+            "v_cvt_f32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cvt_f32_f64_test", lines)
+        self.assertIn("OpCapability Float64", spv)
+        self.assertIn("OpFConvert %float", spv)
+
+    def test_cvt_f32_f64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_cvt_f32_f64", ["v_cvt_f32_f64"])
+
 
 if __name__ == "__main__":
     unittest.main()
