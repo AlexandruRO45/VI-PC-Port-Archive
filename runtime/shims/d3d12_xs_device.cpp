@@ -1643,7 +1643,15 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
 // The retail exe also asks for the console signature IID {c36a797c-ec80-4f0a-8985-a7b2475082d1}; the PC runtime does
 // not know it, so the call is made with the PC IID. A null output goes to the real device: its answer is the one
 // Windows gives (E_UNEXPECTED), and the validation suite compares it.
-constexpr D3D12_INDIRECT_ARGUMENT_TYPE kXboxIndirectArgumentDispatch105 = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105);
+// 105 is outside D3D12_INDIRECT_ARGUMENT_TYPE's range, so the field is read as its 32 bits (a constant expression that
+// casts 105 to the enum does not compile with clang-cl).
+constexpr std::uint32_t kXboxIndirectArgumentDispatch105 = 105;
+
+std::uint32_t argument_type(const D3D12_INDIRECT_ARGUMENT_DESC& arg) {
+    std::uint32_t type = 0;
+    std::memcpy(&type, &arg.Type, sizeof(type));
+    return type;
+}
 
 HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                        std::uint64_t root_signature, const IID* riid, void** out) {
@@ -1657,8 +1665,7 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     bool console = false;
     if (desc && desc->pArgumentDescs)
         for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i)
-            console = static_cast<std::uint32_t>(desc->pArgumentDescs[i].Type) ==
-                      static_cast<std::uint32_t>(kXboxIndirectArgumentDispatch105);
+            console = argument_type(desc->pArgumentDescs[i]) == kXboxIndirectArgumentDispatch105;
 
     std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args;
     D3D12_COMMAND_SIGNATURE_DESC pc{};
@@ -1668,8 +1675,7 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
         if (!args) return E_OUTOFMEMORY;
         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
             args[i] = desc->pArgumentDescs[i];
-            if (static_cast<std::uint32_t>(args[i].Type) ==
-                static_cast<std::uint32_t>(kXboxIndirectArgumentDispatch105))
+            if (argument_type(args[i]) == kXboxIndirectArgumentDispatch105)
                 args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
         }
         static std::atomic<bool> logged{false};
