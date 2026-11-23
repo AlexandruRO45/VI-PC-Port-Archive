@@ -37,6 +37,12 @@ happens **on your PC, from your own copy of the game**.
 Discord: https://discord.gg/rexed
 <br>
 
+## Coverage dashboard
+
+![Leonida Codebase & Instruction Coverage](docs/coverage/dashboard.svg)
+
+*Instruction-form and codebase coverage from repository-owned synthetic tests and translator tables; updates automatically every 20 minutes.*
+
 ## Project status
 
 **Early. The game does not boot yet.** Everything that can be done without the game's executable is in place, so
