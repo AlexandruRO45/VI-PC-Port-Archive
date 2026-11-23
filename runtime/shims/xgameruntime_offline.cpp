@@ -49,6 +49,7 @@ using XUserHandle = void*;
 
 // XGameErr.h values, from the GDK "Error codes" page.
 constexpr HRESULT E_GAMESTREAMING_NOT_INITIALIZED = static_cast<HRESULT>(0x89245400);
+constexpr HRESULT E_GAMESTREAMING_CLIENT_NOT_CONNECTED = static_cast<HRESULT>(0x89245401);
 
 constexpr GUID kIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 
@@ -331,9 +332,9 @@ template <int Slot> HRESULT STDMETHODCALLTYPE client_not_connected(void*) {
 static_assert((static_cast<uint32_t>(E_GAMESTREAMING_NOT_INITIALIZED) & 0xFF) == 0, "reads as false in al");
 
 // Public GDK signatures: the client ID is passed through but no client exists offline.
-HRESULT STDMETHODCALLTYPE streaming_register_properties(void*, uint64_t, XTaskQueueHandle queue, void* context,
-                                                        void* callback, XTaskQueueRegistrationToken* token) {
-    return streaming_register_connection(nullptr, queue, context, callback, token);
+HRESULT STDMETHODCALLTYPE streaming_register_properties(void*, uint64_t, XTaskQueueHandle, void*,
+                                                        void*, XTaskQueueRegistrationToken*) {
+    return E_GAMESTREAMING_CLIENT_NOT_CONNECTED;
 }
 HRESULT STDMETHODCALLTYPE streaming_dimensions(void*, uint64_t, uint32_t* width, uint32_t* height) {
     if (width) *width = 0;

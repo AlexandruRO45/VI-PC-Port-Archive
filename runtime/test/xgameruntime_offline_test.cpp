@@ -160,7 +160,7 @@ int main() {
     using Location = HRESULT (STDMETHODCALLTYPE*)(void*, size_t, char*);
     using Session = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, size_t, char*, size_t*);
     token = {};
-    check(at<RegisterProperties>(streaming, 6)(streaming, 0, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == S_OK && token.token != 0 && at<Bool>(streaming, 7)(streaming), "client properties registration and unregister");
+    check(at<RegisterProperties>(streaming, 6)(streaming, 0, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == static_cast<HRESULT>(0x89245401) && token.token == 0, "disconnected client properties registration fails without a token");
     uint32_t width = 99, height = 99;
     check(FAILED(at<Dimensions>(streaming, 8)(streaming, 0, &width, &height)) && width == 0 && height == 0, "offline dimensions are cleared");
     check(at<LocationSize>(streaming, 15)(streaming) == 0, "offline location size is zero");
