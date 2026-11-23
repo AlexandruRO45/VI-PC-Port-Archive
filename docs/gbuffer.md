@@ -43,9 +43,14 @@ Confirming #1891 against the 5-target (`mrt0..mrt4`) and 6-target (`mrt0..mrt5`)
 | `mrt5` (`SV_Target5`) | `0xF` (`RGBA`, 1,690 deferred PS) | `R8G8B8A8_UNORM` | **Sixth deferred target** on the 6-target permutations (`rgb` material terms + clamped alpha). |
 
 ## 3. The 24-bit octahedral normal in `mrt1.gba` and why binding `f16` targets breaks lighting
-semantic_index, component_type, mask, min_precision}` per declared output element. (The FSSM header dword at `+0x0FC`
-holds `5` and `6` on the two sampled `PS_DeferredTextured` blobs below, but holds `16` and `18` on two stock vehicle
-deferred passes, so target counts must be read from `OSG1` rather than FSSM `+0x0FC`.)
+semantic_index, component_type, mask, min_precision}` per declared output element. Target counts must be read from
+`OSG1`: the FSSM header dword at `+0x0FC` is not a target count. Over all 26,503 FSSM blobs, `u32 +0x0F8` plus
+`u32 +0x0FC` equals the number of 20-byte records in the blob's post-code binding table (`tools/fssm_header.py`,
+`binding_table()["groups"]`) in 26,503/26,503, in every stage (`+0x0FC` is 2 in all 195 GS). It equals the
+`OSG1` `SV_Target` count in only 229 of the 12,101 pixel shaders, 40 of the 3,004 `*Deferred*` ones and 19 of the
+807 `PS_DeferredTextured` ones. On the six-target `PS_DeferredTextured` variants it ranges from 5 to 21, on the
+five-target ones from 3 to 20. Reproduce with `python -I tools/fssm_header.py <work>/shaders/dxbc/fssm --bindings`
+(last line); the per-PS comparison reads `OSG1` from the `.dxbc` next to each blob.
 
 Depending on whether container names are matched case-insensitively on raw RPF entry names (`2,989` pixel shaders) or
 case-sensitively on `Deferred` in the carved `.dxbc` file stems (`3,004` pixel shaders, including `807`

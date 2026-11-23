@@ -51,7 +51,11 @@ The post-`code_end` tail carries a binding table.  After 16 bytes of `0xBF9F0000
 8-byte header, 20-byte records run until a `0xFFFFFFFF` sentinel; then `u32 0`, `u16 0`, `u16`
 name length and the name.  `binding_table()` returns those records.  On the local 26,503-blob
 corpus every blob parses (5,640,704 records), and the tail name is a substring of the container
-name in all 26,503 cases, exactly equal in 691.
+name in all 26,503 cases, exactly equal in 691.  The header u32s at 0xF8 and 0xFC split the
+records into two groups: their sum equals the record count in all 26,503 blobs (`groups`).  The
+groups differ in shape: in the first (5,195,311 records) word 2 is 0 or 1, in the second
+(445,393) word 2 is 0 or a multiple of 16 and ascends through the group in 15,967 blobs.  What
+the groups mean is not known; 0xFC is not a render-target count (docs/gbuffer.md).
 
 Usage:
     python -I fssm_header.py <fssm dir or file> [--json] [--limit N] [--bindings]
@@ -89,6 +93,8 @@ TAIL_PAD = 16
 TAIL_HEADER = 8
 BINDING_SIZE = 20
 BINDING_SENTINEL = 0xFFFFFFFF
+BINDING_FIRST_COUNT = 0xF8    # u32: records in the table's first group
+BINDING_SECOND_COUNT = 0xFC   # u32: records in its second group, after the first
 MAX_BINDINGS = 100_000
 
 
@@ -178,9 +184,12 @@ def binding_table(blob):
         +0x08  u16 0, u16 name length
         +0x0C  name bytes
 
-    Keys: code_end, header, records (5-word tuples), name, trailing.  `trailing` counts the
-    bytes after the name, which are not parsed here.  None means the tail is shorter than the
-    layout, lacks the filler or sentinel, or has a malformed length or prefix.
+    Keys: code_end, header, records (5-word tuples), name, trailing, groups.  `trailing` counts
+    the bytes after the name, which are not parsed here.  `groups` is the pair of header u32s
+    at 0xF8 and 0xFC (None when the blob ends before 0x100); on the corpus they sum to the
+    record count in every blob, the first group being the first u32-0xF8 records and the second
+    group the rest.  None means the tail is shorter than the layout, lacks the filler or
+    sentinel, or has a malformed length or prefix.
     """
     if len(blob) < CODE_END + 8:
         return None
@@ -215,6 +224,8 @@ def binding_table(blob):
         "records": records,
         "name": name,
         "trailing": len(blob) - (offset + 12 + length),
+        "groups": (None if len(blob) < BINDING_SECOND_COUNT + 4 else
+                   (_u32(blob, BINDING_FIRST_COUNT), _u32(blob, BINDING_SECOND_COUNT))),
     }
 
 
@@ -291,6 +302,7 @@ def summarize(path, stages, bindings=False):
             "records": len(table["records"]),
             "name": table["name"],
             "trailing": table["trailing"],
+            "groups": None if table["groups"] is None else list(table["groups"]),
         }
     return row
 
@@ -376,7 +388,7 @@ def main(argv=None):
                 print("  bindings unparsed")
             else:
                 print(f"  bindings header={table['header']} records={table['records']} "
-                      f"name_len={len(table['name'])} trailing={table['trailing']}")
+                      f"name_len={len(table['name'])} trailing={table['trailing']} groups={table['groups']}")
     total = summary
     print(f"{total['files']} files, directory_ok {total['directory_ok']}, "
           f"PS with table {total['ps_with_table']}, entries {total['entries']}")
@@ -395,6 +407,9 @@ def main(argv=None):
         exact = sum(1 for row in parsed
                     if os.path.splitext(row["name"])[0].casefold() == row["bindings"]["name"].casefold())
         print(f"binding tables {len(parsed)}, records {records}, tail name equals file stem {exact}")
+        split = sum(1 for row in parsed
+                    if row["bindings"]["groups"] and sum(row["bindings"]["groups"]) == row["bindings"]["records"])
+        print(f"u32 0xF8 + u32 0xFC equals the record count in {split}/{len(parsed)}")
     return 0
 
 

@@ -219,6 +219,36 @@ class BindingTableTest(unittest.TestCase):
     def test_short_blob_is_rejected(self):
         self.assertIsNone(fssm_header.binding_table(b"FSSM"))
 
+    def test_groups_split_the_records(self):
+        data = bytearray(tail_blob([(1, 0, 0, 3, 0), (1, 0, 1, 3, 0), (4, 4, 16, 768, 0)]))
+        struct.pack_into("<II", data, 0xF8, 2, 1)
+        table = fssm_header.binding_table(bytes(data))
+        self.assertEqual(table["groups"], (2, 1))
+        self.assertEqual(sum(table["groups"]), len(table["records"]))
+
+    def test_groups_are_read_not_derived_from_the_records(self):
+        # A lookalike: header words that do not add up to the record count are reported as
+        # stored, so the CLI tally can count the mismatch instead of hiding it.
+        data = bytearray(tail_blob([(1, 2, 3, 4, 5), (6, 7, 8, 9, 10)]))
+        struct.pack_into("<II", data, 0xF8, 5, 6)
+        table = fssm_header.binding_table(bytes(data))
+        self.assertEqual(table["groups"], (5, 6))
+        self.assertNotEqual(sum(table["groups"]), len(table["records"]))
+
+    def test_groups_none_when_the_blob_ends_before_0x100(self):
+        data = bytearray(0xFC)
+        data[0:4] = b"FSSM"
+        struct.pack_into("<Q", data, 0xE8, 0xC0)
+        for i in range(4):
+            struct.pack_into("<I", data, 0xC0 + 4 * i, 0xBF9F0000)
+        struct.pack_into("<I", data, 0xD8, 0xFFFFFFFF)
+        struct.pack_into("<H", data, 0xE2, 1)
+        data[0xE4] = ord("x")
+        # The name sits inside the header words here; only the length check matters.
+        table = fssm_header.binding_table(bytes(data))
+        self.assertIsNotNone(table)
+        self.assertIsNone(table["groups"])
+
 
 class CliTest(unittest.TestCase):
     def setUp(self):
