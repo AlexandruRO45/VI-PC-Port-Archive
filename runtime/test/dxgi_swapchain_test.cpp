@@ -21,6 +21,7 @@
 #include <set>
 #include <tuple>
 #include <vector>
+#include <wrl/client.h>
 
 namespace {
 
@@ -32,6 +33,36 @@ int fail(const char* what) {
 unsigned& validation_errors() {
     static unsigned count = 0;
     return count;
+}
+
+// Ask each interface to match a real centered and stretched timing, when the output offers one.
+bool same_explicit_matches(IDXGIOutput* shim, IDXGIOutput* host) {
+    Microsoft::WRL::ComPtr<IDXGIOutput1> shim1, host1;
+    if (FAILED(host->QueryInterface(IID_PPV_ARGS(host1.GetAddressOf())))) return true;
+    if (FAILED(shim->QueryInterface(IID_PPV_ARGS(shim1.GetAddressOf())))) return false;
+    UINT count = 0;
+    constexpr auto fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (FAILED(host1->GetDisplayModeList1(fmt, DXGI_ENUM_MODES_SCALING, &count, nullptr))) return false;
+    std::vector<DXGI_MODE_DESC1> modes(count);
+    if (count && FAILED(host1->GetDisplayModeList1(fmt, DXGI_ENUM_MODES_SCALING, &count, modes.data()))) return false;
+    auto same = [](const auto& a, const auto& b) {
+        return a.Width == b.Width && a.Height == b.Height && a.Format == b.Format &&
+               a.Scaling == b.Scaling && a.ScanlineOrdering == b.ScanlineOrdering &&
+               a.RefreshRate.Numerator == b.RefreshRate.Numerator && a.RefreshRate.Denominator == b.RefreshRate.Denominator;
+    };
+    std::set<DXGI_MODE_SCALING> checked;
+    for (const auto& req : modes) {
+        if (req.Stereo || req.Scaling == DXGI_MODE_SCALING_UNSPECIFIED || !checked.insert(req.Scaling).second) continue;
+        DXGI_MODE_DESC1 expected1{}, actual1{};
+        if (FAILED(host1->FindClosestMatchingMode1(&req, &expected1, nullptr)) ||
+            FAILED(shim1->FindClosestMatchingMode1(&req, &actual1, nullptr)) ||
+            !same(actual1, expected1) || actual1.Stereo != expected1.Stereo) return false;
+        DXGI_MODE_DESC legacy{req.Width, req.Height, req.RefreshRate, req.Format, req.ScanlineOrdering, req.Scaling};
+        DXGI_MODE_DESC expected{}, actual{};
+        if (FAILED(host->FindClosestMatchingMode(&legacy, &expected, nullptr)) ||
+            FAILED(shim->FindClosestMatchingMode(&legacy, &actual, nullptr)) || !same(actual, expected)) return false;
+    }
+    return true;
 }
 
 bool same_monitor_modes(IDXGIOutput* shim, IDXGIOutput* host) {
@@ -75,7 +106,7 @@ bool compare_attached_modes(IDXGIAdapter1* adapter, IDXGIAdapter1* host_adapter,
                 if (FAILED(adapter->EnumOutputs(i, &output))) continue;
                 DXGI_OUTPUT_DESC desc{};
                 if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target.Monitor)
-                    matched = same_monitor_modes(output, host);
+                    matched = same_monitor_modes(output, host) && same_explicit_matches(output, host);
                 output->Release();
             }
         }

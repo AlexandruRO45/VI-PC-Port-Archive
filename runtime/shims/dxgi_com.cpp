@@ -897,7 +897,11 @@ HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IU
     out = {};
     if (req.Format == DXGI_FORMAT_UNKNOWN && !concerned_device) return DXGI_ERROR_INVALID_CALL;
     const DXGI_FORMAT target_fmt = (req.Format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_B8G8R8A8_UNORM : req.Format;
-    const auto modes = collect_modes(info, target_fmt, 0);
+    UINT flags = 0;
+    if (req.Scaling == DXGI_MODE_SCALING_STRETCHED) flags |= DXGI_ENUM_MODES_SCALING;
+    if (req.ScanlineOrdering == DXGI_MODE_SCANLINE_ORDER_UPPER_FIELD_FIRST ||
+        req.ScanlineOrdering == DXGI_MODE_SCANLINE_ORDER_LOWER_FIELD_FIRST) flags |= DXGI_ENUM_MODES_INTERLACED;
+    const auto modes = collect_modes(info, target_fmt, flags);
     if (modes.empty()) return DXGI_ERROR_NOT_FOUND;
 
     const UINT target_w = req.Width ? req.Width : info.current_width;
@@ -914,7 +918,13 @@ HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IU
         const std::uint64_t m_mhz =
             m.RefreshRate.Denominator ? (std::uint64_t(m.RefreshRate.Numerator) * 1000ull) / m.RefreshRate.Denominator : 0;
         const std::uint64_t hz_diff = abs_diff(m_mhz, target_mhz);
-        return std::make_tuple(dim_diff, area_diff, hz_diff);
+        const bool refresh_mismatch = has_refresh &&
+            std::uint64_t(req.RefreshRate.Numerator) * m.RefreshRate.Denominator !=
+            std::uint64_t(m.RefreshRate.Numerator) * req.RefreshRate.Denominator;
+        const bool scan_mismatch = req.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED &&
+                                   req.ScanlineOrdering != m.ScanlineOrdering;
+        const bool scaling_mismatch = req.Scaling != DXGI_MODE_SCALING_UNSPECIFIED && req.Scaling != m.Scaling;
+        return std::make_tuple(dim_diff, area_diff, hz_diff, refresh_mismatch, scan_mismatch, scaling_mismatch);
     };
 
     const DXGI_MODE_DESC1* best = &modes[0];
