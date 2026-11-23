@@ -111,6 +111,18 @@ class ScalarInterpreter:
         # Note: s_mul_i32, s_mul_hi_i32, s_mul_hi_u32 do NOT modify SCC in RDNA2 ISA
         return res
 
+class ScalarWaveModel:
+    """SALU scalar wave model: SALU operations execute once per wave and broadcast
+    identically across all active or inactive lanes.
+    """
+    def __init__(self, wave_size: int = 32, exec_mask: int = 0xFFFFFFFF) -> None:
+        self.wave_size = wave_size
+        self.exec_mask = exec_mask & ((1 << wave_size) - 1)
+
+    def broadcast_result(self, scalar_val: int) -> list[int]:
+        # Scalar result is uniform across all lanes of the wave
+        return [scalar_val & MASK32] * self.wave_size
+
 def ref_s_mul_i32(s0: int, s1: int) -> int:
     """Low 32 bits of 32x32 integer multiply (identical for signed/unsigned)."""
     return (s0 * s1) & MASK32
@@ -216,6 +228,21 @@ class TestSMulI32ConditionCodeAndSCC(unittest.TestCase):
         )
         ScalarInterpreter().step(inst, state)
         self.assertEqual(state.scc, 1)
+
+class TestSMulI32SIMDAndWaveDivergence(unittest.TestCase):
+    def test_wave_uniform_broadcast(self) -> None:
+        wave = ScalarWaveModel(wave_size=32, exec_mask=0x00FF00FF)
+        val = ref_s_mul_i32(15, 3)
+        lanes = wave.broadcast_result(val)
+        self.assertEqual(len(lanes), 32)
+        self.assertTrue(all(l == 45 for l in lanes))
+
+    def test_wave64_uniform_broadcast(self) -> None:
+        wave = ScalarWaveModel(wave_size=64, exec_mask=MASK64)
+        val = ref_s_mul_i32(u32(-1), 10)
+        lanes = wave.broadcast_result(val)
+        self.assertEqual(len(lanes), 64)
+        self.assertTrue(all(l == u32(-10) for l in lanes))
 
 if __name__ == "__main__":
     unittest.main()
