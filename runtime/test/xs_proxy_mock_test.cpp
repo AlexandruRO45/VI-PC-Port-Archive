@@ -14,6 +14,7 @@
 
 #include <d3d12.h>
 #include <windows.h>
+#include <dxgi1_4.h>
 
 #include <crtdbg.h>
 
@@ -480,6 +481,17 @@ int check_create_failures() {
     EXPECT(hr_of(raw(queue, 0, word(&kExtraIid), word(&extra))) == E_NOINTERFACE && !extra);
     EXPECT(xs::command_object_proxy_ref_count(queue) == 1 && queue_mock->refs == 1);
     EXPECT(release(queue) == 0 && queue_mock->refs == 0);
+
+    // IDXGIDevice1::GetParent (slot 6) must null its _COM_Outptr_ output when returning E_POINTER for a null IID.
+    {
+        const IID dxgi_device1_iid = __uuidof(IDXGIDevice1);
+        void* dxgi = nullptr;
+        EXPECT(hr_of(raw(device, 0, word(&dxgi_device1_iid), word(&dxgi))) == S_OK && dxgi != nullptr);
+        void* parent_out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(dxgi, 6, 0, word(&parent_out))) == E_POINTER && !parent_out);
+        EXPECT(release(dxgi) == device_refs);
+    }
+
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: creation with no object (E_FAIL), a failing device, null IID and output, and an interface the "
@@ -599,6 +611,45 @@ int check_alloc_failures() {
            }) == E_OUTOFMEMORY);
     EXPECT(!second && other->refs == 1);
 
+    // Slot 67 (DeserializeComputePipelineStateX): an allocation failure inside fspx_payload_from_parts must return
+    // E_OUTOFMEMORY rather than letting std::bad_alloc cross the COM ABI boundary, and a null-pointer/non-zero-size
+    // part without kind0 must fail with E_INVALIDARG before reaching CreateComputePipelineState (slot 11).
+    {
+        struct XboxNativeComputeDesc {
+            ID3D12RootSignature* root_signature;
+            const void* kind0;
+            std::uint64_t kind0_size;
+            const void* kind1;
+            std::uint64_t kind1_size;
+            const void* kind6;
+            std::uint64_t kind6_size;
+            const void* kind7;
+            std::uint64_t kind7_size;
+        };
+        const std::uint8_t k0[28] = {};
+        const std::uint8_t k6[16] = {};
+        const IID pso_iid = __uuidof(ID3D12PipelineState);
+        const unsigned calls11 = mock->calls[11];
+
+        XboxNativeComputeDesc native_desc{};
+        native_desc.kind0 = k0;
+        native_desc.kind0_size = sizeof(k0);
+        native_desc.kind6 = k6;
+        native_desc.kind6_size = sizeof(k6);
+        out = reinterpret_cast<void*>(1);
+        EXPECT(failing([&] {
+                   return hr_of(raw(device, 67, word(&native_desc), word(&pso_iid), word(&out)));
+               }) == E_OUTOFMEMORY);
+        EXPECT(!out && mock->calls[11] == calls11);
+
+        XboxNativeComputeDesc bad_desc{};
+        bad_desc.kind6 = nullptr;
+        bad_desc.kind6_size = 16;
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 67, word(&bad_desc), word(&pso_iid), word(&out))) == E_INVALIDARG);
+        EXPECT(!out && mock->calls[11] == calls11);
+    }
+
     Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
     Mock* const fence_mock = reinterpret_cast<Mock*>(xs::fence_proxy_real_fence(fence));
     EXPECT(release(queue) == 0 && release(fence) == 0 && queue_mock->refs == 0 && fence_mock->refs == 0);
@@ -714,10 +765,13 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, 0)) == E_POINTER);
     EXPECT(mock->calls[80] == 0 && xs::device_slot_hits(80) == 3);
 
-    // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path.
+    // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path without
+    // attributing a slot-8 device hit.
     void* queue = nullptr;
     EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
+    EXPECT(xs::device_slot_hits(48) == 1 && xs::device_slot_hits(8) == 0 &&
+           !xs::device_slot_first_call_seen(8));
     EXPECT(mock->args[8][0] == word(&kQueueDesc));
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
