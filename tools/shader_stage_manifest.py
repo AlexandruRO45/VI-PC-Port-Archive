@@ -5,6 +5,13 @@ import ntpath
 import posixpath
 
 
+_WINDOWS_DEVICES = frozenset({
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+    *(f"LPT{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+})
+
+
 def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
     try:
         with open(path, encoding="utf-8") as f:
@@ -34,6 +41,10 @@ def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
             raise ValueError(f"{path}: expected a {suffix} filename in {field!r}")
         stem = value.removesuffix(suffix)
         if not stem or stem in (".", ".."):
+            raise ValueError(f"{path}: expected a shader basename in {field!r}")
+        # Extensions and spaces before them do not turn Windows devices into files.
+        # Keep this check on every OS: indices can move between build machines.
+        if stem.split(".", 1)[0].rstrip(" ").upper() in _WINDOWS_DEVICES:
             raise ValueError(f"{path}: expected a shader basename in {field!r}")
         stems.add(stem)
     return stems

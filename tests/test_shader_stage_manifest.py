@@ -103,6 +103,22 @@ class ShaderStemsTests(unittest.TestCase):
                     shader_stems(path, "file", ".dxbc")
                 self.assertIn(path, str(ctx.exception))
 
+    def test_rejects_windows_device_names_with_or_without_suffix(self):
+        devices = ("NUL", "con", "PRN", "AUX", "CONIN$", "CONOUT$",
+                   "COM1", "com9", "LPT1", "lpt9", "COM¹", "LPT²", "COM³",
+                   "NUL.extra", "NUL .extra")
+        for device in devices:
+            for field, suffix in (("file", ".dxbc"), ("name", "")):
+                with self.subTest(device=device, field=field):
+                    path = self.write_json("device.json", [{field: device + suffix}])
+                    with self.assertRaisesRegex(ValueError, "expected a shader basename"):
+                        shader_stems(path, field, suffix)
+
+    def test_allows_device_prefixes_in_ordinary_shader_names(self):
+        names = {"console", "null_shader", "COM0", "COM10", "LPT10", "shader.NUL"}
+        path = self.write_json("names.json", [{"name": name} for name in names])
+        self.assertEqual(shader_stems(path, "name"), names)
+
     def test_rejects_wrong_suffix(self):
         path = self.write_json("wrong_suffix.json", [{"file": "ps_water.fssm"}])
         with self.assertRaises(ValueError) as ctx:
@@ -180,6 +196,7 @@ class CallerIntegrationTests(unittest.TestCase):
         src = os.path.join(self.dir, "carved")
         os.makedirs(src)
         for name, content, expected_msg in (
+            ("device.json", json.dumps([{"file": "NUL.dxbc"}]), "expected a shader basename"),
             ("dot.json", json.dumps([{"file": "..dxbc"}]), "expected a shader basename"),
             ("dotdot.json", json.dumps([{"file": "...dxbc"}]), "expected a shader basename"),
             ("bad.json", "{not json", "invalid JSON"),
@@ -202,6 +219,7 @@ class CallerIntegrationTests(unittest.TestCase):
         fssm_dir = os.path.join(self.dir, "fssm")
         os.makedirs(fssm_dir)
         for name, content, expected_msg in (
+            ("device.json", json.dumps([{"name": "NUL"}]), "expected a shader basename"),
             ("dot.json", json.dumps([{"name": "."}]), "expected a shader basename"),
             ("dotdot.json", json.dumps([{"name": ".."}]), "expected a shader basename"),
             ("bad.json", "[{\"name\":", "invalid JSON"),
