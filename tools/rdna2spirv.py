@@ -6733,20 +6733,13 @@ class Gen:
                 raise Unsupported("gs sendmsg " + t)
             return
         if op == "s_sendmsg" and a and "MSG_GS_ALLOC_REQ" in a[0].get("t", "") and self.stage == "ms":
-            # SHADER-766: only invocation 0 stores the workgroup counts to avoid SharedMemoryDataRace-RaceOnStore.
-            # The counts are uniform (from SGPR m0), and all invocations synchronize at the post-alloc barrier.
+            # Atomically exchange the uniform alloc request (SGPR m0) into Workgroup-scoped %ms_counts.
+            # Avoids SharedMemoryDataRace-RaceOnStore without requiring invocation 0 to be active (e.g.
+            # when wave 0 branches around the allocation request in multi-wave mesh shaders like ms_wave_info_s3).
             m = self.tmp()
             self.emit(f"{m} = OpLoad %uint %m0")
-            li = self.local_index()
-            is_lead = self.tmp()
-            self.emit(f"{is_lead} = OpIEqual %bool {li} {self.cu(0)}")
-            do_lbl, end_lbl = self.tmp() + "_alloc_do", self.tmp() + "_alloc_end"
-            self.emit(f"OpSelectionMerge {end_lbl} None")
-            self.emit(f"OpBranchConditional {is_lead} {do_lbl} {end_lbl}")
-            self.emit(f"{do_lbl} = OpLabel")
-            self.emit(f"OpStore %ms_counts {m}")
-            self.emit(f"OpBranch {end_lbl}")
-            self.emit(f"{end_lbl} = OpLabel")
+            old = self.tmp()
+            self.emit(f"{old} = OpAtomicExchange %uint %ms_counts {self.cu(2)} {self.cu(0)} {m}")
             self.ms_alloc = True
             return
         if op == "s_sendmsg" and a and "MSG_ORDERED_PS_DONE" in a[0].get("t", ""):
