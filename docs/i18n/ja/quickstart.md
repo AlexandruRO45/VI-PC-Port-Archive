@@ -41,8 +41,8 @@ RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル
     ```
   - [conda](https://docs.conda.io/) を使う場合はこちらが速いです: `conda install -c conda-forge llvm-tools`
     （Windows 版に AMDGPU target が含まれ、[docs/testing.md](../../testing.md) ではバージョン 23.1.6 を使用）。
-    環境を有効にしたうえで `where llvm-mc` に表示される、インストールされた `llvm-mc.exe` のフルパスを
-    `LLVM_MC` に設定します。
+    環境を有効にしたうえで `where.exe llvm-mc` に表示される、インストールされた `llvm-mc.exe` のフルパスを
+    `LLVM_MC` に設定します（PowerShell では素の `where` は `Where-Object` の別名なので、`where.exe` を指定します）。
   - または WSL に `llvm-21` を入れて、`LLVM_MC` にコマンド全体を設定します:
     `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`
     （[docs/design.md](../../design.md#disassembling-shaders)）。
