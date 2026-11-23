@@ -371,6 +371,17 @@ class PeInspectTest(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), "keep me")
 
+    def test_cli_rejects_an_invalid_game_directory_before_creating_reports(self):
+        out = os.path.join(self.dir, "reports")
+        for game_dir in (os.path.join(self.dir, "missing"), self.image):
+            with self.subTest(game_dir=game_dir):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as exc:
+                    pe_inspect.main([self.image, "--game-dir", game_dir, "--out", out])
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn(f"--game-dir is not a directory: {game_dir}", stderr.getvalue())
+                self.assertFalse(os.path.exists(out))
+
     def test_cli_writes_json_and_markdown(self):
         out = os.path.join(self.dir, "reports")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
