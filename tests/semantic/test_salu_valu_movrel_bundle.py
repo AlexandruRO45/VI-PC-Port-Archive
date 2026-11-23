@@ -611,3 +611,42 @@ class TestVMovrelsB32AST(unittest.TestCase):
         spv = support.translate_lines("ps_vmovrels_exec", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0xFACEB00C)
+
+
+class TestVMovrelsB32Indexing(unittest.TestCase):
+    def test_dynamic_source_sweep(self):
+        for offset in (0, 1, 3):
+            with self.subTest(offset=offset):
+                val = 0x30303030 * (offset + 1)
+                lines = [
+                    f"v_mov_b32 v{10 + offset}, {val}",
+                    f"s_mov_b32 m0, {offset}",
+                    "v_movrels_b32 v1, v10",
+                    "v_mov_b32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_vmovrels_sweep_{offset}", lines)
+                out = support.mrt0_words(spv)
+                self.assertEqual(out[0], val)
+
+    def test_aliasing_same_register(self):
+        # Reading from v[1 + 2] = v3 and overwriting v1
+        lines = [
+            "v_mov_b32 v1, 0x11111111",
+            "v_mov_b32 v3, 0x33333333",
+            "s_mov_b32 m0, 2",
+            "v_movrels_b32 v1, v1",
+            "v_mov_b32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrels_alias", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x33333333)
