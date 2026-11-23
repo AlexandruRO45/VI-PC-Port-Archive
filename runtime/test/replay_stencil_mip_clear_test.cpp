@@ -1,7 +1,8 @@
 // A ClearDepthStencilView with STENCIL and rects on a mip past 0 writes the stencil by copies, not through the
-// attachment: NVIDIA's Vulkan driver (621.14) sends a stencil attachment view of mip > 0 to mip 0 (issue 5256). Depth
-// stays an attachment clear; mip 0, or no transfer scratch, keeps the attachment path for both aspects. Checks the
-// recorded Vulkan calls. No Vulkan loader, GPU, shaders or game data.
+// attachment: NVIDIA's Vulkan driver on Blackwell sends a stencil attachment view of mip > 0 to mip 0 (issue 5256). Depth
+// stays an attachment clear; mip 0, no transfer scratch, or a predicated clear (conditional rendering doesn't cover
+// copies) keeps the attachment path for both aspects. Checks the recorded Vulkan calls. No Vulkan loader, GPU, shaders
+// or game data.
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
@@ -57,8 +58,18 @@ leonida::ResourceBinding depth_stencil() {
     return b;
 }
 
+VKAPI_ATTR void VKAPI_CALL begin_conditional(VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {}
+VKAPI_ATTR void VKAPI_CALL end_conditional(VkCommandBuffer) {}
+
 leonida::ReplayFunctions functions(bool scratch) {
     leonida::ReplayFunctions vk{};
+    vk.begin_conditional_rendering = begin_conditional;
+    vk.end_conditional_rendering = end_conditional;
+    vk.prepare_predicate = [](VkBuffer source, VkDeviceSize offset, leonida::PredicateCapture& out) {
+        out = {source, offset, reinterpret_cast<VkBuffer>(std::uintptr_t{3}), 0, VK_NULL_HANDLE};
+        return true;
+    };
+    vk.capture_predicate = [](VkCommandBuffer, const leonida::PredicateCapture&) {};
     vk.pipeline_barrier = barrier;
     vk.clear_depth_stencil_image = clear_depth;
     vk.begin_rendering = begin;
@@ -76,16 +87,21 @@ leonida::ReplayFunctions functions(bool scratch) {
     return vk;
 }
 
-bool run(std::uint32_t mip, std::uint32_t flags, bool scratch) {
+bool run(std::uint32_t mip, std::uint32_t flags, bool scratch, bool predicated = false) {
     leonida::CommandList list;
     const leonida::Rect rects[] = {{1, 1, 3, 2}, {0, 0, 1, 1}};
+    if (predicated && !list.set_predication({2, 0, leonida::d3d12_predication::equal_zero})) return false;
     if (!list.clear_depth_stencil({1, mip, 1, 1}, flags, 0.5f, 0x77, rects) || !list.close()) return false;
     const auto binding = depth_stencil();
+    leonida::ResourceBinding predicate{};
+    predicate.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
+    predicate.size = 8;
     cleared_aspects = 0;
     attachment_clears = fills = 0;
     copies.clear();
-    return leonida::replay(list, VK_NULL_HANDLE, [&](auto) { return &binding; }, functions(scratch)) ==
-           leonida::ReplayResult::success;
+    return leonida::replay(list, VK_NULL_HANDLE,
+                           [&](leonida::ResourceId id) { return id == 2 ? &predicate : &binding; },
+                           functions(scratch)) == leonida::ReplayResult::success;
 }
 } // namespace
 
@@ -128,6 +144,13 @@ int main() {
     expect(attachment_clears == 1 && cleared_aspects == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) &&
                copies.empty(),
            "mip 1 without scratch: the attachment path");
+
+    // Under SetPredication: the attachment path for both aspects, which conditional rendering covers. A copy would
+    // write the stencil of a clear the predicate skips while its depth half is skipped.
+    expect(run(1, both, true, true), "predicated mip 1 replays");
+    expect(attachment_clears == 1 && cleared_aspects == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) &&
+               fills == 0 && copies.empty(),
+           "predicated mip 1: no fill or copy, both aspects through the attachment");
 
     if (failures) return 1;
     std::puts("replay_stencil_mip_clear_test: OK");

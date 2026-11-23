@@ -2607,14 +2607,16 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 r != ReplayResult::success)
                 return r;
             if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
-            // NVIDIA's Vulkan driver (621.14, RTX 5060 Ti) writes the stencil of a depth-stencil attachment view of a
-            // mip past 0 into mip 0, through vkCmdClearAttachments and loadOp CLEAR alike, with no validation message
-            // (issue 5256 has a standalone repro); depth goes to the right mip. So the stencil part of a clear with
-            // rects past mip 0 is copied from a scratch range filled with the stencil value, one copy per rect, which is
-            // exact on every driver. Without scratch it stays on the attachment path.
+            // NVIDIA's Vulkan driver on Blackwell (RTX 5060 Ti 621.14, RTX 5080 615.78; not Ampere or Ada) writes the
+            // stencil of a depth-stencil attachment view of a mip past 0 into mip 0, through vkCmdClearAttachments and
+            // loadOp CLEAR alike, with no validation message (issue 5256 has a standalone repro); depth goes to the right
+            // mip. So the stencil part of a clear with rects past mip 0 is copied from a scratch range filled with the
+            // stencil value, one copy per rect, which is exact on every driver. Under SetPredication it stays on the
+            // attachment path: conditional rendering covers vkCmdClearAttachments but not transfers, so a copy would
+            // write the stencil of a clear the predicate skips (@CharlyRien's review). Without scratch it stays there too.
             p.stencil_copies.clear();
-            if (!p.skip && !p.rects.empty() && (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && depth_clear->target.mip > 0 &&
-                vk.copy_buffer_to_image && vk.fill_buffer && vk.copy_scratch) {
+            if (!p.skip && !predicated && !p.rects.empty() && (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+                depth_clear->target.mip > 0 && vk.copy_buffer_to_image && vk.fill_buffer && vk.copy_scratch) {
                 VkDeviceSize most = 0;
                 for (const VkClearRect& r : p.rects)
                     most = std::max<VkDeviceSize>(most, VkDeviceSize(r.rect.extent.width) * r.rect.extent.height *
