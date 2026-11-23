@@ -362,7 +362,7 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
 }
 
 </style>
-<!-- A src swapped in onerror loads asynchronously, after the inline script below has already run. A fallback
+<!-- A script that already started is never refetched when onerror swaps its src (HTML spec). A fallback
      written while parsing blocks like the local tag, so THREE and its loaders exist before the script either way.
      SRI pins the CDN copies to the same r128 bytes as /vendor. -->
 <script src="/vendor/three.min.js"></script>

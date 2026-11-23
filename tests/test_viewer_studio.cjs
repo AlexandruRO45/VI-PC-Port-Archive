@@ -278,7 +278,7 @@ test('half-float coordinates follow the selected mip and late reads cannot repla
 });
 
 test('each library falls back to its CDN copy while the page is parsed, before the inline script runs', () => {
-    // An onerror that swaps src loads the CDN copy asynchronously, after the inline script has thrown on THREE.
+    // An onerror that swaps src never fetches the CDN copy: a started script is not refetched (HTML spec).
     assert.doesNotMatch(html, /<script[^>]*\bonerror=/);
     for (const [file, global] of [['three.min.js', 'window.THREE'], ['OrbitControls.js', 'THREE.OrbitControls'],
                                   ['GLTFLoader.js', 'THREE.GLTFLoader']]) {
