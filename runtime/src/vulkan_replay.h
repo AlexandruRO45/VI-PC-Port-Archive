@@ -3326,6 +3326,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
             } else if (!p.buffer_copies.empty()) {
+                // D3D12 orders successive copies to a buffer that remains in COPY_DEST. Vulkan transfer writes
+                // to the same bytes need an explicit execution and memory dependency even without a state change.
+                // Include read access for copies whose source was written by an earlier transfer.
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
             } else if (p.staged) {

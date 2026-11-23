@@ -1143,6 +1143,13 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_buffer_tiles COMMAND d3d12_buffer_tiles_test)
     set_tests_properties(d3d12_buffer_tiles PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # WARP oracle: later CopyBufferRegion writes win without an explicit same-state application barrier.
+    add_executable(d3d12_buffer_copy_order_test test/d3d12_buffer_copy_order_test.cpp)
+    target_link_libraries(d3d12_buffer_copy_order_test PRIVATE d3d12 dxgi)
+    target_compile_definitions(d3d12_buffer_copy_order_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_buffer_copy_order_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_buffer_copy_order COMMAND d3d12_buffer_copy_order_test)
+    set_tests_properties(d3d12_buffer_copy_order PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
     set_tests_properties(d3d12_vulkan_device PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(d3d12_texture1d_test test/d3d12_texture1d_test.cpp)
