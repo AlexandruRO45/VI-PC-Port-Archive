@@ -511,7 +511,7 @@ def parse_gpu_log(text):
         if rest == "ok":
             rows.append((name, "pass", ""))
         elif rest.startswith("SKIP"):
-            rows.append((name, "skip", rest))
+            rows.append((name, "skip", scrub(rest)))
         else:
             rows.append((name, "fail", scrub(rest)))
     return rows, summary

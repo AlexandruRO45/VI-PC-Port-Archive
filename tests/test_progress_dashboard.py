@@ -262,6 +262,11 @@ class GpuLog(unittest.TestCase):
         self.assertIn("want 0x00000007", rows[2][2])
         self.assertEqual(summary, (2, 3, 1))
 
+    def test_skip_detail_redacts_an_absolute_path(self):
+        path = f"/synthetic-work/shaders/{SENTINEL}.fssm"
+        rows, _ = pd.parse_gpu_log(f"{'ps_skip':20} SKIP (could not read {path} during setup)")
+        self.assertEqual(rows, [("ps_skip", "skip", "SKIP (could not read <path> during setup)")])
+
     def test_panel_groups_by_gpu_label(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, "check.txt")
