@@ -208,9 +208,12 @@ class MainWiringTest(unittest.TestCase):
     def test_f16_interp_fallback_follows_the_device(self):
         """On by itself where vk_subgroup_info says the GPU can't take PerVertexKHR inputs (MoltenVK), not where
         it can or can't tell; asked for explicitly, it is on everywhere."""
-        self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
+        both = ("--bary-fallback", "--f16-interp-fallback")
+        self.assertEqual(self.run_main(per_vertex=False), (both,) * 2)
+        self.assertEqual(self.run_main("--bary-fallback", per_vertex=False), (both,) * 2)
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
+        self.assertEqual(self.run_main("--bary-fallback", per_vertex=True), (("--bary-fallback",),) * 2)
 
     def test_pc_tail_ubo_follows_the_device(self):
         """On by itself where maxPushConstantsSize is below what the shaders need (144, or 152 with
@@ -241,7 +244,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
     timed-out probe used to translate the whole corpus without the automatic flags, and the next run that could
     ask translated it a third time. This runs the real main() and shaders() on one work folder."""
 
-    AUTOMATIC = ("--f16-interp-fallback", "--pc-tail-ubo")
+    AUTOMATIC = ("--bary-fallback", "--f16-interp-fallback", "--pc-tail-ubo")
 
     def build(self, *extra_argv, per_vertex, max_push_constants):
         """One `make_game.py --stages shaders` run: (the fallbacks of each translation it started, its log)."""
@@ -315,11 +318,11 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
         self.assertEqual(make_game.recorded_fallback_flags(os.path.join(self.work, "elsewhere")), ())
 
     def test_the_other_flags_are_not_kept_by_a_failed_probe(self):
-        # Only the two flags the probe decides are kept; one the user stops passing is dropped as before.
+        # Only the flags the probe decides are kept; one the user stops passing is dropped as before.
         self.build("--no-float-controls", per_vertex=False, max_push_constants=256)
-        self.assertEqual(self.recorded(), "--no-float-controls --f16-interp-fallback")
+        self.assertEqual(self.recorded(), "--no-float-controls --bary-fallback --f16-interp-fallback")
         translations, _ = self.build(per_vertex=None, max_push_constants=None)
-        self.assertEqual(translations, [("--f16-interp-fallback",)])
+        self.assertEqual(translations, [("--bary-fallback", "--f16-interp-fallback")])
 
 
 if __name__ == "__main__":

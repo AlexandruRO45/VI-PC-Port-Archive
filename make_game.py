@@ -1988,7 +1988,8 @@ def main() -> int:
     ap.add_argument("--bary-fallback", action="store_true",
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "
-                         "VK_KHR_fragment_shader_barycentric")
+                         "VK_KHR_fragment_shader_barycentric; on by itself when the runtime's GPU lacks "
+                         "fragmentShaderBarycentric (Intel, NVIDIA Pascal)")
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
                          "without VK_KHR_maintenance8")
@@ -2066,14 +2067,15 @@ def main() -> int:
                 "(or pass --runtime-build)")
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
-    if "shaders" in stages and not a.f16_interp_fallback:
+    if "shaders" in stages and not (a.f16_interp_fallback and a.bary_fallback):
         per_vertex = runtime_gpu_per_vertex()
         if per_vertex is False:
             log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
-                "fragmentShaderBarycentric): translating with --f16-interp-fallback")
-            a.f16_interp_fallback = True
+                "fragmentShaderBarycentric): translating with --f16-interp-fallback and --bary-fallback")
+            a.f16_interp_fallback = a.bary_fallback = True
         elif per_vertex is None:
-            a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
+            a.f16_interp_fallback = a.f16_interp_fallback or keep_recorded_fallback("--f16-interp-fallback", work)
+            a.bary_fallback = a.bary_fallback or keep_recorded_fallback("--bary-fallback", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
         max_pc = runtime_gpu_max_push_constants()
