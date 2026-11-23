@@ -16,6 +16,7 @@
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
 #include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
 
+#include <d3d12video.h>  // ID3D12VideoDevice: whether the host has video queues at all
 #include <dxgi1_4.h>
 
 #include <dxgi1_4.h>
@@ -3065,6 +3066,14 @@ bool host_ray_tracing(ID3D12Device* host) {
            o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
 }
 
+// A host without video hardware refuses the video command-list types: WARP has no ID3D12VideoDevice
+// (E_NOINTERFACE) and answers E_INVALIDARG for a VIDEO_ENCODE queue and allocator, where a GPU host (RTX 5060,
+// RX 9060 XT) and the layer create them. Those cases are compared only on a host with a video device.
+bool host_video(ID3D12Device* host) {
+    Ref<ID3D12VideoDevice> video;
+    return SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&video.p)));
+}
+
 // Windows 10's runtime (no ID3D12Device10) still checks a buffer's initial state and refuses a HARDWARE_PROTECTED
 // heap, where newer runtimes and the layer accept them (measured on Windows 10 22H2 build 19045.5737). For a case
 // marked windows10_refuses only that pair is excused: the layer's S_OK against the host's E_INVALIDARG, on a host
@@ -3955,7 +3964,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command allocator: type video encode", [](ID3D12Device* d) {
              return command_allocator(d, D3D12_COMMAND_LIST_TYPE(6));
-         }},
+         }, host_video},
         {"command allocator: type 7", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(7)); }},
         {"command allocator: type 99", [](ID3D12Device* d) {
              return command_allocator(d, D3D12_COMMAND_LIST_TYPE(99));
