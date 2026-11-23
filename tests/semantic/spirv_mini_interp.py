@@ -940,9 +940,18 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
             if types.t[a[0]] == ("float", 64):
-                if op != "OpFMul":
+                if op == "OpFMul":
+                    values[res] = x * y
+                elif op == "OpFAdd":
+                    values[res] = x + y
+                elif op == "OpFSub":
+                    values[res] = x - y
+                elif op == "OpFDiv":
+                    if y == 0.0:
+                        raise UnsupportedConstruct("OpFDiv by zero")
+                    values[res] = x / y
+                else:
                     raise UnsupportedConstruct(f"{op} on binary64")
-                values[res] = x * y
                 continue
 
             def _fdiv(p, q):

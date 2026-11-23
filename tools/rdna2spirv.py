@@ -18,6 +18,7 @@ Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
 Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
 Prints coverage and validation results.
 """
+from __future__ import annotations
 import argparse
 import hashlib
 import os
@@ -6693,7 +6694,7 @@ class Gen:
                 self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
                 self.emit(f"{hi} = OpCompositeExtract %uint {v2} 1")
                 d = a[0]
-                if d["k"] != "vgpr":
+                if d["k"] != "vgpr" or d.get("n") != 2:
                     raise Unsupported(op + " destination")
                 self.dst({"k": "vgpr", "r": d["r"], "n": 1}, lo)
                 self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, hi)
