@@ -366,15 +366,17 @@ def inflate_at(m, at, size):
     return data, p - at - len(d.unused_data)
 
 def next_stream(m, fp, size):
-    """The next zlib stream at or after `fp` (padding between streams is zero): (data, start, used)."""
-    mt = ZHDR.search(m, fp, size)
-    if not mt:
-        return None
-    at = mt.start()
-    data, used = inflate_at(m, at, size)
-    if data is None:
-        return None
-    return data, at, used
+    """The next valid zlib stream at or after `fp`, skipping false header matches: (data, start, used)."""
+    while fp < size:
+        mt = ZHDR.search(m, fp, size)
+        if not mt:
+            return None
+        at = mt.start()
+        data, used = inflate_at(m, at, size)
+        if data is not None and used > 0:
+            return data, at, used
+        fp = at + 1
+    return None
 
 
 def scan_archive(path, sample, log):
@@ -385,8 +387,7 @@ def scan_archive(path, sample, log):
     if size == 0:
         return stats    # mmap refuses an empty file; an empty archive has no resources to count
     t0 = time.time()
-    with open(path, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         pos = 0
         while pos < size:
             page = (pos + PAGE - 1) & ~(PAGE - 1)
@@ -404,19 +405,45 @@ def scan_archive(path, sample, log):
                 continue
             stats["candidates"] += 1
             try:
-                directory = s_off(data, 8, 16)
-                system_pages, graphics_pages = data[directory + 8], data[directory + 9]
-                check(0 < system_pages <= MAX_PAGE_COUNT and 0 < graphics_pages <= MAX_PAGE_COUNT)
-                following, fp = [], at + used
-                for _ in range(system_pages - 1 + graphics_pages):
+                directory = u64(data, 8) - 0x50000000
+                check(0 <= directory <= MAX_SYS - 16)
+                sys_chunks = [data]
+                sys_len = len(data)
+                fp = at + used
+                while sys_len < directory + 16:
+                    check(len(sys_chunks) < MAX_PAGE_COUNT)
+                    check(len(sys_chunks[-1]) > 0 and (len(sys_chunks[-1]) & 0xFFFF) == 0)
                     nxt = next_stream(m, fp, size)
-                    if nxt is None:
-                        break
+                    check(nxt is not None)
                     more, start, used2 = nxt
-                    following.append(more)
+                    check(sys_len + len(more) <= MAX_SYS)
+                    sys_chunks.append(more)
+                    sys_len += len(more)
                     fp = start + used2
-                resource_sys = b"".join([data] + following[:system_pages - 1])
-                resource_gfx = b"".join(following[system_pages - 1:])
+                sys_probe = sys_chunks[0] if len(sys_chunks) == 1 else b"".join(sys_chunks)
+                system_pages, graphics_pages = sys_probe[directory + 8], sys_probe[directory + 9]
+                check(len(sys_chunks) <= system_pages <= MAX_PAGE_COUNT
+                      and 0 < graphics_pages <= MAX_PAGE_COUNT)
+                for _ in range(system_pages - len(sys_chunks)):
+                    nxt = next_stream(m, fp, size)
+                    check(nxt is not None)
+                    more, start, used2 = nxt
+                    check(sys_len + len(more) <= MAX_SYS)
+                    sys_chunks.append(more)
+                    sys_len += len(more)
+                    fp = start + used2
+                gfx_chunks = []
+                gfx_len = 0
+                for _ in range(graphics_pages):
+                    nxt = next_stream(m, fp, size)
+                    check(nxt is not None)
+                    more, start, used2 = nxt
+                    check(gfx_len + len(more) <= MAX_GFX)
+                    gfx_chunks.append(more)
+                    gfx_len += len(more)
+                    fp = start + used2
+                resource_sys = sys_chunks[0] if len(sys_chunks) == 1 else b"".join(sys_chunks)
+                resource_gfx = gfx_chunks[0] if len(gfx_chunks) == 1 else b"".join(gfx_chunks)
                 meshes = walk_resource(resource_sys, kind)
             except (Skip, struct.error):
                 stats["skipped"] += 1

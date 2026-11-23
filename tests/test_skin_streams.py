@@ -452,6 +452,128 @@ class TestScanArchive(unittest.TestCase):
         self.assertEqual(stats["resources"], 1)
         self.assertEqual(stats["layouts"]["weighted-8inf-8bit"]["meshes"], 1)
 
+    def test_next_stream_skips_false_zlib_header_between_pages(self):
+        system, gfx, _mesh = weighted_mesh("weighted-4inf-8bit", vertices=8, bones=6)
+        out = bytearray(0x2000)
+        c_sys = zlib.compress(system, 9)
+        c_gfx = zlib.compress(gfx, 9)
+        out[0x1010:0x1010 + len(c_sys)] = c_sys
+        # False zlib header (0x78 0x9c followed by invalid deflate bytes) in the gap before graphics page.
+        out[0x1800:0x1808] = b"\x78\x9c\xff\xff\xff\xff\xff\xff"
+        out += b"\0" * (0x3010 - len(out))
+        out[0x3010:0x3010 + len(c_gfx)] = c_gfx
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "false_hdr.rpf")
+            with open(path, "wb") as fh:
+                fh.write(out)
+            stats = ss.scan_archive(path, 64, lambda _text: None)
+        self.assertEqual(stats["resources"], 1)
+        self.assertEqual(stats["skipped"], 0)
+        v = stats["validated"]["weighted-4inf-8bit"]
+        self.assertEqual(v["weight-sum-255"], 8)
+        self.assertEqual(v["components-out-of-range"], 0)
+
+    def test_scan_assembles_multipage_system_when_directory_is_past_page_zero(self):
+        # 3-page system segment: page 0 (64 KiB) holds the drawable header, page 1 (64 KiB) holds
+        # datResourceMap (u64@+0x08 -> 0x10020), and page 2 holds the LOD/model/geometry/FVF chain.
+        vertices, bones = 8, 6
+        w16 = bytes([200, 40, 10, 5] * vertices)
+        i20 = bytes([1, 2, 3, 4] * vertices)
+        slots = {
+            0: (8, 16, 128, quantized_position(vertices, 128)),
+            16: (4, 28, 96, w16),
+            20: (4, 30, 96 + 8 * vertices, i20),
+        }
+        page = Page(size=0x21000)
+        page.ptr(16, page.put(b"\0" * 64))
+        struct.pack_into("<f", page.buf, 44, 1.0)
+        struct.pack_into("<3f", page.buf, 48, -1.0, -1.0, -1.0)
+        struct.pack_into("<3f", page.buf, 64, 1.0, 1.0, 1.0)
+        # Put datResourceMap on page 1 (offset 0x10020).
+        page.at = 0x10020
+        directory = page.put(b"\0" * 16)
+        page.buf[directory + 8] = 3   # system_pages
+        page.buf[directory + 9] = 1   # graphics_pages
+        page.ptr(8, directory)
+        page.u64(168, 0)
+        # Put the drawable's LOD/model/geometry/FVF chain on page 2 (offset 0x20020).
+        page.at = 0x20020
+        _fvf, _vb, gfx_len = build_drawable(page, slots, vertices, bones)
+        gfx = bytearray(gfx_len)
+        for w, semantic in enumerate(sorted(slots)):
+            size, _fmt, offset, _data = slots[semantic]
+            struct.pack_into("<I", gfx, 4 * w, (offset << 7) | (size << 3) | (semantic & 15))
+        for semantic, (_size, _fmt, offset, data) in slots.items():
+            gfx[offset:offset + len(data)] = data
+
+        raw = bytes(page.buf)
+        sys_p0, sys_p1, sys_p2 = raw[:0x10000], raw[0x10000:0x20000], raw[0x20000:]
+        archive = bytearray(0x1010)
+        for chunk in (sys_p0, sys_p1, sys_p2, bytes(gfx)):
+            compressed = zlib.compress(chunk, 9)
+            archive += compressed
+            pad = (-len(archive)) & 0xF
+            archive += b"\0" * pad
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "multipage.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive)
+            stats = ss.scan_archive(path, 64, lambda _text: None)
+        self.assertEqual(stats["resources"], 1)
+        self.assertEqual(stats["skipped"], 0)
+        self.assertEqual(stats["layouts"]["weighted-4inf-8bit"]["meshes"], 1)
+        v = stats["validated"]["weighted-4inf-8bit"]
+        self.assertEqual(v["weight-sum-255"], vertices)
+        self.assertEqual(v["components-out-of-range"], 0)
+        self.assertEqual(v["descriptor-mismatch"], 0)
+
+    def test_scan_skips_resource_with_missing_declared_graphics_page(self):
+        system, _gfx, _mesh = weighted_mesh("weighted-4inf-8bit", vertices=8, bones=6)
+        c_sys = zlib.compress(system, 9)
+        archive = bytearray(0x1010) + c_sys + b"\0" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive)
+            stats = ss.scan_archive(path, 64, lambda _text: None)
+        self.assertEqual(stats["candidates"], 1)
+        self.assertEqual(stats["resources"], 0)
+        self.assertEqual(stats["meshes"], 0)
+        self.assertEqual(stats["skipped"], 1)
+
+    def test_scan_closes_mmap_on_return_and_exception(self):
+        system, gfx, _mesh = weighted_mesh("weighted-4inf-8bit", vertices=4, bones=6)
+        real_mmap = ss.mmap.mmap
+        created = []
+
+        def track_mmap(*args, **kwargs):
+            mapping = real_mmap(*args, **kwargs)
+            created.append(mapping)
+            return mapping
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "closing.rpf")
+            with open(path, "wb") as fh:
+                fh.write(build_archive(system, gfx))
+            try:
+                with mock.patch.object(ss.mmap, "mmap", side_effect=track_mmap):
+                    ss.scan_archive(path, 64, lambda _text: None)
+                self.assertEqual(len(created), 1)
+                self.assertTrue(created[0].closed)
+
+                with mock.patch.object(ss.mmap, "mmap", side_effect=track_mmap), \
+                        mock.patch.object(ss, "walk_resource", side_effect=RuntimeError("boom")):
+                    with self.assertRaisesRegex(RuntimeError, "boom"):
+                        ss.scan_archive(path, 64, lambda _text: None)
+                self.assertEqual(len(created), 2)
+                self.assertTrue(created[1].closed)
+                os.remove(path)
+                self.assertFalse(os.path.exists(path))
+            finally:
+                for mapping in created:
+                    if not mapping.closed:
+                        mapping.close()
+
 
 class TestResourceKind(unittest.TestCase):
     """Fragment headers follow the pinned rpf9-explorer decoder (breadbbbb/rpf9-explorer#8).
