@@ -380,6 +380,8 @@ def exact_pair(i, left, right):
                 data = f.read(size + 1)
         except FileNotFoundError:
             return "missing", []
+        except OSError:
+            return "incompatible", []
         if len(data) != size:
             return "incompatible", []
         payloads.append(data)

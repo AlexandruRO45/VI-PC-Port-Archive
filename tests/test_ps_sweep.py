@@ -334,6 +334,13 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
             self.assertEqual(ps_sweep.depth_measurements(0, {"code": 0}, rec), {"depth_class": "missing"})
 
+    def test_unreadable_exact_readback(self):
+        # A folder where the .raw file should be (or a permission failure) is incompatible, not a traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = {"code": 0, "targets": 1, "dir": tmp}
+            os.makedirs(os.path.join(tmp, "0.raw"))
+            self.assertEqual(ps_sweep.exact_pair(0, rec, rec), ("incompatible", []))
+
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker")
     def test_integer_texture_fetch(self):
         from pathlib import Path
