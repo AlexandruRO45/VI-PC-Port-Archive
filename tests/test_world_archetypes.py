@@ -285,10 +285,10 @@ class CliTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def run_cli(self, path):
+    def run_cli(self, path, extra=()):
         out = os.path.join(self.tmp.name, "out", "archetypes.json")
         with redirect_stdout(io.StringIO()):
-            self.assertEqual(WA.main([path, "--out", out, "--check-extents"]), 0)
+            self.assertEqual(WA.main([path, "--out", out, "--check-extents", *extra]), 0)
         with open(out, "rb") as f:
             raw = f.read()
         self.assertNotIn(b"\r\n", raw)
@@ -347,6 +347,28 @@ class CliTest(unittest.TestCase):
                 WA.main([os.path.join(self.tmp.name, "nope")])
             finally:
                 sys.stderr = saved
+
+
+    def test_a_window_that_cannot_scan_is_one_error_and_writes_no_report(self):
+        defs, _ = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs]))
+        out = os.path.join(self.tmp.name, "never.json")
+        for argv, needle in ((["--start", "-1"], "--start"),
+                             (["--limit", "0"], "--limit"),
+                             (["--limit", "-5"], "--limit"),
+                             (["--start", "0x100000"], "outside the data area")):
+            with self.subTest(argv=argv):
+                self.assertIn(needle, self.cli_error([path, "--out", out] + argv))
+                self.assertFalse(os.path.exists(out))
+
+    def test_a_hex_window_start_still_scans(self):
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        self.check(self.run_cli(path, ["--start", "0x40"]))
 
 
 if __name__ == "__main__":
