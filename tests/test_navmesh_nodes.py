@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -298,6 +299,17 @@ class ArchiveTest(unittest.TestCase):
         cp = subprocess.run([sys.executable, "-I", TOOL, junk, self.levels], capture_output=True, text=True)
         self.assertEqual(cp.returncode, 2)
         self.assertNotIn("Traceback", cp.stderr)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}\n'
+        path = os.path.join(self.tmp.name, "out.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(nn, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                nn.write_json_text(path, '{"summary": {}}\n')
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

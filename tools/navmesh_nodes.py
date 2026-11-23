@@ -21,6 +21,7 @@ Usage:
     python -I navmesh_nodes.py <navmeshes.rpf> <levels.rpf> [--out summary.json] [--jobs N] [--max-dz METRES]
 
 The output is counts only: no position, name or payload is written.
+`--out` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 """
 import argparse
 import collections
@@ -28,14 +29,18 @@ import json
 import math
 import mmap
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling readers.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import navmesh_decode as nd  # noqa: E402
 import world_lights_paths as wlp  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 TILE = 128.0
@@ -332,12 +337,44 @@ def main(argv=None):
     summary["nodes_read"] = read
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
+        write_json_text(a.out, text + "\n")
     else:
         sys.stdout.write(text + "\n")
     return 0
+
+
+def write_json_text(path: str, text: str) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".navmesh_nodes-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
