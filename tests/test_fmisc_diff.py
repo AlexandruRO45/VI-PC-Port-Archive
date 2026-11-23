@@ -283,6 +283,22 @@ class VulkanOracle(unittest.TestCase):
         import vk_fuzz_run
         self.vk = vk_fuzz_run
 
+    def test_uniform_lane_divergence_is_a_vk_campaign_mismatch(self):
+        import unittest.mock as mock
+        lines = prefix() + ["v_fract_f32 v1, v2"] + d.observe([1, 2, 3, 4])
+        vk_counts = {"mismatch": 1}
+        vk_failures = [(0, "Vulkan uniform-input result diverged", lines)]
+        with mock.patch.object(d, "generate", return_value=lines), \
+             mock.patch.object(d, "check", return_value=None), \
+             mock.patch.object(self.vk, "judge", return_value=(vk_counts, vk_failures)) as judge:
+            counts, failures = d.run_suite(1, 1, 1, d.ALL_OPS, backends=("vk",))
+        judge.assert_called_once_with([lines], [None], d.vk_verdict, wave=32, build=None, work_parent=None, opaque=True)
+        self.assertEqual(counts["vk"], {"mismatch": 1})
+        self.assertEqual(failures, [])
+        self.assertEqual(counts["vk_failures"][0][0], 0)
+        self.assertEqual(counts["vk_failures"][0][1], "Vulkan uniform-input result diverged")
+        self.assertEqual(counts["vk_failures"][0][2], lines)
+
     def test_program_text_wave32(self):
         lines = ["v_mov_b32_e32 v1, 0x3f800000", "v_cmp_lt_f32_e64 s20, v1, v2", "v_cndmask_b32_e64 v8, 0, 1, s20"]
         text = self.vk.program_text("cs_x", lines, 4, 32).splitlines()

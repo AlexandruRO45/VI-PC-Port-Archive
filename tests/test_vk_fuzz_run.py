@@ -98,6 +98,73 @@ class ProgramText(unittest.TestCase):
         self.assertEqual(counts, {"match": 1, "mismatch": 1, "skip: llvm-mc: bad": 1})
         self.assertEqual([b[0] for b in bad], [1])
 
+    def test_judge_counts_uniform_lane_divergence_as_mismatch(self):
+        import unittest.mock as mock
+        divergence = R.UniformLaneDivergence("lanes [1, 2, 3] differ from lane 0 on identical inputs")
+        progs = [["a"], ["b"], ["c"], ["d"]]
+        hardware = [[1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], "unsupported"]
+        results = [divergence, "llvm-mc: bad", [1, 2, 3, 4], [1, 2, 3, 4]]
+        with mock.patch.object(R, "run_programs", return_value=results):
+            counts, bad = R.judge(progs, hardware, R.exact_verdict)
+        self.assertEqual(counts, {"mismatch": 1, "skip: llvm-mc: bad": 1, "match": 1,
+                                  "skip: hardware: unsupported": 1})
+        self.assertEqual(bad[0][0], 0)
+        self.assertEqual(bad[0][1], f"Vulkan uniform-input result diverged: {divergence}")
+        self.assertEqual(bad[0][2], progs[0])
+
+    def test_run_programs_types_lane_divergence_from_synthetic_readback(self):
+        import json
+        import os
+        import struct
+        import tempfile
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / ("vk_compute_test.exe" if os.name == "nt" else "vk_compute_test")
+            exe.write_bytes(b"")
+
+            def run_child(args, **kwargs):
+                if len(args) > 2 and args[2].endswith("rdna2spirv.py"):
+                    spirv = Path(args[-1])
+                    spirv.mkdir()
+                    (spirv / "index.json").write_text(
+                        json.dumps({"cs_vkfuzz_0": {}}), encoding="utf-8", newline="\n")
+                    (spirv / "cs_vkfuzz_0.spv").write_bytes(b"synthetic")
+                else:
+                    dump = Path(kwargs["env"]["VKC_DUMP"])
+                    values = [0x12345678] * 128
+                    values[4] = 0x87654321
+                    dump.write_bytes(struct.pack("<128I", *values))
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            assembler = subprocess.CompletedProcess([], 0, ".text\ns_endpgm\n", "")
+            with mock.patch("mc_command.mc_command", return_value=["synthetic-mc"]), \
+                 mock.patch("mc_command.run", return_value=assembler), \
+                 mock.patch.object(R.subprocess, "run", side_effect=run_child):
+                result = R.run_programs([[]], build=tmp, work_parent=tmp, opaque=False)
+                per_lane = R.run_programs([[]], build=tmp, work_parent=tmp, opaque=False, per_lane=True)
+                lane_zero = R.run_programs([[]], build=tmp, work_parent=tmp, opaque=False, uniform=False)
+                counts, bad = R.judge([[]], [[0x12345678] * 4], R.exact_verdict,
+                                      build=tmp, work_parent=tmp, opaque=False)
+
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], str)
+        self.assertIs(type(result[0]), R.UniformLaneDivergence)
+        self.assertEqual(str(result[0]), "lanes [1] differ from lane 0 on identical inputs")
+        self.assertEqual(len(per_lane[0]), 32)
+        self.assertEqual(per_lane[0][1][0], 0x87654321)
+        self.assertEqual(lane_zero, [[0x12345678] * 4])
+        self.assertEqual(counts, {"mismatch": 1})
+        self.assertEqual(bad[0][0], 0)
+
+    def test_judge_nonuniform_mode_compares_lane_zero(self):
+        import unittest.mock as mock
+        progs = [["a"]]
+        with mock.patch.object(R, "run_programs", return_value=[[1, 2, 3, 4]]) as run:
+            counts, bad = R.judge(progs, [[1, 2, 3, 4]], R.exact_verdict, uniform=False)
+        run.assert_called_once_with(progs, 4, 32, None, None, opaque=True, uniform=False)
+        self.assertEqual(counts, {"match": 1})
+        self.assertEqual(bad, [])
+
     def test_all_skipped(self):
         self.assertTrue(R.all_skipped({}))
         self.assertTrue(R.all_skipped({"skip: vk_compute_test: unsupported": 3}))
@@ -108,6 +175,7 @@ class ProgramText(unittest.TestCase):
 
 class Guard(unittest.TestCase):
     FUZZERS = ("pk16_diff", "vint_diff", "sdwa_diff", "wint_diff", "fmisc_diff")
+    UNIFORM_FUZZERS = ("pk16_diff", "vint_diff", "sdwa_diff", "fmisc_diff")
 
     def test_vk_without_hw_is_a_usage_error(self):
         for tool in self.FUZZERS:
@@ -137,6 +205,22 @@ class Guard(unittest.TestCase):
                         self.assertIn("no Vulkan program ran: every one was skipped", out.getvalue())
                     else:
                         self.assertNotIn("no Vulkan program ran", out.getvalue())
+
+    def test_uniform_lane_divergence_makes_fuzzer_campaign_fail(self):
+        for tool in self.UNIFORM_FUZZERS:
+            mod = importlib.import_module(tool)
+            counts = {"pass": 2, "mismatch": 0, "skip": {},
+                      "vk": {"mismatch": 1},
+                      "vk_failures": [(0, "Vulkan uniform-input result diverged", ["v_add_u32 v1, v2, v3"])]}
+            oracle = mock.Mock(device="mock", arch="gfx1030")
+            out = io.StringIO()
+            with self.subTest(tool=tool):
+                with mock.patch.object(hw_oracle.runner, "open_oracle", return_value=oracle), \
+                     mock.patch.object(mod, "run_suite", return_value=(counts.copy(), [])), \
+                     contextlib.redirect_stdout(out):
+                    rc = mod.main(["--oracle", "hw,vk", "--programs", "2"])
+                self.assertEqual(rc, 1, out.getvalue())
+                self.assertIn("VK MISMATCH program 0", out.getvalue())
 
 
 if __name__ == "__main__":

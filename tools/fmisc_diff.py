@@ -676,16 +676,8 @@ def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=Non
     vk_failures = []
     if "vk" in backends:
         import vk_fuzz_run
-        vk = vk_fuzz_run.run_programs(progs, 4, wave, build, work, opaque=not VK_CONSTANTS)
-        for i, lines in enumerate(progs):
-            if isinstance(hw[i], str) or isinstance(vk[i], str):
-                why = ("hardware: " + hw[i]) if isinstance(hw[i], str) else vk[i]
-                counts["vk"]["skip: " + why] = counts["vk"].get("skip: " + why, 0) + 1
-                continue
-            klass, detail = vk_verdict(lines, hw[i], vk[i])
-            counts["vk"][klass] = counts["vk"].get(klass, 0) + 1
-            if klass == "mismatch":
-                vk_failures.append((i, detail, lines))
+        counts["vk"], vk_failures = vk_fuzz_run.judge(
+            progs, hw, vk_verdict, wave=wave, build=build, work_parent=work, opaque=not VK_CONSTANTS)
     counts["vk_failures"] = vk_failures
     backends = tuple(b for b in backends if b != "vk")
     for i, lines in enumerate(progs):

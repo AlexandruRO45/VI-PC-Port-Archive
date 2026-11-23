@@ -52,6 +52,10 @@ FILL_REG = 22
 SEED_RE = re.compile(r"^v_mov_b32(?:_e32)? v(\d+), (0x[0-9a-fA-F]+|\d+)$")
 
 
+class UniformLaneDivergence(str):
+    """Uniform-input GPU readback differed between lanes. String-compatible for existing run_programs callers."""
+
+
 def opaque_seed(line):
     """`v_mov_b32 vN, K` as the same value computed from the buffer fill; other lines unchanged."""
     m = SEED_RE.match(line)
@@ -167,7 +171,8 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
                 elif not uniform:
                     results[i] = lanes[0]
                 else:
-                    results[i] = lanes[0] if not odd else f"lanes {odd[:3]} differ from lane 0 on identical inputs"
+                    results[i] = (lanes[0] if not odd else
+                                  UniformLaneDivergence(f"lanes {odd[:3]} differ from lane 0 on identical inputs"))
         return results
     finally:
         if not os.environ.get("VK_FUZZ_KEEP"):
@@ -181,11 +186,15 @@ def judge(progs, hw, verdict, wave=32, words=4, build=None, work_parent=None, op
     got = run_programs(progs, words, wave, build, work_parent, opaque=opaque, uniform=uniform)
     counts, bad = {}, []
     for i, lines in enumerate(progs):
-        if isinstance(hw[i], str) or isinstance(got[i], str):
+        lane_diverged = uniform and isinstance(got[i], UniformLaneDivergence)
+        if isinstance(hw[i], str) or (isinstance(got[i], str) and not lane_diverged):
             why = "skip: " + (("hardware: " + hw[i]) if isinstance(hw[i], str) else got[i])
             counts[why] = counts.get(why, 0) + 1
             continue
-        klass, detail = verdict(lines, hw[i], got[i])
+        if lane_diverged:
+            klass, detail = "mismatch", f"Vulkan uniform-input result diverged: {got[i]}"
+        else:
+            klass, detail = verdict(lines, hw[i], got[i])
         counts[klass] = counts.get(klass, 0) + 1
         if klass == "mismatch":
             bad.append((i, detail, lines))
