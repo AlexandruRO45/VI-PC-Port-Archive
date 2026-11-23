@@ -379,5 +379,43 @@ class TestGalleryCommandLine(unittest.TestCase):
             serve.assert_called_once_with()
 
 
+class TestGalleryAssetDirectories(unittest.TestCase):
+    """The gallery never writes asset folders into the checkout, and an explicit folder must exist."""
+
+    def test_a_missing_explicit_directory_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "no_such_assets")
+            for option in ("--models-dir", "--textures-dir"):
+                with (
+                    self.subTest(option=option),
+                    mock.patch.object(gallery, "start_server") as start_server,
+                    mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    with self.assertRaises(SystemExit) as raised:
+                        gallery.main([option, missing, "--no-browser"])
+
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn(f"{option} is not a directory: {missing}", stderr.getvalue())
+                    start_server.assert_not_called()
+
+    def test_starting_without_asset_directories_creates_nothing_in_the_checkout(self) -> None:
+        checkout = os.path.dirname(os.path.dirname(os.path.abspath(gallery.__file__)))
+        folders = [os.path.join(checkout, name) for name in ("models", "textures")]
+        existing = [path for path in folders if os.path.exists(path)]
+        if existing:
+            self.skipTest(f"the checkout already has {existing}; nothing to prove here")
+        with (
+            mock.patch.object(gallery.http.server.HTTPServer, "__init__", return_value=None),
+            mock.patch.object(gallery.http.server.HTTPServer, "serve_forever"),
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+        ):
+            gallery.start_server(models_dir=None, textures_dir=None, open_browser=False, retry_next_port=False)
+
+        self.assertEqual([path for path in folders if os.path.exists(path)], [],
+                         "starting the gallery created an asset folder inside the checkout")
+        self.assertEqual(gallery.StudioHandler.models_dir, "")
+        self.assertEqual(gallery.StudioHandler.textures_dir, "")
+
+
 if __name__ == "__main__":
     unittest.main()
