@@ -7,6 +7,8 @@ $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrEmpty($Output)) { $Output = Join-Path $root 'out/run1' }
 $exe = Join-Path $root 'build/Release/conform_native.exe'
-if (Test-Path $Output) { Remove-Item $Output -Recurse -Force }
+if (Test-Path -LiteralPath $Output) { Remove-Item -LiteralPath $Output -Recurse -Force }
 & $exe $Output @Extra
-Write-Output "EXITCODE $LASTEXITCODE"
+$code = $LASTEXITCODE
+Write-Output "EXITCODE $code"
+exit $code
