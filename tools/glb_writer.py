@@ -1105,14 +1105,18 @@ def instance_bounds(box_min, box_max, translation, rotation, scale) -> list[floa
     translation, the order glTF applies a node's TRS in."""
     r = _quat_matrix(rotation)
     m = [[r[i][j] * float(scale[j]) for j in range(3)] for i in range(3)]
-    c = [(float(box_min[j]) + float(box_max[j])) * 0.5 for j in range(3)]
-    h = [(float(box_max[j]) - float(box_min[j])) * 0.5 for j in range(3)]
     out_min, out_max = [], []
-    for i in range(3):
-        ci = m[i][0] * c[0] + m[i][1] * c[1] + m[i][2] * c[2] + float(translation[i])
-        hi = abs(m[i][0]) * h[0] + abs(m[i][1]) * h[1] + abs(m[i][2]) * h[2]
-        out_min.append(ci - hi)
-        out_max.append(ci + hi)
+    for row, offset in zip(m, translation):
+        # Project the two endpoints directly. A center/half-extent split can
+        # round away a small endpoint on a box that straddles the origin.
+        lo = hi = 0.0
+        for weight, lower, upper in zip(row, box_min, box_max):
+            if weight < 0:
+                lower, upper = upper, lower
+            lo += weight * float(lower)
+            hi += weight * float(upper)
+        out_min.append(lo + float(offset))
+        out_max.append(hi + float(offset))
     return out_min + out_max
 
 

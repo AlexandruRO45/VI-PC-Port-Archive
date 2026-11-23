@@ -94,6 +94,24 @@ def tri_prim():
 
 
 class InstancedGlbTest(unittest.TestCase):
+    def test_asymmetric_box_contains_both_transformed_endpoints(self):
+        # Both endpoints are exact float32s. Reconstructing the small endpoint
+        # from the center and half-extent loses it even with float64 arithmetic.
+        primitive = glb_writer.pack_primitive({
+            "positions": [(-1, 0, 0), (2**55, 0, 0), (0, 1, 0)], "indices": [0, 1, 2],
+        })
+        for mode in ("gpu", "nodes"):
+            for rotation, sign in (((0, 0, 0, 1), 1), ((0, 0, 1, 0), -1)):
+                with self.subTest(mode=mode, rotation=rotation):
+                    transform = ((0, 0, 0), rotation, (1, 1, 1))
+                    data, stats = glb_writer.build_instanced_glb(
+                        [{"primitives": [primitive], "instances": [transform]}], mode=mode)
+                    gltf, binary = twb.parse_and_validate_glb(data)
+                    attrs = gltf["meshes"][0]["primitives"][0]["attributes"]
+                    positions = twb.read_accessor_floats(gltf, binary, attrs["POSITION"])
+                    axes = list(zip(*[(sign * x, sign * y, z) for x, y, z in positions]))
+                    self.assertEqual(stats["bounds"], [min(a) for a in axes] + [max(a) for a in axes])
+
     def test_gpu_instance_bounds_follow_the_stored_translation_and_scale(self) -> None:
         meshes = [{
             "primitives": [tri_prim()],
