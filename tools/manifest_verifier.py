@@ -6,6 +6,8 @@ Live progress is reported continuously during verification.
 
 --cache FILE remembers files that already passed. if a file's size, times and id haven't changed it gets skipped,
 so rechecking takes like a second instead of rereading the whole package. leave it off if you want every byte read.
+it's a shortcut not proof, anyone who can edit the cache can make a broken copy pass, so keep it out of the game
+folder and don't share it.
 
 Usage:
     python -I manifest_verifier.py <target_dir> [--manifest FILE] [--jobs N] [--cache FILE]
@@ -22,7 +24,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
 from typing import Callable, Optional, TextIO
 
@@ -95,9 +96,29 @@ def _cache_key(abs_path: str) -> str:
     return os.path.normcase(os.path.realpath(abs_path))
 
 
-def _cache_stamp(st: os.stat_result) -> list[int]:
+def _change_time(path: str, st: os.stat_result) -> int:
+    # st_ctime on windows is creation time, so a rewrite with the old mtime put back wouldn't show up.
+    # NTFS ChangeTime moves on any write or metadata change, same job as ctime on linux
+    if os.name != "nt":
+        return st.st_ctime_ns
+    try:
+        import ctypes
+        import msvcrt
+
+        info = (ctypes.c_longlong * 5)()  # FILE_BASIC_INFO, ChangeTime is [3]
+        k32 = ctypes.windll.kernel32
+        k32.GetFileInformationByHandleEx.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong)
+        with open(path, "rb") as f:
+            if k32.GetFileInformationByHandleEx(msvcrt.get_osfhandle(f.fileno()), 0, info, ctypes.sizeof(info)):
+                return info[3] or st.st_ctime_ns  # FAT has no change time
+    except (OSError, AttributeError, ImportError):
+        pass
+    return st.st_ctime_ns
+
+
+def _cache_stamp(path: str, st: os.stat_result) -> list[int]:
     # file id (st_dev, st_ino) catches a file swapped for another one with the same size and times
-    return [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_dev, st.st_ino]
+    return [st.st_size, st.st_mtime_ns, _change_time(path, st), st.st_dev, st.st_ino]
 
 
 def load_cache(path: str) -> dict[str, dict]:
@@ -105,32 +126,19 @@ def load_cache(path: str) -> dict[str, dict]:
     try:
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(doc, dict) or doc.get("version") != CACHE_VERSION or not isinstance(doc.get("files"), dict):
-        return {}
-    return {key: entry for key, entry in doc["files"].items()
-            if isinstance(entry, dict) and isinstance(entry.get("stamp"), list)
-            and isinstance(entry.get("sha256"), str)}
+        if doc["version"] == CACHE_VERSION:
+            return {k: e for k, e in doc["files"].items() if isinstance(e, dict) and "stamp" in e and "sha256" in e}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return {}
 
 
 def save_cache(path: str, entries: dict[str, dict]) -> None:
     """Saves the cache via a temp file + replace, so if it gets interrupted the old one is still there."""
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    doc = {"version": CACHE_VERSION, "files": {key: entries[key] for key in sorted(entries)}}
-    fd, tmp = tempfile.mkstemp(prefix=".verify-cache-", suffix=".tmp", dir=directory)
-    try:
-        with open(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1)
-            f.write("\n")
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"version": CACHE_VERSION, "files": dict(sorted(entries.items()))}, f, indent=1)
+    os.replace(tmp, path)
 
 
 def walk(target_dir: str, *, exclude: str | tuple[str, ...] | None = None):
@@ -288,11 +296,7 @@ def verify_manifest(
     strict: bool = False,
     cache_path: Optional[str] = None,
 ) -> ManifestReport:
-    """Verifies target_dir against manifest_path, optionally in parallel.
-
-    with cache_path, files that haven't changed since they last passed get skipped, and anything that passes
-    this time gets saved for next run.
-    """
+    """Verifies target_dir against manifest_path, optionally in parallel."""
     if not os.path.isdir(target_dir):
         raise ManifestError(f"target directory does not exist: {target_dir}")
 
@@ -301,7 +305,7 @@ def verify_manifest(
     untracked = sorted(set(have.keys()) - set(want.keys()))
 
     cache = load_cache(cache_path) if cache_path is not None else {}
-    cache_dirty = False
+    kept: dict[str, dict] = {}  # what gets saved, only files that passed this run so the cache doesn't pile up
     stamps: dict[str, list[int]] = {}
     cached_files = 0
     cached_bytes = 0
@@ -333,9 +337,11 @@ def verify_manifest(
             continue
         expected_sha256 = info["sha256"]
         if cache_path is not None:
-            stamp = _cache_stamp(st)
-            hit = cache.get(_cache_key(abs_p))
+            stamp = _cache_stamp(abs_p, st)
+            key = _cache_key(abs_p)
+            hit = cache.get(key)
             if hit is not None and hit["stamp"] == stamp and hit["sha256"] == expected_sha256:
+                kept[key] = hit
                 cached_files += 1
                 cached_bytes += actual_size
                 continue
@@ -349,7 +355,6 @@ def verify_manifest(
     t0 = time.time()
 
     def hash_worker(rel: str, abs_p: str, size: int, expected_hash: str) -> tuple[str, int, str, Optional[str]]:
-        nonlocal cache_dirty
         try:
             actual_hash = sha256_file(abs_p, expected_size=size)
             if actual_hash.lower() != expected_hash:
@@ -360,12 +365,11 @@ def verify_manifest(
             # only save it if the stamp didn't move while hashing and it wasn't written super recently,
             # otherwise a sneaky write could hide behind the cache
             try:
-                after = _cache_stamp(os.stat(abs_p))
+                after = _cache_stamp(abs_p, os.stat(abs_p))
             except OSError:
                 after = None
             if after == stamps[rel] and time.time_ns() - after[1] > RACY_WINDOW_NS:
-                cache[_cache_key(abs_p)] = {"stamp": after, "sha256": expected_hash}
-                cache_dirty = True
+                kept[_cache_key(abs_p)] = {"stamp": after, "sha256": expected_hash}
         return rel, size, "OK", None
 
     def on_file_done(rel: str, size: int, status: str, err_msg: Optional[str]) -> None:
@@ -435,9 +439,9 @@ def verify_manifest(
 
     problem_count = len(missing) + len(size_mismatch) + len(hash_mismatch) + len(unreadable)
     passed = (problem_count == 0) and (not strict or len(untracked) == 0)
-    if cache_path is not None and cache_dirty:
+    if cache_path is not None and kept != cache:
         try:
-            save_cache(cache_path, cache)
+            save_cache(cache_path, kept)
         except OSError as err:  # not fatal, next run is just slow again
             print(f"warning: cannot write verify cache {cache_path}: {err}", file=sys.stderr)
     elapsed_total = time.time() - t0
@@ -477,9 +481,7 @@ def print_report(
     if bad == 0:
         if verbose:
             gib = report.bytes_verified / (1024**3)
-            cached = ""
-            if report.cached:
-                cached = f"; {report.cached} unchanged, {report.bytes_cached / (1024**3):.2f} GiB from the cache"
+            cached = f"; {report.cached} from cache" if report.cached else ""
             out.write(f"OK ({len(report.matched)} files, {gib:.2f} GiB in {report.elapsed_seconds:.2f}s{cached})\n")
         else:
             out.write("OK\n")
@@ -502,8 +504,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hash up to N files concurrently (default: %(default)s; 1 = serial)",
     )
     ap.add_argument("--cache", metavar="FILE", default=None,
-                    help="Skip files unchanged since they last matched, recording stamps in FILE "
-                         "(default: off, every byte is read)")
+                    help="Skip files unchanged since they last passed. Shortcut, not proof: keep it out of "
+                         "the target and don't share it (default: off)")
     ap.add_argument("--quiet", "-q", action="store_true", help="Suppress live progress output")
     ap.add_argument("--progress-stream", choices=["stderr", "stdout"], default="stderr",
                     help="Stream for live progress reporting (default: stderr)")
