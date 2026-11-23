@@ -159,6 +159,39 @@ class ParseTest(unittest.TestCase):
         struct.pack_into("<Q", b, off + 0x30, 9)  # block 9 does not exist
         self.assertEqual(T.parse(bytes(b))[0][0]["rooms"], [])
 
+    def test_room_array_cannot_read_the_following_block(self):
+        b = build([(T.ROOM, ROOM_SIZE, ROOM_MEMBERS), (T.MLO, MLO_SIZE, MLO_MEMBERS)],
+                  [(T.ROOM, room(J("a"), *ROOM_BOX)), (T.MLO, interior(HA, 0, 0, 2))])
+        found, _ = T.parse(b)
+        self.assertEqual([d["name"] for d in found], [HA])
+        self.assertEqual(found[0]["rooms"], [])  # reject the whole array, not just its excess records
+
+    def test_room_array_offset_and_count_stay_within_block(self):
+        for first, count, expected in ((1, 3, [J("a"), T.LIMBO, J("b")]), (3, 1, [J("b")]),
+                                       (3, 2, []), (1, 4, []), (4, 1, []), (0, 0, [])):
+            with self.subTest(first=first, count=count):
+                b = bytearray(interiors())
+                _, blocks = WA.schema(b)
+                off = blocks[1][2]
+                struct.pack_into("<QH", b, off + 0x30, 1 | ((first * ROOM_SIZE) << 20), count)
+                found, _ = T.parse(bytes(b))
+                self.assertEqual([r[0] for r in found[0]["rooms"]], expected)
+                self.assertEqual([r[0] for r in found[1]["rooms"]], [T.LIMBO, J("b")])
+
+    def test_room_array_rejects_partial_record_at_block_end(self):
+        rooms = room(J("a"), *ROOM_BOX) + room(J("b"), *ROOM_BOX)[:-1]
+        b = build([(T.ROOM, ROOM_SIZE, ROOM_MEMBERS), (T.MLO, MLO_SIZE, MLO_MEMBERS)],
+                  [(T.ROOM, rooms), (T.MLO, interior(HA, 0, 0, 2))])
+        self.assertEqual(T.parse(b)[0][0]["rooms"], [])
+
+    def test_room_array_must_fit_available_resource_bytes(self):
+        mlo = bytearray(interior(HA, 0, 0, 2))
+        struct.pack_into("<Q", mlo, 0x30, 2)  # put the room block last so it can be truncated independently
+        b = build([(T.ROOM, ROOM_SIZE, ROOM_MEMBERS), (T.MLO, MLO_SIZE, MLO_MEMBERS)],
+                  [(T.MLO, mlo), (T.ROOM, room(J("a"), *ROOM_BOX) + room(J("b"), *ROOM_BOX))])
+        self.assertEqual([r[0] for r in T.parse(b[:-16])[0][0]["rooms"]], [J("a"), J("b")])
+        self.assertEqual(T.parse(b[:-17])[0][0]["rooms"], [])
+
     def test_invalid_input_gives_nothing(self):
         self.assertEqual(T.parse(b"\0" * 0x100), ([], []))
 
