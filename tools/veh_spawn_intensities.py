@@ -22,6 +22,7 @@ import argparse
 import json
 import math
 import os
+import stat
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
@@ -172,7 +173,11 @@ def main(argv=None) -> int:
                 try:
                     os.remove(staged)
                 except OSError:
-                    pass
+                    try:
+                        os.chmod(staged, stat.S_IRUSR | stat.S_IWUSR)
+                        os.remove(staged)
+                    except OSError:
+                        pass
     return 0
 
 

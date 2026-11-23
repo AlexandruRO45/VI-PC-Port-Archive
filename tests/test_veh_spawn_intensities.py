@@ -206,6 +206,31 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(f.read(), '{"previous": true}\n')
             self.assertEqual(sorted(os.listdir(tmp)), ["graphics.xml", "report.json"])
 
+    def test_failed_json_replace_of_readonly_report_cleans_up_staged_file(self):
+        import contextlib
+        import stat
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = write_doc(tmp)
+            report = os.path.join(tmp, "report.json")
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"previous": true}\n')
+            os.chmod(report, stat.S_IREAD)
+            try:
+                replace_ctx = (contextlib.nullcontext() if sys.platform == "win32"
+                               else mock.patch.object(vsi.os, "replace",
+                                                      side_effect=PermissionError(13, "read-only")))
+                with replace_ctx:
+                    status, _, err = self.run_tool(xml, "--json", report)
+                self.assertEqual(status, 2)
+                self.assertIn("cannot write", err)
+                self.assertNotIn("Traceback", err)
+                with open(report, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), '{"previous": true}\n')
+                self.assertEqual(sorted(os.listdir(tmp)), ["graphics.xml", "report.json"])
+            finally:
+                os.chmod(report, stat.S_IRUSR | stat.S_IWUSR)
+
 
 if __name__ == "__main__":
     unittest.main()
