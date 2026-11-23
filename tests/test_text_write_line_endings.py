@@ -5,7 +5,7 @@ assembly listing is CRLF there and LF on Linux and macOS: the same input gives b
 (checksums and diffs differ). The CSV writers were fixed in #1573; this covers the other text writers. This test reads
 the source with `ast` (standard library, no game data, no GPU) and fails for any `open`, `io.open`, `Path.open`,
 `os.fdopen` or `tempfile.NamedTemporaryFile` (and `TemporaryFile`, `SpooledTemporaryFile`) in a text write mode (`w`,
-`a`, `x`, `r+`), or any `Path.write_text`, under tools/, scripts/, make_game.py and runtime/test/shaders/ that has no
+`a`, `x`, `r+`), or any `Path.write_text`, under tools/, scripts/, make_game.py and runtime/test/ that has no
 `newline=` argument. `codecs.open` is left alone: it never translates line ends and takes no `newline=`. Pass `newline="\\n"` for LF output (or `newline=""` when the text carries its own line ends,
 like a csv writer).
 """
@@ -16,7 +16,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SCAN = ("tools", "scripts", "make_game.py", os.path.join("runtime", "test", "shaders"))
+SCAN = ("tools", "scripts", "make_game.py", os.path.join("runtime", "test"))
 
 
 def python_files():
@@ -145,6 +145,20 @@ class TextWriteLineEndings(unittest.TestCase):
                     bad.append(f"{os.path.relpath(path, ROOT)}:{line}")
         self.assertGreater(count, 50, "the scan found almost no Python files; is the layout different?")
         self.assertEqual(bad, [], "text writes without newline= (CRLF on Windows, LF elsewhere): " + ", ".join(bad))
+
+    def test_the_scan_includes_runtime_test_helpers_outside_shaders(self):
+        """BUILD-468's first scan stopped at runtime/test/shaders/, so a write in a sibling
+        helper such as check_sparse_queue_family.py was never checked."""
+        rels = {os.path.relpath(path, ROOT).replace(os.sep, "/") for path in python_files()}
+        self.assertTrue(
+            any(r.startswith("runtime/test/shaders/") and r.endswith(".py") for r in rels),
+            "the scan no longer sees runtime/test/shaders/",
+        )
+        self.assertIn(
+            "runtime/test/check_sparse_queue_family.py",
+            rels,
+            "the scan missed runtime/test/*.py outside shaders/; vk_layer_settings.txt would be CRLF on Windows",
+        )
 
 
 if __name__ == "__main__":

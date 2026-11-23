@@ -78,6 +78,7 @@ def main() -> int:
             "lunarg_api_dump.pre_dump = true\n"
             "lunarg_api_dump.detailed = true\n",
             encoding="utf-8",
+            newline="\n",
         )
         env["VK_LAYER_SETTINGS_PATH"] = str(path)
         run = subprocess.run([str(exe)], cwd=path, env=env, capture_output=True,
