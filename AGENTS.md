@@ -29,7 +29,8 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
   renamed file the extension check in CI misses.
 - **No keys, decryption or protection workarounds.** If a format turns out to be encrypted, write that down in
   `docs/design.md` and stop there.
-- **Nothing online**: no Xbox Live or Rockstar services or domains.
+- **Nothing online**: no Xbox Live or Rockstar services or domains. `tests/test_no_online_services.py` fails on
+  a tracked file that names one.
 - **Fix, don't disable**: a shader the translator rejects gets a rule, not a skip list. A new rule goes into the
   contract table in `docs/design.md` with how it was confirmed (a GPU test, a Mesa/LLVM reference, or a count over
   the corpus).
