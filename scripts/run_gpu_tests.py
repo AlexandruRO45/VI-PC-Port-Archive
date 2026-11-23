@@ -1282,6 +1282,9 @@ def run_suite(a, work: str) -> int:
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
                 "ps_vcmp_f32_nan": (0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7),   # from the .asm headers
                 "ps_vcmp_64": (0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93),
+                # Partial color exports: two exports to one target merge per channel, or per RG/BA pair compressed
+                "ps_partial_exports": (0x3F800000, 0x40000000, 0x40400000, 0x40800000),
+                "ps_partial_exports_compr": (0x41100000, 0x41200000, 0x40E00000, 0x41000000),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge

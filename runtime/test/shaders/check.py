@@ -385,6 +385,9 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # f32 VOPC ordered/unordered with a NaN, 64-bit integer VOPC (derivations in the .asm headers)
               "ps_vcmp_f32_nan": (0x0000376c, 0x0000fd5b, 0x0000d36c, 0x00000fe7),
               "ps_vcmp_64": (0x0000b3c4, 0x000091e6, 0x00006787, 0x00007c93),
+              # two exports to one target merge: per channel uncompressed, per RG/BA pair compressed (.asm headers)
+              "ps_partial_exports": (0x3f800000, 0x40000000, 0x40400000, 0x40800000),
+              "ps_partial_exports_compr": (0x41100000, 0x41200000, 0x40e00000, 0x41000000),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
