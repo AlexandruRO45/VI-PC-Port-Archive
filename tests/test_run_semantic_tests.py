@@ -6,6 +6,7 @@ or unimportable file always makes it exit 1 with that file named, in parallel an
 import contextlib
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -61,6 +62,15 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             self.assertIn("1 tests skipped", out)
 
+    def test_skipped_setup_class_can_exceed_tests_run(self):
+        skipped = "import unittest\nclass T(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls): raise unittest.SkipTest('optional')\n    def test_one(self): pass\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_skipped.py": skipped})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("1 files, 0 tests, 0 files failed", out)
+            self.assertIn("1 tests skipped", out)
+
     def test_parallel_summary_counts_skips_even_in_failed_files(self):
         skipped = "import unittest\nclass S(unittest.TestCase):\n    @unittest.skip('optional')\n    def test_skip(self): pass\n"
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,17 +98,65 @@ class T(unittest.TestCase):
 '''
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"test_nested.py": nested})
-            code, out = run(tmp, "-j", "2", "-v")
-            self.assertEqual(code, 0, out)
-            self.assertIn("1 files, 2 tests, 0 files failed", out)
-            self.assertIn("1 tests skipped", out)
+            for args in ((), ("-v",)):
+                with self.subTest(args=args):
+                    code, out = run(tmp, "-j", "2", *args)
+                    self.assertEqual(code, 0, out)
+                    self.assertIn("1 files, 2 tests, 0 files failed", out)
+                    self.assertIn("1 tests skipped", out)
 
     def test_parallel_summary_reports_unknown_skip_count_on_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"test_crash.py": "import os\nos._exit(2)\n"})
             code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 1, out)
-            self.assertIn("skip count unknown", out)
+            self.assertIn("test and skip count unknown", out)
+
+    def test_successful_exit_without_result_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_exit.py": "import os\nos._exit(0)\n"})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("test and skip count unknown", out)
+
+    def test_empty_module_keeps_unittest_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_empty.py": ""})
+            expected = subprocess.run([sys.executable, "-m", "unittest", "test_empty"], cwd=tmp,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT).returncode
+            code, ran, skipped, _ = r.run_module(tmp, "test_empty", False)
+            self.assertEqual((code, ran, skipped), (expected, 0, 0))
+
+    def test_module_sees_unittest_arguments(self):
+        module = '''import os, sys, unittest
+class T(unittest.TestCase):
+    def test_arguments(self):
+        self.assertEqual(os.path.basename(sys.argv[0]), "__main__.py")
+        self.assertEqual(sys.argv[1:], ["test_args"])
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_args.py": module})
+            code, _, _, out = r.run_module(tmp, "test_args", False)
+            self.assertEqual(code, 0, out)
+
+    def test_buffered_nested_runner_counts_outer_summary(self):
+        nested = '''import io, unittest
+class T(unittest.TestCase):
+    def test_nested(self):
+        output = io.StringIO()
+        unittest.TextTestRunner(stream=output).run(unittest.TestSuite([unittest.FunctionTestCase(lambda: None)]))
+        print(output.getvalue())
+    @unittest.skip("optional")
+    def test_skip(self): pass
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_nested.py": nested})
+            for args in ((), ("-v",)):
+                with self.subTest(args=args):
+                    code, out = run(tmp, "-j", "2", *args)
+                    self.assertEqual(code, 0, out)
+                    self.assertIn("1 files, 2 tests, 0 files failed", out)
+                    self.assertIn("1 tests skipped", out)
 
     def test_a_failure_or_import_error_is_reported_and_fails_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:

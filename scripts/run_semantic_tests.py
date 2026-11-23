@@ -4,8 +4,8 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
     python -I scripts/run_semantic_tests.py tests/semantic -j 4     # four at a time
     python -I scripts/run_semantic_tests.py tests/semantic -v       # also print the output of the files that pass
 
-It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each as
-`python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
+It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each in
+a separate unittest process from that folder, so a file sees the same import path as under discover. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
 line, and exits 1 if a file fails or none is found. Standard library only.
@@ -13,10 +13,11 @@ line, and exits 1 if a file fails or none is found. Standard library only.
 import argparse
 import concurrent.futures
 import fnmatch
+import json
 import os
-import re
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -34,13 +35,31 @@ def test_modules(directory):
 
 def run_module(directory, module, verbose):
     """Return exit code, test count, skipped count (or None), and output for a module."""
-    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
-    p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                       errors="replace")
-    summaries = re.findall(r"^Ran (\d+) tests? in [^\n]*\n\s*\n(?:OK|FAILED)(?: \(([^\n]*)\))?$", p.stdout, re.M)
-    skip = re.search(r"(?:^|, )skipped=(\d+)(?:,|$)", summaries[-1][1]) if summaries else None
-    skipped = int(skip.group(1)) if skip else (0 if summaries else None)
-    return p.returncode, int(summaries[-1][0]) if summaries else 0, skipped, p.stdout
+    child = '''import json, os, sys, unittest
+sys.path.insert(0, os.getcwd())
+result_path = sys.argv[1]
+sys.argv = [os.path.join(os.path.dirname(unittest.__file__), "__main__.py"), *sys.argv[2:]]
+class ReportingRunner(unittest.TextTestRunner):
+    def run(self, test):
+        result = super().run(test)
+        with open(result_path, "w", encoding="utf-8", newline="\\n") as f:
+            json.dump([result.testsRun, len(result.skipped)], f)
+        return result
+unittest.main(module=None, testRunner=ReportingRunner)
+'''
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = os.path.join(tmp, "result.json")
+        cmd = [sys.executable, "-c", child, result_path, *(["-v"] if verbose else []), module]
+        p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           errors="replace")
+        try:
+            with open(result_path, encoding="utf-8") as f:
+                ran, skipped = json.load(f)
+            if type(ran) is not int or type(skipped) is not int or ran < 0 or skipped < 0:
+                raise ValueError("invalid test counts")
+        except (OSError, ValueError, TypeError):
+            ran, skipped = 0, None
+    return p.returncode, ran, skipped, p.stdout
 
 
 def main(argv=None):
@@ -78,7 +97,7 @@ def main(argv=None):
     summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
     summary += f", {skipped} tests skipped"
     if unknown_skips:
-        summary += f" (skip count unknown for {unknown_skips} files)"
+        summary += f" (test and skip count unknown for {unknown_skips} files)"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
     return 1 if failed else 0
 
