@@ -318,6 +318,19 @@ class TestNopAST(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestNopCycleBounds(unittest.TestCase):
+    def test_modulo_bounds(self):
+        for i in range(8):
+            self.assertEqual(model_nop(i), i + 1)
+        self.assertEqual(model_nop(8), 1)
+
+    def test_translator_nop_range(self):
+        for imm in range(8):
+            prog = [f"s_nop {imm}", "s_endpgm"]
+            spv = support.translate_lines(f"cs_nop_{imm}", prog, fssm=saveexec_run.fssm())
+            self.assertIn("OpCapability Shader", spv)
+            si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
