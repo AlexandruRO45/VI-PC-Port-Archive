@@ -191,6 +191,17 @@ class CheckOnlyFlags(unittest.TestCase):
         self.assertIn("--warn needs --check", err)
         self.assertEqual(self.calls, [])
 
+    def test_check_still_reaches_run_check_with_both_flags(self):
+        code, err = self.run_main("--check", "--json", "--warn")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.calls, ["check"])
+
+    def test_cli_alone_still_reaches_the_text_reporter(self):
+        sys.argv = ["pc_checker.py", "--cli"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            pc.main()                   # run_cli returns; only a --check run exits
+        self.assertEqual(self.calls, ["cli"])
+
 
 if __name__ == "__main__":
     unittest.main()
