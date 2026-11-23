@@ -658,6 +658,7 @@ dependencies = [
  "victory-hle",
  "victory-loader",
  "victory-pe",
+ "victory-profile",
  "victory-shader",
  "walkdir",
 ]
@@ -715,6 +716,7 @@ dependencies = [
  "victory-gpu",
  "victory-loader",
  "victory-pe",
+ "victory-profile",
  "windows",
  "windows-core",
  "windows-sys",
