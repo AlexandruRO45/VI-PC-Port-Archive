@@ -1541,7 +1541,7 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_queue_list_type_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_queue_list_type COMMAND d3d12_queue_list_type_test)
     set_tests_properties(d3d12_queue_list_type PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
-    # WriteBufferImmediate writes on every list type OPTIONS3 advertises (DIRECT, BUNDLE, COMPUTE, COPY).
+    # WriteBufferImmediate writes on the list types OPTIONS3 advertises (DIRECT, BUNDLE, COMPUTE) and on COPY lists.
     add_executable(d3d12_write_immediate_queues_test test/d3d12_write_immediate_queues_test.cpp)
     target_link_libraries(d3d12_write_immediate_queues_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_write_immediate_queues_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -2949,6 +2949,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_readback_stages_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_readback_stages COMMAND replay_readback_stages_test)
+    # The barriers of each WriteBufferImmediate mode, and an enhanced SYNC_COPY barrier ordering a DEFAULT write (no GPU).
+    add_executable(replay_write_immediate_barriers_test test/replay_write_immediate_barriers_test.cpp)
+    target_link_libraries(replay_write_immediate_barriers_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_write_immediate_barriers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_write_immediate_barriers COMMAND replay_write_immediate_barriers_test)
     # emit of an enhanced texture barrier: no heap allocation for one layout piece, one barrier for each piece (no GPU).
     add_executable(replay_texture_barrier_test test/replay_texture_barrier_test.cpp)
     target_link_libraries(replay_texture_barrier_test PRIVATE Vulkan::Headers)

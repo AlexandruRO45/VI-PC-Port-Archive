@@ -1,9 +1,10 @@
-// CheckFeatureSupport(OPTIONS3) names the list types WriteBufferImmediate works on (WriteBufferImmediateSupportFlags;
-// WARP answers DIRECT | BUNDLE | COMPUTE | COPY). Each advertised type is held to it here: a list of that type writes
-// in all three modes on a queue of its type, and a bundle's writes land through the DIRECT list that executes it.
-// Each of the three lists also copies a word and then overwrites it with a MARKER_OUT write, which runs after the
-// copy. The values are read back from a readback buffer the writes target directly. No game files; exits 77 without
-// a Vulkan device.
+// CheckFeatureSupport(OPTIONS3) names the list types WriteBufferImmediate works on (WriteBufferImmediateSupportFlags):
+// DIRECT | BUNDLE | COMPUTE here, COPY not yet (d3d12_vulkan_device.cpp). Each advertised type is held to it: a list of
+// that type records a write in each of the three modes and runs it on a queue of its type, and a bundle's writes land
+// through the DIRECT list that executes it. A COPY list does the same, as coverage of its replay. Only the values are
+// checked, which the modes do not change; the barriers each mode adds are in replay_write_immediate_barriers_test.
+// The values are read back from a readback buffer the writes target directly. No game files; exits 77 without a
+// Vulkan device.
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -42,10 +43,6 @@ void write_three(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS base
     list2->WriteBufferImmediate(3, params, modes);
 }
 
-// The word a list copies at `slot` * 16 + 12 and then overwrites with MARKER_OUT.
-constexpr std::uint32_t copied = 0x434f5059;  // "COPY"
-std::uint32_t marker_after_copy(std::uint32_t slot) { return 0x4d4b0000u | slot; }
-
 bool landed(const std::uint8_t* bytes, std::uint32_t slot) {
     for (std::uint32_t i = 0; i < 3; ++i) {
         std::uint32_t word = 0;
@@ -62,10 +59,10 @@ int main() {
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
     const auto advertised = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE |
-                            D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
+                            D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE;
     check(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof options)) &&
               options.WriteBufferImmediateSupportFlags == advertised,
-          "OPTIONS3 advertises WriteBufferImmediate on DIRECT, BUNDLE, COMPUTE and COPY lists");
+          "OPTIONS3 advertises WriteBufferImmediate on DIRECT, BUNDLE and COMPUTE lists");
 
     // Which Vulkan families the COMPUTE and COPY queues below lease from (the type's own family when it has queues).
     if (const auto* info = rt::d3d12::vulkan_device_info(device.p))
@@ -81,21 +78,14 @@ int main() {
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    Ref<ID3D12Resource> readback, upload;
+    Ref<ID3D12Resource> readback;
     if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
                                                nullptr, IID_PPV_ARGS(&readback.p))))
-        return 1;
-    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                               nullptr, IID_PPV_ARGS(&upload.p))))
         return 1;
     void* mapped = nullptr;
     if (FAILED(readback->Map(0, nullptr, &mapped))) return 1;
     std::memset(mapped, 0, 256);
     readback->Unmap(0, nullptr);
-    if (FAILED(upload->Map(0, nullptr, &mapped))) return 1;
-    std::memcpy(mapped, &copied, sizeof copied);
-    upload->Unmap(0, nullptr);
     const D3D12_GPU_VIRTUAL_ADDRESS base = readback->GetGPUVirtualAddress();
     check(base != 0, "the readback buffer has a GPU virtual address");
 
@@ -116,15 +106,6 @@ int main() {
             return 1;
         }
         write_three(list.p, base, t);
-        list->CopyBufferRegion(readback.p, t * 16 + 12, upload.p, 0, sizeof copied);
-        {
-            Ref<ID3D12GraphicsCommandList2> list2;
-            if (SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list2.p)))) {
-                const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER after{base + t * 16 + 12, marker_after_copy(t)};
-                const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
-                list2->WriteBufferImmediate(1, &after, &mode);
-            }
-        }
         char what[96];
         std::snprintf(what, sizeof what, "a %s list with WriteBufferImmediate closes", names[t]);
         check(list->Close() == S_OK, what);
@@ -163,14 +144,6 @@ int main() {
     check(landed(bytes, 1), "the COMPUTE list's three writes landed");
     check(landed(bytes, 2), "the COPY list's three writes landed");
     check(landed(bytes, 3), "the bundle's three writes landed through the DIRECT list");
-    for (std::uint32_t t = 0; t < 3; ++t) {
-        std::uint32_t word = 0;
-        std::memcpy(&word, bytes + t * 16 + 12, sizeof word);
-        char what[96];
-        std::snprintf(what, sizeof what, "the %s list's MARKER_OUT write landed after its copy to the same word",
-                      names[t]);
-        check(word == marker_after_copy(t), what);
-    }
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
 

@@ -7201,11 +7201,13 @@ public:
             opts->CopyQueueTimestampQueriesSupported = FALSE;
             // Only typeless resources set VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
             opts->CastingFullyTypedFormatSupported = FALSE;
-            // WriteBufferImmediate records on every list type and replays as vkCmdUpdateBuffer, which any queue family
-            // runs (d3d12_write_immediate_queues_test). WARP answers the same four types.
-            opts->WriteBufferImmediateSupportFlags =
-                D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE |
-                D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
+            // WriteBufferImmediate records on every list type and replays as vkCmdUpdateBuffer
+            // (d3d12_write_immediate_queues_test). Not COPY yet: the COPY queue's stage mask (queue_stages_copy) drops
+            // the CLEAR stage vkCmdUpdateBuffer runs in, so an enhanced SYNC_COPY barrier there does not order a
+            // DEFAULT-mode write. WARP answers COPY as well.
+            opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
+                                                     D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE |
+                                                     D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE;
             opts->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
             opts->BarycentricsSupported = FALSE;
             return d3d12_trace::result(method, S_OK);
