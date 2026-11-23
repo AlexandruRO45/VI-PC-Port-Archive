@@ -396,6 +396,29 @@ class TestDsBPermuteB32AST(unittest.TestCase):
         for d in range(32):
             self.assertEqual(out[d], datas[(d + 3) % 32])
 
+class TestDsBPermuteB32SIMD(unittest.TestCase):
+    def test_simd_inactive_source_returns_zero(self) -> None:
+        # Source lane 5 is inactive
+        exec_mask = MASK32 & ~(1 << 5)
+        addrs = [l * 4 for l in range(32)]
+        datas = [300 + l for l in range(32)]
+        out = ref_ds_bpermute_b32(addrs, datas, offset=4, exec_mask=exec_mask)
+        # Destination 4 reads from source 5 -> gets 0
+        self.assertEqual(out[4], 0)
+        # Destination 0 reads from source 1 -> gets datas[1]
+        self.assertEqual(out[0], datas[1])
+
+    def test_simd_inactive_destination_preserves_old(self) -> None:
+        exec_mask = 0x000000FF  # only lower 8 lanes active
+        addrs = [l * 4 for l in range(32)]
+        datas = [700 + l for l in range(32)]
+        old_dst = [0xCAFE0000 + l for l in range(32)]
+        out = ref_ds_bpermute_b32(addrs, datas, offset=0, exec_mask=exec_mask, old_dst=old_dst)
+        for l in range(8):
+            self.assertEqual(out[l], datas[l])
+        for l in range(8, 32):
+            self.assertEqual(out[l], old_dst[l])
+
 
 if __name__ == "__main__":
     unittest.main()
