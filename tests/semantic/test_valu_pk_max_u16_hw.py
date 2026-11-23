@@ -112,5 +112,73 @@ class TestVPkMaxU16Reference(unittest.TestCase):
                 self.assertEqual(got, ref_pk_max_u16(s0, s1))
 
 
+class RegType(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    val: int = 0
+
+    def format(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        return f"{self.val:#x}"
+
+
+@dataclasses.dataclass(frozen=True)
+class VPkMaxU16Inst:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    op_sel: tuple[int, int] = (0, 0)
+    op_sel_hi: tuple[int, int] = (1, 1)
+
+    def emit_asm(self) -> str:
+        mods = ""
+        if self.op_sel != (0, 0):
+            mods += f" op_sel:[{self.op_sel[0]},{self.op_sel[1]}]"
+        if self.op_sel_hi != (1, 1):
+            mods += f" op_sel_hi:[{self.op_sel_hi[0]},{self.op_sel_hi[1]}]"
+        return f"v_pk_max_u16 {self.dst.format()}, {self.src0.format()}, {self.src1.format()}{mods}"
+
+
+class TestVPkMaxU16AST(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self):
+        inst = VPkMaxU16Inst(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+        )
+        self.assertEqual(inst.emit_asm(), "v_pk_max_u16 v0, v1, v2")
+
+    def test_ast_with_modifiers(self):
+        inst = VPkMaxU16Inst(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            op_sel=(1, 0),
+            op_sel_hi=(0, 1),
+        )
+        self.assertEqual(inst.emit_asm(), "v_pk_max_u16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,1]")
+
+    def test_ast_immutability(self):
+        inst = VPkMaxU16Inst(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            inst.dst = Operand(RegType.VGPR, 3)  # type: ignore
+
+
 if __name__ == '__main__':
     unittest.main()
