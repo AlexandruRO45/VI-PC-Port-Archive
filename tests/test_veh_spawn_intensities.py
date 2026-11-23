@@ -88,6 +88,24 @@ def write_doc(directory):
     return path
 
 
+def write_carve(directory):
+    blob = DOC.encode("utf-8")
+    rows = []
+    paths = []
+    for i, chunk in enumerate((blob[:256], blob[256:])):
+        off = 0x1000 + i * 256
+        path = os.path.join(directory, f"{off:012x}.bin")
+        with open(path, "wb") as f:
+            f.write(chunk)
+        paths.append(path)
+        rows.append({"off": off, "stored": len(chunk), "size": len(chunk),
+                     "pre": "00" * 16, "head": chunk[:16].hex()})
+    index = os.path.join(directory, "index.json")
+    with open(index, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"files": rows}, f)
+    return [index] + paths
+
+
 class RecordsTest(unittest.TestCase):
     def test_records_and_aggregates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,20 +173,57 @@ class CliTest(unittest.TestCase):
 
     def test_carve_directory_input(self):
         with tempfile.TemporaryDirectory() as tmp:
-            blob = DOC.encode("utf-8")
-            first, second = blob[:256], blob[256:]
-            rows = []
-            for i, chunk in enumerate((first, second)):
-                off = 0x1000 + i * len(first)
-                with open(os.path.join(tmp, f"{off:012x}.bin"), "wb") as f:
-                    f.write(chunk)
-                rows.append({"off": off, "stored": len(chunk), "size": len(chunk),
-                             "pre": "00" * 16, "head": chunk[:16].hex()})
-            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
-                json.dump({"files": rows}, f)
+            write_carve(tmp)
             status, out, err = self.run_tool(tmp)
             self.assertEqual(status, 0, err)
             self.assertEqual(json.loads(out), WANT)
+
+    def test_json_over_carve_inputs_is_refused(self):
+        for target_index in range(3):
+            with self.subTest(target=target_index), tempfile.TemporaryDirectory() as tmp:
+                inputs = write_carve(tmp)
+                before = {}
+                for path in inputs:
+                    with open(path, "rb") as f:
+                        before[path] = f.read()
+                status, out, err = self.run_tool(tmp, "--json", inputs[target_index])
+                self.assertEqual(status, 2, err)
+                self.assertEqual(out, "")
+                self.assertIn("--json must not overwrite", err)
+                for path, data in before.items():
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), data)
+
+    def test_json_over_external_hard_link_to_carve_input_is_refused(self):
+        for target_index in range(3):
+            with self.subTest(target=target_index), tempfile.TemporaryDirectory() as tmp:
+                carve = os.path.join(tmp, "carve")
+                os.mkdir(carve)
+                source = write_carve(carve)[target_index]
+                alias = os.path.join(tmp, "report.json")
+                try:
+                    os.link(source, alias)
+                except OSError as exc:
+                    self.skipTest(f"hard links unavailable: {exc}")
+                with open(source, "rb") as f:
+                    before = f.read()
+                status, out, err = self.run_tool(carve, "--json", alias)
+                self.assertEqual(status, 2, err)
+                self.assertEqual(out, "")
+                self.assertIn("--json must not overwrite", err)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_distinct_report_inside_carve_directory_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_carve(tmp)
+            report = os.path.join(tmp, "report.json")
+            for _ in range(2):
+                status, out, err = self.run_tool(tmp, "--json", report)
+                self.assertEqual(status, 0, err)
+                self.assertEqual(json.loads(out), WANT)
+                with open(report, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f), WANT)
 
     def test_carve_without_the_document_is_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:

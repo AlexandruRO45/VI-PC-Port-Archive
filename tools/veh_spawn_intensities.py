@@ -139,6 +139,14 @@ def main(argv=None) -> int:
         print("ERROR: --json must not overwrite the input", file=sys.stderr)
         return 2
     try:
+        if args.json and os.path.isdir(args.input):
+            # DirectorySource reads the index and carved chunks. Protect aliases
+            # too, including a report outside the directory hard-linked to a chunk.
+            with os.scandir(args.input) as entries:
+                for entry in entries:
+                    name = entry.name.lower()
+                    if (name == "index.json" or name.endswith((".bin", ".bk2"))) and same_report_path(entry.path, args.json):
+                        raise CensusError("--json must not overwrite a carve input")
         census_out = census(args.input)
     except (OSError, CensusError, ET.ParseError, KeyError, TypeError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
