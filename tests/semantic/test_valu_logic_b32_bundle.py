@@ -1112,3 +1112,46 @@ class TestAndOrB32NegativeAndTranslator(unittest.TestCase):
         self.assertIn("OpBitwiseAnd", spv)
         self.assertIn("OpBitwiseOr", spv)
         self.assertEqual(val, 0xF00F)
+
+
+# ------------------------------------------------------------------------------
+# v_or3_b32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def ref_or3_b32(s0: int, s1: int, s2: int) -> int:
+    return (s0 | s1 | s2) & MASK32
+
+
+class TestOr3B32Oracle(unittest.TestCase):
+    def test_oracle_matches_hardware(self):
+        vectors = [
+            (1, 2, 4),
+            (0xF000_0000, 0x0F00_0000, 0x00F0_0000),
+            (0x1200_0000, 0x0034_0000, 0x0000_5678),
+            (0, 0, 0),
+        ]
+        for idx, (a, b, c) in enumerate(vectors):
+            val, _ = run_shader(f"ps_or3_oracle_{idx}", [
+                f"v_mov_b32 v1, {hex(a)}",
+                f"v_mov_b32 v2, {hex(b)}",
+                f"v_mov_b32 v3, {hex(c)}",
+                "v_or3_b32 v0, v1, v2, v3",
+            ])
+            self.assertEqual(val, ref_or3_b32(a, b, c))
+
+    def test_oracle_identities_hardware(self):
+        val_id, _ = run_shader("ps_or3_id", [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "v_or3_b32 v0, v1, v2, v3",
+        ])
+        self.assertEqual(val_id, 0x12345678)
+
+        val_dom, _ = run_shader("ps_or3_dom", [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0xFFFFFFFF",
+            "v_or3_b32 v0, v1, v2, v3",
+        ])
+        self.assertEqual(val_dom, 0xFFFFFFFF)
