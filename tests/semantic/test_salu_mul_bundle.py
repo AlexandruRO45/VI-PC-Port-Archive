@@ -297,5 +297,30 @@ class TestSMulI32Validation(unittest.TestCase):
             right = (ref_s_mul_i32(a, b) + ref_s_mul_i32(a, c)) & MASK32
             self.assertEqual(left, right)
 
+def ref_s_mul_hi_i32(s0: int, s1: int) -> int:
+    """High 32 bits of 64-bit signed integer product."""
+    a = i32(s0)
+    b = i32(s1)
+    prod = a * b
+    return (prod >> 32) & MASK32
+
+
+class TestSMulHiI32Oracle(unittest.TestCase):
+    def test_oracle_small_positive_product(self) -> None:
+        # Small positive products fit in low 32 bits, high 32 bits is 0
+        self.assertEqual(ref_s_mul_hi_i32(100, 200), 0)
+
+    def test_oracle_small_negative_product(self) -> None:
+        # -2 * 100 = -200 -> in 64-bit two's complement, high 32 bits is 0xFFFFFFFF
+        self.assertEqual(ref_s_mul_hi_i32(u32(-2), 100), 0xFFFFFFFF)
+
+    def test_oracle_negative_times_negative(self) -> None:
+        # (-1) * (-1) = 1 -> high 32 bits is 0
+        self.assertEqual(ref_s_mul_hi_i32(0xFFFFFFFF, 0xFFFFFFFF), 0)
+
+    def test_oracle_large_signed_product(self) -> None:
+        # -2147483648 * -2147483648 = 2^62 = 0x40000000_00000000 -> high 32 bits is 0x40000000
+        self.assertEqual(ref_s_mul_hi_i32(0x80000000, 0x80000000), 0x40000000)
+
 if __name__ == "__main__":
     unittest.main()
