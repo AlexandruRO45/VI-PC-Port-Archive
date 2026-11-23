@@ -200,10 +200,11 @@ class AudioStageResumeTest(unittest.TestCase):
         p = os.path.join(self.audio, "probe.done")
         cases = (("tool finished\n", True), ("tool finished", True), ("tool finish", False),
                  ("tool finished" + "x" * (1 << 20), False), ("tool finished\n" + "x" * (1 << 20), False),
-                 ("tool finished\n\nforeign\n", False), ("tool finished\n\n", False), (" tool finished\n", False))
+                 ("tool finished\n\nforeign\n", False), ("tool finished\n\n", False), (" tool finished\n", False),
+                 ("tool finished\r\n", True), ("tool finished\r\nforeign", False), ("tool finished\r\n\r\n", False))
         for text, want in cases:
             with self.subTest(size=len(text), want=want):
-                with open(p, "w", encoding="utf-8") as f:
+                with open(p, "w", encoding="utf-8", newline="") as f:
                     f.write(text)
                 real_open = open
                 reads = []
@@ -215,7 +216,7 @@ class AudioStageResumeTest(unittest.TestCase):
                     return f
                 with mock.patch("builtins.open", tracking_open):
                     self.assertEqual(make_game.marker_matches(p, "tool"), want)
-                self.assertTrue(reads and all(0 <= n <= len("tool finished") + 2 for n in reads), reads)
+                self.assertTrue(reads and all(0 <= n <= len("tool finished") + 3 for n in reads), reads)
         self.assertFalse(make_game.marker_matches(os.path.join(self.audio, "missing.done"), "tool"))
 
     def test_matching_awc_opus_fingerprint_skips_the_ogg_step(self):
