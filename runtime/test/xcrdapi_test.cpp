@@ -100,6 +100,18 @@ int main() {
     check(qi(factory, &kUnknownInterface, &unknown_out) == E_NOINTERFACE && unknown_out == nullptr,
           "QueryInterface with an unsupported non-null IID zeroes ppv and returns E_NOINTERFACE");
 
+    void* acquired = nullptr;
+    void* queried = nullptr;
+    const HRESULT get_hr = get_factory(&kUnknownInterface, &acquired);
+    const HRESULT query_hr = qi(factory, &kUnknownInterface, &queried);
+    std::printf("unknown IID: get=%08lx query=%08lx same=%d\n",
+                static_cast<unsigned long>(get_hr), static_cast<unsigned long>(query_hr),
+                acquired == factory && queried == factory);
+    check(get_hr == E_NOINTERFACE && acquired == nullptr, "factory rejects unsupported IID");
+    check(query_hr == E_NOINTERFACE && queried == nullptr, "interface set stays fixed");
+    if (SUCCEEDED(query_hr)) release(queried);
+    if (SUCCEEDED(get_hr)) release(acquired);
+
     void* qi_out = reinterpret_cast<void*>(uintptr_t{0x1234});
     check(qi(factory, &kTestIid, nullptr) == E_POINTER, "QueryInterface with null ppv returns E_POINTER");
     check(qi(factory, nullptr, &qi_out) == E_INVALIDARG && qi_out == nullptr,

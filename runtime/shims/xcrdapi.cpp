@@ -13,7 +13,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <mutex>
 #include <utility>
 
 #include "shims.h"
@@ -27,22 +26,17 @@ constexpr IID kIDStorageFactory = {0x6924ea0c, 0xc3cd, 0x4826, {0xb1, 0x0a, 0xf6
 struct StubDStorageFactory {
     const void* const* vtable;
     std::atomic<ULONG> refs{0};
-    std::mutex iid_mutex;
-    IID factory_iid = kIDStorageFactory;
 };
 
-bool supports_iid(StubDStorageFactory* self, const IID& iid) {
-    if (IsEqualIID(iid, IID_NULL)) return false;
-    if (IsEqualIID(iid, IID_IUnknown) || IsEqualIID(iid, kIDStorageFactory)) return true;
-    const std::lock_guard lock(self->iid_mutex);
-    return IsEqualIID(iid, self->factory_iid);
+bool supports_iid(const IID& iid) {
+    return IsEqualIID(iid, IID_IUnknown) || IsEqualIID(iid, kIDStorageFactory);
 }
 
 HRESULT STDMETHODCALLTYPE factory_query_interface(StubDStorageFactory* self, const IID* riid, void** ppv) {
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
     if (!self || !riid) return E_INVALIDARG;
-    if (!supports_iid(self, *riid)) return E_NOINTERFACE;
+    if (!supports_iid(*riid)) return E_NOINTERFACE;
     self->refs.fetch_add(1, std::memory_order_relaxed);
     *ppv = self;
     return S_OK;
@@ -91,7 +85,7 @@ HRESULT WINAPI dstorage_get_factory(const IID* riid, void** ppv) {
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
     if (!riid) return E_INVALIDARG;
-    if (IsEqualIID(*riid, IID_NULL)) return E_NOINTERFACE;
+    if (!supports_iid(*riid)) return E_NOINTERFACE;
 
     static std::atomic<bool> s_logged{false};
     if (!s_logged.exchange(true, std::memory_order_relaxed)) {
@@ -104,10 +98,6 @@ HRESULT WINAPI dstorage_get_factory(const IID* riid, void** ppv) {
     }
 
     StubDStorageFactory& factory = stub_factory();
-    if (!IsEqualIID(*riid, IID_IUnknown) && !IsEqualIID(*riid, kIDStorageFactory)) {
-        const std::lock_guard lock(factory.iid_mutex);
-        factory.factory_iid = *riid;
-    }
     factory.refs.fetch_add(1, std::memory_order_relaxed);
     *ppv = &factory;
     return S_OK;
