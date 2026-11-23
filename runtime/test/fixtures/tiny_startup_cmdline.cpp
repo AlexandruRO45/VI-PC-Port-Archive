@@ -83,7 +83,15 @@ int main(int argc, char** argv) {
     ok = ok && argc == entry.argc;
     for (int i = 0; ok && i < argc; ++i) ok = std::strcmp(argv[i], entry.argv[i]) == 0;
     std::printf("tiny_startup_cmdline: %s\n", ok ? "PASS" : "FAIL");
-    return ok ? 0 : 1;
+    if (!ok) return 1;
+    if (argc == 2) {
+        // Mark entry before the controls which deliberately never return to the loader.
+        std::fflush(stdout);
+        if (std::strcmp(argv[1], "timeout") == 0) Sleep(INFINITE);
+        if (std::strcmp(argv[1], "abnormal") == 0) TerminateProcess(GetCurrentProcess(), 73);
+        if (std::strcmp(argv[1], "exit-code") == 0) return 42;
+    }
+    return 0;
 }
 
 #endif

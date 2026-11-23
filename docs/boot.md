@@ -4,6 +4,28 @@
 not contain `game_scarlett_master.exe` (RT-5), so this page is the procedure and the trace tool for the day it
 arrives. Nothing here quotes game data; a real trace stays on the player's machine.
 
+## Synthetic CPU rehearsal on Windows
+
+After building the x64 `gta6rt` and `tiny_startup_cmdline` targets in RelWithDebInfo, run the
+same command as the Windows Runtime CI job from the repository root:
+
+```powershell
+python -I scripts/rehearse_first_boot.py
+```
+
+The defaults use the Ninja layout under `runtime/build`. For a Visual Studio build, add
+`--loader runtime/build/RelWithDebInfo/gta6rt.exe`. Use `--fixtures DIR` for a different fixture
+output directory. Missing build artifacts fail the rehearsal.
+
+The command copies the synthetic executable and its DLL to a fresh temporary folder, runs the
+first-look inspection tools and checks the loader's three phases using `boot_trace.py --json`.
+A successful guest returns 42. The controls check the unresolved import in the dry-run output,
+a DLL that rejects attach, a guest that terminates its process, and a guest still waiting five
+seconds after launch. Temporary reports and traces are removed after the run.
+
+**Optional GPU check.** With the frame fixture and Vulkan prerequisites built, run
+`ctest --test-dir runtime/build -C RelWithDebInfo -R "^run_tiny_frame$" --output-on-failure`.
+
 ## 1. What the first boot produces
 
 `gta6rt` has three passes over the executable (`runtime/README.md`, "Dry run" and "Current limits"):

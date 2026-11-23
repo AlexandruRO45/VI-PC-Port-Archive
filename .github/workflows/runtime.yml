@@ -20,6 +20,12 @@ on:
       - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
+      - "tools/boot_trace.py"
+      - "tools/exe_checklist.py"
+      - "tools/find_hash_lookup.py"
+      - "tools/gdk_runtime_calls.py"
+      - "tools/gdk_runtime_classes.json"
+      - "tools/pe_inspect.py"
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
@@ -58,6 +64,12 @@ on:
       - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
+      - "tools/boot_trace.py"
+      - "tools/exe_checklist.py"
+      - "tools/find_hash_lookup.py"
+      - "tools/gdk_runtime_calls.py"
+      - "tools/gdk_runtime_classes.json"
+      - "tools/pe_inspect.py"
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
@@ -246,6 +258,8 @@ jobs:
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
       - name: Build
         run: cmake --build runtime/build
+      - name: Synthetic first-boot rehearsal (CPU)
+        run: python -I scripts/rehearse_first_boot.py
       - name: Verify the descriptor test shaders
         shell: pwsh
         run: |
