@@ -269,6 +269,7 @@ jobs:
         run: |
           ctest --test-dir runtime/build --show-only=json-v1 > runtime/build/ctest.json
           cygpath -m "$GITHUB_WORKSPACE" > runtime/build/windows-root.txt
+          python -I scripts/write_runtime_build_info.py runtime/build
       - name: Upload the Windows build for Wine
         id: upload-wine-artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -284,6 +285,7 @@ jobs:
             runtime/build/generated/*.spv
             runtime/build/ctest.json
             runtime/build/windows-root.txt
+            runtime/build/build-info.json
           retention-days: 7
           if-no-files-found: error
       - name: CPU runtime tests
