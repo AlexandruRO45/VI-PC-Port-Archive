@@ -97,16 +97,16 @@ def rewrite(text, counts):
             continue
         candidates.append((b, definition_positions[old_ptr], order, v, old_ptr, rt.group(1)))
 
-    if candidates:
-        if uint is None:
-            raise SystemExit("module has no 32-bit uint type for the array lengths")
-        first_pointer = min(candidate[1] for candidate in candidates)
-        uint_position = definition_positions[uint]
-        if uint_position > first_pointer:
-            # The generated length may precede an original declaration of its integer type.
-            lines.insert(first_pointer, lines.pop(uint_position))
-
     used_ids = set(defs) | set(sets) | set(binds)
+    if candidates:
+        first_pointer = min(candidate[1] for candidate in candidates)
+        if uint is None:
+            uint = _fresh_id("%msl_uint", used_ids)
+            lines.insert(first_pointer, f"{uint} = OpTypeInt 32 0")
+        elif definition_positions[uint] > first_pointer:
+            # The generated length may precede an original declaration of its integer type.
+            lines.insert(first_pointer, lines.pop(definition_positions[uint]))
+
     cap_by_bind = {}    # binding -> OpConstant id (emitted once per binding)
     ptr_by_key = {}     # (binding, elem_type) -> new OpTypePointer id
     new_types = []      # inserted right after the variable's pointer type is declared

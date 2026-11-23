@@ -698,7 +698,7 @@ OpDecorate %orphan Binding 1
                 self.assertIn("%bad", str(ctx.exception))
                 self.assertIn(f"binding {b}", str(ctx.exception))
 
-    def test_missing_uint32_type_raises_when_runtime_array_rewritten(self):
+    def test_declares_missing_uint32_type_before_generated_array_lengths(self):
         base = """\
 OpDecorate %images DescriptorSet 0
 OpDecorate %images Binding 0
@@ -715,9 +715,12 @@ OpDecorate %images Binding 0
             ("unsigned_64", "%u64 = OpTypeInt 64 0"),
         ):
             with self.subTest(case=label):
-                with self.assertRaises(SystemExit) as ctx:
-                    m.rewrite(base.format(int_decl=int_decl), [4096])
-                self.assertIn("no 32-bit uint type", str(ctx.exception))
+                rewritten = m.rewrite(base.format(int_decl=int_decl), [4096])
+                self.assertEqual(rewritten.count("OpTypeInt 32 0"), 1)
+                type_line = "%msl_uint = OpTypeInt 32 0"
+                length_line = "%msl_cap_b0 = OpConstant %msl_uint 4096"
+                self.assertLess(rewritten.index(type_line), rewritten.index(length_line))
+                self.assertIn("OpTypeArray %img2d %msl_cap_b0", rewritten)
 
 
 class TestMainAndCli(unittest.TestCase):

@@ -132,14 +132,15 @@ OpFunctionEnd
 
 @pytest.mark.skipif(not all(shutil.which(tool) for tool in ("spirv-as", "spirv-dis", "spirv-val")),
                     reason="needs SPIRV-Tools on PATH")
-@pytest.mark.parametrize("resource,binding,depth", [
-    ("samplers", 1, 0),
-    ("samplers", 1, 1),
-    ("samplers", 1, 2),
-    ("images", 3, 1),
-], ids=["direct", "sampler-copy", "sampler-chain", "image-copy"])
-def test_cli_retypes_descriptor_array_copies(tmp_path, resource, binding, depth):
-    assembly = SAMPLE_FRAGMENT
+@pytest.mark.parametrize("resource,binding,depth,signedness", [
+    ("samplers", 1, 0, 0),
+    ("samplers", 1, 0, 1),
+    ("samplers", 1, 1, 0),
+    ("samplers", 1, 2, 0),
+    ("images", 3, 1, 0),
+], ids=["direct", "signed-index", "sampler-copy", "sampler-chain", "image-copy"])
+def test_cli_retypes_descriptor_array_copies(tmp_path, resource, binding, depth, signedness):
+    assembly = SAMPLE_FRAGMENT.replace("OpTypeInt 32 0", f"OpTypeInt 32 {signedness}")
     if resource == "images":
         assembly = assembly.replace("OpDecorate %images Binding 0", f"OpDecorate %images Binding {binding}")
     base = f"%{resource}"
