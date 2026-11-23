@@ -185,10 +185,22 @@ def carved_stream(address: str, directory: str):
     rpf9_carve.py writes one `<offset:012x>.bin` (or `.bk2`) per stream beside its index.json, so it is an input,
     not a place for a report; guarding only index.json left `--json`/`--csv` free to replace a carved stream.
     """
-    if not CARVED_STREAM.fullmatch(os.path.basename(address)):
+    try:
+        report_stat = os.stat(address)
+    except (FileNotFoundError, NotADirectoryError):
         return None
-    candidate = os.path.join(directory, os.path.basename(address))
-    return candidate if os.path.isfile(candidate) and same_report_path(address, candidate) else None
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not CARVED_STREAM.fullmatch(entry.name.lower()) or not entry.is_file():
+                continue
+            try:
+                # os.stat provides the file identity on Windows.
+                stream_stat = os.stat(entry.path)
+            except FileNotFoundError:
+                continue
+            if os.path.samestat(report_stat, stream_stat):
+                return entry.path
+    return None
 
 
 class DirectorySource:
@@ -439,7 +451,12 @@ def main() -> int:
                 if same_report_path(path, input_path):
                     ap.error(f"{flag} would overwrite the input {input_path}")
             for directory in (a.target, a.carve_dir):
-                stream = directory and os.path.isdir(directory) and carved_stream(path, directory)
+                if not directory or not os.path.isdir(directory):
+                    continue
+                try:
+                    stream = carved_stream(path, directory)
+                except OSError as e:
+                    ap.error(f"cannot inspect {e.filename or path}: {e.strerror or e}")
                 if stream:
                     ap.error(f"{flag} would overwrite the carved stream {stream}")
     source = None

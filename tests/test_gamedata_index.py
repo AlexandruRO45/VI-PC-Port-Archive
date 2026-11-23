@@ -118,6 +118,25 @@ class GamedataIndexTest(unittest.TestCase):
         with open(stream, "rb") as f:
             self.assertEqual(f.read(), before)
 
+    def test_a_report_cannot_overwrite_a_differently_named_stream_alias(self):
+        original = b"synthetic payload"
+        self.add(original)
+        self.finish()
+        stream = os.path.join(self.carve, f"{self.rows[0]['off']:012x}.bin")
+        for flag in ("--json", "--csv"):
+            with self.subTest(flag=flag):
+                alias = os.path.join(self.root, "report." + flag[2:])
+                try:
+                    os.link(stream, alias)
+                except OSError as e:
+                    self.skipTest(f"hard links unavailable: {e}")
+                p = self.run_tool(self.carve, flag, alias)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("would overwrite the carved stream", p.stderr)
+                for name in (stream, alias):
+                    with open(name, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
     def test_bad_targets_are_one_line(self):
         empty = os.path.join(self.root, "empty.rpf")
         open(empty, "wb").close()
