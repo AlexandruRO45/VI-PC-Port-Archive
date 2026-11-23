@@ -1142,7 +1142,8 @@ def pump_process(proc, stage: str | None, board: LeonidaBoard | None) -> int:
                 if not line:
                     continue
                 for piece in line.split("\n"):
-                    piece = piece.strip()
+                    # Keep leading indentation (traceback frames, compiler caret lines).
+                    piece = piece.rstrip()
                     if not piece:
                         continue
                     if board is not None:

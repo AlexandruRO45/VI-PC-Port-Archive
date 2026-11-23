@@ -113,6 +113,41 @@ class CapturePopenTest(unittest.TestCase):
             self.assertNotIn("creationflags", kw)
 
 
+class PumpProcessTest(unittest.TestCase):
+    def test_keeps_leading_indentation_and_drops_blank_lines(self):
+        import subprocess
+        expected = [
+            "Traceback (most recent call last):",
+            '  File "x.py", line 3, in <module>',
+            "    y = foo(1, 2)",
+            "            ^^^^",
+            "      |           ^",
+        ]
+        child = (
+            "import sys;"
+            "w = sys.stdout.write;"
+            "w('Traceback (most recent call last):\\n');"
+            "w('  File \"x.py\", line 3, in <module>\\n');"
+            "w('    y = foo(1, 2)\\n');"
+            "w('\\n');"
+            "w('   \\t  \\n');"
+            "w('            ^^^^   \\n');"
+            "w('      |           ^\\n')"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            board = leonida_tui.LeonidaBoard(["shaders"], tmp)  # not entered: nothing is drawn
+            try:
+                proc = subprocess.Popen([sys.executable, "-I", "-c", child], **leonida_tui.capture_popen_kwargs())
+                rc = leonida_tui.pump_process(proc, "shaders", board)
+            finally:
+                for console in board.consoles.values():
+                    console.close()
+            self.assertEqual(rc, 0)
+            self.assertEqual(list(board.consoles["shaders"].lines), expected)
+            with open(os.path.join(tmp, "shaders.log"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "".join(line + "\n" for line in expected))
+
+
 class InterruptKeyTest(unittest.TestCase):
     def test_ctrl_c_char_force_exits(self):
         calls = {"exit": 0}
