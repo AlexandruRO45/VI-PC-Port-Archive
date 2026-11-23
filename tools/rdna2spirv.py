@@ -228,6 +228,13 @@ DPP_MODS = ("quad_perm", "row_", "wave_", "dpp8", "bank_mask", "bound_ctrl", "fi
 MIN_ACTIVE_RUN = 2
 
 
+# A VALU instruction writes a VGPR. The exceptions name a scalar first operand by design: v_readlane_b32 and
+# v_readfirstlane_b32 put a lane's value into an SGPR, and the v_cmp/v_cmpx compares write a lane mask (SGPR pair, VCC
+# or EXEC). Any other VALU op given a scalar destination is not encodable (the destination field of VOP1/VOP2/VOP3
+# is a VGPR number) and used to be translated as if it were a VGPR write, on a register the program never named.
+VALU_SCALAR_DST = ("v_cmp", "v_readlane", "v_readfirstlane")
+
+
 def base_op(op):
     for suf in ("_e32", "_e64", "_sdwa", "_dpp"):
         if op.endswith(suf):
@@ -6723,6 +6730,8 @@ class Gen:
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
         if op in NOOPS or op.startswith("s_waitcnt"):
             return
+        if op.startswith("v_") and a and not op.startswith(VALU_SCALAR_DST) and a[0]["k"] != "vgpr":
+            raise Unsupported(f"{op} destination {a[0].get('t', a[0]['k'])} (a VALU result goes to a VGPR)")
         if op == "s_sendmsg" and a and self.stage == "gs":
             t = a[0].get("t", "")
             if "GS_OP_EMIT" in t:
