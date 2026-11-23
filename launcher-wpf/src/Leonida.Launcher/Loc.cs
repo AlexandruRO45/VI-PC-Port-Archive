@@ -81,6 +81,9 @@ public static class Loc
         if (!Translated) return;
         var seen = new HashSet<DependencyObject>();
         Walk(root, seen);
+        // Templates and bound lists are built after the window is loaded, so the same walk runs once more then.
+        if (root is FrameworkElement { IsLoaded: false } fe)
+            fe.Loaded += (_, _) => Walk(root, new HashSet<DependencyObject>());
     }
 
     static void Walk(DependencyObject d, HashSet<DependencyObject> seen)
@@ -113,6 +116,9 @@ public static class Loc
         if (d is FrameworkElement fe)
         {
             if (fe.ToolTip is string tip && Lookup(tip, out var tt)) fe.ToolTip = tt;
+            // The name screen readers announce is a string of its own; it is written next to many tooltips.
+            var said = System.Windows.Automation.AutomationProperties.GetName(d);
+            if (!string.IsNullOrEmpty(said) && Lookup(said, out var saidT)) System.Windows.Automation.AutomationProperties.SetName(d, saidT);
             if (fe.ContextMenu != null) Walk(fe.ContextMenu, seen);
             if (fe is ListView { View: GridView gv })
                 foreach (var col in gv.Columns)
@@ -120,6 +126,10 @@ public static class Loc
         }
         foreach (var child in LogicalTreeHelper.GetChildren(d))
             if (child is DependencyObject c) Walk(c, seen);
+        // Template parts (the title bar's buttons, list rows) are only in the visual tree, so it is walked too.
+        if (d is System.Windows.Media.Visual or System.Windows.Media.Media3D.Visual3D)
+            for (int i = 0, n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(d); i < n; i++)
+                Walk(System.Windows.Media.VisualTreeHelper.GetChild(d, i), seen);
     }
 
     /// <summary>{l:T text} for text inside templates, which the walk can't reach.</summary>

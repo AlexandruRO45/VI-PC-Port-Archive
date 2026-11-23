@@ -41,7 +41,7 @@ has its own tabs at the top right. The avatar next to the tabs opens **Settings*
 | **GPU tests** | For contributors: runs `scripts/run_gpu_tests.py` against the test programs built from your checkout (docs/testing.md), lists each test's result, and drafts the `Tested <commit> on <GPU, driver, OS>` report to paste on a pull request, with no local paths in it. It won't run during a build. |
 | **Settings** (avatar menu) | One page per group, one setting per row. **Launcher settings**: *General* (language, theme, start page, sidebar, avatar: random or your own picture), *Builds* (how builds stop, taskbar flash, sound, Windows notification, keep running in the tray, console text size, log clean-up), *Online* (GitHub and the Can I Run checker, each on or off), *About and files* (version, settings file, logs, restore defaults). **Leonida settings**: *Your setup* (`make_game.py`'s own preflight), *Play* (Play's options), *Folders and Python* (the Leonida folder, Python, environment variables), *Disk space* (what the build has written, folder by folder, with what deleting each costs). |
 
-The launcher is in **English** and **Polish**; choose the language in Launcher settings. The README pages and the
+The launcher is in **English**, **Polish** and **Russian**; choose the language in Launcher settings. The README pages and the
 build's own output stay in English. Each translation is one JSON file in `src/Leonida.Launcher/Languages`; that
 folder's README says how to add a language, and how to try one without building the launcher.
 

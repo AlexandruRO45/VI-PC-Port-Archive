@@ -64,7 +64,7 @@ public sealed class LauncherSettings
     // Launcher settings
     /// <summary>"system" (Windows' app theme), "light" or "dark".</summary>
     public string Theme { get; set; } = "system";
-    /// <summary>"en" or "pl".</summary>
+    /// <summary>A language code: "en", or a file in Languages (pl, ru, …).</summary>
     public string Language { get; set; } = "en";
     /// <summary>"last" (where you left off), "home", "leonida" or "caniru".</summary>
     public string StartPage { get; set; } = "last";
