@@ -22,6 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import shader_profile as P  # noqa: E402
+import report_paths  # noqa: E402
 
 
 def diag(line, col, src, kind="warning: invalid instruction encoding"):
@@ -586,11 +587,11 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertEqual(summary["cs"]["sgpr_mean"], 8.5)
         self.assertEqual(P.register_summary({}), {})
 
-    def test_same_output_path_identity(self):
+    def test_report_path_identity(self):
         a = os.path.join(self.disasm_dir, "a.json")
-        self.assertTrue(P.same_output_path(a, a))
+        self.assertTrue(P.same_report_path(a, a))
         b = os.path.join(self.disasm_dir, "b.json")
-        self.assertFalse(P.same_output_path(a, b))
+        self.assertFalse(P.same_report_path(a, b))
 
     def assert_carve_index_output_refused(self, output):
         tool = os.path.join(ROOT, "tools", "shader_profile.py")
@@ -645,6 +646,23 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertIn("ERROR: output would overwrite input shader", res.stderr)
         with open(shader_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), original_content)
+
+    def test_output_with_an_equivalent_unicode_shader_name_is_refused(self):
+        original = "\ts_endpgm\n"
+        self.write("caf\u00e9", original)
+        source = os.path.join(self.disasm_dir, "caf\u00e9.s")
+        output = os.path.join(self.disasm_dir, "cafe\u0301.s")
+        stderr = io.StringIO()
+        with (patch.object(report_paths, "case_insensitive_volume", return_value=True),
+              patch.object(P, "profile_shader", wraps=P.profile_shader) as profile,
+              patch.object(sys, "argv", ["shader_profile.py", self.disasm_dir, "--out", output]),
+              redirect_stdout(io.StringIO()),
+              patch.object(sys, "stderr", stderr)):
+            self.assertEqual(P.main(), 2)
+        profile.assert_not_called()
+        self.assertIn("output would overwrite input shader", stderr.getvalue())
+        with open(source, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
 
     def test_unreadable_listing_reports_its_path_and_preserves_report(self):
         from io import StringIO
