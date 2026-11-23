@@ -272,5 +272,38 @@ class VMulF64TranslatorTests(unittest.TestCase):
         except rdna2spirv.Unsupported as caught:
             self.assertIn("v_mul_f64", str(caught))
 
+# -----------------------------------------------------------------------------
+# Opcode 3: v_fma_f64
+# -----------------------------------------------------------------------------
+def oracle_fma_f64(a_bits: int, b_bits: int, c_bits: int) -> int:
+    """Reference mathematical oracle for v_fma_f64: computes S0 * S1 + S2."""
+    if is_nan_u64(a_bits) or is_nan_u64(b_bits) or is_nan_u64(c_bits):
+        return F64_QNAN
+    fa = u64_to_f64(a_bits)
+    fb = u64_to_f64(b_bits)
+    fc = u64_to_f64(c_bits)
+    if (fa == 0.0 and math.isinf(fb)) or (fb == 0.0 and math.isinf(fa)):
+        return F64_QNAN
+    prod = fa * fb
+    if (math.isinf(prod) and math.isinf(fc)) and (prod > 0 != fc > 0):
+        return F64_QNAN
+    try:
+        res = prod + fc
+        if res == 0.0:
+            return F64_POS_ZERO
+        return f64_to_u64(res)
+    except OverflowError:
+        return F64_POS_INF if prod > 0 else F64_NEG_INF
+
+
+class VFmaF64OracleTests(unittest.TestCase):
+    def test_fma_basic(self):
+        # 2.0 * 3.0 + 4.0 = 10.0
+        self.assertEqual(oracle_fma_f64(f64_to_u64(2.0), f64_to_u64(3.0), f64_to_u64(4.0)), f64_to_u64(10.0))
+
+    def test_fma_with_zero_addend(self):
+        # 5.0 * 5.0 + 0.0 = 25.0
+        self.assertEqual(oracle_fma_f64(f64_to_u64(5.0), f64_to_u64(5.0), F64_POS_ZERO), f64_to_u64(25.0))
+
 if __name__ == "__main__":
     unittest.main()
