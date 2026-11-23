@@ -40,6 +40,7 @@ import os
 import struct
 import sys
 import tempfile
+from bisect import bisect_right
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -161,7 +162,48 @@ def align(scores: list) -> list:
     """Order-constrained alignment: tile i (archive order) to slot path[i], strictly increasing, maximising the sum.
 
     ``scores[i][j]`` is tile i's score at slot j. Needs at least as many slots as tiles.
+
+    The recurrence is ``cur[j] = max(best[:j]) + scores[i][j]``. Row i can only be on a path in slots i to
+    i + (m - n): earlier slots leave no slot for tiles 0..i-1 and later ones none for the tiles after it, and a
+    slot outside that window never feeds one inside it. The table is therefore (m - n + 1) wide and each row is one
+    comprehension. A row's back pointers are just the slots where its running maximum strictly grows (the earliest
+    argmax of a prefix is the last such slot in it), which a bisect reads back; that is far smaller than an n x m
+    table. Scores that are not all finite take ``_align_general``, the plain loop.
     """
+    n = len(scores)
+    if not n:
+        return []
+    m = len(scores[0])
+    if m < n:
+        raise ValueError(f"{n} tiles do not fit {m} slots in order")
+    if any(len(row) != m or not math.isfinite(sum(row)) for row in scores):
+        return _align_general(scores)
+    neg = float("-inf")
+    w = m - n + 1                       # slots per row; best[t] is the score at slot i + t
+    best = list(scores[0][:w])
+    records = []
+    for i in range(1, n):
+        at = []
+        push = at.append
+        run = neg
+        # run is the maximum of best[:t + 1]; a strict gain at t makes t a back-pointer target
+        best = [((push(t) or (run := b)) if b > run else run) + s
+                for t, b, s in zip(range(w), best, scores[i][i:i + w])]
+        records.append(at)
+    top = max(best)
+    if top == neg:                      # sums overflowed to -inf: no finite path to follow
+        return _align_general(scores)
+    t = best.index(top)
+    path = [n - 1 + t]
+    for i in range(n - 1, 0, -1):
+        at = records[i - 1]
+        t = at[bisect_right(at, t) - 1]
+        path.append(i - 1 + t)
+    return path[::-1]
+
+
+def _align_general(scores: list) -> list:
+    """``align`` as the plain n x m loop; it also handles scores that are not finite."""
     n = len(scores)
     if not n:
         return []
