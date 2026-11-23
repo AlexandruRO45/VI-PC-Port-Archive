@@ -480,5 +480,59 @@ class TestFrexpExpI32F32StatusFlags(unittest.TestCase):
             self.assertEqual(self.machine.scc, 1)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestFrexpExpI32F32IEEE754Handling(unittest.TestCase):
+    def test_subnormals_flushed_to_zero(self):
+        subnormals = [
+            0x0000_0001,
+            0x0000_0002,
+            0x0000_FFFF,
+            0x0040_0000,
+            0x007F_FFFF,
+            0x8000_0001,
+            0x8000_FFFF,
+            0x807F_FFFF,
+        ]
+        for sub in subnormals:
+            self.assertEqual(ref_frexp_exp_i32_f32(sub), 0, f"Subnormal {sub:#x} did not return 0")
+
+    def test_zeros_yield_zero(self):
+        self.assertEqual(ref_frexp_exp_i32_f32(POS_ZERO), 0)
+        self.assertEqual(ref_frexp_exp_i32_f32(NEG_ZERO), 0)
+
+    def test_infinities_yield_zero(self):
+        self.assertEqual(ref_frexp_exp_i32_f32(POS_INF), 0)
+        self.assertEqual(ref_frexp_exp_i32_f32(NEG_INF), 0)
+
+    def test_all_nans_yield_zero(self):
+        nans = [
+            QNAN,
+            SNAN,
+            0xFFC0_0000,
+            0xFF80_0001,
+            0x7F80_0002,
+            0x7FFF_FFFF,
+            0xFFFF_FFFF,
+        ]
+        for nan in nans:
+            self.assertEqual(ref_frexp_exp_i32_f32(nan), 0, f"NaN {nan:#x} did not return 0")
+
+    def test_exponent_boundary_continuity(self):
+        # Exponent continuity across adjacent power of 2 boundaries
+        # Just below 1.0f: 0x3F7FFFFF (exp 0)
+        self.assertEqual(ref_frexp_exp_i32_f32(0x3F7F_FFFF), 0)
+        # Exactly 1.0f: 0x3F800000 (exp 1)
+        self.assertEqual(ref_frexp_exp_i32_f32(0x3F80_0000), 1)
+        # Just above 1.0f: 0x3F800001 (exp 1)
+        self.assertEqual(ref_frexp_exp_i32_f32(0x3F80_0001), 1)
+        # Just below 2.0f: 0x3FFFFFFF (exp 1)
+        self.assertEqual(ref_frexp_exp_i32_f32(0x3FFF_FFFF), 1)
+        # Exactly 2.0f: 0x40000000 (exp 2)
+        self.assertEqual(ref_frexp_exp_i32_f32(0x4000_0000), 2)
+
+
 if __name__ == '__main__':
     unittest.main()
