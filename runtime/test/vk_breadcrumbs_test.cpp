@@ -74,6 +74,17 @@ int synthetic() {
     EXPECT(ops.size() == 2);
     EXPECT(ops[0] == breadcrumb_op::copy_buffer_region && ops[1] == breadcrumb_op::resource_barrier);
     EXPECT(breadcrumb_op::copy_buffer_region == 7 && breadcrumb_op::resource_barrier == 15);  // D3D12 values
+    {
+        // DispatchMesh is a Draw with `mesh` set: it is D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH, not DrawInstanced.
+        Draw mesh{};
+        mesh.mesh = true;
+        Draw indexed{};
+        indexed.indexed = true;
+        EXPECT(breadcrumb_op_of(Command{mesh}, op) && op == breadcrumb_op::dispatch_mesh && op == 42);
+        EXPECT(breadcrumb_op_of(Command{indexed}, op) && op == breadcrumb_op::draw_indexed_instanced);
+        EXPECT(breadcrumb_op_of(Command{Draw{}}, op) && op == breadcrumb_op::draw_instanced);
+        EXPECT(std::strcmp(breadcrumb_op_name(breadcrumb_op::dispatch_mesh), "DispatchMesh") == 0);
+    }
 
     // 2. The report starts at the last completed list before the first one that did not complete.
     std::vector<BreadcrumbRing::Entry> entries = {
