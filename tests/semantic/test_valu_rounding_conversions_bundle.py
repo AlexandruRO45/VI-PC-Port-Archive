@@ -279,6 +279,13 @@ class TestVTruncF32TranslatorAndControls(unittest.TestCase):
         with self.assertRaises(Exception):
             support.translate_lines("ps_neg_v_trunc_f32", ["v_trunc_f32", "s_endpgm"])
 
+class TestVRndneF32ReferenceOracle(unittest.TestCase):
+    """Stage 1 for v_rndne_f32: reference mathematical oracle validation."""
+
+    def test_v_rndne_f32_oracle_identity(self):
+        res = oracle_v_rndne_f32(0x3fc00000)
+        self.assertEqual(res, 0x40000000)
+
 
 if __name__ == '__main__':
     unittest.main()
