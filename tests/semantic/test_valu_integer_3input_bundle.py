@@ -178,5 +178,37 @@ class TestAdd3U32Oracle(unittest.TestCase):
         self.assertEqual(oracle_add3_u32(z, x, y), m)
         self.assertEqual(oracle_add3_u32(y, z, x), m)
 
+# ---------------------------------------------------------------------------
+# Opcode 1: v_add3_u32 - AST and Interpreter
+# ---------------------------------------------------------------------------
+
+class TestAdd3U32ASTInterpreter(unittest.TestCase):
+    def test_ast_construction(self) -> None:
+        inst = VOP3Instruction(
+            TriOpcode.V_ADD3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        self.assertEqual(inst.opcode, TriOpcode.V_ADD3_U32)
+        self.assertEqual(str(inst.vdst), "v0")
+
+    def test_interpreter_step(self) -> None:
+        interp = BundleInterpreter()
+        interp.vgprs[1] = 15
+        interp.vgprs[2] = 25
+        interp.sgprs[0] = 35
+        inst = VOP3Instruction(
+            TriOpcode.V_ADD3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.SGPR, 0),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 75)
+        self.assertEqual(interp.vgprs[0], 75)
+
 if __name__ == "__main__":
     unittest.main()
