@@ -62,6 +62,20 @@ class TestInterpP1F32Reference(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP1F32Barycentric(unittest.TestCase):
+    def test_p1_f32_coordinate_registers(self):
+        code = [
+            "v_mov_b32_e32 v10, 0",
+            "v_interp_p1_f32 v4, v10, attr1.y",
+            "v_interp_p2_f32 v4, v1, attr1.y",
+            "exp mrt0, v4, v4, v4, v4 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p1_f32_bary", code)
+        self.assertIn("OpCapability Shader", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
