@@ -601,5 +601,81 @@ class TestSAddI32RegisterAliasing(unittest.TestCase):
             self.interp.step(inst)
             self.assertEqual(self.state.sgprs[0], i * 10)
 
+class TestSAddI32ConditionCodes(unittest.TestCase):
+    """Unit tests for SCC (Scalar Condition Code) flag generation and preservation."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter(self.state)
+
+    def test_scc_cleared_from_prior_set(self) -> None:
+        # Pre-set SCC = 1
+        self.state.scc = 1
+        self.state.sgprs[1] = 10
+        self.state.sgprs[2] = 20
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Reg(OperandKind.SGPR, 2),
+        )
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, 30)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.state.scc, 0)  # SCC must be cleared
+
+    def test_scc_set_from_prior_cleared(self) -> None:
+        # Pre-set SCC = 0
+        self.state.scc = 0
+        self.state.sgprs[1] = INT32_MAX
+        self.state.sgprs[2] = 1
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Reg(OperandKind.SGPR, 2),
+        )
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, UINT32_INT_MIN)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.scc, 1)  # SCC must be set
+
+    def test_conditional_select_simulation(self) -> None:
+        # Simulate s_cselect_b32 behavior following s_add_i32:
+        # if SCC == 1 select overflow_val else normal_val
+        for x, y, expected_overflow in [
+            (INT32_MAX, 1, 1),
+            (10, 20, 0),
+            (UINT32_INT_MIN, to_u32(-1), 1),
+            (0xFFFFFFFF, 1, 0),
+        ]:
+            with self.subTest(x=hex(x), y=hex(y)):
+                dst, scc = ref_s_add_i32(x, y)
+                self.assertEqual(scc, expected_overflow)
+                selected = 0xFEEDFACE if scc else 0xCAFEBABE
+                expected_sel = 0xFEEDFACE if expected_overflow else 0xCAFEBABE
+                self.assertEqual(selected, expected_sel)
+
+    def test_systematic_overflow_truth_table(self) -> None:
+        cases = [
+            # (+A) + (+B) = (+R) -> no overflow
+            (100, 200, 300, 0),
+            # (+A) + (+B) = (-R) -> overflow
+            (0x70000000, 0x20000000, 0x90000000, 1),
+            # (-A) + (-B) = (-R) -> no overflow
+            (to_u32(-100), to_u32(-200), to_u32(-300), 0),
+            # (-A) + (-B) = (+R) -> overflow
+            (0x80000000, 0x80000000, 0, 1),
+            # (+A) + (-B) = (+R) -> no overflow
+            (500, to_u32(-100), 400, 0),
+            # (+A) + (-B) = (-R) -> no overflow
+            (100, to_u32(-500), to_u32(-400), 0),
+        ]
+        for s0, s1, expected_dst, expected_scc in cases:
+            with self.subTest(s0=hex(s0), s1=hex(s1)):
+                dst, scc = ref_s_add_i32(s0, s1)
+                self.assertEqual(dst, expected_dst)
+                self.assertEqual(scc, expected_scc)
+
 if __name__ == "__main__":
     unittest.main()
