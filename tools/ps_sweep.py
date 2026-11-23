@@ -286,6 +286,10 @@ def written_stats(vals):
     return (any(math.isnan(x) for x in vals), bool(written) and all(x == 0.0 for x in written), not written)
 
 
+def _valid_targets(n):
+    return type(n) is int and 1 <= n <= 8
+
+
 def classify_pair(rec_a, rec_b, raw_a, raw_b, tol=TOLERANCE):
     """The class of one shader from its two result records and output files."""
     code_a, code_b = rec_a["code"], rec_b["code"]
@@ -295,7 +299,7 @@ def classify_pair(rec_a, rec_b, raw_a, raw_b, tol=TOLERANCE):
         return "timeout", ""
     if code_a == 0 and code_b == 0:
         targets_a, targets_b = rec_a.get("targets"), rec_b.get("targets")
-        if any(type(n) is not int or not 1 <= n <= 8 for n in (targets_a, targets_b)):
+        if not (_valid_targets(targets_a) and _valid_targets(targets_b)):
             return "invalid readback", "invalid target count"
         if targets_a != targets_b:
             return "invalid readback", "target counts differ"
@@ -365,11 +369,10 @@ def exact_pair(i, left, right):
     for rec in (left, right):
         if rec is None or rec["code"] != 0:
             return "missing", []
-    if left["targets"] != right["targets"]:
+    left_targets, right_targets = left.get("targets"), right.get("targets")
+    if not (_valid_targets(left_targets) and _valid_targets(right_targets)) or left_targets != right_targets:
         return "incompatible", []
-    count = left["targets"]
-    if type(count) is not int or type(right["targets"]) is not int or not 1 <= count <= 8:
-        return "incompatible", []
+    count = left_targets
     size = count * target_bytes
     for rec in (left, right):
         try:
@@ -427,17 +430,21 @@ def depth_measurements(i, left, right):
         planes.append(data)
         changed.append(count)
         if rec.get("two_clear"):
+            targets = rec.get("targets")
+            if not _valid_targets(targets):
+                return {"depth_class": "incompatible"}
             raw = os.path.join(rec["dir"], f"{i}.raw")
             try:
                 with open(raw + ".zero.depth", "rb") as f:
                     zero = f.read(pixels * 4 + 1)
-                color_size = pixels * 16 * rec["targets"]
+                color_size = pixels * 16 * targets
                 with open(raw, "rb") as first, open(raw + ".zero", "rb") as second:
                     color = first.read(color_size + 1)
                     same_color = len(color) == color_size and color == second.read(color_size + 1)
             except FileNotFoundError:
                 return {"depth_class": "missing"}
-            if len(zero) != len(data) or not same_color or rec.get("zero_samples_passed") != passed:
+            zero_passed = rec.get("zero_samples_passed")
+            if len(zero) != len(data) or not same_color or type(zero_passed) is not int or zero_passed != passed:
                 return {"depth_class": "incompatible"}
             fixed = follows = 0
             for n in range(0, len(data), 4):

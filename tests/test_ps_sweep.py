@@ -326,6 +326,108 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
             self.assertEqual(ps_sweep.depth_measurements(0, {"code": 0}, rec), {"depth_class": "missing"})
 
+    def test_two_clear_depth_and_exact_pair_validate_targets_and_counts(self):
+        pixels = ps_sweep.W * ps_sweep.H
+        depth_clear = struct.pack("<f", 1.0) * pixels
+        depth_zero = bytes(pixels * 4)
+        depth_one_written = struct.pack("<f", 0.5) + struct.pack("<f", 1.0) * (pixels - 1)
+        depth_zero_one_written = struct.pack("<f", 0.5) + bytes((pixels - 1) * 4)
+        color_one = struct.pack("<f", 0.25) * TARGET_FLOATS
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "0.raw.depth").write_bytes(depth_clear)
+            (out / "0.raw.zero.depth").write_bytes(depth_zero)
+            (out / "0.raw").write_bytes(color_one)
+            (out / "0.raw.zero").write_bytes(color_one)
+
+            # Valid baseline: two_clear with valid integer targets and matching integer zero_samples_passed.
+            valid = {"depth": True, "two_clear": True, "code": 0, "dir": tmp, "targets": 1,
+                     "samples_passed": 0, "zero_samples_passed": 0}
+            self.assertEqual(ps_sweep.depth_measurements(0, valid, valid)["depth_class"], "exact")
+
+            # Missing or invalid targets must classify as incompatible rather than crashing or accepting empty files.
+            for bad_targets in (None, -1, 0, 9, True, "1", 1.5):
+                rec = dict(valid)
+                if bad_targets is None:
+                    rec.pop("targets")
+                else:
+                    rec["targets"] = bad_targets
+                if bad_targets == 0:
+                    (out / "1.raw.depth").write_bytes(depth_clear)
+                    (out / "1.raw.zero.depth").write_bytes(depth_zero)
+                    (out / "1.raw").write_bytes(b"")
+                    (out / "1.raw.zero").write_bytes(b"")
+                    idx = 1
+                elif bad_targets == 9:
+                    (out / "3.raw.depth").write_bytes(depth_clear)
+                    (out / "3.raw.zero.depth").write_bytes(depth_zero)
+                    (out / "3.raw").write_bytes(color_one * 9)
+                    (out / "3.raw.zero").write_bytes(color_one * 9)
+                    idx = 3
+                else:
+                    idx = 0
+                with self.subTest(bad_targets=bad_targets):
+                    self.assertEqual(ps_sweep.depth_measurements(idx, rec, rec), {"depth_class": "incompatible"})
+
+            # Booleans must not match integer samples_passed (False == 0, True == 1).
+            bool_zero = dict(valid, zero_samples_passed=False)
+            self.assertEqual(ps_sweep.depth_measurements(0, bool_zero, bool_zero), {"depth_class": "incompatible"})
+
+            (out / "2.raw.depth").write_bytes(depth_one_written)
+            (out / "2.raw.zero.depth").write_bytes(depth_zero_one_written)
+            (out / "2.raw").write_bytes(color_one)
+            (out / "2.raw.zero").write_bytes(color_one)
+            bool_one = {"depth": True, "two_clear": True, "code": 0, "dir": tmp, "targets": 1,
+                        "samples_passed": 1, "zero_samples_passed": True}
+            self.assertEqual(ps_sweep.depth_measurements(2, bool_one, bool_one), {"depth_class": "incompatible"})
+            valid_one = dict(bool_one, zero_samples_passed=1)
+            self.assertEqual(ps_sweep.depth_measurements(2, valid_one, valid_one)["depth_class"], "exact")
+
+            # exact_pair must not raise KeyError when either record omits "targets".
+            no_targets = {"code": 0, "dir": tmp}
+            with_targets = {"code": 0, "dir": tmp, "targets": 1}
+            self.assertEqual(ps_sweep.exact_pair(0, no_targets, with_targets), ("incompatible", []))
+            self.assertEqual(ps_sweep.exact_pair(0, with_targets, no_targets), ("incompatible", []))
+            self.assertEqual(ps_sweep.exact_pair(0, no_targets, no_targets), ("incompatible", []))
+
+        # End-to-end compare and compare --exact must not crash on two_clear records with missing/invalid targets.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            cases = [
+                None,   # missing targets
+                -1,     # negative targets
+                0,      # zero targets with empty color files
+                9,      # above 8-MRT limit
+                True,   # bool targets
+            ]
+            sample = [{"name": str(i), "stratum": [False, "none", "structured"]} for i in range(len(cases))]
+            (out / "sample.json").write_text(json.dumps(sample), encoding="utf-8", newline="\n")
+            for tag in ("a", "b"):
+                folder = out / f"{tag}_z"
+                folder.mkdir()
+                with (folder / "results_0.jsonl").open("w", encoding="utf-8", newline="\n") as f:
+                    for i, bad_targets in enumerate(cases):
+                        rec = {"i": i, "code": 0, "reason": "", "depth": True, "two_clear": True,
+                               "samples_passed": 0, "zero_samples_passed": 0}
+                        if bad_targets is not None:
+                            rec["targets"] = bad_targets
+                        f.write(json.dumps(rec) + "\n")
+                        (folder / f"{i}.raw.depth").write_bytes(depth_clear)
+                        (folder / f"{i}.raw.zero.depth").write_bytes(depth_zero)
+                        raw_bytes = b"" if bad_targets == 0 else color_one
+                        (folder / f"{i}.raw").write_bytes(raw_bytes)
+                        (folder / f"{i}.raw.zero").write_bytes(raw_bytes)
+            with contextlib.redirect_stdout(io.StringIO()):
+                ps_sweep.main(["compare", "--out", tmp])
+                ps_sweep.main(["compare", "--exact", "--out", tmp])
+            ordinary = json.loads((out / "classes_z.json").read_text(encoding="utf-8"))
+            exact = json.loads((out / "exact_z.json").read_text(encoding="utf-8"))["rows"]
+            self.assertEqual([(r["class"], r["sub"], r["depth_class"]) for r in ordinary],
+                             [("invalid readback", "invalid target count", "incompatible")] * len(cases))
+            self.assertEqual([(r["class"], r["depth_class"]) for r in exact],
+                             [("incompatible", "incompatible")] * len(cases))
+
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker")
     def test_integer_texture_fetch(self):
         from pathlib import Path
