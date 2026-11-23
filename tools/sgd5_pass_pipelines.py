@@ -10,8 +10,8 @@ a PS, in the format ``tools/shader_link_check.py batch`` reads. ``--spirv-dir`` 
 ``--passes`` writes one row per pass with its programs, stages, the raster/depth/blend row bytes (6, 7, 8) and
 the decoded rows as raster_state/depth_state/blend_state (null for an empty table); ``--states`` writes the
 distinct decoded rows with the number of stored passes using each.
-A selected row outside the measured value ranges is an error even without ``--passes``: the tool exits 1 rather
-than decode a layout it has not seen.
+A decoded field outside its measured value range is an error even without ``--passes``: the tool exits 1 rather
+than decode a layout it has not seen. The bytes kept raw are not range-checked.
 The archive is opened read-only and read in place, one database at a time.
 """
 import argparse
