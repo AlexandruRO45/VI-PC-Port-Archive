@@ -317,3 +317,115 @@ class TestScalarInterpreter(unittest.TestCase):
         spv_res = run_translator_min3_i32(v1_val, v2_val, v3_val, name="ps_scalar_min3_cross")
         self.assertEqual(interp_res, spv_res)
         self.assertEqual(interp_res, from_signed_i32(-500))
+
+
+# ==============================================================================
+# SECTION 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    num_lanes: int = 32
+    exec_mask: int = MASK32
+    vgprs: List[Dict[int, int]] = field(default_factory=list)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [dict() for _ in range(self.num_lanes)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, idx: int) -> int:
+        return self.vgprs[lane].get(idx, 0)
+
+    def set_vgpr(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[lane][idx] = u32(val)
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = u32(val)
+
+
+class SIMDInterpreter:
+    def resolve_lane_operand(self, op: Operand, lane: int, state: SIMDState) -> int:
+        if op.kind == OperandKind.VGPR:
+            return state.get_vgpr(lane, op.value)
+        elif op.kind == OperandKind.SGPR:
+            return state.get_sgpr(op.value)
+        elif op.kind == OperandKind.IMMEDIATE:
+            return u32(op.value)
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def step(self, instr: VMin3I32Instruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = []
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                results.append(None)
+                continue
+            v0 = self.resolve_lane_operand(instr.src0, lane, state)
+            v1 = self.resolve_lane_operand(instr.src1, lane, state)
+            v2 = self.resolve_lane_operand(instr.src2, lane, state)
+            res = oracle_min3_i32(v0, v1, v2)
+            state.set_vgpr(lane, instr.dst.value, res)
+            results.append(res)
+        return results
+
+
+class TestSIMDDivergence(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_alternating_lanes(self) -> None:
+        """Verify Wave32 alternating even/odd lane execution and inactive preservation."""
+        mask = 0x5555_5555
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        sentinel = 0xDEAD_BEEF
+
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr(lane, 1, lane)
+            state.set_vgpr(lane, 2, from_signed_i32(-10))
+            state.set_vgpr(lane, 3, 20)
+
+        interp = SIMDInterpreter()
+        instr = VMin3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], from_signed_i32(-10))
+                self.assertEqual(state.get_vgpr(lane, 0), from_signed_i32(-10))
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+    def test_wave64_divergence(self) -> None:
+        """Verify Wave64 boundary execution across low and high 32-lane words."""
+        mask = (1 << 0) | (1 << 31) | (1 << 32) | (1 << 63)
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        sentinel = 0xBAAD_F00D
+
+        for lane in range(64):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr(lane, 1, from_signed_i32(-100 + lane))
+            state.set_vgpr(lane, 2, 0)
+            state.set_vgpr(lane, 3, 50)
+
+        interp = SIMDInterpreter()
+        instr = VMin3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        results = interp.step(instr, state)
+
+        for lane in range(64):
+            if lane in (0, 31, 32, 63):
+                expected = from_signed_i32(-100 + lane)
+                self.assertEqual(results[lane], expected)
+                self.assertEqual(state.get_vgpr(lane, 0), expected)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
