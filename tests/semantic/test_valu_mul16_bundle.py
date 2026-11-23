@@ -361,5 +361,18 @@ class VMadI32I16TranslatorIntegrationTests(unittest.TestCase):
         unsigned_res = ref_mad_u32_u16(s0, s1, s2)
         self.assertNotEqual(signed_res, unsigned_res)
 
+class VMadU32U16OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_mad_u32_u16."""
+
+    def test_unsigned_multiplication_32bit_addend(self):
+        # 1000 * 2000 + 50 = 2000050
+        res = ref_mad_u32_u16(1000, 2000, 50)
+        self.assertEqual(res, 2000050)
+
+    def test_max_u16_product(self):
+        # 0xFFFF * 0xFFFF + 0 = 65535 * 65535 = 4294836225
+        res = ref_mad_u32_u16(0xFFFF, 0xFFFF, 0)
+        self.assertEqual(res, 4294836225)
+
 if __name__ == "__main__":
     unittest.main()
