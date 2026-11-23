@@ -153,7 +153,7 @@ def main(argv=None):
             return subprocess.call([tool, scene, *pair, "--window", "--cam", *cam])
         frame = scene + ".ppm"
         r = subprocess.run([tool, scene, *pair, "--out", frame, "--size", "640", "360", "--cam", *cam],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         if r.returncode:
             print((r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "vk_sandbox failed")
             return r.returncode

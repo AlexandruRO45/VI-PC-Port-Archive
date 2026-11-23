@@ -859,7 +859,7 @@ def translate(progs, work, emulate, pc_tail=False, *, asm_jobs=1):
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
-        r = mc_command.run(cmd, input=text, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=text, capture_output=True, text=True, errors="replace")
         if r.returncode or "error:" in r.stderr:
             raise RuntimeError(f"{p.name} did not assemble:\n{r.stderr}")
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
@@ -886,7 +886,7 @@ def translate(progs, work, emulate, pc_tail=False, *, asm_jobs=1):
         cmd.append("--wave64-emulate")
     if pc_tail:
         cmd.append("--pc-tail-ubo")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     index = spirv / "index.json"
     if not index.exists():
         raise RuntimeError(f"rdna2spirv.py exited {r.returncode} without an index.json:\n{(r.stdout + r.stderr)[-2000:]}")
@@ -910,7 +910,7 @@ def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
         env["VKC_SUBGROUP_SIZE"] = str(index_entry["subgroup_size"])
     limit = gpu_test_timeout()
     try:
-        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=limit)
+        r = subprocess.run(args, capture_output=True, text=True, errors="replace", env=env, timeout=limit)
     except subprocess.TimeoutExpired:
         return 1, timed_out(exe, limit)
     return r.returncode, (r.stdout + r.stderr).strip()

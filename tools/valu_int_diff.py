@@ -481,11 +481,11 @@ def translate_and_run(lines, name="ps_fuzz_valu_int", spirv_tools=None):
                 fh.write(spv_text)
             spirv_as, spirv_val = spirv_tools
             r1 = subprocess.run([spirv_as, "--target-env", "vulkan1.2", "-o", spv_bin, spv_asm],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, errors="replace")
             if r1.returncode != 0:
                 raise RuntimeError(f"spirv-as failed:\n{r1.stderr}")
             r2 = subprocess.run([spirv_val, "--target-env", "vulkan1.2", spv_bin],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, errors="replace")
             if r2.returncode != 0:
                 raise RuntimeError(f"spirv-val failed:\n{r2.stderr}")
         got = run_fragment(spv_text)

@@ -77,7 +77,7 @@ def run_on_silicon(name, asm_lines, wave_size=32, user_sgprs=None):
         
         extra_args = ["--require-wave64"] if wave_size == 64 else []
         res = subprocess.run([VK_COMPUTE_TEST, spv_path, "1", "none"] + extra_args,
-                             env=env, capture_output=True, text=True)
+                             env=env, capture_output=True, text=True, errors="replace")
         if res.returncode != 0:
             print(f"FAILED {name} (rc={res.returncode}):\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
             return None

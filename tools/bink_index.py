@@ -258,7 +258,7 @@ def probe_row(row, ffprobe):
         proc = subprocess.run(
             [ffprobe, "-v", "error", "-f", "bink", "-show_entries",
              "stream=codec_name,codec_type:format=duration", "-of", "json", name],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, errors="replace", timeout=60,
         )
         proc.check_returncode()
         info = json.loads(proc.stdout)

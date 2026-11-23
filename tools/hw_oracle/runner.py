@@ -42,7 +42,7 @@ def _exe(name):
 
 def _has_amdgcn(clang):
     try:
-        out = subprocess.run([clang, "--print-targets"], capture_output=True, text=True, timeout=60).stdout
+        out = subprocess.run([clang, "--print-targets"], capture_output=True, text=True, errors="replace", timeout=60).stdout
     except (OSError, subprocess.SubprocessError):
         return False
     return "amdgcn" in out
@@ -115,7 +115,7 @@ def find_vcvars():
     try:
         out = subprocess.run([vswhere, "-latest", "-products", "*", "-requires",
                               "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
-                             capture_output=True, text=True, timeout=60).stdout.strip().splitlines()
+                             capture_output=True, text=True, errors="replace", timeout=60).stdout.strip().splitlines()
     except (OSError, subprocess.SubprocessError):
         return None
     bat = os.path.join(out[0].strip(), "VC", "Auxiliary", "Build", "vcvars64.bat") if out else ""
@@ -173,7 +173,7 @@ def detect_arch(clang):
     tool = os.path.join(os.path.dirname(clang), _exe("amdgpu-arch"))
     if os.path.isfile(tool):
         try:
-            out = subprocess.run([tool], capture_output=True, text=True, timeout=60).stdout.split()
+            out = subprocess.run([tool], capture_output=True, text=True, errors="replace", timeout=60).stdout.split()
             if out:
                 return out[0].split(":")[0]   # amdgpu-arch prints 'gfx1010:xnack-': the kernels want the bare name
         except (OSError, subprocess.SubprocessError):
@@ -288,19 +288,19 @@ class Oracle:
         if self.code_object:
             flags.append(f"-mcode-object-version={self.code_object}")
         r = subprocess.run([self.clang, "--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", *flags, "-c", s, "-o", o],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         if r.returncode:
             return None, r.stderr
         # Some Windows LLD builds default to PE even when the input object is AMDGPU ELF.
         r = subprocess.run([self.lld, "-m", "elf64_amdgpu", "-shared", o, "-o", co],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         if r.returncode:
             return None, r.stderr
         return co, ""
 
     def _launch(self, co, names, words=4):
         try:
-            r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True, text=True)
+            r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True, text=True, errors="replace")
         except OSError as e:
             if getattr(e, "winerror", None) != 225:
                 raise

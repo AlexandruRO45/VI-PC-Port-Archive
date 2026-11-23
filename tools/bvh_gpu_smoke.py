@@ -65,7 +65,7 @@ def run_program(vkc, spv, init, dump, heap_words, validation, timeout):
     if validation:
         env["VK_INSTANCE_LAYERS"] = "VK_LAYER_KHRONOS_validation"
     try:
-        p = subprocess.run([str(vkc), str(spv), "1", "dump"], capture_output=True, text=True, env=env,
+        p = subprocess.run([str(vkc), str(spv), "1", "dump"], capture_output=True, text=True, errors="replace", env=env,
                            timeout=timeout)
     except subprocess.TimeoutExpired:
         return "timeout", ""
@@ -238,7 +238,7 @@ def translate(game_dir, work, max_shared_memory):
          "--max-shared-memory", str(max_shared_memory)],
     ]
     for step in steps:
-        p = subprocess.run([sys.executable, "-I", *map(str, step)], capture_output=True, text=True)
+        p = subprocess.run([sys.executable, "-I", *map(str, step)], capture_output=True, text=True, errors="replace")
         if p.returncode != 0:
             raise SystemExit(f"error: {Path(step[0]).name} failed:\n{p.stdout}{p.stderr}")
     return spirv

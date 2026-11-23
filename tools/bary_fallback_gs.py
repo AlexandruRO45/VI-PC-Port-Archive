@@ -179,7 +179,7 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
             Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
             for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
                         ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
-                r = subprocess.run(cmd, capture_output=True, text=True)
+                r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
                 if r.returncode:
                     raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
             os.replace(staged_asm, asm)

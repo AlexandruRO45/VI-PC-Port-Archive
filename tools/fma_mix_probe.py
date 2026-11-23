@@ -268,13 +268,13 @@ def run_vulkan(build, cases=CASES):
         with open(sa, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         try:
-            r = subprocess.run(["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"], capture_output=True, text=True)
+            r = subprocess.run(["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"], capture_output=True, text=True, errors="replace")
         except FileNotFoundError:
             raise FileNotFoundError("spirv-as is not on PATH (SPIRV-Tools)") from None
         if r.returncode:
             raise RuntimeError("spirv-as failed: " + (r.stderr or r.stdout).strip()[:300])
         env = dict(os.environ, VKC_SGPRS=",".join(f"0x{w:x}" for w in sgpr_words(cases)))
-        r = subprocess.run([exe, sv, "1", "dump"], capture_output=True, text=True, env=env, timeout=120)
+        r = subprocess.run([exe, sv, "1", "dump"], capture_output=True, text=True, errors="replace", env=env, timeout=120)
     msg = r.stdout + r.stderr
     m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)
     if r.returncode == 77:

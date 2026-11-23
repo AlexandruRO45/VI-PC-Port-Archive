@@ -495,7 +495,7 @@ def _spirv_val(spv, tmp):
         f.write(spv)
     for cmd in (["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"],
                 ["spirv-val", "--target-env", "vulkan1.2", sv]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         if r.returncode:
             return (cmd[0] + ": " + (r.stderr or r.stdout).strip().splitlines()[0]) if (r.stderr or r.stdout) \
                 else f"{cmd[0]} exited with {r.returncode}"

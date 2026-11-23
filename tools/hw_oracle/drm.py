@@ -173,14 +173,14 @@ class DrmOracle(runner.Oracle):
             flags = ["-I/usr/include/libdrm", "-ldrm_amdgpu"]
             pkg_config = shutil.which("pkg-config")
             if pkg_config:
-                r = subprocess.run([pkg_config, "--cflags", "--libs", "libdrm_amdgpu"], capture_output=True, text=True)
+                r = subprocess.run([pkg_config, "--cflags", "--libs", "libdrm_amdgpu"], capture_output=True, text=True, errors="replace")
                 if r.returncode == 0 and r.stdout.strip():
                     flags = r.stdout.split()
             tmp = exe + f".{os.getpid()}"
             kind, cc = runner.find_cc()
             if kind != "gcc":   # only an override named cl gives anything else on Linux
                 raise Unavailable(f"hw_oracle_drm.c needs gcc or a compiler that takes its options, not {cc}")
-            r = subprocess.run([cc, "-O1", SOURCE, "-o", tmp, *flags], capture_output=True, text=True)
+            r = subprocess.run([cc, "-O1", SOURCE, "-o", tmp, *flags], capture_output=True, text=True, errors="replace")
             if r.returncode:
                 raise Unavailable("hw_oracle_drm.c did not build (it needs the libdrm headers): " + r.stderr.strip()[:300])
             os.replace(tmp, exe)
@@ -188,7 +188,7 @@ class DrmOracle(runner.Oracle):
 
     def _device_arch(self):
         """What the launcher says the GPU is; it prints its device line before it reads any code."""
-        r = subprocess.run([self.exe, os.devnull, "4", self.node], input="", capture_output=True, text=True)
+        r = subprocess.run([self.exe, os.devnull, "4", self.node], input="", capture_output=True, text=True, errors="replace")
         head = r.stdout.splitlines()[0] if r.stdout else ""
         if not head.startswith("#"):
             raise Unavailable((r.stderr.strip() or "the launcher printed no device line")[:300])
@@ -203,7 +203,7 @@ class DrmOracle(runner.Oracle):
             f.write(text)
         r = subprocess.run([self.clang, "--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}",
                             *(["-mwavefrontsize64"] if wave == 64 else []), "-c", s, "-o", o],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         if r.returncode:
             return None, r.stderr
         with open(o, "rb") as f:
@@ -217,5 +217,5 @@ class DrmOracle(runner.Oracle):
     def _launch(self, code, tokens, words=4):
         r = subprocess.run([self.exe, code, str(words), self.node],
                            input="\n".join(launcher_tokens(tokens, self._offsets, self._registers)) + "\n",
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, errors="replace")
         return r.returncode, r.stdout, r.stderr

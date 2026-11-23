@@ -1256,7 +1256,7 @@ def assemble(mc, prog, src, disasm, fssm):
     cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", f"-mattr={mattr}", "-show-encoding"]
     if "@" in src:
         src = resolve_branches(cmd, prog, src)
-    r = mc_command.run(cmd, input=src, capture_output=True, text=True)
+    r = mc_command.run(cmd, input=src, capture_output=True, text=True, errors="replace")
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{src}")
     code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
@@ -1296,7 +1296,7 @@ def resolve_branches(cmd, prog, src):
     lines = src.splitlines()
     insns = [i for i, ln in enumerate(lines) if ln.strip() and not ln.strip().startswith(";")]
     first = "\n".join(re.sub(r"@-?\d+$", "0", ln) for ln in lines) + "\n"
-    r = mc_command.run(cmd, input=first, capture_output=True, text=True)
+    r = mc_command.run(cmd, input=first, capture_output=True, text=True, errors="replace")
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{first}")
     sizes = [len(re.findall(r"0x[0-9a-f]{2}", m)) // 4 for m in re.findall(r"encoding: \[([^\]]*)\]", r.stdout)]
@@ -1310,7 +1310,7 @@ def translate(work, emulate):
     cmd = [sys.executable, "-I", TRANSLATOR[0], os.path.join(work, "disasm"), "--out", out]
     if emulate:
         cmd.append("--wave64-emulate")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     return out, r.stdout + r.stderr
 
 
@@ -1346,7 +1346,7 @@ def run_gpu(exe, spv, prog, work, emulate):
         os.remove(dump)                 # never compare a stale dump
     env = gpu_env(prog, emulate, dump)
     try:
-        r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=GPU_TIMEOUT)
+        r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, errors="replace", env=env, timeout=GPU_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s") from None
     import compute_fixture

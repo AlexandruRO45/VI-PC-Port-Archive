@@ -382,7 +382,7 @@ def main(argv):
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
-    text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True, errors="replace").stdout
     ver = re.search(r"; Version: (\d+)\.(\d+)", text)
     version = (int(ver[1]), int(ver[2])) if ver else (1, 5)
     try:
@@ -391,7 +391,7 @@ def main(argv):
         print(f"{args[0]}: not supported: {e}", file=sys.stderr)
         return 1
     target = f"spv{version[0]}.{version[1]}" if ver else "vulkan1.2"
-    subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
+    subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True, errors="replace")
     if lay_path:
         with open(lay_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(lay, f, indent=1)

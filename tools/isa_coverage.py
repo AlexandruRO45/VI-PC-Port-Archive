@@ -308,7 +308,7 @@ def probe_llvm_mc(llvm_mc, names, mcpu="gfx1013"):
     for n in names:
         try:
             r = subprocess.run([llvm_mc, "-arch=amdgcn", f"-mcpu={mcpu}"], input=n + "\n", capture_output=True,
-                               text=True, timeout=PROBE_TIMEOUT)
+                               text=True, errors="replace", timeout=PROBE_TIMEOUT)
         except OSError as e:
             return {"error": str(e)}
         except subprocess.TimeoutExpired:

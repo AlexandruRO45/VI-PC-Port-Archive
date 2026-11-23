@@ -27,7 +27,8 @@ if TOOLS_DIR not in sys.path:
 import bary_fallback_gs  # noqa: E402
 
 
-def _successful_spirv_tools(cmd: list[str], *, capture_output: bool, text: bool) -> subprocess.CompletedProcess[str]:
+def _successful_spirv_tools(cmd: list[str], *, capture_output: bool, text: bool,
+                            errors: str | None = None) -> subprocess.CompletedProcess[str]:
     if cmd[0] == "spirv-as":
         Path(cmd[-1]).write_bytes(b"synthetic binary")
     return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -450,7 +451,7 @@ class TestBuildForIndex(unittest.TestCase):
             self._write_index(tmp, index)
             seen_asm_exists = []
 
-            def fake_run(cmd, capture_output=False, text=False):
+            def fake_run(cmd, capture_output=False, text=False, errors=None):
                 self.assertTrue(capture_output)
                 self.assertTrue(text)
                 if cmd[0] == "spirv-as":

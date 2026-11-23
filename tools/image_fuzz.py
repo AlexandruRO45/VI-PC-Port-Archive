@@ -82,7 +82,7 @@ NTSTATUS = {
 def assemble(asm: str, name: str, work: str) -> None:
     """Assemble with llvm-mc like runtime/test/shaders/build.py, into work/disasm/<name>.s."""
     cmd = mc_command.mc_command() + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
-    r = mc_command.run(cmd, input=asm, capture_output=True, text=True)
+    r = mc_command.run(cmd, input=asm, capture_output=True, text=True, errors="replace")
     if r.returncode or "error:" in r.stderr:
         raise SystemExit(f"llvm-mc rejected {name}:\n{r.stderr}")
     code = "".join(line for line in r.stdout.splitlines(keepends=True)
@@ -106,7 +106,7 @@ def translate(work: str, pc_tail: bool = False) -> str:
     cmd = [sys.executable, "-I", TRANSLATOR, os.path.join(work, "disasm"), "--out", spirv]
     if pc_tail:
         cmd.append("--pc-tail-ubo")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode:
         raise SystemExit(f"translator failed:\n{r.stdout}\n{r.stderr}")
     # The batch translator can exit successfully even when an individual shader is rejected.

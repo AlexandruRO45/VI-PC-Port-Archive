@@ -272,7 +272,7 @@ def build_for_index(spirv_dir):
             for name, tool in steps:
                 args = [asm, "-o", staged_spv] if name == "spirv-as" else [staged_spv]
                 cmd = [tool, "--target-env", "vulkan1.2"] + args
-                r = subprocess.run(cmd, capture_output=True, text=True)
+                r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
                 if r.returncode:
                     raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
             os.replace(staged_spv, spv)

@@ -580,7 +580,7 @@ def spirv(path_or_text, out, work):
         f.write(src)
     try:
         r = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", asm_path, "-o", out], capture_output=True,
-                           text=True)
+                           text=True, errors="replace")
     except OSError:
         raise Unavailable("spirv-as is not on PATH") from None
     if r.returncode:
@@ -614,7 +614,7 @@ def run_harness(exe, vs, ps, out_raw, size, env_extra, fmt="rgba32f"):
     env = dict(os.environ, **env_extra)
     number, nbytes, _ = FORMATS[fmt]
     env["VKH_COLOR_FORMAT"] = f"{number}:{nbytes}"
-    r = subprocess.run([exe, vs, ps, out_raw, str(size[0]), str(size[1])], capture_output=True, text=True, env=env)
+    r = subprocess.run([exe, vs, ps, out_raw, str(size[0]), str(size[1])], capture_output=True, text=True, errors="replace", env=env)
     if r.returncode == 77:
         raise Unavailable(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "vk_harness: unsupported")
     return r
@@ -633,7 +633,7 @@ def assemble(lines, mcpu, wave64, work):
         f.write(".text\n" + "".join(f"  {ln}\n" for ln in lines))
     flags = ["-mwavefrontsize64"] if wave64 else []
     r = subprocess.run([clang, "--target=amdgcn-amd-amdpal", f"-mcpu={mcpu}", *flags, "-c", s, "-o", o],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, errors="replace")
     if r.returncode:
         raise ValueError("the assembler rejected the code:\n" + r.stderr.strip())
     with open(o, "rb") as f:
@@ -719,7 +719,7 @@ class Oracle:
         try:
             objdump = os.path.join(os.path.dirname(runner.find_clang()), "llvm-objdump" + (".exe" if os.name == "nt" else ""))
             r = subprocess.run([objdump, "-d", f"--mcpu={self.mcpu}", f"--start-address=0x{start:x}", path],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             lines += [ln for ln in r.stdout.splitlines() if ln.strip() and "s_code_end" not in ln]
         except (runner.Unavailable, OSError) as e:
             lines.append(f"(no disassembly: {e})")
@@ -743,7 +743,7 @@ class Oracle:
             mc = mc if os.path.exists(mc) else shutil.which("llvm-mc") or mc
             r = subprocess.run([mc, "--disassemble", "-arch=amdgcn", f"-mcpu={self.mcpu}",
                                 f"-mattr=+wavefrontsize{lay.wave}"], input=" ".join(f"0x{b:02x}" for b in code),
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             lines += [ln for ln in r.stdout.splitlines() if ln.strip() and not ln.lstrip().startswith(".")]
         except (runner.Unavailable, OSError) as e:
             lines.append(f"(no disassembly: {e})")

@@ -17892,7 +17892,7 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as", validate=True):
         if result.returncode == 0 and validate:
             # Offset on non-gather: VK_KHR_maintenance8
             result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
-                                     tmp.name], capture_output=True, text=True, cwd=folder)
+                                     tmp.name], capture_output=True, text=True, errors="replace", cwd=folder)
         if result.returncode == 0:
             tmp.replace(sv)
         else:

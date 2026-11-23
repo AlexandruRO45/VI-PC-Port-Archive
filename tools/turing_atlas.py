@@ -114,7 +114,7 @@ OpReturn
 
 def run(cmd, **kw):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", **kw)
     except FileNotFoundError:
         return None
 

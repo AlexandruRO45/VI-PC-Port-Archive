@@ -99,7 +99,7 @@ def check(classes: dict, interfaces: dict) -> list[str]:
 
 def revision(root: str) -> str:
     try:
-        out = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+        out = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, errors="replace", check=True)
         return out.stdout.strip() or "unknown revision"
     except (OSError, subprocess.CalledProcessError):
         return "unknown revision"

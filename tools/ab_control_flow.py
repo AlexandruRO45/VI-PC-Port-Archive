@@ -332,9 +332,9 @@ def main(argv=None):
     tool = os.path.join(a.repo, "tools", "rdna2spirv.py")
     for name in picked:
         src = os.path.join(disasm, name + ".s")
-        r1 = subprocess.run([sys.executable, "-I", tool, src, "--out", new], capture_output=True, text=True)
+        r1 = subprocess.run([sys.executable, "-I", tool, src, "--out", new], capture_output=True, text=True, errors="replace")
         r2 = subprocess.run([sys.executable, "-I", tool, src, "--out", loopdir, "--dispatch-loop"],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, errors="replace")
         if "1 pass spirv-val" not in r1.stdout or "1 pass spirv-val" not in r2.stdout:
             note(name, "a translation is invalid")
             continue
