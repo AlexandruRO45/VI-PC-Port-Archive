@@ -1,5 +1,8 @@
 """The verdict logic of runtime/test/check_tiny_frame.py on synthetic output: no loader, GPU or game files."""
 import importlib.util
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -75,6 +78,31 @@ class SubsequenceTest(unittest.TestCase):
 
     def test_order_matters(self):
         self.assertEqual(check.ordered_subsequence(["a", "b"], ["b", "a"]), "b")
+
+
+class LaunchDiagnosticTest(unittest.TestCase):
+    def test_start_errors_name_the_stage_and_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            guest = root / "synthetic.exe"
+            probe = root / "missing probe"
+            loader = root / "missing loader"
+            cwd = root / "missing working directory"
+            cases = (
+                ("Vulkan device probe", probe, [sys.executable, str(guest), "--probe", str(probe)]),
+                ("tiny-frame loader", loader, [str(loader), str(guest)]),
+                ("tiny-frame loader", cwd, [sys.executable, str(cwd / guest.name)]),
+            )
+            for stage, path, args in cases:
+                with self.subTest(path=path):
+                    result = subprocess.run(
+                        [sys.executable, "-I", SPEC.origin, *args],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(f"FAIL: cannot start {stage}", result.stderr)
+                    self.assertIn(str(path), result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":
