@@ -741,6 +741,12 @@ int main() {
 #endif
         } else {
             pc = create_pc_device(env("LEONIDA_FSR_WARP") == "1");
+            if (!pc && !g_failures) {
+                // Wine without a working vkd3d, a VM or a headless host: nothing to create the context on.
+                std::printf("SKIP fsr_dispatch_test: no PC D3D12 device (LEONIDA_FSR_DEVICE=vulkan runs it on the "
+                            "layer's Vulkan device instead)\n");
+                return 77;
+            }
         }
         check(pc != nullptr, on_vulkan ? "Vulkan-backed D3D12 device created" : "PC D3D12 device created");
         if (!pc) return 1;

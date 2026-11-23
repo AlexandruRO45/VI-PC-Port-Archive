@@ -819,6 +819,13 @@ int main() {
                 warp = true;
             }
             pc = create_pc_device(warp);
+            if (!pc && !g_failures) {
+                // Wine without a working vkd3d, a VM or a headless host: nothing to run the constructor on.
+                std::printf("SKIP bvh_builder_test: no PC D3D12 device (no %s adapter could create one; "
+                            "LEONIDA_BVH_DEVICE=vulkan runs on the Vulkan-backed device)\n",
+                            warp ? "WARP" : "hardware");
+                return 77;
+            }
             check(pc != nullptr, "PC D3D12 device created");
         }
         if (!pc) return 1;
