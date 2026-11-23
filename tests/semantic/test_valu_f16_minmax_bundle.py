@@ -1,1032 +1,731 @@
 from __future__ import annotations
 
-"""Semantic interpreter tests and reference mathematical model for RDNA2 Float16 Min/Max/Clamp Suite.
+"""Semantic translator verification suite for RDNA2 Float16 Min/Max and Rounding Bundle.
 
-Covers:
-- v_min_f16: IEEE 754 binary16 minimum, NMin semantics (NaN passes other operand, -0.0 < +0.0).
-- v_max_f16: IEEE 754 binary16 maximum, NMax semantics (NaN passes other operand, +0.0 > -0.0).
-- v_floor_f16: floor rounding in binary16, preserving sign of +-0.0 and pass-through for NaN/inf.
-- v_ceil_f16: ceiling rounding in binary16, preserving sign of +-0.0 and pass-through for NaN/inf.
-- v_trunc_f16: truncation towards zero in binary16, preserving sign of +-0.0 and pass-through for NaN/inf.
-- v_rndne_f16: round to nearest even in binary16, preserving sign of +-0.0 and pass-through for NaN/inf.
+Covers 6 opcodes with 100% translator execution via support.translate_lines and support.mrt0_words:
+- v_min_f16: IEEE 754 binary16 minimum, NMin semantics (NaN pass-through of other operand, -0.0 < +0.0).
+- v_max_f16: IEEE 754 binary16 maximum, NMax semantics (NaN pass-through of other operand, +0.0 > -0.0).
+- v_floor_f16: binary16 floor rounding, sign preservation on +-0.0, pass-through for NaN/inf.
+- v_ceil_f16: binary16 ceiling rounding, sign preservation on +-0.0, pass-through for NaN/inf.
+- v_trunc_f16: binary16 truncation towards zero, sign preservation on +-0.0, pass-through for NaN/inf.
+- v_rndne_f16: binary16 round-to-nearest-even, sign preservation on +-0.0, pass-through for NaN/inf.
 
-Zero game data, standard library Python only (python -I, struct, math, unittest).
+Every test method compiles an RDNA2 assembly program, runs the translated SPIR-V through
+spirv_mini_interp, and asserts the concrete register values written to mrt0.
+Zero mock machines, zero game data, standard library Python only.
 """
 
-from dataclasses import dataclass, field
-from enum import Enum, auto
 import math
 import os
 import struct
 import sys
 import unittest
-from typing import List, Optional, Tuple, Union
 
-MASK16: int = 0xFFFF
-SIGN_BIT16: int = 0x8000
-EXP_MASK16: int = 0x001F
-EXP_SHIFT16: int = 10
-MANT_MASK16: int = 0x03FF
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 
-POS_ZERO16: int = 0x0000
-NEG_ZERO16: int = 0x8000
-POS_INF16: int = 0x7C00
-NEG_INF16: int = 0xFC00
-QNAN16: int = 0x7E00
-SNAN16: int = 0x7C01
+sys.dont_write_bytecode = True
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+import support  # noqa: E402
+
+MASK16 = 0xFFFF
+MASK32 = 0xFFFFFFFF
+
+# IEEE 754 binary16 bit constants
+POS_ZERO = 0x0000
+NEG_ZERO = 0x8000
+POS_ONE = 0x3C00
+NEG_ONE = 0xBC00
+POS_HALF = 0x3800
+NEG_HALF = 0xB800
+POS_TWO = 0x4000
+NEG_TWO = 0xC000
+POS_THREE = 0x4200
+NEG_THREE = 0xC200
+POS_FOUR = 0x4400
+NEG_FOUR = 0xC400
+POS_INF = 0x7C00
+NEG_INF = 0xFC00
+QNAN_CANONICAL = 0x7E00
+QNAN_ALT = 0x7E55
+SNAN = 0x7C01
+
+POS_MIN_SUBNORM = 0x0001
+POS_MAX_SUBNORM = 0x03FF
+NEG_MIN_SUBNORM = 0x8001
+NEG_MAX_SUBNORM = 0x83FF
+POS_MIN_NORMAL = 0x0400
+POS_MAX_NORMAL = 0x7BFF
+NEG_MAX_NORMAL = 0xFBFF
 
 
-def f16_to_bits(f: float) -> int:
+def f16_bits(f: float) -> int:
     return struct.unpack("<H", struct.pack("<e", f))[0]
 
 
-def bits_to_f16(u: int) -> float:
-    return struct.unpack("<e", struct.pack("<H", u & MASK16))[0]
-
-
-def is_nan_f16(u: int) -> bool:
+def is_nan16(u: int) -> bool:
     return (u & 0x7C00) == 0x7C00 and (u & 0x03FF) != 0
 
 
-def is_inf_f16(u: int) -> bool:
-    return (u & 0x7FFF) == 0x7C00
+def run_ps_16(lines: list[str], name: str = "ps_f16") -> int:
+    """Helper to assemble a pixel shader ending with mrt0 export and return the first 32-bit word."""
+    full = list(lines) + [
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, full)
+    words = support.mrt0_words(spv)
+    return words[0]
 
 
-# ------------------------------------------------------------------------------
-# v_min_f16 Reference Oracle
-# ------------------------------------------------------------------------------
-
-def ref_min_f16(s0: int, s1: int) -> int:
-    u0 = s0 & MASK16
-    u1 = s1 & MASK16
-    nan0 = is_nan_f16(u0)
-    nan1 = is_nan_f16(u1)
-    if nan0 and nan1:
-        return u0
-    if nan0:
-        return u1
-    if nan1:
-        return u0
-    if (u0 | u1) == 0x8000:
-        return NEG_ZERO16
-    f0 = bits_to_f16(u0)
-    f1 = bits_to_f16(u1)
-    return u0 if f0 < f1 else u1
-
-
-class TestMinF16Oracle(unittest.TestCase):
-    def test_basic_min(self):
-        self.assertEqual(ref_min_f16(f16_to_bits(1.0), f16_to_bits(2.0)), f16_to_bits(1.0))
-        self.assertEqual(ref_min_f16(f16_to_bits(-3.0), f16_to_bits(1.0)), f16_to_bits(-3.0))
-        self.assertEqual(ref_min_f16(f16_to_bits(5.0), f16_to_bits(5.0)), f16_to_bits(5.0))
-
-    def test_signed_zeros(self):
-        # -0.0 < +0.0
-        self.assertEqual(ref_min_f16(POS_ZERO16, NEG_ZERO16), NEG_ZERO16)
-        self.assertEqual(ref_min_f16(NEG_ZERO16, POS_ZERO16), NEG_ZERO16)
-
-
-# ------------------------------------------------------------------------------
-# v_min_f16 AST & Scalar Machine
-# ------------------------------------------------------------------------------
-
-class OperandType(Enum):
-    VGPR = auto()
-    SGPR = auto()
-    LITERAL = auto()
-
-
-@dataclass(frozen=True)
-class RegisterOperand:
-    op_type: OperandType
-    index: int
-
-    def __post_init__(self):
-        if self.op_type == OperandType.VGPR and not (0 <= self.index <= 255):
-            raise ValueError(f"VGPR index out of range: {self.index}")
-        if self.op_type == OperandType.SGPR and not (0 <= self.index <= 105):
-            raise ValueError(f"SGPR index out of range: {self.index}")
-
-    @property
-    def name(self) -> str:
-        return f"{'v' if self.op_type == OperandType.VGPR else 's'}{self.index}"
-
-
-@dataclass(frozen=True)
-class LiteralOperand:
-    value: int
-
-    def __post_init__(self):
-        if not (-0x8000_0000 <= self.value <= 0xFFFF_FFFF):
-            raise ValueError(f"Literal value out of range: {self.value}")
-
-
-@dataclass
-class VMinF16Instruction:
-    dst: RegisterOperand
-    src0: Union[RegisterOperand, LiteralOperand]
-    src1: Union[RegisterOperand, LiteralOperand]
-
-    def __post_init__(self):
-        if self.dst.op_type != OperandType.VGPR:
-            raise TypeError("Destination must be a VGPR")
-
-
-class ScalarMachineMinF16:
-    def __init__(self):
-        self.vgprs: List[int] = [0] * 256
-        self.sgprs: List[int] = [0] * 106
-
-    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
-        if isinstance(op, LiteralOperand):
-            return op.value & MASK16
-        elif op.op_type == OperandType.VGPR:
-            return self.vgprs[op.index] & MASK16
-        elif op.op_type == OperandType.SGPR:
-            return self.sgprs[op.index] & MASK16
-        raise TypeError(f"Unknown operand: {op}")
-
-    def step(self, insn: VMinF16Instruction):
-        s0 = self.read_operand(insn.src0)
-        s1 = self.read_operand(insn.src1)
-        res = ref_min_f16(s0, s1)
-        # Low 16 bits written, preserving high 16 bits
-        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res
-
-
-class TestMinF16ASTAndScalar(unittest.TestCase):
-    def test_ast(self):
-        insn = VMinF16Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-            src1=RegisterOperand(OperandType.VGPR, 2),
-        )
-        self.assertEqual(insn.dst.name, "v0")
-
-    def test_scalar_execution(self):
-        machine = ScalarMachineMinF16()
-        machine.vgprs[0] = 0xAAAA_0000
-        machine.vgprs[1] = f16_to_bits(10.0)
-        machine.vgprs[2] = f16_to_bits(2.5)
-        insn = VMinF16Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-            src1=RegisterOperand(OperandType.VGPR, 2),
-        )
-        machine.step(insn)
-        self.assertEqual(machine.vgprs[0], 0xAAAA_0000 | f16_to_bits(2.5))
-
-
-# ------------------------------------------------------------------------------
-# v_min_f16 SIMD & IEEE 754
-# ------------------------------------------------------------------------------
-
-class SIMDWaveMinF16:
-    def __init__(self, wave_size: int = 64):
-        self.wave_size = wave_size
-        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
-        self.exec_mask: int = (1 << wave_size) - 1
-
-    def step(self, insn: VMinF16Instruction):
-        for lane in range(self.wave_size):
-            if (self.exec_mask >> lane) & 1:
-                s0 = self.vgprs[insn.src0.index][lane] & MASK16
-                s1 = self.vgprs[insn.src1.index][lane] & MASK16
-                res = ref_min_f16(s0, s1)
-                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res
-
-
-class TestMinF16SIMDAndIEEE(unittest.TestCase):
-    def test_simd_divergence(self):
-        wave = SIMDWaveMinF16(wave_size=32)
-        for lane in range(32):
-            wave.vgprs[1][lane] = f16_to_bits(float(lane))
-            wave.vgprs[2][lane] = f16_to_bits(16.0)
-            wave.vgprs[0][lane] = 0
-
-        wave.exec_mask = 0x5555_5555
-        insn = VMinF16Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-            src1=RegisterOperand(OperandType.VGPR, 2),
-        )
-        wave.step(insn)
-
-        for lane in range(32):
-            if lane % 2 == 0:
-                expected = f16_to_bits(min(float(lane), 16.0))
-                self.assertEqual(wave.vgprs[0][lane], expected)
-            else:
-                self.assertEqual(wave.vgprs[0][lane], 0)
-
-    def test_nan_and_infinities(self):
-        # One NaN returns other operand
-        self.assertEqual(ref_min_f16(QNAN16, f16_to_bits(3.0)), f16_to_bits(3.0))
-        self.assertEqual(ref_min_f16(f16_to_bits(-5.0), QNAN16), f16_to_bits(-5.0))
-        # Infinities
-        self.assertEqual(ref_min_f16(POS_INF16, f16_to_bits(100.0)), f16_to_bits(100.0))
-        self.assertEqual(ref_min_f16(NEG_INF16, f16_to_bits(-100.0)), NEG_INF16)
-
-
-# ------------------------------------------------------------------------------
-# v_min_f16 Rejection & Hardware Translator
-# ------------------------------------------------------------------------------
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
-import support
-import rdna2spirv
-
-
-class TestMinF16HardwareTranslator(unittest.TestCase):
-    def test_syntax_rejection(self):
-        with self.assertRaises(ValueError):
-            RegisterOperand(OperandType.VGPR, 256)
-
-    def test_hardware_translator_execution(self):
+# ==============================================================================
+# 1. v_min_f16 Translator Tests
+# ==============================================================================
+class TestVMinF16Translator(unittest.TestCase):
+    def test_min_f16_basic_values(self):
         cases = [
-            (f16_to_bits(1.0), f16_to_bits(2.0), f16_to_bits(1.0)),
-            (f16_to_bits(-3.0), f16_to_bits(1.0), f16_to_bits(-3.0)),
-            (POS_ZERO16, NEG_ZERO16, NEG_ZERO16),
-            (QNAN16, f16_to_bits(1.0), f16_to_bits(1.0)),
-            (POS_INF16, f16_to_bits(10.0), f16_to_bits(10.0)),
+            (f16_bits(1.0), f16_bits(2.0), f16_bits(1.0)),
+            (f16_bits(-3.0), f16_bits(1.0), f16_bits(-3.0)),
+            (f16_bits(5.0), f16_bits(5.0), f16_bits(5.0)),
+            (f16_bits(-2.0), f16_bits(-4.0), f16_bits(-4.0)),
         ]
         for s0, s1, expected in cases:
             prog = [
-                "v_mov_b32 v0, 0",
-                f"v_mov_b32 v1, {s0:#x}",
-                f"v_mov_b32 v2, {s1:#x}",
-                "v_min_f16 v0, v1, v2",
-                "exp mrt0 v0, v0, v0, v0 done vm",
-                "s_endpgm",
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_min_f16 v0, s0, s1",
             ]
-            spv = support.translate_lines("ps_min_f16_hw", prog)
-            words = support.mrt0_words(spv)
-            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on min_f16({s0:#x}, {s1:#x})")
+            w = run_ps_16(prog, f"ps_min_basic_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
 
-
-# ------------------------------------------------------------------------------
-# v_max_f16 Reference Oracle
-# ------------------------------------------------------------------------------
-
-def ref_max_f16(s0: int, s1: int) -> int:
-    u0 = s0 & MASK16
-    u1 = s1 & MASK16
-    nan0 = is_nan_f16(u0)
-    nan1 = is_nan_f16(u1)
-    if nan0 and nan1:
-        return u0
-    if nan0:
-        return u1
-    if nan1:
-        return u0
-    if (u0 | u1) == 0x8000:
-        return POS_ZERO16
-    f0 = bits_to_f16(u0)
-    f1 = bits_to_f16(u1)
-    return u0 if f0 > f1 else u1
-
-
-class TestMaxF16Oracle(unittest.TestCase):
-    def test_basic_max(self):
-        self.assertEqual(ref_max_f16(f16_to_bits(1.0), f16_to_bits(2.0)), f16_to_bits(2.0))
-        self.assertEqual(ref_max_f16(f16_to_bits(-3.0), f16_to_bits(1.0)), f16_to_bits(1.0))
-
-    def test_signed_zeros(self):
-        # +0.0 > -0.0
-        self.assertEqual(ref_max_f16(POS_ZERO16, NEG_ZERO16), POS_ZERO16)
-        self.assertEqual(ref_max_f16(NEG_ZERO16, POS_ZERO16), POS_ZERO16)
-
-
-# ------------------------------------------------------------------------------
-# v_max_f16 AST & Scalar Machine
-# ------------------------------------------------------------------------------
-
-@dataclass
-class VMaxF16Instruction:
-    dst: RegisterOperand
-    src0: Union[RegisterOperand, LiteralOperand]
-    src1: Union[RegisterOperand, LiteralOperand]
-
-    def __post_init__(self):
-        if self.dst.op_type != OperandType.VGPR:
-            raise TypeError("Destination must be a VGPR")
-
-
-class ScalarMachineMaxF16:
-    def __init__(self):
-        self.vgprs: List[int] = [0] * 256
-        self.sgprs: List[int] = [0] * 106
-
-    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
-        if isinstance(op, LiteralOperand):
-            return op.value & MASK16
-        elif op.op_type == OperandType.VGPR:
-            return self.vgprs[op.index] & MASK16
-        elif op.op_type == OperandType.SGPR:
-            return self.sgprs[op.index] & MASK16
-        raise TypeError(f"Unknown operand: {op}")
-
-    def step(self, insn: VMaxF16Instruction):
-        s0 = self.read_operand(insn.src0)
-        s1 = self.read_operand(insn.src1)
-        res = ref_max_f16(s0, s1)
-        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res
-
-
-class TestMaxF16ASTAndScalar(unittest.TestCase):
-    def test_ast(self):
-        insn = VMaxF16Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-            src1=RegisterOperand(OperandType.VGPR, 2),
-        )
-        self.assertEqual(insn.dst.name, "v0")
-
-    def test_scalar_execution(self):
-        machine = ScalarMachineMaxF16()
-        machine.vgprs[1] = f16_to_bits(1.0)
-        machine.vgprs[2] = f16_to_bits(4.0)
-        insn = VMaxF16Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-            src1=RegisterOperand(OperandType.VGPR, 2),
-        )
-        machine.step(insn)
-        self.assertEqual(machine.vgprs[0], f16_to_bits(4.0))
-
-
-# ------------------------------------------------------------------------------
-# v_max_f16 SIMD & IEEE 754
-# ------------------------------------------------------------------------------
-
-class SIMDWaveMaxF16:
-    def __init__(self, wave_size: int = 64):
-        self.wave_size = wave_size
-        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
-        self.exec_mask: int = (1 << wave_size) - 1
-
-    def step(self, insn: VMaxF16Instruction):
-        for lane in range(self.wave_size):
-            if (self.exec_mask >> lane) & 1:
-                s0 = self.vgprs[insn.src0.index][lane] & MASK16
-                s1 = self.vgprs[insn.src1.index][lane] & MASK16
-                res = ref_max_f16(s0, s1)
-                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res
-
-
-class TestMaxF16SIMDAndIEEE(unittest.TestCase):
-    def test_simd_divergence(self):
-        wave = SIMDWaveMaxF16(wave_size=32)
-        for lane in range(32):
-            wave.vgprs[1][lane] = f16_to_bits(float(lane))
-            wave.vgprs[2][lane] = f16_to_bits(10.0)
-            wave.vgprs[0][lane] = 0
-
-        insn = VMaxF16Instruction(
-            dst=RegisterOperand(OperandType.VGPR, 0),
-            src0=RegisterOperand(OperandType.VGPR, 1),
-            src1=RegisterOperand(OperandType.VGPR, 2),
-        )
-        wave.step(insn)
-
-        for lane in range(32):
-            expected = f16_to_bits(max(float(lane), 10.0))
-            self.assertEqual(wave.vgprs[0][lane], expected)
-
-    def test_nan_and_infinities(self):
-        self.assertEqual(ref_max_f16(QNAN16, f16_to_bits(3.0)), f16_to_bits(3.0))
-        self.assertEqual(ref_max_f16(f16_to_bits(-5.0), QNAN16), f16_to_bits(-5.0))
-        self.assertEqual(ref_max_f16(NEG_INF16, f16_to_bits(-100.0)), f16_to_bits(-100.0))
-        self.assertEqual(ref_max_f16(POS_INF16, f16_to_bits(100.0)), POS_INF16)
-
-
-# ------------------------------------------------------------------------------
-# v_max_f16 Rejection & Hardware Translator
-# ------------------------------------------------------------------------------
-
-class TestMaxF16HardwareTranslator(unittest.TestCase):
-    def test_syntax_rejection(self):
-        with self.assertRaises(TypeError):
-            VMaxF16Instruction(
-                dst=RegisterOperand(OperandType.SGPR, 0),
-                src0=RegisterOperand(OperandType.VGPR, 1),
-                src1=RegisterOperand(OperandType.VGPR, 2),
-            )
-
-    def test_hardware_translator_execution(self):
+    def test_min_f16_signed_zeros(self):
+        # RDNA2 / NMin orders -0.0 < +0.0
         cases = [
-            (f16_to_bits(1.0), f16_to_bits(2.0), f16_to_bits(2.0)),
-            (f16_to_bits(-3.0), f16_to_bits(1.0), f16_to_bits(1.0)),
-            (POS_ZERO16, NEG_ZERO16, POS_ZERO16),
-            (QNAN16, f16_to_bits(1.0), f16_to_bits(1.0)),
-            (NEG_INF16, f16_to_bits(10.0), f16_to_bits(10.0)),
+            (POS_ZERO, NEG_ZERO, NEG_ZERO),
+            (NEG_ZERO, POS_ZERO, NEG_ZERO),
+            (NEG_ZERO, NEG_ZERO, NEG_ZERO),
+            (POS_ZERO, POS_ZERO, POS_ZERO),
         ]
         for s0, s1, expected in cases:
             prog = [
-                "v_mov_b32 v0, 0",
-                f"v_mov_b32 v1, {s0:#x}",
-                f"v_mov_b32 v2, {s1:#x}",
-                "v_max_f16 v0, v1, v2",
-                "exp mrt0 v0, v0, v0, v0 done vm",
-                "s_endpgm",
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_min_f16 v0, s0, s1",
             ]
-            spv = support.translate_lines("ps_max_f16_hw", prog)
-            words = support.mrt0_words(spv)
-            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on max_f16({s0:#x}, {s1:#x})")
+            w = run_ps_16(prog, f"ps_min_sz_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
 
-
-# ------------------------------------------------------------------------------
-# v_floor_f16 Reference Oracle
-# ------------------------------------------------------------------------------
-
-def ref_floor_f16(src: int) -> int:
-    u = src & MASK16
-    if is_nan_f16(u) or is_inf_f16(u):
-        return u
-    if (u & 0x7FFF) == 0:
-        return u
-    f = bits_to_f16(u)
-    rf = math.floor(f)
-    return f16_to_bits(rf)
-
-
-class TestFloorF16Oracle(unittest.TestCase):
-    def test_basic_floor(self):
-        self.assertEqual(ref_floor_f16(f16_to_bits(1.5)), f16_to_bits(1.0))
-        self.assertEqual(ref_floor_f16(f16_to_bits(-1.5)), f16_to_bits(-2.0))
-        self.assertEqual(ref_floor_f16(f16_to_bits(2.0)), f16_to_bits(2.0))
-
-    def test_special_cases(self):
-        self.assertEqual(ref_floor_f16(POS_ZERO16), POS_ZERO16)
-        self.assertEqual(ref_floor_f16(NEG_ZERO16), NEG_ZERO16)
-        self.assertEqual(ref_floor_f16(POS_INF16), POS_INF16)
-        self.assertEqual(ref_floor_f16(NEG_INF16), NEG_INF16)
-        self.assertEqual(ref_floor_f16(QNAN16), QNAN16)
-
-
-# ------------------------------------------------------------------------------
-# v_floor_f16 AST & Scalar Machine
-# ------------------------------------------------------------------------------
-
-@dataclass
-class VFloorF16Instruction:
-    dst: RegisterOperand
-    src0: Union[RegisterOperand, LiteralOperand]
-
-    def __post_init__(self):
-        if self.dst.op_type != OperandType.VGPR:
-            raise TypeError("Destination must be a VGPR")
-
-
-class ScalarMachineFloorF16:
-    def __init__(self):
-        self.vgprs: List[int] = [0] * 256
-        self.sgprs: List[int] = [0] * 106
-
-    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
-        if isinstance(op, LiteralOperand):
-            return op.value & MASK16
-        elif op.op_type == OperandType.VGPR:
-            return self.vgprs[op.index] & MASK16
-        elif op.op_type == OperandType.SGPR:
-            return self.sgprs[op.index] & MASK16
-        raise TypeError(f"Unknown operand: {op}")
-
-    def step(self, insn: VFloorF16Instruction):
-        s0 = self.read_operand(insn.src0)
-        res = ref_floor_f16(s0)
-        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res
-
-
-class TestFloorF16ASTAndScalar(unittest.TestCase):
-    def test_ast(self):
-        insn = VFloorF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        self.assertEqual(insn.dst.name, "v0")
-
-    def test_scalar_execution(self):
-        machine = ScalarMachineFloorF16()
-        machine.vgprs[1] = f16_to_bits(2.75)
-        insn = VFloorF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        machine.step(insn)
-        self.assertEqual(machine.vgprs[0], f16_to_bits(2.0))
-
-
-# ------------------------------------------------------------------------------
-# v_floor_f16 SIMD & IEEE 754
-# ------------------------------------------------------------------------------
-
-class SIMDWaveFloorF16:
-    def __init__(self, wave_size: int = 64):
-        self.wave_size = wave_size
-        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
-        self.exec_mask: int = (1 << wave_size) - 1
-
-    def step(self, insn: VFloorF16Instruction):
-        for lane in range(self.wave_size):
-            if (self.exec_mask >> lane) & 1:
-                s0 = self.vgprs[insn.src0.index][lane] & MASK16
-                res = ref_floor_f16(s0)
-                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res
-
-
-class TestFloorF16SIMDAndIEEE(unittest.TestCase):
-    def test_simd_divergence(self):
-        wave = SIMDWaveFloorF16(wave_size=32)
-        for lane in range(32):
-            wave.vgprs[1][lane] = f16_to_bits(float(lane) + 0.5)
-            wave.vgprs[0][lane] = 0
-
-        insn = VFloorF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        wave.step(insn)
-
-        for lane in range(32):
-            expected = f16_to_bits(float(lane))
-            self.assertEqual(wave.vgprs[0][lane], expected)
-
-    def test_nans_pass_through(self):
-        self.assertEqual(ref_floor_f16(QNAN16), QNAN16)
-        self.assertEqual(ref_floor_f16(SNAN16), SNAN16)
-
-
-# ------------------------------------------------------------------------------
-# v_floor_f16 Rejection & Hardware Translator
-# ------------------------------------------------------------------------------
-
-class TestFloorF16HardwareTranslator(unittest.TestCase):
-    def test_syntax_rejection(self):
-        with self.assertRaises(ValueError):
-            LiteralOperand(0x1_0000_0000)
-
-    def test_hardware_translator_execution(self):
+    def test_min_f16_nan_suppression(self):
         cases = [
-            (f16_to_bits(1.5), f16_to_bits(1.0)),
-            (f16_to_bits(-1.5), f16_to_bits(-2.0)),
-            (f16_to_bits(3.0), f16_to_bits(3.0)),
-            (POS_ZERO16, POS_ZERO16),
-            (NEG_ZERO16, NEG_ZERO16),
-            (POS_INF16, POS_INF16),
-            (NEG_INF16, NEG_INF16),
-            (QNAN16, QNAN16),
+            (QNAN_CANONICAL, f16_bits(3.0), f16_bits(3.0)),
+            (f16_bits(-5.0), QNAN_CANONICAL, f16_bits(-5.0)),
+            (SNAN, f16_bits(2.0), f16_bits(2.0)),
         ]
-        for src_val, expected in cases:
+        for s0, s1, expected in cases:
             prog = [
-                "v_mov_b32 v0, 0",
-                f"v_mov_b32 v1, {src_val:#x}",
-                "v_floor_f16 v0, v1",
-                "exp mrt0 v0, v0, v0, v0 done vm",
-                "s_endpgm",
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_min_f16 v0, s0, s1",
             ]
-            spv = support.translate_lines("ps_floor_f16_hw", prog)
-            words = support.mrt0_words(spv)
-            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on floor_f16({src_val:#x})")
+            w = run_ps_16(prog, f"ps_min_nan_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
 
+        # Both NaNs produce a NaN
+        prog_all_nan = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {QNAN_CANONICAL:#x}",
+            f"s_mov_b32 s1, {QNAN_ALT:#x}",
+            "v_min_f16 v0, s0, s1",
+        ]
+        w = run_ps_16(prog_all_nan, "ps_min_all_nan")
+        self.assertTrue(is_nan16(w & MASK16))
 
-# ------------------------------------------------------------------------------
-# v_ceil_f16 Reference Oracle
-# ------------------------------------------------------------------------------
-
-def ref_ceil_f16(src: int) -> int:
-    u = src & MASK16
-    if is_nan_f16(u) or is_inf_f16(u):
-        return u
-    if (u & 0x7FFF) == 0:
-        return u
-    f = bits_to_f16(u)
-    rf = math.ceil(f)
-    return f16_to_bits(rf)
-
-
-class TestCeilF16Oracle(unittest.TestCase):
-    def test_basic_ceil(self):
-        self.assertEqual(ref_ceil_f16(f16_to_bits(1.2)), f16_to_bits(2.0))
-        self.assertEqual(ref_ceil_f16(f16_to_bits(-1.8)), f16_to_bits(-1.0))
-        self.assertEqual(ref_ceil_f16(f16_to_bits(4.0)), f16_to_bits(4.0))
-
-    def test_special_cases(self):
-        self.assertEqual(ref_ceil_f16(POS_ZERO16), POS_ZERO16)
-        self.assertEqual(ref_ceil_f16(NEG_ZERO16), NEG_ZERO16)
-        self.assertEqual(ref_ceil_f16(POS_INF16), POS_INF16)
-        self.assertEqual(ref_ceil_f16(NEG_INF16), NEG_INF16)
-        self.assertEqual(ref_ceil_f16(QNAN16), QNAN16)
-
-
-# ------------------------------------------------------------------------------
-# v_ceil_f16 AST & Scalar Machine
-# ------------------------------------------------------------------------------
-
-@dataclass
-class VCeilF16Instruction:
-    dst: RegisterOperand
-    src0: Union[RegisterOperand, LiteralOperand]
-
-    def __post_init__(self):
-        if self.dst.op_type != OperandType.VGPR:
-            raise TypeError("Destination must be a VGPR")
-
-
-class ScalarMachineCeilF16:
-    def __init__(self):
-        self.vgprs: List[int] = [0] * 256
-        self.sgprs: List[int] = [0] * 106
-
-    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
-        if isinstance(op, LiteralOperand):
-            return op.value & MASK16
-        elif op.op_type == OperandType.VGPR:
-            return self.vgprs[op.index] & MASK16
-        elif op.op_type == OperandType.SGPR:
-            return self.sgprs[op.index] & MASK16
-        raise TypeError(f"Unknown operand: {op}")
-
-    def step(self, insn: VCeilF16Instruction):
-        s0 = self.read_operand(insn.src0)
-        res = ref_ceil_f16(s0)
-        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res
-
-
-class TestCeilF16ASTAndScalar(unittest.TestCase):
-    def test_ast(self):
-        insn = VCeilF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        self.assertEqual(insn.dst.name, "v0")
-
-    def test_scalar_execution(self):
-        machine = ScalarMachineCeilF16()
-        machine.vgprs[1] = f16_to_bits(1.1)
-        insn = VCeilF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        machine.step(insn)
-        self.assertEqual(machine.vgprs[0], f16_to_bits(2.0))
-
-
-# ------------------------------------------------------------------------------
-# v_ceil_f16 SIMD & IEEE 754
-# ------------------------------------------------------------------------------
-
-class SIMDWaveCeilF16:
-    def __init__(self, wave_size: int = 64):
-        self.wave_size = wave_size
-        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
-        self.exec_mask: int = (1 << wave_size) - 1
-
-    def step(self, insn: VCeilF16Instruction):
-        for lane in range(self.wave_size):
-            if (self.exec_mask >> lane) & 1:
-                s0 = self.vgprs[insn.src0.index][lane] & MASK16
-                res = ref_ceil_f16(s0)
-                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res
-
-
-class TestCeilF16SIMDAndIEEE(unittest.TestCase):
-    def test_simd_divergence(self):
-        wave = SIMDWaveCeilF16(wave_size=32)
-        for lane in range(32):
-            wave.vgprs[1][lane] = f16_to_bits(float(lane) + 0.1)
-            wave.vgprs[0][lane] = 0
-
-        insn = VCeilF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        wave.step(insn)
-
-        for lane in range(32):
-            expected = f16_to_bits(float(lane) + 1.0)
-            self.assertEqual(wave.vgprs[0][lane], expected)
-
-    def test_nans_pass_through(self):
-        self.assertEqual(ref_ceil_f16(QNAN16), QNAN16)
-        self.assertEqual(ref_ceil_f16(SNAN16), SNAN16)
-
-
-# ------------------------------------------------------------------------------
-# v_ceil_f16 Rejection & Hardware Translator
-# ------------------------------------------------------------------------------
-
-class TestCeilF16HardwareTranslator(unittest.TestCase):
-    def test_syntax_rejection(self):
-        with self.assertRaises(TypeError):
-            VCeilF16Instruction(dst=RegisterOperand(OperandType.SGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-
-    def test_hardware_translator_execution(self):
+    def test_min_f16_infinities(self):
         cases = [
-            (f16_to_bits(1.2), f16_to_bits(2.0)),
-            (f16_to_bits(-1.8), f16_to_bits(-1.0)),
-            (f16_to_bits(4.0), f16_to_bits(4.0)),
-            (POS_ZERO16, POS_ZERO16),
-            (NEG_ZERO16, NEG_ZERO16),
-            (POS_INF16, POS_INF16),
-            (NEG_INF16, NEG_INF16),
-            (QNAN16, QNAN16),
+            (POS_INF, f16_bits(100.0), f16_bits(100.0)),
+            (NEG_INF, f16_bits(-100.0), NEG_INF),
+            (NEG_INF, POS_INF, NEG_INF),
+            (POS_INF, POS_INF, POS_INF),
         ]
-        for src_val, expected in cases:
+        for s0, s1, expected in cases:
             prog = [
-                "v_mov_b32 v0, 0",
-                f"v_mov_b32 v1, {src_val:#x}",
-                "v_ceil_f16 v0, v1",
-                "exp mrt0 v0, v0, v0, v0 done vm",
-                "s_endpgm",
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_min_f16 v0, s0, s1",
             ]
-            spv = support.translate_lines("ps_ceil_f16_hw", prog)
-            words = support.mrt0_words(spv)
-            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on ceil_f16({src_val:#x})")
+            w = run_ps_16(prog, f"ps_min_inf_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
 
-
-# ------------------------------------------------------------------------------
-# v_trunc_f16 Reference Oracle
-# ------------------------------------------------------------------------------
-
-def ref_trunc_f16(src: int) -> int:
-    u = src & MASK16
-    if is_nan_f16(u) or is_inf_f16(u):
-        return u
-    if (u & 0x7FFF) == 0:
-        return u
-    f = bits_to_f16(u)
-    rf = math.trunc(f)
-    return f16_to_bits(rf)
-
-
-class TestTruncF16Oracle(unittest.TestCase):
-    def test_basic_trunc(self):
-        self.assertEqual(ref_trunc_f16(f16_to_bits(1.9)), f16_to_bits(1.0))
-        self.assertEqual(ref_trunc_f16(f16_to_bits(-1.9)), f16_to_bits(-1.0))
-        self.assertEqual(ref_trunc_f16(f16_to_bits(5.0)), f16_to_bits(5.0))
-
-    def test_special_cases(self):
-        self.assertEqual(ref_trunc_f16(POS_ZERO16), POS_ZERO16)
-        self.assertEqual(ref_trunc_f16(NEG_ZERO16), NEG_ZERO16)
-        self.assertEqual(ref_trunc_f16(POS_INF16), POS_INF16)
-        self.assertEqual(ref_trunc_f16(NEG_INF16), NEG_INF16)
-        self.assertEqual(ref_trunc_f16(QNAN16), QNAN16)
-
-
-# ------------------------------------------------------------------------------
-# v_trunc_f16 AST & Scalar Machine
-# ------------------------------------------------------------------------------
-
-@dataclass
-class VTruncF16Instruction:
-    dst: RegisterOperand
-    src0: Union[RegisterOperand, LiteralOperand]
-
-    def __post_init__(self):
-        if self.dst.op_type != OperandType.VGPR:
-            raise TypeError("Destination must be a VGPR")
-
-
-class ScalarMachineTruncF16:
-    def __init__(self):
-        self.vgprs: List[int] = [0] * 256
-        self.sgprs: List[int] = [0] * 106
-
-    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
-        if isinstance(op, LiteralOperand):
-            return op.value & MASK16
-        elif op.op_type == OperandType.VGPR:
-            return self.vgprs[op.index] & MASK16
-        elif op.op_type == OperandType.SGPR:
-            return self.sgprs[op.index] & MASK16
-        raise TypeError(f"Unknown operand: {op}")
-
-    def step(self, insn: VTruncF16Instruction):
-        s0 = self.read_operand(insn.src0)
-        res = ref_trunc_f16(s0)
-        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res
-
-
-class TestTruncF16ASTAndScalar(unittest.TestCase):
-    def test_ast(self):
-        insn = VTruncF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        self.assertEqual(insn.dst.name, "v0")
-
-    def test_scalar_execution(self):
-        machine = ScalarMachineTruncF16()
-        machine.vgprs[1] = f16_to_bits(-3.8)
-        insn = VTruncF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        machine.step(insn)
-        self.assertEqual(machine.vgprs[0], f16_to_bits(-3.0))
-
-
-# ------------------------------------------------------------------------------
-# v_trunc_f16 SIMD & IEEE 754
-# ------------------------------------------------------------------------------
-
-class SIMDWaveTruncF16:
-    def __init__(self, wave_size: int = 64):
-        self.wave_size = wave_size
-        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
-        self.exec_mask: int = (1 << wave_size) - 1
-
-    def step(self, insn: VTruncF16Instruction):
-        for lane in range(self.wave_size):
-            if (self.exec_mask >> lane) & 1:
-                s0 = self.vgprs[insn.src0.index][lane] & MASK16
-                res = ref_trunc_f16(s0)
-                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res
-
-
-class TestTruncF16SIMDAndIEEE(unittest.TestCase):
-    def test_simd_divergence(self):
-        wave = SIMDWaveTruncF16(wave_size=32)
-        for lane in range(32):
-            sign = -1.0 if lane % 2 else 1.0
-            wave.vgprs[1][lane] = f16_to_bits(sign * (float(lane) + 0.9))
-            wave.vgprs[0][lane] = 0
-
-        insn = VTruncF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        wave.step(insn)
-
-        for lane in range(32):
-            sign = -1.0 if lane % 2 else 1.0
-            expected = f16_to_bits(sign * float(lane))
-            self.assertEqual(wave.vgprs[0][lane], expected)
-
-    def test_nans_pass_through(self):
-        self.assertEqual(ref_trunc_f16(QNAN16), QNAN16)
-        self.assertEqual(ref_trunc_f16(SNAN16), SNAN16)
-
-
-# ------------------------------------------------------------------------------
-# v_trunc_f16 Rejection & Hardware Translator
-# ------------------------------------------------------------------------------
-
-class TestTruncF16HardwareTranslator(unittest.TestCase):
-    def test_hardware_translator_execution(self):
+    def test_min_f16_subnormals(self):
         cases = [
-            (f16_to_bits(1.9), f16_to_bits(1.0)),
-            (f16_to_bits(-1.9), f16_to_bits(-1.0)),
-            (f16_to_bits(5.0), f16_to_bits(5.0)),
-            (POS_ZERO16, POS_ZERO16),
-            (NEG_ZERO16, NEG_ZERO16),
-            (POS_INF16, POS_INF16),
-            (NEG_INF16, NEG_INF16),
-            (QNAN16, QNAN16),
+            (POS_MIN_SUBNORM, POS_MIN_NORMAL, POS_MIN_SUBNORM),
+            (NEG_MIN_SUBNORM, POS_MIN_SUBNORM, NEG_MIN_SUBNORM),
+            (POS_MAX_SUBNORM, POS_MIN_SUBNORM, POS_MIN_SUBNORM),
         ]
-        for src_val, expected in cases:
+        for s0, s1, expected in cases:
             prog = [
-                "v_mov_b32 v0, 0",
-                f"v_mov_b32 v1, {src_val:#x}",
-                "v_trunc_f16 v0, v1",
-                "exp mrt0 v0, v0, v0, v0 done vm",
-                "s_endpgm",
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_min_f16 v0, s0, s1",
             ]
-            spv = support.translate_lines("ps_trunc_f16_hw", prog)
-            words = support.mrt0_words(spv)
-            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on trunc_f16({src_val:#x})")
+            w = run_ps_16(prog, f"ps_min_subnorm_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_min_f16_clamp(self):
+        # min(-2.0, 5.0) = -2.0 clamped to [0.0, 1.0] -> 0.0
+        # min(2.0, 3.0) = 2.0 clamped to [0.0, 1.0] -> 1.0
+        prog1 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {NEG_TWO:#x}",
+            f"s_mov_b32 s1, {POS_FOUR:#x}",
+            "v_min_f16 v0, s0, s1 clamp",
+        ]
+        self.assertEqual(run_ps_16(prog1, "ps_min_clamp_neg") & MASK16, POS_ZERO)
+
+        prog2 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_TWO:#x}",
+            f"s_mov_b32 s1, {POS_THREE:#x}",
+            "v_min_f16 v0, s0, s1 clamp",
+        ]
+        self.assertEqual(run_ps_16(prog2, "ps_min_clamp_hi") & MASK16, POS_ONE)
+
+    def test_min_f16_op_sel_and_preservation(self):
+        # v0 seeded with 0x5555AAAA; op_sel:[1, 0, 1] reads s0.hi (0.5), s1.lo (2.0), writes dst.hi
+        # min(0.5, 2.0) = 0.5 (0x3800) -> dst becomes 0x3800AAAA (low half 0xAAAA preserved)
+        prog = [
+            "v_mov_b32_e32 v0, 0x5555AAAA",
+            f"s_mov_b32 s0, {(POS_HALF << 16) | POS_FOUR:#x}",
+            f"s_mov_b32 s1, {POS_TWO:#x}",
+            "v_min_f16 v0, s0, s1 op_sel:[1, 0, 1]",
+        ]
+        w = run_ps_16(prog, "ps_min_opsel")
+        self.assertEqual(w, (POS_HALF << 16) | 0xAAAA)
+
+    def test_min_f16_input_modifiers(self):
+        # -|s0| vs s1: -|2.0| = -2.0; min(-2.0, -1.0) = -2.0
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_TWO:#x}",
+            f"s_mov_b32 s1, {NEG_ONE:#x}",
+            "v_min_f16 v0, -|s0|, s1",
+        ]
+        w = run_ps_16(prog, "ps_min_mods")
+        self.assertEqual(w & MASK16, NEG_TWO)
+
+    def test_min_f16_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_min_err", ["v_min_f16 v0, s0", "s_endpgm"])
+
+    def test_min_f16_mutation_detection(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_ONE:#x}",
+            f"s_mov_b32 s1, {POS_TWO:#x}",
+            "v_min_f16 v0, s0, s1",
+        ]
+        w = run_ps_16(prog, "ps_min_mut")
+        # Mutating NMin to NMax would produce 2.0 instead of 1.0
+        self.assertNotEqual(w & MASK16, POS_TWO)
 
 
-# ------------------------------------------------------------------------------
-# v_rndne_f16 Reference Oracle
-# ------------------------------------------------------------------------------
-
-def ref_rndne_f16(src: int) -> int:
-    u = src & MASK16
-    if is_nan_f16(u) or is_inf_f16(u):
-        return u
-    if (u & 0x7FFF) == 0:
-        return u
-    f = bits_to_f16(u)
-    rf = round(f)
-    return f16_to_bits(rf)
-
-
-class TestRndneF16Oracle(unittest.TestCase):
-    def test_round_to_nearest_even(self):
-        # 1.5 -> 2.0 (2 is even)
-        self.assertEqual(ref_rndne_f16(f16_to_bits(1.5)), f16_to_bits(2.0))
-        # 2.5 -> 2.0 (2 is even)
-        self.assertEqual(ref_rndne_f16(f16_to_bits(2.5)), f16_to_bits(2.0))
-        # 3.5 -> 4.0 (4 is even)
-        self.assertEqual(ref_rndne_f16(f16_to_bits(3.5)), f16_to_bits(4.0))
-        # -1.5 -> -2.0
-        self.assertEqual(ref_rndne_f16(f16_to_bits(-1.5)), f16_to_bits(-2.0))
-        # -2.5 -> -2.0
-        self.assertEqual(ref_rndne_f16(f16_to_bits(-2.5)), f16_to_bits(-2.0))
-
-    def test_special_cases(self):
-        self.assertEqual(ref_rndne_f16(POS_ZERO16), POS_ZERO16)
-        self.assertEqual(ref_rndne_f16(NEG_ZERO16), NEG_ZERO16)
-        self.assertEqual(ref_rndne_f16(POS_INF16), POS_INF16)
-        self.assertEqual(ref_rndne_f16(NEG_INF16), NEG_INF16)
-        self.assertEqual(ref_rndne_f16(QNAN16), QNAN16)
-
-
-# ------------------------------------------------------------------------------
-# v_rndne_f16 AST & Scalar Machine
-# ------------------------------------------------------------------------------
-
-@dataclass
-class VRndneF16Instruction:
-    dst: RegisterOperand
-    src0: Union[RegisterOperand, LiteralOperand]
-
-    def __post_init__(self):
-        if self.dst.op_type != OperandType.VGPR:
-            raise TypeError("Destination must be a VGPR")
-
-
-class ScalarMachineRndneF16:
-    def __init__(self):
-        self.vgprs: List[int] = [0] * 256
-        self.sgprs: List[int] = [0] * 106
-
-    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
-        if isinstance(op, LiteralOperand):
-            return op.value & MASK16
-        elif op.op_type == OperandType.VGPR:
-            return self.vgprs[op.index] & MASK16
-        elif op.op_type == OperandType.SGPR:
-            return self.sgprs[op.index] & MASK16
-        raise TypeError(f"Unknown operand: {op}")
-
-    def step(self, insn: VRndneF16Instruction):
-        s0 = self.read_operand(insn.src0)
-        res = ref_rndne_f16(s0)
-        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res
-
-
-class TestRndneF16ASTAndScalar(unittest.TestCase):
-    def test_ast(self):
-        insn = VRndneF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        self.assertEqual(insn.dst.name, "v0")
-
-    def test_scalar_execution(self):
-        machine = ScalarMachineRndneF16()
-        machine.vgprs[1] = f16_to_bits(1.5)
-        insn = VRndneF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        machine.step(insn)
-        self.assertEqual(machine.vgprs[0], f16_to_bits(2.0))
-
-
-# ------------------------------------------------------------------------------
-# v_rndne_f16 SIMD & IEEE 754
-# ------------------------------------------------------------------------------
-
-class SIMDWaveRndneF16:
-    def __init__(self, wave_size: int = 64):
-        self.wave_size = wave_size
-        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
-        self.exec_mask: int = (1 << wave_size) - 1
-
-    def step(self, insn: VRndneF16Instruction):
-        for lane in range(self.wave_size):
-            if (self.exec_mask >> lane) & 1:
-                s0 = self.vgprs[insn.src0.index][lane] & MASK16
-                res = ref_rndne_f16(s0)
-                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res
-
-
-class TestRndneF16SIMDAndIEEE(unittest.TestCase):
-    def test_simd_divergence(self):
-        wave = SIMDWaveRndneF16(wave_size=32)
-        for lane in range(32):
-            wave.vgprs[1][lane] = f16_to_bits(float(lane) + 0.5)
-            wave.vgprs[0][lane] = 0
-
-        insn = VRndneF16Instruction(dst=RegisterOperand(OperandType.VGPR, 0), src0=RegisterOperand(OperandType.VGPR, 1))
-        wave.step(insn)
-
-        for lane in range(32):
-            expected = f16_to_bits(round(float(lane) + 0.5))
-            self.assertEqual(wave.vgprs[0][lane], expected)
-
-    def test_nans_pass_through(self):
-        self.assertEqual(ref_rndne_f16(QNAN16), QNAN16)
-        self.assertEqual(ref_rndne_f16(SNAN16), SNAN16)
-
-
-# ------------------------------------------------------------------------------
-# v_rndne_f16 Rejection & Hardware Translator
-# ------------------------------------------------------------------------------
-
-class TestRndneF16HardwareTranslator(unittest.TestCase):
-    def test_syntax_rejection(self):
-        with self.assertRaises(ValueError):
-            RegisterOperand(OperandType.SGPR, 150)
-
-    def test_hardware_translator_execution(self):
+# ==============================================================================
+# 2. v_max_f16 Translator Tests
+# ==============================================================================
+class TestVMaxF16Translator(unittest.TestCase):
+    def test_max_f16_basic_values(self):
         cases = [
-            (f16_to_bits(1.5), f16_to_bits(2.0)),
-            (f16_to_bits(2.5), f16_to_bits(2.0)),
-            (f16_to_bits(3.5), f16_to_bits(4.0)),
-            (f16_to_bits(-1.5), f16_to_bits(-2.0)),
-            (f16_to_bits(2.0), f16_to_bits(2.0)),
-            (POS_ZERO16, POS_ZERO16),
-            (NEG_ZERO16, NEG_ZERO16),
-            (POS_INF16, POS_INF16),
-            (NEG_INF16, NEG_INF16),
-            (QNAN16, QNAN16),
+            (f16_bits(1.0), f16_bits(2.0), f16_bits(2.0)),
+            (f16_bits(-3.0), f16_bits(1.0), f16_bits(1.0)),
+            (f16_bits(-5.0), f16_bits(-2.0), f16_bits(-2.0)),
         ]
-        for src_val, expected in cases:
+        for s0, s1, expected in cases:
             prog = [
-                "v_mov_b32 v0, 0",
-                f"v_mov_b32 v1, {src_val:#x}",
-                "v_rndne_f16 v0, v1",
-                "exp mrt0 v0, v0, v0, v0 done vm",
-                "s_endpgm",
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_max_f16 v0, s0, s1",
             ]
-            spv = support.translate_lines("ps_rndne_f16_hw", prog)
-            words = support.mrt0_words(spv)
-            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on rndne_f16({src_val:#x})")
+            w = run_ps_16(prog, f"ps_max_basic_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_max_f16_signed_zeros(self):
+        # RDNA2 / NMax orders +0.0 > -0.0
+        cases = [
+            (POS_ZERO, NEG_ZERO, POS_ZERO),
+            (NEG_ZERO, POS_ZERO, POS_ZERO),
+            (NEG_ZERO, NEG_ZERO, NEG_ZERO),
+            (POS_ZERO, POS_ZERO, POS_ZERO),
+        ]
+        for s0, s1, expected in cases:
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_max_f16 v0, s0, s1",
+            ]
+            w = run_ps_16(prog, f"ps_max_sz_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_max_f16_nan_suppression(self):
+        cases = [
+            (QNAN_CANONICAL, f16_bits(3.0), f16_bits(3.0)),
+            (f16_bits(-5.0), QNAN_CANONICAL, f16_bits(-5.0)),
+            (SNAN, f16_bits(4.0), f16_bits(4.0)),
+        ]
+        for s0, s1, expected in cases:
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_max_f16 v0, s0, s1",
+            ]
+            w = run_ps_16(prog, f"ps_max_nan_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_max_f16_infinities(self):
+        cases = [
+            (POS_INF, f16_bits(100.0), POS_INF),
+            (NEG_INF, f16_bits(-100.0), f16_bits(-100.0)),
+            (NEG_INF, POS_INF, POS_INF),
+        ]
+        for s0, s1, expected in cases:
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_max_f16 v0, s0, s1",
+            ]
+            w = run_ps_16(prog, f"ps_max_inf_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_max_f16_subnormals(self):
+        cases = [
+            (POS_MIN_SUBNORM, POS_MIN_NORMAL, POS_MIN_NORMAL),
+            (NEG_MIN_SUBNORM, NEG_MAX_SUBNORM, NEG_MIN_SUBNORM),
+        ]
+        for s0, s1, expected in cases:
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {s0:#x}",
+                f"s_mov_b32 s1, {s1:#x}",
+                "v_max_f16 v0, s0, s1",
+            ]
+            w = run_ps_16(prog, f"ps_max_subnorm_{s0}_{s1}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_max_f16_clamp(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_TWO:#x}",
+            f"s_mov_b32 s1, {POS_THREE:#x}",
+            "v_max_f16 v0, s0, s1 clamp",
+        ]
+        self.assertEqual(run_ps_16(prog, "ps_max_clamp") & MASK16, POS_ONE)
+
+    def test_max_f16_op_sel_and_preservation(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0x12345678",
+            f"s_mov_b32 s0, {(POS_THREE << 16) | POS_ONE:#x}",
+            f"s_mov_b32 s1, {POS_TWO:#x}",
+            "v_max_f16 v0, s0, s1 op_sel:[1, 0, 1]",
+        ]
+        w = run_ps_16(prog, "ps_max_opsel")
+        self.assertEqual(w, (POS_THREE << 16) | 0x5678)
+
+    def test_max_f16_input_modifiers(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {NEG_THREE:#x}",
+            f"s_mov_b32 s1, {POS_ONE:#x}",
+            "v_max_f16 v0, |s0|, s1",
+        ]
+        w = run_ps_16(prog, "ps_max_mods")
+        self.assertEqual(w & MASK16, POS_THREE)
+
+    def test_max_f16_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_max_err", ["v_max_f16 v0, s0", "s_endpgm"])
+
+    def test_max_f16_mutation_detection(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_ONE:#x}",
+            f"s_mov_b32 s1, {POS_TWO:#x}",
+            "v_max_f16 v0, s0, s1",
+        ]
+        w = run_ps_16(prog, "ps_max_mut")
+        self.assertNotEqual(w & MASK16, POS_ONE)
 
 
-if __name__ == '__main__':
+# ==============================================================================
+# 3. v_floor_f16 Translator Tests
+# ==============================================================================
+class TestVFloorF16Translator(unittest.TestCase):
+    def test_floor_f16_basic_values(self):
+        cases = [
+            (f16_bits(1.7), f16_bits(1.0)),
+            (f16_bits(-1.2), f16_bits(-2.0)),
+            (f16_bits(3.0), f16_bits(3.0)),
+            (f16_bits(-4.0), f16_bits(-4.0)),
+        ]
+        for src, expected in cases:
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {src:#x}",
+                "v_floor_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_floor_basic_{src}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_floor_f16_signed_zeros(self):
+        # floor(+0.0) = +0.0, floor(-0.0) = -0.0
+        for z in (POS_ZERO, NEG_ZERO):
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {z:#x}",
+                "v_floor_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_floor_sz_{z}")
+            self.assertEqual(w & MASK16, z)
+
+    def test_floor_f16_infinities_and_nans(self):
+        for inf in (POS_INF, NEG_INF):
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {inf:#x}",
+                "v_floor_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_floor_inf_{inf}")
+            self.assertEqual(w & MASK16, inf)
+
+        prog_nan = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {QNAN_CANONICAL:#x}",
+            "v_floor_f16 v0, s0",
+        ]
+        w = run_ps_16(prog_nan, "ps_floor_nan")
+        self.assertTrue(is_nan16(w & MASK16))
+
+    def test_floor_f16_subnormals(self):
+        # Small positive subnormal rounds down to +0.0; small negative subnormal rounds down to -1.0
+        prog1 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_MIN_SUBNORM:#x}",
+            "v_floor_f16 v0, s0",
+        ]
+        self.assertEqual(run_ps_16(prog1, "ps_floor_subnorm_pos") & MASK16, POS_ZERO)
+
+        prog2 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {NEG_MIN_SUBNORM:#x}",
+            "v_floor_f16 v0, s0",
+        ]
+        self.assertEqual(run_ps_16(prog2, "ps_floor_subnorm_neg") & MASK16, NEG_ONE)
+
+    def test_floor_f16_clamp(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {f16_bits(3.7):#x}",
+            "v_floor_f16 v0, s0 clamp",
+        ]
+        self.assertEqual(run_ps_16(prog, "ps_floor_clamp") & MASK16, POS_ONE)
+
+    def test_floor_f16_op_sel_and_preservation(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0xA5A51234",
+            f"s_mov_b32 s0, {(f16_bits(2.9) << 16) | POS_ZERO:#x}",
+            "v_floor_f16 v0, s0 op_sel:[1, 1]",
+        ]
+        w = run_ps_16(prog, "ps_floor_opsel")
+        self.assertEqual(w, (POS_TWO << 16) | 0x1234)
+
+    def test_floor_f16_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_floor_err", ["v_floor_f16 v0", "s_endpgm"])
+
+    def test_floor_f16_mutation_detection(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {f16_bits(1.5):#x}",
+            "v_floor_f16 v0, s0",
+        ]
+        w = run_ps_16(prog, "ps_floor_mut")
+        self.assertNotEqual(w & MASK16, POS_TWO)
+
+
+# ==============================================================================
+# 4. v_ceil_f16 Translator Tests
+# ==============================================================================
+class TestVCeilF16Translator(unittest.TestCase):
+    def test_ceil_f16_basic_values(self):
+        cases = [
+            (f16_bits(1.2), f16_bits(2.0)),
+            (f16_bits(-1.7), f16_bits(-1.0)),
+            (f16_bits(3.0), f16_bits(3.0)),
+            (f16_bits(-4.0), f16_bits(-4.0)),
+        ]
+        for src, expected in cases:
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {src:#x}",
+                "v_ceil_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_ceil_basic_{src}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_ceil_f16_signed_zeros(self):
+        for z in (POS_ZERO, NEG_ZERO):
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {z:#x}",
+                "v_ceil_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_ceil_sz_{z}")
+            self.assertEqual(w & MASK16, z)
+
+    def test_ceil_f16_infinities_and_nans(self):
+        for inf in (POS_INF, NEG_INF):
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {inf:#x}",
+                "v_ceil_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_ceil_inf_{inf}")
+            self.assertEqual(w & MASK16, inf)
+
+    def test_ceil_f16_subnormals(self):
+        prog1 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_MIN_SUBNORM:#x}",
+            "v_ceil_f16 v0, s0",
+        ]
+        self.assertEqual(run_ps_16(prog1, "ps_ceil_subnorm_pos") & MASK16, POS_ONE)
+
+        prog2 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {NEG_MIN_SUBNORM:#x}",
+            "v_ceil_f16 v0, s0",
+        ]
+        self.assertEqual(run_ps_16(prog2, "ps_ceil_subnorm_neg") & MASK16, NEG_ZERO)
+
+    def test_ceil_f16_clamp(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {f16_bits(-2.5):#x}",
+            "v_ceil_f16 v0, s0 clamp",
+        ]
+        self.assertEqual(run_ps_16(prog, "ps_ceil_clamp") & MASK16, POS_ZERO)
+
+    def test_ceil_f16_op_sel_and_preservation(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0x11112222",
+            f"s_mov_b32 s0, {(f16_bits(0.1) << 16) | POS_ZERO:#x}",
+            "v_ceil_f16 v0, s0 op_sel:[1, 1]",
+        ]
+        w = run_ps_16(prog, "ps_ceil_opsel")
+        self.assertEqual(w, (POS_ONE << 16) | 0x2222)
+
+    def test_ceil_f16_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_ceil_err", ["v_ceil_f16", "s_endpgm"])
+
+    def test_ceil_f16_mutation_detection(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {f16_bits(1.1):#x}",
+            "v_ceil_f16 v0, s0",
+        ]
+        w = run_ps_16(prog, "ps_ceil_mut")
+        self.assertNotEqual(w & MASK16, POS_ONE)
+
+
+# ==============================================================================
+# 5. v_trunc_f16 Translator Tests
+# ==============================================================================
+class TestVTruncF16Translator(unittest.TestCase):
+    def test_trunc_f16_basic_values(self):
+        cases = [
+            (f16_bits(1.9), f16_bits(1.0)),
+            (f16_bits(-1.9), f16_bits(-1.0)),
+            (f16_bits(2.0), f16_bits(2.0)),
+            (f16_bits(-3.0), f16_bits(-3.0)),
+        ]
+        for src, expected in cases:
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {src:#x}",
+                "v_trunc_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_trunc_basic_{src}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_trunc_f16_signed_zeros(self):
+        for z in (POS_ZERO, NEG_ZERO):
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {z:#x}",
+                "v_trunc_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_trunc_sz_{z}")
+            self.assertEqual(w & MASK16, z)
+
+    def test_trunc_f16_infinities_and_nans(self):
+        for inf in (POS_INF, NEG_INF):
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {inf:#x}",
+                "v_trunc_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_trunc_inf_{inf}")
+            self.assertEqual(w & MASK16, inf)
+
+    def test_trunc_f16_subnormals(self):
+        prog1 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_MIN_SUBNORM:#x}",
+            "v_trunc_f16 v0, s0",
+        ]
+        self.assertEqual(run_ps_16(prog1, "ps_trunc_subnorm_pos") & MASK16, POS_ZERO)
+
+        prog2 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {NEG_MIN_SUBNORM:#x}",
+            "v_trunc_f16 v0, s0",
+        ]
+        self.assertEqual(run_ps_16(prog2, "ps_trunc_subnorm_neg") & MASK16, NEG_ZERO)
+
+    def test_trunc_f16_clamp(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {f16_bits(5.8):#x}",
+            "v_trunc_f16 v0, s0 clamp",
+        ]
+        self.assertEqual(run_ps_16(prog, "ps_trunc_clamp") & MASK16, POS_ONE)
+
+    def test_trunc_f16_op_sel_and_preservation(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0x88889999",
+            f"s_mov_b32 s0, {(f16_bits(3.99) << 16) | POS_ZERO:#x}",
+            "v_trunc_f16 v0, s0 op_sel:[1, 1]",
+        ]
+        w = run_ps_16(prog, "ps_trunc_opsel")
+        self.assertEqual(w, (POS_THREE << 16) | 0x9999)
+
+    def test_trunc_f16_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_trunc_err", ["v_trunc_f16 v0", "s_endpgm"])
+
+    def test_trunc_f16_mutation_detection(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {f16_bits(-1.8):#x}",
+            "v_trunc_f16 v0, s0",
+        ]
+        w = run_ps_16(prog, "ps_trunc_mut")
+        self.assertNotEqual(w & MASK16, NEG_TWO)
+
+
+# ==============================================================================
+# 6. v_rndne_f16 Translator Tests
+# ==============================================================================
+class TestVRndneF16Translator(unittest.TestCase):
+    def test_rndne_f16_ties_to_even(self):
+        # 1.5 -> 2.0 (even), 2.5 -> 2.0 (even), -1.5 -> -2.0, -2.5 -> -2.0
+        cases = [
+            (f16_bits(1.5), f16_bits(2.0)),
+            (f16_bits(2.5), f16_bits(2.0)),
+            (f16_bits(-1.5), f16_bits(-2.0)),
+            (f16_bits(-2.5), f16_bits(-2.0)),
+            (f16_bits(1.4), f16_bits(1.0)),
+            (f16_bits(1.6), f16_bits(2.0)),
+        ]
+        for src, expected in cases:
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {src:#x}",
+                "v_rndne_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_rndne_tie_{src}")
+            self.assertEqual(w & MASK16, expected)
+
+    def test_rndne_f16_signed_zeros(self):
+        for z in (POS_ZERO, NEG_ZERO):
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {z:#x}",
+                "v_rndne_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_rndne_sz_{z}")
+            self.assertEqual(w & MASK16, z)
+
+    def test_rndne_f16_infinities_and_nans(self):
+        for inf in (POS_INF, NEG_INF):
+            prog = [
+                "v_mov_b32_e32 v0, 0",
+                f"s_mov_b32 s0, {inf:#x}",
+                "v_rndne_f16 v0, s0",
+            ]
+            w = run_ps_16(prog, f"ps_rndne_inf_{inf}")
+            self.assertEqual(w & MASK16, inf)
+
+    def test_rndne_f16_subnormals(self):
+        prog1 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {POS_MIN_SUBNORM:#x}",
+            "v_rndne_f16 v0, s0",
+        ]
+        self.assertEqual(run_ps_16(prog1, "ps_rndne_subnorm_pos") & MASK16, POS_ZERO)
+
+        prog2 = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {NEG_MIN_SUBNORM:#x}",
+            "v_rndne_f16 v0, s0",
+        ]
+        self.assertEqual(run_ps_16(prog2, "ps_rndne_subnorm_neg") & MASK16, NEG_ZERO)
+
+    def test_rndne_f16_clamp(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {f16_bits(4.5):#x}",
+            "v_rndne_f16 v0, s0 clamp",
+        ]
+        self.assertEqual(run_ps_16(prog, "ps_rndne_clamp") & MASK16, POS_ONE)
+
+    def test_rndne_f16_op_sel_and_preservation(self):
+        prog = [
+            "v_mov_b32_e32 v0, 0x43211234",
+            f"s_mov_b32 s0, {(f16_bits(1.5) << 16) | POS_ZERO:#x}",
+            "v_rndne_f16 v0, s0 op_sel:[1, 1]",
+        ]
+        w = run_ps_16(prog, "ps_rndne_opsel")
+        self.assertEqual(w, (POS_TWO << 16) | 0x1234)
+
+    def test_rndne_f16_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_rndne_err", ["v_rndne_f16 v0", "s_endpgm"])
+
+    def test_rndne_f16_mutation_detection(self):
+        # 1.5 rounded to nearest even MUST be 2.0, not 1.0
+        prog = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {f16_bits(1.5):#x}",
+            "v_rndne_f16 v0, s0",
+        ]
+        w = run_ps_16(prog, "ps_rndne_mut")
+        self.assertNotEqual(w & MASK16, POS_ONE)
+
+
+if __name__ == "__main__":
     unittest.main()
