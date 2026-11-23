@@ -108,6 +108,47 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertEqual(len(rejected), 1)
 
+    def test_scan_rejects_overlapping_chunks(self):
+        # Two chunks: [40, 68) and [52, 76), sorted and ending at total=76, but overlapping by 16 bytes.
+        total = 76
+        buf = bytearray(total)
+        buf[0:4] = b"DXBC"
+        struct.pack_into("<III", buf, 20, 1, total, 2)
+        struct.pack_into("<II", buf, 32, 40, 52)
+        buf[40:44] = b"SFI0"
+        struct.pack_into("<I", buf, 44, 20)
+        buf[52:56] = b"DXIL"
+        struct.pack_into("<I", buf, 56, 16)
+        with self.assertRaisesRegex(psc.ContainerError, "overlap"):
+            psc.parse_container(bytes(buf), 0)
+        found, rejected = psc.inspect(bytes(buf), "fake.dll")
+        self.assertEqual(found, [])
+        self.assertEqual(rejected, [0])
+
+    def test_scan_rejects_nested_chunks(self):
+        # Chunk 0 spans [40, 88) (= total) while chunk 1 sits inside it at [56, 72).
+        total = 88
+        buf = bytearray(total)
+        buf[0:4] = b"DXBC"
+        struct.pack_into("<III", buf, 20, 1, total, 2)
+        struct.pack_into("<II", buf, 32, 40, 56)
+        buf[40:44] = b"SFI0"
+        struct.pack_into("<I", buf, 44, 40)
+        buf[56:60] = b"DXIL"
+        struct.pack_into("<I", buf, 60, 8)
+        with self.assertRaisesRegex(psc.ContainerError, "overlap"):
+            psc.parse_container(bytes(buf), 0)
+        found, rejected = psc.inspect(bytes(buf), "fake.dll")
+        self.assertEqual(found, [])
+        self.assertEqual(rejected, [0])
+
+    def test_scan_accepts_adjacent_and_padded_chunks(self):
+        # First chunk has 5-byte payload (padded to 4-byte boundary before second chunk).
+        data = container([(b"SFI0", b"12345"), (b"ACCC", b"FSPX" + bytes(8))])
+        total, chunks = psc.parse_container(data, 0)
+        self.assertEqual(total, len(data))
+        self.assertEqual([c[0] for c in chunks], [b"SFI0", b"ACCC"])
+
     def test_fspx_is_reported_and_has_no_xbch(self):
         data = container([(b"SFI0", bytes(8)), (b"ACCC", b"FSPX" + bytes(12))])
         found, _ = psc.inspect(data, "fsr.dll")

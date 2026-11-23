@@ -92,7 +92,14 @@ def parse_container(data: bytes, offset: int):
     starts = [start for _, start, _ in chunks]
     if starts != sorted(starts) or len(set(starts)) != len(starts):
         raise ContainerError("chunk table is not sorted and unique")
-    if not chunks or max(start + 8 + size for _, start, size in chunks) != total:
+    for k in range(len(chunks) - 1):
+        _, prev_start, prev_size = chunks[k]
+        _, next_start, _ = chunks[k + 1]
+        if prev_start + 8 + prev_size > next_start:
+            raise ContainerError(
+                f"chunk {k} ({prev_start}..{prev_start + 8 + prev_size}) overlaps chunk {k + 1} at {next_start}"
+            )
+    if not chunks or chunks[-1][1] + 8 + chunks[-1][2] != total:
         raise ContainerError("the last chunk does not end at the container size")
     return total, chunks
 
