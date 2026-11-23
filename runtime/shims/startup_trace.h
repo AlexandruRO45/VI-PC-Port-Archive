@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 #include "shims.h"
 
@@ -38,12 +39,14 @@ namespace rt::startup_trace {
 
 namespace detail {
 inline std::atomic<bool> on{false};
-// Intentionally immortal: vectored exception handlers or late teardown paths can still run after normal statics would
-// have been destroyed.
-inline std::mutex& mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+// A VEH can interrupt this thread while it owns the sink. An exclusive SRW try-lock safely fails in that case.
+struct SinkMutex {
+    SRWLOCK lock_ = SRWLOCK_INIT;
+    void lock() noexcept { AcquireSRWLockExclusive(&lock_); }
+    bool try_lock() noexcept { return TryAcquireSRWLockExclusive(&lock_) != 0; }
+    void unlock() noexcept { ReleaseSRWLockExclusive(&lock_); }
+};
+inline SinkMutex sink_mutex;
 inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
@@ -54,26 +57,34 @@ inline thread_local bool in_handler = false;
 // thread resets this, so only the exception right after the wide one, with that same pointer, is skipped.
 inline thread_local ULONG_PTR wide_fallback = 0;
 
-inline void append_escaped(std::string& out, const char* s, size_t n) {
+template<class Write>
+inline void write_quoted(std::string_view s, Write write) {
     static const char hex[] = "0123456789abcdef";
-    for (size_t i = 0; i < n; ++i) {
+    write("\"");
+    size_t run_start = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
         const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c >= 0x20 && c != '"' && c != '\\') continue;
+        write(s.substr(run_start, i - run_start));
         switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20) {
-                    out += "\\u00";
-                    out += hex[c >> 4];
-                    out += hex[c & 15];
-                } else {
-                    out += static_cast<char>(c);  // UTF-8 passes through
-                }
+            case '"': write("\\\""); break;
+            case '\\': write("\\\\"); break;
+            case '\n': write("\\n"); break;
+            case '\r': write("\\r"); break;
+            case '\t': write("\\t"); break;
+            default: {
+                const char escaped[] = {'\\', 'u', '0', '0', hex[c >> 4], hex[c & 15]};
+                write(std::string_view(escaped, sizeof escaped));
+            }
         }
+        run_start = i + 1;
     }
+    write(s.substr(run_start));
+    write("\"");
+}
+
+inline double elapsed_seconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 }  // namespace detail
 
@@ -81,9 +92,8 @@ inline bool enabled() noexcept { return detail::on.load(std::memory_order_acquir
 
 // A JSON string literal, quotes included.
 inline std::string quote(const std::string& s) {
-    std::string out = "\"";
-    detail::append_escaped(out, s.data(), s.size());
-    out += '"';
+    std::string out;
+    detail::write_quoted(s, [&](std::string_view part) { out.append(part); });
     return out;
 }
 
@@ -99,11 +109,10 @@ inline std::string where(uint64_t address) { return shims::module_offset(address
 // `fields` is the rest of the object, already JSON: `"module":"a.dll","result":1`. Empty is allowed.
 inline void event(const char* kind, const std::string& fields = {}) {
     if (!enabled()) return;
-    const std::lock_guard lock(detail::mutex());
+    const std::lock_guard lock(detail::sink_mutex);
     if (!detail::file) return;
-    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - detail::start).count();
-    std::fprintf(detail::file, "{\"seq\":%llu,\"t\":%.6f,\"kind\":\"%s\"%s%s}\n", ++detail::seq, t, kind,
-                 fields.empty() ? "" : ",", fields.c_str());
+    std::fprintf(detail::file, "{\"seq\":%llu,\"t\":%.6f,\"kind\":\"%s\"%s%s}\n", ++detail::seq, detail::elapsed_seconds(),
+                 kind, fields.empty() ? "" : ",", fields.c_str());
     std::fflush(detail::file);
 }
 
@@ -113,12 +122,11 @@ constexpr DWORD kDbgPrintWide = 0x4001000A;  // DBG_PRINTEXCEPTION_WIDE_C
 constexpr DWORD kCppException = 0xE06D7363;  // MSVC throw: logged with its address, never its payload
 constexpr int kMaxFrames = 16;
 
-inline std::string stack_from(const CONTEXT& start_context) {
+inline int capture_stack(const CONTEXT& start_context, DWORD64 (&frames)[kMaxFrames]) {
     CONTEXT c = start_context;
-    std::string out = "[";
-    for (int i = 0; i < kMaxFrames && c.Rip; ++i) {
-        if (i) out += ',';
-        out += quote(where(c.Rip));
+    int count = 0;
+    while (count < kMaxFrames && c.Rip) {
+        frames[count++] = c.Rip;
         DWORD64 image_base = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image_base, nullptr);
         if (!fn) {  // a leaf function: the return address is at [rsp]
@@ -131,7 +139,53 @@ inline std::string stack_from(const CONTEXT& start_context) {
         DWORD64 frame = 0;
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, c.Rip, fn, &c, &handler_data, &frame, nullptr);
     }
+    return count;
+}
+
+inline std::string stack_from(const CONTEXT& context) {
+    DWORD64 frames[kMaxFrames];
+    const int count = capture_stack(context, frames);
+    std::string out = "[";
+    for (int i = 0; i < count; ++i) {
+        if (i) out += ',';
+        out += quote(where(frames[i]));
+    }
     return out + "]";
+}
+
+// Shared scratch keeps a full set of UTF-8 basenames off the faulting thread's stack. The handler owns this
+// mutex across symbolization; regular events can still write to the sink while addresses are being resolved.
+inline SinkMutex cpp_format_mutex;
+
+// An MSVC first-chance throw can be operator new reporting exhaustion. Even constructing an empty std::string
+// can allocate an iterator proxy in Debug. Keep the original exception dispatch free of C++ heap allocations.
+inline void log_cpp_exception(const EXCEPTION_POINTERS& info) {
+    DWORD64 frames[kMaxFrames];
+    const int count = info.ContextRecord ? capture_stack(*info.ContextRecord, frames) : 0;
+    // A UTF-8 Windows basename plus the host prefix and a 64-bit RVA. Resolve before taking the sink lock.
+    static char labels[1 + kMaxFrames][4 * MAX_PATH + 32];
+    const auto address = reinterpret_cast<uint64_t>(info.ExceptionRecord->ExceptionAddress);
+    shims::format_trace_address(address, labels[0], sizeof labels[0]);
+    for (int i = 0; i < count; ++i)
+        shims::format_trace_address(frames[i], labels[i + 1], sizeof labels[i + 1]);
+
+    const std::unique_lock lock(sink_mutex, std::try_to_lock);
+    if (!lock || !file) return;
+    const auto write = [](std::string_view part) { std::fwrite(part.data(), 1, part.size(), file); };
+    std::fprintf(file, "{\"seq\":%llu,\"t\":%.6f,\"kind\":\"exception\",\"code\":\"0x%lx\",\"at\":",
+                 ++seq, elapsed_seconds(), kCppException);
+    write_quoted(labels[0], write);
+    std::fputs(",\"cpp\":true", file);
+    if (info.ContextRecord) {
+        std::fputs(",\"stack\":[", file);
+        for (int i = 0; i < count; ++i) {
+            if (i) std::fputc(',', file);
+            write_quoted(labels[i + 1], write);
+        }
+        std::fputc(']', file);
+    }
+    std::fputs("}\n", file);
+    std::fflush(file);
 }
 
 inline std::string utf8_from_wide(const wchar_t* w, int len) {
@@ -166,7 +220,9 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
-        if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
+        if (r.ExceptionCode == kCppException) {
+            log_cpp_exception(info);
+        } else if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
             const ULONG_PTR fallback = wide_fallback;
             const bool wide = r.ExceptionCode == kDbgPrintWide;
             wide_fallback = wide && r.NumberParameters >= 4 ? r.ExceptionInformation[3] : 0;
@@ -182,7 +238,6 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
-            if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }
@@ -211,24 +266,29 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
     return true;
 }
 
-inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
-    if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
-    if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    in_handler = true;
+// Catch faults while reading debug-string pointers or unwinding a corrupt stack. Keep the SEH frame free of
+// C++ destructors under /EHsc so the caller can always release the scratch and clear its recursion guard.
+inline void guarded_log_exception(const EXCEPTION_POINTERS& info) {
 #ifdef _MSC_VER
-    // Under /EHsc, catch(...) does not catch SEH faults (e.g. a bad DBG_PRINTEXCEPTION_C pointer or corrupt unwind).
-    // Keep the __try frame free of C++ destructors so in_handler is always reset and the exception still propagates.
     __try {
-        log_exception(*info);
+        log_exception(info);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 #else
+    log_exception(info);
+#endif
+}
+
+inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
+    if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    std::unique_lock scratch(cpp_format_mutex, std::defer_lock);
+    if (info->ExceptionRecord->ExceptionCode == kCppException && !scratch.try_lock()) return EXCEPTION_CONTINUE_SEARCH;
+    in_handler = true;
     struct Reset {
         ~Reset() { in_handler = false; }
     } reset;
-    log_exception(*info);
-#endif
-    in_handler = false;
+    guarded_log_exception(*info);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 }  // namespace detail
@@ -240,7 +300,7 @@ inline void close();
 // itself. Returns false if the file exists or cannot be created; `error`, when given, receives the errno.
 inline bool open(const wchar_t* path, int* error = nullptr) {
     {
-        const std::lock_guard lock(detail::mutex());
+        const std::lock_guard lock(detail::sink_mutex);
         if (detail::file) return true;
         const errno_t e = _wfopen_s(&detail::file, path, L"wxb");
         if (e != 0 || !detail::file) {
@@ -264,7 +324,7 @@ inline void close() {
     detail::on.store(false, std::memory_order_release);
     if (detail::veh) RemoveVectoredExceptionHandler(detail::veh);
     detail::veh = nullptr;
-    const std::lock_guard lock(detail::mutex());
+    const std::lock_guard lock(detail::sink_mutex);
     if (detail::file) std::fclose(detail::file);
     detail::file = nullptr;
 }

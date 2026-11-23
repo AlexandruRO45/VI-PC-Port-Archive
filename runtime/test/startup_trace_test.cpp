@@ -10,14 +10,18 @@
 // RVA and access kind. No game data and no GPU are involved.
 // LEONIDA_TEST_DIR names the folder for the image and the trace, as for loader_test; the default is the temp folder.
 #include <windows.h>
+#include <psapi.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -26,6 +30,23 @@
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "../src/pe_loader.h"
+
+namespace {
+// When armed, every ordinary C++ allocation on this test thread fails, including inside the VEH.
+thread_local bool refuse_allocations = false;
+thread_local unsigned refused_allocations = 0;
+}
+
+void* operator new(std::size_t size) {
+    if (refuse_allocations) {
+        ++refused_allocations;
+        throw std::bad_alloc();
+    }
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -208,8 +229,7 @@ bool valid_utf8(const fs::path& p) {
            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, all.data(), static_cast<int>(all.size()), nullptr, 0) > 0;
 }
 
-void test_trace(const fs::path& dir) {
-    const fs::path image = write_file(dir / kImageName, make_image());
+void test_trace(const fs::path& dir, const fs::path& image) {
     const fs::path trace = dir / "trace.jsonl";
     check(rt::startup_trace::open(trace.c_str()), "open the trace file");
     {
@@ -277,6 +297,119 @@ void test_trace(const fs::path& dir) {
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");
 }
 
+bool run_without_blocking(LPTHREAD_START_ROUTINE run, void* arg, const char* operation) {
+    HANDLE worker = CreateThread(nullptr, 0, run, arg, 0, nullptr);
+    if (!worker) return false;
+    if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0) {
+        std::fprintf(stderr, "FAIL %s did not return\n", operation);
+        std::_Exit(77);
+    }
+    DWORD status = 1;
+    const BOOL got_status = GetExitCodeThread(worker, &status);
+    CloseHandle(worker);
+    return got_status && status == 0;
+}
+
+void test_recursive_lookup(uint64_t guest_address) {
+    struct Probe {
+        uint64_t guest;
+        char nested[64]{};
+        char after[64]{};
+    } probe{guest_address};
+    // The address of this stack object cannot belong to any loaded module, so the callback runs
+    // independently of the order in which the real Loader and this probe were registered.
+    rt::shims::add_module_lookup(&probe, [](void* ctx, uint64_t address, std::string_view&, uint32_t&) noexcept {
+        if (address == reinterpret_cast<uint64_t>(ctx)) {
+            auto& p = *static_cast<Probe*>(ctx);
+            rt::shims::format_trace_address(p.guest, p.nested, sizeof p.nested);
+        }
+        return false;
+    });
+    const bool returned = run_without_blocking([](void* ctx) -> DWORD {
+        auto& p = *static_cast<Probe*>(ctx);
+        char outer[64];
+        rt::shims::format_trace_address(reinterpret_cast<uint64_t>(ctx), outer, sizeof outer);
+        rt::shims::format_trace_address(p.guest, p.after, sizeof p.after);
+        return 0;
+    }, &probe, "recursive trace address lookup");
+    rt::shims::remove_module_lookup(&probe);
+    check(returned && probe.nested == rt::startup_trace::hex(guest_address), "recursive lookup returns the raw address");
+    check(probe.after == std::string(kImageName) + hex_rva(kCallerBase), "the same thread resolves the guest after reentry");
+}
+
+void test_cpp_exception_oom(const fs::path& dir, const fs::path& image) {
+    rt::Loader loader(dir);
+    const rt::Module& guest = loader.load(image);
+    test_recursive_lookup(reinterpret_cast<uint64_t>(guest.base + kCallerBase));
+    const fs::path trace = dir / "cpp_oom.jsonl";
+    if (!rt::startup_trace::open(trace.c_str())) {
+        check(false, "open the C++ exception trace");
+        return;
+    }
+
+    // Use an address in this executable's image and a leaf in the existing guest fixture. No synthetic
+    // code is executed. The zero Rsp ends the walk after the guest frame.
+    constexpr uint32_t host_rva = 0x20;
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = rt::startup_trace::detail::kCppException;
+    record.ExceptionAddress = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr)) + host_rva;
+    CONTEXT context{};
+    context.Rip = reinterpret_cast<DWORD64>(guest.base + kCallerBase);
+    EXCEPTION_POINTERS info{&record, &context};
+
+    // A second exception escaping a noexcept routine would otherwise open the Debug CRT abort dialog in CI.
+    const auto old_terminate = std::set_terminate([] { std::_Exit(76); });
+    bool caught = false;
+    refuse_allocations = true;
+    try {
+        ::operator delete(::operator new(1));
+    } catch (const std::bad_alloc&) {
+        caught = true;
+    }
+    const LONG disposition = rt::startup_trace::detail::handler(&info);
+    refuse_allocations = false;
+    std::set_terminate(old_terminate);
+
+    // Model the VEH interrupting the thread that already owns the sink. Bound the wait so a blocking
+    // lock regression fails the test without hanging the suite.
+    const bool skipped = run_without_blocking([](void* arg) -> DWORD {
+        using namespace rt::startup_trace::detail;
+        const std::lock_guard held(sink_mutex);
+        const auto before = seq;
+        const LONG result = handler(static_cast<EXCEPTION_POINTERS*>(arg));
+        return result == EXCEPTION_CONTINUE_SEARCH && seq == before ? 0 : 1;
+    }, &info, "exception handling on the sink owner");
+    check(skipped, "a C++ exception on the sink owner continues without consuming a sequence number");
+    rt::startup_trace::event("after_busy_sink");
+    rt::startup_trace::close();
+    check(caught, "the original bad_alloc reaches the caller with tracing enabled");
+    check(disposition == EXCEPTION_CONTINUE_SEARCH && refused_allocations == 1,
+          "C++ exception tracing lets dispatch continue without allocating");
+
+    wchar_t filename[MAX_PATH + 1]{};
+    const DWORD length = K32GetModuleBaseNameW(GetCurrentProcess(), GetModuleHandleW(nullptr), filename,
+                                               static_cast<DWORD>(std::size(filename)));
+    check(length != 0 && length < std::size(filename), "read the complete basename of the host executable");
+    if (!length || length >= std::size(filename)) return;
+    const auto basename = fs::path(filename).u8string();
+    const std::string host = "host:" + std::string(basename.begin(), basename.end()) + hex_rva(host_rva);
+    const auto lines = read_lines(trace);
+    check(find_line(lines, "after_busy_sink") != nullptr, "trace output resumes after the sink is released");
+    std::vector<const std::string*> exceptions;
+    for (const std::string& line : lines)
+        if (has(&line, "\"kind\":\"exception\"")) exceptions.push_back(&line);
+    check(exceptions.size() == 2, "one C++ exception record for the real throw and one for the supplied context");
+    if (exceptions.size() != 2) return;
+    for (const auto* line : exceptions)
+        check(has(line, "\"code\":\"0xe06d7363\"") && has(line, "\"cpp\":true"), "the bad_alloc trace identifies a C++ throw");
+    check(has(exceptions[0], "\"at\":\"host:") && has(exceptions[0], "\"stack\":[\""),
+          "the actual throw retains its address and a nonempty stack under allocation failure");
+    check(has(exceptions[1], "\"at\":" + rt::startup_trace::quote(host)), "host exception address keeps its module and RVA");
+    const std::string guest_frame = std::string(kImageName) + hex_rva(kCallerBase);
+    check(has(exceptions[1], "\"stack\":[" + rt::startup_trace::quote(guest_frame) + "]"),
+          "the supplied guest stack frame keeps its module and RVA");
+}
+
 }  // namespace
 
 int wmain() {
@@ -284,7 +417,9 @@ int wmain() {
         const fs::path dir = test_dir();
         test_disabled_is_silent();
         test_existing_file_is_kept(dir);
-        test_trace(dir);
+        const fs::path image = write_file(dir / kImageName, make_image());
+        test_trace(dir, image);
+        test_cpp_exception_oom(dir, image);
         std::error_code ec;
         fs::remove_all(dir, ec);
     } catch (const std::exception& e) {

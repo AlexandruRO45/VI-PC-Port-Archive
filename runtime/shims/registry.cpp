@@ -1,11 +1,11 @@
 #include <windows.h>
 #include <intrin.h>
+#include <psapi.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cwchar>
 #include <map>
 #include <mutex>
 #include <set>
@@ -48,6 +48,35 @@ struct Lookup {
 };
 std::mutex g_lookup_mutex;
 std::vector<Lookup> g_lookups;
+// Exception dispatch may interrupt a registry operation, including push_back while it holds the lock.
+// Mark the region before acquiring the mutex so a lookup on the same thread never tries to lock it again.
+thread_local bool g_lookup_active = false;
+struct LookupScope {
+    LookupScope() { g_lookup_active = true; }
+    ~LookupScope() { g_lookup_active = false; }
+};
+
+template<class Use>
+bool with_guest_address(uint64_t address, bool try_only, Use use) {
+    if (g_lookup_active) return false;
+    const LookupScope active;
+    std::unique_lock lock(g_lookup_mutex, std::defer_lock);
+    if (try_only) {
+        if (!lock.try_lock()) return false;
+    } else {
+        lock.lock();
+    }
+    for (size_t i = 0; i < g_lookups.size(); ++i) {
+        const auto& lookup = g_lookups[i];
+        std::string_view name;
+        uint32_t rva = 0;
+        if (lookup.fn(lookup.ctx, address, name, rva)) {
+            use(name, rva);  // The Loader stays registered until the view has been consumed.
+            return true;
+        }
+    }
+    return false;
+}
 
 // The imports known to return HRESULT. Everything else is "other" and keeps returning 0 under `fail`.
 // Each family was checked against the public Microsoft documentation (learn.microsoft.com), one signature per
@@ -132,15 +161,10 @@ std::string describe_address(uint64_t addr) {
     char head[32], tail[64];
     std::snprintf(head, sizeof head, "0x%016llx", static_cast<unsigned long long>(addr));
     std::string module;
-    uint32_t rva = 0;
-    {
-        std::lock_guard lock(g_lookup_mutex);
-        for (auto& l : g_lookups)
-            if (l.fn(l.ctx, addr, module, rva)) {
-                std::snprintf(tail, sizeof tail, "+0x%x", rva);
-                return std::string(head) + " = " + module + tail;
-            }
-    }
+    if (with_guest_address(addr, false, [&](std::string_view name, uint32_t rva) {
+            module = name;
+            std::snprintf(tail, sizeof tail, "+0x%x", rva);
+        })) return std::string(head) + " = " + module + tail;
     HMODULE host = nullptr;
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            reinterpret_cast<LPCSTR>(addr), &host) && host) {
@@ -319,54 +343,58 @@ ReturnClass classify_import(const std::string& dll, const std::string& name) { r
 void set_unimplemented_test_hook(TestHook hook) { g_test_hook.store(hook); }
 
 void add_module_lookup(void* ctx, ModuleLookup fn) {
+    const LookupScope active;
     std::lock_guard lock(g_lookup_mutex);
     g_lookups.push_back({ctx, fn});
 }
 
 bool mapped_image_base(uint64_t address, uint64_t& base) {
-    std::string module;
-    uint32_t rva = 0;
-    std::lock_guard lock(g_lookup_mutex);
-    for (auto& l : g_lookups)
-        if (l.fn(l.ctx, address, module, rva)) {
-            base = address - rva;
-            return true;
-        }
-    return false;
+    return with_guest_address(address, false, [&](std::string_view, uint32_t rva) { base = address - rva; });
 }
 
-std::string module_offset(uint64_t address) {
-    char b[48];
-    std::string module;
-    uint32_t rva = 0;
-    {
-        std::lock_guard lock(g_lookup_mutex);
-        for (auto& l : g_lookups)
-            if (l.fn(l.ctx, address, module, rva)) {
-                std::snprintf(b, sizeof b, "+0x%x", rva);
-                return module + b;
-            }
-    }
+namespace {
+void format_address(uint64_t address, char* out, size_t capacity, bool try_only) {
+    if (!out || !capacity) return;
+    int length = -1;
+    const bool guest = with_guest_address(address, try_only, [&](std::string_view name, uint32_t rva) {
+        if (name.size() < capacity)
+            length = std::snprintf(out, capacity, "%.*s+0x%x", static_cast<int>(name.size()),
+                                   name.empty() ? "" : name.data(), rva);
+    });
     HMODULE host = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(address), &host) && host) {
-        // Wide, then UTF-8: the ANSI form would put code-page bytes into the trace's JSON lines.
-        wchar_t path[MAX_PATH] = {};
-        const DWORD len = GetModuleFileNameW(host, path, MAX_PATH);
-        const wchar_t* slash = std::wcsrchr(path, L'\\');
-        const wchar_t* file = slash ? slash + 1 : path;
-        const int wlen = len ? static_cast<int>(path + len - file) : 0;
-        const int bytes = wlen > 0 ? WideCharToMultiByte(CP_UTF8, 0, file, wlen, nullptr, 0, nullptr, nullptr) : 0;
-        std::string name(bytes > 0 ? bytes : 0, '\0');
-        if (bytes > 0) WideCharToMultiByte(CP_UTF8, 0, file, wlen, name.data(), bytes, nullptr, nullptr);
-        std::snprintf(b, sizeof b, "+0x%llx", static_cast<unsigned long long>(address - reinterpret_cast<uint64_t>(host)));
-        return "host:" + name + b;
+    if (!guest && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                     reinterpret_cast<LPCWSTR>(address), &host)) {
+        // Query just the filename so a long directory cannot truncate a valid UTF-8 basename.
+        wchar_t basename[MAX_PATH + 1];
+        const DWORD chars = K32GetModuleBaseNameW(GetCurrentProcess(), host, basename, MAX_PATH + 1);
+        char name[3 * MAX_PATH + 1];
+        if (chars && chars < MAX_PATH + 1) {
+            const int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, basename, static_cast<int>(chars),
+                                                  name, sizeof(name) - 1, nullptr, nullptr);
+            if (bytes)
+                length = std::snprintf(out, capacity, "host:%.*s+0x%llx", bytes, name,
+                                       static_cast<unsigned long long>(address - reinterpret_cast<uint64_t>(host)));
+        }
     }
-    std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(address));
-    return b;
+    if (length < 0 || static_cast<size_t>(length) >= capacity) {
+        length = std::snprintf(out, capacity, "0x%llx", static_cast<unsigned long long>(address));
+        if (length < 0 || static_cast<size_t>(length) >= capacity) out[0] = '\0';
+    }
+}
+}  // namespace
+
+std::string module_offset(uint64_t address) {
+    char out[4 * MAX_PATH + 32];
+    format_address(address, out, sizeof out, false);
+    return out;
+}
+
+void format_trace_address(uint64_t address, char* out, size_t capacity) noexcept {
+    format_address(address, out, capacity, true);
 }
 
 void remove_module_lookup(void* ctx) {
+    const LookupScope active;
     std::lock_guard lock(g_lookup_mutex);
     for (auto it = g_lookups.begin(); it != g_lookups.end(); ++it)
         if (it->ctx == ctx) {

@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace rt::shims {
 
@@ -46,13 +47,16 @@ UnimplementedPolicy unimplemented_policy();
 void set_unimplemented_policy(UnimplementedPolicy policy);  // overrides the environment (tests)
 ReturnClass classify_import(const std::string& dll, const std::string& name);
 
-// Resolves an address to a mapped module for the `stop` message. A Loader registers itself; `fn` returns true and
-// fills the module's file name and the address's RVA when the address is inside one of its modules.
-using ModuleLookup = bool (*)(void* ctx, uint64_t address, std::string& module, uint32_t& rva);
+// A Loader registers this lookup for mapped addresses. On success it supplies the immutable UTF-8 basename
+// (valid until the Loader unregisters) and the address's RVA.
+using ModuleLookup = bool (*)(void* ctx, uint64_t address, std::string_view& module, uint32_t& rva) noexcept;
 void add_module_lookup(void* ctx, ModuleLookup fn);
 // "a.dll+0x1234" for an address inside a mapped module, "host:ntdll.dll+0x1234" inside a host module, else the bare
 // address in hex. Used by the startup trace (startup_trace.h).
 std::string module_offset(uint64_t address);
+// First-chance exception path. A busy guest registry or an oversized name falls back to the bare address.
+// Writes an empty string if even that address will not fit. No C++ allocation.
+void format_trace_address(uint64_t address, char* out, size_t capacity) noexcept;
 void remove_module_lookup(void* ctx);
 
 // The base of the mapped module holding `address`, through the same lookups. False if no live Loader maps it.

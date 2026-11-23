@@ -896,8 +896,8 @@ void redirect_pc_to_file_header_at(const void* resolved) {
 void cleanup_tls_clones() { cleanup_tls_clones_internal(); }
 
 namespace {
-bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t& rva) {
-    return static_cast<Loader*>(ctx)->find_address(address, module, rva);
+bool lookup_in_loader(void* ctx, uint64_t address, std::string_view& module, uint32_t& rva) noexcept {
+    return static_cast<Loader*>(ctx)->find_address_view(address, module, rva);
 }
 
 void* bundled_find_loaded(void* ctx, const std::string& dll_lower) {
@@ -1163,11 +1163,18 @@ void* Loader::resolve_module_export(void* module_handle, const std::string& sym,
 }
 
 bool Loader::find_address(uint64_t address, std::string& module, uint32_t& rva) const {
-    std::shared_lock lock(ranges_mutex_);
-    for (const MappedRange& r : ranges_) {
-        if (address >= r.base && address - r.base < r.size) {
-            module = r.name;
-            rva = static_cast<uint32_t>(address - r.base);
+    std::string_view name;
+    if (!find_address_view(address, name, rva)) return false;
+    module = name;
+    return true;
+}
+
+bool Loader::find_address_view(uint64_t address, std::string_view& module, uint32_t& rva) const noexcept {
+    for (const Module* m = last_mapped_.load(std::memory_order_acquire); m; m = m->previous_mapped) {
+        const uint64_t base = reinterpret_cast<uint64_t>(m->base);
+        if (address >= base && address - base < m->size) {
+            module = m->name;
+            rva = static_cast<uint32_t>(address - base);
             return true;
         }
     }
@@ -1307,12 +1314,9 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
         m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
     }
-    {
-        // From here an address inside the image names it. The memory stays until ~Loader, which unregisters the
-        // lookup first.
-        std::unique_lock lock(ranges_mutex_);
-        ranges_.push_back({reinterpret_cast<uint64_t>(m->base), m->size, m->name});
-    }
+    // Publish only once the image has an address. ~Loader unregisters the lookup before releasing its memory.
+    m->previous_mapped = last_mapped_.load(std::memory_order_relaxed);
+    last_mapped_.store(m, std::memory_order_release);
 
     std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
     auto* sec = IMAGE_FIRST_SECTION(nt);
