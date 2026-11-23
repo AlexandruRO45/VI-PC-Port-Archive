@@ -1047,6 +1047,24 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     // one to give, although the SDK annotates the parameter as required.
 #pragma warning(suppress : 6387)
     if (!out) return self->real->CreateCommandQueue(desc, *riid, nullptr);
+    // Console queue flags beyond the PC's one (DISABLE_GPU_TIMEOUT, 0x1): the retail executable asks for a compute
+    // queue with flags 0x2 through slot 48 (RVA 0x2478853). ASSUMPTION: a console scheduling hint with no PC
+    // counterpart; the PC runtime refuses unknown flags with E_INVALIDARG, so they are dropped (logged once per value).
+    D3D12_COMMAND_QUEUE_DESC pc_desc{};
+    if (desc) {
+        pc_desc = *desc;
+        const auto console_flags = static_cast<unsigned>(desc->Flags) &
+                                   ~static_cast<unsigned>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
+        if (console_flags) {
+            static std::atomic<unsigned> logged{0};
+            if ((logged.fetch_or(console_flags, std::memory_order_relaxed) & console_flags) != console_flags) {
+                std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueue: dropping console queue flags 0x%x (type %d)\n",
+                             console_flags, static_cast<int>(desc->Type));
+            }
+            pc_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(static_cast<unsigned>(desc->Flags) & ~console_flags);
+        }
+        desc = &pc_desc;
+    }
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
@@ -1318,6 +1336,48 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+void** get_vtable();
+
+// Device methods that return a struct larger than 8 bytes (slot 25 GetResourceAllocationInfo, 16 bytes; slot 26
+// GetCustomHeapProperties, 20 bytes). The PC/MSVC member-function ABI passes `this` in RCX and the hidden return
+// pointer in RDX. The Xbox headers declare the methods as free functions with an explicit `This`, so the title passes
+// the return pointer in RCX and `this` in RDX, then the method's arguments from R8 (measured: the retail executable's
+// slot 26 calls at RVAs 0x247870d and 0x2478731 load RCX = a stack buffer, RDX = the device, R8 = 1 (node mask),
+// R9 = 1 or 2 (heap type), the heap-handle thunk's RAX return is the same ABI for 8-byte structs). Which register
+// holds the proxy tells the two apart: its first word is the proxy vtable. Returns the device and the return pointer
+// and shifts the method's arguments into `args` (PC order), or null when neither register is a device proxy.
+DeviceProxy* struct_return_call(DeviceProxy* rcx, std::uint64_t rdx, const std::uint64_t (&words)[4], void** ret,
+                                std::uint64_t (&args)[3], bool& xbox_order) {
+    void** const vtable = get_vtable();
+    if (rcx && *reinterpret_cast<void***>(rcx) == vtable) {  // PC order: this, ret, a2, a3, a4
+        *ret = reinterpret_cast<void*>(rdx);
+        args[0] = words[0];
+        args[1] = words[1];
+        args[2] = words[2];
+        xbox_order = false;
+        return rcx;
+    }
+    auto* const device = reinterpret_cast<DeviceProxy*>(rdx);
+    if (device && *reinterpret_cast<void***>(device) == vtable) {  // Xbox order: ret, this, a2, a3, a4
+        *ret = rcx;
+        args[0] = words[0];
+        args[1] = words[1];
+        args[2] = words[2];
+        xbox_order = true;
+        return device;
+    }
+    return nullptr;
+}
+
+void note_struct_return_order(unsigned slot, bool xbox_order) {
+    static std::atomic<bool> logged[2][2];
+    const unsigned which = slot == 25 ? 0 : 1;
+    if (!logged[which][xbox_order ? 1 : 0].exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u called in %s struct-return order\n", slot,
+                     xbox_order ? "the Xbox (RCX = return, RDX = this)" : "the PC (RCX = this, RDX = return)");
+    }
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1333,6 +1393,33 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 8) {
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                     reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 48) {
+        // On the PC slot 48 is ID3D12Device3::OpenExistingHeapFromAddress(address, riid, out). The retail executable
+        // calls it right after slot 8 with the same shape as slot 8 (RVA 0x2478813): RDX points at a 16-byte
+        // D3D12_COMMAND_QUEUE_DESC {Type 2 (compute), Priority 0, Flags 1 (DISABLE_GPU_TIMEOUT), NodeMask 0},
+        // R8 at IID_ID3D12CommandQueue and R9 at the output, and breaks unless the result is a success. So on the
+        // console's device this slot creates a command queue too. ASSUMPTION: it is CreateCommandQueue with the same
+        // description (the console vtable differs from the PC one here, as at slots 62 and 76). Any other IID still
+        // goes to the PC method.
+        const auto* const riid = reinterpret_cast<const IID*>(a2);
+        if (riid && *riid == __uuidof(ID3D12CommandQueue) && a1 != 0) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                const auto* desc = reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: device slot 48 with IID_ID3D12CommandQueue: creating a queue "
+                             "(type %d, priority %d, flags 0x%x, node mask 0x%x)\n",
+                             static_cast<int>(desc->Type), desc->Priority, static_cast<unsigned>(desc->Flags),
+                             desc->NodeMask);
+            }
+            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+                                                        riid, reinterpret_cast<void**>(a3)));
+        }
+        note_slot(Slot);
+        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t);
+        return reinterpret_cast<ForwardFn>(self->real_vtable[Slot])(self->real, a1, a2, a3, a4, a5);
     } else if constexpr (Slot == 9) {
         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
@@ -1342,6 +1429,48 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 32) {
         return hr_to_u64(proxy_open_shared_handle(self, a1, reinterpret_cast<const IID*>(a2),
                                                   reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 26) {
+        note_slot(26);
+        void* ret = nullptr;
+        std::uint64_t args[3] = {};
+        bool xbox_order = false;
+        DeviceProxy* const device = struct_return_call(self, a1, {a2, a3, a4, a5}, &ret, args, xbox_order);
+        if (!device || !ret) return 0;
+        note_struct_return_order(26, xbox_order);
+        *static_cast<D3D12_HEAP_PROPERTIES*>(ret) = device->real->GetCustomHeapProperties(
+            static_cast<UINT>(args[0]), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(args[1])));
+        return reinterpret_cast<std::uint64_t>(ret);
+    } else if constexpr (Slot == 25) {
+        // GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs). The descriptions are Xbox ones:
+        // their layout word is not a PC value (see slot 76), so each is copied with the PC layout slot 76 uses.
+        // ASSUMPTION: the array stride is sizeof(D3D12_RESOURCE_DESC) (56); only the 56-byte prefix is measured.
+        note_slot(25);
+        void* ret = nullptr;
+        std::uint64_t args[3] = {};
+        bool xbox_order = false;
+        DeviceProxy* const device = struct_return_call(self, a1, {a2, a3, a4, a5}, &ret, args, xbox_order);
+        if (!device || !ret) return 0;
+        note_struct_return_order(25, xbox_order);
+        const auto count = static_cast<UINT>(args[1]);
+        const auto* const xbox_descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[2]);
+        auto* const info = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(ret);
+        if (count == 0 || !xbox_descs) {
+            *info = {0, 0};
+            return reinterpret_cast<std::uint64_t>(ret);
+        }
+        std::unique_ptr<D3D12_RESOURCE_DESC[]> pc_descs(new (std::nothrow) D3D12_RESOURCE_DESC[count]);
+        if (!pc_descs) {
+            *info = {~0ull, 0};
+            return reinterpret_cast<std::uint64_t>(ret);
+        }
+        for (UINT i = 0; i < count; ++i) {
+            pc_descs[i] = xbox_descs[i];
+            pc_descs[i].Layout = pc_descs[i].Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                                     ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                     : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        }
+        *info = device->real->GetResourceAllocationInfo(static_cast<UINT>(args[0]), count, pc_descs.get());
+        return reinterpret_cast<std::uint64_t>(ret);
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
     } else if constexpr (Slot == 75) {
