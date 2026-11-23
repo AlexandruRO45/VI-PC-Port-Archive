@@ -59,7 +59,8 @@ class Skip(Exception):
 
 def stage_index(disasm_dir):
     path = os.path.join(os.path.dirname(os.path.abspath(disasm_dir)), "index.json")
-    with open(path, encoding="utf-8") as f:
+    # A user can re-save the carve index from an editor that writes a UTF-8 BOM.
+    with open(path, encoding="utf-8-sig") as f:
         rows = json.load(f)
     return {e["file"][:-5]: e["stage"] for e in rows}
 
