@@ -554,5 +554,63 @@ class TestValuSqrtF64SIMD(unittest.TestCase):
         self.assertIn("OpSelect", spv)
 
 
+# ---------------------------------------------------------------------------
+# Stage 5: Register aliasing and in-place operand preservation
+# ---------------------------------------------------------------------------
+
+class TestValuSqrtF64RegisterAliasing(unittest.TestCase):
+    """Stage 5: Register aliasing and in-place operand preservation for v_sqrt_f64."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+
+    def test_in_place_square_root_scalar(self) -> None:
+        pair = RegisterPair(RegKind.VGPR, 0)
+        self.state.write_f64(pair, f64_to_bits(16.0))
+        inst = VOP1Instruction(Opcode.V_SQRT_F64, pair, pair)
+        res_bits = self.state.step(inst)
+        self.assertEqual(bits_to_f64(res_bits), 4.0)
+        self.assertEqual(bits_to_f64(self.state.read_f64(pair)), 4.0)
+
+    def test_in_place_square_root_translated(self) -> None:
+        inp_bits = f64_to_bits(25.0)
+        lo, hi = split_f64_words(inp_bits)
+        lines = [
+            f"v_mov_b32 v0, {lo:#x}",
+            f"v_mov_b32 v1, {hi:#x}",
+            "v_sqrt_f64 v[0:1], v[0:1]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_inplace_sqrt", lines)
+        words = support.mrt0_words(spv)
+        res_bits = combine_f64_words(words[0], words[1])
+        self.assertEqual(bits_to_f64(res_bits), 5.0)
+
+    def test_partially_overlapping_register_pairs(self) -> None:
+        # src: v[0:1], dst: v[1:2]
+        self.state.vgprs[0] = 0
+        self.state.vgprs[1] = 0x40100000  # 4.0
+        inst = VOP1Instruction(
+            Opcode.V_SQRT_F64,
+            RegisterPair(RegKind.VGPR, 1),
+            RegisterPair(RegKind.VGPR, 0),
+        )
+        res_bits = self.state.step(inst)
+        self.assertEqual(bits_to_f64(res_bits), 2.0)
+        self.assertEqual(combine_f64_words(self.state.vgprs[1], self.state.vgprs[2]), res_bits)
+
+    def test_surrounding_registers_unmodified(self) -> None:
+        self.state.vgprs[0] = 0x11111111
+        self.state.vgprs[3] = 0x33333333
+        dst = RegisterPair(RegKind.VGPR, 1)
+        src = RegisterPair(RegKind.VGPR, 4)
+        self.state.write_f64(src, f64_to_bits(9.0))
+        inst = VOP1Instruction(Opcode.V_SQRT_F64, dst, src)
+        self.state.step(inst)
+        self.assertEqual(self.state.vgprs[0], 0x11111111)
+        self.assertEqual(self.state.vgprs[3], 0x33333333)
+
+
 if __name__ == "__main__":
     unittest.main()
