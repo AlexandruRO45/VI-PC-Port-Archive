@@ -256,6 +256,13 @@ void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* 
 // void XErrorSetOptions(XErrorOptions, XErrorOptions), as Microsoft documents it: nothing to configure offline.
 void STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) {}
 
+// Flat exports for titles that GetProcAddress("XErrorReport" / "XErrorSetCallback" / "XErrorSetOptions") directly.
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
+void WINAPI XErrorSetCallback(XErrorCallback callback, void* context) { error_set_callback(nullptr, callback, context); }
+void WINAPI XErrorSetOptions(uint32_t opt_debugger, uint32_t opt_no_debugger) {
+    error_set_options(nullptr, opt_debugger, opt_no_debugger);
+}
+
 const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
     reinterpret_cast<const void*>(&object_release),
@@ -1329,6 +1336,9 @@ SHIM_TABLE(xgameruntime,
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
     XGR(XGameRuntimeInitialize),
     XGR(XGameRuntimeUninitialize),
+    XGR(XErrorReport),
+    XGR(XErrorSetCallback),
+    XGR(XErrorSetOptions),
     XGR(XSystemGetDeviceType),
     XGR(XSystemGetConsoleId),
     XGR(XSystemGetAppMemoryUsageLimit),
