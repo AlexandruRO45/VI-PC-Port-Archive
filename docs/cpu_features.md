@@ -61,4 +61,28 @@ in the image.
 - The CPUID sites see the host's vendor, family and features, not the console's. What the game does with the
   answers is not measured here.
 
-Not measured: which of these sites a boot reaches, and in which order.
+## Which sites a boot reaches, and what a trap costs
+
+`gta6rt` counts every emulated instruction against its address ([runtime/README.md](../runtime/README.md), "PE
+loader"): a `cpu_emulated` startup-trace event at each new site, a per-site summary at exit, and with
+`LEONIDA_CPU_EMU_STATS=N` the same summary every N seconds, so a run that stops on a crash or an assert keeps its
+counts. `cpu_emulation_test --bench` times one emulated instruction, the whole `#UD` round trip (kernel dispatch,
+the vectored handler, the return), against the same loop with a NOP in its place.
+
+Measured 2026-11-23 on an Intel Core i9-9900K (Coffee Lake: no SSE4a, CLZERO, MONITORX or CLWB), Windows 11, RTX
+2080 Ti, own 1.0.2.1 copy. Counts only; nothing from the executable is quoted.
+
+| What | Result |
+|---|---|
+| One emulated instruction (`--bench`, CLWB, 200,000 iterations) | 1.5 to 1.9 µs, against under 1 ns for the NOP loop |
+| Sites the boot reached | 1 of the 41: a CLWB in a cache-line write-back loop |
+| Hits at that site | 16 at the first compute pipeline (boot stop 18); 18 by the next stop |
+| Time in the emulation, boot so far | about 30 to 40 µs in all |
+| INSERTQ/EXTRQ, CLZERO, MONITORX/MWAITX | not reached yet |
+
+The boot used `main` with the open boot-chain pull requests merged locally (stops 1-20, #7111 for this page, and
+#7516 for the BVH builder), and stopped about 4 s in, at a fatal assert right after the first device slot 41 command
+signature. So far the trap path costs nothing that matters, and no load-time patching is needed for the sites a boot
+reaches today. The vector-code SSE4a sites are the ones to watch: at about 2 µs a trap, a site reached once per
+object per frame would cost a frame budget's worth at around 8,000 hits a frame. A boot that gets further should
+re-run with `LEONIDA_CPU_EMU_STATS` and update this table.

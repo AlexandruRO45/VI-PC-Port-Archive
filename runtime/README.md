@@ -123,6 +123,13 @@ them the CPU runs them and the handler never sees them. Each emulated instructio
 hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
 real: natively on a Zen host, through the handler on an Intel one.
 
+Every emulated instruction is also counted against its address (a fixed table, no locks or allocation in the
+handler). With `--trace`, the first emulation at each address is a `cpu_emulated` event (`instruction`, `at` as
+module+RVA). A normal exit prints one `[rt] cpu:` line per site (hits, average handler ticks) and a total; with
+`LEONIDA_CPU_EMU_STATS=N` the same summary is also printed every N seconds while the counts change, so a run that
+ends in a crash keeps its last counts. `cpu_emulation_test --bench` times the whole `#UD` round trip against a NOP
+loop on the host it runs on.
+
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
 reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
@@ -373,6 +380,7 @@ from the ANSI code page.
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
+| `cpu_emulated` | the first time an instruction this CPU lacks is emulated at an address (`src/cpu_emulation.h`) | `instruction`, `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
