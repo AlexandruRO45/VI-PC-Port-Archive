@@ -51,6 +51,7 @@
 #include "pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
 #include "pipeline_summary.h"
+#include "pipeline_progress.h"
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
 
@@ -1394,11 +1395,16 @@ int main(int argc, char** argv) {
     auto save_cache = [&](bool final_save) {
         if (cache_path.empty()) return true;
         try {
+            const auto t_save = std::chrono::steady_clock::now();
             const auto data = pipeline_cache_snapshot([&](size_t* size, void* dest) {
                 return vkGetPipelineCacheData(dev, cache, size, dest);
             });
+            const double t_get = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_save).count();
             if (auto error = write_pipeline_cache_file(cache_path, data.data(), data.size()))
                 throw std::system_error(error);
+            std::fprintf(stderr, "  %s cache save: %zu bytes, vkGetPipelineCacheData %.1fs, write %.1fs\n",
+                         final_save ? "final" : "periodic", data.size(), t_get,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_save).count() - t_get);
             if (final_save) std::printf("pipeline cache: %zu bytes -> %s\n", data.size(), cache_path.c_str());
             return true;
         } catch (const std::exception& e) {
@@ -1437,6 +1443,26 @@ int main(int argc, char** argv) {
     std::map<std::string, StageStats> stats;
     std::map<std::string, VkShaderModule> stub_cache;
     std::atomic<size_t> next{0}, done{0};
+    // Time-based progress (pipeline_progress.h): bytes and weights of every module, finished ones summed as they go.
+    std::vector<uint64_t> module_bytes(work.size(), 0);
+    double total_weight = 0, total_bytes = 0;
+    size_t large_total = 0;
+    for (size_t i = 0; i < work.size(); i++) {
+        std::error_code size_ec;
+        const auto sz = std::filesystem::file_size(dir + "/" + *work[i].first + ".spv", size_ec);
+        module_bytes[i] = size_ec ? 0 : sz;
+        total_weight += leonida::module_weight(module_bytes[i]);
+        total_bytes += static_cast<double>(module_bytes[i]);
+        if (large_module_bytes && module_bytes[i] > large_module_bytes) large_total++;
+    }
+    double done_weight = 0, done_bytes = 0;   // under mu
+    size_t large_done = 0;
+    auto complete_module = [&](size_t i) {
+        std::lock_guard<std::mutex> g(mu);
+        done_weight += leonida::module_weight(module_bytes[i]);
+        done_bytes += static_cast<double>(module_bytes[i]);
+        if (large_module_bytes && module_bytes[i] > large_module_bytes) large_done++;
+    };
     std::atomic<uint32_t> total_pipes_done{0};
     // What each worker is doing in the driver: creating the shader module, then creating its pipeline.
     struct InFlight {
@@ -1564,7 +1590,10 @@ int main(int argc, char** argv) {
     };
 
     auto worker = [&] {
+        size_t previous = SIZE_MAX;   // finished when the next one is taken (every path below ends in a loop turn)
         for (size_t k; (k = next++) < work.size();) {
+            if (previous != SIZE_MAX) complete_module(previous);
+            previous = k;
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
@@ -1874,6 +1903,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "  %zu/%zu (%.0fs)\n", size_t(done), work.size(), elapsed());
             }
         }
+        if (previous != SIZE_MAX) complete_module(previous);
     };
     if (iso_child) std::printf("ISO-READY\n");
     std::fflush(stdout);
@@ -1883,7 +1913,8 @@ int main(int argc, char** argv) {
     std::condition_variable watch_cv;
     bool all_done = false;
     std::thread watch([&] {
-        auto last_save = std::chrono::steady_clock::now();
+        auto last_save = std::chrono::steady_clock::now(), last_progress = last_save;
+        leonida::ProgressEta eta;
         std::unique_lock<std::mutex> g(mu);
         while (!all_done) {
             if (watch_cv.wait_for(g, std::chrono::seconds(5), [&] { return all_done; })) break;
@@ -1895,6 +1926,15 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "  still %s %s after %.0fs\n",
                                  job.phase[0] == 'm' ? "creating the shader module of" : "compiling",
                                  job.name.c_str(), s);
+            }
+            eta.sample(elapsed(), done_weight);
+            if (now - last_progress >= std::chrono::minutes(5)) {   // the module count says little: sizes differ 1000x
+                last_progress = now;
+                std::fprintf(stderr, "  progress: %zu/%zu modules, %.2f/%.2f GB of SPIR-V, %zu/%zu large done, "
+                                     "rough ETA %s, elapsed %s\n",
+                             size_t(done), work.size(), done_bytes / 1e9, total_bytes / 1e9, large_done, large_total,
+                             leonida::format_duration(eta.eta_seconds(total_weight)).c_str(),
+                             leonida::format_duration(elapsed()).c_str());
             }
             if (now - last_save > std::chrono::minutes(10)) {
                 g.unlock();
