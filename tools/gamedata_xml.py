@@ -478,7 +478,8 @@ def xml_files(directory: str):
     def scan_failed(exc: OSError) -> None:
         raise exc
 
-    for base, _, names in os.walk(directory, onerror=scan_failed):
+    for base, dirs, names in os.walk(directory, onerror=scan_failed):
+        dirs.sort()
         for name in sorted(names):
             if name.lower().endswith(".xml"):
                 yield os.path.join(base, name)

@@ -371,6 +371,35 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("permission denied", err.getvalue())
 
+    def test_directory_rows_follow_sorted_sub_folders_not_the_file_system(self):
+        for folder in ("gamma", "alpha", "beta"):
+            os.makedirs(os.path.join(self.root, "tree", folder))
+            self.write(os.path.join("tree", folder, folder + ".xml"), BETA)
+        tree = os.path.join(self.root, "tree")
+        real_walk = os.walk
+
+        def ordered_walk(reverse):
+            def walk(top, *args, **kwargs):
+                for base, dirs, names in real_walk(top, *args, **kwargs):
+                    dirs[:] = sorted(dirs, reverse=reverse)
+                    yield base, dirs, names
+            return walk
+
+        results = []
+        for reverse in (False, True):
+            js = os.path.join(self.root, "out%d.json" % reverse)
+            cs = os.path.join(self.root, "out%d.csv" % reverse)
+            with mock.patch.object(g.os, "walk", side_effect=ordered_walk(reverse)), \
+                    mock.patch.object(sys, "argv", ["gamedata_xml.py", tree, "--json", js, "--csv", cs]), \
+                    contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(g.main(), 0)
+            with open(js, encoding="utf-8") as f:
+                sources = [row["source"] for row in json.load(f)["rows"]]
+            with open(cs, "rb") as f:
+                results.append((sources, f.read()))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0][0], ["alpha.xml", "beta.xml", "gamma.xml"])
+
     @unittest.skipUnless(os.name == "posix" and getattr(os, "geteuid", lambda: 0)() != 0,
                          "needs a POSIX filesystem and a non-root user to make a folder unlistable")
     def test_a_real_unlistable_folder_fails_the_scan(self):
