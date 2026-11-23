@@ -3386,12 +3386,18 @@ public:
                 return E_FAIL;
             }
         }
-        // A stage that declares a storage image or buffer it may write needs a device feature outside compute
-        // (src/spirv_stores.h). Without it the pipeline would be created all the same and break
-        // VUID-RuntimeSpirv-NonWritable-06340 / -06341, so the PSO is refused here with the stage named.
+        // A stage that declares a storage image or buffer it may write needs a device feature outside compute and
+        // mesh shaders (src/spirv_stores.h): VUID-RuntimeSpirv-NonWritable-06340 covers the fragment stage and
+        // -06341 covers vertex, tessellation and geometry stages. Without the matching feature the pipeline would be
+        // created all the same and break validation, so the PSO is refused here with the stage named.
         for (const Stage& stage : stages) {
             if (!stage.entry) continue;
             const bool pixel = stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT;
+            const bool vertex_pipeline = stage.bit == VK_SHADER_STAGE_VERTEX_BIT ||
+                                         stage.bit == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ||
+                                         stage.bit == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT ||
+                                         stage.bit == VK_SHADER_STAGE_GEOMETRY_BIT;
+            if (!pixel && !vertex_pipeline) continue;
             const VkBool32 allowed = pixel ? device_.info.features.fragmentStoresAndAtomics
                                            : device_.info.features.vertexPipelineStoresAndAtomics;
             if (allowed || !leonida::spirv_declares_writable_storage(stage.words)) continue;

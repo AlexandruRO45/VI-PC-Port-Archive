@@ -27,7 +27,7 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
     constexpr std::uint16_t op_type_image = 25, op_type_array = 28, op_type_runtime_array = 29, op_type_struct = 30,
                             op_type_pointer = 32, op_variable = 59, op_decorate = 71, op_member_decorate = 72,
                             op_group_decorate = 74, op_group_member_decorate = 75;
-    constexpr std::uint32_t decoration_buffer_block = 3, decoration_non_writable = 24;
+    constexpr std::uint32_t decoration_block = 2, decoration_buffer_block = 3, decoration_non_writable = 24;
     constexpr std::uint32_t dim_subpass_data = 6;  // an input attachment: Sampled 2 as well, but read-only
     constexpr std::uint32_t class_uniform_constant = 0, class_uniform = 2, class_storage_buffer = 12;
     if (words.size() < 5 || words[0] != magic) return false;
@@ -42,7 +42,7 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
     std::unordered_map<std::uint32_t, std::uint32_t> element_of;       // array type -> element type
     std::unordered_map<std::uint32_t, std::uint32_t> member_count;     // struct type -> members
     std::unordered_map<std::uint32_t, Pointer> pointers;
-    std::unordered_set<std::uint32_t> non_writable, buffer_blocks;     // decorated ids
+    std::unordered_set<std::uint32_t> non_writable, blocks, buffer_blocks;  // decorated ids
     std::unordered_map<std::uint32_t, std::unordered_set<std::uint32_t>> non_writable_members;
     std::vector<Variable> variables;
     // OpGroupDecorate / OpGroupMemberDecorate: a decoration group's decorations reach these targets. Resolved after
@@ -74,6 +74,7 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
             break;
         case op_decorate:
             if (count >= 3 && w[2] == decoration_non_writable) non_writable.insert(w[1]);
+            if (count >= 3 && w[2] == decoration_block) blocks.insert(w[1]);
             if (count >= 3 && w[2] == decoration_buffer_block) buffer_blocks.insert(w[1]);
             break;
         case op_member_decorate:
@@ -93,6 +94,7 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
 
     for (const auto& [group, target] : group_targets) {
         if (non_writable.count(group)) non_writable.insert(target);
+        if (blocks.count(group)) blocks.insert(target);
         if (buffer_blocks.count(group)) buffer_blocks.insert(target);
     }
     for (const auto& [group, member] : group_members)
@@ -100,7 +102,7 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
 
     for (const Variable& variable : variables) {
         const auto pointer = pointers.find(variable.pointer_type);
-        if (pointer == pointers.end()) continue;
+        if (pointer == pointers.end() || pointer->second.storage_class != variable.storage_class) continue;
         // An array of images or of buffer blocks: the element decides. Arrays nest a few levels at most; the bound
         // is for a malformed module whose array type names itself, which would otherwise never end.
         constexpr int max_array_depth = 16;
@@ -115,14 +117,16 @@ inline bool spirv_declares_writable_storage(std::span<const std::uint32_t> words
             if (storage_images.count(type)) return true;  // a storage image or a storage texel buffer
             continue;
         }
-        const bool storage_buffer = variable.storage_class == class_storage_buffer ||
-                                    (variable.storage_class == class_uniform && buffer_blocks.count(type));
+        const bool storage_buffer =
+            (variable.storage_class == class_storage_buffer && blocks.count(type)) ||
+            (variable.storage_class == class_uniform && buffer_blocks.count(type));
         if (!storage_buffer) continue;
         // A block is read-only only when every declared member [0, total) is NonWritable; counting the set's size
         // alone would let an out-of-range member decoration mask an undecorated writable member.
         const auto members = member_count.find(type);
+        if (members == member_count.end()) continue;
         const auto read_only = non_writable_members.find(type);
-        const std::uint32_t total = members == member_count.end() ? 0 : members->second;
+        const std::uint32_t total = members->second;
         if (total == 0 || read_only == non_writable_members.end()) return true;
         for (std::uint32_t member = 0; member < total; ++member)
             if (!read_only->second.count(member)) return true;

@@ -197,8 +197,61 @@ int main() {
     inst(mixed, OpVariable, {struct_t, length_c, UniformConstant});
     check(spirv_declares_writable_storage(mixed), "a storage image after a malformed array is still found");
 
+    // Mismatched OpTypePointer and OpVariable storage classes do not refer to a writable storage descriptor.
+    {
+        auto wrong_pointer_class = [](std::uint32_t pointer_class, std::uint32_t var_class, bool is_buffer) {
+            Words w = header();
+            if (is_buffer) {
+                inst(w, OpDecorate, {struct_t, Block});
+                inst(w, OpTypeInt, {uint_t, 32, 0});
+                inst(w, OpTypeStruct, {struct_t, uint_t});
+                inst(w, OpTypePointer, {pointer_t, pointer_class, struct_t});
+            } else {
+                inst(w, OpTypeInt, {uint_t, 32, 0});
+                inst(w, OpTypeImage, {image_t, uint_t, Dim2D, 0, 0, 0, 2, 33});
+                inst(w, OpTypePointer, {pointer_t, pointer_class, image_t});
+            }
+            inst(w, OpVariable, {pointer_t, var, var_class});
+            return w;
+        };
+        check(!spirv_declares_writable_storage(wrong_pointer_class(Uniform, StorageBuffer, true)),
+              "a StorageBuffer variable with a Uniform pointer is ignored");
+        check(!spirv_declares_writable_storage(wrong_pointer_class(Uniform, UniformConstant, false)),
+              "a UniformConstant variable with a Uniform pointer is ignored");
+    }
+
+    // A StorageBuffer variable must point to a Block-decorated OpTypeStruct (directly or through a group).
+    {
+        Words no_block = header();
+        inst(no_block, OpTypeInt, {uint_t, 32, 0});
+        inst(no_block, OpTypeStruct, {struct_t, uint_t});
+        inst(no_block, OpTypePointer, {pointer_t, StorageBuffer, struct_t});
+        inst(no_block, OpVariable, {pointer_t, var, StorageBuffer});
+        check(!spirv_declares_writable_storage(no_block),
+              "a StorageBuffer struct without Block decoration is ignored");
+
+        Words non_struct = header();
+        inst(non_struct, OpTypeInt, {uint_t, 32, 0});
+        inst(non_struct, OpTypePointer, {pointer_t, StorageBuffer, uint_t});
+        inst(non_struct, OpVariable, {pointer_t, var, StorageBuffer});
+        check(!spirv_declares_writable_storage(non_struct),
+              "a StorageBuffer variable pointing to a non-struct type is ignored");
+
+        constexpr std::uint32_t group = 20;
+        Words grouped_block = header();
+        inst(grouped_block, OpDecorate, {group, Block});
+        inst(grouped_block, OpDecorationGroup, {group});
+        inst(grouped_block, OpGroupDecorate, {group, struct_t});
+        inst(grouped_block, OpTypeInt, {uint_t, 32, 0});
+        inst(grouped_block, OpTypeStruct, {struct_t, uint_t});
+        inst(grouped_block, OpTypePointer, {pointer_t, StorageBuffer, struct_t});
+        inst(grouped_block, OpVariable, {pointer_t, var, StorageBuffer});
+        check(spirv_declares_writable_storage(grouped_block),
+              "a StorageBuffer struct decorated Block through OpGroupDecorate is checked");
+    }
+
     if (failures) return 1;
     std::printf("spirv_stores_test: OK (storage images, arrays of them, storage buffers in both forms, framing, a "
-                "self-referential array, input attachments, decoration groups)\n");
+                "self-referential array, input attachments, decoration groups, pointer storage class and Block checks)\n");
     return 0;
 }
