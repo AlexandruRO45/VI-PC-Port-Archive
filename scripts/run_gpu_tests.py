@@ -984,6 +984,7 @@ def run_suite(a, work: str) -> int:
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
+                      "cs_w64_thread_id",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
@@ -1041,6 +1042,8 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_bfm64": [16, 8, 8, 40],
                 "cs_wm_scc_rfl": [55, 48],
                 "cs_w64_mask_detect": [48],
+                # wave64 compute thread ids: lane = index & 63, wave = index >> 6 (cs_w64_thread_id.asm header)
+                "cs_w64_thread_id": [0, 0, 64, 24, 63, 1, 64, 104],
                 "cs_wqm_w64": [20, 4, 12, 8, 1, 0, 15728895, 20],       # cs_wqm_w64.asm / cs_wqm_w32.asm headers
                 "cs_wqm_w32": [12, 1, 4, 0, 8, 15728880, 4, 32],
                 "cs_wqm_w64_half": [11, 14, 0, 1, 6, 8, 12, 2],
