@@ -178,5 +178,54 @@ class TestVCvtF32U32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(mach.vgprs[4], 0x4F800000)
 
 
+class SimdWave:
+    def __init__(self, size: int = 32):
+        self.size = size
+        self.exec_mask: int = (1 << size) - 1
+        self.lanes: list[dict[int, int]] = [{i: 0 for i in range(32)} for _ in range(size)]
+
+    def step_cvt(self, dst_idx: int, src_idx: int):
+        for lane in range(self.size):
+            if self.exec_mask & (1 << lane):
+                s0 = self.lanes[lane].get(src_idx, 0)
+                self.lanes[lane][dst_idx] = ref_cvt_f32_u32(s0)
+
+
+class TestVCvtF32U32SIMDDivergence(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergent_conversions(self):
+        wave = SimdWave(32)
+        for lane in range(32):
+            wave.lanes[lane][1] = 1 << lane  # Powers of 2
+            wave.lanes[lane][0] = 0xDEADBEEF
+
+        wave.exec_mask = 0x55555555  # Even lanes
+        wave.step_cvt(0, 1)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                expected = ref_cvt_f32_u32(1 << lane)
+                self.assertEqual(wave.lanes[lane][0], expected)
+            else:
+                self.assertEqual(wave.lanes[lane][0], 0xDEADBEEF)
+
+    def test_wave64_divergence(self):
+        wave = SimdWave(64)
+        for lane in range(64):
+            wave.lanes[lane][1] = lane * 1000
+            wave.lanes[lane][0] = 0xCAFEBABE
+
+        wave.exec_mask = 0xFFFFFFFF00000000  # High 32 lanes
+        wave.step_cvt(0, 1)
+
+        for lane in range(64):
+            if lane >= 32:
+                expected = ref_cvt_f32_u32(lane * 1000)
+                self.assertEqual(wave.lanes[lane][0], expected)
+            else:
+                self.assertEqual(wave.lanes[lane][0], 0xCAFEBABE)
+
+
 if __name__ == '__main__':
     unittest.main()
