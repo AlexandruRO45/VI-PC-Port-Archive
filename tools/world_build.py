@@ -1439,6 +1439,7 @@ def build_world(
     jobs: int = 1,
     base_color_param: str | None = None,
     extra_assets=(),
+    prefer_model_lod: int | None = None,
     placements: str | None = None,
     lod_levels=DEFAULT_LOD_LEVELS,
     region=None,
@@ -1503,6 +1504,9 @@ def build_world(
     glb_mod = _get_glb_writer()
     dds_mod = _get_dds_png() if textures else None
 
+    if prefer_model_lod is not None:
+        if placements is None or type(prefer_model_lod) is not int or prefer_model_lod not in range(4):
+            raise ValueError("--prefer-model-lod requires --placements and a geometry LOD in 0..3")
     if extra_assets and placements is None:
         raise ValueError("--extra-assets requires --placements")
     manifests = discover_model_manifests(assets_dir)
@@ -1550,6 +1554,15 @@ def build_world(
 
     if limit is not None:
         entries = entries[:limit]
+
+    if prefer_model_lod is not None:
+        # Work within the limit. Keep every candidate for a source lacking the requested LOD.
+        preferred = {(src, offset, drawable, name)
+                     for (src, offset, drawable, lod, name), pos in source_entries.items()
+                     if pos < len(entries) and lod == prefer_model_lod}
+        superseded = {pos for (src, offset, drawable, lod, name), pos in source_entries.items()
+                      if lod != prefer_model_lod and (src, offset, drawable, name) in preferred}
+        entries = [entry for pos, entry in enumerate(entries) if pos not in superseded]
 
     ttpf_index = index_ttpf_textures(assets_dir) if textures else {}
 
@@ -1885,6 +1898,8 @@ def main(argv: list[str] | None = None) -> int:
         "assets_dir",
         help="Path to a models/ dir, an archive dir, or a full <work>\\assets tree.",
     )
+    ap.add_argument("--prefer-model-lod", type=int, choices=range(4),
+                    help="Prefer this cached geometry LOD among variants of the same placement model.")
     ap.add_argument("--extra-assets", action="append", default=[], metavar="ROOT",
                     help="Additional model export root for placements (repeatable).")
     ap.add_argument(
@@ -2003,6 +2018,7 @@ def main(argv: list[str] | None = None) -> int:
             base_color_param=args.base_color_param,
             placements=args.placements,
             extra_assets=args.extra_assets,
+            prefer_model_lod=args.prefer_model_lod,
             lod_levels=lod_levels,
             region=args.region,
             instancing=args.instancing,

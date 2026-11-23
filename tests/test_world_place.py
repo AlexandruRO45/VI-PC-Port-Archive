@@ -275,6 +275,45 @@ class PlacedBuildTest(unittest.TestCase):
                         self.assertEqual((stats["placed"], stats["distinct_models"], stats["ambiguous_model"]),
                                          (2, 2, 2))
 
+    def test_geometry_lod_preference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            roots = []
+            for lod in (0, 1):
+                root = base / str(lod)
+                root.mkdir()
+                roots.append(str(root))
+                obj = UNIT_BOX_OBJ.replace("v 1 ", "v 7 ") if lod else UNIT_BOX_OBJ
+                (root / "mesh.obj").write_text(obj, encoding="utf-8", newline="\n")
+                items = [dict(Name="box", File="mesh.obj", Offset=0, Drawable=None),
+                         dict(Name="distinct", File="mesh.obj", Offset=lod, Drawable=None),
+                         dict(Name="unknown", File="mesh.obj", Offset=0)]
+                if not lod:
+                    items.append(dict(Name="single", File="mesh.obj", Offset=2, Drawable=None))
+                manifest = dict(src="/a/archive.rpf", Items=items)
+                if lod:
+                    manifest["Lod"] = lod
+                (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+            ents = str(base / "p.jsonl")
+            rows = [entity(name, (0, 0, 0)) for name in ("box", "single", "distinct", "unknown")]
+            rows.append(entity("box", (0, 0, 0), key="0000000000000001"))
+            write_entities(ents, rows)
+            out = base / "world"
+            for mode in world_build.INSTANCING_MODES:
+                for first, second in (roots, roots[::-1]):
+                    for lod, placed, width in ((None, 1, 1), (0, 2, 1), (1, 2, 7), (3, 1, 1)):
+                        args = [first, "--extra-assets", second, "--placements", ents,
+                                "--instancing", mode, "--no-textures", "--out", str(out)]
+                        if lod is not None:
+                            args.extend(["--prefer-model-lod", str(lod)])
+                        with self.subTest(mode=mode, first=first, lod=lod), contextlib.redirect_stdout(io.StringIO()):
+                            self.assertEqual(world_build.main(args), 0)
+                            doc = json.loads((out / "world.json").read_text())
+                            self.assertEqual(max(c["bounds"][3] for c in doc["chunks"]), width)
+                            stats = doc["stats"]["placements"]
+                            self.assertEqual((stats["placed"], stats["ambiguous_model"], stats["key_mismatch"]),
+                                             (placed, 4 - placed, 1))
+
     def test_counts_and_bounds(self):
         rows = [
             entity("test_box", (100, 200, 10), stored_rotation_about_z(90), sxy=2.0, sz=1.0),      # placed

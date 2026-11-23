@@ -590,6 +590,12 @@ export LOD and model names identify repeat observations. Keep exports from diffe
 Rows without a complete source address remain separate candidates. An ambiguous placement is skipped in all
 three instancing modes.
 
+Pass a geometry export directory (such as `models_lod1`) directly with `--extra-assets`.
+With `--prefer-model-lod N` (0..3), a cached variant at N supersedes the other geometry LODs
+of that same archive path, resource offset, drawable offset and name. If N is absent, all existing
+candidates remain. Distinct sources still compete. Placement `--lod-levels` filters map entities
+by streaming tier independently of this preference.
+
 On a private CPU-only `--lod-sets --no-textures` run, one export placed 1,488 of 75,551 rows. Adding two
 windows with no complementary matches gave the same count. Adding a complementary export and its repeat
 placed 1,663 rows using 1,501 distinct models (+175 placements, +63 models). The other 73,888 rows had
