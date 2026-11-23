@@ -39,6 +39,7 @@ Usage:
 Offsets are the resources' zlib stream offsets in the archive (the `0x...` offsets rpf9dump and skin_streams
 report). `--part` takes a drawable, a fragment or a drawable dictionary; `:<child>` picks a dictionary child.
 `--coverage` writes counts only: how many clip-dictionary bone tracks name a joint of the skeleton.
+Usage: `python -I tools/anim_glb.py --help` lists the options.
 """
 import argparse
 import collections
@@ -796,9 +797,11 @@ def main(argv=None):
                     help="bone influences per vertex; 4 keeps the largest four, renormalised (three.js reads four)")
     ap.add_argument("--no-root-motion", action="store_true", help="leave out the mover (bone hash 0) tracks")
     ap.add_argument("--coverage", action="store_true", help="count clip bone tracks that name a skeleton joint")
-    ap.add_argument("--jobs", type=int, default=1, help="worker processes for --coverage")
+    ap.add_argument("--jobs", type=int, default=1, help="worker processes for --coverage (at least 1)")
     ap.add_argument("--report", help="write a JSON report (counts only)")
     args = ap.parse_args(argv)
+    if args.jobs < 1:
+        ap.error("--jobs must be at least 1")
     inputs = [args.archive] + ([args.anim] if args.anim else [])
     outputs = [p for p in (args.out, args.report) if p]
     for o in outputs:
@@ -821,7 +824,10 @@ def main(argv=None):
             ap.error("--anim needs --dictionary")
     try:
         report = coverage(args) if args.coverage else export(args)
-    except (ExportError, anim_clips.DecodeError, struct.error, OSError, ValueError) as e:
+    except OSError as e:
+        print(f"ERROR: {e.filename or args.archive}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    except (ExportError, anim_clips.DecodeError, struct.error, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     if args.report:

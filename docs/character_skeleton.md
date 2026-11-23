@@ -300,8 +300,8 @@ it does and why:
   the track's bone hash. Bone hash 0 drives a `mover` node above the skeleton (root motion;
   `--no-root-motion` leaves it out). Other track types are counted, not exported. A clip entry
   plays its animation's `[start, end]` window at `rate`, so animation time `t` is clip time
-  `(t − start) / rate`. In 300 sampled dictionaries, `(end − start) / rate` equals the clip's
-  `+0x78` duration for all 4,471 entries.
+  `(t − start) / rate`. `(end − start) / rate` equals the clip's `+0x78` duration for all 785,174
+  entries of all 61,505 dictionaries, to within 2.2e-4 relative (see [animation.md](animation.md#clip-dictionaries-are-rage-resources)).
   Positive-duration exports include both window boundaries and the interior source frames:
   translation and scale boundaries use linear interpolation, and rotations use shortest-path
   quaternion interpolation, following [glTF's LINEAR sampler rules](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#interpolation).
@@ -389,6 +389,11 @@ total). This is a static-export skip: only the components named on the command l
 exported, and no body or other unrequested component is assembled. No game data or generated
 GLB is stored in the repository; `tests/test_skinned_glb.py` builds its own skeleton, skin
 buffer and GLB.
+
+`python -I tools/glb_inspect.py out.glb` reads the written file back with no glTF library and
+prints its mesh, skin (joint count) and animation counts, the POSITION bounding box and any
+field the exporter dropped; [models.md](models.md#skinned-glb-export) lists what the rest of
+the report carries.
 
 ## Texture parameter split
 
