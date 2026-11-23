@@ -117,6 +117,15 @@ jobs:
           python -I tests/test_ttpf_assets.py
       - name: Test rpf9dump diagnostics
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
+      - name: Build the native meshlet kernels and check Python parity
+        shell: bash
+        run: |
+          export CARGO_HOME="$(mktemp -d)"
+          cargo build --release --locked --offline --manifest-path tools/meshlet_native/Cargo.toml
+          cargo test --release --locked --offline --manifest-path tools/meshlet_native/Cargo.toml
+          python -I -c "import sys; sys.path.insert(0, 'tools'); import meshlet_native; assert meshlet_native._load() is not None"
+          python -I tests/test_meshlet_native.py
+          python -I tests/test_meshlet_page.py
   translator-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
