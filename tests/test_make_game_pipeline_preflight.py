@@ -1,4 +1,4 @@
-"""make_game.py: a missing vk_pipeline_check is reported in preflight, before a long shader build.
+"""make_game.py: refresh vk_pipeline_check in preflight, before a long shader build.
 
     python -I tests/test_make_game_pipeline_preflight.py
 
@@ -154,7 +154,7 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
 
     def test_builds_the_checker_after_the_checks(self):
         self.write_shader_index()
-        with mock.patch.object(make_game, "pipeline_check_exe", side_effect=[None, None, "/bin/vk_pipeline_check"]), \
+        with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:
             make_game.preflight(["pipelines"], self.work, jobs=3)
         build.assert_called_once_with(3)
@@ -185,12 +185,12 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
             self.assert_preflight_fails(["shaders", "pipelines"], "llvm-mc")
         build.assert_not_called()
 
-    def test_a_built_checker_is_not_rebuilt(self):
+    def test_an_existing_checker_is_refreshed(self):
         self.write_shader_index()
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:
             make_game.preflight(["pipelines"], self.work)
-        build.assert_not_called()
+        build.assert_called_once_with(1)
 
     def test_the_build_uses_the_readme_folder(self):
         with mock.patch.object(make_game, "ROOT", self.root), \
