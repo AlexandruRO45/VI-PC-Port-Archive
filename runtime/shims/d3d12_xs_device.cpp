@@ -50,11 +50,12 @@ namespace rt::d3d12_xs {
 namespace {
 
 constexpr unsigned kMaxSlots = 128;
-static_assert(kMaxSlots >= console::kKnownDeviceSlots, "the proxy table must cover the known console device order");
+static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
 static_assert(sizeof(D3D12_RESOURCE_DESC) == 56, "the measured Xbox description prefix is 56 bytes");
+static_assert(kMaxSlots >= console::kKnownDeviceSlots, "the proxy table must cover the known console device order");
 
 struct DeviceProxy {
     void** vtable;          // offset 0: the caller's ID3D12Device* points here
