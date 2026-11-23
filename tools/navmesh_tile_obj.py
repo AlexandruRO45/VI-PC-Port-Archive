@@ -13,7 +13,9 @@ from contextlib import closing
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode
 from navmesh_nodes import navmesh_resources, tile_geometry
+from replace_retry import replace as replace_retry
 from report_paths import same_report_path
 
 
@@ -45,8 +47,16 @@ def main(argv=None):
         parser.error("--tile must be non-negative")
     temp = None
     try:
+        if args.out.is_dir():
+            raise ValueError("--out is a directory")
         if same_report_path(args.archive, args.out):
             raise ValueError("--out aliases the archive")
+        out_parent = Path(os.path.abspath(args.out)).parent
+        for ancestor in (out_parent, *out_parent.parents):
+            if os.path.lexists(ancestor):
+                if not os.path.isdir(ancestor):
+                    raise ValueError(f"--out parent is not a directory: {ancestor}")
+                break
         with closing(navmesh_resources(args.archive)) as resources:
             for ordinal, tile in enumerate(resources):
                 if ordinal == args.tile:
@@ -61,13 +71,18 @@ def main(argv=None):
                                          dir=args.out.parent, delete=False) as out:
             temp = Path(out.name)
             write_obj(out, geometry, ordinal)
-        os.replace(temp, args.out)
+        os.chmod(temp, published_mode(args.out))
+        replace_retry(temp, args.out)
         temp = None
     except (OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     finally:
         if temp is not None:
+            try:
+                os.chmod(temp, 0o600)
+            except OSError:
+                pass
             temp.unlink(missing_ok=True)
     return 0
 

@@ -1,16 +1,26 @@
 """Read back OBJ primitives from a synthetic archive, independently of the writer."""
+import contextlib
+import io
+import os
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from test_navmesh_decode import build_navmesh, make_rpf, nd
 
-TOOL = HERE.parent / "tools" / "navmesh_tile_obj.py"
+TOOLS = HERE.parent / "tools"
+TOOL = TOOLS / "navmesh_tile_obj.py"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+import file_mode  # noqa: E402
+import navmesh_tile_obj  # noqa: E402
 
 
 def read_obj(path):
@@ -62,6 +72,49 @@ class ExportTest(unittest.TestCase):
                 self.assertEqual(run(invalid, out).returncode, 2)
                 self.assertEqual(out.read_bytes(), original)
             self.assertEqual(run(1, archive).returncode, 2)
+
+
+    def test_preflight_refuses_bad_out_before_scanning_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "input.rpf"
+            archive.write_bytes(b"")
+            blocker = root / "not_a_dir"
+            blocker.write_bytes(b"x")
+            with mock.patch.object(navmesh_tile_obj, "navmesh_resources",
+                                   side_effect=AssertionError("archive should not be scanned")):
+                for bad_out in (root, blocker / "sub" / "tile.obj"):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = navmesh_tile_obj.main([str(archive), "--tile", "0", "--out", str(bad_out)])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("ERROR:", err.getvalue())
+
+    def test_publish_preserves_permissions_and_cleans_up_on_replace_failure(self):
+        head, tail = build_navmesh(n_verts=3, poly_sizes=(3,), tiny_bm_cont=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "input.rpf"
+            out = root / "tile.obj"
+            make_rpf(archive, [head, tail])
+
+            expected_new = file_mode.new_file_mode(root)
+            self.assertEqual(navmesh_tile_obj.main([str(archive), "--tile", "0", "--out", str(out)]), 0)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), expected_new)
+                os.chmod(out, 0o640)
+                self.assertEqual(navmesh_tile_obj.main([str(archive), "--tile", "0", "--out", str(out)]), 0)
+                self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o640)
+
+            before = out.read_bytes()
+            err = io.StringIO()
+            with mock.patch.object(navmesh_tile_obj, "replace_retry", side_effect=OSError("busy")):
+                with contextlib.redirect_stderr(err):
+                    rc = navmesh_tile_obj.main([str(archive), "--tile", "0", "--out", str(out)])
+            self.assertEqual(rc, 2)
+            self.assertIn("busy", err.getvalue())
+            self.assertEqual(out.read_bytes(), before)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["input.rpf", "tile.obj"])
 
 
 if __name__ == "__main__":
