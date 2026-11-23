@@ -412,5 +412,59 @@ class TestVAlignbyteB32RegisterAliasing(unittest.TestCase):
         self.assertEqual(support.mrt0_words(spv)[0], 0xBB112233)
 
 
+@dataclasses.dataclass(frozen=True)
+class AlignbyteStatusFlags:
+    is_zero: bool
+    is_negative: bool
+    shift_bytes: int
+    high_bit: int
+    all_from_src1: bool
+    mixed_bytes: bool
+
+
+def compute_status_flags(res: int, sel: int) -> AlignbyteStatusFlags:
+    shift = sel & 3
+    return AlignbyteStatusFlags(
+        is_zero=(res == 0),
+        is_negative=((res & 0x80000000) != 0),
+        shift_bytes=shift,
+        high_bit=(res >> 31) & 1,
+        all_from_src1=(shift == 0),
+        mixed_bytes=(shift in (1, 2, 3)),
+    )
+
+
+class TestVAlignbyteB32ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and classification."""
+
+    def test_zero_result_flags(self):
+        flags = compute_status_flags(0, sel=0)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertEqual(flags.shift_bytes, 0)
+        self.assertTrue(flags.all_from_src1)
+        self.assertFalse(flags.mixed_bytes)
+
+    def test_negative_result_flags(self):
+        flags = compute_status_flags(0x80000000, sel=2)
+        self.assertFalse(flags.is_zero)
+        self.assertTrue(flags.is_negative)
+        self.assertEqual(flags.shift_bytes, 2)
+        self.assertEqual(flags.high_bit, 1)
+        self.assertFalse(flags.all_from_src1)
+        self.assertTrue(flags.mixed_bytes)
+
+    def test_mixed_shifts(self):
+        for shift in range(4):
+            flags = compute_status_flags(0x12345678, sel=shift)
+            self.assertEqual(flags.shift_bytes, shift)
+            if shift == 0:
+                self.assertTrue(flags.all_from_src1)
+                self.assertFalse(flags.mixed_bytes)
+            else:
+                self.assertFalse(flags.all_from_src1)
+                self.assertTrue(flags.mixed_bytes)
+
+
 if __name__ == "__main__":
     unittest.main()
