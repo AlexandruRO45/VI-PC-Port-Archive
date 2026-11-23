@@ -411,40 +411,44 @@ def main(argv=None):
         for problem in report["problems"]:
             print("  %s" % problem, file=sys.stderr)
         return 2
-    with open(a.cache, "rb") as fh:
-        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-            if a.entry is not None:
-                meta_off = report["regions"]["meta_blob"]["offset"]
-                meta_region = report["regions"]["meta_index"]
-                meta_index = [
-                    struct.unpack_from(
-                        "<II", m, meta_region["offset"] + i * pi.INDEX_STRIDE
+    try:
+        with open(a.cache, "rb") as fh:
+            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                if a.entry is not None:
+                    meta_off = report["regions"]["meta_blob"]["offset"]
+                    meta_region = report["regions"]["meta_index"]
+                    meta_index = [
+                        struct.unpack_from(
+                            "<II", m, meta_region["offset"] + i * pi.INDEX_STRIDE
+                        )
+                        for i in range(report["counts"]["meta_index"])
+                    ]
+                    chunk_records = {
+                        i: pi.entry_chunks(m, meta_off, off, size)
+                        for i, (off, size) in enumerate(meta_index)
+                    }
+                    chunk_records = {i: c for i, c in chunk_records.items() if c}
+                    if not 0 <= a.entry < report["counts"]["graphics"]:
+                        print(
+                            "--entry %d is outside the %d graphics records"
+                            % (a.entry, report["counts"]["graphics"]),
+                            file=sys.stderr,
+                        )
+                        return 2
+                    pso = describe_pso(
+                        m,
+                        report["regions"]["graphics"]["offset"],
+                        meta_off,
+                        meta_index,
+                        chunk_records,
+                        a.entry,
                     )
-                    for i in range(report["counts"]["meta_index"])
-                ]
-                chunk_records = {
-                    i: pi.entry_chunks(m, meta_off, off, size)
-                    for i, (off, size) in enumerate(meta_index)
-                }
-                chunk_records = {i: c for i, c in chunk_records.items() if c}
-                if not 0 <= a.entry < report["counts"]["graphics"]:
-                    print(
-                        "--entry %d is outside the %d graphics records"
-                        % (a.entry, report["counts"]["graphics"]),
-                        file=sys.stderr,
-                    )
-                    return 2
-                pso = describe_pso(
-                    m,
-                    report["regions"]["graphics"]["offset"],
-                    meta_off,
-                    meta_index,
-                    chunk_records,
-                    a.entry,
-                )
-                result = {"summary": None, "pso": pso}
-            else:
-                result = {"summary": summarise(m, report, a.limit), "pso": None}
+                    result = {"summary": None, "pso": pso}
+                else:
+                    result = {"summary": summarise(m, report, a.limit), "pso": None}
+    except (OSError, ValueError) as e:
+        print("%s: %s" % (a.cache, e), file=sys.stderr)
+        return 2
     if not a.quiet:
         if a.json:
             print(json.dumps(result, indent=1))

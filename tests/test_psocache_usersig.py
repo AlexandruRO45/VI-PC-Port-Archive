@@ -4,6 +4,9 @@ The cache has two graphics PSOs. Their stage records name three chunk records: o
 entries and constants (fits), one with extra slots (fits), and one with 40 constant dwords (does not fit).
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import struct
@@ -11,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "psocache_usersig.py")
@@ -371,6 +375,34 @@ class UsersigTest(unittest.TestCase):
         p = run(self.path, "--entry", "99")
         self.assertEqual(p.returncode, 2)
         self.assertIn("outside the 2 graphics records", p.stderr)
+
+    def test_second_read_failures_exit_two(self):
+        spec = importlib.util.spec_from_file_location("usersig_under_test", TOOL)
+        tool = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "path", [os.path.join(ROOT, "tools"), *sys.path]):
+            spec.loader.exec_module(tool)
+        inspect = tool.pi.inspect
+        for action in ("remove", "truncate"):
+            with self.subTest(action=action):
+                with open(self.path, "wb") as stream:
+                    stream.write(build())
+
+                def inspect_then_change(path):
+                    report = inspect(path)
+                    if action == "remove":
+                        os.remove(path)
+                    else:
+                        with open(path, "wb"):
+                            pass
+                    return report
+
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch.object(tool.pi, "inspect", side_effect=inspect_then_change), \
+                        contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    self.assertEqual(tool.main([self.path, "--quiet"]), 2)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(self.path, errors.getvalue())
 
     def test_not_a_cache_exits_two(self):
         bad = os.path.join(self.tmp.name, "bad.bin")
