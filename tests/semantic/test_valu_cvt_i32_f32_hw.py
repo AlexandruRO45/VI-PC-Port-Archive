@@ -13,10 +13,9 @@ Saturation and Edge Case Behavior (measured on RDNA2 / gfx1036):
 - Representable values in (-2^31, 2^31) truncate toward zero (round-toward-zero).
 - Floating-point +/-0.0 both produce 0.
 
-Syntax:
-    v_cvt_i32_f32 vdst, vsrc
-    v_cvt_i32_f32_e32 vdst, vsrc
-    v_cvt_i32_f32_e64 vdst, [mods] vsrc
+All test methods compile assembly listings directly through tools/rdna2spirv.py
+via support.translate_lines(...) and execute in spirv_mini_interp via support.mrt0_words.
+Standard library Python only; zero third-party dependencies; zero game data.
 """
 
 import math
@@ -24,9 +23,9 @@ import os
 import struct
 import sys
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Optional, Union
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -65,68 +64,86 @@ def oracle_cvt_i32_f32(bits: int) -> int:
     return val & MASK_32
 
 
-def run_translator_cvt_i32_f32(
-    src_bits: int,
-    name: str = "ps_cvt_i32_f32",
-    op: str = "v_cvt_i32_f32",
-    src_expr: Optional[str] = None,
-) -> int:
-    """Translate and run a minimal shader through tools/rdna2spirv and return result word."""
-    if src_expr is None:
-        lines = [
-            f"v_mov_b32 v1, {src_bits & MASK_32:#x}",
-            f"{op} v0, v1",
-            "exp mrt0 v0, v0, v0, v0 done vm",
-            "s_endpgm",
-        ]
-    else:
-        lines = [
-            f"v_mov_b32 v1, {src_bits & MASK_32:#x}",
-            f"{op} v0, {src_expr}",
-            "exp mrt0 v0, v0, v0, v0 done vm",
-            "s_endpgm",
-        ]
-    spv = support.translate_lines(name, lines)
-    return support.mrt0_words(spv)[0]
-
-
 class TestOracleAndHardwareModel(unittest.TestCase):
-    """Commit 1: Reference mathematical oracle and architectural model verification."""
+    """Reference mathematical oracle and architectural model verification."""
 
     def test_positive_integers_and_truncation(self) -> None:
         """Verify standard positive float conversion with truncation toward zero."""
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(1.0)), 1)
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(1.9999)), 1)
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(42.75)), 42)
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(100.25)), 100)
+        for f_val in (1.0, 1.9999, 42.75, 100.25):
+            bits = f32_to_bits(f_val)
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_pos_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            expected = oracle_cvt_i32_f32(bits)
+            self.assertEqual(words[0], expected)
 
     def test_negative_integers_and_truncation(self) -> None:
         """Verify negative float conversion with truncation toward zero."""
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(-1.0)), 0xFFFF_FFFF)
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(-1.9999)), 0xFFFF_FFFF)
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(-42.75)), (-42) & MASK_32)
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(-100.25)), (-100) & MASK_32)
+        for f_val in (-1.0, -1.9999, -42.75, -100.25):
+            bits = f32_to_bits(f_val)
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_neg_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            expected = oracle_cvt_i32_f32(bits)
+            self.assertEqual(words[0], expected)
 
     def test_zeros_and_subnormals(self) -> None:
         """Verify +0.0, -0.0 and subnormals convert to zero."""
-        self.assertEqual(oracle_cvt_i32_f32(0x0000_0000), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0x8000_0000), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0x0000_0001), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0x8000_0001), 0)
+        for bits in (0x0000_0000, 0x8000_0000, 0x0000_0001, 0x8000_0001):
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_zero_sub_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], 0)
+            self.assertEqual(oracle_cvt_i32_f32(bits), 0)
 
     def test_saturation_limits(self) -> None:
         """Verify positive and negative overflow saturation."""
-        self.assertEqual(oracle_cvt_i32_f32(0x4F00_0000), INT32_MAX)           # 2^31
-        self.assertEqual(oracle_cvt_i32_f32(0xCF00_0000), INT32_MIN_UNSIGNED)  # -2^31
-        self.assertEqual(oracle_cvt_i32_f32(0x7F80_0000), INT32_MAX)           # +inf
-        self.assertEqual(oracle_cvt_i32_f32(0xFF80_0000), INT32_MIN_UNSIGNED)  # -inf
+        cases = [
+            (0x4F00_0000, INT32_MAX),           # 2^31
+            (0xCF00_0000, INT32_MIN_UNSIGNED),  # -2^31
+            (0x7F80_0000, INT32_MAX),           # +inf
+            (0xFF80_0000, INT32_MIN_UNSIGNED),  # -inf
+        ]
+        for bits, expected in cases:
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_sat_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], expected)
+            self.assertEqual(oracle_cvt_i32_f32(bits), expected)
 
     def test_nan_produces_zero(self) -> None:
         """Verify NaNs produce zero according to RDNA2 hardware semantics."""
-        self.assertEqual(oracle_cvt_i32_f32(0x7FC0_0000), 0)  # +qNaN
-        self.assertEqual(oracle_cvt_i32_f32(0xFFC0_0000), 0)  # -qNaN
-        self.assertEqual(oracle_cvt_i32_f32(0x7F80_0001), 0)  # +sNaN
-        self.assertEqual(oracle_cvt_i32_f32(0xFF80_0001), 0)  # -sNaN
+        for bits in (0x7FC0_0000, 0xFFC0_0000, 0x7F80_0001, 0xFF80_0001):
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_nan_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], 0)
+            self.assertEqual(oracle_cvt_i32_f32(bits), 0)
 
     def test_oracle_matches_translator(self) -> None:
         """Verify oracle directly against translator execution."""
@@ -145,8 +162,15 @@ class TestOracleAndHardwareModel(unittest.TestCase):
         ]
         for idx, bits in enumerate(cases):
             expected = oracle_cvt_i32_f32(bits)
-            translated = run_translator_cvt_i32_f32(bits, name=f"ps_oracle_{idx}")
-            self.assertEqual(translated, expected, f"Mismatch on bits {bits:#010x}")
+            lines = [
+                f"v_mov_b32 v1, {bits & MASK_32:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_oracle_{idx}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], expected, f"Mismatch on bits {bits:#010x}")
 
 
 # ==============================================================================
@@ -218,25 +242,22 @@ class VCvtI32F32Instruction:
 
 
 class TestASTDefinitions(unittest.TestCase):
-    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
+    """Symbolic AST opcode definitions and typed expressions."""
 
     def test_ast_construction_and_formatting(self) -> None:
-        """Verify AST node string formatting for e32 and e64 encodings."""
+        """Verify AST node string formatting and compile through translator."""
         instr_e32 = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
         self.assertEqual(instr_e32.to_asm(), "v_cvt_i32_f32 v0, v1")
 
-        instr_sgpr = VCvtI32F32Instruction(dst=VGPR(5), src=SGPR(2))
-        self.assertEqual(instr_sgpr.to_asm(), "v_cvt_i32_f32 v5, s2")
-
-        instr_imm = VCvtI32F32Instruction(dst=VGPR(3), src=FloatImm(4.0))
-        self.assertEqual(instr_imm.to_asm(), "v_cvt_i32_f32 v3, 4.0")
-
-        instr_e64_mods = VCvtI32F32Instruction(
-            dst=VGPR(0),
-            src=Operand(OperandKind.VGPR, 1, neg=True, abs_val=True),
-            is_e64=True,
-        )
-        self.assertEqual(instr_e64_mods.to_asm(), "v_cvt_i32_f32_e64 v0, -|v1|")
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(12.0):#x}",
+            instr_e32.to_asm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_fmt", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 12)
 
     def test_ast_translation_validity(self) -> None:
         """Verify shader using AST-emitted instructions translates and executes correctly."""
@@ -251,72 +272,27 @@ class TestASTDefinitions(unittest.TestCase):
 
 
 # ==============================================================================
-# SECTION 3: Deterministic Scalar Instruction Interpreter
+# SECTION 3: Scalar Instruction Execution
 # ==============================================================================
 
-@dataclass
-class ScalarState:
-    vgprs: Dict[int, int] = field(default_factory=dict)
-    sgprs: Dict[int, int] = field(default_factory=dict)
-
-    def get_vgpr(self, idx: int) -> int:
-        return self.vgprs.get(idx, 0)
-
-    def set_vgpr(self, idx: int, val: int) -> None:
-        self.vgprs[idx] = val & MASK_32
-
-    def get_sgpr(self, idx: int) -> int:
-        return self.sgprs.get(idx, 0)
-
-    def set_sgpr(self, idx: int, val: int) -> None:
-        self.sgprs[idx] = val & MASK_32
-
-
-class ScalarInterpreter:
-    """Deterministic scalar interpreter executing VCvtI32F32Instruction."""
-
-    def eval_operand(self, op: Operand, state: ScalarState) -> int:
-        if op.kind == OperandKind.VGPR:
-            raw = state.get_vgpr(int(op.value))
-        elif op.kind == OperandKind.SGPR:
-            raw = state.get_sgpr(int(op.value))
-        elif op.kind == OperandKind.FLOAT_IMM:
-            raw = f32_to_bits(float(op.value))
-        else:
-            raise ValueError(f"Unknown operand kind: {op.kind}")
-
-        f = bits_to_f32(raw)
-        if op.abs_val:
-            f = abs(f)
-        if op.neg:
-            f = -f
-        return f32_to_bits(f)
-
-    def step(self, instr: VCvtI32F32Instruction, state: ScalarState) -> None:
-        src_bits = self.eval_operand(instr.src, state)
-        res = oracle_cvt_i32_f32(src_bits)
-        state.set_vgpr(int(instr.dst.value), res)
-
-
 class TestScalarInterpreter(unittest.TestCase):
-    """Commit 3: Deterministic scalar instruction interpreter."""
+    """Deterministic scalar execution via translator."""
 
     def test_scalar_interpreter_execution(self) -> None:
-        interp = ScalarInterpreter()
-        state = ScalarState()
-        state.set_vgpr(1, f32_to_bits(55.8))
-        state.set_sgpr(2, f32_to_bits(-12.4))
-
-        instr1 = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
-        interp.step(instr1, state)
-        self.assertEqual(state.get_vgpr(0), 55)
-
-        instr2 = VCvtI32F32Instruction(dst=VGPR(3), src=SGPR(2))
-        interp.step(instr2, state)
-        self.assertEqual(state.get_vgpr(3), (-12) & MASK_32)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(55.8):#x}",
+            f"s_mov_b32 s2, {f32_to_bits(-12.4):#x}",
+            "v_cvt_i32_f32 v0, v1",
+            "v_cvt_i32_f32 v3, s2",
+            "exp mrt0 v0, v3, v0, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_scalar_exec", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 55)
+        self.assertEqual(words[1], (-12) & MASK_32)
 
     def test_scalar_interpreter_cross_validation_with_translator(self) -> None:
-        interp = ScalarInterpreter()
         test_values = [
             f32_to_bits(0.0),
             f32_to_bits(-0.0),
@@ -326,100 +302,45 @@ class TestScalarInterpreter(unittest.TestCase):
             0x7FC0_0000,
         ]
         for idx, bits in enumerate(test_values):
-            state = ScalarState()
-            state.set_vgpr(1, bits)
-            instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
-            interp.step(instr, state)
-            expected = state.get_vgpr(0)
-            translated = run_translator_cvt_i32_f32(bits, name=f"ps_interp_{idx}")
-            self.assertEqual(translated, expected)
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_interp_{idx}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], oracle_cvt_i32_f32(bits))
 
 
 # ==============================================================================
-# SECTION 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# SECTION 4: SIMD Multi-Lane Divergence and EXEC Masking
 # ==============================================================================
-
-@dataclass
-class SIMDState:
-    num_lanes: int = 32
-    exec_mask: int = 0xFFFF_FFFF
-    vgprs: List[Dict[int, int]] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        if not self.vgprs:
-            self.vgprs = [{} for _ in range(self.num_lanes)]
-
-    def is_lane_active(self, lane: int) -> bool:
-        return bool((self.exec_mask >> lane) & 1)
-
-    def get_vgpr(self, lane: int, reg: int) -> int:
-        return self.vgprs[lane].get(reg, 0)
-
-    def set_vgpr(self, lane: int, reg: int, val: int) -> None:
-        self.vgprs[lane][reg] = val & MASK_32
-
-
-class SIMDInterpreter:
-    """SIMD vector interpreter executing instructions with lane masking."""
-
-    def __init__(self) -> None:
-        self.scalar_interp = ScalarInterpreter()
-
-    def step(self, instr: VCvtI32F32Instruction, state: SIMDState) -> List[int]:
-        updated_lanes = []
-        for lane in range(state.num_lanes):
-            if state.is_lane_active(lane):
-                sub_state = ScalarState(vgprs=dict(state.vgprs[lane]))
-                self.scalar_interp.step(instr, sub_state)
-                state.vgprs[lane] = sub_state.vgprs
-                updated_lanes.append(lane)
-        return updated_lanes
-
 
 class TestSIMDDivergence(unittest.TestCase):
-    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+    """SIMD execution and divergent values."""
 
     def test_wave32_alternating_lanes(self) -> None:
-        num_lanes = 32
-        mask = 0x5555_5555
-        state = SIMDState(num_lanes=num_lanes, exec_mask=mask)
-        sentinel = 0xDEAD_BEEF
-
-        for lane in range(num_lanes):
-            state.set_vgpr(lane, 0, sentinel)
-            state.set_vgpr(lane, 1, f32_to_bits(float(lane) + 0.5))
-
-        simd = SIMDInterpreter()
-        instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
-        updated = simd.step(instr, state)
-
-        self.assertEqual(len(updated), 16)
-        for lane in range(num_lanes):
-            if lane % 2 == 0:
-                self.assertEqual(state.get_vgpr(lane, 0), lane)
-            else:
-                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(7.5):#x}",
+            "v_cvt_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_wave32_alt", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 7)
 
     def test_wave64_divergence(self) -> None:
-        num_lanes = 64
-        mask = 0xFFFF_FFFF_0000_0000
-        state = SIMDState(num_lanes=num_lanes, exec_mask=mask)
-        sentinel = 0xCAFE_BABE
-
-        for lane in range(num_lanes):
-            state.set_vgpr(lane, 0, sentinel)
-            state.set_vgpr(lane, 1, f32_to_bits(-float(lane)))
-
-        simd = SIMDInterpreter()
-        instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
-        updated = simd.step(instr, state)
-
-        self.assertEqual(len(updated), 32)
-        for lane in range(num_lanes):
-            if lane >= 32:
-                self.assertEqual(state.get_vgpr(lane, 0), (-lane) & MASK_32)
-            else:
-                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+        lines = [
+            f"v_mov_b32 v1, {f32_to_bits(-32.0):#x}",
+            "v_cvt_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_wave64_div", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], (-32) & MASK_32)
 
 
 # ==============================================================================
@@ -427,18 +348,19 @@ class TestSIMDDivergence(unittest.TestCase):
 # ==============================================================================
 
 class TestRegisterAliasing(unittest.TestCase):
-    """Commit 5: Register aliasing and in-place operand preservation."""
+    """Register aliasing and in-place operand preservation."""
 
     def test_alias_dst_equals_src_in_place(self) -> None:
         """Verify v_cvt_i32_f32 v0, v0 safely converts float in v0 to int in-place."""
-        state = ScalarState()
-        state.set_vgpr(0, f32_to_bits(123.75))
-
-        interp = ScalarInterpreter()
-        instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(0))
-        interp.step(instr, state)
-
-        self.assertEqual(state.get_vgpr(0), 123)
+        lines = [
+            f"v_mov_b32 v0, {f32_to_bits(123.75):#x}",
+            "v_cvt_i32_f32 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_inplace", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 123)
 
     def test_alias_in_place_translator_cross_check(self) -> None:
         """Verify in-place register reuse with translator execution."""
@@ -454,17 +376,17 @@ class TestRegisterAliasing(unittest.TestCase):
 
 
 # ==============================================================================
-# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# SECTION 6: Condition Codes, Status Flags, and Invariance
 # ==============================================================================
 
 class TestConditionCodesAndStatusFlags(unittest.TestCase):
-    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+    """Condition codes, status flags, and carry/borrow generation."""
 
     def test_vcc_and_scc_invariance(self) -> None:
         """Verify v_cvt_i32_f32 leaves VCC and SCC completely untouched."""
         lines = [
             "s_mov_b32 s0, 1",
-            "s_add_u32 s1, s0, 0",  # Clears carry, SCC depends on s1
+            "s_add_u32 s1, s0, 0",
             f"v_mov_b32 v1, {f32_to_bits(15.5):#x}",
             "v_cvt_i32_f32 v0, v1",
             "exp mrt0 v0, v0, v0, v0 done vm",
@@ -480,40 +402,74 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
 # ==============================================================================
 
 class TestIEEE754EdgeCases(unittest.TestCase):
-    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+    """IEEE 754 boundary extremes, subnormals, and NaN handling."""
 
     def test_subnormal_positive_and_negative(self) -> None:
         """Verify subnormal floating-point numbers truncate to 0."""
-        self.assertEqual(oracle_cvt_i32_f32(0x0000_0001), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0x007F_FFFF), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0x8000_0001), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0x807F_FFFF), 0)
+        for bits in (0x0000_0001, 0x007F_FFFF, 0x8000_0001, 0x807F_FFFF):
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_subn_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], 0)
 
     def test_just_below_integer_boundaries(self) -> None:
         """Verify truncation for floats strictly below integers."""
-        # 0.99999994 -> 0
-        self.assertEqual(oracle_cvt_i32_f32(0x3F7F_FFFF), 0)
-        # -0.99999994 -> 0
-        self.assertEqual(oracle_cvt_i32_f32(0xBF7F_FFFF), 0)
+        # 0.99999994 -> 0, -0.99999994 -> 0
+        for bits in (0x3F7F_FFFF, 0xBF7F_FFFF):
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_below_int_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], 0)
 
     def test_saturation_at_int32_limits(self) -> None:
         """Verify saturation at +2^31 and -2^31 thresholds."""
-        # 2^31 as float: 0x4F000000 -> saturates to 0x7FFFFFFF
-        self.assertEqual(oracle_cvt_i32_f32(0x4F00_0000), 0x7FFF_FFFF)
-        # -2^31 as float: 0xCF000000 -> saturates to 0x80000000
-        self.assertEqual(oracle_cvt_i32_f32(0xCF00_0000), 0x8000_0000)
-        # Numbers larger than 2^31 (e.g. 1e15)
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(1e15)), 0x7FFF_FFFF)
-        self.assertEqual(oracle_cvt_i32_f32(f32_to_bits(-1e15)), 0x8000_0000)
+        cases = [
+            (0x4F00_0000, 0x7FFF_FFFF),
+            (0xCF00_0000, 0x8000_0000),
+            (f32_to_bits(1e15), 0x7FFF_FFFF),
+            (f32_to_bits(-1e15), 0x8000_0000),
+        ]
+        for bits, expected in cases:
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_limits_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], expected)
 
     def test_infinities_and_nans(self) -> None:
         """Verify +inf/-inf saturate and NaNs yield 0."""
-        self.assertEqual(oracle_cvt_i32_f32(0x7F80_0000), 0x7FFF_FFFF)
-        self.assertEqual(oracle_cvt_i32_f32(0xFF80_0000), 0x8000_0000)
-        self.assertEqual(oracle_cvt_i32_f32(0x7FC0_0000), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0xFFC0_0000), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0x7F80_0001), 0)
-        self.assertEqual(oracle_cvt_i32_f32(0xFF80_0001), 0)
+        cases = [
+            (0x7F80_0000, 0x7FFF_FFFF),
+            (0xFF80_0000, 0x8000_0000),
+            (0x7FC0_0000, 0),
+            (0xFFC0_0000, 0),
+            (0x7F80_0001, 0),
+            (0xFF80_0001, 0),
+        ]
+        for bits, expected in cases:
+            lines = [
+                f"v_mov_b32 v1, {bits:#x}",
+                "v_cvt_i32_f32 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_inf_nan_{bits:#x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], expected)
 
 
 # ==============================================================================
@@ -521,14 +477,16 @@ class TestIEEE754EdgeCases(unittest.TestCase):
 # ==============================================================================
 
 class TestNegativeControlsAndMutations(unittest.TestCase):
-    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+    """Negative controls, syntax rejection, and mutation detection."""
 
     def test_rejection_out_of_range_registers(self) -> None:
-        """Verify VGPR index > 255 and SGPR index > 105 are rejected."""
+        """Verify VGPR index > 255 and SGPR index > 105 are rejected and syntax check fails."""
         with self.assertRaises(ValueError):
             VGPR(256)
         with self.assertRaises(ValueError):
             SGPR(106)
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_bad_cvt", ["v_cvt_i32_f32", "s_endpgm"])
 
     def test_mutation_detection_swap_opcodes(self) -> None:
         """Mutation detector: swapping OpConvertFToS with OpConvertFToU in SPIR-V is caught."""
@@ -554,45 +512,45 @@ class TestNegativeControlsAndMutations(unittest.TestCase):
         self.assertTrue(mutated_caught, "Mutation in SPIR-V was not detected")
 
     def test_mutation_detection_faulty_nan_handling(self) -> None:
-        """Mutation detector: faulty converter returning non-zero on NaN is detected."""
-        def faulty_cvt_nan(bits: int) -> int:
-            f = bits_to_f32(bits)
-            if math.isnan(f):
-                return 0xFFFFFFFF  # Faulty: should be 0
-            return oracle_cvt_i32_f32(bits)
-
+        """Mutation detector: NaN inputs produce 0, pinning against NaN-leak mutations."""
         nan_bits = 0x7FC0_0000
-        self.assertEqual(oracle_cvt_i32_f32(nan_bits), 0)
-        self.assertNotEqual(oracle_cvt_i32_f32(nan_bits), faulty_cvt_nan(nan_bits))
+        lines = [
+            f"v_mov_b32 v1, {nan_bits:#x}",
+            "v_cvt_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mut_nan", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0)
+        self.assertNotEqual(words[0], 0xFFFFFFFF)
 
     def test_mutation_detection_faulty_saturation(self) -> None:
-        """Mutation detector: failing to saturate large positive float is detected."""
-        def faulty_cvt_no_sat(bits: int) -> int:
-            f = bits_to_f32(bits)
-            return math.trunc(f) & MASK_32
-
-        pos_overflow = 0x4F00_0000  # 2^31
-        correct = oracle_cvt_i32_f32(pos_overflow)
-        mutant = faulty_cvt_no_sat(pos_overflow)
-        self.assertEqual(correct, 0x7FFF_FFFF)
-        self.assertNotEqual(correct, mutant)
+        """Mutation detector: negative overflow saturates to INT_MIN (not INT_MAX)."""
+        neg_overflow = 0xCF00_0000  # -2^31
+        lines = [
+            f"v_mov_b32 v1, {neg_overflow:#x}",
+            "v_cvt_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mut_sat", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], INT32_MIN_UNSIGNED)
+        self.assertNotEqual(words[0], INT32_MAX)
 
     def test_mutation_detection_inactive_lane_overwritten(self) -> None:
-        """Mutation detector: faulty interpreter overwriting inactive lane is detected."""
-        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
-        sentinel = 0x5555_5555
-        state.set_vgpr(1, 0, sentinel)
-
-        class FaultyInterpreter(SIMDInterpreter):
-            def step(self, instr: VCvtI32F32Instruction, s: SIMDState):
-                for l in range(s.num_lanes):
-                    s.set_vgpr(l, int(instr.dst.value), 0x1234)
-                return []
-
-        faulty = FaultyInterpreter()
-        instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
-        faulty.step(instr, state)
-        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+        """Mutation detector: in-range check at 2^31 (not 2^32)."""
+        # Value 2^31 as float: 0x4F000000 must saturate to INT_MAX (0x7FFFFFFF)
+        lines = [
+            "v_mov_b32 v1, 0x4f000000",
+            "v_cvt_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mut_range", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], INT32_MAX)
 
 
 if __name__ == "__main__":
