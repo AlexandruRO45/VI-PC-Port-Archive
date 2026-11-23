@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
@@ -2543,11 +2544,17 @@ def _invoke_stage(name: str, fn) -> None:
         except SystemExit as e:
             if e.code in (0, None):
                 return
+            # A non-zero SystemExit comes from fail(), which has already printed the error line.
             raise RuntimeError(f"stage exited with {e.code}") from e
         except Exception as e:
             detail = " ".join(str(e).splitlines())
+            frames = traceback.extract_tb(e.__traceback__)
+            where = ""
+            if frames:
+                last = frames[-1]
+                where = f" (at {os.path.basename(last.filename)}:{last.lineno} in {last.name})"
             try:
-                fail(f"{name} stage failed: {type(e).__name__}: {detail}")
+                fail(f"{name} stage failed: {type(e).__name__}: {detail}{where}")
             except SystemExit:
                 pass
             raise RuntimeError(f"stage {name} raised {type(e).__name__}") from e

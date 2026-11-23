@@ -349,38 +349,82 @@ class SerialOverlapTest(unittest.TestCase):
         self.assertIn("start-pipelines", order)
         self.assertLess(order.index("end-runtime"), order.index("start-pipelines"))
 
-    def test_stage_exception_is_reported_before_exit(self):
-        """A stage raising something other than fail()/SystemExit must print an error, not exit 1 silently."""
+    def _run_failing_assets(self, assets_effect, overlap):
+        """Run shaders, assets and runtime (in series or in parallel) with assets failing as `assets_effect` does.
+        Returns (exit code, captured stderr)."""
         import io
 
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "g")
+            os.makedirs(game)
+            err = io.StringIO()
+            with mock.patch.object(make_game, "shaders"), \
+                    mock.patch.object(make_game, "assets", side_effect=assets_effect), \
+                    mock.patch.object(make_game, "runtime"), \
+                    mock.patch.object(make_game, "log"), \
+                    mock.patch.object(leonida_tui, "current_board", return_value=None), \
+                    mock.patch.object(sys, "stderr", err):
+                with self.assertRaises(SystemExit) as cm:
+                    make_game.run_build_stages(
+                        ["shaders", "assets", "runtime"],
+                        game=game, work=os.path.join(tmp, "w"), out=os.path.join(tmp, "o"), v={},
+                        wav=False, jobs=2, runtime_build=None, emulate=False, keep_emulated=True,
+                        fallbacks=(), overlap=overlap)
+        return cm.exception.code, err.getvalue()
+
+    @staticmethod
+    def _error_lines(text):
+        return [line for line in text.splitlines() if "ERROR:" in line]
+
+    def test_stage_exception_is_reported_before_exit(self):
+        """A stage raising something other than fail()/SystemExit must print one error line with where it was
+        raised, not exit 1 silently."""
         denied = os.path.join("some", "dir", "locked.bin")
 
         def boom(*a, **k):
             raise PermissionError(13, "Permission denied", denied)
 
+        raise_line = boom.__code__.co_firstlineno + 1
         for overlap in (False, True):
-            with self.subTest(overlap=overlap), tempfile.TemporaryDirectory() as tmp:
-                game = os.path.join(tmp, "g")
-                os.makedirs(game)
-                err = io.StringIO()
-                with mock.patch.object(make_game, "shaders"), \
-                        mock.patch.object(make_game, "assets", side_effect=boom), \
-                        mock.patch.object(make_game, "runtime"), \
-                        mock.patch.object(make_game, "log"), \
-                        mock.patch.object(leonida_tui, "current_board", return_value=None), \
-                        mock.patch.object(sys, "stderr", err):
-                    with self.assertRaises(SystemExit) as cm:
-                        make_game.run_build_stages(
-                            ["shaders", "assets", "runtime"],
-                            game=game, work=os.path.join(tmp, "w"), out=os.path.join(tmp, "o"), v={},
-                            wav=False, jobs=2, runtime_build=None, emulate=False, keep_emulated=True,
-                            fallbacks=(), overlap=overlap)
-                self.assertEqual(cm.exception.code, 1)
-                text = err.getvalue()
-                self.assertIn("ERROR:", text)
-                self.assertIn("assets", text)
-                self.assertIn("PermissionError", text)
-                self.assertIn("locked.bin", text)
+            with self.subTest(overlap=overlap):
+                code, text = self._run_failing_assets(boom, overlap)
+                self.assertEqual(code, 1)
+                lines = self._error_lines(text)
+                self.assertEqual(len(lines), 1, text)
+                line = lines[0]
+                self.assertIn("assets", line)
+                self.assertIn("PermissionError", line)
+                self.assertIn("locked.bin", line)
+                self.assertIn(f"(at {os.path.basename(__file__)}:{raise_line} in boom)", line)
+
+    def test_stage_fail_reports_one_error_line(self):
+        """A stage that calls fail() has printed its message already: no second ERROR line, exit code 1."""
+        def stop(*a, **k):
+            make_game.fail("no space left for the assets")
+
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                code, text = self._run_failing_assets(stop, overlap)
+                self.assertEqual(code, 1)
+                lines = self._error_lines(text)
+                self.assertEqual(len(lines), 1, text)
+                self.assertIn("no space left for the assets", lines[0])
+
+    def test_stage_output_then_exception_reports_one_error_line(self):
+        """Output printed by a stage before it raises does not hide or duplicate the error line."""
+        def chatty(*a, **k):
+            print("assets: 3 of 10 archives done", file=sys.stderr)
+            raise ValueError("bad entry\nin archive")
+
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                code, text = self._run_failing_assets(chatty, overlap)
+                self.assertEqual(code, 1)
+                self.assertIn("assets: 3 of 10 archives done", text)
+                lines = self._error_lines(text)
+                self.assertEqual(len(lines), 1, text)
+                self.assertIn("ValueError: bad entry in archive", lines[0])
+                self.assertIn("in chatty)", lines[0])
 
 
 class SetupDefaultsTest(unittest.TestCase):
