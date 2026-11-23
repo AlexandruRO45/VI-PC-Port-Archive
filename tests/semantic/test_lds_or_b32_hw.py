@@ -581,5 +581,108 @@ class TestLdsOrB32BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(1023 * 4), 0x30)
 
 
+# ---------------------------------------------------------------------------
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ---------------------------------------------------------------------------
+
+class TestLdsOrB32NegativeControls(unittest.TestCase):
+    """Negative controls and syntax rejection tests for ds_or_b32."""
+
+    def test_invalid_vaddr_kind_and_count(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(Opcode.DS_OR_B32, Register(RegKind.SGPR, 0), Register(RegKind.VGPR, 1))
+        with self.assertRaises(ValueError):
+            Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0, count=2), Register(RegKind.VGPR, 1))
+
+    def test_invalid_vdata_kind_and_count(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.SGPR, 1))
+        with self.assertRaises(ValueError):
+            Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1, count=2))
+
+    def test_invalid_offset_range(self) -> None:
+        with self.assertRaises(ValueError):
+            LdsModifiers(offset=-1)
+        with self.assertRaises(ValueError):
+            LdsModifiers(offset=65536)
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDLdsWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDLdsWavefrontInterpreter(wave_size=128)
+
+    def test_register_bounds_scalar_interpreter(self) -> None:
+        interp = ScalarLdsInterpreter(size_dwords=1024)
+        with self.assertRaises(IndexError):
+            interp.read_vgpr(-1)
+        with self.assertRaises(IndexError):
+            interp.read_vgpr(256)
+        with self.assertRaises(IndexError):
+            interp.write_vgpr(-1, 0)
+        with self.assertRaises(IndexError):
+            interp.write_vgpr(256, 0)
+
+
+class TestLdsOrB32MutationDetection(unittest.TestCase):
+    """Tests ensuring mutation kill for common semantic implementation errors."""
+
+    def test_mutant_and_instead_of_or_killed(self) -> None:
+        # A mutant computing bitwise AND instead of OR must be rejected
+        self.assertNotEqual(ref_ds_or_b32(0xF0, 0x0F), 0xF0 & 0x0F)
+        self.assertEqual(ref_ds_or_b32(0xF0, 0x0F), 0xFF)
+
+    def test_mutant_xor_instead_of_or_killed(self) -> None:
+        # A mutant computing bitwise XOR instead of OR must be rejected
+        self.assertNotEqual(ref_ds_or_b32(0xFF, 0xFF), 0xFF ^ 0xFF)
+        self.assertEqual(ref_ds_or_b32(0xFF, 0xFF), 0xFF)
+
+    def test_mutant_inactive_lane_leak_killed(self) -> None:
+        simd = SIMDLdsWavefrontInterpreter(wave_size=32, size_dwords=1024)
+        simd.lds.write_dword(0, 0x10)
+        simd.lds.write_dword(4, 0x20)
+
+        # Enable only lane 0; lane 1 is inactive
+        simd.set_exec_mask(0x1)
+
+        simd.write_lane_vgpr(0, 0, 0)     # vaddr lane 0 = 0
+        simd.write_lane_vgpr(0, 1, 0x01)  # vdata lane 0 = 0x01
+        simd.write_lane_vgpr(1, 0, 4)     # vaddr lane 1 = 4
+        simd.write_lane_vgpr(1, 1, 0x02)  # vdata lane 1 = 0x02
+
+        inst = Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        simd.step(inst)
+
+        # Lane 0 active: 0x10 | 0x01 = 0x11
+        self.assertEqual(simd.lds.read_dword(0), 0x11)
+        # Lane 1 inactive: must remain untouched 0x20
+        self.assertEqual(simd.lds.read_dword(4), 0x20)
+
+
+class TestLdsOrB32TranslationAndExecution(unittest.TestCase):
+    """End-to-end SPIR-V translation and execution under support and spirv_mini_interp."""
+
+    def test_translator_ds_or_b32_basic(self) -> None:
+        if support is None or rdna2spirv is None or lds_run is None:
+            self.skipTest("support/rdna2spirv/lds_run not available in this Python environment")
+
+        asm = [
+            "v_mov_b32_e32 v0, 0x10",
+            "v_mov_b32_e32 v1, 0x0F",
+            "ds_or_b32 v0, v1",
+            "s_endpgm",
+        ]
+        spvasm = support.translate_lines("cs_lds_or_b32_basic", asm, fssm=lds_run.fssm())
+        self.assertIn("OpAtomicOr", spvasm)
+
+    def test_execution_ds_or_b32_chain(self) -> None:
+        if support is None or rdna2spirv is None or lds_run is None:
+            self.skipTest("support/rdna2spirv/lds_run not available in this Python environment")
+
+        # Initialize LDS byte 0x20 with 0xF0, then execute ds_or_b32 with 0x0F
+        rets, mem = lds_run.run_chain([("ds_or_b32", 0x20, 0, [0x0F])], {0x20: 0xF0})
+        self.assertEqual(mem[0x20], 0xFF)
+
+
 if __name__ == "__main__":
     unittest.main()
