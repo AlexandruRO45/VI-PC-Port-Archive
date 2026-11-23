@@ -128,6 +128,11 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
+Not sure your PC is up to it? `python -I tools/pc_checker.py` compares this PC's CPU, GPU and RAM with two reference
+profiles (an Xbox Series X and a community 1080p-Low estimate) and names the weakest part; `--cli` prints the same
+without the window, and `--check` returns the verdict as an exit code (0 good, 1 weak, 2 unknown). It reads no game
+files. The scores are rough relative estimates made for this tool, not benchmarks.
+
 **Low disk space:** the ~400 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
 needs about 30 GB; the `assets` stage (~370 GB) is only for the asset tools, and `--wav` adds several times the
 Ogg Opus size (the preflight prints this choice when the assets stage is what does not fit). `--work` and `--out`
