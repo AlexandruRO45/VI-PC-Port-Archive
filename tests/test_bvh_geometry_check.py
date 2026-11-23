@@ -49,6 +49,16 @@ class TestChecks(unittest.TestCase):
         self.assertEqual(r["leaves_outside"], 0)
         self.assertFalse(r["consistent"])
 
+    def test_nan_leaf_bounds_are_counted_outside_and_inconsistent(self):
+        # Leaf 0 matches BOUNDS; leaf 1 has NaN x-coordinates so its rehydrated bounds contain NaN.
+        vb_nan = VB + struct.pack("<9f", float("nan"), 0, 0, float("nan"), 0, 0, float("nan"), 0, 0)
+        ib_nan = IB + struct.pack("<3I", 4, 5, 6)
+        geom = R.Geometry(vb_nan, indices=ib_nan)
+        src, _, _ = build([(0, 0x81, 0, 1, 0x09), (0, 0x01, 2, None, 0x09)], bounds=BOUNDS)
+        r = C.check(src, [geom])
+        self.assertEqual(r["leaves_outside"], 1)
+        self.assertFalse(r["consistent"])
+
     def test_reindexed_geometry_fails_pairs_without_positions(self):
         # same triangles count, but the second one no longer shares an edge with the first
         src, _, _ = build(LEAVES, bounds=BOUNDS)

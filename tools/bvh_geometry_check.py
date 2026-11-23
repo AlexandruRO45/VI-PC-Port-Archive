@@ -49,16 +49,25 @@ def check_bounds(hdr, out):
     lo, hi = hdr.bounds[:3], hdr.bounds[3:]
     corners = [frame.apply((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]
     box = [min(c[a] for c in corners) for a in range(3)] + [max(c[a] for c in corners) for a in range(3)]
-    extent = max(max(box[a + 3] - box[a] for a in range(3)), 1e-30)
+    box_finite = all(math.isfinite(v) for v in box)
+    extent = max(max(box[a + 3] - box[a] for a in range(3)), 1e-30) if box_finite else 1e-30
     union = [math.inf] * 3 + [-math.inf] * 3
     outside = 0
     for off in leaf_offsets(hdr):
         b = R.node_bounds(out, (off >> 6) << 3 | R.TRI0)
+        if not box_finite or not all(math.isfinite(v) for v in b):
+            outside += 1
+            continue
         if max([box[a] - b[a] for a in range(3)] + [b[a] - box[a] for a in range(3, 6)]) > OUTSIDE_TOLERANCE * extent:
             outside += 1
         for a in range(3):
             union[a], union[a + 3] = min(union[a], b[a]), max(union[a + 3], b[a + 3])
-    gap = max(abs(union[a] - box[a]) for a in range(6)) / extent if hdr.num_elements else 0.0
+    if not hdr.num_elements:
+        gap = 0.0
+    elif not box_finite or not all(math.isfinite(v) for v in union):
+        gap = math.inf
+    else:
+        gap = max(abs(union[a] - box[a]) for a in range(6)) / extent
     return outside, gap
 
 
