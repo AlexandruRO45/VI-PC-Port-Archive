@@ -471,6 +471,18 @@ class TestVRsqF16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & MASK16, 0x3800)
 
+def ref_v_sqrt_f16(u: int) -> int:
+    f = u16_to_f16(u)
+    return f16_to_u16(math.sqrt(f))
+
+GLOBAL_ORACLE_MAP[Opcode.V_SQRT_F16] = ref_v_sqrt_f16
+
+
+class TestVSqrtF16Oracle(unittest.TestCase):
+    def test_oracle_truth_table(self) -> None:
+        res = ref_v_sqrt_f16(0x4400)
+        self.assertEqual(res, 0x4000)
+
 
 if __name__ == "__main__":
     unittest.main()
