@@ -16,6 +16,7 @@ OpEntryPoint Fragment %main "main" %out
 %float = OpTypeFloat 32
 %bool = OpTypeBool
 %v2float = OpTypeVector %float 2
+%v2uint = OpTypeVector %uint 2
 %_ptr_Output_uint = OpTypePointer Output %uint
 %out = OpVariable %_ptr_Output_uint Output
 %c0 = OpConstant %uint 0
@@ -30,6 +31,10 @@ OpEntryPoint Fragment %main "main" %out
 %cInf = OpConstant %uint 2139095040
 %c80 = OpConstant %uint 128
 %ch = OpConstant %uint 1073757184
+%c3 = OpConstant %uint 3
+%c5 = OpConstant %uint 5
+%c7 = OpConstant %uint 7
+%c9 = OpConstant %uint 9
 %f1 = OpConstant %float 1
 %f2 = OpConstant %float 2
 %f3 = OpConstant %float 3
@@ -58,6 +63,12 @@ FOOTER = "OpReturn\nOpFunctionEnd\n"
 def run_word(body):
     """Run `body` (instructions that must define %res as a uint) and return the word stored to %out."""
     return si.run_fragment(HEADER + body + "OpStore %out %res\n" + FOOTER)["%out"][0]
+
+
+def vector_words(prelude, inst):
+    """Run an instruction defining a %v2uint %r and return both of its components."""
+    body = prelude + inst
+    return tuple(run_word(f"{body}%res = OpCompositeExtract %uint %r {i}\n") for i in (0, 1))
 
 
 class InterpreterTests(unittest.TestCase):
@@ -89,6 +100,37 @@ class InterpreterTests(unittest.TestCase):
     def test_signed_unsigned_min_max(self):
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl SMax %cFF %c1\n"), 1)        # -1 vs 1 signed
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl UMin %cFF %c1\n"), 1)        # 2^32-1 vs 1 unsigned
+
+    def test_vector_umin_is_component_wise(self):
+        # GLSL.std.450 UMin (instruction 38): integer vectors are compared per component.
+        pair = ("%a = OpCompositeConstruct %v2uint %cFF %c1\n"
+                "%b = OpCompositeConstruct %v2uint %c1 %cFF\n")
+        self.assertEqual(vector_words(pair, "%r = OpExtInst %v2uint %glsl UMin %a %b\n"), (1, 1))
+        distinct = ("%a = OpCompositeConstruct %v2uint %c5 %c1\n"
+                    "%b = OpCompositeConstruct %v2uint %c3 %c9\n")
+        self.assertEqual(vector_words(distinct, "%r = OpExtInst %v2uint %glsl UMin %a %b\n"), (3, 1))
+
+    def test_vector_umax_is_component_wise(self):
+        # GLSL.std.450 UMax (instruction 41): the second components are (1, 0xFFFFFFFF), so 0xFFFFFFFF wins.
+        pair = ("%a = OpCompositeConstruct %v2uint %cFF %c1\n"
+                "%b = OpCompositeConstruct %v2uint %c1 %cFF\n")
+        self.assertEqual(vector_words(pair, "%r = OpExtInst %v2uint %glsl UMax %a %b\n"),
+                         (0xFFFFFFFF, 0xFFFFFFFF))
+        distinct = ("%a = OpCompositeConstruct %v2uint %c5 %c1\n"
+                    "%b = OpCompositeConstruct %v2uint %c3 %c9\n")
+        self.assertEqual(vector_words(distinct, "%r = OpExtInst %v2uint %glsl UMax %a %b\n"), (5, 9))
+
+    def test_scalar_umax_and_uclamp_still_take_the_scalar_path(self):
+        # The vector-only early branch must not change scalar GLSL std.450 UMax/UClamp.
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl UMax %cFF %c1\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl UClamp %c2 %c1 %c3\n"), 2)
+
+    def test_vector_uclamp_is_component_wise(self):
+        # GLSL.std.450 UClamp (instruction 44): component 1 is clamp(1, 2, 3) = 2, a crossed operand case.
+        clamp = ("%x = OpCompositeConstruct %v2uint %c5 %c1\n"
+                 "%lo = OpCompositeConstruct %v2uint %c1 %c2\n"
+                 "%hi = OpCompositeConstruct %v2uint %c7 %c3\n")
+        self.assertEqual(vector_words(clamp, "%r = OpExtInst %v2uint %glsl UClamp %x %lo %hi\n"), (5, 2))
 
     def test_integer_ops_wrap(self):
         self.assertEqual(run_word("%res = OpIAdd %uint %cFF %c2\n"), 1)

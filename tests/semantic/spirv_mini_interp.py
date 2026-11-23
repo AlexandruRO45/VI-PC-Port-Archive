@@ -1035,6 +1035,21 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if len(a) < 3 or a[1] != "%glsl":
                 raise UnsupportedConstruct("extended instruction set")
             name, args = a[2], [val(x) for x in a[3:]]
+            if name in ("UMin", "UMax", "UClamp") and all(isinstance(v, tuple) for v in args):
+                # GLSL.std.450 instructions 38/41/44: these take integer vectors and compute per component.
+                # Handle vector operands here, before the scalar branches, leaving the signed variants and
+                # their signedness keys untouched.
+                def unsigned_component(*c):
+                    if name == "UMin":
+                        return min(c)
+                    if name == "UMax":
+                        return max(c)
+                    x, lo, hi = c
+                    if lo > hi:
+                        raise UnsupportedConstruct(f"GLSL.std.450 {name} with minVal > maxVal (undefined)")
+                    return min(max(x, lo), hi)
+                values[res] = tuple(unsigned_component(*c) for c in zip(*args))
+                continue
             if name == "UnpackHalf2x16":
                 values[res] = (half_to_float(args[0]), half_to_float(args[0] >> 16))
             elif name == "PackHalf2x16":
