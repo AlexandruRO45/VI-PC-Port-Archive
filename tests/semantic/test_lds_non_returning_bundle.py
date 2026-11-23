@@ -390,6 +390,24 @@ class TestLdsIncU32BoundariesAndNegative(unittest.TestCase):
         with self.assertRaises(Exception):
             L.translate(["ds_inc_u32_bad_opcode v0, v1"])
 
+class TestLdsDecU32Reference(unittest.TestCase):
+    def test_dec_stepping_above_zero(self):
+        rtns, fin = L.run_chain([("ds_dec_u32", 0x40, 0, (10,))], {0x40: 5})
+        self.assertEqual(fin[0x40], 4)
+
+    def test_dec_wrapping_at_zero(self):
+        rtns, fin = L.run_chain([("ds_dec_u32", 0x40, 0, (10,))], {0x40: 0})
+        self.assertEqual(fin[0x40], 10)
+
+    def test_dec_clamping_above_threshold(self):
+        rtns, fin = L.run_chain([("ds_dec_u32", 0x40, 0, (10,))], {0x40: 25})
+        self.assertEqual(fin[0x40], 10)
+
+    def test_non_returning_preserves_dst_sentinel(self):
+        rtns, fin = L.run_chain([("ds_dec_u32", 0x40, 0, (10,))], {0x40: 5})
+        self.assertEqual(rtns, [0xDEAD])
+        self.assertEqual(fin[0x40], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
