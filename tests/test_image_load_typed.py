@@ -77,6 +77,14 @@ class Module:
             if m:
                 self.order.append((None, m.group(1), m.group(2).split()))
 
+    def through_phis(self, x):
+        """The id that x's value reaches through the OpPhis it is an incoming value of (x itself if none)."""
+        while True:
+            nxt = next((r for r, op, args in self.order if op == "OpPhi" and x in args[1::2]), None)
+            if nxt is None:
+                return x
+            x = nxt
+
     def fetches(self):
         """(result id, image variable, OpTypeImage operands) of every OpImageFetch."""
         out = []
@@ -265,12 +273,18 @@ class LoadOnlyShaders(unittest.TestCase):
 
     def test_only_the_dmask_components_are_written(self):
         m = Module(load_shader("2D", dmask=0x9))
+        finals = set()
         for rid, _, _ in m.fetches():
             uses = [args for _, op, args in m.order if op == "OpBitcast" and rid in args]
             self.assertEqual(len(uses), 1)
-            bits = next(r for r, op, args in m.order if op == "OpBitcast" and args[1] == rid)
+            own = next(r for r, op, args in m.order if op == "OpBitcast" and args[1] == rid)
+            bits = m.through_phis(own)
             comps = sorted(int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits)
             self.assertEqual(comps, [0, 3], "dmask 0x9: R into v0, A into v1")
+            # Without d16 a branch's bits are only merged, never extracted there: the writes come once, after it.
+            self.assertEqual([a for _, op, a in m.order if op == "OpCompositeExtract" and a[1] == own], [])
+            finals.add(bits)
+        self.assertEqual(len(finals), 1, "the three typed fetches meet in one value")
 
     def test_d16_odd_dmask_preserves_trailing_vgpr_high_half(self):
         # Odd component counts (1 or 3) must keep the trailing destination VGPR's high 16 bits via write_lo16

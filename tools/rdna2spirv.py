@@ -11271,33 +11271,41 @@ class Gen:
                     self.emit(f"{w} = OpBitwiseOr %uint {xs[i]} {hi}")
                 self.dst(dest, w)
 
-        def read_integer(cls, ty):
-            im = view(cls)
+        def read_class(cls, ty):
+            """The four components of the view of class cls as a %v4uint_st, and the block that computed them. With
+            d16 they're written here, since the packing depends on the class; otherwise once, after the merge."""
             b = self.tmp()
-            r = read(im, cls, ty)
+            r = read(view(cls), cls, ty)
             self.emit(f"{b} = OpBitcast %v4uint_st {r}")
-            write(b, cls)
+            if d16:
+                write(b, cls)
+            return b, self.current_label_placeholder()
 
         self.emit(f"OpSelectionMerge {L['e2']} None")
         self.emit(f"OpBranchConditional {use_s} {L['s']} {L['rest']}")
         self.emit(f"{L['s']} = OpLabel")
-        read_integer(2, "%v4int_st")
+        bs, ls = read_class(2, "%v4int_st")
         self.emit(f"OpBranch {L['e2']}")
         self.emit(f"{L['rest']} = OpLabel")
         self.emit(f"OpSelectionMerge {L['e3']} None")
         self.emit(f"OpBranchConditional {use_u} {L['u']} {L['f']}")
         self.emit(f"{L['u']} = OpLabel")
-        read_integer(1, "%v4uint_st")
+        bu, lu = read_class(1, "%v4uint_st")
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
-        res = read(view(0), 0, "%v4float")
-        b = self.tmp()
-        self.emit(f"{b} = OpBitcast %v4uint_st {res}")
-        write(b, 0)
+        bf, lf = read_class(0, "%v4float")
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['e3']} = OpLabel")
+        if not d16:
+            # Without d16 the three classes write their bits the same way, so the branches only pick the bits: one
+            # set of extracts and EXEC-masked register writes instead of three.
+            b3, b2 = self.tmp(), self.tmp()
+            self.emit(f"{b3} = OpPhi %v4uint_st {bu} {lu} {bf} {lf}")
         self.emit(f"OpBranch {L['e2']}")
         self.emit(f"{L['e2']} = OpLabel")
+        if not d16:
+            self.emit(f"{b2} = OpPhi %v4uint_st {bs} {ls} {b3} {L['e3']}")
+            write(b2, None)
 
     def unpack_image_a16_uints(self, words: list[str]) -> list[str]:
         """Unpack the unsigned address components of a samplerless MIMG instruction, low half first."""
