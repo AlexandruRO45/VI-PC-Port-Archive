@@ -1993,6 +1993,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # Held sparse mappings must preserve the next submission's timeline waits (CPU mock).
+    add_executable(vk_sparse_queue_order_test test/vk_sparse_queue_order_test.cpp)
+    target_link_libraries(vk_sparse_queue_order_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(vk_sparse_queue_order_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME vk_sparse_queue_order COMMAND vk_sparse_queue_order_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)

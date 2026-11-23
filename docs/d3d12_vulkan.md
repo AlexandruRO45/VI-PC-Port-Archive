@@ -1921,7 +1921,9 @@ The trace will enumerate them.
     Sequential, NULL, SKIP and single-tile reuse ranges are supported. Queue timeline waits order binding between
     ordinary submissions, and the previous heap allocation is retained until an in-flight unbind completes.
     `CopyTiles` copies 64 KiB tiles between sparse buffers and linear buffers in either explicit direction.
-    `d3d12_buffer_tiles_test` compares three full readbacks with native D3D12, including a fence-gated queue.
+    `d3d12_buffer_tiles_test` compares three full readbacks with native D3D12 and covers remapping behind a
+    fence-gated copy batch. Deferred `CopyTileMappings` reads the source mapping at its position in the queue
+    so it observes earlier mapping operations (section 4.4).
   - Drivers that exclude the host-visible arena memory type from sparse buffers (including NVIDIA 621.01 on the
     RTX 3090) use a dedicated device-local allocation per heap for its tiles. A heap with this dedicated backing
     cannot mix placed buffers and sparse mappings. Sparse mapping and `CopyTiles` for reserved textures are open.
@@ -2164,7 +2166,11 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   value counts), which is not the completed value. A queue that is asked to run a batch (or a `Signal`) while a
   `Wait` it carries names a value above that, or while an earlier batch of the queue is held, copies the lists
   (`CommandList` is a value; the application may `Reset` its list at once) and holds the operation. Everything the
-  queue is asked to do after it (batches, Signals, queue markers) goes behind it, so per-queue order is kept.
+  queue is asked to do after it (batches, Signals, reserved-buffer tile mappings and queue markers) goes behind
+  it, so per-queue order is kept. A mapping can also be the first operation held by a Wait. It owns its input
+  ranges and retains the involved sparse buffers and the heap backing until release. If a mapping submits no
+  bind, its waits carry over to the next submission. `vk_sparse_queue_order_test` checks this with a producer
+  signal that has been submitted but has not reached the requested value.
   The held operations are recorded and submitted, in order, on their own `VkQueue` as soon as the Signals they wait for
   have been submitted: by the thread that submits that Signal, after it has released its own queue's lock (or by the
   thread of a CPU `Signal`). There is no worker thread and no caller ever waits for the GPU or for a Signal: the cost
@@ -2181,9 +2187,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   others; a fence released while operations wait for it drops them and says so; a Signal value that is not above
   the fence's (Vulkan timelines only increase) is still dropped with a note, as before. Failures of a held
   `ExecuteCommandLists` (what the call would have returned) are printed when it is released, not returned from the
-  call. Not covered: sparse `UpdateTileMappings` while a queue holds work still submits at once, and the resources a
-  held batch names must stay alive until its fence signals (the layer does not pin them; the deferred-destruction
-  tickets only know submitted work, D3D-203). Facts from vkd3d-proton (LGPL, approach only, nothing copied): it keeps
+  call. The application must keep resources named in a held command list alive until its fence signals. The
+  deferred-destruction tickets track submitted work (D3D-203). Facts from vkd3d-proton (LGPL, approach only,
+  nothing copied): it keeps
   a CPU-side virtual value and pending signals per fence and blocks the queue's submission thread until a signal that
   satisfies a wait has been submitted, so Vulkan never sees a wait without a submitted signal; a satisfied wait stays
   satisfied. It also maps virtual fence values to physical timeline values so a D3D12 `Signal` of a lower value works;
