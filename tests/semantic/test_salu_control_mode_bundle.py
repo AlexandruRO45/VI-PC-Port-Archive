@@ -148,6 +148,17 @@ class TestDenormModeOracle(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("cs_denorm_oracle", prog, fssm=saveexec_run.fssm())
 
+class TestDenormModeAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        modes = model_denorm_mode(15)
+        self.assertEqual(modes["fp32"], 3)
+        self.assertEqual(modes["fp16_64"], 3)
+
+    def test_translator_denorm_mode_ast(self):
+        prog = ["s_denorm_mode 15", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("cs_denorm_ast", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
