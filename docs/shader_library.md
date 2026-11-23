@@ -118,7 +118,8 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
 * `--carve` names each program's source shaders. It copies the first source container to `<name>.dxbc`, because
   the translator reads the stage's signatures and `PSV0` from there. Pipeline compilation keeps the D3D12 stage
   interface.
-* `--save` writes the reassembled library. A saved file is also accepted as input.
+* `--save` writes the reassembled library. A saved file is also accepted as input; a `--save` that names the
+  input is refused, because it would replace the archive with the smaller library taken from it.
 * `--stages` limits the output to some stages.
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
