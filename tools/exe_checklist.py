@@ -4,8 +4,9 @@
 
 The runtime and the docs mark what was written without the executable: `// ASSUMPTION ...` or `// ... UNVERIFIED`
 comments in runtime/src and runtime/shims (C++), and `**VERIFY:**`, `**ASSUMPTION:**` or `**UNVERIFIED:**` notes in
-docs/*.md. This collects them with their file and line, the whole comment block or list item each starts, so the
-first look at the executable (scripts/first_look.ps1) has one list to work through.
+docs/*.md, in any case (the prose spelling `**Assumption**`, `**Unverified:**` counts too; a bold term followed by
+a dash defines it and is not a note). This collects them with their file and line, the whole comment block or list
+item each starts, so the first look at the executable (scripts/first_look.ps1) has one list to work through.
 
 --gdk-calls takes gdk_runtime_calls.py's JSON for the executable (its --out file or its --json output, one image or
 several). A shim note then says whether the executable calls a runtime class that file serves: "called" items are
@@ -31,7 +32,11 @@ DEFAULT_ROOT = os.path.normpath(os.path.join(HERE, ".."))
 SOURCE_DIRS = ("runtime/src", "runtime/shims")
 SOURCE_EXTS = (".cpp", ".h", ".hpp", ".inl")
 CODE_MARK = re.compile(r"\b(ASSUMPTION|UNVERIFIED)\b")
-DOC_MARK = re.compile(r"\*\*(VERIFY|ASSUMPTION|UNVERIFIED)\b[^*]*:?\*\*")
+# The docs spell the marker in caps (`**VERIFY:**`) and in prose (`**Assumption**`, `**Unverified:**`, `**Assumptions
+# to confirm:**`); all of them are notes.
+DOC_MARK = re.compile(r"\*\*(VERIFY|ASSUMPTION|UNVERIFIED)S?\b[^*]*:?\*\*", re.IGNORECASE)
+# A bold marker followed by a dash defines the term (`- **Assumption** — a design choice ...`), it is not a note.
+DEFINITION = re.compile(r"[\u2014\u2013-]\s")
 
 
 def comment_text(line: str) -> str | None:
@@ -42,7 +47,7 @@ def comment_text(line: str) -> str | None:
 
 def without_marker(text: str) -> str:
     """The note without its leading marker word ("ASSUMPTION: x" -> "x"), which the list already shows."""
-    return re.sub(r"^\**\s*(ASSUMPTION|UNVERIFIED|VERIFY)\b[^:]*:\**\s*", "", text, count=1)
+    return re.sub(r"^\**\s*(ASSUMPTION|UNVERIFIED|VERIFY)S?\b[^:]*:\**\s*", "", text, count=1, flags=re.IGNORECASE)
 
 
 def code_notes(path: str, rel: str) -> list[dict]:
@@ -81,6 +86,8 @@ def doc_notes(path: str, rel: str) -> list[dict]:
         m = DOC_MARK.search(line)
         if not m:
             continue
+        if DEFINITION.match(line[m.end():].lstrip()):
+            continue
         start = i
         while start > 0 and lines[start].strip() and not lines[start].lstrip().startswith(("- ", "* ", "|")) \
                 and lines[start - 1].strip() and not lines[start - 1].lstrip().startswith("#"):
@@ -89,7 +96,7 @@ def doc_notes(path: str, rel: str) -> list[dict]:
         while end < len(lines) and lines[end].strip() and not lines[end].lstrip().startswith(("- ", "* ", "#", "|")):
             end += 1
         text = " ".join(re.sub(r"^[-*] ", "", l.strip()) for l in lines[start:end])
-        notes.append({"file": rel, "line": i + 1, "kind": m.group(1), "text": without_marker(text)})
+        notes.append({"file": rel, "line": i + 1, "kind": m.group(1).upper(), "text": without_marker(text)})
     return notes
 
 
