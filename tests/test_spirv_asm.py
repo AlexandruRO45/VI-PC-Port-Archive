@@ -407,6 +407,45 @@ OpFunctionEnd
             self.assertIn("ERROR:", r.stderr)
             self.assertFalse(os.path.exists(dst))
 
+    def test_cli_out_must_not_name_the_input(self):
+        # Without the guard the CLI exited 0 and replaced the .spvasm source with the assembled binary.
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "sub")
+            os.makedirs(sub)
+            src = os.path.join(d, "min.spvasm")
+            text = (
+                "OpCapability Shader\nOpMemoryModel Logical GLSL450\n"
+                'OpEntryPoint GLCompute %m "main"\nOpExecutionMode %m LocalSize 1 1 1\n'
+                "%v = OpTypeVoid\n%ft = OpTypeFunction %v\n%m = OpFunction %v None %ft\n"
+                "%l = OpLabel\nOpReturn\nOpFunctionEnd\n"
+            )
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            with open(src, "rb") as f:
+                before = f.read()
+            for out in (src, os.path.join(sub, "..", "min.spvasm")):
+                with self.subTest(out=out):
+                    r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"),
+                                        src, "-o", out], capture_output=True, text=True, errors="replace")
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertEqual(r.stderr.count("would overwrite the input"), 1)
+                    self.assertNotIn("Traceback", r.stderr)
+                    with open(src, "rb") as f:
+                        self.assertEqual(f.read(), before)
+            alias = os.path.join(d, "alias.spvasm")
+            try:
+                os.link(src, alias)
+            except (OSError, NotImplementedError):
+                alias = None
+            if alias is not None:
+                with self.subTest(out=alias):
+                    r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"),
+                                        src, "-o", alias], capture_output=True, text=True, errors="replace")
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertEqual(r.stderr.count("would overwrite the input"), 1)
+                    with open(alias, "rb") as f:
+                        self.assertEqual(f.read(), before)
+
 
 _INT_HEAD = (
     "OpCapability Shader\nOpCapability Int64\nOpCapability Int16\nOpCapability Int8\n"

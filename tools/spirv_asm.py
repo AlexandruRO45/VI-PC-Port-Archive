@@ -27,6 +27,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from report_paths import same_report_path  # noqa: E402
 from spirv_asm_tables import BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, VALUE_ENUMS  # noqa: E402
 
 SPIRV_MAGIC = 0x07230203
@@ -552,6 +553,8 @@ def main(argv=None) -> int:
     ap.add_argument("--target-env", default="vulkan1.2", choices=sorted(TARGET_ENV_VERSION),
                     help="target SPIR-V / Vulkan environment (default: vulkan1.2)")
     args = ap.parse_args(argv)
+    if same_report_path(args.out, args.src):
+        ap.error(f"{args.out} would overwrite the input {args.src}")
     try:
         with open(args.src, encoding="utf-8") as f:
             text = f.read()
