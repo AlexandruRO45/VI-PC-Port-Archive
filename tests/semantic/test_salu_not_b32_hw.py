@@ -247,5 +247,89 @@ class TestSaluNotB32AST(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_salu_instruction("s_not_b32 s106, s0")
 
+# --- Section 3: Deterministic Scalar Instruction Interpreter ---
+
+class ScalarRegisterFile:
+    """RDNA2 Scalar Register File model (106 SGPRs: s0..s105, plus SCC)."""
+
+    def __init__(self) -> None:
+        self.sgprs: List[int] = [0] * 106
+        self.scc: int = 0
+
+    def read_sgpr(self, idx: int) -> int:
+        if not (0 <= idx < 106):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < 106):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def read_operand(self, op: OperandAST) -> int:
+        if op.kind == OperandKind.SGPR:
+            assert op.reg_idx is not None
+            return self.read_sgpr(op.reg_idx)
+        return op.value & MASK32
+
+
+class SaluInterpreter:
+    """Deterministic Scalar ALU instruction interpreter for s_not_b32."""
+
+    def __init__(self, reg_file: Optional[ScalarRegisterFile] = None) -> None:
+        self.reg_file = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def execute(self, inst: InstructionAST) -> int:
+        if inst.mnemonic != "s_not_b32":
+            raise ValueError(f"Unsupported instruction mnemonic: {inst.mnemonic}")
+        src_val = self.reg_file.read_operand(inst.src0)
+        res = ref_s_not_b32(src_val)
+        assert inst.dst.reg_idx is not None
+        self.reg_file.write_sgpr(inst.dst.reg_idx, res)
+        self.reg_file.scc = ref_s_not_b32_scc(src_val)
+        return res
+
+
+class TestSaluNotB32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter tests."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = SaluInterpreter(self.rf)
+
+    def test_deterministic_vectors(self) -> None:
+        for bit in range(32):
+            self.rf.write_sgpr(0, 1 << bit)
+            inst = parse_salu_instruction("s_not_b32 s1, s0")
+            res = self.interp.execute(inst)
+            expected = MASK32 ^ (1 << bit)
+            self.assertEqual(res, expected)
+            self.assertEqual(self.rf.read_sgpr(1), expected)
+            self.assertEqual(self.rf.scc, 1)
+
+    def test_all_ones_inversion_to_zero(self) -> None:
+        self.rf.write_sgpr(0, 0xFFFFFFFF)
+        inst = parse_salu_instruction("s_not_b32 s1, s0")
+        res = self.interp.execute(inst)
+        self.assertEqual(res, 0)
+        self.assertEqual(self.rf.read_sgpr(1), 0)
+        self.assertEqual(self.rf.scc, 0)
+
+    def test_immediate_and_literal_operands(self) -> None:
+        inst_imm = parse_salu_instruction("s_not_b32 s10, 0")
+        res = self.interp.execute(inst_imm)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(self.rf.scc, 1)
+
+    def test_translator_cross_validation(self) -> None:
+        cases = [0x12345678, 0x89ABCDEF, 0xFFFFFFFF, 0x00000000]
+        for c in cases:
+            self.rf.write_sgpr(0, c)
+            inst = parse_salu_instruction("s_not_b32 s1, s0")
+            interp_res = self.interp.execute(inst)
+            hw_res, hw_scc = run_salu_not_ps(c)
+            self.assertEqual(interp_res, hw_res)
+            self.assertEqual(self.rf.scc, hw_scc)
+
 if __name__ == "__main__":
     unittest.main()
