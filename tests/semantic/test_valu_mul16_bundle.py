@@ -118,5 +118,19 @@ class VMulLoU16InterpreterTests(unittest.TestCase):
         regs["v0"] = res
         self.assertEqual(regs["v0"], 100)
 
+class VMulLoU16SimdBoundaryTests(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_mul_lo_u16."""
+
+    def test_simd_divergent_lanes(self):
+        lanes = 64
+        src0 = [i for i in range(lanes)]
+        src1 = [10 for _ in range(lanes)]
+        out = [ref_mul_lo_u16(s0, s1) for s0, s1 in zip(src0, src1)]
+        for i in range(lanes):
+            self.assertEqual(out[i], i * 10)
+
+    def test_max_u16_boundary(self):
+        self.assertEqual(ref_mul_lo_u16(0xFFFF, 0xFFFF), 1)
+
 if __name__ == "__main__":
     unittest.main()
