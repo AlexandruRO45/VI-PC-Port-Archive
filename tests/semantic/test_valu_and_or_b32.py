@@ -70,6 +70,129 @@ def ref_and_or_b32(src0: int, src1: int, src2: int) -> int:
     s2 = src2 & MASK32
     return ((s0 & s1) | s2) & MASK32
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Definitions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    SGPR = "s"
+    VGPR = "v"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count == 1:
+            return f"{self.kind.value}{self.index}"
+        return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+
+
+class Opcode(enum.Enum):
+    V_AND_OR_B32 = "v_and_or_b32"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a v_and_or_b32 instruction."""
+    opcode: Opcode
+    dst: Register
+    src0: Register | int
+    src1: Register | int
+    src2: Register | int
+
+    def __post_init__(self) -> None:
+        if not self.dst.is_vgpr or self.dst.count != 1:
+            raise ValueError(f"dst must be a single 32-bit VGPR: {self.dst}")
+        if self.dst.index < 0 or self.dst.index > 255:
+            raise ValueError(f"dst register index out of range [0, 255]: {self.dst.index}")
+
+    def format_operand(self, op: Register | int) -> str:
+        if isinstance(op, Register):
+            return op.format_asm()
+        if op < 0:
+            return f"{s32(op)}"
+        if op > 9:
+            return f"{hex(op)}"
+        return str(op)
+
+    def to_assembly(self) -> str:
+        d_str = self.dst.format_asm()
+        s0_str = self.format_operand(self.src0)
+        s1_str = self.format_operand(self.src1)
+        s2_str = self.format_operand(self.src2)
+        return f"{self.opcode.value} {d_str}, {s0_str}, {s1_str}, {s2_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of VALU instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestValuAndOrB32AST(unittest.TestCase):
+    """Unit tests for symbolic AST nodes and assembly formatting."""
+
+    def test_instruction_creation_defaults(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Register(RegKind.VGPR, 3),
+        )
+        self.assertEqual(inst.opcode, Opcode.V_AND_OR_B32)
+        self.assertEqual(inst.to_assembly(), "v_and_or_b32 v0, v1, v2, v3")
+
+    def test_instruction_with_sgpr_and_immediates(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 4),
+            src0=Register(RegKind.SGPR, 0),
+            src1=Register(RegKind.VGPR, 5),
+            src2=0x1234,
+        )
+        self.assertEqual(inst.to_assembly(), "v_and_or_b32 v4, s0, v5, 0x1234")
+
+    def test_program_representation(self) -> None:
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=0xF0,
+            src2=0x0F,
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 2),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.SGPR, 4),
+            src2=0,
+        ))
+        lines = prog.to_assembly().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("v_and_or_b32 v0", lines[0])
+        self.assertIn("v_and_or_b32 v2", lines[1])
+
 class TestValuAndOrB32Oracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and bitwise truth tables."""
 
