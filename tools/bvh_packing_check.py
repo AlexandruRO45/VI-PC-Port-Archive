@@ -415,22 +415,27 @@ def scan_window(args):
                     tally.kinds[kind] += 1
                 if kind == "bvh4-chunk":
                     # Join the continuation streams that follow, up to the declared end.
-                    parts, have, q, joined = [data], len(data), pos, []
+                    parts, have, prev_end, q, joined, saw_bad = [data], len(data), pos, pos, [], False
                     while have < row["declared_bytes"]:
-                        nxt = I.ZHDR.search(m, q, size)
-                        if not nxt:
+                        search_end = min(prev_end + 18, size) if saw_bad else size
+                        nxt = I.ZHDR.search(m, q, search_end)
+                        if not nxt or (saw_bad and nxt.start() > prev_end + 16):
                             break
                         more = _inflate(m, nxt.start(), size)
                         if more is None:
+                            if nxt.start() > prev_end + 16:
+                                break
+                            saw_bad = True
                             q = nxt.start() + 1
                             continue
                         more_kind = I.classify(more[0][:I.HEAD], len(more[0]))["kind"]
-                        if more_kind in ("bvh4", "bvh4-chunk", "descriptor", "instance208"):
+                        if more_kind != "raw":
                             break
                         parts.append(more[0])
                         have += len(more[0])
                         joined.append(nxt.start())
-                        q = nxt.start() + more[1]
+                        prev_end = q = nxt.start() + more[1]
+                        saw_bad = False
                     data = b"".join(parts)
                     if have < row["declared_bytes"]:
                         tally.add(s, _short())

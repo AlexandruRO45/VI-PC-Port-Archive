@@ -286,6 +286,35 @@ class TestArchive(unittest.TestCase):
         self.assertNotIn("continuation", rep_short["kinds"])
         self.assertEqual(rep_short["kinds"].get("raw"), 1)
 
+        # A damaged continuation stream followed by an unrelated later raw stream must not skip past the damage
+        # and glue in the unrelated stream.
+        bad_cont_body = (
+            zlib.compress(big[:0x10000])
+            + zlib.compress(big[0x10000:])[:-20]
+            + bytes(32)
+            + zlib.compress(b"\x05" * 0x20000)
+            + bytes(16)
+        )
+        fd, path_dmg = tempfile.mkstemp(suffix=".rpf")
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"RPF9" + struct.pack("<I", 16) + bytes(8) + bad_cont_body)
+        self.addCleanup(os.unlink, path_dmg)
+        tally_dmg, _ = C.scan_archive(path_dmg, 1, 1 << 20, progress=False)
+        rep_dmg = tally_dmg.report()
+        self.assertEqual((rep_dmg["checked"], rep_dmg["passed"]), (1, 0))
+        self.assertEqual(rep_dmg["fail_streams"], {"short_input": 1})
+        self.assertNotIn("continuation", rep_dmg["kinds"])
+        self.assertEqual(rep_dmg["kinds"].get("raw"), 1)
+
+        # A truncated bvh4-chunk must also stop before an XML stream.
+        path_xml = self.write_rpf([big[:0x10000], b"<?xml version='1.0'?><root/>" + bytes(0x20000)])
+        tally_xml, _ = C.scan_archive(path_xml, 1, 1 << 20, progress=False)
+        rep_xml = tally_xml.report()
+        self.assertEqual((rep_xml["checked"], rep_xml["passed"]), (1, 0))
+        self.assertEqual(rep_xml["fail_streams"], {"short_input": 1})
+        self.assertEqual(rep_xml["kinds"].get("xml"), 1)
+        self.assertNotIn("continuation", rep_xml["kinds"])
+
     def test_stream_starting_at_window_boundary_is_not_dropped(self):
         good_z = zlib.compress(payload(build()))
         bad_z = zlib.compress(payload(build(orders=[GOOD_ORDER, 0x05, GOOD_ORDER, GOOD_ORDER])))
@@ -337,7 +366,10 @@ class TestArchive(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(C.main([good, "--json", good]), 2)          # never overwrite an input
                 self.assertEqual(C.main([good, "--limit", "5"]), 2)          # --limit is for an archive
-                self.assertEqual(C.main([good, "--header-offset", "-1"]), 2)  # negative header offset
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(C.main([os.path.join(d, "missing.bin"), "--header-offset", "-1"]), 2)
+                self.assertIn("--header-offset", err.getvalue())
                 self.assertEqual(C.main([os.path.join(d, "missing.bin")]), 2)
                 self.assertEqual(C.main([good, "--json", d]), 2)             # --json is a directory
                 self.assertEqual(C.main([good, "--json", os.path.join(d, "no_such_dir", "r.json")]), 2)
