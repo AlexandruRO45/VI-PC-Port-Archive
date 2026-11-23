@@ -301,5 +301,37 @@ class TestCeilConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(words[1], 0x2222)
 
 
+class TestCeilBoundaryAndExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling for v_ceil_f32."""
+
+    def test_boundary_values_and_flushing(self):
+        cases = [
+            0x00000000,  # +0.0
+            0x80000000,  # -0.0
+            0x3F800000,  # +1.0
+            0xBF800000,  # -1.0
+            0x4B800001,  # large positive (no fractional bits) -> 0x4B800001
+            0xCB000001,  # large negative (no fractional bits) -> 0xCB000001
+            0x00400000,  # mid subnormal -> +0.0
+            0x80400000,  # mid neg subnormal -> -0.0
+            0x7F800000,  # +inf
+            0xFF800000,  # -inf
+            0x7FA00000,  # sNaN
+            0x7FC00000,  # qNaN
+        ]
+        for idx, u in enumerate(cases):
+            with self.subTest(u=hex(u)):
+                expected = v_ceil_f32_oracle(u)
+                lines = [
+                    f"v_mov_b32 v1, {u:#x}",
+                    "v_ceil_f32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_ceil_ps(lines, f"ps_ceil_ext_{idx}")
+                self.assertEqual(words[0], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
