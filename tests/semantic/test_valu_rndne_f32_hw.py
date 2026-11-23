@@ -355,5 +355,94 @@ class TestValuRndneF32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.vgprs[7], 0xDEADBEEF)
 
 
+class WavefrontState:
+    """SIMD wavefront state modeling lane divergence and 32/64-bit EXEC masking."""
+
+    def __init__(self, wave_size: int = 32):
+        if wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave size: {wave_size}")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.lane_vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * 106
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool(self.exec_mask & (1 << lane))
+
+    def execute_wave(self, inst: ASTInstruction) -> None:
+        inst.validate()
+        for lane in range(self.wave_size):
+            if self.is_lane_active(lane):
+                if inst.src0.kind == OperandKind.VGPR:
+                    src_val = self.lane_vgprs[lane][inst.src0.reg_idx]
+                elif inst.src0.kind == OperandKind.SGPR:
+                    src_val = self.sgprs[inst.src0.reg_idx]
+                else:
+                    src_val = inst.src0.raw_bits
+                res = ref_rndne_f32(src_val, clamp=inst.clamp)
+                self.lane_vgprs[lane][inst.dst.reg_idx] = res
+
+
+class TestValuRndneF32SIMDDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_full_wave32(self):
+        wave = WavefrontState(wave_size=32)
+        wave.exec_mask = 0xFFFFFFFF
+        test_values = [1.5, 2.5, 3.5, 4.5] * 8
+        for lane in range(32):
+            wave.lane_vgprs[lane][1] = f32_to_bits(test_values[lane])
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        wave.execute_wave(inst)
+        for lane in range(32):
+            exp = ref_rndne_f32(f32_to_bits(test_values[lane]))
+            self.assertEqual(wave.lane_vgprs[lane][0], exp)
+
+    def test_simd_alternating_lanes_mask(self):
+        wave = WavefrontState(wave_size=32)
+        wave.exec_mask = 0x55555555
+        initial_sentinel = 0xBAADF00D
+        for lane in range(32):
+            wave.lane_vgprs[lane][0] = initial_sentinel
+            wave.lane_vgprs[lane][1] = f32_to_bits(1.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        wave.execute_wave(inst)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.lane_vgprs[lane][0], F32_TWO)
+            else:
+                self.assertEqual(wave.lane_vgprs[lane][0], initial_sentinel)
+
+    def test_simd_single_active_lane(self):
+        wave = WavefrontState(wave_size=32)
+        wave.exec_mask = 1 << 15
+        sentinel = 0x11223344
+        for lane in range(32):
+            wave.lane_vgprs[lane][0] = sentinel
+            wave.lane_vgprs[lane][1] = f32_to_bits(2.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        wave.execute_wave(inst)
+        for lane in range(32):
+            if lane == 15:
+                self.assertEqual(wave.lane_vgprs[lane][0], F32_TWO)
+            else:
+                self.assertEqual(wave.lane_vgprs[lane][0], sentinel)
+
+    def test_simd_wave64_divergence(self):
+        wave = WavefrontState(wave_size=64)
+        wave.exec_mask = 0x00000000FFFFFFFF
+        sentinel = 0x55667788
+        for lane in range(64):
+            wave.lane_vgprs[lane][0] = sentinel
+            wave.lane_vgprs[lane][1] = f32_to_bits(-1.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        wave.execute_wave(inst)
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(wave.lane_vgprs[lane][0], F32_NEG_TWO)
+            else:
+                self.assertEqual(wave.lane_vgprs[lane][0], sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
