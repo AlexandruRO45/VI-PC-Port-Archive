@@ -25,11 +25,40 @@
 
 namespace {
 
+// Function-local statics below avoid dynamic C++ init (_Init_thread_header): guest threads created after
+// #4313/#7524 hand TLS slot 0 to the mapped title must not read uninitialized thread-safe static guards.
 FARPROC host(const char* name) {
-    static HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static HMODULE d3d12 = nullptr;
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            return TRUE;
+        },
+        nullptr, nullptr);
     FARPROC p = d3d12 ? GetProcAddress(d3d12, name) : nullptr;
     if (!p) std::fprintf(stderr, "[rt] d3d12_xs: host d3d12.dll has no %s\n", name);
     return p;
+}
+
+struct HostProcCache {
+    INIT_ONCE once;
+    FARPROC proc;
+    const char* name;
+};
+
+template <typename Fn>
+Fn cached_host_proc(HostProcCache& cache) {
+    InitOnceExecuteOnce(
+        &cache.once,
+        [](PINIT_ONCE, PVOID param, PVOID*) -> BOOL {
+            auto* c = static_cast<HostProcCache*>(param);
+            c->proc = host(c->name);
+            return TRUE;
+        },
+        &cache, nullptr);
+    return reinterpret_cast<Fn>(cache.proc);
 }
 
 using SerializeFn = decltype(&::D3D12SerializeVersionedRootSignature);
@@ -40,22 +69,30 @@ using CreateDeviceFn = decltype(&::D3D12CreateDevice);
 // Asked once: does the host serializer take version 1.2 at all? An empty 1.2 description is valid everywhere 1.2 is
 // supported; Windows 10's built-in d3d12.dll rejects it with E_INVALIDARG.
 bool host_serializes_1_2(SerializeFn fn) {
-    static const bool supported = [fn] {
-        D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty{};
-        empty.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
-        ID3DBlob* blob = nullptr;
-        ID3DBlob* error = nullptr;
-        const HRESULT hr = fn(&empty, &blob, &error);
-        if (blob) blob->Release();
-        if (error) error->Release();
-        return SUCCEEDED(hr);
-    }();
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static bool supported = false;
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID param, PVOID*) -> BOOL {
+            auto serialize = reinterpret_cast<SerializeFn>(param);
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty{};
+            empty.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+            ID3DBlob* blob = nullptr;
+            ID3DBlob* error = nullptr;
+            const HRESULT hr = serialize(&empty, &blob, &error);
+            if (blob) blob->Release();
+            if (error) error->Release();
+            supported = SUCCEEDED(hr);
+            return TRUE;
+        },
+        reinterpret_cast<PVOID>(fn), nullptr);
     return supported;
 }
 
 HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc,
                                         ID3DBlob** blob, ID3DBlob** error) {
-    static auto fn = reinterpret_cast<SerializeFn>(host("D3D12SerializeVersionedRootSignature"));
+    static HostProcCache cache{INIT_ONCE_STATIC_INIT, nullptr, "D3D12SerializeVersionedRootSignature"};
+    auto fn = cached_host_proc<SerializeFn>(cache);
     if (!fn) return E_NOTIMPL;
     if (!desc) return fn(desc, blob, error);
 
@@ -94,7 +131,8 @@ HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DES
 HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* desc,
                                                D3D_ROOT_SIGNATURE_VERSION version, ID3DBlob** blob,
                                                ID3DBlob** error) {
-    static auto fn = reinterpret_cast<LegacySerializeFn>(host("D3D12SerializeRootSignature"));
+    static HostProcCache cache{INIT_ONCE_STATIC_INIT, nullptr, "D3D12SerializeRootSignature"};
+    auto fn = cached_host_proc<LegacySerializeFn>(cache);
     if (!fn) return E_NOTIMPL;
     if (!desc) return fn(desc, version, blob, error);
 
@@ -104,7 +142,8 @@ HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* 
 }
 
 HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
-    static auto fn = reinterpret_cast<DeserializerFn>(host("D3D12CreateRootSignatureDeserializer"));
+    static HostProcCache cache{INIT_ONCE_STATIC_INIT, nullptr, "D3D12CreateRootSignatureDeserializer"};
+    auto fn = cached_host_proc<DeserializerFn>(cache);
     if (!fn) return E_NOTIMPL;
 
     // The host deserializer rejects a blob whose RTS0 flags carry the Xbox high
@@ -186,7 +225,8 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     }
 #endif
 
-    static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
+    static HostProcCache create_cache{INIT_ONCE_STATIC_INIT, nullptr, "D3D12CreateDevice"};
+    auto create = cached_host_proc<CreateDeviceFn>(create_cache);
     if (!create) return result(method, E_NOTIMPL);
 
     ID3D12Device* real = nullptr;
