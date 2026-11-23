@@ -176,5 +176,57 @@ class TestVSinF32ASTInterpreter(unittest.TestCase):
         self.assertAlmostEqual(bits_to_f32(state.vgprs[2]), -1.0, places=6)
 
 
+class WaveState:
+    def __init__(self, wave_size: int = 64) -> None:
+        self.wave_size = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: list[dict[int, int]] = [{i: 0 for i in range(256)} for _ in range(wave_size)]
+
+    def read_lane_f32(self, lane: int, op: Operand) -> float:
+        if op.reg_type == RegType.IMM:
+            return float(op.index_or_val)
+        elif op.reg_type == RegType.VGPR:
+            return bits_to_f32(self.vgprs[lane][int(op.index_or_val)])
+        raise ValueError(f"Unsupported operand for lane: {op.reg_type}")
+
+    def write_lane_f32(self, lane: int, idx: int, val: float) -> None:
+        if (self.exec_mask >> lane) & 1:
+            self.vgprs[lane][idx] = f32_to_bits(val)
+
+def step_simd_sin_f32(wave: WaveState, instr: Instruction) -> None:
+    if instr.opcode != "v_sin_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            val = wave.read_lane_f32(lane, instr.src0)
+            res = ref_sin_f32(val)
+            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+
+
+class TestVSinF32SIMDAndIEEE(unittest.TestCase):
+    """SIMD multi-lane divergence and IEEE 754 edge cases for v_sin_f32."""
+
+    def test_simd_divergence_and_exec_masking(self):
+        wave = WaveState(wave_size=64)
+        wave.exec_mask = 0x5555555555555555
+        for lane in range(64):
+            wave.vgprs[lane][1] = f32_to_bits(0.25)
+            wave.vgprs[lane][0] = f32_to_bits(999.0)
+
+        instr = Instruction("v_sin_f32", Operand.vgpr(0), Operand.vgpr(1))
+        step_simd_sin_f32(wave, instr)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertAlmostEqual(bits_to_f32(wave.vgprs[lane][0]), 1.0, places=6)
+            else:
+                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 999.0)
+
+    def test_ieee_denormal_subnormal_handling(self):
+        subnormal = bits_to_f32(0x00000001)
+        res = ref_sin_f32(subnormal)
+        self.assertAlmostEqual(res, subnormal * 2.0 * math.pi, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()
