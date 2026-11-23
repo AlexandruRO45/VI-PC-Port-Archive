@@ -338,6 +338,16 @@ class _Reader:
                 f"({view_offset}+{view_length} > {self.buffer_limit})"
             )
         accessor_offset = _int_field(accessor, "byteOffset", f"accessors[{index}]", default=0)
+        if accessor_offset % component_size:
+            raise GlbSkinError(
+                f"accessors[{index}].byteOffset {accessor_offset} is not a multiple "
+                f"of the component size {component_size}"
+            )
+        if (view_offset + accessor_offset) % component_size:
+            raise GlbSkinError(
+                f"accessors[{index}] buffer offset {view_offset + accessor_offset} is not a multiple "
+                f"of the component size {component_size}"
+            )
         stride = view.get("byteStride")
         if stride is None:
             stride = element_size
@@ -358,6 +368,11 @@ class _Reader:
                     f"accessors[{index}] needs {last_end} bytes of bufferViews[{view_index}], "
                     f"which has {view_length}"
                 )
+        elif accessor_offset > view_length:
+            raise GlbSkinError(
+                f"accessors[{index}].byteOffset {accessor_offset} exceeds "
+                f"bufferViews[{view_index}] length {view_length}"
+            )
 
         if self.buffer_limit == 0:
             raise GlbSkinError(f"accessors[{index}] needs buffer 0, but the GLB has no embedded buffer")
