@@ -331,5 +331,46 @@ class TestSaluXnorSaveexecB32SimdExecution(unittest.TestCase):
         self.assertEqual(hw_lo, 0xFFFF00FF)
         self.assertEqual(hw_scc, 1)
 
+# --- Section 5: Register Aliasing and In-Place Operand Preservation ---
+
+class TestSaluXnorSaveexecB32RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation tests."""
+
+    def test_aliasing_dst_and_src0(self) -> None:
+        rf = ScalarRegisterFile()
+        interp = SaluInterpreter(rf)
+        rf.exec_lo = 0x12345678
+        rf.write_sgpr(0, 0x55555555)
+        inst = parse_salu_instruction("s_xnor_saveexec_b32 s0, s0")
+        new_lo, saved_d, scc = interp.execute(inst)
+        self.assertEqual(saved_d, 0x12345678)
+        self.assertEqual(rf.read_sgpr(0), 0x12345678)
+        self.assertEqual(new_lo, (~(0x55555555 ^ 0x12345678)) & MASK32)
+
+    def test_hardware_aliasing(self) -> None:
+        lines = [
+            "s_mov_b64 exec, -1",
+            "s_mov_b32 exec_lo, 0x0000000F",
+            "s_mov_b32 exec_hi, 0x000000FF",
+            "s_xnor_saveexec_b32 s8, 0x55555555",
+            "s_cselect_b32 s10, 1, 0",
+            "s_bcnt1_i32_b32 s11, s8",
+            "v_cmpx_eq_u32_e32 0, v0",
+            "v_mov_b32_e32 v1, s10",
+            "v_mov_b32_e32 v2, s11",
+            "v_mov_b32_e32 v12, 0", "buffer_store_dword v1, v12, s[0:3], 0 offen",
+            "v_mov_b32_e32 v12, 4", "buffer_store_dword v2, v12, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_xnor_aliasing", lines, fssm=FSSM_64)
+        mem = si.run_workgroup(
+            spv, 64, 64,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=VSHARP + [0] * 28,
+            memory={},
+        )
+        self.assertEqual(mem.get(0), 1)  # SCC
+        self.assertEqual(mem.get(4), 4)  # popcount of saved_d (0xF has 4 bits)
+
 if __name__ == "__main__":
     unittest.main()
