@@ -1060,8 +1060,10 @@ struct PreparedDraw {
 // differently. NaN is 0 and values outside 0..1 clamp, as in D3D.
 //
 // Ties go to even whatever the thread's floating-point rounding mode: std::nearbyint follows it, so a game that
-// changes the mode would round differently. floor() does not depend on it, and x + 0.5 is exact here (x is at most
-// a float times 65535, well inside a double's 53 bits).
+// changes the mode would round differently. floor() does not depend on it. x is a float times at most 65535, so it has
+// at most 40 significant bits and x + 0.5 is exact whenever |x| >= 2^-14. Below that the sum may round, but only to
+// 0.5 or one of its neighbours: floor() gives 0 and r - x is not 0.5, so a tiny value is still 0 in every mode
+// (checked exhaustively over every float, all four modes and 8/10/16-bit scales).
 inline double round_half_even(double x) {
     const double r = std::floor(x + 0.5);
     return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;

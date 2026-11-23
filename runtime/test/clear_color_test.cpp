@@ -226,6 +226,40 @@ int main() {
             ++checks;
         }
     }
+    // Near zero, x + 0.5 is not exact and rounds with the mode (to just above 0.5 under FE_UPWARD); the result must
+    // still be code 0, and a 16-bit tie still goes to even.
+    {
+        const int mode = std::fegetround();
+        const float tiny = std::numeric_limits<float>::denorm_min(), smallest = std::numeric_limits<float>::min();
+        VkClearColorValue unorm8[3]{}, unorm16[3]{}, snorm8[3]{};
+        const int modes[3] = {FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+        for (int m = 0; m < 3; ++m) {
+            std::fesetround(modes[m]);
+            unorm8[m] = leonida::detail::render_target_clear_color(VK_FORMAT_R8G8B8A8_UNORM,
+                                                                   {tiny, smallest, 1e-20f, 0.99f / 255.0f});
+            unorm16[m] = leonida::detail::render_target_clear_color(VK_FORMAT_R16G16B16A16_UNORM,
+                                                                    {tiny, smallest, 0.5f, 1.0f});
+            snorm8[m] = leonida::detail::render_target_clear_color(VK_FORMAT_R8G8B8A8_SNORM,
+                                                                   {tiny, -tiny, -smallest, 0.99f / 127.0f});
+        }
+        std::fesetround(mode);
+        const long want8[4] = {0, 0, 0, 1}, want16[4] = {0, 0, 32768, 65535}, want_s8[4] = {0, 0, 0, 1};
+        for (int m = 0; m < 3; ++m) {
+            for (int c = 0; c < 4; ++c) {
+                const long u8 = std::lround(double(unorm8[m].float32[c]) * 255.0);
+                const long u16 = std::lround(double(unorm16[m].float32[c]) * 65535.0);
+                const long s8 = std::lround(double(snorm8[m].float32[c]) * 127.0);
+                if (u8 != want8[c] || u16 != want16[c] || s8 != want_s8[c]) {
+                    std::fprintf(stderr,
+                                 "near-zero rounding under FP mode %d, channel %d: UNORM8 %ld (%ld), UNORM16 %ld (%ld), "
+                                 "SNORM8 %ld (%ld)\n",
+                                 modes[m], c, u8, want8[c], u16, want16[c], s8, want_s8[c]);
+                    return 1;
+                }
+            }
+            ++checks;
+        }
+    }
     if (failed_formats) {
         std::fprintf(stderr, "clear_color_test: %u integer format(s) failed\n", failed_formats);
         return 1;
