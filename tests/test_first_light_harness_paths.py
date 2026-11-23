@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -38,6 +39,39 @@ class FirstLightHarnessPathsTests(unittest.TestCase):
         self.put_harness("runtime", "build", "windows", "Release")
         standalone = self.put_harness("runtime", "build")
         self.assertEqual(first_light.find_harness(None), str(standalone))
+
+    def test_linux_refreshes_a_configured_build_with_visible_parallel_output(self) -> None:
+        linux_build = self.root / "runtime" / "build" / "linux"
+        linux_build.mkdir(parents=True)
+        (linux_build / "CMakeCache.txt").touch()
+        (linux_build / "Makefile").touch()
+        harness = linux_build / "vk_harness"
+
+        def build(args, **kwargs):
+            self.assertEqual(
+                args,
+                ["/usr/bin/cmake", "--build", str(linux_build), "--parallel", "--target", "vk_harness"],
+            )
+            self.assertEqual(kwargs, {})  # output is streamed instead of captured
+            harness.touch()
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(first_light.os, "name", "posix"), \
+                patch.object(first_light.shutil, "which", return_value="/usr/bin/cmake"), \
+                patch.object(first_light.subprocess, "run", side_effect=build) as run:
+            self.assertEqual(first_light.find_harness(None), str(harness))
+        run.assert_called_once()
+
+    def test_linux_uses_an_existing_harness_without_a_configured_build(self) -> None:
+        standalone = self.root / "runtime" / "build" / "vk_harness"
+        standalone.parent.mkdir(parents=True, exist_ok=True)
+        standalone.touch()
+
+        with patch.object(first_light.os, "name", "posix"), \
+                patch.object(first_light.shutil, "which", return_value=None), \
+                patch.object(first_light.subprocess, "run") as run:
+            self.assertEqual(first_light.find_harness(None), str(standalone))
+        run.assert_not_called()
 
     def test_explicit_and_environment_paths_keep_priority(self) -> None:
         configured = self.put_harness("runtime", "build", "windows", "Release")
