@@ -5620,6 +5620,20 @@ public:
                     if (!desc->ppGeometryDescs[i]) return;
             }
         }
+        // The six triangle vertex formats D3D12 allows for BLAS builds (matching d3d12_com.cpp); any other
+        // returns VK_FORMAT_UNDEFINED so invalid formats are refused cleanly with zeroed prebuild info instead
+        // of mis-sizing or triggering VUIDs on mismatched strides.
+        auto dxr_vertex_format = [](DXGI_FORMAT format) noexcept -> VkFormat {
+            switch (format) {
+            case DXGI_FORMAT_R32G32B32_FLOAT: return VK_FORMAT_R32G32B32_SFLOAT;
+            case DXGI_FORMAT_R32G32_FLOAT: return VK_FORMAT_R32G32_SFLOAT;
+            case DXGI_FORMAT_R16G16B16A16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
+            case DXGI_FORMAT_R16G16_FLOAT: return VK_FORMAT_R16G16_SFLOAT;
+            case DXGI_FORMAT_R16G16B16A16_SNORM: return VK_FORMAT_R16G16B16A16_SNORM;
+            case DXGI_FORMAT_R16G16_SNORM: return VK_FORMAT_R16G16_SNORM;
+            default: return VK_FORMAT_UNDEFINED;
+            }
+        };
         auto& vk = state_.context->vk;
         if (state_.context->xdxr_acceleration_structures()) {
             // XDXR records: the layout depends only on the triangle or instance count and on whether the nodes are
@@ -5639,6 +5653,7 @@ public:
                             ? desc->ppGeometryDescs[i]
                             : &desc->pGeometryDescs[i];
                     if (gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                    if (dxr_vertex_format(gd->Triangles.VertexFormat) == VK_FORMAT_UNDEFINED) return;
                     leonida::RtTriangleGeometry t{};
                     t.vertex_count = gd->Triangles.VertexCount;
                     t.index_count = gd->Triangles.IndexCount;
@@ -5674,13 +5689,16 @@ public:
                         ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
                         : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
                 if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                const VkFormat vfmt = dxr_vertex_format(gd->Triangles.VertexFormat);
+                if (vfmt == VK_FORMAT_UNDEFINED) return;
                 VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
                 g.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-                g.flags = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0u;
+                if (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) g.flags |= VK_GEOMETRY_OPAQUE_BIT_KHR;
+                if (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION)
+                    g.flags |= VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
                 auto& tr = g.geometry.triangles;
                 tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-                tr.vertexFormat = (gd->Triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT) ? VK_FORMAT_R32G32_SFLOAT
-                                                                                           : VK_FORMAT_R32G32B32_SFLOAT;
+                tr.vertexFormat = vfmt;
                 tr.vertexStride = gd->Triangles.VertexBuffer.StrideInBytes;
                 tr.maxVertex = gd->Triangles.VertexCount ? (gd->Triangles.VertexCount - 1u) : 0u;
                 tr.indexType = (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
@@ -5703,6 +5721,8 @@ public:
                            : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
         if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
             bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+        if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION)
+            bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
         if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE)
             bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
         if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)

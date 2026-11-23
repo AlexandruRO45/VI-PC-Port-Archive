@@ -1647,6 +1647,18 @@ if(TARGET Vulkan::Headers)
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     set_tests_properties(d3d12_dxr_validation_khr PROPERTIES ENVIRONMENT "LEONIDA_RT_AS=khr")
 
+    # DXR prebuild vertexFormat mapping (including 16-bit formats + invalid format refusal),
+    # ALLOW_COMPACTION, and NO_DUPLICATE_ANYHIT_INVOCATION flag forwarding contract test.
+    add_executable(d3d12_dxr_prebuild_test test/d3d12_dxr_prebuild_test.cpp)
+    target_link_libraries(d3d12_dxr_prebuild_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_dxr_prebuild_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_dxr_prebuild_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_dxr_prebuild COMMAND d3d12_dxr_prebuild_test)
+    add_test(NAME d3d12_dxr_prebuild_khr COMMAND d3d12_dxr_prebuild_test)
+    set_tests_properties(d3d12_dxr_prebuild d3d12_dxr_prebuild_khr PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    set_tests_properties(d3d12_dxr_prebuild_khr PROPERTIES ENVIRONMENT "LEONIDA_RT_AS=khr")
+
     # D3D12 permits UpdateTileMappings on DIRECT/COPY/COMPUTE and a sparse buffer must remain
     # accessible across their selected Vulkan families. The optional API-dump check catches an
     # EXCLUSIVE VkBuffer even on drivers that happen to return correct bytes without ownership barriers.

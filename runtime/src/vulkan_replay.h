@@ -3982,7 +3982,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 for (const auto& t : build->triangles) {
                     VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
                     g.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-                    g.flags = t.opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0u;
+                    g.flags = (t.opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0u) |
+                              ((t.flags & 0x2u) ? VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR : 0u);
                     auto& tr = g.geometry.triangles;
                     tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
                     tr.vertexFormat = static_cast<VkFormat>(t.vertex_format);
