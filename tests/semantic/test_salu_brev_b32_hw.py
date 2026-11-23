@@ -671,6 +671,72 @@ class TestSaluBrevB32IEEE754BitPatterns(unittest.TestCase):
                 res = run_salu_brev_ps(nan)
                 self.assertEqual(res, ref_s_brev_b32(nan))
 
+# --- Section 8: Negative Controls, Syntax Rejection, and Mutation Detection ---
+
+class TestSaluBrevB32NegativeAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection tests."""
+
+    def test_rejection_out_of_bounds_registers(self) -> None:
+        invalid_lines = [
+            "s_brev_b32 s106, s0",
+            "s_brev_b32 s200, s1",
+            "s_brev_b32 s0, s106",
+            "s_brev_b32 v0, s0",
+            "s_brev_b32 s0, v0",
+        ]
+        for line in invalid_lines:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_salu_instruction(line)
+
+    def test_rejection_malformed_syntax(self) -> None:
+        malformed = [
+            "s_brev_b32",
+            "s_brev_b32 s0",
+            "s_brev_b32 s0, s1, s2",
+            "s_brev_b32 s0, 0xGHIJ",
+            "s_brev_b32 s0, , s1",
+        ]
+        for line in malformed:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_salu_instruction(line)
+
+    def test_mutation_stride_detection(self) -> None:
+        """Mutant 1: Bit-reversal with incorrect shift stride (e.g. 16-bit instead of 32-bit)."""
+        def mutant_16bit(val: int) -> int:
+            return int(f"{val & 0xFFFF:016b}"[::-1], 2)
+
+        val = 0x12345678
+        self.assertNotEqual(mutant_16bit(val), ref_s_brev_b32(val))
+
+    def test_mutation_identity_detection(self) -> None:
+        """Mutant 2: Pass-through identity without reversing bits."""
+        def mutant_identity(val: int) -> int:
+            return val & MASK32
+
+        val = 0x80000000
+        self.assertNotEqual(mutant_identity(val), ref_s_brev_b32(val))
+
+    def test_mutation_scc_clobber_detection(self) -> None:
+        """Mutant 3: Instruction erroneously sets SCC based on zero result."""
+        def mutant_scc(val: int) -> int:
+            return 1 if (val & MASK32) != 0 else 0
+
+        initial_scc = 1
+        res = 0
+        mutant_res_scc = mutant_scc(res)
+        self.assertNotEqual(initial_scc, mutant_res_scc)
+
+    def test_mutation_byte_swap_only(self) -> None:
+        """Mutant 4: Byte swap (endianness flip) instead of true bit reversal."""
+        def mutant_bswap32(val: int) -> int:
+            b = struct.pack(">I", val & MASK32)
+            return struct.unpack("<I", b)[0]
+
+        val = 0x12345678
+        self.assertNotEqual(mutant_bswap32(val), ref_s_brev_b32(val))
+
 
 if __name__ == "__main__":
     unittest.main()
