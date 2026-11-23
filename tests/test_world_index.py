@@ -160,6 +160,12 @@ class WorldIndexTest(unittest.TestCase):
         self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 0, 0x32)))
         self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 7, 0x34)))
 
+    def test_a_float_hash_member_is_rejected(self):
+        # A float is hashable, so it reached the aggregates and only failed when formatted as a hex hash.
+        self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 0, 0x21)))   # archetypeName
+        self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 7, 0x21)))   # lodLevel
+        self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 9, 0x21)))   # 64-bit archetype key
+
     def test_a_float_archetype_name_keeps_the_valid_sibling(self):
         # Kev-Ball's review of #5655: a float archetypeName passed the set-based aggregate and both optional
         # writers died formatting it as hex (exit 2, no report at all). Rejecting the declaration, as for the
