@@ -1129,6 +1129,19 @@ if(TARGET Vulkan::Headers)
     set_property(TARGET vk_pipeline_check PROPERTY
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   endif()
+  # BUILD-1457: a driver compiles on the thread that creates the pipeline, and its compiler can recurse with the
+  # shader's nesting. On Windows a thread that asks for no size gets the reserve in the PE header, 1 MB by default:
+  # the main thread and every std::thread worker of the checker. AMD's Windows compiler (26.11.2) overflows that
+  # on 26 of the corpus's mesh shaders, and 2 MB is still too little for compute shaders nested deeper than 16
+  # (docs/pipeline_check.md, "Stack reserve"). Keep the number in step with scripts/build_runtime.ps1.
+  set(LEONIDA_PIPELINE_CHECK_STACK 8388608)
+  if(WIN32)
+    if(MSVC)
+      target_link_options(vk_pipeline_check PRIVATE /STACK:${LEONIDA_PIPELINE_CHECK_STACK})
+    else()
+      target_link_options(vk_pipeline_check PRIVATE -Wl,--stack,${LEONIDA_PIPELINE_CHECK_STACK})
+    endif()
+  endif()
   if(BUILD_TESTING)
     if(WIN32)
       # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.
@@ -1146,6 +1159,13 @@ if(TARGET Vulkan::Headers)
              "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
     add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)
+    if(WIN32)
+      # Reads SizeOfStackReserve from the built file; the program is not run, so it needs no emulator.
+      add_test(NAME vk_pipeline_check_stack COMMAND "${CMAKE_COMMAND}"
+               "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
+               "-DWANT=${LEONIDA_PIPELINE_CHECK_STACK}"
+               -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
+    endif()
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
     # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).

@@ -65,6 +65,18 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             with self.subTest(source=name):
                 self.assertTrue((ROOT / "runtime" / "test" / name).is_file())
 
+    def test_the_pipeline_checker_gets_the_stack_reserve_cmake_gives_it(self):
+        """BUILD-1457: a driver compiles on vk_pipeline_check's threads, and AMD's Windows compiler overflows the
+        1 MB PE default. CMake links the checker with /STACK:<LEONIDA_PIPELINE_CHECK_STACK>; the fallback has to pass
+        the same number on the checker's own cl line (a /link option applies to that one program)."""
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        reserve = re.search(r"set\(LEONIDA_PIPELINE_CHECK_STACK (\d+)\)", cmake).group(1)
+        self.assertGreaterEqual(int(reserve), 8 * 1024 * 1024)
+        self.assertIn("target_link_options(vk_pipeline_check PRIVATE /STACK:${LEONIDA_PIPELINE_CHECK_STACK})", cmake)
+        lines = [line for line in self.body.splitlines() if "/Fe:vk_pipeline_check.exe" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertRegex(lines[0], rf"/Fe:vk_pipeline_check\.exe /link (\S+ )*/STACK:{reserve}( |$)")
+
     def test_build_cmd_sets_utf8_codepage_for_ninja_showincludes(self):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("chcp 65001 >nul", text)
