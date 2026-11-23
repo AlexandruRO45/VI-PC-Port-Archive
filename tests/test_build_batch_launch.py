@@ -19,24 +19,36 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ("build_runtime.ps1", "build_llvm_mc.ps1")
-LAUNCH = re.compile(r"^\$p = Start-Process cmd\.exe -ArgumentList (.+?) -NoNewWindow -PassThru\s*$", re.M)
+LAUNCH = re.compile(
+    r"^\$p = Start-Process (?:-FilePath )?cmd\.exe -ArgumentList (.+?)(?: -NoNewWindow)? -PassThru(?:\s*`)?\s*$",
+    re.M,
+)
 FOLDERS = ("plain", "a & b", "a&b", "x^y", "sp (x)", "東京 & co")
 
 
 def launch_arguments(script):
-    """The -ArgumentList expression of the script's one `$p = Start-Process cmd.exe` line."""
+    """The -ArgumentList expression of the script's one `$p = Start-Process ... cmd.exe` line."""
     found = LAUNCH.findall((ROOT / "scripts" / script).read_text(encoding="utf-8-sig"))
     if len(found) != 1:
-        raise AssertionError(f"{script}: expected one `$p = Start-Process cmd.exe -ArgumentList ...` line, found "
-                             f"{len(found)}; update tests/test_build_batch_launch.py together with the script")
+        raise AssertionError(f"{script}: expected one `$p = Start-Process [-FilePath] cmd.exe -ArgumentList ...` line, "
+                             f"found {len(found)}; update tests/test_build_batch_launch.py together with the script")
     return found[0]
 
 
-def start(arguments, bat):
-    """Run `$p = Start-Process cmd.exe -ArgumentList <arguments>` with $bat set, as the script does; its exit code."""
+def start(arguments, bat, *, hidden_redirect=False):
+    """Run `$p = Start-Process ... cmd.exe -ArgumentList <arguments>` with $bat set, as the script does; its exit code."""
+    if hidden_redirect:
+        launch = (
+            "$stdoutLog = Join-Path (Split-Path -Parent $bat) '_build.stdout.log'\n"
+            "$stderrLog = Join-Path (Split-Path -Parent $bat) '_build.stderr.log'\n"
+            f"$p = Start-Process -FilePath cmd.exe -ArgumentList {arguments} -PassThru "
+            "-WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog\n"
+        )
+    else:
+        launch = f"$p = Start-Process cmd.exe -ArgumentList {arguments} -NoNewWindow -PassThru\n"
     command = ("$ErrorActionPreference = 'Stop'\n"
                "$bat = $env:LEONIDA_LAUNCH_BAT\n"
-               f"$p = Start-Process cmd.exe -ArgumentList {arguments} -NoNewWindow -PassThru\n"
+               f"{launch}"
                "$null = $p.Handle\n"
                "$p.WaitForExit()\n"
                "exit $p.ExitCode\n")
@@ -45,9 +57,16 @@ def start(arguments, bat):
                           env=dict(os.environ, LEONIDA_LAUNCH_BAT=str(bat)), capture_output=True, timeout=60)
 
 
+class LaunchLineParseTest(unittest.TestCase):
+    def test_each_script_has_one_cmd_launch_line(self):
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                self.assertIn("$bat", launch_arguments(script))
+
+
 @unittest.skipUnless(sys.platform == "win32", "requires Windows PowerShell and cmd.exe")
 class BatchLaunchTest(unittest.TestCase):
-    def check(self, arguments):
+    def check(self, arguments, *, hidden_redirect=False):
         """Folders the launch line fails in, as `name/exit code` strings."""
         broken = []
         with tempfile.TemporaryDirectory() as directory:
@@ -60,7 +79,7 @@ class BatchLaunchTest(unittest.TestCase):
                     bat.write_bytes(f'@echo off\r\necho ran> "%~dp0ran.txt"\r\nexit /b {code}\r\n'.encode("ascii"))
                     if ran.exists():
                         ran.unlink()
-                    result = start(arguments, bat)
+                    result = start(arguments, bat, hidden_redirect=hidden_redirect)
                     if not ran.exists() or result.returncode != code:
                         broken.append(f"{name}/{code}->{result.returncode}")
         return broken
@@ -68,7 +87,8 @@ class BatchLaunchTest(unittest.TestCase):
     def test_each_script_starts_its_batch_in_any_folder(self):
         for script in SCRIPTS:
             with self.subTest(script=script):
-                self.assertEqual(self.check(launch_arguments(script)), [],
+                hidden_redirect = script == "build_runtime.ps1"
+                self.assertEqual(self.check(launch_arguments(script), hidden_redirect=hidden_redirect), [],
                                  f"{script}'s launch line does not run the batch in these folders")
 
     def test_the_check_catches_a_launch_line_that_drops_the_quotes(self):
