@@ -840,7 +840,7 @@ other titles and kit headers, and are checked against what this repository measu
 |---|---|---|---|
 | 43 | `GetAdapterLuid`, LUID in RAX | `GetAdapterLuid`, hidden return pointer | calls the PC method with its own buffer, returns the 8 bytes |
 | 44 | `CreatePlacedResourceX(address, desc, state, clear, iid, out)` | `CreatePipelineLibrary` | committed default-heap stand-in; the title's memory is not shared (logged) |
-| 48, 73, 78-80 | `CreateCommandQueueX`, `CreateCommandListX`, `Set/Schedule/WaitFrameEventX` | Device3/9/10/11/12 methods | refused and reported here (#6935 routes them) |
+| 48, 73, 78-80 | `CreateCommandQueueX`, `CreateCommandListX`, `Set/Schedule/WaitFrameEventX` | Device3/9/10/11/12 methods | #6935's routes (queue proxy, PC `CreateCommandList`, frame tokens), checked before this table; refused when `LEONIDA_XS_*_SLOT` moves a route away |
 | 49-54, 58, 69, 72 | driver hints, hang and debug callbacks | Device3/4/5/8 methods | `S_OK`, counted, first call reported |
 | 55 | `CreateDerivedGraphicsPipelineStateX` | `CreateReservedResource1` | refused, reported |
 | 60 | `CreateGraphicsPipelineStateX(desc, w2, w3, iid, out)` | `EnumerateMetaCommandParameters` | PC `CreateGraphicsPipelineState`, console flag bits removed |
@@ -850,7 +850,7 @@ other titles and kit headers, and are checked against what this repository measu
 | 74, 75 | `RegisterPagePoolX`, `UnregisterPagePoolX` | `ShaderCacheControl`, `CreateCommandQueue1` | records the pool, hands out a handle of its own; an unknown handle is `E_INVALIDARG` |
 | 81 | `GetFrameStatisticsX` | `OpenExistingHeapFromAddress1` | count 0, `S_FALSE` ("not available yet") |
 | 83-103, 105-112 | public `ID3D12Device1`-`5` and `6`-`8` | (PC 44-64, 65-72) | forwarded to the PC slot 39 or 40 lower |
-| 45-47, 56, 57, 59, 63-66, 70, 71, 77, 82, 104, 113+ | console methods no source names | | `E_NOTIMPL`, reported with the caller |
+| 45-47, 56, 57, 59, 63-66, 70, 71, 77, 82, 104, 113+ | console methods no source names | | `E_NOTIMPL`, reported with the caller (70, 127 and 133 have owners of their own: #7066, #7235, #6953) |
 
 Every slot the proxy does not forward is counted and its first call is logged with the caller (`module+RVA`,
 through the loader's own module list under gta6rt) and four argument words, so the first boot names every console
