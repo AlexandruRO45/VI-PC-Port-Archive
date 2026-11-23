@@ -17,7 +17,7 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 ## المتطلبات
 
 - نسختك الخاصة من حزمة Xbox Series بالإصدار `1.0.2.1`. اختر المجلد الذي يحتوي على `MicrosoftGame.Config` وأرشيفات `.rpf`.
-- Windows 10 أو 11 بمعمارية x64، مع نحو 350 غيغابايت متاحة لملفات العمل. يمكن وضعها على قرص آخر باستخدام `--work`.
+- Windows 10 أو 11 بمعمارية x64، مع نحو 450 غيغابايت متاحة لملفات العمل. يمكن وضعها على قرص آخر باستخدام `--work`.
 - Git و[Python 3.12 أو أحدث](https://www.python.org/downloads/) و[حزمة .NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
   عند تثبيت Python على Windows، اختر إضافة `python.exe` إلى `PATH`.
 - [حزمة Vulkan SDK](https://vulkan.lunarg.com/) لتوفير `spirv-as` و`spirv-val` و`vulkaninfo`.
