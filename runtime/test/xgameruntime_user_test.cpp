@@ -89,9 +89,28 @@ int main(int argc, char** argv) {
     check(finished(&add) && XAsyncGetStatus(&add, false) == S_OK, "it completes with S_OK");
     XUserHandle h = nullptr;
     check(at<AddResult>(user, 8)(user, &add, &h) == S_OK && h != nullptr, "XUserAddResult hands out a user handle");
+    using CloseAdded = void(STDMETHODCALLTYPE*)(void*, XUserHandle);
     XAsyncBlock bad{};
     check(at<AddAsync>(user, 7)(user, 0x01 | 0x02, &bad) == E_INVALIDARG,
           "AllowGuests with AddDefaultUserSilently is refused (a guest can't be the default user)");
+    for (uint32_t options : {0x08u, 0x10u, 0x80000000u, 0xffffffffu}) {
+        XAsyncBlock invalid{};
+        const HRESULT result = at<AddAsync>(user, 7)(user, options, &invalid);
+        check(result == E_INVALIDARG, "unknown XUserAddOptions bits are refused");
+        if (result == S_OK) {
+            XUserHandle unexpected = nullptr;
+            if (finished(&invalid) && at<AddResult>(user, 8)(user, &invalid, &unexpected) == S_OK)
+                at<CloseAdded>(user, 4)(user, unexpected);
+        }
+    }
+    for (uint32_t options : {0x02u, 0x04u, 0x05u, 0x06u}) {
+        XAsyncBlock valid_add{};
+        XUserHandle valid_handle = nullptr;
+        check(at<AddAsync>(user, 7)(user, options, &valid_add) == S_OK && finished(&valid_add) &&
+                  at<AddResult>(user, 8)(user, &valid_add, &valid_handle) == S_OK && valid_handle,
+              "documented or unproven XUserAddOptions combination adds the offline user");
+        if (valid_handle) at<CloseAdded>(user, 4)(user, valid_handle);
+    }
     XAsyncBlock picker{};
     XUserHandle h_picker = nullptr;
     check(at<AddAsync>(user, 7)(user, 0x00, &picker) == S_OK && finished(&picker) &&

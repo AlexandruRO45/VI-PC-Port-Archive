@@ -196,8 +196,9 @@ HRESULT CALLBACK resolve_provider(XAsyncOp op, const XAsyncProviderData* data) {
 HRESULT STDMETHODCALLTYPE user_add_async(void*, XUserAddOptions options, XAsyncBlock* async) {
     if (!async) return E_POINTER;
     const auto bits = static_cast<uint32_t>(options);
-    if ((bits & static_cast<uint32_t>(XUserAddOptions::AddDefaultUserSilently)) &&
-        (bits & static_cast<uint32_t>(XUserAddOptions::AllowGuests)))
+    if ((bits & ~uint32_t{0x07}) ||
+        ((bits & static_cast<uint32_t>(XUserAddOptions::AddDefaultUserSilently)) &&
+         (bits & static_cast<uint32_t>(XUserAddOptions::AllowGuests))))
         return E_INVALIDARG;
     return XAsyncBegin(async, nullptr, &kAddIdentity, "XUserAddAsync", add_provider);
 }
