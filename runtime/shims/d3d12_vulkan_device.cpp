@@ -2598,9 +2598,13 @@ public:
 
     // As the host reports it (measured against the PC runtime, d3d12_vulkan_device_test compare_heap_descs): the
     // alignment the heap was placed with (64 KiB for an Alignment of 0) and the one node for a node mask of 0, as the
-    // layer's resources, descriptor heaps and queues already answer.
+    // layer's resources, descriptor heaps and queues already answer. The flags lose the two creation-only bits
+    // (CREATE_NOT_ZEROED, CREATE_NOT_RESIDENT), as GetHeapProperties drops them too; the others are kept (measured
+    // on an RTX 3080 / 621.24, d3d12_heap_properties_test). desc_ keeps them for the layer's own use.
     D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override {
         D3D12_HEAP_DESC desc = desc_;
+        desc.Flags = D3D12_HEAP_FLAGS(UINT(desc.Flags) &
+                                      ~UINT(D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT));
         desc.Alignment = alignment();
         desc.Properties.CreationNodeMask = 1;
         desc.Properties.VisibleNodeMask = 1;

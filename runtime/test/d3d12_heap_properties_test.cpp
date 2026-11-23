@@ -1,7 +1,8 @@
 // ID3D12Resource::GetHeapProperties on the Vulkan-backed device, compared with the host PC runtime: the properties
 // (type, CPU page property, memory pool, node masks) and heap flags it reports for committed resources in every heap
 // type (custom ones included) and with SHARED, ALLOW_DISPLAY, CREATE_NOT_ZEROED and CREATE_NOT_RESIDENT, for placed
-// resources in heaps of each kind, and for a reserved resource, with null arguments too. d3d12_node_mask_test covers
+// resources in heaps of each kind (with their heap's ID3D12Heap::GetDesc), and for a reserved resource, with null
+// arguments too. d3d12_node_mask_test covers
 // the node masks and DENY bits of a few committed resources; this test covers the rest. Every value is recorded,
 // with whether the call wrote its outputs (they start as a sentinel), and the two records must be the same. A
 // resource one device refuses to create is reported and its steps aren't compared. No shaders or game data. Skips
@@ -146,6 +147,14 @@ std::vector<Case> cases() {
          D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_SHARED, buffer(), kCommon},
         {"placed buffer, DEFAULT heap, CREATE_NOT_ZEROED", Kind::placed, heap(D3D12_HEAP_TYPE_DEFAULT),
          D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, buffer(), kCommon},
+        {"placed buffer, DEFAULT heap, CREATE_NOT_RESIDENT", Kind::placed, heap(D3D12_HEAP_TYPE_DEFAULT),
+         D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, buffer(), kCommon},
+        {"placed buffer, DEFAULT heap, CREATE_NOT_ZEROED | CREATE_NOT_RESIDENT", Kind::placed,
+         heap(D3D12_HEAP_TYPE_DEFAULT),
+         D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
+         buffer(), kCommon},
+        {"placed buffer, DEFAULT heap, ALLOW_SHADER_ATOMICS", Kind::placed, heap(D3D12_HEAP_TYPE_DEFAULT),
+         D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS, buffer(), kCommon},
 
         {"reserved buffer", Kind::reserved, {}, kNone, buffer(), kCommon},
         {"reserved texture", Kind::reserved, {}, kNone, [] {
@@ -208,6 +217,15 @@ void record_call(Record& out, const std::string& what, ID3D12Resource* r, bool w
     if (want_flags) out.add(what + ": flags", std::uint32_t(f));
 }
 
+// ID3D12Heap::GetDesc of a placed resource's heap: the host runtime reads its flags back without the creation-only
+// CREATE_NOT_ZEROED and CREATE_NOT_RESIDENT, and keeps the others (SHARED, ALLOW_SHADER_ATOMICS, the DENY bits).
+void record_heap(Record& out, const std::string& what, ID3D12Heap* h) {
+    const D3D12_HEAP_DESC d = h->GetDesc();
+    out.add(what + ": heap Flags", std::uint32_t(d.Flags));
+    out.add(what + ": heap SizeInBytes", d.SizeInBytes);
+    out.add(what + ": heap Alignment", d.Alignment);
+}
+
 void run(ID3D12Device* device, Record& out) {
     for (const Case& c : cases()) {
         Ref<ID3D12Heap> h;
@@ -218,6 +236,7 @@ void run(ID3D12Device* device, Record& out) {
             out.add(std::string(c.name) + " [not created]", kNotCreated);
             continue;
         }
+        if (h.p) record_heap(out, c.name, h.p);
         record_call(out, c.name, r.p, true, true);
         record_call(out, std::string(c.name) + ", properties only", r.p, true, false);
         record_call(out, std::string(c.name) + ", flags only", r.p, false, true);
@@ -236,6 +255,17 @@ int main() {
     const bool verbose = GetEnvironmentVariableA("LEONIDA_D3D49_VERBOSE", nullptr, 0) > 0;
     Record ours;
     run(device.p, ours);
+    // Without a host to compare with, the layer's heaps still drop the creation-only flags.
+    for (std::size_t i = 0; i < ours.names.size(); ++i) {
+        const std::string& name = ours.names[i];
+        const std::string suffix = ": heap Flags";
+        if (name.size() < suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix)) continue;
+        if (ours.values[i] & (D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT)) {
+            std::fprintf(stderr, "heap properties %s: 0x%llx keeps a creation-only flag\n", name.c_str(),
+                         static_cast<unsigned long long>(ours.values[i]));
+            return 1;
+        }
+    }
 
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
