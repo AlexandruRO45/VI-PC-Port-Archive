@@ -442,6 +442,37 @@ class LodSetsTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(out, "chunks", f'{chunk["id"]}.glb')))
         self.assertEqual(world["lod_bands"], {"hd": [0.0, 120.0], "lod": [120.0, 450.0]})
 
+    def test_only_exported_placements_contribute_to_lod_bands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = twp.write_assets(tmp)
+            manifest = os.path.join(assets, "levels", "models", "manifest.json")
+            with open(manifest, encoding="utf-8") as f:
+                models = json.load(f)
+            models["Items"].append({"File": "missing.obj", "Name": "missing_obj.#dr"})
+            with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(models, f)
+
+            pos = (10, 10, 0)
+            hd = self.lod_row(pos, 0, own=130.0)
+            lod = self.lod_row(pos, 1, child=130.0, own=450.0)
+            for reason, row in (
+                ("unresolved_archetype", twp.entity("unknown_model", pos, lod=1)),
+                ("degenerate_scale", twp.entity("test_box", pos, lod=1, sz=0)),
+                ("model_not_loadable", twp.entity("missing_obj", pos, lod=1)),
+            ):
+                with self.subTest(reason=reason):
+                    skipped = dict(row, child_lod_dist=500.0, lod_dist=450.0)
+                    entities = os.path.join(tmp, "entities.jsonl")
+                    twp.write_entities(entities, [hd, lod, skipped, skipped])
+                    out = os.path.join(tmp, reason)
+                    world_build.build_world(assets, out, placements=entities, textures=False,
+                                            lod_sets=True, lod_levels=(0, 1))
+                    with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
+                        world = json.load(f)
+                    self.assertEqual(world["stats"]["placements"][reason], 2)
+                    self.assertEqual({c["lod"]: c["models"] for c in world["chunks"]}, {"hd": 1, "lod": 1})
+                    self.assertEqual(world["lod_bands"], {"hd": [0.0, 130.0], "lod": [130.0, 450.0]})
+
     def test_option_rules(self):
         with self.assertRaisesRegex(ValueError, "lod-sets needs --instancing"):
             self.build([self.lod_row((0, 0, 0), 0)], lod_sets=True, instancing="bake")
