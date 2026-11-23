@@ -121,6 +121,18 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(reparsed["op"], ins["op"])
         self.assertEqual(reparsed["mods"], ins["mods"])
 
+    def test_gfx1013_vop3_140_is_mad_legacy(self):
+        # VOP3 0x140 is v_mad_legacy_f32 on the console's gfx1013 target. GFX10.3 reuses the encoding for the
+        # fused v_fma_legacy_f32, but the pure-Python backend always decodes the console ISA.
+        w0 = (0x35 << 26) | (0x140 << 16) | 4
+        w1 = (256 + 1) | ((256 + 2) << 9) | ((256 + 3) << 18)
+        info = rdna2_decode.decode_bytes(words(w0, w1))
+        self.assertEqual(info["invalid"], 0)
+        self.assertEqual(info["insns"][0]["op"], "v_mad_legacy_f32")
+        self.assertEqual([a["r"] for a in info["insns"][0]["args"]], [4, 1, 2, 3])
+        self.assertEqual(shader_ir.parse_line(rdna2_decode.format_insn(info["insns"][0]))["op"],
+                         "v_mad_legacy_f32")
+
     def test_smem_vcc_tuple_and_offsets(self):
         # s_buffer_load_dwordx8 [s100..s105,vcc_lo,vcc_hi], s[0:3], null (SMEM op=0x0b, sdata=100, sbase=0, soff=125)
         w0 = (0x3D << 26) | (0x0B << 18) | (100 << 6) | 0
