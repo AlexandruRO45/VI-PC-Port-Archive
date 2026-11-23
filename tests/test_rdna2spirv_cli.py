@@ -18,10 +18,12 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 TOOL = os.path.join(ROOT, "tools", "rdna2spirv.py")
 
 import rdna2spirv  # noqa: E402
+from tool_test_helpers import tool_stem  # noqa: E402
 
 # These tests stand in for spirv-as and spirv-val; whether the SDK's library is on this machine must not change them.
 _NO_LIBRARY = mock.patch.object(rdna2spirv.spirv_tools_lib, "load", return_value=None)
@@ -79,7 +81,7 @@ class SourceDiscovery(unittest.TestCase):
 
     def run_main(self, src, out):
         def spirv_tool(cmd, **kwargs):
-            tool = os.path.basename(cmd[0])
+            tool = tool_stem(cmd[0])
             if tool == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
@@ -319,7 +321,7 @@ class OutputInsideInput(unittest.TestCase):
         out = self.tmp / "spirv"
 
         def spirv_tool(cmd, **kwargs):
-            if cmd[0] == "spirv-as":
+            if tool_stem(cmd[0]) == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -344,7 +346,7 @@ class ValidatedOutput(unittest.TestCase):
 
     def translate(self, *, reject_at=None):
         def spirv_tool(cmd, **kwargs):
-            tool = os.path.basename(cmd[0])
+            tool = tool_stem(cmd[0])
             if tool == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
@@ -364,6 +366,12 @@ class ValidatedOutput(unittest.TestCase):
 
     def test_existing_single_s_file_still_translates(self):
         self.assertIn("1 pass spirv-val", self.translate())
+
+    def test_doubles_accept_windows_sdk_executable_paths(self):
+        sdk_tools = {"spirv-as": r"C:\SDK\Bin\spirv-as.EXE", "spirv-val": r"C:\SDK\Bin\SPIRV-VAL.ExE"}
+        with mock.patch.object(rdna2spirv.spirv_tools_lib, "program", side_effect=sdk_tools.__getitem__):
+            self.assertIn("1 pass spirv-val", self.translate())
+        self.assertEqual(self.module.read_bytes(), b"new module")
 
     def test_missing_required_inputs_retire_stale_outputs_and_continue(self):
         listing_dir = self.src.parent
@@ -483,7 +491,7 @@ class ValidatedOutput(unittest.TestCase):
 
     def test_missing_validator_does_not_publish_the_module(self):
         def spirv_tool(cmd, **kwargs):
-            if cmd[0] == "spirv-as":
+            if tool_stem(cmd[0]) == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             raise FileNotFoundError(2, "No such file or directory", "spirv-val")

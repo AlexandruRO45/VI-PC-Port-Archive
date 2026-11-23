@@ -11,9 +11,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import run_gpu_tests as rgt
 import check   # runtime/test/shaders, on the path once run_gpu_tests is imported
+from tool_test_helpers import tool_stem
 
 WANT = [55, 48]
 DEVICE_32 = "device: X (subgroup 32..32)\n"
@@ -145,7 +147,7 @@ class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):
             args = SimpleNamespace(filter="ps_tex.asm", build=tmp, llvm_mc="unused")   # not ps_texoff etc.
 
             def run(cmd, env=None, gpu=True):
-                if Path(cmd[0]).stem == "vk_bindless_test":
+                if tool_stem(cmd[0]) == "vk_bindless_test":
                     return rc, msg
                 (Path(tmp) / "spirv" / "ps_tex.spv").touch()   # rdna2spirv.py "translating" the shader
                 return 0, ""
@@ -179,7 +181,7 @@ class StoreHelperUnsupported(unittest.TestCase):
             args = SimpleNamespace(filter=f"{shader}.asm", build=tmp, llvm_mc="unused")
 
             def run(cmd, env=None, gpu=True):
-                if Path(cmd[0]).stem == "vk_store_test":
+                if tool_stem(cmd[0]) == "vk_store_test":
                     return rc, msg
                 (Path(tmp) / "spirv" / f"{shader}.spv").touch()   # rdna2spirv.py "translating" the shader
                 return 0, ""
@@ -235,7 +237,7 @@ class ComputeFeatureUnsupported(unittest.TestCase):
             args = SimpleNamespace(filter=f"{shader}.asm", build=tmp, llvm_mc="unused")
 
             def run(cmd, env=None, gpu=True):
-                if Path(cmd[0]).stem == "vk_compute_test":
+                if tool_stem(cmd[0]) == "vk_compute_test":
                     calls.append(cmd)
                     return rc, msg
                 (Path(tmp) / "spirv" / f"{shader}.spv").touch()
@@ -627,7 +629,7 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
                 for s in os.listdir(cmd[cmd.index(rgt.TRANSLATOR) + 1]):
                     Path(out, Path(s).stem + ".spv").touch()
                 return 0, ""
-            if os.path.basename(cmd[0]).startswith("vk_harness"):
+            if tool_stem(cmd[0]).startswith("vk_harness"):
                 drawn.append(cmd)
                 return rgt.UNSUPPORTED, self.DRAWN
             return 0, ""
@@ -746,7 +748,7 @@ class FmaFusedSuite(unittest.TestCase):
             args = SimpleNamespace(filter="cs_fma_fused", build=tmp, llvm_mc="unused")
 
             def fake_run(cmd, env=None, gpu=True):
-                if Path(cmd[0]).stem == "vk_compute_test":
+                if tool_stem(cmd[0]) == "vk_compute_test":
                     self.assertEqual((env or {}).get("VKC_SGPRS"), rgt.FMA_FUSED_ENV["VKC_SGPRS"])
                     return rc, msg
                 (Path(tmp) / "spirv" / "cs_fma_fused.spv").touch()
