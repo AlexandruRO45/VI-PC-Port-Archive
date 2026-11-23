@@ -191,6 +191,10 @@ bool unmap_page(Region& r, uintptr_t base, size_t index) {
 
 bool map_page(Region& r, uintptr_t base, size_t index, uint32_t slot) {
     if (r.page[index] == slot + 1) return true;
+    // Allocate space for the new record before removing the old view. Undoing
+    // a replacement can reuse the capacity retained by the old record.
+    auto& mappings = g_slots[slot].mapped_at;
+    if (mappings.size() == mappings.capacity()) mappings.reserve(mappings.size() * 2 + 1);
     if (!unmap_page(r, base, index) || !isolate(r, base, index)) return false;
     void* const a = reinterpret_cast<void*>(page_address(base, index));
     const Chunk& chunk = g_chunks[slot / kChunkPages];
@@ -205,15 +209,100 @@ bool map_page(Region& r, uintptr_t base, size_t index, uint32_t slot) {
         DWORD old = 0;
         if (view && !VirtualProtect(view, kPage, r.protect, &old)) {
             const DWORD error = GetLastError();
-            api().unmap2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            if (!api().unmap2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER)) {
+                mappings.push_back(page_address(base, index));
+                r.page[index] = slot + 1;
+            }
             SetLastError(error);
             return false;
         }
     }
     if (!view) return false;
-    g_slots[slot].mapped_at.push_back(page_address(base, index));
+    mappings.push_back(page_address(base, index));
     r.page[index] = slot + 1;
     return true;
+}
+
+struct ProtectionRange {
+    void* address;
+    SIZE_T size;
+    DWORD protection;
+};
+
+struct MappingChange {
+    Region* region;
+    uintptr_t base;
+    size_t index;
+    uint32_t slot;
+    uint32_t previous_slot = 0;
+    std::vector<ProtectionRange> previous_protections;
+};
+
+bool capture_protections(MappingChange& change) {
+    const uintptr_t base = page_address(change.base, change.index);
+    const uintptr_t end = base + kPage;
+    for (uintptr_t address = base; address < end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        auto* const ptr = reinterpret_cast<void*>(address);
+        if (!VirtualQuery(ptr, &info, sizeof(info))) return false;
+        if (info.State != MEM_COMMIT || info.Type != MEM_MAPPED || info.BaseAddress != ptr ||
+            info.AllocationBase != reinterpret_cast<void*>(base) || info.RegionSize == 0 ||
+            info.RegionSize > end - address) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return false;
+        }
+        if (info.Protect != change.region->protect)
+            change.previous_protections.push_back({ptr, info.RegionSize, info.Protect});
+        address += info.RegionSize;
+    }
+    return true;
+}
+
+bool set_mapping(const MappingChange& change, uint32_t slot) {
+    if (slot == 0) return unmap_page(*change.region, change.base, change.index);
+    return map_page(*change.region, change.base, change.index, slot - 1);
+}
+
+// Restore earlier views if any native operation fails. Capture each old view
+// in order so scatter requests with repeated addresses retain their semantics.
+bool apply_mappings(std::vector<MappingChange>& changes) {
+    size_t undo = 0;
+    DWORD error = ERROR_SUCCESS;
+    try {
+        for (auto& change : changes) {
+            change.previous_slot = change.region->page[change.index];
+            if (change.previous_slot != change.slot && change.previous_slot != 0 && !capture_protections(change)) {
+                error = GetLastError();
+                break;
+            }
+            ++undo;  // A failed replacement may already have removed its old view.
+            if (!set_mapping(change, change.slot)) {
+                error = GetLastError();
+                if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
+                break;
+            }
+        }
+        if (error == ERROR_SUCCESS && undo == changes.size()) return true;
+    } catch (const std::bad_alloc&) {
+        error = ERROR_NOT_ENOUGH_MEMORY;
+    }
+
+    bool restored = true;
+    while (undo != 0) {
+        const auto& change = changes[--undo];
+        if (change.region->page[change.index] == change.previous_slot) continue;
+        if (!set_mapping(change, change.previous_slot)) {
+            restored = false;
+            continue;
+        }
+        for (const auto& range : change.previous_protections) {
+            DWORD old = 0;
+            if (!VirtualProtect(range.address, range.size, range.protection, &old)) restored = false;
+        }
+    }
+    if (!restored) std::fprintf(stderr, "[rt] xmem: could not restore all views after a physical mapping failed\n");
+    SetLastError(error != ERROR_SUCCESS ? error : ERROR_GEN_FAILURE);
+    return false;
 }
 
 // Unmaps a slot wherever it is mapped.
@@ -351,11 +440,10 @@ PVOID WINAPI XMemMapPhysicalPages(PVOID va, ULONG_PTR count, ULONG_PTR* page_arr
             SetLastError(ERROR_INVALID_PARAMETER);
             return nullptr;
         }
-        for (ULONG_PTR i = 0; i < count; ++i) {
-            const bool ok = slots[i] ? map_page(*r, base, first + i, slots[i] - 1) : unmap_page(*r, base, first + i);
-            if (!ok) return nullptr;
-        }
-        return va;
+        std::vector<MappingChange> changes;
+        changes.reserve(count);
+        for (ULONG_PTR i = 0; i < count; ++i) changes.push_back({r, base, first + i, slots[i]});
+        return apply_mappings(changes) ? va : nullptr;
     } catch (const std::bad_alloc&) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
@@ -378,28 +466,20 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(PVOID* va_array, ULONG_PTR count, ULONG_
             SetLastError(ERROR_INVALID_PARAMETER);
             return FALSE;
         }
-        struct Target {
-            Region* region;
-            uintptr_t base;
-            size_t index;
-        };
-        std::vector<Target> targets(static_cast<size_t>(count));
+        std::vector<MappingChange> changes;
+        changes.reserve(count);
         for (ULONG_PTR i = 0; i < count; ++i) {
             const uintptr_t a = reinterpret_cast<uintptr_t>(va_array[i]);
-            Target& t = targets[i];
-            t.region = a % kPage == 0 ? region_of(a, 1, t.base, t.index) : nullptr;
-            if (!t.region) {
+            uintptr_t base = 0;
+            size_t index = 0;
+            Region* const region = a % kPage == 0 ? region_of(a, 1, base, index) : nullptr;
+            if (!region) {
                 SetLastError(ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
+            changes.push_back({region, base, index, slots[i]});
         }
-        for (ULONG_PTR i = 0; i < count; ++i) {
-            const Target& t = targets[i];
-            const bool ok =
-                slots[i] ? map_page(*t.region, t.base, t.index, slots[i] - 1) : unmap_page(*t.region, t.base, t.index);
-            if (!ok) return FALSE;
-        }
-        return TRUE;
+        return apply_mappings(changes) ? TRUE : FALSE;
     } catch (const std::bad_alloc&) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return FALSE;

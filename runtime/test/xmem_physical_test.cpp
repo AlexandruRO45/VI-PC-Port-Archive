@@ -81,6 +81,57 @@ void test_allocate(const Api& x) {
           "freeing them a second time is ERROR_INVALID_PARAMETER");
 }
 
+void test_host_failure(const Api& x) {
+    const auto alloc2 = reinterpret_cast<decltype(&VirtualAlloc2)>(
+        GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2"));
+    void* const region = x.virtual_alloc(nullptr, 2 * kPage, kPhysicalReserve, 0x21, PAGE_READWRITE);
+    ULONG_PTR count = 2;
+    ULONG_PTR frames[2]{};
+    const bool setup = alloc2 && region && x.allocate(0x280, &count, frames) && x.map(region, 2, frames) == region;
+    check(setup, "host-failure setup");
+    if (!setup) return;
+    at(region, 0)[0] = 0x11;
+    at(region, 1)[0] = 0x22;
+    SYSTEM_INFO host{};
+    GetSystemInfo(&host);
+    DWORD old = 0;
+    check(VirtualProtect(region, host.dwPageSize, PAGE_READONLY, &old) == TRUE,
+          "restrict the first host page of the original view");
+
+    void* const second = at(region, 1);
+    // Occupy the second placeholder so Win32 rejects the replacement even
+    // though both guest addresses and frame handles pass validation.
+    check(x.map(second, 1, nullptr) == second, "restore an isolated placeholder for the second page");
+    void* const obstruction = alloc2(nullptr, second, kPage, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                                     PAGE_READWRITE, nullptr, 0);
+    check(obstruction == second, "occupy the second placeholder with native memory");
+    if (!obstruction) return;
+
+    ULONG_PTR remap[2]{frames[1], frames[0]};
+    const auto contiguous = x.map(region, 2, remap);
+    const auto contiguous_error = GetLastError();
+    check(contiguous == nullptr && contiguous_error != ERROR_SUCCESS, "Win32 rejects the second contiguous map");
+    check(committed(region) && at(region, 0)[0] == 0x11, "contiguous map leaves first page intact on host failure");
+    check(query(region).Protect == PAGE_READONLY && query(at(region, 0) + host.dwPageSize).Protect == PAGE_READWRITE,
+          "contiguous rollback restores the original per-page protection");
+
+    check(x.map(region, 1, frames) == region, "restore original first page for the scatter test");
+    check(VirtualProtect(region, host.dwPageSize, PAGE_READONLY, &old) == TRUE,
+          "restrict the original view for the scatter test");
+    void* addresses[3]{region, region, second};
+    ULONG_PTR scatter_frames[3]{frames[1], 0, frames[0]};
+    const auto scatter = x.scatter(addresses, 3, scatter_frames);
+    const auto scatter_error = GetLastError();
+    check(scatter == FALSE && scatter_error != ERROR_SUCCESS, "Win32 rejects the final scatter map");
+    check(committed(region) && at(region, 0)[0] == 0x11,
+          "scatter rollback restores the original mapping when an address appears twice");
+    check(query(region).Protect == PAGE_READONLY && query(at(region, 0) + host.dwPageSize).Protect == PAGE_READWRITE,
+          "scatter rollback restores the original per-page protection");
+
+    check(VirtualFree(obstruction, kPage, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == TRUE, "restore native placeholder");
+    check(x.free_pages(2, frames) == TRUE && x.virtual_free(region, 0, MEM_RELEASE) == TRUE, "release pages and region");
+}
+
 void test_map(const Api& x) {
     void* rw = x.virtual_alloc(nullptr, 16 * kPage, kPhysicalReserve, 0x21, PAGE_READWRITE);
     void* alias = x.virtual_alloc(nullptr, 16 * kPage, kPhysicalReserve, 0x23, PAGE_READWRITE | kGraphicsReadWrite);
@@ -229,6 +280,7 @@ int main() {
         test_map(x);
         test_large_reservation(x);
         test_bulk(x);
+        test_host_failure(x);
     }
     std::printf("%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
