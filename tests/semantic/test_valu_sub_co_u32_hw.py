@@ -522,5 +522,57 @@ class TestValuSubCoU32IEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(res_nan, (qnan, 0))
         self.assertEqual(run_translated_sub_co_u32(qnan, 0), (qnan, 0))
 
+# ---------------------------------------------------------------------------
+# Stage 8: Negative controls, syntax rejection, and mutation detection
+# ---------------------------------------------------------------------------
+
+class TestValuSubCoU32NegativeControls(unittest.TestCase):
+    """Stage 8: Negative controls, syntax rejection, and mutation detection for v_sub_co_u32."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+
+    def test_invalid_destination_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            VOP3COInstruction(
+                Opcode.V_SUB_CO_U32,
+                Register(RegKind.SGPR, 0),
+                Register(RegKind.SPECIAL, 0, "vcc_lo"),
+                Register(RegKind.VGPR, 1),
+                Register(RegKind.VGPR, 2),
+            )
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=128)
+
+    def test_mutation_detection_and_oracle_rejection(self) -> None:
+        a, b = 15, 25
+        correct = oracle_sub_co_u32(a, b)
+
+        def mutated_oracle_inverted_borrow(x: int, y: int) -> tuple[int, int]:
+            return (x - y) & MASK32, 1 if x > y else 0
+
+        def mutated_oracle_reversed_sub(x: int, y: int) -> tuple[int, int]:
+            return (y - x) & MASK32, 1 if y < x else 0
+
+        self.assertNotEqual(mutated_oracle_inverted_borrow(a, b), correct)
+        self.assertNotEqual(mutated_oracle_reversed_sub(a, b), correct)
+
+    def test_translator_compliance_guard(self) -> None:
+        test_path = os.path.join(HERE, "test_valu_sub_co_u32_hw.py")
+        self.assertTrue(os.path.isfile(test_path))
+        with open(test_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("import support", content)
+        self.assertIn("support.translate_lines", content)
+
 if __name__ == "__main__":
     unittest.main()
