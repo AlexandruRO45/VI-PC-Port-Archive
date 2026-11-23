@@ -108,6 +108,29 @@ class TestPackB32F16IEEE754(unittest.TestCase):
         res = run_ps_pack(0x7C00, 0xFC00, name="ps_pack_infs")
         self.assertEqual(res, 0xFC00_7C00)
 
+class TestPackB32F16Aliasing(unittest.TestCase):
+    def test_dst_aliases_src0(self):
+        code = [
+            "v_mov_b32_e32 v0, 0x1111",
+            "v_mov_b32_e32 v1, 0x2222",
+            "v_pack_b32_f16 v0, v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pack_alias_s0", code)
+        self.assertEqual(support.mrt0_words(spv)[0], 0x2222_1111)
+
+    def test_dst_aliases_src1(self):
+        code = [
+            "v_mov_b32_e32 v1, 0x3333",
+            "v_mov_b32_e32 v0, 0x4444",
+            "v_pack_b32_f16 v0, v1, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pack_alias_s1", code)
+        self.assertEqual(support.mrt0_words(spv)[0], 0x4444_3333)
+
 
 if __name__ == "__main__":
     unittest.main()
