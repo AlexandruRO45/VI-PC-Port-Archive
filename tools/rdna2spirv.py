@@ -34,6 +34,7 @@ from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
+import pal_stages  # noqa: E402
 import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
 import wave64_emulate_opt  # noqa: E402
@@ -16429,6 +16430,30 @@ def fspx_wave_size(path, name):
     return None if not isinstance(wave32, bool) else (32 if wave32 else 64)
 
 
+# The PAL hardware stage (tools/pal_stages.py, first record of the FSSM header's stage table) that each translator
+# stage was compiled for, measured over all 26,503 blobs of 1.0.2.1 with no exception: every VS on the legacy
+# hardware VS (4), never on GS/NGG, every PS on 5, every GS on 3 (its second record is the VS copy), every CS on 6
+# and every mesh shader on 7. The input VGPR layout the translator assumes follows from it: a legacy VS gets
+# v0 = vertex id and v3 = instance id (docs/design.md, "Inputs and outputs"), while an NGG or ES variant puts its
+# inputs elsewhere (v5/v8 after the GS VGPRs in an NGG or merged ES-GS wave), so translating one as a legacy VS
+# would read the wrong registers without any other sign.
+PAL_HARDWARE_STAGE = {"vs": "vs", "ps": "ps", "gs": "gs", "cs": "cs", "ms": "ngg"}
+
+
+def check_pal_hardware_stage(stage, blob):
+    """Refuse a shader whose FSSM stage record names a hardware stage other than the one its input layout assumes.
+
+    A blob without stage records (synthetic listings, a sidecar without the FSSM magic) is not checked."""
+    records = pal_stages.stage_descriptors(blob)
+    want = PAL_HARDWARE_STAGE.get(stage)
+    if not records or want is None:
+        return
+    found = records[0]["hardware_stage"] or f"id {records[0]['hardware_id']}"
+    if found != want:
+        raise Unsupported(f"FSSM stage record puts this {stage} on hardware stage {found}, not {want}: "
+                          f"its input VGPR layout is not the one translated")
+
+
 def translate(path):
     info = parse_file(path)
     stage = stage_of(info["name"], path)
@@ -16498,7 +16523,9 @@ def translate(path):
     fssm_ws = None
     try:
         with open(fssm_path, "rb") as f:
-            fssm_ws = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
+            fssm_blob = f.read()
+        fssm_ws = fssm_header.wave_size(fssm_blob[:fssm_header.WAVE_FLAGS_OFFSET + 4])
+        check_pal_hardware_stage(stage, fssm_blob)
     except OSError:
         pass
     # An FSPX program (the FidelityFX DLL's) has no FSSM header; its kind-0 dispatch state carries the wave size
