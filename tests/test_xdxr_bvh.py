@@ -527,6 +527,27 @@ class Cli(unittest.TestCase):
                 f.write("not json at all")
             self.assertIn("broken.json", self.check_build_stderr(d))
 
+    def test_load_case_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "bom.bin"), "wb") as f:
+                f.write(b"\x00" * 16)
+            with open(os.path.join(d, "bom.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write('{"kind": "blas", "address": 4096, "triangles": []}')
+            desc, data = X._load_case(d, "bom")
+            self.assertEqual(desc["kind"], "blas")
+            self.assertEqual(desc["address"], 4096)
+            self.assertEqual(len(data), 16)
+
+    def test_load_case_malformed_json_with_utf8_bom_raises_case_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "bad_bom.bin"), "wb") as f:
+                f.write(b"")
+            with open(os.path.join(d, "bad_bom.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write("{bad json")
+            with self.assertRaises(X.CaseError) as ctx:
+                X._load_case(d, "bad_bom")
+            self.assertIn("bad_bom.json", str(ctx.exception))
+
     def test_check_build_json_without_a_kind_is_one_line(self):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "case.bin"), "wb") as f:

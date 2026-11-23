@@ -840,7 +840,7 @@ def _load_case(directory, name):
     js = f"{directory}/{name}.json"
     fix = lambda x: math.nan if x == "nan" else x                                   # noqa: E731
     try:
-        with open(js, encoding="utf-8") as fh:
+        with open(js, encoding="utf-8-sig") as fh:
             desc = json.load(fh)
         with open(f"{directory}/{name}.bin", "rb") as fh:
             data = fh.read()
