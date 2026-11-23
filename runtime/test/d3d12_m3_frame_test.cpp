@@ -22,16 +22,31 @@
 // exact number of samples F made visible (rectangles are pixel-aligned, so the count is the area of F minus N).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 // --first-pass-only isolates depth/stencil, MRT, queries and slot reuse from the descriptor-sampling second pass.
+// Built a second time with LEONIDA_M3_GUEST, this file is tiny_guest_m3.exe, which runs the same six frames and the same
+// pixel checks as a `gta6rt --run` guest (test/run_guest_frame.cmake): its device comes from an imported
+// d3d12_xs.dll!D3D12XboxCreateDevice that gta6rt's shim registry answers (LEONIDA_D3D12=vulkan, LEONIDA_SHADERS=
+// <folder>/spirv), the folder build.py wrote is argv[1], and `--first-pass-only` and `--imprecise-occlusion` follow it.
+// It links nothing from src/ or shims/, so the checks that need the runtime's internals (the shader library, the hash
+// table index, the replay result of each submission, the proxy's ref count, validation) stay in the host build; the
+// guest keeps every pixel and sample-count check. On success it prints one marker line, after every check.
+#ifndef LEONIDA_M3_GUEST
 #include "vk_test_device.h"
+#endif
 #include "d3d12_test_shaders.h"
+#ifndef LEONIDA_M3_GUEST
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#endif
 
 #include <array>
 #include <cstring>
 
-#ifndef LEONIDA_TEST_M3_DIR
+#ifdef LEONIDA_M3_GUEST
+// Resolved at link time against test/fixtures/d3d12_xs_stub.cpp (which fails), at run time by gta6rt's shim registry.
+extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params,
+                                                                      const IID* riid, void** out);
+#elif !defined(LEONIDA_TEST_M3_DIR)
 #error "LEONIDA_TEST_M3_DIR must name the folder build.py wrote (spirv/index.json, fssm/*.fssm)"
 #endif
 
@@ -127,6 +142,13 @@ Reference reference_of(const Frame& fr, bool first_pass_only) {
 
 }  // namespace
 
+#ifdef LEONIDA_M3_GUEST
+// The six frames, as a function: tiny_guest_m3's main calls it, and so does tiny_guest_m34 (test/d3d12_guest_concurrent.cpp,
+// built with LEONIDA_GUEST_LIB), which passes the device it shares with the M4 workload on another thread. Returns 0 when
+// every pixel and sample count matched; `samples` receives the occlusion counts' sum.
+int m3_guest_run(ID3D12Device* shared_device, const std::filesystem::path& root_dir, bool first_pass_only,
+                 bool precise_occlusion, unsigned long long* samples) {
+#else
 int main(int argc, char** argv) {
     const bool first_pass_only = argc == 2 && std::strcmp(argv[1], "--first-pass-only") == 0;
     if (argc != 1 && !first_pass_only) {
@@ -143,15 +165,22 @@ int main(int argc, char** argv) {
     }
 
     const std::filesystem::path root_dir = LEONIDA_TEST_M3_DIR;
+#endif
+#ifndef LEONIDA_M3_GUEST
     leonida::ShaderLibrary library;
     EXPECT(library.load((root_dir / "spirv").string()));
+#endif
     const auto program = [&](const char* name) { return read_file(root_dir / "fssm" / (std::string(name) + ".fssm")); };
     const auto vs1 = program("vs_m3"), ps1 = program("ps_m3"), vs2 = program("vs_m2"), ps2 = program("ps_m3_post");
     const auto ps_query = program("ps_m3_query");
     EXPECT(vs1.size() >= 4 && ps1.size() >= 4 && vs2.size() >= 4 && ps2.size() >= 4);
+#ifndef LEONIDA_M3_GUEST
     EXPECT(library.find("vs", leonida::sha256_hex(vs1)) && library.find("ps", leonida::sha256_hex(ps1)));
     EXPECT(library.find("vs", leonida::sha256_hex(vs2)) && library.find("ps", leonida::sha256_hex(ps2)));
     EXPECT(ps_query.size() >= 4 && library.find("ps", leonida::sha256_hex(ps_query)));
+#else
+    EXPECT(ps_query.size() >= 4);
+#endif
     const auto vs1_container = shader_container(vs1), ps1_container = shader_container(ps1);
     const auto vs2_container = shader_container(vs2), ps2_container = shader_container(ps2);
     const auto query_container = shader_container(ps_query);
@@ -159,6 +188,25 @@ int main(int argc, char** argv) {
     unsigned mismatches = 0, frames_checked = 0;
     UINT64 total_samples = 0;
     {
+#ifdef LEONIDA_M3_GUEST
+        // The import the game uses is the guest's only way to a device: with LEONIDA_D3D12=vulkan the shim returns the
+        // Vulkan device behind the Xbox-ABI proxy; the link-time stub returns none, so a loader that cannot answer the
+        // import fails here.
+        const std::uint32_t device_params[24] = {};  // the 24-word block the shim logs; it does not create from it
+        const IID device_iid = __uuidof(ID3D12Device);
+        Ref<ID3D12Device> device;
+        if (shared_device) {  // tiny_guest_m34: one device, created once by the guest's main, used from two threads
+            shared_device->AddRef();
+            device.p = shared_device;
+        } else {
+            const HRESULT created =
+                D3D12XboxCreateDevice(nullptr, device_params, &device_iid, reinterpret_cast<void**>(&device.p));
+            if (FAILED(created) || !device.p) {
+                std::fprintf(stderr, "D3D12XboxCreateDevice failed (hr=0x%08lx)\n", static_cast<unsigned long>(created));
+                return 1;
+            }
+        }
+#else
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
@@ -179,6 +227,7 @@ int main(int argc, char** argv) {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
+#endif
 
         // Pass 1: [0] eight 32-bit constants (s0..s7). Pass 2: [0] one SRV (s[0:1]), [1] one sampler (s[2:3]),
         // [2] one constant (s4).
@@ -383,12 +432,14 @@ int main(int argc, char** argv) {
             EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot_.fence.p))));
         }
         // The T# of each render target's SRV has an index in the hash table, and no two share one.
+#ifndef LEONIDA_M3_GUEST
         std::uint32_t indices_seen[slots];
         for (UINT s = 0; s < slots; ++s) {
             indices_seen[s] = rt::d3d12::bindless_hash_lookup(device.p, keys[s]);
             EXPECT(indices_seen[s] != 0);
             for (UINT t = 0; t < s; ++t) EXPECT(indices_seen[s] != indices_seen[t]);
         }
+#endif
         const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         EXPECT(event != nullptr);
 
@@ -482,7 +533,9 @@ int main(int argc, char** argv) {
             if (list->Close() != S_OK) return false;
             ID3D12CommandList* lists[] = {list};
             queue->ExecuteCommandLists(1, lists);
+#ifndef LEONIDA_M3_GUEST
             if (rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return false;
+#endif
             slot_.fence_value += 1;
             slot_.frame = int(n);
             return SUCCEEDED(queue->Signal(slot_.fence.p, slot_.fence_value));
@@ -521,7 +574,11 @@ int main(int argc, char** argv) {
             compare("rt0", offset_rt0, want.rt0.data(), 4);
             compare("rt1", offset_rt1, want.rt1.data(), 4);
             compare("rt2", offset_rt2, want.rt2.data(), 4);
+#ifdef LEONIDA_M3_GUEST
+            const bool precise = precise_occlusion;
+#else
             const bool precise = d.occlusion_query_precise;
+#endif
             if (precise ? samples != want.samples : samples == 0) {
                 std::fprintf(stderr, "frame %u: occlusion query counted %llu samples, want %llu\n", n,
                              static_cast<unsigned long long>(samples), static_cast<unsigned long long>(want.samples));
@@ -550,11 +607,17 @@ int main(int argc, char** argv) {
         srv_heap.reset(); sampler_heap.reset(); rtv_heap.reset(); dsv_heap.reset();
         query_heap.reset();
         queue.reset();
+#ifndef LEONIDA_M3_GUEST
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+#endif
     }
 
     EXPECT(frames_checked == frames);
     EXPECT(!mismatches);
+#ifdef LEONIDA_M3_GUEST
+    if (samples) *samples = total_samples;
+    return 0;
+#else
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
@@ -567,4 +630,29 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(total_samples),
                 d.occlusion_query_precise ? ", exact" : ", imprecise device: non-zero only");
     return 0;
+#endif
 }
+
+#if defined(LEONIDA_M3_GUEST) && !defined(LEONIDA_GUEST_LIB)
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // the marker reaches the launcher even if the process dies after it
+    bool first_pass_only = false, precise_occlusion = true, usage_ok = argc >= 2;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--first-pass-only") == 0) first_pass_only = true;
+        else if (std::strcmp(argv[i], "--imprecise-occlusion") == 0) precise_occlusion = false;
+        else usage_ok = false;
+    }
+    if (!usage_ok) {
+        std::fprintf(stderr, "usage: tiny_guest_m3 <folder build.py wrote (spirv/index.json, fssm/*.fssm)> "
+                             "[--first-pass-only] [--imprecise-occlusion]\n");
+        return 2;
+    }
+    unsigned long long samples = 0;
+    if (const int failed = m3_guest_run(nullptr, argv[1], first_pass_only, precise_occlusion, &samples)) return failed;
+    std::printf("M3 guest: PASS, %u frames, %u in flight, all %u pixels of three targets per frame exact%s, "
+                "%llu samples counted%s\n",
+                frames, slots, dim * dim, first_pass_only ? " (first pass only)" : "", samples,
+                precise_occlusion ? ", exact" : ", non-zero only");
+    return 0;
+}
+#endif

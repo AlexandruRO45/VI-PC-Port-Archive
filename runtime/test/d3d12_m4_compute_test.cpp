@@ -23,16 +23,31 @@
 // argument buffer, the image and the indirect dispatch's output (which also shows that exactly the 3 groups the
 // first dispatch asked for ran).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
+// Built a second time with LEONIDA_M4_GUEST, this file is tiny_guest_m4.exe, which runs the same three queues and the
+// same word-for-word checks as a `gta6rt --run` guest (test/run_guest_frame.cmake): its device comes from an imported
+// d3d12_xs.dll!D3D12XboxCreateDevice that gta6rt's shim registry answers (LEONIDA_D3D12=vulkan, LEONIDA_SHADERS=
+// <folder>/spirv), and the folder build.py wrote (with LEONIDA_USER_DATA_SHIFT=4) is argv[1]. It links nothing from
+// src/ or shims/, so the checks that need the runtime's internals (the shader library, the replay result of each
+// submission, the proxy's ref count, validation) stay in the host build. On success it prints one marker line, after
+// every check.
+#ifndef LEONIDA_M4_GUEST
 #include "vk_test_device.h"
+#endif
 #include "d3d12_test_shaders.h"
+#ifndef LEONIDA_M4_GUEST
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#endif
 
 #include <array>
 #include <cstring>
 
-#ifndef LEONIDA_TEST_M4_DIR
+#ifdef LEONIDA_M4_GUEST
+// Resolved at link time against test/fixtures/d3d12_xs_stub.cpp (which fails), at run time by gta6rt's shim registry.
+extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params,
+                                                                      const IID* riid, void** out);
+#elif !defined(LEONIDA_TEST_M4_DIR)
 #error "LEONIDA_TEST_M4_DIR must name the folder build.py wrote (spirv/index.json, fssm/cs_*.fssm)"
 #endif
 
@@ -93,6 +108,12 @@ Reference reference() {
 
 }  // namespace
 
+#ifdef LEONIDA_M4_GUEST
+// The three queues' workload, as a function: tiny_guest_m4's main calls it, and so does tiny_guest_m34
+// (test/d3d12_guest_concurrent.cpp, built with LEONIDA_GUEST_LIB), which passes the device it shares with the M3 frames
+// on another thread. Returns 0 when every word matched; `words_out` receives the number of words compared.
+int m4_guest_run(ID3D12Device* shared_device, const std::filesystem::path& root_dir, unsigned* words_out) {
+#else
 int main() {
     vktest::Device d;
     d.queue_count_wanted = 2;   // the copy queue and the compute queue each get a VkQueue where the family has two
@@ -105,18 +126,44 @@ int main() {
     }
 
     const std::filesystem::path root_dir = LEONIDA_TEST_M4_DIR;
+#endif
+#ifndef LEONIDA_M4_GUEST
     leonida::ShaderLibrary library;
     EXPECT(library.load((root_dir / "spirv").string()));
+#endif
     const auto program = [&](const char* name) { return read_file(root_dir / "fssm" / (std::string(name) + ".fssm")); };
     const auto fill = program("cs_m4_fill"), indirect = program("cs_m4_indirect");
     EXPECT(fill.size() >= 0x150 && indirect.size() >= 0x150 && fill != indirect);
+#ifndef LEONIDA_M4_GUEST
     EXPECT(library.find("cs", leonida::sha256_hex(fill)) && library.find("cs", leonida::sha256_hex(indirect)));
+#endif
     const auto fill_container = shader_container(fill), indirect_container = shader_container(indirect);
 
+#ifndef LEONIDA_M4_GUEST
     const bool distinct_queues = d.queues.size() >= 2;
+#endif
     Reference want = reference();
     std::vector<std::uint8_t> got;
     {
+#ifdef LEONIDA_M4_GUEST
+        // The import the game uses is the guest's only way to a device: with LEONIDA_D3D12=vulkan the shim returns the
+        // Vulkan device behind the Xbox-ABI proxy; the link-time stub returns none, so a loader that cannot answer the
+        // import fails here.
+        const std::uint32_t device_params[24] = {};  // the 24-word block the shim logs; it does not create from it
+        const IID device_iid = __uuidof(ID3D12Device);
+        Ref<ID3D12Device> device;
+        if (shared_device) {  // tiny_guest_m34: one device, created once by the guest's main, used from two threads
+            shared_device->AddRef();
+            device.p = shared_device;
+        } else {
+            const HRESULT created =
+                D3D12XboxCreateDevice(nullptr, device_params, &device_iid, reinterpret_cast<void**>(&device.p));
+            if (FAILED(created) || !device.p) {
+                std::fprintf(stderr, "D3D12XboxCreateDevice failed (hr=0x%08lx)\n", static_cast<unsigned long>(created));
+                return 1;
+            }
+        }
+#else
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
@@ -137,6 +184,7 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
+#endif
 
         // [0] four 32-bit constants (s4..s7), [1] a table of five UAVs (s8, its 32-bit VA): the console compute layout
         // (D3D-448). The fixtures are built with LEONIDA_USER_DATA_SHIFT=4 (runtime/CMakeLists.txt).
@@ -320,7 +368,11 @@ int main() {
         const auto execute = [&](ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list) {
             ID3D12CommandList* lists[] = {list};
             queue->ExecuteCommandLists(1, lists);
+#ifdef LEONIDA_M4_GUEST
+            return true;   // the replay result is the host build's; the guest sees the fences and the readback
+#else
             return rt::d3d12::last_execute_result(queue) == leonida::ReplayResult::success;
+#endif
         };
         const auto submit_copy = [&] {
             return execute(copy_queue.p, stream_list.p) && SUCCEEDED(copy_queue->Signal(copy_fence.p, 1));
@@ -367,7 +419,9 @@ int main() {
         copy_fence.reset(); compute_fence.reset();
         signature.reset(); pso_fill.reset(); pso_indirect.reset(); root.reset(); heap.reset();
         copy_queue.reset(); compute_queue.reset();
+#ifndef LEONIDA_M4_GUEST
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+#endif
     }
 
     unsigned mismatches = 0, words = 0;
@@ -391,6 +445,10 @@ int main() {
     compare("image", offset_image, want.image, image_pitch, image_dim);
     compare("indirect dispatch output", offset_out2, want.out2, 0, 0);
     EXPECT(!mismatches);
+#ifdef LEONIDA_M4_GUEST
+    if (words_out) *words_out = words;
+    return 0;
+#else
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
@@ -401,4 +459,19 @@ int main() {
                 "results back (%s): %u words matched the CPU reference (error 0)\n",
                 distinct_queues ? "two VkQueues" : "one VkQueue", words);
     return 0;
+#endif
 }
+
+#if defined(LEONIDA_M4_GUEST) && !defined(LEONIDA_GUEST_LIB)
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // the marker reaches the launcher even if the process dies after it
+    if (argc != 2) {
+        std::fprintf(stderr, "usage: tiny_guest_m4 <folder build.py wrote (spirv/index.json, fssm/cs_*.fssm)>\n");
+        return 2;
+    }
+    unsigned words = 0;
+    if (const int failed = m4_guest_run(nullptr, argv[1], &words)) return failed;
+    std::printf("M4 guest: PASS, %u words matched the CPU reference\n", words);
+    return 0;
+}
+#endif

@@ -303,6 +303,15 @@ yet: `at_quick_exit` handlers (`quick_exit` runs none) and the thread-local dest
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks
 the verdict, the `shim` binding and the call order in the `--trace-d3d12` output, and skips without a Vulkan GPU).
+The M3 frames and the M4 compute workload also run as guests (`tiny_guest_m3`, `tiny_guest_m4`: the host tests built
+again with `LEONIDA_M3_GUEST` / `LEONIDA_M4_GUEST`, the device from the imported `D3D12XboxCreateDevice`, every pixel
+and word compared as in the host tests; `d3d12_m3_frame_guest`, `d3d12_m3_first_pass_guest`, `d3d12_m4_compute_guest`),
+and `tiny_guest_m34` runs both on one device from three threads at once, checking every pixel and word of each run and
+that the runs really overlapped in time (`d3d12_m34_concurrent_guest`; its negative control,
+`d3d12_m34_concurrent_guest_without_m4_shaders`, must fail). They need a Vulkan GPU and the M3/M4 shader fixtures, so
+they are registered with `-DLEONIDA_TEST_GUEST_DRAW=ON` like `d3d12_translated_draw_guest`; the checks that need the
+runtime's internals (shader library, hash-table index, replay result, reference count, validation) stay in the host
+tests.
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The

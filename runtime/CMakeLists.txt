@@ -2896,6 +2896,100 @@ if(TARGET Vulkan::Headers)
       else()
         message(STATUS "tiny_guest_draw will build. For an external synthetic M1.5 fixture or Wine run see runtime/README.md.")
       endif()
+
+      # M3 and M4 as `gta6rt --run` guests: test/d3d12_m3_frame_test.cpp and test/d3d12_m4_compute_test.cpp built again
+      # with LEONIDA_M3_GUEST / LEONIDA_M4_GUEST. Same shape as tiny_guest_draw (the failing d3d12_xs import stub, only
+      # the CRT beside the exe, the fixture folder as argv[1]); test/run_guest_frame.cmake checks the exit code and the
+      # marker line. The guests keep every pixel and word check; the checks that need the runtime's internals stay in
+      # the host tests. They need the same M3/M4 shader fixtures as those tests (llvm-mc and the SPIR-V tools).
+      if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING AND TARGET gta6rt AND TARGET d3d12_m3_frame_test
+         AND TARGET d3d12_m4_compute_test)
+        add_executable(tiny_guest_m3 test/d3d12_m3_frame_test.cpp)
+        target_compile_definitions(tiny_guest_m3 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_M3_GUEST)
+        add_executable(tiny_guest_m4 test/d3d12_m4_compute_test.cpp)
+        target_compile_definitions(tiny_guest_m4 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_M4_GUEST)
+        foreach(_guest tiny_guest_m3 tiny_guest_m4)
+          target_link_libraries(${_guest} PRIVATE d3d12_xs_stub)
+          target_compile_options(${_guest} PRIVATE /W4 /permissive- /utf-8)
+          set_target_properties(${_guest} PROPERTIES
+            OUTPUT_NAME ${_guest}
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/guest_frame/$<CONFIG>")
+        endforeach()
+        add_dependencies(tiny_guest_m3 d3d12_m3_frame_test gta6rt)
+        add_dependencies(tiny_guest_m4 d3d12_m4_compute_test gta6rt)
+        set(_guest_runner ${CMAKE_COMMAND} -DGTA6RT=$<TARGET_FILE:gta6rt>)
+        set(_m3_marker "M3 guest: PASS, 6 frames, 3 in flight, all 4096 pixels of three targets per frame exact")
+        add_test(NAME d3d12_m3_frame_guest
+                 COMMAND ${_guest_runner} -DGUEST=$<TARGET_FILE:tiny_guest_m3> -DFIXTURE=${LEONIDA_M3_DIR}
+                         "-DMARKER=${_m3_marker}, [0-9]+ samples counted, exact"
+                         -DREQUIRE=fssm/vs_m3.fssm$<SEMICOLON>fssm/ps_m3.fssm$<SEMICOLON>fssm/vs_m2.fssm$<SEMICOLON>fssm/ps_m3_post.fssm$<SEMICOLON>fssm/ps_m3_query.fssm
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_frame.cmake)
+        add_test(NAME d3d12_m3_first_pass_guest
+                 COMMAND ${_guest_runner} -DGUEST=$<TARGET_FILE:tiny_guest_m3> -DFIXTURE=${LEONIDA_M3_DIR}
+                         "-DMARKER=${_m3_marker} \\(first pass only\\), [0-9]+ samples counted, exact"
+                         -DGUEST_ARGS=--first-pass-only
+                         -DREQUIRE=fssm/vs_m3.fssm$<SEMICOLON>fssm/ps_m3.fssm$<SEMICOLON>fssm/vs_m2.fssm$<SEMICOLON>fssm/ps_m3_post.fssm$<SEMICOLON>fssm/ps_m3_query.fssm
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_frame.cmake)
+        add_test(NAME d3d12_m4_compute_guest
+                 COMMAND ${_guest_runner} -DGUEST=$<TARGET_FILE:tiny_guest_m4> -DFIXTURE=${LEONIDA_M4_DIR}
+                         "-DMARKER=M4 guest: PASS, [0-9]+ words matched the CPU reference"
+                         -DREQUIRE=fssm/cs_m4_fill.fssm$<SEMICOLON>fssm/cs_m4_indirect.fssm
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_frame.cmake)
+        set_tests_properties(d3d12_m3_frame_guest d3d12_m3_first_pass_guest d3d12_m4_compute_guest PROPERTIES TIMEOUT 240)
+
+        # M3 and M4 in one guest on one device from three threads (test/d3d12_guest_concurrent.cpp): the shader library
+        # of a device is one folder, so the five M3 and the two M4 programs are built into one (the user-data shift of
+        # the M4 build only changes the compute programs, so every module is byte-identical to its own test's).
+        set(LEONIDA_M34_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m34_shaders)
+        set(LEONIDA_M34_FILES ${LEONIDA_M34_DIR}/spirv/index.json ${LEONIDA_M34_DIR}/fssm/vs_m3.fssm
+                              ${LEONIDA_M34_DIR}/fssm/ps_m3.fssm ${LEONIDA_M34_DIR}/fssm/vs_m2.fssm
+                              ${LEONIDA_M34_DIR}/fssm/ps_m3_post.fssm ${LEONIDA_M34_DIR}/fssm/ps_m3_query.fssm
+                              ${LEONIDA_M34_DIR}/fssm/cs_m4_fill.fssm ${LEONIDA_M34_DIR}/fssm/cs_m4_indirect.fssm)
+        add_custom_command(
+          OUTPUT ${LEONIDA_M34_FILES}
+          COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M34_DIR}
+          COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                  LEONIDA_USER_DATA_SHIFT=4
+                  $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                  ${LEONIDA_M34_DIR} vs_m3 ps_m3 vs_m2 ps_m3_post ps_m3_query cs_m4_fill cs_m4_indirect
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3.asm
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_post.asm
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_query.asm
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_fill.asm
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_indirect.asm
+                  ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+          COMMENT "Translating the M3 and M4 shaders into one folder for the concurrent guest"
+          VERBATIM)
+        add_executable(tiny_guest_m34 test/d3d12_guest_concurrent.cpp test/d3d12_m3_frame_test.cpp
+                       test/d3d12_m4_compute_test.cpp ${LEONIDA_M34_FILES})
+        target_compile_definitions(tiny_guest_m34 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_M3_GUEST LEONIDA_M4_GUEST
+                                   LEONIDA_GUEST_LIB)
+        target_link_libraries(tiny_guest_m34 PRIVATE d3d12_xs_stub)
+        target_compile_options(tiny_guest_m34 PRIVATE /W4 /permissive- /utf-8)
+        set_target_properties(tiny_guest_m34 PROPERTIES
+          OUTPUT_NAME tiny_guest_m34
+          RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/guest_frame/$<CONFIG>")
+        add_dependencies(tiny_guest_m34 gta6rt)
+        add_test(NAME d3d12_m34_concurrent_guest
+                 COMMAND ${_guest_runner} -DGUEST=$<TARGET_FILE:tiny_guest_m34> -DFIXTURE=${LEONIDA_M34_DIR}
+                         "-DMARKER=M34 guest: PASS, 7 M3 runs and 7 M4 runs on one device, 12 of them from three threads at once, every pixel and word exact \\([0-9]+ samples, [0-9]+ words, [0-9]+ runs overlapped another thread's\\)"
+                         -DGUEST_ARGS=3
+                         -DREQUIRE=fssm/vs_m3.fssm$<SEMICOLON>fssm/ps_m3_query.fssm$<SEMICOLON>fssm/cs_m4_fill.fssm$<SEMICOLON>fssm/cs_m4_indirect.fssm
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_frame.cmake)
+        set_tests_properties(d3d12_m34_concurrent_guest PROPERTIES TIMEOUT 400)
+        # Negative control: the same guest on the M3 folder, which has no compute programs. The M4 workload cannot build
+        # its pipelines there, so the guest must fail, and the runner must report it (WILL_FAIL), or the guest would
+        # pass without checking what it claims to.
+        add_test(NAME d3d12_m34_concurrent_guest_without_m4_shaders
+                 COMMAND ${_guest_runner} -DGUEST=$<TARGET_FILE:tiny_guest_m34> -DFIXTURE=${LEONIDA_M3_DIR}
+                         "-DMARKER=M34 guest: PASS, .*" -DGUEST_ARGS=1
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_frame.cmake)
+        set_tests_properties(d3d12_m34_concurrent_guest_without_m4_shaders PROPERTIES TIMEOUT 400 WILL_FAIL TRUE)
+      endif()
     endif()
     # bvh_builder_test can put the package's XboxBvhBuilder on this device too (LEONIDA_BVH_DEVICE=vulkan).
     if(TARGET bvh_builder_test)
