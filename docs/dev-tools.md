@@ -12,7 +12,8 @@ From another directory, pass the path to `scripts/dev.py`, quoting it if needed.
 The inventory always describes the checkout containing that script.
 
 `boot-trace` points to the analyzer for startup JSONL and D3D12 stderr logs.
-`guest-scene` points to the headless synthetic guest runner. Run a listed help
+`guest-scene` points to the headless synthetic guest runner.
+`conformance` points to the rendered PNG comparator. Run a listed help
 command from the checkout root to see the producer's options. The text
 inventory displays commands for PowerShell on Windows and POSIX shells
 on other platforms. The inventory
@@ -91,3 +92,23 @@ the runner produced. If the runner rejects an occupied directory, any
 report already there belongs to an earlier run.
 
 You can also invoke `python -I scripts/run_guest_scene.py` directly.
+
+## Check rendered PNGs
+
+Use the existing comparator through the development CLI.
+
+```powershell
+python -I scripts/dev.py conformance --help
+python -I scripts/dev.py conformance selftest
+python -I scripts/dev.py conformance inspect --image "renders/reference/clear.png" --pixel 0,0
+```
+
+`selftest` creates its own PNG fixtures and runs without a GPU. `inspect`
+reads the given PNG and prints the requested pixel. Use `expect` and `diff`
+with the [conformance manifests and rendered PNGs](../tools/conformance/COMPARE.md).
+The guest scene produces PPM images, which this command does not convert.
+
+Relative paths are resolved from the directory where you run the CLI. The
+comparator supplies the output, diagnostics and exit status. Exit code `0`
+means success, `1` means a comparison found a mismatch, and `2` means the
+comparator could not run the requested check.

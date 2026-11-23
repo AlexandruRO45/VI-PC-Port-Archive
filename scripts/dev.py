@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BOOT_TRACE = "tools/boot_trace.py"
 GUEST_SCENE = "scripts/run_guest_scene.py"
+CONFORMANCE = "tools/conformance/compare.py"
 TOOLS = (
     (
         "boot-trace",
@@ -28,6 +29,11 @@ TOOLS = (
             "Vulkan and the synthetic M1.5 shader fixture with a spirv/ directory",
             "Wine when running the Windows loader outside Windows",
         ),
+    ),
+    (
+        "conformance",
+        CONFORMANCE,
+        ("Python 3", "Rendered PNGs and, for expect and diff, conformance manifests"),
     ),
 )
 
@@ -94,6 +100,8 @@ def main() -> int:
         return run_producer(BOOT_TRACE, argv[1:])
     if argv[:1] == ["guest-scene"]:
         return guest_scene(argv[1:])
+    if argv[:1] == ["conformance"]:
+        return run_producer(CONFORMANCE, argv[1:])
 
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -101,6 +109,7 @@ def main() -> int:
     inventory.add_argument("--json", action="store_true", help="write a JSON inventory to stdout")
     commands.add_parser("boot-trace", help="summarize startup and D3D12 boot traces")
     commands.add_parser("guest-scene", help="run the synthetic guest scene with a required --out")
+    commands.add_parser("conformance", help="inspect rendered PNGs and compare them against manifests")
     args = parser.parse_args(argv)
 
     result = discover()

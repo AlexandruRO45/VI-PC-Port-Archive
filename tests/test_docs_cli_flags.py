@@ -160,6 +160,7 @@ def fenced_commands(text):
 DEV_PRODUCERS = {
     "boot-trace": "tools/boot_trace.py",
     "guest-scene": "scripts/run_guest_scene.py",
+    "conformance": "tools/conformance/compare.py",
 }
 
 
