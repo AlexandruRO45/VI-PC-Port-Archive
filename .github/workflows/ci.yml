@@ -77,13 +77,19 @@ jobs:
       - name: Tests (standard library only, no game data)
         shell: bash
         run: |
+          # Run every file, then fail: stopping at the first failure would hide the files after it.
+          failed=()
           while IFS= read -r t; do
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               continue
             fi
             echo "== $t"
-            python -I "$t" || exit 1
+            python -I "$t" || failed+=("$t")
           done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)  # pytest-based files run in the translator-tests job
+          if (( ${#failed[@]} )); then
+            for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
+            exit 1
+          fi
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
       - name: Test TTPF export retry
@@ -158,7 +164,22 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
+      # Some semantic tests assemble and validate the translator's output with spirv-as / spirv-val and skip without
+      # them (test_fma_khr, test_bary_fallback, test_image_coherent...). The runner images have neither, so a skip
+      # here reads as a pass. The Linux leg installs SPIRV-Tools and LEONIDA_REQUIRE_SPIRV_TOOLS=1 makes
+      # tests/semantic/test_spirv_tools_required.py fail when they are missing, so those tests cannot go quiet again.
+      # The Windows leg has no SPIRV-Tools and still skips them.
+      - name: Install SPIRV-Tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends spirv-tools
+          spirv-as --version
+          spirv-val --version
       - name: Translator semantic tests
+        env:
+          LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: python -m unittest discover -s tests/semantic -v
 
   viewer-tests:

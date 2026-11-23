@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import bvh_match as M  # noqa: E402
+import bvh_rehydrate as R  # noqa: E402
 from test_bvh_rehydrate import build  # noqa: E402
 
 # Two triangles over x,y 0..1 sharing the edge (1, 2); the leaf holds both primitives.
@@ -77,6 +78,23 @@ class TestMatching(unittest.TestCase):
             status = M.main([path, manifest, *argv])
         return status, out.getvalue(), err.getvalue()
 
+    def test_a_manifest_that_is_not_an_object_is_one_error_line(self):
+        path = os.path.join(self.dir, "blas.bin")
+        with open(path, "wb") as f:
+            f.write(build(LEAVES, bounds=BOUNDS)[0])
+        for doc in ([1], [], "x", 3, None):
+            manifest = os.path.join(self.dir, "manifest.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                status = M.main([path, manifest])
+            self.assertEqual(status, 2, doc)
+            lines = err.getvalue().splitlines()
+            self.assertEqual(len(lines), 1, err.getvalue())
+            self.assertTrue(lines[0].startswith("error: "), lines[0])
+            self.assertNotIn("Traceback", err.getvalue())
+
     def test_the_right_geometry_is_found_and_consistent(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         status, out, _ = self.guide(src, [item(0x1000, "a.obj", [5, 2, 3])],
@@ -92,6 +110,8 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("0 candidates", out)
         self.assertIn("0 of 0 scored candidates are consistent", out)
+        # An empty run says why: the drawable is outside the exported window, or the rule does not fit.
+        self.assertIn("outside the exported window", out)
 
     def test_a_wrong_geometry_is_rejected(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
@@ -145,6 +165,51 @@ class TestMatching(unittest.TestCase):
         status, _, err = self.guide(src, [row], {"a.obj": [group(2)]})
         self.assertEqual(status, 2)
         self.assertIn("MeshTris", err)
+
+    def test_a_manifest_that_lists_more_geometries_than_its_obj_holds_is_an_error_not_a_traceback(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        row = item(0x1000, "a.obj", [5, 2])          # the signature fits the second geometry only
+        row["MeshTris"] = [5, 2]
+        status, out, _ = self.guide(src, [row], {"a.obj": [group(5)]})   # ... but the OBJ has one group
+        self.assertEqual(status, 1, out)
+        self.assertIn("the manifest lists", out)
+        self.assertIn("scored candidates are consistent", out)
+
+    def test_a_manifest_with_no_models_says_what_is_wrong(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        status, _, err = self.guide(src, [], {"a.obj": [group(2)]})
+        self.assertEqual(status, 2)
+        self.assertIn("found no model in its window", err)
+
+    def test_write_produces_the_buffers_bvh_rehydrate_reads(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        out = os.path.join(self.dir, "written")
+        status, text, _ = self.guide(src, [item(0x1000, "a.obj", [5, 2, 3])],
+                                    {"a.obj": [group(5), group(2), group(3)]}, ["--write", out])
+        self.assertEqual(status, 0, text)
+        with open(os.path.join(out, "export.json"), encoding="utf-8") as f:
+            rows = json.load(f)
+        self.assertEqual(len(rows), 1)                        # only the geometry the BLAS uses is written
+        row = rows[0]
+        self.assertEqual((row["drawable_geometry"], row["vertices"], row["triangles"]), (1, 4, 2))
+        self.assertIsNone(row["transform"])
+        with open(os.path.join(out, row["vb"]), "rb") as f:
+            vb = f.read()
+        with open(os.path.join(out, row["ib"]), "rb") as f:
+            ib = f.read()
+        self.assertEqual((len(vb), len(ib)), (4 * 12, 2 * 12))
+        geometry = R.Geometry(vb, row["stride"], ib, False)
+        self.assertEqual([geometry.triangle(0), geometry.triangle(1)], list(QUAD_FACES))
+
+    def test_write_stores_nothing_when_no_candidate_is_consistent(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        moved = [(x + 0.5, y, z) for x, y, z in QUAD]
+        out = os.path.join(self.dir, "nothing")
+        status, text, _ = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [(moved, QUAD_FACES)]},
+                                     ["--write", out])
+        self.assertEqual(status, 1, text)
+        self.assertIn("nothing written", text)
+        self.assertFalse(os.path.exists(out))
 
     def test_the_shader_rule_is_not_applied_without_every_hash(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)

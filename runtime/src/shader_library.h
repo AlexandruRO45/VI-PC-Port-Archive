@@ -642,6 +642,9 @@ struct ShaderEntry {
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
     // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
     std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
+    // The S#s the shader builds from immediates (the index's literal_samplers): no heap slot names them, so a
+    // pipeline that uses the shader registers them in the bindless set itself (docs/design.md, Literal samplers).
+    std::vector<std::array<std::uint32_t, 4>> literal_samplers;
 };
 
 class ShaderLibrary {
@@ -671,6 +674,9 @@ public:
 
     bool loaded() const { return !dir_.empty(); }
     std::size_t size() const { return count_; }
+    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
+    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    std::size_t fspx_size() const { return fspx_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -758,6 +764,7 @@ private:
             entries_.clear();
             fspx_entries_.clear();
             count_ = 0;
+            fspx_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -809,8 +816,17 @@ private:
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
                 }
             }
+            if (const Json* l = meta.find("literal_samplers"); l && l->kind == Json::Kind::array) {
+                for (const Json& item : l->array) {
+                    if (item.kind != Json::Kind::array || item.array.size() != 4) continue;
+                    std::array<std::uint32_t, 4> words{};
+                    for (std::size_t i = 0; i < 4; ++i) words[i] = u32(&item.array[i]);
+                    e.literal_samplers.push_back(words);
+                }
+            }
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+            if (by_fspx && prefix == "fspx/") ++fspx_count_;
             ++count_;
         }
         return true;
@@ -818,6 +834,7 @@ private:
 
     std::string dir_;
     std::size_t count_ = 0;
+    std::size_t fspx_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;

@@ -18,6 +18,10 @@ second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-
 it (or that has 64 as its only size: AMD GCN), and W64G_REF=<dir> compares every run of the other device with those
 files (equal for A and B, different for C).
 
+A device whose subgroups can be narrower than 32 (Intel: 8..32) and that could not be held to 32 or 64 skips the tier
+A and B pixel fixtures: its fragment stage may run fewer live lanes than 32 (Intel UHD 770 reports 32 but runs 16 live
+invocations), and tiers A and B assume 32 or 64 live lanes (TEST-433).
+
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
 Each draws 960 vertices with zero area (VKH_VERTICES) and stores four words per vertex to the heap; vs_w64_c_lane_id
@@ -30,6 +34,7 @@ drawn after vs_ids with VKH_GS, finds its triangle from the vertex number vs_ids
 words per triangle to the heap; gs_w64_c_lane_id is the geometry probe. RADV puts at most 42 GS invocations in a wave64.
 """
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -56,6 +61,16 @@ def _y(i):
 def _a_skip(i):
     x, y = _x(i), _y(i)
     return (7 * y + x if x % 4 == 1 else 1000 + x, int(x % 4 < 2), 2000 + y + (9 if y % 4 == 2 else 0), x % 4 + 1)
+
+
+CLEAR = 0xBF800000     # the harness clears the target to -1.0f: the words of a pixel no shader wrote
+
+
+def _a_discard(i):
+    x, y = _x(i), _y(i)
+    if x < 30 or y >= 50 or (x % 4 == 3 and y % 2 == 1):
+        return (CLEAR,) * 4
+    return (7 * y + x, 1, 2000 + y, x % 4 + 1)
 
 
 def _b_waterfall(i):
@@ -164,6 +179,7 @@ FIXTURES = {
     "ps_w64_a_permlane": ("A", _a_permlane, {}),
     "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
     "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
+    "ps_w64_a_discard": ("A", _a_discard, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),
@@ -237,6 +253,9 @@ def _draw_heap(tools, spirv, name, size, tmp):
     return [tuple(words[VS_RECORDS + 4 * v:VS_RECORDS + 4 * v + 4]) for v in range(records)], words
 
 
+_device_min = [None]   # the smallest subgroup size vk_harness reported for the device
+
+
 def draw(tools, spirv, name, size, tmp):
     """(words per pixel, heap words or None, applied) of one draw. `applied`: the required size took effect (size
     None: no size asked, applied is None). The words are None when the draw failed; then `heap` is the message."""
@@ -264,6 +283,9 @@ def draw(tools, spirv, name, size, tmp):
     data = raw.read_bytes()
     if len(data) != W * H * 16:
         return None, f"{len(data)} bytes of pixels, expected {W * H * 16}", None
+    m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
+    if m:
+        _device_min[0] = int(m.group(1))
     applied = None
     if size:
         applied = f"fragment subgroup size: {size}\n" in out.replace("\r", "")
@@ -330,6 +352,13 @@ def check(tools, spirv, name):
             if size is None or applied:
                 runs[size] = (words, heap)
         compared = False
+        # Tiers A and B mean exact on 32 or 64 live lanes. A device whose subgroups can be narrower than 32 (Intel:
+        # 8..32) and that could not be held to 32 or 64 may run fewer live lanes than it reports (UHD 770: 16 live
+        # behind a reported 32): reads across them return garbage.
+        if tier in ("A", "B") and name.startswith("ps_") and 64 not in runs and 32 not in runs \
+                and _device_min[0] is not None and _device_min[0] < 32:
+            return Skip(f"SKIP (the fragment stage may run fewer live lanes than 32 here ({_device_min[0]}..) "
+                        "and 32 or 64 could not be required: tiers A and B assume 32 or 64 live lanes)")
         if save and 64 in runs:
             Path(save).mkdir(parents=True, exist_ok=True)
             (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
@@ -354,6 +383,8 @@ def check(tools, spirv, name):
             for size, (words, heap) in runs.items():
                 if size == 64:
                     continue
+                if tier == "C" and comparable(name, ref_words, None) != comparable(name, words, None):
+                    return "a partition-invariant word differs from the 64-lane reference"
                 if tier == "C":
                     if comparable(name, ref_words, None) != comparable(name, words, None):
                         return "a word that must not depend on the partition differs from the 64-lane reference"
@@ -372,7 +403,13 @@ def main(argv):
         sys.exit(__doc__)
     spirv = os.path.join(argv[0], "spirv")
     tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
-    names = [a for a in argv[1:] if a in FIXTURES] or sorted(FIXTURES)
+    start = 2 if len(argv) > 1 and os.path.isdir(argv[1]) else 1
+    requested = argv[start:]
+    unknown = [a for a in requested if a not in FIXTURES]
+    if unknown:
+        print(f"Unknown fixture name{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}", file=sys.stderr)
+        return 1
+    names = requested or sorted(FIXTURES)
     failed = 0
     for name in names:
         problem = check(os.path.abspath(tools), spirv, name)

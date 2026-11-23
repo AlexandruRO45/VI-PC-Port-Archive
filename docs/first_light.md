@@ -1,7 +1,7 @@
-# First light: a real game model with its own translated shaders
+# First light: a game model's UVs drawn with translated game shaders
 
 **Status: measured** on the 1.0.2.1 package and an NVIDIA RTX 2060 SUPER (driver 620.73.04, Vulkan 1.4.357,
-CachyOS). This is the first draw of a real game model with its own translated VS and PS on a real GPU. The image
+CachyOS). The fixture draws a model from the package with a vertex and pixel shader chosen to display its UVs. The image
 stays in the user's work folder; this note records the counts and the recipe, not the model, the shaders or a
 screenshot.
 
@@ -20,6 +20,13 @@ The shaders are two ordinary containers from `shaders.rpf`, carved and translate
 |---|---|---|
 | VS | `128867d3233a97ba5b203c313a24ab8a77df20c2a308091a5595bb9f669677f4` | forwards POSITION and TEXCOORD from the vertex fetch to clip space and a varying |
 | PS | `ed4147a5f7514947c2eb8d79255bd80f72761ac1ba2205dd811d3e050cf1b495` | writes the interpolated TEXCOORD as the colour; no bindings, no texture |
+
+The model's authored shader assignment can be checked separately. In the model export manifest for the OBJ
+above, `MeshShaders[0]` selects material slot 0, the only slot. Looking up its `Materials[0].Shader` in the
+native shader database yields one effect with one technique and four compute-only passes. The VS and PS
+in the table are the fixture's chosen pair. The model's use during gameplay remains unverified.
+See the [effect lookup](https://github.com/ItsNotRexed/Leonida/pull/3036) and the
+[Windows reproduction of the UV draw](https://github.com/ItsNotRexed/Leonida/pull/2893#issuecomment-7084947193).
 
 Both disassemble with no invalid word, translate, and pass `spirv-val`; `tools/shader_link_check.py check` reports
 the pair compatible. At 128×128 the draw covers **12,804 of 16,384 pixels (0.781)** and the centre pixel is
@@ -71,6 +78,11 @@ indices), writes `manifest.json` with the counts and FSSM hashes, and runs `vk_h
 other names from the carve index; `--no-fit` keeps a model that is already in NDC (the sky dome is). The test is
 package-gated: without `LEONIDA_FIRST_LIGHT_DIR` it skips, and it writes its image to that folder.
 
+Each run stages its pair in `<work>/first_light/dxbc` and translates it into `<work>/first_light/spirv`. Both folders
+are removed at the start of a run, so they hold that run's two shaders and nothing an earlier run selected; do not
+keep files there. The output folder (`first_light/out` or `--out`) and `<work>/shaders` are not emptied. If either
+folder is a symlink or a junction, or a file in it cannot be removed, the run stops and names it.
+
 ## 4. The harness mode
 
 `runtime/test/vk_harness.cpp` gained two environment options, inert when unset (the existing three-vertex and
@@ -103,12 +115,41 @@ LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/out ctest --test-dir <build> 
 
 Without `LEONIDA_FIRST_LIGHT_DIR` the test prints SKIP and exits 77.
 
-## 6. Limits and next
+## 6. With a texture (`TEST-524`)
+
+Passing `--dds <exported.dds>` to `tools/first_light.py` switches the default pixel shader to a translated
+single-sample game pixel shader (`PS_Copy_3ea4b38a_Wrapped`, FSSM SHA-256
+`19e2e7612505b9d3b19e6607b47e09dcdde02a2c9987a63e834d9586f217090f`, wave32, `inputs=[0]`, `outputs=[0]`,
+`shader_link_check.py check`: compatible with `VS_main_170e32e6_Wrapped`). `first_light.py` decodes the DDS
+(for example a BCPack-decoded TTPF albedo) with `tools/dds_png.py`, writes `texture.rgba` (`u32 width, u32 height` +
+`R8G8B8A8_UNORM` texels) into the output folder, and passes `VKH_TEX_RGBA`, `VKH_TSHARP_VA` (`0x100`),
+`VKH_SSHARP` (the shader's literal sampler `0x92, 0xc00000, 0x14500000, 0`, bilinear + clamp-to-edge) and
+`VKH_SGPRS` (`s9 = 0x100`) to `vk_harness`.
+
+`vk_harness` enables `bufferDeviceAddress`, `runtimeDescriptorArray` and `descriptorIndexing` only when
+`VKH_TEX_RGBA` is set (inert otherwise), writes the 8-dword `T#` at `VKH_TSHARP_VA` in the 64 KiB heap, binds
+set 0 (`binding 0` 2D images with a 1×1 magenta fallback at index 0 and the decoded texture at index 1; `binding 1`
+samplers with the decoded `S#` at index 1; `binding 2` the `DescriptorTable` hash buffer), and draws the mesh.
+
+The CPU oracle (`check_image`) samples the decoded `R8G8B8A8_UNORM` texture bilinearly (clamp-to-edge) at
+`centre_uv` and each `uv_probes` entry and requires the GPU readback to match within `0.02` (rejecting the
+magenta unbound-texture fallback and wrong-colour probes). Verified on Windows 11 with an NVIDIA GeForce RTX 3060
+(driver 621.24, Vulkan 1.4.357): **12,804/16,384 (0.781)** covered. Without `LEONIDA_FIRST_LIGHT_DIR`,
+`python -I tests/test_first_light.py -v` runs **14 tests: 11 passed, 3 skipped** (the 3 package-gated
+`FirstLightTests` require `LEONIDA_FIRST_LIGHT_DIR`; the 4 `OracleTests` and 7 `TexturedOracleTests` run without a
+package). With `LEONIDA_FIRST_LIGHT_DIR` set against a local package run, all **14/14** tests pass.
+
+```sh
+python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
+    --obj ~/leonida-work/assets/data/models/<model>.obj \
+    --dds ~/leonida-work/assets/ttpf/<pool>/<texture>.dds --no-fit --run
+LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/out python -I tests/test_first_light.py -v
+```
+
+## 7. Limits and next
 
 * The chosen VS applies no matrix; the tool's fit is an orthographic stand-in for the game's view/projection. A
   real camera needs a VS that reads its constants, which is the next model/shader pair.
-* No texture: the PS writes the UV map. A texture path needs a TTPF albedo, BCPack decode, a T# in the bindless
-  set and the game's sampler.
 * One model and one draw. The `levels.rpf` windows have world props with POSITION/NORMAL/COLOUR/UV layouts that
   match the `sga_dr_*`/`Rage_Transform*` families by signature; pairing one of those is the natural next image.
 * The game still cannot boot: the executable is not in the package (RT-5), so no call site selects these programs.

@@ -12,20 +12,31 @@
 // the same functions under that name too; nothing else changes.
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <unordered_map>
+#include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "file_system.h"
 #include "shims.h"
+
+namespace rt::shims {
+bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
+}
 
 namespace {
 
@@ -40,7 +51,8 @@ std::atomic<int> g_runtime_refs{0};
 // XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
 // XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
-// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below); for any other class QueryApiImpl
+// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below), and XPersistentLocalStorageImpl from
+// the public docs' layout (no caller in the shipped DLLs to measure); for any other class QueryApiImpl
 // logs the class and interface id and refuses it, so the first boot with the executable lists the interfaces to
 // implement next.
 
@@ -154,6 +166,17 @@ template <int Slot> uint64_t STDMETHODCALLTYPE private_slot(void*) {
     return 0;
 }
 
+// Slot 8, XAsyncBeginAlloc: private (no public page) and never called by the package's DLLs, so its signature here
+// is not measured. Refuse it: answering S_OK would tell the caller its async call has begun while no provider ever
+// receives XAsyncOp::Begin, so its completion never arrives.
+HRESULT STDMETHODCALLTYPE begin_alloc_not_provided(void*) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XThreadingImpl slot 8 (XAsyncBeginAlloc) called; not provided, "
+                             "returning E_NOTIMPL\n");
+    return E_NOTIMPL;
+}
+
 // XThreadSetTimeSensitive / XThreadIsTimeSensitive / XThreadAssertNotTimeSensitive. The flag is per thread, as in
 // the GDK; nothing is enforced offline (a time-sensitive thread may still block).
 thread_local bool t_time_sensitive = false;
@@ -173,7 +196,7 @@ const void* const kThreadingVtable[] = {
     XM(XAsyncCancel),                       // 5
     XM(XAsyncRun),                          // 6
     XM(XAsyncBegin),                        // 7
-    reinterpret_cast<const void*>(&private_slot<8>),  // 8  XAsyncBeginAlloc (private, not called by the package)
+    reinterpret_cast<const void*>(&begin_alloc_not_provided),  // 8  XAsyncBeginAlloc (private, not called by the package)
     XM(XAsyncSchedule),                     // 9
     XM(XAsyncComplete),                     // 10
     XM(XAsyncGetResult),                    // 11
@@ -332,20 +355,153 @@ const void* const kNetworkingVtable[] = {
 #undef NM
 static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's 15 + IXNetworkingImpl2's 3");
 
+// ---- XPersistentLocalStorageImpl (IXPersistentLocalStorageImpl .. 3), a folder beside the overlay ----
+//
+// The package declares persistent local storage (MicrosoftGame.Config, PersistentLocalStorage, 2048 MB), so the title
+// can ask where it may keep its cache. Slots 3-7 follow Microsoft's XPersistentLocalStorage reference and the ids and
+// layout in the public xgameruntime-docs and Wine IDL (facts only): GetPathSize, GetPath, GetSpaceInfo,
+// PromptUserForSpaceAsync and PromptUserForSpaceResult; IXPersistentLocalStorageImpl3 adds MountForPackage at slot 8.
+// The storage is <overlay>\persistent, so the package stays read-only and --overlay moves it with everything else a
+// title writes. Offline there is nobody to ask for more room: a prompt for space the quota can hold succeeds, one it
+// cannot fails with ERROR_DISK_FULL.
+
+constexpr GUID kPersistentStorageClass = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
+constexpr GUID kPersistentStorage2 = {0xd29411df, 0x0794, 0x4553, {0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d}};
+constexpr GUID kPersistentStorage3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
+constexpr uint64_t kPersistentQuotaBytes = 2048ull * 1024 * 1024;  // MicrosoftGame.Config of package 1.0.2.1
+
+// XPersistentLocalStorageSpaceInfo: four 64-bit counts.
+struct PersistentSpaceInfo {
+    uint64_t available_free_bytes;  // what the title can still write: the quota left, capped by the host volume
+    uint64_t total_free_bytes;      // the quota left
+    uint64_t used_bytes;
+    uint64_t total_bytes;           // the quota
+};
+static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceInfo is four UINT64");
+
+// The storage folder, created on first use. Empty when there is no overlay (no place to keep files) or the folder
+// cannot be created.
+std::filesystem::path persistent_storage_dir() {
+    const std::filesystem::path overlay = rt::fs::overlay_dir();
+    if (overlay.empty()) return {};
+    std::filesystem::path dir = overlay / L"persistent";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return ec ? std::filesystem::path{} : dir;
+}
+
+std::string utf8_of(const std::filesystem::path& path) {
+    const std::wstring& wide = path.native();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string utf8(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), utf8.data(), n, nullptr, nullptr);
+    return utf8;
+}
+
+uint64_t folder_bytes(const std::filesystem::path& dir) {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(dir, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        std::error_code file_ec;
+        if (!it->is_regular_file(file_ec) || file_ec) continue;
+        const uintmax_t size = it->file_size(file_ec);
+        if (!file_ec) total += size;
+    }
+    return total;
+}
+
+HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
+    if (!path_size) return E_POINTER;
+    *path_size = 0;
+    const std::string path = utf8_of(persistent_storage_dir());
+    if (path.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    *path_size = path.size() + 1;  // with the terminating NUL
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size_t* path_used) {
+    if (path_used) *path_used = 0;
+    if (!path) return E_POINTER;
+    const std::string folder = utf8_of(persistent_storage_dir());
+    if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    if (path_size < folder.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, folder.c_str(), folder.size() + 1);
+    if (path_used) *path_used = folder.size() + 1;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE pls_get_space_info(void*, PersistentSpaceInfo* info) {
+    if (!info) return E_POINTER;
+    *info = {};
+    const std::filesystem::path dir = persistent_storage_dir();
+    if (dir.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    const uint64_t used = folder_bytes(dir);
+    const uint64_t left = used < kPersistentQuotaBytes ? kPersistentQuotaBytes - used : 0;
+    std::error_code ec;
+    const std::filesystem::space_info host = std::filesystem::space(dir, ec);
+    info->total_bytes = kPersistentQuotaBytes;
+    info->used_bytes = used;
+    info->total_free_bytes = left;
+    info->available_free_bytes = ec || left < host.available ? left : host.available;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE pls_prompt_async(void*, uint64_t requested_bytes, XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    const std::filesystem::path dir = persistent_storage_dir();
+    const bool fits = !dir.empty() && requested_bytes <= kPersistentQuotaBytes - (std::min)(folder_bytes(dir), kPersistentQuotaBytes);
+    if (fits) return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return S_OK; });
+    return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return HRESULT_FROM_WIN32(ERROR_DISK_FULL); });
+}
+
+HRESULT STDMETHODCALLTYPE pls_prompt_result(void*, XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    return XAsyncGetStatus(async, false);
+}
+
+// IXPersistentLocalStorageImpl3's package mount has nothing to mount offline; the handle is left empty.
+HRESULT STDMETHODCALLTYPE pls_mount_for_package(void*, const char*, void** mount_handle) {
+    if (!mount_handle) return E_POINTER;
+    *mount_handle = nullptr;
+    return E_NOTIMPL;
+}
+
+#define PLS(fn) reinterpret_cast<const void*>(&fn)
+const void* const kPersistentStorageVtable[] = {
+    PLS(object_query_interface), PLS(object_add_ref), PLS(object_release),
+    PLS(pls_get_path_size),      // 3 XPersistentLocalStorageGetPathSize
+    PLS(pls_get_path),           // 4 XPersistentLocalStorageGetPath
+    PLS(pls_get_space_info),     // 5 XPersistentLocalStorageGetSpaceInfo
+    PLS(pls_prompt_async),       // 6 XPersistentLocalStoragePromptUserForSpaceAsync
+    PLS(pls_prompt_result),      // 7 XPersistentLocalStoragePromptUserForSpaceResult
+    PLS(pls_mount_for_package),  // 8 XPersistentLocalStorageMountForPackage (IXPersistentLocalStorageImpl3)
+};
+#undef PLS
+static_assert(std::size(kPersistentStorageVtable) == 9, "IUnknown + IXPersistentLocalStorageImpl's 5 + Impl3's 1");
+
 // The ids xgameruntime-docs and the xgameruntime IDL give: XThreadingImpl's and XErrorImpl's class id is also their
 // one interface's; IXNetworkingImpl's id is the class id, and IXNetworkingImpl2 derives from it.
 const GUID* const kNetworkingIids[] = {&kNetworking2, nullptr};
 RuntimeObject g_threading{kThreadingVtable, &kThreadingClass, nullptr};
 RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
 RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
+const GUID* const kPersistentStorageIids[] = {&kPersistentStorage2, &kPersistentStorage3, nullptr};
+RuntimeObject g_persistent_storage{kPersistentStorageVtable, &kPersistentStorageClass, kPersistentStorageIids};
 
-RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
+RuntimeObject& system_object();   // XSystemImpl, defined after the XSystem functions it serves
+RuntimeObject& package_object();  // XPackageImpl, after the XPackage functions
+RuntimeObject& game_object();     // XGameImpl, after XPackageImpl
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object()})
+        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &system_object(),
+                                 &package_object(), &game_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
+        HRESULT hr = S_OK;
+        if (rt::shims::xgameruntime_user_query(*class_id, interface_id, out, &hr)) return hr;   // xgameruntime_user.cpp
     }
     char cls[40], iid[40];
     print_guid(cls, class_id);
@@ -694,6 +850,238 @@ bool __stdcall XPackageIsPackagedProcess() {
         if (std::atoi(s) == 0) return false;
     }
     return true;
+}
+
+// ---- XPackageImpl (asked for as IXPackageImpl3), offline ----
+//
+// libHttpClient.GDK.dll asks QueryApiImpl for XPackageImpl with IXPackageImpl3's id through 30 thunks (slots 3-19,
+// 22, 24-27, 30, 32-34, 37-40), each in the argument shape of the method at that position of xgameruntime-docs'
+// IXPackageImpl (slots 3-34), IXPackageImpl2 (35-38) and IXPackageImpl3 (39-40) lists (docs/runtime_imports.md).
+// The slots with an offline answer forward to the XPackage functions above (the package identifier, whether the
+// process is packaged, the mount path and its size, the user's locale); every other slot logs its number once and
+// returns E_NOTIMPL, so the first boot shows which ones the title needs.
+
+constexpr GUID kPackageClass = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
+// IXPackageImpl3 : IXPackageImpl2 : IXPackageImpl (xgameruntime include/xpackage.idl); the class id is its own.
+constexpr GUID kPackage1 = {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}};
+constexpr GUID kPackage2 = {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}};
+constexpr GUID kPackage3 = {0xe2a4734b, 0x2f4a, 0x456d, {0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09}};
+const GUID* const kPackageIids[] = {&kPackage1, &kPackage2, &kPackage3, nullptr};
+
+template <int Slot> HRESULT STDMETHODCALLTYPE package_not_implemented(void*) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackageImpl slot %d not implemented offline (E_NOTIMPL)\n", Slot);
+    return E_NOTIMPL;
+}
+HRESULT STDMETHODCALLTYPE pkg_identifier(void*, size_t size, char* buffer) {
+    return XPackageGetCurrentProcessPackageIdentifier(size, buffer);
+}
+bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess(); }
+// The locales the package declares: <Resources><Resource Language="xx-YY"/> in MicrosoftGame.Config, read from
+// the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
+// The package's MicrosoftGame.Config as text, from the game folder (LEONIDA_GAME_DIR, else --game-dir); empty when
+// there is no folder or no config. Wide on purpose: a game folder named outside the ANSI code page must reach the file
+// intact.
+std::string package_config() {
+    wchar_t env[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_GAME_DIR", env, MAX_PATH);
+    const std::filesystem::path dir = (n > 0 && n < MAX_PATH) ? std::filesystem::path(env) : rt::fs::game_dir();
+    if (dir.empty()) return {};
+    std::ifstream f(dir / L"MicrosoftGame.Config", std::ios::binary);
+    if (!f) return {};
+    return std::string{std::istreambuf_iterator<char>(f), {}};
+}
+
+std::vector<std::string> package_locales() {
+    std::vector<std::string> out;
+    const std::string xml = package_config();
+    if (xml.empty()) return out;
+    for (size_t at = 0; (at = xml.find("<Resource", at)) != std::string::npos; ++at) {
+        if (xml.compare(at, 10, "<Resources") == 0) continue;
+        const size_t end = xml.find('>', at);
+        const size_t key = xml.find("Language=", at);
+        if (end == std::string::npos || key == std::string::npos || key + 10 > end) continue;
+        const char quote = xml[key + 9];
+        const size_t close = xml.find(quote, key + 10);
+        if ((quote == '"' || quote == '\'') && close != std::string::npos && close < end)
+            out.push_back(xml.substr(key + 10, close - key - 10));
+    }
+    return out;
+}
+
+// XPackageGetUserLocale(size_t localeSize, char* locale): of the locales the package declares, the one closest to
+// the user's (the same name, else the same language, else the first declared). Microsoft's contract: "If no locale
+// information is declared for the package, this function succeeds but does not return a user locale". The host's
+// locale is never handed out as the package's.
+HRESULT STDMETHODCALLTYPE pkg_user_locale(void*, size_t size, char* locale) {
+    if (!locale || !size) return E_INVALIDARG;
+    const std::vector<std::string> declared = package_locales();
+    if (declared.empty()) return S_OK;
+    wchar_t wide[LOCALE_NAME_MAX_LENGTH] = {};
+    char user[LOCALE_NAME_MAX_LENGTH * 4] = "";
+    if (GetUserDefaultLocaleName(wide, LOCALE_NAME_MAX_LENGTH) > 0)
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, user, static_cast<int>(sizeof(user)), nullptr, nullptr);
+    const auto language = [](const std::string& name) { return name.substr(0, name.find('-')); };
+    const auto same = [](const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) == 0; };
+    const std::string* pick = &declared.front();
+    bool exact = false;
+    for (const std::string& d : declared)
+        if (same(d, user)) { pick = &d; exact = true; break; }
+    if (!exact)
+        for (const std::string& d : declared)
+            if (same(language(d), language(user))) { pick = &d; break; }
+    if (size < pick->size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(locale, pick->c_str(), pick->size() + 1);
+    return S_OK;
+}
+// Slots 23-26 forward to the named exports' content-package mounts (XPackageMount and its handle registry), so the two
+// ways in behave the same. XPackageMountHandle is one u64, passed in a register like the named exports take it.
+HRESULT STDMETHODCALLTYPE pkg_mount(void*, const char* package_identifier, XPackageMountHandle* mount) {
+    return XPackageMount(package_identifier, mount);
+}
+HRESULT STDMETHODCALLTYPE pkg_mount_path_size(void*, XPackageMountHandle mount, size_t* size) {
+    return XPackageGetMountPathSize(mount, size);
+}
+HRESULT STDMETHODCALLTYPE pkg_mount_path(void*, XPackageMountHandle mount, size_t size, char* path) {
+    return XPackageGetMountPath(mount, size, path);
+}
+void STDMETHODCALLTYPE pkg_close_mount(void*, XPackageMountHandle mount) { XPackageCloseMountHandle(mount); }
+
+// XPackageInstallationProgress: totalBytes, installedBytes, launchBytes (u64), launchable, completed (bool).
+struct InstallationProgress {
+    uint64_t total_bytes, installed_bytes, launch_bytes;
+    bool launchable, completed;
+};
+static_assert(sizeof(InstallationProgress) == 32, "XPackageInstallationProgress layout");
+// void XPackageGetInstallationProgress(monitor, XPackageInstallationProgress*): an offline package is installed,
+// launchable and completed, every byte present.
+void STDMETHODCALLTYPE pkg_installation_progress(void*, void*, InstallationProgress* progress) {
+    if (progress) *progress = {0, 0, 0, true, true};
+}
+// The bool methods with no offline work, as Microsoft documents them: XPackageUpdateInstallationMonitor is false
+// (nothing changed), the two Unregister* calls are true (nothing pending), XPackageUninstallPackage is false (not
+// uninstalled). A generic E_NOTIMPL stub would read as true in al.
+bool STDMETHODCALLTYPE pkg_update_monitor(void*, void*) { return false; }
+bool STDMETHODCALLTYPE pkg_unregister_progress(void*, void*, XTaskQueueRegistrationToken, bool) { return true; }
+bool STDMETHODCALLTYPE pkg_unregister_installed(void*, XTaskQueueRegistrationToken, bool) { return true; }
+bool STDMETHODCALLTYPE pkg_uninstall_package(void*, const char*) { return false; }
+
+#define PN(n) reinterpret_cast<const void*>(&package_not_implemented<n>)
+const void* const kPackageVtable[] = {
+    reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
+    reinterpret_cast<const void*>(&object_release),
+    reinterpret_cast<const void*>(&pkg_identifier),   // 3  XPackageGetCurrentProcessPackageIdentifier
+    reinterpret_cast<const void*>(&pkg_is_packaged),  // 4  XPackageIsPackagedProcess
+    PN(5), PN(6),                                     // 5-6 installation monitor: create, close
+    reinterpret_cast<const void*>(&pkg_installation_progress),  // 7  XPackageGetInstallationProgress (void, writes)
+    reinterpret_cast<const void*>(&pkg_update_monitor),         // 8  XPackageUpdateInstallationMonitor (bool)
+    PN(9),                                                      // 9  XPackageRegisterInstallationProgressChanged
+    reinterpret_cast<const void*>(&pkg_unregister_progress),    // 10 ...UnregisterInstallationProgressChanged (bool)
+    reinterpret_cast<const void*>(&pkg_user_locale),  // 11 XPackageGetUserLocale
+    PN(12), PN(13), PN(14), PN(15), PN(16), PN(17),   // 12-19 chunks: find / enumerate availability, change order,
+    PN(18), PN(19),                                   //       install (+ async, result), estimate size, uninstall
+    PN(20), PN(21),                                   // 20-21 _unknown_ (older enumerate / register installed)
+    reinterpret_cast<const void*>(&pkg_unregister_installed),  // 22 XPackageUnregisterPackageInstalled (bool)
+    reinterpret_cast<const void*>(&pkg_mount),            // 23 XPackageMount
+    reinterpret_cast<const void*>(&pkg_mount_path_size),  // 24 XPackageGetMountPathSize
+    reinterpret_cast<const void*>(&pkg_mount_path),       // 25 XPackageGetMountPath
+    reinterpret_cast<const void*>(&pkg_close_mount),      // 26 XPackageCloseMountHandle
+    PN(27), PN(28), PN(29), PN(30), PN(31),           // 27 _unknown_, 28 EnumeratePackages, 29 RegisterPackageInstalled,
+                                                      // 30 GetWriteStats, 31 _unknown_
+    PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
+    reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
+    PN(35), PN(36), PN(37), PN(38),                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
+                                                      //   MountWithUiAsync, MountWithUiResult
+    PN(39), PN(40),                                   // IXPackageImpl3: EnumeratePackages, RegisterPackageInstalled
+};
+#undef PN
+static_assert(std::size(kPackageVtable) == 41, "IUnknown + IXPackageImpl's 32 + IXPackageImpl2's 4 + IXPackageImpl3's 2");
+
+RuntimeObject& package_object() {
+    static RuntimeObject object{kPackageVtable, &kPackageClass, kPackageIids};
+    return object;
+}
+
+// ---- XGameImpl (asked for as IXGameImpl3), offline ----
+//
+// IXGameImpl3 : IXGameImpl2 : IXGameImpl (xgameruntime include/xgame.idl); the class id is IXGameImpl's. Three
+// methods after IUnknown: 3 XGameGetXboxTitleId (IXGameImpl), 4 XLaunchNewGame (IXGameImpl2), 5 XLaunchRestartOnCrash
+// (IXGameImpl3). A retail Gen9 title asks QueryApiImpl for this class (Freminet/ScarlettX's README, observed on
+// Concept Destruction); the executable here is not available yet, so its own requests are unmeasured.
+
+constexpr GUID kGameClass = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+constexpr GUID kGame2 = {0x50849859, 0x0ad8, 0x4f81, {0x80, 0xe4, 0x5b, 0xc7, 0x86, 0x26, 0xf8, 0x52}};
+constexpr GUID kGame3 = {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
+const GUID* const kGameIids[] = {&kGame2, &kGame3, nullptr};
+
+// The title id MicrosoftGame.Config declares (<TitleId>, eight hex digits), or false when there is none or it is not
+// hex. The first <TitleId> element counts; surrounding whitespace is allowed.
+bool package_title_id(uint32_t& out) {
+    const std::string xml = package_config();
+    const size_t open = xml.find("<TitleId>");
+    if (open == std::string::npos) return false;
+    const size_t begin = xml.find_first_not_of(" \t\r\n", open + 9);
+    const size_t close = xml.find("</TitleId>", open);
+    if (begin == std::string::npos || close == std::string::npos || begin >= close) return false;
+    size_t end = close;
+    while (end > begin && std::isspace(static_cast<unsigned char>(xml[end - 1]))) --end;
+    if (end - begin == 0 || end - begin > 8) return false;
+    uint32_t value = 0;
+    for (size_t i = begin; i < end; ++i) {
+        const char c = xml[i];
+        const int digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                        : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (digit < 0) return false;
+        value = value << 4 | static_cast<uint32_t>(digit);
+    }
+    out = value;
+    return true;
+}
+
+// HRESULT XGameGetXboxTitleId(uint32_t* titleId): the package's title id. Without a config that declares one there
+// is no title id to give (E_FAIL), rather than a made-up one.
+HRESULT STDMETHODCALLTYPE game_get_title_id(void*, uint32_t* title_id) {
+    if (!title_id) return E_INVALIDARG;
+    uint32_t id = 0;
+    if (!package_title_id(id)) {
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] xgameruntime: XGameGetXboxTitleId: no <TitleId> in MicrosoftGame.Config\n");
+        return E_FAIL;
+    }
+    *title_id = id;
+    return S_OK;
+}
+
+// void XLaunchNewGame(const char* exePath, const char* args, XUserHandle defaultUser): on the console this ends the
+// title and starts another. Offline there is no other title to start; the call is logged and returns.
+void STDMETHODCALLTYPE game_launch_new(void*, const char* exe_path, const char* args, void*) {
+    std::fprintf(stderr, "[rt] xgameruntime: XLaunchNewGame(\"%s\", \"%s\") ignored offline\n",
+                 exe_path ? exe_path : "", args ? args : "");
+}
+
+// HRESULT XLaunchRestartOnCrash(const char* args, uint32_t reserved): asks the console to restart the title after a
+// crash. Nothing restarts the process here; it succeeds with nothing registered.
+HRESULT STDMETHODCALLTYPE game_restart_on_crash(void*, const char*, uint32_t) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XLaunchRestartOnCrash: no restart is registered offline\n");
+    return S_OK;
+}
+
+const void* const kGameVtable[] = {
+    reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
+    reinterpret_cast<const void*>(&object_release),
+    reinterpret_cast<const void*>(&game_get_title_id),      // 3 XGameGetXboxTitleId (IXGameImpl)
+    reinterpret_cast<const void*>(&game_launch_new),        // 4 XLaunchNewGame (IXGameImpl2, void)
+    reinterpret_cast<const void*>(&game_restart_on_crash),  // 5 XLaunchRestartOnCrash (IXGameImpl3)
+};
+static_assert(std::size(kGameVtable) == 6, "IUnknown + IXGameImpl3's 3 methods");
+
+RuntimeObject& game_object() {
+    static RuntimeObject object{kGameVtable, &kGameClass, kGameIids};
+    return object;
 }
 
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}

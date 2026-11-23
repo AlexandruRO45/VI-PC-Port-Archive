@@ -6,15 +6,18 @@
 // without trigger motors. The test covers enumeration and device callbacks, readings and their button/axis mapping,
 // UI navigation, the guide button, rumble and trigger rumble as SDL receives them, the DualSense effect bytes for
 // each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, unplug/replug, reading history,
-// and identification of two or three otherwise indistinguishable pads. No game data.
+// identification of two or three otherwise indistinguishable pads, and which kind of device was used last
+// (active_input, LEONIDA_PROMPTS). No game data.
 #include <windows.h>
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -131,10 +134,17 @@ void CALLBACK on_device(GameInputCallbackToken token, void*, IGameInputDevice* d
     g_device_events.push_back({device, current, previous, token});
 }
 DWORD g_reading_sleep_ms = 0;  // makes on_reading slow, for the Dispatch quota checks
+SDL_Joystick* g_requeue_pad = nullptr;  // set: on_reading queues one more reading from inside the callback
+bool g_requeue_down = false;
 
 void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
     if (reading) ++g_reading_events;
     if (g_reading_sleep_ms) Sleep(g_reading_sleep_ms);
+    if (g_requeue_pad) {
+        g_requeue_down = !g_requeue_down;
+        SDL_SetJoystickVirtualButton(g_requeue_pad, SDL_GAMEPAD_BUTTON_WEST, g_requeue_down);
+        rt::gameinput::poll();
+    }
 }
 void CALLBACK on_guide(GameInputCallbackToken, void*, IGameInputDevice*, uint64_t, bool pressed) {
     g_guide_events.push_back(pressed);
@@ -230,6 +240,221 @@ GameInputMotionState motion_state(IGameInput* input, IGameInputDevice* dev, bool
     if (r) r->Release();
     if (ok) *ok = got;
     return ms;
+}
+
+// ---- raw HID (RT-175) -------------------------------------------------------------------------------------------
+
+using rt::gameinput::RawReportSize;
+
+bool same_reports(const std::vector<RawReportSize>& got, std::initializer_list<RawReportSize> want) {
+    if (got.size() != want.size()) return false;
+    size_t i = 0;
+    for (const RawReportSize& w : want) {
+        if (got[i].kind != w.kind || got[i].id != w.id || got[i].bytes != w.bytes) return false;
+        ++i;
+    }
+    return true;
+}
+
+// A game pad with numbered reports: input 1 (3 bytes), output 2 (2 bytes), feature 3 (4 bytes).
+const uint8_t kRawPadDescriptor[] = {
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01,  // usage page generic desktop, usage game pad, collection application
+    0x85, 0x01, 0x75, 0x08, 0x95, 0x03, 0x81, 0x02,  // report id 1, size 8, count 3, input
+    0x85, 0x02, 0x95, 0x02, 0x91, 0x02,              // report id 2, count 2, output
+    0x85, 0x03, 0x95, 0x04, 0xB1, 0x02,              // report id 3, count 4, feature
+    0xC0,                                            // end collection
+};
+
+void test_parse_report_descriptor() {
+    std::vector<RawReportSize> r;
+    check(rt::gameinput::parse_report_descriptor(kRawPadDescriptor, sizeof kRawPadDescriptor, &r) &&
+              same_reports(r, {{0, 1, 3}, {1, 2, 2}, {2, 3, 4}}),
+          "raw hid: a descriptor with report ids gives input 1 (3), output 2 (2), feature 3 (4)");
+    // No report id: one 16-bit input report under id 0, from two main items that add up (12 + 4 bits).
+    const uint8_t no_ids[] = {0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x75, 0x0C, 0x95, 0x01, 0x81, 0x02,
+                              0x75, 0x04, 0x81, 0x03, 0xC0};
+    check(rt::gameinput::parse_report_descriptor(no_ids, sizeof no_ids, &r) && same_reports(r, {{0, 0, 2}}),
+          "raw hid: without report ids one input report of the summed bits (12 + 4 bits = 2 bytes)");
+    // Push saves the globals (size 8, count 2) and Pop restores them after a 32-bit item; a long item is skipped.
+    const uint8_t push_pop[] = {0x75, 0x08, 0x95, 0x02, 0xA4, 0x75, 0x20, 0x95, 0x01, 0x81, 0x02, 0xB4,
+                                0xFE, 0x02, 0x10, 0xAA, 0xBB, 0x81, 0x02};
+    check(rt::gameinput::parse_report_descriptor(push_pop, sizeof push_pop, &r) && same_reports(r, {{0, 0, 6}}),
+          "raw hid: Push/Pop restore Report Size and Count, a long item is skipped (4 + 2 bytes)");
+    const uint8_t truncated[] = {0x75, 0x08, 0x96, 0x01};      // a two-byte Report Count cut after one byte
+    const uint8_t id_zero[] = {0x85, 0x00, 0x81, 0x02};       // Report ID 0 is reserved
+    const uint8_t pop_empty[] = {0xB4, 0x81, 0x02};           // Pop without Push
+    const uint8_t huge[] = {0x77, 0xFF, 0xFF, 0x00, 0x00, 0x97, 0xFF, 0xFF, 0x00, 0x00, 0x81, 0x02};  // > 64 KiB
+    check(!rt::gameinput::parse_report_descriptor(truncated, sizeof truncated, &r) &&
+              !rt::gameinput::parse_report_descriptor(id_zero, sizeof id_zero, &r) &&
+              !rt::gameinput::parse_report_descriptor(pop_empty, sizeof pop_empty, &r) &&
+              !rt::gameinput::parse_report_descriptor(huge, sizeof huge, &r),
+          "raw hid: a truncated item, Report ID 0, Pop without Push and a report over 64 KiB are refused");
+    check(rt::gameinput::parse_report_descriptor(nullptr, 0, &r) && r.empty(), "raw hid: an empty descriptor declares nothing");
+}
+
+// The fake HID device behind the raw pad: input reports to hand out, what the shim wrote, the feature reply.
+struct FakeRawHid {
+    uint16_t vendor = 0x1209, product = 0x0001;  // pid.codes test ids, not a real pad
+    int opens = 0, closes = 0;
+    std::deque<std::vector<uint8_t>> inputs;
+    std::vector<std::vector<uint8_t>> writes, features_sent;
+    std::vector<uint8_t> feature_reply;
+    bool fail = false;
+};
+FakeRawHid g_raw;
+void* raw_open(const char*, uint16_t vendor, uint16_t product) {
+    if (vendor != g_raw.vendor || product != g_raw.product) return nullptr;
+    ++g_raw.opens;
+    return &g_raw;
+}
+void raw_close(void*) { ++g_raw.closes; }
+int raw_descriptor(void*, uint8_t* buf, size_t size) {
+    if (size < sizeof kRawPadDescriptor) return -1;
+    std::memcpy(buf, kRawPadDescriptor, sizeof kRawPadDescriptor);
+    return static_cast<int>(sizeof kRawPadDescriptor);
+}
+int raw_read(void*, uint8_t* buf, size_t size) {
+    if (g_raw.inputs.empty()) return 0;
+    const std::vector<uint8_t> r = g_raw.inputs.front();
+    g_raw.inputs.pop_front();
+    const size_t n = std::min(size, r.size());
+    std::memcpy(buf, r.data(), n);
+    return static_cast<int>(n);
+}
+int raw_write(void*, const uint8_t* buf, size_t size) {
+    if (g_raw.fail) return -1;
+    g_raw.writes.emplace_back(buf, buf + size);
+    return static_cast<int>(size);
+}
+int raw_get_feature(void*, uint8_t* buf, size_t size) {
+    if (g_raw.fail || g_raw.feature_reply.empty() || g_raw.feature_reply[0] != buf[0]) return -1;
+    const size_t n = std::min(size, g_raw.feature_reply.size());
+    std::memcpy(buf, g_raw.feature_reply.data(), n);
+    return static_cast<int>(n);
+}
+int raw_send_feature(void*, const uint8_t* buf, size_t size) {
+    if (g_raw.fail) return -1;
+    g_raw.features_sent.emplace_back(buf, buf + size);
+    return static_cast<int>(size);
+}
+const rt::gameinput::HidBackend kFakeRawHid = {raw_open, raw_close, raw_descriptor, raw_read,
+                                            raw_write, raw_get_feature, raw_send_feature};
+
+std::vector<uint8_t> raw_bytes(IGameInputRawDeviceReport* r) {
+    std::vector<uint8_t> v(r ? r->GetRawDataSize() : 0);
+    if (r) r->GetRawData(v.size(), v.data());
+    return v;
+}
+
+void test_raw_hid(IGameInput* input) {
+    test_parse_report_descriptor();
+    rt::gameinput::set_hid_backend(&kFakeRawHid);
+    const size_t events_before = g_device_events.size();
+    Pad raw_pad, plain;
+    attach(raw_pad, "Leonida virtual raw pad", g_raw.vendor, g_raw.product, false);
+    attach(plain, "Leonida virtual pad without HID", 0x045E, 0x02FF, false);
+    rt::gameinput::poll();
+    std::vector<IGameInputDevice*> found;  // attach order: the raw pad first (see test_motion)
+    for (size_t i = events_before; i < g_device_events.size() && found.size() < 2; ++i) {
+        const DeviceEvent& e = g_device_events[i];
+        if ((e.current & GameInputDeviceConnected) && std::find(found.begin(), found.end(), e.device) == found.end())
+            found.push_back(e.device);
+    }
+    IGameInputDevice* rdev = found.size() > 0 ? found[0] : nullptr;
+    IGameInputDevice* pdev = found.size() > 1 ? found[1] : nullptr;
+    check(rdev && pdev && g_raw.opens == 1, "raw hid: both pads connected, the backend opened the raw pad only");
+    if (!rdev || !pdev) return;
+    rdev->AddRef();
+    pdev->AddRef();
+
+    const GameInputDeviceInfo* ri = rdev->GetDeviceInfo();
+    check((ri->supportedInput & GameInputKindRawDeviceReport) && (rdev->GetDeviceStatus() & GameInputDeviceRawIoEnabled),
+          "raw hid: the raw pad reports GameInputKindRawDeviceReport and GameInputDeviceRawIoEnabled");
+    const auto* in = static_cast<const GameInputRawDeviceReportInfo*>(ri->inputReportInfo);
+    const auto* out = static_cast<const GameInputRawDeviceReportInfo*>(ri->outputReportInfo);
+    const auto* feat = static_cast<const GameInputRawDeviceReportInfo*>(ri->featureReportInfo);
+    check(ri->inputReportCount == 1 && in && in->kind == GameInputRawInputReport && in->id == 1 && in->size == 3 &&
+              in->itemCount == 0 && ri->outputReportCount == 1 && out && out->id == 2 && out->size == 2 &&
+              ri->featureReportCount == 1 && feat && feat->id == 3 && feat->size == 4,
+          "raw hid: the report tables follow the descriptor (input 1/3, output 2/2, feature 3/4, no items)");
+    const GameInputDeviceInfo* pi = pdev->GetDeviceInfo();
+    check(!(pi->supportedInput & GameInputKindRawDeviceReport) && pi->inputReportCount == 0 &&
+              !(pdev->GetDeviceStatus() & GameInputDeviceRawIoEnabled),
+          "raw hid: a pad without a HID device has no raw reports");
+
+    IGameInputReading* reading = nullptr;
+    void* report = nullptr;
+    check(input->GetCurrentReading(GameInputKindGamepad, rdev, &reading) == S_OK && reading &&
+              !(reading->GetInputKind() & GameInputKindRawDeviceReport) && !reading->GetRawReport(&report) && !report,
+          "raw hid: before the first input report a reading carries no raw report");
+    if (reading) reading->Release();
+
+    g_raw.inputs.push_back({0x01, 0x11, 0x22, 0x33});
+    g_raw.inputs.push_back({0x09, 0x99});              // an id the descriptor does not declare: ignored
+    rt::gameinput::poll();
+    reading = nullptr;
+    check(input->GetCurrentReading(GameInputKindRawDeviceReport, rdev, &reading) == S_OK && reading &&
+              (reading->GetInputKind() & GameInputKindRawDeviceReport),
+          "raw hid: an input report makes a reading of kind GameInputKindRawDeviceReport");
+    IGameInputRawDeviceReport* rr = nullptr;
+    if (reading && reading->GetRawReport(&report)) rr = static_cast<IGameInputRawDeviceReport*>(report);
+    const GameInputRawDeviceReportInfo* rinfo = rr ? rr->GetReportInfo() : nullptr;
+    IGameInputDevice* owner = nullptr;
+    if (rr) rr->GetDevice(&owner);
+    check(rr && rinfo && rinfo->kind == GameInputRawInputReport && rinfo->id == 1 &&
+              raw_bytes(rr) == std::vector<uint8_t>({0x11, 0x22, 0x33}) && owner == rdev,
+          "raw hid: GetRawReport gives the newest declared input report, without its id byte, of this device");
+    if (owner) owner->Release();
+    int64_t item = 7;
+    check(rr && !rr->GetItemValue(0, &item) && item == 0 && !rr->SetItemValue(0, 1) && !rr->ResetAllItems(),
+          "raw hid: the item calls answer false (no item tables)");
+    if (rr) rr->Release();
+    if (reading) reading->Release();
+
+    void* created = nullptr;
+    check(rdev->CreateRawDeviceReport(2, GameInputRawOutputReport, &created) == S_OK && created,
+          "raw hid: CreateRawDeviceReport(2, output)");
+    auto* outr = static_cast<IGameInputRawDeviceReport*>(created);
+    const uint8_t payload[] = {0xAA, 0xBB};
+    check(outr && outr->GetRawDataSize() == 2 && raw_bytes(outr) == std::vector<uint8_t>({0, 0}) &&
+              !outr->SetRawData(1, payload) && outr->SetRawData(2, payload),
+          "raw hid: a new report is zeroed, and SetRawData takes exactly its size");
+    check(rdev->SendRawDeviceOutput(outr) == S_OK && !g_raw.writes.empty() &&
+              g_raw.writes.back() == std::vector<uint8_t>({0x02, 0xAA, 0xBB}),
+          "raw hid: SendRawDeviceOutput writes the id byte then the payload");
+    check(rdev->SetRawDeviceFeature(outr) == E_INVALIDARG && rdev->SendRawDeviceOutput(nullptr) == E_INVALIDARG,
+          "raw hid: an output report is not a feature report, and a null report is refused");
+    g_raw.fail = true;
+    check(rdev->SendRawDeviceOutput(outr) == E_FAIL, "raw hid: a failed write is E_FAIL");
+    g_raw.fail = false;
+    if (outr) outr->Release();
+
+    g_raw.feature_reply = {0x03, 0x01, 0x02, 0x03, 0x04};
+    void* fr = nullptr;
+    check(rdev->GetRawDeviceFeature(3, &fr) == S_OK && fr &&
+              raw_bytes(static_cast<IGameInputRawDeviceReport*>(fr)) == std::vector<uint8_t>({1, 2, 3, 4}),
+          "raw hid: GetRawDeviceFeature(3) reads the feature report");
+    check(fr && rdev->SetRawDeviceFeature(fr) == S_OK && !g_raw.features_sent.empty() &&
+              g_raw.features_sent.back() == std::vector<uint8_t>({0x03, 1, 2, 3, 4}),
+          "raw hid: SetRawDeviceFeature sends it back with its id byte");
+    if (fr) static_cast<IGameInputRawDeviceReport*>(fr)->Release();
+    void* none = reinterpret_cast<void*>(1);
+    check(rdev->CreateRawDeviceReport(9, GameInputRawOutputReport, &none) == E_INVALIDARG && !none &&
+              rdev->CreateRawDeviceReport(1, 7, &none) == E_INVALIDARG && rdev->GetRawDeviceFeature(2, &none) == E_INVALIDARG,
+          "raw hid: an undeclared id or kind is E_INVALIDARG");
+    check(pdev->CreateRawDeviceReport(1, GameInputRawInputReport, &none) == E_NOTIMPL && !none &&
+              pdev->GetRawDeviceFeature(3, &none) == E_NOTIMPL,
+          "raw hid: a pad without raw I/O answers E_NOTIMPL, as before");
+
+    detach(raw_pad);
+    detach(plain);
+    rt::gameinput::poll();
+    check(g_raw.closes == 1 && rt::gameinput::connected_count() == 0, "raw hid: unplugging closes the HID device");
+    check(rdev->CreateRawDeviceReport(2, GameInputRawOutputReport, &none) == E_NOTIMPL,
+          "raw hid: no raw I/O once the pad is gone");
+    rdev->Release();
+    pdev->Release();
+    rt::gameinput::set_hid_backend(nullptr);
 }
 
 void test_motion(IGameInput* input) {
@@ -566,6 +791,156 @@ void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::reload_config();
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
+    rt::gameinput::set_keyboard_source(nullptr, nullptr);
+    rt::gameinput::set_cursor_source(nullptr);
+}
+
+// active_input(): which kind of device the player used last. Virtual pads with a DualSense, a DualShock 4 and an Xbox
+// pad's vendor and product id (SDL takes the gamepad type from them) plus the keyboard pad; first with no wait
+// between changes (LEONIDA_PROMPTS_SWITCH_MS=0), then with the default 300 ms window on the real clock, then a family
+// forced by LEONIDA_PROMPTS.
+void test_active_input() {
+    using leonida::InputFamily;
+    const auto family = [] { return rt::gameinput::active_input().family; };
+    const auto generation = [] { return rt::gameinput::active_input().generation; };
+
+    set_env("LEONIDA_PROMPTS", nullptr);
+    set_env("LEONIDA_PROMPTS_SWITCH_MS", "0");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(!rt::gameinput::active_input().forced, "active input: not forced without LEONIDA_PROMPTS");
+
+    Pad ds, ds4, xbox;
+    attach(ds, "Leonida virtual DualSense", 0x054C, 0x0CE6, false);
+    attach(ds4, "Leonida virtual DualShock 4", 0x054C, 0x09CC, false);
+    attach(xbox, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_SOUTH, true);  // held while it connects
+    const uint64_t at_connect = generation();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 3, "active input: three pads open");
+    check(generation() == at_connect, "active input: connecting pads (one with a button held) changes nothing");
+
+    auto press = [](Pad& p, SDL_GamepadButton b) {
+        SDL_SetJoystickVirtualButton(p.js, b, true);
+        rt::gameinput::poll();
+        SDL_SetJoystickVirtualButton(p.js, b, false);
+        rt::gameinput::poll();
+    };
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_SOUTH, false);  // the held button, let go
+    rt::gameinput::poll();
+    check(generation() == at_connect, "active input: letting go of a button is not input");
+
+    // The tests before this one leave whichever pad they used last; an Xbox press makes the start known.
+    press(xbox, SDL_GAMEPAD_BUTTON_SOUTH);
+    check(family() == InputFamily::Xbox, "active input: the Xbox pad in use");
+    const uint64_t g0 = generation();
+
+    press(ds, SDL_GAMEPAD_BUTTON_SOUTH);
+    check(family() == InputFamily::PlayStation5 && generation() == g0 + 1, "active input: DualSense press");
+    press(ds4, SDL_GAMEPAD_BUTTON_EAST);
+    check(family() == InputFamily::PlayStation4 && generation() == g0 + 2, "active input: DualShock 4 press");
+
+    // Stick drift on the Xbox pad (0.18) is not input; the stick pushed over is.
+    SDL_SetJoystickVirtualAxis(xbox.js, SDL_GAMEPAD_AXIS_LEFTX, 6000);
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation4 && generation() == g0 + 2, "active input: stick drift changes nothing");
+    SDL_SetJoystickVirtualAxis(xbox.js, SDL_GAMEPAD_AXIS_LEFTX, 32767);
+    rt::gameinput::poll();
+    check(family() == InputFamily::Xbox && generation() == g0 + 3, "active input: Xbox stick pushed over");
+    SDL_SetJoystickVirtualAxis(xbox.js, SDL_GAMEPAD_AXIS_LEFTX, 0);
+    rt::gameinput::poll();
+
+    // Buttons GameInput's gamepad state leaves out count too: the DualSense touchpad.
+    press(ds, SDL_GAMEPAD_BUTTON_TOUCHPAD);
+    check(family() == InputFamily::PlayStation5 && generation() == g0 + 4, "active input: DualSense touchpad click");
+    // A trigger pulled on the DualShock 4.
+    SDL_SetJoystickVirtualAxis(ds4.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 32767);
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation4 && generation() == g0 + 5, "active input: DualShock 4 trigger pull");
+    SDL_SetJoystickVirtualAxis(ds4.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
+    rt::gameinput::poll();
+
+    // The keyboard pad: a key, and the mouse through the keyboard pad's right stick.
+    rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+    rt::gameinput::set_cursor_source(fake_cursor);
+    std::memset(g_keys, 0, sizeof g_keys);
+    g_cursor_x = g_cursor_y = 0;
+    set_env("LEONIDA_KEYBOARD_PAD", "always");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();  // attaches the keyboard pad
+    rt::gameinput::poll();  // opens it: its first sample is the baseline
+    check(rt::gameinput::connected_count() == 4 && generation() == g0 + 5,
+          "active input: the keyboard pad connecting changes nothing");
+    g_keys[VK_RETURN] = true;
+    rt::gameinput::poll();
+    g_keys[VK_RETURN] = false;
+    rt::gameinput::poll();
+    check(family() == InputFamily::Keyboard && generation() == g0 + 6, "active input: Enter on the keyboard pad");
+    press(xbox, SDL_GAMEPAD_BUTTON_SOUTH);
+    check(family() == InputFamily::Xbox && generation() == g0 + 7, "active input: back to the Xbox pad");
+    g_cursor_x += 1;  // a 1-count jitter stays well inside the stick radius
+    rt::gameinput::poll();
+    check(family() == InputFamily::Xbox, "active input: mouse jitter changes nothing");
+    g_cursor_x += 20;  // a real movement pushes the right stick past the radius
+    rt::gameinput::poll();
+    check(family() == InputFamily::Keyboard && generation() == g0 + 8, "active input: mouse movement");
+    for (int i = 0; i < 80; ++i) rt::gameinput::poll();  // the stick falls back to rest
+
+    // The default window on the real clock: a second change within 300 ms of the last is ignored.
+    set_env("LEONIDA_PROMPTS_SWITCH_MS", nullptr);
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().prompts_switch_ms == 300, "active input: 300 ms by default");
+    Sleep(350);
+    press(ds, SDL_GAMEPAD_BUTTON_NORTH);
+    check(family() == InputFamily::PlayStation5 && generation() == g0 + 9, "active input: DualSense after the window");
+    press(xbox, SDL_GAMEPAD_BUTTON_WEST);
+    check(family() == InputFamily::PlayStation5 && generation() == g0 + 9,
+          "active input: an Xbox press right after a change is ignored");
+    Sleep(350);
+    press(xbox, SDL_GAMEPAD_BUTTON_WEST);
+    check(family() == InputFamily::Xbox && generation() == g0 + 10,
+          "active input: the Xbox press once the window passed");
+
+    // LEONIDA_PROMPTS forces a family; tracking goes on underneath and takes over again when it is cleared.
+    set_env("LEONIDA_PROMPTS_SWITCH_MS", "0");
+    set_env("LEONIDA_PROMPTS", "keyboard");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(family() == InputFamily::Keyboard && rt::gameinput::active_input().forced && generation() == g0 + 11,
+          "active input: LEONIDA_PROMPTS=keyboard");
+    press(ds, SDL_GAMEPAD_BUTTON_SOUTH);
+    check(family() == InputFamily::Keyboard && generation() == g0 + 11,
+          "active input: forced, a DualSense press shows nothing");
+    set_env("LEONIDA_PROMPTS", "PlayStation");  // case does not matter
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation5 && rt::gameinput::active_input().forced && generation() == g0 + 12,
+          "active input: LEONIDA_PROMPTS=PlayStation (any case) is PlayStation 5");
+    set_env("LEONIDA_PROMPTS", "ps4");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation4 && generation() == g0 + 13, "active input: LEONIDA_PROMPTS=ps4");
+    set_env("LEONIDA_PROMPTS", "nonsense");  // warns and follows the devices
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(!rt::gameinput::active_input().forced && family() == InputFamily::PlayStation5 && generation() == g0 + 14,
+          "active input: an unknown LEONIDA_PROMPTS follows the devices (the DualSense pressed while forced)");
+    set_env("LEONIDA_PROMPTS", "playstation");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(family() == InputFamily::PlayStation5 && rt::gameinput::active_input().forced && generation() == g0 + 14,
+          "active input: forcing the family already in use changes no generation");
+
+    // Clean up: everything off and unplugged.
+    set_env("LEONIDA_PROMPTS", nullptr);
+    set_env("LEONIDA_PROMPTS_SWITCH_MS", nullptr);
+    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    rt::gameinput::reload_config();
+    detach(ds);
+    detach(ds4);
+    detach(xbox);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "active input: all pads closed at the end");
     rt::gameinput::set_keyboard_source(nullptr, nullptr);
     rt::gameinput::set_cursor_source(nullptr);
 }
@@ -1361,6 +1736,8 @@ int main() {
         if (wait) WaitForSingleObject(wait, 0);  // consume the signal from queueing
         check(dispatcher->Dispatch(0) && g_reading_events == before_quota + 1, "Dispatch(0) runs exactly one event and reports more");
         check(wait && WaitForSingleObject(wait, 0) == WAIT_OBJECT_0, "the wait handle is signalled again while events remain");
+        // The callback sleeps 5 ms, so at least 5 ms have passed after the first event however loaded the machine
+        // is; a slower run only makes the 1 ms quota more clearly spent.
         g_reading_sleep_ms = 5;
         before_quota = g_reading_events;
         check(dispatcher->Dispatch(1000) && g_reading_events == before_quota + 1,
@@ -1370,6 +1747,26 @@ int main() {
         check(!dispatcher->Dispatch(1'000'000) && g_reading_events >= before_quota + 2,
               "a large quota drains the queue and returns false");
         check(!dispatcher->Dispatch(0), "Dispatch on an empty queue returns false");
+
+        // Events queued during a call wait for the next one: each callback here queues another reading, so a
+        // Dispatch that kept draining would never return. With two events queued, each call runs exactly the batch
+        // it started with and reports the readings queued meanwhile.
+        queue_changes(2);
+        g_requeue_pad = xbox.js;
+        before_quota = g_reading_events;
+        check(dispatcher->Dispatch(UINT64_MAX) && g_reading_events == before_quota + 2,
+              "Dispatch runs only the events queued when it started");
+        before_quota = g_reading_events;
+        check(dispatcher->Dispatch(UINT64_MAX) && g_reading_events == before_quota + 2,
+              "the events queued during the call run on the next one");
+        g_requeue_pad = nullptr;
+        while (dispatcher->Dispatch(UINT64_MAX)) {}
+        if (g_requeue_down) {
+            g_requeue_down = false;
+            SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_WEST, false);
+            rt::gameinput::poll();
+            while (dispatcher->Dispatch(UINT64_MAX)) {}
+        }
     }
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();
@@ -1569,12 +1966,14 @@ int main() {
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "all pads closed after detaching");
 
+    test_active_input();
     test_twins(input);
     test_keyboard_pad(input);
     test_motion(input);
     test_aggregate_device(input);
     test_force_feedback(input);
     test_haptic_motors(input);
+    test_raw_hid(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

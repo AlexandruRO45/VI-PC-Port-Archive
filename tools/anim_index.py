@@ -30,6 +30,11 @@ import sys
 import unicodedata
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
+
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 PACK_NAMES = re.compile(rb"pack:/[^\x00]{1,200}")
@@ -324,14 +329,23 @@ def collect_skeletons_dir(path):
     out = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")) or os.path.getsize(full) > 16384:
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
+        size = os.path.getsize(full)
         with open(full, "rb") as f:
-            data = f.read()
+            head = f.read(5)
+            if size > 16384 and head != b"SKEL_":
+                continue
+            data = head + f.read()
+        m = re.match(r"([0-9a-fA-F]{6,})", name)
+        offset = int(m.group(1), 16) if m else 0
+        sig = classify(data, offset, len(data))["signature"]
+        if not (sig == "skeleton-names" or (size <= 16384 and sig.startswith("raw:"))):
+            continue
         if b"SKEL_" in data or b"PH_" in data:
-            m = re.match(r"([0-9a-fA-F]{6,})", name)
-            record = parse_skel_names(data, int(m.group(1), 16) if m else 0)
-            record["kind"] = "motion-matcher" if b"motionmatcher" in data else "bone-table"
+            record = parse_skel_names(data, offset)
+            record["kind"] = ("plain-bone-table" if sig == "skeleton-names"
+                              else ("motion-matcher" if b"motionmatcher" in data else "bone-table"))
             if record["distinct"] or record["hashes_present"]:
                 out.append(record)
     return out
@@ -367,9 +381,6 @@ def collect_rbf0_dir(path):
     return bytes(blob)
 
 
-def _gap(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
-
 
 def scan_rpf(path, start=None, limit=None, progress=None):
     """Walk an RPF9 data area. Returns (records, summary). No tables of contents are read or decrypted."""
@@ -396,7 +407,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                z, u = _gap(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 head = m[s:s + min(blen, 0x20)]
@@ -422,14 +433,14 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            z, u = _gap(m[last:s])
+            z, u = gap_split(m, last, s)
             zero += z
             unread += u
             rows.append(classify(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        z, u = _gap(m[last:end])
+        z, u = gap_split(m, last, end)
         zero += z
         unread += u
     summary = summarise(rows, end - span_start, zero, unread)

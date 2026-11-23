@@ -211,6 +211,7 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | entity id | `1b60404d` | +0x08 | u64 | per-entity id (not a name key; not unique, see world_names.md) |
 | archetype key | `c8a7b90a` | +0x20 | u64 | per-archetype key: MurmurHash3 x64 128 low 64 of the name |
 | `lodLevel` | `6c8f1715` | +0x7e | u8 | 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4 |
+| terrain parent-map selector | `84799847` | +0x7f | i8 | zero-based slot in the source map's parent-map reference array, or -1 in the measured terminal rows |
 | `parentIndex` | `d89231bd` | +0x5c | i16 | parent entity index (signed; -1 = none) |
 | `parentInstance` | `e74c3c23` | +0x5e | i16 | parent batch instance |
 | `numChildren` | `a687ac89` | +0x68 | u32 | linked children |
@@ -400,10 +401,66 @@ The place names shown to the player come from one `GameShape__Data__LocationName
   sections.
 - **All 2,280 interior positions lie inside the world rectangle** shared by the `PAMH` heightmap and the region
   tint map (x -13,312..5,120, y -9,728..11,264); none is at the origin. Heights run from -78 to 821 (median 5).
-- None of the keys is an archive entry name or the joaat of a model archetype name in the local catalog, the two
-  texture-dictionary names match archive entries but not `.ytd` ones, so the keys are their own namespace (probably shape
-  or zone ids resolved elsewhere at runtime; not measured). The 46 textures match no texture-dictionary item
-  in the catalog either.
+- **Interior keys are interior archetype names.** 1,357 of the 1,358 `InteriorNames` keys, lower-cased, are the
+  joaat `name` of a `CMloArchetypeDef` in `levels.rpf`, and all 1,357 are confirmed by that archetype's 64-bit key
+  (MurmurHash3 x64 low 64 of the lower-cased key at +0x08, member `8bfb6095`). The remaining key names no interior
+  and its hash occurs in no hash member of `levels.rpf`. The earlier "own namespace" reading came from a 1 GiB
+  window holding 15 of the 1,706 interior archetypes and from the model catalog, which has no interiors. See
+  [Interior keys and interior placements](#interior-keys-and-interior-placements).
+- None of the location, river or road keys is an archive entry name or the joaat of a model archetype name in the
+  local catalog; the two texture-dictionary names match archive entries but not `.ytd` ones. The 46 textures
+  match no texture-dictionary item in the catalog either.
+
+### Interior keys and interior placements
+
+`tools/world_interior_names.py` reads every interior definition and every interior placement in `levels.rpf`
+and joins them with the `InteriorNames` section (full archive, `--jobs 15`, about 2 minutes):
+
+| Measured | Count |
+|---|---:|
+| `CMloArchetypeDef` definitions / distinct names | 1,706 / 1,706 |
+| `CMloInstanceDef` placements / distinct interiors placed | 2,590 / 1,704 |
+| keys naming an interior (confirmed by the 64-bit key) | 1,357 (1,357) |
+| keys whose interior is placed | 1,356 |
+| ... with as many positions as placements | 1,268 |
+| ... with more positions than placements | 64 |
+| ... with fewer positions than placements | 24 |
+
+So a key selects one interior archetype, and its inner items are, in most cases, one per placed copy of that
+interior: the `Name` of each item labels that copy.
+
+Interiors are not placed by `CEntityDef`: no entity in the 1,670,435 rows of `world_index.py --entities-out`
+uses an interior name. They are placed by `CMloInstanceDef` (`09cc28be`, 0x250 bytes), which carries the entity
+members `rotation` (+0x10), `position` (+0x38), `archetypeName` (+0x44), `scaleXY` (+0x54) and `scaleZ` (+0x58)
+plus interior-specific members. These 2,590 placements are separate from the 23,535 map / 1,670,442 entity
+census, which counts `CEntityDef` only.
+
+The positions sit at the edge of their own interior, not at its origin or centre. Distance from each of the 2,278
+positions to the nearest placed copy of its own interior's box (0 = inside):
+
+| Rotation | Inside | ≤ 1 m | ≤ 2 m | ≤ 5 m | ≤ 25 m | ≤ 100 m | Median | In a non-`limbo` room box |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| stored quaternion | 315 | 1,015 | 1,189 | 1,443 | 1,867 | 2,199 | 1.72 m | 213 |
+| conjugated | 571 | 950 | 1,121 | 1,416 | 1,863 | 2,199 | 2.10 m | 482 |
+
+The interior box's largest side has a median of 16.7 m. Most positions are therefore just outside or just inside
+the interior shell, which fits an entry or label point; that they are doors is a hypothesis (portals were not
+compared). The conjugated rotation puts more positions inside rooms, consistent with the entity rule in
+[Map placement records](#map-placement-records); it is not a separate proof of it. 79 positions are more than
+100 m from every copy of their interior.
+
+Interior rooms (`CMloRoomDef` `0b1811f1`, 0x70 bytes: `name` +0x00, `bbMin` +0x10, `bbMax` +0x20) are reached
+through the interior's array members, which use the `InstanceList` reference of
+[Instanced props and grass](#instanced-props-and-grass) (1-based block index, offset from bit 20, u16 count). Room
+names are lower-cased joaat; in all 908 resources that hold one interior, its first room is `limbo`. A room's hash member `a261e0a9` (+0x34)
+holds the hash of 267 interior keys.
+
+```powershell
+python -I tools\gamedata_reader.py <work>\common --root GameShape__Data__LocationNameLoopkup --out <work>\gamedata
+python -I tools\world_interior_names.py <game>\levels.rpf --names <work>\gamedata\GameShape__Data__LocationNameLoopkup_<offset>.json `
+    --jobs 15 --out <work>\world\interior_names.json
+python -I tests\test_world_interior_names.py
+```
 
 ## What a runtime needs
 
@@ -462,6 +519,16 @@ and the continuation join. It does not decrypt anything and does not extract mod
 output is aggregate (one row per resource). `--entities-out` adds a local-only JSON-lines file with one row per
 complete entity (archetype hash and key, position, stored rotation, scales, LOD fields), the input of
 `world_build.py --placements` below.
+
+For a complete placement uniquely referenced by the map root, `map_name` is the source map's 32-bit name
+hash (eight lowercase hex digits) and `entity_index` is its zero-based ordinal in the authored `entities`
+array. Other classes may occupy slots in that array. The JSONL keeps its physical record order.
+For the ordinary terrain case (`parentInstance == -1`, a nonnegative `parent_index` and a valid signed
+map selector), `parent_map_name` holds the selected map hash in the same format. Match
+`(parent_map_name, parent_index)` to a unique `(map_name, entity_index)` across the input maps.
+These fields are optional. Older exports, unavailable references and unsupported parent forms can lack
+the corresponding keys. A missing or ambiguous target stays unresolved, including when a scan covers only
+part of the map set.
 
 `tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
 `0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
@@ -561,9 +628,32 @@ From HD to SLOD2, each tier's median `lodDist` is within 5% of the next tier's m
 450/450, 1,000/1,000, 2,000/1,976), so the two fields agree on the bands. For SLOD3 they differ (4,000 and
 6,043.5), and the band follows `childLodDist`.
 
-This is an approximation of point 5, per cell and per tier. Per-entity `lodDist` overrides and the
-`parentIndex`/`numChildren` links are not used: an entity row doesn't say which map file it came from, and
-`parentIndex` is an index into that file's entity table.
+The viewer approximates point 5 with distance bands per cell and tier. To follow an individual parent link,
+a loader needs the selected map's name and the target placement's original ordinal in that map's `entities` array.
+
+Two terrain regions on Xbox 1.0.2.1 give a cross-map example. In each tested HD and LOD map, `CMapData.parent` is zero.
+The schema member `75d16adf` at +0x58 is an array with one 32-bit hash in a block of type `0x4a`. That hash
+matches the next map's `CMapData.name`. The child's signed `parentIndex` selects an ordinal in **that map's**
+`entities` reference array. Looking up the index in the HD map itself returns the child in all 127 cases.
+
+For all 127 HD/LOD pairs, the same name stem with the respective tier suffix reproduced both stored archetype
+keys (JOAAT and Murmur3-64). Following the reference from LOD grouped the 127 children under 32 SLOD1 entities.
+At both steps, every parent's incoming count matched its `numChildren`, and its `childLodDist` matched each
+child's `lodDist`.
+
+Four terrain maps with two references show how an entity selects its parent map. Schema member `84799847` at
++0x7f is a signed byte (type `0x10`). Use its value as a zero-based index in the stored `75d16adf` array,
+then apply `parentIndex` to that map's `entities` array. In these maps, 64 children select slot 0 and 18
+select slot 1. For 42 children the same parent ordinal, tier and distance fields fit both maps. In every
+one of these cases the selected parent is closer to the child's XY position. Reversing
+the array while keeping the selector fixed sends those 42 to the other map and the remaining 40 to an
+out-of-range ordinal. Remapping the selector along with the array restores all 82 links.
+
+Including the adjacent single-reference maps, all 324 links agree with the declared child counts of all 34
+parents. Always selecting slot 0 gives incorrect child counts for ten parents. The six terminal entities
+have an empty map reference array, selector -1 and `parentIndex` -1.
+All 330 entities have `parentInstance` -1. These checks establish authored associations for the measured
+terrain records. Nondefault batch instances and the runtime switching distance remain open.
 
 ### Measured
 

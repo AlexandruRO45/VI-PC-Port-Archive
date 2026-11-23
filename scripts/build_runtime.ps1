@@ -1,8 +1,12 @@
-﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores.
+﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores by default.
 # Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed, otherwise calls cl.exe directly.
 # The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
 # with -FetchSdl3, which lets CMake download the pinned SDL3 release. The cl.exe fallback never builds it.
-param([switch]$Debug, [switch]$FetchSdl3)
+param(
+    [switch]$Debug,
+    [switch]$FetchSdl3,
+    [ValidateRange(1, 2147483647)][int]$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
+)
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path $PSScriptRoot -Parent
@@ -10,7 +14,6 @@ $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
 $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
 
 $src = Join-Path $root "runtime"
 $out = Join-Path $src "build"
@@ -35,7 +38,7 @@ if ((Test-Path $cmake) -and (Test-Path $ninja)) {
     Write-Warning "VS C++ CMake tools not found: building with cl.exe directly, without the GameInput shim (SDL3). Install the CMake tools component to get it."
     $xtaskqueueDir = Join-Path $root "third_party\xtaskqueue"
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
-    $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }
+    $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }
     $includes = "/I `"$src\src`" /I `"$src\shims`" /I `"$src\shims\xtaskqueue`" /I `"$xtaskqueueDir\Include`" /I `"$xtaskqueueDir\Source\Task`" /I `"$xtaskqueueDir\Source\Common`""
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
     $body = @"
@@ -48,6 +51,7 @@ cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /D
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\src" "$src\test\command_list_test.cpp" /Fe:command_list_test.exe /link /OPT:NOREF || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" "$src\test\vk_pipeline_check.cpp" /Fe:vk_pipeline_check.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_texture_test.cpp" /Fe:vk_texture_test.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_sampler_test.cpp" /Fe:vk_sampler_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\gfx10_descriptors_test.cpp" /Fe:gfx10_descriptors_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_bindless_test.cpp" /Fe:vk_bindless_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_descriptor_bench.cpp" /Fe:vk_descriptor_bench.exe || exit /b 1
@@ -67,7 +71,8 @@ $bat = Join-Path $out "_build.cmd"
 $batchText = "@echo off`r`nchcp 65001 >nul`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body`r`n"
 [System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
-$p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
+# /s with a second pair of quotes: cmd.exe strips only the outer pair, so a path holding & or ^ stays quoted.
+$p = Start-Process cmd.exe -ArgumentList "/s", "/c", "`"`"$bat`"`"" -NoNewWindow -PassThru
 $null = $p.Handle  # keeps the exit code readable after WaitForExit
 try { $p.PriorityClass = "BelowNormal" } catch {}
 $p.WaitForExit()

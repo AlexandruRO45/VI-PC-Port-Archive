@@ -126,6 +126,45 @@ class SpirvAsmUnitTests(unittest.TestCase):
         self.assertIn(0x80000000, words)
         self.assertIn(0x3FC00000, words)  # 0x1.8p+0 = 1.5f
 
+    def test_subword_integer_literals_use_the_declared_signedness(self) -> None:
+        for width, signed, token, expected in (
+            (8, 1, "0x80", 0xFFFFFF80),
+            (16, 1, "0x8000", 0xFFFF8000),
+            (16, 1, "-32768", 0xFFFF8000),
+            (16, 0, "0x8000", 0x00008000),
+        ):
+            with self.subTest(width=width, signed=signed, token=token):
+                asm = f'''OpCapability Shader
+OpCapability Int{width}
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%short = OpTypeInt {width} {signed}
+%value = OpConstant %short {token}
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %value %merge {token} %case
+%case = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+'''
+                spv = spirv_asm.assemble(asm, target_env="vulkan1.2")
+                words = struct.unpack(f"<{len(spv) // 4}I", spv)
+                literals = {}
+                offset = 5
+                while offset < len(words):
+                    count, opcode = words[offset] >> 16, words[offset] & 0xFFFF
+                    if opcode in (43, 251):  # OpConstant, OpSwitch
+                        literals[opcode] = words[offset + 3]
+                    offset += count
+                self.assertEqual(literals, {43: expected, 251: expected})
+                _validate(spv)
+
     def test_hex_float_inf_nan_and_string_escapes_match_spirv_as(self):
         # Regression tests for PR #2251 review (@FreddyxS):
         # 1) Width-aware hex-float Inf and NaN payload spellings (f16, f32, f64).
@@ -280,6 +319,19 @@ class SpirvAsmUnitTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             with open(dst, "rb") as f:
                 _validate(f.read())
+
+    def test_cli_source_that_is_not_utf8_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "bad.spvasm")
+            dst = os.path.join(d, "bad.spv")
+            with open(src, "wb") as f:
+                f.write(b"OpCapability Shader\n; \xb1\xff\n")
+            r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("ERROR:", r.stderr)
+            self.assertFalse(os.path.exists(dst))
 
 
 if __name__ == "__main__":

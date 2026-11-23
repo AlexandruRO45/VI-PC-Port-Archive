@@ -16,11 +16,13 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/conservative_raster.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/vulkan_present.h"
@@ -47,6 +49,7 @@
 #include <set>
 #include <string>
 #include <type_traits>
+#include <cwchar>
 #include <vector>
 
 namespace rt::d3d12 {
@@ -75,6 +78,81 @@ void log_once(const char* what, int value) {
     static std::set<std::pair<std::string, int>> seen;
     std::lock_guard lock(mutex);
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+}
+
+// The pipelines build stage writes its cache beside gta6rt.exe, independently of the working directory.
+std::filesystem::path pipeline_cache_path() {
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length >= path.size()) return {};
+    path.resize(length);
+    return std::filesystem::path(path).parent_path() / L"pipeline_cache.bin";
+}
+
+// A corpus cache may be several GiB. Keep the read-only view alive through vkCreatePipelineCache
+// and deny writers while the view is in use.
+class PipelineCacheSeed {
+public:
+    explicit PipelineCacheSeed(const std::filesystem::path& path) {
+        if (path.empty()) return;
+        file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER length{};
+        constexpr auto header_size = static_cast<LONGLONG>(sizeof(VkPipelineCacheHeaderVersionOne));
+        if (!GetFileSizeEx(file_, &length) || length.QuadPart < header_size)
+            return;
+        const HANDLE mapping = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!mapping) return;
+        data_ = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(mapping);
+        if (data_) size_ = static_cast<std::size_t>(length.QuadPart);
+    }
+
+    ~PipelineCacheSeed() {
+        if (data_) UnmapViewOfFile(data_);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    }
+
+    PipelineCacheSeed(const PipelineCacheSeed&) = delete;
+    PipelineCacheSeed& operator=(const PipelineCacheSeed&) = delete;
+
+    const void* data() const { return data_; }
+    std::size_t size() const { return size_; }
+
+    bool compatible(const leonida::cached_pso::Identity& identity) const {
+        static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == 32);
+        VkPipelineCacheHeaderVersionOne header{};
+        // The header is little-endian, like the host. The driver interprets the opaque payload.
+        std::memcpy(&header, data_, sizeof(header));
+        return header.headerSize == sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+               header.vendorID == identity.vendor && header.deviceID == identity.device &&
+               std::memcmp(header.pipelineCacheUUID, identity.cache_uuid, VK_UUID_SIZE) == 0;
+    }
+
+private:
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    const void* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
+                                             const leonida::cached_pso::Identity& identity) {
+    const PipelineCacheSeed seed(pipeline_cache_path());
+    if (!seed.data()) return VK_NULL_HANDLE;
+    if (!seed.compatible(identity)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.bin does not match this Vulkan device\n");
+        return VK_NULL_HANDLE;
+    }
+    const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                           nullptr, 0, seed.size(), seed.data()};
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    if (create_cache(device, &create, nullptr, &cache) != VK_SUCCESS) {
+        std::fprintf(stderr, "[rt] d3d12: Vulkan declined the pipeline cache seed\n");
+        return VK_NULL_HANDLE;
+    }
+    std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from pipeline_cache.bin\n", seed.size());
+    return cache;
 }
 
 // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
@@ -412,6 +490,8 @@ struct DeviceState {
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
     bool upload_in_vram = false;
+    // D3D-299: the first texture or default-heap buffer that lands outside device-local memory is logged, once.
+    mutable std::once_flag spill_logged;
 
     // What D3D12_OPTIONS1 answers with: the physical device's own subgroup facts, read on first use.
     struct SubgroupFacts {
@@ -427,6 +507,23 @@ struct DeviceState {
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
     LUID luid{};       // VkPhysicalDeviceIDProperties::deviceLUID; zero when the driver reports none
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
+    std::once_flag pipeline_cache_once;
+    VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
+
+    VkPipelineCache pipeline_cache() {
+        std::call_once(pipeline_cache_once, [this] {
+            const auto& vk = context->vk;
+            if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
+            pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
+            if (pipeline_cache_handle) return;
+            const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
+                pipeline_cache_handle = VK_NULL_HANDLE;
+        });
+        // Without EXTERNALLY_SYNCHRONIZED_BIT the driver synchronizes concurrent pipeline creation using this cache.
+        return pipeline_cache_handle;
+    }
+
     QueueClock clock;  // what every queue's GetClockCalibration uses
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
@@ -436,6 +533,7 @@ struct DeviceState {
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
     float max_sampler_lod_bias = 0;
+    bool conservative_raster_tier1 = false;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
     VkResolveModeFlags stencil_resolve_modes = 0;
@@ -463,6 +561,14 @@ struct DeviceState {
         std::uint32_t memory_type = 0;
         std::mutex mutex;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+
+        // The high-water mark (D3D-55, open question 5): the arena's size is a guess until a run measures it.
+        // `peak_end` is the highest end offset ever handed out, the size the arena must have; `peak_in_use` is the
+        // most bytes live at once, which differs from it by fragmentation.
+        bool log = false;  // LEONIDA_ARENA_LOG=1: one line per VA handed out
+        VkDeviceSize in_use = 0, peak_in_use = 0, peak_end = 0;
+        VkDeviceSize use_in_use[4] = {}, use_peak[4] = {};
+        std::uint64_t allocations = 0, failures = 0;
     } arena;
 
     std::uint32_t sparse_buffer_memory_types = 0;
@@ -479,12 +585,20 @@ struct DeviceState {
                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (info.conditional_rendering) result.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        // D3D12 reserved buffers are visible to DIRECT, COPY and COMPUTE queues without exposing Vulkan
+        // queue-family ownership. Their tile bindings and accesses may use distinct families, so match the
+        // CONCURRENT sharing policy used for ordinary buffers and the GPU address arena.
+        share(result);
         return result;
     }
 
+    // What an arena range holds, for the high-water report (D3D-55).
+    enum ArenaUse { arena_buffer, arena_descriptor_heap, arena_shader, arena_heap };
+    static constexpr const char* kArenaUseNames[4] = {"buffer", "descriptor heap", "shader", "heap"};
+
     // A zero-size range is refused: it would share its offset with the next range, and its release would collide
     // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
-    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out) {
+    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
         if (!bytes || bytes > arena.size) return false;
         std::lock_guard lock(arena.mutex);
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
@@ -496,14 +610,51 @@ struct DeviceState {
             if (start > block) arena.free[block] = start - block;
             if (start + bytes < end) arena.free[start + bytes] = end - (start + bytes);
             out = start;
+            ++arena.allocations;
+            arena.in_use += bytes;
+            arena.peak_in_use = std::max(arena.peak_in_use, arena.in_use);
+            arena.peak_end = std::max(arena.peak_end, start + bytes);
+            arena.use_in_use[use] += bytes;
+            arena.use_peak[use] = std::max(arena.use_peak[use], arena.use_in_use[use]);
+            if (arena.log)
+                std::fprintf(stderr, "[rt] d3d12: arena %s VA 0x%llx + 0x%llx\n", kArenaUseNames[use],
+                             (unsigned long long)start, (unsigned long long)bytes);
             return true;
         }
+        ++arena.failures;
+        if (arena.log)
+            std::fprintf(stderr, "[rt] d3d12: arena %s: no room for 0x%llx bytes\n", kArenaUseNames[use],
+                         (unsigned long long)bytes);
         return false;
     }
 
-    void arena_release(VkDeviceSize offset, VkDeviceSize bytes) {
+    // A console VA outside the arena (an upload or readback buffer: its device address minus heap_base).
+    void log_va(const char* what, std::uint64_t va, VkDeviceSize bytes) {
+        if (arena.log)
+            std::fprintf(stderr, "[rt] d3d12: %s VA 0x%llx + 0x%llx (outside the arena)\n", what,
+                         (unsigned long long)va, (unsigned long long)bytes);
+    }
+
+    // Printed once at device release, so a run reports the size the arena needs.
+    void report_arena() {
+        std::lock_guard lock(arena.mutex);
+        if (!arena.size) return;
+        const double mib = 1.0 / (1 << 20);
+        std::fprintf(stderr,
+                     "[rt] d3d12: GPU address arena: peak end %.1f of %.1f MiB (%.1f%%), peak live %.1f MiB "
+                     "(buffers %.1f, descriptor heaps %.1f, shaders %.1f, heaps %.1f), %llu allocations, %llu refused\n",
+                     arena.peak_end * mib, arena.size * mib, 100.0 * double(arena.peak_end) / double(arena.size),
+                     arena.peak_in_use * mib, arena.use_peak[arena_buffer] * mib,
+                     arena.use_peak[arena_descriptor_heap] * mib, arena.use_peak[arena_shader] * mib,
+                     arena.use_peak[arena_heap] * mib,
+                     (unsigned long long)arena.allocations, (unsigned long long)arena.failures);
+    }
+
+    void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         if (!bytes) return;
         std::lock_guard lock(arena.mutex);
+        arena.in_use -= bytes;
+        arena.use_in_use[use] -= bytes;
         auto it = arena.free.emplace(offset, bytes).first;
         if (auto next = std::next(it); next != arena.free.end() && it->first + it->second == next->first) {
             it->second += next->second;
@@ -1066,12 +1217,15 @@ struct DeviceState {
             if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
                 if (chosen_type) *chosen_type = i;
-                if ((preferred & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-                    !(memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                    const std::string msg = "resource allocation spilled from DEVICE_LOCAL to host memory (heap " +
-                                            std::to_string(memory.memoryTypes[i].heapIndex) + "); size in KiB:";
-                    log_once(msg.c_str(), static_cast<int>(requirements.size / 1024));
-                }
+                if (leonida::spilled_to_host(required, preferred, memory.memoryTypes[i].propertyFlags))
+                    std::call_once(spill_logged, [&] {
+                        const std::uint32_t heap = memory.memoryTypes[i].heapIndex;
+                        std::fprintf(stderr,
+                                     "[rt] d3d12: a %llu-byte allocation did not fit in device-local memory and went "
+                                     "to memory type %u (heap %u, %llu MiB); later ones are not logged\n",
+                                     static_cast<unsigned long long>(requirements.size), i, heap,
+                                     static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20));
+                    });
                 return out;
             }
         }
@@ -1332,6 +1486,30 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     return nullptr;
 }
 
+// Why the host refuses this enhanced-barrier initial layout for `desc`, or null when valid (measured on Windows D3D12).
+const char* barrier_layout_refusal(const D3D12_RESOURCE_DESC& desc, D3D12_BARRIER_LAYOUT layout) {
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        return layout == D3D12_BARRIER_LAYOUT_UNDEFINED ? nullptr : "buffer barrier layout";
+    const UINT flags = UINT(desc.Flags);
+    switch (layout) {
+    case D3D12_BARRIER_LAYOUT_RENDER_TARGET:
+        return (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? nullptr : "RENDER_TARGET barrier layout";
+    case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS:
+        return (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? nullptr : "UNORDERED_ACCESS barrier layout";
+    case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE:
+    case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ:
+        return (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ? nullptr : "DEPTH_STENCIL barrier layout";
+    case D3D12_BARRIER_LAYOUT_SHADER_RESOURCE:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE:
+        return (flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ? "SHADER_RESOURCE barrier layout" : nullptr;
+    default:
+        return nullptr;
+    }
+}
+
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12DescriptorHeap> {
@@ -1347,7 +1525,7 @@ public:
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
         if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
-            if (!device.arena_allocate(bytes, 256, arena_offset_)) {
+            if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
                          int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
                 return;
@@ -1362,7 +1540,8 @@ public:
     }
 
     ~DescriptorHeap() override {
-        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize);
+        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
+                                            DeviceState::arena_descriptor_heap);
     }
 
     bool ok() const { return cpu_ != nullptr; }
@@ -1405,7 +1584,7 @@ public:
     // here and nothing goes back to the arena when this object dies.
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), va_(placed_va) {}
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
         if (accel_) {
@@ -1415,7 +1594,7 @@ public:
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
-        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width);
+        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
@@ -1430,6 +1609,14 @@ public:
     bool allows_view_format(VkFormat format) const {
         return view_formats_.empty() || format == format_ ||
                std::find(view_formats_.begin(), view_formats_.end(), format) != view_formats_.end();
+    }
+    // The castable-format list in DXGI formats, which the Vulkan list can't tell apart where two families share a
+    // VkFormat: B8G8R8X8 and B8G8R8A8 are both BGRA8 images.
+    void keep_castable_formats(UINT32 count, const DXGI_FORMAT* formats) {
+        if (count && formats) castable_formats_.assign(formats, formats + count);
+    }
+    bool lists_castable_format(DXGI_FORMAT format) const {
+        return std::find(castable_formats_.begin(), castable_formats_.end(), format) != castable_formats_.end();
     }
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
     VkImageAspectFlags aspects() const { return aspects_; }
@@ -1449,7 +1636,8 @@ public:
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
         if (!host && device_.arena.mapped) {
-            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_)) {
+            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
+                                        DeviceState::arena_buffer)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
                          int(desc_.Width / 1024));
                 return E_OUTOFMEMORY;
@@ -1514,13 +1702,13 @@ public:
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = buffer_;
             va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+            device_.log_va(heap_.Type == D3D12_HEAP_TYPE_READBACK ? "readback buffer" : "upload buffer", va_,
+                           desc_.Width);
         }
         if (host) {
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
                 return E_OUTOFMEMORY;
             std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
-        } else {
-            log_once("default-heap buffers are not zero-filled yet; dimension", int(desc_.Dimension));
         }
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -1553,6 +1741,10 @@ public:
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         binding.va = va_;
         device_.context->add_resource(id(), binding);
+        // Committed resources start zeroed unless the heap says otherwise; the host cannot reach device-local memory,
+        // so the next submission fills it (D3D-71).
+        if (!host && !(heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED))
+            device_.context->zero_on_next_submit(id(), buffer_);
         return S_OK;
     }
 
@@ -1718,6 +1910,8 @@ public:
         desc_.Layout = layout;
     }
     bool reserved() const { return reserved_; }
+    // A committed resource: neither placed in a heap nor reserved. It owns its memory, like a heap does.
+    bool committed() const { return !placed_ && !reserved_; }
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
@@ -1751,6 +1945,9 @@ public:
         else if (desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
             deny = deny_buffers | deny_non_rt_ds;
         const UINT creation_only = D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        // A placed resource reports its heap's flags as they are (an ALLOW_ALL heap reads back 0): the DENY bits
+        // are the runtime's choice only for the implicit heap of a committed resource (d3d12_heap_properties_test).
+        if (placed_) return D3D12_HEAP_FLAGS(UINT(heap_flags_) & ~creation_only);
         return D3D12_HEAP_FLAGS((UINT(heap_flags_) & ~creation_only) | deny);
     }
 
@@ -2010,6 +2207,7 @@ private:
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
+    std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     bool r9g9b9e5_as_r32_uint_ = false;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
@@ -2017,6 +2215,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool reserved_ = false;
+    bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
@@ -2183,12 +2382,13 @@ public:
     Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
         VkDeviceSize offset = 0;
         if (device_.arena.mapped &&
-            device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset)) {
+            device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset,
+                                   DeviceState::arena_heap)) {
             allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
                 new leonida::TileHeapAllocation{device_.arena.memory, offset, desc_.SizeInBytes,
                                                 device_.arena.memory_type},
                 [&device](const leonida::TileHeapAllocation* allocation) {
-                    device.arena_release(allocation->offset, allocation->size);
+                    device.arena_release(allocation->offset, allocation->size, DeviceState::arena_heap);
                     delete allocation;
                 });
         }
@@ -2247,6 +2447,17 @@ private:
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
 // corpus), the one to build: the first that `fits` and declares no set-0 bindings (the cheaper pipeline); else the
 // first that fits; else the first without bindings; else the first. Null when there is none.
+// The S#s a shader builds from immediates (literal_samplers in its index entry) are named by no heap slot, so
+// nothing else gives them a sampler and a hash-table key: without this their lookup finds the fallback sampler
+// (index 0) and the shader samples with the wrong filter and address modes (docs/design.md, Literal samplers).
+// Registering is idempotent and also runs when the pipeline is created again.
+void register_literal_samplers(DeviceState& device, const leonida::ShaderEntry& entry) {
+    for (const leonida::gfx10::SamplerWords& words : entry.literal_samplers)
+        if (!device.bind_sampler(words))
+            log_once("a shader's literal S# has no sampler (no bindless set, or its sampler array is full); words",
+                     int(entry.literal_samplers.size()));
+}
+
 template<typename Fits>
 const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEntry*>& candidates, Fits&& fits) {
     const leonida::ShaderEntry* fitting = nullptr;
@@ -2434,7 +2645,7 @@ public:
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
-        if (code_bytes_) device_.arena_release(code_base_, code_bytes_);
+        if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
     }
 
     // Pipeline layouts declare the whole 144-byte block as one push-constant range. A device whose
@@ -2476,11 +2687,13 @@ public:
     bool graphics() const { return registered_ && is_graphics_; }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
 
-    // A VS (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the VS's
-    // input signature by semantic name and index: location = the element's register, the translator's rule
-    // (docs/design.md, "Vertex fetch"). Hull, domain and geometry stages, more than one sample, and two stages
-    // that both read their code base are refused with a log. Viewport, scissor, topology, vertex strides, stencil
-    // reference and blend factor are dynamic, set from the list's state at each draw.
+    // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
+    // VS's input signature by semantic name and index: location = the element's register, the translator's rule
+    // (docs/design.md, "Vertex fetch"). Refused with a log: hull and domain stages, stream output, the centre
+    // multisample pattern, two stages that both read their code base, and state that needs a Vulkan feature the
+    // device lacks (including the geometryShader feature a GS needs). A GS takes triangles; the sample count may
+    // be above one. Viewport, scissor, topology, vertex strides, stencil reference and blend factor are dynamic,
+    // set from the list's state at each draw.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
@@ -2552,6 +2765,21 @@ public:
         // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
         auto& required_sizes = recipe_.required_sizes;
         const Stage* code_stage = nullptr;
+        // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU): the pixel stage writes the depth D24
+        // would hold, biased in D24 units and quantised (src/depth24_fragment.h, D3D-309), and the rasterizer's own
+        // bias is turned off. Multisampled targets keep the old path: a FragDepth write is per pixel.
+        const bool d24_as_float = desc.DSVFormat != DXGI_FORMAT_UNKNOWN &&
+                                  vulkan_format(desc.DSVFormat, true).format == VK_FORMAT_D24_UNORM_S8_UINT &&
+                                  !device_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT);
+        bool depth24_fragment = d24_as_float && desc.DepthStencilState.DepthEnable;
+        if (depth24_fragment && samples > 1) {
+            log_once("D24 depth stored as D32 keeps float depth bias and precision on multisampled targets; samples",
+                     int(samples));
+            depth24_fragment = false;
+        }
+        const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
+                                                desc.RasterizerState.SlopeScaledDepthBias,
+                                                desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             stage.fssm = leonida::fssm_program(
@@ -2578,6 +2806,7 @@ public:
                     return E_NOTIMPL;
                 }
                 uses_bindless = true;
+                register_literal_samplers(device_, *stage.entry);
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -2609,6 +2838,18 @@ public:
         }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
+            // After the f16 link above, which can also edit the pixel shader's words.
+            if (depth24_fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                std::string why;
+                std::vector<std::uint32_t> patched = leonida::depth24_patch_fragment(stage.words, depth24_bias, why);
+                if (patched.empty()) {
+                    std::fprintf(stderr, "[rt] d3d12: %s keeps float depth on a D24 target stored as D32: %s\n",
+                                 stage.entry->name.c_str(), why.c_str());
+                    depth24_fragment = false;
+                } else {
+                    stage.words = std::move(patched);
+                }
+            }
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module_info.codeSize = stage.words.size() * 4;
             module_info.pCode = stage.words.data();
@@ -2622,10 +2863,27 @@ public:
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
+        if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
+            const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = words.size() * 4;
+            module_info.pCode = words.data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (words.empty() || vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS)
+                return E_FAIL;
+            modules_.push_back(module);
+            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            info.module = module;
+            info.pName = "main";
+            stage_infos.push_back(info);
+        }
 
         // Input layout -> vertex input, by semantic.
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
+        std::uint32_t divisor_slots = 0;
         UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
         for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
             const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
@@ -2651,8 +2909,17 @@ public:
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
             // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
             if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
-            if (instance && element.InstanceDataStepRate > 1)
-                log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
+            if (instance && element.InstanceDataStepRate > 1) {
+                if (!device_.info.vertex_attribute_divisor) {
+                    log_once("instance step rates above 1 need vertexAttributeInstanceRateDivisor; rate",
+                             int(element.InstanceDataStepRate));
+                    return E_NOTIMPL;
+                }
+                if (!(divisor_slots & (1u << element.InputSlot))) {
+                    divisor_slots |= 1u << element.InputSlot;
+                    divisors.push_back({element.InputSlot, element.InstanceDataStepRate});
+                }
+            }
             if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
                 graphics_.vertex_slots |= 1u << element.InputSlot;
                 bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
@@ -2687,6 +2954,18 @@ public:
         graphics_.strip_cut = desc.IBStripCutValue;
 
         const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
+        if (r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF &&
+            r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) return E_INVALIDARG;
+        if (r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) {
+            if (!device_.conservative_raster_tier1) {
+                log_once("conservative rasterization needs enabled VK_EXT_conservative_rasterization and Tier 1 precision", 1);
+                return E_INVALIDARG;
+            }
+            if (r.FillMode != D3D12_FILL_MODE_SOLID ||
+                desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
+            // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
+            if (r.ForcedSampleCount) return E_NOTIMPL;
+        }
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         raster.polygonMode = r.FillMode == D3D12_FILL_MODE_WIREFRAME ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
         raster.cullMode = r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
@@ -2694,10 +2973,14 @@ public:
                                                                : VK_CULL_MODE_NONE;
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-        raster.depthBiasEnable = r.DepthBias || r.SlopeScaledDepthBias != 0.0f;
-        raster.depthBiasConstantFactor = float(r.DepthBias);
-        raster.depthBiasClamp = r.DepthBiasClamp;
-        raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
+        // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
+        // rasterizer's bias stays off and zero, so its clamp needs no depthBiasClamp feature either.
+        raster.depthBiasEnable = !depth24_fragment && (r.DepthBias || r.SlopeScaledDepthBias != 0.0f);
+        if (raster.depthBiasEnable) {
+            raster.depthBiasConstantFactor = float(r.DepthBias);
+            raster.depthBiasClamp = r.DepthBiasClamp;
+            raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
+        }
         raster.lineWidth = 1.0f;
         // No depth clipping: fragments outside the viewport's depth range are kept and their depth clamped to it, as
         // D3D12 clamps output depth to MinDepth..MaxDepth anyway (needs depthClamp, checked below).
@@ -2876,8 +3159,10 @@ public:
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
+        recipe_.divisors = std::move(divisors);
         recipe_.assembly = assembly;
         recipe_.raster = raster;
+        recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
         recipe_.sample_mask = sample_mask;
@@ -2890,7 +3175,7 @@ public:
 
         if (code_stage) {
             VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset)) return E_OUTOFMEMORY;
+            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
             std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
             code_bytes_ = code_stage->fssm.size();
             code_base_ = offset;
@@ -2945,6 +3230,7 @@ public:
                          entry->name.c_str());
             return E_NOTIMPL;
         }
+        if (entry->binding_count) register_literal_samplers(device_, *entry);
         // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
         // and RADV dies on (#1721); some drivers report 32768. Refuse it here instead of creating the pipeline.
         if (entry->lds_bytes) {
@@ -2994,7 +3280,7 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
+        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
             VK_SUCCESS)
             return E_FAIL;
 
@@ -3002,7 +3288,7 @@ public:
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
         const std::vector<std::uint8_t>& code = program.bytes;
         VkDeviceSize offset = 0;
-        if (!device_.arena_allocate(code.size(), 256, offset)) return E_OUTOFMEMORY;
+        if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
         std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
         code_bytes_ = code.size();
         code_base_ = offset;
@@ -3020,8 +3306,10 @@ private:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
+        bool conservative = false;
         VkPipelineMultisampleStateCreateInfo multisample{};
         VkSampleMask sample_mask = ~0u;
         VkPipelineDepthStencilStateCreateInfo depth{};
@@ -3053,6 +3341,13 @@ private:
             rendering.stencilAttachmentFormat = graphics_.depth_format;
 
         VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT};
+        if (!r.divisors.empty()) {
+            divisor_state.vertexBindingDivisorCount = std::uint32_t(r.divisors.size());
+            divisor_state.pVertexBindingDivisors = r.divisors.data();
+            vertex_input.pNext = &divisor_state;
+        }
         vertex_input.vertexBindingDescriptionCount = std::uint32_t(r.bindings.size());
         vertex_input.pVertexBindingDescriptions = r.bindings.data();
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
@@ -3061,6 +3356,15 @@ private:
         viewport.viewportCount = 1;
         viewport.scissorCount = 1;
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
+        VkPipelineRasterizationStateCreateInfo raster = r.raster;
+        VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
+        if (r.conservative) {
+            conservative.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
+            conservative.extraPrimitiveOverestimationSize = 0.0f;
+            conservative.pNext = raster.pNext;
+            raster.pNext = &conservative;
+        }
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
         blend.attachmentCount = std::uint32_t(r.blends.size());
@@ -3075,15 +3379,15 @@ private:
         info.pVertexInputState = &vertex_input;
         info.pInputAssemblyState = &r.assembly;
         info.pViewportState = &viewport;
-        info.pRasterizationState = &r.raster;
+        info.pRasterizationState = &raster;
         info.pMultisampleState = &multisample;
         info.pDepthStencilState = &r.depth;
         info.pColorBlendState = &blend;
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, VK_NULL_HANDLE, 1, &info, nullptr,
-                                                          &pipeline) != VK_SUCCESS)
+        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
+                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         return pipeline;
     }
@@ -3235,54 +3539,82 @@ private:
 };
 
 // Process-wide backing for ID3D12Device9::CreateShaderCacheSession and ID3D12ShaderCacheSession (D3D-34).
-// Sessions in the same process sharing (Identifier, Mode, Version, disk_path) share their entries; MODE_DISK
-// persists entries to a versioned binary file so data survives device/process teardown; SetDeleteOnDestroy
-// removes the backing store (and disk file, if any) once the last live session referencing it is released.
+// Sessions in the same process sharing (Identifier, Mode, disk_path) share their entries; a live session with a
+// different Version returns DXGI_ERROR_ALREADY_EXISTS, while reopening after all sessions close clears and recreates
+// the cache. MODE_MEMORY discards its entries when the final session is released; MODE_DISK persists entries to a
+// versioned binary file via unique per-writer temp files and atomic replacement.
 struct ShaderCacheKey {
     GUID identifier{};
     D3D12_SHADER_CACHE_MODE mode = D3D12_SHADER_CACHE_MODE_MEMORY;
-    UINT64 version = 0;
     std::wstring disk_path;  // empty for MODE_MEMORY
 
     bool operator<(const ShaderCacheKey& other) const {
         const int cmp = std::memcmp(&identifier, &other.identifier, sizeof(GUID));
         if (cmp != 0) return cmp < 0;
         if (mode != other.mode) return mode < other.mode;
-        if (version != other.version) return version < other.version;
         return disk_path < other.disk_path;
     }
 };
 
 struct ShaderCacheStore {
     static constexpr std::uint32_t kDiskMagic = 0x3143534Cu;  // "LSC1"
-    static constexpr std::uint32_t kDiskVersion = 1;
+    static constexpr std::uint32_t kDiskFormatVersion = 2;
+    static constexpr UINT kDefaultMaxMemoryBytes = 1024u;
+    static constexpr UINT kDefaultMaxMemoryEntries = 128u;
+    static constexpr UINT kDefaultMaxValueFileBytes = 128u * 1024u * 1024u;
+
+    struct DiskHeader {
+        std::uint32_t magic;
+        std::uint32_t format_version;
+        std::uint32_t entry_count;
+        std::uint32_t reserved;
+        std::uint64_t cache_version;
+    };
 
     std::mutex mutex;
     std::map<std::string, std::vector<std::uint8_t>> entries;
     std::size_t total_bytes = 0;
     std::uint32_t live_sessions = 0;
+    UINT64 version = 0;
     bool delete_on_destroy = false;
     std::filesystem::path disk_path;
 
-    void load_from_disk_locked() {
+    void load_from_disk_locked(UINT64 expected_version, UINT max_file_bytes) {
         if (disk_path.empty()) return;
+        std::error_code ec;
+        const std::uintmax_t file_size = std::filesystem::file_size(disk_path, ec);
+        if (ec || file_size < sizeof(DiskHeader)) return;
         std::ifstream in(disk_path, std::ios::binary);
         if (!in) return;
-        std::uint32_t header[3]{};
-        if (!in.read(reinterpret_cast<char*>(header), sizeof(header))) return;
-        if (header[0] != kDiskMagic || header[1] != kDiskVersion) return;
-        const std::uint32_t count = header[2];
+        DiskHeader header{};
+        if (!in.read(reinterpret_cast<char*>(&header), sizeof(header))) return;
+        if (header.magic != kDiskMagic || header.format_version != kDiskFormatVersion || header.reserved != 0) return;
+        if (header.cache_version != expected_version) {
+            in.close();
+            std::filesystem::remove(disk_path, ec);
+            return;
+        }
+        std::uint64_t remaining = static_cast<std::uint64_t>(file_size) - sizeof(DiskHeader);
+        if (header.entry_count > remaining / 8u) return;
         std::map<std::string, std::vector<std::uint8_t>> loaded;
         std::size_t bytes = 0;
-        for (std::uint32_t i = 0; i < count; ++i) {
+        for (std::uint32_t i = 0; i < header.entry_count; ++i) {
+            if (remaining < 8u) return;
             std::uint32_t lens[2]{};
             if (!in.read(reinterpret_cast<char*>(lens), sizeof(lens))) return;
-            if (!lens[0] || !lens[1]) return;
-            std::string k(lens[0], '\0');
-            std::vector<std::uint8_t> v(lens[1]);
-            if (!in.read(k.data(), lens[0]) || !in.read(reinterpret_cast<char*>(v.data()), lens[1])) return;
+            remaining -= 8u;
+            const std::uint64_t key_len = lens[0];
+            const std::uint64_t val_len = lens[1];
+            if (!key_len || !val_len || key_len > remaining || val_len > remaining - key_len) return;
+            if (val_len > max_file_bytes || bytes > max_file_bytes - val_len) return;
+            std::string k(static_cast<std::size_t>(key_len), '\0');
+            std::vector<std::uint8_t> v(static_cast<std::size_t>(val_len));
+            if (!in.read(k.data(), static_cast<std::streamsize>(key_len)) ||
+                !in.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(val_len)))
+                return;
+            remaining -= key_len + val_len;
             loaded.emplace(std::move(k), std::move(v));
-            bytes += lens[1];
+            bytes += static_cast<std::size_t>(val_len);
         }
         entries = std::move(loaded);
         total_bytes = bytes;
@@ -3292,13 +3624,20 @@ struct ShaderCacheStore {
         if (disk_path.empty()) return true;
         std::error_code ec;
         std::filesystem::create_directories(disk_path.parent_path(), ec);
+        static std::atomic<std::uint64_t> write_seq{0};
+        const std::uint64_t seq = write_seq.fetch_add(1, std::memory_order_relaxed);
+        wchar_t suffix[64]{};
+        std::swprintf(suffix, std::size(suffix), L".%lu.%lu.%llu.tmp",
+                      static_cast<unsigned long>(GetCurrentProcessId()),
+                      static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(seq));
         std::filesystem::path tmp = disk_path;
-        tmp += L".tmp";
+        tmp += suffix;
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
             if (!out) return false;
-            const std::uint32_t header[3] = {kDiskMagic, kDiskVersion, static_cast<std::uint32_t>(entries.size())};
-            out.write(reinterpret_cast<const char*>(header), sizeof(header));
+            const DiskHeader header{kDiskMagic, kDiskFormatVersion, static_cast<std::uint32_t>(entries.size()), 0,
+                                    version};
+            out.write(reinterpret_cast<const char*>(&header), sizeof(header));
             for (const auto& [k, v] : entries) {
                 const std::uint32_t lens[2] = {static_cast<std::uint32_t>(k.size()),
                                                static_cast<std::uint32_t>(v.size())};
@@ -3326,24 +3665,41 @@ struct ShaderCacheStore {
     }
 };
 
+std::filesystem::path default_shader_cache_dir() {
+    std::error_code ec;
+    const auto tmp = std::filesystem::temp_directory_path(ec);
+    if (ec || tmp.empty()) return {};
+    return tmp / L"leonida_shader_cache";
+}
+
 struct ShaderCacheRegistry {
     std::mutex mutex;
     std::map<ShaderCacheKey, std::shared_ptr<ShaderCacheStore>> stores;
     std::atomic<bool> disabled{false};
 
-    std::shared_ptr<ShaderCacheStore> acquire(const ShaderCacheKey& key) {
+    HRESULT acquire(const ShaderCacheKey& key, UINT64 version, UINT max_file_bytes,
+                    std::shared_ptr<ShaderCacheStore>& out) {
+        if (disabled.load(std::memory_order_relaxed)) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
         std::lock_guard lock(mutex);
-        auto& slot = stores[key];
-        if (!slot) {
-            slot = std::make_shared<ShaderCacheStore>();
-            if (key.mode == D3D12_SHADER_CACHE_MODE_DISK && !key.disk_path.empty()) {
-                slot->disk_path = key.disk_path;
-                std::lock_guard store_lock(slot->mutex);
-                slot->load_from_disk_locked();
-            }
+        if (disabled.load(std::memory_order_relaxed)) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        auto it = stores.find(key);
+        if (it != stores.end()) {
+            if (it->second->version != version) return DXGI_ERROR_ALREADY_EXISTS;
+            ++it->second->live_sessions;
+            out = it->second;
+            return S_OK;
         }
-        ++slot->live_sessions;
-        return slot;
+        auto store = std::make_shared<ShaderCacheStore>();
+        store->version = version;
+        if (key.mode == D3D12_SHADER_CACHE_MODE_DISK && !key.disk_path.empty()) {
+            store->disk_path = key.disk_path;
+            std::lock_guard store_lock(store->mutex);
+            store->load_from_disk_locked(version, max_file_bytes);
+        }
+        store->live_sessions = 1;
+        stores.emplace(key, store);
+        out = std::move(store);
+        return S_OK;
     }
 
     void mark_delete_on_destroy(const std::shared_ptr<ShaderCacheStore>& store) {
@@ -3356,18 +3712,13 @@ struct ShaderCacheRegistry {
         if (!store) return;
         if (store->live_sessions > 0) --store->live_sessions;
         if (store->live_sessions == 0) {
-            if (store->delete_on_destroy) {
-                if (!store->disk_path.empty()) {
-                    std::error_code ec;
-                    std::filesystem::remove(store->disk_path, ec);
-                }
-                const auto it = stores.find(key);
-                if (it != stores.end() && it->second == store) stores.erase(it);
-            } else if (key.mode == D3D12_SHADER_CACHE_MODE_DISK) {
-                // Evict idle disk stores from memory so reopening reloads from disk.
-                const auto it = stores.find(key);
-                if (it != stores.end() && it->second == store) stores.erase(it);
+            if (store->delete_on_destroy && !store->disk_path.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(store->disk_path, ec);
             }
+            // Discard both idle MEMORY stores (per D3D12 spec) and idle DISK stores (so reopening reloads from disk).
+            const auto it = stores.find(key);
+            if (it != stores.end() && it->second == store) stores.erase(it);
         }
     }
 
@@ -3379,6 +3730,19 @@ struct ShaderCacheRegistry {
             for (const auto& [k, v] : stores) snapshot.push_back(v);
         }
         for (const auto& store : snapshot) store->clear();
+        // Also remove inactive and prior-run disk caches stored in the default cache directory (non-USE_WORKING_DIR).
+        const auto default_dir = default_shader_cache_dir();
+        if (!default_dir.empty()) {
+            std::error_code ec;
+            if (std::filesystem::exists(default_dir, ec)) {
+                for (const auto& entry : std::filesystem::directory_iterator(default_dir, ec)) {
+                    if (ec) break;
+                    if (!entry.is_regular_file(ec)) continue;
+                    const auto fname = entry.path().filename().wstring();
+                    if (fname.rfind(L"leonida_sc_", 0) == 0) std::filesystem::remove(entry.path(), ec);
+                }
+            }
+        }
     }
 };
 
@@ -3392,22 +3756,20 @@ std::filesystem::path shader_cache_disk_path(const D3D12_SHADER_CACHE_SESSION_DE
     std::error_code ec;
     std::filesystem::path dir = (desc.Flags & D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR)
                                     ? std::filesystem::current_path(ec)
-                                    : (std::filesystem::temp_directory_path(ec) / L"leonida_shader_cache");
+                                    : default_shader_cache_dir();
     if (ec || dir.empty()) return {};
     wchar_t name[160]{};
     const auto& g = desc.Identifier;
     if (desc.Flags & D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED) {
         std::swprintf(name, std::size(name),
-                      L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x_v%llu_d%04x_%04x_%08x.bin",
+                      L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x_d%04x_%04x_%08x.bin",
                       static_cast<unsigned long>(g.Data1), g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2],
-                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7],
-                      static_cast<unsigned long long>(desc.Version), gpu_props.vendorID, gpu_props.deviceID,
-                      gpu_props.driverVersion);
+                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7], gpu_props.vendorID,
+                      gpu_props.deviceID, gpu_props.driverVersion);
     } else {
-        std::swprintf(name, std::size(name), L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x_v%llu.bin",
+        std::swprintf(name, std::size(name), L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x.bin",
                       static_cast<unsigned long>(g.Data1), g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2],
-                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7],
-                      static_cast<unsigned long long>(desc.Version));
+                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
     }
     return dir / name;
 }
@@ -3429,7 +3791,8 @@ public:
 
     HRESULT STDMETHODCALLTYPE FindValue(const void* key, UINT key_size, void* value, UINT* value_size) override {
         if (!key || !key_size || !value_size) return E_INVALIDARG;
-        if (registry_ && registry_->disabled.load(std::memory_order_relaxed)) return DXGI_ERROR_NOT_FOUND;
+        if (registry_ && registry_->disabled.load(std::memory_order_relaxed))
+            return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
         std::lock_guard lock(store_->mutex);
         const std::string k(static_cast<const char*>(key), key_size);
         const auto it = store_->entries.find(k);
@@ -3450,20 +3813,25 @@ public:
 
     HRESULT STDMETHODCALLTYPE StoreValue(const void* key, UINT key_size, const void* value, UINT value_size) override {
         if (!key || !key_size || !value || !value_size) return E_INVALIDARG;
-        if (registry_ && registry_->disabled.load(std::memory_order_relaxed)) return S_OK;
+        if (registry_ && registry_->disabled.load(std::memory_order_relaxed))
+            return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
         std::lock_guard lock(store_->mutex);
         const std::string k(static_cast<const char*>(key), key_size);
         if (store_->entries.find(k) != store_->entries.end()) return DXGI_ERROR_ALREADY_EXISTS;
-        if (desc_.MaximumInMemoryCacheEntries && store_->entries.size() >= desc_.MaximumInMemoryCacheEntries)
-            return E_OUTOFMEMORY;
-        if (desc_.MaximumInMemoryCacheSizeBytes &&
-            (value_size > desc_.MaximumInMemoryCacheSizeBytes ||
-             store_->total_bytes > desc_.MaximumInMemoryCacheSizeBytes - value_size))
-            return E_OUTOFMEMORY;
-        if (desc_.Mode == D3D12_SHADER_CACHE_MODE_DISK && desc_.MaximumValueFileSizeBytes &&
-            (value_size > desc_.MaximumValueFileSizeBytes ||
-             store_->total_bytes > desc_.MaximumValueFileSizeBytes - value_size))
-            return E_OUTOFMEMORY;
+        if (desc_.Mode == D3D12_SHADER_CACHE_MODE_MEMORY) {
+            const UINT max_entries = desc_.MaximumInMemoryCacheEntries ? desc_.MaximumInMemoryCacheEntries
+                                                                       : ShaderCacheStore::kDefaultMaxMemoryEntries;
+            const UINT max_bytes = desc_.MaximumInMemoryCacheSizeBytes ? desc_.MaximumInMemoryCacheSizeBytes
+                                                                       : ShaderCacheStore::kDefaultMaxMemoryBytes;
+            if (store_->entries.size() >= max_entries || value_size > max_bytes ||
+                store_->total_bytes > max_bytes - value_size)
+                return DXGI_ERROR_CACHE_FULL;
+        } else {
+            const UINT max_file_bytes = desc_.MaximumValueFileSizeBytes ? desc_.MaximumValueFileSizeBytes
+                                                                        : ShaderCacheStore::kDefaultMaxValueFileBytes;
+            if (value_size > max_file_bytes || store_->total_bytes > max_file_bytes - value_size)
+                return DXGI_ERROR_CACHE_FULL;
+        }
         const auto* bytes = static_cast<const std::uint8_t*>(value);
         auto [it, inserted] = store_->entries.emplace(k, std::vector<std::uint8_t>(bytes, bytes + value_size));
         store_->total_bytes += value_size;
@@ -3586,7 +3954,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("incompatible typed A8 view format:", int(view.format));
             return false;
         }
-        if (alpha_unused(view.format) != alpha_unused(desc.Format)) {
+        // Only a castable-format list that names the view's format lets a view cross the two families, as WARP and
+        // AMD's D3D12 driver accept (relaxed casting).
+        if (alpha_unused(view.format) != alpha_unused(desc.Format) && !resource.lists_castable_format(view.format)) {
             log_once("view format from another typeless family (B8G8R8X8 and B8G8R8A8):", int(view.format));
             return false;
         }
@@ -3661,11 +4031,17 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
     // A stencil view's format has its eight bits in G and no R, B or A of its own (0, 0, 1 when read).
-    // B8G8R8X8 has no alpha: it reads 1.
-    g::Swizzle channels = g::format_swizzle(view_format);
+    // B8G8R8X8 has no alpha: a view in its family reads 1, and a B8G8R8A8 view of a B8G8R8X8 texture (through a
+    // castable-format list) the stored byte. The view's format decides, as on WARP and AMD's D3D12 driver.
+    // The T#'s format code is the same for both channel orders of a colour format (R8G8B8A8 and B8G8R8A8 are one
+    // 8_8_8_8 code), and the image view keeps the image's format; a castable-format list may still ask for the other
+    // order, so then the view's own format places the channels. Depth images keep their own format's channels.
+    const bool other_order = view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane && !rgb96 &&
+                             named != view_format && !g::is_depth_stencil_format(view_format);
+    g::Swizzle channels = g::format_swizzle(other_order ? named : view_format);
     if (stencil) channels = {g::select_zero, g::select_x, g::select_zero, g::select_one};
     else if (desc.Format == DXGI_FORMAT_A8_UNORM) channels = {g::select_zero, g::select_zero, g::select_zero, g::select_x};
-    else if (alpha_unused(desc.Format)) channels[3] = g::select_one;
+    else if (alpha_unused(view.format != DXGI_FORMAT_UNKNOWN ? view.format : desc.Format)) channels[3] = g::select_one;
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         if (msaa && from > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) {
@@ -3733,7 +4109,8 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc, Devic
 // A query heap: one VkQueryPool, registered with the context so that lists can resolve it by ID
 // (docs/d3d12_vulkan.md section 4.6). Occlusion heaps hold both OCCLUSION and BINARY_OCCLUSION queries; timestamp
 // and copy-queue timestamp heaps are timestamp pools; pipeline-statistics heaps count all eleven Vulkan
-// statistics, whose result order is the field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS.
+// statistics, whose result order is the field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS. Stream-output
+// statistics heaps have no pool: without stream output every such query is zero.
 class QueryHeap final
     : public Child<QueryHeap, ID3D12QueryHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12QueryHeap> {
@@ -3744,9 +4121,9 @@ public:
     explicit QueryHeap(DeviceState& device) : device_(device) {}
 
     ~QueryHeap() override {
-        if (!pool_) return;
+        if (!registered_) return;
         device_.context->remove_query_pool(id());
-        device_.context->vk.vkDestroyQueryPool(device_.info.device, pool_, nullptr);
+        if (pool_) device_.context->vk.vkDestroyQueryPool(device_.info.device, pool_, nullptr);
     }
 
     leonida::QueryHeapId id() const { return query_heap_id(this); }
@@ -3767,6 +4144,12 @@ public:
             }
             info.queryType = VK_QUERY_TYPE_TIMESTAMP;
             break;
+        case h::so_statistics:
+            // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
+            // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
+            // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
+            // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
+            return register_pool(desc);
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
                 log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
@@ -3776,7 +4159,7 @@ public:
             info.pipelineStatistics = kPipelineStatistics;
             break;
         default:
-            // Stream output, video decode and mesh-shader statistics (PIPELINE_STATISTICS1) have no path yet.
+            // Video decode and mesh-shader statistics (PIPELINE_STATISTICS1) have no path yet.
             log_once("query heap type not supported:", desc.Type);
             return E_NOTIMPL;
         }
@@ -3784,6 +4167,11 @@ public:
             pool_ = VK_NULL_HANDLE;
             return E_OUTOFMEMORY;
         }
+        return register_pool(desc);
+    }
+
+private:
+    HRESULT register_pool(const D3D12_QUERY_HEAP_DESC& desc) {
         leonida::QueryPool pool{};
         pool.pool = pool_;
         pool.heap_type = desc.Type;
@@ -3791,10 +4179,10 @@ public:
         pool.precise = device_.info.occlusion_query_precise;
         pool.ended.assign(desc.Count, false);
         device_.context->add_query_pool(id(), pool);
+        registered_ = true;
         return S_OK;
     }
 
-private:
     // VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT through COMPUTE_SHADER_INVOCATIONS_BIT (0x1-0x400):
     // IAVertices, IAPrimitives, VSInvocations, GSInvocations, GSPrimitives, CInvocations, CPrimitives,
     // PSInvocations, HSInvocations (patches), DSInvocations, CSInvocations.
@@ -3802,7 +4190,8 @@ private:
     static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 11 * sizeof(UINT64));
 
     DeviceState& device_;
-    VkQueryPool pool_ = VK_NULL_HANDLE;
+    VkQueryPool pool_ = VK_NULL_HANDLE;  // null for a stream-output heap (no Vulkan query behind it)
+    bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
@@ -3895,8 +4284,14 @@ public:
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
                 VkPhysicalDeviceDepthStencilResolveProperties resolve{
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+                VkPhysicalDeviceConservativeRasterizationPropertiesEXT conservative{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
+                if (info.conservative_rasterization) resolve.pNext = &conservative;
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
                 get_props2(info.physical, &props);
+                state_.conservative_raster_tier1 = leonida::conservative_raster::tier1(
+                    info.conservative_rasterization, props.properties.limits.subPixelPrecisionBits,
+                    conservative.primitiveOverestimationSize);
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
             }
@@ -3942,6 +4337,14 @@ public:
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         });
+        if (info.buffer_device_address && info.physical && info.get_instance_proc) {
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+                VkPhysicalDeviceProperties props{};
+                get_props(info.physical, &props);
+                state_.context->configure_counted_dispatch(get_device, state_.memory, props.limits);
+            }
+        }
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
         // a 96-bit texture, which every GPU stores as RGBA32 (D3D-62): the converter is there whether or not the
         // GPU has a native D24_UNORM_S8_UINT. It costs nothing until a copy needs it (its pipeline is made on the
@@ -4167,6 +4570,10 @@ public:
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
         arena.free[kArenaReserved] = arena.size - kArenaReserved;
+        arena.peak_end = kArenaReserved;
+        char log[4] = {};
+        length = 0;
+        arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
         return true;
@@ -4190,11 +4597,14 @@ public:
             state_.sampler_entries.clear();
             state_.bindless.reset();
         }
+        state_.report_arena();
         if (state_.context && state_.arena.buffer) {
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
         }
+        if (state_.pipeline_cache_handle)
+            state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
@@ -4283,20 +4693,31 @@ public:
 
     // Device1: priorities only order what the OS evicts first under memory pressure. VK_EXT_pageable_device_local_memory
     // could pass them on, but it is optional and changes no result, so they are accepted and dropped. Any UINT is a
-    // valid priority (the D3D12_RESIDENCY_PRIORITY values are named points, the low 24 bits a refinement).
+    // valid priority (the D3D12_RESIDENCY_PRIORITY values are named points, the low 24 bits a refinement). As on the
+    // host runtime (d3d12_residency_test, RTX 3060 / 610.88), only objects that own their memory take one: committed
+    // resources and heaps. A placed resource (a reserved one too, by the same rule; not measured), a descriptor heap, a query heap or a fence is E_INVALIDARG.
+    // The host also removes its device then (DXGI_ERROR_INVALID_CALL); the layer doesn't, since a console title that
+    // sets priorities on its placed resources would lose its device over a hint.
     HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT count, ID3D12Pageable* const* objects,
                                                    const D3D12_RESIDENCY_PRIORITY* priorities) override {
-        return count && (!objects || !priorities) ? E_INVALIDARG : S_OK;
+        if (count && (!objects || !priorities)) return E_INVALIDARG;
+        for (UINT i = 0; i < count; ++i) {
+            if (from<Heap>(objects[i])) continue;
+            const Resource* resource = from<Resource>(objects[i]);
+            if (!resource || !resource->committed()) return E_INVALIDARG;
+        }
+        return S_OK;
     }
 
     // Device3: the asynchronous MakeResident. The objects are already resident, so the work is complete at once
     // and the fence is signalled from the CPU now. The caller's queue Wait on it must not hang, which is why the
-    // signal is kept although the residency part is a no-op. DENY_OVERBUDGET cannot fail: nothing is paged in.
+    // signal is kept although the residency part is a no-op. DENY_OVERBUDGET cannot fail: nothing is paged in. A
+    // null fence is accepted, as the host runtime does: there is nothing to signal.
     HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS flags, UINT count,
                                                   ID3D12Pageable* const* objects, ID3D12Fence* fence,
                                                   UINT64 value) override {
-        if (!fence || (count && !objects) || (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)) return E_INVALIDARG;
-        return fence->Signal(value);
+        if ((count && !objects) || (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)) return E_INVALIDARG;
+        return fence ? fence->Signal(value) : S_OK;
     }
 
     // Stable power state pins GPU clocks for profiling, a developer-mode feature on Windows. Vulkan has no clock
@@ -4437,20 +4858,27 @@ public:
         return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity()));
     }
 
-    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
-                                                ID3D12PipelineState* state, REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                                                ID3D12CommandAllocator* allocator, ID3D12PipelineState* state,
+                                                REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandList";
+        if (out) *out = nullptr;
+        if (node_mask & ~1u) return d3d12_trace::result(method, E_INVALIDARG);  // one node, as the host answers
         // The initial pipeline state is set as SetPipelineState would set it (a bundle's is its first deferred call).
         HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state);
         return d3d12_trace::result(method, hr);
     }
 
     // Device4: a list created closed, without an allocator.
-    HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS,
-                                                 REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                                                 D3D12_COMMAND_LIST_FLAGS, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device4::CreateCommandList1";
-        if (!out) return d3d12_trace::result(method, E_POINTER);
-        *out = nullptr;
+        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE, then a null
+        // output is E_UNEXPECTED.
+        if (out) *out = nullptr;
+        if ((node_mask & ~1u) || UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE))
+            return d3d12_trace::result(method, E_INVALIDARG);
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12CommandAllocator* allocator = nullptr;
         HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
@@ -4501,7 +4929,7 @@ public:
             case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: size += sizeof(D3D12_VERTEX_BUFFER_VIEW); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: size += sizeof(D3D12_INDEX_BUFFER_VIEW); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: size += UINT64{4} * arg.Constant.Num32BitValuesToSet; break;
-            case D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT: size += 4; break;
+            case compat::kIndirectArgumentIncrementingConstant: size += 4; break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
             case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
             case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS); break;
@@ -4703,6 +5131,7 @@ public:
                 }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values});
         }
+        register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
             std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
         signature->attach_device(identity());
@@ -4783,9 +5212,13 @@ public:
             if (path.empty()) return d3d12_trace::result(method, E_FAIL);
             disk_path = path.wstring();
         }
-        const ShaderCacheKey key{desc->Identifier, desc->Mode, desc->Version, std::move(disk_path)};
+        const ShaderCacheKey key{desc->Identifier, desc->Mode, std::move(disk_path)};
         auto& registry = process_shader_cache_registry();
-        auto store = registry.acquire(key);
+        const UINT max_file_bytes = desc->MaximumValueFileSizeBytes ? desc->MaximumValueFileSizeBytes
+                                                                    : ShaderCacheStore::kDefaultMaxValueFileBytes;
+        std::shared_ptr<ShaderCacheStore> store;
+        if (const HRESULT hr = registry.acquire(key, desc->Version, max_file_bytes, store); FAILED(hr))
+            return d3d12_trace::result(method, hr);
         auto* session = new ShaderCacheSession(*desc, key, registry, std::move(store));
         session->attach_device(identity());
         return d3d12_trace::result(method, hand_out(session, riid, out));
@@ -5013,8 +5446,8 @@ public:
     }
 
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
-    // dwords through its descriptor table and finds the image by them. A slot left as zeros is a null descriptor:
-    // nothing is registered for it, so the shader gets the fallback image. Buffer views are not implemented.
+    // dwords through its descriptor table and finds the image by them. A buffer SRV writes a 16-byte GFX10 V# in the
+    // first half of the slot (raw, structured, or typed). A slot left as zeros is a null descriptor.
     void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
@@ -5027,9 +5460,80 @@ public:
             if (resource) stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
             return;
         }
-        if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
         if (r->desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
             log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
+            return;
+        }
+        if (!r->image()) {
+            if (!desc) {
+                log_once("buffer SRV requires a description; width", int(r->desc().Width));
+                return;
+            }
+            if (desc->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+                log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
+                return;
+            }
+            const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
+            const UINT64 width = r->desc().Width;
+            if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
+            leonida::gfx10::Buffer buffer{};
+            if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+                if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
+                if (desc->Buffer.FirstElement > width / 4) return;
+                const UINT64 byte_off = desc->Buffer.FirstElement * 4;
+                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
+                if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = 0;
+                buffer.num_records = std::uint32_t(byte_size);
+                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+                buffer.oob_select = leonida::gfx10::OobSelect::raw;
+            } else if (desc->Buffer.StructureByteStride != 0) {
+                if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return;
+                const UINT64 stride = desc->Buffer.StructureByteStride;
+                if (desc->Buffer.FirstElement > width / stride) return;
+                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+                if (byte_size > width - byte_off) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = std::uint32_t(stride);
+                buffer.num_records = desc->Buffer.NumElements;
+                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+                buffer.oob_select = leonida::gfx10::OobSelect::structured;
+            } else {
+                const Format fmt = vulkan_format(desc->Format, false);
+                if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+                    log_once("buffer SRV format not supported:", int(desc->Format));
+                    return;
+                }
+                const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
+                const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
+                const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
+                if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
+                    log_once("buffer SRV format not supported:", int(desc->Format));
+                    return;
+                }
+                const UINT64 stride = bf.bytes;
+                if (desc->Buffer.FirstElement > width / stride) return;
+                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+                if (byte_size > width - byte_off) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = std::uint32_t(stride);
+                buffer.num_records = desc->Buffer.NumElements;
+                buffer.format = code;
+                const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
+                for (unsigned i = 0; i < 4; ++i) {
+                    const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
+                    buffer.swizzle[i] = from < 4 ? channels[from]
+                                        : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
+                                            ? leonida::gfx10::select_zero
+                                            : leonida::gfx10::select_one;
+                }
+                buffer.oob_select = leonida::gfx10::OobSelect::structured;
+            }
+            const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+            std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
             return;
         }
         TextureView view{};
@@ -5287,17 +5791,25 @@ public:
             log_once(refusal, desc->Flags);
             return;
         }
-        const bool uint_border = desc->Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
-        D3D12_SAMPLER_DESC base{desc->Filter,   desc->AddressU,      desc->AddressV,       desc->AddressW,
-                                desc->MipLODBias, desc->MaxAnisotropy, desc->ComparisonFunc, {},
-                                desc->MinLOD,   desc->MaxLOD};
-        if (!uint_border) std::memcpy(base.BorderColor, desc->FloatBorderColor, sizeof(base.BorderColor));
+        const leonida::gfx10::SamplerWords words = sampler2_words(*desc);
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.bind_sampler(words);
+    }
+
+    // The S# of a D3D12_SAMPLER_DESC2 that sampler2_refusal accepts.
+    leonida::gfx10::SamplerWords sampler2_words(const D3D12_SAMPLER_DESC2& desc) {
+        const bool uint_border = desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+        D3D12_SAMPLER_DESC base{desc.Filter,     desc.AddressU,      desc.AddressV,       desc.AddressW,
+                                desc.MipLODBias, desc.MaxAnisotropy, desc.ComparisonFunc, {},
+                                desc.MinLOD,     desc.MaxLOD};
+        if (!uint_border) std::memcpy(base.BorderColor, desc.FloatBorderColor, sizeof(base.BorderColor));
         leonida::gfx10::Sampler sampler = sampler_descriptor(base, uint_border ? nullptr : &state_);
         if (uint_border) {
             // The S#'s border types are the float ones', plus the layer's integer mark (kIntegerBorderPtr), which
             // gives the integer border its own key and VK_BORDER_COLOR_INT_* in Vulkan.
             namespace g = leonida::gfx10;
-            const UINT* c = desc->UintBorderColor;
+            const UINT* c = desc.UintBorderColor;
             const bool black = c[0] == 0 && c[1] == 0 && c[2] == 0;
             if (black && c[3] == 0) {
                 sampler.border_color = g::BorderColor::transparent_black;
@@ -5311,11 +5823,54 @@ public:
             }
             sampler.integer_border = true;
         }
-        sampler.unnormalized = desc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
-        const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler);
-        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
-        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        state_.bind_sampler(words);
+        sampler.unnormalized = desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+        return leonida::gfx10::encode(sampler);
+    }
+
+    // A root signature's static samplers take no root argument: a shader that uses one holds its S# by value
+    // (docs/d3d12_vulkan.md section 3.5). So each gets a sampler in set 0 and a key in the hash table here, as
+    // CreateSampler gives a heap slot's S#; without them the shader's lookup misses and it samples through the
+    // fallback sampler. A static sampler is a D3D12_SAMPLER_DESC2 whose border colour is one of five named ones
+    // (D3D12_STATIC_BORDER_COLOR; the two UINT ones can be in a blob of any version, the flags only in 1.2).
+    void register_static_samplers(const rt::rootsig::RootSignature& signature) {
+        for (const rt::rootsig::StaticSampler& s : signature.static_samplers) {
+            D3D12_SAMPLER_DESC2 desc{};
+            desc.Filter = D3D12_FILTER(s.filter);
+            desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE(s.address_u);
+            desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE(s.address_v);
+            desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE(s.address_w);
+            desc.MipLODBias = s.mip_lod_bias;
+            desc.MaxAnisotropy = s.max_anisotropy;
+            desc.ComparisonFunc = D3D12_COMPARISON_FUNC(s.comparison_func);
+            desc.MinLOD = s.min_lod;
+            desc.MaxLOD = s.max_lod;
+            desc.Flags = D3D12_SAMPLER_FLAGS(s.flags);
+            const bool white = s.border_color == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
+                               s.border_color == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT;
+            if (s.border_color == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT ||
+                s.border_color == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT) {
+                desc.Flags |= D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+                desc.UintBorderColor[0] = desc.UintBorderColor[1] = desc.UintBorderColor[2] = white ? 1u : 0u;
+                desc.UintBorderColor[3] = 1;
+            } else if (s.border_color > D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT ||
+                       (desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) {
+                // A value past the enum, or the UINT flag with a float border: not a sampler D3D12 defines.
+                log_once("static sampler not registered: border colour and flags do not go together; border colour",
+                         int(s.border_color));
+                continue;
+            } else {
+                desc.FloatBorderColor[0] = desc.FloatBorderColor[1] = desc.FloatBorderColor[2] = white ? 1.0f : 0.0f;
+                desc.FloatBorderColor[3] =
+                    s.border_color == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK ? 0.0f : 1.0f;
+            }
+            if (sampler2_refusal(desc)) {
+                log_once("static sampler not registered: a sampler CreateSampler2 refuses; flags", int(desc.Flags));
+                continue;
+            }
+            if (!state_.bind_sampler(sampler2_words(desc)))
+                log_once("static sampler not registered: no room in the bindless set; register",
+                         int(s.shader_register));
+        }
     }
 
     // Why the PC runtime refuses a D3D12_SAMPLER_DESC2, or null. The non-normalized rules are its debug layer's
@@ -5343,32 +5898,8 @@ public:
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                                                       const D3D12_CLEAR_VALUE* clear, REFIID riid,
                                                       void** out) override {
-        constexpr auto method = "ID3D12Device::CreateCommittedResource";
-        if (out) *out = nullptr;
-        if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
-        // The host runtime's argument checks (D3D-49). A refusal is logged once per reason and dimension, since a
-        // game that trips one (for example with an Xbox-only flag through slot 76) gets no resource.
-        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
-                                                         acceleration_structures())) {
-            log_once((std::string("CreateCommittedResource refused (") + why + "), dimension").c_str(),
-                     desc->Dimension);
-            return d3d12_trace::result(method, E_INVALIDARG);
-        }
-        // The sample quality is checked above as the host does it here: CreateCommittedResource accepts a quality on a
-        // single-sampled texture and the two standard MSAA patterns, which GetResourceAllocationInfo's rules refuse.
-        // The size, mip and alignment checks below run on a copy with quality 0.
-        D3D12_RESOURCE_DESC checked = *desc;
-        if (checked.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) checked.SampleDesc.Quality = 0;
-        if ((desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-             desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) &&
-            allocation(checked).SizeInBytes == UINT64_MAX) {
-            // Extents, mips, samples and alignment, as GetResourceAllocationInfo answers.
-            log_once("CreateCommittedResource refused (texture size, mips, samples or alignment), dimension",
-                     desc->Dimension);
-            return d3d12_trace::result(method, E_INVALIDARG);
-        }
-        return d3d12_trace::result(method, create_committed(heap, heap_flags, desc, state, 0, nullptr, riid,
-                                                            out));
+        return create_committed_validated("ID3D12Device::CreateCommittedResource", heap, heap_flags, desc, state, clear,
+                                          0, nullptr, riid, out);
     }
 
     // Reserved buffers use sparse binding where available. Textures and fallback buffers are fully backed.
@@ -5379,8 +5910,7 @@ public:
     HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                                                      const D3D12_CLEAR_VALUE* clear, REFIID riid,
                                                      void** out) override {
-        constexpr auto method = "ID3D12Device::CreateReservedResource";
-        return d3d12_trace::result(method, create_reserved(desc, state, clear, riid, out));
+        return create_reserved("ID3D12Device::CreateReservedResource", desc, state, clear, 0, nullptr, riid, out);
     }
 
     // Device4. Protected sessions are not supported.
@@ -5388,23 +5918,29 @@ public:
                                                       const D3D12_CLEAR_VALUE* clear,
                                                       ID3D12ProtectedResourceSession* session, REFIID riid,
                                                       void** out) override {
-        if (session) {
-            if (out) *out = nullptr;
-            log_once("CreateReservedResource1 with a protected session not supported:", 1);
-            return E_NOTIMPL;
-        }
-        return create_reserved(desc, state, clear, riid, out);
+        constexpr auto method = "ID3D12Device4::CreateReservedResource1";
+        if (out) *out = nullptr;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        if (session) return d3d12_trace::result(method, refuse_protected_session("CreateReservedResource1"));
+        return create_reserved(method, desc, state, clear, 0, nullptr, riid, out);
     }
 
-    // Device10: an initial layout instead of a state (resources start in their first use's layout here anyway).
-    // Castable formats are not used: typeless resources are already mutable-format images.
-    HRESULT STDMETHODCALLTYPE CreateReservedResource2(const D3D12_RESOURCE_DESC* desc, D3D12_BARRIER_LAYOUT,
+    // Device10: an initial layout instead of a state (resources start in their first use's layout here anyway), and a
+    // castable-format list forwarded to the backing texture.
+    HRESULT STDMETHODCALLTYPE CreateReservedResource2(const D3D12_RESOURCE_DESC* desc, D3D12_BARRIER_LAYOUT layout,
                                                       const D3D12_CLEAR_VALUE* clear,
                                                       ID3D12ProtectedResourceSession* session,
-                                                      UINT32 castable_formats, const DXGI_FORMAT*, REFIID riid,
+                                                      UINT32 castable_formats, const DXGI_FORMAT* castable, REFIID riid,
                                                       void** out) override {
-        if (castable_formats) log_once("CreateReservedResource2: castable formats ignored, count", int(castable_formats));
-        return CreateReservedResource1(desc, D3D12_RESOURCE_STATE_COMMON, clear, session, riid, out);
+        constexpr auto method = "ID3D12Device10::CreateReservedResource2";
+        if (out) *out = nullptr;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        if (session) return d3d12_trace::result(method, refuse_protected_session("CreateReservedResource2"));
+        if (const char* why = barrier_layout_refusal(*desc, layout)) {
+            log_once((std::string(method) + " refused (" + why + "), layout").c_str(), int(layout));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        return create_reserved(method, desc, D3D12_RESOURCE_STATE_COMMON, clear, castable_formats, castable, riid, out);
     }
 
     // Tiling of a reserved resource or a tiled (64KB_UNDEFINED_SWIZZLE) texture (src/resource_tiling.h). Anything
@@ -5443,7 +5979,7 @@ public:
                                                        ID3D12ProtectedResourceSession* session, REFIID riid,
                                                        void** out) override {
         if (out) *out = nullptr;
-        if (session) return refuse_protected_session(1);
+        if (session) return refuse_protected_session("CreateCommittedResource1");
         return CreateCommittedResource(heap, heap_flags, desc, state, clear, riid, out);
     }
 
@@ -5454,7 +5990,7 @@ public:
                                                        void** out) override {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
-        if (session) return refuse_protected_session(2);
+        if (session) return refuse_protected_session("CreateCommittedResource2");
         if (texture_mip_region(*desc)) return E_INVALIDARG;
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
         return CreateCommittedResource(heap, heap_flags, &base, state, clear, riid, out);
@@ -5462,23 +5998,25 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateCommittedResource3(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                        const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
-                                                       const D3D12_CLEAR_VALUE*,
+                                                       const D3D12_CLEAR_VALUE* clear,
                                                        ID3D12ProtectedResourceSession* session, UINT32 castable_count,
                                                        const DXGI_FORMAT* castable, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device10::CreateCommittedResource3";
         if (out) *out = nullptr;
-        if (!desc) return E_INVALIDARG;
-        if (session) return refuse_protected_session(3);
-        if (texture_mip_region(*desc)) return E_INVALIDARG;
-        // Enhanced barriers: a buffer has no layout, so its initial layout must be UNDEFINED.
-        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && layout != D3D12_BARRIER_LAYOUT_UNDEFINED)
-            return E_INVALIDARG;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        if (session) return d3d12_trace::result(method, refuse_protected_session("CreateCommittedResource3"));
+        if (texture_mip_region(*desc)) return d3d12_trace::result(method, E_INVALIDARG);
         // A count with a null array is no list (as on the PC runtime). The layer reports relaxed format casting, so
         // a real list is passed through; only buffers are refused.
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        if (const char* why = barrier_layout_refusal(base, layout)) {
+            log_once((std::string(method) + " refused (" + why + "), layout").c_str(), int(layout));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
         // D3D12_BARRIER_LAYOUT has no acceleration-structure value; an AS buffer's state comes through the
         // legacy CreateCommittedResource path. Buffers here start COMMON, as before.
-        return create_committed(heap, heap_flags, &base, D3D12_RESOURCE_STATE_COMMON, castable_count, castable,
-                                riid, out);
+        return create_committed_validated(method, heap, heap_flags, &base, D3D12_RESOURCE_STATE_COMMON, clear,
+                                          castable_count, castable, riid, out);
     }
 
     // Device9. The creator ID only groups queues for tools; one creator is as good as another here.
@@ -5528,7 +6066,8 @@ public:
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
                                                    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                                                    const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) override {
-        return create_placed(heap_interface, heap_offset, desc, state, clear, 0, nullptr, riid, out);
+        return create_placed("ID3D12Device::CreatePlacedResource", heap_interface, heap_offset, desc, state, clear, 0,
+                             nullptr, riid, out);
     }
 
     // Device8: the DESC1 placed variant without a castable list. A texture with a mip region gets the failure
@@ -5536,11 +6075,12 @@ public:
     HRESULT STDMETHODCALLTYPE CreatePlacedResource1(ID3D12Heap* heap_interface, UINT64 heap_offset,
                                                     const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES state,
                                                     const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device8::CreatePlacedResource1";
         if (out) *out = nullptr;
-        if (!desc) return E_INVALIDARG;
-        if (texture_mip_region(*desc)) return E_INVALIDARG;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        if (texture_mip_region(*desc)) return d3d12_trace::result(method, E_INVALIDARG);
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
-        return create_placed(heap_interface, heap_offset, &base, state, clear, 0, nullptr, riid, out);
+        return create_placed(method, heap_interface, heap_offset, &base, state, clear, 0, nullptr, riid, out);
     }
 
     // Device10: an initial layout instead of a state, and the castable-format list, which the placed texture's
@@ -5550,16 +6090,18 @@ public:
                                                     const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
                                                     const D3D12_CLEAR_VALUE* clear, UINT32 castable_count,
                                                     const DXGI_FORMAT* castable, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device10::CreatePlacedResource2";
         if (out) *out = nullptr;
-        if (!desc) return E_INVALIDARG;
-        if (texture_mip_region(*desc)) return E_INVALIDARG;
-        // Enhanced barriers: a buffer has no layout, so its initial layout must be UNDEFINED.
-        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && layout != D3D12_BARRIER_LAYOUT_UNDEFINED)
-            return E_INVALIDARG;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        if (texture_mip_region(*desc)) return d3d12_trace::result(method, E_INVALIDARG);
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        if (const char* why = barrier_layout_refusal(base, layout)) {
+            log_once((std::string(method) + " refused (" + why + "), layout").c_str(), int(layout));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
         // An initial layout replaces the state, so the state rules are not this call's.
-        return create_placed(heap_interface, heap_offset, &base, D3D12_RESOURCE_STATE_COMMON, clear, castable_count,
-                             castable, riid, out);
+        return create_placed(method, heap_interface, heap_offset, &base, D3D12_RESOURCE_STATE_COMMON, clear,
+                             castable_count, castable, riid, out);
     }
 
     // The placed path every CreatePlacedResource variant shares. A castable-format list reaches the placed
@@ -5570,15 +6112,15 @@ public:
     // CreateCommittedResource has, then the placement: a buffer at a 64 KiB-aligned offset, a texture at a
     // multiple of its GetResourceAllocationInfo alignment (4 KiB for a small texture), in a heap aligned at least
     // as much, and the whole resource inside the heap. Only then is a null output E_UNEXPECTED, with nothing made.
-    HRESULT create_placed(ID3D12Heap* heap_interface, UINT64 heap_offset, const D3D12_RESOURCE_DESC* desc,
-                          D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, UINT32 castable_count,
-                          const DXGI_FORMAT* castable, REFIID riid, void** out) {
+    HRESULT create_placed(const char* method, ID3D12Heap* heap_interface, UINT64 heap_offset,
+                          const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
+                          UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
-        if (!heap || !desc) return E_INVALIDARG;
+        if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
         if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             log_once("castable formats on a placed buffer are invalid; count", int(castable_count));
-            return E_INVALIDARG;
+            return d3d12_trace::result(method, E_INVALIDARG);
         }
         // The description, state and clear value rules of a committed resource, but on a default heap: the heap's
         // DENY flags are checked against the resource below, and the host takes any initial state for a buffer in
@@ -5592,62 +6134,73 @@ public:
             (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             why = "UAV access in an upload or readback heap";
         if (why) {
-            log_once((std::string("CreatePlacedResource refused (") + why + "), dimension").c_str(),
-                     desc->Dimension);
-            return E_INVALIDARG;
+            log_once((std::string(method) + " refused (" + why + "), dimension").c_str(), int(desc->Dimension));
+            return d3d12_trace::result(method, E_INVALIDARG);
         }
         const bool tiled = is_tiled_layout(desc->Layout);
+        const bool msaa = desc->SampleDesc.Count > 1;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            if (heap->flags() & D3D12_HEAP_FLAG_DENY_BUFFERS) return E_INVALIDARG;
+            if (heap->flags() & D3D12_HEAP_FLAG_DENY_BUFFERS) return d3d12_trace::result(method, E_INVALIDARG);
             if (heap_offset % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
                 log_once("placed buffer offset not 64 KiB aligned:", int(heap_offset));
-                return E_INVALIDARG;
+                return d3d12_trace::result(method, E_INVALIDARG);
             }
-            if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width) return E_INVALIDARG;
+            if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width)
+                return d3d12_trace::result(method, E_INVALIDARG);
         } else {
             if (heap->properties().Type == D3D12_HEAP_TYPE_UPLOAD ||
                 heap->properties().Type == D3D12_HEAP_TYPE_READBACK)
-                return E_INVALIDARG;
+                return d3d12_trace::result(method, E_INVALIDARG);
             const bool rt_ds = (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                                               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
-            if (rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
-            if (!rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)) return E_INVALIDARG;
+            if (rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES))
+                return d3d12_trace::result(method, E_INVALIDARG);
+            if (!rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES))
+                return d3d12_trace::result(method, E_INVALIDARG);
             if (tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                 desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
-                return E_INVALIDARG;
-            if (desc->SampleDesc.Count > 1 && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
-                return E_INVALIDARG;
+                return d3d12_trace::result(method, E_INVALIDARG);
+            if (msaa && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+                return d3d12_trace::result(method, E_INVALIDARG);
             // Extents, mips, samples, layout and alignment, as GetResourceAllocationInfo answers them (the sample
             // quality is the description rules' above, as in CreateCommittedResource).
             D3D12_RESOURCE_DESC checked = *desc;
             checked.SampleDesc.Quality = 0;
             const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(checked);
             if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
-                heap_offset % alloc.Alignment || alloc.SizeInBytes > heap->bytes() ||
-                heap_offset > heap->bytes() - alloc.SizeInBytes) {
+                heap_offset % alloc.Alignment) {
                 log_once("placed texture refused (size, alignment or room in the heap), dimension",
                          int(desc->Dimension));
-                return E_INVALIDARG;
+                return d3d12_trace::result(method, E_INVALIDARG);
+            }
+            const UINT64 fit_bytes =
+                (tiled || msaa)
+                    ? alloc.SizeInBytes
+                    : min_placed_texture_bytes(checked, state_.texture_format(checked), alloc.Alignment,
+                                               alloc.SizeInBytes);
+            if (fit_bytes > heap->bytes() || heap_offset > heap->bytes() - fit_bytes) {
+                log_once("placed texture refused (size, alignment or room in the heap), dimension",
+                         int(desc->Dimension));
+                return d3d12_trace::result(method, E_INVALIDARG);
             }
             if (tiled && static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
                 log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          int(desc->Dimension));
             }
         }
-        if (!out) return E_UNEXPECTED;
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !heap->use_as_placed_buffer(true)) {
             log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
-            return E_NOTIMPL;
+            return d3d12_trace::result(method, E_NOTIMPL);
         }
-        // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
+        // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image, which
+        // create_texture makes for 1D, 2D and 3D alike (arrays and mips included), as for a committed texture.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
         auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             hr = resource->create_placed_buffer();
-        } else if (!tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-            log_once("placed resource dimension not supported:", int(desc->Dimension));
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
@@ -5657,13 +6210,14 @@ public:
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
         if (FAILED(hr)) {
             resource->Release();
-            return hr;
+            return d3d12_trace::result(method, hr);
         }
-        return hand_out(resource, riid, out);
+        return d3d12_trace::result(method, hand_out(resource, riid, out));
     }
 
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
@@ -5761,16 +6315,23 @@ public:
     // to D3D12's alignment for it; the alignment itself is D3D12's, since placed textures bind their own memory
     // (section 4.2). Several resources are laid out one after another, each at its own alignment. An invalid
     // description gives SizeInBytes = UINT64_MAX, as on D3D12. d3d12_vulkan_device_test compares with the PC runtime.
+    // A visible mask above 1 names a node the single-node adapter lacks: the same invalid answer, also for no
+    // resources at all, and the per-resource array is left untouched (host runtime and WARP, measured).
     D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(
-        UINT, UINT count, const D3D12_RESOURCE_DESC* descs) override {
+        UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC* descs) override {
+        if (visible_mask > 1) return kInvalidAllocation;
         return place(count, descs, [&](UINT i) { return descs[i]; }, nullptr);
     }
     D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo1(
-        UINT, UINT count, const D3D12_RESOURCE_DESC* descs, D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC* descs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        if (visible_mask > 1) return kInvalidAllocation;
         return place(count, descs, [&](UINT i) { return descs[i]; }, each);
     }
     D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo2(
-        UINT, UINT count, const D3D12_RESOURCE_DESC1* descs, D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC1* descs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        if (visible_mask > 1) return kInvalidAllocation;
         return place(count, descs, [&](UINT i) {
             const D3D12_RESOURCE_DESC1& d = descs[i];
             if (d.SamplerFeedbackMipRegion.Width || d.SamplerFeedbackMipRegion.Height ||
@@ -5840,7 +6401,8 @@ public:
             opts->PSSpecifiedStencilRefSupported = TRUE;
             opts->TypedUAVLoadAdditionalFormats = TRUE;
             opts->ROVsSupported = TRUE;
-            opts->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+            opts->ConservativeRasterizationTier = state_.conservative_raster_tier1
+                ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_1 : D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
             opts->MaxGPUVirtualAddressBitsPerResource = 40;
             opts->StandardSwizzle64KBSupported = FALSE;
             opts->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
@@ -6016,20 +6578,20 @@ public:
             opts->ComputeOnlyCustomHeapSupported = FALSE;
             return d3d12_trace::result(method, S_OK);
         }
-        case D3D12_FEATURE_D3D12_OPTIONS20: {
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS20)) return d3d12_trace::result(method, E_INVALIDARG);
-            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS20*>(data);
+        case compat::kFeatureOptions20: {
+            if (size != sizeof(compat::FeatureDataOptions20)) return d3d12_trace::result(method, E_INVALIDARG);
+            auto* opts = static_cast<compat::FeatureDataOptions20*>(data);
             *opts = {};
             opts->ComputeOnlyWriteWatchSupported = FALSE;
-            opts->RecreateAtTier = D3D12_RECREATE_AT_TIER_NOT_SUPPORTED;
+            opts->RecreateAtTier = compat::kRecreateAtTierNotSupported;
             return d3d12_trace::result(method, S_OK);
         }
-        case D3D12_FEATURE_D3D12_OPTIONS21: {
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21)) return d3d12_trace::result(method, E_INVALIDARG);
-            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS21*>(data);
+        case compat::kFeatureOptions21: {
+            if (size != sizeof(compat::FeatureDataOptions21)) return d3d12_trace::result(method, E_INVALIDARG);
+            auto* opts = static_cast<compat::FeatureDataOptions21*>(data);
             *opts = {};
-            opts->WorkGraphsTier = D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
-            opts->ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
+            opts->WorkGraphsTier = compat::kWorkGraphsTierNotSupported;
+            opts->ExecuteIndirectTier = compat::kExecuteIndirectTier1_0;
             opts->SampleCmpGradientAndBiasSupported = FALSE;
             opts->ExtendedCommandInfoSupported = FALSE;
             return d3d12_trace::result(method, S_OK);
@@ -6146,7 +6708,10 @@ public:
                 return d3d12_trace::result(method, S_OK);
             }
 
-            if (buffer != 0) s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
+            // D3D12 disallows typed buffer views for the RGBA8 and BGRA8 sRGB formats (including BGRX8).
+            // Vulkan can still advertise buffer features for their backing formats.
+            if (buffer != 0 && vk_fmt != VK_FORMAT_R8G8B8A8_SRGB && vk_fmt != VK_FORMAT_B8G8R8A8_SRGB)
+                s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
             // Only what CreateGraphicsPipelineState's input layouts accept (vertex_format): R8/R16 SNORM and SINT
             // have Vulkan vertex support but no input-layout mapping yet.
             VkFormat vertex_vk = VK_FORMAT_UNDEFINED;
@@ -6372,7 +6937,10 @@ public:
         case D3D12_FEATURE_ROOT_SIGNATURE: {
             if (size != sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE)) return E_INVALIDARG;
             auto* root = static_cast<D3D12_FEATURE_DATA_ROOT_SIGNATURE*>(data);
-            if (root->HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_0) return E_INVALIDARG;
+            // 1.0 to 1.2 are defined (1.2 by number: not every SDK names it). The host refuses anything else and leaves
+            // the value alone (RTX 4070 Laptop 621.24 and WARP), so only 1.2 is clamped.
+            const UINT requested = static_cast<UINT>(root->HighestVersion);
+            if (requested < static_cast<UINT>(D3D_ROOT_SIGNATURE_VERSION_1_0) || requested > 0x3) return E_INVALIDARG;
             if (root->HighestVersion > kHighestRootSignatureVersion)
                 root->HighestVersion = kHighestRootSignatureVersion;
             return S_OK;
@@ -6452,8 +7020,8 @@ public:
         case D3D12_FEATURE_QUERY_META_COMMAND:
             // EnumerateMetaCommands reports 0 meta-commands, so any query is rejected (as on host D3D12).
             return d3d12_trace::result(method, E_INVALIDARG);
-        case D3D12_FEATURE_PREDICATION:
-            return write_supported_feature<D3D12_FEATURE_DATA_PREDICATION>(
+        case compat::kFeaturePredication:
+            return write_supported_feature<compat::FeatureSupportFlag>(
                 method, data, size, state_.info.conditional_rendering ? TRUE : FALSE);
         case compat::kFeatureApplicationSpecificDriverState:
             return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);
@@ -6604,6 +7172,42 @@ private:
                    tiles(volume ? desc.DepthOrArraySize : 1, 1, shape.depth) <= 16;
     }
 
+    // Strict lower bound on the heap bytes a non-tiled single-sample texture needs: sums uncompressed texel/block
+    // payload across subresources and rounds to `alignment`, capped at `fallback` (Vulkan allocation size). Avoids
+    // rejecting host-valid placed textures when Vulkan driver padding exceeds D3D12's GetResourceAllocationInfo.
+    static UINT64 min_placed_texture_bytes(const D3D12_RESOURCE_DESC& desc, const Format& format, UINT64 alignment,
+                                           UINT64 fallback) {
+        const VkImageAspectFlags aspect =
+            (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : format.aspects;
+        const leonida::BlockFormat block = footprint_block(format, aspect);
+        if (!block.bytes || !alignment) return fallback;
+        const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        const UINT depth = volume ? desc.DepthOrArraySize : 1;
+        const UINT slices = volume ? 1 : desc.DepthOrArraySize;
+        const UINT mips = desc.MipLevels ? desc.MipLevels : full_mips(desc.Width, desc.Height, depth);
+        UINT64 per_slice = 0;
+        for (UINT m = 0; m < mips; ++m) {
+            const UINT64 w = std::max<UINT64>(1, desc.Width >> m);
+            const UINT64 h = one_d ? 1 : std::max<UINT64>(1, desc.Height >> m);
+            const UINT64 d = volume ? std::max<UINT64>(1, depth >> m) : 1;
+            const UINT64 bw = (w + block.block - 1) / block.block;
+            const UINT64 bh = (h + block.block - 1) / block.block;
+            if (bw > UINT64_MAX / bh) return fallback;
+            const UINT64 blocks = bw * bh;
+            if (blocks > UINT64_MAX / d) return fallback;
+            const UINT64 count = blocks * d;
+            if (count > UINT64_MAX / block.bytes) return fallback;
+            const UINT64 mip_bytes = count * block.bytes;
+            if (per_slice > UINT64_MAX - mip_bytes) return fallback;
+            per_slice += mip_bytes;
+        }
+        if (slices && per_slice > UINT64_MAX / slices) return fallback;
+        const UINT64 total = per_slice * slices;
+        if (total > UINT64_MAX - (alignment - 1)) return fallback;
+        return std::min(fallback, align_up(total, alignment));
+    }
+
     // Writes the view's T# into the slot and makes sure set 0 and the hash table know it. A view that cannot be
     // shown leaves the slot a null descriptor.
     void write_image_descriptor(const Resource& resource, const TextureView& view,
@@ -6618,9 +7222,40 @@ private:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 
-    // Shared by CreateCommittedResource and CreateCommittedResource3. A castable-format list is only meaningful on
-    // textures; the layer reports RelaxedFormatCastingSupported, so each format is mapped and handed to Vulkan as a
-    // VkImageFormatListCreateInfo. A nonzero count with a null list is no list, as on the PC runtime.
+    // Validation shared by CreateCommittedResource and CreateCommittedResource3; internal callers pass null `method`
+    // to skip trace recording.
+    HRESULT create_committed_validated(const char* method, const D3D12_HEAP_PROPERTIES* heap,
+                                       D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc,
+                                       D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
+                                       UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+        const auto finish = [&](HRESULT hr) { return method ? d3d12_trace::result(method, hr) : hr; };
+        if (out) *out = nullptr;
+        if (!heap || !desc) return finish(E_INVALIDARG);
+        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
+                                                         acceleration_structures())) {
+            log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")
+                         .c_str(),
+                     int(desc->Dimension));
+            return finish(E_INVALIDARG);
+        }
+        // The sample quality is checked above as the host does it here: CreateCommittedResource accepts a quality on a
+        // 1x texture while GetResourceAllocationInfo requires 0; the other texture checks stay shared with allocation.
+        D3D12_RESOURCE_DESC checked = *desc;
+        if (checked.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) checked.SampleDesc.Quality = 0;
+        if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && allocation(checked).SizeInBytes == UINT64_MAX) {
+            log_once((std::string(method ? method : "CreateCommittedResource") +
+                      " refused (texture size, mips, samples or alignment), dimension")
+                         .c_str(),
+                     int(desc->Dimension));
+            return finish(E_INVALIDARG);
+        }
+        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out));
+    }
+
+    // Shared by CreateCommittedResource, CreateCommittedResource3 and CreateReservedResource*. A castable-format list
+    // is only meaningful on textures; the layer reports RelaxedFormatCastingSupported, so each format is mapped and
+    // handed to Vulkan as a VkImageFormatListCreateInfo. A nonzero count with a null list is no list, as on the PC
+    // runtime.
     HRESULT create_committed(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                              const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
                              UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
@@ -6674,6 +7309,7 @@ private:
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
         if (FAILED(hr)) {
@@ -6745,43 +7381,47 @@ private:
     // compare_placed_reserved, RTX 3060 / 610.88): the description, initial state and clear value rules of a
     // committed resource on a default heap, the reserved layouts below, and only then E_UNEXPECTED for a null
     // output, with nothing made.
-    HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
-                            const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
+    HRESULT create_reserved(const char* method, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                            const D3D12_CLEAR_VALUE* clear, UINT32 castable_count, const DXGI_FORMAT* castable,
+                            REFIID riid, void** out) {
         if (out) *out = nullptr;
-        if (!desc) return E_INVALIDARG;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            log_once("castable formats on a reserved buffer are invalid; count", int(castable_count));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
         D3D12_RESOURCE_DESC backing = *desc;
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+            if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return d3d12_trace::result(method, E_INVALIDARG);
         } else {
             if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
                 log_once("reserved resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          desc->Dimension);
             } else if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
-                return E_INVALIDARG;  // 64KB_STANDARD_SWIZZLE too: CheckFeatureSupport reports it unsupported
+                return d3d12_trace::result(method, E_INVALIDARG);  // 64KB_STANDARD_SWIZZLE too: CheckFeatureSupport reports it unsupported
             }
             backing.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
             leonida::ResourceTiling tiling;
             backing.MipLevels = std::max<UINT16>(desc->MipLevels, 1);  // any count: only the format is checked here
             if (!resource_tiling(backing, tiling)) {
                 log_once("reserved texture format has no tile shape:", desc->Format);
-                return E_INVALIDARG;
+                return d3d12_trace::result(method, E_INVALIDARG);
             }
             backing.MipLevels = desc->MipLevels;
         }
         if (const char* why = committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, backing, state, clear,
                                                          acceleration_structures())) {
-            log_once((std::string("CreateReservedResource refused (") + why + "), dimension").c_str(),
-                     desc->Dimension);
-            return E_INVALIDARG;
+            log_once((std::string(method) + " refused (" + why + "), dimension").c_str(), int(desc->Dimension));
+            return d3d12_trace::result(method, E_INVALIDARG);
         }
         if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // Extents, mips and samples, as the committed backing below checks them (GetResourceAllocationInfo).
             D3D12_RESOURCE_DESC checked = backing;
             checked.SampleDesc.Quality = 0;
-            if (allocation(checked).SizeInBytes == UINT64_MAX) return E_INVALIDARG;
+            if (allocation(checked).SizeInBytes == UINT64_MAX) return d3d12_trace::result(method, E_INVALIDARG);
         }
-        if (!out) return E_UNEXPECTED;
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12Resource* resource = nullptr;
         HRESULT hr;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && state_.sparse_buffer_memory_types) {
@@ -6790,18 +7430,18 @@ private:
             hr = sparse->create_sparse_buffer();
             if (FAILED(hr)) {
                 sparse->Release();
-                return hr;
+                return d3d12_trace::result(method, hr);
             }
             resource = sparse;
         } else {
-            hr = CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &backing, D3D12_RESOURCE_STATE_COMMON,
-                                         nullptr, IID_PPV_ARGS(&resource));
+            hr = create_committed_validated(nullptr, &heap, D3D12_HEAP_FLAG_NONE, &backing, D3D12_RESOURCE_STATE_COMMON,
+                                            clear, castable_count, castable, IID_PPV_ARGS(&resource));
         }
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) return d3d12_trace::result(method, hr);
         Resource::from<Resource>(resource)->make_reserved(desc->Layout);
         hr = resource->QueryInterface(riid, out);
         resource->Release();
-        return hr;
+        return d3d12_trace::result(method, hr);
     }
 
     // The tiling of a reserved resource's description; false for formats without a tile shape (three- and
@@ -6866,9 +7506,9 @@ private:
     }
 
     // The layer reports no protected-session support, so a session is refused, as D3D12 refuses one on a device
-    // without D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT. `variant` is the method's number.
-    static HRESULT refuse_protected_session(int variant) {
-        log_once("protected resource session refused (not supported) by CreateCommittedResource", variant);
+    // without D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT.
+    static HRESULT refuse_protected_session(const char* method) {
+        log_once((std::string("protected resource session refused (not supported) by ") + method + ':').c_str(), 1);
         return E_INVALIDARG;
     }
 
@@ -6914,7 +7554,28 @@ std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, c
 }
 
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
-    if (Device* d = Device::from<Device>(device)) d->set_outer(outer);
+    Device* d = Device::from<Device>(device);
+    if (!d) return;
+    // A caller passes what create_device_proxy returned, which is the proxy's DXGI pointer when the title asked
+    // for IDXGIDevice1: the device's outer identity is the proxy itself either way.
+    if (void* proxy = rt::d3d12_xs::device_proxy_primary(outer)) outer = static_cast<IUnknown*>(proxy);
+    d->set_outer(outer);
+    // Second job, for an outer that is the Xbox-ABI proxy: its IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands
+    // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
+    // a host DXGI object from it.
+    if (!rt::d3d12_xs::is_device_proxy(outer)) return;
+    rt::d3d12_xs::set_device_adapter_provider(outer, [](ID3D12Device* real, REFIID riid, void** out) {
+        IDXGIFactory1* factory = nullptr;
+        HRESULT hr = create_dxgi_factory(real, __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+        if (FAILED(hr)) return hr;
+        IDXGIAdapter* adapter = nullptr;
+        hr = factory->EnumAdapters(0, &adapter);
+        factory->Release();
+        if (FAILED(hr)) return hr;
+        hr = adapter->QueryInterface(riid, out);
+        adapter->Release();
+        return hr;
+    });
 }
 
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) {
@@ -7141,6 +7802,45 @@ bool WindowPresenter::hdr_active() const { return presenter_->hdr_active(); }
 void WindowPresenter::force_hdr_encoding(bool on) { presenter_->force_hdr_encoding(on); }
 std::uint64_t WindowPresenter::composed_presents() const { return presenter_->composed_presents(); }
 
+// DISPLAYCONFIG_SDR_WHITE_LEVEL.SDRWhiteLevel is the white level in units of 80/1000 nits: 1000 is 80 nits (the scRGB 1.0),
+// 2500 is 200 nits (MS Learn, DISPLAYCONFIG_SDR_WHITE_LEVEL). Zero is not a level.
+float sdr_white_nits_from_level(unsigned long level) { return float(level) / 1000.0f * 80.0f; }
+
+float WindowPresenter::display_sdr_white_nits() const {
+    if (!window_) return 0.0f;
+    // The GDI name of the monitor the window is on, matched to a display path's source, whose target has the setting.
+    MONITORINFOEXW monitor{};
+    monitor.cbSize = sizeof(monitor);
+    if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor)) return 0.0f;
+    // The active configuration can change between the size query and the read (a hot-plug): ERROR_INSUFFICIENT_BUFFER asks
+    // for the sizes again (the pattern Microsoft documents for QueryDisplayConfig).
+    UINT32 path_count = 0, mode_count = 0;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    LONG status = ERROR_INSUFFICIENT_BUFFER;
+    for (int attempt = 0; attempt < 8 && status == ERROR_INSUFFICIENT_BUFFER; ++attempt) {
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) return 0.0f;
+        paths.assign(path_count, {});
+        modes.assign(mode_count, {});
+        status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr);
+    }
+    if (status != ERROR_SUCCESS) return 0.0f;  // the caller keeps the last good value
+    for (UINT32 i = 0; i < path_count; ++i) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), paths[i].sourceInfo.adapterId,
+                        paths[i].sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+            std::wcscmp(source.viewGdiDeviceName, monitor.szDevice) != 0)
+            continue;
+        DISPLAYCONFIG_SDR_WHITE_LEVEL level{};
+        level.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, sizeof(level), paths[i].targetInfo.adapterId,
+                        paths[i].targetInfo.id};
+        if (DisplayConfigGetDeviceInfo(&level.header) != ERROR_SUCCESS || level.SDRWhiteLevel == 0) return 0.0f;
+        return sdr_white_nits_from_level(level.SDRWhiteLevel);
+    }
+    return 0.0f;
+}
+
 bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
 
 void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
@@ -7201,7 +7901,9 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
     }
-    return std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+    auto window_presenter = std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+    window_presenter->set_window(window);
+    return window_presenter;
 }
 
 HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
@@ -7527,7 +8229,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         q.pQueuePriorities = priorities.data();
         queue_infos.push_back(q);
     }
-    const auto picked = leonida::pick_queue_families(families, info.queue_family);
+    const auto preferred = leonida::pick_queue_families(families, info.queue_family);
+    // D3D12 permits UpdateTileMappings on DIRECT, COMPUTE and COPY queues. Vulkan requires
+    // VK_QUEUE_SPARSE_BINDING_BIT on the VkQueue passed to vkQueueBindSparse. A dedicated
+    // async family without that capability cannot implement all D3D12 queue operations;
+    // fall back to the graphics family when sparse buffers are supported. QueueKind still
+    // enforces the D3D12 COPY/COMPUTE stage restrictions on the more capable family.
+    const bool sparse_buffers = chosen_features.sparseBinding && chosen_features.sparseResidencyBuffer &&
+                                chosen_features.sparseResidencyAliased;
+    const auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
     std::uint32_t compute_count = 0, copy_count = 0;
     if (picked.compute != info.queue_family) {
         info.compute_family = picked.compute;
@@ -7572,6 +8282,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
     std::vector<VkExtensionProperties> extensions(extension_count);
     vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
+    info.conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
+    });
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
@@ -7585,6 +8298,37 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         if (info.image_view_min_lod) {
             min_lod.pNext = *v13.next();
             *v13.next() = &min_lod;
+        }
+    }
+    const char* divisor_extension = nullptr;
+    for (const char* name :
+         {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
+        if (std::any_of(extensions.begin(), extensions.end(),
+                        [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+            divisor_extension = name;
+            break;
+        }
+    }
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_khr{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_ext{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+    if (divisor_extension) {
+        const bool is_khr = std::strcmp(divisor_extension, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) == 0;
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                        is_khr ? static_cast<void*>(&divisor_khr) : static_cast<void*>(&divisor_ext)};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.vertex_attribute_divisor =
+            (is_khr ? divisor_khr.vertexAttributeInstanceRateDivisor : divisor_ext.vertexAttributeInstanceRateDivisor) ==
+            VK_TRUE;
+        if (info.vertex_attribute_divisor) {
+            if (is_khr) {
+                divisor_khr.pNext = *v13.next();
+                *v13.next() = &divisor_khr;
+            } else {
+                divisor_ext.pNext = *v13.next();
+                *v13.next() = &divisor_ext;
+            }
         }
     }
     VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
@@ -7661,6 +8405,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
 #endif
+    VkPhysicalDeviceShaderClockFeaturesKHR shader_clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &shader_clock};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.shader_subgroup_clock = shader_clock.shaderSubgroupClock == VK_TRUE;
+        info.shader_device_clock = shader_clock.shaderDeviceClock == VK_TRUE;
+        if (info.shader_subgroup_clock || info.shader_device_clock) {
+            shader_clock.pNext = *v13.next();
+            *v13.next() = &shader_clock;
+        }
+    }
     // What graphics PSOs may ask for: different blend state per render target, wireframe, a depth-bias clamp and
     // SRC1 blend factors. Enabled where the GPU has them; a PSO that needs a missing one is refused.
     enable.independentBlend = chosen_features.independentBlend;
@@ -7753,7 +8508,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.pEnabledFeatures = &enable;
     std::vector<const char*> device_extensions;
     v13.add_extensions(device_extensions);
+    if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     if (info.fragment_shader_barycentric)
@@ -7765,6 +8522,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+    if (info.shader_subgroup_clock || info.shader_device_clock)
+        device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
