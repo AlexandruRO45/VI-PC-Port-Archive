@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "file_system.h"
 #include "shims.h"
 
 namespace rt::shims::library_loader {
@@ -199,6 +200,51 @@ HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
     return LoadLibraryExW(name, file, flags);
 }
 
+
+HMODULE WINAPI load_packaged_library(LPCWSTR name, DWORD reserved) {
+    if (reserved) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    return load_library_ex_w(name, nullptr, 0);
+}
+
+std::map<DLL_DIRECTORY_COOKIE, std::filesystem::path>& dll_directories() {
+    static auto* dirs = new std::map<DLL_DIRECTORY_COOKIE, std::filesystem::path>;
+    return *dirs;
+}
+
+DLL_DIRECTORY_COOKIE WINAPI add_dll_directory(PCWSTR dir) {
+    if (!dir) return AddDllDirectory(dir);
+    std::filesystem::path resolved;
+    DWORD error = 0;
+    if (!rt::fs::resolve_read_path(dir, resolved, error)) {
+        SetLastError(error);
+        return nullptr;
+    }
+    std::lock_guard lock(loader_mutex());
+    auto cookie = AddDllDirectory(resolved.c_str());
+    if (cookie) dll_directories().emplace(cookie, resolved);
+    return cookie;
+}
+
+BOOL WINAPI remove_dll_directory(DLL_DIRECTORY_COOKIE cookie) {
+    std::lock_guard lock(loader_mutex());
+    auto& dirs = dll_directories();
+    auto it = dirs.find(cookie);
+    if (it == dirs.end()) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (!RemoveDllDirectory(cookie)) return FALSE;
+    dirs.erase(it);
+    return TRUE;
+}
+
+BOOL WINAPI set_default_dll_directories(DWORD flags) {
+    return SetDefaultDllDirectories(flags);
+}
+
 // GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), and for any
 // bundled package module already mapped by the native loader.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
@@ -298,6 +344,10 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "LoadLibraryW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_w)},                        \
     {dll, "LoadLibraryExA", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_a)},                   \
     {dll, "LoadLibraryExW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_w)},                   \
+    {dll, "LoadPackagedLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::load_packaged_library)},            \
+    {dll, "AddDllDirectory", reinterpret_cast<void*>(&rt::shims::library_loader::add_dll_directory)},                  \
+    {dll, "RemoveDllDirectory", reinterpret_cast<void*>(&rt::shims::library_loader::remove_dll_directory)},            \
+    {dll, "SetDefaultDllDirectories", reinterpret_cast<void*>(&rt::shims::library_loader::set_default_dll_directories)}, \
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \

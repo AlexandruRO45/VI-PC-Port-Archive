@@ -488,6 +488,8 @@ if(BUILD_TESTING)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
       test/loader_test.cpp
+      shims/library_loader.cpp
+      shims/file_system.cpp
       src/pe_loader.cpp
       shims/registry.cpp
     )
@@ -770,6 +772,7 @@ if(BUILD_TESTING)
     )
     add_executable(dll_thread_calls_test
       test/dll_thread_calls_test.cpp
+      shims/file_system.cpp
       src/pe_loader.cpp
       shims/library_loader.cpp
       shims/registry.cpp

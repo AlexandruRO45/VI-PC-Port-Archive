@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "../shims/shims.h"
+#include "../shims/file_system.h"
 #include "../src/pe_loader.h"
 #include "free_image_base.h"
 
@@ -1245,6 +1246,42 @@ void test_lookup_during_loads() {
     }
 }
 
+
+void test_packaged_loader_directories() {
+    auto lookup = [](const char* name) { return rt::shims::find("kernel32.dll", name); };
+    auto packaged = reinterpret_cast<HMODULE (WINAPI*)(LPCWSTR, DWORD)>(lookup("LoadPackagedLibrary"));
+    auto load = reinterpret_cast<HMODULE (WINAPI*)(LPCWSTR)>(lookup("LoadLibraryW"));
+    auto add = reinterpret_cast<DLL_DIRECTORY_COOKIE (WINAPI*)(PCWSTR)>(lookup("AddDllDirectory"));
+    auto remove = reinterpret_cast<BOOL (WINAPI*)(DLL_DIRECTORY_COOKIE)>(lookup("RemoveDllDirectory"));
+    auto defaults = lookup("SetDefaultDllDirectories");
+    if (!packaged || !load || !add || !remove || !defaults) {
+        failed("packaged loader exports", "missing shim");
+        return;
+    }
+    pass("packaged loader exports");
+    SetLastError(0);
+    if (!packaged(L"testshim.dll", 1) && GetLastError() == ERROR_INVALID_PARAMETER)
+        pass("packaged loader rejects reserved flags");
+    else failed("packaged loader rejects reserved flags", "wrong result or error");
+    HMODULE expected = load(L"testshim.dll");
+    if (expected && packaged(L"testshim.dll", 0) == expected) pass("packaged loader returns owned shim");
+    else failed("packaged loader returns owned shim", "wrong handle");
+    auto game = g_dir / L"dll_game";
+    auto overlay = g_dir / L"dll_overlay";
+    std::filesystem::create_directories(game / L"x");
+    rt::fs::configure(game, overlay);
+    auto cookie = add(L"GAME:\\x");
+    if (cookie && remove(cookie) && !remove(cookie)) pass("console DLL directory round trip");
+    else failed("console DLL directory round trip", "add or remove failed");
+    cookie = add(game.c_str());
+    if (cookie && remove(cookie)) pass("host DLL directory round trip");
+    else failed("host DLL directory round trip", "add or remove failed");
+    SetLastError(0);
+    if (!add(L"GAME:\\..\\escape") && GetLastError() == ERROR_INVALID_NAME)
+        pass("console DLL directory refuses traversal");
+    else failed("console DLL directory refuses traversal", "wrong result or error");
+}
+
 void test_export_bounds() {
     auto outside = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
     nt_of(outside)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
@@ -1329,6 +1366,7 @@ int main() {
             std::filesystem::remove_all(g_dir, ec);
             return 1;
         }
+        test_packaged_loader_directories();
         test_valid_image();
         test_entry_bounds();
         test_header_bounds();

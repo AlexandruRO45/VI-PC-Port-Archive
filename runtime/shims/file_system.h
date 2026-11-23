@@ -16,7 +16,9 @@
 // CopyFile*/CopyFileEx*/CopyFile2 and SetFileAttributes* (the rules for each are in docs/runtime_imports.md).
 #pragma once
 
+#include <windows.h>
 #include <filesystem>
+#include <string>
 
 namespace rt::fs {
 
@@ -28,6 +30,8 @@ void configure(const std::filesystem::path& game_dir, const std::filesystem::pat
 
 std::filesystem::path game_dir();
 std::filesystem::path overlay_dir();
+
+bool resolve_read_path(const std::wstring& path, std::filesystem::path& out, DWORD& error);
 
 // For tests: true makes the CopyFile2 shim use its CopyFileExW fallback even where the host has CopyFile2, so the
 // path Wine 9 takes can be checked on Windows. Off by default; main.cpp never sets it.

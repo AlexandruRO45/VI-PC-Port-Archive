@@ -365,6 +365,18 @@ Target read_target(const std::wstring& path) {
     return t;
 }
 
+}  // namespace
+
+bool resolve_read_path(const std::wstring& path, std::filesystem::path& out, DWORD& error) {
+    const Target target = read_target(path);
+    error = target.error;
+    if (error) return false;
+    out = target.path;
+    return true;
+}
+
+namespace {
+
 Target write_target(const std::wstring& path, bool copy_up) {
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(path, parts);
