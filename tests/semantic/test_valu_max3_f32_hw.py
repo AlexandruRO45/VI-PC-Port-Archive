@@ -428,5 +428,24 @@ class TestNanAndModifiers(unittest.TestCase):
         spv2 = support.translate_lines("ps_max3_clamp_lo", prog2)
         self.assertEqual(support.mrt0_words(spv2)[0], 0x00000000)   # 0.0f
 
+class TestNegativeRejection(unittest.TestCase):
+    """Negative controls and syntax error rejection validation."""
+
+    def test_missing_operand_rejected(self):
+        prog = [
+            "v_max3_f32 v0, v1, v2",
+            "s_endpgm",
+        ]
+        with self.assertRaises((ValueError, rdna2spirv.Unsupported)):
+            support.translate_lines("ps_max3_missing_op", prog)
+
+    def test_unsupported_64bit_register_rejected(self):
+        prog = [
+            "v_max3_f32 v0, v[1:2], v3, v4",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_max3_64bit", prog)
+
 if __name__ == "__main__":
     unittest.main()
