@@ -402,6 +402,21 @@ class TestSOrn2B32Oracle(unittest.TestCase):
         res, scc = ref_s_orn2_b32(0, 0)
         self.assertEqual(scc, 1 if res != 0 else 0)
 
+class TestSOrn2B32ASTAndInterpreter(unittest.TestCase):
+    def test_ast_disasm(self) -> None:
+        inst = ASTInstruction(Opcode.S_ORN2_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
+        self.assertEqual(inst.disasm(), "s_orn2_b32 s0, s1, s2")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_sgpr(1, 0x12345678)
+        state.write_sgpr(2, 0x0F0F0F0F)
+        inst = ASTInstruction(Opcode.S_ORN2_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
+        res, scc = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0xf2f4f6f8)
+        self.assertEqual(state.sgprs[0], 0xf2f4f6f8)
+        self.assertEqual(state.scc, scc)
+
 
 if __name__ == "__main__":
     unittest.main()
