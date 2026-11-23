@@ -1026,6 +1026,9 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
+    const DWORD attributes = ::GetFileAttributesW(join(v.in_overlay ? r.overlay : r.game, parts).c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY) != 0)
+        return fail_bool(ERROR_ACCESS_DENIED);
     if (!empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
 
     if (v.in_overlay && !::RemoveDirectoryW(join(r.overlay, parts).c_str())) return FALSE;  // its error

@@ -765,6 +765,39 @@ void run_checks(const std::filesystem::path& root) {
               "and the old name is deleted");
     }
 
+    // A read-only folder is not removed, empty or not, the way the host's RemoveDirectoryW refuses it.
+    {
+        const std::filesystem::path host = root / "host_readonly";
+        std::filesystem::create_directories(host / "empty");
+        write_path(host / "full" / "a.txt", "a");
+        write_path(host / "made" / "a.txt", "a");
+        std::filesystem::create_directories(package / "readonly" / "empty");
+        write_path(package / "readonly" / "full" / "a.txt", "a");
+        check(mkdir_w(L"GAME:\\readonly\\made", nullptr) != FALSE, "an overlay folder to make read-only");
+        HANDLE h = create_w(L"GAME:\\readonly\\made\\a.txt", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "with a file in it");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const std::filesystem::path read_only[] = {host / "empty", host / "full", host / "made",
+                                                   package / "readonly" / "empty", package / "readonly" / "full"};
+        for (const auto& folder : read_only) ::SetFileAttributesW(folder.c_str(), FILE_ATTRIBUTE_READONLY);
+        check(setattr_w(L"GAME:\\readonly\\made", FILE_ATTRIBUTE_READONLY) != FALSE,
+              "SetFileAttributesW makes the overlay folder read-only");
+        for (const wchar_t* name : {L"empty", L"full", L"made"}) {
+            SetLastError(0);
+            const DWORD host_error = ::RemoveDirectoryW((host / name).c_str()) ? 0 : GetLastError();
+            const std::wstring game = L"GAME:\\readonly\\" + std::wstring(name);
+            SetLastError(0);
+            const DWORD game_error = rmdir_w(game.c_str()) ? 0 : GetLastError();
+            char what[160];
+            std::snprintf(what, sizeof what,
+                          "RemoveDirectoryW of the read-only folder %ls fails as on the host (%lu, GAME: %lu)", name,
+                          host_error, game_error);
+            check(game_error == host_error, what);
+        }
+        for (const auto& folder : read_only) ::SetFileAttributesW(folder.c_str(), FILE_ATTRIBUTE_NORMAL);
+        ::SetFileAttributesW((overlay / "readonly" / "made").c_str(), FILE_ATTRIBUTE_NORMAL);
+    }
+
     // CopyFile: reads where a read would, writes the overlay; an existing name counts even if only the package has it.
     {
         check(copy_w(L"GAME:\\misc\\keep.txt", L"GAME:\\cache\\keep_copy.txt", TRUE) != FALSE &&
