@@ -323,5 +323,24 @@ class TestVPkMaxU16ConditionCodes(unittest.TestCase):
         self.assertEqual(scc, scc_initial)
 
 
+class TestVPkMaxU16IEEE754(unittest.TestCase):
+    """IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_float16_bitcast_interpretation(self):
+        # Float16 values treated as raw unsigned 16-bit integers
+        # +0.0 = 0x0000, -0.0 = 0x8000 (sign bit set)
+        # In uint16 comparison, 0x8000 (32768) > 0x0000 (0)
+        pos_zero = 0x0000
+        neg_zero = 0x8000
+        self.assertEqual(ref_pk_max_u16(P(pos_zero, pos_zero), P(neg_zero, neg_zero)), P(neg_zero, neg_zero))
+
+    def test_nan_and_inf_payload_preservation(self):
+        # Float16 +inf = 0x7C00 (31744), NaN = 0x7E00 (32256)
+        # 0x7E00 > 0x7C00 in unsigned uint16 comparison
+        pos_inf = 0x7C00
+        qnan = 0x7E00
+        self.assertEqual(ref_pk_max_u16(P(pos_inf, pos_inf), P(qnan, qnan)), P(qnan, qnan))
+
+
 if __name__ == '__main__':
     unittest.main()
