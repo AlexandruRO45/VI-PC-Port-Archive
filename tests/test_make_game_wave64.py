@@ -112,6 +112,54 @@ ALL = ["SHADER_STAGE_FRAGMENT_BIT", "SHADER_STAGE_COMPUTE_BIT", "SHADER_STAGE_TA
        "SHADER_STAGE_MESH_BIT_EXT"]
 
 
+def typed(device_type, name, size):
+    """One device in vulkaninfo's text order: deviceType is printed just above deviceName."""
+    return (f"VkPhysicalDeviceProperties:\n\tdeviceType        = PHYSICAL_DEVICE_TYPE_{device_type}\n"
+            + REAL_FORMAT_BLOCK.split("\n", 1)[1].format(name=name, size=size, n=len(ALL),
+                                                         stages="\n".join("\t\t" + x for x in ALL)))
+
+
+class CpuDeviceTest(unittest.TestCase):
+    """Mesa's llvmpipe (lavapipe) is a CPU Vulkan device with maxSubgroupSize 8. Installed next to a GPU driver, it
+    must not turn emulation on for a GPU with 64-wide subgroups."""
+
+    def test_a_cpu_device_next_to_a_gpu_is_left_out(self):
+        for order in ((("DISCRETE_GPU", "RX 7800 XT", 64), ("CPU", "llvmpipe", 8)),
+                      (("CPU", "llvmpipe", 8), ("DISCRETE_GPU", "RX 7800 XT", 64))):
+            text = "\n".join(typed(*device) for device in order)
+            self.assertEqual(make_game.smallest_max_subgroup(text), 64)
+
+    def test_the_smallest_gpu_still_counts(self):
+        text = "\n".join(typed(*d) for d in (("DISCRETE_GPU", "Big GPU", 64), ("CPU", "llvmpipe", 8),
+                                             ("INTEGRATED_GPU", "Small GPU", 32)))
+        self.assertEqual(make_game.smallest_max_subgroup(text), 32)
+
+    def test_only_cpu_devices_still_count(self):
+        self.assertEqual(make_game.smallest_max_subgroup(typed("CPU", "llvmpipe", 8)), 8)
+
+    def test_a_cpu_device_without_a_size_does_not_make_the_answer_unknown(self):
+        text = typed("DISCRETE_GPU", "Big GPU", 64) + \
+            "VkPhysicalDeviceProperties:\n\tdeviceType        = PHYSICAL_DEVICE_TYPE_CPU\n\tdeviceName        = llvmpipe\n"
+        self.assertEqual(make_game.smallest_max_subgroup(text), 64)
+
+    def test_json_device_types(self):
+        for cpu in ('"VK_PHYSICAL_DEVICE_TYPE_CPU"', '"PHYSICAL_DEVICE_TYPE_CPU"', "4"):
+            text = ('{"devices": [\n'
+                    '\t{"VkPhysicalDeviceProperties": {\n\t\t"deviceName": "RX 7800 XT",\n\t\t"deviceType": 2},\n'
+                    '\t "VkPhysicalDeviceSubgroupSizeControlProperties": {\n\t\t"maxSubgroupSize": 64}},\n'
+                    '\t{"VkPhysicalDeviceProperties": {\n\t\t"deviceName": "llvmpipe",\n\t\t"deviceType": ' + cpu
+                    + '},\n\t "VkPhysicalDeviceSubgroupSizeControlProperties": {\n\t\t"maxSubgroupSize": 8}}]}')
+            self.assertEqual(make_game.smallest_max_subgroup(text), 64, cpu)
+
+    def test_auto_leaves_emulation_off_for_the_gpu(self):
+        text = "\n".join(typed(*d) for d in (("DISCRETE_GPU", "RX 7800 XT", 64), ("CPU", "llvmpipe", 8)))
+        with mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                mock.patch.object(make_game.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess(["vulkaninfo"], 0, stdout=text, stderr="")), \
+                mock.patch.object(make_game, "log"):
+            self.assertEqual(make_game.wave64_settings("auto")[0], False)
+
+
 class DetectionGapsTest(unittest.TestCase):
     """Where auto's detection is less strict than vk_pipeline_check's can_require_sg, native shaders would run
     inexact without any error."""

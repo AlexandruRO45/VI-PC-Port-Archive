@@ -1561,7 +1561,11 @@ def keep_recorded_fallback(flag: str, work: str) -> bool:
 
 
 def smallest_max_subgroup(vulkaninfo_text: str):
-    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
+    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None.
+
+    A CPU device (Mesa's llvmpipe/lavapipe, maxSubgroupSize 8) is left out when a GPU is listed too: some
+    distributions install it next to the GPU driver, and the build is for the GPU, so counting it turned emulation on
+    for a GPU with native 64-wide subgroups. When every device is a CPU one, they count as before."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
     # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
     # MoltenVK's Metal device, in both the text and the --json output) belong to the device above them.
@@ -1571,15 +1575,26 @@ def smallest_max_subgroup(vulkaninfo_text: str):
     if not starts:
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
         return min(sizes) if sizes else None
+    # A device's type sits next to its name in the same properties block (just above it in the text output), so a
+    # CPU type line belongs to the nearest device name at the same depth. Text: PHYSICAL_DEVICE_TYPE_CPU; --json: the
+    # enum name with or without VK_, or its value 4.
+    cpu_type = r'(?m)^([ \t]*)"?deviceType"?\s*[=:]\s*"?(?:(?:VK_)?PHYSICAL_DEVICE_TYPE_CPU\b|4\b)'
+    cpu = {min(range(len(starts)), key=lambda k: abs(starts[k] - m.start()))
+           for m in re.finditer(cpu_type, vulkaninfo_text) if len(m.group(1)) == depth}
     # One section per device (a 1.3 device can print the size twice, in two property structs): one value each,
-    # and a device that prints none makes the answer unknown rather than being left out of the smallest.
-    per_device = []
-    for a, b in zip(starts, starts[1:] + [len(vulkaninfo_text)]):
+    # and a GPU that prints none makes the answer unknown rather than being left out of the smallest.
+    gpus, cpus = [], []
+    for k, (a, b) in enumerate(zip(starts, starts[1:] + [len(vulkaninfo_text)])):
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text[a:b])]
-        if not sizes:
+        if k in cpu:
+            if sizes:
+                cpus.append(min(sizes))
+        elif sizes:
+            gpus.append(min(sizes))
+        else:
             return None
-        per_device.append(min(sizes))
-    return min(per_device)
+    smallest = gpus or cpus
+    return min(smallest) if smallest else None
 
 
 def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
