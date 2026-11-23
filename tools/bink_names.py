@@ -391,7 +391,9 @@ def main(argv=None):
     try:
         names = read_mount_lists(a.mount)
     except (OSError, ValueError) as error:
-        print(f"bink_names: error: {error}", file=sys.stderr)
+        where = getattr(error, "filename", None)
+        detail = getattr(error, "strerror", None) or error
+        print(f"bink_names: error: {where + ': ' if where else ''}{detail}", file=sys.stderr)
         return 1
     try:
         streams = load_streams(a.source, skip_report=a.out if a.out and os.path.isfile(a.out) else None)

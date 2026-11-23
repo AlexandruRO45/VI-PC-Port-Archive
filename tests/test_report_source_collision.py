@@ -109,7 +109,7 @@ class ReportSourceCollisionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             src = os.path.join(folder, "x.bk2")
             out = os.path.join(folder, "index.csv")
-            contents = make_bink()
+            contents = make_rpf(b"no stream in this archive")
             with open(src, "wb") as fh:
                 fh.write(contents)
             result = self.run_tool("bink_index.py", [src, "--out", out])

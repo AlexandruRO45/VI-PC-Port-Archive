@@ -40,6 +40,8 @@ import sys
 import tempfile
 
 SIG = re.compile(rb"KB2[a-z]")
+# One wording for the rejection, so the CLI and target_problem() cannot drift apart.
+NOT_BINK = "not a Bink 2 stream (KB2) or an RPF archive"
 HDR = 0x2C
 MAX_FRAMES = 1_000_000
 MAX_WIDTH = 7680
@@ -344,7 +346,7 @@ def target_problem(path):
     if not head:
         return "empty file"
     if head[1:4] != b"FPR" and not SIG.match(head):
-        return "not a Bink 2 stream (KB2) or an RPF archive"
+        return NOT_BINK
     return None
 
 
@@ -396,7 +398,7 @@ def main(argv=None):
     if not rows and not os.path.isdir(a.target) and not is_rpf_archive(a.target):
         # A named file with no Bink 2 stream and no RPF header is a wrong path or
         # format, not an empty index; a directory scan still reports 0 streams.
-        print(f"bink_index: error: {a.target}: not a Bink 2 stream or an RPF archive", file=sys.stderr)
+        print(f"bink_index: error: {a.target}: {NOT_BINK}", file=sys.stderr)
         return 2
     probe = False
     if a.probe:

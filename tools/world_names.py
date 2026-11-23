@@ -671,7 +671,9 @@ def main(argv=None) -> int:
     try:
         return args.func(args)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        where = getattr(exc, "filename", None)
+        detail = getattr(exc, "strerror", None) or exc
+        print(f"ERROR: {where + ': ' if where else ''}{detail}", file=sys.stderr)
         return 1
 
 
