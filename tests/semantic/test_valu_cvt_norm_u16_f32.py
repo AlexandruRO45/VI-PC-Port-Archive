@@ -852,5 +852,191 @@ class TestValuCvtNormU16F32Aliasing(unittest.TestCase):
         self.assertEqual(self.interp.get_vgpr_half(0, False), 65535)
         self.assertEqual(self.interp.get_vgpr_u32(0), (32768 << 16) | 65535)
 
+
+# ---------------------------------------------------------------------------
+# Condition codes, status flags, and carry/borrow generation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FPStatusFlags:
+    """IEEE 754 floating-point status exception flags."""
+    invalid: bool = False
+    div_by_zero: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+
+    def merge(self, other: FPStatusFlags) -> None:
+        self.invalid |= other.invalid
+        self.div_by_zero |= other.div_by_zero
+        self.overflow |= other.overflow
+        self.underflow |= other.underflow
+        self.inexact |= other.inexact
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "invalid": self.invalid,
+            "div_by_zero": self.div_by_zero,
+            "overflow": self.overflow,
+            "underflow": self.underflow,
+            "inexact": self.inexact,
+        }
+
+
+@dataclass
+class IntConditionCodes:
+    """Condition codes and carry/borrow generation for 16-bit unsigned integer result."""
+    zero: bool = False
+    max_pos: bool = False
+    overflow: bool = False
+    carry: bool = False
+    borrow: bool = False
+
+
+def calc_cvt_norm_status_flags(src0_bits: int, res_bits: int) -> FPStatusFlags:
+    """Calculate IEEE 754 exception flags for v_cvt_norm_u16_f32 conversion."""
+    flags = FPStatusFlags()
+    s0 = src0_bits & MASK32
+
+    # NaNs set invalid flag
+    if is_nan_f32(s0):
+        flags.invalid = True
+        return flags
+
+    # Infinities set overflow and inexact
+    if is_inf_f32(s0):
+        flags.overflow = True
+        flags.inexact = True
+        return flags
+
+    if is_zero_f32(s0):
+        return flags
+
+    val_f = bits_to_f32(s0)
+    # Range check: input outside [0.0, 1.0] sets overflow & inexact
+    if val_f > 1.0 or val_f < 0.0:
+        flags.overflow = True
+        flags.inexact = True
+        return flags
+
+    # Underflow: non-zero input float rounded to zero
+    if (res_bits & MASK16) == 0 and not is_zero_f32(s0):
+        flags.underflow = True
+        flags.inexact = True
+        return flags
+
+    # Inexact check: if val_f * 65535.0 has fractional part
+    scaled = val_f * UNORM16_SCALE
+    if scaled != float(int(round(scaled))):
+        flags.inexact = True
+
+    return flags
+
+
+def calc_cvt_norm_condition_codes(src0_bits: int, res_bits: int) -> IntConditionCodes:
+    """Calculate integer condition codes and boundary carry/borrow flags."""
+    is_zero = (res_bits & MASK16) == 0
+    is_max = (res_bits & MASK16) == UNORM16_MAX
+
+    s0 = src0_bits & MASK32
+    overflow = False
+    carry = False
+    borrow = False
+
+    if is_nan_f32(s0):
+        pass
+    elif is_inf_f32(s0):
+        overflow = True
+        if not (s0 & SIGN_MASK_F32):
+            carry = True
+        else:
+            borrow = True
+    else:
+        val_f = bits_to_f32(s0)
+        if val_f > 1.0:
+            overflow = True
+            carry = True
+        elif val_f < 0.0:
+            overflow = True
+            borrow = True
+
+    return IntConditionCodes(
+        zero=is_zero,
+        max_pos=is_max,
+        overflow=overflow,
+        carry=carry,
+        borrow=borrow,
+    )
+
+
+class TestValuCvtNormU16F32StatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow generation."""
+
+    def test_invalid_flag_on_nans(self) -> None:
+        flags_qnan = calc_cvt_norm_status_flags(QNAN_F32, 0)
+        self.assertTrue(flags_qnan.invalid)
+        self.assertFalse(flags_qnan.overflow)
+
+        flags_snan = calc_cvt_norm_status_flags(SNAN_F32, 0)
+        self.assertTrue(flags_snan.invalid)
+
+    def test_overflow_and_inexact_on_out_of_range(self) -> None:
+        flags_pos = calc_cvt_norm_status_flags(TWO_F32, 65535)
+        self.assertTrue(flags_pos.overflow)
+        self.assertTrue(flags_pos.inexact)
+        self.assertFalse(flags_pos.invalid)
+
+        flags_neg = calc_cvt_norm_status_flags(NEG_TWO_F32, 0)
+        self.assertTrue(flags_neg.overflow)
+        self.assertTrue(flags_neg.inexact)
+
+        flags_inf = calc_cvt_norm_status_flags(POS_INF_F32, 65535)
+        self.assertTrue(flags_inf.overflow)
+        self.assertTrue(flags_inf.inexact)
+
+    def test_inexact_flag_on_fractional_scaled(self) -> None:
+        # 0.3f
+        bits_0_3 = f32_to_bits(0.3)
+        res = oracle_v_cvt_norm_u16_f32(bits_0_3)
+        flags = calc_cvt_norm_status_flags(bits_0_3, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.overflow)
+
+    def test_exact_conversions_no_flags(self) -> None:
+        # 0.0 -> 0 (exact)
+        flags_zero = calc_cvt_norm_status_flags(POS_ZERO_F32, 0)
+        self.assertEqual(flags_zero.to_dict(), {
+            "invalid": False, "div_by_zero": False, "overflow": False, "underflow": False, "inexact": False
+        })
+
+        # 1.0 -> 65535 (exact)
+        flags_one = calc_cvt_norm_status_flags(ONE_F32, 65535)
+        self.assertFalse(flags_one.overflow)
+        self.assertFalse(flags_one.inexact)
+
+    def test_condition_codes_zero_and_max(self) -> None:
+        cc_zero = calc_cvt_norm_condition_codes(POS_ZERO_F32, 0)
+        self.assertTrue(cc_zero.zero)
+        self.assertFalse(cc_zero.max_pos)
+
+        cc_max = calc_cvt_norm_condition_codes(ONE_F32, 65535)
+        self.assertFalse(cc_max.zero)
+        self.assertTrue(cc_max.max_pos)
+
+    def test_condition_codes_saturation_and_carry_borrow(self) -> None:
+        # +2.0 clamps to +1.0: sets max_pos, overflow, carry
+        cc_pos = calc_cvt_norm_condition_codes(TWO_F32, 65535)
+        self.assertTrue(cc_pos.max_pos)
+        self.assertTrue(cc_pos.overflow)
+        self.assertTrue(cc_pos.carry)
+        self.assertFalse(cc_pos.borrow)
+
+        # -2.0 clamps to 0: sets zero, overflow, borrow
+        cc_neg = calc_cvt_norm_condition_codes(NEG_TWO_F32, 0)
+        self.assertTrue(cc_neg.zero)
+        self.assertTrue(cc_neg.overflow)
+        self.assertTrue(cc_neg.borrow)
+        self.assertFalse(cc_neg.carry)
+
 if __name__ == "__main__":
     unittest.main()
