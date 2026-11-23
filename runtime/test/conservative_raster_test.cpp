@@ -43,6 +43,15 @@ int main() {
     const std::uint32_t ordinary[] = {0x07230203, 0x00010500, 0, 2, 0, (2u << 16) | 17, 1};
     const auto regular = inner_coverage_requirements(ordinary);
     check(regular.valid && !regular.fully_covered && !regular.post_depth);
+    using leonida::conservative_raster::graphics_state_allowed;
+    check(graphics_state_allowed(true, true, false));
+    check(!graphics_state_allowed(true, false, false));
+    check(!graphics_state_allowed(false, true, false));
+    check(!graphics_state_allowed(false, false, false));
+    check(graphics_state_allowed(true, false, true));
+    check(graphics_state_allowed(true, true, true));
+    check(!graphics_state_allowed(false, true, true));
+    check(!graphics_state_allowed(false, false, true));
     if (failures) std::fprintf(stderr, "conservative raster capability checks: %u failures\n", failures);
     else std::puts("conservative raster: enabled extension, precision and uncertainty bounds checked");
     return failures ? 1 : 0;

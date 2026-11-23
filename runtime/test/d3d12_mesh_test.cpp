@@ -1,11 +1,13 @@
 // D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh, through the Xbox-ABI proxy over the Vulkan
 // device (docs/d3d12_vulkan.md section 5, "Pipelines").
-//   - A device without VK_EXT_mesh_shader reports D3D12_MESH_SHADER_TIER_NOT_SUPPORTED and refuses a mesh PSO with
-//     E_NOTIMPL; that part runs on every GPU. The rest needs the extension (exit 77 without it).
-//   - With it: MeshShaderTier 1; CreatePipelineState builds an MS + PS PSO and a VS + PS PSO from streams laid out as
-//     d3dx12.h lays them out (each subobject a type and its description, pointer-aligned); streams the PC runtime
-//     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
-//     state not built yet (an amplification shader, a depth-bounds test) is E_NOTIMPL.
+//   - On every Vulkan 1.3 GPU (even without VK_EXT_mesh_shader): a device without the extension reports
+//     D3D12_MESH_SHADER_TIER_NOT_SUPPORTED and refuses a mesh PSO with E_NOTIMPL; non-mesh CreatePipelineState
+//     streams (all 9 E_INVALIDARG validation cases, 4 versioned depth-stencil/rasterizer subobjects, AS and
+//     depth-bounds E_NOTIMPL, conservative-raster mesh/non-mesh checks, and a VS + PS stream PSO draw/readback) run
+//     before skipping the mesh-draw checks (exit 77).
+//   - With VK_EXT_mesh_shader: MeshShaderTier 1; CreatePipelineState builds an MS + PS PSO (including with
+//     ConservativeRaster = ON without a topology subobject, and with a PS declaring f16_halves) and a VS + PS PSO
+//     from streams laid out as d3dx12.h lays them out.
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
 //     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
 //     Y and Z counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
@@ -18,6 +20,7 @@
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/conservative_raster.h"
 #include "../src/shader_library.h"
 
 #include <array>
@@ -93,6 +96,13 @@ D3D12_MESH_SHADER_TIER mesh_tier(ID3D12Device* device) {
     return options.MeshShaderTier;
 }
 
+D3D12_CONSERVATIVE_RASTERIZATION_TIER conservative_raster_tier(ID3D12Device* device) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))))
+        return D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+    return options.ConservativeRasterizationTier;
+}
+
 }  // namespace
 
 int main() {
@@ -107,13 +117,16 @@ int main() {
 
     const auto ms_program = fssm_program({0x4d530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
+    const auto ps_f16_program = fssm_program({0x50530002, 0xbf810000});
     const auto vs_program = fssm_program({0x56530002, 0xbf810000});
     const auto ms_container = shader_container(ms_program), ps_container = shader_container(ps_program);
-    const auto vs_container = shader_container(vs_program);
+    const auto ps_f16_container = shader_container(ps_f16_program), vs_container = shader_container(vs_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw_f16.spv",
+                               std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
@@ -124,7 +137,10 @@ int main() {
                  " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
                  " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
+                 " \"ps_draw_f16\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_f16_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
+                 "\"f16_halves\": {\"0\": [28, 29]}}}";
     }
 
     const auto device_info = [&](bool mesh) {
@@ -138,6 +154,7 @@ int main() {
         info.buffer_device_address = true;
         info.shader_dir = library.string();
         info.mesh_shader = mesh;
+        info.conservative_rasterization = d.conservative_rasterization;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
         return info;
     };
@@ -166,30 +183,244 @@ int main() {
     };
     const D3D12_SHADER_BYTECODE ms{ms_container.data(), ms_container.size()};
     const D3D12_SHADER_BYTECODE ps{ps_container.data(), ps_container.size()};
+    const D3D12_SHADER_BYTECODE ps_f16{ps_f16_container.data(), ps_f16_container.size()};
     const D3D12_SHADER_BYTECODE vs{vs_container.data(), vs_container.size()};
 
-    // Without the extension: no tier, and a mesh PSO is refused as not implemented.
+    const D3D12_DEPTH_STENCIL_DESC depth{FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS};
+    const D3D12_DEPTH_STENCIL_DESC1 depth1{FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS};
+    D3D12_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D12_FILL_MODE_SOLID;
+    raster.CullMode = D3D12_CULL_MODE_NONE;
+    raster.DepthClipEnable = TRUE;  // D3D12's default; depth clamping is not built
+    D3D12_RASTERIZER_DESC2 raster2{};
+    raster2.FillMode = D3D12_FILL_MODE_SOLID;
+    raster2.CullMode = D3D12_CULL_MODE_NONE;
+    raster2.DepthClipEnable = TRUE;  // D3D12's default; depth clamping is not built
+
+    constexpr UINT size = 64;
+
+    // Unit check for conservative rasterization state rules on mesh vs non-mesh PSOs (runs on every GPU).
+    EXPECT(leonida::conservative_raster::graphics_state_allowed(true, true, false));
+    EXPECT(!leonida::conservative_raster::graphics_state_allowed(true, false, false));
+    EXPECT(!leonida::conservative_raster::graphics_state_allowed(false, true, false));
+    EXPECT(leonida::conservative_raster::graphics_state_allowed(true, false, true));
+    EXPECT(leonida::conservative_raster::graphics_state_allowed(true, true, true));
+    EXPECT(!leonida::conservative_raster::graphics_state_allowed(false, false, true));
+
+    // Without VK_EXT_mesh_shader: no mesh tier and mesh PSOs return E_NOTIMPL, while non-mesh CreatePipelineState
+    // stream validation, versioned subobjects, conservative-raster checks and a VS+PS stream PSO draw/readback all
+    // run on every Vulkan 1.3 GPU (including non-mesh hardware such as Pascal).
     {
         Ref<ID3D12Device> device;
         Ref<ID3D12RootSignature> root;
         EXPECT(make_device(false, device));
         EXPECT(root_signature(device.p, root));
         EXPECT(mesh_tier(device.p) == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED);
-        Stream stream;
-        stream.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms}).add(PsSubobject{.inner = ps});
-        stream.add(TargetsSubobject{.inner = one_target()});
-        Ref<ID3D12PipelineState> pso;
-        EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
+        Stream mesh_only;
+        mesh_only.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms}).add(PsSubobject{.inner = ps});
+        mesh_only.add(TargetsSubobject{.inner = one_target()});
+        Ref<ID3D12PipelineState> refused;
+        EXPECT(create(device.p, mesh_only, refused) == E_NOTIMPL && !refused.p);
+
+        Stream vs_stream;
+        vs_stream.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
+        vs_stream.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
+        vs_stream.add(TargetsSubobject{.inner = one_target()});
+        Ref<ID3D12PipelineState> vs_pso;
+        EXPECT(SUCCEEDED(create(device.p, vs_stream, vs_pso)));
+
+        // Streams the PC runtime refuses (9 E_INVALIDARG cases).
+        Stream bad = vs_stream;
+        bad.add(MsSubobject{.inner = ms});  // a mesh shader and a vertex shader
+        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        bad = vs_stream;
+        bad.add(PsSubobject{.inner = ps});  // the same subobject twice
+        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        bad = vs_stream;
+        bad.add(CsSubobject{.inner = ps});  // compute with graphics stages
+        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        EXPECT(create(device.p, vs_stream, refused, 4) == E_INVALIDARG && !refused.p);  // truncated
+        bad = vs_stream;
+        bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), UINT>{.inner = 0});  // 23 is no subobject type
+        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        Stream empty;
+        EXPECT(create(device.p, empty.add(MaskSubobject{.inner = UINT_MAX}), refused) == E_INVALIDARG && !refused.p);
+        for (int order = 0; order < 2; ++order) {
+            bad = vs_stream;
+            if (order == 0) bad.add(DepthStencilSubobject{.inner = depth}).add(DepthStencil1Subobject{.inner = depth1});
+            else bad.add(DepthStencil1Subobject{.inner = depth1}).add(DepthStencilSubobject{.inner = depth});
+            EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        }
+        bad = vs_stream;
+        bad.add(RasterizerSubobject{.inner = raster}).add(Rasterizer2Subobject{.inner = raster2});
+        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        for (int which = 0; which < 4; ++which) {
+            Stream one = vs_stream;
+            if (which == 0) one.add(DepthStencilSubobject{.inner = depth});
+            if (which == 1) one.add(DepthStencil1Subobject{.inner = depth1});
+            if (which == 2) one.add(RasterizerSubobject{.inner = raster});
+            if (which == 3) one.add(Rasterizer2Subobject{.inner = raster2});
+            Ref<ID3D12PipelineState> accepted;
+            const HRESULT one_hr = create(device.p, one, accepted);
+            if (FAILED(one_hr)) std::fprintf(stderr, "non-mesh single subobject %d: 0x%08lx\n", which, static_cast<unsigned long>(one_hr));
+            EXPECT(SUCCEEDED(one_hr));
+        }
+        // State the layer does not build yet (2 E_NOTIMPL cases).
+        bad = vs_stream;
+        bad.add(AsSubobject{.inner = vs});
+        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        bad = vs_stream;
+        D3D12_DEPTH_STENCIL_DESC1 bounds{};
+        bounds.DepthBoundsTestEnable = TRUE;
+        bad.add(DepthStencil1Subobject{.inner = bounds});
+        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+
+        // Conservative rasterization on non-mesh streams: solid + triangle succeeds, non-triangle or wireframe fails.
+        if (conservative_raster_tier(device.p) != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED) {
+            D3D12_RASTERIZER_DESC conservative = raster;
+            conservative.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+            Stream cr_ok = vs_stream;
+            cr_ok.add(RasterizerSubobject{.inner = conservative});
+            Ref<ID3D12PipelineState> accepted;
+            EXPECT(SUCCEEDED(create(device.p, cr_ok, accepted)));
+
+            Stream cr_line;
+            cr_line.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
+            cr_line.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE});
+            cr_line.add(TargetsSubobject{.inner = one_target()});
+            cr_line.add(RasterizerSubobject{.inner = conservative});
+            EXPECT(create(device.p, cr_line, refused) == E_INVALIDARG && !refused.p);
+
+            D3D12_RASTERIZER_DESC conservative_wire = conservative;
+            conservative_wire.FillMode = D3D12_FILL_MODE_WIREFRAME;
+            Stream cr_wire = vs_stream;
+            cr_wire.add(RasterizerSubobject{.inner = conservative_wire});
+            EXPECT(create(device.p, cr_wire, refused) == E_INVALIDARG && !refused.p);
+        }
+
+        // VS+PS stream PSO draw and readback: blue clear, yellow triangle in the bottom-left quadrant.
+        const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+        const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+        Ref<ID3D12Resource> upload, readback, target;
+        const auto upload_desc = buffer_desc(4096);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         IID_PPV_ARGS(&upload.p))));
+        const auto readback_desc = buffer_desc(size * 256);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&readback.p))));
+        D3D12_RESOURCE_DESC rt_desc{};
+        rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rt_desc.Width = rt_desc.Height = size;
+        rt_desc.DepthOrArraySize = 1;
+        rt_desc.MipLevels = 1;
+        rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt_desc.SampleDesc.Count = 1;
+        rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p))));
+        const float white_tint[3] = {1, 1, 1};
+        std::uint8_t* up = nullptr;
+        EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
+        std::memcpy(up, white_tint, sizeof(white_tint));
+        const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
+
+        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        Ref<ID3D12DescriptorHeap> rtv_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv{
+            SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(rtv_heap.p, 9))(rtv_heap.p))};
+        device->CreateRenderTargetView(target.p, nullptr, rtv);
+
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        Ref<ID3D12CommandQueue> queue;
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        Ref<ID3D12Fence> fence;
+        EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, vs_pso.p,
+                                                   IID_PPV_ARGS(&list.p))));
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+        D3D12_RESOURCE_BARRIER to_target =
+            transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &to_target);
+        const FLOAT blue[4] = {0, 0, 1, 1};
+        list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+        list->SetGraphicsRootSignature(root.p);
+        const D3D12_VIEWPORT bottom_left{0, float(size / 2), float(size / 2), float(size / 2), 0, 1};
+        const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
+        list->RSSetViewports(1, &bottom_left);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        const float origin[2] = {0, 0};
+        list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+        list->SetGraphicsRootConstantBufferView(1, upload_va);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+
+        D3D12_RESOURCE_BARRIER to_copy =
+            transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &to_copy);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = readback.p;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, size, size, 1, 256}};
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = target.p;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+
+        std::vector<std::uint8_t> vs_pixels(size * 256);
+        void* mapped = nullptr;
+        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        std::memcpy(vs_pixels.data(), mapped, vs_pixels.size());
+        unsigned vs_mismatches = 0;
+        for (UINT row = 0; row < size; ++row) {
+            for (UINT col = 0; col < size; ++col) {
+                const bool want_yellow = row >= size / 2 && col < size / 2;
+                using Pixel = std::array<std::uint8_t, 4>;
+                const Pixel want = want_yellow ? Pixel{255, 255, 0, 255} : Pixel{0, 0, 255, 255};
+                const std::uint8_t* got = vs_pixels.data() + row * 256 + col * 4;
+                if (std::equal(want.begin(), want.end(), got)) continue;
+                if (vs_mismatches++ < 6)
+                    std::fprintf(stderr, "VS stream pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                                 got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+            }
+        }
+        EXPECT(!vs_mismatches);
+
+        for (auto* r : {&upload, &readback, &target}) r->reset();
+        for (auto* p : {&vs_pso, &refused}) p->reset();
         root.reset();
+        rtv_heap.reset();
+        list.reset();
+        allocator.reset();
+        queue.reset();
+        fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
     if (!d.mesh_shader) {
         std::filesystem::remove_all(library);
-        std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
+        if (d.validation_errors()) {
+            std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+            return 1;
+        }
+        std::printf("D3D-29 (no VK_EXT_mesh_shader): mesh PSO refused as E_NOTIMPL; non-mesh CreatePipelineState "
+                    "streams (9 invalid, 2 not implemented, 4 versioned subobjects) and VS stream PSO draw matched all "
+                    "%u pixels; skipping mesh-draw checks\n",
+                    size * size);
         return 77;
     }
 
-    constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256);
     {
         Ref<ID3D12Device> device;
@@ -211,43 +442,9 @@ int main() {
         vs_stream.add(TargetsSubobject{.inner = one_target()});
         EXPECT(SUCCEEDED(create(device.p, vs_stream, vs_pso)));
 
-        // Streams the PC runtime refuses.
-        Stream bad = mesh_stream;
-        bad.add(VsSubobject{.inner = vs});  // a mesh shader and a vertex shader
-        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
-        bad = mesh_stream;
-        bad.add(PsSubobject{.inner = ps});  // the same subobject twice
-        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
-        bad = mesh_stream;
-        bad.add(CsSubobject{.inner = ps});  // compute with graphics stages
-        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
-        EXPECT(create(device.p, mesh_stream, refused, 4) == E_INVALIDARG && !refused.p);  // truncated
-        bad = mesh_stream;
-        bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), UINT>{.inner = 0});  // 23 is no subobject type
-        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
-        Stream empty;
-        EXPECT(create(device.p, empty.add(MaskSubobject{.inner = UINT_MAX}), refused) == E_INVALIDARG && !refused.p);
-        // Versions of one subobject count as the same subobject (D3D12_PIPELINE_STATE_STREAM_DESC): DEPTH_STENCIL with
-        // DEPTH_STENCIL1 in either order, and RASTERIZER with RASTERIZER2. Each description alone is accepted.
-        const D3D12_DEPTH_STENCIL_DESC depth{FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS};
-        const D3D12_DEPTH_STENCIL_DESC1 depth1{FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS};
-        D3D12_RASTERIZER_DESC raster{};
-        raster.FillMode = D3D12_FILL_MODE_SOLID;
-        raster.CullMode = D3D12_CULL_MODE_NONE;
-        raster.DepthClipEnable = TRUE;  // D3D12's default; depth clamping is not built
-        D3D12_RASTERIZER_DESC2 raster2{};
-        raster2.FillMode = D3D12_FILL_MODE_SOLID;
-        raster2.CullMode = D3D12_CULL_MODE_NONE;
-        raster2.DepthClipEnable = TRUE;  // D3D12's default; depth clamping is not built
-        for (int order = 0; order < 2; ++order) {
-            bad = mesh_stream;
-            if (order == 0) bad.add(DepthStencilSubobject{.inner = depth}).add(DepthStencil1Subobject{.inner = depth1});
-            else bad.add(DepthStencil1Subobject{.inner = depth1}).add(DepthStencilSubobject{.inner = depth});
-            EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
-        }
-        bad = mesh_stream;
-        bad.add(RasterizerSubobject{.inner = raster}).add(Rasterizer2Subobject{.inner = raster2});
-        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        // Mesh-stream subobject coverage: each versioned depth-stencil / rasterizer subobject is accepted,
+        // ConservativeRaster = ON without a PRIMITIVE_TOPOLOGY subobject succeeds (wireframe still refused), and a PS
+        // with f16_halves skips VS->PS linking instead of aliasing MS as VS.
         for (int which = 0; which < 4; ++which) {
             Stream one = mesh_stream;
             if (which == 0) one.add(DepthStencilSubobject{.inner = depth});
@@ -259,15 +456,27 @@ int main() {
             if (FAILED(one_hr)) std::fprintf(stderr, "single subobject %d: 0x%08lx\n", which, static_cast<unsigned long>(one_hr));
             EXPECT(SUCCEEDED(one_hr));
         }
-        // State the layer does not build yet.
-        bad = mesh_stream;
-        bad.add(AsSubobject{.inner = vs});
-        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
-        bad = mesh_stream;
-        D3D12_DEPTH_STENCIL_DESC1 bounds{};
-        bounds.DepthBoundsTestEnable = TRUE;
-        bad.add(DepthStencil1Subobject{.inner = bounds});
-        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        if (conservative_raster_tier(device.p) != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED) {
+            D3D12_RASTERIZER_DESC conservative = raster;
+            conservative.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+            Stream cr_mesh = mesh_stream;
+            cr_mesh.add(RasterizerSubobject{.inner = conservative});
+            Ref<ID3D12PipelineState> accepted;
+            EXPECT(SUCCEEDED(create(device.p, cr_mesh, accepted)));
+
+            D3D12_RASTERIZER_DESC conservative_wire = conservative;
+            conservative_wire.FillMode = D3D12_FILL_MODE_WIREFRAME;
+            Stream cr_mesh_wire = mesh_stream;
+            cr_mesh_wire.add(RasterizerSubobject{.inner = conservative_wire});
+            EXPECT(create(device.p, cr_mesh_wire, refused) == E_INVALIDARG && !refused.p);
+        }
+        {
+            Stream mesh_f16;
+            mesh_f16.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms}).add(PsSubobject{.inner = ps_f16});
+            mesh_f16.add(TargetsSubobject{.inner = one_target()});
+            Ref<ID3D12PipelineState> accepted;
+            EXPECT(SUCCEEDED(create(device.p, mesh_f16, accepted)));
+        }
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};

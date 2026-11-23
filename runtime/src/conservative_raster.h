@@ -46,4 +46,10 @@ inline InnerCoverageRequirements inner_coverage_requirements(std::span<const std
     result.valid = true;
     return result;
 }
+
+// Conservative rasterization requires solid fill, and for non-mesh pipelines a triangle primitive topology
+// (mesh pipelines declare their output topology in the shader, not in D3D12_GRAPHICS_PIPELINE_STATE_DESC).
+inline bool graphics_state_allowed(bool solid_fill, bool triangle_topology, bool mesh) {
+    return solid_fill && (mesh || triangle_topology);
+}
 } // namespace leonida::conservative_raster

@@ -3322,20 +3322,25 @@ public:
         }
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
-        // stages[] is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is stages[2], and with a
-        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
+        // stages[] is {vs, gs, ps} for vertex PSOs (#2109) and {ms, gs, ps} for mesh PSOs: the PS is always stages[2],
+        // and the VS->PS halves link only applies when !mesh and no geometry shader is bound.
         Stage& vs_stage = stages[0];
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
-        if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
-            log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
-        }
-        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry && !ps_stage.entry->f16_halves.empty()) {
-            std::string link_error;
-            if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                          &link_error)) {
-                std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
-                return E_FAIL;
+        if (mesh) {
+            if (ps_stage.entry && !ps_stage.entry->f16_halves.empty()) {
+                log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a mesh shader", 0);
+            }
+        } else if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty()) {
+            if (gs_stage.entry) {
+                log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
+            } else {
+                std::string link_error;
+                if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
+                                              &link_error)) {
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
+                    return E_FAIL;
+                }
             }
         }
         // A stage that declares a storage image or buffer it may write needs a device feature outside compute
@@ -3481,8 +3486,10 @@ public:
                 log_once("conservative rasterization needs enabled VK_EXT_conservative_rasterization and Tier 1 precision", 1);
                 return E_INVALIDARG;
             }
-            if (r.FillMode != D3D12_FILL_MODE_SOLID ||
-                desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
+            if (!leonida::conservative_raster::graphics_state_allowed(
+                    r.FillMode == D3D12_FILL_MODE_SOLID,
+                    desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, mesh))
+                return E_INVALIDARG;
             // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
             if (r.ForcedSampleCount) return E_NOTIMPL;
         }
