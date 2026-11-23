@@ -317,6 +317,12 @@ void test_relocations() {
                 failed("a valid relocation is applied", "the pointer wasn't moved by the load delta");
             else
                 pass("a valid relocation is applied");
+            const auto* mapped = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + 0x80);
+            if (mapped->OptionalHeader.ImageBase != reinterpret_cast<uint64_t>(m.base))
+                failed("a relocated image's headers name the base it was mapped at",
+                       "OptionalHeader.ImageBase is still the file's");
+            else
+                pass("a relocated image's headers name the base it was mapped at");
         } catch (const std::exception& e) {
             failed("a valid relocation is applied", e.what());
         }

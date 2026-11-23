@@ -1280,6 +1280,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
             }
             block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uint8_t*>(block) + block->SizeOfBlock);
         }
+        at<IMAGE_NT_HEADERS64>(m->base, dos->e_lfanew)->OptionalHeader.ImageBase = reinterpret_cast<uint64_t>(m->base);
     }
     // The TLS directory and the exception directory hold virtual addresses, so both are read after relocation. TLS is
     // installed here, before bind_imports can return control to the caller and before any image code can run.
