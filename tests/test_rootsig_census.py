@@ -271,6 +271,30 @@ class TestCensus(unittest.TestCase):
                 self.assertEqual(len(lines), 1, r.stderr)
                 self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
 
+    def test_fspx_json_with_utf8_bom_is_accepted(self):
+        self.write("c1", [(b"RTS0", rts0(params=[("cbv", 0)]))])
+        state = os.path.join(self.tmp.name, "fspx", "c1.json")
+        os.makedirs(os.path.dirname(state), exist_ok=True)
+        with open(state, "w", encoding="utf-8-sig", newline="\n") as fh:
+            json.dump({"user_sgprs": 8}, fh)
+        rows, errors = R.census(self.tmp.name)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["user_sgprs"], 8)
+
+    def test_malformed_fspx_json_with_utf8_bom_is_one_error_line(self):
+        self.write("c1", [(b"RTS0", rts0(params=[("cbv", 0)]))])
+        state = os.path.join(self.tmp.name, "fspx", "c1.json")
+        os.makedirs(os.path.dirname(state), exist_ok=True)
+        with open(state, "w", encoding="utf-8-sig", newline="\n") as fh:
+            fh.write("{not valid json")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+        lines = r.stderr.splitlines()
+        self.assertEqual(len(lines), 1, r.stderr)
+        self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
+
 
 if __name__ == "__main__":
     unittest.main()

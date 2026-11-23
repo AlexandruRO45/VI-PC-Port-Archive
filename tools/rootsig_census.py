@@ -237,7 +237,7 @@ def census(root, disasm=None):
         user_sgprs = None
         if os.path.exists(state_path):
             try:
-                with open(state_path, encoding="utf-8") as fh:
+                with open(state_path, encoding="utf-8-sig") as fh:
                     user_sgprs = json.load(fh).get("user_sgprs")
                 if user_sgprs is not None and (type(user_sgprs) is not int or user_sgprs < 0):
                     raise ValueError(f"user_sgprs must be a non-negative integer, got {user_sgprs!r}")
