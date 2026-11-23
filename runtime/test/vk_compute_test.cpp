@@ -11,7 +11,8 @@
 //   and before the dispatch, so a program can read prepared inputs (a root table, descriptors, data) from the heap.
 //   The file must fit in the buffer (raise VKC_OUT_WORDS); bytes past it keep the fill.
 //   --require-wave64: require full 64-wide subgroups (local size X must be a multiple of 64), or exit 77.
-//   VKC_SUBGROUP_SIZE=N (env): run at N lanes. Where the device can't require a compute subgroup size but N is its
+//   VKC_SUBGROUP_SIZE=N (env): run at N lanes, a decimal power of two (0 lets the device choose).
+//   Where the device can't require a compute subgroup size but N is its
 //   default subgroupSize (MoltenVK: 32, and requiredSubgroupSizeStages 0), the size is still fixed for a SPIR-V 1.5
 //   module (no varying subgroup size); cs_wave_probe.comp then checks, with the test's local size and flags, that every
 //   subgroup is N lanes wide (by its lane numbers and a ballot), or the test fails (exit 1) without running; N-lane
@@ -32,7 +33,9 @@
 #include "cs_wave_probe_spv.h"
 #include "spirv_capability.h"
 
+#include <bit>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -115,6 +118,15 @@ static int run(int argc, char** argv) {
     if (argc != 4 && !require_wave64) {
         std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
         return 2;
+    }
+    uint32_t req_sg = require_wave64 ? 64u : 0u;
+    if (const char* sg_env = require_wave64 ? nullptr : std::getenv("VKC_SUBGROUP_SIZE")) {
+        const char* end = sg_env + std::strlen(sg_env);
+        const auto [next, error] = std::from_chars(sg_env, end, req_sg);
+        if (error != std::errc{} || next != end || (req_sg && !std::has_single_bit(req_sg))) {
+            std::fprintf(stderr, "VKC_SUBGROUP_SIZE: expected 0 or a decimal power of two, got \"%s\"\n", sg_env);
+            return 2;
+        }
     }
     uint32_t pc[36] = {};
     const char* sgprs_env = std::getenv("VKC_SGPRS");
@@ -261,8 +273,6 @@ static int run(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f12q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
-    const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
-    const uint32_t req_sg = require_wave64 ? 64u : (sg_env ? uint32_t(std::atoi(sg_env)) : 0u);
     const bool can_request_size = req_sg > 0 && f13q.subgroupSizeControl &&
         req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize &&
         (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
