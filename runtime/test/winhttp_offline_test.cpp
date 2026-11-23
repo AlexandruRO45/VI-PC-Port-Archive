@@ -17,6 +17,10 @@
 
 #include "shims.h"
 
+extern int g_native_auto_proxy_calls;
+BOOL WINAPI intercepted_auto_proxy(DWORD, LPWSTR*);
+FARPROC WINAPI intercepted_get_proc_address(HMODULE, LPCSTR);
+
 namespace {
 
 using OpenFn = HINTERNET(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
@@ -278,14 +282,16 @@ int main() {
             check(!schemes(session, &supported, &first, &target) && GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
                   "auth schemes require a request");
             LPWSTR url = nullptr;
-            const bool offline_proxy = !detect_proxy(0, &url) &&
-                GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url;
-            check(offline_proxy, "auto proxy takes the offline path for zero flags");
-            // Do not request DHCP if the negative control indicates delegation to native WinHTTP.
-            if (offline_proxy) {
-                check(!detect_proxy(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url) &&
-                          GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url, "auto proxy detection fails offline");
-            }
+            const auto native_stub = reinterpret_cast<DetectProxyFn>(
+                intercepted_get_proc_address(nullptr, "WinHttpDetectAutoProxyConfigUrl"));
+            g_native_auto_proxy_calls = 0;
+            check(native_stub && !native_stub(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url) &&
+                      g_native_auto_proxy_calls == 1, "native auto proxy interception observes valid flags");
+            g_native_auto_proxy_calls = 0;
+            const BOOL proxy_result = detect_proxy(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url);
+            check(!proxy_result && GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url &&
+                      g_native_auto_proxy_calls == 0, "auto proxy fails offline without native DHCP discovery");
+
         }
         check(add_headers(request, L"X-Test: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
               "request headers are accepted");

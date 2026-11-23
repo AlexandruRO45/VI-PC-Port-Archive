@@ -261,7 +261,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
-    shims/winhttp_offline.cpp
+    test/winhttp_offline_interposed.cpp
     shims/registry.cpp
   )
   target_include_directories(winhttp_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
