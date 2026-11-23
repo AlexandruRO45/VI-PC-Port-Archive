@@ -44,6 +44,7 @@ MAGICS = (
     ("RAGE resource", 0, b"RSC8"),
     ("RAGE resource", 0, b"RSCC"),
     ("RAGE page directory", 0, b"0DRP"),
+    ("RAGE page directory", 0x10, b"0DRP"),      # the measured header: marker at +0x10, version at +0x14
     ("RBF0 tree", 0, b"RBF0"),
     ("XBCH shader container", 0, b"XBCH"),
     ("FSSM shader", 0, b"FSSM"),
