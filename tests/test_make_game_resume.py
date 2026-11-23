@@ -40,12 +40,27 @@ class ResumeShardsTest(unittest.TestCase):
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
 
-            def wait(self):
+                self.code = None
+
+            def wait(self, timeout=None):
+                if self.code is None:
+                    self.code = self.finish()
+                return self.code
+
+            # translate() polls its shards instead of waiting on them one by one.
+            poll = wait
+
+            def terminate(self):
+                pass
+
+            kill = terminate
+
+            def finish(self):
                 if self.i in crash:
                     return 1
-                with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
+                with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8", newline="\n") as f:
                     json.dump({"index": self.i, "count": self.n}, f)
-                with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
+                with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8", newline="\n") as f:
                     json.dump({"tag": tag, "n": self.n}, f)
                 return 0
         with mock.patch.object(make_game.subprocess, "Popen", side_effect=FakeProc), \
