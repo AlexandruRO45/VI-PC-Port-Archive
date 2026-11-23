@@ -60,7 +60,8 @@ namespace leonida {
 enum class ImageDimension : std::uint32_t { dim_2d, dim_2d_array, dim_3d, dim_1d, dim_2d_ms, dim_2d_ms_array };
 
 // Storage views of one image by the component type a shader reads or writes it with (the translator picks by the
-// T# format at run time). r32ui is for the atomic instructions, whose image type is R32ui (2D and 3D only).
+// T# format at run time). r32ui is for the atomic instructions, whose image type is R32ui (bindings 4 and 7 for
+// 2D and 3D; 2D-array/cube and 1D alias their uint storage bindings 12 and 18).
 // A null view leaves the fallback in that binding.
 struct StorageViews {
     VkImageView as_float = VK_NULL_HANDLE;
@@ -163,7 +164,11 @@ constexpr std::uint32_t storage_binding(ImageDimension dimension, std::uint32_t 
 }
 
 constexpr std::uint32_t r32ui_binding(ImageDimension dimension) {
-    return dimension == ImageDimension::dim_2d ? 4 : dimension == ImageDimension::dim_3d ? 7 : no_binding;
+    return dimension == ImageDimension::dim_2d         ? 4
+           : dimension == ImageDimension::dim_2d_array ? storage_binding(ImageDimension::dim_2d_array, 1)
+           : dimension == ImageDimension::dim_3d       ? 7
+           : dimension == ImageDimension::dim_1d       ? storage_binding(ImageDimension::dim_1d, 1)
+                                                       : no_binding;
 }
 
 // Set 0's descriptor set layout at features' counts: what create_layout creates and what size_bindings'
@@ -1006,9 +1011,11 @@ private:
                   view ? VkDescriptorImageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL} : fallback_info(binding));
         };
         store(bindless::storage_binding(dimension, 0), storage.as_float);
-        store(bindless::storage_binding(dimension, 1), storage.as_uint);
+        const std::uint32_t uint_at = bindless::storage_binding(dimension, 1);
+        const std::uint32_t r32ui_at = bindless::r32ui_binding(dimension);
+        store(uint_at, (r32ui_at == uint_at && !storage.as_uint) ? storage.r32ui : storage.as_uint);
         store(bindless::storage_binding(dimension, 2), storage.as_sint);
-        store(bindless::r32ui_binding(dimension), storage.r32ui);
+        if (r32ui_at != uint_at) store(r32ui_at, storage.r32ui);
     }
 
     VkDevice device_;

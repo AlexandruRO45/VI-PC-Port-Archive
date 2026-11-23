@@ -150,7 +150,7 @@ class ImageAtomics32Tests(unittest.TestCase):
             "image_atomic_inc v[2:3], v[4:5], s[4:11] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm",        # 64-bit inc
             "image_atomic_fcmpswap v2, v[4:5], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",       # 1-VGPR fcmpswap
             "image_atomic_fmin v2, v4, s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",               # too few 2D coords
-            "image_atomic_fmax v2, v[4:5], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm",           # unsupported 1D dim
+            "image_atomic_fmax v2, v[4:5], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_1D_ARRAY unorm",     # unsupported 1D_ARRAY dim
             "image_atomic_swap v2, v[4:5], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm d16",       # unsupported d16
         ):
             with self.subTest(line=line):

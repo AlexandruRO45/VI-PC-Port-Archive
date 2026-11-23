@@ -357,6 +357,8 @@ class Gen:
         self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
+        self.uses_storage2da = False
+        self.uses_storage1d = False
         self.uses_heap = False
         self.uses_codebase = False
         self.uses_pc_tail = False       # --pc-tail-ubo and the shader reads the tail (set in assemble)
@@ -12951,7 +12953,7 @@ class Gen:
         return vals + [lv]
 
     def emit_image_atomic_extra(self, op, ptr_ty, arr_var, idx, iv, vdata, mods):
-        """Lower 32-bit image_atomic_{swap,inc,dec,fmin,fmax,fcmpswap} on an r32ui storage image (2D or 3D).
+        """Lower 32-bit image_atomic_{swap,inc,dec,fmin,fmax,fcmpswap} on an r32ui storage image (1D/2D/2D_ARRAY/CUBE/3D).
         Inactive lanes skip the op and preserve vdata. CAS loops use OpAtomicLoad (valid on Image pointers) +
         OpAtomicCompareExchange, requiring no shader float atomic extension."""
         need_n = 2 if op == "image_atomic_fcmpswap" else 1
@@ -13061,7 +13063,14 @@ class Gen:
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
         array_query = op == "image_get_resinfo" and dim == "dim:SQ_RSRC_IMG_2D_ARRAY"
         is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap" or op in self.IMG_ATOMICS_EXTRA
-        is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and is_atomic
+        atomic_dims = (
+            "dim:SQ_RSRC_IMG_1D",
+            "dim:SQ_RSRC_IMG_2D",
+            "dim:SQ_RSRC_IMG_2D_ARRAY",
+            "dim:SQ_RSRC_IMG_CUBE",
+            "dim:SQ_RSRC_IMG_3D",
+        )
+        supported_atomic_dim = is_atomic and dim in atomic_dims
         if op == "image_store":
             self.image_store(a, mods, dim)
             return
@@ -13087,7 +13096,7 @@ class Gen:
                                   vdata, xs[3], d16="d16" in mods)
             return
         packed_mip = op == "image_load_mip" and "tfe" not in mods and "lwe" not in mods
-        if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))
+        if ((dim != "dim:SQ_RSRC_IMG_2D" and not (supported_atomic_dim or array_query))
                 or ("a16" in mods and not (is_atomic or packed_mip))
                 or ("d16" in mods and op != "image_load_mip")):
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
@@ -13110,15 +13119,27 @@ class Gen:
             return [self.as_int(c) for c in raw[:nc]]
 
         if is_atomic:
-            # 2D (binding 4) or 3D (binding 7) r32ui storage image atomics.
+            # 2D (binding 4), 3D (binding 7), 2D_ARRAY/CUBE (binding 12, aliasing 2D-array uint storage),
+            # or 1D (binding 18, aliasing 1D uint storage) r32ui storage image atomics.
             # Guard OpAccessChain / OpImageTexelPointer / OpAtomic* inside `if (active)` so inactive lanes never
             # execute spurious RMWs or dereference uninitialized descriptors/coordinates.
-            if is3d_atomic:
+            if dim == "dim:SQ_RSRC_IMG_3D":
                 self.uses_storage3d = True
                 coords = atomic_coords(3)
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
                 ptr_ty, arr_var = "%_ptr_UC_simg3", "%simages3d"
+            elif dim in ("dim:SQ_RSRC_IMG_2D_ARRAY", "dim:SQ_RSRC_IMG_CUBE"):
+                # Cube storage images are bound as 6-layer 2D arrays (runtime/src/vulkan_bindless.h).
+                self.uses_storage2da = True
+                coords = atomic_coords(3)
+                iv = self.tmp()
+                self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
+                ptr_ty, arr_var = "%_ptr_UC_simg2da", "%simages2da"
+            elif dim == "dim:SQ_RSRC_IMG_1D":
+                self.uses_storage1d = True
+                iv = atomic_coords(1)[0]
+                ptr_ty, arr_var = "%_ptr_UC_simg1d", "%simages1d"
             else:
                 self.uses_storage = True
                 coords = atomic_coords(2)
@@ -14282,7 +14303,8 @@ def assemble(gen):
     if tex:
         iface += ["%images", "%samplers", "%desc_map"] + (["%images_arr"] if gen.uses_tex_array else []) + \
                  (["%simages"] if gen.uses_storage else []) + (["%images_1d"] if gen.uses_tex_1d else []) + \
-                 (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
+                 (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else []) + \
+                 (["%simages2da"] if gen.uses_storage2da else []) + (["%simages1d"] if gen.uses_storage1d else [])
     if sg:
         iface += ["%sg_lane"]
     if gen.writes_depth:
@@ -14352,6 +14374,8 @@ def assemble(gen):
             caps.append("StorageImageReadWithoutFormat")  # shaderStorageImageReadWithoutFormat: coherent image_load
         if 3 in gen.uses_store_views:
             caps.append("Image1D")
+    if gen.uses_storage1d and "Image1D" not in caps:
+        caps.append("Image1D")
     if vs:
         caps.append("DrawParameters")   # BaseVertex / BaseInstance (shaderDrawParameters), see the seeding of v0 / v3
     if gsx:
@@ -14526,9 +14550,17 @@ def assemble(gen):
             types += ["%simg3d_u = OpTypeImage %uint 3D 0 0 0 2 R32ui", "%rt_simg3 = OpTypeRuntimeArray %simg3d_u",
                       "%_ptr_UC_rt_simg3 = OpTypePointer UniformConstant %rt_simg3",
                       "%_ptr_UC_simg3 = OpTypePointer UniformConstant %simg3d_u"]
-            if not gen.uses_storage:
-                types += ["%_ptr_Image_uint = OpTypePointer Image %uint"]
             dec += ["OpDecorate %simages3d DescriptorSet 0", "OpDecorate %simages3d Binding 7"]
+        if gen.uses_storage2da:
+            types += ["%simg2da_u = OpTypeImage %uint 2D 0 1 0 2 R32ui", "%rt_simg2da = OpTypeRuntimeArray %simg2da_u",
+                      "%_ptr_UC_rt_simg2da = OpTypePointer UniformConstant %rt_simg2da",
+                      "%_ptr_UC_simg2da = OpTypePointer UniformConstant %simg2da_u"]
+            dec += ["OpDecorate %simages2da DescriptorSet 0", "OpDecorate %simages2da Binding 12"]
+        if gen.uses_storage1d:
+            types += ["%simg1d_u = OpTypeImage %uint 1D 0 0 0 2 R32ui", "%rt_simg1d = OpTypeRuntimeArray %simg1d_u",
+                      "%_ptr_UC_rt_simg1d = OpTypePointer UniformConstant %rt_simg1d",
+                      "%_ptr_UC_simg1d = OpTypePointer UniformConstant %simg1d_u"]
+            dec += ["OpDecorate %simages1d DescriptorSet 0", "OpDecorate %simages1d Binding 18"]
         if gen.uses_tex_3d:
             types += ["%img3d = OpTypeImage %float 3D 0 0 0 1 Unknown", "%simg3d = OpTypeSampledImage %img3d",
                       "%rt_img3 = OpTypeRuntimeArray %img3d",
@@ -14545,8 +14577,10 @@ def assemble(gen):
             types += ["%simg2d_u = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%rt_simg = OpTypeRuntimeArray %simg2d_u",
                       "%_ptr_UC_rt_simg = OpTypePointer UniformConstant %rt_simg",
                       "%_ptr_UC_simg = OpTypePointer UniformConstant %simg2d_u",
-                      "%_ptr_Image_uint = OpTypePointer Image %uint", "%v4uint = OpTypeVector %uint 4"]
+                      "%v4uint = OpTypeVector %uint 4"]
             dec += ["OpDecorate %simages DescriptorSet 0", "OpDecorate %simages Binding 4"]
+        if gen.uses_storage or gen.uses_storage2da or gen.uses_storage3d or gen.uses_storage1d:
+            types += ["%_ptr_Image_uint = OpTypePointer Image %uint"]
     if sg:
         types += ["%_ptr_Input_uint = OpTypePointer Input %uint"]
         dec += ["OpDecorate %sg_lane BuiltIn SubgroupLocalInvocationId"]
@@ -14824,6 +14858,10 @@ def assemble(gen):
             gvars += ["%images_3d = OpVariable %_ptr_UC_rt_img3 UniformConstant"]
         if gen.uses_storage3d:
             gvars += ["%simages3d = OpVariable %_ptr_UC_rt_simg3 UniformConstant"]
+        if gen.uses_storage2da:
+            gvars += ["%simages2da = OpVariable %_ptr_UC_rt_simg2da UniformConstant"]
+        if gen.uses_storage1d:
+            gvars += ["%simages1d = OpVariable %_ptr_UC_rt_simg1d UniformConstant"]
     if vs:
         gvars.append("%vertex_index = OpVariable %_ptr_Input_int Input")
         gvars.append("%instance_index = OpVariable %_ptr_Input_int Input")
