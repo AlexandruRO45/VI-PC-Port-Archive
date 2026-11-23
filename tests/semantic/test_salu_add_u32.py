@@ -521,5 +521,53 @@ class SaluAddU32ConditionCodesTests(unittest.TestCase):
         self.assertEqual(res2, 0)
         self.assertEqual(scc2, 1)
 
+
+# --- Section 7: IEEE 754 Boundary Extremes and NaN Handling ---
+
+class SaluAddU32IEEE754BitPatternsTests(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN bit patterns."""
+
+    def test_float_zero_bit_patterns(self) -> None:
+        """+0.0f (0x0) and -0.0f (0x80000000) are treated strictly as unsigned integers."""
+        pos_zero = 0x00000000
+        neg_zero = 0x80000000
+        # +0.0 + -0.0 = 0x80000000 (no carry)
+        res, scc = ref_s_add_u32(pos_zero, neg_zero)
+        self.assertEqual(res, 0x80000000)
+        self.assertEqual(scc, 0)
+
+        # -0.0 + -0.0 = 0x00000000 with carry-out
+        res, scc = ref_s_add_u32(neg_zero, neg_zero)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 1)
+
+    def test_subnormal_float_preservation(self) -> None:
+        """Subnormal bit patterns are preserved without denormal flushing."""
+        min_subnorm = 0x00000001
+        max_subnorm = 0x007FFFFF
+        res, scc = ref_s_add_u32(min_subnorm, max_subnorm)
+        self.assertEqual(res, 0x00800000)  # min normal float pattern
+        self.assertEqual(scc, 0)
+
+    def test_infinity_and_nan_bit_patterns(self) -> None:
+        """Infinity and NaN bit patterns undergo standard modular integer arithmetic."""
+        pos_inf = 0x7F800000
+        qnan = 0x7FC00000
+        # pos_inf + 1 becomes 0x7F800001 (signaling NaN pattern), no float exception trapped
+        res, scc = ref_s_add_u32(pos_inf, 1)
+        self.assertEqual(res, 0x7F800001)
+        self.assertEqual(scc, 0)
+
+        # qnan + qnan
+        res, scc = ref_s_add_u32(qnan, qnan)
+        self.assertEqual(res, (qnan * 2) & MASK32)
+        self.assertEqual(scc, 0)
+
+    def test_sign_bit_rollover(self) -> None:
+        """0x7FFFFFFF (+max float exponent/mantissa edge) + 1 rolls over to 0x80000000."""
+        res, scc = ref_s_add_u32(0x7FFFFFFF, 1)
+        self.assertEqual(res, 0x80000000)
+        self.assertEqual(scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
