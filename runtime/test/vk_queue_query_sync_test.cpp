@@ -335,7 +335,9 @@ int main() {
             EXPECT(gate.signal(1));                                        // releases the batch on this thread
             EXPECT(queue_a.take_held_failure() == ReplayResult::unsupported);
             EXPECT(queue_a.take_held_failure() == ReplayResult::success);  // reported once
-            EXPECT(queue_a.idle() && after.completed() == 1);              // the Signal behind it still signaled
+            // Wait for the value instead of reading it: some drivers (AMD Windows 24.30.46) show a signal from a
+            // submission without command buffers only shortly after vkQueueWaitIdle returns.
+            EXPECT(queue_a.idle() && after.wait(1, 5'000'000'000ull));     // the Signal behind it still signaled
 
             driver::captured_wait_count.store(0);
             driver::captured_wait_sem.store(0);
@@ -373,7 +375,7 @@ int main() {
             std::memcpy(&got, dst_ptr, sizeof(got));
             EXPECT(got == 0);                                                  // the waiter did not run
             EXPECT(queue_a.signal(fence.semaphore(), 1));                      // the retry signals, and releases it
-            EXPECT(queue_b.idle() && queue_a.idle() && fence.completed() == 1);
+            EXPECT(queue_b.idle() && queue_a.idle() && fence.wait(1, 5'000'000'000ull));  // waited for, as in 3b
             std::memcpy(&got, dst_ptr, sizeof(got));
             EXPECT(got == pattern);
             std::printf("queue/query sync: a failed Signal does not release its waiters; the retry does\n");
