@@ -381,9 +381,21 @@ Hash-only or opaque:
   resolves placement → archetype → model → material asset key;
 - the 0–2 GiB 7-struct family's field semantics and most of its payload;
 - `PSIN` page-directory internals beyond the chunk tags (`MNEL`/`LSNS`, `LGID`/`LRSC`, `0DRP`/`0x7a`, `CHKS`);
-- texture dictionaries: no `.#td` system page was found in the sampled `levels.rpf` windows. World textures in
-  this package are the loose RDS5 pools under `data/ttdb` plus `textures.rpf`, so placement records do not
-  carry texture names, only material/asset keys in the model resources.
+- texture dictionaries: no `.#td` system page was found in the sampled `levels.rpf` windows (how they were looked
+  for is not recorded). The asset export's full page+16 scan (rpf9-explorer's texture recovery: a zeroed 16-byte page
+  head, a zlib stream at page+16, a system page that decodes as a texture dictionary) finds 23,180 candidates and
+  recovers **1,009** standalone texture dictionaries, all at 70.80-70.92 GiB, inside the tail window above. They
+  hold 1,013 textures with only 9 distinct name hashes (1,008 dictionaries have one texture). They are not the
+  dictionaries embedded in models: none of the 1,293 levels models with embedded textures lies in that band (those
+  sit at 62.9-70.6 GiB), and the two sets share no name hash. Whether they are what a `.#td` entry name labels can't
+  be told until the RPF9 directory is decoded. No model material references them: of the 418,714 distinct material
+  texture keys in all ten `rpf9dump models` manifests (20,781,927 bindings), **0** resolve to a dictionary texture,
+  by `joaat(Name)` (equal to the entry's `Hash` for all 1,013) or by exact name, and `textures.rpf`'s 1,356
+  dictionaries (4,604 textures) also give 0. **296,785** resolve to the 57 texture pools by 64-bit key, 137 to
+  textures embedded in models, and **121,925** (29.1%) to none of these. So the material textures that resolve come
+  from the loose RDS5 pools (46 under `data/ttdb`, 11 under `pack/`), and placement records do not carry texture
+  names, only material/asset keys in the model resources (`python -I tools/texture_dicts.py <export dir>`; counts
+  only).
 
 ## Location, interior, river and road names (`GameShape__Data__LocationNameLoopkup`)
 
