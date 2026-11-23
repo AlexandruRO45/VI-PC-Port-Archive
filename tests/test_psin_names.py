@@ -97,6 +97,25 @@ class TestDictionaries(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "UTF-16"):
                 N.load_names([t])
 
+    def test_utf16_name_list_without_bom_is_refused(self):
+        # No BOM to sniff, but UTF-16 text holds NUL bytes, which no name list does.
+        for codec in ("utf-16-le", "utf-16-be"):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as d:
+                t = os.path.join(d, "n.txt")
+                with open(t, "wb") as f:
+                    f.write("prop_lamp_03\r\n".encode(codec))
+                with self.assertRaisesRegex(ValueError, "UTF-16"):
+                    N.load_names([t])
+
+    def test_nul_past_the_first_64_bytes_is_still_refused(self):
+        # BOM-less UTF-16 whose first characters have no zero byte (e.g. a long Cyrillic line) shows NULs only later.
+        with tempfile.TemporaryDirectory() as d:
+            t = os.path.join(d, "n.txt")
+            with open(t, "wb") as f:
+                f.write(("ж" * 40 + "\r\nprop_lamp_03\r\n").encode("utf-16-le"))
+            with self.assertRaisesRegex(ValueError, "UTF-16"):
+                N.load_names([t])
+
 
 class TestScan(unittest.TestCase):
     def folder(self, d, blobs):

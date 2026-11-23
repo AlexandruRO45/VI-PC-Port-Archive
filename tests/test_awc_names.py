@@ -335,6 +335,45 @@ class TestCli(unittest.TestCase):
                 self.assertIn("UTF-16", err.getvalue())
                 self.assertNotIn("Traceback", err.getvalue())
 
+    def test_utf16_word_list_without_bom_reports_rc_2(self):
+        # UTF-16 written without a BOM has no marker to sniff; its NUL bytes give it away, as no word holds one.
+        for codec in ("utf-16-le", "utf-16-be"):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as tmp:
+                write(os.path.join(tmp, "dlg.awc"), make_bank(["zz_rootau_abcd_01"]))
+                words = write(os.path.join(tmp, "words.txt"), "zz_rootau_abcd_01\r\n".encode(codec))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = A.main([tmp, "--words", words, "--out", os.path.join(tmp, "o.csv")])
+                self.assertEqual(rc, 2)
+                self.assertIn("UTF-16", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+
+    def test_nul_past_the_first_64_bytes_is_still_refused(self):
+        # BOM-less UTF-16 whose first characters have no zero byte (e.g. a long Cyrillic line) shows NULs only later.
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.txt"), ("ж" * 40 + "\r\nzz_word\r\n").encode("utf-16-le"))
+            with open(words, "rb") as fh:
+                self.assertNotIn(b"\x00", fh.read(64))
+            with self.assertRaisesRegex(ValueError, "UTF-16"):
+                A.read_words(words)
+
+    def test_brace_after_leading_space_is_a_text_word_list(self):
+        # Only a file whose first byte (after a BOM) is "{" is sniffed as hashdict.py JSON, as before the BOM fix.
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.txt"), b" {not_json\nzz_word\n")
+            self.assertEqual(A.read_words(words), ["{not_json", "zz_word"])
+
+    def test_json_after_a_leading_newline_without_json_suffix_is_read_as_text(self):
+        # Pins main's rule: hashdict.py never writes leading whitespace, so such a file is a text list, not JSON.
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "hashes"), b'\n{"0000abcd": "W"}')
+            self.assertEqual(A.read_words(words), ['{"0000abcd": "W"}'])
+
+    def test_hashdict_json_with_utf8_bom_and_no_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bom_json = write(os.path.join(tmp, "hashes"), b"\xef\xbb\xbf" + b'{"0000abcd": "W"}')
+            self.assertEqual(A.read_words(bom_json), ["W"])
+
     def test_needs_a_dictionary(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             A.main([ROOT])

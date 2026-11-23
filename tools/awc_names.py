@@ -157,15 +157,17 @@ def _files(path: str):
 def read_words(path: str) -> list:
     """Words from a text file (one per line) or a hashdict.py JSON object. A UTF-8 BOM (Windows PowerShell 5.1's
     `Out-File -Encoding utf8`) is dropped instead of becoming part of the first word; a UTF-16 file (PowerShell
-    5.1's `>`) raises ValueError, since read as UTF-8 none of its words would match and the run would look clean."""
+    5.1's `>`, or UTF-16 without a BOM, which a NUL byte anywhere in the file gives away, as no word holds one)
+    raises ValueError, since read as UTF-8 none of its words would match and the run would look clean."""
     with open(path, "rb") as fh:
-        head = fh.read(64)
-    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        raise ValueError("the word list is UTF-16 (PowerShell 5.1's `>` writes it); save it as UTF-8, e.g. with "
-                         "`Out-File -Encoding utf8`")
+        data = fh.read()
+    head = data[:64]
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in data:
+        raise ValueError("the word list looks like UTF-16 (e.g. PowerShell 5.1's `>`), not UTF-8 text; save it as "
+                         "UTF-8, e.g. with `Out-File -Encoding utf8`")
     if head.startswith(b"\xef\xbb\xbf"):
         head = head[3:]
-    if path.lower().endswith(".json") or head.lstrip()[:1] == b"{":
+    if path.lower().endswith(".json") or head[:1] == b"{":
         with open(path, encoding="utf-8-sig") as fh:
             doc = json.load(fh)
         return [str(v) for v in (doc.values() if isinstance(doc, dict) else doc)]

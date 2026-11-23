@@ -92,8 +92,8 @@ def load_names(paths):
     names = set()
     for path in paths:
         # A UTF-8 BOM (Windows PowerShell 5.1's `Out-File -Encoding utf8`) is dropped instead of becoming part of the
-        # first name; a UTF-16 text list (PowerShell 5.1's `>`) is refused, since read as UTF-8 none of its names
-        # match. A UTF-16 .json is already refused as "not JSON" below.
+        # first name; a UTF-16 text list (PowerShell 5.1's `>`, or one without a BOM, which a NUL byte gives away) is
+        # refused, since read as UTF-8 none of its names match. A UTF-16 .json is already refused as "not JSON" below.
         if path.endswith(".json"):
             try:
                 with open(path, encoding="utf-8-sig") as f:
@@ -111,9 +111,10 @@ def load_names(paths):
                 names.update(SUFFIX.sub("", n) for n in listed)
         else:
             with open(path, "rb") as f:
-                if f.read(2) in (b"\xff\xfe", b"\xfe\xff"):
-                    raise ValueError(f"{path}: the name list is UTF-16 (PowerShell 5.1's `>` writes it); save it as "
-                                     "UTF-8, e.g. with `Out-File -Encoding utf8`")
+                data = f.read()   # UTF-16 without a BOM shows as a NUL byte; a name list never holds one
+                if data[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in data:
+                    raise ValueError(f"{path}: the name list looks like UTF-16 (e.g. PowerShell 5.1's `>`), not UTF-8 "
+                                     "text; save it as UTF-8, e.g. with `Out-File -Encoding utf8`")
             with open(path, encoding="utf-8-sig", errors="replace") as f:
                 names.update(line.strip() for line in f)
     names.discard("")
