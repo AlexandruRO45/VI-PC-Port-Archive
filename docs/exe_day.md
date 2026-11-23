@@ -5,25 +5,27 @@
 [boot.md](boot.md) has the trace formats, the triage order and the Q1-Q22 list; this page is the timed plan that uses
 them. Nothing here quotes game data: traces, captures and the overlay stay on the player's machine.
 
-The target: executable at 17:00, a captured frame from the title's own present path by 22:00. The plan assumes the
-shader library is already staged, the build tree is warm and the first trace is read in order. It spends 30 minutes
-proving the boot path, 90 on imports, 90 on the device and draws, an hour on pixels and the last 30 minutes on
-evidence.
+The target: executable at 17:00, a captured frame from the title's own present path by 22:00. If the delivered binary
+lacks the capture route, the target is an offscreen PPM from the title's own draw; §1.1 gates that before 17:00. The
+plan assumes the shader library is already staged, the build tree is warm and the first trace is read in order. It
+spends 30 minutes proving the boot path, 90 on imports, 90 on the device and draws, an hour on pixels and the last 30
+minutes on evidence.
 
 **What is verified.** 26,503/26,503 shaders translate and pass `spirv-val`; the staged `<work>/shaders/spirv` +
 `<work>/shaders/dxbc` layout resolves all 26,503 containers in `shader_library_corpus_test` with 0 failures
-(`docs/design.md`, `runtime/README.md`). `run_tiny_frame` passes on a Vulkan device. **What is not:** the retail
-executable has not been run, the PresentX queue slot is unmeasured, and the opt-in `LEONIDA_PRESENTX_SLOT` /
-`LEONIDA_CAPTURE` route is not on main at `561b65a83`.
+(`docs/design.md`, `runtime/README.md`). The delivered `gta6rt.exe` passes `check_tiny_frame.py` on a Vulkan device.
+**What is not:** the retail executable has not been run, the PresentX queue slot is unmeasured, and the opt-in
+`LEONIDA_PRESENTX_SLOT` / `LEONIDA_CAPTURE` route is in PR #6230 and the final exe-day assembly, not on main at
+`561b65a83`. The delivered intermediate does not contain those strings.
 
 ## 0. The build you are timing
 
-Main at `561b65a83` does not contain all of the validated boot fixes. At the time of writing, XErrorReport (#5312),
-the console-sized `D3D12_OPTIONS` answer (#4026), the loader host-binding/module-identity fix (#5731), the mesh PSO
-path (#1712) and the DXGI present recovery (#5689) are separate branches. `exe-day-integration` carries the set, 16
-commits over `561b65a83`; build that if it is present, and keep the previous `gta6rt.exe` beside it. If you build main
-instead, expect those failures back, and check the build with the pre-flight tests rather than discovering the gap at
-17:05.
+Main at `561b65a83` does not contain all of the validated boot fixes. The delivered kit is the `exe-day-3777`
+assembly: base `561b65a83`, final commit `366c2463b`, with the PRs in its `MANIFEST.txt` (#5731, #5312, #4026,
+#5662, #1712, #5689, #5855, #5797, #5805, #5814 and #3777). Run that binary. The earlier `exe-day-integration` (16
+commits over `561b65a83`) is the integration without #3777; it is history, not the exe-day loader. If you build main
+instead, expect the fixed failures back, and check the build with the pre-flight tests rather than discovering the
+gap at 17:05.
 
 The failures those fixes remove, so you recognise them if they return: an early `XErrorReport` stops the title; a
 console-sized `CheckFeatureSupport(D3D12_OPTIONS)` returns `E_INVALIDARG`; a bundled module and a host DLL with the
@@ -32,78 +34,162 @@ None of them is a diagnosis to make during the five hours.
 
 ## 1. Pre-flight (before 17:00)
 
-### 1.1 Build Release `gta6rt`
+### 1.1 Use the delivered SDL3 binary
 
-Use a **Developer PowerShell for VS 2022** so `cl.exe`, `cmake` and `ninja` are on `PATH`. `scripts/build_runtime.ps1`
-finds them itself but builds `RelWithDebInfo`; this page assumes Release, so configure it directly. Keep the build
-tree: the import loop rebuilds one target at a time.
+The exe-day kit at `C:\Users\kam\leonida-work\gta6rt-exeday` is the loader to run. Its `gta6rt.exe` has SDL3 3.4.20
+statically linked, so the GameInput shim is inside the binary, and it carries the integration fixes in §0 (#5731,
+#5312, #4026, #1712, #5689 and the #3777 indirect path). Do not rebuild it just to run; a code fix in §3 is the
+exception. A source rebuild without `-DLEONIDA_SDL3_FETCH=ON` omits the GameInput shim, and
+`gameinput.dll!GameInputCreate` becomes a boot blocker.
+
+Use `gta6rt.exe`, not the kit's `gta6rt-mesh-only.exe` or `gta6rt-nosdl3.exe`; those are history. Stage the five
+files the loader needs in a private folder. `gta6rt.exe` links the MSVC runtime dynamically, and `gta6rt_tls_host.dll`
+is the loader's TLS anchor; all must sit beside the executable.
 
 ```powershell
-$repo  = "C:\path\to\Leonida"
+$repo  = "C:\path\to\exe-day-3777"   # the kit's source tree at 366c2463b, not fresh main
 $build = Join-Path $repo "runtime\build"
+$work  = "E:\leonida-work"
+$kit   = "C:\Users\kam\leonida-work\gta6rt-exeday"
+$bin  = Join-Path $work "exeday\bin"
+New-Item -ItemType Directory -Force $bin | Out-Null
 
-cmake -S (Join-Path $repo "runtime") -B $build -G Ninja `
-      -DCMAKE_BUILD_TYPE=Release -DLEONIDA_REQUIRE_VULKAN=ON
-cmake --build $build -j 8
-
-Test-Path (Join-Path $build "gta6rt.exe")
-Test-Path (Join-Path $build "gta6rt_tls_host.dll")
+$files = "gta6rt.exe", "gta6rt_tls_host.dll",
+         "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"
+$files | ForEach-Object { Copy-Item (Join-Path $kit $_) $bin -Force }
+Get-ChildItem $bin | Select-Object Name, Length
+Get-FileHash (Join-Path $bin "gta6rt.exe") -Algorithm SHA256
+$loader = Join-Path $bin "gta6rt.exe"
 ```
 
-`-DLEONIDA_REQUIRE_VULKAN=ON` makes a missing Vulkan SDK a configure error instead of silently dropping the D3D12
-device. If `cmake` or `ninja` is not on `PATH`, use the copies under
-`...\Microsoft Visual Studio\2022\...\Common7\IDE\CommonExtensions\Microsoft\CMake\`; the build script uses those.
-With the Visual Studio generator the binary lands in `runtime/build/Release/`; every command below assumes the Ninja
-layout, so use Ninja or adjust `$loader`.
+Compare the hash with the one in the kit's `MANIFEST.txt`; a mismatch means the kit changed, so re-read the manifest
+before trusting its recorded test results.
 
-Keep a last-good pair. `gta6rt_tls_host.dll` must stay next to `gta6rt.exe`.
+The frame attempt is gated on three strings in this exact binary:
+
+```powershell
+$tokens = "LEONIDA_PRESENTX_SLOT", "LEONIDA_CAPTURE", "present-"
+$ascii  = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($loader))
+$tokens | ForEach-Object { "$_ = $($ascii.Contains($_))" }
+$captureRoute = ($tokens | Where-Object { -not $ascii.Contains($_) }).Count -eq 0
+"capture route in this binary: $captureRoute"
+"SDL3 3.4.20 in binary: $($ascii.Contains('SDL-release-3.4.20'))"
+```
+
+The SDL3 marker must be `True`; if it is `False`, this is the no-SDL3 build and the GameInput shim is absent. The
+deployed intermediate (13:35 UTC, 2026-11-23) has none of the three capture strings; the final exe-day assembly will.
+They are in PR #6230 and that assembly, not on `main` at `561b65a83`. If `$captureRoute` is false, the binary can
+trace and draw but cannot write a frame artifact: plan the offscreen fallback in §5.4 and say "trace/draw only" in
+the handoff. The strings are a necessary condition, not proof that capture works; §5 still has to produce the file.
+
+If the delivered binary is lost, rebuild it from the tree that produced it, with SDL3:
+
+```powershell
+cmake -S (Join-Path $repo "runtime") -B $build -G Ninja `
+      -DCMAKE_BUILD_TYPE=Release -DLEONIDA_REQUIRE_VULKAN=ON -DLEONIDA_SDL3_FETCH=ON
+cmake --build $build -j 8
+```
+
+A rebuild also needs the three CRT DLLs and `gta6rt_tls_host.dll` beside the new exe. `-DLEONIDA_REQUIRE_VULKAN=ON`
+makes a missing Vulkan SDK a configure error instead of silently dropping the D3D12 device; if `cmake` or `ninja` is
+not on `PATH`, use the copies under
+`...\Microsoft Visual Studio\2022\...\Common7\IDE\CommonExtensions\Microsoft\CMake\`; the build script uses those.
+
+Keep a last-good loader. All five files go together.
 
 ```powershell
 $prev = Join-Path $repo "runtime\build-prev"
 New-Item -ItemType Directory -Force $prev | Out-Null
-Copy-Item (Join-Path $build "gta6rt.exe"), (Join-Path $build "gta6rt_tls_host.dll") $prev -Force
+Copy-Item (Join-Path $bin "*") $prev -Force
 ```
 
-### 1.2 Stage and verify the shader library
+### 1.2 Stage the package, the movie and the shader library
+
+`$game` is your own package root. Before import triage, check that the 16 modules the loader maps are present; a
+missing DLL is a package-path problem, not a missing shim.
+
+```powershell
+$game = "D:\path\to\your\package"
+$exe  = Join-Path $game "game_scarlett_master.exe"   # or wherever the exe was delivered
+
+$modules = @(
+    "Bink2Scarlett.dll", "XboxBvhBuilder.dll", "amd_fidelityfx_upscaler_xbox.dll",
+    "amd_fidelityfx_loader_xbox.dll", "libHttpClient.GDK.dll", "XCurl.dll",
+    "concrt140.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+    "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll", "vccorlib140.dll",
+    "vcomp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"
+)
+$modules | ForEach-Object {
+    $p = Join-Path $game $_
+    [pscustomobject]@{ Module = $_; Present = Test-Path $p; Bytes = if (Test-Path $p) { (Get-Item $p).Length } else { 0 } }
+} | Format-Table -AutoSize
+```
+
+All 16 must be `True`. `Bink2Scarlett.dll` is also the boot-movie decoder; the movie check is separate.
+
+The title's boot movie is a likely first-frame path. `d3d12_boot_movie` decodes a real `.bk2` through that DLL and
+presents it through PresentX on pixels. Point `LEONIDA_MOVIE` at a carved stream; if it is unset the test skips and
+the movie path stays unverified. The stream stays on the player's machine.
+
+```powershell
+$env:LEONIDA_GAME_DIR = $game
+$env:LEONIDA_MOVIE    = "E:\leonida-work\movies\boot.bk2"   # a carved Bink 2 stream
+Test-Path $env:LEONIDA_MOVIE
+```
 
 The shader stage is the long pole: it carves 26,503 containers, disassembles them and translates every one. Start it
 the day before. If `<work>\shaders\spirv\index.json` already exists, do not re-run it; verify it instead.
 
 ```powershell
-$game = "D:\path\to\your\package"
-$work = "E:\leonida-work"
-
 python -I make_game.py --game $game --work $work --stages shaders
 $env:LEONIDA_SHADERS = Join-Path $work "shaders\spirv"
 Test-Path (Join-Path $env:LEONIDA_SHADERS "index.json")
+(Get-ChildItem $env:LEONIDA_SHADERS -Filter 'VS_Bink_*' -File | Measure-Object).Count
 ```
 
 `--stages shaders` needs the package; `--out` is not needed for this stage. The run needs about 30 GB for check,
 shaders and runtime; the assets stage is ~370 GB and is not part of exe day. `LEONIDA_SHADERS` points at the `spirv`
-folder, not at `shaders`; the corpus test reads `<spirv>/../dxbc` for the containers.
+folder, not at `shaders`; the corpus test reads `<spirv>/../dxbc` for the containers. The 1.0.2.1 corpus has four
+`VS_Bink_*` modules; a zero count means the staged library is not the full corpus.
 
-### 1.3 Verify the runtime and the corpus
+### 1.3 Verify the delivered binary, the corpus and the movie
+
+`$tests` is the build tree that produced the kit; the kit's `MANIFEST.txt` names it. If it is gone, the delivered
+binary can still be run, but these checks need a source build.
 
 ```powershell
-$env:LEONIDA_D3D12   = "vulkan"
-$env:LEONIDA_SHADERS = Join-Path $work "shaders\spirv"
+$tests = "C:\path\to\the\kit-build"   # MANIFEST.txt names the real path
+$env:LEONIDA_D3D12    = "vulkan"
+$env:LEONIDA_SHADERS  = Join-Path $work "shaders\spirv"
+$env:LEONIDA_GAME_DIR = $game
 
-ctest --test-dir $build -C Release -R '^run_tiny_frame$' --output-on-failure
-ctest --test-dir $build -C Release -R '^shader_library_corpus$' --output-on-failure
-ctest --test-dir $build -C Release -R '^(d3d12_present|xbox_present)$' --output-on-failure
+# 1. The exact delivered gta6rt.exe, through the synthetic tiny_frame guest.
+python -I runtime\test\check_tiny_frame.py $loader `
+    (Join-Path $tests "fixtures\game\Release\tiny_frame.exe") `
+    --probe (Join-Path $tests "d3d12_com_test.exe")
+
+# 2. The staged corpus (standalone; no gta6rt needed).
+& (Join-Path $tests "shader_library_corpus_test.exe")
+
+# 3. Present and movie core.
+ctest --test-dir $tests -C Release `
+    -R '^(d3d12_present|xbox_present|d3d12_boot_movie|bink_decode)$' --output-on-failure
 ```
 
-CTest ignores `-C Release` on Ninja and needs it on the Visual Studio generator; keeping it makes the block work with
-both.
+CTest ignores `-C Release` on Ninja and needs it on the Visual Studio generator. If `shader_library_corpus_test.exe`
+is not in `$tests`, build it with `cmake --build $tests --target shader_library_corpus_test`. Build
+`d3d12_boot_movie` and `bink_decode` the same way if the kit's selection did not include them.
 
-| Test | Pass looks like | If it does not |
+| Check | Pass looks like | If it does not |
 |---|---|---|
-| `run_tiny_frame` | `Passed`; the trace has device, queue, allocator, list, fence and the clear/copy; 32/32 pixels | no usable Vulkan device, or a broken build. Fix before 17:00. |
-| `shader_library_corpus` | `Passed`; 26,503 containers resolve, 0 failures | `Skipped` means `LEONIDA_SHADERS` is wrong. A failure names a shader and means the staged layout or the stage split is incomplete. |
+| `check_tiny_frame.py` | `OK`; the trace has device, queue, allocator, list, fence and the clear/copy; 32/32 pixels | no usable Vulkan device, a missing CRT DLL or a broken loader. Fix before 17:00. |
+| `shader_library_corpus_test` | 26,503 containers resolve, 0 failures | `LEONIDA_SHADERS` is wrong or the staged layout is incomplete. |
 | `d3d12_present`, `xbox_present` | `Passed`; the swapchain/present core and its capture work | no presentation-capable Vulkan device. The present hour is at risk. |
+| `d3d12_boot_movie`, `bink_decode` | `Passed`; a real boot-movie frame is decoded and presented on pixels | `LEONIDA_GAME_DIR`/`LEONIDA_MOVIE` unset means SKIP; the movie path is unverified, not passed. |
 
-The corpus test reads every container; about 9 minutes from a hard disk, up to an hour by CTest's timeout. Run it
-before 17:00. `run_tiny_frame` and the present tests take seconds.
+A test missing from the build is a gap to record, not a pass. The corpus test reads every container; about 9 minutes
+from a hard disk, up to an hour by CTest's timeout. Run it before 17:00. `check_tiny_frame` and the present tests take
+seconds.
 
 The corpus is 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh and 195 GS. A mesh PSO is not an exotic case; it is most of
 the corpus, and the mesh path is one of the branches in §0.
@@ -114,22 +200,27 @@ Every pass gets a new directory. `--trace` refuses an existing file (exit 2) rat
 reuse a trace path.
 
 ```powershell
+$stamp   = Get-Date -Format "MMdd-HHmmss"
+$run     = Join-Path $work "exeday\$stamp"
+$overlay = Join-Path $run "overlay"
+$saves   = Join-Path $run "saves"
+New-Item -ItemType Directory -Force $run, $overlay, $saves | Out-Null
+
 $env:LEONIDA_D3D12              = "vulkan"
 $env:LEONIDA_UNIMPLEMENTED      = "log"
 $env:LEONIDA_SHADERS            = Join-Path $work "shaders\spirv"
+$env:LEONIDA_GAME_DIR           = $game
+$env:LEONIDA_SAVE_DIR           = $saves
 $env:LEONIDA_VK_VALIDATION      = $null    # only while diagnosing a validation error
 $env:DISABLE_RTSS_LAYER         = "1"      # only if Afterburner/RTSS is installed
 $env:DISABLE_VULKAN_OBS_CAPTURE = "1"      # only if OBS is installed
-
-$exe     = "D:\path\to\your\package\game_scarlett_master.exe"  # confirm the name
-$overlay = Join-Path $work "overlay"
-$stamp   = Get-Date -Format "MMdd-HHmmss"
-$run     = Join-Path $work "exeday\$stamp"
-New-Item -ItemType Directory -Force $run, $overlay | Out-Null
-$loader  = Join-Path $build "gta6rt.exe"
 ```
 
 Run every block from the repository root (`$repo`); the `python -I tools\...` and `make_game.py` paths assume it.
+
+`LEONIDA_SAVE_DIR` is the offline `XGameSave` root (`<root>\local-user\<container>\<blob>`); a fresh folder per run
+keeps saves out of the repository and makes a first-run save path visible. `$overlay` is where the title's writes go;
+a fresh folder per run keeps the previous run's files from masking a failure.
 
 `LEONIDA_D3D12=vulkan` is not optional: it selects the only backend that writes the `[d3d12-trace]` lines. Without it
 the title runs through the PC D3D12 device and the D3D12 trace has nothing to read. `LEONIDA_VK_VALIDATION=1` adds the
@@ -137,14 +228,27 @@ Khronos validation layer, which is a diagnostic and not a timed-run setting.
 
 ### 1.5 The pre-flight checklist
 
+```powershell
+foreach ($d in @($overlay, $saves)) {
+    New-Item -ItemType Directory -Force $d | Out-Null
+    $probe = Join-Path $d ".write-probe"
+    "ok" | Set-Content $probe
+    Remove-Item $probe
+}
+```
+
 | Before 17:00 | Done when |
 |---|---|
-| Build | `gta6rt.exe` and `gta6rt_tls_host.dll` in `$build`; the tree carries the fixes in §0 |
-| Shaders | `index.json` exists; `shader_library_corpus` passed 26,503/26,503 |
-| Device and present | `run_tiny_frame`, `d3d12_present` and `xbox_present` passed |
-| Paths | `$exe`, `$game` and `$overlay` exist; the overlay is writable; there is room for the title's writes |
+| Loader | `$bin` has `gta6rt.exe`, `gta6rt_tls_host.dll`, `msvcp140.dll`, `vcruntime140.dll` and `vcruntime140_1.dll`; the hash matches `MANIFEST.txt` |
+| SDL3/GameInput | the delivered binary is used; if rebuilt, `-DLEONIDA_SDL3_FETCH=ON` was set and the GameInput shim is in it |
+| Capture route | `$captureRoute` is recorded; if false, the deliverable is trace/draw only, not a frame artifact |
+| Package | all 16 modules are present; `$exe` exists |
+| Movie | `LEONIDA_MOVIE` is a file; `d3d12_boot_movie` passed (or the gap is recorded) |
+| Shaders | `index.json` exists; four `VS_Bink_*` modules; corpus passed 26,503/26,503 |
+| Device and present | `check_tiny_frame.py` passed on the delivered binary; the present tests passed |
+| Overlay and saves | `$overlay` and `$saves` exist and the write probe succeeded |
 | Traces | `$run` is empty; no path is reused between passes |
-| Rollback | `runtime\build-prev` holds the last good `gta6rt.exe` and `gta6rt_tls_host.dll` |
+| Rollback | `runtime\build-prev` holds all five loader files |
 | Clock | 17:00 start, 21:30 evidence freeze, 22:00 hard stop |
 
 ## 2. Hour 0-0:30 — trace
@@ -224,6 +328,9 @@ New-Item -ItemType Directory -Force $runDir | Out-Null
     ForEach-Object { $_.ToString() } |
     Out-File (Join-Path $runDir "console.log") -Width 4096 -Encoding utf8
 "run exit=$LASTEXITCODE"
+
+python -I tools\boot_trace.py (Join-Path $runDir "startup.jsonl") --d3d12 (Join-Path $runDir "console.log") --json |
+    Out-File (Join-Path $runDir "summary.json") -Encoding utf8
 ```
 
 If it has not exited after 3 minutes, stop it explicitly, unless the console log shows a PSO being created: the
@@ -288,11 +395,22 @@ Write the six facts and the decision in `$run\triage.md`. It is the handoff if t
 Goal: `--run` reaches `D3D12XboxCreateDevice` with no unimplemented call before it. `LEONIDA_UNIMPLEMENTED=log` is the
 map; `stop` is the iteration tool.
 
-First get the full unique list without stopping. Set `$runDir = Join-Path $run "all-imports"` and run the §2.3 block
-once with `LEONIDA_UNIMPLEMENTED=log`; then parse its summary:
+First get the full unique list without stopping. Use a fresh directory and write the summary in the same block; the
+`--trace` file must not exist yet.
 
 ```powershell
-$s = Get-Content (Join-Path $run "all-imports\summary.json") -Raw | ConvertFrom-Json
+$allDir = Join-Path $run "all-imports"
+New-Item -ItemType Directory -Force $allDir | Out-Null
+$env:LEONIDA_UNIMPLEMENTED = "log"
+& $loader --run $exe --game-dir $game --overlay $overlay `
+    --trace (Join-Path $allDir "startup.jsonl") --trace-d3d12 2>&1 |
+    ForEach-Object { $_.ToString() } |
+    Out-File (Join-Path $allDir "console.log") -Width 4096 -Encoding utf8
+"all-imports exit=$LASTEXITCODE"
+
+python -I tools\boot_trace.py (Join-Path $allDir "startup.jsonl") --d3d12 (Join-Path $allDir "console.log") --json |
+    Out-File (Join-Path $allDir "summary.json") -Encoding utf8
+$s = Get-Content (Join-Path $allDir "summary.json") -Raw | ConvertFrom-Json
 $s.startup.unimplemented | Format-Table import, caller
 ```
 
@@ -326,6 +444,10 @@ Fix, rebuild only `gta6rt`, then rerun the iteration block above; its `$i++` adv
 ```powershell
 cmake --build $build --target gta6rt -j 8
 ```
+
+`$build` is the SDL3 build from §1.1 and `$repo` is the kit's source tree, not fresh main. If `$build` was never
+configured, run the §1.1 fallback block first. A rebuilt `gta6rt.exe` needs the same three CRT DLLs and
+`gta6rt_tls_host.dll` beside it; stage the set in a new folder and point `$loader` at it before rerunning.
 
 ### 3.2 What to do with the call
 
@@ -378,7 +500,7 @@ The second command is the work queue: each line is one method and one outcome. F
 
 ### 4.1 2:00-2:20 — device, queue, allocator, list, fence
 
-`run_tiny_frame` is the expected order: `D3D12XboxCreateDevice ok`, `CreateCommandQueue ok`,
+The tiny_frame trace is the expected order: `D3D12XboxCreateDevice ok`, `CreateCommandQueue ok`,
 `CreateCommandAllocator ok`, `CreateCommandList ok`, `CreateFence ok`, `CreateDescriptorHeap ok`.
 
 - `D3D12XboxCreateDevice failed`: the HRESULT, the adapter, the IID and the 24 words are the first facts. The shim
@@ -430,11 +552,12 @@ the decision in `$run\triage.md`.
 ## 5. Hour 3:30-4:30 — first pixels
 
 Goal: a file on disk, non-black, produced by the title's own draw and present path. The trace's draw count must be
-non-zero. A clear-only frame counts; a black frame does not.
+non-zero. A clear-only frame counts; a black frame does not. Check `$captureRoute` first: if it is false, this binary
+cannot write a capture file, and the hour's deliverable is the offscreen PPM in §5.4, not a PresentX capture.
 
 | Trace | Path | First move |
 |---|---|---|
-| `XboxID3D12CommandQueue::SlotN unsupported`, plus `[rt] ... queue slot N` | PresentX | Check the opt-in route; set slot N; capture. |
+| `XboxID3D12CommandQueue::SlotN unsupported`, plus `[rt] ... queue slot N` | PresentX | Check `$captureRoute`; set slot N; capture. |
 | `IDXGISwapChain::Present` or `CreateSwapChain` | DXGI | Keep the window visible; use the presenter capture. |
 | Draws `ok`, no present call | offscreen | Copy the last render target to a readback buffer. |
 | No draws | back to §4 | Fix the first draw; do not chase present. |
@@ -447,25 +570,28 @@ this title, not a measurement. The queue proxy accepts the 19 public slots and l
 the D3D12 trace as `XboxID3D12CommandQueue::SlotN unsupported`. That N is the only evidence for the slot. Do not guess
 30 or 32: a wrong slot can fault past the proxy's 128-entry table.
 
-Check whether the opt-in route is on the build:
+The gate is the exact binary, not the source tree: `$captureRoute` from §1.1. The flags are in PR #6230 and the final
+exe-day assembly, not on `main` at `561b65a83`; a `git grep` on main is expected to be empty even when the delivered
+binary has them.
 
 ```powershell
-git -C $repo grep -n 'LEONIDA_PRESENTX_SLOT'
+if (-not $captureRoute) {
+    "this binary has no LEONIDA_PRESENTX_SLOT/LEONIDA_CAPTURE/present-: trace and draw only; use §5.4"
+} else {
+    $slotN = 30   # replace with the N the trace printed; do not guess
+    $env:LEONIDA_PRESENTX_SLOT = "$slotN"
+    $env:LEONIDA_CAPTURE       = Join-Path $run "capture"
+    New-Item -ItemType Directory -Force $env:LEONIDA_CAPTURE | Out-Null
+    # rerun the --run block with a fresh trace path
+}
 ```
 
-If it prints nothing, the route has not landed; use a fallback in §6. If it prints, the branch's README is the
-authority for the value and the capture format:
+If `$captureRoute` is false, do not run the capture block; the binary cannot write the artifact. If it is true, the
+branch's README is the authority for the slot value and the capture format. `$captureRoute` is necessary, not
+sufficient: §5.2 still has to find and check the file.
 
-```powershell
-$slotN = 30   # replace with the N the trace printed; do not guess
-$env:LEONIDA_PRESENTX_SLOT = "$slotN"
-$env:LEONIDA_CAPTURE       = Join-Path $run "capture"
-New-Item -ItemType Directory -Force $env:LEONIDA_CAPTURE | Out-Null
-# rerun the --run block with a fresh trace path
-```
-
-If the branch writes raw RGBA instead of PPM or PNG, convert it in the branch, not in this repository. The capture is
-game data and stays local.
+If the capture route writes raw RGBA instead of PPM or PNG, convert it in the route's source, not in this repository.
+The capture is game data and stays local.
 
 ### 5.2 The non-black check
 
@@ -530,10 +656,12 @@ function Get-FrameStats {
 ```
 
 ```powershell
-$frame = Get-ChildItem -Path $env:LEONIDA_CAPTURE -Recurse -File -Include *.ppm,*.png |
-         Sort-Object LastWriteTime | Select-Object -Last 1
-if (-not $frame) { throw 'no capture file; read the branch log for the reason' }
-Get-FrameStats $frame.FullName | Format-List
+if ($captureRoute) {
+    $frame = Get-ChildItem -Path $env:LEONIDA_CAPTURE -Recurse -File -Include *.ppm,*.png |
+             Sort-Object LastWriteTime | Select-Object -Last 1
+    if (-not $frame) { throw 'no capture file; read the branch log for the reason' }
+    Get-FrameStats $frame.FullName | Format-List
+}
 ```
 
 Pass: `NonBlackPct` above 0 and `MaxLuma` above 8. A non-black clear is a first frame for this runbook. Record `Width`,
@@ -573,7 +701,8 @@ python -I tools\boot_trace.py (Join-Path $last "startup.jsonl") --d3d12 (Join-Pa
 ```
 
 `triage.txt` can quote module names, import names, debug strings, resource names and paths. It stays on the player's
-machine. The shareable summary is the next block.
+machine. The shareable summary is the next block. Record `$captureRoute` and the three token results beside it: a
+binary without the capture route is a trace/draw result, not a first-frame artifact.
 
 ### 6.2 Shareable summary (counts and error classes only)
 
@@ -618,15 +747,16 @@ Write it in `$run\blocker.txt` and in the handoff as `#seq method outcome`; do n
 |---|---|---|---|
 | Offscreen readback | device and draws are `ok`; present is the only blocker | a 30-minute hook at the last render target | pixels from the title's draw, not the present path |
 | DXGI path | the title creates a swapchain, or `IDXGISwapChain::Present` appears | minutes if the title uses it; not a drop-in if PresentX-only | the standard PC present path and the presenter capture |
-| Capture-only PresentX | the opt-in route is on the build and the slot is known | minutes | the composed planes without a window; a first-frame artifact |
+| Capture-only PresentX | `$captureRoute` is true and the slot is known | minutes | the composed planes without a window; a first-frame artifact |
 
 The order is deliberate: offscreen needs no unmeasured slot; DXGI is a real path only if the title uses it;
 capture-only PresentX is last because the slot and the branch are the two unknowns.
 
 ### 6.4 Handoff
 
-Five lines, by 22:00: build hash and branch, environment variables, the first blocker, the last good trace path, and
-the next three fixes. Counts and error classes only in the repository; the paths and the captures stay local.
+Five lines, by 22:00: build hash and branch, environment variables and `$captureRoute`, the first blocker, the last
+good trace path, and the next three fixes. If `$captureRoute` is false, say "trace/draw only". Counts and error
+classes only in the repository; the paths and the captures stay local.
 
 ## 7. Hard rules
 
@@ -647,13 +777,17 @@ These restate `AGENTS.md` for the pressure of the day.
 
 ## 8. Verification for this page
 
-Run on 2026-11-23 on Windows 11, NVIDIA GeForce RTX 5070 Ti (driver 621.24), with a Release build of `561b65a83`:
+Run on 2026-11-23 on Windows 11, NVIDIA GeForce RTX 5070 Ti (driver 621.24):
 
-- The Release configure and build completed; `gta6rt.exe` and `gta6rt_tls_host.dll` were produced.
-- `run_tiny_frame` passed: 19 D3D12 calls, 0 `failed`/`unsupported`/`refused`, 32/32 pixels the clear colour.
-- `d3d12_present` and `xbox_present` passed.
-- `shader_library_corpus` skipped without `LEONIDA_SHADERS`, the expected branch; it was not run on a corpus here.
+- The delivered `gta6rt.exe` from the kit passed `check_tiny_frame.py` against the synthetic `tiny_frame` guest:
+  `tiny_frame under gta6rt --run on the Vulkan D3D12 device: OK`.
+- The delivered binary's string scan is `False` for `LEONIDA_PRESENTX_SLOT`, `LEONIDA_CAPTURE` and `present-`. It can
+  trace and draw; the frame artifact waits for the final exe-day assembly with #6230.
+- The staged 1.0.2.1 corpus: 26,503 containers, 26,503 reached, 0 not translated, 0 failures.
+- A Release build of `561b65a83` produced `gta6rt.exe` and `gta6rt_tls_host.dll`; `run_tiny_frame`, `d3d12_present`
+  and `xbox_present` passed on the source build (19 D3D12 calls, 0 failed/unsupported/refused, 32/32 pixels).
+- `d3d12_boot_movie` and `bink_decode` were not run here because no `LEONIDA_MOVIE` was staged; the page treats that
+  as a gap, not a pass.
 - `boot_trace.py` passed its 20 unit tests and produced text and JSON reports from the synthetic `tiny_frame` trace.
-- The 33 documentation tests passed.
-- The retail executable was not run. The 26,503/26,503 corpus result is the recorded one in `docs/design.md`, not a
-  measurement made for this page.
+- The 33 `test_docs_*` tests and the 9 `test_i18n_index` tests passed.
+- The retail executable was not run.
