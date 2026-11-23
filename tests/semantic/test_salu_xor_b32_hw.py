@@ -124,5 +124,74 @@ class SXorB32AstValidationTests(unittest.TestCase):
         )
         self.assertEqual(ast.dst.kind, RegKind.SPECIAL)
 
+class ScalarRegisterState:
+    def __init__(self):
+        self.sgprs: dict[int, int] = {}
+        self.scc: int = 0
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0) & MASK32
+
+    def set_sgpr(self, idx: int, val: int):
+        self.sgprs[idx] = val & MASK32
+
+    def get_operand_val(self, op: Operand32) -> int:
+        if op.kind == RegKind.SGPR:
+            return self.get_sgpr(op.index)
+        else:
+            return op.raw_val & MASK32
+
+
+def execute_scalar_xor_b32(state: ScalarRegisterState, ast: InstructionAST) -> None:
+    s0 = state.get_operand_val(ast.src0)
+    s1 = state.get_operand_val(ast.src1)
+    res, scc = oracle_xor_b32(s0, s1)
+    state.set_sgpr(ast.dst.index, res)
+    state.scc = scc
+
+
+class SXorB32ScalarInterpreterTests(unittest.TestCase):
+    def test_scalar_execution_basic(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x00FF00FF)
+        state.set_sgpr(1, 0x0F0F0F0F)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 2),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        execute_scalar_xor_b32(state, ast)
+        res = state.get_sgpr(2)
+        self.assertEqual(res, 0x0FF00FF0)
+        self.assertEqual(state.scc, 1)
+
+    def test_scalar_execution_zero_result(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0xABCD1234)
+        state.set_sgpr(1, 0xABCD1234)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 2),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 1),
+        )
+        execute_scalar_xor_b32(state, ast)
+        self.assertEqual(state.get_sgpr(2), 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_scalar_execution_with_immediate(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x12340000)
+        ast = InstructionAST(
+            "s_xor_b32",
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.SGPR, 0),
+            Operand32(RegKind.IMM, raw_val=0x00005678),
+        )
+        execute_scalar_xor_b32(state, ast)
+        self.assertEqual(state.get_sgpr(0), 0x12345678)
+        self.assertEqual(state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
