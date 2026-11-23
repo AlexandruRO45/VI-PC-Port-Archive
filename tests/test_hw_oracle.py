@@ -282,7 +282,7 @@ class ToolchainFallbacks(unittest.TestCase):
         self.assertEqual(error, "")
         run.assert_called_with(
             [o.lld, "-m", "elf64_amdgpu", "-shared", os.path.join(tmp, "k.o"), "-o", code],
-            capture_output=True, text=True,
+            capture_output=True, text=True, errors="replace",
         )
 
     def test_true16_is_used_only_where_the_assembler_needs_it(self):
