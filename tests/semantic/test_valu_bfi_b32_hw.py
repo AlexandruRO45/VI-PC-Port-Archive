@@ -376,6 +376,24 @@ class TestBfiTranslator(unittest.TestCase):
         self.assertIn("%out_mrt0 = OpVariable", spv)
 
 
+class TestBfiNegative(unittest.TestCase):
+    def test_reject_too_few_operands(self):
+        interp = ScalarInterp()
+        with self.assertRaises(IndexError):
+            interp.execute_line("v_bfi_b32 v0, v1, v2")
+
+    def test_reject_invalid_register(self):
+        interp = ScalarInterp()
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_bfi_b32 v0, x1, v2, v3")
+
+    def test_mutation_detection(self):
+        # Mutating oracle logic (e.g. using OR instead of AND) must fail tests
+        def buggy_bfi(m, f, b):
+            return (m | f) & b
+        self.assertNotEqual(buggy_bfi(0x55555555, 0xFFFFFFFF, 0x00000000), 0x55555555)
+
+
 if __name__ == "__main__":
     unittest.main()
 
