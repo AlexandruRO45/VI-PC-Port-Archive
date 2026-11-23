@@ -71,9 +71,10 @@ std::vector<Lookup> g_lookups;
 //  xgameruntime.dll          GDK reference, gaming/gdk/docs/reference/system/<family>/functions/<name>. These families
 //                            return HRESULT except the functions in kNotHResult, which the same pages show as
 //                            void/bool/int: XAsync*, XTaskQueue*, XUser*, XStore*, XGameSave*, XPackage*, XGameUi*.
-//                            XGameRuntimeInitialize and XGameEventWrite: HRESULT.
-//                            Mixed families (XSystem*, XGameStreaming*, XThread*, XDisplay*, XGameRuntimeFeature*) are
-//                            left out on purpose.
+//                            XGameStreaming* follows the same rule, including the unregister prefix exception.
+//                            XGameRuntimeInitialize, XGameEventWrite, XSystemGetXboxLiveSandboxId,
+//                            XThreadSetTimeSensitive and XErrorReport return HRESULT (see xgameruntime.cpp).
+//                            Other mixed families remain unclassified.
 //  gameinput.dll             GameInputCreate: HRESULT (gaming/gdk/docs/reference/input/gameinput/functions/
 //                            gameinputcreate). The shim implements it (runtime/shims/gameinput.cpp); the class is
 //                            listed anyway for a build or import it misses.
@@ -91,11 +92,13 @@ const char* const kNotHResult[] = {
     "XStoreCloseContextHandle", "XStoreCloseLicenseHandle", "XStoreCloseProductsQueryHandle", "XStoreIsLicenseValid",
     "XStoreProductsQueryHasMorePages", "XStoreUnregisterGameLicenseChanged", "XStoreUnregisterPackageLicenseLost",
     "XGameSaveCloseContainer", "XGameSaveCloseProvider", "XGameSaveCloseUpdate",
+    "XGameStreamingIsStreaming", "XGameStreamingGetClientCount", "XGameStreamingGetConnectionState",
+    "XGameStreamingIsTouchInputEnabled", "XGameStreamingUninitialize",
     "XPackageCloseInstallationMonitorHandle", "XPackageCloseMountHandle", "XPackageGetInstallationProgress",
     "XPackageIsPackagedProcess", "XPackageUninstallPackage", "XPackageUnregisterInstallationProgressChanged",
     "XPackageUnregisterPackageInstalled", "XPackageUpdateInstallationMonitor",
 };
-const char* const kXFamilies[] = {"XAsync", "XTaskQueue", "XUser", "XStore", "XGameSave", "XPackage", "XGameUi"};
+const char* const kXFamilies[] = {"XAsync", "XTaskQueue", "XUser", "XStore", "XGameSave", "XPackage", "XGameUi", "XGameStreaming"};
 
 ReturnClass classify(const std::string& dll, const std::string& name) {
     if (dll == "d3d12.dll" || dll == "d3d12_xs.dll") {
@@ -114,7 +117,10 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
     } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
-        if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
+        if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite" ||
+            name == "XSystemGetXboxLiveSandboxId" || name == "XThreadSetTimeSensitive" || name == "XErrorReport")
+            return ReturnClass::HResult;
+        if (starts_with(name, "XGameStreamingUnregister")) return ReturnClass::Other;
         for (const char* n : kNotHResult)
             if (name == n) return ReturnClass::Other;
         for (const char* f : kXFamilies)

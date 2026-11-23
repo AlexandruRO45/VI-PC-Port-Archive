@@ -245,6 +245,16 @@ void test_classification() {
     check(cls("kernel32.dll", "XUserAddAsync") == ReturnClass::Other, "the DLL matters");
     check(cls("leonida_policy_probe.dll", "PolicyProbeOther") == ReturnClass::Other, "unknown import is other");
 
+    for (const char* name : {"XGameStreamingInitialize", "XGameStreamingGetStreamAddedLatency",
+                             "XGameStreamingRegisterConnectionStateChanged", "XSystemGetXboxLiveSandboxId",
+                             "XThreadSetTimeSensitive", "XErrorReport"})
+        check(cls("xgameruntime.dll", name) == ReturnClass::HResult, std::string(name) + " returns HRESULT");
+    for (const char* name : {"XGameStreamingIsStreaming", "XGameStreamingGetClientCount",
+                             "XGameStreamingGetConnectionState", "XGameStreamingIsTouchInputEnabled",
+                             "XGameStreamingUninitialize", "XGameStreamingUnregisterClientPropertiesChanged",
+                             "XGameStreamingUnregisterConnectionStateChanged", "XGameStreamingUnregisterFuture"})
+        check(cls("xgameruntime.dll", name) == ReturnClass::Other, std::string(name) + " is not HRESULT");
+
     bool valid = true;
     check(rt::shims::parse_unimplemented_policy("fail", &valid) == UnimplementedPolicy::Fail && valid, "parse fail");
     check(rt::shims::parse_unimplemented_policy("STOP", &valid) == UnimplementedPolicy::Stop && valid, "parse STOP");
