@@ -426,5 +426,78 @@ class TestMed3I32SimdDivergence(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 0xDEADBEEF)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation (Commit 5)
+# ==============================================================================
+
+class TestMed3I32RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_src0_in_shader(self):
+        # v1 = med3(v1, v2, v3) -> dst aliases src0
+        lines = [
+            "v_mov_b32_e32 v1, 100",
+            "v_mov_b32_e32 v2, -50",
+            "v_mov_b32_e32 v3, 20",
+            "v_med3_i32 v1, v1, v2, v3",
+            "exp mrt0, v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_alias_dst_s0", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 20)
+
+    def test_alias_dst_src1_in_shader(self):
+        # v2 = med3(v1, v2, v3) -> dst aliases src1
+        lines = [
+            "v_mov_b32_e32 v1, 100",
+            "v_mov_b32_e32 v2, -50",
+            "v_mov_b32_e32 v3, 20",
+            "v_med3_i32 v2, v1, v2, v3",
+            "exp mrt0, v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_alias_dst_s1", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 20)
+
+    def test_alias_dst_src2_in_shader(self):
+        # v3 = med3(v1, v2, v3) -> dst aliases src2
+        lines = [
+            "v_mov_b32_e32 v1, 100",
+            "v_mov_b32_e32 v2, -50",
+            "v_mov_b32_e32 v3, 20",
+            "v_med3_i32 v3, v1, v2, v3",
+            "exp mrt0, v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_alias_dst_s2", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 20)
+
+    def test_alias_all_sources_identical(self):
+        lines = [
+            "v_mov_b32_e32 v0, 42",
+            "v_med3_i32 v0, v0, v0, v0",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_alias_all", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 42)
+
+    def test_alias_pairwise_sources(self):
+        lines = [
+            "v_mov_b32_e32 v1, -15",
+            "v_mov_b32_e32 v2, 30",
+            "v_med3_i32 v0, v1, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_alias_pairwise", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], u32(-15))
+
+
 if __name__ == "__main__":
     unittest.main()
