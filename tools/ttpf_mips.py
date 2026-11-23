@@ -346,7 +346,7 @@ def _bc6h_unquantize(comp, bits, signed):
             return 0xFFFF
         return ((comp << 16) + 0x8000) >> bits
     if bits >= 16:
-        return -32767 if comp < -32767 else comp
+        return comp
     neg = comp < 0
     c = -comp if neg else comp
     if c == 0:
@@ -359,18 +359,12 @@ def _bc6h_unquantize(comp, bits, signed):
 
 
 def _bc6h_finish(val, signed, lut):
-    """Finish BC6H unquantization to a finite IEEE 754 half-float."""
+    """Finish BC6H unquantization to an IEEE 754 half-float (signed -32768 maps to -inf)."""
     if not signed:
         h = (val * 31) >> 6
         return lut[h if h <= 0x7BFF else 0x7BFF]
-    neg = val < 0
-    v = -val if neg else val
-    if v > 0x7FFF:
-        v = 0x7FFF
-    h = (v * 31) >> 5
-    if h > 0x7BFF:
-        h = 0x7BFF
-    return lut[h | 0x8000] if neg else lut[h]
+    h = (abs(val) * 31) >> 5
+    return lut[h | 0x8000] if val < 0 else lut[h]
 
 
 def decode_bc6h_block(data, at, *, signed=False):

@@ -615,8 +615,7 @@ class BcDecodeTest(unittest.TestCase):
         self.assertEqual(px0b[1][0], exp_e1)
 
         # Mode 0x0F (1-region transformed 16-bit base + 4-bit delta, reversed rw[15:10]).
-        # Test exact round-trip of large positive UF16 and negative SF16 via solid_bc6h,
-        # plus -32768 clamp in SF16 -> finite -65504.0 (never -inf/NaN).
+        # Test round-trip of large positive UF16 and negative SF16 via solid_bc6h.
         px_hi = ttpf.decode_pixels(95, solid_bc6h(128.0, 0.5, 0.0, signed=False), 1, 1)
         self.assertAlmostEqual(px_hi[0][0], 128.0, places=2)
         self.assertAlmostEqual(px_hi[0][1], 0.5, places=3)
@@ -624,9 +623,6 @@ class BcDecodeTest(unittest.TestCase):
         self.assertAlmostEqual(px_neg[0][0], -12.5, places=2)
         self.assertAlmostEqual(px_neg[0][1], 3.25, places=2)
         self.assertAlmostEqual(px_neg[0][2], -0.25, places=3)
-        blk_min16 = pack_bc6h_block(0x0F, fields=[[0x8000, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
-        px_min16 = ttpf.decode_pixels(96, blk_min16, 1, 1)
-        self.assertEqual(px_min16[0][0], -65504.0)
 
         # Mode 0x02 (2-region transformed 11-bit base, deltas (5,4,4)) with partition 1.
         # Subset 0: R=1000, Subset 1: R=1000+10=1010..1000-6=994.
@@ -651,6 +647,19 @@ class BcDecodeTest(unittest.TestCase):
         px1e = ttpf.decode_pixels(96, blk1e, 1, 1)
         self.assertGreater(px1e[0][0], 0.0)
         self.assertEqual(px1e[2][0], -px1e[0][0])
+
+    def test_bc6h_signed_mode14_minimum_endpoint_and_interpolants(self):
+        # Khronos Data Format 20.2: interpolate -32768 to -32761 using all
+        # 16 weights, then scale the magnitude by 31/32 and restore the sign.
+        block = pack_bc6h_block(0x0F, fields=[[0x8000, 7, 0, 0], [0x8000, 0, 0, 0], [0x7FFF, 0, 0, 0]],
+                                indices=range(16))
+        pixels = ttpf.decode_pixels(96, block, 1, 1)
+        red_words = [struct.unpack("<H", struct.pack("<e", r))[0] for r, _, _ in pixels]
+        self.assertEqual(red_words, [
+            0xFC00, 0xFC00, 0xFBFF, 0xFBFF, 0xFBFE, 0xFBFE, 0xFBFD, 0xFBFD,
+            0xFBFC, 0xFBFC, 0xFBFB, 0xFBFB, 0xFBFA, 0xFBFA, 0xFBF9, 0xFBF9,
+        ])
+        self.assertEqual([(g, b) for _, g, b in pixels], [(float("-inf"), 65504.0)] * 16)
 
     def test_hdr_tonemap_metric(self):
         same = [(0.0, 1.0, 500.0), (1000.0, 0.25, 65504.0)]
