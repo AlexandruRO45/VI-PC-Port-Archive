@@ -6774,7 +6774,7 @@ public:
             opts->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
             opts->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
             opts->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;  // Bindless descriptor indexing supported
-            opts->PSSpecifiedStencilRefSupported = TRUE;
+            opts->PSSpecifiedStencilRefSupported = FALSE;
             opts->TypedUAVLoadAdditionalFormats = TRUE;
             opts->ROVsSupported = TRUE;
             opts->ConservativeRasterizationTier = state_.conservative_raster_tier;

@@ -5152,6 +5152,8 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
         EXPECT(options.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_3);
         EXPECT(options.MaxGPUVirtualAddressBitsPerResource == 40);
+        // No VK_EXT_shader_stencil_export path: native D3D12 on the RTX 5070 Ti also answers FALSE.
+        EXPECT(!options.PSSpecifiedStencilRefSupported);
 
         D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va_support{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va_support, sizeof(va_support))));
