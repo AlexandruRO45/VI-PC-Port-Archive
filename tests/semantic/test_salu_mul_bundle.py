@@ -262,5 +262,22 @@ class TestSMulI32IntegerOverflowExtremes(unittest.TestCase):
         expected = (0xDEADBEEF * 0xCAFEBABE) & MASK32
         self.assertEqual(ref_s_mul_i32(a, b), expected)
 
+class TestSMulI32TranslatorIntegration(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available in this Python environment")
+        lines = [
+            "s_mov_b32 s0, 0xa",
+            "s_mov_b32 s1, 0x14",
+            "s_mul_i32 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_s_mul_i32", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 200)
+
 if __name__ == "__main__":
     unittest.main()
