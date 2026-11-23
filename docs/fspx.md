@@ -223,26 +223,25 @@ and `RSRC2`).
 
 ## Translation status
 
-With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs (`main` at `aa2988cc` with the
-`v_fma_mix*` literal repair in [design.md](design.md), "Printed encodings"):
-**Wave size.** On `main` at `aa2988cc`, `make_game.py`'s FSPX step translates 26 of the 29, and each now gets the
-wave size of its dispatch state. Before, the code heuristic gave 4 of the 26 the other size: one wave64 program
-was translated as wave32, and three wave32 programs as wave64, because they write `vcc` with `s_mov_b64`. The
-translated and `spirv-val`-valid count is the same (26) either way. The breakdown below was measured when 17 translated.
+With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs of package 1.0.2.1, **20 of 29
+translate and pass `spirv-val`** (recount by @CuteBooty with LLVM 23.1.5, `gfx1030` listings, `spirv-val
+--target-env vulkan1.2`).
 
-With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs:
+The count depends on the LLVM version: LLVM 21.1.8 cannot decode two words that LLVM 23.1.5 decodes, so it gives
+**18 of 29** and refuses 11.
 
-- **27 translate and pass `spirv-val`**, 11 of the 13 programs that use dot4 among them (design.md, "Signed-byte
-  dot products"). Without the repair, 26: the `v_fma_mix_f32` it is for is refused.
-- **The other 2** (both use dot4) stop at a reachable `v_dot4_i32_i8` VOP3P word with `op_sel` 2 that `llvm-mc` does
-  not decode (the VOP3P words above).
+Of the 9 programs LLVM 23.1.5 refuses, 8 stop at a reachable `v_dot4_i32_i8` VOP3P word with `op_sel` 2 that
+`llvm-mc` does not decode (the VOP3P words above). Since SHADER-813 such a program is refused (`fall-through into
+undecodable words`) instead of translating with the path cut at the gap, which dropped its later stores from a module
+that still passed `spirv-val`; programs 04, 05, 06, 09, 12 and 15 of package 1.0.2.1 are refused for this (found by
+@aslan2142). The 20 that translate give byte-identical SPIR-V before and after the change.
 
-These counts predate SHADER-813. A program whose reachable code falls through into those undecodable VOP3P words used
-to translate with the path cut at the gap, so its later stores were missing from a module that passed `spirv-val`;
-it is now refused (`fall-through into undecodable words`): programs 04, 05, 06, 09, 12 and 15 of package 1.0.2.1
-(found by @aslan2142). Recount by @CuteBooty with LLVM 23.1.5 (gfx1030 listings, `spirv-val --target-env vulkan1.2`):
-26 of 29 translated and passed before the change, **20 of 29** after it; the 20 kept give byte-identical SPIR-V, and
-8 of the 9 refused stop at a fall-through into undecodable words.
+Earlier revisions of this page quoted 17, 26 and 27 translating; those numbers predate SHADER-813 and are historical,
+not current.
+
+**Wave size.** Each translated program gets the wave size of its dispatch state (kind 0 word 4 bit 20). The older code
+heuristic had given 4 programs the other size: one wave64 program translated as wave32 and three wave32 programs as
+wave64, because they write `vcc` with `s_mov_b64`. The number that translated and passed `spirv-val` did not change.
 
 ## Unknown
 
