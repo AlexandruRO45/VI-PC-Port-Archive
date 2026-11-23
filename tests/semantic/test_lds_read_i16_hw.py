@@ -201,5 +201,63 @@ class TestDSReadI16AST(unittest.TestCase):
         self.assertEqual(inst.to_asm(), "ds_read_i16 v5, v1")
 
 
+class RegisterFile:
+    """Architectural VGPR and SGPR register storage."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarThreadState:
+    """Thread state for scalar LDS execution."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.rf: RegisterFile = RegisterFile()
+        self.lds: LDSMemory = lds
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar interpreter for DS READ instructions."""
+
+    def execute(self, state: ScalarThreadState, inst: DSReadInstruction) -> int:
+        addr = state.rf.get_vgpr(inst.vaddr)
+        eff_addr = (addr + inst.offset.value) & MASK32
+        val = state.lds.read_i16(eff_addr)
+        state.rf.set_vgpr(inst.vdst, val)
+        return val
+
+
+class TestDSReadI16ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_execution_positive_and_negative(self) -> None:
+        self.lds.write_dword(0x40, 0x80007FFF)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+
+        # Read positive halfword at offset 0
+        inst_pos = DSReadInstruction(DSOpcode.DS_READ_I16, vdst=VGPR(5), vaddr=VGPR(1))
+        val_pos = self.interp.execute(self.state, inst_pos)
+        self.assertEqual(val_pos, 0x00007FFF)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(5)), 0x00007FFF)
+
+        # Read negative halfword at offset 2
+        inst_neg = DSReadInstruction(DSOpcode.DS_READ_I16, vdst=VGPR(6), vaddr=VGPR(1), offset=OffsetImmediate(2))
+        val_neg = self.interp.execute(self.state, inst_neg)
+        self.assertEqual(val_neg, 0xFFFF8000)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(6)), 0xFFFF8000)
+
+
 if __name__ == "__main__":
     unittest.main()
