@@ -84,11 +84,13 @@ def parse_startup(path: str, limit: int = 10) -> dict:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
-                trace["bad_lines"] += 1
-                if len(trace["bad_line_numbers"]) < limit:
-                    trace["bad_line_numbers"].append(number)
-                continue
-            if not isinstance(event, dict) or "kind" not in event:
+                event = None
+            # The loader serializes the native BOOL as an integer.
+            if (
+                not isinstance(event, dict)
+                or "kind" not in event
+                or (event["kind"] == "dllmain" and type(event.get("result")) is not int)
+            ):
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
                     trace["bad_line_numbers"].append(number)
@@ -110,7 +112,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
             elif kind == "tls_callback":
                 trace["tls_callbacks"] += 1
             elif kind == "dllmain":
-                if event.get("result"):
+                if event["result"] != 0:
                     trace["dllmain"]["ok"] += 1
                 else:
                     trace["dllmain"]["failed"] += 1

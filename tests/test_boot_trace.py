@@ -137,6 +137,29 @@ class BootTraceTests(unittest.TestCase):
         self.assertIs(trace["exceptions"][1]["cpp"], True)
         self.assertEqual(trace["exit"], 0)
 
+    def test_malformed_dllmain_results_do_not_count_as_outcomes(self):
+        self.write(self.startup, [
+            {"kind": "trace_open", "pid": 123},
+            {"kind": "dllmain", "module": "false.dll", "result": 0},
+            {"kind": "dllmain", "module": "string-zero.dll", "result": "0"},
+            {"kind": "dllmain", "module": "missing-result.dll"},
+            {"kind": "dllmain", "module": "object.dll", "result": {"value": 0}},
+            {"kind": "dllmain", "module": "bool.dll", "result": True},
+            {"kind": "dllmain", "module": "float.dll", "result": 1.0},
+            {"kind": "dllmain", "module": "true.dll", "result": 1},
+            {"kind": "dllmain", "module": "nonstandard-true.dll", "result": -1},
+            {"kind": "exit", "code": 7},
+        ])
+        trace = bt.parse_startup(self.startup)
+        self.assertEqual(trace["bad_lines"], 5)
+        self.assertEqual(trace["bad_line_numbers"], [3, 4, 5, 6, 7])
+        self.assertEqual(trace["events"], 5)
+        self.assertEqual(trace["kinds"]["dllmain"], 3)
+        self.assertEqual(
+            trace["dllmain"], {"ok": 2, "failed": 1, "failed_modules": ["false.dll"]}
+        )
+        self.assertEqual(trace["exit"], 7)
+
     def test_debug_text_is_not_printed(self):
         self.write(self.startup, STARTUP)
         text = bt.format_text(bt.summarize(bt.parse_startup(self.startup), None), 10)
