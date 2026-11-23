@@ -1413,10 +1413,13 @@ def _read_glb_png(doc: dict, bin_chunk: bytes, info: object, cache: dict[tuple[i
         return None
     start, length = view.get("byteOffset", 0), view.get("byteLength")
     declared = buffer.get("byteLength")
-    if any(type(value) is not int or value < 0 for value in (start, length, declared)):
+    if any(type(value) is not int or value < 0 for value in (start, length, declared)) or length == 0:
         raise invalid("invalid embedded PNG buffer bounds")
     if start + length > declared or start + length > len(bin_chunk):
         raise invalid("embedded PNG bufferView exceeds buffer 0")
+    tex_coord = info.get("texCoord", 0)
+    if type(tex_coord) is not int or tex_coord != 0:
+        raise invalid(f"embedded PNG requires TEXCOORD_0 (texCoord={tex_coord!r})")
     # Validate every reference before reusing immutable data from this import's buffer 0.
     span = (start, length)
     if span not in cache:
@@ -1425,7 +1428,11 @@ def _read_glb_png(doc: dict, bin_chunk: bytes, info: object, cache: dict[tuple[i
 
 
 def read_glb_parts(path: str) -> list[MeshPart]:
-    """Read mesh parts from a binary glTF 2.0 (``.glb``) file (always Y-up)."""
+    """Read mesh parts from a binary glTF 2.0 (``.glb``) file (always Y-up).
+
+    Embedded PNGs require TEXCOORD_0. Source sampler settings are not retained;
+    the writer uses repeat wrapping and linear filtering with mipmaps.
+    """
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 20 or data[:4] != GLB_MAGIC:

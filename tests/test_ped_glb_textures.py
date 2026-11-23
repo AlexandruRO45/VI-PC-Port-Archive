@@ -203,7 +203,7 @@ class PedGlbTextureTests(unittest.TestCase):
         view_index = image["bufferView"]
         end = (original["bufferViews"][view_index]["byteOffset"]
                + original["bufferViews"][view_index]["byteLength"])
-        for case in ("declared-end", "actual-end", "negative-offset", "negative-length", "view-index"):
+        for case in ("declared-end", "actual-end", "negative-offset", "negative-length", "empty", "view-index"):
             with self.subTest(case=case):
                 doc = copy.deepcopy(original)
                 view = doc["bufferViews"][view_index]
@@ -216,6 +216,8 @@ class PedGlbTextureTests(unittest.TestCase):
                     view["byteOffset"] = -1
                 elif case == "negative-length":
                     view["byteLength"] = -1
+                elif case == "empty":
+                    view["byteLength"] = 0
                 else:
                     doc["images"][-1]["bufferView"] = -1
                 self.source.write_bytes(container(doc, payload))
@@ -223,6 +225,26 @@ class PedGlbTextureTests(unittest.TestCase):
                     pa.read_glb_parts(str(self.source))
                 self.assertIn(str(self.source), str(caught.exception))
                 self.assertIn("normalTexture", str(caught.exception))
+
+    def test_embedded_textures_require_supported_coordinates_before_reusing_bytes(self):
+        original, payload = split_glb(self.source.read_bytes())
+        # This is a valid second coordinate set, even though the importer retains only TEXCOORD_0.
+        for mesh in original["meshes"]:
+            for primitive in mesh["primitives"]:
+                primitive["attributes"]["TEXCOORD_1"] = primitive["attributes"]["TEXCOORD_0"]
+        for _, keys in SLOTS:
+            with self.subTest(slot=keys[-1]):
+                doc = copy.deepcopy(original)
+                # The first material has already populated the image cache when this slot is read.
+                texture_info(doc["materials"][1], keys)["texCoord"] = 1
+                self.source.write_bytes(container(doc, payload))
+                with self.assertRaisesRegex(pa.PedAssembleError, keys[-1] + ".*TEXCOORD_0"):
+                    pa.read_glb_parts(str(self.source))
+        for material in original["materials"]:
+            for _, keys in SLOTS:
+                texture_info(material, keys)["texCoord"] = 0
+        self.source.write_bytes(container(original, payload))
+        self.assert_materials(pa.read_glb_parts(str(self.source)))
 
     def test_untextured_and_external_uri_inputs_keep_existing_behavior(self):
         doc, payload = split_glb(self.source.read_bytes())
