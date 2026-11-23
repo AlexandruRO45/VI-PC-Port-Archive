@@ -1097,6 +1097,16 @@ struct DeviceState {
         if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
     }
 
+    bool supports_sampled_bindings(const leonida::ShaderEntry& shader) const {
+        constexpr auto array_binding_bit = std::uint32_t{1} << leonida::bindless::sampled_1d_array_binding;
+        if (!(shader.set0_binding_mask & array_binding_bit) ||
+            bindless->image_capacity(leonida::ImageDimension::dim_1d_array))
+            return true;
+        std::fprintf(stderr, "[rt] d3d12: %s needs the 1D array binding, which exceeds the device's descriptor limits\n",
+                     shader.name.c_str());
+        return false;
+    }
+
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
@@ -1116,6 +1126,10 @@ struct DeviceState {
         case g::ImageType::cube: dimension = leonida::ImageDimension::dim_2d_array; break;
         case g::ImageType::image_3d: dimension = leonida::ImageDimension::dim_3d; break;
         case g::ImageType::image_1d: dimension = leonida::ImageDimension::dim_1d; break;
+        case g::ImageType::image_1d_array:
+            if (storage || !bindless->image_capacity(leonida::ImageDimension::dim_1d_array)) return false;
+            dimension = leonida::ImageDimension::dim_1d_array;
+            break;
         case g::ImageType::image_2d_msaa: dimension = leonida::ImageDimension::dim_2d_ms; break;
         case g::ImageType::image_2d_msaa_array: dimension = leonida::ImageDimension::dim_2d_ms_array; break;
         default:
@@ -1161,7 +1175,8 @@ struct DeviceState {
         }
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-        const bool supports_lod_clamp = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_2d ||
+        const bool supports_lod_clamp = image.type == g::ImageType::image_1d ||
+                                        image.type == g::ImageType::image_1d_array || image.type == g::ImageType::image_2d ||
                                         image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube ||
                                         image.type == g::ImageType::image_3d;
         if (!storage && supports_lod_clamp && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
@@ -3275,6 +3290,7 @@ public:
                                  stage.entry->name.c_str());
                     return E_NOTIMPL;
                 }
+                if (!device_.supports_sampled_bindings(*stage.entry)) return E_NOTIMPL;
                 uses_bindless = true;
                 register_literal_samplers(device_, *stage.entry);
             }
@@ -3749,7 +3765,10 @@ public:
                          entry->name.c_str());
             return E_NOTIMPL;
         }
-        if (entry->binding_count) register_literal_samplers(device_, *entry);
+        if (entry->binding_count) {
+            if (!device_.supports_sampled_bindings(*entry)) return E_NOTIMPL;
+            register_literal_samplers(device_, *entry);
+        }
         // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
         // and RADV dies on (#1721); some drivers report 32768. Refuse it here instead of creating the pipeline.
         if (entry->lds_bytes) {
@@ -4425,7 +4444,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     const bool msaa = g::multisampled(view.type);
     const bool line = view.type == g::ImageType::image_1d;
-    const auto dimension = line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
+    const bool line_array = view.type == g::ImageType::image_1d_array;
+    const auto dimension = (line || line_array) ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
                            view.type == g::ImageType::image_3d ? D3D12_RESOURCE_DIMENSION_TEXTURE3D :
                                                                D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     if (desc.Dimension != dimension || (line && view.layer_count != 1) || msaa != (desc.SampleDesc.Count > 1)) {
@@ -4535,13 +4555,17 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("view format not supported for this texture:", int(view.format));
         return false;
     }
+    if (line_array && (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || DeviceState::numeric_class(view_format))) {
+        log_once("1D array shader view requires a float-sampled colour format:", int(view.format));
+        return false;
+    }
     const UINT layers = volume ? 1 : desc.DepthOrArraySize;
     if (view.first_mip >= desc.MipLevels || view.first_layer >= layers) {
         log_once("view starts past the texture's mips or layers; first mip", int(view.first_mip));
         return false;
     }
-    if (msaa && view.layer_count != UINT_MAX && view.layer_count > UINT(desc.DepthOrArraySize) - view.first_layer) {
-        log_once("multisample shader view ends past the texture array; layers", int(view.layer_count));
+    if ((msaa || line_array) && view.layer_count != UINT_MAX && view.layer_count > layers - view.first_layer) {
+        log_once("shader view ends past the texture array; layers", int(view.layer_count));
         return false;
     }
     out = {};
@@ -6197,9 +6221,9 @@ public:
         TextureView view{};
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
-                view.type = ImageType::image_1d;
-                view.layer_count = 1;
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+                view.type = array ? ImageType::image_1d_array : ImageType::image_1d;
+                view.layer_count = r->desc().DepthOrArraySize;
             } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                 view.type = ImageType::image_3d;
             else if (r->desc().SampleDesc.Count > 1)
@@ -6216,6 +6240,14 @@ public:
                 view.mip_count = desc->Texture1D.MipLevels;
                 view.layer_count = 1;
                 view.min_lod = desc->Texture1D.ResourceMinLODClamp;
+                break;
+            case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+                view.type = ImageType::image_1d_array;
+                view.first_mip = desc->Texture1DArray.MostDetailedMip;
+                view.mip_count = desc->Texture1DArray.MipLevels;
+                view.first_layer = desc->Texture1DArray.FirstArraySlice;
+                view.layer_count = desc->Texture1DArray.ArraySize;
+                view.min_lod = desc->Texture1DArray.ResourceMinLODClamp;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE3D:
                 view.type = leonida::gfx10::ImageType::image_3d;
@@ -7925,7 +7957,8 @@ private:
                                                   resource.aspects(), storage, resource.has_view_format_list(),
                                                   resource.r9g9b9e5_as_r32_uint());
         if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
-        if (leonida::gfx10::multisampled(image.type) && !registered) return;
+        if (!registered && (leonida::gfx10::multisampled(image.type) ||
+                            image.type == leonida::gfx10::ImageType::image_1d_array)) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 
@@ -8496,7 +8529,8 @@ std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&k
 BindlessRoom bindless_room(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     if (!set) return {};
-    return {set->free_images(leonida::ImageDimension::dim_2d), set->free_samplers()};
+    return {set->free_images(leonida::ImageDimension::dim_2d), set->free_samplers(),
+            set->free_images(leonida::ImageDimension::dim_1d_array)};
 }
 
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)

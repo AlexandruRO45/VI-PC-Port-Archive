@@ -276,6 +276,7 @@ class Gen:
         self.uses_storage = False
         self.uses_query = False
         self.uses_tex_1d = False
+        self.uses_tex_1d_array = False
         self.uses_tex_3d = False
         self.uses_v4uint = False
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
@@ -12146,12 +12147,16 @@ class Gen:
         a16 = "a16" in mods
         d16 = "d16" in mods
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
+        is_1d_array = dim == "dim:SQ_RSRC_IMG_1D_ARRAY"
+        if is_1d_array and op not in ("image_sample", "image_sample_l", "image_sample_lz"):
+            raise Unsupported(op + " 1D_ARRAY")
         kinds = {"dim:SQ_RSRC_IMG_2D": ("img2d", "%images", "simg2d", 2, "_ptr_UC_img"),
                  "dim:SQ_RSRC_IMG_2D_ARRAY": ("img2da", "%images_arr", "simg2da", 3, "_ptr_UC_imga"),
                  # Cube: the shader already did face selection (v_cube*), and cube_coords maps (s, t, face) onto a
                  # 6-layer 2D array view of the cube. The runtime binds cube textures as 2D-array views.
                  "dim:SQ_RSRC_IMG_CUBE": ("img2da", "%images_arr", "simg2da", 3, "_ptr_UC_imga"),
                  "dim:SQ_RSRC_IMG_1D": ("img1d", "%images_1d", "simg1d", 1, "_ptr_UC_img1"),
+                 "dim:SQ_RSRC_IMG_1D_ARRAY": ("img1da", "%images_1d_arr", "simg1da", 2, "_ptr_UC_img1a"),
                  "dim:SQ_RSRC_IMG_3D": ("img3d", "%images_3d", "simg3d", -3, "_ptr_UC_img3")}
         if dim not in kinds:
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
@@ -12164,6 +12169,8 @@ class Gen:
             self.uses_tex_array = True
         if ncoord == 1:
             self.uses_tex_1d = True
+        if is_1d_array:
+            self.uses_tex_1d_array = True
         if is3d and op in ("image_sample_d", "image_sample_d_cl") and ("tfe" in mods or "lwe" in mods):
             raise Unsupported(op + " 3D gradient status")
         grad_width = 3 if is3d else min(ncoord, 2)  # an array layer has no derivative
@@ -14282,7 +14289,8 @@ def assemble(gen):
     if tex:
         iface += ["%images", "%samplers", "%desc_map"] + (["%images_arr"] if gen.uses_tex_array else []) + \
                  (["%simages"] if gen.uses_storage else []) + (["%images_1d"] if gen.uses_tex_1d else []) + \
-                 (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
+                 (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else []) + \
+                 (["%images_1d_arr"] if gen.uses_tex_1d_array else [])
     if sg:
         iface += ["%sg_lane"]
     if gen.writes_depth:
@@ -14325,7 +14333,7 @@ def assemble(gen):
     # SPIR-V module layout: every OpCapability, then every OpExtension, then imports.
     caps = ["Shader"] + (["Int64", "PhysicalStorageBufferAddresses"] if psb else []) + \
         (["RuntimeDescriptorArray"] if tex else []) + (["GroupNonUniform", "GroupNonUniformShuffle"] if sg else []) + \
-        (["ImageQuery"] if gen.uses_query else []) + (["Sampled1D"] if gen.uses_tex_1d else []) + \
+        (["ImageQuery"] if gen.uses_query else []) + (["Sampled1D"] if gen.uses_tex_1d or gen.uses_tex_1d_array else []) + \
         (["MinLod"] if gen.uses_minlod else []) + (["ImageGatherExtended"] if gen.uses_img_offset else []) + \
         (["FragmentBarycentricKHR"] if bary_builtin else [])
     if gen.uses_vote:
@@ -14541,6 +14549,12 @@ def assemble(gen):
                       "%_ptr_UC_rt_img1 = OpTypePointer UniformConstant %rt_img1",
                       "%_ptr_UC_img1 = OpTypePointer UniformConstant %img1d"]
             dec += ["OpDecorate %images_1d DescriptorSet 0", "OpDecorate %images_1d Binding 5"]
+        if gen.uses_tex_1d_array:
+            types += ["%img1da = OpTypeImage %float 1D 0 1 0 1 Unknown", "%simg1da = OpTypeSampledImage %img1da",
+                      "%rt_img1a = OpTypeRuntimeArray %img1da",
+                      "%_ptr_UC_rt_img1a = OpTypePointer UniformConstant %rt_img1a",
+                      "%_ptr_UC_img1a = OpTypePointer UniformConstant %img1da"]
+            dec += ["OpDecorate %images_1d_arr DescriptorSet 0", "OpDecorate %images_1d_arr Binding 26"]
         if gen.uses_storage:
             types += ["%simg2d_u = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%rt_simg = OpTypeRuntimeArray %simg2d_u",
                       "%_ptr_UC_rt_simg = OpTypePointer UniformConstant %rt_simg",
@@ -14820,6 +14834,8 @@ def assemble(gen):
             gvars += ["%simages = OpVariable %_ptr_UC_rt_simg UniformConstant"]
         if gen.uses_tex_1d:
             gvars += ["%images_1d = OpVariable %_ptr_UC_rt_img1 UniformConstant"]
+        if gen.uses_tex_1d_array:
+            gvars += ["%images_1d_arr = OpVariable %_ptr_UC_rt_img1a UniformConstant"]
         if gen.uses_tex_3d:
             gvars += ["%images_3d = OpVariable %_ptr_UC_rt_img3 UniformConstant"]
         if gen.uses_storage3d:

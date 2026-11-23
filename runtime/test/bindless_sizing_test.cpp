@@ -105,6 +105,8 @@ int main() {
         EXPECT(storage(f, D::dim_2d) == bindless::max_storage_indices);
         EXPECT(storage(f, D::dim_2d_array) == 1024 && storage(f, D::dim_3d) == 256 && storage(f, D::dim_1d) == 256);
         EXPECT(count(f, D::dim_2d_array) == 1024 && count(f, D::dim_3d) == 256 && count(f, D::dim_1d) == 256);
+        EXPECT(count(f, D::dim_1d_array) == 256);
+        EXPECT(bindless::storage_binding(D::dim_1d_array, 0) == bindless::no_binding);
         EXPECT(f.ms_samples[0] == VK_SAMPLE_COUNT_4_BIT && f.ms_samples[2] == VK_SAMPLE_COUNT_4_BIT);
         EXPECT(storage_consistent(f));
         if (update_after_bind)
@@ -125,6 +127,8 @@ int main() {
         for (std::uint32_t b = 0; b < bindless::first_ms_binding; ++b)
             if (bindless::bindings[b].type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) EXPECT(f.counts[b] == defaults[b]);
         EXPECT(f.ms_samples == (std::array{VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT}));
+        EXPECT(count(f, D::dim_1d_array) == 0);
+        EXPECT(!bindless::binding_enabled(bindless::sampled_binding(D::dim_1d_array), f));
         EXPECT(storage_consistent(f));
     }
 

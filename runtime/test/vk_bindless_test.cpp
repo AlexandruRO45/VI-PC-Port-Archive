@@ -539,6 +539,7 @@ int main(int argc, char** argv) {
     // resource budget can also leave room for just one class (9985 original resources + 512).
     constexpr auto ms_classes = [](std::uint32_t sampled, std::uint32_t total) {
         BindlessFeatures f{};
+        f.counts[bindless::sampled_1d_array_binding] = 0;  // sized after the MS bindings
         f.ms_samples.fill(VK_SAMPLE_COUNT_4_BIT);
         bindless::limit_ms_bindings(f, sampled, total);
         return f.ms_samples;

@@ -1,6 +1,6 @@
 // Driver-level check of the translated corpus: vk_pipeline_check <spirv dir> [pipeline_cache.bin]
 // Reads <spirv dir>/index.json (written by tools/rdna2spirv.py) and checks module and pipeline creation for compatible
-// entries with the translator's resource contract (set 0: sampled images 0, 3, 5, 6; samplers 1; descriptor hash
+// entries with the translator's resource contract (set 0: sampled images 0, 3, 5, 6 and optional 26; samplers 1; descriptor hash
 // table 2; storage images 4, 7 and 8..19; set 1 binding 0 dynamic UBO for --pc-tail-ubo shaders; push constants
 // sized from push_constant_bytes, default 144 or 128 with pc_tail):
 //   - cs: compute pipeline via vkCreateComputePipelines, using the runtime layout and subgroup request for
@@ -104,6 +104,7 @@ struct ShaderMeta {
     uint32_t push_constant_bytes = 0;  // 0 = absent in index (128 with pc_tail, else 144)
     uint32_t pc_tail_bytes = 0;        // >0 = --pc-tail-ubo uniform block at set 1, binding 0
     bool no_set0_bindings = false;
+    bool uses_1d_array = false;
     bool wave64 = false;
     std::array<uint32_t, 3> local_size{1, 1, 1};
     std::string wave64_exchange;
@@ -352,12 +353,12 @@ struct JsonParser {
                 m.push_constant_bytes = parse_strict_u32("expected unsigned 32-bit push_constant_bytes");
             else if (k == "pc_tail") m.pc_tail_bytes = parse_pc_tail_bytes();
             else if (k == "bindings") {
-                const size_t start = i;
-                m.no_set0_bindings = consume('[') && consume(']');
-                if (!m.no_set0_bindings) {
-                    i = start;
-                    skip_value();
-                }
+                ws();
+                if (i < s.size() && s[i] == '[') {
+                    const auto bindings = parse_u32_array();
+                    m.no_set0_bindings = bindings.empty();
+                    m.uses_1d_array = std::find(bindings.begin(), bindings.end(), 26u) != bindings.end();
+                } else skip_value();
             }
             else if (k == "wave64") {
                 ws();
@@ -1321,6 +1322,8 @@ int main(int argc, char** argv) {
     add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
     add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
     for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
+    if (std::any_of(work.begin(), work.end(), [](const Item& item) { return item.second->uses_1d_array; }))
+        add(26, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
     VkDescriptorSetLayout dsl;

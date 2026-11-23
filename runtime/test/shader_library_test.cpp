@@ -397,6 +397,7 @@ int main() {
           ps->f16_halves.at(7)[0] == 20 && ps->f16_halves.at(7)[1] == 21);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
+    CHECK(entry->set0_binding_mask == (std::uint32_t{1} << 2));
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
     CHECK(!library.find("ms", hash));  // no mesh shader with this hash
     // The subgroup fields of the index (wave64 / subgroup_size / wave64_exchange): absent, native and emulated.

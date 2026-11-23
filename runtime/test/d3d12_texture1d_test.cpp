@@ -3,6 +3,7 @@
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -116,7 +117,8 @@ int main() {
     uav1d.Texture1D.MipSlice = 1;
     dev->CreateUnorderedAccessView(tex1d, nullptr, &uav1d, {cbv_cpu.ptr + cbv_inc * 5});
 
-    // Default (nullptr) SRV and UAV on a 1D array must write a null descriptor (set 0 has no 1D-array binding).
+    // The default SRV shows all slices and mips when the descriptor set has room for 1D arrays.
+    const bool has_array_binding = rt::d3d12::bindless_room(dev).images_1d_array != 0;
     std::memset(reinterpret_cast<void*>(cbv_cpu.ptr + cbv_inc * 6), 0x77, cbv_inc * 2);
     dev->CreateShaderResourceView(tex1d, nullptr, {cbv_cpu.ptr + cbv_inc * 6});
     dev->CreateUnorderedAccessView(tex1d, nullptr, nullptr, {cbv_cpu.ptr + cbv_inc * 7});
@@ -147,11 +149,18 @@ int main() {
     if (!decode_and_lookup(5, img) || img.type != g::ImageType::image_1d || img.first_mip != 1 || img.mip_count != 1 ||
         img.layer_count != 1)
         return fail("explicit 1D UAV on array T# or bindless lookup mismatch");
-    for (UINT slot = 6; slot < 8; ++slot) {
+    const auto is_null = [&](UINT slot) {
         const auto* bytes = reinterpret_cast<const std::uint8_t*>(cbv_cpu.ptr + cbv_inc * slot);
-        for (UINT b = 0; b < 32; ++b)
-            if (bytes[b] != 0) return fail("default 1DArray view should write a null descriptor");
+        return std::all_of(bytes, bytes + 32, [](std::uint8_t byte) { return byte == 0; });
+    };
+    if (has_array_binding) {
+        if (!decode_and_lookup(6, img) || img.type != g::ImageType::image_1d_array || img.first_layer != 0 ||
+            img.layer_count != 4 || img.first_mip != 0 || img.mip_count != 2)
+            return fail("default 1DArray SRV T# or bindless lookup mismatch");
+    } else if (!is_null(6)) {
+        return fail("default 1DArray SRV should be null when binding 26 is unavailable");
     }
+    if (!is_null(7)) return fail("default 1DArray UAV should write a null descriptor");
 
     // RTV / DSV 1D bounds validation (out-of-bounds mip/slice must write a null TargetView)
     D3D12_RENDER_TARGET_VIEW_DESC bad_rtv{};

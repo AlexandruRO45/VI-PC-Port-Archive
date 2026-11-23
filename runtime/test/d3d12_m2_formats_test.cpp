@@ -5,6 +5,7 @@
 //   - bc7: the same in DXGI_FORMAT_BC7_UNORM, mode-6 blocks built by hand;
 //   - bc6h: identical mode-11 blocks in BC6H_UF16 and BC6H_SF16, sampled into an unclamped RGBA32F target;
 //   - arr: an 8x8 R8G8B8A8_UNORM 2D array of 3 slices, read by ps_m2_array.asm (dim:SQ_RSRC_IMG_2D_ARRAY, slice 1.0).
+//   - arr1d: an 8-texel R8G8B8A8_UNORM 1D array sampled at slice 1 and explicit LOD 1 of the view.
 // Every subresource is uploaded at the layout GetCopyableFootprints returns, with one CopyTextureRegion each.
 // The quad magnifies (64x64 pixels), so a POINT sampler with MinLOD = MaxLOD = k reads level k of the view: four
 // samplers pin levels 0..3. A view with MostDetailedMip 1 checks that the level is relative to the view, and two
@@ -51,7 +52,7 @@ constexpr UINT slice_count = 3;
 constexpr UINT target_size = 64;
 constexpr UINT target_pitch = target_size * 4;  // 256
 
-enum Kind : UINT { bc1, bc7, arr, bc6u, bc6s, kind_count };
+enum Kind : UINT { bc1, bc7, arr, bc6u, bc6s, arr1d, kind_count };
 
 // BC6H mode 11: prefix 00011 (LSB first), then endpoint 0 RGB = (512, 511, 0)
 // in consecutive 10-bit fields. Endpoint 1 and all indices are zero.
@@ -126,6 +127,8 @@ Texel arr_texel(UINT s, UINT x, UINT y) {
 }
 
 Texel texel(Kind kind, UINT level, UINT slice, UINT x, UINT y) {
+    if (kind == arr1d)
+        return {std::uint8_t(x * 30 + 9), std::uint8_t(30 + 70 * level), std::uint8_t(20 + 90 * slice), 255};
     return kind == bc1 ? bc1_texel(level, x, y) : kind == bc7 ? bc7_texel(level, x, y) : arr_texel(slice, x, y);
 }
 
@@ -148,6 +151,7 @@ struct Case {
     UINT srv, sampler;  // heap slots
     Kind kind;
     UINT level, slice;  // what the draw must read
+    bool null_srv = false;
 };
 
 }  // namespace
@@ -177,6 +181,9 @@ int main() {
         {"bc1 view from mip 1, lod 2", false, 2, 2, bc1, 3, 0},
         {"array view of slices 0..2, slice 1", true, 3, 0, arr, 0, 1},
         {"array view of slices 1..2, slice 1", true, 4, 0, arr, 0, 2},
+        {"1D array default SRV, mip 1, slice 1", false, 7, mip_count, arr1d, 1, 1},
+        {"1D array SRV subrange, mip 1, slice 1", false, 8, mip_count, arr1d, 2, 2},
+        {"1D array null SRV", false, 9, mip_count, arr1d, 0, 0, true},
     };
     // The cases can only fail when the wrong level or slice is read if those hold other texels.
     for (UINT m = 1; m < mip_count; ++m) {
@@ -190,18 +197,21 @@ int main() {
     const auto vs_program = read_file(root_dir / "fssm" / "vs_m2.fssm");
     const auto ps_program = read_file(root_dir / "fssm" / "ps_m2.fssm");
     const auto array_program = read_file(root_dir / "fssm" / "ps_m2_array.fssm");
-    EXPECT(vs_program.size() >= 4 && ps_program.size() >= 4 && array_program.size() >= 4);
+    const auto array1d_program = read_file(root_dir / "fssm" / "ps_m2_array1d.fssm");
+    EXPECT(vs_program.size() >= 4 && ps_program.size() >= 4 && array_program.size() >= 4 &&
+           array1d_program.size() >= 4);
     leonida::ShaderLibrary library;
     EXPECT(library.load((root_dir / "spirv").string()));
     const auto* vs_entry = library.find("vs", leonida::sha256_hex(vs_program));
     const auto* ps_entry = library.find("ps", leonida::sha256_hex(ps_program));
     const auto* array_entry = library.find("ps", leonida::sha256_hex(array_program));
-    EXPECT(vs_entry && ps_entry && array_entry);
-    EXPECT(ps_entry->binding_count > 0 && array_entry->binding_count > 0);
+    const auto* array1d_entry = library.find("ps", leonida::sha256_hex(array1d_program));
+    EXPECT(vs_entry && ps_entry && array_entry && array1d_entry);
+    EXPECT(ps_entry->binding_count > 0 && array_entry->binding_count > 0 && array1d_entry->binding_count > 0);
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program),
-               array_container = shader_container(array_program);
+               array_container = shader_container(array_program), array1d_container = shader_container(array1d_program);
 
-    unsigned failed = 0;
+    unsigned attempted = 0, failed = 0;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -222,6 +232,8 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
+        const auto array1d_room = rt::d3d12::bindless_room(device.p).images_1d_array;
+        if (array1d_room < 2) std::printf("SKIP: 1D array readbacks require two live views in binding 26\n");
 
         // Root signature: [0] a table of one SRV (s0:s1), [1] a table of one sampler (s2:s3), as in the M2 test.
         D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
@@ -254,10 +266,13 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
-        Ref<ID3D12PipelineState> pso, array_pso, float_pso;
+        Ref<ID3D12PipelineState> pso, array_pso, array1d_pso, float_pso;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.PS = {array_container.data(), array_container.size()};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&array_pso.p))));
+        pso_desc.PS = {array1d_container.data(), array1d_container.size()};
+        const HRESULT array1d_result = device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&array1d_pso.p));
+        EXPECT(array1d_room ? SUCCEEDED(array1d_result) : array1d_result == E_NOTIMPL);
 
         pso_desc.PS = {ps_container.data(), ps_container.size()};
         pso_desc.RTVFormats[0] = float_format;
@@ -279,6 +294,10 @@ int main() {
         descs[arr].Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         descs[arr].DepthOrArraySize = slice_count;
         descs[arr].MipLevels = 1;
+        descs[arr1d] = descs[arr];
+        descs[arr1d].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        descs[arr1d].Height = 1;
+        descs[arr1d].MipLevels = mip_count;
         descs[bc6u].Format = DXGI_FORMAT_BC6H_UF16;
         descs[bc6s].Format = DXGI_FORMAT_BC6H_SF16;
         descs[bc6u].MipLevels = descs[bc6s].MipLevels = 1;
@@ -338,6 +357,13 @@ int main() {
                             std::memcpy(base + y * pitch + x * 4, arr_texel(slice, x, y).data(), 4);
                     continue;
                 }
+                if (k == arr1d) {
+                    const UINT width = std::max(1u, texture_size >> level);
+                    EXPECT(rows[i] == 1 && row_bytes[i] == width * 4);
+                    for (UINT x = 0; x < width; ++x)
+                        std::memcpy(base + x * 4, texel(arr1d, level, slice, x, 0).data(), 4);
+                    continue;
+                }
                 const UINT block_bytes = k == bc1 ? 8 : 16;
                 const UINT blocks = (std::max(1u, texture_size >> level) + 3) / 4;
                 EXPECT(rows[i] == blocks && row_bytes[i] == UINT64(blocks) * block_bytes);
@@ -352,9 +378,9 @@ int main() {
         }
 
         // The heaps; their start handles come back in RAX (heap slots 9 and 10).
-        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 7,
+        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 10,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-        const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, mip_count,
+        const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, mip_count + 1,
                                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> srv_heap, sampler_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
@@ -391,14 +417,25 @@ int main() {
         make_srv(4, arr, 1, slice_count - 1);
         make_srv(5, bc6u, 0, 1);
         make_srv(6, bc6s, 0, 1);
-        // Sampler slot k: POINT, CLAMP, MinLOD = MaxLOD = k.
-        for (UINT k = 0; k < mip_count; ++k) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv1d{};
+        srv1d.Format = descs[arr1d].Format;
+        srv1d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv1d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+        srv1d.Texture1DArray = {1, 2, 1, 2, 0.0f};
+        if (array1d_room >= 2) {
+            device->CreateShaderResourceView(textures[arr1d].p, nullptr, {SIZE_T(srv_cpu + 7 * step)});
+            device->CreateShaderResourceView(textures[arr1d].p, &srv1d, {SIZE_T(srv_cpu + 8 * step)});
+            device->CreateShaderResourceView(nullptr, &srv1d, {SIZE_T(srv_cpu + 9 * step)});
+        }
+        // Each sampler pins one level. The 1D-array PS selects its own LOD with the last sampler.
+        for (UINT k = 0; k <= mip_count; ++k) {
             D3D12_SAMPLER_DESC sampler_desc{};
             sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
             sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             sampler_desc.MaxAnisotropy = 1;
             sampler_desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-            sampler_desc.MinLOD = sampler_desc.MaxLOD = float(k);
+            sampler_desc.MinLOD = k == mip_count ? 0.0f : float(k);
+            sampler_desc.MaxLOD = k == mip_count ? D3D12_FLOAT32_MAX : float(k);
             device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu + k * sampler_step)});
         }
 
@@ -458,13 +495,16 @@ int main() {
         const D3D12_VIEWPORT viewport{0, 0, float(target_size), float(target_size), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(target_size), LONG(target_size)};
         for (const Case& c : cases) {
+            if (c.kind == arr1d && array1d_room < 2) continue;
+            ++attempted;
             const bool hdr = c.kind == bc6u || c.kind == bc6s;
             auto* draw_target = hdr ? float_target.p : target.p;
             const auto draw_rtv = hdr ? float_rtv : rtv;
             const UINT pitch = hdr ? target_size * UINT(sizeof(FloatTexel)) : target_pitch;
             std::vector<std::uint8_t> pixels(std::size_t(pitch) * target_size);
             EXPECT(SUCCEEDED(allocator->Reset()));
-            EXPECT(SUCCEEDED(list->Reset(allocator.p, hdr ? float_pso.p : c.array_pso ? array_pso.p : pso.p)));
+            auto* draw_pso = c.kind == arr1d ? array1d_pso.p : (c.array_pso ? array_pso.p : pso.p);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, hdr ? float_pso.p : draw_pso)));
             const FLOAT clear[4] = {1.0f, 0.0f, 1.0f, 1.0f};  // magenta: a pixel the draw missed shows
             list->ClearRenderTargetView(draw_rtv, clear, 0, nullptr);
             list->SetGraphicsRootSignature(root.p);
@@ -511,7 +551,7 @@ int main() {
                                          c.name, x, y, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
                         continue;
                     }
-                    const Texel want = expected(c.kind, c.level, c.slice, x, y);
+                    const Texel want = c.null_srv ? Texel{} : expected(c.kind, c.level, c.slice, x, y);
                     const std::uint8_t* got = &pixels[std::size_t(y) * target_pitch + x * 4];
                     if (std::memcmp(got, want.data(), 4) == 0) continue;
                     if (mismatches++ < 4)
@@ -533,6 +573,7 @@ int main() {
         target.reset();
         pso.reset();
         array_pso.reset();
+        array1d_pso.reset();
         root.reset();
         srv_heap.reset();
         sampler_heap.reset();
@@ -549,6 +590,6 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("d3d12_m2_formats: PASS (%zu cases)\n", std::size(cases));
+    std::printf("d3d12_m2_formats: PASS (%u cases)\n", attempted);
     return 0;
 }

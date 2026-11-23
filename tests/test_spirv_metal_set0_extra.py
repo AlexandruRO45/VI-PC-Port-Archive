@@ -1,7 +1,7 @@
 """Expanded stdlib-only unit tests for tools/spirv_metal_set0.py.
 
 Covers bindless capacity parsing from vulkan_bindless.h and custom headers,
-metal_ids() layout math, rewrite() across all 26 bindings, non-set-0 /
+metal_ids() layout math, rewrite() across all 27 bindings, non-set-0 /
 push-constant / non-runtime-array / pre-sized / raw-ID / error branches,
 synthetic SPIR-V binary word header/magic/endianness/bounds handling,
 out-of-place vs in-place CLI execution via mocked spirv-dis/spirv-as,
@@ -376,17 +376,17 @@ def _make_fake_spirv_tools(dis_name="spirv-dis", asm_name="spirv-as"):
 
 
 class TestCapacities(unittest.TestCase):
-    def test_default_bindless_header_all_26_entries_and_cross_check(self):
+    def test_default_bindless_header_all_27_entries_and_cross_check(self):
         counts = m.capacities()
-        expected = [4096, 1024, 1, 1024, 1024] + [256] * 21
+        expected = [4096, 1024, 1, 1024, 1024] + [256] * 22
         self.assertEqual(counts, expected)
-        self.assertEqual(len(counts), 26)
-        self.assertEqual(sum(counts), 12545)
+        self.assertEqual(len(counts), 27)
+        self.assertEqual(sum(counts), 12801)
 
         with open(m.BINDLESS_H, encoding="utf-8") as f:
             hdr = f.read()
-        self.assertIn("inline constexpr std::uint32_t binding_count = 26;", hdr)
-        self.assertIn("inline constexpr std::array<Binding, 26> bindings =", hdr)
+        self.assertIn("inline constexpr std::uint32_t binding_count = 27;", hdr)
+        self.assertIn("inline constexpr std::array<Binding, 27> bindings =", hdr)
 
     def test_custom_header_parsing_variants(self):
         cases = [
@@ -465,12 +465,13 @@ class TestMetalIds(unittest.TestCase):
     def test_vulkan_bindless_ids_contiguous_and_non_overlapping(self):
         counts = m.capacities()
         ids = m.metal_ids(counts)
-        self.assertEqual(len(ids), 26)
+        self.assertEqual(len(ids), 27)
         self.assertEqual(ids[0], 0)
         self.assertEqual(ids[:6], [0, 4096, 5120, 5121, 6145, 7169])
         self.assertEqual(ids[8], 7937)
         self.assertEqual(ids[20], 11009)
         self.assertEqual(ids[25], 12289)
+        self.assertEqual(ids[26], 12545)
         for b in range(len(counts) - 1):
             self.assertEqual(ids[b + 1], ids[b] + counts[b])
         self.assertEqual(ids[-1] + counts[-1], sum(counts))
@@ -480,11 +481,11 @@ class TestMetalIds(unittest.TestCase):
             if b > 0:
                 self.assertGreater(ids[b], ids[b - 1] + counts[b - 1] - 1)
             seen_total += counts[b]
-        self.assertEqual(seen_total, 12545)
+        self.assertEqual(seen_total, 12801)
 
 
 class TestRewrite(unittest.TestCase):
-    def test_all_26_vulkan_bindless_bindings(self):
+    def test_all_27_vulkan_bindless_bindings(self):
         counts = m.capacities()
         ids = m.metal_ids(counts)
         lines = [
@@ -492,7 +493,7 @@ class TestRewrite(unittest.TestCase):
             "               OpCapability RuntimeDescriptorArray",
             "               OpMemoryModel Logical GLSL450",
         ]
-        for b in range(26):
+        for b in range(27):
             lines.append(f"               OpDecorate %v{b} DescriptorSet 0")
             lines.append(f"               OpDecorate %v{b} Binding {b}")
         lines.extend([
@@ -504,13 +505,13 @@ class TestRewrite(unittest.TestCase):
             "        %map = OpTypeStruct %rt_map",
             "    %ptr_map = OpTypePointer StorageBuffer %map",
         ])
-        for b in range(26):
+        for b in range(27):
             if b == 2:
                 continue
             elem = "%smp" if b == 1 else "%img2d"
             lines.append(f"      %rt_b{b} = OpTypeRuntimeArray {elem}")
             lines.append(f"     %ptr_b{b} = OpTypePointer UniformConstant %rt_b{b}")
-        for b in range(26):
+        for b in range(27):
             if b == 2:
                 lines.append("         %v2 = OpVariable %ptr_map StorageBuffer")
             else:
@@ -519,7 +520,7 @@ class TestRewrite(unittest.TestCase):
         out = m.rewrite("\n".join(lines) + "\n", counts)
         out_lines = out.splitlines()
 
-        for b in range(26):
+        for b in range(27):
             self.assertIn(f"               OpDecorate %v{b} Binding {ids[b]}", out_lines)
             if b == 2:
                 self.assertIn("         %v2 = OpVariable %ptr_map StorageBuffer", out_lines)
@@ -690,7 +691,7 @@ OpDecorate %orphan Binding 1
         self.assertEqual(m.rewrite(plain, [4]), plain)
 
     def test_out_of_bounds_set0_binding_raises_system_exit(self):
-        for b, counts in ((2, [10, 20]), (26, m.capacities()), (100, m.capacities())):
+        for b, counts in ((2, [10, 20]), (27, m.capacities()), (100, m.capacities())):
             with self.subTest(binding=b, count_len=len(counts)):
                 text = f"OpDecorate %bad DescriptorSet 0\nOpDecorate %bad Binding {b}\n"
                 with self.assertRaises(SystemExit) as ctx:
@@ -731,20 +732,21 @@ class TestMainAndCli(unittest.TestCase):
                 code = m.main(argv)
         return code, out.getvalue(), err.getvalue()
 
-    def test_print_layout_outputs_26_formatted_ranges_without_subprocess(self):
+    def test_print_layout_outputs_27_formatted_ranges_without_subprocess(self):
         with mock.patch.object(m.subprocess, "run") as run_mock:
             code, out, err = self._call_main(["spirv_metal_set0.py", "--print-layout"])
         run_mock.assert_not_called()
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
         lines = out.splitlines()
-        self.assertEqual(len(lines), 26)
+        self.assertEqual(len(lines), 27)
         self.assertEqual(lines[0], "binding  0:  4096 descriptors at IDs 0..4095")
         self.assertEqual(lines[1], "binding  1:  1024 descriptors at IDs 4096..5119")
         self.assertEqual(lines[2], "binding  2:     1 descriptors at IDs 5120..5120")
         self.assertEqual(lines[3], "binding  3:  1024 descriptors at IDs 5121..6144")
         self.assertEqual(lines[4], "binding  4:  1024 descriptors at IDs 6145..7168")
         self.assertEqual(lines[25], "binding 25:   256 descriptors at IDs 12289..12544")
+        self.assertEqual(lines[26], "binding 26:   256 descriptors at IDs 12545..12800")
 
     def test_print_layout_uses_capacities_table(self):
         with mock.patch.object(m, "capacities", return_value=[3, 1, 2]):
@@ -801,7 +803,7 @@ class TestMainAndCli(unittest.TestCase):
         )
         self.assertEqual(r_layout.returncode, 0, r_layout.stderr)
         self.assertEqual(r_layout.stderr, "")
-        self.assertEqual(len(r_layout.stdout.splitlines()), 26)
+        self.assertEqual(len(r_layout.stdout.splitlines()), 27)
         self.assertEqual(r_layout.stdout.splitlines()[0], "binding  0:  4096 descriptors at IDs 0..4095")
 
         for args in ([], ["only_one.spv"], ["a.spv", "b.spv", "c.spv"]):
@@ -1025,7 +1027,7 @@ class TestMainAndCli(unittest.TestCase):
                             runpy.run_path(TOOL_PATH, run_name="__main__")
                 self.assertEqual(ctx.exception.code, 0)
                 self.assertEqual(err_stream.getvalue(), "")
-                self.assertEqual(len(out_stream.getvalue().splitlines()), 26)
+                self.assertEqual(len(out_stream.getvalue().splitlines()), 27)
 
         err_stream = io.StringIO()
         with warnings.catch_warnings():

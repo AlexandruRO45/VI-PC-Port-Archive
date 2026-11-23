@@ -1645,7 +1645,11 @@ The layer's descriptor model:
   handles to views for the rendering scope. RTV/DSV descriptors are never shader-visible.
 - View creation maps `D3D12_SRV_DIMENSION`/`D3D12_UAV_DIMENSION` to `VkImageViewType`, the mip and layer ranges,
   sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. Single-layer 1D textures have default and
-  explicit shader-resource views on sampled binding 5. Single-sampled 1D, 2D, 2D-array, cube and 3D colour SRVs apply
+  explicit shader-resource views on sampled binding 5. Texture1DArray colour SRVs use sampled binding 26 with the
+  float sampled type, including UNORM formats. A default view covers all mips and slices. An explicit view selects
+  mip and slice ranges. An explicit null view samples a zero-filled 1D-array fallback at slot zero. The device adds
+  binding 26 when the existing descriptor layout leaves room for the fallback and at least one live index.
+  Single-sampled 1D, 1D-array, 2D, 2D-array, cube and 3D colour SRVs apply
   the T# minimum LOD in resource mip coordinates. A clamp inside the exposed mip range uses
   `VK_EXT_image_view_min_lod`. Vulkan allows the image-view minimum to be rounded down to an integer.
   With nearest mip filtering, the UHD 770 and Arrow Lake Xe-LPG returned mip 0 for a 2D minimum of 0.75.

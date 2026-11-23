@@ -692,6 +692,7 @@ struct ShaderEntry {
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
     std::size_t binding_count = 0;  // set-0 bindings the module declares
+    std::uint32_t set0_binding_mask = 0;  // bindings 0..31, for layout entries limited by device capacity
     std::uint32_t push_constant_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     // Workgroup memory the module declares: its LDS array plus what --wave64-emulate adds (SHADER-309). A compute
@@ -867,7 +868,14 @@ private:
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
             if (const Json* s = meta.find("fspx_state_sha256"); s && s->kind == Json::Kind::string)
                 e.fspx_state_sha256 = s->string;
-            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
+            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) {
+                e.binding_count = b->array.size();
+                for (const Json& item : b->array) {
+                    if (item.kind != Json::Kind::number) continue;
+                    const auto binding = u32(&item);
+                    if (binding < 32) e.set0_binding_mask |= std::uint32_t{1} << binding;
+                }
+            }
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
             e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
