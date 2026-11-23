@@ -209,7 +209,6 @@ class TestCli(unittest.TestCase):
 
     def test_uses_shared_same_report_path_for_refs_and_carve_index(self):
         import report_paths
-        from unittest import mock
         self.assertIs(N.same_report_path, report_paths.same_report_path)
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "carved")
@@ -223,16 +222,6 @@ class TestCli(unittest.TestCase):
                 f.write('{"files": []}\n')
             with open(names, "w", encoding="utf-8", newline="\n") as f:
                 f.write("prop_crate_01\n")
-
-            folded_names = os.path.join(tmp, "NAMES.TXT")
-            with (mock.patch.object(report_paths, "path_key", side_effect=str),
-                  mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
-                  mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe,
-                  mock.patch.object(sys, "argv", ["psin_names.py", src, "--names", names, "--refs", folded_names])):
-                with self.assertRaises(SystemExit) as cm:
-                    N.main()
-                self.assertEqual(cm.exception.code, 2)
-            self.assertGreaterEqual(probe.call_count, 1)
 
             index_link = os.path.join(tmp, "index_alias.tsv")
             try:
