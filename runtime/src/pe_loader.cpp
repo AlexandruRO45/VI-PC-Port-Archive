@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <malloc.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -377,6 +378,8 @@ void install_thread_block(Module& m) {
     const size_t slot = m.tls_slot;
     ThreadTlsSlot& entry = g_thread_tls_slots[slot];
     if (entry.module == &m && entry.generation == m.tls_generation) return;
+    std::fprintf(stderr, "[rt] tls-probe: install tid=%lu %s slot=%zu index=%u\n", GetCurrentThreadId(),
+                 m.name.c_str(), slot, m.tls_index);
     if (has_existing_thread_block(GetCurrentThreadId(), m)) return;  // load() already gave this thread its copy
     if (entry.module) {
         // A copy left by a module whose Loader is gone (or from an earlier generation) is released; a live owner's is a conflict.
@@ -525,6 +528,82 @@ bool write_thread_slot(void** slots, uint32_t index, void* value) noexcept {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
+    }
+}
+
+// ---- The host process's own static TLS ----
+//
+// The retail executable was linked as an EXE, and its static CRT assumes the EXE's TLS index is 0. A measured
+// initializer (game+0x14713b0, one of the callbacks in the tls_callback trace) does `mov rsi,[gs:58h][0]` and writes
+// a ~0x400-byte CRT block at [rsi+0x130..0x3f8]. The loader's gta6rt_tls_host.dll got index 8, so giving the game
+// index 8 made that write land in the runtime's own 704-byte TLS block and past it into the heap (HeapValidate:
+// 0xC0000374). A mapped EXE must own index 0. The runtime's TLS then moves to the helper's index: the same block is
+// aliased there, the runtime's _tls_index global is patched to that index, and the game's block replaces slot 0.
+IMAGE_TLS_DIRECTORY64* self_tls_directory() {
+    auto* image = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (!image) return nullptr;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dir.Size || !dir.VirtualAddress || dir.VirtualAddress >= nt->OptionalHeader.SizeOfImage) return nullptr;
+    return reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(image + dir.VirtualAddress);
+}
+
+std::atomic<DWORD> g_runtime_tls_index{TLS_OUT_OF_INDEXES};
+
+// Puts the runtime's OS-allocated TLS block in the helper's index for this thread. Called before the runtime's
+// _tls_index is patched (main/existing) or before any runtime TLS access (new threads).
+void alias_runtime_tls_current_thread(DWORD index) {
+    if (index == TLS_OUT_OF_INDEXES || index == 0 || index >= kMaxModuleTlsSlots) return;
+    if (void** slots = module_tls_slots()) slots[index] = slots[0];
+}
+
+// Patches the runtime EXE's _tls_index. Every runtime TLS access after this (magic statics, thread_local) reads
+// the aliased block at the helper index.
+void set_runtime_tls_index(DWORD index) {
+    if (IMAGE_TLS_DIRECTORY64* tls = self_tls_directory())
+        if (tls->AddressOfIndex) *reinterpret_cast<DWORD*>(tls->AddressOfIndex) = index;
+    g_runtime_tls_index.store(index, std::memory_order_release);
+}
+
+// The same alias for threads that were already running when the game was mapped. Uses the TEB of each thread, like
+// install_on_existing_threads, and holds the TLS lock so a thread event cannot run in the middle.
+void alias_runtime_tls_existing_threads(DWORD index) {
+    if (index == TLS_OUT_OF_INDEXES || index == 0 || index >= kMaxModuleTlsSlots) return;
+    if (!query_thread_fn()) return;
+    struct Candidate {
+        DWORD id = 0;
+        HANDLE handle = nullptr;
+    };
+    struct Candidates {
+        std::vector<Candidate> list;
+        HANDLE snapshot = INVALID_HANDLE_VALUE;
+        ~Candidates() {
+            if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot);
+            for (const Candidate& c : list)
+                if (c.handle) CloseHandle(c.handle);
+        }
+    } found;
+    found.snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (found.snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof entry;
+    const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
+    for (BOOL more = Thread32First(found.snapshot, &entry); more; more = Thread32Next(found.snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+        found.list.push_back({entry.th32ThreadID, nullptr});
+        found.list.back().handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+    }
+    ExclusiveTlsLock lock;
+    for (const Candidate& c : found.list) {
+        if (!c.handle) continue;
+        void*** vector = running_thread_tls_vector(c.handle);
+        void** slots = nullptr;
+        void* block = nullptr;
+        if (!vector || !read_thread_slot(vector, 0, slots, block) || !slots || !block) continue;
+        write_thread_slot(slots, index, block);
     }
 }
 
@@ -715,8 +794,22 @@ void release_existing_blocks_of_this_thread() {
 // the Windows loader lock, on that thread. A new thread gets its own copy of each active TLS owner's template; an
 // ending one gives each helper's block back before the Windows loader frees it. TLS callbacks get the thread events
 // only after the module's DLL_PROCESS_ATTACH (initialise()), as the Windows loader orders them.
+void heap_probe(const char* where, size_t slot, const char* name) {
+    if (!std::getenv("LEONIDA_HEAP_PROBE")) return;
+    std::fprintf(stderr, "[rt] heap-probe: %s slot=%zu %s tid=%lu\n", where, slot, name ? name : "",
+                 GetCurrentThreadId());
+    std::fflush(stderr);
+    const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
+    std::fprintf(stderr, "[rt] heap-probe: %s slot=%zu %s ok=%d\n", where, slot, name ? name : "", ok);
+    std::fflush(stderr);
+}
+
 void __cdecl on_host_thread_event(DWORD reason) {
+    // Before any runtime TLS access: move this thread's runtime block to the helper index. The OS built slot 0 from
+    // the runtime EXE's template and slot <helper> from the helper's one-byte template; the game will take slot 0.
+    if (reason == DLL_THREAD_ATTACH) alias_runtime_tls_current_thread(g_runtime_tls_index.load(std::memory_order_acquire));
     SharedTlsLock lock;
+    const bool skip_thread_callbacks = std::getenv("LEONIDA_NO_THREAD_TLS_CALLBACKS") != nullptr;
     // The try/catch is per slot: a throw from one module's install or callbacks must not take the thread events
     // away from the other slots. Nothing may leave DllMain.
     if (reason == DLL_THREAD_ATTACH) {
@@ -725,12 +818,19 @@ void __cdecl on_host_thread_event(DWORD reason) {
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[rt] loader: thread attach: %s\n", e.what());
         }
+        heap_probe("attach start", 0, "");
         for (size_t slot = 0; slot < kMaxMappedTlsModules; ++slot) {
             Module* m = g_tls_slot_owners[slot].load();
             if (!m) continue;
             try {
+                heap_probe("before install", slot, m->name.c_str());
                 install_thread_block(*m);
-                if (m->initialised) run_callbacks(*m, DLL_THREAD_ATTACH);
+                heap_probe("after install", slot, m->name.c_str());
+                if (m->initialised && !skip_thread_callbacks) {
+                    heap_probe("before callbacks", slot, m->name.c_str());
+                    run_callbacks(*m, DLL_THREAD_ATTACH);
+                    heap_probe("after callbacks", slot, m->name.c_str());
+                }
             } catch (const std::exception& e) {
                 // The thread runs on without this module's TLS; later slots still get theirs.
                 std::fprintf(stderr, "[rt] loader: thread attach, slot %zu (%s): %s\n", slot, m->name.c_str(),
@@ -1299,6 +1399,9 @@ Module& Loader::map_image(const std::filesystem::path& path) {
 // getting its own index. All kMaxMappedTlsModules slots can be live at once; a further module is rejected rather than
 // silently sharing (and corrupting) a slot.
 void Loader::initialize_tls(Module& m) {
+    // The first image load() maps is the exe. A console exe's static CRT assumes its TLS index is 0, so it must own
+    // slot 0; the runtime's own TLS moves to the helper index (see "The host process's own static TLS" above).
+    const bool is_main = order_.empty();
     auto* tls = tls_directory(m);
     if (!tls) return;
     // A present but all-zero directory is treated like an absent one.
@@ -1323,6 +1426,7 @@ void Loader::initialize_tls(Module& m) {
 
     size_t slot = kMaxMappedTlsModules;
     DWORD index = TLS_OUT_OF_INDEXES;
+    DWORD host_index = TLS_OUT_OF_INDEXES;
     {
         std::lock_guard alloc_lock(g_tls_alloc_mutex);
         for (size_t i = 0; i < kMaxMappedTlsModules; ++i) {
@@ -1337,16 +1441,29 @@ void Loader::initialize_tls(Module& m) {
 
         // Load/clone gta6rt_tls_host.dll OUTSIDE ExclusiveTlsLock so LoadLibraryExW cannot deadlock with
         // on_host_thread_event (which runs under the Windows loader lock and takes SharedTlsLock).
-        index = ensure_tls_host(slot).index;
-        if (index == TLS_OUT_OF_INDEXES)
-            throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
-        if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+        if (is_main) {
+            index = 0;  // the exe's static CRT hardcodes index 0
+            host_index = ensure_tls_host(0).index;
+            if (host_index == TLS_OUT_OF_INDEXES)
+                throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+            if (host_index == 0 || host_index >= kMaxModuleTlsSlots)
+                throw std::runtime_error(m.name + ": reserved runtime TLS index is out of range");
+        } else {
+            index = ensure_tls_host(slot).index;
+            if (index == TLS_OUT_OF_INDEXES)
+                throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+            if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+        }
 
-        // The fields are complete before a thread event can see the owner.
-        ExclusiveTlsLock lock;
-        Module* expected = nullptr;
-        if (!g_tls_slot_owners[slot].compare_exchange_strong(expected, &m))
-            throw std::runtime_error(m.name + ": static TLS slot was claimed concurrently");
+        // The fields are complete before a thread event can see the owner. For the main image the owner is
+        // published only after the runtime's TLS has moved, so a new thread never installs the game at slot 0
+        // while the runtime still reads it.
+        if (!is_main) {
+            ExclusiveTlsLock lock;
+            Module* expected = nullptr;
+            if (!g_tls_slot_owners[slot].compare_exchange_strong(expected, &m))
+                throw std::runtime_error(m.name + ": static TLS slot was claimed concurrently");
+        }
 
         m.tls_slot = static_cast<uint32_t>(slot);
         m.tls_generation = g_next_tls_generation.fetch_add(1, std::memory_order_relaxed);
@@ -1359,6 +1476,18 @@ void Loader::initialize_tls(Module& m) {
         // The index lives in a writable section and protect_sections() has not run yet, so the write needs no
         // VirtualProtect dance.
         if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = index;
+    }
+    if (is_main) {
+        // Move the runtime's TLS first (current thread, then every other running thread), then patch _tls_index.
+        // Until the patch, runtime code still reads slot 0; after it, it reads the same block at the helper index.
+        alias_runtime_tls_current_thread(host_index);
+        alias_runtime_tls_existing_threads(host_index);
+        set_runtime_tls_index(host_index);
+        ExclusiveTlsLock lock;
+        Module* expected = nullptr;
+        if (!g_tls_slot_owners[slot].compare_exchange_strong(expected, &m))
+            throw std::runtime_error(m.name + ": static TLS slot was claimed concurrently");
+        g_tls_slot_generations[slot].store(m.tls_generation);
     }
     try {
         install_thread_block(m);
@@ -1375,6 +1504,13 @@ void Loader::initialize_tls(Module& m) {
     if (g_thread_tls_slots[slot].module == &m && g_thread_tls_slots[slot].generation == m.tls_generation) {
         m.tls_block = g_thread_tls_slots[slot].block;
         m.tls_saved_block = g_thread_tls_slots[slot].saved;
+    }
+    {
+        void** slots = module_tls_slots();
+        void* slotv = (slots && m.tls_index < kMaxModuleTlsSlots) ? slots[m.tls_index] : nullptr;
+        std::fprintf(stderr, "[rt] tls-probe: mapped %s index=%u slot=%zu raw=%u zero=%lu block=%p slotv=%p\n",
+                     m.name.c_str(), m.tls_index, slot, m.tls_raw_size,
+                     static_cast<unsigned long>(m.tls_zero_fill), m.tls_block, slotv);
     }
     // Threads started from here on get their copy from the helper DLL's DLL_THREAD_ATTACH; the ones already running
     // get it now.

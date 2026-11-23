@@ -19,6 +19,7 @@
 #include <deque>
 #include <filesystem>
 #include <map>
+#include <malloc.h>
 #include <mutex>
 #include <set>
 #include <string>
@@ -72,20 +73,18 @@ std::string module_name(std::string path) {
     return path;
 }
 
-std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
+bool crt_heap_ok() { return HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr) != FALSE; }
 
+std::string host_module_name(HMODULE module) {
+    // No lazy static map: GetProcAddress on a host module is reached during the title's CRT
+    // initialisation, and a first-use magic static there depends on TLS/epoch state that is not
+    // dependable yet (it was observed reading a null map pointer). The lookup is not hot enough to
+    // be worth that risk.
     std::vector<wchar_t> path(MAX_PATH);
     for (;;) {
         const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
         if (!length) return {};
-        if (length < path.size()) {
-            const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
-            return name;
-        }
+        if (length < path.size()) return module_name(narrow(path.data()));
         if (path.size() == 32768) return {};
         path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
     }
@@ -184,6 +183,13 @@ HMODULE WINAPI get_module_handle_a(LPCSTR name) {
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
+    if (getenv("LEONIDA_HEAP_PROBE")) {
+        std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry tid=%lu\n", GetCurrentThreadId());
+        std::fflush(stderr);
+        const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
+        std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry ok=%d\n", ok);
+        std::fflush(stderr);
+    }
     if (!name) {
         // The process's own image: the mapped exe, not gta6rt.
         if (void* h = bundled_main_module()) return reinterpret_cast<HMODULE>(h);
@@ -254,6 +260,10 @@ DWORD WINAPI get_module_file_name_a(HMODULE module, LPSTR buffer, DWORD size) {
 }
 
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
+    const bool heap_probe = getenv("LEONIDA_HEAP_PROBE") != nullptr;
+    if (heap_probe)
+        std::fprintf(stderr, "[rt] heap-probe: GetProcAddress entry tid=%lu module=%p ok=%d\n",
+                     GetCurrentThreadId(), module, crt_heap_ok());
     if (const Pseudo* p = pseudo(module)) {
         if (!name) {
             SetLastError(ERROR_PROC_NOT_FOUND);
@@ -283,8 +293,10 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     }
 
     const std::string what = IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
+    if (heap_probe) std::fprintf(stderr, "[rt] heap-probe: after name ok=%d name=%s\n", crt_heap_ok(), what.c_str());
     bool owns_handle = false;
     void* fn = get_bundled_proc_address(module, what, owns_handle);
+    if (heap_probe) std::fprintf(stderr, "[rt] heap-probe: after bundled ok=%d owns=%d\n", crt_heap_ok(), owns_handle);
     if (owns_handle) {
         if (fn) return reinterpret_cast<FARPROC>(fn);
         SetLastError(ERROR_PROC_NOT_FOUND);

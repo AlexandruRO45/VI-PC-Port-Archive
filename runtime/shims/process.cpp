@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <malloc.h>
 #include <mutex>
 #include <new>
 #include <string>
@@ -260,6 +261,13 @@ struct EntryCall {
 };
 
 DWORD WINAPI game_thread(void* p) {
+    if (getenv("LEONIDA_HEAP_PROBE")) {
+        std::fprintf(stderr, "[rt] heap-probe: game_thread before entry\n");
+        std::fflush(stderr);
+        const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
+        std::fprintf(stderr, "[rt] heap-probe: game_thread before entry ok=%d\n", ok);
+        std::fflush(stderr);
+    }
     auto* call = static_cast<EntryCall*>(p);
     // An EXE entry point (mainCRTStartup and friends) takes the PEB pointer and returns the process exit code.
     auto entry = reinterpret_cast<DWORD(WINAPI*)(void*)>(call->entry);

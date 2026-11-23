@@ -2271,6 +2271,11 @@ inline void emit_indirect(const ReplayFunctions& vk, VkCommandBuffer command_buf
         } else if (ind.kind == IndirectKind::dispatch_mesh) {
             vk.draw_mesh_tasks_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer, count,
                                               ind.max_count, ind.stride);
+        } else if (ind.kind == IndirectKind::dispatch) {
+            // Vulkan has no vkCmdDispatchIndirectCount: the helper prepass wrote the counted records.
+            for (std::uint64_t k = 0; k < ind.max_count; ++k)
+                vk.dispatch_indirect(command_buffer, p.counted_dispatch.indirect,
+                                     p.counted_dispatch.offset + VkDeviceSize(k) * 12);
         }
         return;
     }
@@ -2302,13 +2307,8 @@ inline void emit_indirect(const ReplayFunctions& vk, VkCommandBuffer command_buf
             k += n;
         }
     } else if (ind.kind == IndirectKind::dispatch) {
-        for (std::uint64_t k = 0; k < ind.max_count; ++k) {
-            if (ind.count_buffer)
-                vk.dispatch_indirect(command_buffer, p.counted_dispatch.indirect,
-                                     p.counted_dispatch.offset + VkDeviceSize(k) * 12);
-            else
-                vk.dispatch_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride);
-        }
+        for (std::uint64_t k = 0; k < ind.max_count; ++k)
+            vk.dispatch_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride);
     }
 }
 

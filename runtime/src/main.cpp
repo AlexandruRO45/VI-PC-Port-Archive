@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <filesystem>
+#include <malloc.h>
 #include <map>
 #include <string>
 #include <system_error>
@@ -207,6 +208,13 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("%zu module(s) mapped, %d unimplemented import(s)\n", loader.modules().size(), unimplemented);
         std::printf("unimplemented by return policy: hresult=%d other=%d\n", unimplemented_hresult,
                     unimplemented - unimplemented_hresult);
+        if (std::getenv("LEONIDA_HEAP_PROBE")) {
+            std::fprintf(stderr, "[rt] heap-probe: after mapping\n");
+            std::fflush(stderr);
+            const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
+            std::fprintf(stderr, "[rt] heap-probe: after mapping ok=%d\n", ok);
+            std::fflush(stderr);
+        }
         if (!run) {
             rt::startup_trace::event("exit", "\"code\":0");
             return 0;
