@@ -153,6 +153,28 @@ class TestPackB32F16Constants(unittest.TestCase):
         # 1.0 in f16 is 0x3C00
         self.assertEqual(support.mrt0_words(spv)[0], 0x7777_3C00)
 
+class TestPackB32F16Mutation(unittest.TestCase):
+    def test_abs_and_neg_modifiers(self):
+        # abs clears bit 15: 0xBC00 (-1.0) -> 0x3C00 (+1.0)
+        res = run_ps_pack(0xBC00, 0x4000, abs0=True, name="ps_pack_abs")
+        self.assertEqual(res, 0x4000_3C00)
+
+        # neg flips bit 15: 0x3C00 (+1.0) -> 0xBC00 (-1.0)
+        res_neg = run_ps_pack(0x3C00, 0x4000, neg0=True, name="ps_pack_neg")
+        self.assertEqual(res_neg, 0x4000_BC00)
+
+    def test_spirv_instructions(self):
+        code = [
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 2",
+            "v_pack_b32_f16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pack_inst", code)
+        self.assertIn("OpShiftLeftLogical", spv)
+        self.assertIn("OpBitwiseOr", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
