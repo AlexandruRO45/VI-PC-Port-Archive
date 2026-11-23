@@ -375,12 +375,18 @@ class Analysis:
             for r in _regs(a_):
                 if r == "exec":
                     continue
-                T[r] = t
+                # A VGPR write while EXEC is not the launch mask changes the lanes that are on only: the lanes that
+                # are off keep their old value, so the register keeps its old taint as well, is not uniform and
+                # carries no lane-id tag (the new value is not in every lane). The idiom tags (elect, cnt, rank,
+                # waterfall, mask, vote) describe a value read from one lane or inside the narrowed region and keep
+                # their meaning under a narrowed EXEC, so those writes are unchanged.
+                masked = isinstance(r, tuple) and r[0] == "v" and not st["f"] and (tag is None or tag[0] == "lmod")
+                T[r] = (T.get(r, 0) | t) if masked else t
                 st["g"].pop(r, None)
-                if tag is not None:
+                if tag is not None and not masked:
                     st["g"][r] = tag
                 if isinstance(r, tuple) and r[0] == "v":
-                    st["u"] = st["u"] | {r[1]} if uniform else st["u"] - {r[1]}
+                    st["u"] = st["u"] | {r[1]} if uniform and not masked else st["u"] - {r[1]}
                     for k in [k for k in st["l"] if k[0] == r[1]]:
                         del st["l"][k]
                     # a waterfall scalar / mask names the VGPR it was read from: once that is rewritten the
