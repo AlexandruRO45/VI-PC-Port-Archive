@@ -26,6 +26,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "xmem_physical.h"
 
 namespace {
 
@@ -134,6 +135,8 @@ constexpr DWORD kXmemPageModeMask = kXmem64kPages;
 constexpr SIZE_T kXmemPageSize64k = 0x10000;
 constexpr DWORD kXmemHostAllocationTypeMask =
     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
+// The physical-page store's reservation, set by xmem_physical.cpp when it is linked (xmem_physical.h).
+std::atomic<rt::xmem::PhysicalReserveFn> g_physical_reserve{nullptr};
 
 bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
@@ -164,6 +167,15 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
+    }
+    // A new reserve-only range in the 64 KiB page mode (MEM_LARGE_PAGES | MEM_PHYSICAL) is where the title maps the
+    // pages of XMemAllocatePhysicalPages, so it comes from the physical-page store when that is linked
+    // (xmem_physical.cpp). Nothing is backed yet, so the attribute word does not matter here; the console's
+    // PAGE_GRAPHICS_* bits are dropped and the CPU protection is what each mapped page gets.
+    if (address == nullptr && (allocation_type & ~MEM_TOP_DOWN) == (MEM_RESERVE | kXmem64kPages)) {
+        if (const rt::xmem::PhysicalReserveFn reserve = rt::xmem::physical_reserve()) {
+            return reserve(size, host_protect(protect));
+        }
     }
 
     const DWORD page_mode = allocation_type & kXmemPageModeMask;
@@ -293,6 +305,11 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
 }
 
 }  // namespace
+
+namespace rt::xmem {
+void set_physical_reserve(PhysicalReserveFn fn) { g_physical_reserve.store(fn, std::memory_order_release); }
+PhysicalReserveFn physical_reserve() { return g_physical_reserve.load(std::memory_order_acquire); }
+}  // namespace rt::xmem
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
 
