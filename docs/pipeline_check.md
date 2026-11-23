@@ -296,6 +296,14 @@ This bounds each invocation to a range that can be split further if concurrent h
 memory. A work folder with at most 500 entries keeps the single invocation. An older checker without the range
 options keeps the older invocation; rebuild the runtime to get batching.
 
+The checker reads one folder's `index.json` and does not descend into subfolders, so the stage runs it once per module
+index: `shaders/spirv` first, then each folder directly in it that has an `index.json`, by name. The shaders stage
+translates the FidelityFX DLL's programs into `spirv/fspx` (`docs/fspx.md`), which the runtime's shader library loads
+beside the game's own. Each folder gets its own batches and crash recovery, and all of them save to the same
+`pipeline_cache.bin`. A failure in one folder does not stop the next from being checked (only a setup error or an
+interruption does); the stage fails at the end, naming each folder that failed, with a crashed module named as the
+runtime names it (`fspx/<name>`). With more than one folder, the log gives each folder's shader count (BUILD-1842).
+
 If a batch crashes, its in-flight modules are checked alone in fresh processes. A module that reproducibly crashes
 is recorded as failed, and the rest is checked. If none crashes alone, the entire failed range is retried in
 smaller processes, down to one entry; healthy modules are not added to the crash list. An unrecoverable crash,

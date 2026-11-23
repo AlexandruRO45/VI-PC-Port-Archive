@@ -1894,7 +1894,50 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
     os.makedirs(out, exist_ok=True)
+    # One cache for every folder: each checker process loads it and saves it back with its own pipelines added, as the
+    # batches below do, and the runtime seeds its device's cache from this one file.
     cache = os.path.join(out, "pipeline_cache.bin")
+    folders = pipeline_folders(spirv)
+    checked, failed = [], []
+    for folder in folders:
+        label = os.path.relpath(folder, work)
+        count = len(pipeline_names(folder))
+        if len(folders) > 1:
+            log(f"pipelines: {label}: {count} shader(s)")
+        code, crashed = check_pipeline_folder(exe, folder, cache, out, jobs)
+        checked.append(f"{label} {count}")
+        if code:
+            prefix = "" if folder == spirv else os.path.relpath(folder, spirv).replace(os.sep, "/") + "/"
+            why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + \
+                ", ".join(prefix + n for n in crashed) if crashed else ""
+            failed.append((label, code, why))
+        if code == 2 or interrupted(code):
+            break   # a wrong folder, a setup error or Ctrl+C: the next folder would stop the same way
+    if len(failed) == 1 and len(folders) == 1:
+        fail(f"vk_pipeline_check exited with {exit_label(failed[0][1])}{failed[0][2]}")
+    if failed:
+        fail("vk_pipeline_check failed for " + "; ".join(f"{label}: exited with {exit_label(code)}{why}"
+                                                          for label, code, why in failed))
+    if len(folders) > 1:
+        log("pipelines: shaders checked per folder: " + ", ".join(checked))
+    log("pipelines: done")
+
+
+def pipeline_folders(spirv: str) -> "list[str]":
+    """The module folders the pipelines stage checks: <spirv> itself, then each folder directly in it that has an
+    index.json, by name. The shaders stage translates the FidelityFX DLL's programs into spirv/fspx (docs/fspx.md),
+    and the runtime's shader library loads them beside the game's own, so a module a driver rejects there fails as
+    surely at run time. vk_pipeline_check reads one folder's index.json and does not descend (BUILD-1842)."""
+    with os.scandir(spirv) as entries:
+        subfolders = sorted(e.name for e in entries
+                            if e.is_dir() and os.path.isfile(os.path.join(e.path, "index.json")))
+    return [spirv] + [os.path.join(spirv, name) for name in subfolders]
+
+
+def check_pipeline_folder(exe: str, spirv: str, cache: str, out: str, jobs: "int | None" = None) \
+        -> "tuple[int, list[str]]":
+    """Check one folder's index.json with vk_pipeline_check in batches, as the pipelines stage does: the checker's
+    exit code over the folder (0 when every module and pipeline was created) and the modules that took it down."""
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
@@ -1906,8 +1949,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
             "crashes the driver is skipped instead of stopping the stage")
         run(base)
-        log("pipelines: done")
-        return
+        return 0, []
     base += ["--inflight-file", inflight]
     # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
@@ -1969,11 +2011,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     if crashed and not code:
         code = 1
     drop(inflight)
-    if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
-            if crashed else ""
-        fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
-    log("pipelines: done")
+    return code, crashed
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the

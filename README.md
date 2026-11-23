@@ -202,7 +202,9 @@ cmake --build runtime/build/linux --parallel
 ./runtime/build/linux/vk_pipeline_check /path/to/spirv
 ```
 
-Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
+Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`. It does not look
+into subfolders, so `spirv/fspx` (the FidelityFX DLL's programs) is checked by passing that folder on its own; the
+`pipelines` stage checks both.
 
 `make_game.py` runs on Linux too. The `pipelines` stage uses the `vk_pipeline_check` built above
 (`runtime/build/linux`, or `runtime/build`), and builds it there itself before any other work if it is missing.
