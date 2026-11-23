@@ -606,6 +606,188 @@ void run_checks(const std::filesystem::path& root) {
         }
     }
 
+    // CREATE_ALWAYS replaces an existing file, and the host refuses that for some attributes of the existing file
+    // and some attributes the open asks for. A file only the package has is not in the overlay, where the open goes,
+    // so the shim has to give the host's answer itself. Every case is compared with the host's own call on a scratch
+    // file given the same attributes (CreateFileW for the CreateFileW and CreateFileA shims, CreateFile2 for
+    // CreateFile2): the same success or failure, the same error, and after a success the same read-only, hidden and
+    // system bits. Some Wine file systems keep neither HIDDEN nor SYSTEM, so a case is compared only when both the
+    // package file and the scratch file read the attributes back.
+    {
+        const auto create2 = resolve<CreateFile2Fn>("api-ms-win-core-file-l1-2-0.dll", "CreateFile2");
+        check(create2 != nullptr, "CreateFile2 resolves for the CREATE_ALWAYS attribute checks");
+        constexpr DWORD kShown = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+        constexpr DWORD kReadOnly = FILE_ATTRIBUTE_READONLY, kHidden = FILE_ATTRIBUTE_HIDDEN,
+                        kSystem = FILE_ATTRIBUTE_SYSTEM, kNormal = FILE_ATTRIBUTE_NORMAL;
+        const DWORD existing_cases[] = {kReadOnly, kHidden, kSystem, kHidden | kSystem, kReadOnly | kHidden, kNormal};
+        const DWORD requested_cases[] = {kNormal, kHidden, kSystem, kHidden | kSystem, kReadOnly};
+        const DWORD access_cases[] = {GENERIC_WRITE, GENERIC_READ};
+        enum class Api { W, A, File2, File2NoParameters };
+        const char* const api_names[] = {"CreateFileW", "CreateFileA", "CreateFile2", "CreateFile2(no parameters)"};
+        // Opens `path` with CREATE_ALWAYS through the host or the shim; returns the error, 0 for success.
+        const auto open_always = [&](bool host, Api api, const std::filesystem::path& native, const std::string& logical,
+                                     DWORD access, DWORD requested) {
+            CREATEFILE2_EXTENDED_PARAMETERS ext{};
+            ext.dwSize = sizeof(ext);
+            ext.dwFileAttributes = requested;
+            const std::wstring wide(logical.begin(), logical.end());
+            SetLastError(0);
+            HANDLE h = INVALID_HANDLE_VALUE;
+            switch (api) {
+            case Api::W:
+            case Api::A:
+                h = host ? ::CreateFileW(native.c_str(), access, 0, nullptr, CREATE_ALWAYS, requested, nullptr)
+                         : api == Api::W ? create_w(wide.c_str(), access, 0, nullptr, CREATE_ALWAYS, requested, nullptr)
+                                         : create_a(logical.c_str(), access, 0, nullptr, CREATE_ALWAYS, requested, nullptr);
+                break;
+            case Api::File2:
+            case Api::File2NoParameters: {
+                const LPCREATEFILE2_EXTENDED_PARAMETERS p = api == Api::File2 ? &ext : nullptr;
+                h = host ? ::CreateFile2(native.c_str(), access, 0, CREATE_ALWAYS, p)
+                         : create2(wide.c_str(), access, 0, CREATE_ALWAYS, p);
+                break;
+            }
+            }
+            const DWORD error = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            return h == INVALID_HANDLE_VALUE && error == 0 ? DWORD{ERROR_GEN_FAILURE} : error;
+        };
+        int index = 0, compared = 0;
+        for (const DWORD existing : existing_cases) {
+            for (const DWORD requested : requested_cases) {
+                for (const DWORD access : access_cases) {
+                    for (const Api api : {Api::W, Api::A, Api::File2, Api::File2NoParameters}) {
+                        if (api == Api::File2NoParameters && requested != kNormal) continue;
+                        const std::string folder = std::to_string(++index);
+                        const auto package_file = package / "replace-attributes" / folder / "file.bin";
+                        const auto overlay_folder = overlay / "replace-attributes" / folder;
+                        const auto overlay_file = overlay_folder / "file.bin";
+                        const auto native_file = root / "native-replace" / folder / "file.bin";
+                        const std::string logical = "GAME:\\replace-attributes\\" + folder + "\\file.bin";
+                        std::printf("CREATE_ALWAYS case %d: %s, existing 0x%lx, requested 0x%lx, access 0x%lx\n",
+                                    index, api_names[static_cast<int>(api)], static_cast<unsigned long>(existing),
+                                    static_cast<unsigned long>(requested), static_cast<unsigned long>(access));
+                        write_path(package_file, "package bytes");
+                        write_path(native_file, "package bytes");
+                        ::SetFileAttributesW(package_file.c_str(), existing);
+                        ::SetFileAttributesW(native_file.c_str(), existing);
+                        const DWORD package_before = ::GetFileAttributesW(package_file.c_str());
+                        const DWORD native_before = ::GetFileAttributesW(native_file.c_str());
+                        const DWORD wanted = existing & kShown;
+                        if (package_before == INVALID_FILE_ATTRIBUTES || native_before == INVALID_FILE_ATTRIBUTES ||
+                            (package_before & kShown) != wanted || (native_before & kShown) != wanted) {
+                            std::printf("NOTE the host does not keep attributes 0x%lx here, case not compared\n",
+                                        static_cast<unsigned long>(existing));
+                        } else {
+                            ++compared;
+                            const DWORD native_error = open_always(true, api, native_file, logical, access, requested);
+                            const DWORD mapped_error = open_always(false, api, native_file, logical, access, requested);
+                            std::printf("  host error %lu, shim error %lu\n", static_cast<unsigned long>(native_error),
+                                        static_cast<unsigned long>(mapped_error));
+                            check(mapped_error == native_error,
+                                  "CREATE_ALWAYS of a package-only file succeeds or fails as the host does, with its error");
+                            check(read_path(package_file) == "package bytes" &&
+                                      ::GetFileAttributesW(package_file.c_str()) == package_before,
+                                  "CREATE_ALWAYS leaves the package file's bytes and attributes as they were");
+                            if (native_error != 0) {
+                                check(!std::filesystem::exists(overlay_folder),
+                                      "a refused CREATE_ALWAYS leaves no file or folder in the overlay");
+                                check(attributes_w(std::wstring(logical.begin(), logical.end()).c_str()) == package_before,
+                                      "after a refused CREATE_ALWAYS the title still sees the package file's attributes");
+                                const HANDLE reread = create_a(logical.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                                               nullptr, OPEN_EXISTING, 0, nullptr);
+                                check(reread != INVALID_HANDLE_VALUE && read_handle(reread) == "package bytes",
+                                      "after a refused CREATE_ALWAYS the title still reads the package file");
+                                if (reread != INVALID_HANDLE_VALUE) ::CloseHandle(reread);
+                            } else if (mapped_error == 0) {
+                                const DWORD native_after = ::GetFileAttributesW(native_file.c_str());
+                                const DWORD mapped_after =
+                                    attributes_w(std::wstring(logical.begin(), logical.end()).c_str());
+                                check(std::filesystem::exists(overlay_file) && read_path(overlay_file).empty(),
+                                      "an accepted CREATE_ALWAYS makes an empty overlay file");
+                                check(native_after != INVALID_FILE_ATTRIBUTES && mapped_after != INVALID_FILE_ATTRIBUTES &&
+                                          (native_after & kShown) == (mapped_after & kShown),
+                                      "an accepted CREATE_ALWAYS leaves the read-only, hidden and system bits the host "
+                                      "leaves");
+                            }
+                        }
+                        // Only these synthetic files, so remove_all can take them at the end.
+                        for (const auto& p : {package_file, overlay_file, native_file})
+                            if (std::filesystem::exists(p)) ::SetFileAttributesW(p.c_str(), kNormal);
+                    }
+                }
+            }
+        }
+        std::printf("CREATE_ALWAYS: %d of %d attribute cases compared with the host\n", compared, index);
+        check(compared > 0, "at least the read-only CREATE_ALWAYS cases are compared with the host");
+
+        // A package file the title deleted is gone from its view, whatever its attributes: CREATE_ALWAYS makes the
+        // name as the host makes a new one.
+        {
+            const auto package_file = package / "replace-attributes" / "deleted.bin";
+            const auto native_file = root / "native-replace" / "deleted.bin";
+            write_path(package_file, "package bytes");
+            check(delete_w(L"GAME:\\replace-attributes\\deleted.bin") != FALSE, "delete a writable package file");
+            ::SetFileAttributesW(package_file.c_str(), kReadOnly | kHidden | kSystem);
+            std::filesystem::remove(native_file);
+            const DWORD native_error =
+                open_always(true, Api::W, native_file, "GAME:\\replace-attributes\\deleted.bin", GENERIC_WRITE, kNormal);
+            const DWORD mapped_error =
+                open_always(false, Api::W, native_file, "GAME:\\replace-attributes\\deleted.bin", GENERIC_WRITE, kNormal);
+            check(native_error == 0 && mapped_error == 0,
+                  "CREATE_ALWAYS of a deleted read-only, hidden, system package name succeeds as for a new name");
+            check(std::filesystem::exists(overlay / "replace-attributes" / "deleted.bin") &&
+                      read_path(package_file) == "package bytes",
+                  "the new file is in the overlay and the package file is untouched");
+            ::SetFileAttributesW(package_file.c_str(), kNormal);
+        }
+
+        // A name the overlay has goes to the host as it is: the overlay copy's attributes decide, not the package's.
+        {
+            struct OverlayCase {
+                const char* name;
+                DWORD package_attributes, overlay_attributes;
+            };
+            const OverlayCase cases[] = {
+                {"readonly-package-normal-overlay", kReadOnly | kHidden, kNormal},
+                {"normal-package-readonly-overlay", kNormal, kReadOnly},
+                {"normal-package-hidden-overlay", kNormal, kHidden},
+            };
+            for (const auto& item : cases) {
+                const std::string leaf = std::string(item.name) + ".bin";
+                const auto package_file = package / "replace-attributes" / leaf;
+                const auto overlay_file = overlay / "replace-attributes" / leaf;
+                const auto native_file = root / "native-replace" / leaf;
+                const std::string logical = "GAME:\\replace-attributes\\" + leaf;
+                std::printf("CREATE_ALWAYS overlay case: %s\n", item.name);
+                write_path(package_file, "package bytes");
+                write_path(overlay_file, "overlay bytes");
+                write_path(native_file, "overlay bytes");
+                ::SetFileAttributesW(package_file.c_str(), item.package_attributes);
+                ::SetFileAttributesW(overlay_file.c_str(), item.overlay_attributes);
+                ::SetFileAttributesW(native_file.c_str(), item.overlay_attributes);
+                const DWORD wanted = item.overlay_attributes & kShown;
+                if ((::GetFileAttributesW(overlay_file.c_str()) & kShown) != wanted ||
+                    (::GetFileAttributesW(native_file.c_str()) & kShown) != wanted) {
+                    std::printf("NOTE the host does not keep attributes 0x%lx here, case not compared\n",
+                                static_cast<unsigned long>(item.overlay_attributes));
+                } else {
+                    const DWORD native_error = open_always(true, Api::W, native_file, logical, GENERIC_WRITE, kNormal);
+                    const DWORD mapped_error = open_always(false, Api::W, native_file, logical, GENERIC_WRITE, kNormal);
+                    std::printf("  host error %lu, shim error %lu\n", static_cast<unsigned long>(native_error),
+                                static_cast<unsigned long>(mapped_error));
+                    check(mapped_error == native_error,
+                          "CREATE_ALWAYS of a name the overlay has answers as the host does for the overlay copy");
+                    check(read_path(overlay_file) == (native_error == 0 ? "" : "overlay bytes") &&
+                              read_path(package_file) == "package bytes",
+                          "it replaces only an accepted overlay copy and never the package file");
+                }
+                for (const auto& p : {package_file, overlay_file, native_file})
+                    if (std::filesystem::exists(p)) ::SetFileAttributesW(p.c_str(), kNormal);
+            }
+        }
+    }
+
     // Deleting one package file must not hide its folder. The overlay has never written to GAME:\pkgonly, so the
     // folder is only in the package, and its marker folder under .gta6rt-deleted is not a marker for the folder.
     {
