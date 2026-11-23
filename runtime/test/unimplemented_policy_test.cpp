@@ -247,11 +247,15 @@ void test_classification() {
 
     for (const char* name : {"XGameStreamingInitialize", "XGameStreamingGetStreamAddedLatency",
                              "XGameStreamingRegisterConnectionStateChanged", "XGameStreamingIsTouchInputEnabled",
+                             "XGameStreamingUpdateTouchControlsState", "XGameStreamingUpdateTouchControlsStateOnClient",
+                             "XGameStreamingShowTouchControlsWithStateUpdate", "XGameStreamingShowTouchControlsWithStateUpdateOnClient",
                              "XSystemGetXboxLiveSandboxId",
                              "XThreadSetTimeSensitive", "XErrorReport"})
         check(cls("xgameruntime.dll", name) == ReturnClass::HResult, std::string(name) + " returns HRESULT");
     for (const char* name : {"XGameStreamingIsStreaming", "XGameStreamingGetClientCount",
                              "XGameStreamingGetConnectionState",
+                             "XGameStreamingHideTouchControls", "XGameStreamingHideTouchControlsOnClient",
+                             "XGameStreamingShowTouchControlLayout", "XGameStreamingShowTouchControlLayoutOnClient",
                              "XGameStreamingUninitialize", "XGameStreamingUnregisterClientPropertiesChanged",
                              "XGameStreamingUnregisterConnectionStateChanged", "XGameStreamingUnregisterFuture"})
         check(cls("xgameruntime.dll", name) == ReturnClass::Other, std::string(name) + " is not HRESULT");
