@@ -165,6 +165,12 @@ class BuildLockTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(entered)
 
+    @unittest.skipIf(sys.platform == "win32", "only Linux builds a missing checker in preflight")
+    def test_pipeline_checker_builds_in_one_checkout_share_the_builder_lock(self):
+        self.start_build("pipelines", self.root / "out1", self.root / "work1")
+        result, entered = self.attempt("pipelines", self.root / "out2", self.root / "work2")
+        self.assert_rejected(result, entered, self.root / "synthetic checkout" / "runtime" / "build")
+
     def test_runtime_builds_in_one_checkout_share_the_builder_lock(self):
         self.start_build("runtime", self.root / "out1", self.root / "work1", prebuilt=False)
         result, entered = self.attempt("runtime", self.root / "out2", self.root / "work2", prebuilt=False)
