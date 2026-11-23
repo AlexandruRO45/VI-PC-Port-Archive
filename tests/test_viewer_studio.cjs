@@ -285,7 +285,9 @@ test('each library falls back to its CDN copy while the page is parsed, before t
         const local = html.indexOf(`<script src="/vendor/${file}"></script>`);
         assert.ok(local > 0, `${file} is loaded from /vendor first`);
         const fallback = html.slice(local).split('\n')[1];
-        assert.match(fallback, new RegExp(`^<script>.*${global.replace('.', '\.')}.*\|\| document\.write\('<script src="https://[^"]*/${file.replace('.', '\.')}"><\\/script>'\);</script>$`));
+        assert.match(fallback, new RegExp(`^<script>.*${global.replace('.', '\\.')}.*\|\| document\.write\('<script src="https://[^"]*/${file.replace('.', '\\.')}"[^>]*><\\/script>'\);</script>$`));
+        assert.match(fallback, /\bintegrity="sha384-[A-Za-z0-9+/]{64}"/, `${file} has pinned SHA-384 integrity`);
+        assert.match(fallback, /\bcrossorigin="anonymous"/, `${file} uses anonymous CORS`);
         assert.ok(local < html.indexOf('<script>\n'), `${file} and its fallback come before the inline script`);
     }
 });
