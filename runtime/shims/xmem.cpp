@@ -292,6 +292,54 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
     return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
 }
 
+// XMemAllocDefault/XMemFreeDefault: convenience wrappers with zero attributes. The name suggests the game's
+// default-heap path, where the two-argument attribute word is not needed. Measured only by name: the ABI hypothesis
+// is XMemAllocDefault(size) and XMemFreeDefault(ptr), one argument each.
+void* __stdcall XMemAllocDefault(size_t size) {
+    return _aligned_malloc(size ? size : 1, kAlign);
+}
+
+void __stdcall XMemFreeDefault(void* p) {
+    _aligned_free(p);
+}
+
+// Xbox physical-page model (hypothesis). The console splits virtual reservation from physical backing; a PC has
+// one pool and VirtualAlloc(MEM_COMMIT) does both. The stubs succeed without tracking individual pages because
+// the mapped game code also calls XMemVirtualAlloc, which already commits the memory.
+//
+// ABI hypothesis: matches the Windows AWE equivalents (AllocateUserPhysicalPages etc.), which the GDK wraps on
+// other platforms. The game survives as long as the return value is TRUE; actual page-frame tracking is not
+// needed here because all virtual memory is already committed by XMemVirtualAlloc or TitleVirtualAlloc.
+
+BOOL __stdcall XMemAllocatePhysicalPages(HANDLE /*process*/, PULONG_PTR numberOfPages, PULONG_PTR pageArray) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem: XMemAllocatePhysicalPages: PC has no physical-page split; "
+                     "returning dummy page frames (logged once)\n");
+    if (!numberOfPages || !pageArray) return FALSE;
+    for (ULONG_PTR i = 0; i < *numberOfPages; ++i) pageArray[i] = i + 1;
+    return TRUE;
+}
+
+BOOL __stdcall XMemFreePhysicalPages(HANDLE /*process*/, PULONG_PTR numberOfPages, PULONG_PTR /*pageArray*/) {
+    if (!numberOfPages) return FALSE;
+    return TRUE;
+}
+
+BOOL __stdcall XMemIsToolsMemAvailable() {
+    return FALSE;
+}
+
+BOOL __stdcall XMemMapPhysicalPages(void* /*virtualAddress*/, ULONG_PTR /*numberOfPages*/,
+                                    PULONG_PTR /*pageArray*/) {
+    return TRUE;
+}
+
+BOOL __stdcall XMemMapPhysicalPagesScatter(void** /*virtualAddresses*/, ULONG_PTR /*numberOfPages*/,
+                                           PULONG_PTR /*pageArray*/) {
+    return TRUE;
+}
+
 }  // namespace
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
@@ -318,4 +366,11 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
     {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
+    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
+    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
+    {"xmem.dll", "XMemAllocatePhysicalPages", reinterpret_cast<void*>(&XMemAllocatePhysicalPages)},
+    {"xmem.dll", "XMemFreePhysicalPages", reinterpret_cast<void*>(&XMemFreePhysicalPages)},
+    {"xmem.dll", "XMemIsToolsMemAvailable", reinterpret_cast<void*>(&XMemIsToolsMemAvailable)},
+    {"xmem.dll", "XMemMapPhysicalPages", reinterpret_cast<void*>(&XMemMapPhysicalPages)},
+    {"xmem.dll", "XMemMapPhysicalPagesScatter", reinterpret_cast<void*>(&XMemMapPhysicalPagesScatter)},
 );
