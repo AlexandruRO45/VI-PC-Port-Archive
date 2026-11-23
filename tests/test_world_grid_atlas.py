@@ -54,6 +54,66 @@ class PlainLogicTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             wga.geometry({**DOC, "width": 4096.5})
 
+    def test_geometry_rejects_nonpositive_dimensions_and_bad_bounds(self):
+        bad_docs = [
+            ("zero width", {**DOC, "width": 0}),
+            ("zero height", {**DOC, "height": 0}),
+            ("negative width", {**DOC, "width": -512}),
+            ("negative height", {**DOC, "height": -512}),
+            ("negative tileSize", {**DOC, "tileSize": -512}),
+            ("bool tileSize", {**DOC, "tileSize": True}),
+            ("bool width", {**DOC, "tileSize": 1, "width": True, "height": 1}),
+            ("bool height", {**DOC, "tileSize": 1, "width": 1, "height": True}),
+            ("none width", {**DOC, "width": None}),
+            ("nan width", {**DOC, "width": float("nan")}),
+            ("inf height", {**DOC, "height": float("inf")}),
+            ("short origin", {**DOC, "origin": (0.0, 0.0)}),
+            ("string origin", {**DOC, "origin": "000"}),
+            ("none origin", {**DOC, "origin": None}),
+            ("bool origin", {**DOC, "origin": (True, 0.0, 0.0)}),
+            ("nan origin", {**DOC, "origin": (float("nan"), 0.0, 0.0)}),
+            ("inf origin", {**DOC, "origin": (0.0, float("inf"), 0.0)}),
+            ("negative zInflation", {**DOC, "zInflation": -1.0}),
+            ("bool zInflation", {**DOC, "zInflation": True}),
+            ("none zInflation", {**DOC, "zInflation": None}),
+            ("nan zInflation", {**DOC, "zInflation": float("nan")}),
+            ("inf zInflation", {**DOC, "zInflation": float("inf")}),
+        ]
+        for label, bad in bad_docs:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    wga.geometry(bad)
+        # Valid edge cases: zero/omitted zInflation and integral floats stay accepted
+        no_z = {k: v for k, v in DOC.items() if k != "zInflation"}
+        g_no_z = wga.geometry(no_z)
+        self.assertEqual((g_no_z["z_min"], g_no_z["z_max"]), (0.0, 0.0))
+        g_float = wga.geometry({**DOC, "width": 4096.0, "height": 6144.0, "tileSize": 512.0, "zInflation": 0.0})
+        self.assertEqual((g_float["columns"], g_float["rows"]), (8, 12))
+
+    def test_main_rejects_zero_width_grid_cleanly(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        import gamedata_maps as gm
+
+        bad_grid = {
+            **DOC,
+            "width": 0,
+            "clientSystemName": "TestGrid",
+            "tileTextureNameSuffix": "test_tile",
+            "globalFallbackTextureName": "test_fb",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(wga, "load_manifests", return_value=[]), \
+                    mock.patch.object(wga, "load_documents",
+                                      return_value={"GridAtlasInfo": [bad_grid], "TextureGridInfo": []}), \
+                    mock.patch.object(gm, "read_payloads", return_value=[]), \
+                    redirect_stdout(out), redirect_stderr(err):
+                rc = wga.main([td, "--carve", td])
+            self.assertEqual(rc, 2)
+            self.assertIn("world_grid_atlas:", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
     def test_row_zero_is_north(self):
         g = wga.geometry(DOC)
         self.assertEqual(wga.cell_box(g, 0), (-2048, 2560, -1536, 3072))

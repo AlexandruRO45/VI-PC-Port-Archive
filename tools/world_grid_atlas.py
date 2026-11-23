@@ -69,16 +69,42 @@ ORDER_KEYS = {
 
 # ---- plain Python: geometry, order, alignment, fit ------------------------------------------------------------
 
+def _finite_float(value, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} {value!r} is not a finite number")
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} {value!r} is not a finite number") from None
+    if not math.isfinite(out):
+        raise ValueError(f"{label} {value!r} is not a finite number")
+    return out
+
+
 def geometry(doc: dict) -> dict:
     """Columns, rows and world box of a grid document; origin is the grid centre (docs/gamedata.md)."""
-    tile, width, height = (doc[k] for k in ("tileSize", "width", "height"))
-    if any(not float(v).is_integer() for v in (tile, width, height)):
-        raise ValueError(f"grid size {width}x{height} or tile {tile} is not a whole number")
-    tile, width, height = int(tile), int(width), int(height)
-    if tile <= 0 or width % tile or height % tile:
-        raise ValueError(f"grid {width}x{height} is not a whole number of {tile}-unit tiles")
-    ox, oy, oz = (float(v) for v in doc["origin"])
-    z = float(doc.get("zInflation", 0.0))
+    raw_tile, raw_width, raw_height = (doc[k] for k in ("tileSize", "width", "height"))
+    tile_f = _finite_float(raw_tile, "grid tileSize")
+    width_f = _finite_float(raw_width, "grid width")
+    height_f = _finite_float(raw_height, "grid height")
+    if not (tile_f.is_integer() and width_f.is_integer() and height_f.is_integer()):
+        raise ValueError(f"grid size {raw_width}x{raw_height} or tile {raw_tile} is not a whole number")
+    tile, width, height = int(tile_f), int(width_f), int(height_f)
+    if tile <= 0 or width <= 0 or height <= 0 or width % tile or height % tile:
+        raise ValueError(f"grid {width}x{height} is not a positive whole number of {tile}-unit tiles")
+    raw_origin = doc["origin"]
+    if isinstance(raw_origin, (str, bytes)):
+        raise ValueError(f"grid origin {raw_origin!r} must have three coordinates")
+    try:
+        origin_items = tuple(raw_origin)
+    except TypeError:
+        raise ValueError(f"grid origin {raw_origin!r} must have three coordinates") from None
+    if len(origin_items) != 3:
+        raise ValueError(f"grid origin {raw_origin!r} must have three coordinates")
+    ox, oy, oz = (_finite_float(v, "grid origin") for v in origin_items)
+    z = _finite_float(doc.get("zInflation", 0.0), "grid zInflation")
+    if z < 0:
+        raise ValueError(f"grid zInflation {z:g} must be non-negative")
     return {"columns": width // tile, "rows": height // tile, "tile": tile,
             "x_min": ox - width / 2, "x_max": ox + width / 2,
             "y_min": oy - height / 2, "y_max": oy + height / 2,
