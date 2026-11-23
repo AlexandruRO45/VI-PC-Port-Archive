@@ -14,6 +14,7 @@ the ones a boot can reach, so they come first; "not called" ones can wait. The c
 
 Output: Markdown, to stdout or --out (LF). Exit status 0; 1 when a --gdk-calls file can't be read. Reads files only.
 Standard library only.
+Usage: `python -I tools/exe_checklist.py --help` lists the options.
 """
 from __future__ import annotations
 
