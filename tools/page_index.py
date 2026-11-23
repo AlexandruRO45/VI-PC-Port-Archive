@@ -23,9 +23,14 @@ last record, their byte total, and the +0x20 count next to the 64 KiB units the 
 predict the boundary (its best byte reading matches 56.7% of `story000` pages), so the table extent is used and the
 mismatch stays visible as `declared_matches_units`.
 
+`--classes` adds a `classes` object to the summary (stdout and the .json): byte-class counts over the joined
+streams of every complete page. The 24-byte window that starts at each q38 target is kept apart from the bytes
+inside the entry's declared size (see `ClassCounts`); the continuation streams, the q30 table prefix and the
+stream the q38 table starts in are counted too. Counts only; no bytes of the archive are written.
+
 Usage:
-    python -I page_index.py <archive.rpf> <out.json|out.csv> [--start N] [--limit BYTES] [--quiet]
-    python -I page_index.py <carved-dir> <out.json|out.csv> [--quiet]
+    python -I page_index.py <archive.rpf> <out.json|out.csv> [--start N] [--limit BYTES] [--classes] [--quiet]
+    python -I page_index.py <carved-dir> <out.json|out.csv> [--classes] [--quiet]
 
 --start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 """
@@ -47,6 +52,11 @@ HEADER_SIZE = 0x60
 PAGE_UNIT = 0x10000   # 64 KiB: the unit a resource's declared +0x20 count is compared against
 MAX_CONTINUATIONS = 16
 Q28_UNREAD = "q28 table ends past the streams read for q38"
+WINDOW = 0x18   # bytes read at a q38 target for --classes: +0x00..+0x17
+MAGICS = (b"PSIN", b"RBF0", b"0DRP", b"RSC7", b"RSC8")
+TYPED_DATA = b"\x15\x00\x01\x00"   # u32 0x00010015 at +0x14 of a typed data page
+Q30_PREFIX = 8
+TOP = 8
 COLUMNS = [
     "page_offset", "stored", "inflated", "version", "page_count",
     "q28_count", "q30_count", "q38_count", "span", "complete",
@@ -276,22 +286,109 @@ def resource_of(page):
     }
 
 
-def index_streams(streams, progress=None):
-    """Consume a stream sequence and return page records. At most one page waits for a continuation."""
+class ClassCounts:
+    """Byte-class counts over complete pages, for `--classes`.
+
+    A *window* is the WINDOW (24) bytes that start at a q38 target in the page's joined streams. It can run on
+    into the next record, or past the end of the joined streams (`windows_cut_short`). The *declared record* is
+    only the entry's `size` bytes. `windows_*`, `magic_at_0_windows` and `typed_at_0x14_windows` count windows
+    (`q38_windows` is their denominator); `records_declaring_*`, `zero_prefix_in_record`, `magic_at_0_records`
+    and `typed_at_0x14_records` use the declared size (`records_declaring_ge_8`, `_ge_4` and `_ge_24` are their
+    denominators, so a field is only counted where the record is long enough to contain it).
+    """
+
+    def __init__(self):
+        self.n = Counter()
+        self.continuations = Counter()
+        self.q30_first8 = Counter()
+        self.sizes = Counter()
+        self.hashes = Counter()
+
+    def add(self, page, base, cont):
+        data = base + b"".join(c[2] for c in cont)
+        n = self.n
+        n["pages"] += 1
+        records = page["q38_records"]
+        q38 = page["tables"]["q38"]
+        if records and q38 is not None:
+            if q38 >= len(base):
+                n["q38_table_in_continuation"] += 1
+            elif q38 + 16 * len(records) > len(base):
+                n["q38_table_split"] += 1
+        for r in records:
+            size = r["size"]
+            window = data[r["target"]:r["target"] + WINDOW]
+            zero8 = window[:8] == bytes(8)
+            magic = window[:4] in MAGICS
+            typed = len(window) >= WINDOW and window[0x14:0x18] == TYPED_DATA
+            self.sizes[size] += 1
+            self.hashes[r["hash"]] += 1
+            n["q38_windows"] += 1
+            if len(window) < WINDOW:
+                n["windows_cut_short"] += 1
+            elif zero8:
+                n["windows_zero_prefix"] += 1
+            else:
+                n["windows_other"] += 1
+            n["magic_at_0_windows"] += magic
+            n["typed_at_0x14_windows"] += typed
+            if size >= 4:
+                n["records_declaring_ge_4"] += 1
+                n["magic_at_0_records"] += magic
+            if size >= 8:
+                n["records_declaring_ge_8"] += 1
+                n["zero_prefix_in_record"] += zero8
+            else:
+                n["records_declaring_lt_8"] += 1
+            if size >= WINDOW:
+                n["records_declaring_ge_24"] += 1
+                n["typed_at_0x14_records"] += typed
+            else:
+                n["records_declaring_lt_24"] += 1
+        for c in cont:
+            stream = c[2]
+            kind = ("short" if len(stream) < WINDOW else
+                    "zero_prefix" if stream[:8] == bytes(8) else "other")
+            self.continuations[kind] += 1
+            self.continuations["is_0drp_page"] += is_page(stream)
+        if page["counts"][1]:
+            q30 = page["tables"]["q30"]
+            if q30 is None or q30 + Q30_PREFIX > len(data):
+                n["q30_tables_unread"] += 1
+            else:
+                n["q30_tables_read"] += 1
+                self.q30_first8[data[q30:q30 + Q30_PREFIX].hex()] += 1
+
+    def result(self):
+        out = dict(sorted(self.n.items()))
+        out["continuation_streams"] = dict(sorted(self.continuations.items()))
+        out["q30_first8_top"] = [[k, v] for k, v in self.q30_first8.most_common(TOP)]
+        out["q30_first8_distinct"] = len(self.q30_first8)
+        out["sizes_top"] = [[k, v] for k, v in self.sizes.most_common(TOP)]
+        out["hashes_top"] = [["0x%08x" % k, v] for k, v in self.hashes.most_common(TOP)]
+        return out
+
+
+def index_streams(streams, progress=None, classes=None):
+    """Consume a stream sequence and return page records. At most one page waits for a continuation.
+
+    `classes`, a ClassCounts, is fed every complete page together with its joined streams."""
     pages = []
     waiting = None
     streams_seen = 0
 
-    def add(page):
+    def add(page, base=None, cont=None):
         page["resource"] = resource_of(page)
         pages.append(page)
+        if classes is not None and base is not None and page["complete"]:
+            classes.add(page, base, cont)
 
     def start(offset, stored, data):
         page, complete = parse_page(data, [])
         page["offset"] = offset
         page["stored"] = stored
         if complete:
-            add(page)
+            add(page, data, [])
             return None
         return (page, data, [])
 
@@ -306,7 +403,7 @@ def index_streams(streams, progress=None):
             page["offset"] = waiting[0]["offset"]
             page["stored"] = waiting[0]["stored"]
             if complete:
-                add(page)
+                add(page, base, cont)
                 waiting = None
                 continue
             if is_page(data):
@@ -435,6 +532,8 @@ def main(argv=None):
     ap.add_argument("out", help="output .json or .csv")
     ap.add_argument("--start", type=offset, help="first archive offset (default: header u32@4)")
     ap.add_argument("--limit", type=byte_count, help="stop after this many bytes")
+    ap.add_argument("--classes", action="store_true",
+                    help="add byte-class counts (windows vs declared records, continuations, q30) to the summary")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
@@ -473,12 +572,15 @@ def main(argv=None):
         print("not a file or directory: %s" % a.source, file=sys.stderr)
         return 2
     try:
-        pages, streams_seen = index_streams(streams, None if a.quiet else progress)
+        classes = ClassCounts() if a.classes else None
+        pages, streams_seen = index_streams(streams, None if a.quiet else progress, classes)
     except (OSError, ValueError) as e:
         print("%s: %s" % (a.source, e), file=sys.stderr)
         return 2
     summary = summarise(pages, mode, a.source)
     summary["streams"] = streams_seen
+    if classes is not None:
+        summary["classes"] = classes.result()
     try:
         if ext == ".json":
             write_json(a.out, pages, summary)

@@ -198,6 +198,45 @@ class PageIndexTest(unittest.TestCase):
             self.assertEqual((rec["target"], rec["size"], rec["target_stream"]), (0x100, 0x80, 1))
             self.assertEqual(page_doc["span"], 0x180)
 
+    def test_classes_keep_the_window_apart_from_the_declared_record(self):
+        page = header(0x180, q30=0x150, q38=0xC0, counts=(0, 1, 4, 0))
+        put_q38(page, 0xC0, [
+            (1, 0x10, 0x60),    # declares 16 bytes: its window is all zero and runs on past the record
+            (2, 0x40, 0x100),   # long enough for +0x14: PSIN at +0 and 0x00010015 at +0x14
+            (3, 0x04, 0x140),   # declares 4 bytes: the window reads 20 bytes past the record
+            (4, 0x10, 0x1B0),   # in the continuation; its window is cut short by the end of the joined streams
+        ])
+        page[0x100:0x104] = b"PSIN"
+        page[0x114:0x118] = bytes.fromhex("15000100")
+        page[0x140:0x158] = b"\xaa" * 0x18
+        page[0x150:0x158] = bytes.fromhex("0102030405060708")
+        cont = bytes(8) + b"\xbb" * 0x38   # 64 bytes: the scan skips shorter streams
+        unread_q30 = header(0x100, q30=0x1000, counts=(0, 1, 0, 0))
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "classes.rpf")
+            out = os.path.join(tmp, "pages.json")
+            make_rpf(arc, [bytes(page), cont, bytes(unread_q30)])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                self.assertNotIn("classes", json.load(f)["summary"])
+            run_tool(arc, out, ["--classes"])
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+        self.assertEqual(doc["summary"]["pages"], 2)
+        c = doc["summary"]["classes"]
+        self.assertEqual({k: v for k, v in c.items() if isinstance(v, int)}, {
+            "pages": 2,
+            "q38_windows": 4, "windows_cut_short": 1, "windows_zero_prefix": 1, "windows_other": 2,
+            "magic_at_0_windows": 1, "typed_at_0x14_windows": 1,
+            "records_declaring_ge_4": 4, "magic_at_0_records": 1,
+            "records_declaring_ge_8": 3, "records_declaring_lt_8": 1, "zero_prefix_in_record": 1,
+            "records_declaring_ge_24": 1, "records_declaring_lt_24": 3, "typed_at_0x14_records": 1,
+            "q30_tables_read": 1, "q30_tables_unread": 1, "q30_first8_distinct": 1,
+        })
+        self.assertEqual(c["continuation_streams"], {"is_0drp_page": 0, "zero_prefix": 1})
+        self.assertEqual(c["q30_first8_top"], [["0102030405060708", 1]])
+        self.assertEqual(sorted(c["sizes_top"]), [[4, 1], [16, 2], [64, 1]])
+
     def test_resource_grouping_reports_streams_and_declared_pages(self):
         # The resource group is the directory plus the streams needed to reach the q38 table and its
         # last record. The +0x20 count is reported next to the 64 KiB units, never used as a boundary.

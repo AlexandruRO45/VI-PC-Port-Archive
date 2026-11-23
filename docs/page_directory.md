@@ -93,9 +93,13 @@ What the samples did not show:
   first 64 MiB has it); the most common hash, `0x0bcb00e4`, is in 9,585 records.
 
 The per-archive tables further down (tiling, spans, common sizes, common hashes, payload classes, `q30` prefix,
-`+0x20` distribution) are counted over the whole archives too: `tools/page_index.py` reports for `pages`, and for
-the byte classes a second pass over the same archive that joins each page with its directory and continuation
-streams (counts only). The class rule reproduces the earlier `data.rpf` numbers exactly.
+`+0x20` distribution) are counted over the whole archives too, from the same report. Every byte-class count comes
+from `python -I tools/page_index.py <archive> pages.json --classes` (its `summary.classes`, over the joined streams
+of each complete page): `q38_windows`, `windows_*` and `*_windows` count the 24-byte windows,
+`records_declaring_*`, `zero_prefix_in_record` and `*_records` the declared records, `continuation_streams`,
+`q30_first8_top` and `q38_table_in_continuation` the streams and tables, and `sizes_top` and `hashes_top` the
+eight most common sizes and hashes per record. `tests/test_page_index.py` checks the counters on a hand-built
+archive. The rest (tiling, gaps, spans, `+0x20`) is counted over the report's `pages`.
 
 ## Fixed header (0x60 bytes)
 
@@ -351,9 +355,12 @@ pages where both tables were present.
 ## `q30`, `q40` and `+0x4e`
 
 - `q30` is present when `u16@0x4a` is nonzero. Its target begins with a 16-byte hash-like header. Over the whole
-  `navmeshes.rpf`, 9,600 of the 9,603 pages have a `q30` table; on 8,386 its first eight bytes are
-  `01 2e 3b 5c 3e b2 ee 6e` (980 of the 1,132 pages in the first 64 MiB), on 1,187 they differ, and on 27 the
-  table lies past the streams read for `q38` and `q28`, so it was not classed. The internal layout is not decoded.
+  `navmeshes.rpf`, 9,600 of the 9,603 pages have a `q30` table. With the streams `page_index.py --classes` reads
+  (those the `q38` table and records need), 9,469 tables can be read: on 8,283 the first eight bytes are
+  `01 2e 3b 5c 3e b2 ee 6e` (1,116 of the 1,132 pages in the first 64 MiB, where 15 are not readable), on 1,185
+  they are `b9 8f ff 32 fd 55 4c d1`, on 1 they are another value, and on 131 the table lies past those streams,
+  so it was not classed. A scratch variant that also read the streams after them for `q28` classed 8,386 / 1,187
+  and left 27 unread; that variant is not in the repository. The internal layout is not decoded.
 - `q40` points at a table whose common prefix is `01 00 00 00 01 01 00 00 20 00 00 00 ...` (1, 0x101, 32, then
   hash words). The 89-count page starts `05 00 00 00 01 01 00 00 40 46 4e 00 0f 01 ...`. It is not used for
   resource boundaries and its fields are unresolved.
@@ -370,7 +377,8 @@ outside it), to another page, or to a named RBF0/PSIN/model/texture resource:
   joined streams). A window is not the record: it can run on into the next record, and the **declared record**
   is only the `size` bytes of the entry. Window classes, `data.rpf`: 46,184 "other" and 14,696 zero-prefix of
   60,880; navmesh (whole archive): 52,171 and 2,727 of 54,898; anim (whole archive): 175,220, 352,213 and 6 too
-  short of 527,439. (The 64 MiB and 256 MiB slices gave 6,194 / 451 and 80,697 / 188,617 / 6.)
+  short of 527,439. (`--limit` slices: 6,189 / 450 for the first 64 MiB of `navmeshes.rpf` and 80,691 / 188,601 / 6 for the first 256 MiB of
+  `anim.rpf`, both with `--limit` and `--classes`.)
 - The declared record is often shorter than its window:
 
   | Count (whole archive) | `data.rpf` | `navmeshes.rpf` | `anim.rpf` |
@@ -478,8 +486,7 @@ path or resource type is present in a `0DRP` page.
    **open**.
 6. **Full-corpus runs.** The tool is bounded by `--limit`; run it on a whole archive before quoting a count for
    that archive. `data.rpf`, `navmeshes.rpf` and `anim.rpf` are read whole in *Whole-archive pass*; `levels.rpf`
-   is still the 64 MiB sample here (its full pass is `docs/world_census.md`), and the common-size, common-hash and
-   payload-class tables are still slices for navmesh and animation.
+   is still the 64 MiB sample here (its full pass is `docs/world_census.md`).
 7. **`q28` tables past the `q38` boundary.** 1,581 pages declare a `q28` table that ends beyond the streams the
    `q38` records need. Reading the following stream for it would settle whether a resource can be longer than its
    `q38` records say.
