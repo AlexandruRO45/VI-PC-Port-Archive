@@ -74,5 +74,56 @@ class VCvtF32I32ReferenceOracleTests(unittest.TestCase):
         # 2^24 + 2 = 16777218 has exact representation
         self.assertEqual(oracle_cvt_f32_i32(16777218), 0x4B800001)
 
+class RegKind(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: Operand
+    src0: Operand
+
+
+class VCvtF32I32AstValidationTests(unittest.TestCase):
+    def test_ast_construction_vgpr(self):
+        ast = InstructionAST(
+            mnemonic="v_cvt_f32_i32",
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+        )
+        self.assertEqual(ast.mnemonic, "v_cvt_f32_i32")
+        self.assertEqual(ast.dst.kind, RegKind.VGPR)
+        self.assertEqual(ast.dst.index, 0)
+        self.assertEqual(ast.src0.kind, RegKind.VGPR)
+        self.assertEqual(ast.src0.index, 1)
+
+    def test_ast_construction_sgpr_src(self):
+        ast = InstructionAST(
+            mnemonic="v_cvt_f32_i32",
+            dst=Operand(RegKind.VGPR, index=2),
+            src0=Operand(RegKind.SGPR, index=4),
+        )
+        self.assertEqual(ast.src0.kind, RegKind.SGPR)
+        self.assertEqual(ast.src0.index, 4)
+
+    def test_ast_construction_imm_src(self):
+        ast = InstructionAST(
+            mnemonic="v_cvt_f32_i32",
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.IMM, raw_val=-100),
+        )
+        self.assertEqual(ast.src0.kind, RegKind.IMM)
+        self.assertEqual(ast.src0.raw_val, -100)
+
 if __name__ == "__main__":
     unittest.main()
