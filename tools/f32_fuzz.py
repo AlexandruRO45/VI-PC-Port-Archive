@@ -55,8 +55,20 @@ SEM_DIR = os.path.join(os.path.dirname(HERE), "tests", "semantic")
 if SEM_DIR not in sys.path:
     sys.path.insert(0, SEM_DIR)
 
-import rdna2spirv  # noqa: E402
-from spirv_mini_interp import run_fragment  # noqa: E402
+rdna2spirv = run_fragment = None
+
+
+def load_translator():
+    """Import the translator and the SPIR-V interpreter on first use. Both are large (Python compiles them on every
+    run, because bytecode is not written), and `--help`, a usage error, `--list-ops` and the hardware-only oracle
+    never need them."""
+    global rdna2spirv, run_fragment
+    if rdna2spirv is None:
+        import rdna2spirv as _r
+        from spirv_mini_interp import run_fragment as _f
+        rdna2spirv, run_fragment = _r, _f
+    return rdna2spirv
+
 
 M32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -695,6 +707,7 @@ def run_translated(text, name="ps_f32_fuzz"):
             f.write(text)
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)
+        load_translator()
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
@@ -1666,7 +1679,8 @@ def main(argv=None):
     if not argv:
         ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
-    rdna2spirv.FMA_KHR = a.fma == "khr"
+    if "translator" in a.oracle:
+        load_translator().FMA_KHR = a.fma == "khr"
     if a.programs < 1:
         ap.error("--programs must be at least 1")
     if a.probes < 0:

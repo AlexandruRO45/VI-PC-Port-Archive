@@ -52,10 +52,18 @@ SEM_DIR = os.path.join(os.path.dirname(HERE), "tests", "semantic")
 if SEM_DIR not in sys.path:
     sys.path.insert(0, SEM_DIR)
 
-import cf_ref  # noqa: E402
-import cpu_ref  # noqa: E402
-import rdna2spirv  # noqa: E402
-from spirv_wave_interp import UnsupportedConstruct, run_wave  # noqa: E402
+cf_ref = cpu_ref = rdna2spirv = run_wave = UnsupportedConstruct = None
+
+
+def load_backends():
+    """Import the reference interpreter, the translator and the wave interpreter on first use. They are large (Python
+    compiles them on every run, because bytecode is not written), and a usage error or `--help` never needs them."""
+    global cf_ref, cpu_ref, rdna2spirv, run_wave, UnsupportedConstruct
+    if rdna2spirv is None:
+        import cf_ref as _cf, cpu_ref as _cpu, rdna2spirv as _r
+        from spirv_wave_interp import UnsupportedConstruct as _u, run_wave as _w
+        cf_ref, cpu_ref, rdna2spirv, run_wave, UnsupportedConstruct = _cf, _cpu, _r, _w, _u
+
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 DATA = (1, 2, 3, 8, 9)            # VGPRs the bodies compute on (v0 = lane id is kept intact)
@@ -433,6 +441,7 @@ def build(body, wave):
 
 def run_case(name, body, wave, structured=True):
     """Returns (status, detail): status in {"match", "mismatch", "skip"}."""
+    load_backends()
     lines = build(body, wave)
     text = listing_text(lines, name)
     with tempfile.TemporaryDirectory(prefix="cf-diff-") as tmp:
@@ -569,6 +578,7 @@ def run_suite(programs, seed, waves, structured=True, depth=3, limit=None):
 def self_test():
     """Harness canaries: a program must match, a sabotaged reference must be caught, the interpreter must
     reconverge after a divergent branch."""
+    load_backends()
     ok = True
     body = [("if", ("gt", "u32", 4, 0), True, [("probe", 5), ("op", "v_add_nc_u32 v9, 1, v9")]), ("probe", 6)]
     for wave in (32, 64):
@@ -618,6 +628,7 @@ def main(argv=None):
     if not argv:
         ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
+    load_backends()
     if a.programs < 1:
         ap.error("--programs must be at least 1")
     if a.spirv_val:
