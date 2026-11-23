@@ -7,7 +7,6 @@
 #include <new>
 #include <thread>
 #include <utility>
-#include <utility>
 
 // Fail one ordinary allocation on this test thread. Keep the injection confined to this executable.
 static thread_local bool fail_next_allocation = false;
