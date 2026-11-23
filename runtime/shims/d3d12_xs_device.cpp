@@ -1768,6 +1768,21 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
 // a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
 HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
                                  std::uint64_t flags, std::uint64_t token_word) {
+    {
+        static std::atomic<unsigned> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            __try {
+                auto** tls = reinterpret_cast<void**>(__readgsqword(0x58));
+                void* slot0 = tls ? tls[0] : nullptr;
+                void* ctx = nullptr;
+                if (slot0) ctx = *reinterpret_cast<void**>(static_cast<unsigned char*>(slot0) + 0x12a8);
+                std::fprintf(stderr, "[rt] wait-tls: tid=%lu slot0=%p ctx+12a8=%p\n", GetCurrentThreadId(), slot0,
+                             ctx);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                std::fprintf(stderr, "[rt] wait-tls: unreadable\n");
+            }
+        }
+    }
     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
     if (!token) return E_POINTER;
     // The real pacer hands out the token its PresentX checks; without a presenter the stand-in below keeps a fresh
@@ -1791,6 +1806,44 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
     (void)flags;
     *token = self->frame_tokens->issue();
     return S_OK;
+}
+
+// Console list slot 139 on a real PC list, whose own vtable ends well before it. The title's pool path calls it with
+// a console allocator address (not a PC allocator object) and no pipeline state; forwarding that to PC Reset faults
+// inside the layer, and the pool only needs the call to succeed. Answer S_OK without touching the PC list. The
+// original vtable is kept at the private index 159 of the copy, which no PC list method uses.
+std::uint64_t WINAPI console_list_slot139(void* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                          std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+                                          std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
+                                          std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; (void)a9; (void)a10; (void)a11; (void)a12;
+    (void)a13; (void)a14;
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: real command list %p: console slot 139 (Reset) accepted (allocator 0x%llx, "
+                     "pso 0x%llx)\n",
+                     self, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2));
+    return hr_to_u64(S_OK);
+}
+
+// Give a real PC list the console entry the title calls. The copy is private to the object and never freed; lists
+// are long-lived and there are a handful, so the leak is bounded. Entries 0..79 are the object's own PC prefix.
+void extend_console_list_slots(void* list) {
+    if (!list) return;
+    void** original = *reinterpret_cast<void***>(list);
+    if (!original) return;
+    if (original[kConsoleListReset]) return;  // already extended
+    auto** copy = static_cast<void**>(std::calloc(160, sizeof(void*)));
+    if (!copy) return;
+    std::memcpy(copy, original, 80 * sizeof(void*));
+    copy[kConsoleListReset] = reinterpret_cast<void*>(&console_list_slot139);
+    copy[159] = original;
+    *reinterpret_cast<void***>(list) = copy;
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr, "[rt] d3d12_xs: real command list %p vtable %p extended with console slot 139\n", list,
+                     static_cast<void*>(original));
 }
 
 // Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
@@ -1833,6 +1886,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     if (FAILED(hr)) return hr;
     if (!xbox_iid) {
         if (!created) return E_FAIL;
+        extend_console_list_slots(created);
         *out = created;
         return S_OK;
     }
@@ -2644,6 +2698,8 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
 
 // Xbox slot 108: GetResourceAllocationInfo2, forwarded to PC ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68).
 // The retail executable calls struct-returning device methods with the C ABI (return buffer in RCX, device proxy in
+D3D12_RESOURCE_ALLOCATION_INFO fallback_allocation(const D3D12_RESOURCE_DESC& d);  // defined below slot 25's helper
+
 // RDX); a PC C++ caller passes the proxy in RCX and the return buffer in RDX. Both orders are accepted. Each resource
 // description's Xbox layout word (e.g. 0x101, 0x105) and console flag bits above the PC D3D12_RESOURCE_FLAGS are
 // normalized on a copy before the PC call, with SamplerFeedbackMipRegion zeroed so 56-byte D3D12_RESOURCE_DESC inputs
@@ -2700,6 +2756,11 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
         D3D12_RESOURCE_ALLOCATION_INFO1*);
     reinterpret_cast<Fn>(proxy->real_vtable[68])(proxy->real, ret, visible_mask, count, descs_to_pass, info1);
+    if (ret->SizeInBytes == UINT64_MAX && descs_to_pass && count) {
+        D3D12_RESOURCE_DESC base{};
+        std::memcpy(&base, reinterpret_cast<const std::uint8_t*>(descs_to_pass), sizeof(base));
+        *ret = fallback_allocation(base);
+    }
     return reinterpret_cast<std::uint64_t>(ret);
 }
 
@@ -3102,6 +3163,29 @@ void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12
     if (console.SizeInBytes >= info.SizeInBytes) info = console;
 }
 
+// A plausible console size for a description the PC layer refuses (a format it cannot map), aligned as a console
+// allocation and below 4 GiB so the title's 32-bit size assert holds.
+D3D12_RESOURCE_ALLOCATION_INFO fallback_allocation(const D3D12_RESOURCE_DESC& d) {
+    std::uint64_t bytes = 0;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        bytes = d.Width;
+    } else {
+        std::uint64_t pixel = 4;
+        switch (d.Format) {
+        case DXGI_FORMAT_A8_UNORM: pixel = 1; break;
+        case DXGI_FORMAT_B5G5R5A1_UNORM: pixel = 2; break;
+        case DXGI_FORMAT_R8_UNORM: pixel = 1; break;
+        case DXGI_FORMAT_R8G8_UNORM: pixel = 2; break;
+        case DXGI_FORMAT_R16_UINT: pixel = 2; break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: pixel = 8; break;
+        default: break;
+        }
+        bytes = static_cast<std::uint64_t>(d.Width) * d.Height * (d.DepthOrArraySize ? d.DepthOrArraySize : 1) *
+                (d.MipLevels ? d.MipLevels : 1) * pixel;
+    }
+    return {(bytes + 0xFFFFull) & ~0xFFFFull, 0x10000};
+}
+
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
@@ -3128,6 +3212,25 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    // A format the PC layer cannot map comes back as UINT64_MAX. The console still has a size for it; answer one the
+    // title accepts (alignment 0x10000, below 4 GiB) instead of its int3 on a >32-bit size.
+    if (info.SizeInBytes == UINT64_MAX && descs && desc_count) info = fallback_allocation(descs[0]);
+    static std::atomic<unsigned> alloc_logs{0};
+    const unsigned alloc_call = alloc_logs.fetch_add(1, std::memory_order_relaxed);
+    if (alloc_call < 40 || (info.SizeInBytes >> 32) != 0 || info.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+        const D3D12_RESOURCE_DESC* d = descs && desc_count ? &descs[0] : nullptr;
+        std::fprintf(stderr,
+                     "[rt] alloc25: #%u count=%u dim=%u %llux%u depth=%u mips=%u fmt=%u samples=%u flags=0x%x "
+                     "layout=0x%x -> size=0x%llx align=0x%llx\n",
+                     alloc_call, static_cast<unsigned>(desc_count), d ? static_cast<unsigned>(d->Dimension) : 0u,
+                     d ? static_cast<unsigned long long>(d->Width) : 0ull, d ? static_cast<unsigned>(d->Height) : 0u,
+                     d ? static_cast<unsigned>(d->DepthOrArraySize) : 0u, d ? static_cast<unsigned>(d->MipLevels) : 0u,
+                     d ? static_cast<unsigned>(d->Format) : 0u,
+                     d ? static_cast<unsigned>(d->SampleDesc.Count) : 0u, d ? static_cast<unsigned>(d->Flags) : 0u,
+                     d ? static_cast<unsigned>(d->Layout) : 0u,
+                     static_cast<unsigned long long>(info.SizeInBytes),
+                     static_cast<unsigned long long>(info.Alignment));
+    }
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }

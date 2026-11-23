@@ -80,6 +80,78 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
                  r.ExceptionAddress, module[0] ? module : "?", host ? static_cast<unsigned long long>(
                      reinterpret_cast<uintptr_t>(r.ExceptionAddress) - reinterpret_cast<uintptr_t>(host)) : 0ull,
                  access, GetCurrentThreadId());
+    if (info->ContextRecord) {
+        const CONTEXT& c = *info->ContextRecord;
+        std::fprintf(stderr,
+                     "[rt] crash-context: rip=%p rsp=%p rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p rbp=%p "
+                     "r8=%p r9=%p r10=%p r11=%p r12=%p r13=%p r14=%p r15=%p\n",
+                     reinterpret_cast<void*>(c.Rip), reinterpret_cast<void*>(c.Rsp),
+                     reinterpret_cast<void*>(c.Rax), reinterpret_cast<void*>(c.Rbx),
+                     reinterpret_cast<void*>(c.Rcx), reinterpret_cast<void*>(c.Rdx),
+                     reinterpret_cast<void*>(c.Rsi), reinterpret_cast<void*>(c.Rdi),
+                     reinterpret_cast<void*>(c.Rbp), reinterpret_cast<void*>(c.R8),
+                     reinterpret_cast<void*>(c.R9), reinterpret_cast<void*>(c.R10),
+                     reinterpret_cast<void*>(c.R11), reinterpret_cast<void*>(c.R12),
+                     reinterpret_cast<void*>(c.R13), reinterpret_cast<void*>(c.R14),
+                     reinterpret_cast<void*>(c.R15));
+        if (c.Rip == 0) {
+            __try {
+                const auto object = static_cast<std::uint64_t>(c.Rax);
+                const auto vtable = *reinterpret_cast<const std::uint64_t*>(object);
+                const auto slot146 = *reinterpret_cast<const std::uint64_t*>(vtable + 0x490);
+                char where[MAX_PATH] = {};
+                HMODULE holder = nullptr;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(vtable), &holder);
+                if (holder) GetModuleFileNameA(holder, where, MAX_PATH);
+                std::fprintf(stderr, "[rt] nullcall: rax=%p vtable=%p slot146=%p module=%s\n",
+                             reinterpret_cast<void*>(object), reinterpret_cast<void*>(vtable),
+                             reinterpret_cast<void*>(slot146), where[0] ? where : "?");
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                std::fprintf(stderr, "[rt] nullcall: unreadable\n");
+            }
+        }
+        __try {
+            const auto* stack = reinterpret_cast<const std::uint64_t*>(c.Rsp);
+            std::fprintf(stderr, "[rt] crash-stack-raw:");
+            for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %016llx", static_cast<unsigned long long>(stack[i]));
+            std::fprintf(stderr, "\n");
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            std::fprintf(stderr, "[rt] crash-stack-raw: unreadable\n");
+        }
+    }
+    // Diagnostic: the retail frame path reads through 0x100000000 (the synthetic-VA base). Commit one guard page
+    // there so a read of that address is a value, not a fault, while the caller is being identified.
+    __try {
+        void* probe = VirtualAlloc(reinterpret_cast<void*>(0x100000000ull), 0x10000,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        std::fprintf(stderr, "[rt] crash-pad: 0x100000000 -> %p\n", probe);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::fprintf(stderr, "[rt] crash-pad: failed\n");
+    }
+    // Diagnostic: the faulting thread's TEB TLS slots (the console main image reads slot 0 directly).
+    __try {
+        auto** tls = reinterpret_cast<void**>(__readgsqword(0x58));
+        std::fprintf(stderr, "[rt] crash-tls: slots=%p slot0=%p slot1=%p slot2=%p slot3=%p\n",
+                     static_cast<void*>(tls), tls ? tls[0] : nullptr, tls ? tls[1] : nullptr,
+                     tls ? tls[2] : nullptr, tls ? tls[3] : nullptr);
+        if (tls && tls[0]) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(tls[0], &info, sizeof(info)) == sizeof(info))
+                std::fprintf(stderr, "[rt] crash-tls: slot0 region base=%p size=0x%llx state=0x%lx protect=0x%lx\n",
+                             info.BaseAddress, static_cast<unsigned long long>(info.RegionSize), info.State,
+                             info.Protect);
+            else
+                std::fprintf(stderr, "[rt] crash-tls: slot0 not mapped\n");
+            auto* base = static_cast<unsigned char*>(tls[0]);
+            std::fprintf(stderr, "[rt] crash-tls: tls+0x12a8=%p tls+0x12a0=%p tls+0x12b0=%p\n",
+                         *reinterpret_cast<void**>(base + 0x12a8), *reinterpret_cast<void**>(base + 0x12a0),
+                         *reinterpret_cast<void**>(base + 0x12b0));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::fprintf(stderr, "[rt] crash-tls: unreadable\n");
+    }
     void* frames[32] = {};
     const USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
     for (USHORT i = 0; i < count; ++i) {
@@ -96,6 +168,38 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
                                 : 0ull);
     }
     std::fflush(stderr);
+    // The retail frame path reads the per-thread context pointer at 0x100000000 (4 GiB): its TLS block is laid out
+    // so the pointer field lands exactly at 4 GiB. This thread's own TLS block already holds that pointer at
+    // +0x12a8, so put it in the slot the title reads, then let the faulting instruction run again against it.
+    // An unknown console method reached through a vtable with no entry at the called offset: skip the call and
+    // answer S_OK (RAX = 0), popping its return address. Bounded and logged, so the next real stop is visible.
+    if (r.ExceptionCode == 0xC0000005 && info->ContextRecord && info->ContextRecord->Rip == 0) {
+        static std::atomic<int> skipped{0};
+        const auto ret = *reinterpret_cast<const std::uint64_t*>(info->ContextRecord->Rsp);
+        if (ret >= 0x140000000ull && ret < 0x150000000ull && skipped.fetch_add(1) < 16) {
+            std::fprintf(stderr, "[rt] nullcall-skip: return=%p rcx=%p rdx=%p\n",
+                         reinterpret_cast<void*>(ret),
+                         reinterpret_cast<void*>(info->ContextRecord->Rcx),
+                         reinterpret_cast<void*>(info->ContextRecord->Rdx));
+            info->ContextRecord->Rip = ret;
+            info->ContextRecord->Rsp += 8;
+            info->ContextRecord->Rax = 0;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    if (r.ExceptionCode == 0xC0000005 && access == reinterpret_cast<void*>(0x100000000ull)) {
+        __try {
+            VirtualAlloc(reinterpret_cast<void*>(0x100000000ull), 0x1000, MEM_COMMIT, PAGE_READWRITE);
+            auto** tls = reinterpret_cast<void**>(__readgsqword(0x58));
+            void* context = nullptr;
+            if (tls && tls[0]) context = *reinterpret_cast<void**>(static_cast<unsigned char*>(tls[0]) + 0x12a8);
+            *reinterpret_cast<void**>(0x100000000ull) = context;
+            std::fprintf(stderr, "[rt] crash-pad: wrote context %p at 0x100000000\n", context);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            std::fprintf(stderr, "[rt] crash-pad: could not write the context slot\n");
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

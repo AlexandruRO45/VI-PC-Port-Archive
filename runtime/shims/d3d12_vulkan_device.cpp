@@ -340,6 +340,9 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
     case DXGI_FORMAT_R16_FLOAT: return {VK_FORMAT_R16_SFLOAT, color};
     case DXGI_FORMAT_R8_UNORM: return {VK_FORMAT_R8_UNORM, color};
+    // Alpha-only A8: the single channel holds the alpha value, so R8_UNORM is the same 8-bit storage; a shader
+    // view that reads alpha expects the component in R. Format 65 in the retail title's render targets.
+    case DXGI_FORMAT_A8_UNORM: return {VK_FORMAT_R8_UNORM, color};
     case DXGI_FORMAT_R8_TYPELESS: return {VK_FORMAT_R8_UNORM, color, true};
     case DXGI_FORMAT_R8_SNORM: return {VK_FORMAT_R8_SNORM, color};
     case DXGI_FORMAT_R8_UINT: return {VK_FORMAT_R8_UINT, color};
