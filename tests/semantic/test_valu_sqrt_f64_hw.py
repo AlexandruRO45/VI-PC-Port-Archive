@@ -747,5 +747,58 @@ class TestValuSqrtF64IEEE754EdgeCases(unittest.TestCase):
         self.assertEqual((lo, hi), (0, 0x7ff00000))
 
 
+# ---------------------------------------------------------------------------
+# Stage 8: Negative controls, syntax rejection, and mutation detection
+# ---------------------------------------------------------------------------
+
+class TestValuSqrtF64NegativeControls(unittest.TestCase):
+    """Stage 8: Negative controls, syntax rejection, and mutation detection for v_sqrt_f64."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+
+    def test_invalid_register_pairs(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterPair(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            RegisterPair(RegKind.VGPR, 255)
+        with self.assertRaises(ValueError):
+            RegisterPair(RegKind.SGPR, 105)
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=128)
+
+    def test_mutation_detection_and_oracle_rejection(self) -> None:
+        val_bits = f64_to_bits(16.0)
+        correct = oracle_sqrt_f64(val_bits)
+
+        def mutated_oracle_square(bits: int) -> int:
+            val = bits_to_f64(bits)
+            return f64_to_bits(val * val)
+
+        def mutated_oracle_inverse(bits: int) -> int:
+            val = bits_to_f64(bits)
+            return f64_to_bits(1.0 / val)
+
+        self.assertNotEqual(mutated_oracle_square(val_bits), correct)
+        self.assertNotEqual(mutated_oracle_inverse(val_bits), correct)
+
+    def test_translator_compliance_guard(self) -> None:
+        test_path = os.path.join(HERE, "test_valu_sqrt_f64_hw.py")
+        self.assertTrue(os.path.isfile(test_path))
+        with open(test_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("import support", content)
+        self.assertIn("support.translate_lines", content)
+
+
 if __name__ == "__main__":
     unittest.main()
