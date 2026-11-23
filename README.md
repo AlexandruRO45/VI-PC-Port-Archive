@@ -198,6 +198,9 @@ per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage
 
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.
+A stage-by-stage checklist for verifying a build on Windows — checking your copy, re-checking the translator on a
+slice, running the pipeline check and the loader dry run against your own package — is in
+[docs/testing_windows.md](docs/testing_windows.md).
 
 ### Vulkan diagnostics on Linux
 
