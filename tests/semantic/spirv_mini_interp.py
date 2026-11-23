@@ -1093,8 +1093,17 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             else:
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
-            negated = -val(a[1])
-            values[res] = negated if types.t[a[0]] == ("float", 64) else f32(negated)
+            operand = val(a[1])
+            if types.t[a[0]] == ("float", 64):
+                values[res] = -operand
+            elif isinstance(operand, _F32):
+                # Negation flips the sign bit and leaves the rest of a NaN alone (the measured RDNA2 word for
+                # -sNaN is sNaN with its sign changed). A float round trip would quiet the signalling NaN:
+                # struct's binary32 -> double conversion drops bit 22 before 3.14 (CPython gh-130317), so this
+                # used to pass only on 3.14.
+                values[res] = bits_f32(operand.bits ^ 0x80000000)
+            else:
+                values[res] = f32(-operand)
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16
