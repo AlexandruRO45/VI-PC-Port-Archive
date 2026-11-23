@@ -6,6 +6,9 @@
 //   macos_host <image.exe> [guest arguments...]
 #include "host.h"
 
+#include <limits.h>
+#include <strings.h>
+
 #include <mach/mach.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -68,8 +71,11 @@ uint32_t thread_id() {
     return static_cast<uint32_t>(tid);
 }
 
-std::string to_host_path(const char* p) {  // ponytail: backslashes only; no drive letters or GAME: yet
+std::string g_game_dir;  // absolute folder of the game image, where GAME:\ points
+
+std::string to_host_path(const char* p) {  // ponytail: no drive letters
     std::string s(p);
+    if (strncasecmp(p, "GAME:", 5) == 0) s = g_game_dir + "/" + s.substr(s.size() > 5 && (p[5] == '\\' || p[5] == '/') ? 6 : 5);
     for (auto& c : s)
         if (c == '\\') c = '/';
     return s;
@@ -272,6 +278,9 @@ int main(int argc, char** argv) {
     for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports})
         for (auto& [name, fn] : (*list)()) g_exports[name] = fn;
 
+    char real[PATH_MAX];
+    if (!realpath(argv[1], real)) fail(std::string("cannot open ") + argv[1]);
+    g_game_dir.assign(real, std::strrchr(real, '/'));
     const char* slash = std::strrchr(argv[1], '/');
     g_argc = argc - 1;
     g_argv = argv + 1;
@@ -280,7 +289,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < g_argc; ++i) g_command_line += std::string(" ") + g_argv[i];
 
     g_peb = static_cast<uint8_t*>(calloc(1, 0x1000));
-    auto entry = reinterpret_cast<void(MSABI*)()>(load_pe(argv[1]));
+    auto entry = reinterpret_cast<void(MSABI*)()>(load_pe(real));
     std::memcpy(g_peb + 0x10, &g_image, sizeof g_image);  // PEB.ImageBaseAddress
     uint8_t* teb = make_teb();
     attach_thread(teb, 1 /* DLL_PROCESS_ATTACH */);
