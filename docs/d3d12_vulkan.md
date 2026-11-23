@@ -306,7 +306,13 @@ What is implemented (all of it testable without the game):
   compares D32, D24S8 and D32S8 resolves (typed and typeless resources, whole and rectangle) with the PC runtime and
   WARP. Its edge cases (TEST-848) draw a triangle over the cleared 4x source first (depth 0.5, stencil 0x44): the
   pixels on its diagonal edge hold differing samples, and MIN, MAX and AVERAGE over them match the PC runtime on an
-  RTX 5070 (driver 621.01) and WARP byte for byte. `DECOMPRESS`,
+  RTX 5070 (driver 621.01) and WARP byte for byte. The layer's AVERAGE is also checked on its own: strictly between
+  its MIN and MAX in every pixel whose samples differ. An RX 9060 XT (AMD 26.10.44) does not average there: its
+  D3D12 returns the triangle's 0.5 for every edge pixel, where the layer returns 0.3125 to 0.625 by how many of
+  the four samples the triangle covers. The test reports that as a host quirk when the host's MIN and MAX match the
+  layer's and its AVERAGE is not strictly between its own MIN and MAX; the rule is based on the returned values, not
+  the adapter vendor. WARP's edge AVERAGE remains a required byte-for-byte comparison, so a layer regression cannot
+  be hidden by the host quirk (TEST-1470). A Radeon 610M (AMD 26.11.2) averages. `DECOMPRESS`,
   `ResolveSubresource` of depth (which D3D12 does not offer) and resolves between two formats of one typeless family
   remain open. A multisampled texture copies only to one with the same sample count
   and has no footprint.

@@ -7,11 +7,11 @@
 // (TEST-847).
 // Edge cases (TEST-848) then draw one triangle over the cleared source with a depth-only PSO (depth 0.5, stencil
 // 0x44, test ALWAYS): its diagonal edge leaves the pixels it crosses with samples that differ, so MIN, MAX and
-// AVERAGE reduce over different values. No CPU model of the coverage: the layer must match the host byte for byte,
-// except for the measured host quirks below, and MIN and MAX must differ somewhere. WARP is the exact AVERAGE reference
-// where AMD's hardware host differs (TEST-1470). The layer's VS is a GLSL stand-in (test/glsl/vs_depth_edge.vert, found by
-// the FSSM hash of its container), the host's HLSL compiled by d3dcompiler_47; without glslangValidator at build
-// time the edge cases are skipped.
+// AVERAGE reduce over different values. No CPU model of the coverage: MIN and MAX must differ somewhere, and the
+// layer's AVERAGE must lie strictly between its MIN and MAX wherever those differ. A host whose own AVERAGE does not,
+// with MIN and MAX matching the layer's, is a host quirk; WARP is also the exact AVERAGE reference (TEST-1470). The
+// layer's VS is a GLSL stand-in (test/glsl/vs_depth_edge.vert, found by the FSSM hash of its container), the host's
+// HLSL compiled by d3dcompiler_47; without glslangValidator at build time the edge cases are skipped.
 // Refused resolves must fail Close and leave the destination as it was. AVERAGE by the depth format or of stencil,
 // and a whole subresource to another offset, the host refuses too (its Close fails); a rectangle to another offset,
 // a plane format naming the other plane, and DECOMPRESS are refused by the layer and not run on the host.
@@ -285,6 +285,32 @@ bool same_planes(const Planes& a, const Planes& b, bool only_resolved, UINT plan
     return a.depth == b.depth && a.stencil == b.stencil;
 }
 
+// An AVERAGE over samples that differ lies strictly between their MIN and MAX. For three resolves of the same edge
+// case: the pixels where MIN and MAX differ, and how many of those have the AVERAGE strictly between the two.
+struct Between {
+    unsigned differing = 0, strictly = 0;
+    bool averaged() const { return differing && strictly == differing; }
+};
+Between average_between(const Case& c, const Planes& lowest, const Planes& highest, const Planes& average) {
+    Between out;
+    const auto value = [&](const Planes& p, std::size_t pixel) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, p.depth.data() + pixel * sizeof(word), sizeof(word));
+        if (unorm24(c)) return double(word & 0xffffffu);
+        float depth = 0;
+        std::memcpy(&depth, &word, sizeof(depth));
+        return double(depth);
+    };
+    if (lowest.depth.size() != highest.depth.size() || lowest.depth.size() != average.depth.size()) return out;
+    for (std::size_t pixel = 0; pixel < average.depth.size() / sizeof(std::uint32_t); ++pixel) {
+        const double low = value(lowest, pixel), high = value(highest, pixel), mean = value(average, pixel);
+        if (!(low < high)) continue;
+        ++out.differing;
+        out.strictly += low < mean && mean < high;
+    }
+    return out;
+}
+
 const char* mode_name(D3D12_RESOLVE_MODE mode) {
     switch (mode) {
     case D3D12_RESOLVE_MODE_MIN: return "MIN";
@@ -465,6 +491,30 @@ int main() {
                 }
             }
         }
+        // The MIN and MAX resolves of an edge case, for its AVERAGE: the same name and rectangle. -1 without them.
+        const auto edge_case = [&](const Case& c, D3D12_RESOLVE_MODE mode) {
+            for (std::size_t j = 0; j < cases.size(); ++j)
+                if (cases[j].edge && cases[j].mode == mode && cases[j].rect == c.rect &&
+                    std::strcmp(cases[j].name, c.name) == 0)
+                    return int(j);
+            return -1;
+        };
+        // The layer's AVERAGE of an edge case is a mean: strictly between its own MIN and MAX wherever those differ.
+        // This holds on its own, whatever the host does (TEST-1470).
+        for (std::size_t i = 0; i < cases.size(); ++i) {
+            const Case& c = cases[i];
+            const int low = edge_case(c, min), high = edge_case(c, max);
+            if (!c.edge || c.mode != average || results[i].depth.empty() || low < 0 || high < 0 ||
+                results[low].depth.empty() || results[high].depth.empty())
+                continue;
+            const Between layer = average_between(c, results[low], results[high], results[i]);
+            if (!layer.averaged()) {
+                std::fprintf(stderr, "edge %s AVERAGE rect %d: the layer's AVERAGE is strictly between its MIN and MAX "
+                             "in %u of the %u pixels whose samples differ\n", c.name, int(c.rect), layer.strictly,
+                             layer.differing);
+                ++failures;
+            }
+        }
         for (const Case& c : refused) {
             Planes p;
             if (!resolve_and_read(ours.p, c, p, true)) return 1;
@@ -489,8 +539,6 @@ int main() {
             std::string adapter_name;
             if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
-            DXGI_ADAPTER_DESC adapter_desc{};
-            const bool amd_host = !warp && SUCCEEDED(adapter->GetDesc(&adapter_desc)) && adapter_desc.VendorId == 0x1002;
             const char* name = adapter_name.c_str();
             unsigned same = 0, compared = 0, refused_alike = 0, quirks = 0;
             std::vector<const Case*> quirks_seen;  // cases without the edge where this host differs from the clears
@@ -499,11 +547,12 @@ int main() {
                     if (std::strcmp(q->name, e.name) == 0 && q->mode == e.mode && q->rect == e.rect) return true;
                 return false;
             };
+            std::vector<Planes> host_results(cases.size());  // for an edge AVERAGE: the host's MIN and MAX of the case
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 const Case& c = cases[i];
                 // See the top of the file; D32S8 by its own format is kept off WARP for the same reason.
                 if (results[i].depth.empty() || (warp && (c.format == d32 || c.format == d32s8))) continue;
-                Planes expected;
+                Planes& expected = host_results[i];
                 if (!resolve_and_read(host.p, c, expected, false, &host_edge)) return 1;
                 ++compared;
                 // The layer's result was checked against the clears above. A host that differs from the clears is a
@@ -511,16 +560,35 @@ int main() {
                 // MIN/MAX on both, an RTX 3070 (NVIDIA 610.74) adds "stencil as X24_G8" and "depth as R24_X8" AVERAGE,
                 // a Ryzen 7 9700X iGPU (AMD 32.0.21042.62) depth MIN/MAX; whole subresources and rectangles alike.
                 // Edge cases have no clear model: MIN/MAX differences on WARP, or differences where the host had a
-                // quirk on the same case without the edge, are only reported. AMD's D3D12 AVERAGE depth resolve can
-                // also differ from the layer over differing samples (RX 9060 XT, AMD 26.10.44). Report that as a host
-                // quirk too, but require WARP's AVERAGE to match so an actual layer regression still fails (TEST-1470).
-                const bool amd_average_quirk = c.edge && amd_host && c.mode == average && SUCCEEDED(expected.close) &&
-                                               !same_planes(expected, results[i], false, c.plane);
-                if (c.edge && ((warp && c.mode != average) || quirky(c) || amd_average_quirk)) {
+                // quirk on the same case without the edge, are only reported. WARP's AVERAGE remains a hard comparison.
+                // An edge AVERAGE that differs from the layer's: a host whose AVERAGE is not strictly between its own
+                // MIN and MAX at a pixel whose samples differ did not average there. With the layer's MIN and MAX
+                // equal to the host's and the layer's AVERAGE checked as a mean above, that is a host quirk: report,
+                // don't fail. An RX 9060 XT (AMD 26.10.44) returns the triangle's depth, 0.5, for every pixel on the
+                // edge, where the layer returns 0.3125 to 0.625 by how many of the four samples the triangle covers
+                // (TEST-1470); a Radeon 610M (AMD 26.11.2) and NVIDIA average, as the layer does.
+                if (!warp && c.edge && c.mode == average && SUCCEEDED(expected.close) &&
+                    !same_planes(expected, results[i], false, c.plane)) {
+                    const int low = edge_case(c, min), high = edge_case(c, max);
+                    if (low >= 0 && high >= 0 && SUCCEEDED(host_results[low].close) && SUCCEEDED(host_results[high].close) &&
+                        same_planes(host_results[low], results[low], true, c.plane) &&
+                        same_planes(host_results[high], results[high], true, c.plane)) {
+                        const Between theirs = average_between(c, host_results[low], host_results[high], expected);
+                        if (theirs.differing && !theirs.averaged() &&
+                            average_between(c, results[low], results[high], results[i]).averaged()) {
+                            std::printf("edge %s AVERAGE rect %d against %s: host quirk: the host's AVERAGE is strictly "
+                                        "between its own MIN and MAX in %u of the %u pixels whose samples differ; the "
+                                        "layer's is in all of them\n", c.name, int(c.rect), name, theirs.strictly,
+                                        theirs.differing);
+                            ++quirks;
+                            continue;
+                        }
+                    }
+                }
+                if (c.edge && ((warp && c.mode != average) || quirky(c))) {
                     if (FAILED(expected.close) || !same_planes(expected, results[i], true, c.plane)) {
-                        std::printf("edge %s %s rect %d: %s differs from the layer (%s)\n", c.name, mode_name(c.mode),
-                                    int(c.rect), name, amd_average_quirk ? "AMD host quirk" : "information");
-                        if (amd_average_quirk) ++quirks;
+                        std::printf("edge %s %s rect %d: %s differs from the layer (information)\n", c.name,
+                                    mode_name(c.mode), int(c.rect), name);
                     } else {
                         ++same;
                     }
