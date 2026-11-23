@@ -69,7 +69,10 @@ controller-button array (`GetControllerButtonState`, indexed in SDL's `SDL_Gamep
 
 ## Keyboard pad
 
-The title reads gamepads only, so keyboard input has to arrive as a gamepad. With `LEONIDA_KEYBOARD_PAD` set, the
+The shim's readings carry no keyboard state and it enumerates no keyboard device (#2413 adds both), so here keyboard
+input reaches the title as a gamepad. The title itself also reads the keyboard through GameInput
+([What the executable asks for](#what-the-executable-asks-for)), which this route does not feed. With
+`LEONIDA_KEYBOARD_PAD` set, the
 shim attaches one SDL virtual gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on
 every poll. It then goes through the same path as a real pad: a device object, the next free player slot, readings,
 reading and device callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is off by
@@ -486,6 +489,37 @@ as working; nothing measured them, and the `resistance` mode was not tried.
   report tables (or why it has none), plays each motor and trigger for a second with `--rumble`, then prints the live
   reading and the newest raw input report.
 
+## What the executable asks for
+
+Read from the call sites of the 1.0.2.1 executable (own copy, nothing run; method names, enum names and counts
+only). The title imports `GameInputCreate` by ordinal 1 (#7216) and calls it from one getter that creates the
+`IGameInput` once and keeps it in a global. The executable refers to it 15 times: 10 calls of the getter and 5
+reads of the global. Four of the reads are inside the getter, one is a shutdown path that releases the object, and
+one getter call only creates it. The other nine are method calls, with these constant arguments (slots as in
+`runtime/shims/gameinput_abi.h`):
+
+| Method (slot) | Calls | `inputKind` | Other |
+|---|---|---|---|
+| `GetCurrentReading` (4) | 2 | `GameInputKindGamepad` 1, `GameInputKindKeyboard` 1 | |
+| `GetNextReading` (5) | 1 | `GameInputKindKeyboard` | |
+| `GetPreviousReading` (6) | 1 | `GameInputKindGamepad` | |
+| `RegisterDeviceCallback` (9) | 2 | `GameInputKindGamepad` 1, `GameInputKindKeyboard` 1 | `statusFilter` `GameInputDeviceConnected` in both |
+| `UnregisterCallback` (13) | 2 | | |
+| `FindDeviceFromId` (16) | 1 | | |
+
+- **The title reads the keyboard through GameInput**, not only gamepads: its current and next readings, and the
+  arrival of keyboards. The shim enumerates no keyboard and answers keyboard readings with nothing, so the title
+  sees no keyboard here. [Keyboard pad](#keyboard-pad) turns keys into a pad instead; #2413 adds keyboard (and
+  mouse) devices and readings behind `LEONIDA_KEYBOARD_MOUSE`.
+- **No call passes `GameInputKindRawDeviceReport` or `GameInputKindMouse`**, and no other `IGameInput` method is
+  called. `CreateDispatcher` is never called, so the callbacks run on the shim's thread ([How it runs](#how-it-runs)).
+- The arguments sit where the v0 signatures put them at those slots: the kind in edx for `GetCurrentReading` and in
+  r8 for the other three, and the status filter in r9 for `RegisterDeviceCallback`. That fits the v0 vtable the shim
+  serves ([VERIFY](#verify)).
+- How: the getter comes from the import's one call site (`tools/import_call_sites.py --import "GameInput.dll!#1"`).
+  Each use was then followed to its vtable call in an llvm-objdump listing, and the constants were read there. A kind
+  that came from memory would not show here; none of the six kind-taking calls has one.
+
 ## VERIFY
 
 These need the game executable or a test on hardware:
@@ -556,4 +590,5 @@ These need the game executable or a test on hardware:
   - Size convention: report sizes exclude the id byte, and `GetRawData` returns the payload without it. What
     Microsoft's runtime does for a device with report ids is not documented on the reference pages.
   - Readings: a pad that streams reports makes a reading for each changed one, like the runtime's
-    `GameInputKindRawDeviceReport` stream, but whether the title asks for raw reports at all is unknown.
+    `GameInputKindRawDeviceReport` stream, but the title never asks for raw reports
+    ([What the executable asks for](#what-the-executable-asks-for)).
