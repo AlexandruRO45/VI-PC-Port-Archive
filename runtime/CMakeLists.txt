@@ -373,6 +373,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # host's GameInput.dll or the unimplemented thunk as before. docs/gameinput.md has the details.
   option(LEONIDA_SDL3 "Build the GameInput shim when SDL3 is available" ON)
   option(LEONIDA_SDL3_FETCH "Download the pinned SDL3 release if no installed SDL3 is found" OFF)
+  # CI sets this: without SDL3 the shim and `gameinput_test` are not built, so a build that silently drops them would
+  # report a green run in which the shim was never compiled. docs/gameinput.md has the CI flags.
+  option(LEONIDA_SDL3_REQUIRED "Fail the configure instead of continuing when SDL3 is unavailable" OFF)
   if(LEONIDA_SDL3)
     find_package(SDL3 3.2 CONFIG QUIET COMPONENTS SDL3-static NO_SYSTEM_ENVIRONMENT_PATH)
     if(NOT TARGET SDL3::SDL3-static AND (LEONIDA_SDL3_FETCH OR FETCHCONTENT_SOURCE_DIR_SDL3))
@@ -411,7 +414,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       target_link_libraries(${_gi} PRIVATE SDL3::SDL3-static)
     endforeach()
   else()
-    if(LEONIDA_SDL3)
+    if(LEONIDA_SDL3_REQUIRED)
+      message(FATAL_ERROR "LEONIDA_SDL3_REQUIRED=ON but SDL3 was not found, so the GameInput shim and gameinput_test "
+                          "would not be built. Install SDL3 3.2+ and set SDL3_DIR, or pass -DLEONIDA_SDL3_FETCH=ON to "
+                          "download the pinned release (see docs/gameinput.md), or drop the flag to build without the shim.")
+    elseif(LEONIDA_SDL3)
       message(STATUS "GameInput shim not built: no installed SDL3 found. Set SDL3_DIR, or pass -DLEONIDA_SDL3_FETCH=ON "
                      "to download the pinned SDL3 release (see docs/gameinput.md)")
     else()

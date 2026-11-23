@@ -34,6 +34,12 @@ it has no `GameInputCreate`, as before, so the loader binds it to the host's `Ga
 thunk. `gameinput_test` and `gameinput_probe` are not built, and CTest lists `gameinput` as not run (disabled) rather
 than failing.
 
+That silence is what `-DLEONIDA_SDL3_REQUIRED=ON` is for: with it, a configure that found no SDL3 fails instead of
+continuing without the shim. The Runtime workflow's `windows` job passes it together with
+`-DLEONIDA_SDL3_FETCH=ON`, so the job downloads the pinned release, builds the shim, and runs `gameinput_test`; a step
+before the tests also checks that `gameinput_test.exe` exists and that CTest's `gameinput` entry is not disabled, so
+the shim cannot go untested again while the job stays green.
+
 `scripts/build_runtime.ps1` (what `make_game.py` runs) builds the shim only on its CMake path, when Visual Studio's
 C++ CMake tools are installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns
 about it.
