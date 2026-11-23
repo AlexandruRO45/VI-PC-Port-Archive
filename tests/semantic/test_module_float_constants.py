@@ -78,15 +78,13 @@ class ModuleFloatConstantTests(unittest.TestCase):
         self.assertEqual([hex(w) for w in got], [hex(b) for b in patterns])
 
     def test_which_values_are_hoisted(self):
-        g = Gen.__new__(Gen)
-        g.fconsts, g.fconsts_frozen, g.consts, g.body, g.n = {}, False, {}, [], 0
-        g.emulate = False
+        g = Gen("ps")                # a whole Gen, so the fallback's bitcast finds whatever state tof keeps
         self.assertEqual(g.fconst(2.0 ** -126), "%cf_00800000")
         self.assertEqual(g.fconst(1.5), "%cf_3fc00000")
         # +0 and 1 are the %f0 and %f1 every module declares, and 0.5 is %fhalf_g: no second constant of the same value.
         self.assertEqual(g.fconst(0.0), "%f0")
         self.assertEqual(g.fconst(1.0), "%f1")
-        g.uses_fhalf = False
+        self.assertFalse(g.uses_fhalf)
         self.assertEqual(g.fconst(0.5), "%fhalf_g")
         self.assertTrue(g.uses_fhalf)
         self.assertEqual(sorted(g.fconsts), [0x00800000, 0x3FC00000])
