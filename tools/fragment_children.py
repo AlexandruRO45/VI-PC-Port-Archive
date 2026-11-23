@@ -45,6 +45,7 @@ import multiprocessing
 import os
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
@@ -318,17 +319,23 @@ def scan_archive(path, start=0, end=None, jobs=1, records=None, log=None):
                 handle.close()
         return total
     ranges = split_ranges(start, end, jobs)
-    work = [(path, lo, hi, f"{records}.{i}" if records else None) for i, (lo, hi) in enumerate(ranges)]
+    if records:
+        # Worker files live in a private directory: a name such as records.jsonl.0 may already exist, and two
+        # concurrent runs must not share or remove each other's parts.
+        with tempfile.TemporaryDirectory(prefix="fragment_children-") as workdir:
+            work = [(path, lo, hi, os.path.join(workdir, f"{i}.jsonl")) for i, (lo, hi) in enumerate(ranges)]
+            with multiprocessing.Pool(len(work)) as pool:
+                for part in pool.imap_unordered(worker, work):
+                    merge(total, part)
+            with open(records, "w", encoding="utf-8", newline="\n") as out:
+                for i in range(len(work)):
+                    with open(os.path.join(workdir, f"{i}.jsonl"), encoding="utf-8") as fh:
+                        out.write(fh.read())
+        return total
+    work = [(path, lo, hi, None) for lo, hi in ranges]
     with multiprocessing.Pool(len(work)) as pool:
         for part in pool.imap_unordered(worker, work):
             merge(total, part)
-    if records:   # join the per-range files in range order
-        with open(records, "w", encoding="utf-8", newline="\n") as out:
-            for i in range(len(work)):
-                part = f"{records}.{i}"
-                with open(part, encoding="utf-8") as fh:
-                    out.write(fh.read())
-                os.remove(part)
     return total
 
 

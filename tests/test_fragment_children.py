@@ -272,6 +272,21 @@ class TestCommandLine(unittest.TestCase):
             self.assertIn("--records", result.stderr)
             self.assertFalse(os.path.exists(same))
 
+    def test_parallel_scan_keeps_an_existing_worker_named_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "synthetic.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive(fragment(drawables=3), fragment()) + bytes(8192))
+            records = os.path.join(tmp, "records.jsonl")
+            prior = records + ".0"
+            with open(prior, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("previous report\n")
+            result = self.run_tool(path, "--jobs", "2", "--records", records)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.exists(records))
+            with open(prior, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "previous report\n")
+
 
 if __name__ == "__main__":
     unittest.main()
