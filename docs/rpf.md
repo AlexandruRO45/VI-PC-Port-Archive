@@ -153,6 +153,10 @@ textures; the original RPF paths still require the missing executable/key.
 `tools/manifest.py` is independent of RPF: it hashes a directory tree and verifies it later, with `--jobs` on
 both paths. It is used to check exported assets without keeping a second copy.
 
+`tools/manifest_verifier.py` is the standalone verifier for a manifest written elsewhere: it hashes the target
+directory against `--manifest` (default `reports/manifest.json`) with live progress, `--json` and `--verbose`
+reports, and `--strict`, which fails the run when the directory holds a file the manifest does not list.
+
 `tools/rpf9_names.py` is the lightweight lookup pass: it walks the same data area, inflates a bounded prefix
 of each zlib stream and indexes the measured `name.#dr`/`#ft`/`#dd` spellings with their archive offsets. It
 does not decode a resource or need the TOC; see [resource_names.md](resource_names.md).
