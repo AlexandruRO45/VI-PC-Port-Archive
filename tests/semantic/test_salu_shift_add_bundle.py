@@ -253,6 +253,16 @@ class TestSLshl4AddU32AST(unittest.TestCase):
         expr = SLshl4AddU32Expr(3, 2)
         self.assertEqual(expr.eval(), (50, 0))
 
+class TestSLshl4AddU32OverflowAndSCC(unittest.TestCase):
+    def test_overflow_detection(self) -> None:
+        res, scc = ref_s_lshl_add_u32(4, 0x0FFFFFFF, 16)
+        self.assertEqual(scc, 1)
+
+    def test_max_unoverflowed(self) -> None:
+        # 0x0FFFFFFF << 4 = 0xFFFFFFF0; + 15 = 0xFFFFFFFF -> scc 0
+        res, scc = ref_s_lshl_add_u32(4, 0x0FFFFFFF, 15)
+        self.assertEqual((res, scc), (0xFFFFFFFF, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
