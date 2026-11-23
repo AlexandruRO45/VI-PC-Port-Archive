@@ -36,14 +36,23 @@ namespace {
 
 // Intentionally immortal: mapped-DLL DLL_PROCESS_DETACH and earlier atexit handlers can call GetProcAddress or
 // FreeLibrary on pseudo-handles during process teardown, after normal statics would have been destroyed.
-std::mutex& loader_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+// Use SRWLOCK and pointers constant-initialized at load time to avoid MSVC dynamic static init guards (_Init_thread_header)
+// which can fail when guest threads have overwritten TLS slot 0 (#8933, #8452).
+static SRWLOCK g_loader_srw = SRWLOCK_INIT;
+static std::deque<Pseudo>* g_pseudos = nullptr;
+static std::map<HMODULE, std::string>* g_host_module_names = nullptr;
+static std::set<std::string>* g_unserved_seen = nullptr;
 
-std::deque<Pseudo>& pseudos() {   // a deque never moves its elements, so handed-out handles stay valid
-    static auto* d = new std::deque<Pseudo>;
-    return *d;
+struct LoaderLock {
+    LoaderLock() { AcquireSRWLockExclusive(&g_loader_srw); }
+    ~LoaderLock() { ReleaseSRWLockExclusive(&g_loader_srw); }
+    LoaderLock(const LoaderLock&) = delete;
+    LoaderLock& operator=(const LoaderLock&) = delete;
+};
+
+std::deque<Pseudo>& pseudos() {   // caller holds LoaderLock
+    if (!g_pseudos) g_pseudos = new std::deque<Pseudo>;
+    return *g_pseudos;
 }
 
 std::string lower_ascii(std::string s) {
@@ -92,9 +101,9 @@ std::string module_name(std::string path) {
 }
 
 std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
+    LoaderLock lock;
+    if (!g_host_module_names) g_host_module_names = new std::map<HMODULE, std::string>;
+    if (auto it = g_host_module_names->find(module); it != g_host_module_names->end()) return it->second;
 
     std::vector<wchar_t> path(MAX_PATH);
     for (;;) {
@@ -102,7 +111,7 @@ std::string host_module_name(HMODULE module) {
         if (!length) return {};
         if (length < path.size()) {
             const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
+            g_host_module_names->emplace(module, name);
             return name;
         }
         if (path.size() == 32768) return {};
@@ -116,7 +125,7 @@ std::string host_module_name(HMODULE module) {
 HMODULE owned_handle(const std::string& path) {
     const std::string dll = module_name(path);
     if (dll.empty() || !owns_dll(dll)) return nullptr;
-    std::lock_guard lock(loader_mutex());
+    LoaderLock lock;
     for (auto& p : pseudos())
         if (p.dll == dll) return reinterpret_cast<HMODULE>(&p);
     pseudos().push_back(Pseudo{});
@@ -127,7 +136,7 @@ HMODULE owned_handle(const std::string& path) {
 
 // The owned module a handle names, or nullptr for a host module.
 const Pseudo* pseudo(HMODULE h) {
-    std::lock_guard lock(loader_mutex());
+    LoaderLock lock;
     for (auto& p : pseudos())
         if (reinterpret_cast<HMODULE>(&p) == h) return &p;
     return nullptr;
@@ -240,10 +249,9 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
             IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
         if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
         {
-            static auto* m = new std::mutex;
-            static auto* seen = new std::set<std::string>;
-            std::lock_guard lock(*m);
-            if (seen->insert(p->dll + "!" + what).second)
+            LoaderLock lock;
+            if (!g_unserved_seen) g_unserved_seen = new std::set<std::string>;
+            if (g_unserved_seen->insert(p->dll + "!" + what).second)
                 std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
         }
         SetLastError(ERROR_PROC_NOT_FOUND);
