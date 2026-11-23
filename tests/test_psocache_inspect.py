@@ -209,6 +209,14 @@ class PsocacheInspectTest(unittest.TestCase):
         doc = json.loads(run(self.path, "--meta", "--json").stdout)
         self.assertEqual(doc["meta"]["records"], 2)
 
+    def test_limit_without_meta_is_a_usage_error(self):
+        # --limit bounds the meta decode; without --meta/--entry it used to be dropped and the full report ran.
+        p = run(self.path, "--limit", "1")
+        self.assertEqual(p.returncode, 2, p.stdout)
+        self.assertIn("--limit only applies to --meta", p.stderr)
+        p = run(self.path, "--entry", "0", "--limit", "1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
     def test_markers(self):
         r = psocache_inspect.inspect(self.path)
         mk = r["markers"]
