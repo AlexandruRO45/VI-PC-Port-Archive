@@ -544,6 +544,68 @@ OpStore %f32_control %control
         self.assertEqual(run_word("%s = OpIAddCarry %umul %c1 %c2\n%res = OpCompositeExtract %uint %s 0\n"), 3)
         self.assertEqual(run_word("%s = OpIAddCarry %umul %c1 %c2\n%res = OpCompositeExtract %uint %s 1\n"), 0)
 
+    # A fragment shader that writes both 64-bit members of a carry or extended-multiply struct as four words
+    # (member 0 low, member 0 high, member 1 low, member 1 high).
+    CARRY64 = """\
+OpCapability Shader
+OpCapability Int64
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%ulong = OpTypeInt 64 0
+%long = OpTypeInt 64 1
+%u4 = OpTypeVector %uint 4
+%umul64 = OpTypeStruct %ulong %ulong
+%smul64 = OpTypeStruct %long %long
+%ptr_out = OpTypePointer Output %u4
+%out = OpVariable %ptr_out Output
+%l1 = OpConstant %ulong 1
+%l32 = OpConstant %ulong 32
+%lFF = OpConstant %ulong 4294967295
+%l2p32 = OpConstant %ulong 4294967296
+%l2p32_3 = OpConstant %ulong 4294967299
+%lm1 = OpConstant %ulong 18446744073709551615
+%sm2p32 = OpConstant %long -4294967296
+%s2p32_3 = OpConstant %long 4294967299
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%s = {inst}
+%m0 = OpCompositeExtract {member} %s 0
+%m1 = OpCompositeExtract {member} %s 1
+%w0 = OpUConvert %uint %m0
+%h0 = OpShiftRightLogical %ulong %m0 %l32
+%w1 = OpUConvert %uint %h0
+%w2 = OpUConvert %uint %m1
+%h1 = OpShiftRightLogical %ulong %m1 %l32
+%w3 = OpUConvert %uint %h1
+%words = OpCompositeConstruct %u4 %w0 %w1 %w2 %w3
+OpStore %out %words
+OpReturn
+OpFunctionEnd
+"""
+    CARRY64_CASES = (
+        ("OpIAddCarry %umul64 %lFF %l1", "%ulong", (0, 1, 0, 0)),                     # 2**32, no carry
+        ("OpIAddCarry %umul64 %lm1 %l1", "%ulong", (0, 0, 1, 0)),                     # 2**64 wraps, carry 1
+        ("OpISubBorrow %umul64 %l2p32 %l1", "%ulong", (0xFFFFFFFF, 0, 0, 0)),         # no borrow
+        ("OpUMulExtended %umul64 %l2p32 %l2p32_3", "%ulong", (0, 3, 1, 0)),           # 2**64 + 3 * 2**32
+        ("OpSMulExtended %smul64 %sm2p32 %s2p32_3", "%long", (0, 0xFFFFFFFD, 0xFFFFFFFE, 0xFFFFFFFF)),
+    )
+
+    def test_carry_borrow_and_extended_multiply_use_the_width_of_a_64bit_member(self):
+        # OpIAddCarry, OpISubBorrow and Op[US]MulExtended work at the width of their result struct's members
+        # (SPIR-V spec), here 64 bits; the words are the ones an RTX 2060 writes for this shader. Read at 32 bits,
+        # 0xFFFFFFFF + 1 carried out, 2**32 - 1 borrowed and both products of a 2**32 multiple were 0.
+        for inst, member, want in self.CARRY64_CASES:
+            with self.subTest(inst=inst):
+                out = si.run_fragment(self.CARRY64.format(inst=inst, member=member))
+                self.assertEqual(out["%out"], want)
+                lane0 = spirv_wave_interp.run_wave(self.CARRY64.format(inst=inst, member=member), wave=32)
+                self.assertEqual(lane0["outputs"][0]["%out"], want)      # the other interpreter agrees
+
     def test_float_mul_ord_equal_findsmsb_sin(self):
         self.assertEqual(run_word("%x = OpFMul %float %f2 %f3\n%res = OpBitcast %uint %x\n"), 0x40C00000)
         self.assertEqual(run_word("%b = OpFOrdEqual %bool %f2 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
