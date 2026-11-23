@@ -413,6 +413,27 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
 
+    def test_truncated_tail_bytes_handled_as_invalid(self):
+        """Verify truncated trailing instruction bytes do not raise struct.error (BUILD-2404)."""
+        endpgm = words(0xBF810000)  # s_endpgm
+        for tail in (b"\x00", b"\x00\x00", b"\x00\x00\x00"):
+            # Trailing partial word by itself
+            dec = rdna2_decode.decode_bytes(tail)
+            self.assertEqual(dec["invalid"], 1)
+            self.assertEqual(dec["insns"], [])
+            text, bad = rdna2_decode.disasm_bytes(tail)
+            self.assertEqual(bad, 1)
+            self.assertEqual(text.strip(), "")
+
+            # Valid instruction followed by partial word tail
+            dec = rdna2_decode.decode_bytes(endpgm + tail)
+            self.assertEqual(dec["invalid"], 1)
+            self.assertEqual(len(dec["insns"]), 1)
+            self.assertEqual(dec["insns"][0]["op"], "s_endpgm")
+            text, bad = rdna2_decode.disasm_bytes(endpgm + tail)
+            self.assertEqual(bad, 1)
+            self.assertIn("s_endpgm", text)
+
 
 if __name__ == "__main__":
     unittest.main()
