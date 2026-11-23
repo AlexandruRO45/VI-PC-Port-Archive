@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools"))
 import turing_atlas
@@ -267,6 +268,18 @@ class ValidationGateTests(unittest.TestCase):
         code, err = self.main_with(tools=False)
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
+
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(turing_atlas, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    turing_atlas.write_json_report(path, '{"new": true}\n')
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

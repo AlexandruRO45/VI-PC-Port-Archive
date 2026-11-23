@@ -16,9 +16,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 
 CASES = {
@@ -271,11 +276,7 @@ def main():
     text = json.dumps(atlas, indent=2, sort_keys=True)
     if a.out:
         try:
-            folder = os.path.dirname(a.out)
-            if folder:
-                os.makedirs(folder, exist_ok=True)
-            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text + "\n")
+            write_json_report(a.out, text + "\n")
         except OSError as error:
             print(f"turing_atlas: error: cannot write {a.out}: {error.strerror or error}", file=sys.stderr)
             return 2
@@ -288,6 +289,42 @@ def main():
             print(f"turing_atlas: error: {error}", file=sys.stderr)
             return 2
     return 0
+
+
+def write_json_report(path, text):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".turing_atlas-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
