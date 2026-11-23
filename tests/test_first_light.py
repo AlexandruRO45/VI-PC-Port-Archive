@@ -474,6 +474,24 @@ class PropRuleTests(unittest.TestCase):
         passing = sorted((p for p in parsed if prop.qualifies(p)), key=prop.rank)
         self.assertEqual([p["File"] for p in passing], ["h.obj", "i.obj", "g.obj"])  # 900 and 1100 tie; name breaks it
 
+    def test_a_reindented_or_compact_manifest_is_a_format_error(self):
+        import first_light_prop as prop
+
+        normal = '{\n  "Count": 1,\n  "Items": [\n' + self.item("a.obj") + "\n  ]\n}\n"
+        self.assertEqual([p["File"] for p in prop.stream_items(normal.splitlines(True))], ["a.obj"])
+        # the same manifest re-indented to 4 spaces per level (items open at 8), and compacted to one line
+        reindented = "".join(
+            (len(line) - len(line.lstrip())) * 2 * " " + line.lstrip() + "\n" for line in normal.splitlines()
+        )
+        compact = "".join(line.strip() for line in normal.splitlines()) + "\n"
+        for name, text in (("reindented", reindented), ("compact", compact)):
+            with self.subTest(layout=name):
+                with self.assertRaises(SystemExit) as cm:
+                    list(prop.stream_items(text.splitlines(True)))
+                self.assertIn("rpf9dump's indented JSON", str(cm.exception))
+        # a manifest with no content at all is still just empty
+        self.assertEqual(list(prop.stream_items([])), [])
+
     @staticmethod
     def box_obj(n=7, size=(2.0, 1.5, 1.0)):
         """A hand-made prop: a box whose six faces are n x n grids with UVs. -> (OBJ text, vertices, triangles)"""

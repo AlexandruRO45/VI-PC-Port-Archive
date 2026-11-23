@@ -63,10 +63,11 @@ python -I tools/first_light.py --check --out ~/leonida-work/first_light/out
 
 `--check` on an existing folder re-runs the harness through the same fresh path and `check_image` as the test; a
 harness that exits 0 without writing, an all-opaque image and a swapped-U/V image all exit 1. The test has
-36 cases. Three are package-gated and skip without `LEONIDA_FIRST_LIGHT_DIR`. The other 33 need no package:
-the oracle fixtures, the CPU checks of `--camera` (section 7) and, from section 8, the layout derivation, the
-constant-colour oracle and the prop rule. The prop rule is checked end to end on a box built in the test (six 7 x 7
-grids with UVs, 588 triangles): manifest, `pick()`, the CLI line, `read_obj` and the coverage masks.
+49 cases. Three are package-gated and skip without `LEONIDA_FIRST_LIGHT_DIR` and one more needs a built `vk_harness`.
+The rest need no package: the oracle fixtures, the OBJ parsing and textured-path checks (section 6), the CPU checks of
+`--camera` (section 7) and, from section 8, the layout derivation, the constant-colour oracle and the prop rule. The
+prop rule is checked end to end on a box built in the test (six 7 x 7 grids with UVs, 588 triangles): manifest,
+`pick()`, the CLI line, `read_obj` and the coverage masks; a re-indented or compact `manifest.json` is a format error.
 
 `first_light.py` carves `shaders.rpf` if the work folder does not have it, translates only the chosen pair, converts
 the OBJ to the harness's mesh file (`u32 vertex_count, u32 index_count`, `(x,y,z,u,v) f32` vertices, `u32`
@@ -278,8 +279,6 @@ because a prop is a small part of the frame; the mask check above is the oracle.
 * `--camera` and `--dds` don't combine: the camera VS's table and the textured PS's T# both take s9 of the shared
   push constants and heap VA 0x100, so `first_light.py` refuses the pair. A textured perspective draw needs a
   second constant layout.
-* Some candidate VSs (one of the `Rage_TransformPosTex` pair among them) are carved under a renamed `~1` file,
-  which `first_light.py` does not follow when copying the SPIR-V (#2419).
 * One model and one draw per run; the prop's quantized vertex formats and packed normals are not exercised (the OBJ
   already holds the floats), and the `levels.rpf` props with COLOUR or NORMAL inputs need the other `sga_dr_*`
   families and a vertex-input layout with more attributes.

@@ -70,14 +70,14 @@ TEX_HEADER = struct.Struct("<II")
 # at 0x00..0x30 (X, Y, Z and translation; the VS reads xyz of each) and a view-projection buffer read as 16 dwords
 # (0x160 on 1.0.2.1). Both multiply a row vector: world = [x y z 1] W, clip = [world 1] VP. On 1.0.2.1, all 9
 # translated VS modules with exactly POSITION and TEXCOORD inputs and a computed clip w read 16 dwords at 0x160 of
-# a constant buffer, as do 1,266 of all 2,236 VS modules (docs/first_light.md section 6).
+# a constant buffer, as do 1,266 of all 2,236 VS modules (docs/first_light.md section 7).
 CAMERA_VS = "VS_TransformVT_e6ebb353_Wrapped"
 TABLE_VA, WORLD_VA, VIEW_VA = 0x100, 0x1000, 0x2000  # Xbox VAs inside vk_harness's 64 KiB VKH_HEAP
 WORLD_ROWS = (0x00, 0x10, 0x20, 0x30)
 # The constant a colour-forwarding VS unpacks: bytes 0x40, 0x80, 0xC0, 0xC0. Alpha is not 0xFF on purpose: the PS
 # sees the varying through barycentric interpolation, which turns 1.0 into 1.0 - 1 ulp on some pixels, and the
 # round-toward-zero pack then writes 0.99951 there (905 of 1,946 covered pixels on the TEST-525 draw). A value that
-# is not a half-float boundary survives (docs/first_light.md section 7).
+# is not a half-float boundary survives (docs/first_light.md section 8).
 DEFAULT_COLOUR = 0xC0C08040
 UBYTE_SCALE = struct.unpack("<f", struct.pack("<I", 0x3B808081))[0]  # the 1/255 the game's VSs multiply by
 
