@@ -84,12 +84,13 @@ class VLdexpF32Oracle:
         return ref_ldexp_f32(s0_u32, s1_i32)
 
     @staticmethod
-    def build_shader(s0_u32: int, s1_i32: int) -> Tuple[str, List[str]]:
+    def build_shader(s0_u32: int, s1_i32: int, clamp: bool = False) -> Tuple[str, List[str]]:
         name = "ps_ldexp_f32_hw"
+        mod = " clamp" if clamp else ""
         lines = [
             f"v_mov_b32_e32 v0, {s0_u32:#x}",
-            f"s_mov_b32 s0, {s1_i32:#x}",
-            "v_ldexp_f32 v2, v0, s0",
+            f"s_mov_b32 s0, {s1_i32 & 0xFFFF_FFFF:#x}",
+            f"v_ldexp_f32 v2, v0, s0{mod}",
             "v_mov_b32_e32 v3, 0",
             "exp mrt0 v2, v3, v3, v3 done vm",
             "s_endpgm",
@@ -97,13 +98,13 @@ class VLdexpF32Oracle:
         return name, lines
 
     @staticmethod
-    def translate_and_validate(s0_u32: int, s1_i32: int) -> str:
-        name, lines = VLdexpF32Oracle.build_shader(s0_u32, s1_i32)
+    def translate_and_validate(s0_u32: int, s1_i32: int, clamp: bool = False) -> str:
+        name, lines = VLdexpF32Oracle.build_shader(s0_u32, s1_i32, clamp=clamp)
         return support.translate_lines(name, lines)
 
     @staticmethod
-    def execute_and_verify(s0_u32: int, s1_i32: int) -> int:
-        spv = VLdexpF32Oracle.translate_and_validate(s0_u32, s1_i32)
+    def execute_and_verify(s0_u32: int, s1_i32: int, clamp: bool = False) -> int:
+        spv = VLdexpF32Oracle.translate_and_validate(s0_u32, s1_i32, clamp=clamp)
         out = support.mrt0_words(spv)
         return out[0]
 
@@ -144,6 +145,91 @@ class TestVLdexpF32Oracle(unittest.TestCase):
         one = 0x3F80_0000
         got = VLdexpF32Oracle.execute_and_verify(one, 2)
         self.assertEqual(got, 0x4080_0000)
+
+    def test_translator_negative_scale_and_negative_sign(self):
+        """Verify translator execution for negative exponents and negative float inputs."""
+        # 1.0f * 2^-2 = 0.25f (0x3E80_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, -2), 0x3E80_0000)
+        # -1.5f * 2^1 = -3.0f (0xC040_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBFC0_0000, 1), 0xC040_0000)
+        # -2.0f * 2^-1 = -1.0f (0xBF80_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xC000_0000, -1), 0xBF80_0000)
+
+    def test_translator_overflow_to_infinity(self):
+        """Verify translator execution saturating to signed infinity on exponent overflow."""
+        # +1.0f * 2^150 -> +inf (0x7F80_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, 150), POS_INF)
+        # -1.0f * 2^150 -> -inf (0xFF80_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBF80_0000, 150), NEG_INF)
+        # +1.5f * 2^200 -> +inf (0x7F80_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3FC0_0000, 200), POS_INF)
+
+    def test_translator_underflow_to_signed_zero(self):
+        """Verify translator execution saturating to signed zero on exponent underflow."""
+        # +1.0f * 2^-150 -> +0.0 (0x0000_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, -150), 0x0000_0000)
+        # -1.0f * 2^-150 -> -0.0 (0x8000_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBF80_0000, -150), 0x8000_0000)
+        # +1.5f * 2^-200 -> +0.0 (0x0000_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3FC0_0000, -200), 0x0000_0000)
+
+    def test_translator_clamped_exponent_scale_bounds(self):
+        """Verify translator execution respects S1 clamping to [-512, 512]."""
+        # S1 = +600 (> 512): clamped to 512, overflows to +inf / -inf
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, 600), POS_INF)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBF80_0000, 600), NEG_INF)
+        # S1 = -600 (< -512): clamped to -512, underflows to +0.0 / -0.0
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, -600), 0x0000_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBF80_0000, -600), 0x8000_0000)
+
+    def test_translator_subnormal_flushing(self):
+        """Verify translator execution flushes subnormal inputs to signed zero (denormal-off mode)."""
+        min_sub = 0x0000_0001
+        max_sub = 0x007F_FFFF
+        # Positive subnormals flush to +0.0
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(min_sub, 10), 0x0000_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(max_sub, 10), 0x0000_0000)
+        # Negative subnormals flush to -0.0
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(min_sub | SIGN_MASK, 10), 0x8000_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(max_sub | SIGN_MASK, 10), 0x8000_0000)
+
+    def test_translator_special_values_passthrough(self):
+        """Verify translator execution preserves signed zeros, infinities, and NaNs bit-exact."""
+        # Signed zeros preserved
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x0000_0000, 5), 0x0000_0000)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x8000_0000, 5), 0x8000_0000)
+        # Infinities preserved
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(POS_INF, 5), POS_INF)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(NEG_INF, -5), NEG_INF)
+        # NaNs preserved bit-exact
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(qnan, 3), qnan)
+        self.assertEqual(VLdexpF32Oracle.execute_and_verify(snan, -3), snan)
+
+    def test_translator_clamp_output_modifier(self):
+        """Verify translator handles VOP3 clamp modifier and emits GLSL FClamp."""
+        # 1.0f * 2^2 = 4.0f clamped to [0.0, 1.0] -> 1.0f (0x3F80_0000)
+        got_clamped = VLdexpF32Oracle.execute_and_verify(0x3F80_0000, 2, clamp=True)
+        self.assertEqual(got_clamped, 0x3F80_0000)
+        # -1.0f * 2^1 = -2.0f clamped to [0.0, 1.0] -> 0.0f (0x0000_0000)
+        got_neg_clamped = VLdexpF32Oracle.execute_and_verify(0xBF80_0000, 1, clamp=True)
+        self.assertEqual(got_neg_clamped, 0x0000_0000)
+        # 1.0f * 2^-1 = 0.5f clamped to [0.0, 1.0] -> 0.5f (0x3F00_0000)
+        got_in_range = VLdexpF32Oracle.execute_and_verify(0x3F80_0000, -1, clamp=True)
+        self.assertEqual(got_in_range, 0x3F00_0000)
+        # Verify SPIR-V contains OpExtInst FClamp
+        spv = VLdexpF32Oracle.translate_and_validate(0x3F80_0000, 2, clamp=True)
+        self.assertIn("OpExtInst %float %glsl FClamp", spv)
+
+    def test_translator_emitted_spirv_instructions(self):
+        """Verify translator emits expected bitwise and selection instructions for v_ldexp_f32."""
+        spv = VLdexpF32Oracle.translate_and_validate(0x3F80_0000, 2)
+        self.assertIn("OpShiftLeftLogical", spv)
+        self.assertIn("OpBitFieldUExtract", spv)
+        self.assertIn("OpSelect", spv)
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertIn("OpBitwiseAnd", spv)
 
 # -----------------------------------------------------------------------------
 # Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
@@ -542,6 +628,17 @@ class TestVLdexpF32NegativeAndMutation(unittest.TestCase):
 
         self.assertEqual(correct, 0x4080_0000)
         self.assertNotEqual(mutant, correct)
+
+    def test_translator_negative_control_rejects_mutant(self):
+        """Verify that a mutated exponent shift (shift 22 instead of 23) diverges from translated execution."""
+        def mutant_shift22_ldexp(s0: int, s1: int) -> int:
+            e = ((s0 >> 23) & 0xFF) + s1
+            return (s0 & 0x807F_FFFF) | (e << 22)
+
+        translated = VLdexpF32Oracle.execute_and_verify(0x3F80_0000, 2)
+        mutant = mutant_shift22_ldexp(0x3F80_0000, 2)
+        self.assertEqual(translated, 0x4080_0000)
+        self.assertNotEqual(translated, mutant)
 
 if __name__ == "__main__":
     unittest.main()
