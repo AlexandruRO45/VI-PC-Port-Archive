@@ -322,6 +322,70 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(data["startup"]["pid"], 123)
         self.assertEqual(data["d3d12"]["calls"], 9)
 
+    def test_counts_only_omits_local_details_and_counts_all_exceptions(self):
+        private = "local-only-marker"
+        self.write(
+            self.startup,
+            [
+                {"kind": "trace_open", "pid": 12345},
+                {"kind": "map", "module": private, "base": private},
+                {"kind": "file_open_failed", "path": private, "caller": private, "error": 2},
+                {"kind": "debug_string", "text": private},
+                {"kind": "unimplemented_call", "import": private, "caller": private},
+                {"kind": "exception", "code": "0xC0000005", "at": private, "stack": [private]},
+                {"kind": "exception", "code": "0xc0000005", "address": private},
+                {"kind": "exception", "code": "0x80000003"},
+                {"kind": "exception", "code": private},
+                {"kind": "error", "what": private},
+                {"kind": private},
+                {"kind": "exit", "code": 3},
+            ],
+        )
+        self.write_lines(self.d3d12, [
+            f"{private} : [d3d12-trace] #30 {private} unsupported",
+            f"[d3d12-trace] #31 {private} {private}",
+            f"[rt] {private}",
+        ])
+
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    result = bt.main([str(self.startup), "--d3d12", str(self.d3d12),
+                                      "--counts-only", "--limit", "1", *flags])
+                self.assertEqual(result, 0)
+                report = stdout.getvalue()
+                for local_detail in (private, str(self.startup), str(self.d3d12), "12345"):
+                    self.assertNotIn(local_detail, report)
+                if flags:
+                    parsed = json.loads(report)
+                    startup = parsed["startup"]
+                    self.assertEqual(startup["modules"], 1)
+                    self.assertEqual(startup["unimplemented_imports"], 1)
+                    self.assertEqual(startup["failed_file_opens"], 1)
+                    self.assertEqual(startup["exceptions"], 4)
+                    self.assertEqual(startup["exit"], 3)
+                    self.assertEqual(startup["exception_codes"],
+                                     {"0x80000003": 1, "0xc0000005": 2, "unknown": 1})
+                    self.assertEqual(parsed["d3d12"], {
+                        "calls": 2, "ignored_lines": 1, "outcomes": {"unsupported": 1, "other": 1},
+                    })
+                else:
+                    self.assertIn("exceptions: 4", report)
+                    self.assertIn("0xc0000005=2", report)
+                    self.assertIn("unsupported=1, other=1", report)
+
+    def test_counts_only_hides_path_when_one_input_is_unreadable(self):
+        self.write_lines(self.d3d12, ["[d3d12-trace] #1 Example ok"])
+        missing = os.path.join(os.path.dirname(self.startup), "local-only-missing.jsonl")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = bt.main([str(missing), "--d3d12", str(self.d3d12), "--counts-only", "--json"])
+        self.assertEqual(result, 2)
+        self.assertIsNone(json.loads(stdout.getvalue())["startup"])
+        self.assertEqual(json.loads(stdout.getvalue())["d3d12"]["outcomes"], {"ok": 1})
+        self.assertEqual(stderr.getvalue(), "error: could not summarize startup trace\n")
+
     def test_missing_and_empty_files_are_errors(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
