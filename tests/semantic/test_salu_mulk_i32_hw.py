@@ -290,5 +290,38 @@ class TestMulkRegisterPreservation(unittest.TestCase):
         self.assertEqual(words[1], (-280) & MASK32)
 
 
+class TestMulkConditionCodesAndSCC(unittest.TestCase):
+    """Commit 6: condition codes, status flags, and carry/borrow generation for s_mulk_i32."""
+
+    def test_scc_preservation_across_mulk(self):
+        lines_true = [
+            "s_cmp_eq_u32 5, 5",
+            "s_mov_b32 s0, 10",
+            "s_mulk_i32 s0, 3",
+            "s_cselect_b32 s1, 0xAAAA, 0xBBBB",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words_true = run_mulk_ps(lines_true, "ps_mulk_scc_true")
+        self.assertEqual(words_true[0], 30)
+        self.assertEqual(words_true[1], 0xAAAA)
+
+        lines_false = [
+            "s_cmp_eq_u32 5, 6",
+            "s_mov_b32 s0, 10",
+            "s_mulk_i32 s0, 3",
+            "s_cselect_b32 s1, 0xAAAA, 0xBBBB",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words_false = run_mulk_ps(lines_false, "ps_mulk_scc_false")
+        self.assertEqual(words_false[0], 30)
+        self.assertEqual(words_false[1], 0xBBBB)
+
+
 if __name__ == '__main__':
     unittest.main()
