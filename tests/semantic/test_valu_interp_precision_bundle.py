@@ -216,6 +216,19 @@ class TestInterpP1LLF16Reference(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP1LLF16Pairing(unittest.TestCase):
+    def test_p1ll_f16_low_lane(self):
+        code = [
+            "v_interp_p1ll_f16 v3, v0, attr1.x",
+            "v_interp_p2_f16 v3, v1, attr1.x, v3",
+            "exp mrt0, v3, v3, v3, v3 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p1ll_pair", code)
+        self.assertIn("OpEntryPoint Fragment", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
