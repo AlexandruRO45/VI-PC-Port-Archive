@@ -394,5 +394,101 @@ class TestValuFrexpExpI32F64ScalarInterpreter(unittest.TestCase):
             self.assertEqual(scalar_res, trans_res)
 
 
+# ---------------------------------------------------------------------------
+# Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking
+# ---------------------------------------------------------------------------
+
+class SIMDWavefront:
+    """Wavefront model simulating 32-lane or 64-lane SIMD execution."""
+
+    def __init__(self, wave_size: int = 32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"wave_size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+
+    def read_f64(self, pair: RegisterPair, lane: int) -> int:
+        return combine_f64_words(self.vgprs[pair.lo][lane], self.vgprs[pair.hi][lane])
+
+    def write_u32(self, reg: Register, lane: int, val: int) -> None:
+        self.vgprs[reg.index][lane] = val & MASK32
+
+    def write_f64(self, pair: RegisterPair, lane: int, bits: int) -> None:
+        lo, hi = split_f64_words(bits)
+        self.vgprs[pair.lo][lane] = lo
+        self.vgprs[pair.hi][lane] = hi
+
+    def step(self, inst: Union[VOP1Instruction, VOP3Instruction]) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                src_bits = self.read_f64(inst.src0, lane)
+                if isinstance(inst, VOP3Instruction):
+                    res_u32 = oracle_frexp_exp_i32_f64(
+                        src_bits,
+                        abs_src=inst.abs_src0,
+                        neg_src=inst.neg_src0,
+                    )
+                else:
+                    res_u32 = oracle_frexp_exp_i32_f64(src_bits)
+                self.write_u32(inst.dst, lane, res_u32)
+
+
+class TestValuFrexpExpI32F64SIMD(unittest.TestCase):
+    """Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for v_frexp_exp_i32_f64."""
+
+    def test_simd32_all_lanes_active(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        dst = Register(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        for lane in range(32):
+            wave.write_f64(src, lane, f64_to_bits(float(1 << lane)))
+        inst = VOP1Instruction(Opcode.V_FREXP_EXP_I32_F64, dst, src)
+        wave.step(inst)
+        for lane in range(32):
+            res = to_s32(wave.vgprs[0][lane])
+            self.assertEqual(res, lane + 1)
+
+    def test_simd64_divergence_exec_mask(self) -> None:
+        wave = SIMDWavefront(wave_size=64)
+        dst = Register(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        wave.exec_mask = 0xAAAA_AAAA_AAAA_AAAA  # odd lanes active
+        for lane in range(64):
+            wave.write_f64(src, lane, f64_to_bits(8.0))
+            wave.write_u32(dst, lane, 0x12345678)
+        inst = VOP1Instruction(Opcode.V_FREXP_EXP_I32_F64, dst, src)
+        wave.step(inst)
+        for lane in range(64):
+            if lane % 2 == 1:
+                self.assertEqual(to_s32(wave.vgprs[0][lane]), 4)
+            else:
+                self.assertEqual(wave.vgprs[0][lane], 0x12345678)
+
+    def test_simd_inactive_lanes_unmodified(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        dst = Register(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        wave.exec_mask = 0x0000_0001  # only lane 0 active
+        for lane in range(32):
+            wave.write_u32(dst, lane, 0xCAFE_BABE)
+            wave.write_f64(src, lane, f64_to_bits(16.0))
+        inst = VOP1Instruction(Opcode.V_FREXP_EXP_I32_F64, dst, src)
+        wave.step(inst)
+        self.assertEqual(to_s32(wave.vgprs[0][0]), 5)
+        for lane in range(1, 32):
+            self.assertEqual(wave.vgprs[0][lane], 0xCAFE_BABE)
+
+    def test_simd_translator_active_mask_preservation(self) -> None:
+        inst = VOP1Instruction(
+            Opcode.V_FREXP_EXP_I32_F64,
+            Register(RegKind.VGPR, 0),
+            RegisterPair(RegKind.VGPR, 2),
+        )
+        lines = [inst.to_asm(), "s_endpgm"]
+        spv = support.translate_lines("ps_simd_frexp", lines)
+        self.assertIn("OpSelect", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
