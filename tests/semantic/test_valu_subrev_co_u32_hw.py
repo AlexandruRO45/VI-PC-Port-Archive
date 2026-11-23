@@ -273,3 +273,84 @@ class TestSubrevCoU32ScalarInterpreter(unittest.TestCase):
         step_scalar_subrev_co(ast, state)
         self.assertEqual(state.vgprs[0], 0)  # Saturated to 0
         self.assertEqual(state.vcc, 1)       # Real borrow preserved
+
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# -----------------------------------------------------------------------------
+@dataclass
+class SimdWaveState:
+    wave_size: int
+    exec_mask: int
+    vgprs: dict[int, list[int]]
+    sdst_mask: int = 0
+
+    @classmethod
+    def create(cls, wave_size: int, exec_mask: int) -> SimdWaveState:
+        return cls(wave_size=wave_size, exec_mask=exec_mask, vgprs={}, sdst_mask=0)
+
+    def ensure_vgpr(self, idx: int, init_val: int = 0) -> None:
+        if idx not in self.vgprs:
+            self.vgprs[idx] = [init_val] * self.wave_size
+
+
+def step_simd_subrev_co(
+    vdst_idx: int,
+    src0_vals: list[int],
+    src1_vals: list[int],
+    state: SimdWaveState,
+    clamp: bool = False,
+) -> None:
+    state.ensure_vgpr(vdst_idx, 0xBAADF00D)
+    sdst_accum = 0
+    for lane in range(state.wave_size):
+        active = (state.exec_mask >> lane) & 1
+        if active:
+            s0 = src0_vals[lane]
+            s1 = src1_vals[lane]
+            dst, borrow = ref_subrev_co_u32(s0, s1, clamp=clamp)
+            state.vgprs[vdst_idx][lane] = dst
+            if borrow:
+                sdst_accum |= (1 << lane)
+        else:
+            # Inactive lane: destination unchanged, no borrow contribution
+            pass
+    state.sdst_mask = sdst_accum
+
+
+class TestSubrevCoU32SIMD(unittest.TestCase):
+    def test_wave32_all_active(self) -> None:
+        state = SimdWaveState.create(32, 0xFFFFFFFF)
+        s0 = [i * 10 for i in range(32)]
+        s1 = [i * 25 for i in range(32)]
+        step_simd_subrev_co(0, s0, s1, state)
+        for i in range(32):
+            self.assertEqual(state.vgprs[0][i], i * 15)
+        self.assertEqual(state.sdst_mask, 0)
+
+    def test_wave32_divergent_lanes(self) -> None:
+        # Even lanes borrow (s1 < s0), odd lanes do not (s1 > s0)
+        s0 = [50 if (i % 2 == 0) else 10 for i in range(32)]
+        s1 = [20 if (i % 2 == 0) else 40 for i in range(32)]
+        exec_mask = 0x55555555  # only even lanes active
+        state = SimdWaveState.create(32, exec_mask)
+        step_simd_subrev_co(0, s0, s1, state)
+
+        for i in range(32):
+            if i % 2 == 0:
+                self.assertEqual(state.vgprs[0][i], (20 - 50) & M32)
+            else:
+                self.assertEqual(state.vgprs[0][i], 0xBAADF00D)  # Preserved
+        self.assertEqual(state.sdst_mask, exec_mask)
+
+    def test_wave64_masking(self) -> None:
+        exec_mask = 0x00000000FFFFFFFF  # lower 32 active, upper 32 inactive
+        state = SimdWaveState.create(64, exec_mask)
+        s0 = [100] * 64
+        s1 = [50] * 64  # Underflow on all lanes
+        step_simd_subrev_co(0, s0, s1, state)
+
+        # Upper 32 lanes must be untouched
+        for i in range(32, 64):
+            self.assertEqual(state.vgprs[0][i], 0xBAADF00D)
+        # Borrow mask must only include lower 32
+        self.assertEqual(state.sdst_mask, 0xFFFFFFFF)
