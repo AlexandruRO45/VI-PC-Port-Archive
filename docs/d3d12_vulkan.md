@@ -160,6 +160,13 @@ The design is therefore an **IR per command list**:
   codes.
 - A queue's `ExecuteCommandLists` submits in order with one timeline semaphore signal. `Wait`/`Signal` become
   timeline-semaphore waits/signals. `Present` queues after the frame's work.
+- Every `ExecuteCommandLists` command buffer starts with a full memory barrier (`ALL_COMMANDS`, memory writes to
+  memory reads and writes). D3D12 finishes and flushes a queue's work at the end of each `ExecuteCommandLists`
+  ([Enhanced Barriers](https://microsoft.github.io/DirectX-Specs/d3d/D3D12EnhancedBarriers.html), "Barrier-Free
+  Access"), so a later call may use a buffer or a simultaneous-access texture that an earlier one wrote, with no
+  barrier; Vulkan orders nothing between two submissions of one queue by itself. `vk_queue_test` checks that every
+  submission of the three queue types records it; without it, Khronos synchronization validation (1.4.369) reports
+  `WRITE_AFTER_WRITE` between two copies into one buffer from consecutive submissions.
 
 The command-list surface maps to the IR as follows:
 

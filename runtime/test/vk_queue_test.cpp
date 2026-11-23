@@ -47,6 +47,40 @@ VKAPI_ATTR VkResult VKAPI_CALL stalling_wait_semaphores(VkDevice device, const V
     return real_wait_semaphores(device, info, timeout);
 }
 
+// Counts the command buffers a queue records with and without a full memory barrier, for the ExecuteCommandLists
+// boundary check in main(). The replay records its own commands through a table copied when the context was made,
+// so only the queue's calls through context.vk are seen here.
+PFN_vkBeginCommandBuffer real_begin_command_buffer = nullptr;
+PFN_vkEndCommandBuffer real_end_command_buffer = nullptr;
+PFN_vkCmdPipelineBarrier real_cmd_pipeline_barrier = nullptr;
+bool boundary_seen = false;  // a full barrier since the command buffer began
+std::uint32_t with_boundary = 0, without_boundary = 0;
+
+VKAPI_ATTR VkResult VKAPI_CALL watching_begin_command_buffer(VkCommandBuffer buffer,
+                                                             const VkCommandBufferBeginInfo* info) {
+    boundary_seen = false;
+    return real_begin_command_buffer(buffer, info);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL watching_end_command_buffer(VkCommandBuffer buffer) {
+    ++(boundary_seen ? with_boundary : without_boundary);
+    return real_end_command_buffer(buffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL watching_cmd_pipeline_barrier(
+    VkCommandBuffer buffer, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags flags,
+    std::uint32_t memory_count, const VkMemoryBarrier* memory, std::uint32_t buffer_count,
+    const VkBufferMemoryBarrier* buffers, std::uint32_t image_count, const VkImageMemoryBarrier* images) {
+    for (std::uint32_t i = 0; i < memory_count; ++i)
+        if (src == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && dst == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT &&
+            (memory[i].srcAccessMask & VK_ACCESS_MEMORY_WRITE_BIT) &&
+            (memory[i].dstAccessMask & (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT)) ==
+                (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT))
+            boundary_seen = true;
+    real_cmd_pipeline_barrier(buffer, src, dst, flags, memory_count, memory, buffer_count, buffers, image_count,
+                              images);
+}
+
 const char* flags_text(VkQueueFlags f) {
     static char buf[32];
     std::snprintf(buf, sizeof buf, "%s%s%s", f & VK_QUEUE_GRAPHICS_BIT ? "G" : "", f & VK_QUEUE_COMPUTE_BIT ? "C" : "",
@@ -321,6 +355,60 @@ int main() {
         EXPECT(injected_stalls.load() == kStalls);  // the queue did reach the cap and wait
         EXPECT(allocated_command_buffers <= VulkanQueue::kMaxQueuedCommandBuffers);
         EXPECT(static_cast<std::uint8_t*>(dst_map)[kBig - 1] == 0x5A);
+    }
+
+    // 6. D3D12 finishes and flushes a queue's work at the end of each ExecuteCommandLists, so two of them may write
+    // one buffer back to back with no barrier, and the second one's bytes are what is left. Every submission must
+    // record a full memory barrier, on every queue type (without it, the validation layer's synchronization check
+    // reports WRITE_AFTER_WRITE between the two submissions' copies).
+    {
+        void *first_map = nullptr, *second_map = nullptr, *target_map = nullptr;
+        VkBuffer first = d.buffer(kSize, usage, &first_map);
+        VkBuffer second = d.buffer(kSize, usage, &second_map);
+        VkBuffer target = d.buffer(kSize, usage, &target_map);
+        EXPECT(first && second && target);
+        add_buffer(9, first, kSize);
+        add_buffer(10, second, kSize);
+        add_buffer(11, target, kSize);
+        std::memset(first_map, 0x11, kSize);
+        std::memset(second_map, 0x22, kSize);
+        CommandList write_first, write_second;
+        EXPECT(write_first.copy_buffer({11, 0, 9, 0, kSize}));
+        EXPECT(write_second.copy_buffer({11, 0, 10, 0, kSize}));
+        EXPECT(write_first.close() && write_second.close());
+        const CommandList* first_lists[] = {&write_first};
+        const CommandList* second_lists[] = {&write_second};
+
+        constexpr std::uint32_t kRounds = 8;
+        VulkanFence done(context, 0);  // its own timeline: `fence` has already passed 11
+        EXPECT(done.semaphore());
+        std::uint64_t value = 0;
+        std::uint32_t stale = 0;  // bytes the first copy left in place of the second's
+        for (VulkanQueue* queue : {&direct, &compute, &copy}) {
+            for (std::uint32_t round = 0; round < kRounds; ++round) {
+                std::memset(target_map, 0, kSize);
+                real_begin_command_buffer = context.vk.vkBeginCommandBuffer;
+                real_end_command_buffer = context.vk.vkEndCommandBuffer;
+                real_cmd_pipeline_barrier = context.vk.vkCmdPipelineBarrier;
+                context.vk.vkBeginCommandBuffer = watching_begin_command_buffer;
+                context.vk.vkEndCommandBuffer = watching_end_command_buffer;
+                context.vk.vkCmdPipelineBarrier = watching_cmd_pipeline_barrier;
+                const bool executed = queue->execute(first_lists) == ReplayResult::success &&
+                                      queue->execute(second_lists) == ReplayResult::success;
+                context.vk.vkBeginCommandBuffer = real_begin_command_buffer;
+                context.vk.vkEndCommandBuffer = real_end_command_buffer;
+                context.vk.vkCmdPipelineBarrier = real_cmd_pipeline_barrier;
+                EXPECT(executed);
+                EXPECT(queue->signal(done.semaphore(), ++value));
+                EXPECT(done.wait(value, 20'000'000'000ull));
+                const auto* bytes = static_cast<const std::uint8_t*>(target_map);
+                for (std::uint32_t i = 0; i < kSize; ++i) stale += bytes[i] != 0x22;
+            }
+        }
+        std::printf("ExecuteCommandLists boundary: %u of %u submissions record a full barrier, %u stale bytes\n",
+                    with_boundary, with_boundary + without_boundary, stale);
+        EXPECT(with_boundary == 3 * 2 * kRounds && without_boundary == 0);
+        EXPECT(stale == 0);
     }
 
     EXPECT(direct.idle() && compute.idle() && copy.idle());

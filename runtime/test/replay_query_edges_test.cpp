@@ -872,6 +872,10 @@ void test_queue_segments() {
     driver.vkCmdWriteTimestamp = r.write_timestamp;
     driver.vkCmdCopyQueryPoolResults = r.copy_query_pool_results;
     driver.vkCmdFillBuffer = r.fill_buffer;
+    // Every submission starts with the ExecuteCommandLists boundary barrier; it touches no query or buffer word.
+    driver.vkCmdPipelineBarrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+        std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t,
+        const VkImageMemoryBarrier*) {};
     driver.vkCreateCommandPool = +[](VkDevice, const VkCommandPoolCreateInfo*, const VkAllocationCallbacks*,
         VkCommandPool* p) {
         *p = handle<VkCommandPool>(1);

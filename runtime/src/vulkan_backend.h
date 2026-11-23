@@ -2374,6 +2374,14 @@ private:
             discard();
             return ReplayResult::unsupported;
         }
+        // D3D12 finishes and flushes all of a queue's work at the end of every ExecuteCommandLists, so a later one
+        // may use what an earlier one wrote with no barrier (buffers and simultaneous-access textures). Vulkan orders
+        // nothing between submissions of one queue by itself: this full barrier is that boundary.
+        VkMemoryBarrier boundary{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        boundary.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        boundary.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &boundary, 0, nullptr, 0, nullptr);
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
