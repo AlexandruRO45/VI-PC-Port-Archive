@@ -90,8 +90,11 @@ class GuestSceneReferenceTest(unittest.TestCase):
                    "--shaders", str(root), "--out", str(out)]
             if sys.platform != "win32":
                 cmd += ["--wine", str(bad_loader)]
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            # The launch error is the OS's own message, in the system language and, on a redirected Windows stream,
+            # the ANSI code page (a French Windows writes "n’est pas une application Win32 valide" with a cp1252
+            # 0x92). Read the streams as bytes: only the report and the logs are asserted on.
+            result = subprocess.run(cmd, capture_output=True, timeout=20)
+            self.assertEqual(result.returncode, 1, (result.stdout + result.stderr).decode("utf-8", "backslashreplace"))
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertIn("could not launch", report["error"])
             record = json.loads((out / "logs" / "full.json").read_text(encoding="utf-8"))
