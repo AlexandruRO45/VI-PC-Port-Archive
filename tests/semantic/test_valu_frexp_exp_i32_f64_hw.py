@@ -626,5 +626,56 @@ class TestValuFrexpExpI32F64IEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(to_s32(res_min), math.frexp(val_min)[1])
 
 
+# ---------------------------------------------------------------------------
+# Stage 8: Negative controls, syntax rejection, and mutation detection
+# ---------------------------------------------------------------------------
+
+class TestValuFrexpExpI32F64NegativeControls(unittest.TestCase):
+    """Stage 8: Negative controls, syntax rejection, and mutation detection for v_frexp_exp_i32_f64."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+
+    def test_invalid_register_pairs(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterPair(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            RegisterPair(RegKind.VGPR, 255)
+        with self.assertRaises(ValueError):
+            RegisterPair(RegKind.SGPR, 105)
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=128)
+
+    def test_mutation_detection_and_oracle_rejection(self) -> None:
+        val_bits = f64_to_bits(16.0)
+        correct = oracle_frexp_exp_i32_f64(val_bits)
+
+        def mutated_oracle_off_by_one(bits: int) -> int:
+            return (oracle_frexp_exp_i32_f64(bits) + 1) & MASK32
+
+        def mutated_oracle_raw_biased(bits: int) -> int:
+            return (bits >> 52) & 0x7FF
+
+        self.assertNotEqual(mutated_oracle_off_by_one(val_bits), correct)
+        self.assertNotEqual(mutated_oracle_raw_biased(val_bits), correct)
+
+    def test_translator_compliance_guard(self) -> None:
+        test_path = os.path.join(HERE, "test_valu_frexp_exp_i32_f64_hw.py")
+        self.assertTrue(os.path.isfile(test_path))
+        with open(test_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("import support", content)
+        self.assertIn("support.translate_lines", content)
+
+
 if __name__ == "__main__":
     unittest.main()
