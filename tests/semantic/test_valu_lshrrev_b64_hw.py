@@ -498,5 +498,58 @@ class TestVLshrrevB64IEEE754(unittest.TestCase):
         self.assertEqual(hw_res, qnan64 >> 1)
 
 
+class TestVLshrrevB64NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_lshrrev_b64."""
+
+    def test_rejection_of_invalid_syntax(self):
+        # Missing operand should fail translator
+        lines_missing = [
+            "v_mov_b32 v1, 1",
+            "v_lshrrev_b64 v[0:1], v1",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_lshr64_err", lines_missing)
+
+    def test_rejection_of_single_register_dst(self):
+        # Destination must be a register pair v[0:1], not a single v0
+        lines_single = [
+            "v_mov_b32 v1, 1",
+            "v_mov_b32 v2, 2",
+            "v_mov_b32 v3, 3",
+            "v_lshrrev_b64 v0, v1, v[2:3]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_lshr64_single", lines_single)
+
+    def test_rejection_of_out_of_bounds_register(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, 256, size=2)
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, -1, size=2)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 106, size=2)
+
+    def test_mutation_detection_wrong_shift_mask(self):
+        # Mutated oracle with shift & 31 instead of shift & 63
+        def bad_oracle_mask31(sh, val):
+            return (val & MASK64) >> (sh & 31)
+
+        val = 0x8000000000000000
+        # For shift = 32: correct is val >> 32 = 0x80000000; bad is val >> 0 = val
+        self.assertNotEqual(ref_lshrrev_b64(32, val), bad_oracle_mask31(32, val))
+
+    def test_mutation_detection_left_shift(self):
+        # Mutated oracle with shift left instead of right
+        def bad_oracle_lshift(sh, val):
+            return ((val & MASK64) << (sh & 63)) & MASK64
+
+        val = 0x123456789ABCDEF0
+        self.assertNotEqual(ref_lshrrev_b64(8, val), bad_oracle_lshift(8, val))
+
+
 if __name__ == "__main__":
     unittest.main()
