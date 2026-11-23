@@ -599,7 +599,9 @@ int main(int argc, char** argv) {
         const bool full = bindless::size_bindings(flags, props.properties.limits, props11, props12);
         const char* name = flags.update_after_bind && flags.partially_bound ? "update after bind, partially bound"
                            : flags.update_after_bind ? "update after bind" : flags.partially_bound ? "partially bound" : "no flags";
-        if ((!full && !depth_test) || !fits(flags) || (depth_test && flags.counts[0] < 4)) {
+        const bool depth_slots_fit = flags.counts[0] >= 5 && flags.counts[bindless::sampler_binding] >= 4 &&
+                                     flags.counts[bindless::storage_binding(ImageDimension::dim_2d, 0)] >= 2;
+        if ((!full && !depth_test) || !fits(flags) || (depth_test && !depth_slots_fit)) {
             std::printf("%s: skipped, the set does not fit this device's descriptor limits\n", name);
             continue;
         }
