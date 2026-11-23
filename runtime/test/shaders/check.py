@@ -829,7 +829,7 @@ def partial_wave_test(tools, spirv, name, expected_words):
             os.environ["VKC_SUBGROUP_SIZE"] = old
     if code != 0:
         return failure(code, out, 2)
-    if not W64_EMULATED and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", out)):
+    if not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", out)):
         return None
     m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
     if m and [int(x) for x in m.group(1).split()] == expected_words:
