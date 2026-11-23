@@ -300,6 +300,46 @@ class RandomCheckTest(unittest.TestCase):
         self.assertEqual(tally[("f32", "p2_f32 = fma(P20, J, p1)")], [0, 1])
         self.assertTrue(any("p2_f32 = fma(P20, J, p1)" in b for b in bad))
 
+    # p2_f16 is documented as ONE rounding to f16, and every case above has an exact fma there,
+    # so a model that rounded to f32 first and only then to f16 passed them all (found by kapitche
+    # on PR #4338). This fixture makes the fma inexact in exactly that way:
+    #   p0 = 0, p10 = 0x10000000 (f32 2^-95, high half the f16 2^-11), p20 = 0x3C000000
+    #   (f32 2^-11, high half the f16 1.0), I = 1 + 2^-13, J = 1.
+    #   o[0] p1_f32      = 2^-95 * I              = 2^-95 + 2^-108  -> 0x10000400
+    #   o[1] p2_f32      = 2^-11 * 1 + p1         = 2^-11           -> 0x3C000000
+    #   o[4] p1ll high   = 2^-11 * I + 0          = 2^-11 + 2^-24   -> 0x3A000400
+    #   o[5] p2_f16 high = 1*1 + (2^-11 + 2^-24): the sum needs 25 bits, so it is NOT an f32.
+    #     It sits half an f32 ulp above 1 + 2^-11, which is the exact midpoint of the f16 1.0 and
+    #     1.0009765625. One rounding to f16 goes up (0x3C01); rounding to f32 first lands on the
+    #     midpoint, where ties-to-even goes down (0x3C00). The halves of the low channel are all
+    #     zero, so the low pair stays at 0.
+    DOUBLE_WORDS = [0x10000400, 0x3C000000, 0x00000000, 0xDEAD0000, 0x3A000400, 0xDEAD3C01, 0x00000000]
+
+    def run_check_double(self, words):
+        params = {(0, 0): (0x00000000, 0x10000000, 0x3C000000)}
+        kinds = {(0, 0): "f32"}
+        ij = [(ihp.f32w(1 + 2.0 ** -13), ihp.f32w(1.0))]
+        info = (params, kinds, ij, 4 * ihp.NOUT_PER)
+        tally, bad = {}, []
+        ihp.check_random(list(words), info, False, tally, bad)
+        return tally, bad
+
+    def test_double_rounding_case_all_match(self):
+        tally, bad = self.run_check_double(self.DOUBLE_WORDS)
+        self.assertEqual(bad, [])
+        self.assertEqual(len(tally), 9)
+        for name, counts in tally.items():
+            self.assertEqual(counts, [1, 0], name)
+
+    def test_a_p2_f16_that_rounded_through_f32_first_is_a_mismatch(self):
+        # 0x3C00 is what a model that rounds the fma to f32 and only then to f16 would ask for.
+        words = list(self.DOUBLE_WORDS)
+        words[5] = 0xDEAD3C00
+        tally, bad = self.run_check_double(words)
+        self.assertEqual(tally[("f32", "p2_f16 high = fma(h20, J, p1ll) in f16")], [0, 1])
+        self.assertEqual(tally[("f32", "p2_f16 high keeps vdst[31:16]")], [1, 0])
+        self.assertTrue(any("p2_f16 high = fma" in b for b in bad))
+
 
 class CliTest(unittest.TestCase):
     def run_tool(self, *argv):
