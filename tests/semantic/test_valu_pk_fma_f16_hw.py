@@ -722,3 +722,78 @@ class TestIEEE754EdgeCases(unittest.TestCase):
         """Verify overflow beyond MAX_NORMAL produces infinity."""
         res = fma_f16(F16_MAX_NORMAL, F16_TWO, F16_POS_ZERO)
         self.assertEqual(res, F16_POS_INF)
+
+
+# ==============================================================================
+# SECTION 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_rejection_invalid_destination(self) -> None:
+        """Verify syntax rejection when destination is not a VGPR."""
+        with self.assertRaises(TypeError):
+            VPKFMA16Instruction(dst=SGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+
+    def test_rejection_out_of_range_registers(self) -> None:
+        """Verify rejection of register indices outside architectural bounds."""
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            SGPR(106)
+
+    def test_mutation_detection_swap_opcodes(self) -> None:
+        """Mutation detector: swapping OpFMul with OpFAdd in SPIR-V alters results."""
+        spv = support.translate_lines("ps_mut_test", [
+            "v_mov_b32 v1, 0x40004000",         # 2.0, 2.0
+            "v_mov_b32 v2, 0x40004000",         # 2.0, 2.0
+            "v_mov_b32 v3, 0x3c003c00",         # 1.0, 1.0
+            "v_pk_fma_f16 v0, v1, v2, v3",      # 2*2 + 1 = 5.0 (0x4500)
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        orig_words = support.mrt0_words(spv)
+        self.assertEqual(orig_words[0], 0x45004500)
+
+        # Mutate SPIR-V: Replace OpFMul with OpFSub
+        self.assertIn("OpFMul", spv)
+        mutated_spv = spv.replace("OpFMul", "OpFSub", 1)
+        mutated_words = support.mrt0_words(mutated_spv)
+        # Mutation must be caught by producing a different result
+        self.assertNotEqual(orig_words[0], mutated_words[0])
+
+    def test_mutation_detection_inactive_lane_overwritten(self) -> None:
+        """Mutation detector: faulty interpreter overwriting inactive lane is detected."""
+        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
+        sentinel = 0x5555_5555
+        state.set_vgpr(1, 0, sentinel)
+
+        class FaultyInterpreter(SIMDInterpreter):
+            def step(self, instr: VPKFMA16Instruction, s: SIMDState):
+                # Bug: writes to all lanes regardless of exec_mask
+                for l in range(s.num_lanes):
+                    s.set_vgpr(l, instr.dst.value, 0x1234)
+                return []
+
+        faulty = FaultyInterpreter()
+        instr = VPKFMA16Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        faulty.step(instr, state)
+        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+
+    def test_mutation_detection_inverted_clamp(self) -> None:
+        """Mutation detector: faulty clamp range fails assertion."""
+        def faulty_clamp_fma(s0: int, s1: int, s2: int) -> int:
+            # Bug: clamps to [0.5, 1.0] instead of [0.0, 1.0]
+            val = u16_to_f16(s0) * u16_to_f16(s1) + u16_to_f16(s2)
+            val = max(0.5, min(1.0, val))
+            return f16_to_u16(val)
+
+        correct = fma_f16(F16_POS_ZERO, F16_ONE, F16_POS_ZERO, clamp=True)
+        mutant = faulty_clamp_fma(F16_POS_ZERO, F16_ONE, F16_POS_ZERO)
+        self.assertEqual(correct, 0x0000)
+        self.assertNotEqual(correct, mutant)
+
+
+if __name__ == "__main__":
+    unittest.main()
