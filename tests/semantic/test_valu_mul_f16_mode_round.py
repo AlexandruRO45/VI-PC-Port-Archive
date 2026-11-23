@@ -11,6 +11,7 @@ Operands are picked so the two modes give different bits (hand-worked, checked b
   0x3e01 * 1.5 = 2305.5/1024 = 2 + 128.75 * 2^-9   -> RNE 0x4081, RTZ 0x4080 (and the same negated)
   65504 * 2.0 = 131008                              -> RNE +-inf (0x7c00 / 0xfc00), RTZ +-65504 (0x7bff / 0xfbff)
   2^-24 * 1.5 = 1.5 * 2^-24 (f16 subnormal)         -> RNE 0x0002, RTZ 0x0001 (and the same negated)
+  0.75 * 2^-24 (between 2^-25 and 2^-24)          -> RNE 0x0001, RTZ +-0; the 0.5 * 2^-24 tie is +-0 in both
   inf * 2.0 and 1.0 * 1.5 are the same in both modes.
 v_mul_f16_e32 writes the low half and keeps the high half of the destination (docs/design.md "16-bit results"),
 so each destination is seeded with 0xaaaa5555 and the expected word is 0xaaaa0000 | result.
@@ -41,6 +42,12 @@ CASES = [
     (0x8001, 0x3E00, 0x8002, 0x8001),
     (0x7C00, 0x4000, 0x7C00, 0x7C00),   # a true inf stays inf toward zero
     (0x3C00, 0x3E00, 0x3E00, 0x3E00),   # exact product: no rounding in either mode
+    # Underflow band (2^-25, 2^-24), where truncation gives zero but nearest-even the smallest subnormal (MoonYueya
+    # and CuteBooty on #4403): a narrowing that exits early on "truncates to zero" gets RNE wrong only here.
+    (0x0001, 0x3A00, 0x0001, 0x0000),   # 0.75 * 2^-24: RNE up to 2^-24, RTZ to +0
+    (0x8001, 0x3A00, 0x8001, 0x8000),   # the same negated: -2^-24 and -0
+    (0x0001, 0x3800, 0x0000, 0x0000),   # 0.5 * 2^-24 is a tie: even is zero in both modes
+    (0x8001, 0x3800, 0x8000, 0x8000),   # the same negated keeps its sign: -0
 ]
 
 
@@ -108,14 +115,14 @@ class OracleSelfTest(unittest.TestCase):
 
 class MulF16ModeRoundTests(unittest.TestCase):
     def test_default_mode_rounds_to_nearest_even(self):
-        for lo in (0, 4):
+        for lo in range(0, len(CASES), 4):
             quad = CASES[lo:lo + 4]
             with self.subTest(cases=lo):
                 got = run_quad([(a, b) for a, b, _, _ in quad])
                 self.assertEqual(got, [word(rne) for _, _, rne, _ in quad])
 
     def test_toward_zero_after_mode_write(self):
-        for lo in (0, 4):
+        for lo in range(0, len(CASES), 4):
             quad = CASES[lo:lo + 4]
             with self.subTest(cases=lo):
                 got = run_quad([(a, b) for a, b, _, _ in quad], prefix=[RTZ])
