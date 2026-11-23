@@ -571,3 +571,31 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         """Verify saturation limits on double float output."""
         got = oracle_div_fixup_f64(F64_FOUR, F64_TWO, F64_TWO, clamp=True)
         self.assertEqual(got, F64_ONE)
+
+
+# ==============================================================================
+# SECTION 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754EdgeCases(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeros_and_infinities(self) -> None:
+        """Verify division boundary signs: (+x)/(-0) = -Inf, (-x)/(+0) = -Inf."""
+        got1 = oracle_div_fixup_f64(F64_ONE, F64_NEG_ZERO, F64_TWO)
+        self.assertEqual(got1, F64_NEG_INF)
+
+        got2 = oracle_div_fixup_f64(F64_ONE, F64_POS_ZERO, 0xC0000000_00000000)
+        self.assertEqual(got2, F64_NEG_INF)
+
+    def test_nan_priority_num_over_denom(self) -> None:
+        """Verify NaN in numerator (S2) takes precedence over NaN in denominator (S1)."""
+        nan_s1 = 0x7FF80000_11111111
+        nan_s2 = 0x7FF80000_22222222
+        got = oracle_div_fixup_f64(F64_ONE, nan_s1, nan_s2)
+        self.assertEqual(got, nan_s2)
+
+    def test_indeterminate_inf_div_inf(self) -> None:
+        """Verify Inf / Inf returns -qNaN."""
+        got = oracle_div_fixup_f64(F64_ONE, F64_POS_INF, F64_POS_INF)
+        self.assertEqual(got, F64_NEG_QNAN)
