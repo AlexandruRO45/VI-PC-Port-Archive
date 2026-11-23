@@ -286,5 +286,19 @@ class VCubeScEdgeCasesTests(unittest.TestCase):
         # +X major ray: (5.0, 1.0, 2.5) -> sc = -z = -2.5
         self.assertEqual(oracle_cubesc_f32(5.0, 1.0, 2.5), -2.5)
 
+class VCubeScTranslatorTests(unittest.TestCase):
+    def test_cubesc_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 1.5",
+            "v_mov_b32 v1, 2.0",
+            "v_mov_b32 v2, 4.0",
+            "v_cubesc_f32 v3, v0, v1, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cubesc_exec", lines)
+        val = u32_to_f32(mrt0_words(spv)[0])
+        self.assertEqual(val, 1.5)
+
 if __name__ == "__main__":
     unittest.main()
