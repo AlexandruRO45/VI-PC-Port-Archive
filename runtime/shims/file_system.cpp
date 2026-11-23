@@ -1148,7 +1148,7 @@ namespace {
 
 // Where a copy writes: a host path as given; a GAME: path is checked against the title's view (an existing name
 // counts even when only the package has it) and then means its overlay copy.
-bool copy_destination(const std::filesystem::path& source, LPCWSTR to, bool fail_if_exists,
+bool copy_destination(LPCWSTR from, const std::filesystem::path& source, LPCWSTR to, bool fail_if_exists,
                       std::filesystem::path& out, DWORD& error) {
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(to, parts);
@@ -1161,6 +1161,19 @@ bool copy_destination(const std::filesystem::path& source, LPCWSTR to, bool fail
     const Roots r = roots();
     error = ERROR_PATH_NOT_FOUND;
     if (r.game.empty() || r.overlay.empty()) return false;
+    // read_target can return a package path that does not exist. A missing source wins
+    // over destination errors and must not materialize the destination's overlay parents.
+    if (::GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const DWORD source_error = GetLastError();
+        if (source_error == ERROR_FILE_NOT_FOUND || source_error == ERROR_PATH_NOT_FOUND) {
+            error = source_error;
+            std::vector<std::wstring> source_parts;
+            if (source_error == ERROR_PATH_NOT_FOUND && parse_console(from, source_parts) == Parsed::Console &&
+                !source_parts.empty() && is_folder(r, parent_of(source_parts)))
+                error = ERROR_FILE_NOT_FOUND;  // the parent may exist only in the overlay
+            return false;
+        }
+    }
     const View v = view(r, parts);
     error = ERROR_ACCESS_DENIED;
     if (v.kind == Kind::Directory) return false;
@@ -1202,7 +1215,7 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::
         return false;
     }
     source = t.path;
-    return copy_destination(source, to, fail_if_exists, destination, error);
+    return copy_destination(from, source, to, fail_if_exists, destination, error);
 }
 
 }  // namespace

@@ -637,11 +637,12 @@ void run_checks(const std::filesystem::path& root) {
     const auto copy_w = resolve<CopyFileWFn>("kernel32.dll", "CopyFileW");
     const auto copy_a = resolve<CopyFileAFn>("kernel32.dll", "CopyFileA");
     const auto copy_ex_w = resolve<CopyFileExWFn>("api-ms-win-core-file-l2-1-0.dll", "CopyFileExW");
+    const auto copy_ex_a = resolve<decltype(&::CopyFileExA)>("kernel32.dll", "CopyFileExA");
     const auto copy2 = resolve<CopyFile2Fn>("api-ms-win-core-file-l2-1-0.dll", "CopyFile2");
     const auto setattr_w = resolve<SetFileAttributesWFn>("api-ms-win-core-file-l1-1-0.dll", "SetFileAttributesW");
     const auto setattr_a = resolve<SetFileAttributesAFn>("kernel32.dll", "SetFileAttributesA");
     check(mkdir_w && mkdir_a && mkdir_ex_w && rmdir_w && rmdir_a && move_w && move_ex_w && move_a && copy_w &&
-              copy_a && copy_ex_w && copy2 && setattr_w && setattr_a,
+              copy_a && copy_ex_w && copy_ex_a && copy2 && setattr_w && setattr_a,
           "the folder, move, copy and attribute calls resolve through the registry");
 
     write_path(package / "misc" / "one.txt", "one");
@@ -763,6 +764,51 @@ void run_checks(const std::filesystem::path& root) {
         SetLastError(0);
         check(attributes_w(L"GAME:\\misc\\wt.txt") == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND,
               "and the old name is deleted");
+    }
+
+    // Windows opens the source before inspecting the destination. Compare the ordinary
+    // copy entry points even when the destination exists only in the package.
+    if (copy_w && copy_a && copy_ex_w && copy_ex_a && copy2) {
+        const auto folder = package / "copy-precedence";
+        std::filesystem::create_directories(folder / "directory");
+        write_path(folder / "existing", "original");
+        constexpr auto from_w = L"GAME:\\copy-precedence\\absent";
+        constexpr auto from_a = "GAME:\\copy-precedence\\absent";
+        for (const auto tail : {"existing", "directory", "missing-parent\\target", "new-file"}) {
+            const auto native_to = folder / tail;
+            const bool exists_flag = std::string(tail) == "existing";
+            const DWORD flags = exists_flag ? COPY_FILE_FAIL_IF_EXISTS : 0;
+            const auto native_from = folder / "absent";
+            check(!::CopyFileW(native_from.c_str(), native_to.c_str(), exists_flag) && GetLastError() == ERROR_FILE_NOT_FOUND,
+                  "native CopyFileW rejects a missing source");
+            const DWORD expected = ERROR_FILE_NOT_FOUND;
+            const std::string dest = std::string("GAME:\\copy-precedence\\") + tail;
+            const std::wstring wide(dest.begin(), dest.end());
+            check(!copy_w(from_w, wide.c_str(), exists_flag) && GetLastError() == expected,
+                  "CopyFileW reports the missing source before destination errors");
+            check(!copy_a(from_a, dest.c_str(), exists_flag) && GetLastError() == expected,
+                  "CopyFileA reports the missing source before destination errors");
+            check(!copy_ex_w(from_w, wide.c_str(), nullptr, nullptr, nullptr, flags) && GetLastError() == expected,
+                  "CopyFileExW reports the missing source before destination errors");
+            check(!copy_ex_a(from_a, dest.c_str(), nullptr, nullptr, nullptr, flags) && GetLastError() == expected,
+                  "CopyFileExA reports the missing source before destination errors");
+            COPYFILE2_EXTENDED_PARAMETERS params{};
+            params.dwSize = sizeof(params);
+            params.dwCopyFlags = flags;
+            for (bool fallback : {false, true}) {
+                rt::fs::force_copy_file2_fallback(fallback);
+                check(copy2(from_w, wide.c_str(), &params) == HRESULT_FROM_WIN32(expected),
+                      "CopyFile2 reports the missing source before destination errors");
+            }
+            rt::fs::force_copy_file2_fallback(false);
+        }
+        std::filesystem::create_directories(overlay / "only-overlay-parent");
+        check(!copy_w(L"GAME:\\only-overlay-parent\\absent", L"GAME:\\copy-precedence\\existing", TRUE) &&
+                  GetLastError() == ERROR_FILE_NOT_FOUND, "a missing leaf in an overlay-only folder reports FILE_NOT_FOUND");
+        check(!copy_w(L"GAME:\\missing-source-parent\\absent", L"GAME:\\copy-precedence\\existing", TRUE) &&
+                  GetLastError() == ERROR_PATH_NOT_FOUND, "a missing source folder reports PATH_NOT_FOUND");
+        check(!std::filesystem::exists(overlay / "copy-precedence") && read_path(folder / "existing") == "original",
+              "missing-source copies preserve the package and create no overlay parent");
     }
 
     // The host copy calls refuse read-only, hidden and system targets. MoveFileEx only refuses read-only.
