@@ -38,11 +38,27 @@ namespace {
 uint8_t* g_peb = nullptr;
 std::map<std::string, void*> g_exports;
 
-struct StaticTls {  // IMAGE_TLS_DIRECTORY64, resolved
-    const uint8_t* start = nullptr;
-    size_t raw_size = 0, zero_fill = 0;
+struct Module {  // a mapped PE: the image, or a DLL loaded from disk
+    uint8_t* base = nullptr;
+    uint8_t* entry = nullptr;
+    uint32_t size = 0;
+    std::string path;
+    const uint8_t* tls_start = nullptr;  // IMAGE_TLS_DIRECTORY64, resolved
+    size_t tls_raw = 0, tls_zero = 0;
+    int tls_index = -1;                  // the module TLS index, -1 without TLS
     std::vector<void(MSABI*)(void*, uint32_t, void*)> callbacks;
-} g_tls;
+    int32_t(MSABI* dll_main)(void*, uint32_t, void*) = nullptr;
+};
+constexpr int kMaxTlsModules = 16;
+std::mutex g_mod_lock;        // guards g_mods, g_tls_count and g_tebs
+std::vector<Module*> g_mods;  // load order; [0] is the image
+int g_tls_count = 0;
+
+uint8_t* tls_block(const Module& m) {
+    auto* b = static_cast<uint8_t*>(calloc(1, m.tls_raw + m.tls_zero + 16));
+    std::memcpy(b, m.tls_start, m.tls_raw);
+    return b;
+}
 
 template <typename T> T rd(const uint8_t* p) {
     T v;
@@ -96,15 +112,15 @@ std::string to_host_path(const char* p) {  // ponytail: no drive letters
     return s;
 }
 
-// Every TEB ever made, so the fault handler can tell whether gs still points at one without touching memory.
-// ponytail: fixed 1024 slots; threads past that fault-report with whatever gs they had.
+// Every TEB made (freed ones are cleared), so the fault handler can tell whether gs points at one without touching
+// memory, and a DLL loaded later can give each live thread its TLS block.
+// ponytail: fixed 1024 slots; threads past that get no late DLL TLS and fault-report with whatever gs they had.
 uint8_t* g_tebs[1024];
 std::atomic<int> g_teb_count{0};
 
 uint8_t* make_teb() {
     auto* teb = static_cast<uint8_t*>(aligned_alloc(0x1000, kTebSize));
     if (!teb) fail("out of memory");
-    if (int i = g_teb_count.fetch_add(1); i < 1024) g_tebs[i] = teb;
     std::memset(teb, 0, kTebSize);
     pthread_t self = pthread_self();
     auto* top = static_cast<uint8_t*>(pthread_get_stackaddr_np(self));
@@ -115,23 +131,40 @@ uint8_t* make_teb() {
     teb_at<uint64_t>(teb, kTebTid) = thread_id();
     teb_at<void*>(teb, kTebPeb) = g_peb;
     teb_at<uint64_t>(teb, kTebHostGs) = pthread_gsbase();
-    if (g_tls.start) {  // MSVC reads gs:[0x58][_tls_index]; the image has one module, so _tls_index is 0
-        auto** slots = static_cast<uint8_t**>(calloc(1, sizeof(void*)));
-        slots[0] = static_cast<uint8_t*>(calloc(1, g_tls.raw_size + g_tls.zero_fill + 16));
-        std::memcpy(slots[0], g_tls.start, g_tls.raw_size);
-        teb_at<uint8_t**>(teb, kTebTlsPointer) = slots;
+    auto** slots = static_cast<uint8_t**>(calloc(kMaxTlsModules, sizeof(void*)));  // MSVC reads gs:[0x58][_tls_index]
+    teb_at<uint8_t**>(teb, kTebTlsPointer) = slots;
+    {
+        std::lock_guard<std::mutex> lock(g_mod_lock);
+        for (auto* m : g_mods)
+            if (m->tls_index >= 0) slots[m->tls_index] = tls_block(*m);
+        if (int i = g_teb_count.fetch_add(1); i < 1024) g_tebs[i] = teb;
     }
     t_teb = teb;
     return teb;
 }
 
+// TLS callbacks and DllMain of every module, in load order (DLL_PROCESS_ATTACH, DLL_THREAD_ATTACH or _DETACH).
+void notify_module(const Module& m, uint32_t reason) {
+    for (auto cb : m.callbacks) call_guest(cb, static_cast<void*>(m.base), reason, static_cast<void*>(nullptr));
+    if (m.dll_main) call_guest(m.dll_main, static_cast<void*>(m.base), reason, static_cast<void*>(nullptr));
+}
 void attach_thread(uint8_t*, uint32_t reason) {
-    for (auto cb : g_tls.callbacks) call_guest(cb, static_cast<void*>(g_image), reason, static_cast<void*>(nullptr));
+    std::vector<Module*> mods;
+    {
+        std::lock_guard<std::mutex> lock(g_mod_lock);
+        mods = g_mods;
+    }
+    for (auto* m : mods) notify_module(*m, reason);
 }
 
 void free_teb(uint8_t* teb) {
+    {
+        std::lock_guard<std::mutex> lock(g_mod_lock);
+        for (int i = 0, n = std::min(g_teb_count.load(), 1024); i < n; ++i)
+            if (g_tebs[i] == teb) g_tebs[i] = nullptr;
+    }
     if (auto** slots = teb_at<uint8_t**>(teb, kTebTlsPointer)) {
-        free(slots[0]);
+        for (int i = 0; i < kMaxTlsModules; ++i) free(slots[i]);
         free(slots);
     }
     if (t_teb == teb) t_teb = nullptr;
@@ -216,6 +249,7 @@ void* thread_main(void* p) {
     obj->exit_code = call_guest(proc, arg);
     attach_thread(teb, 3 /* DLL_THREAD_DETACH */);
     free_teb(teb);
+    obj->finished = true;
     return nullptr;
 }
 }  // namespace
@@ -230,6 +264,7 @@ void* thread_main(void* p) {
     uint8_t* teb = t_teb;
     attach_thread(teb, 3 /* DLL_THREAD_DETACH */);
     free_teb(teb);
+    t_self->finished = true;
     pthread_exit(nullptr);
 }
 namespace {
@@ -277,7 +312,7 @@ void close_object(Object* o) {
 // ---- PE loading ----------------------------------------------------------------------------------------------
 namespace {
 
-uint8_t* load_pe(const char* path) {
+Module* load_pe(const char* path, bool dll) {
     std::ifstream f(path, std::ios::binary);
     std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), {});
     if (file.size() < 0x40 || file[0] != 'M' || file[1] != 'Z') fail("not a PE file (no MZ header)");
@@ -343,16 +378,25 @@ uint8_t* load_pe(const char* path) {
         fail(std::to_string(missing.size()) + " unresolved imports");
     }
 
+    auto* mod = new Module;
+    mod->base = image;
+    mod->entry = entry_rva ? image + entry_rva : nullptr;
+    mod->size = image_size;
+    mod->path = path;
+    if (dll && entry_rva) mod->dll_main = reinterpret_cast<int32_t(MSABI*)(void*, uint32_t, void*)>(image + entry_rva);
     if (auto [rva, size] = dir(9); size) {
         const uint8_t* t = image + rva;
         uint64_t start = rd<uint64_t>(t), end = rd<uint64_t>(t + 8), index = rd<uint64_t>(t + 16),
                  callbacks = rd<uint64_t>(t + 24);
-        g_tls.start = reinterpret_cast<const uint8_t*>(start);
-        g_tls.raw_size = end - start;
-        g_tls.zero_fill = rd<uint32_t>(t + 32);
-        if (index) *reinterpret_cast<uint32_t*>(index) = 0;
+        mod->tls_start = reinterpret_cast<const uint8_t*>(start);
+        mod->tls_raw = end - start;
+        mod->tls_zero = rd<uint32_t>(t + 32);
         for (auto* cb = reinterpret_cast<uint64_t*>(callbacks); cb && *cb; ++cb)
-            g_tls.callbacks.push_back(reinterpret_cast<void(MSABI*)(void*, uint32_t, void*)>(*cb));
+            mod->callbacks.push_back(reinterpret_cast<void(MSABI*)(void*, uint32_t, void*)>(*cb));
+        std::lock_guard<std::mutex> lock(g_mod_lock);
+        if (g_tls_count == kMaxTlsModules) fail("too many modules with TLS");
+        mod->tls_index = g_tls_count++;
+        if (index) *reinterpret_cast<uint32_t*>(index) = static_cast<uint32_t>(mod->tls_index);
     }
 
     sec = opt + optsz;
@@ -365,11 +409,73 @@ uint8_t* load_pe(const char* path) {
     }
     std::fprintf(stderr, "host: mapped %s at %p (preferred %#llx)\n", path, static_cast<void*>(image),
                  static_cast<unsigned long long>(base));
-    g_image = image;
-    return image + entry_rva;
+    std::lock_guard<std::mutex> lock(g_mod_lock);
+    if (mod->tls_index >= 0)  // threads that already exist get this module's TLS block too
+        for (int i = 0, n = std::min(g_teb_count.load(), 1024); i < n; ++i)
+            if (g_tebs[i]) teb_at<uint8_t**>(g_tebs[i], kTebTlsPointer)[mod->tls_index] = tls_block(*mod);
+    g_mods.push_back(mod);
+    return mod;
 }
 
 }  // namespace
+
+// ---- DLLs loaded from disk ------------------------------------------------------------------------------------
+void* load_module(const std::string& host_path) {
+    char real[PATH_MAX];
+    if (!realpath(host_path.c_str(), real)) return nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mod_lock);
+        for (auto* m : g_mods)
+            if (m->path == real) return m->base;
+    }
+    Module* m = load_pe(real, true);
+    notify_module(*m, 1 /* DLL_PROCESS_ATTACH */);
+    return m->base;
+}
+
+const Module* module_at(const void* p) {  // the module whose image holds p
+    auto a = reinterpret_cast<const uint8_t*>(p);
+    std::lock_guard<std::mutex> lock(g_mod_lock);
+    for (auto* m : g_mods)
+        if (a >= m->base && a < m->base + m->size) return m;
+    return nullptr;
+}
+bool is_module(void* h) {
+    const Module* m = module_at(h);
+    return m && m->base == h;
+}
+void* module_containing(const void* p) {
+    const Module* m = module_at(p);
+    return m ? m->base : nullptr;
+}
+void* find_module(const std::string& name) {  // by file name, case-insensitive
+    std::lock_guard<std::mutex> lock(g_mod_lock);
+    for (auto* m : g_mods) {
+        std::string file = m->path.substr(m->path.find_last_of('/') + 1);
+        if (strcasecmp(file.c_str(), name.c_str()) == 0) return m->base;
+    }
+    return nullptr;
+}
+void* module_export(void* h, const char* name) {  // by name, or by ordinal when name < 0x10000
+    auto* base = static_cast<uint8_t*>(h);
+    const uint8_t* opt = base + rd<uint32_t>(base + 0x3C) + 24;
+    uint32_t rva = rd<uint32_t>(opt + 112), size = rd<uint32_t>(opt + 116);
+    if (!size) return nullptr;
+    const uint8_t* ed = base + rva;
+    uint32_t ordinal_base = rd<uint32_t>(ed + 16), nfuncs = rd<uint32_t>(ed + 20), nnames = rd<uint32_t>(ed + 24);
+    auto* funcs = reinterpret_cast<const uint32_t*>(base + rd<uint32_t>(ed + 28));
+    auto* names = reinterpret_cast<const uint32_t*>(base + rd<uint32_t>(ed + 32));
+    auto* ords = reinterpret_cast<const uint16_t*>(base + rd<uint32_t>(ed + 36));
+    uint32_t index = UINT32_MAX;
+    if (reinterpret_cast<uintptr_t>(name) < 0x10000) index = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(name)) - ordinal_base;
+    else
+        for (uint32_t i = 0; i < nnames; ++i)
+            if (std::strcmp(reinterpret_cast<const char*>(base + names[i]), name) == 0) index = ords[i];
+    if (index >= nfuncs || !funcs[index]) return nullptr;
+    if (funcs[index] >= rva && funcs[index] < rva + size) return nullptr;  // ponytail: forwarders are not followed
+    return base + funcs[index];
+}
+
 }  // namespace host
 
 int main(int argc, char** argv) {
@@ -388,7 +494,7 @@ int main(int argc, char** argv) {
             execv(self, argv);  // falls through on failure: the guest still runs, without AVX in CPUID
         }
     }
-    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports, &kernel32_file_exports, &d3d12_serialize_exports, &seh_exports})
+    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports, &kernel32_file_exports, &d3d12_serialize_exports, &seh_exports, &kernel32_loader_exports})
         for (auto& [name, fn] : (*list)()) g_exports[name] = fn;
 
     char real[PATH_MAX];
@@ -407,7 +513,9 @@ int main(int argc, char** argv) {
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) sigaction(sig, &sa, nullptr);
     g_peb = static_cast<uint8_t*>(calloc(1, 0x1000));
-    auto entry = reinterpret_cast<void(MSABI*)()>(load_pe(real));
+    Module* exe = load_pe(real, false);
+    g_image = exe->base;
+    auto entry = reinterpret_cast<void(MSABI*)()>(exe->entry);
     std::memcpy(g_peb + 0x10, &g_image, sizeof g_image);  // PEB.ImageBaseAddress
     uint8_t* teb = make_teb();
     attach_thread(teb, 1 /* DLL_PROCESS_ATTACH */);

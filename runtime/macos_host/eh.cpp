@@ -5,7 +5,9 @@
 // std::current_exception, no epilog detection (frames are only ever unwound from call sites).
 #include "host.h"
 
+#include <algorithm>
 #include <cstring>
+#include <mutex>
 
 namespace host {
 
@@ -53,13 +55,43 @@ template <typename T> T rd(uint64_t addr) {
 
 }  // namespace
 
+namespace {
+struct DynamicTable { const RuntimeFunction* table; uint32_t count; uint64_t base, end; };
+std::mutex g_tables_lock;
+std::vector<DynamicTable> g_tables;  // RtlAddFunctionTable, for code a guest loader mapped itself
+
+bool find_table(uint64_t rip, uint64_t& base, const RuntimeFunction*& table, uint32_t& count) {
+    if (void* m = module_containing(reinterpret_cast<void*>(rip))) {
+        base = reinterpret_cast<uint64_t>(m);
+        uint64_t nt = base + rd<uint32_t>(base + 0x3C);
+        table = reinterpret_cast<const RuntimeFunction*>(base + rd<uint32_t>(nt + 24 + 136));  // data directory 3
+        count = rd<uint32_t>(nt + 24 + 140) / sizeof(RuntimeFunction);
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(g_tables_lock);
+    for (const auto& t : g_tables)
+        if (rip >= t.base && rip < t.end) {
+            base = t.base, table = t.table, count = t.count;
+            return true;
+        }
+    return false;
+}
+}  // namespace
+
+uint64_t code_base(uint64_t rip) {
+    uint64_t base = 0;
+    const RuntimeFunction* table;
+    uint32_t count;
+    return find_table(rip, base, table, count) ? base : 0;
+}
+
 const RuntimeFunction* lookup_function(uint64_t rip) {
-    const uint8_t* nt = g_image + rd<uint32_t>(reinterpret_cast<uint64_t>(g_image) + 0x3C);
-    uint32_t rva = rd<uint32_t>(reinterpret_cast<uint64_t>(nt) + 24 + 136);  // PE32+ data directory 3
-    uint32_t size = rd<uint32_t>(reinterpret_cast<uint64_t>(nt) + 24 + 140);
-    auto* table = reinterpret_cast<const RuntimeFunction*>(g_image + rva);
-    uint32_t off = static_cast<uint32_t>(rip - reinterpret_cast<uint64_t>(g_image));
-    size_t lo = 0, hi = size / sizeof(RuntimeFunction);
+    uint64_t base;
+    const RuntimeFunction* table;
+    uint32_t count;
+    if (!find_table(rip, base, table, count)) return nullptr;
+    uint32_t off = static_cast<uint32_t>(rip - base);
+    size_t lo = 0, hi = count;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
         if (off < table[mid].begin) hi = mid;
@@ -69,12 +101,29 @@ const RuntimeFunction* lookup_function(uint64_t rip) {
     return nullptr;
 }
 
+uint8_t RtlAddFunctionTable(const RuntimeFunction* table, uint32_t count, uint64_t base) {
+    uint64_t end = base;
+    for (uint32_t i = 0; i < count; ++i) end = std::max(end, base + table[i].end);
+    if (rd<uint16_t>(base) == 0x5A4D) {  // a whole PE image: data too, so RtlPcToFileHeader finds its RTTI
+        uint64_t nt = base + rd<uint32_t>(base + 0x3C);
+        if (rd<uint32_t>(nt) == 0x4550) end = std::max(end, base + rd<uint32_t>(nt + 24 + 56));
+    }
+    std::lock_guard<std::mutex> lock(g_tables_lock);
+    g_tables.push_back({table, count, base, end});
+    return 1;
+}
+uint8_t RtlDeleteFunctionTable(const RuntimeFunction* table) {
+    std::lock_guard<std::mutex> lock(g_tables_lock);
+    auto it = std::find_if(g_tables.begin(), g_tables.end(), [&](const DynamicTable& t) { return t.table == table; });
+    if (it == g_tables.end()) return 0;
+    g_tables.erase(it);
+    return 1;
+}
 
 namespace {
 // RtlVirtualUnwind for a frame stopped at a call site: the registers become the caller's state.
-void apply_codes(uint64_t* gpr, uint8_t* xmm, const RuntimeFunction* rf, uint64_t rip_offset, uint64_t& frame,
-                 Unwound* out) {
-    uint64_t base = reinterpret_cast<uint64_t>(g_image);
+void apply_codes(uint64_t base, uint64_t* gpr, uint8_t* xmm, const RuntimeFunction* rf, uint64_t rip_offset,
+                 uint64_t& frame, Unwound* out) {
     uint64_t ui = base + rf->unwind;
     uint8_t flags = rd<uint8_t>(ui) >> 3, count = rd<uint8_t>(ui + 2), fr = rd<uint8_t>(ui + 3);
     uint8_t frame_reg = fr & 0xF, frame_off = fr >> 4;
@@ -104,7 +153,7 @@ void apply_codes(uint64_t* gpr, uint8_t* xmm, const RuntimeFunction* rf, uint64_
     }
     uint64_t tail = ui + 4 + 2 * ((count + 1) & ~1);
     if (flags & 4) {  // CHAININFO: the parent's codes, all executed
-        apply_codes(gpr, xmm, reinterpret_cast<const RuntimeFunction*>(tail), ~0ull, frame, nullptr);
+        apply_codes(base, gpr, xmm, reinterpret_cast<const RuntimeFunction*>(tail), ~0ull, frame, nullptr);
     } else if (out && (flags & 3)) {
         out->flags = flags & 3;
         out->handler = base + rd<uint32_t>(tail);
@@ -120,7 +169,7 @@ Unwound unwind_frame(uint64_t* gpr, uint8_t* xmm) {
     const RuntimeFunction* rf = lookup_function(rip);
     if (rf) {
         uint64_t frame = 0;
-        apply_codes(gpr, xmm, rf, rip - reinterpret_cast<uint64_t>(g_image) - rf->begin, frame, &u);
+        apply_codes(code_base(rip), gpr, xmm, rf, rip - code_base(rip) - rf->begin, frame, &u);
     } else {
         u.establisher = gpr[4];  // leaf function
     }
@@ -243,6 +292,8 @@ Exports eh_exports() {
         {"vcruntime140.dll!_CxxThrowException", reinterpret_cast<void*>(&host_cxx_throw_entry)},
         {"vcruntime140.dll!__CxxFrameHandler3", kFrameHandler3},
         {"vcruntime140.dll!__C_specific_handler", kSpecificHandler},
+        EXPORT("kernel32.dll", RtlAddFunctionTable),
+        EXPORT("kernel32.dll", RtlDeleteFunctionTable),
     };
 }
 

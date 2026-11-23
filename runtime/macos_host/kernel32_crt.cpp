@@ -88,11 +88,19 @@ template <typename C> int32_t copy_out(const std::basic_string<C>& s, bool with_
 // ---- modules: the image, plus one handle per DLL the host exports from ----------------------------------------
 std::mutex g_modules_lock;
 std::map<std::string, std::string> g_modules;  // lowercase name -> itself; the handle is the value's address
+HANDLE load_from_disk(const std::string& name) {  // a real PE DLL: as given, then next to the image
+    if (HANDLE h = load_module(to_host_path(name.c_str()))) return h;
+    std::string file = name.substr(name.find_last_of("\\/") + 1);
+    return load_module(g_exe_path.substr(0, g_exe_path.find_last_of('/') + 1) + file);
+}
 HANDLE load_library(std::string name) {
+    if (HANDLE h = find_module(name.substr(name.find_last_of("\\/") + 1))) return h;
+    std::string original = name;
     for (auto& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (auto slash = name.find_last_of("\\/"); slash != std::string::npos) name.erase(0, slash + 1);
     if (name.find('.') == std::string::npos) name += ".dll";
     if (!has_dll(name)) {
+        if (HANDLE h = load_from_disk(original)) return h;
         set_last_error(126 /* ERROR_MOD_NOT_FOUND */);
         return nullptr;
     }
@@ -100,26 +108,31 @@ HANDLE load_library(std::string name) {
     return &g_modules.try_emplace(name, name).first->second;
 }
 HANDLE LoadLibraryA(const char* name) { return load_library(name); }
+HANDLE LoadLibraryW(const char16_t* name) { return load_library(narrow(name)); }
 HANDLE LoadLibraryExA(const char* name, HANDLE, uint32_t) { return load_library(name); }
 HANDLE LoadLibraryExW(const char16_t* name, HANDLE, uint32_t) { return load_library(narrow(name)); }
 int FreeLibrary(HANDLE) { return 1; }
 HANDLE GetModuleHandleW(const char16_t* name) {
     if (!name) return g_image;
     std::string n = narrow(name);
+    if (HANDLE h = find_module(n.substr(n.find_last_of("\\/") + 1))) return h;
     std::string probe = n;  // a module counts as loaded when the host exports from it
     for (auto& c : probe) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (probe.find('.') == std::string::npos) probe += ".dll";
     return has_dll(probe) ? load_library(n) : (set_last_error(126), nullptr);
 }
+HANDLE GetModuleHandleA(const char* name) { return GetModuleHandleW(name ? widen(name).c_str() : nullptr); }
 void* GetProcAddress(HANDLE module, const char* name) {
     void* fn = nullptr;
-    if (module && module != g_image && reinterpret_cast<uintptr_t>(name) >= 0x10000)
+    if (is_module(module)) fn = module_export(module, name);
+    else if (module && reinterpret_cast<uintptr_t>(name) >= 0x10000)
         fn = find_export(*static_cast<std::string*>(module) + "!" + name);
     if (!fn) set_last_error(127 /* ERROR_PROC_NOT_FOUND */);
     return fn;
 }
 int GetModuleHandleExW(uint32_t flags, const char16_t* name, HANDLE* out) {
-    if (!name || (flags & 4 /* FROM_ADDRESS */)) *out = g_image;  // ponytail: every address is in the image
+    if (flags & 4 /* FROM_ADDRESS */) *out = module_containing(name) ? module_containing(name) : g_image;
+    else if (!name) *out = g_image;
     else *out = load_library(narrow(name));
     return *out != nullptr;
 }
@@ -137,10 +150,7 @@ uint32_t GetModuleFileNameA(HANDLE, char* buf, uint32_t n) {
     return len;
 }
 HANDLE RtlPcToFileHeader(uint64_t pc, HANDLE* base) {
-    const uint8_t* nt = g_image + *reinterpret_cast<const uint32_t*>(g_image + 0x3C);
-    uint32_t size = *reinterpret_cast<const uint32_t*>(nt + 24 + 56);  // OptionalHeader.SizeOfImage
-    bool in = pc >= reinterpret_cast<uint64_t>(g_image) && pc < reinterpret_cast<uint64_t>(g_image) + size;
-    *base = in ? g_image : nullptr;
+    *base = reinterpret_cast<HANDLE>(code_base(pc));
     return *base;
 }
 
@@ -363,10 +373,37 @@ int ResetEvent(HANDLE h) {
     s->count = 0;
     return 1;
 }
+// ponytail: polls every millisecond; a wait list per Signal if a game waits on many handles for long
+bool try_take(Object* o, bool take) {
+    if (o->kind == Object::Thread) return o->finished;
+    if (!o->signal) return false;
+    std::lock_guard<std::mutex> g(o->signal->m);
+    if (o->signal->count <= 0) return false;
+    if (take && !o->signal->manual) --o->signal->count;
+    return true;
+}
+uint32_t WaitForMultipleObjects(uint32_t n, HANDLE* hs, int32_t all, uint32_t ms) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    for (;;) {
+        if (all) {
+            bool ready = true;
+            for (uint32_t i = 0; i < n && ready; ++i) ready = try_take(static_cast<Object*>(hs[i]), false);
+            if (ready) {  // ponytail: not atomic across the handles
+                for (uint32_t i = 0; i < n; ++i) try_take(static_cast<Object*>(hs[i]), true);
+                return 0;
+            }
+        } else {
+            for (uint32_t i = 0; i < n; ++i)
+                if (try_take(static_cast<Object*>(hs[i]), true)) return i;  // WAIT_OBJECT_0 + i
+        }
+        if (ms != 0xFFFFFFFFu && std::chrono::steady_clock::now() >= deadline) return 0x102;  // WAIT_TIMEOUT
+        usleep(1000);
+    }
+}
 uint32_t WaitForSingleObjectEx(HANDLE h, uint32_t ms, int32_t) {
     auto* o = static_cast<Object*>(h);
-    if (o->kind == Object::Thread) {  // ponytail: a thread is waited for without a timeout
-        if (ms != 0xFFFFFFFFu) fail("WaitForSingleObject: thread waits need INFINITE");
+    if (o->kind == Object::Thread) {
+        if (ms != 0xFFFFFFFFu) return WaitForMultipleObjects(1, &h, 0, ms);
         wait_thread(o);
         return 0;
     }
@@ -641,7 +678,7 @@ void* DecodePointer(void* p) { return p; }
 #define K(name) EXPORT("kernel32.dll", name)
 Exports kernel32_crt_exports() {
     return {
-        K(LoadLibraryA), K(LoadLibraryExA), K(LoadLibraryExW), K(FreeLibrary), K(GetModuleHandleW), K(GetProcAddress),
+        K(LoadLibraryA), K(LoadLibraryW), K(LoadLibraryExA), K(LoadLibraryExW), K(FreeLibrary), K(GetModuleHandleW), K(GetModuleHandleA), K(GetProcAddress),
         K(GetModuleHandleExW), K(GetModuleFileNameW), K(GetModuleFileNameA), K(RtlPcToFileHeader),
         K(AcquireSRWLockExclusive), K(AcquireSRWLockShared), K(TryAcquireSRWLockExclusive),
         K(TryAcquireSRWLockShared), K(ReleaseSRWLockExclusive), K(ReleaseSRWLockShared),
@@ -659,7 +696,7 @@ Exports kernel32_crt_exports() {
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
         K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
         K(SetEvent), K(ResetEvent), K(AreFileApisANSI), K(FormatMessageA), K(LocalFree), K(GetTempPathW),
-        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(ExitThread), K(FreeLibraryAndExitThread),
+        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
         K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),
     };
 }

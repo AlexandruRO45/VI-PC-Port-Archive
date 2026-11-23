@@ -3,6 +3,7 @@
 #pragma once
 #include <pthread.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -42,6 +43,11 @@ std::string narrow(const char16_t* s, int64_t n = -1);  // UTF-16 -> UTF-8
 std::u16string widen(const char* s, int64_t n = -1);    // UTF-8 -> UTF-16
 void* find_export(const std::string& key);  // "dll!name" (dll lowercase) -> entry, or nullptr
 bool has_dll(const std::string& dll);       // the host exports something from this (lowercase) DLL
+void* load_module(const std::string& host_path);  // a PE DLL from disk, mapped once and attached; nullptr if absent
+bool is_module(void* h);                            // h is the base of the image or of a DLL from disk
+void* module_containing(const void* p);            // the image or DLL that holds p, or nullptr
+void* find_module(const std::string& file_name);   // a loaded image or DLL by file name, case-insensitive
+void* module_export(void* h, const char* name);    // its export by name, or by ordinal below 0x10000
 
 // Run guest code with gs on the thread's TEB, from host code.
 template <typename R, typename... A, typename... B> R call_guest(R(MSABI* fn)(A...), B... args) {
@@ -85,6 +91,7 @@ struct Object {
     uint32_t exit_code = 0;
     bool joined = false;
     Signal* signal = nullptr;
+    std::atomic<bool> finished{false};  // a thread that has returned or called ExitThread
     int refs = 1;  // DuplicateHandle hands out the same object; the last CloseHandle frees it
 };
 void free_signal(Signal* s);
@@ -104,6 +111,7 @@ struct Unwound {
     uint64_t handler_data = 0;  // what follows the handler RVA in UNWIND_INFO
     uint8_t flags = 0;          // UNW_FLAG_EHANDLER 1, UNW_FLAG_UHANDLER 2
 };
+uint64_t code_base(uint64_t rip);                     // image base of the module or function table holding rip, or 0
 const RuntimeFunction* lookup_function(uint64_t rip);  // nullptr outside the image or in a leaf
 Unwound unwind_frame(uint64_t* gpr, uint8_t* xmm);    // the registers become the caller's
 
@@ -117,6 +125,7 @@ Exports kernel32_crt_exports();
 Exports kernel32_file_exports();
 Exports d3d12_serialize_exports();
 Exports seh_exports();
+Exports kernel32_loader_exports();
 
 }  // namespace host
 

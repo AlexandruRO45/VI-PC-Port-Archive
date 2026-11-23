@@ -42,17 +42,12 @@ using LanguageHandler = int32_t(MSABI*)(ExceptionRecord*, uint64_t, Context*, Di
 
 thread_local Context t_raise;  // the registers at the last RaiseException, where RtlUnwindEx starts
 
-bool in_image(uint64_t pc) {
-    uint64_t lo = reinterpret_cast<uint64_t>(g_image);
-    uint32_t size;
-    std::memcpy(&size, g_image + *reinterpret_cast<const uint32_t*>(g_image + 0x3C) + 24 + 56, 4);  // SizeOfImage
-    return pc >= lo && pc < lo + size;
-}
+bool in_image(uint64_t pc) { return code_base(pc) != 0; }
 
 DispatcherContext dispatcher(uint64_t pc, const Unwound& u, Context* frame, uint64_t target_ip) {
     DispatcherContext dc{};
     dc.control_pc = pc;
-    dc.image_base = reinterpret_cast<uint64_t>(g_image);
+    dc.image_base = code_base(pc);
     dc.function_entry = lookup_function(pc);
     dc.establisher = u.establisher;
     dc.target_ip = target_ip;
@@ -141,7 +136,7 @@ namespace {
         uint64_t pc = rip(frame);
         if (!in_image(pc)) {
             char what[64];
-            std::snprintf(what, sizeof what, "unhandled exception 0x%08x", rec.code);
+            std::snprintf(what, sizeof what, "unhandled exception 0x%08x at pc %llx", rec.code, (unsigned long long)pc);
             if (rec.code == 0xE06D7363 && rec.n >= 3 && rec.info[1]) {  // MSVC C++: std::exception::what at +8
                 const char* msg = *reinterpret_cast<const char* const*>(rec.info[1] + 8);
                 fail(std::string(what) + ": " + (msg ? msg : "?"));
@@ -195,7 +190,7 @@ namespace {
 
 const void* RtlLookupFunctionEntry(uint64_t pc, uint64_t* image_base, void*) {
     if (!in_image(pc)) return nullptr;
-    *image_base = reinterpret_cast<uint64_t>(g_image);
+    *image_base = code_base(pc);
     return lookup_function(pc);
 }
 
