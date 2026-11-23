@@ -463,9 +463,8 @@ int main() {
     for (const VkShaderModule module : {input_module, capture_module, draw_vs_module, ps_module})
         destroy_module(d.device, module, nullptr);
     d.fn<PFN_vkDestroyImageView>("vkDestroyImageView")(d.device, rt_view, nullptr);
-    d.fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(d.device, heap, nullptr);
-    d.fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(d.device, readback, nullptr);
-    d.fn<PFN_vkDestroyImage>("vkDestroyImage")(d.device, rt, nullptr);
+    // rt, heap and readback stay alive here: d.image()/d.buffer() registered them, and ~Device destroys
+    // every registered object once. Destroying them here too left dangling handles for that loop.
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
