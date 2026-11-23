@@ -71,15 +71,50 @@ function Remove-DirectoryRobust([string]$path) {
 }
 
 if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
+    $tag = "llvmorg-$Version"
+    $repo = "https://github.com/llvm/llvm-project"
+    # Resolve the tag to its peeled commit before fetching: Git 2.56 fails `git clone --depth 1 --branch <tag>
+    # --filter=blob:none` on an annotated tag ("refs/tags/... is not a commit!"). Prefer the peeled entry
+    # (refs/tags/<tag>^{}) for annotated tags and fall back to refs/tags/<tag> for lightweight tags.
+    $lsOut = @(& git ls-remote --tags $repo "refs/tags/$tag" "refs/tags/$tag^{}")
+    if ($LASTEXITCODE -ne 0) { throw "git ls-remote of $tag failed." }
+    $escapedTag = [regex]::Escape($tag)
+    $commit = $null
+    foreach ($line in $lsOut) {
+        if ($line -match "^([0-9a-f]{40,64})\s+refs/tags/$escapedTag\^\{\}$") {
+            $commit = $Matches[1]
+            break
+        }
+    }
+    if (-not $commit) {
+        foreach ($line in $lsOut) {
+            if ($line -match "^([0-9a-f]{40,64})\s+refs/tags/$escapedTag$") {
+                $commit = $Matches[1]
+                break
+            }
+        }
+    }
+    if (-not $commit) { throw "Release tag $tag was not found in $repo." }
+
     if (Test-Path -LiteralPath $src) { Remove-DirectoryRobust $src }
-    New-Item -ItemType Directory -Force $Temp | Out-Null
+    New-Item -ItemType Directory -Force $src | Out-Null
+    & git -C $src init --quiet
+    if ($LASTEXITCODE -ne 0) { throw "git init failed." }
+    & git -C $src remote add origin $repo
+    if ($LASTEXITCODE -ne 0) { throw "git remote add failed." }
     # core.longpaths: some llvm/docs paths are about 150 characters, so with a -Temp of about 100 characters the
     # sparse checkout fails with "Filename too long" (Windows' 260-character limit). Set in the clone's config only.
-    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse --config core.longpaths=true https://github.com/llvm/llvm-project $src
-    if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
+    & git -C $src config core.longpaths true
+    if ($LASTEXITCODE -ne 0) { throw "git config core.longpaths failed." }
     # libc: LLVM 23 configures only with its shared headers (llvm/CMakeLists.txt, "LLVM libc is not found").
     & git -C $src sparse-checkout set llvm cmake third-party libc
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
+    & git -C $src fetch --quiet --depth 1 --no-tags --filter=blob:none origin $commit
+    if ($LASTEXITCODE -ne 0) { throw "git fetch of $tag ($commit) failed." }
+    & git -C $src tag -f $tag FETCH_HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git tag $tag failed." }
+    & git -C $src checkout --quiet --detach FETCH_HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git checkout of $tag failed." }
 }
 # A source kept by a failed LLVM 23 build of an older version of this script has no libc yet.
 if ((Test-Path (Join-Path $src ".git\info\sparse-checkout")) -and -not (Test-Path (Join-Path $src "libc"))) {
