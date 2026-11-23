@@ -136,7 +136,7 @@ def load_cache(path: str) -> dict[str, dict]:
             doc = json.load(f)
         if doc["version"] == CACHE_VERSION:
             return {k: e for k, e in doc["files"].items() if isinstance(e, dict) and "stamp" in e and "sha256" in e}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
         pass
     return {}
 
@@ -215,7 +215,7 @@ def load_manifest(path: str) -> dict[str, dict]:
     try:
         with open(path, encoding="utf-8") as f:
             doc = json.load(f, object_pairs_hook=unique_object)
-    except ValueError as err:
+    except (ValueError, RecursionError) as err:
         raise ManifestError(f"{path} is not valid JSON ({err})") from None
     except OSError as err:
         raise ManifestError(f"cannot read manifest {path}: {err}") from None

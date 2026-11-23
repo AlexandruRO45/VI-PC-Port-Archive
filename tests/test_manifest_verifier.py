@@ -355,6 +355,16 @@ class TestManifestVerifier(unittest.TestCase):
         with self.assertRaises(mv.ManifestError):
             mv.load_manifest(bad_json)
 
+    def test_cli_rejects_excessive_manifest_nesting(self) -> None:
+        with (
+            patch.object(mv.json, "load", side_effect=RecursionError("JSON nesting limit")),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            rc = mv.main([self.game_dir, "--manifest", self.manifest_path, "--quiet"])
+        self.assertEqual(rc, 2)
+        self.assertIn("is not valid JSON", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_load_manifest_missing_file(self) -> None:
         missing_path = os.path.join(self.root, "non_existent.json")
         with self.assertRaises(mv.ManifestError):
@@ -953,6 +963,20 @@ class TestVerifyCache(unittest.TestCase):
                     f.write(text)
                 report = self.verify()
                 self.assertEqual((report.passed, report.cached), (True, 0))
+
+    def test_excessive_cache_nesting_is_a_cache_miss(self) -> None:
+        self.assertTrue(self.verify().passed)
+        load = mv.json.load
+
+        def load_with_bad_cache(source, **kwargs):
+            if source.name == self.cache:
+                raise RecursionError("JSON nesting limit")
+            return load(source, **kwargs)
+
+        with patch.object(mv.json, "load", side_effect=load_with_bad_cache):
+            report = self.verify()
+        self.assertEqual((report.passed, report.cached), (True, 0))
+        self.assertEqual(report.matched, ["a.bin", "b.bin"])
 
     def test_cache_inside_target_and_strict(self) -> None:
         self.cache = os.path.join(self.game, "cache.json")
