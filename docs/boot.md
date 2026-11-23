@@ -8,6 +8,10 @@ separately maps it and leaves 30 imports unimplemented, and `--init` runs its TL
 trace tool for the first boot. The executable's `ws2_32.dll` imports bind to the host's, so run `--run` with the
 network off. Nothing here quotes game data; a real trace stays on the player's machine.
 
+One earlier shim gap is closed: `GetModuleFileName` was host-bound, so a mapped image asking for its own path got
+`gta6rt.exe`'s; the bundled-module ops now expose the main image and each module's load path, and
+`GetModuleHandle(nullptr)`/`GetModuleFileNameA/W`/`GetModuleHandleExA/W` answer for mapped images first.
+
 ## 1. What the first boot produces
 
 `gta6rt` has three passes over the executable (`runtime/README.md`, "Dry run" and "Current limits"):
