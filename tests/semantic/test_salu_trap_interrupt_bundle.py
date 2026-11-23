@@ -531,5 +531,28 @@ class TestSTrapSyntax(unittest.TestCase):
         self.assertEqual(str(cm.exception), "s_trap")
 
 
+class TestSTrapMutation(unittest.TestCase):
+    def test_trap_cannot_be_quietly_ignored(self):
+        # Confirms s_trap is NOT in NOOPS: must throw Unsupported rather than silently pass
+        bad_lines = [
+            "s_trap 0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_trap_not_noop", bad_lines)
+
+    def test_trap_preserves_strict_rejection_contract(self):
+        bad_lines = [
+            "s_mov_b32 s0, 1",
+            "s_trap 5",
+            "s_mov_b32 s0, 2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_trap_strict_refuse", bad_lines)
+
+
 if __name__ == "__main__":
     unittest.main()
