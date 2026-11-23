@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -857,6 +858,25 @@ class NavmeshDecodeTest(unittest.TestCase):
 
 class OutputPathTest(unittest.TestCase):
     """A report path that is already a folder is a usage error, not a PermissionError traceback."""
+
+    def test_same_report_path_is_the_shared_helper(self):
+        import report_paths
+        self.assertIs(nd.same_report_path, report_paths.same_report_path)
+
+    def test_same_report_path_asks_the_folding_volume(self):
+        # A Linux mount that folds case (vfat, exFAT, CIFS) hides a collision from normcase/samefile;
+        # the shared helper asks the volume itself, and the tool must go through it.
+        import report_paths
+        with tempfile.TemporaryDirectory() as tmp:
+            upper = os.path.join(tmp, "Nav.JSON")
+            lower = os.path.join(tmp, "nav.json")
+            real_normcase = os.path.normcase
+            try:
+                os.path.normcase = lambda path: path
+                with mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True):
+                    self.assertTrue(nd.same_report_path(upper, lower))
+            finally:
+                os.path.normcase = real_normcase
 
     def test_out_that_is_a_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
