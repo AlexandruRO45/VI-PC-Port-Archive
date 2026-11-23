@@ -1122,7 +1122,7 @@ def run_suite(a, work: str) -> int:
                                       0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
                 # the null operand of the three quad-byte SAD operations (cs_sad64_null.asm): a zero 64-bit window
                 # in each of them and a zero 64-bit addend in the two packed forms
-                "cs_sad64_null": [0x000B000A, 0x000D000C, 0x00050001, 0x000D0009,
+                "cs_sad64_null": [0x000B000A, 0x000D000C, 0x00050001, 0x004D0009,
                                   0x00170016, 0x00190018, 0x00030000, 8],
             }
             want = cs_dump_wants[name]

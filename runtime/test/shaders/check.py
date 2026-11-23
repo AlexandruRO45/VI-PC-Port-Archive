@@ -162,7 +162,7 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
                                    0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF])]
 # the GFX10.3 null operand of the three quad-byte SAD operations: a zero 64-bit window in each of them and a zero
 # 64-bit addend in the two packed forms (derivations in cs_sad64_null.asm)
-CS_DUMPS += [("cs_sad64_null", [0x000B000A, 0x000D000C, 0x00050001, 0x000D0009,
+CS_DUMPS += [("cs_sad64_null", [0x000B000A, 0x000D000C, 0x00050001, 0x004D0009,
                                 0x00170016, 0x00190018, 0x00030000, 8])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 # The SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm header): one thread too.
