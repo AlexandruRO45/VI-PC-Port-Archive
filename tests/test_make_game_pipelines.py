@@ -240,6 +240,42 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.skip))
         self.assertIn("pipelines: done", logs)
 
+    def test_staging_files_a_stopped_checker_left_are_removed(self):
+        os.makedirs(self.out)
+        cache = os.path.join(self.out, "pipeline_cache.bin")
+        left = [cache + ".tmp.49010197148000.0", self.inflight + ".tmp.7.1"]
+        kept = [cache, cache + ".old", os.path.join(self.out, "notes.tmp.1")]
+        for path in left + kept:
+            with open(path, "wb") as f:
+                f.write(b"x" * 16)
+        failed, logs = self.stage(lambda args, n: 0)
+        self.assertIsNone(failed)
+        for path in left:
+            self.assertFalse(os.path.exists(path), path)
+        for path in kept:
+            self.assertTrue(os.path.exists(path), path)
+        self.assertTrue(any("removed 2 staging file(s)" in m for m in logs), logs)
+
+    def test_a_staging_file_left_during_the_run_is_removed_at_the_end(self):
+        staged = os.path.join(self.out, "pipeline_cache.bin.tmp.5.0")
+        def script(args, n):
+            with open(staged, "wb") as f:   # a checker killed during a checkpoint
+                f.write(b"partial")
+            return 0
+        failed, logs = self.stage(script)
+        self.assertIsNone(failed)
+        self.assertFalse(os.path.exists(staged))
+        self.assertTrue(any("removed 1 staging file(s)" in m for m in logs), logs)
+
+    def test_a_staging_file_that_cannot_be_removed_is_kept(self):
+        os.makedirs(self.out)
+        staged = os.path.join(self.out, "pipeline_cache.bin.tmp.5.0")
+        with open(staged, "wb") as f:
+            f.write(b"open in a running checker")
+        with mock.patch.object(make_game.os, "remove", side_effect=PermissionError):
+            self.assertEqual(make_game.drop_staged(os.path.join(self.out, "pipeline_cache.bin")), (0, 0))
+        self.assertTrue(os.path.exists(staged))
+
 
     def test_an_older_checker_gets_the_old_invocation(self):
         # Before --inflight-file the checker took unknown arguments as the cache path (it would write the cache into

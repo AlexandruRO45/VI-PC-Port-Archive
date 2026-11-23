@@ -1583,7 +1583,26 @@ def drop(*paths: str) -> None:
             os.remove(p)
 
 
-SHARD_PLAN = "shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
+def drop_staged(*paths: str) -> "tuple[int, int]":
+    """Remove the `<path>.tmp.*` staging files a stopped vk_pipeline_check left beside its outputs.
+
+    Returns how many files were removed and their total size. A staging file that a running checker still holds
+    open is kept: Windows refuses to remove it.
+    """
+    removed = size = 0
+    for p in paths:
+        for staged in glob.glob(glob.escape(p) + ".tmp.*"):
+            try:
+                n = os.path.getsize(staged)
+                os.remove(staged)
+            except OSError:
+                continue
+            removed += 1
+            size += n
+    return removed, size
+
+
+SHARD_PLAN ="shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
 
 
 def drop_index(index: str) -> str:
@@ -2239,6 +2258,15 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+
+    def drop_checker_staging() -> None:
+        # A checker killed during a checkpoint leaves its staging file (as large as the cache) behind.
+        removed, size = drop_staged(cache, inflight)
+        if removed:
+            log(f"pipelines: removed {removed} staging file(s) ({size / 2**30:.1f} GiB) a stopped "
+                "vk_pipeline_check left behind")
+
+    drop_checker_staging()
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
@@ -2310,6 +2338,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     if crashed and not code:
         code = 1
     drop(inflight)
+    drop_checker_staging()
     if code != 0:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
             if crashed else ""
