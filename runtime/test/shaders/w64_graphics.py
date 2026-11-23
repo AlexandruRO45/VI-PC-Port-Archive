@@ -44,6 +44,7 @@ from pathlib import Path
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77
 W = H = 64
+HEAP_BYTES = 65536
 
 
 class Skip(str):
@@ -250,14 +251,31 @@ def _draw_heap(tools, spirv, name, size, tmp):
         vs, records = os.path.join(spirv, "vs_ids.spv"), VS_VERTICES // 3
     # The triangles have zero area (a GS fixture emits no primitive), so no pixel is drawn and any fragment shader does.
     cmd = [os.path.join(tools, "vk_harness" + EXE), vs, os.path.join(spirv, "ps_w64_a_skip.spv"), str(raw)]
+    # A lane-ID fixture and its probe can use the same destination in this draw.
+    heap.unlink(missing_ok=True)
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
     out = r.stdout + r.stderr
     if r.returncode == UNSUPPORTED:
-        return None, "unsupported: " + out.strip().splitlines()[-1]
-    if r.returncode or not heap.is_file():
+        return None, _unsupported_reason(out)
+    if r.returncode:
         return None, f"exit {r.returncode}: {' | '.join(out.strip().splitlines()[-3:])}"
-    words = list(struct.unpack("<%dI" % (65536 // 4), heap.read_bytes()))
-    return [tuple(words[VS_RECORDS + 4 * v:VS_RECORDS + 4 * v + 4]) for v in range(records)], words
+    if not heap.is_file():
+        return None, "no heap dump"
+    data = heap.read_bytes()
+    if len(data) != HEAP_BYTES:
+        return None, f"{len(data)} bytes of heap, expected {HEAP_BYTES}"
+    words = list(struct.unpack("<%dI" % (HEAP_BYTES // 4), data))
+    rows = [tuple(words[VS_RECORDS + 4 * v:VS_RECORDS + 4 * v + 4]) for v in range(records)]
+    if name in PROBES.values():
+        for i, row in enumerate(rows):
+            if row[0] >= 64:
+                return None, f"record {i}: lane ID {row[0]} outside 0..63"
+    return rows, words
+
+
+def _unsupported_reason(out):
+    lines = out.strip().splitlines()
+    return "unsupported: " + (lines[-1] if lines else "harness exited with status 77")
 
 
 _device_min = [None]   # the smallest subgroup size vk_harness reported for the device
@@ -289,7 +307,7 @@ def draw(tools, spirv, name, size, tmp):
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
     out = r.stdout + r.stderr
     if r.returncode == UNSUPPORTED:
-        return None, "unsupported: " + out.strip().splitlines()[-1], None
+        return None, _unsupported_reason(out), None
     if r.returncode or not raw.is_file():
         return None, f"exit {r.returncode}: {' | '.join(out.strip().splitlines()[-3:])}", None
     data = raw.read_bytes()
