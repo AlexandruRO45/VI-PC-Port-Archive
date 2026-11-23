@@ -201,6 +201,8 @@ int main() {
         std::snprintf(label, sizeof(label), "slot %d starts", slot_index);
         check(start == S_OK, label);
         if (start != S_OK) continue;
+        std::snprintf(label, sizeof(label), "slot %d pending before dispatch", slot_index);
+        check(called == 0 && XAsyncGetStatus(&block, false) == E_PENDING, label);
         XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0);
         XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0);
         std::snprintf(label, sizeof(label), "slot %d callback and offline status", slot_index);
