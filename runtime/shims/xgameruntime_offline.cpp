@@ -219,6 +219,34 @@ HRESULT STDMETHODCALLTYPE ui_error_dialog_result(void*, XAsyncBlock* async) {
 // 16: XGameUiSetNotificationPositionHint(position): there are no notifications to place.
 HRESULT STDMETHODCALLTYPE ui_set_notification_hint(void*) { return S_OK; }
 
+const char kDismissedUiIdentity = 0;
+
+HRESULT CALLBACK dismissed_ui_provider(XAsyncOp op, const XAsyncProviderData* data) {
+    if (op == XAsyncOp::Begin) return XAsyncSchedule(data->async, 0);
+    if (op == XAsyncOp::DoWork) XAsyncComplete(data->async, E_ABORT, 0);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ui_dismissed_async(void*, XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    return XAsyncBegin(async, nullptr, &kDismissedUiIdentity, "XGameUiOffline", dismissed_ui_provider);
+}
+
+HRESULT STDMETHODCALLTYPE ui_dismissed_result(void*, XAsyncBlock* async) {
+    return XAsyncGetResult(async, &kDismissedUiIdentity, 0, nullptr, nullptr);
+}
+
+HRESULT STDMETHODCALLTYPE ui_picker_count(void*, XAsyncBlock* async, uint32_t* count) {
+    if (!count) return E_POINTER;
+    *count = 0;
+    return XAsyncGetStatus(async, false);
+}
+
+HRESULT STDMETHODCALLTYPE ui_picker_result(void*, XAsyncBlock* async, uint32_t, uint64_t*, uint32_t* used) {
+    if (used) *used = 0;
+    return XAsyncGetResult(async, &kDismissedUiIdentity, 0, nullptr, nullptr);
+}
+
 template <int Slot> HRESULT STDMETHODCALLTYPE ui_offline(void* self) { return offline_failure<kUiName, Slot>(self); }
 template <int Slot> HRESULT STDMETHODCALLTYPE ui_unknown(void* self) { return unknown_slot<kUiName, Slot>(self); }
 
@@ -227,15 +255,15 @@ const void* const kUiVtable[] = {
     FN(ui_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
     FN(ui_message_dialog_async),       // 3  XGameUiShowMessageDialogAsync
     FN(ui_message_dialog_result),      // 4  XGameUiShowMessageDialogResult
-    FN(ui_offline<5>),                 // 5  XGameUiShowSendGameInviteAsync
-    FN(ui_offline<6>),                 // 6  XGameUiShowSendGameInviteResult
-    FN(ui_offline<7>),                 // 7  XGameUiShowPlayerProfileCardAsync
-    FN(ui_offline<8>),                 // 8  XGameUiShowPlayerProfileCardResult
-    FN(ui_offline<9>),                 // 9  XGameUiShowAchievementsAsync
-    FN(ui_offline<10>),                // 10 XGameUiShowAchievementsResult
-    FN(ui_offline<11>),                // 11 XGameUiShowPlayerPickerAsync
-    FN(ui_offline<12>),                // 12 XGameUiShowPlayerPickerResultCount
-    FN(ui_offline<13>),                // 13 XGameUiShowPlayerPickerResult
+    FN(ui_dismissed_async),            // 5  XGameUiShowSendGameInviteAsync
+    FN(ui_dismissed_result),           // 6  XGameUiShowSendGameInviteResult
+    FN(ui_dismissed_async),            // 7  XGameUiShowPlayerProfileCardAsync
+    FN(ui_dismissed_result),           // 8  XGameUiShowPlayerProfileCardResult
+    FN(ui_dismissed_async),            // 9  XGameUiShowAchievementsAsync
+    FN(ui_dismissed_result),           // 10 XGameUiShowAchievementsResult
+    FN(ui_dismissed_async),            // 11 XGameUiShowPlayerPickerAsync
+    FN(ui_picker_count),               // 12 XGameUiShowPlayerPickerResultCount
+    FN(ui_picker_result),              // 13 XGameUiShowPlayerPickerResult
     FN(ui_error_dialog_async),         // 14 XGameUiShowErrorDialogAsync
     FN(ui_error_dialog_result),        // 15 XGameUiShowErrorDialogResult
     FN(ui_set_notification_hint),      // 16 XGameUiSetNotificationPositionHint

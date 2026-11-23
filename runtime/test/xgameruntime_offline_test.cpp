@@ -52,6 +52,13 @@ using Dialog = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, const char*, con
 using DialogResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t*);
 using ErrorDialog = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, HRESULT, const char*);
 using AsyncOnly = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*);
+using Invite = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void*, const char*, const char*, const char*, const char*, const char*);
+using Profile = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void*, uint64_t);
+using Achievements = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void*, uint32_t);
+using Picker = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void*, const char*, uint32_t, const uint64_t*, uint32_t, const uint64_t*, uint32_t, uint32_t);
+using PickerCount = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t*);
+using PickerResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t, uint64_t*, uint32_t*);
+void CALLBACK ui_done(XAsyncBlock* async) { SetEvent(static_cast<HANDLE>(async->context)); }
 using NoArgs = HRESULT(STDMETHODCALLTYPE*)(void*);
 using Bool = bool(STDMETHODCALLTYPE*)(void*);
 using Count = uint32_t(STDMETHODCALLTYPE*)(void*);
@@ -133,7 +140,32 @@ int main() {
     check(at<ErrorDialog>(ui, 14)(ui, &async, static_cast<HRESULT>(0x80830003), "save") == S_OK && finished(&async) &&
               at<AsyncOnly>(ui, 15)(ui, &async) == S_OK,
           "an error dialog is logged and dismissed");
-    check(at<NoArgs>(ui, 7)(ui) == E_FAIL, "a profile card is not available offline");
+    for (int i = 0; i != 4; ++i) {
+        HANDLE event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        XAsyncBlock block{};
+        block.context = event;
+        block.callback = ui_done;
+        HRESULT hr = E_FAIL;
+        if (i == 0) hr = at<Invite>(ui, 5)(ui, &block, nullptr, "scid", "template", "session", nullptr, nullptr);
+        if (i == 1) hr = at<Profile>(ui, 7)(ui, &block, nullptr, 123);
+        if (i == 2) hr = at<Achievements>(ui, 9)(ui, &block, nullptr, 1);
+        if (i == 3) hr = at<Picker>(ui, 11)(ui, &block, nullptr, "pick", 0, nullptr, 0, nullptr, 0, 1);
+        check(hr == S_OK, "offline UI async starts successfully");
+        if (hr == S_OK) {
+            check(WaitForSingleObject(event, 5000) == WAIT_OBJECT_0, "offline UI callback runs");
+            check(XAsyncGetStatus(&block, false) == E_ABORT, "offline UI completes dismissed");
+            if (i == 3) {
+                uint32_t count = 99, used = 99;
+                check(at<PickerCount>(ui, 12)(ui, &block, &count) == E_ABORT && count == 0,
+                      "picker count is zero and reports dismissal");
+                check(at<PickerResult>(ui, 13)(ui, &block, 0, nullptr, &used) == E_ABORT && used == 0,
+                      "picker result reports dismissal and no players");
+            } else {
+                check(at<AsyncOnly>(ui, 6 + i * 2)(ui, &block) == E_ABORT, "offline UI result reports dismissal");
+            }
+        }
+        CloseHandle(event);
+    }
     check(at<NoArgs>(ui, 20)(ui) == E_NOTIMPL, "an unknown slot answers E_NOTIMPL");
 
     // ---- XGameStreaming ----
