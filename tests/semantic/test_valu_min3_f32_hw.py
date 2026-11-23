@@ -200,6 +200,107 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
         ])
         self.assertEqual(words[0], expected)
 
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    literal_val: int = 0
+    neg: bool = False
+    abs_: bool = False
+
+    def __post_init__(self):
+        if self.reg_type == RegType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of bounds [0, 255]")
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of bounds [0, 105]")
+
+    @classmethod
+    def vgpr(cls, idx: int, neg: bool = False, abs_: bool = False) -> Operand:
+        return cls(RegType.VGPR, index=idx, neg=neg, abs_=abs_)
+
+    @classmethod
+    def sgpr(cls, idx: int, neg: bool = False, abs_: bool = False) -> Operand:
+        return cls(RegType.SGPR, index=idx, neg=neg, abs_=abs_)
+
+    @classmethod
+    def literal(cls, val: int, neg: bool = False, abs_: bool = False) -> Operand:
+        return cls(RegType.LITERAL, literal_val=val & MASK32, neg=neg, abs_=abs_)
+
+    def to_asm(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            base = f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            base = f"s{self.index}"
+        else:
+            base = f"{self.literal_val:#x}"
+
+        if self.abs_:
+            base = f"|{base}|"
+        if self.neg:
+            base = f"-{base}"
+        return base
+
+
+@dataclass(frozen=True)
+class VMin3F32Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def __post_init__(self):
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError("Destination must be a VGPR for VALU instruction v_min3_f32")
+        if self.dst.neg or self.dst.abs_:
+            raise ValueError("Destination cannot have neg or abs modifiers")
+
+    def to_asm(self) -> str:
+        s0 = self.src0.to_asm()
+        s1 = self.src1.to_asm()
+        s2 = self.src2.to_asm()
+        clamp_str = " clamp" if self.clamp else ""
+        return f"v_min3_f32 {self.dst.to_asm()}, {s0}, {s1}, {s2}{clamp_str}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    def test_ast_construction_and_formatting(self):
+        insn = VMin3F32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0, neg=True, abs_=True),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(ONE_F32),
+            clamp=True,
+        )
+        self.assertEqual(insn.to_asm(), f"v_min3_f32 v3, -|v0|, s4, {ONE_F32:#x} clamp")
+
+    def test_ast_immutability(self):
+        insn = VMin3F32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        with self.assertRaises(Exception):
+            insn.clamp = True  # type: ignore
+
+    def test_ast_validation_errors(self):
+        with self.assertRaises(TypeError):
+            VMin3F32Instruction(
+                dst=Operand.sgpr(3),  # Invalid dst
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+        with self.assertRaises(ValueError):
+            Operand.vgpr(300)  # Out of range
+
 
 if __name__ == "__main__":
     unittest.main()
