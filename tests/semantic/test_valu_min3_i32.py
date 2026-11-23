@@ -507,3 +507,43 @@ class TestRegisterAliasing(unittest.TestCase):
 
         self.assertEqual(res, v1_val)
         self.assertEqual(state.get_vgpr(0), v1_val)
+
+
+# ==============================================================================
+# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_invariance(self) -> None:
+        """Verify v_min3_i32 as a VOP3 instruction never alters VCC or SCC."""
+        lines = [
+            "v_cmp_eq_u32 vcc, 10, 10",
+            "v_mov_b32 v1, 0x00000020",
+            "v_mov_b32 v2, 0x00000005",
+            "v_mov_b32 v3, 0x00000010",
+            "v_min3_i32 v0, v1, v2, v3",
+            "v_cndmask_b32 v4, 0x11111111, 0x22222222, vcc",
+            "exp mrt0 v4, v0, v4, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_vcc_invariant", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x22222222)
+        self.assertEqual(words[1], 0x00000005)
+
+    def test_scalar_status_non_interference(self) -> None:
+        """Verify execution preserves scalar register and condition state."""
+        state = ScalarMachineState()
+        state.set_sgpr(0, 0xCAFE_BABE)
+        state.set_vgpr(1, 100)
+        state.set_vgpr(2, 50)
+        state.set_vgpr(3, 75)
+
+        interp = ScalarInterpreter()
+        instr = VMin3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, 50)
+        self.assertEqual(state.get_sgpr(0), 0xCAFE_BABE)
