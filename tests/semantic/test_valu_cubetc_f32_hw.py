@@ -198,5 +198,95 @@ class TestSimdDivergence(unittest.TestCase):
             words = support.mrt0_words(spv)
             self.assertEqual(words[0], f32_to_u32(expected_f), f"Lane {lane_idx} mismatch")
 
+class TestOperandFormsAndAliasing(unittest.TestCase):
+    """Register aliasing, literal constants, inline float constants, and SGPR sources."""
+
+    def test_sgpr_scalar_source(self):
+        prog = [
+            "s_mov_b32 s0, 0x40800000",   # 4.0f (+X major)
+            "v_mov_b32 v1, 0xbfe00000",   # -1.75f
+            "v_mov_b32 v2, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 v0, s0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_sgpr", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x3fe00000)   # 1.75f (-(-1.75))
+
+    def test_inline_float_constants(self):
+        prog = [
+            "v_mov_b32 v1, 0xbf000000",   # -0.5f
+            "v_mov_b32 v2, 0x3e800000",   # 0.25f
+            "v_cubetc_f32 v0, 1.0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_inline_const", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x3f000000)   # 0.5f
+
+    def test_literal_constant(self):
+        prog = [
+            "v_mov_b32 v1, 0xbfa00000",   # -1.25f
+            "v_mov_b32 v2, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 v0, 0x40800000, v1, v2",  # 4.0f literal
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_literal", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x3fa00000)   # 1.25f
+
+    def test_dst_aliasing_src0(self):
+        prog = [
+            "v_mov_b32 v1, 0x40800000",   # 4.0f
+            "v_mov_b32 v2, 0xbfe00000",   # -1.75f
+            "v_mov_b32 v3, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 v1, v1, v2, v3",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_alias_s0", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x3fe00000)
+
+    def test_dst_aliasing_src1(self):
+        prog = [
+            "v_mov_b32 v1, 0x40800000",   # 4.0f
+            "v_mov_b32 v2, 0xbfe00000",   # -1.75f
+            "v_mov_b32 v3, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 v2, v1, v2, v3",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_alias_s1", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x3fe00000)
+
+    def test_dst_aliasing_src2(self):
+        prog = [
+            "v_mov_b32 v1, 0x40800000",   # 4.0f
+            "v_mov_b32 v2, 0xbfe00000",   # -1.75f
+            "v_mov_b32 v3, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 v3, v1, v2, v3",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_alias_s2", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x3fe00000)
+
+    def test_all_operands_same_register(self):
+        prog = [
+            "v_mov_b32 v1, 0x40000000",   # 2.0f
+            "v_cubetc_f32 v1, v1, v1, v1",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_all_same", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xc0000000)   # -2.0f
+
 if __name__ == "__main__":
     unittest.main()
