@@ -863,6 +863,17 @@ class Gen:
         self.emit(f"{r} = OpSelect %uint {is_z} {self.cu(0)} {v}")
         return r
 
+    def cvt_f16_out_mods(self, h, mods):
+        """VOP3 omod, then clamp, on the f16 bits ``h`` (low 16) an f32 -> f16 conversion rounded: v_cvt_f16_f32 (the
+        order measured on RDNA2, see f16_omod) and each half of v_cvt_pkrtz_f16_f32."""
+        h = self.f16_omod(h, mods)
+        if "clamp" in mods:
+            v2, f = self.tmp(), self.tmp()
+            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {h}")
+            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
+            h = self.f16_bits(self.clamp_mods(f, ["clamp"]))     # exact: the clamped value is an f16
+        return h
+
     def f16_omod(self, h, mods):
         """VOP3 mul:2 / mul:4 / div:2 on the rounded f16 bits ``h`` (low 16) of v_cvt_f16_f32, as measured on RDNA2
         (RX 6800 on #718; gfx1036 across wave32/wave64 and MODE RNE/RTZ): after rounding and before clamp, so 65520
@@ -6893,13 +6904,7 @@ class Gen:
             # VOP3 omod and clamp apply to the f16 (ACO: dst(F16)), in the order an RX 6800 applies them: round, omod
             # (f16_omod), then clamp. They were dropped until 2026-11-22.
             x = self.src_f(a[1])
-            h = self.f16_omod(self.f16_res(x), mods)
-            if "clamp" in mods:
-                v2, f = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {h}")
-                self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-                h = self.f16_bits(self.clamp_mods(f, ["clamp"]))     # exact: the clamped value is an f16
-            self.write_lo16(a[0], h)
+            self.write_lo16(a[0], self.cvt_f16_out_mods(self.f16_res(x), mods))
         elif op == "s_mulk_i32":
             v = a[1]["v"] & 0xFFFF
             k = v - 0x10000 if v & 0x8000 else v
@@ -10721,8 +10726,10 @@ class Gen:
         elif op == "v_cvt_pkrtz_f16_f32":
             # Packs two f32 as f16 into one dword with round-toward-zero (exact, see f16_rtz). The earlier
             # round-to-nearest version produced inf where hardware gives 65504 (found by the GPU smoke test).
+            # The VOP3 form's omod and clamp apply to each f16 half after the narrowing, as for v_cvt_f16_f32 (llvm-mc
+            # gfx1030 encodes both on v_cvt_pkrtz_f16_f32_e64); until 2026-11-23 they were dropped.
             x, y = self.src_f(a[1]), self.src_f(a[2])
-            lo, hi = self.f16_rtz(x), self.f16_rtz(y)
+            lo, hi = (self.cvt_f16_out_mods(self.f16_rtz(v), mods) for v in (x, y))
             sh, r = self.tmp(), self.tmp()
             self.emit(f"{sh} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {lo} {sh}")
