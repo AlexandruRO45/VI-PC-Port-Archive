@@ -412,6 +412,29 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(r["merges"], [merge])
         self.assertEqual(r["reverted"], [])
 
+    def test_reverting_a_reapply_takes_the_merge_out_again(self):
+        # Merged, reverted, reapplied, then the reapply reverted: git names the reapply commit, the paragraph is gone
+        # again and the branch is still in main's history, so it reads `reverted`. Named by its subject alone, the
+        # third layer counts the same: `Revert "Reapply "..."` takes the merge out.
+        base = self.git("rev-parse", "main")
+        self.pr_branch("add-file", base, "\n" + PARAGRAPH)
+        self.merge(314, "add-file")
+        merge = self.git("rev-parse", "HEAD")[:12]
+        self.git("revert", "--no-edit", "-m", "1", "HEAD")
+        self.git("revert", "--no-edit", "HEAD")
+        self.git("revert", "--no-edit", "HEAD")
+        last = self.git("rev-parse", "HEAD")[:12]
+        code, [r] = self.run_check("314=add-file")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["verdict"], "reverted")
+        self.assertEqual(r["merges"], [])
+        self.assertEqual(r["reverted"], [[merge, last]])
+        self.git("commit", "-q", "--amend", "-m", 'Revert "Reapply "Merge pull request #314 from someone/add-file""')
+        last = self.git("rev-parse", "HEAD")[:12]
+        code, [r] = self.run_check("314=add-file")
+        self.assertEqual(r["verdict"], "reverted")
+        self.assertEqual(r["reverted"], [[merge, last]])
+
     def test_reverted_pr_number_subject_parsing(self):
         # Subjects as they stand on main.
         self.assertEqual(mc._reverted_pr_number("Revert #4247: its tail-scheduler tests need a mini scheduler"), 4247)
@@ -424,6 +447,10 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(mc._reapplied_pr_number('Reapply "Merge pull request #314 from fixture/add-file"'), 314)
         self.assertEqual(mc._reapplied_pr_number('Revert "Revert "docs: fix wording (#5523)""'), 5523)
         self.assertIsNone(mc._reapplied_pr_number('Revert "docs: fix wording (#5523)"'))
+        third = 'Revert "Reapply "Merge pull request #314 from fixture/add-file""'
+        self.assertEqual(mc._reverted_pr_number(third), 314)
+        self.assertIsNone(mc._reapplied_pr_number(third))
+        self.assertEqual(mc._reapplied_pr_number('Revert "Revert #4247: its tests need a mini scheduler"'), 4247)
 
     def test_merged_pr_number_subject_parsing(self):
         self.assertEqual(mc._merged_pr_number("Merge pull request #7 from someone/first"), 7)

@@ -11,8 +11,9 @@ against `--main` (default `origin/main`), using one history scan for the whole b
 - `reverted`: earlier merges of the PR that a later commit on main reverted, as [merge, revert] pairs, newest
   first; `merges` leaves them out. A revert that names the commit it undoes ("This reverts commit <sha>.", as
   git writes it) undoes that one, and one that names none ("Revert #PR: why") the PR's newest merge still
-  standing. Reverting a revert (git's `Reapply "..."`) puts its merge back. With a revert in a PR's history,
-  `already-merged` needs the merged tree to match main, since its patches stay in main's history.
+  standing. Reverting a revert (git's `Reapply "..."`) puts its merge back, and reverting that takes it out
+  again, however long the chain. With a revert in a PR's history, `already-merged` needs the merged tree to
+  match main, since its patches stay in main's history.
 - `commits`: the PR's commits (merge base..REF) and how many `git cherry` finds on main already (same patch).
 - `duplicates`: runs of three or more consecutive lines the merge would add (each at least `--min-length`
   characters once stripped) that already stand in the same order in the same file on main. This is what a second
@@ -42,8 +43,8 @@ REVERT_SUBJECT = re.compile(r"^Revert\b", re.IGNORECASE)
 # What a revert commit on main undoes: the maintainer's "Revert #N: why", or git's own `Revert "<the merge's subject>"`.
 REVERTED_NUMBER = re.compile(r"^Revert #(\d+)\b")
 REVERTED_SUBJECT = re.compile(r'^Revert "(.*)"\s*$')
-# Reverting a revert puts the merge back: git says `Reapply "<subject>"`, older git `Revert "Revert "<subject>""`.
-REAPPLIED_SUBJECT = re.compile(r'^(?:Reapply "(.*)"|Revert "Revert "(.*)"")\s*$')
+# Git's name for reverting a revert: `Reapply "<subject>"` (older git writes `Revert "Revert "<subject>""`).
+REAPPLIED_SUBJECT = re.compile(r'^Reapply "(.*)"\s*$')
 # The commit a revert names in its message, as git writes it; the maintainer's "Revert #N: why" names none.
 REVERTS_COMMIT = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b", re.MULTILINE)
 # Where a doubled block is the repeated-merge damage. In code, three equal lines in two functions are ordinary, so a
@@ -75,19 +76,40 @@ def _merged_pr_number(subject):
     return int(m.group(1)) if m else None
 
 
-def _reverted_pr_number(subject):
-    """The PR whose merge a revert commit undoes, or None (a revert of a revert, or one that names no PR)."""
+def _undo_layers(subject):
+    """(PR number, layers) for a subject that reverts or reapplies a merge of a PR, else None.
+
+    Each `Revert "..."` around the merge's subject is one layer, each `Reapply "..."` two, and the maintainer's
+    innermost "Revert #N: why" one: an odd count takes the merge out, an even one puts it back.
+    """
+    layers = 0
+    while True:
+        m = REVERTED_SUBJECT.match(subject)
+        if m:
+            layers, subject = layers + 1, m.group(1)
+            continue
+        m = REAPPLIED_SUBJECT.match(subject)
+        if m:
+            layers, subject = layers + 2, m.group(1)
+            continue
+        break
     m = REVERTED_NUMBER.match(subject)
     if m:
-        return int(m.group(1))
-    m = REVERTED_SUBJECT.match(subject)
-    return _merged_pr_number(m.group(1)) if m else None
+        return int(m.group(1)), layers + 1
+    number = _merged_pr_number(subject)
+    return (number, layers) if number is not None and layers else None
+
+
+def _reverted_pr_number(subject):
+    """The PR whose merge a commit takes out (an odd number of undo layers), or None."""
+    found = _undo_layers(subject)
+    return found[0] if found and found[1] % 2 else None
 
 
 def _reapplied_pr_number(subject):
-    """The PR whose reverted merge a revert of the revert puts back, or None."""
-    m = REAPPLIED_SUBJECT.match(subject)
-    return _merged_pr_number(m.group(1) or m.group(2)) if m else None
+    """The PR whose reverted merge a commit puts back (an even number of undo layers), or None."""
+    found = _undo_layers(subject)
+    return found[0] if found and not found[1] % 2 else None
 
 
 def _named_commit(prefix, *tables):
@@ -113,6 +135,7 @@ def prior_merges(repo, main, numbers, depth):
     order = []  # merges of the PRs asked about, oldest first, as (number, sha)
     undone_by = {}  # merge sha: the revert that undid it, or None while it stands
     undid = {}  # revert sha: the merge it undid, until a later commit reverts the revert
+    restored = {}  # reapply sha: the merge it put back, until a later commit reverts the reapply
     # Oldest first. A revert that names the commit it undoes ("This reverts commit <sha>.", as git writes it) undoes
     # exactly that one; one that names none (the maintainer's "Revert #N: why") the PR's newest merge still standing.
     # Reverting a revert puts its merge back.
@@ -127,16 +150,20 @@ def prior_merges(repo, main, numbers, depth):
             undone_by[sha] = None
             continue
         named = REVERTS_COMMIT.search(body)
-        target = _named_commit(named.group(1), undone_by, undid) if named else None
+        target = _named_commit(named.group(1), undone_by, undid, restored) if named else None
         if named and target is None:
             continue  # it undoes a commit of a PR this run does not ask about
         reapplied = _reapplied_pr_number(subject)
         if target in undid or (not named and reapplied in hits):
             revert = target if named else _latest(order, undone_by, reapplied, standing=False)
             if revert:
-                undone_by[undid.pop(revert)] = None
+                merge = undid.pop(revert)
+                undone_by[merge] = None
+                restored[sha] = merge
             continue
-        if not named:
+        if target in restored:
+            target = restored.pop(target)  # a revert of a reapply takes its merge out again
+        elif not named:
             target = _latest(order, undone_by, _reverted_pr_number(subject), standing=True)
         if target in undone_by and undone_by[target] is None:
             undone_by[target] = sha
