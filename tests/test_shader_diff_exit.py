@@ -135,6 +135,16 @@ class ArgumentValidation(unittest.TestCase):
     def test_max_ops_negative_is_rejected(self):
         self._rejected(["--max-ops", "-2"], "--max-ops")
 
+    def test_listing_ops_cannot_silently_skip_self_test(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                sd.main(["--list-ops", "--self-test"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--list-ops", err.getvalue())
+        self.assertIn("--self-test", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
     def test_a_valid_limit_still_runs_that_many_programs(self):
         out = io.StringIO()
         with mock.patch.object(sd, "run_one", lambda *_a: ("match", "")), contextlib.redirect_stdout(out):

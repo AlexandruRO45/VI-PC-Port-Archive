@@ -346,8 +346,9 @@ def main(argv=None):
                     help="maximum ops per generated program (default: 8)")
     ap.add_argument("--limit", type=_at_least_one, default=None,
                     help="run only the first N programs (N >= 1)")
-    ap.add_argument("--list-ops", action="store_true", help="print the op table and exit")
-    ap.add_argument("--self-test", action="store_true", help="run harness canaries and exit")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--list-ops", action="store_true", help="print the op table and exit")
+    mode.add_argument("--self-test", action="store_true", help="run harness canaries and exit")
     a = ap.parse_args(argv)
     if a.list_ops:
         for name, _ in _op_templates():
