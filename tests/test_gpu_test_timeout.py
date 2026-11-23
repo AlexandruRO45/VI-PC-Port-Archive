@@ -81,6 +81,14 @@ class HungProgram(unittest.TestCase):
             with self.subTest(stream=stream):
                 self.assertIn(f"{stream} before timeout", message)
 
+    def test_check_run_preserves_text_timeout_output(self):
+        timeout = subprocess.TimeoutExpired(
+            HANG, 0.5, output="stdout before timeout\r\n", stderr="stderr before timeout\r\n"
+        )
+        with patch.object(check.subprocess, "run", side_effect=timeout):
+            message = self.assert_killed(lambda: check.run(*HANG))
+        self.assertEqual(message.splitlines()[1:], ["stdout before timeout", "stderr before timeout"])
+
     def test_texture_cases_use_the_timeout_from_the_shader_directory(self) -> None:
         for name in ("ps_texture_sample", "ps_gather_wrap"):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as work:

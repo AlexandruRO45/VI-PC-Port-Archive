@@ -527,12 +527,15 @@ def run(*cmd, env=None):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
     except subprocess.TimeoutExpired as timeout:
-        # TimeoutExpired keeps captured output as bytes even with text=True.
+        # TimeoutExpired can carry bytes or text, depending on the platform.
         encoding = locale.getpreferredencoding(False)
-        stdout = (timeout.stdout or b"").decode(encoding, errors="replace").rstrip("\r\n")
-        stderr = (timeout.stderr or b"").decode(encoding, errors="replace").rstrip("\r\n")
-        reason = timed_out(cmd[0], limit)
-        return 1, "\n".join(part for part in (reason, stdout, stderr) if part)
+        detail = [timed_out(cmd[0], limit)]
+        for output in (timeout.stdout, timeout.stderr):
+            if isinstance(output, bytes):
+                output = output.decode(encoding, errors="replace")
+            if text := (output or "").rstrip("\r\n"):
+                detail.append(text)
+        return 1, "\n".join(detail)
     except OSError as e:
         if isinstance(e, FileNotFoundError):
             tools = os.path.abspath(os.path.dirname(cmd[0]))
