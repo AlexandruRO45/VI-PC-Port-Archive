@@ -165,6 +165,9 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           ("cs_smem_stride_align", [0x5eed0010, 0, 0, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0004]),
           # SHADER-328: a constant SGPR offset gives what the run-time one gives (no 32-bit wrap)
           ("cs_smem_sconst_off", [0, 0x5eed0018, 0x5eed0018, 0x5eed0014]),
+          # chained SALU constants build the two s_buffer_load offsets and the five data words
+          # (cs_salu_const_fold.asm header)
+          ("cs_salu_const_fold", [0x5eed0028, 0x5eed0018, 0, 0xabcd1234, 0xfff00000, 0x40, 0x307, 0xffffff80]),
           ("cs_smem_sload_neg", [0x5eed0004, 0x5eed0000, 0x5eed0004, 0x5eed0004, 0x5eed0008, 0x5eed000c,
                                  0xeeeeeeee, 0xeeeeeeee]),
           ("cs_buf_tail", [0, 0x5eed000c, 0x5eed0008, 0x5eed000c, 0, 0, 0x5eed0010, 0]),
