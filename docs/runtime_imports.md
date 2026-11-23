@@ -124,6 +124,16 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
 - `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
   on an out-of-memory path, after an allocation has already failed.
 
+The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
+`XApuEnqueueCommand`, `XApuGetResultCount`) and `chad.dll` (`XDspActivate`, `XDspConnectWithMaximumStreamLimit`,
+`XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
+read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
+a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
+Commands are accepted and dropped, the result count is always 0 and dequeuing fails, so the audio stays silent. The
+buffer size (128 stream slots) and the empty result queue are hypotheses, explained in the file. `xapu_chad_test`
+calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
+`audio_queue` event.
+
 ## The retail executable (RT-5)
 
 `game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
@@ -296,8 +306,9 @@ mostly correspond one to one to the `xgameruntime.lib` functions. The executable
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`, `gameinput.dll`)
-with a pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`,
+`gameinput.dll`, `xapu.dll`, `chad.dll`) with a pseudo-handle, and `GetProcAddress` on it resolves through the
+registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
