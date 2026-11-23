@@ -379,6 +379,25 @@ $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
 ```
 
+### Device queries over every format
+
+`d3d12_query_sweep_test` asks the Vulkan-backed device and Windows D3D12 (the layer's adapter and WARP) the same
+questions about all 192 DXGI formats and about grids of texture descriptions: `FORMAT_SUPPORT`, `FORMAT_INFO`,
+`MULTISAMPLE_QUALITY_LEVELS`, `GetResourceAllocationInfo` and `GetCopyableFootprints` (about 17,000 answers). An answer
+counts only when the hardware adapter and WARP agree, since where they differ there is nothing to match.
+
+The layer may know less than the host: a refused video format, no tiled support, a missing MSAA unordered-access
+texture are gaps, printed with `LEONIDA_SWEEP_GAPS=1`. It must not claim more or answer differently, and those fail the
+run: a `Support1`/`Support2` bit or a quality level the host lacks, a size where the host refuses (or, for render
+targets, depth buffers and block-compressed textures with their flags, a size smaller than the host's), and any
+footprint that is not the host's. Each failure is one query and format with its smallest description.
+`LEONIDA_SWEEP_REPORT=1` prints every group and exits 0, for exploring a new area. It needs a Vulkan GPU and runs
+explicitly.
+
+```powershell
+.\runtime\build\RelWithDebInfo\d3d12_query_sweep_test.exe
+```
+
 ### Depth and stencil resolves
 
 `d3d12_depth_resolve_test` resolves one plane of a 4x D32 or D24S8 target into a 1x one with

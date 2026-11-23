@@ -1376,6 +1376,15 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_resource_desc COMMAND d3d12_resource_desc_test)
     set_tests_properties(d3d12_resource_desc PROPERTIES SKIP_RETURN_CODE 77)
 
+    # FORMAT_SUPPORT, MULTISAMPLE_QUALITY_LEVELS, GetResourceAllocationInfo and GetCopyableFootprints over every DXGI
+    # format and grids of descriptions, against the host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_query_sweep_test test/d3d12_query_sweep_test.cpp)
+    target_link_libraries(d3d12_query_sweep_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_query_sweep_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_query_sweep_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_query_sweep COMMAND d3d12_query_sweep_test)
+    set_tests_properties(d3d12_query_sweep PROPERTIES SKIP_RETURN_CODE 77)
+
     # WriteToSubresource/ReadFromSubresource arguments and bytes, compared with the host runtime.
     add_executable(d3d12_subresource_copy_test test/d3d12_subresource_copy_test.cpp)
     target_link_libraries(d3d12_subresource_copy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

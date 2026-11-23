@@ -6571,8 +6571,19 @@ public:
             if (levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT)
                 return d3d12_trace::result(method, E_FAIL);
             Format format = texture_storage_format(levels->Format, false);
+            // A tiled texture has no tile shape for these formats at any count (RTX 5070 Ti and WARP: 0 levels with the
+            // tiled flag, while the same formats keep their plain answer without it): the stencil-bearing depth
+            // formats and their plane views, the packed 4:2:2 formats, the video formats and the sampler-feedback
+            // formats.
+            const UINT f = UINT(levels->Format);
+            const bool no_tile_shape = (f >= DXGI_FORMAT_R32G8X24_TYPELESS && f <= DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) ||
+                                       (f >= DXGI_FORMAT_R24G8_TYPELESS && f <= DXGI_FORMAT_X24_TYPELESS_G8_UINT) ||
+                                       f == DXGI_FORMAT_R8G8_B8G8_UNORM || f == DXGI_FORMAT_G8R8_G8B8_UNORM ||
+                                       (f >= DXGI_FORMAT_AYUV && f <= DXGI_FORMAT_A8P8) ||
+                                       f == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE ||
+                                       f == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE;
             if (levels->SampleCount == 1) {
-                levels->NumQualityLevels = tiled && format.rgb96 ? 0 : 1;
+                levels->NumQualityLevels = tiled && (format.rgb96 || no_tile_shape) ? 0 : 1;
                 return d3d12_trace::result(method, S_OK);
             }
             if ((levels->SampleCount & (levels->SampleCount - 1)) != 0)
@@ -6614,7 +6625,7 @@ public:
             const VkSampleCountFlagBits samples = VkSampleCountFlagBits(levels->SampleCount);
             if (result == VK_SUCCESS && (image_properties.sampleCounts & samples))
                 levels->NumQualityLevels = 1;
-            if (tiled && levels->SampleCount != 1 && levels->SampleCount != 4) levels->NumQualityLevels = 0;
+            if (tiled && (levels->SampleCount != 4 || no_tile_shape)) levels->NumQualityLevels = 0;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_SHADER_MODEL: {
@@ -6808,9 +6819,14 @@ private:
                             (desc.Flags & attachment) == attachment ||
                             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
-        // The PC runtime: simultaneous access only single-sampled and without depth-stencil, and no volume depth.
+        // The PC runtime: simultaneous access only single-sampled and without depth-stencil, and no volume depth, which
+        // it refuses by the format as well as by the flag (D16, D32, D24S8 and D32S8 3D textures without
+        // ALLOW_DEPTH_STENCIL: UINT64_MAX on an RTX 5070 Ti and WARP).
+        const bool depth_format = desc.Format == DXGI_FORMAT_D16_UNORM || desc.Format == DXGI_FORMAT_D32_FLOAT ||
+                                  desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                                  desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
-            (volume && depth_stencil))
+            (volume && (depth_stencil || depth_format)))
             return kInvalidAllocation;
         const bool tiled = is_tiled_layout(desc.Layout);
         if (tiled) {
