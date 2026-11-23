@@ -45,6 +45,24 @@ class DocsTableRowsTest(unittest.TestCase):
                     block = []
             check(block)
 
+    def test_no_table_block_is_repeated_on_a_page(self):
+        # A merge that keeps both sides can duplicate a whole block (docs/embedded_shaders.md's blocker table).
+        for path in DOCS:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            blocks, block = [], []
+            for line in lines + [""]:
+                if line.startswith("|"):
+                    block.append(line.strip())
+                elif block:
+                    blocks.append(tuple(block))
+                    block = []
+            seen = set()
+            for rows in blocks:
+                if len(rows) < 4:
+                    continue                    # a header, a separator and one row is not worth flagging
+                self.assertNotIn(rows, seen, f"{path.relative_to(ROOT)}: this {len(rows)}-row table appears twice")
+                seen.add(rows)
+
 
 if __name__ == "__main__":
     unittest.main()

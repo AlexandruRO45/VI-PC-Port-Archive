@@ -665,30 +665,6 @@ are little-endian:
 3. **The pass records.** The first six bytes of each pass select an entry of each stage list: 0 is unused,
    otherwise `stage_list[selector - 1]`.
 
-The group walk and its counts above were reproduced on a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256
-`0bc16345…`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
---list-effects` (#3036, `0029eba7`): 932 effect records with 932 distinct name hashes, 913 of them with a
-technique table, 25,037 techniques and 28,798 passes. Since `c0439966` the tool also **walks** the records
-forward from each database's effect count, using only stored lengths: every record's string pool, the next
-record, and at the end the terminal word and zero padding. Its tests, run against this package
-(`LEONIDA_GAME_DIR` set, `tests/test_sgd5_effects.py`), pass: the walk and the earlier search agree on every
-record, technique and pass. The record and pass format below was also checked by hand on three records:
-
-| Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass list 0 / list 1 ordinal |
-|---|---|---:|---:|---|
-| windshield wiper mask | 1, 1, 0, 0, 0, 0 | 1 | 1 | 11017 / 10943 |
-| stock rim | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9143 / 8925 |
-| stock tire | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9089 / 8835 |
-
-Two things are still open:
-
-- **The u32 after an effect's name.** What it means is still unknown.
-- **Which technique and pass the game draws with.** That is a run-time choice; it is presumably made in the
-  executable (RT-5).
-
-Until both are settled, a real model is drawn with a chosen pair ([first_light.md](first_light.md)). The effect
-records already give that choice a pair that can be checked independently.
-
 ## Vehicle distant-light recipes
 
 `common.rpf` has one `CVehicleDistantLightData` XML document (see [gamedata.md](gamedata.md)) that ties
