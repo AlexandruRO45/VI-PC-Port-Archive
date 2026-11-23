@@ -1020,6 +1020,57 @@ class JsonDepthTest(unittest.TestCase):
             self.assertEqual(saves.json_depth(rd_json(os.path.join(out, "payload.json"))), saves.MAX_JSON_DEPTH)
 
 
+class ChivesJsonDepthTest(unittest.TestCase):
+    """tedin7 on #5240: info on a save folder and import read chives.json with no depth limit, so 100,000 nested
+    arrays gave a RecursionError traceback on 3.13 and were accepted from 3.14 on."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = os.path.join(self.tmp.name, "story")
+        write(os.path.join(self.folder, "SLOT0"), make_jsav()[0])
+        self.chives = os.path.join(self.folder, "chives.json")
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, timeout=60)
+
+    def nest(self, levels):
+        # {"save_directory": "story", "x": [[...]]}: levels deep counting the top object.
+        inner = levels - 1
+        write(self.chives, b'{"save_directory":"story","x":' + b"[" * inner + b"0" + b"]" * inner + b"}")
+
+    def test_chives_at_the_limit_is_read(self):
+        self.nest(saves.MAX_JSON_DEPTH)
+        self.assertEqual(saves.json_depth(rd_json(self.chives)), saves.MAX_JSON_DEPTH)
+        result = self.run_tool("info", self.folder)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("save folder, dir story", result.stdout)
+        self.assertEqual(saves.save_slot(self.folder)[0], "story")
+
+    def test_too_deep_chives_is_one_error_line(self):
+        for levels in (saves.MAX_JSON_DEPTH + 1, 100_000):
+            with self.subTest(levels=levels):
+                self.nest(levels)
+                with self.assertRaises(ValueError) as error:
+                    saves.save_slot(self.folder)
+                self.assertIn(self.chives, str(error.exception))
+                self.assertIn("invalid JSON", str(error.exception))
+                result = self.run_tool("info", self.folder)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertIn(self.chives, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_import_with_too_deep_chives_writes_nothing(self):
+        self.nest(100_000)
+        out = os.path.join(self.tmp.name, "saves")
+        result = self.run_tool("import", self.folder, "--out", out)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(self.chives, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(out))
+
+
 class PackIndexValidationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

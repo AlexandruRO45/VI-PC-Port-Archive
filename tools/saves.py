@@ -60,6 +60,24 @@ def json_depth(value):
             stack.pop()
     return deepest
 
+
+def parse_json(text, path):
+    """The JSON value in text, read from path. Text that isn't JSON, or nests deeper than MAX_JSON_DEPTH, is a
+    ValueError naming the file, whatever this Python's decoder would have accepted or raised."""
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError(f'{path}: invalid JSON ({exc})') from None
+    if (depth := json_depth(value)) > MAX_JSON_DEPTH:
+        raise ValueError(f'{path}: invalid JSON (it nests {depth} levels deep, more than the {MAX_JSON_DEPTH} '
+                         'this tool reads)')
+    return value
+
+
+def read_json(path):
+    """The JSON value in the file at path, with parse_json's checks."""
+    return parse_json(read(path), path)
+
 # ---------------------------------------------------------------------------------------------- ASAV
 ASAV_HDR = 0x170          # header size seen on every plain ASAV file
 ASAV_TITLE = (0x28, 0x128)  # UTF-16LE display title, 128 code units
@@ -336,7 +354,7 @@ def info(paths):
         if os.path.isdir(p):
             cj = os.path.join(p, 'chives.json')
             if os.path.exists(cj):
-                meta = json.loads(read(cj))
+                meta = read_json(cj)
                 print(f'{p}: save folder, dir {meta.get("save_directory")}')
             for name in sorted(os.listdir(p)):
                 fp = os.path.join(p, name)
@@ -417,14 +435,7 @@ def pack_from_dir(src, refuse=None):
             raise ValueError(f'{path}: pack reads this file, and --out {refuse} would replace it')
         return read(path)
 
-    text = source('index.json')
-    try:
-        idx = json.loads(text)
-    except (ValueError, RecursionError) as exc:
-        raise ValueError(f'{index_path}: invalid JSON ({exc})') from None
-    if (depth := json_depth(idx)) > MAX_JSON_DEPTH:
-        raise ValueError(f'{index_path}: invalid JSON (it nests {depth} levels deep, more than the {MAX_JSON_DEPTH} '
-                         'this tool reads)')
+    idx = parse_json(source('index.json'), index_path)
     if not isinstance(idx, dict):
         invalid('index', 'an object')
     h, es = idx.get('header'), idx.get('entries')
@@ -588,7 +599,7 @@ def xgs_encode(name):
 def save_slot(folder):
     """Return (folder label, payload filename, slot name, title) for one save folder."""
     meta_path = os.path.join(folder, 'chives.json')
-    meta = json.loads(read(meta_path)) if os.path.isfile(meta_path) else {}
+    meta = read_json(meta_path) if os.path.isfile(meta_path) else {}
     found = []
     for name in sorted(os.listdir(folder)):
         fp = os.path.join(folder, name)
