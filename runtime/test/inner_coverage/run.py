@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--harness", required=True, type=Path)
     parser.add_argument("--glslang", default="glslangValidator")
     parser.add_argument("--spirv-as", default="spirv-as")
+    parser.add_argument("--spirv-val", help="Validator executable; otherwise resolved next to spirv-as or on PATH")
     parser.add_argument("--work", type=Path, help="Keep synthetic artifacts in this directory")
     parser.add_argument("--benchmark", action="store_true", help="Also time 1/16/64 triangles at 8/32 pixels")
     args = parser.parse_args()
@@ -33,7 +34,7 @@ def main():
                LEONIDA_INNER_GLSLANG=shutil.which(args.glslang), PROBE_SYNC_VALIDATION="1")
     assembler = Path(shutil.which(args.spirv_as)).resolve()
     env["PATH"] = str(assembler.parent) + os.pathsep + env.get("PATH", "")
-    validator = shutil.which("spirv-val", path=env["PATH"])
+    validator = shutil.which(args.spirv_val or "spirv-val", path=env["PATH"])
     if not validator:
         parser.error("spirv-val must be next to spirv-as or on PATH")
     # ps_oracle invokes spirv-as by name. Verify the selected binary has that name.

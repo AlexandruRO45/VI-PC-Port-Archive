@@ -95,6 +95,39 @@ ctest --test-dir runtime/build-inner -C Release --output-on-failure
 python -I runtime/test/inner_coverage/run.py --harness runtime/build-inner/Release/vk_inner_coverage.exe --glslang <path>/glslangValidator.exe --spirv-as <path>/spirv-as.exe
 ```
 
+### Optional CTest entry
+
+On Windows, configure, build and run with a single command (tools on PATH or already cached):
+
+```powershell
+./scripts/run_inner_coverage_matrix.ps1
+```
+
+Use `-Build <existing-build>` and `-Config <configuration>` to reuse another build. Optional `-Glslang`,
+`-SpirvAs` and `-SpirvVal` arguments accept explicit tool paths. The script inherits `VK_LAYER_PATH` and
+`LEONIDA_VK_DEVICE`, stops on configure/build/test failures, and leaves CTest's Skipped result visible.
+A skipped matrix is not evidence of supported GPU execution.
+
+Alternatively, enable once in either the normal runtime build or the standalone build:
+
+```powershell
+cmake -S runtime -B runtime/build -DLEONIDA_TEST_INNER_COVERAGE_MATRIX=ON
+cmake --build runtime/build --config RelWithDebInfo --target vk_inner_coverage
+```
+
+Then run the complete 73-case mask/capture suite with one command:
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^inner_coverage_matrix$' -V
+```
+
+This is distinct from the native FullyCoveredEXT test. It is labelled `gpu`, `conservative` and `inner_coverage`,
+so `ctest -L conservative` also includes it when enabled. It is off by default; enabling requires Python,
+glslang, spirv-as and spirv-val at configure time. Override discovery with `LEONIDA_INNER_GLSLANG`,
+`LEONIDA_INNER_SPIRV_AS` and `LEONIDA_INNER_SPIRV_VAL` cache paths if needed. Core and synchronization
+validation remain mandatory. CTest interprets exit 77 as skipped, not passed; comparison/validation failures
+remain failed tests. Timeout: 600 seconds.
+
 Set `VK_LAYER_PATH` if the layer is not installed globally; select an adapter with `LEONIDA_VK_DEVICE`.
 Missing GPU properties or validation propagate exit code 77 through the harness, child suite and top-level
 runner, with a SKIP diagnostic; the incomplete matrix is not reported as a pass. Real execution/readback errors

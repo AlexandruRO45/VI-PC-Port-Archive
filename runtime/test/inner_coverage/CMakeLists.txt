@@ -25,3 +25,5 @@ target_link_libraries(vk_inner_coverage PRIVATE ${CMAKE_DL_LIBS})
 if(WIN32)
   target_compile_definitions(vk_inner_coverage PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/register_matrix.cmake")
