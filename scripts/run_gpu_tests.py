@@ -803,7 +803,11 @@ def run_suite(a, work: str) -> int:
     # runner, not here: they need a 64-wide fragment subgroup or the halves-aware lowering it drives.
     asm_files = [f for f in asm_files if f[:-4] not in W64_GRAPHICS_ONLY]
     if disasm_src is not None:
-        available = {os.path.splitext(f)[0] for f in os.listdir(disasm_src) if f.endswith(".s")}
+        try:
+            available = {p.stem for p in Path(disasm_src).iterdir() if p.suffix == ".s" and p.is_file()}
+        except OSError as exc:
+            print(f"error: cannot read --disasm-dir {disasm_src}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
         asm_files = [
             f for f in asm_files
             if all(os.path.splitext(p)[0] in available for p in with_draw_shaders([f]))
@@ -860,11 +864,16 @@ def run_suite(a, work: str) -> int:
         fname = shader_source(name) + ".asm"
         disasm_path = os.path.join(disasm_dir, f"{name}.s")
         if disasm_src is not None:
+            source_listing = os.path.join(disasm_src, f"{name}.s")
             try:
-                shutil.copyfile(os.path.join(disasm_src, f"{name}.s"), disasm_path)
+                shutil.copyfile(source_listing, disasm_path)
             except shutil.SameFileError:
                 # A replay can use the work folder's existing listings as its source.
                 pass
+            except OSError as exc:
+                print(f"error: cannot copy listing {source_listing} to {disasm_path}: {exc.strerror or exc}",
+                      file=sys.stderr)
+                return 2
         else:
             assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
         disasm_files.append(disasm_path)

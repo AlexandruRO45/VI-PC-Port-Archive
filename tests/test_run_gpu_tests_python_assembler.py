@@ -100,6 +100,40 @@ class PythonAssemblerTests(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("--disasm-dir is not a directory", err.getvalue())
 
+    def test_run_suite_ignores_directories_named_like_listings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            (source / "cs_lds.s").mkdir(parents=True)
+            work = root / "work"
+            args = SimpleNamespace(assembler="python", no_validate=True, disasm_dir=str(source),
+                                   filter="cs_lds", build=str(work), require_pass=True)
+            err = io.StringIO()
+            with patch("sys.stderr", err), patch.object(run_gpu_tests, "run_cmd") as launch:
+                self.assertEqual(run_gpu_tests.run_suite(args, str(work)), 2)
+            launch.assert_not_called()
+            self.assertIn("matched no GPU test cases", err.getvalue())
+            self.assertFalse(work.exists())
+
+    def test_run_suite_reports_a_listing_copy_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            listing = source / "cs_lds.s"
+            listing.write_bytes(b"; synthetic\n\ts_endpgm\n")
+            work = root / "work"
+            args = SimpleNamespace(assembler="python", no_validate=True, disasm_dir=str(source),
+                                   filter="cs_lds", build=str(work), require_pass=True)
+            err = io.StringIO()
+            with (patch("sys.stderr", err),
+                  patch.object(run_gpu_tests.shutil, "copyfile", side_effect=PermissionError("read denied")),
+                  patch.object(run_gpu_tests, "run_cmd") as launch):
+                self.assertEqual(run_gpu_tests.run_suite(args, str(work)), 2)
+            launch.assert_not_called()
+            self.assertIn(str(listing), err.getvalue())
+            self.assertIn("read denied", err.getvalue())
+
     def test_run_suite_reuses_existing_work_listings(self) -> None:
         listing = b"; synthetic\n\ts_endpgm\n"
         run_command = run_gpu_tests.run_cmd
