@@ -56,6 +56,9 @@ if config.get("interrupt") or config.get("interrupt_probe") and count == 1 and o
         os.kill(os.getpid(), signal.SIGTERM)
 if config.get("crash_before_work"):
     sys.exit(70)
+if config.get("merge_fail") and "--merge-cache" in args:
+    cache.write_text("partial", encoding="utf-8")
+    sys.exit(1)
 if config.get("probe_crash_before_work") and count == 1 and option("--jobs") == "1":
     report = config.get("probe_report", "missing")
     if inflight and report != "missing":
@@ -307,6 +310,32 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual({c[2] for c in self.commands}, {str(self.out / "pipeline_cache.bin")})
         self.assertEqual(len(self.commands), 3)
+
+    def test_parts_are_removed_once_a_run_checks_a_single_batch(self):
+        self.assertEqual(self.invoke()[0], 0)
+        parts = self.out / "pipeline_cache.parts"
+        self.assertEqual(len(list(parts.glob("*.bin"))), 3)
+        self.write_index(self.names[:2])
+        code, _, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(parts.exists())
+        self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8"))[-2:],
+                         self.names[:2])
+
+    def test_parts_are_removed_by_a_run_with_a_checker_without_merge_cache(self):
+        self.assertEqual(self.invoke()[0], 0)
+        code, _, err = self.invoke(merge_support=False)
+        self.assertEqual(code, 0, err)
+        self.assertFalse((self.out / "pipeline_cache.parts").exists())
+
+    def test_a_failed_merge_still_names_the_modules_that_crashed(self):
+        code, _, err = self.invoke({"crasher": "m_01", "merge_fail": True})
+        self.assertNotEqual(code, 0)
+        self.assertIn("could not merge the batch caches", err)
+        self.assertIn("1 module(s) took the driver down and were counted as failed: m_01", err)
+        self.assertEqual(len(list((self.out / "pipeline_cache.parts").glob("*.bin"))), 3)   # kept for the next run
+        self.assertFalse((self.out / "pipeline_cache.bin.merging").exists())
+        self.assertFalse((self.out / "pipeline_cache.bin").exists())
 
 
 if __name__ == "__main__":

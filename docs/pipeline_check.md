@@ -343,8 +343,11 @@ that size. Which threads the game creates pipelines on is not known without its 
 Windows and POSIX. The ranges partition the same name-sorted index as `--start` / `--count`, including the final
 short range. Each range keeps its own cache part in `pipeline_cache.parts\<start>-<count>.bin`, which seeds the
 same range on the next run, and one more checker run that checks no shader (its `--start` is past the index) merges
-the parts into `pipeline_cache.bin` with `--merge-cache` (`vkMergePipelineCaches`). Parts of an earlier batch layout
-are removed after the merge; an interrupted run merges nothing and keeps the previous `pipeline_cache.bin`. The
+the parts into `pipeline_cache.bin` with `--merge-cache` (`vkMergePipelineCaches`). A part the driver refuses is
+left out with a warning, as a refused seed is. Parts of an earlier batch layout are removed after the merge, and
+every part once a run checks without them (a single batch, or a checker without `--merge-cache`); an interrupted
+run merges nothing and keeps the previous `pipeline_cache.bin`, and a failed merge keeps the parts for the next run
+and still names any module that took the driver down. The
 batches never seed from `pipeline_cache.bin` itself, so the first run with parts starts every range from an empty
 cache, and its merge replaces a `pipeline_cache.bin` that a single shared cache wrote earlier. Each run removes the
 `.tmp.*` staging files that a checker stopped while saving a part or the merged cache left in

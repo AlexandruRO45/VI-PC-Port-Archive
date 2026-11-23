@@ -2469,18 +2469,28 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     if crashed and not code:
         code = 1
     drop(inflight)
+    merge_error = ""
     written = [p for p in used_parts if os.path.isfile(p)]
     if written and not stopped:
-        merge_cache_parts(exe, spirv, cache, written, len(names))
+        merge_error = merge_cache_parts(exe, spirv, cache, written, len(names))
+    drop_part_staging()
+    if not stopped and not merge_error:
+        # A range of an earlier batch layout, or every part once a run checks without them: pipeline_cache.bin
+        # already holds their merge, and nothing seeds from them any more.
         current = {os.path.normcase(os.path.abspath(p)) for p in used_parts}
         for stale in glob.glob(os.path.join(glob.escape(parts_dir), "*.bin")):
             if os.path.normcase(os.path.abspath(stale)) not in current:
-                os.remove(stale)   # a range of an earlier batch layout; nothing seeds from it any more
-    drop_part_staging()
-    if code != 0:
+                os.remove(stale)
+        if not used_parts:
+            try:
+                os.rmdir(parts_dir)
+            except OSError:
+                pass   # missing, or holds files that are not parts
+    if code != 0 or merge_error:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
             if crashed else ""
-        fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
+        checked = f"vk_pipeline_check exited with {exit_label(code)}{why}" if code else ""
+        fail("; ".join(m for m in (merge_error, checked) if m))
     log("pipelines: done")
 
 
@@ -2492,9 +2502,9 @@ PIPELINE_CACHE_PARTS = "pipeline_cache.parts"   # beside pipeline_cache.bin: one
 PIPELINE_CACHE_MERGING = ".merging"   # suffix of the merge output, renamed over pipeline_cache.bin when complete
 
 
-def merge_cache_parts(exe: str, spirv: str, cache: str, parts: "list[str]", entries: int) -> None:
+def merge_cache_parts(exe: str, spirv: str, cache: str, parts: "list[str]", entries: int) -> str:
     """Merge the batch caches into `cache` with one checker run that checks no shader (its range starts past the
-    index), then replace `cache` with the result."""
+    index), then replace `cache` with the result. Returns "" when merged, otherwise what went wrong."""
     merged = cache + PIPELINE_CACHE_MERGING
     drop(merged)
     log(f"pipelines: merging {len(parts)} batch cache(s) into {os.path.basename(cache)}")
@@ -2503,9 +2513,11 @@ def merge_cache_parts(exe: str, spirv: str, cache: str, parts: "list[str]", entr
         args += ["--merge-cache", part]
     code = run(args, check=False)
     if code != 0 or not os.path.isfile(merged):
-        fail(f"vk_pipeline_check could not merge the batch caches ({exit_label(code)}); they stay in "
-             f"{os.path.dirname(parts[0])} for the next run")
+        drop(merged)
+        return (f"vk_pipeline_check could not merge the batch caches ({exit_label(code)}); they stay in "
+                f"{os.path.dirname(parts[0])} for the next run")
     os.replace(merged, cache)
+    return ""
 
 
 def interrupted(code: int) -> bool:

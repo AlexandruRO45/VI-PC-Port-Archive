@@ -1431,9 +1431,10 @@ int main(int argc, char** argv) {
         mci.initialDataSize = data.size();
         mci.pInitialData = data.data();
         VkPipelineCache part = VK_NULL_HANDLE;
-        if (VkResult r = vkCreatePipelineCache(dev, &mci, nullptr, &part)) {
-            std::fprintf(stderr, "--merge-cache %s: vkCreatePipelineCache failed: %d\n", path.c_str(), r);
-            return 1;
+        if (VkResult r = vkCreatePipelineCache(dev, &mci, nullptr, &part)) {   // left out, like a refused seed
+            std::fprintf(stderr, "warning: --merge-cache %s: vkCreatePipelineCache failed: %d; not merged\n",
+                         path.c_str(), r);
+            continue;
         }
         std::vector<char>().swap(data);
         const VkResult r = vkMergePipelineCaches(dev, cache, 1, &part);
