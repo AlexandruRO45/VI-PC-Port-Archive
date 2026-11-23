@@ -79,20 +79,16 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 continue
             try:
                 event = json.loads(line)
-                if isinstance(event, dict) and event.get("kind") == "exit" and type(event.get("code")) is not int:
-                    event = None
             except json.JSONDecodeError:
-                trace["bad_lines"] += 1
-                if len(trace["bad_line_numbers"]) < limit:
-                    trace["bad_line_numbers"].append(number)
-                continue
-            if not isinstance(event, dict) or "kind" not in event:
+                event = None
+            kind = event.get("kind") if isinstance(event, dict) else None
+            if (not isinstance(kind, str) or not kind.strip()
+                    or (kind == "exit" and type(event.get("code")) is not int)):
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
                     trace["bad_line_numbers"].append(number)
                 continue
             trace["events"] += 1
-            kind = str(event.get("kind"))
             trace["kinds"][kind] = trace["kinds"].get(kind, 0) + 1
             if kind == "trace_open":
                 trace["pid"] = event.get("pid")

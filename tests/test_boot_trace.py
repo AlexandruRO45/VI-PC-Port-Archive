@@ -218,6 +218,31 @@ class BootTraceTests(unittest.TestCase):
                 self.assertEqual(trace["exit"], code)
                 self.assertEqual(trace["debug_strings"], 1)
 
+    def test_malformed_event_kinds_are_counted_without_losing_future_kinds(self):
+        self.write(self.startup, [
+            {"kind": None},
+            {"kind": 123},
+            {"kind": []},
+            {"kind": ""},
+            {"kind": " \t"},
+            {"kind": "future_event"},
+            {"kind": "exit", "code": 0},
+        ])
+        trace = bt.parse_startup(self.startup, limit=2)
+        self.assertEqual(trace["bad_lines"], 5)
+        self.assertEqual(trace["bad_line_numbers"], [1, 2])
+        self.assertEqual(trace["events"], 2)
+        self.assertEqual(trace["kinds"], {"future_event": 1, "exit": 1})
+        self.assertEqual(trace["exit"], 0)
+
+    def test_only_malformed_event_kinds_are_an_input_error(self):
+        self.write(self.startup, [{"kind": None}, {"kind": " "}])
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--json"]), 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("no valid startup event", err.getvalue())
+
     def test_d3d12_summary(self):
         self.write_lines(self.d3d12, D3D12)
         trace = bt.parse_d3d12(self.d3d12)
