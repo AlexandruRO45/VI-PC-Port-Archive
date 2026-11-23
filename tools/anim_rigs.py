@@ -43,7 +43,9 @@ def block_tables(s, at):
     if at + 8 > len(s.d):
         raise anim_clips.DecodeError(f"truncated RIG block at 0x{at:x}")
     version, length = s.d[at + 3], s.u32(at + 4)
-    end = min(len(s.d), at + 8 + length)
+    end = at + 8 + length
+    if end > len(s.d):
+        raise anim_clips.DecodeError(f"truncated RIG block payload at 0x{at:x}")
     o, tables = at + 8, []
     while o + 16 <= end:
         kind, size, count, _word = struct.unpack_from("<4I", s.d, o)

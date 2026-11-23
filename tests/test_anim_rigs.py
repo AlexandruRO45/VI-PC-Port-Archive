@@ -156,6 +156,22 @@ class RigDictionaryTest(unittest.TestCase):
         self.assertEqual(summary["counts"]["rig_dictionaries_unparsed"], 1)
         self.assertIn("truncated RIG block", dicts[0]["error"])
 
+    def test_rig_block_payload_must_fit_in_the_resource(self):
+        page = bytearray(rig_dictionary("src@length", {"anim/rig/b": [(KIND_A, [1])]}))
+        at = page.rfind(b"RIG\x02")
+        length = len(page) - (at + 8)
+        struct.pack_into("<I", page, at + 4, length)
+        exact_end = bytes(page)
+        struct.pack_into("<I", page, at + 4, length + 1)
+        offsets = write_rpf(self.rpf, [exact_end, bytes(page)])
+
+        dictionaries, summary = anim_rigs.scan(self.rpf)
+        counts = summary["counts"]
+        self.assertEqual((counts.get("rig_dictionaries"), counts.get("rig_dictionaries_unparsed")), (1, 1))
+        self.assertEqual([row["offset"] for row in dictionaries], offsets)
+        self.assertEqual(dictionaries[0]["entries"][0]["tables"], [(KIND_A, 1)])
+        self.assertIn("truncated RIG block payload", dictionaries[1]["error"])
+
     def test_cli_writes_counts_only(self):
         out = os.path.join(self.tmp.name, "out.json")
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", self.rigs],
