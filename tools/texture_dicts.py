@@ -33,104 +33,121 @@ from hashdict import joaat  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 CHUNK = 8 << 20
-_WS = " \t\r\n,"
 
 
-def _count_after_items(f, buf, pos, chunk, dec):
-    """The top-level ``Count`` among the keys that follow the ``Items`` array, or None.
+_WS_RUN = re.compile(r"[ \t\r\n]*")
 
-    Parses the remaining members of the top-level object one at a time (a nested ``Count`` inside a later value is
-    not a top-level count), reading more of the file as needed."""
-    def value_at(pos):
-        nonlocal buf
+
+class _Stream:
+    """Incremental reader over a JSON text: whitespace, single characters and whole values, reading more as needed."""
+
+    def __init__(self, f, chunk, dec):
+        self.f, self.chunk, self.dec = f, chunk, dec
+        self.buf, self.pos = "", 0
+
+    def fill(self):
+        more = self.f.read(self.chunk)
+        if not more:
+            return False
+        self.buf, self.pos = self.buf[self.pos:] + more, 0
+        return True
+
+    def peek(self):
+        """The next non-whitespace character (not consumed), or None at the end of the file."""
+        while True:
+            self.pos = _WS_RUN.match(self.buf, self.pos).end()
+            if self.pos < len(self.buf):
+                return self.buf[self.pos]
+            if not self.fill():
+                return None
+
+    def expect(self, ch, where):
+        got = self.peek()
+        if got != ch:
+            raise ValueError(f"expected {ch!r} {where}, found {got!r}")
+        self.pos += 1
+
+    def value(self, where):
+        """Decode one JSON value. A value that reaches the end of the buffer may go on in the next read (the digits of
+        a number split between reads), so it is accepted only when something follows it or the file has ended."""
+        if self.peek() is None:
+            raise ValueError(f"file ends {where}")
         while True:
             try:
-                val, end = dec.raw_decode(buf, pos)
+                val, end = self.dec.raw_decode(self.buf, self.pos)
             except json.JSONDecodeError:
                 val, end = None, None
-            if end is not None and end < len(buf):
-                return val, end
-            # A value that reaches the end of the buffer may go on in the next read (the digits of a number split
-            # between reads were accepted as a shorter number): read on before accepting it.
-            more = f.read(chunk)
-            if not more:
+            if end is not None and end < len(self.buf):
+                self.pos = end
+                return val
+            if not self.fill():
                 if end is None:
-                    raise ValueError("truncated JSON after the Items array")
-                return val, end
-            buf, pos = buf[pos:] + more, 0
+                    raise ValueError(f"invalid or truncated JSON value {where}")
+                self.pos = end
+                return val
 
-    def skip(pos):
-        nonlocal buf
-        while True:
-            while pos < len(buf) and buf[pos] in " \t\r\n":
-                pos += 1
-            if pos < len(buf):
-                return pos
-            more = f.read(chunk)
-            if not more:
-                return pos
-            buf, pos = buf[pos:] + more, 0
 
-    count = None
-    while True:
-        pos = skip(pos)
-        if pos >= len(buf) or buf[pos] == "}":
-            return count
-        if buf[pos] == ",":
-            pos += 1
-            continue
-        key, pos = value_at(pos)
-        pos = skip(pos)
-        if pos >= len(buf) or buf[pos] != ":":
-            return count
-        val, pos = value_at(skip(pos + 1))
-        if key == "Count" and isinstance(val, int) and not isinstance(val, bool):
-            count = val
+def _is_count(key, val):
+    return key == "Count" and isinstance(val, int) and not isinstance(val, bool)
 
 
 def iter_items(path, chunk=CHUNK):
-    """Yield the objects of the top-level ``"Items"`` array without loading the file; returns ``Count`` if seen first."""
-    dec = json.JSONDecoder()
+    """Yield the objects of the top-level ``"Items"`` array of a JSON object without loading the file whole.
+
+    The top level is parsed member by member, so ``Count`` is the top-level member wherever it stands (before or after
+    ``Items``; a ``Count`` nested in another value is not it), and separators are checked: a missing, doubled, leading
+    or trailing comma in ``Items``, an unclosed object or data after it raise ``ValueError``. Returns (as the
+    generator's value) the top-level ``Count``, or None."""
     with open(path, "r", encoding="utf-8") as f:
-        buf, start = "", -1
-        while start < 0:
-            more = f.read(chunk)
-            if not more:
-                raise ValueError(f"{path}: no top-level \"Items\" array")
-            buf += more
-            m = re.search(r'"Items"\s*:\s*\[', buf)
-            if m:
-                start = m.end()
-        cm = re.search(r'"Count"\s*:\s*(\d+)', buf[:start])
-        count = int(cm.group(1)) if cm else None
-        pos = start
+        s = _Stream(f, chunk, json.JSONDecoder())
+        s.expect("{", "at the start")
+        count = None
         while True:
-            while True:
-                while pos < len(buf) and buf[pos] in _WS:
-                    pos += 1
-                if pos < len(buf):
+            if s.peek() == "}":
+                raise ValueError("no top-level \"Items\" array")
+            key = s.value("in the top-level object")
+            if not isinstance(key, str):
+                raise ValueError("a top-level key is not a string")
+            s.expect(":", f"after the top-level key {key!r}")
+            if key != "Items":
+                val = s.value(f"for the top-level key {key!r}")
+                if _is_count(key, val):
+                    count = val
+                s.expect(",", "between top-level members")
+                continue
+            s.expect("[", "to open \"Items\"")
+            if s.peek() == "]":
+                s.pos += 1
+            else:
+                while True:
+                    yield s.value("in \"Items\"")
+                    nxt = s.peek()
+                    if nxt == "]":
+                        s.pos += 1
+                        break
+                    if nxt != ",":
+                        raise ValueError(f"expected ',' or ']' in \"Items\", found {nxt!r}")
+                    s.pos += 1
+                    if s.peek() in (",", "]"):
+                        raise ValueError("misplaced ',' in \"Items\"")
+            while True:  # the members after Items, then the end of the object
+                nxt = s.peek()
+                if nxt == "}":
+                    s.pos += 1
                     break
-                more = f.read(chunk)
-                if not more:
-                    raise ValueError(f"{path}: \"Items\" array is not closed")
-                buf, pos = buf[pos:] + more, 0
-            if buf[pos] == "]":
-                if count is None:  # Count may follow Items: read the rest of the top-level object, key by key
-                    count = _count_after_items(f, buf, pos + 1, chunk, dec)
-                return count
-            while True:
-                try:
-                    obj, end = dec.raw_decode(buf, pos)
-                    break
-                except json.JSONDecodeError:
-                    more = f.read(chunk)
-                    if not more:
-                        raise
-                    buf, pos = buf[pos:] + more, 0
-            yield obj
-            pos = end
-            if pos > chunk:
-                buf, pos = buf[pos:], 0
+                if nxt != ",":
+                    raise ValueError(f"expected ',' or '}}' after \"Items\", found {nxt!r}")
+                s.pos += 1
+                key = s.value("in the top-level object")
+                if not isinstance(key, str):
+                    raise ValueError("a top-level key is not a string")
+                s.expect(":", f"after the top-level key {key!r}")
+                val = s.value(f"for the top-level key {key!r}")
+                if _is_count(key, val):
+                    count = val
+            if s.peek() is not None:
+                raise ValueError("data after the top-level object")
+            return count
 
 
 def read_all(path):

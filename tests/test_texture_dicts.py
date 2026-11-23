@@ -94,6 +94,38 @@ class CensusTests(unittest.TestCase):
             dump(os.path.join(exp, ".hidden", "textures", "manifest.json"), {"Count": 1, "Items": [dictionary(16, ["h"])]})
             self.assertIn(".hidden", td.census(exp)["dictionaries"])
 
+    def test_invalid_json_is_rejected(self):
+        # review on #4946: separators and the enclosing object are checked, at every read size
+        bad = ['{ "Count":2,"Items":[{}{}]', '{"Items":[{},]}', '{"Items":[,{}]}', '{"Items":[{},,{}]}',
+               '{"Items":[{}]', '{"Items":[{}]} x', '{"Items":[{}] "Count":1}', '{"Count":1 "Items":[]}',
+               '{"Items":[{}],}', '{"Count":1}', '[{}]', '']
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.json")
+            for text in bad:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                for chunk in (1, 2, 5, td.CHUNK):
+                    with self.assertRaises(ValueError, msg=(text, chunk)):
+                        list(td.iter_items(path, chunk))
+
+    def test_top_level_count_only(self):
+        good = {'{"src":"\\"Items\\": [","Items":[{}],"Count":1}': 1,
+                '{"Count":2,"Items":[{},{}],"Fail":[{"Count":7}]}': 2,
+                '{"Items":[],"Count":0}': 0, '{"Items":[{}]}': None}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.json")
+            for text, want in good.items():
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                for chunk in range(1, len(text) + 2):
+                    gen = td.iter_items(path, chunk)
+                    while True:
+                        try:
+                            next(gen)
+                        except StopIteration as stop:
+                            self.assertEqual(stop.value, want, (text, chunk))
+                            break
+
     def test_key64_normalisation(self):
         self.assertEqual(td.key64("0xAbC"), "0000000000000abc")
         self.assertEqual(td.key64(255), "00000000000000ff")
