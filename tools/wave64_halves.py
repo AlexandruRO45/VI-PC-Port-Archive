@@ -185,6 +185,15 @@ def _zero(a):
     return a.get("k") == "imm" and a.get("v") == 0
 
 
+def _uniform_mask_const(a):
+    """True when `a` is constant 0 or all-64-bits-set (-1 / 0xFFFFFFFFFFFFFFFF / null): bit L agrees in lanes 0..31
+    and 32..63, so `rdna2spirv.Gen.mask_src` is partition-invariant. A positive 32-bit literal such as 0xFFFFFFFF has
+    zero upper 32 bits (lanes 0..31 on, 32..63 off) and is NOT uniform across halves."""
+    if a.get("k") == "imm":
+        return a["v"] in (0, -1, 0xFFFFFFFFFFFFFFFF)
+    return a.get("k") == "special" and a.get("t") == "null"
+
+
 def _mask64(a):
     """A whole 64-bit SGPR pair or VCC (a lane mask register), not EXEC and not a 32-bit half."""
     if a.get("k") == "sgpr":
@@ -875,25 +884,40 @@ class Analysis:
             T["scc"] = t_src
             st["g"].pop("scc", None)
             return
-        if op.startswith(MASK_BITWISE) and dests and any(self.is_mask(ins, x) for x in srcs):
+        if op.startswith(MASK_BITWISE) and dests and (
+                any(self.is_mask(ins, x) for x in srcs)
+                or (_half(dests[0]) and self.is_mask(ins, dests[0]))
+                or (op.endswith("b64") and _regs(dests[0]) == ["vcc"])):
             if not op.endswith("b64") or any(_half(x) for x in srcs + dests):
                 violation("mask-half")
                 put(dests[0], t_src | X)
                 return
-            if any(not self.is_mask(ins, x) and not (x.get("k") == "imm" and x["v"] in (
-                    0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF)) for x in srcs):
-                # a lane mask combined with a register that is not one (a user value, a loaded mask): the result is
-                # no mask the translator tracks, and its bits are the lanes of the half
+            def non_uniform_mask_src(x):
+                if self.is_mask(ins, x) or _uniform_mask_const(x):
+                    return False
+                # A half-overwritten SGPR mask pair (one dword in masks, the other overwritten) is not a plain-data
+                # pair; keep its downstream vote checks (unsafe-vote-branch) intact.
+                if x.get("k") == "sgpr" and x.get("n", 1) == 2:
+                    held = self.masks.get(id(ins), {})
+                    if any(x["r"] + k in held for k in range(2)):
+                        return False
+                return True
+
+            if any(non_uniform_mask_src(x) for x in srcs):
+                # a lane mask combined with (or built from) a non-mask register or non-uniform 64-bit literal
+                # (including 0xFFFFFFFF, whose high dword is 0): mask_src takes bit wave_lane (0..63 vs 0..31)
                 put(dests[0], t_src | X | MASKD)
-                T["scc"] = X | MASKD
-                st["g"].pop("scc", None)
+                if not op.startswith(("s_mov", "s_cselect")):
+                    T["scc"] = X | MASKD
+                    st["g"].pop("scc", None)
                 return
             tag = None
             if op == "s_mov_b64" and len(srcs) == 1:
                 r = _regs(srcs[0])
                 if srcs[0].get("k") == "special" and srcs[0].get("t") == "exec":
                     tag = ("mask", st["x"])
-                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote"):
+                elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask", "uvote") and \
+                        all(st["g"].get(rk) == st["g"][r[0]] for rk in r):
                     tag = st["g"][r[0]]
             elif op == "s_and_b64" and not t_src and all(
                     (_regs(x) == ["exec"] and st["f"]) or (_regs(x) and all(st["g"].get(r) == UVOTE for r in _regs(x)))
@@ -1167,6 +1191,8 @@ class Analysis:
         if any(op.startswith(p) for p in SAVEEXEC):
             m = srcs[0] if srcs else None
             mt = self.rd(st, ins, m) if m else 0
+            if m is not None and not self.is_mask(ins, m) and not _uniform_mask_const(m):
+                mt |= LANE
             mg = st["g"].get(_regs(m)[0]) if m and _regs(m) else None
             is_wrexec = "_wrexec_" in op
             narrowing = op.startswith(("s_and_saveexec_", "s_andn1_saveexec_", "s_and_wrexec_", "s_andn1_wrexec_"))
@@ -1193,7 +1219,10 @@ class Analysis:
                 mt = 0
                 for x in srcregs:
                     mt |= self.rd(st, ins, x)
+                    if not self.is_mask(ins, x) and not _uniform_mask_const(x):
+                        mt |= LANE
             if (op == "s_mov_b64" or (op == "s_or_b64" and any(_regs(x) == ["exec"] for x in srcs))) \
+                    and not (mt & LANE) \
                     and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
