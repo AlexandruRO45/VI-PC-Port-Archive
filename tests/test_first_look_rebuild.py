@@ -22,11 +22,21 @@ PE_INSPECT_STUB = (
     "report = Path(sys.argv[-1]) / (Path(sys.argv[1]).name + '.json')\n"
     "report.write_text('{\"imports\":[],\"sections\":[]}', encoding='utf-8', newline='\\n')\n"
 )
-# The rebuild test is about the loader, not about the other tools the script runs. Each of those must be a python
-# call that exits 0: first_look.ps1 records the dry run's code from $LASTEXITCODE, and the loader is stood in for by a
-# Write-Output alias, which does not set it. A tool left out of the fixture leaves 1 behind, and the script then exits
-# 1 even when it rebuilt and dry-ran correctly.
+# Stubs for the three tools first_look.ps1 runs after pe_inspect. Each accepts its real arguments (argparse would
+# reject unknown flags) and exits 0, so none leaves a code behind for the dry run's exit status to pick up;
+# find_hash_lookup also writes the json the checklist is pointed at. A test that needs a failing tool writes
+# TOOL_STUB_TEMPLATE instead.
 TOOL_STUB_TEMPLATE = "raise SystemExit(%d)\n"
+GDK_RUNTIME_CALLS_STUB = "import sys\n"
+FIND_HASH_LOOKUP_STUB = (
+    "from pathlib import Path\n"
+    "import sys\n"
+    "for a in sys.argv:\n"
+    "    if a.endswith('.json'):\n"
+    "        Path(a).parent.mkdir(parents=True, exist_ok=True)\n"
+    "        Path(a).write_text('{}', encoding='utf-8', newline='\\n')\n"
+)
+EXE_CHECKLIST_STUB = "import sys\n"
 # The build script leaves a marker; the loader is replaced by an alias that echoes its arguments.
 BUILD_STUB = r"""
 Set-Content -LiteralPath (Join-Path $PSScriptRoot 'built.txt') -Value 'built'
@@ -67,7 +77,7 @@ $ErrorActionPreference = 'Stop'
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell diagnostics script")
 class FirstLookRebuildTest(unittest.TestCase):
     def run_case(self, source_newer=False, missing=(), incomplete_build=False, tool_exit=0, stub_loader=True,
-                 cache=None):
+                 cache=None, dryrun_before=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for folder in ("scripts", "tools", "runtime/build", "runtime/src"):
@@ -75,8 +85,11 @@ class FirstLookRebuildTest(unittest.TestCase):
             shutil.copyfile(SCRIPT, root / "scripts" / SCRIPT.name)
             (root / "scripts" / "build_runtime.ps1").write_text(BUILD_STUB, encoding="utf-8")
             (root / "tools" / "pe_inspect.py").write_text(PE_INSPECT_STUB, encoding="utf-8", newline="\n")
-            for name in ("gdk_runtime_calls.py", "find_hash_lookup.py", "exe_checklist.py"):
-                (root / "tools" / name).write_text(TOOL_STUB_TEMPLATE % tool_exit, encoding="utf-8", newline="\n")
+            for name, stub in (("gdk_runtime_calls.py", GDK_RUNTIME_CALLS_STUB),
+                               ("find_hash_lookup.py", FIND_HASH_LOOKUP_STUB),
+                               ("exe_checklist.py", EXE_CHECKLIST_STUB)):
+                (root / "tools" / name).write_text(TOOL_STUB_TEMPLATE % tool_exit if tool_exit else stub,
+                                                   encoding="utf-8", newline="\n")
             (root / "fixture.exe").write_bytes(b"MZ")
             loader = root / "runtime" / "build" / "gta6rt.exe"
             if cache is not None:
@@ -92,6 +105,10 @@ class FirstLookRebuildTest(unittest.TestCase):
             os.utime(source, (newer, newer) if source_newer else (older, older))
             for name in missing:
                 loader.with_name(name).unlink()
+            if dryrun_before is not None:
+                report = root / "reports" / "exe" / "fixture" / "dryrun.txt"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(dryrun_before, encoding="utf-8")
             env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
             env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
             env["LEONIDA_TEST_INCOMPLETE_RUNTIME"] = "1" if incomplete_build else "0"
@@ -120,6 +137,16 @@ class FirstLookRebuildTest(unittest.TestCase):
         self.assertFalse(dry_run, out)
         self.assertEqual(code, 1, out)
         self.assertIn("the loader did not run", out)
+
+    def test_a_failed_launch_does_not_leave_the_previous_runs_report(self):
+        # A retry after a working run: the loader is empty, the launch fails, and the tee has nothing to write, so
+        # the first run's report would stay in the folder looking current.
+        built, dry_run, code, out = self.run_case(stub_loader=False, dryrun_before="dry run ok\n")
+        self.assertFalse(built, out)
+        self.assertFalse(dry_run, out)
+        self.assertEqual(code, 1, out)
+        self.assertIn("the loader did not run", out)
+        self.assertIn("previous dry run report was removed", out)
 
     def test_a_loader_older_than_the_sources_is_rebuilt(self):
         built, dry_run, code, out = self.run_case(source_newer=True)

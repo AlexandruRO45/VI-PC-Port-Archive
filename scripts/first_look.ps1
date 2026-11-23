@@ -93,6 +93,7 @@ if (-not $hasTls -or $stale) {
     if (-not (Test-Path -LiteralPath $tlsHost -PathType Leaf)) { throw "runtime build did not produce $tlsHost" }
 }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
+$dryRunReport = Join-Path $out "dryrun.txt"
 # The exit status below is the dry run's, so clear the one the tools above left behind and require the loader to set
 # it. A loader that cannot start (an interrupted build's empty gta6rt.exe, or a call this script no longer makes as a
 # native command) leaves it null, and the report then says the dry run never ran instead of exiting with a tool's code.
@@ -102,9 +103,12 @@ $global:LASTEXITCODE = $null
     $ErrorActionPreference = "Continue"
     $PSNativeCommandUseErrorActionPreference = $false
     & $rt --dry-run $Exe --game-dir $GameDir 2>&1
-} | Tee-Object -LiteralPath (Join-Path $out "dryrun.txt") | Select-Object -Last 40
+} | Tee-Object -LiteralPath $dryRunReport | Select-Object -Last 40
 if ($null -eq $global:LASTEXITCODE) {
-    Write-Warning "the loader did not run, so the dry run has no exit status"
+    # The tee writes nothing when the loader cannot start, so an earlier run's report would stay in place and look
+    # current. Remove it and say so in the warning.
+    Remove-Item -LiteralPath $dryRunReport -Force -ErrorAction SilentlyContinue
+    Write-Warning "the loader did not run, so the dry run has no exit status; the previous dry run report was removed"
     $dryRunExitCode = 1
 } else {
     $dryRunExitCode = $global:LASTEXITCODE
