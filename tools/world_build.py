@@ -512,10 +512,10 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
                               "base_color_factor": [1.0, 1.0, 1.0, 1.0], "double_sided": True}
     path = os.path.join(staging_dir, f"{chunk_id}.glb")
     info = glb_mod.write_instanced_glb(path, meshes, materials or None, mode=mode)
-    _verify_staged_chunk(path, int(info["bytes"]), glb_mod)
+    digest = _verify_staged_chunk(path, int(info["bytes"]), glb_mod)
     rec = {
         "id": chunk_id,
-        "url": f"world/chunks/{chunk_id}.glb",
+        "url": f"world/chunks/{chunk_id}.{digest}.glb",
         "bounds": info["bounds"],
         "models": info["instances"],
         "triangles": info["triangles"],
@@ -704,8 +704,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
         if lod_sets:
             world_doc["lod_bands"] = bands
             world_doc["stats"]["lod_tiers"] = measured
-        _publish_world(staging_dir, chunks_dir, [f"{c['id']}.glb" for c in chunks],
-                       os.path.join(abs_out, "world.json"), world_doc, glb_mod)
+        _publish_world(staging_dir, chunks_dir, os.path.join(abs_out, "world.json"), world_doc, glb_mod)
     except BaseException:
         if not _holds_unrestored_chunks(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
@@ -716,7 +715,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
                 pass
         raise
     shutil.rmtree(staging_dir, ignore_errors=True)
-    _prune_stale_chunks(chunks_dir, {f"{c['id']}.glb" for c in world_doc["chunks"]})
+    _prune_stale_chunks(chunks_dir, {os.path.basename(c["url"]) for c in world_doc["chunks"]})
     return world_doc
 
 
@@ -1226,10 +1225,10 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
         raise
 
 
-# Cell coordinates are written as decimal integers, without leading zeros; --lod-sets prefixes the tier name.
+# Match generated names, including pre-digest chunks left by earlier builds.
 _LOD_TIER_PATTERN = "|".join(re.escape(name) for name in LOD_TIER_NAMES.values())
 _CHUNK_FILE_RE = re.compile(
-    rf"c_(?:(?:{_LOD_TIER_PATTERN})_)?(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?"
+    rf"c_(?:(?:{_LOD_TIER_PATTERN})_)?(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)(?:\.[0-9a-f]{{64}})?\.glb(?:\.tmp)?"
 )
 
 
@@ -1345,66 +1344,39 @@ def _remove_stale_staging(out_dir: str) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _verify_staged_chunk(path: str, expected_size: int, glb_mod) -> None:
-    """Raise GlbError unless the staged file is the complete GLB that write_glb reported."""
+def _verify_staged_chunk(path: str, expected_size: int, glb_mod) -> str:
+    """Return the digest of the complete GLB that write_glb reported."""
     with open(path, "rb") as f:
         data = f.read()
     if len(data) != expected_size:
         raise glb_mod.GlbError(f"staged chunk {path} is {len(data)} bytes, expected {expected_size}")
     glb_mod.read_glb_summary(data)
+    return hashlib.sha256(data).hexdigest()
 
 
 def _publish_world(
     staging_dir: str,
     chunks_dir: str,
-    chunk_names: list[str],
     world_path: str,
     world_doc: dict,
     glb_mod,
 ) -> None:
-    """Move the verified staged chunks into chunks_dir, then commit world.json.
-
-    Every live chunk that gets replaced is first moved into <staging>/previous/. If a move or
-    the world.json write fails, the new chunks are taken out again and the previous ones put
-    back, so the old world.json keeps matching its chunks. A previous chunk that cannot be put
-    back stays in <staging>/previous/ and is named in the raised error.
-    """
-    backup_dir = os.path.join(staging_dir, _STAGING_BACKUP)
-    os.makedirs(backup_dir, exist_ok=True)
+    """Install verified chunks at content-specific URLs, then atomically publish their manifest."""
     os.makedirs(chunks_dir, exist_ok=True)
-    backed_up: list[str] = []
-    placed: list[str] = []
+    added: list[str] = []
     try:
-        for name in chunk_names:
-            live = os.path.join(chunks_dir, name)
-            staged = os.path.join(staging_dir, name)
+        for chunk in world_doc["chunks"]:
+            live = os.path.join(chunks_dir, os.path.basename(chunk["url"]))
+            staged = os.path.join(staging_dir, f"{chunk['id']}.glb")
             os.chmod(staged, published_mode(live))
-            if os.path.lexists(live):
-                glb_mod._replace(live, os.path.join(backup_dir, name))
-                backed_up.append(name)
+            if not os.path.lexists(live):
+                added.append(live)
             glb_mod._replace(staged, live)
-            placed.append(name)
         _write_json_atomic(world_path, world_doc, replace=glb_mod._replace)
-    except BaseException as exc:
-        unrestored = []
-        restore = set(backed_up)
-        for name in reversed(placed):
-            if name not in restore:
-                try:
-                    os.remove(os.path.join(chunks_dir, name))
-                except OSError:
-                    pass
-        for name in reversed(backed_up):
-            try:
-                glb_mod._replace(os.path.join(backup_dir, name), os.path.join(chunks_dir, name))
-            except OSError:
-                unrestored.append(name)
-        if unrestored:
-            raise OSError(
-                f"publishing chunks failed ({exc!r}) and {len(unrestored)} previous chunk(s) could not be "
-                f"put back; they are in {backup_dir} (kept by later builds until restored or deleted): "
-                f"{', '.join(sorted(unrestored))}"
-            ) from exc
+    except Exception:
+        for path in added:
+            if os.path.lexists(path):
+                os.remove(path)
         raise
 
 
@@ -1620,7 +1592,7 @@ def build_world(
                 pass
         raise
     shutil.rmtree(staging_dir, ignore_errors=True)
-    _prune_stale_chunks(chunks_dir, {f"{c['id']}.glb" for c in world_doc["chunks"]})
+    _prune_stale_chunks(chunks_dir, {os.path.basename(c["url"]) for c in world_doc["chunks"]})
     return world_doc
 
 
@@ -1713,7 +1685,6 @@ def _build_staged_world(
         info = glb_mod.write_glb(glb_path, cell_prims, materials=materials if materials else None)
         chunk_rec = {
             "id": chunk_id,
-            "url": f"world/chunks/{chunk_id}.glb",
             "bounds": info["bounds"],
             "models": len(cell_models),
             "triangles": info["triangles"],
@@ -1738,10 +1709,10 @@ def _build_staged_world(
                     f.cancel()  # stop cells that have not started; running ones finish before cleanup
                 raise
 
-    for chunk_rec, _, _, size in cell_results:
-        _verify_staged_chunk(os.path.join(staging_dir, f"{chunk_rec['id']}.glb"), size, glb_mod)
-
-    for chunk_rec, embedded_count, skipped_count, _ in cell_results:
+    for chunk_rec, embedded_count, skipped_count, size in cell_results:
+        chunk_id = chunk_rec["id"]
+        digest = _verify_staged_chunk(os.path.join(staging_dir, f"{chunk_id}.glb"), size, glb_mod)
+        chunk_rec["url"] = f"world/chunks/{chunk_id}.{digest}.glb"
         chunks.append(chunk_rec)
         total_triangles += int(chunk_rec["triangles"])
         textures_embedded += embedded_count
@@ -1764,7 +1735,7 @@ def _build_staged_world(
     if placement_stats is not None:
         world_doc["stats"]["placements"] = dict(placement_stats)
 
-    _publish_world(staging_dir, chunks_dir, [f"{c['id']}.glb" for c in chunks], world_path, world_doc, glb_mod)
+    _publish_world(staging_dir, chunks_dir, world_path, world_doc, glb_mod)
     return world_doc
 
 

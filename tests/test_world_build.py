@@ -1802,7 +1802,7 @@ class WorldBuildTest(unittest.TestCase):
             res_limited = world_build.build_world(assets_dir, out_dir, limit=1, jobs=4)
             self.assertEqual(len(res_limited["chunks"]), 1)
             after_files = sorted(os.listdir(chunks_dir))
-            expected = [f"{res_limited['chunks'][0]['id']}.glb"] + unrelated
+            expected = [os.path.basename(res_limited["chunks"][0]["url"])] + unrelated
             self.assertEqual(after_files, sorted(expected))
 
             # Non-existent assets_dir raises FileNotFoundError in API and returns exit 1 in CLI.
@@ -1860,7 +1860,7 @@ class WorldBuildStagingTest(unittest.TestCase):
                         parse_and_validate_glb(f.read())
                 self.assertEqual(sorted(os.listdir(output)), ["chunks", "world.json"])
                 self.assertEqual(sorted(os.listdir(os.path.join(output, "chunks"))),
-                                 sorted(f"{c['id']}.glb" for c in document["chunks"]))
+                                 sorted(os.path.basename(c["url"]) for c in document["chunks"]))
 
     def test_failed_chunk_write_leaves_existing_world_untouched(self):
         failures = (glb_writer.GlbError("synthetic broken asset"), OSError("synthetic write error"),
@@ -1907,6 +1907,21 @@ class WorldBuildStagingTest(unittest.TestCase):
                 with self.assertRaises(OSError):
                     world_build.build_world(assets, output)
             self.assertEqual(self._snapshot(output), before)
+
+    def test_old_manifest_and_chunks_remain_readable_until_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            real_write = world_build._write_json_atomic
+
+            def observe_commit(path, document, **kwargs):
+                on_disk = self._snapshot(output)
+                self.assertEqual({name: on_disk.get(name) for name in before}, before)
+                for chunk in document["chunks"]:
+                    self.assertTrue(os.path.isfile(_chunk_disk_path(output, chunk["url"])))
+                return real_write(path, document, **kwargs)
+
+            with unittest.mock.patch.object(world_build, "_write_json_atomic", side_effect=observe_commit):
+                world_build.build_world(assets, output, textures=True)
 
     def test_staging_left_by_a_killed_build_is_removed_on_the_next_build(self):
         with tempfile.TemporaryDirectory() as tmp:
