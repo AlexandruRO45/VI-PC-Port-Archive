@@ -247,9 +247,9 @@ HRESULT builder_rehydrate_batched2x(void*, void* list, UINT count,
             std::fprintf(stderr, "\n");
         }
     }
+    // The real list behind a console list proxy: the private interface is the layer list's, not the proxy's.
     ILeonidaXdxrRehydrate* rehydrate = nullptr;
-    if (FAILED(static_cast<IUnknown*>(list)->QueryInterface(IID_ILeonidaXdxrRehydrate,
-                                                             reinterpret_cast<void**>(&rehydrate)))) {
+    if (FAILED(real_list(list)->QueryInterface(IID_ILeonidaXdxrRehydrate, reinterpret_cast<void**>(&rehydrate)))) {
         static std::atomic<bool> s_logged{false};
         log_once(s_logged, "RehydrateRaytracingAccelerationStructureBatched2X: the list is not the layer's; E_NOTIMPL");
         return E_NOTIMPL;
