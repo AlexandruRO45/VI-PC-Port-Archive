@@ -322,6 +322,33 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(data["startup"]["pid"], 123)
         self.assertEqual(data["d3d12"]["calls"], 9)
 
+    def test_compare_groups_recurring_last_events(self):
+        self.write(self.startup, STARTUP)
+        self.assertNotIn("last_event", bt.parse_startup(self.startup))
+        paths = [os.path.join(self.tmp.name, f"boot-{n}.jsonl") for n in range(3)]
+        fault = {"kind": "exception", "code": "0xc0000005", "at": "game.exe+0x40"}
+        for n, path in enumerate(paths):
+            self.write(path, [{**fault, "address": hex(n), "pid": n}])
+        with open(paths[2], "a", encoding="utf-8", newline="\n") as stream:
+            stream.write('{"kind":')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main(["--compare", self.startup, *paths, "--json"]), 0)
+        result = json.loads(out.getvalue())
+        self.assertEqual(result["outcomes"], {"exception 0xc0000005 at game.exe+0x40": 3, "exit 0": 1})
+        self.assertEqual([run["path"] for run in result["runs"]], [self.startup, *paths])
+        self.assertEqual([run["last_event"] for run in result["runs"]], ["exit", "exception", "exception", "exception"])
+        self.assertEqual([run["bad_lines"] for run in result["runs"]], [0, 0, 0, 1])
+        self.assertNotIn("secret game text", out.getvalue())
+
+    def test_compare_preserves_readable_runs_when_an_input_fails(self):
+        self.write(self.startup, [{"kind": "unimplemented_call", "import": "x.dll!Foo"}])
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main(["--compare", self.d3d12, self.startup]), 2)
+        self.assertIn("cannot read", err.getvalue())
+        self.assertIn("1x unimplemented_call x.dll!Foo", out.getvalue())
+
     def test_missing_and_empty_files_are_errors(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

@@ -50,6 +50,16 @@ The capture pipeline writes each message as text to avoid PowerShell 5.1 wrappin
 narrow output width. The tool also reads existing UTF-16LE logs saved with `2>` in PowerShell 5.1 and recognizes
 the `program.exe : ` prefix on the first stderr line.
 
+Give each run a different startup trace path. To compare the last recorded events across runs:
+
+```text
+python -I tools/boot_trace.py --compare boot-1.jsonl boot-2.jsonl boot-3.jsonl
+```
+
+The report counts repeated outcomes, distinguishing exception codes and sites, missing imports and exit codes.
+The last recorded event may have preceded the actual stop. Use `--json` for structured results. Unreadable
+or empty traces are reported on stderr and cause exit code 2. Readable traces still appear in the report.
+
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 
 ```sh

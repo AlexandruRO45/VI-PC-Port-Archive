@@ -13,6 +13,7 @@ tag is accepted too. The reader accepts UTF-8 and BOM-marked UTF-16, including P
 
 Usage:
     python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
+    python -I boot_trace.py --compare boot-1.jsonl boot-2.jsonl [...] [--json]
 
 The traces can quote what the game prints, so they stay on the player's machine: the text report counts debug
 strings instead of printing them, and only the tests' synthetic fixtures go into the repository. Share counts and
@@ -26,6 +27,7 @@ parse, the report still includes the other trace.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import re
 import sys
@@ -48,7 +50,7 @@ def _open_text(path: str):
         raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
 
 
-def parse_startup(path: str, limit: int = 10) -> dict:
+def parse_startup(path: str, limit: int = 10, *, include_last_event: bool = False) -> dict:
     """Read the `--trace` JSONL into the units the first-boot triage uses."""
     trace = {
         "path": path,
@@ -72,6 +74,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "error": None,
     }
     seen_imports = set()
+    last_event = None
     with _open_text(path) as fh:
         for number, line in enumerate(fh, 1):
             line = line.strip()
@@ -93,6 +96,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 continue
             trace["events"] += 1
             kind = str(event.get("kind"))
+            last_event = event
             trace["kinds"][kind] = trace["kinds"].get(kind, 0) + 1
             if kind == "trace_open":
                 trace["pid"] = event.get("pid")
@@ -167,7 +171,44 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["error"] = event.get("what")
     if trace["events"] == 0:
         raise TraceError(f"{path} has no valid startup event")
+    if include_last_event:
+        kind = str(last_event["kind"])
+        outcome = kind
+        if kind == "exit":
+            outcome = f"exit {last_event['code']}"
+        elif kind == "exception":
+            outcome = f"exception {last_event.get('code') or '?'} at {last_event.get('at') or '?'}"
+        elif kind == "unimplemented_call":
+            outcome = f"unimplemented_call {last_event.get('import') or '?'}"
+        trace["last_event"] = kind
+        trace["outcome"] = outcome
     return trace
+
+
+def compare_startup(paths: list[str], as_json: bool) -> int:
+    runs = []
+    counts = Counter()
+    exit_code = 0
+    for path in paths:
+        try:
+            trace = parse_startup(path, limit=1, include_last_event=True)
+        except TraceError as e:
+            print(f"error: {e}", file=sys.stderr)
+            exit_code = 2
+            continue
+        runs.append({key: trace[key] for key in ("path", "events", "bad_lines", "last_event", "outcome")})
+        counts[trace["outcome"]] += 1
+    if not runs:
+        return 2
+    if as_json:
+        print(json.dumps({"runs": runs, "outcomes": dict(sorted(counts.items()))}, indent=1))
+    else:
+        for run in runs:
+            print(f"{run['path']}: {run['outcome']} ({run['events']} events, {run['bad_lines']} malformed)")
+        print("Last recorded outcomes:")
+        for outcome, count in sorted(counts.items()):
+            print(f"  {count}x {outcome}")
+    return exit_code
 
 
 def parse_d3d12(path: str, limit: int = 10) -> dict:
@@ -318,12 +359,19 @@ def main(argv=None) -> int:
         description="Summarize gta6rt's startup and D3D12 first-boot traces."
     )
     ap.add_argument("startup", nargs="?", help="the JSONL written by gta6rt --trace")
+    ap.add_argument("--compare", nargs="+", metavar="TRACE", help="compare two or more startup JSONL traces")
     ap.add_argument("--d3d12", help="the stderr log written with --trace-d3d12")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     ap.add_argument(
         "--limit", type=int, default=10, help="items listed per section (default 10)"
     )
     a = ap.parse_args(argv)
+    if a.compare is not None:
+        if len(a.compare) < 2 or a.startup or a.d3d12:
+            ap.error("--compare needs at least two startup traces and cannot be combined with startup or --d3d12")
+        if a.limit < 1:
+            ap.error("--limit must be at least 1")
+        return compare_startup(a.compare, a.json)
     if not a.startup and not a.d3d12:
         print("error: give the startup trace, --d3d12, or both", file=sys.stderr)
         return 2
