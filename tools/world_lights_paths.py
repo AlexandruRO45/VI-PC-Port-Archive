@@ -694,7 +694,7 @@ def summarize(total, entities=None, lights_out=None):
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
         if entities:
-            with open(entities, encoding="utf-8") as f:
+            with open(entities, encoding="utf-8-sig") as f:
                 for line in f:
                     if not line.strip():
                         continue

@@ -577,6 +577,27 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(lines[3], "ERROR: --limit must be at least 1")
         self.assertEqual(lines[4], "ERROR: --limit must be at least 1")
 
+    def test_entities_with_utf8_bom_is_accepted(self):
+        bom_entities = os.path.join(self.tmp.name, "entities_bom.jsonl")
+        with open(bom_entities, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write(json.dumps({"archetype": "a1b2c3d4", "position": [10, 0, 0], "rotation": [0, 0, 0, 1]}) + "\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = T.main([self.rpf, "--entities", bom_entities])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue())["placement"]["entities"], 1)
+
+    def test_malformed_entities_with_utf8_bom_is_one_line_error(self):
+        bom_bad = os.path.join(self.tmp.name, "entities_bad_bom.jsonl")
+        with open(bom_bad, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("{not valid json\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = T.main([self.rpf, "--entities", bom_bad])
+        self.assertEqual(rc, 2)
+        self.assertIn("entities_bad_bom.jsonl", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
 
 class GraphStatsFirstLinkTest(unittest.TestCase):
     @staticmethod
