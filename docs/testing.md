@@ -94,7 +94,13 @@ section below; GitHub expires the artifact after 7 days. Not every commit on `ma
 only when a commit touches what it builds or reads (the `paths` list in `.github/workflows/runtime.yml`), so a
 commit that changes only docs, tests or other tools has no Runtime run. Take the most recent run under
 Actions -> Runtime, and check out the commit it built, or start a run of the commit you want on your own fork with
-"Run workflow" (`workflow_dispatch`). Download and unzip `runtime-windows`, and pass the unzipped folder to `--build`:
+"Run workflow" (`workflow_dispatch`).
+
+The artifact includes `build-info.json` with its full checkout commit (`source_commit`), workflow run attempt URL,
+and an explicit list of CMake configuration fields. Use that commit for the test scripts; on a pull request it can
+be GitHub's merge commit. Older artifacts may not include this file.
+
+Download and unzip `runtime-windows`, and pass the unzipped folder to `--build`:
 
 ```sh
 python -I scripts/run_gpu_tests.py --build <unzipped runtime-windows>
