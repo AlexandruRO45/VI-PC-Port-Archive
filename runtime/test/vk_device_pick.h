@@ -33,16 +33,23 @@ inline int device_rank(VkPhysicalDeviceType type, std::uint32_t vendor_id) {
     return leonida::vulkan_device_rank(static_cast<int>(type), vendor_id);
 }
 
-// Index of the best candidate, or candidates.size() when there are none. Ties keep the earlier device.
-inline std::size_t pick_device(const std::vector<VkPhysicalDeviceProperties>& candidates) {
+// Index of the best candidate, or candidates.size() when there are none. Ties keep the earlier device. Devices below
+// min_api_version are ranked only when no device reaches it, so a 1.1 discrete GPU does not outrank a 1.2 integrated
+// one for a program that needs 1.2, while a machine with old devices only still picks one for the version
+// diagnostic (api_version_at_least below).
+inline std::size_t pick_device(const std::vector<VkPhysicalDeviceProperties>& candidates,
+                               std::uint32_t min_api_version = 0) {
     std::size_t best = candidates.size();
     int best_rank = -1;
-    for (std::size_t i = 0; i < candidates.size(); ++i) {
-        if (!leonida::vulkan_device_wanted(candidates[i].deviceName)) continue;
-        const int rank = device_rank(candidates[i].deviceType, candidates[i].vendorID);
-        if (rank > best_rank) {
-            best = i;
-            best_rank = rank;
+    for (int pass = 0; pass < 2 && best == candidates.size(); ++pass) {
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (!leonida::vulkan_device_wanted(candidates[i].deviceName)) continue;
+            if (pass == 0 && candidates[i].apiVersion < min_api_version) continue;
+            const int rank = device_rank(candidates[i].deviceType, candidates[i].vendorID);
+            if (rank > best_rank) {
+                best = i;
+                best_rank = rank;
+            }
         }
     }
     return best;
@@ -61,8 +68,9 @@ inline void report_no_device() {
 
 // The Vulkan 1.1 / 1.2 / 1.3 core feature structs are valid pNext members of VkPhysicalDeviceFeatures2 and
 // VkDeviceCreateInfo on a device of that version only (VUID-VkDeviceCreateInfo-pNext-pNext; the 1.1 struct itself
-// is a 1.2 addition), and a 1.0 instance has no vkGetPhysicalDeviceFeatures2. A program that chains them checks the
-// chosen device first and reports an older one as unsupported, which the runners count as a skip (exit 77).
+// is a 1.2 addition). A program that chains them checks the chosen device first and reports an older one (a 1.1
+// device: a 1.0 implementation already refuses the instance) as unsupported, exit 77 like its other unsupported
+// exits.
 inline bool api_version_at_least(const VkPhysicalDeviceProperties& props, std::uint32_t needed, const char* program) {
     if (props.apiVersion >= needed) return true;
     std::fprintf(stderr, "unsupported: %s is a Vulkan %u.%u device, %s needs %u.%u\n", props.deviceName,

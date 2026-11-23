@@ -130,6 +130,20 @@ int main() {
     expect_bool("1.2 device fails a 1.3 program", api_version_at_least(mid_device, VK_API_VERSION_1_3, "test"), false);
     expect_bool("1.3 device passes a 1.3 program", api_version_at_least(new_device, VK_API_VERSION_1_3, "test"), true);
 
+    // The minimum version ranks first: a 1.1 discrete GPU loses to a 1.2 integrated one for a 1.2 program, old
+    // devices only still pick the best of them (the program then reports it), and no minimum keeps the old order.
+    VkPhysicalDeviceProperties old_discrete = device(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, nvidia, "GeForce GTX 780");
+    old_discrete.apiVersion = VK_API_VERSION_1_1;
+    devices = {old_discrete, mid_device, old_device};
+    devices[1].deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    expect_index("1.2 integrated beats 1.1 discrete for a 1.2 program", pick_device(devices, VK_API_VERSION_1_2), 1);
+    expect_index("no minimum keeps the discrete GPU", pick_device(devices), 0);
+    devices = {old_device, old_discrete};
+    expect_index("old devices only: the best of them", pick_device(devices, VK_API_VERSION_1_2), 1);
+    set_filter("hd 4000");
+    expect_index("an explicit filter still picks the old device", pick_device(devices, VK_API_VERSION_1_2), 0);
+    set_filter("");
+
     if (failures) {
         std::fprintf(stderr, "%d device-pick test(s) failed\n", failures);
         return 1;
