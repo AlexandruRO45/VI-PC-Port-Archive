@@ -240,5 +240,17 @@ class CliTest(unittest.TestCase):
             self.assertNotIn("Traceback", r.stderr)
 
 
+    def test_index_saved_with_bom_is_read(self):
+        # PowerShell 5.1 Set-Content and some editors save JSON with a UTF-8 BOM; the index is still JSON.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "index.json")
+            with open(path, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps(NO_SPILL).encode("utf-8"))
+            result = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("cs: 2 shaders; base s4", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
