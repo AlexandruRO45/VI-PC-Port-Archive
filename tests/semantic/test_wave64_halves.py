@@ -68,6 +68,12 @@ BREAK_LOOP = ["v_and_b32_e32 v4, 3, v0", "v_add_nc_u32_e32 v10, 1, v4", "v_mov_b
               "v_add_nc_u32_e32 v9, 1, v9", "v_cmp_ge_u32_e32 vcc, v9, v10", "s_or_b64 s[16:17], vcc, s[16:17]",
               "s_andn2_b64 exec, exec, s[16:17]", "s_cbranch_execnz -5",
               "s_or_b64 exec, exec, s[16:17]"]
+# a second `break` loop after the first (two loops: @CuteBooty, #4870): s[18:19], 1..8 trips per lane on v13
+BREAK_LOOP_2 = ["v_lshrrev_b32_e32 v5, 2, v0", "v_and_b32_e32 v5, 7, v5", "v_add_nc_u32_e32 v12, 1, v5",
+                "v_mov_b32_e32 v13, 0", "s_mov_b64 s[18:19], 0",
+                "v_add_nc_u32_e32 v13, 1, v13", "v_cmp_ge_u32_e32 vcc, v13, v12", "s_or_b64 s[18:19], vcc, s[18:19]",
+                "s_andn2_b64 exec, exec, s[18:19]", "s_cbranch_execnz -5",
+                "s_or_b64 exec, exec, s[18:19]"]
 # a lane-local def behind an EXEC vote that only lane 2 passes; `widen` restores the launch mask before the compare
 def _skip_then_def(first, define, widen):
     return [first, "v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc",
@@ -380,6 +386,16 @@ class Classification(unittest.TestCase):
         lines[lines.index("s_or_b64 s[16:17], vcc, s[16:17]")] = "s_or_b64 s[16:17], s[10:11], s[16:17]"
         self.tier("ps_c_break_or_exec", ps(lines + ["v_mov_b32_e32 v6, v9"]), "C")
 
+    def test_a_two_break_loops(self):
+        # the first loop's restore is at its exit block, which post-dominates its vote: that vote is closed, so the
+        # second loop's v_cmp still counts (CuteBooty's ps_w64_a_break, #4870)
+        self.tier("ps_a_two_breaks", ps(BREAK_LOOP + BREAK_LOOP_2 + ["v_mov_b32_e32 v6, v9", "v_mov_b32_e32 v7, v13"]),
+                  "A", [], [])
+
+    def test_c_widened_after_a_closed_break_loop(self):
+        # closing the loop's vote closes only that vote: a later vote with a restore inside its region is still C
+        self.tier("ps_c_break_then_widened", ps(BREAK_LOOP + WIDENED_OR), "C", contains=["tainted-exec"])
+
     def test_c_lane_local_def_after_exec_widens_again(self):
         # @shdann on #4656: the run side restores the launch mask before the compare, so lanes of the half that skipped
         # are on again at the v_cmp and its bits change: not lane-local (both spellings)
@@ -446,6 +462,19 @@ class Execution(unittest.TestCase):
         self.assertEqual(tier, "A")
         self.assertEqual(whole, halves)
         self.assertEqual(len({w for w in whole if w is not None}), 4)
+
+    def test_two_break_loops_run_the_same(self):
+        # each lane loops 1..4 times, then 1..8 times; the halves leave both loops at different trip counts
+        tier, whole, halves = self.run_both("vs_a_two_breaks", vs(BREAK_LOOP + BREAK_LOOP_2 +
+                                                                 ["v_mov_b32_e32 v6, v9", "v_mov_b32_e32 v7, v13"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual(len({w[1] for w in whole if w is not None}), 8)
+
+    def test_widened_after_a_closed_break_loop_differs_and_is_c(self):
+        tier, whole, halves = self.run_both("vs_c_break_then_widened", vs(BREAK_LOOP + WIDENED_OR))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual(whole, halves)
 
     def test_lane_local_def_after_exec_widens_differs_and_is_c(self):
         # @shdann on #4656: the wave and the halves really differ in lanes 32..63, so tier A would be wrong

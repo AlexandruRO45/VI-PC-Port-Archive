@@ -1374,15 +1374,18 @@ class Analysis:
         that are off, so OR-ing or AND-NOT-ing M changes only the bits of active lanes (SHADER-821: a compiler's
         `break` loop accumulates the lanes that left in such a pair).
 
-        The lanes that are off at the v_cmp must include those of a half that a vote sent away, so EXEC may only
-        have narrowed since the first vote on every path to the v_cmp (`widened_after_vote`): an EXEC write that can
-        switch lanes back on (`s_mov_b64 exec, <launch mask>`, an OR, a join's restore) makes the def an ordinary
-        one again (counterexample by @shdann on #4656)."""
+        The lanes that are off at the v_cmp must include those of a half that a vote sent away, so while a vote is
+        open (after it, before a block that post-dominates it, where both halves are back) EXEC may only have
+        narrowed since it on every path to the v_cmp (`widened_after_vote`): an EXEC write that can switch lanes
+        back on (`s_mov_b64 exec, <launch mask>`, an OR, a join's restore) inside an open vote's region makes the
+        def an ordinary one again (counterexample by @shdann on #4656). A `break` loop's restore at its exit block
+        is past its vote's region, so a second loop after it keeps the rule (two loops: @CuteBooty, #4870)."""
         widened = self.widened_after_vote()
         out = {}
         for b, blk in enumerate(self.blocks):
             zero_off = {}                            # register key tuple -> True while it holds a v_cmp result
-            voted, wide = widened.get(b, (False, False))
+            opened, wide_votes = widened.get(b, (frozenset(), frozenset()))
+            wide = bool(wide_votes)
             starts = {self.voted[p] for p in range(self.n) if b in self.succ[p] and p in self.voted}
             first_exec = True
             for i, ins in enumerate(blk):
@@ -1398,7 +1401,7 @@ class Analysis:
                         out[(b, i)] = dk
                 if "exec" in written:
                     zero_off.clear()
-                    if voted and not self.narrowing_exec_write(ins, starts if first_exec else ()):
+                    if opened and not self.narrowing_exec_write(ins, starts if first_exec else ()):
                         wide = True
                     first_exec = False
                 for k in list(zero_off):
@@ -1427,31 +1430,62 @@ class Analysis:
         return False
 
     def widened_after_vote(self):
-        """block -> (a vote ran on some path to its entry, EXEC may have widened after one on some path): a forward
-        dataflow over the CFG (both bits OR at a join)."""
-        state = {0: (False, False)} if self.n else {}
-        work = [0] if self.n else []
+        """block -> (the votes open at its entry, the open votes after which EXEC may have widened), on some path: a
+        forward dataflow over the CFG (both sets union at a join). A vote opens leaving its block and closes on
+        entering a block that post-dominates it, where the halves it may have split are together again."""
+        if not self.n:
+            return {}
+        pdom = self.post_dominators()
+        closes = {b: frozenset(v for v in self.voted if v != b and pdom[v] >> b & 1) for b in range(self.n)}
+        empty = frozenset()
+        state = {0: (empty, empty)}
+        work = [0]
         while work:
             b = work.pop()
-            voted, wide = state[b]
+            opened, wide = state[b]
+            opened, wide = opened - closes[b], wide - closes[b]
             starts = {self.voted[p] for p in range(self.n) if b in self.succ[p] and p in self.voted}
             first_exec = True
             for ins in self.blocks[b]:
                 dests, _, d2, _ = operands(ins)
                 if "exec" in [r for d in dests for r in _regs(d)] + list(d2):
-                    if voted and not self.narrowing_exec_write(ins, starts if first_exec else ()):
-                        wide = True
+                    if opened and not self.narrowing_exec_write(ins, starts if first_exec else ()):
+                        wide = wide | opened
                     first_exec = False
-            out = (voted or b in self.voted, wide)
+            out = (opened | ({b} if b in self.voted else empty), wide)
             for s in self.succ[b]:
                 if s >= self.n:
                     continue
                 old = state.get(s)
-                new = out if old is None else (old[0] or out[0], old[1] or out[1])
+                new = out if old is None else (old[0] | out[0], old[1] | out[1])
                 if new != old:
                     state[s] = new
                     work.append(s)
-        return state
+        return {b: (o - closes[b], w - closes[b]) for b, (o, w) in state.items()}
+
+    def post_dominators(self):
+        """b -> bitset of the blocks that post-dominate b (bit n is the virtual exit every block without a successor
+        goes to)."""
+        n = self.n
+        exit_ = n
+        succ = [list(s) for s in self.succ] + [[]]
+        for b in range(n):
+            if not succ[b]:
+                succ[b] = [exit_]
+        full = (1 << (n + 1)) - 1
+        pdom = [full] * (n + 1)
+        pdom[exit_] = 1 << exit_
+        changed = True
+        while changed:
+            changed = False
+            for b in range(n - 1, -1, -1):
+                new = full
+                for s in succ[b]:
+                    new &= pdom[s]
+                new |= 1 << b
+                if new != pdom[b]:
+                    pdom[b], changed = new, True
+        return pdom
 
     def stale_uses(self):
         n = self.n
