@@ -253,7 +253,8 @@ int main() {
             // Every name a title can import it under reaches the shim (a missing alias falls through to the host).
             for (const char* dll : {"kernelbase.dll", "api-ms-win-core-processthreads-l1-1-0.dll",
                                     "api-ms-win-core-processthreads-l1-1-1.dll", "api-ms-win-core-processthreads-l1-1-2.dll",
-                                    "api-ms-win-core-processthreads-l1-1-3.dll"})
+                                    "api-ms-win-core-processthreads-l1-1-3.dll",
+                                    "api-ms-win-core-processtopology-obsolete-l1-1-0.dll"})
                 if (rt::shims::find(dll, "SetThreadAffinityMask") != reinterpret_cast<void*>(set_mask)) {
                     std::fprintf(stderr, "FAIL SetThreadAffinityMask is not served under %s\n", dll);
                     ++failures;

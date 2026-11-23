@@ -444,6 +444,7 @@ SHIM_TABLE(process,
     THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-1.dll"),
     THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-2.dll"),
     THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-3.dll"),
+    THREAD_AFFINITY("api-ms-win-core-processtopology-obsolete-l1-1-0.dll"),  // Bink2Scarlett.dll imports it from here
     THREAD_GROUP_AFFINITY("kernel32.dll"),
     THREAD_GROUP_AFFINITY("kernelbase.dll"),
     THREAD_GROUP_AFFINITY("api-ms-win-core-processtopology-l1-1-0.dll"),
