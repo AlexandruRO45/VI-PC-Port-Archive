@@ -104,8 +104,31 @@ Observed constants, where the window before the call loads one:
 `runtime/shims/xmem.cpp` says one call site "passes `0x5e50000`" as the attribute word. The two `XMemAlloc` sites here
 whose attribute is a constant pass `0xf0814000`, not that value, so it comes from another image.
 
+## The boot's call order (measured)
+
+One `gta6rt --run --trace` on the retail executable, `main` `9f53c502e`, own 1.0.2.1 copy, Windows 11 26200, RTX
+3070 Ti (driver 32.0.15.9649), `LEONIDA_D3D12=vulkan`, MSVC `RelWithDebInfo`. Before the first allocation the title
+calls `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` once, unimplemented at `main`. The trace keeps only the first call
+for each distinct attribute word, so this is the first five distinct attribute words in first-seen order, not the 23
+sites:
+
+| # | `attributes` | Size (bytes) | Page mode / type | Outcome |
+|---:|---|---|---|---|
+| 1 | `0x21` | 25,769,803,776 (24 GiB) | 64 KiB page mode (`0x20402000`) | succeeds |
+| 2 | `0x3` | 25,769,803,776 (24 GiB) | 64 KiB page mode (`0x20402000`) | succeeds |
+| 3 | `0x183` | 1,228,931,072 (about 1.14 GiB) | 2 MiB page mode (`0x20003000`) | succeeds |
+| 4 | `0x283` | 2,305,818,624 (about 2.15 GiB) | 2 MiB page mode (`0x20003000`) | succeeds |
+| 5 | `0x181` | 20,971,520 (20 MiB) | 64 KiB committed (`0x20403000`), other caller | succeeds |
+
+The shim now serves all five: #6908 records the words, #6919 adds the 2 MiB page mode, placeholders, physical pages
+and the default allocators. The sizes are the bytes the executable requests, not the rounded values the host reserves.
+After the five, plain `main` faults on a bad TLS read (module TLS index 0); with the open pull request that fixes that
+load, the title instead asks `xgameruntime.dll!XErrorReport` through `GetProcAddress`, which `main` does not serve, and
+hits its own `int3`. Both stops are open pull requests, not facts about `main`.
+
 ## What this does not show
 
-Which of these calls the boot reaches, and in what order, is not measured: nothing ran. A call site is code that can
-call, and the boot may reach only some of them. The first run's trace (`--trace`, `xmem_attributes` events) is the
-signal for the order.
+The order is measured for the first five distinct attribute words, in the section above; what follows them, and whether
+the boot reaches every one of the 23 sites, is not. A call site is code that can call, and the trace keeps one event per
+distinct attribute word, so a later allocation that reuses a word is missing from this order as well. The next run
+(`--trace`, `xmem_attributes` events) extends it.
