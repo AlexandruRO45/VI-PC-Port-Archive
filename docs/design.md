@@ -628,8 +628,8 @@ rejects it. Synthetic tests cover a type-compatible skipped
 export, an identity pair, both SPIR-V byte orders and conflicting records.
 
 `tools/fssm_header.py` decodes the FSSM input table: 8-byte records from 0x138 while the first byte is 6.
-Byte 1 is the semantic id, byte 2 the component mask, byte 3 the running index, byte 6 the parameter slot,
-and byte 7 holds flags (bits 0–1 = the **read method**: 0x01 read through `v_interp_mov_f32`, 0x02 through
+Byte 1 is the semantic id, byte 2 the component mask, and byte 3 the zero-based row index in the measured tables.
+Byte 6 is the parameter slot and byte 7 holds flags (bits 0–1 = the **read method**: 0x01 read through `v_interp_mov_f32`, 0x02 through
 32-bit `v_interp_p1/p2`; values 0 and 3 never occur; bit 3 marks a Float16-typed parameter; bit 4 = 16-bit
 interpolant). The record's position is the `v_interp attr` number. `read_methods()` returns those bits by
 position (the #1246 accessor was named `interpolation_modes`; #1301 renamed it) — they are the read method,
