@@ -16,6 +16,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
 
+option(LEONIDA_TEST_GUEST_CHUNK_TEXTURE "Run the mapped two-chunk shared texture test on a Vulkan GPU" OFF)
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
@@ -2182,6 +2183,20 @@ if(TARGET Vulkan::Headers)
       set_target_properties(tiny_frame PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       )
+      # Opt-in, like the other GPU guest fixtures: the M2 shaders use bindless descriptor indexing.
+      if(LEONIDA_TEST_GUEST_CHUNK_TEXTURE AND Python3_FOUND AND TARGET d3d12_m2_textured_test)
+        add_executable(tiny_chunk_texture test/fixtures/tiny_chunk_texture.cpp)
+        target_compile_definitions(tiny_chunk_texture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_options(tiny_chunk_texture PRIVATE /W4 /permissive- /utf-8)
+        target_link_libraries(tiny_chunk_texture PRIVATE d3d12_xs_stub)
+        add_dependencies(tiny_chunk_texture d3d12_m2_textured_test gta6rt)
+        set_target_properties(tiny_chunk_texture PROPERTIES
+          RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
+        add_test(NAME run_tiny_chunk_texture COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_chunk_texture.py" "$<TARGET_FILE:gta6rt>"
+                 "$<TARGET_FILE:tiny_chunk_texture>" "${LEONIDA_M2_DIR}" ${_trace_runner})
+        set_tests_properties(run_tiny_chunk_texture PROPERTIES TIMEOUT 150)
+      endif()
       if(Python3_FOUND)
         add_test(NAME run_tiny_frame COMMAND "${Python3_EXECUTABLE}" -I
                  "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
@@ -2321,4 +2336,8 @@ if(TARGET Vulkan::Headers)
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
   leonida_vulkan_headers_missing()
+endif()
+
+if(LEONIDA_TEST_GUEST_CHUNK_TEXTURE AND NOT TARGET tiny_chunk_texture)
+  message(FATAL_ERROR "LEONIDA_TEST_GUEST_CHUNK_TEXTURE requires the Windows Vulkan runtime, Python 3 and the M2 shader build (LLVM and SPIR-V tools)")
 endif()

@@ -282,6 +282,14 @@ yet: `at_quick_exit` handlers (`quick_exit` runs none) and the thread-local dest
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks
 the verdict, the `shim` binding and the call order in the `--trace-d3d12` output, and skips without a Vulkan GPU).
+
+Build with `-DLEONIDA_TEST_GUEST_CHUNK_TEXTURE=ON` and run
+`ctest --test-dir runtime/build -R "^run_tiny_chunk_texture$" --output-on-failure` to check a shared sampled texture
+through the same mapped guest entry. This opt-in test uses the M2 shader tools and a Vulkan GPU with bindless
+descriptor indexing. Two adjacent quads acquire separate descriptor heaps and index buffers. The test compares each
+readback as the quads load, overlap in residency, unload and return. The returning quad uploads new texels after the
+last reference to the original texture has been released.
+
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
