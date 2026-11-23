@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 if str(TOOLS_DIR) not in sys.path:
@@ -82,6 +83,32 @@ class TestFindAssets(unittest.TestCase):
                 code = find_assets.main(["--work", str(root), "--min-size", "1e308"])
             self.assertEqual(code, 0)
             self.assertIn("Found 0 matching .obj models", out.getvalue())
+
+    def test_stat_permission_error_is_caught_and_returns_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            blocked = assets / "blocked.obj"
+            blocked.write_bytes(b"x" * (20 * 1024))
+            good = assets / "cs_good.obj"
+            good.write_bytes(b"x" * (20 * 1024))
+
+            orig_stat = Path.stat
+
+            def fake_stat(self: Path, *args, **kwargs):
+                if self == blocked:
+                    raise PermissionError("access denied")
+                return orig_stat(self, *args, **kwargs)
+
+            out = io.StringIO()
+            err = io.StringIO()
+            with patch.object(Path, "stat", fake_stat), redirect_stdout(out), redirect_stderr(err):
+                code = find_assets.main(["--work", str(root)])
+
+            self.assertEqual(code, 1)
+            self.assertIn("cs_good.obj", out.getvalue())
+            self.assertIn("access denied", err.getvalue())
 
     def test_invalid_cli_arguments_rejected(self) -> None:
         for bad_args in (
