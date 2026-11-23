@@ -396,6 +396,16 @@ def main(argv=None):
     if os.path.isdir(a.out):
         print("world_interior_names.py: --out is a directory: %s" % a.out, file=sys.stderr)
         return 2
+    if os.path.isdir(a.path) and os.path.isfile(a.out):
+        # An outside name can still be a hard link to a scanned member. Check identity before opening the
+        # report for writing; the parent-chain check above only protects names located inside the folder.
+        try:
+            report_stat = os.stat(a.out)
+            for source in WI._directory_files(a.path):
+                if os.path.samestat(report_stat, os.stat(source)):
+                    ap.error("--out would overwrite the input %s" % source)
+        except OSError as exc:
+            ap.error("cannot check --out %s: %s" % (a.out, exc))
     try:
         names, duplicate_keys, malformed = load_names(a.names)
     except (OSError, ValueError) as exc:  # json.JSONDecodeError is a ValueError
