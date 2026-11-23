@@ -551,6 +551,18 @@ class CliTest(unittest.TestCase):
                     with open(source, "rb") as handle:
                         self.assertEqual(handle.read(), original)
 
+    def test_deeply_nested_json_returns_1_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "deep.json")
+            with open(bad, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("[" * 50_000 + "]" * 50_000)
+            err_buf = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_buf):
+                rc = WN.main(["build", "--manifest", bad, "--out", os.path.join(tmp, "out.json")])
+            self.assertEqual(rc, 1)
+            self.assertIn("ERROR:", err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
