@@ -212,5 +212,22 @@ class TestLshlrevScalarInterpreter(unittest.TestCase):
         self.assertEqual(words[1], 1)
 
 
+class TestLshlrevSimdInteraction(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for v_lshlrev_b64."""
+
+    def test_simd_divergent_shift_results(self):
+        lines = [
+            "v_mov_b32 v2, 0x55",
+            "v_mov_b32 v3, 0",
+            "v_lshlrev_b64 v[0:1], 4, v[2:3]",    # 0x550
+            "v_lshlrev_b64 v[2:3], 8, v[2:3]",    # 0x5500
+            "v_cndmask_b32 v0, v0, v2, vcc",
+            "v_cndmask_b32 v1, v1, v3, vcc",
+        ]
+        words = run_lshlrev_ps(lines, "ps_lshlrev_simd")
+        self.assertEqual(words[0], 0x550)
+        self.assertEqual(words[1], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
