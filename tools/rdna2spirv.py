@@ -10039,7 +10039,8 @@ class Gen:
         if dim not in kinds:
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         itype, iarr, stype, ncoord, iptr = kinds[dim]
-        if SEPARATE_DEPTH_2D and ncoord == 2 and op.removesuffix("_o") in ("image_sample_c_lz", "image_sample_c_l"):
+        compare_sample = op == "image_sample_c" or op.startswith("image_sample_c_")
+        if SEPARATE_DEPTH_2D and dim == "dim:SQ_RSRC_IMG_2D" and compare_sample:
             # Metal arrays have one texture type. A Dref on the color table turns every RGBA sample into a scalar.
             self.uses_depth_2d = True
             itype, iarr, stype, iptr = "depth2d", "%depth_images", "sampled_depth2d", "_ptr_UC_depth2d"

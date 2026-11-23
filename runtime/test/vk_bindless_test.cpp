@@ -740,11 +740,15 @@ int main(int argc, char** argv) {
             const float fail_shadow[4]{1.0f, 128.0f / 255.0f, 0.0f, 0.0f};
             CHECK(draw(0.5f)); compare("LESS passes", pass_shadow);
             CHECK(draw(0.875f)); compare("LESS fails", fail_shadow);
+            EXPECT(set.erase_key(shadow_key) && flush());
+            CHECK(draw(0.5f)); compare("missing depth key", fail_shadow);
+            CHECK(draw(-0.125f)); compare("missing depth still compares against zero", pass_shadow);
+            set.insert_key(shadow_key, shadow_index);
+            EXPECT(flush());
+            CHECK(draw(0.5f)); compare("restored depth key", pass_shadow);
             set.update_image(ImageDimension::dim_2d, shadow_index, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             EXPECT(flush());
             CHECK(draw(0.5f)); compare("updated to color uses depth fallback", fail_shadow);
-            EXPECT(set.erase_key(shadow_key) && flush());
-            CHECK(draw(0.5f)); compare("missing depth key", fail_shadow);
             ++runs;
             vkDestroyPipeline(dev, pipeline, nullptr);
             vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
