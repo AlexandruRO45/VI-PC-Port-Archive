@@ -29,6 +29,7 @@
 
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cerrno>
@@ -1968,7 +1969,9 @@ const D3D12_CLEAR_VALUE* sanitize_xbox_clear_value(const D3D12_RESOURCE_DESC& pc
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     if ((pc_desc.Flags & kClearFlags) == 0) return nullptr;
     storage = *clear_value;
-    storage.Format = pc_desc.Format;
+    if (storage.Format == DXGI_FORMAT_UNKNOWN) {
+        storage.Format = pc_desc.Format;
+    }
     return &storage;
 }
 
@@ -2040,10 +2043,11 @@ private:
     std::atomic<ULONG> refs_{1};
 };
 
-void notify_xbox_d3d12_committed_alloc(ID3D12Device* real, const D3D12_RESOURCE_DESC& pc_desc, void* created_obj) {
+void notify_xbox_d3d12_committed_alloc(ID3D12Device* real, const D3D12_RESOURCE_DESC& pc_desc, void* created_obj,
+                                       std::uint64_t caller_addr) {
     if (!real || !created_obj) return;
-    const auto* hooks = rt::shims::find_guest_xmem_hooks();
-    if (!hooks || !hooks->alloc_fn) return;
+    const auto* hooks = rt::shims::find_guest_xmem_hooks(caller_addr);
+    if (!hooks || !hooks->alloc_fn || !hooks->free_fn) return;
     ID3D12Object* d3d_obj = nullptr;
     if (FAILED(static_cast<IUnknown*>(created_obj)
                    ->QueryInterface(__uuidof(ID3D12Object), reinterpret_cast<void**>(&d3d_obj))) ||
@@ -2081,12 +2085,14 @@ void notify_xbox_d3d12_committed_alloc(ID3D12Device* real, const D3D12_RESOURCE_
 
 // Xbox device slot 127: CreateCommittedResourceX(heap_props, heap_flags, desc, initial_layout, clear,
 // protected_session, num_castable, castable_formats, riid, out). Mirrors CreateCommittedResource3 semantics:
-// sanitizes console heap flags, resource flags/layout, clear value, and maps InitialLayout to COMMON.
+// sanitizes console heap flags, resource flags/layout, clear value, and maps InitialLayout to the required PC state
+// for each heap type (GENERIC_READ for UPLOAD, COPY_DEST for READBACK, COMMON otherwise).
 HRESULT proxy_create_committed_resource_x(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                                             D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                                             D3D12_RESOURCE_STATES initial_layout, const D3D12_CLEAR_VALUE* clear_value,
                                             std::uint64_t /*protected_session*/, std::uint32_t /*num_castable*/,
-                                            const DXGI_FORMAT* /*castable_formats*/, const IID* riid, void** out) {
+                                            const DXGI_FORMAT* /*castable_formats*/, const IID* riid, void** out,
+                                            std::uint64_t caller_addr) {
     note_slot(127);
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -2095,6 +2101,14 @@ HRESULT proxy_create_committed_resource_x(DeviceProxy* self, const D3D12_HEAP_PR
     D3D12_HEAP_PROPERTIES pc_heap = *heap_properties;
     if (pc_heap.Type < D3D12_HEAP_TYPE_DEFAULT || pc_heap.Type > D3D12_HEAP_TYPE_CUSTOM) {
         pc_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        pc_heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        pc_heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    }
+    D3D12_RESOURCE_STATES pc_state = D3D12_RESOURCE_STATE_COMMON;
+    if (pc_heap.Type == D3D12_HEAP_TYPE_UPLOAD) {
+        pc_state = D3D12_RESOURCE_STATE_GENERIC_READ;
+    } else if (pc_heap.Type == D3D12_HEAP_TYPE_READBACK) {
+        pc_state = D3D12_RESOURCE_STATE_COPY_DEST;
     }
     const auto xbox_flags = static_cast<std::uint32_t>(xbox_desc->Flags);
     const auto xbox_layout_arg = static_cast<std::uint32_t>(initial_layout);
@@ -2106,14 +2120,15 @@ HRESULT proxy_create_committed_resource_x(DeviceProxy* self, const D3D12_HEAP_PR
     if (first_call(logged)) {
         std::fprintf(stderr,
                      "[rt] d3d12_xs: slot 127 CreateCommittedResourceX dim=%d width=%llu height=%u fmt=%d "
-                     "flags=0x%x->0x%x heap_flags=0x%x layout=0x%x->COMMON\n",
+                     "flags=0x%x->0x%x heap_type=%d heap_flags=0x%x layout=0x%x->0x%x\n",
                      static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
                      static_cast<unsigned>(pc_desc.Height), static_cast<int>(pc_desc.Format), xbox_flags,
-                     static_cast<unsigned>(pc_desc.Flags), static_cast<unsigned>(heap_flags), xbox_layout_arg);
+                     static_cast<unsigned>(pc_desc.Flags), static_cast<int>(pc_heap.Type),
+                     static_cast<unsigned>(heap_flags), xbox_layout_arg, static_cast<unsigned>(pc_state));
     }
     const HRESULT hr = self->real->CreateCommittedResource(&pc_heap, D3D12_HEAP_FLAG_NONE, &pc_desc,
-                                                           D3D12_RESOURCE_STATE_COMMON, pc_clear_ptr, *riid, out);
-    if (SUCCEEDED(hr)) notify_xbox_d3d12_committed_alloc(self->real, pc_desc, *out);
+                                                           pc_state, pc_clear_ptr, *riid, out);
+    if (SUCCEEDED(hr)) notify_xbox_d3d12_committed_alloc(self->real, pc_desc, *out, caller_addr);
     return hr;
 }
 
@@ -2272,17 +2287,35 @@ std::uint64_t proxy_get_resource_allocation_info(DeviceProxy* self, std::uint64_
         if (first_call(swapped_logged))
             std::fprintf(stderr, "[rt] d3d12_xs: slot 25 GetResourceAllocationInfo swapped (buf, this) -> PC\n");
 
+        // Xbox GetResourceAllocationInfo takes a contiguous D3D12_RESOURCE_DESC[count] array (56-byte stride,
+        // matching PC sizeof(D3D12_RESOURCE_DESC); any Xbox extension words live outside D3D12_RESOURCE_DESC).
         if (count > 0 && count <= 64 &&
             memory_range_valid(reinterpret_cast<const void*>(descs_arg),
                                static_cast<std::size_t>(count) * sizeof(D3D12_RESOURCE_DESC), false)) {
             D3D12_RESOURCE_DESC sanitized[64]{};
             const auto* src = reinterpret_cast<const D3D12_RESOURCE_DESC*>(descs_arg);
+            bool dims_valid = true;
             for (std::uint64_t i = 0; i < count; ++i) {
+                if (src[i].Dimension < D3D12_RESOURCE_DIMENSION_BUFFER ||
+                    src[i].Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                    dims_valid = false;
+                    static std::atomic<bool> stride_warned{false};
+                    if (first_call(stride_warned)) {
+                        std::fprintf(stderr,
+                                     "[rt] d3d12_xs: slot 25 entry %llu/%llu has invalid Dimension=%d "
+                                     "(expected 56-byte D3D12_RESOURCE_DESC stride); forwarding raw descs\n",
+                                     static_cast<unsigned long long>(i), static_cast<unsigned long long>(count),
+                                     static_cast<int>(src[i].Dimension));
+                    }
+                    break;
+                }
                 sanitized[i] = sanitize_xbox_resource_desc(src[i]);
             }
-            forward_device<25>(proxy, out_buf, visible_mask & 1ULL, count,
-                               reinterpret_cast<std::uint64_t>(sanitized), a5);
-            return out_buf;
+            if (dims_valid) {
+                forward_device<25>(proxy, out_buf, visible_mask & 1ULL, count,
+                                   reinterpret_cast<std::uint64_t>(sanitized), a5);
+                return out_buf;
+            }
         }
         forward_device<25>(proxy, out_buf, visible_mask, count, descs_arg, a5);
         return out_buf;
@@ -2369,7 +2402,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), a6, static_cast<std::uint32_t>(a7),
             reinterpret_cast<const DXGI_FORMAT*>(a8), reinterpret_cast<const IID*>(a9),
-            reinterpret_cast<void**>(a10)));
+            reinterpret_cast<void**>(a10), reinterpret_cast<std::uint64_t>(_ReturnAddress())));
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_placed_resource_x(
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),

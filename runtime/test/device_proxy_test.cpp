@@ -570,6 +570,16 @@ int main(int argc, char** argv) {
         check(returned == &alloc_info && alloc_info.SizeInBytes != 0 && alloc_info.SizeInBytes != UINT64_MAX &&
                   alloc_info.Alignment >= 65536,
               "slot 25 handles Xbox swapped (out_buf, this) and sanitizes Xbox resource desc");
+
+        D3D12_RESOURCE_DESC batch_descs[2]{xbox_desc, xbox_desc};
+        batch_descs[1].Width = 512;
+        batch_descs[1].Height = 512;
+        D3D12_RESOURCE_ALLOCATION_INFO batch_info{};
+        D3D12_RESOURCE_ALLOCATION_INFO* batch_returned =
+            reinterpret_cast<Slot25XboxFn>(vtable[25])(&batch_info, device.Get(), 1, 2, batch_descs);
+        check(batch_returned == &batch_info && batch_info.SizeInBytes > alloc_info.SizeInBytes &&
+                  batch_info.SizeInBytes != UINT64_MAX,
+              "slot 25 sanitizes count > 1 batch with 56-byte D3D12_RESOURCE_DESC stride");
     }
 
     // Slot 127 (CreateCommittedResourceX): 10-arg Xbox call with InitialLayout, console heap flags, and clear value.
@@ -676,6 +686,89 @@ int main(int argc, char** argv) {
 
         rt::shims::set_guest_xmem_hooks_for_testing(nullptr);
         g_hook_counters = nullptr;
+
+        // Partial hook pair (missing free_fn) must be ignored so allocations are never leaked.
+        static int partial_alloc_calls = 0;
+        partial_alloc_calls = 0;
+        const rt::shims::XMemAllocationHooks partial_hooks{
+            [](std::size_t size, std::uint64_t) -> void* {
+                ++partial_alloc_calls;
+                return std::malloc(size ? size : 1);
+            },
+            nullptr,
+        };
+        rt::shims::set_guest_xmem_hooks_for_testing(&partial_hooks);
+        {
+            ComPtr<ID3D12Resource> partial_res;
+            const HRESULT hr_partial = reinterpret_cast<Slot127XboxFn>(vtable[127])(
+                device.Get(), &heap_props, D3D12_HEAP_FLAG_NONE, &xbox_desc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, 0, 0, nullptr, &iid_res,
+                reinterpret_cast<void**>(partial_res.GetAddressOf()));
+            check(SUCCEEDED(hr_partial) && partial_res != nullptr && partial_alloc_calls == 0,
+                  "slot 127 ignores partial __XMemAllocationHooks__ when free_fn is null");
+        }
+        rt::shims::set_guest_xmem_hooks_for_testing(nullptr);
+
+        // UPLOAD and READBACK heaps require GENERIC_READ and COPY_DEST respectively, not COMMON.
+        D3D12_RESOURCE_DESC buf_desc{};
+        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Width = 4096;
+        buf_desc.Height = 1;
+        buf_desc.DepthOrArraySize = 1;
+        buf_desc.MipLevels = 1;
+        buf_desc.Format = DXGI_FORMAT_UNKNOWN;
+        buf_desc.SampleDesc.Count = 1;
+        buf_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+        buf_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x300000);
+
+        D3D12_HEAP_PROPERTIES upload_heap{};
+        upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        ComPtr<ID3D12Resource> upload_res;
+        const HRESULT hr_upload = reinterpret_cast<Slot127XboxFn>(vtable[127])(
+            device.Get(), &upload_heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
+            static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFu), nullptr, 0, 0, nullptr, &iid_res,
+            reinterpret_cast<void**>(upload_res.GetAddressOf()));
+        check(SUCCEEDED(hr_upload) && upload_res != nullptr,
+              "slot 127 maps UPLOAD heap initial state to GENERIC_READ");
+
+        D3D12_HEAP_PROPERTIES readback_heap{};
+        readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+        ComPtr<ID3D12Resource> readback_res;
+        const HRESULT hr_readback = reinterpret_cast<Slot127XboxFn>(vtable[127])(
+            device.Get(), &readback_heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
+            static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFu), nullptr, 0, 0, nullptr, &iid_res,
+            reinterpret_cast<void**>(readback_res.GetAddressOf()));
+        check(SUCCEEDED(hr_readback) && readback_res != nullptr,
+              "slot 127 maps READBACK heap initial state to COPY_DEST");
+
+        // Heap type 5 (GPU_UPLOAD) folded to DEFAULT must also clear CPUPageProperty and MemoryPoolPreference.
+        D3D12_HEAP_PROPERTIES gpu_upload_heap{};
+        gpu_upload_heap.Type = static_cast<D3D12_HEAP_TYPE>(5);
+        gpu_upload_heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+        gpu_upload_heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        ComPtr<ID3D12Resource> gpu_upload_res;
+        const HRESULT hr_gpu_upload = reinterpret_cast<Slot127XboxFn>(vtable[127])(
+            device.Get(), &gpu_upload_heap, D3D12_HEAP_FLAG_NONE, &xbox_desc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, 0, 0, nullptr, &iid_res,
+            reinterpret_cast<void**>(gpu_upload_res.GetAddressOf()));
+        check(SUCCEEDED(hr_gpu_upload) && gpu_upload_res != nullptr,
+              "slot 127 folds heap type 5 to DEFAULT and clears CPUPageProperty/MemoryPoolPreference");
+
+        // Typeless depth resource with concrete D32_FLOAT clear value must preserve clear_val.Format.
+        D3D12_RESOURCE_DESC depth_desc = xbox_desc;
+        depth_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE depth_clear{};
+        depth_clear.Format = DXGI_FORMAT_D32_FLOAT;
+        depth_clear.DepthStencil.Depth = 1.0f;
+        depth_clear.DepthStencil.Stencil = 0;
+        ComPtr<ID3D12Resource> depth_res;
+        const HRESULT hr_depth = reinterpret_cast<Slot127XboxFn>(vtable[127])(
+            device.Get(), &heap_props, D3D12_HEAP_FLAG_NONE, &depth_desc,
+            D3D12_RESOURCE_STATE_COMMON, &depth_clear, 0, 0, nullptr, &iid_res,
+            reinterpret_cast<void**>(depth_res.GetAddressOf()));
+        check(SUCCEEDED(hr_depth) && depth_res != nullptr,
+              "slot 127 preserves explicit D32_FLOAT clear value format on R32_TYPELESS depth resource");
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.

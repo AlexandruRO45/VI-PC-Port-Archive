@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -650,6 +651,62 @@ void print_result() {
 
 }  // namespace
 
+void test_guest_hooks(XMemAllocFn alloc, XMemFreeFn free_mem) {
+    struct HookCounts {
+        size_t allocs = 0;
+        size_t frees = 0;
+        void* last_ptr = nullptr;
+    };
+    static HookCounts* g_counts = nullptr;
+    HookCounts counts;
+    g_counts = &counts;
+
+    // Partial hook pairs must be ignored cleanly without crashing or mixing allocators.
+    const rt::shims::XMemAllocationHooks alloc_only{
+        [](size_t s, uint64_t) -> void* {
+            ++g_counts->allocs;
+            return std::malloc(s ? s : 1);
+        },
+        nullptr,
+    };
+    rt::shims::set_guest_xmem_hooks_for_testing(&alloc_only);
+    void* partial_ptr = alloc(64, 0);
+    check(partial_ptr != nullptr && counts.allocs == 0,
+          "XMemAlloc ignores partial __XMemAllocationHooks__ without free_fn");
+    free_mem(partial_ptr, 0);
+    rt::shims::set_guest_xmem_hooks_for_testing(nullptr);
+
+    // Full hook pair: blocks allocated by default allocator must not go to hooks->free_fn,
+    // and blocks allocated by hooks->alloc_fn must still go to hooks->free_fn even after hooks clear.
+    void* default_ptr = alloc(128, 0);
+    check(default_ptr != nullptr, "XMemAlloc allocates default block before hooks are installed");
+
+    const rt::shims::XMemAllocationHooks full_hooks{
+        [](size_t s, uint64_t) -> void* {
+            ++g_counts->allocs;
+            g_counts->last_ptr = std::malloc(s ? s : 1);
+            return g_counts->last_ptr;
+        },
+        [](void* p, uint64_t) {
+            ++g_counts->frees;
+            std::free(p);
+        },
+    };
+    rt::shims::set_guest_xmem_hooks_for_testing(&full_hooks);
+    void* hook_ptr = alloc(256, 0x1234);
+    check(hook_ptr != nullptr && hook_ptr == counts.last_ptr && counts.allocs == 1,
+          "XMemAlloc routes through complete __XMemAllocationHooks__");
+
+    free_mem(default_ptr, 0);
+    check(counts.frees == 0, "XMemFree does not pass pre-hook default block to hooks->free_fn");
+
+    rt::shims::set_guest_xmem_hooks_for_testing(nullptr);
+    free_mem(hook_ptr, 0x1234);
+    check(counts.frees == 1, "XMemFree routes hook-allocated block to its matching hooks->free_fn");
+
+    g_counts = nullptr;
+}
+
 int main() {
     std::printf("xmem_test: registered xmem.dll shim ABI\n");
 
@@ -715,6 +772,7 @@ int main() {
     test_title_virtual_alloc();
 
     if (alloc_default && free_default) test_default_alloc(alloc, free_mem, alloc_default, free_default);
+    test_guest_hooks(alloc, free_mem);
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);

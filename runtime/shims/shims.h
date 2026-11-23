@@ -112,14 +112,32 @@ inline void set_guest_xmem_hooks_for_testing(const XMemAllocationHooks* hooks) {
     guest_xmem_hooks_override().store(hooks, std::memory_order_release);
 }
 
-// Resolves __XMemAllocationHooks__ from the mapped guest image at 0x140000000 when present, or nullptr.
-inline const XMemAllocationHooks* find_guest_xmem_hooks() {
+using GuestImageBaseLookupFn = bool (*)(uint64_t address, uint64_t& base);
+
+inline std::atomic<GuestImageBaseLookupFn>& guest_image_base_lookup() {
+    static std::atomic<GuestImageBaseLookupFn> fn{nullptr};
+    return fn;
+}
+
+inline void register_guest_image_base_lookup(GuestImageBaseLookupFn fn) {
+    guest_image_base_lookup().store(fn, std::memory_order_release);
+}
+
+// Resolves __XMemAllocationHooks__ from a mapped guest image via mapped_image_base, or nullptr.
+// Requires both alloc_fn and free_fn to be non-null and caches both hits and missed image scans.
+inline const XMemAllocationHooks* find_guest_xmem_hooks(uint64_t caller_addr = 0x140000000ULL) {
     if (const auto* override_hooks = guest_xmem_hooks_override().load(std::memory_order_acquire)) {
-        return override_hooks;
+        return (override_hooks->alloc_fn && override_hooks->free_fn) ? override_hooks : nullptr;
     }
 #ifdef _WIN32
     static std::atomic<const XMemAllocationHooks*> cached{nullptr};
     if (const auto* found = cached.load(std::memory_order_acquire)) return found;
+
+    const GuestImageBaseLookupFn lookup_base = guest_image_base_lookup().load(std::memory_order_acquire);
+    if (!lookup_base) return nullptr;
+
+    static std::atomic<uint64_t> missed_base_0{0};
+    static std::atomic<uint64_t> missed_base_1{0};
 
     const auto committed_ok = [](uintptr_t addr, size_t size) -> bool {
         MEMORY_BASIC_INFORMATION mbi{};
@@ -129,52 +147,87 @@ inline const XMemAllocationHooks* find_guest_xmem_hooks() {
         return addr <= end && size <= end - addr;
     };
 
-    constexpr uintptr_t kGuestBase = 0x140000000ULL;
-    if (!committed_ok(kGuestBase, sizeof(IMAGE_DOS_HEADER))) return nullptr;
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(kGuestBase);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
-        dos->e_lfanew > 0x10000) {
-        return nullptr;
-    }
-    const uintptr_t nt_addr = kGuestBase + static_cast<uintptr_t>(dos->e_lfanew);
-    if (!committed_ok(nt_addr, sizeof(IMAGE_NT_HEADERS64))) return nullptr;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(nt_addr);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        return nullptr;
-    }
-    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return nullptr;
-    const IMAGE_DATA_DIRECTORY& exp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!exp_dir.VirtualAddress || exp_dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) return nullptr;
+    const auto scan_image = [&](uintptr_t image_base) -> const XMemAllocationHooks* {
+        if (!image_base || !committed_ok(image_base, sizeof(IMAGE_DOS_HEADER))) return nullptr;
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
+            dos->e_lfanew > 0x10000) {
+            return nullptr;
+        }
+        const uintptr_t nt_addr = image_base + static_cast<uintptr_t>(dos->e_lfanew);
+        if (!committed_ok(nt_addr, sizeof(IMAGE_NT_HEADERS64))) return nullptr;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(nt_addr);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            return nullptr;
+        }
+        if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return nullptr;
+        const IMAGE_DATA_DIRECTORY& exp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (!exp_dir.VirtualAddress || exp_dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) return nullptr;
 
-    const uintptr_t exp_addr = kGuestBase + exp_dir.VirtualAddress;
-    if (!committed_ok(exp_addr, sizeof(IMAGE_EXPORT_DIRECTORY))) return nullptr;
-    const auto* exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(exp_addr);
-    if (!exp->NumberOfNames || !exp->AddressOfNames || !exp->AddressOfNameOrdinals || !exp->AddressOfFunctions) {
+        const uintptr_t exp_addr = image_base + exp_dir.VirtualAddress;
+        if (!committed_ok(exp_addr, sizeof(IMAGE_EXPORT_DIRECTORY))) return nullptr;
+        const auto* exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(exp_addr);
+        if (!exp->NumberOfNames || !exp->AddressOfNames || !exp->AddressOfNameOrdinals || !exp->AddressOfFunctions) {
+            return nullptr;
+        }
+        const uintptr_t names_addr = image_base + exp->AddressOfNames;
+        const uintptr_t ords_addr = image_base + exp->AddressOfNameOrdinals;
+        const uintptr_t funcs_addr = image_base + exp->AddressOfFunctions;
+        if (!committed_ok(names_addr, exp->NumberOfNames * sizeof(DWORD)) ||
+            !committed_ok(ords_addr, exp->NumberOfNames * sizeof(WORD)) ||
+            !committed_ok(funcs_addr, exp->NumberOfFunctions * sizeof(DWORD))) {
+            return nullptr;
+        }
+
+        const auto* names = reinterpret_cast<const DWORD*>(names_addr);
+        const auto* ords = reinterpret_cast<const WORD*>(ords_addr);
+        const auto* funcs = reinterpret_cast<const DWORD*>(funcs_addr);
+        for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+            const uintptr_t name_ptr = image_base + names[i];
+            if (!committed_ok(name_ptr, 24)) continue;
+            if (std::strcmp(reinterpret_cast<const char*>(name_ptr), "__XMemAllocationHooks__") != 0) continue;
+            const WORD ord = ords[i];
+            if (ord >= exp->NumberOfFunctions) return nullptr;
+            const uintptr_t sym_addr = image_base + funcs[ord];
+            if (!committed_ok(sym_addr, sizeof(XMemAllocationHooks))) return nullptr;
+            const auto* hooks = reinterpret_cast<const XMemAllocationHooks*>(sym_addr);
+            if (!hooks->alloc_fn || !hooks->free_fn) return nullptr;
+            return hooks;
+        }
         return nullptr;
-    }
-    const uintptr_t names_addr = kGuestBase + exp->AddressOfNames;
-    const uintptr_t ords_addr = kGuestBase + exp->AddressOfNameOrdinals;
-    const uintptr_t funcs_addr = kGuestBase + exp->AddressOfFunctions;
-    if (!committed_ok(names_addr, exp->NumberOfNames * sizeof(DWORD)) ||
-        !committed_ok(ords_addr, exp->NumberOfNames * sizeof(WORD)) ||
-        !committed_ok(funcs_addr, exp->NumberOfFunctions * sizeof(DWORD))) {
-        return nullptr;
+    };
+
+    const auto already_missed = [&](uint64_t base) -> bool {
+        return base == missed_base_0.load(std::memory_order_acquire) ||
+               base == missed_base_1.load(std::memory_order_acquire);
+    };
+    const auto record_miss = [&](uint64_t base) {
+        uint64_t expected = 0;
+        if (!missed_base_0.compare_exchange_strong(expected, base, std::memory_order_acq_rel) &&
+            expected != base) {
+            expected = 0;
+            missed_base_1.compare_exchange_strong(expected, base, std::memory_order_acq_rel);
+        }
+    };
+
+    uint64_t base = 0;
+    if (caller_addr && lookup_base(caller_addr, base) && base && !already_missed(base)) {
+        if (const auto* hooks = scan_image(static_cast<uintptr_t>(base))) {
+            cached.store(hooks, std::memory_order_release);
+            return hooks;
+        }
+        record_miss(base);
     }
 
-    const auto* names = reinterpret_cast<const DWORD*>(names_addr);
-    const auto* ords = reinterpret_cast<const WORD*>(ords_addr);
-    const auto* funcs = reinterpret_cast<const DWORD*>(funcs_addr);
-    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
-        const uintptr_t name_ptr = kGuestBase + names[i];
-        if (!committed_ok(name_ptr, 24)) continue;
-        if (std::strcmp(reinterpret_cast<const char*>(name_ptr), "__XMemAllocationHooks__") != 0) continue;
-        const WORD ord = ords[i];
-        if (ord >= exp->NumberOfFunctions) return nullptr;
-        const uintptr_t sym_addr = kGuestBase + funcs[ord];
-        if (!committed_ok(sym_addr, sizeof(XMemAllocationHooks))) return nullptr;
-        const auto* hooks = reinterpret_cast<const XMemAllocationHooks*>(sym_addr);
-        cached.store(hooks, std::memory_order_release);
-        return hooks;
+    constexpr uint64_t kDefaultGuestAddr = 0x140000000ULL;
+    uint64_t default_base = 0;
+    if (caller_addr != kDefaultGuestAddr && lookup_base(kDefaultGuestAddr, default_base) && default_base &&
+        default_base != base && !already_missed(default_base)) {
+        if (const auto* hooks = scan_image(static_cast<uintptr_t>(default_base))) {
+            cached.store(hooks, std::memory_order_release);
+            return hooks;
+        }
+        record_miss(default_base);
     }
 #endif
     return nullptr;

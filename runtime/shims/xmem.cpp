@@ -64,20 +64,48 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
+using XMemHookFreeFn = void(__stdcall*)(void*, uint64_t);
+
+std::mutex& hook_allocs_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::unordered_map<void*, XMemHookFreeFn>& hook_allocs() {
+    static auto* m = new std::unordered_map<void*, XMemHookFreeFn>;
+    return *m;
+}
+
 void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAlign); }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
-    if (const auto* hooks = rt::shims::find_guest_xmem_hooks(); hooks && hooks->alloc_fn) {
-        return hooks->alloc_fn(size, attributes);
+    const void* caller = _ReturnAddress();
+    note_attributes("XMemAlloc", attributes, size, caller);
+    if (const auto* hooks = rt::shims::find_guest_xmem_hooks(reinterpret_cast<uint64_t>(caller));
+        hooks && hooks->alloc_fn && hooks->free_fn) {
+        void* p = hooks->alloc_fn(size, attributes);
+        if (p) {
+            const std::lock_guard lock(hook_allocs_mutex());
+            hook_allocs()[p] = hooks->free_fn;
+        }
+        return p;
     }
     return allocate_block(size);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
-    if (const auto* hooks = rt::shims::find_guest_xmem_hooks(); hooks && hooks->free_fn) {
-        hooks->free_fn(p, attributes);
+    if (!p) return;
+    XMemHookFreeFn free_fn = nullptr;
+    {
+        const std::lock_guard lock(hook_allocs_mutex());
+        if (auto it = hook_allocs().find(p); it != hook_allocs().end()) {
+            free_fn = it->second;
+            hook_allocs().erase(it);
+        }
+    }
+    if (free_fn) {
+        free_fn(p, attributes);
         return;
     }
     _aligned_free(p);
