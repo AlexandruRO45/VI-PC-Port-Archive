@@ -546,9 +546,10 @@ python -I tools/xdxr_bvh.py validate <dumped BVH buffer>    # structural check o
 python -I tests/test_xdxr_bvh.py
 ```
 
-## 7c. The native instruction against the translator on real nodes (measured)
+## 7b. The native instruction against the translator on real nodes (measured)
 
-**Status: measured** on an AMD Radeon RX 6800 (gfx1030), Windows 11, AMD driver 32.0.21045.29003, through
+**Status: measured** on an AMD Radeon RX 6800 (gfx1030), Windows 11, AMD driver 26.11.2 (Windows driver
+32.0.21045.29003), through
 `tools/hw_oracle`. The nodes come from 39 console BLASes rehydrated with `tools/bvh_rehydrate.py` (§7). One
 `image_bvh_intersect_ray` step runs per case, with the default descriptor and types 0, 1, 4 and 5 only. Box nodes run
 with their child ids replaced by ids inside the oracle buffer. Only the counts below are reproduced here: no node,

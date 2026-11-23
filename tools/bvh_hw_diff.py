@@ -250,7 +250,7 @@ def tri_eval(node, ntype, ray, mode="exact"):
 
 
 def hw_model_words(node, ntype, ray):
-    """The arithmetic the RX 6800 matched on real nodes (docs/bvh.md §7c): the measured rules with every float
+    """The arithmetic the RX 6800 matched on real nodes (docs/bvh.md §7b): the measured rules with every float
     operation rounded toward zero. Boxes: box_eval(mode="rtz"). Triangles: V - o, the multiply-through shear, the edge
     functions, T = (U az + V bz) + W cz and word 1 = (k U + k V) + k W (k = |d[kz]|), each op RTZ; a zero edge
     function is decided by #4202's tie rule in the computation frame (it decided 202 of the 242 such real cases; the
@@ -776,6 +776,11 @@ def self_test():
     return 0 if ok else 1
 
 
+def _read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _load(work):
     with open(os.path.join(work, "cases.json"), encoding="utf-8") as f:
         return json.load(f)
@@ -844,7 +849,7 @@ def main(argv=None):
                 print(f"hardware oracle unavailable: {e}", file=sys.stderr)
                 return 77
             p = os.path.join(a.work, "hw.json")
-            hw = json.load(open(p, encoding="utf-8")) if os.path.isfile(p) else {}
+            hw = _read_json(p) if os.path.isfile(p) else {}
             for t in tabs:
                 if (a.kernel and t["label"] not in a.kernel) or t["label"] in hw:
                     continue
@@ -859,8 +864,8 @@ def main(argv=None):
                 with open(p, "w", encoding="utf-8", newline="\n") as f:
                     json.dump(hw, f)
             return 0
-        hw = json.load(open(os.path.join(a.work, "hw.json"), encoding="utf-8"))
-        other = json.load(open(os.path.join(a.work, f"tr_{a.against}.json"), encoding="utf-8"))
+        hw = _read_json(os.path.join(a.work, "hw.json"))
+        other = _read_json(os.path.join(a.work, f"tr_{a.against}.json"))
         counts, stops = score(tabs, hw, other)
         for (kind, k), n in sorted(counts.items()):
             print(f"{kind:6} {k:16} {n}")
