@@ -61,5 +61,16 @@ int main(void) {
         !GetTempPathA(MAX_PATH, tmp) || !GetTempFileNameA(tmp, "crt", 0, name) ||
         GetFileAttributesA(name) == INVALID_FILE_ATTRIBUTES || !DeleteFileA(name))
         return 14;
+    char longdir[300];
+    memset(longdir, 'a', 250);
+    strcpy(longdir + 250, "\\");
+    FILE_STANDARD_INFO small;
+    HANDLE g = CreateFileW(L"GAME:\\..\\crt_probe_escape.tmp", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    HANDLE self = CreateFileW(L"crt_probe.exe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (GetTempFileNameA(longdir, "tmp", 0x1234, name) || GetLastError() != ERROR_BUFFER_OVERFLOW ||
+        g != INVALID_HANDLE_VALUE || self == INVALID_HANDLE_VALUE ||
+        GetFileInformationByHandleEx(self, FileStandardInfo, &small, 4) || GetLastError() != ERROR_BAD_LENGTH)
+        return 17;
+    CloseHandle(self);
     return 0;
 }

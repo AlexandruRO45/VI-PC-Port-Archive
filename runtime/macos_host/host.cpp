@@ -134,12 +134,28 @@ bool has_dll(const std::string& dll) {
     return false;
 }
 
+// GAME:\ paths resolve inside the game folder: "." and empty parts drop, ".." may not climb above it (an empty path
+// comes back, which every call refuses). Not a sandbox: the guest runs in this process and other paths pass through.
 std::string to_host_path(const char* p) {  // ponytail: no drive letters
     std::string s(p);
-    if (strncasecmp(p, "GAME:", 5) == 0) s = g_game_dir + "/" + s.substr(s.size() > 5 && (p[5] == '\\' || p[5] == '/') ? 6 : 5);
     for (auto& c : s)
         if (c == '\\') c = '/';
-    return s;
+    if (strncasecmp(p, "GAME:", 5) != 0) return s;
+    std::vector<std::string> parts;
+    for (size_t at = 5; at <= s.size();) {
+        const size_t end = std::min(s.find('/', at), s.size());
+        const std::string part = s.substr(at, end - at);
+        if (part == "..") {
+            if (parts.empty()) return {};
+            parts.pop_back();
+        } else if (!part.empty() && part != ".") {
+            parts.push_back(part);
+        }
+        at = end + 1;
+    }
+    std::string out = g_game_dir;
+    for (const auto& part : parts) out += "/" + part;
+    return out;
 }
 
 // Every TEB made (freed ones are cleared), so the fault handler can tell whether gs points at one without touching

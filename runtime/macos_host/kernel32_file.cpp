@@ -63,7 +63,9 @@ uint32_t GetTempFileNameA(const char* path, const char* prefix, uint32_t unique,
         u &= 0xFFFF;
         if (!u) continue;
         char name[PATH_MAX];
-        std::snprintf(name, sizeof name, "%s%X.TMP", base.c_str(), unique ? unique : u);
+        const int len = std::snprintf(name, sizeof name, "%s%X.TMP", base.c_str(), unique ? unique : u);
+        if (len < 0 || len >= 260)  // the caller's buffer is MAX_PATH: refuse, as Windows does, before any file is made
+            return set_last_error(111 /* ERROR_BUFFER_OVERFLOW */), 0;
         if (!unique) {
             const int fd = open(to_host_path(name).c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
             if (fd < 0) {
@@ -158,6 +160,10 @@ int GetFileInformationByHandle(HANDLE h, uint8_t* out) {  // BY_HANDLE_FILE_INFO
 int GetFileInformationByHandleEx(HANDLE h, int32_t cls, uint8_t* out, uint32_t size) {
     struct stat st;
     if (fstat(fd_of(h), &st) != 0) return failed();
+    // The smallest buffer each class needs (FILE_BASIC_INFO 40, FILE_STANDARD_INFO 24, FILE_ATTRIBUTE_TAG_INFO 8,
+    // FILE_ID_INFO 24): a shorter one is ERROR_BAD_LENGTH, as on Windows, before anything is written.
+    const uint32_t need = cls == 0 ? 40 : cls == 1 ? 24 : cls == 9 ? 8 : cls == 18 ? 24 : 0;
+    if (size < need) return set_last_error(24 /* ERROR_BAD_LENGTH */), 0;
     std::memset(out, 0, size);
     switch (cls) {
         case 0:  // FileBasicInfo
