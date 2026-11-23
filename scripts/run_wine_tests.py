@@ -386,7 +386,8 @@ def main() -> int:
                 f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
                 f.write("| Test | Result | Required |\n|---|---|---|\n")
                 for name, status in results.items():
-                    f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
+                    cell_name = name.replace("|", r"\|")
+                    f.write(f"| `{cell_name}` | {status} | {'yes' if name in args.require else ''} |\n")
                 f.write("\n")
         except OSError as e:
             print(f"ERROR: cannot write the summary {args.summary}: {e.strerror or e}", file=sys.stderr)

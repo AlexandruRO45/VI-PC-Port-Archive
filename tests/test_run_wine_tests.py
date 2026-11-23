@@ -548,6 +548,14 @@ class MainTest(unittest.TestCase):
         self.assertIn("| `ok` | pass | yes |", text)
         self.assertIn("| `bad` | fail |  |", text)
 
+    def test_summary_escapes_pipes_in_test_names(self):
+        summary = self.root / "summary.md"
+        name = "front|back"
+        code, _, err = self.run_main([ctest_entry(name, self.command("ok.py"))],
+                                     "--summary", str(summary), "--require", name)
+        self.assertEqual(code, 0, err)
+        self.assertIn(r"| `front\|back` | pass | yes |", summary.read_text(encoding="utf-8"))
+
     def test_a_summary_in_a_missing_folder_creates_it(self):
         summary = self.root / "missing" / "sub" / "summary.md"
         code, _, err = self.run_main([ctest_entry("ok", self.command("ok.py"))],
