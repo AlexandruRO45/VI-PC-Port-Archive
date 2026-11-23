@@ -162,3 +162,25 @@ test('volume slices shrink with the selected mip', async () => {
     select(mip.children[0], 0);
     assert.equal(z.disabled, false);
 });
+
+test('half-float coordinates follow the selected mip and late reads cannot replace its value', async () => {
+    const { context, elements, run } = loadStudio();
+    const info = {format: 'R16_FLOAT', width: 5, height: 3, mip_count: 2, array_size: 1};
+    const pending = [];
+    context.fetch = url => url.endsWith('?info') ? {ok: true, json: async () => info} :
+        new Promise(resolve => pending.push({url, resolve}));
+    await run("openModal({name:'a', preview:'/a.png', ddsPreview:'/api/dds/a.dds'})");
+    const [mip, x, y, output] = elements.get('dds-controls').children;
+    x.children[0].value = 4;
+    y.children[0].value = 2;
+    const older = x.children[0].onchange();
+    assert.match(pending[1].url, /mip=0&layer=0&x=4&y=2$/);
+    Object.assign(mip.children[0], {value: '1', valueAsNumber: 1, validity: {valid: true}});
+    mip.children[0].onchange();
+    assert.match(pending[2].url, /mip=1&layer=0&x=1&y=0$/);
+    pending[2].resolve({ok: true, json: async () => ({R: '-2.5'})});
+    await new Promise(resolve => setImmediate(resolve));
+    pending[1].resolve({ok: false});
+    await older;
+    assert.equal(output.textContent, 'R = -2.5');
+});

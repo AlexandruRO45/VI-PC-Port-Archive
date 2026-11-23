@@ -277,11 +277,39 @@ class TestGalleryServer(unittest.TestCase):
             expected = gallery.dds_png.encode_png(3, 2, rgba)
             status, _, png = _raw_get(self.port, f"{url}?mip=0&z={z}")
             self.assertEqual((status, png), (200, expected))
+            status, _, sample = _raw_get(self.port, f"{url}?x=1&y=1&z={z}")
+            self.assertEqual((status, json.loads(sample)), (200, {"R": str(pattern[4] / 4)}))
             if z == 0:
                 self.assertEqual(_raw_get(self.port, url)[2], expected)
-        for query in ("z=3", "layer=1&z=0", "z=-1", "z=1&z=2", "mip=1&z=0"):
+        for query in ("z=3", "layer=1&z=0", "z=-1", "z=1&z=2", "mip=1&z=0",
+                      "x=0", "y=1", "x=3&y=0", "x=0&y=2"):
             with self.subTest(query=query):
                 self.assertEqual(_raw_get(self.port, url + "?" + query)[0], 400)
+
+    def test_rgba16_source_texel(self) -> None:
+        hdr = bytearray(_make_1x1_rgba_dds()[:128])
+        struct.pack_into("<IIII", hdr, 8, 0x2100F, 2, 4, 40)
+        struct.pack_into("<I", hdr, 28, 2)
+        struct.pack_into("<I4s", hdr, 80, 4, b"DX10")
+        data = hdr + struct.pack("<5I", 10, 3, 0, 2, 0)
+        # Each layer has two padded 40-byte rows then two tight mip-1 texels.
+        data.extend(bytes(2 * (80 + 16)))
+        struct.pack_into("<4e", data, 148 + 96 + 40 + 16, -3, 2.5, -0.0, float("inf"))
+        struct.pack_into("<4H", data, len(data) - 8, 1, 0x7e03, 0xfc00, 0x3c00)
+        path = os.path.join(self.textures_dir, "hdr.dds")
+        with open(path, "wb") as f:
+            f.write(data)
+        url = "/api/dds/hdr.dds?"
+        for query, expected in [
+            ("layer=1&x=2&y=1", ["-3.0", "2.5", "-0.0", "inf"]),
+            ("layer=1&mip=1&x=1&y=0", [str(2 ** -24), "nan", "-inf", "1.0"]),
+        ]:
+            status, _, sample = _raw_get(self.port, url + query)
+            self.assertEqual((status, json.loads(sample)), (200, dict(zip("RGBA", expected))))
+        with open(path, "rb+") as f:
+            f.truncate(len(data) - 1)
+        self.assertEqual(_raw_get(self.port, url + "layer=1&mip=1&x=1&y=0")[0], 400)
+        self.assertEqual(_raw_get(self.port, "/api/dds/inside.dds?x=0&y=0")[0], 400)
 
     def test_endpoints(self) -> None:
         base = f"http://127.0.0.1:{self.port}"
