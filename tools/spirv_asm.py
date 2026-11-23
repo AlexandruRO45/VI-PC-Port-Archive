@@ -14,6 +14,8 @@ As a module:
 
 As a CLI:
     python3 -I tools/spirv_asm.py input.spvasm -o output.spv [--target-env vulkan1.2]
+
+The output must not alias the input, including through symbolic or hard links.
 """
 import argparse
 import array
@@ -27,6 +29,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from spirv_asm_tables import BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, VALUE_ENUMS  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 SPIRV_MAGIC = 0x07230203
 
@@ -495,6 +498,8 @@ def main(argv=None) -> int:
                     help="target SPIR-V / Vulkan environment (default: vulkan1.2)")
     args = ap.parse_args(argv)
     try:
+        if same_report_path(args.src, args.out):
+            raise SpirvAsmError(f"output would overwrite input: {args.src}")
         with open(args.src, encoding="utf-8") as f:
             text = f.read()
         data = assemble(text, target_env=args.target_env)
