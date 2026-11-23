@@ -287,10 +287,11 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_carve(self, archive_path: str, out_path: str) -> subprocess.CompletedProcess:
+        # -I ignores Python's encoding environment variables; pin both ends of the pipe.
         return subprocess.run(
-            [sys.executable, "-I", TOOL, archive_path, out_path],
+            [sys.executable, "-I", "-X", "utf8", TOOL, archive_path, out_path],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
         )
 
     def test_carve_synthetic_archive_with_variants_and_sanitization(self):
