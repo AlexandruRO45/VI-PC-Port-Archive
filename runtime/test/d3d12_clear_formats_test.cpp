@@ -4,11 +4,13 @@
 // bytes with what WARP wrote. Extends d3d12_uint_clear_test.cpp (UINT only).
 // No game data or shaders. Run explicitly (needs Vulkan hardware and WARP); LEONIDA_VK_VALIDATION=1 checks Vulkan
 // usage. A format the layer cannot create yet is listed as "not exposed" and does not fail the test; any other
-// difference does.
+// difference does, except a byte of the two 8-bit sRGB formats within D3D's FLOAT -> SRGB tolerance (below).
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -31,6 +33,7 @@ struct Event {
 };
 
 constexpr UINT kWidth = 5, kHeight = 3;  // odd sizes expose a wrong treatment of footprint padding
+constexpr D3D12_RECT kRect{1, 1, 4, 3};  // the second colour's rectangle
 using Color = std::array<float, 4>;
 constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
 constexpr float kInf = std::numeric_limits<float>::infinity();
@@ -157,8 +160,7 @@ Result clear_color(ID3D12Device* device, DXGI_FORMAT format, DXGI_FORMAT resourc
     view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     device->CreateRenderTargetView(image.p, resource_format != DXGI_FORMAT_UNKNOWN ? &view : nullptr, handle);
     run.list->ClearRenderTargetView(handle, full.data(), 0, nullptr);
-    const D3D12_RECT rect{1, 1, 4, 3};
-    run.list->ClearRenderTargetView(handle, part.data(), 1, &rect);
+    run.list->ClearRenderTargetView(handle, part.data(), 1, &kRect);
     transition(run.list.p, image.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Plane plane;
     if (!add_copy(device, run.list.p, image.p, texture, 0, bytes, plane) || !run.execute() ||
@@ -302,7 +304,7 @@ const DepthValues kDepthValues[] = {{0.25f, 0x5A, 0.75f, 0xA5}, {1.0f, 0xFF, 0.0
                                     {0.3333f, 0x01, 0.9999f, 0x80}, {0.5f, 0x7F, 0.0001f, 0x10}};
 
 struct Tally {
-    unsigned matched = 0, differ = 0, not_exposed = 0, failed = 0, skipped = 0;
+    unsigned matched = 0, tolerated = 0, differ = 0, not_exposed = 0, failed = 0, skipped = 0;
 };
 
 // Names the first byte that differs.
@@ -317,6 +319,47 @@ void report(const char* group, const char* name, unsigned index, const char* wha
     }
     std::printf("DIFF %-6s %-22s case %u %s: sizes %zu and %zu\n", group, name, index, what, actual.size(),
                 expected.size());
+}
+
+// The exact value of an 8-bit sRGB clear byte before rounding (D3D11.3 functional spec 3.2.3.8); alpha is UNORM.
+double srgb_exact(float value, bool alpha) {
+    double c = value == value ? std::clamp(double(value), 0.0, 1.0) : 0.0;  // NaN clears to 0
+    if (!alpha) c = c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055;
+    return c * 255.0;
+}
+
+// FLOAT -> SRGB is permitted 0.6 ULP on the integer side (D3D11_FLOAT32_TO_INTEGER_TOLERANCE_IN_ULP), and FLOAT ->
+// UNORM for alpha the same, so on the two 8-bit sRGB formats a byte that differs from WARP's passes when it is within
+// 0.6 of the exact value: Intel's Windows driver rounds 187.516 to 187, where WARP writes 188. WARP is held to the
+// exact values too, so a wrong model fails instead of passing every byte.
+bool srgb_within_tolerance(const ColorCase& c, unsigned index, const Color& full, const Color& part,
+                           const std::vector<unsigned char>& actual, const std::vector<unsigned char>& expected) {
+    if (std::strcmp(c.group, "SRGB") != 0 || actual.size() != expected.size()) return false;
+    const bool bgra = c.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    unsigned outside = 0;
+    std::size_t first = 0;
+    double first_exact = 0;
+    for (std::size_t b = 0; b < actual.size(); ++b) {
+        const UINT pixel = UINT(b / 4), channel = UINT(b % 4);
+        const LONG x = LONG(pixel % kWidth), y = LONG(pixel / kWidth);
+        const bool inside = x >= kRect.left && x < kRect.right && y >= kRect.top && y < kRect.bottom;
+        const UINT component = bgra && channel != 3 ? 2 - channel : channel;
+        const double exact = srgb_exact((inside ? part : full)[component], channel == 3);
+        if (std::fabs(exact - expected[b]) > 0.6) {
+            std::printf("FAIL SRGB   %-22s case %u byte %zu: WARP %02x is not within 0.6 of the exact %.3f\n",
+                        c.name, index, b, unsigned(expected[b]), exact);
+            return false;
+        }
+        if (std::fabs(exact - actual[b]) > 0.6 && outside++ == 0) {
+            first = b;
+            first_exact = exact;
+        }
+    }
+    if (outside)
+        std::printf("DIFF %-6s %-22s case %u colour: %u bytes more than 0.6 from the exact value, first byte %zu: "
+                    "layer %02x, exact %.3f, WARP %02x\n", c.group, c.name, index, outside, first,
+                    unsigned(actual[first]), first_exact, unsigned(expected[first]));
+    return outside == 0;
 }
 } // namespace
 
@@ -368,11 +411,13 @@ int main() {
                 if (got != Result::ok) {
                     ++tally.failed;
                     std::printf("FAIL %-6s %-22s case %u: the layer could not run it\n", c.group, c.name, i);
-                } else if (actual != expected) {
-                    ++tally.differ;
-                    report(c.group, c.name, i, "colour", actual, expected);
-                } else {
+                } else if (actual == expected) {
                     ++tally.matched;
+                } else if (srgb_within_tolerance(c, i, full, part, actual, expected)) {
+                    ++tally.tolerated;
+                } else {
+                    ++tally.differ;
+                    if (std::strcmp(c.group, "SRGB") != 0) report(c.group, c.name, i, "colour", actual, expected);
                 }
             }
         }
@@ -409,9 +454,9 @@ int main() {
             }
         }
     } // Destroy the D3D12 objects before checking the Vulkan validation counter.
-    std::printf("clears: %u matched WARP, %u differ, %u failed, %u in formats the layer does not expose, "
-                "%u skipped (WARP does not offer the format)\n",
-                tally.matched, tally.differ, tally.failed, tally.not_exposed, tally.skipped);
+    std::printf("clears: %u matched WARP, %u within D3D's sRGB tolerance, %u differ, %u failed, %u in formats the "
+                "layer does not expose, %u skipped (WARP does not offer the format)\n",
+                tally.matched, tally.tolerated, tally.differ, tally.failed, tally.not_exposed, tally.skipped);
     if (tally.differ || tally.failed) return 1;
     if (vk.validation_errors() != errors_before) return 1;
     return 0;
