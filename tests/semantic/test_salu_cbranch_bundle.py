@@ -305,5 +305,20 @@ class SCbranchScc0TranslatorTests(unittest.TestCase):
         spv = translate_lines("ps_cbranch_scc0_not_taken", lines)
         self.assertEqual(mrt0_words(spv)[0], 0x40000000)  # 2.0
 
+# -----------------------------------------------------------------------------
+# Opcode 4: s_cbranch_scc1
+# -----------------------------------------------------------------------------
+
+def ref_oracle_scc1(scc: int) -> bool:
+    return (scc & 1) == 1
+
+
+class SCbranchScc1OracleTests(unittest.TestCase):
+    def test_scc_set(self):
+        self.assertTrue(ref_oracle_scc1(1))
+
+    def test_scc_cleared(self):
+        self.assertFalse(ref_oracle_scc1(0))
+
 if __name__ == '__main__':
     unittest.main()
