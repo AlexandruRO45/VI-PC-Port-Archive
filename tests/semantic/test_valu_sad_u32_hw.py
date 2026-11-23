@@ -279,5 +279,33 @@ class TestSadConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(words[1], 0x2222)
 
 
+class TestSadBoundaryAndExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling for v_sad_u32."""
+
+    def test_boundary_values_and_wrapping(self):
+        cases = [
+            (0x00000000, 0xFFFFFFFF, 0x00000000),  # max difference 0xFFFFFFFF
+            (0xFFFFFFFF, 0x00000000, 0x00000001),  # difference + 1 wraps to 0
+            (0x80000000, 0x80000000, 0x7FFFFFFF),  # equal extreme, adds acc
+            (0x7FFFFFFF, 0x80000000, 0x00000000),  # diff is 1
+            (0x3F800000, 0xBF800000, 0x00000000),  # float patterns as raw unsigned ints
+            (0x7F800000, 0xFF800000, 0x00000000),  # +inf vs -inf patterns
+        ]
+        for idx, (s0, s1, s2) in enumerate(cases):
+            with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                expected = v_sad_u32_oracle(s0, s1, s2)
+                lines = [
+                    f"v_mov_b32 v1, {s0:#x}",
+                    f"v_mov_b32 v2, {s1:#x}",
+                    f"v_mov_b32 v3, {s2:#x}",
+                    "v_sad_u32 v0, v1, v2, v3",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_sad_ps(lines, f"ps_sad_ext_{idx}")
+                self.assertEqual(words[0], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
