@@ -61,7 +61,9 @@ panels count different things. The trend chart breaks a line where a metric's fo
 one treemap per panel, groups laid out as on the page, one cell per unit coloured by status (the corpus panel draws
 areas by count), with the panel's first ratio in its title and the commit and date in the footer. It holds panel
 titles, group names and counts only, never a unit's name or detail, so it is the one output that may be written
-inside the repository. CI on main is left out: a handful of cells that change with every run. To refresh it, run the
+inside the repository; it only takes a `.svg` name and only replaces a file that is already an SVG. Group names come
+from the data: for the GPU panel that is the `--gpu-log` label (or the log's file name), so pass one you mean to
+publish. CI on main is left out: a handful of cells that change with every run. To refresh it, run the
 tool with the same options as the page plus `--svg docs/progress.svg`; the picture shows that run, including its
 unit-test outcome and, with `--work`, your corpus counts.
 

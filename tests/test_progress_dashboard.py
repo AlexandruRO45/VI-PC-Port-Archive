@@ -310,6 +310,36 @@ class Svg(unittest.TestCase):
         fills = [r.get("fill") for r in root.iter() if r.tag.endswith("rect") and r.get("fill") == pd.SVG_COLORS["verified"]]
         self.assertLess(len(fills), 20)            # 20 verified cells in a few row runs, not 20 rectangles
 
+    def test_empty_snapshot_is_a_valid_picture(self):
+        for snap in ({"panels": [], "components": [], "metrics": []},
+                     {"panels": [{"id": "contract", "title": "Contract", "unit": "rows"}], "components": [], "metrics": [],
+                      "generated_at": "2026-01-02T03:04:05Z"}):
+            root = ET.fromstring(pd.render_svg(snap))
+            self.assertTrue(root.tag.endswith("svg"))
+
+    def test_svg_target_takes_only_svg_names_and_svg_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "tool.py")
+            with open(script, "w", encoding="utf-8", newline="\n") as f:
+                f.write("print('keep me')\n")
+            fake = os.path.join(tmp, "notes.svg")
+            with open(fake, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# not a picture\n")
+            old = os.path.join(tmp, "progress.svg")
+            with open(old, "w", encoding="utf-8", newline="\n") as f:
+                f.write(pd.render_svg({"panels": [], "components": [], "metrics": []}))
+            self.assertIn(".svg", pd.svg_target_problem(script))
+            self.assertIn("not an SVG", pd.svg_target_problem(fake))
+            os.mkdir(os.path.join(tmp, "dir.svg"))
+            self.assertIn("folder", pd.svg_target_problem(os.path.join(tmp, "dir.svg")))
+            self.assertIsNone(pd.svg_target_problem(old))
+            self.assertIsNone(pd.svg_target_problem(os.path.join(tmp, "new.svg")))
+            r = subprocess.run([sys.executable, "-I", TOOL, "--out", os.path.join(tmp, "out"), "--svg", script],
+                               capture_output=True, text=True, cwd=ROOT, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            with open(script, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "print('keep me')\n")
+
 
 if __name__ == "__main__":
     unittest.main()

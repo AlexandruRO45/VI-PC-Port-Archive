@@ -904,7 +904,8 @@ def render_page(snap, history):
 # ----------------------------------------------------------------------------------------------- svg
 # A static picture of the same panels for a README: one treemap per panel, groups by squarified layout, one cell per
 # unit coloured by status (a weighted panel such as the corpus draws areas instead). It carries panel titles, group
-# names, counts and ratios only, no component names or details, and nothing from the machine except the commit.
+# names, counts and ratios, the commit and the date; no component name or detail. Group names come from the data:
+# for the GPU panel that is the --gpu-log LABEL (or the log's file name), so pass a label you mean to publish.
 SVG_COLORS = {"verified": "#2fa84f", "implemented": "#3d8bfd", "partial": "#e3b11a", "failed": "#e5484d",
               "blocked": "#a37ef5", "missing": "#7c828c", "unknown": "#454b55"}
 SVG_ORDER = {s: i for i, s in enumerate(("verified", "implemented", "partial", "failed", "blocked", "missing", "unknown"))}
@@ -986,6 +987,24 @@ def svg_panel_height(units, weighted):
     return int(min(330, max(70, 40 + 8.5 * math.sqrt(units))))
 
 
+def svg_target_problem(path):
+    """Why --svg may not write to `path`, or None. It may point inside the repository, so it only takes a .svg name
+    and only replaces a file that is already an SVG: a mistyped path never overwrites a script or a document."""
+    if not path.lower().endswith(".svg"):
+        return "the file name must end in .svg"
+    if os.path.isdir(path):
+        return "is a folder"
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                head = f.read(256).lstrip()
+        except OSError as error:
+            return f"cannot read the existing file ({error.strerror})"
+        if not (head.startswith(b"<svg") or head.startswith(b"<?xml")):
+            return "exists and is not an SVG; refusing to overwrite it"
+    return None
+
+
 def render_svg(snap):
     """The panels of a snapshot as one SVG; returns the text. Deterministic for a given snapshot."""
     parts, defs = [], []
@@ -1059,7 +1078,7 @@ def render_svg(snap):
         lx += 22 + 6 * len(s) + 12
     y += 26
     head = (snap.get("git") or {}).get("head") or ""
-    foot = f"tools/progress_dashboard.py · {snap['generated_at'][:10]}" + (f" · {head[:8]}" if head else "")
+    foot = " · ".join(x for x in ("tools/progress_dashboard.py", (snap.get("generated_at") or "")[:10], head[:8]) if x)
     parts.append(f'<text x="{SVG_PAD + 2}" y="{y}" class="f">{_xml(foot)}</text>')
     height = y + SVG_PAD
     style = ("text{font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace}"
@@ -1113,6 +1132,11 @@ def main(argv=None):
     if args.work and not os.path.isdir(args.work):
         print(f"--work {args.work} is not a folder", file=sys.stderr)
         return 2
+    if args.svg:
+        problem = svg_target_problem(args.svg)
+        if problem:
+            print(f"--svg {args.svg}: {problem}", file=sys.stderr)
+            return 2
     os.makedirs(out_dir, exist_ok=True)
     snap = build(args, out_dir)
     new = write_outputs(snap, out_dir)
