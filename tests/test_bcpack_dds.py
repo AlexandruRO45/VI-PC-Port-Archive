@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tools")]
 
 from bcpack_tables import BC1_HISTORY_CONFIRMED
-import ttpf_assets
+import test_ttpf_assets as assets_fixtures
 import ttpf_mips as ttpf
 import test_ttpf_mips as fixtures
 from test_bcpack import encode_bc7_mode6_blocks, encode_lanes
@@ -112,18 +112,32 @@ class RustBatchExport(unittest.TestCase):
         struct.pack_into("<Q", pool, 48, len(pool) // 256 | (4 << 30))
         self.source.write_bytes(pool)
 
-        def run(directory, report):
-            directory.mkdir()
-            manifest = {"Textures": [{"Index": i, "DxgiFormat": 71, "File": None} for i in range(3)]}
-            result = ttpf_assets.complete_pool(self.source, directory, manifest, ("v1-strict", None),
-                                               os.environ["LEONIDA_BCPACK_DDS"], report=report)
-            self.assertEqual(result, (2, 1), manifest)
-            return {p.name: p.read_bytes() for p in directory.iterdir()}
+        def run(report):
+            stage = assets_fixtures.TextureAssets()
+            stage.setUp()
+            try:
+                stage.pool.write_bytes(self.source.read_bytes())
+                rows = []
+                for index in range(3):
+                    name = f"partial_{index}.dds"
+                    (stage.folder / name).write_bytes(b"previous mip chain")
+                    rows.append(stage.row | dict(Index=index, File=name, BaseMipLevel=1))
+                stage.catalog.write_text(json.dumps({"Count": len(rows), "Textures": rows}), encoding="utf-8",
+                                         newline="\n")
+                with mock.patch.dict(os.environ, {"LEONIDA_BCPACK_EXPORT_REPORT": str(int(report))}):
+                    stage.build()
+                self.assertEqual([p.name for p in stage.folder.glob("partial_*.dds")], ["partial_2.dds"])
+                return {p.name: p.read_bytes() for p in stage.folder.iterdir()}
+
+            finally:
+                stage.doCleanups()
 
         invoke = subprocess.run
 
         def refuse_second(command, **kwargs):
             result = invoke(command, **kwargs)
+            if "--selection" not in command:
+                return result
             result.check_returncode()
             catalog = Path(command[2], "manifest.json")
             rows = json.loads(catalog.read_bytes())
@@ -132,8 +146,8 @@ class RustBatchExport(unittest.TestCase):
             return result
 
         with mock.patch.object(subprocess, "run", side_effect=refuse_second):
-            ordinary = run(self.root / "ordinary", False)
-            outputs = run(self.out, True)
+            ordinary = run(False)
+            outputs = run(True)
         entries = json.loads(outputs.pop("bcpack-export-report.json"))["entries"]
         self.assertEqual(outputs, ordinary)
         self.assertEqual([e["index"] for e in entries], [0, 1, 2])
