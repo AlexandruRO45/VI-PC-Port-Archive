@@ -45,7 +45,9 @@
 //   --memory-cap-mb N  Windows: cap each checker process at N MiB of committed memory with a job object
 //                 (process_memory_cap.h), so a runaway driver compile fails the checker instead of exhausting the
 //                 system's commit limit (0xC000012D in other programs). Default: the physical memory size; 0 = no
-//                 cap. --isolate children are in the same job. No effect off Windows. When the job can't be set
+//                 cap. --isolate children are in the same job. Off Windows there is no default cap, and a cap
+//                 given with N > 0 is refused (not implemented there: use a container or systemd-run -p
+//                 MemoryMax=...). Below 256 MiB (other than 0) it is a usage error. When the job can't be set
 //                 up, the default cap is a warning and the check goes on; a cap given with --memory-cap-mb N (N > 0)
 //                 is an error (exit 2) before any Vulkan call, since the caller asked for the containment.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE=1 makes setting up the memory cap fail (on every platform),

@@ -307,8 +307,9 @@ Measured on Windows 11, RTX 3080 (NVIDIA 621.14), 32 GB RAM, the wave64-emulated
 - A driver that crashes instead of returning an error when its allocation fails is handled as any other crash:
   `--inflight-file` and `--isolate` name the module, and the `pipelines` stage of `make_game.py` retries it alone.
 - `--isolate` children run in the same job and get the same cap each.
-- The cap does nothing off Windows. On Linux a container or `systemd-run -p MemoryMax=...` caps the process, and the
-  budget above reads that limit.
+- Off Windows there is no default cap, and `--memory-cap-mb N` with N > 0 is refused with exit 2 (not implemented
+  there) rather than reported as installed. On Linux a container or `systemd-run -p MemoryMax=...` caps the
+  process, and the budget above reads that limit.
 
 ## Skipping huge modules
 

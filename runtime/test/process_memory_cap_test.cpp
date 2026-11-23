@@ -1,6 +1,6 @@
 // process_memory_cap.h: the job-object cap vk_pipeline_check puts on itself on Windows. No Vulkan device needed.
 // On Windows the test caps its own process at 256 MiB and checks that a larger commit fails while a small one still
-// succeeds; elsewhere it checks that the functions are no-ops.
+// succeeds; elsewhere it checks that there is no default cap and that a requested one is refused.
 #include "process_memory_cap.h"
 
 #include <cstdio>
@@ -50,9 +50,10 @@ int main() {
     CHECK(nested == nullptr);
     if (nested) VirtualFree(nested, 0, MEM_RELEASE);
 #else
+    // No default cap, and a requested one is refused rather than reported as installed.
     CHECK(leonida::default_process_memory_cap() == 0);
-    CHECK(leonida::apply_process_memory_cap(256ull * 1024 * 1024, error));
-    CHECK(error.empty());
+    CHECK(!leonida::apply_process_memory_cap(256ull * 1024 * 1024, error));
+    CHECK(error.find("only implemented on Windows") != std::string::npos);
 #endif
 
     if (failures) {

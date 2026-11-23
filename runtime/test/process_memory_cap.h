@@ -10,8 +10,8 @@
 // allocations fail, so the driver returns an error or the checker dies: make_game.py's pipelines stage and --isolate
 // already handle a dead checker (the module is named in --inflight-file and retried alone, then skipped). Processes
 // the checker starts (--isolate children) are in the same job, and the limit applies to each of them on its own.
-// Off Windows these functions do nothing: a Linux container or systemd-run -p MemoryMax=... already caps the
-// process, and large_module_gate.h reads that limit.
+// Off Windows there is no default cap and a requested one is refused with an error naming the alternative: a Linux
+// container or systemd-run -p MemoryMax=... caps the process, and large_module_gate.h reads that limit.
 #pragma once
 
 #include <cstdint>
@@ -37,8 +37,9 @@ inline uint64_t default_process_memory_cap() {
     return 0;
 }
 
-// Caps the current process at `bytes` of committed memory. 0 = no cap. Returns false with `error` set when the job
-// object can't be set up; the caller decides whether to go on without the cap.
+// Caps the current process at `bytes` of committed memory. 0 = no cap (always succeeds). Returns false with `error`
+// set when the cap can't be installed (the job object fails, or the platform has no implementation); the caller
+// decides whether to go on without it.
 inline bool apply_process_memory_cap(uint64_t bytes, std::string& error) {
     error.clear();
     if (bytes == 0) return true;
@@ -69,8 +70,12 @@ inline bool apply_process_memory_cap(uint64_t bytes, std::string& error) {
     }
     return true;
 #else
+    // No cap is installed here, so say so instead of reporting a limit that doesn't exist: a caller who asked for
+    // one (vk_pipeline_check --memory-cap-mb N) stops rather than running uncapped.
     (void)bytes;
-    return true;
+    error = "a process memory cap is only implemented on Windows; on Linux use a container or "
+            "systemd-run -p MemoryMax=...";
+    return false;
 #endif
 }
 
