@@ -418,8 +418,15 @@ int main(int argc, char** argv) {
 
     ComPtr<ID3D12Device> device;
     if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device)))) {
-        std::puts("Vulkan standalone device unavailable");
-        return 77;
+        // With LEONIDA_VK_VALIDATION set, no device means no validation (the layer is missing): a failure, not a skip,
+        // so a ctest run that asked for validation never passes or skips without it.
+        char validation[8] = {};
+        size_t validation_length = 0;
+        const bool wants_validation = getenv_s(&validation_length, validation, "LEONIDA_VK_VALIDATION") == 0 &&
+                                      validation_length > 1 && validation[0] != '0';
+        std::puts(wants_validation ? "Vulkan standalone device unavailable with LEONIDA_VK_VALIDATION set (see the [rt] line above)"
+                                   : "Vulkan standalone device unavailable");
+        return wants_validation ? 1 : 77;
     }
     bool ok = true;
     if (which == "all" || which == "many") ok &= many_queues(device.Get());

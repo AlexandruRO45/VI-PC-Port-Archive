@@ -8012,9 +8012,31 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     char validation[8] = {};
     size_t length = 0;
     if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
-        instance_info.pNext = &validation_features;
-        instance_info.enabledLayerCount = 1;
-        instance_info.ppEnabledLayerNames = &layer;
+        // Ask for the layer only when the loader lists it, and say so when it does not: an instance that cannot be
+        // made because of a missing layer left the caller with "Vulkan unavailable" and no hint that validation was
+        // the cause. Wine does not list the Linux loader's layers to the program and refuses an explicit request for
+        // one, so there only VK_INSTANCE_LAYERS (which Wine keeps out of the program's environment) loads it.
+        bool layer_listed = false;
+        if (const auto enumerate_layers = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
+                get(nullptr, "vkEnumerateInstanceLayerProperties"))) {
+            std::uint32_t layer_count = 0;
+            enumerate_layers(&layer_count, nullptr);
+            std::vector<VkLayerProperties> layers(layer_count);
+            if (layer_count && enumerate_layers(&layer_count, layers.data()) >= VK_SUCCESS)
+                for (std::uint32_t i = 0; i < layer_count; ++i)
+                    layer_listed = layer_listed || std::strcmp(layers[i].layerName, layer) == 0;
+        }
+        if (layer_listed) {
+            instance_info.pNext = &validation_features;
+            instance_info.enabledLayerCount = 1;
+            instance_info.ppEnabledLayerNames = &layer;
+        } else {
+            std::fprintf(stderr,
+                         "[rt] d3d12: LEONIDA_VK_VALIDATION is set but %s is not listed by the Vulkan loader "
+                         "(install the Vulkan SDK; under Wine set VK_INSTANCE_LAYERS=%s instead)\n",
+                         layer, layer);
+            return E_FAIL;
+        }
     }
     // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
     const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
