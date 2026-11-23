@@ -4,7 +4,11 @@
   - SGPR high halves, f16 abs/neg/ordered-vs-unordered NaN.
 
 Usage:
-  powershell -File C:\\Leonida-worktrees\\with-gpu-lock.ps1 "cd C:\\Leonida-worktrees\\w4-cmp16-opsel; python scripts/probe_gfx1036_vcmp16.py"
+  python -I tools/probe_gfx1036_vcmp16.py        (from the repository root; takes no arguments)
+
+It translates each probe with tools/rdna2spirv.py and runs it through
+runtime/build/vk_compute_test.exe, so it needs a Vulkan device, the SPIR-V tools on PATH
+and a built runtime/ directory.
 """
 import math
 import os
