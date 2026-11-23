@@ -6,7 +6,8 @@
 // here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
-//     the overlay (RT-218); any other path is a host path and goes to the host;
+//     the overlay (RT-218), <overlay>\\.gta6rt-temp\\<run>, a new one for every process; any other path is a host
+//     path and goes to the host;
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
 //     package stays exactly as installed. A write-open of a package file copies it into the overlay first, so
 //     OPEN_EXISTING keeps its bytes; a delete of a package file leaves an empty marker under
@@ -48,7 +49,7 @@ namespace {
 constexpr wchar_t kGamePrefix[] = L"game:";
 constexpr size_t kGamePrefixLength = 5;
 constexpr wchar_t kDeletedDir[] = L".gta6rt-deleted";
-constexpr wchar_t kScratchDir[] = L".gta6rt-temp";  // what "T:\" names, inside the overlay
+constexpr wchar_t kScratchDir[] = L".gta6rt-temp";  // holds one folder per process; "T:\" names this process's
 // A removed package folder is marked by this file inside its marker folder: the marker folder itself can already
 // exist because files below it were deleted, and that alone does not hide the folder.
 constexpr wchar_t kRemovedDirMarker[] = L".gta6rt-dir";
@@ -123,8 +124,33 @@ bool lies_under(const std::wstring& path, const std::filesystem::path& root) {
 // other console layers map those two drives (RT-218). Only the executable can say which spelling the title uses, so
 // a host drive of the same letter must keep working: a path under --game-dir or the overlay (a package on drive G:,
 // or a path GetModuleFileName handed back) stays a host path, and so does every G:/T: path while no roots are
-// configured. The scratch folder lives in the overlay, as `.gta6rt-temp`.
+// configured. The scratch folder lives in the overlay, as `.gta6rt-temp\<run>`, one per process (scratch_run()).
 enum class Drive { None, Game, Scratch };
+
+// The name of this process's T: folder below `.gta6rt-temp`: the process's start time (UTC, to the millisecond) and
+// its id, e.g. "20261123-181502-123-pid4242". On the console T: is the title's own temporary drive, empty at launch
+// and shared with nothing; one folder that every run shared kept the files earlier runs left, so a title that makes a
+// file there with CREATE_NEW (its crash dump and crash log, measured under Wine) got ERROR_FILE_EXISTS. The start
+// time keeps a reused process id from landing in an old run's folder; the folders of earlier runs are left in place
+// for whoever wants to read what those runs wrote.
+const std::wstring& scratch_run() {
+    static const std::wstring name = [] {
+        const DWORD last_error = ::GetLastError();
+        FILETIME created{}, exited{}, kernel{}, user{};
+        SYSTEMTIME t{};
+        if (!::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user) ||
+            !::FileTimeToSystemTime(&created, &t))
+            ::GetSystemTime(&t);
+        wchar_t buffer[64];
+        const unsigned long pid = ::GetCurrentProcessId();
+        std::swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%04u%02u%02u-%02u%02u%02u-%03u-pid%lu",
+                      unsigned{t.wYear}, unsigned{t.wMonth}, unsigned{t.wDay}, unsigned{t.wHour}, unsigned{t.wMinute},
+                      unsigned{t.wSecond}, unsigned{t.wMilliseconds}, pid);
+        ::SetLastError(last_error);
+        return std::wstring(buffer);
+    }();
+    return name;
+}
 
 Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     if (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) {
@@ -148,10 +174,11 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     parts.clear();
     if (drive == Drive::Scratch) {
         parts.push_back(kScratchDir);
+        parts.push_back(scratch_run());
         const std::filesystem::path overlay = roots().overlay;
         const DWORD last_error = ::GetLastError();
         std::error_code ec;
-        if (!overlay.empty()) std::filesystem::create_directories(overlay / kScratchDir, ec);
+        if (!overlay.empty()) std::filesystem::create_directories(overlay / kScratchDir / scratch_run(), ec);
         ::SetLastError(last_error);
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
@@ -183,7 +210,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     if (!flush()) return Parsed::Refused;
     // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
-    // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
+    // T: still names the scratch folder: its first two parts are pushed above, not parsed from the title's path.
     if (drive == Drive::Game && !parts.empty() && internal_dir(parts.front().c_str())) return Parsed::Refused;
     return Parsed::Console;
 }
@@ -196,7 +223,7 @@ std::filesystem::path join(const std::filesystem::path& root, const std::vector<
 
 bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts) {
     size_t prefix_length = 0;
-    return parts.empty() || (parts.size() == 1 && console_drive(path, prefix_length) == Drive::Scratch);
+    return parts.empty() || (parts.size() == 2 && console_drive(path, prefix_length) == Drive::Scratch);
 }
 
 struct Target {
@@ -633,6 +660,11 @@ std::filesystem::path game_dir() {
 std::filesystem::path overlay_dir() {
     std::lock_guard lock(g_mutex);
     return g_overlay_dir;
+}
+
+std::filesystem::path scratch_dir() {
+    const std::filesystem::path overlay = overlay_dir();
+    return overlay.empty() ? overlay : overlay / kScratchDir / scratch_run();
 }
 
 // gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the

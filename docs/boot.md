@@ -81,7 +81,13 @@ Useful switches:
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
-* `--overlay DIR` sends the guest's writes to a private folder instead of the package.
+* `--overlay DIR` sends the guest's writes to a private folder instead of the package. The title's `T:` drive (its
+  temporary drive, where it writes its crash dump `T:\<guid>.dmp` and crash log) is a folder of each process's own
+  inside it, `<overlay>\.gta6rt-temp\<YYYYMMDD-HHMMSS-mmm>-pid<id>` (the process's start time in UTC and its id),
+  made on the first `T:` call. The startup line names it (`console paths: GAME: -> ..., writes -> ..., T: -> ...`).
+  Folders of earlier runs are kept, so a run's crash files can be read after it stops; delete them by hand. With
+  one folder for every run, a `CREATE_NEW` of a name an earlier run had left failed with `ERROR_FILE_EXISTS` (80)
+  and no report landed (#7913).
 
 ## 3. Triage order
 

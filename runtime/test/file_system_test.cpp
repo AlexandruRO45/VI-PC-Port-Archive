@@ -117,6 +117,78 @@ int count(const std::vector<std::wstring>& names, const wchar_t* name) {
 
 bool contains(const std::vector<std::wstring>& names, const wchar_t* name) { return count(names, name) != 0; }
 
+// The folder "T:\" names in process `pid`: the one below <overlay>\.gta6rt-temp whose name ends in "-pid<pid>"
+// (rt::fs::scratch_dir() in that process). Empty when there is none, as when every process shared .gta6rt-temp.
+std::filesystem::path t_folder(const std::filesystem::path& overlay, DWORD pid) {
+    const std::wstring suffix = L"-pid" + std::to_wstring(pid);
+    std::error_code ec;
+    for (auto it = std::filesystem::directory_iterator(overlay / ".gta6rt-temp", ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        const std::wstring name = it->path().filename().wstring();
+        std::error_code type_ec;
+        if (it->is_directory(type_ec) && name.size() > suffix.size() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+            return it->path();
+    }
+    return {};
+}
+
+std::filesystem::path own_t_folder(const std::filesystem::path& overlay) {
+    return t_folder(overlay, ::GetCurrentProcessId());
+}
+
+// file_system_test started by itself as a second process (run_t_drive_child below): it opens T:\crash.dmp with
+// CREATE_NEW on the overlay its parent uses, writes "child process" and exits with 0, or with the open's Win32 error.
+constexpr wchar_t kChildPackage[] = L"LEONIDA_FS_TEST_CHILD_PACKAGE";
+constexpr wchar_t kChildOverlay[] = L"LEONIDA_FS_TEST_CHILD_OVERLAY";
+
+std::wstring environment(const wchar_t* name) {
+    std::wstring buffer(32768, L'\0');
+    const DWORD n = ::GetEnvironmentVariableW(name, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (n == 0 || n >= buffer.size()) return {};
+    buffer.resize(n);
+    return buffer;
+}
+
+int t_drive_child(const std::wstring& package, const std::wstring& overlay) {
+    rt::fs::configure(package, overlay);
+    const auto create_w = resolve<CreateFileWFn>("kernel32.dll", "CreateFileW");
+    if (!create_w) return 1000;
+    const HANDLE h = create_w(L"T:\\crash.dmp", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return static_cast<int>(::GetLastError());
+    DWORD written = 0;
+    ::WriteFile(h, "child process", 13, &written, nullptr);
+    ::CloseHandle(h);
+    return 0;
+}
+
+// Runs t_drive_child in a new process of this executable on the given folders. Returns its exit code (~0u when it
+// could not be started or did not finish) and its process id in `pid`.
+DWORD run_t_drive_child(const std::filesystem::path& package, const std::filesystem::path& overlay, DWORD& pid) {
+    pid = 0;
+    std::wstring self(32768, L'\0');
+    const DWORD length = ::GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
+    if (length == 0 || length >= self.size()) return ~0u;
+    self.resize(length);
+    std::wstring command = L"\"" + self + L"\"";
+    ::SetEnvironmentVariableW(kChildPackage, package.c_str());
+    ::SetEnvironmentVariableW(kChildOverlay, overlay.c_str());
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    const BOOL started = ::CreateProcessW(self.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                                          &startup, &process);
+    ::SetEnvironmentVariableW(kChildPackage, nullptr);
+    ::SetEnvironmentVariableW(kChildOverlay, nullptr);
+    if (!started) return ~0u;
+    DWORD code = ~0u;
+    if (::WaitForSingleObject(process.hProcess, 60000) == WAIT_OBJECT_0) ::GetExitCodeProcess(process.hProcess, &code);
+    pid = process.dwProcessId;
+    ::CloseHandle(process.hThread);
+    ::CloseHandle(process.hProcess);
+    return code;
+}
+
 // Denies the current user `rights` on a folder while it lives and puts the folder's old DACL back when it goes, on
 // every way out of the check. Both changes go through one handle opened before the deny. Under Wine the DACL is the
 // folder's unix mode: a deny of FILE_LIST_DIRECTORY clears its owner and group read bits (server/file.c, sd_to_mode),
@@ -186,6 +258,8 @@ void run_checks(const std::filesystem::path& root);
 }  // namespace
 
 int main() {
+    if (const std::wstring child_overlay = environment(kChildOverlay); !child_overlay.empty())
+        return t_drive_child(environment(kChildPackage), child_overlay);
     // A folder of this run's own: Wine hands each fresh prefix the same small process ids, so a folder named after
     // the process id alone can be one an earlier run left behind.
     LARGE_INTEGER now{};
@@ -1117,18 +1191,18 @@ void run_checks(const std::filesystem::path& root) {
               "on a fresh overlay CreateDirectoryW(T:\\shadercache) succeeds");
         std::filesystem::path fresh = fresh_overlay();
         check(copy_w(L"GAME:\\data\\hello.txt", L"T:\\hello.tmp", FALSE) != FALSE &&
-                  read_path(fresh / ".gta6rt-temp" / "hello.tmp") == "package",
+                  read_path(own_t_folder(fresh) / "hello.tmp") == "package",
               "on a fresh overlay CopyFileW(GAME:\\data\\hello.txt, T:\\hello.tmp) succeeds");
         fresh = fresh_overlay();
         SetLastError(0);
         check(rmdir_w(L"T:\\") == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
-                  std::filesystem::is_directory(fresh / ".gta6rt-temp"),
+                  std::filesystem::is_directory(own_t_folder(fresh)),
               "T:\\ cannot be removed, like GAME:\\");
         fresh = fresh_overlay();
         SetLastError(0);
         check(move_w(L"T:\\", L"GAME:\\moved") == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
                   attributes_w(L"GAME:\\moved") == INVALID_FILE_ATTRIBUTES &&
-                  std::filesystem::is_directory(fresh / ".gta6rt-temp"),
+                  std::filesystem::is_directory(own_t_folder(fresh)),
               "T:\\ cannot be moved");
         fresh_overlay();
         attributes_w(L"T:\\");
@@ -1145,8 +1219,8 @@ void run_checks(const std::filesystem::path& root) {
             ::WriteFile(h, "scratch", 7, &written, nullptr);
             ::CloseHandle(h);
         }
-        check(read_path(overlay / ".gta6rt-temp" / "cache" / "scratch.bin") == "scratch",
-              "a T: file lands in the overlay's scratch folder");
+        check(read_path(own_t_folder(overlay) / "cache" / "scratch.bin") == "scratch",
+              "a T: file lands in this process's scratch folder in the overlay");
         check(!std::filesystem::exists(package / "cache" / "scratch.bin") && !std::filesystem::exists(package / ".gta6rt-temp"),
               "and the package is untouched");
         h = create_w(L"t:/cache/scratch.bin", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1166,6 +1240,8 @@ void run_checks(const std::filesystem::path& root) {
         // as an explicit GAME: or G: path, refused like any other invalid name, in every spelling parse_console()
         // normalises (RT-294). T:\ still names the scratch folder, and an ordinary dotted name is not reserved.
         write_path(overlay / ".gta6rt-temp" / "runtime.tmp", "runtime");
+        if (const std::filesystem::path t_dir = own_t_folder(overlay); !t_dir.empty())
+            write_path(t_dir / "runtime.tmp", "runtime");
         write_path(overlay / ".gta6rt-deleted" / "data" / "gone.txt", "");
         write_path(overlay / ".gta6rt-other" / "ok.txt", "ok");
         for (const wchar_t* reserved : {L"GAME:\\.gta6rt-temp\\runtime.tmp", L"GAME:\\.GTA6RT-TEMP\\runtime.tmp",
@@ -1190,7 +1266,8 @@ void run_checks(const std::filesystem::path& root) {
         if (markers != INVALID_HANDLE_VALUE) find_close(markers);
         SetLastError(0);
         const HANDLE probe = create_w(L"GAME:\\.gta6rt-temp\\probe.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-        check(probe == INVALID_HANDLE_VALUE && !std::filesystem::exists(overlay / ".gta6rt-temp" / "probe.txt"),
+        check(probe == INVALID_HANDLE_VALUE && !std::filesystem::exists(overlay / ".gta6rt-temp" / "probe.txt") &&
+                  !std::filesystem::exists(own_t_folder(overlay) / "probe.txt"),
               "a write through GAME:\\.gta6rt-temp creates nothing in the scratch folder");
         if (probe != INVALID_HANDLE_VALUE) ::CloseHandle(probe);
         check(mkdir_w(L"GAME:\\.gta6rt-copy\\sub", nullptr) == FALSE && !std::filesystem::exists(overlay / ".gta6rt-copy" / "sub"),
@@ -1216,6 +1293,94 @@ void run_checks(const std::filesystem::path& root) {
         SetLastError(0);
         check(attributes_w(L"T:\\x") == INVALID_FILE_ATTRIBUTES && GetLastError() != ERROR_INVALID_NAME,
               "without configured folders G: and T: stay host drives");
+        rt::fs::configure(package, overlay);
+    }
+
+    // T: is the title's temporary drive, which on the console no other run shares: each process gets a folder of its
+    // own below <overlay>\.gta6rt-temp. With one folder for every run, the title's crash dump and crash log, made with
+    // CREATE_NEW, failed with ERROR_FILE_EXISTS on names an earlier run had left (issue #7913, measured under Wine).
+    {
+        const std::filesystem::path t_overlay = root / "t_overlay";
+        const std::filesystem::path temp = t_overlay / ".gta6rt-temp";
+        // What earlier runs left: a file in the folder they all shared, and one in an earlier process's own folder.
+        write_path(temp / "crash.dmp", "earlier run");
+        write_path(temp / "20200101-000000-000-pid1" / "crash.dmp", "earlier process");
+        write_path(package / "crash.dmp", "package");  // and a GAME: file of the same name
+        rt::fs::configure(package, t_overlay);
+
+        SetLastError(0);
+        HANDLE h = create_w(L"T:\\crash.dmp", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        const DWORD create_error = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        check(h != INVALID_HANDLE_VALUE,
+              "CreateFileW(T:\\crash.dmp, CREATE_NEW) succeeds when earlier runs left that name in .gta6rt-temp");
+        if (create_error) std::printf("     (failed with Win32 error %lu)\n", static_cast<unsigned long>(create_error));
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            ::WriteFile(h, "this process", 12, &written, nullptr);
+            ::CloseHandle(h);
+        }
+        const std::filesystem::path mine = own_t_folder(t_overlay);
+        check(!mine.empty() && mine.parent_path() == temp && read_path(mine / "crash.dmp") == "this process",
+              "T:\\crash.dmp lands in this process's own folder <overlay>\\.gta6rt-temp\\<start time>-pid<id>");
+        const std::wstring name = mine.filename().wstring();
+        const auto digits = [&](size_t from, size_t n) {
+            if (name.size() < from + n) return false;
+            for (size_t i = from; i < from + n; ++i)
+                if (name[i] < L'0' || name[i] > L'9') return false;
+            return true;
+        };
+        check(digits(0, 8) && name.size() > 20 && name[8] == L'-' && digits(9, 6) && name[15] == L'-' &&
+                  digits(16, 3) && name.compare(19, 4, L"-pid") == 0,
+              "the folder is named YYYYMMDD-HHMMSS-mmm-pid<id>, the process's start time and id");
+        check(read_path(temp / "crash.dmp") == "earlier run" &&
+                  read_path(temp / "20200101-000000-000-pid1" / "crash.dmp") == "earlier process" &&
+                  read_path(package / "crash.dmp") == "package",
+              "the earlier runs' files and the package file of the same name are left as they were");
+
+        // The same folder for every T: call of this process, also after configure() names the overlay again.
+        rt::fs::configure(package, t_overlay);
+        h = create_w(L"t:/crash.dmp", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "this process",
+              "T: keeps naming the same folder for the rest of the process");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const std::vector<std::wstring> t_names = list(first_w, next_w, find_close, L"T:\\*");
+        check(count(t_names, L"crash.dmp") == 1 && !contains(t_names, L"20200101-000000-000-pid1") &&
+                  !contains(t_names, L".gta6rt-temp"),
+              "a T:\\ listing shows this process's files only");
+        SetLastError(0);
+        check(create_w(L"T:\\..\\crash.dmp", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr) ==
+                      INVALID_HANDLE_VALUE &&
+                  GetLastError() == ERROR_INVALID_NAME,
+              "T:\\.. cannot climb into the shared .gta6rt-temp folder");
+        SetLastError(0);
+        check(rmdir_w(L"T:\\") == FALSE && GetLastError() == ERROR_ACCESS_DENIED && std::filesystem::is_directory(mine),
+              "this process's T:\\ folder cannot be removed, like GAME:\\");
+
+        // A second process on the same overlay gets a folder of its own, and its CREATE_NEW of the same name succeeds.
+        DWORD child_pid = 0;
+        const DWORD child_code = run_t_drive_child(package, t_overlay, child_pid);
+        check(child_code == 0,
+              "a second process's CreateFileW(T:\\crash.dmp, CREATE_NEW) on the same overlay succeeds");
+        if (child_code != 0)
+            std::printf("     (the second process exited with %lu)\n", static_cast<unsigned long>(child_code));
+        const std::filesystem::path theirs = child_pid ? t_folder(t_overlay, child_pid) : std::filesystem::path();
+        check(!theirs.empty() && theirs != mine && theirs.parent_path() == temp &&
+                  read_path(theirs / "crash.dmp") == "child process",
+              "the second process wrote into a folder of its own");
+        check(read_path(mine / "crash.dmp") == "this process", "and this process's T: file is unchanged");
+
+        // GAME: is not affected: reads come from the package, writes land in the overlay's mirror of the package.
+        h = create_w(L"GAME:\\crash.dmp", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
+              "GAME:\\crash.dmp still reads the package file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        h = create_w(L"GAME:\\data\\t_written.txt", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "a GAME: write-open still succeeds");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(std::filesystem::exists(t_overlay / "data" / "t_written.txt") &&
+                  !std::filesystem::exists(mine / "data") &&
+                  !std::filesystem::exists(package / "data" / "t_written.txt"),
+              "and lands at <overlay>\\data, not in T:'s folder or the package");
         rt::fs::configure(package, overlay);
     }
 

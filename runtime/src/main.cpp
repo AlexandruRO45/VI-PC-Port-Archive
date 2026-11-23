@@ -224,7 +224,9 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
         }
-        const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " + overlay_dir.native();
+        const std::filesystem::path scratch_dir = rt::fs::scratch_dir();
+        const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " +
+                                   overlay_dir.native() + L", T: -> " + scratch_dir.native();
         const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD mode;
         bool printed = false;
@@ -237,8 +239,10 @@ int wmain(int argc, wchar_t** argv) {
         if (!printed) {
             const auto game = game_dir.u8string();
             const auto overlay = overlay_dir.u8string();
-            std::printf("console paths: GAME: -> %s, writes -> %s\n",
-                        reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
+            const auto scratch = scratch_dir.u8string();
+            std::printf("console paths: GAME: -> %s, writes -> %s, T: -> %s\n",
+                        reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()),
+                        reinterpret_cast<const char*>(scratch.c_str()));
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);

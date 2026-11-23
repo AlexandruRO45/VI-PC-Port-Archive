@@ -28,6 +28,9 @@ void configure(const std::filesystem::path& game_dir, const std::filesystem::pat
 
 std::filesystem::path game_dir();
 std::filesystem::path overlay_dir();
+// The folder "T:\" names in this process: <overlay dir>\.gta6rt-temp\<start time>-pid<id>, a different one for every
+// process, made on the first T: call; empty while no overlay is configured.
+std::filesystem::path scratch_dir();
 
 // For tests: true makes the CopyFile2 shim use its CopyFileExW fallback even where the host has CopyFile2, so the
 // path Wine 9 takes can be checked on Windows. Off by default; main.cpp never sets it.
