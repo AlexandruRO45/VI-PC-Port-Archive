@@ -33,7 +33,7 @@ The 16 DLLs and the package's root files were scanned first (`XboxBvhBuilder.dll
 | `XboxBvhBuilder.dll` | 52 | 674,404 | 4,072 / 7,454 / 74,508 | `SFI0 ISG1 OSG1 PSV0 RTS0 STAT ILDN HASH DXIL` |
 | `amd_fidelityfx_upscaler_xbox.dll` | 29 | 289,656 | 1,764 / 5,176 / 42,616 | `SFI0 ISG1 OSG1 PSV0 RTS0 HASH ACCC` |
 | other 14 DLLs | 0 | 0 | — | — |
-| `game_scarlett_master.exe` | 10 | 9,520 | 924 / 936 / 992 | `SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV` |
+| `game_scarlett_master.exe` | 10 | 9,548 | 924 / 952 / 992 | `SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV` |
 
 The 29 `ACCC` containers hold `FSPX` payloads ([fspx.md](fspx.md)); the 52 `DXIL` containers are the subject of
 this note. The FSR DLL has one rejected `DXBC` hit: the bytes are an immediate in its own magic check, and the
@@ -42,7 +42,7 @@ validator rejects it (the scan reports both counts).
 ### Retail executable (`game_scarlett_master.exe`, RT-5)
 
 Scanning the retail executable (120,181,760 bytes, SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`)
-with `tools/pe_shader_containers.py` finds **10** valid DXBC containers (9,520 bytes total, file offsets
+with `tools/pe_shader_containers.py` finds **10** valid DXBC containers (9,548 bytes total, file offsets
 `0x688cd3c`..`0x688fdf6`, sizes 924–992 bytes) and 1 rejected `DXBC` hit:
 
 * **Stages (`PSV0`):** **1** vertex shader (`0x688cd3c`, 992 bytes) and **9** pixel shaders (924–980 bytes). Unlike the
