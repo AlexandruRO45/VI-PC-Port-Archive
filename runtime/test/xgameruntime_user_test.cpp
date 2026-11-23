@@ -205,6 +205,10 @@ int main(int argc, char** argv) {
           "Modern: the classic gamertag when none is set");
     check(tag(tag_face, h, 2, sizeof(buf), buf, &used) == S_OK && buf[0] == 0 && used == 1,
           "ModernSuffix: empty (just the terminator)");
+    char title_buf[21] = {};
+    check(tag(tag_face, h, 0, sizeof(title_buf), title_buf, nullptr) == S_OK &&
+              std::strcmp(title_buf, expect_tag) == 0,
+          "the title's call: Classic into a 21-byte buffer with no gamertagUsed");
     check(tag(tag_face, h, 0, want - 1, buf, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
           "a buffer one byte short is E_INSUFFICIENT_BUFFER");
     check(tag(tag_face, h, 7, sizeof(buf), buf, &used) == E_INVALIDARG, "an unknown component is E_INVALIDARG");

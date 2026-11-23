@@ -358,7 +358,8 @@ run sees from each slot is still the executable's first boot:
 - `XUserAddAsync` has one caller, which passes `AddDefaultUserSilently` (1) and tests only the `HRESULT`.
 - `XUserGetGamertag` is called by the title with `Classic` (0), a 21-byte buffer and no `gamertagUsed`, so a classic
   gamertag of up to 15 characters fits. Its other caller is library code that passes the component and the buffer
-  size through and does read `gamertagUsed` (#7418).
+  size through and does read `gamertagUsed`. For a buffer that is too small the shim leaves `gamertagUsed` at 0, so
+  a caller that sizes its retry from it gets 0; open #7418 reports the required size there.
 - `XUserGetState`: the title's one caller asks for four users in turn, starts each answer at `SignedOut` (2), and
   treats a failing `HRESULT` or `SignedOut` as signed out.
 - `XUserCheckPrivilege`: one caller, with options `None` (0), the privilege from its argument, and the bool and the
