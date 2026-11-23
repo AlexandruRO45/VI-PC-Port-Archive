@@ -148,6 +148,26 @@ class TestLdsAddU32BoundariesAndNegative(unittest.TestCase):
         with self.assertRaises(Exception):
             L.translate(["ds_add_u32_bad_opcode v0, v1"])
 
+class TestLdsSubU32Reference(unittest.TestCase):
+    def test_sub_basic_operations(self):
+        cases = [
+            (0, 0, 0),
+            (15, 5, 10),
+            (0, 1, 0xFFFFFFFF),
+            (0x80000000, 1, 0x7FFFFFFF),
+            (0x80000000, 0x80000000, 0),
+            (0x23456789, 0x11111111, 0x12345678),
+        ]
+        for m, d, want in cases:
+            with self.subTest(m=hex(m), d=hex(d)):
+                rtns, fin = L.run_chain([("ds_sub_u32", 0x40, 0, (d,))], {0x40: m})
+                self.assertEqual(fin[0x40], want)
+
+    def test_non_returning_preserves_dst_sentinel(self):
+        rtns, fin = L.run_chain([("ds_sub_u32", 0x40, 0, (42,))], {0x40: 100})
+        self.assertEqual(rtns, [0xDEAD])
+        self.assertEqual(fin[0x40], 58)
+
 
 if __name__ == "__main__":
     unittest.main()
