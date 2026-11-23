@@ -301,6 +301,11 @@ def main(argv=None):
                 ap.error("--json must not be the input folder")
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             pass
+        if os.path.isdir(a.json):  # open() on a folder ends the run in an IsADirectoryError traceback
+            ap.error(f"--json is a folder, not a JSON file: {a.json}")
+        folder = os.path.dirname(os.path.abspath(a.json))
+        if not os.path.isdir(folder):  # the census prints every row before it reaches this write
+            ap.error(f"--json folder does not exist: {folder}")
     if not os.path.isdir(a.root):
         ap.error(f"not a folder: {a.root}")
     if a.disasm and not os.path.isdir(a.disasm):
