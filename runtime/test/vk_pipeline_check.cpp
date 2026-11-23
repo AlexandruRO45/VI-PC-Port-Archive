@@ -1320,6 +1320,8 @@ int main(int argc, char** argv) {
     };
 
     // Resource contract (docs/design.md): set 0, runtime-sized arrays as large bindless arrays.
+    // The runtime creates this layout with UPDATE_AFTER_BIND so the bindless counts fit within the
+    // device's update-after-bind limits (much larger than the base limits on Intel iGPU).
     std::vector<VkDescriptorSetLayoutBinding> b;
     auto add = [&](uint32_t bind, VkDescriptorType t, uint32_t cnt) {
         b.push_back({bind, t, cnt, VK_SHADER_STAGE_ALL, nullptr});
@@ -1329,7 +1331,19 @@ int main(int argc, char** argv) {
     add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
     add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
     for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
+    const bool uab = f12.descriptorBindingSampledImageUpdateAfterBind &&
+                     f12.descriptorBindingStorageImageUpdateAfterBind &&
+                     f12.descriptorBindingStorageBufferUpdateAfterBind &&
+                     f12.descriptorBindingPartiallyBound;
+    std::vector<VkDescriptorBindingFlags> bind_flags(b.size(),
+        uab ? (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT)
+            : VkDescriptorBindingFlags{0});
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    flags_info.bindingCount = uint32_t(bind_flags.size());
+    flags_info.pBindingFlags = bind_flags.data();
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    if (uab) { dli.pNext = &flags_info; dli.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT; }
     dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
     VkDescriptorSetLayout dsl;
     if (VkResult r = vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl)) { std::fprintf(stderr, "layout %d\n", r); return 1; }
