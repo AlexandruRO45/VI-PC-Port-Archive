@@ -420,3 +420,34 @@ class TestSIMDDivergence(unittest.TestCase):
                 self.assertEqual(state.get_vgpr(lane, 0), (-lane) & MASK_32)
             else:
                 self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+
+# ==============================================================================
+# SECTION 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src_in_place(self) -> None:
+        """Verify v_cvt_i32_f32 v0, v0 safely converts float in v0 to int in-place."""
+        state = ScalarState()
+        state.set_vgpr(0, f32_to_bits(123.75))
+
+        interp = ScalarInterpreter()
+        instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(0))
+        interp.step(instr, state)
+
+        self.assertEqual(state.get_vgpr(0), 123)
+
+    def test_alias_in_place_translator_cross_check(self) -> None:
+        """Verify in-place register reuse with translator execution."""
+        lines = [
+            f"v_mov_b32 v0, {f32_to_bits(-77.8):#x}",
+            "v_cvt_i32_f32 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_test", lines)
+        got = support.mrt0_words(spv)[0]
+        self.assertEqual(got, (-77) & MASK_32)
