@@ -13,6 +13,7 @@ import os
 import re
 import sys
 from collections import Counter
+from itertools import chain
 
 ENC = re.compile(r";\s*encoding:\s*\[([^\]]*)\]")
 HDR = re.compile(r"^;\s*(\S+)\s+code 0x([0-9a-f]+)\.\.0x([0-9a-f]+)")
@@ -236,30 +237,35 @@ def parse_line(line):
 
 
 def parse_file(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
     info = {"name": os.path.splitext(os.path.basename(path))[0], "insns": [], "invalid": 0}
-    m = HDR.match(lines[0]) if lines else None
-    pc = int(m.group(2), 16) if m else 0
-    info["code_start"] = pc
-    # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
-    # between the last printed instruction and it
-    info["code_end"] = int(m.group(3), 16) if m else None
-    start = 1 if (lines and not lines[0].startswith("\t")) else 0
-    for ln in lines[start:]:
-        if ln.startswith("; ---"):
-            break
-        if not ln.startswith("\t") or ln.lstrip().startswith("."):
-            continue
-        ins = parse_line(ln)
-        if not ins:
-            continue
-        ins["pc"] = pc
-        if ins["enc"]:
-            pc += len(ins["enc"]) // 2
-        info["insns"].append(ins)
-    tail = "\n".join(lines)
-    info["invalid"] = tail.count("invalid instruction encoding")
+    invalid_encoding = "invalid instruction encoding"
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = (ln for raw_line in f for ln in raw_line.splitlines())
+        first_line = next(lines, "")
+        m = HDR.match(first_line)
+        pc = int(m.group(2), 16) if m else 0
+        info["code_start"] = pc
+        # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
+        # between the last printed instruction and it.
+        info["code_end"] = int(m.group(3), 16) if m else None
+        if first_line.startswith("\t"):
+            lines = chain((first_line,), lines)
+        else:
+            info["invalid"] = first_line.count(invalid_encoding)
+        for ln in lines:
+            info["invalid"] += ln.count(invalid_encoding)
+            if ln.startswith("; ---"):
+                break
+            if not ln.startswith("\t") or ln.lstrip().startswith("."):
+                continue
+            ins = parse_line(ln)
+            if not ins:
+                continue
+            ins["pc"] = pc
+            if ins["enc"]:
+                pc += len(ins["enc"]) // 2
+            info["insns"].append(ins)
+        info["invalid"] += sum(ln.count(invalid_encoding) for ln in lines)
     return info
 
 

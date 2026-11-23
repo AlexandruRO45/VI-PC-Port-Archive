@@ -303,6 +303,23 @@ class ParseFileTests(unittest.TestCase):
         self.assertEqual([i["pc"] for i in info["insns"]], [0x100, 0x102, 0x104])
         self.assertEqual(info["invalid"], 1)
 
+    def test_diagnostics_are_counted_without_reading_the_whole_listing(self):
+        class Listing(io.StringIO):
+            def read(self, *args, **kwargs):
+                raise AssertionError("listing must be read incrementally")
+
+        warning = "invalid instruction encoding"
+        listing = Listing(
+            f"; shader code 0x100..0x108 {warning}\r\n"
+            f"\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf] {warning}\u2028"
+            f"; --- llvm-mc messages --- {warning}\r\n"
+            f"\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\r\n{warning} {warning}"
+        )
+        with mock.patch("builtins.open", return_value=listing):
+            info = shader_ir.parse_file("shader.s")
+        self.assertEqual([(ins["op"], ins["pc"]) for ins in info["insns"]], [("s_nop", 0x100)])
+        self.assertEqual(info["invalid"], 5)
+
     def test_tab_between_mnemonic_and_operands(self):
         path = self.write(
             "; sample code 0x0..0x4 (header)\n"
