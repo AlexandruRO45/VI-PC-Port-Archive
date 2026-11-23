@@ -802,5 +802,43 @@ class TestVDot2cF32F16ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(res, 0x40400000)
         self.assertEqual(state.vgprs[2], 0x40400000)
 
+class TestVDot2cF32F16SIMDAndIEEE(unittest.TestCase):
+    def test_condition_code_neutrality(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xFEDCBA9876543210
+        state.write_vgpr(0, 0x3C003C00)
+        state.write_vgpr(1, 0x3C003C00)
+        state.write_vgpr(2, 0x3F800000)
+        inst = ASTInstruction(
+            Opcode.V_DOT2C_F32_F16,
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+        )
+        ScalarInterpreter().step(inst, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xFEDCBA9876543210)
+
+    def test_accumulator_preservation(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x00000000)
+        state.write_vgpr(1, 0x00000000)
+        state.write_vgpr(2, 0x40A00000)  # 5.0f
+        inst = ASTInstruction(
+            Opcode.V_DOT2C_F32_F16,
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x40A00000)
+
+    def test_ieee754_nan_and_inf(self) -> None:
+        res_nan = ref_v_dot2c_f32_f16(0x7E003C00, 0x3C003C00, old_dst=0x3F800000)
+        self.assertEqual(res_nan, 0x7FC00000)
+        res_inf = ref_v_dot2c_f32_f16(0x7C003C00, 0x3C003C00, old_dst=0x3F800000)
+        self.assertEqual(res_inf, 0x7F800000)
+
 if __name__ == "__main__":
     unittest.main()
