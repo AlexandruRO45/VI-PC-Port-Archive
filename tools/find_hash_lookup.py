@@ -143,7 +143,11 @@ def main(argv=None):
         return 2
     for h in report["hashes"]:
         print(f"{h['name']} = {h['value']}: {h['occurrences']} occurrence(s) in code")
-    if not report["candidates"]:
+    if not any(h["occurrences"] for h in report["hashes"]):
+        # Nothing to follow, so a larger --window cannot help (the retail 1.0.2.1 executable holds neither default id).
+        print("none of the hashes occurs in the executable sections: the code does not hold them as constants, "
+              "so the lookup has to be found another way (docs/modding.md)")
+    elif not report["candidates"]:
         print("no direct call follows any of the hashes: try a larger --window, or the lookup is reached indirectly")
     for c in report["candidates"]:
         print(f"  {c['rva']:>12}  callers {c['direct_callers']:>6}  led by {', '.join(c['led_by'])}")

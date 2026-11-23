@@ -128,6 +128,31 @@ class FindHashLookupTest(unittest.TestCase):
             self.assertIn("ERROR: cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def run_tool(self, data, *args):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            return subprocess.run([sys.executable, "-I", TOOL, exe, *args], capture_output=True, text=True)
+
+    def test_no_hash_in_the_code_does_not_ask_for_a_larger_window(self):
+        # The retail 1.0.2.1 executable holds neither default id: a larger --window cannot find anything to follow.
+        data, _, _ = image()
+        r = self.run_tool(data, "--hash", "0x12345678")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0x12345678: 0 occurrence(s) in code", r.stdout)
+        self.assertIn("none of the hashes occurs in the executable sections", r.stdout)
+        self.assertNotIn("--window", r.stdout)
+
+    def test_a_hash_with_no_call_after_it_still_suggests_a_larger_window(self):
+        code = bytearray(b"\xCC" * 0x100)
+        code[0:5] = b"\xB9" + struct.pack("<I", fhl.joaat("cs_mandy"))   # mov ecx, mandy ; no call follows
+        r = self.run_tool(pe(bytes(code)), "--hash", "cs_mandy")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("cs_mandy = 0xD7C0CDFF: 1 occurrence(s) in code", r.stdout)
+        self.assertIn("no direct call follows any of the hashes: try a larger --window", r.stdout)
+        self.assertNotIn("none of the hashes occurs", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

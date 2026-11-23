@@ -1,6 +1,7 @@
 # Mods
 
-**Status: the mod format, loader and hook are in place; only the lookup's address in the executable is missing.** `gta6rt` reads every
+**Status: the mod format, loader and hook are in place; only the lookup's address in the executable is missing, and
+the constant search in "Day one" below does not find it in the retail 1.0.2.1 executable.** `gta6rt` reads every
 `mods/<folder>/mod.json`, checks it and logs what it would change. A swap takes effect once the game's
 archetype lookup is hooked, and that needs the executable (RT-5): its address differs per version.
 
@@ -91,6 +92,14 @@ whole image has. Run it alone with `python -I tools/find_hash_lookup.py <exe>`. 
    and walks a chain comparing a 32-bit key; it is called from hundreds of sites.
 3. **Cross-check.** Called with `0xD7C0CDFF` it must return a valid archetype too (`cs_mandy` is a live
    model id: a `story000.rpf` cutscene table uses it).
+
+**Measured on the retail executable, step 1 finds nothing.** In `game_scarlett_master.exe` 1.0.2.1 (SHA-256
+`e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`), `find_hash_lookup.py` reports 0
+occurrences in code for both default ids, and a count over the whole file finds neither 32-bit value anywhere,
+nor `player_story000_00` or `cs_mandy` as an ASCII or UTF-16 string. The code does not name these models: the
+ids reach it from the data tables ([character_skeleton.md](character_skeleton.md)), so the lookup has to be
+found by its shape (step 2) or from a model id the code does hold, and a larger `--window` cannot help. The tool
+says so when none of the hashes occurs.
 
 Then pass it to the runtime:
 
