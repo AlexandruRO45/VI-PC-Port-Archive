@@ -395,12 +395,21 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
         full = os.path.join(path, name)
         if not os.path.isfile(full) or not (name.endswith(".bin") or name.endswith(".bk2")):
             continue
-        if name.endswith(".bin") and os.path.getsize(full) > max_inflate:
+        size = os.path.getsize(full)
+        if name.endswith(".bin") and size > max_inflate:
             skipped += 1
             continue
         found = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(found.group(1), 16) if found else len(rows)
         with open(full, "rb") as f:
+            if name.endswith(".bk2"):
+                # Archive mode also classifies video from a fixed header. Other
+                # .bk2 contents still need the complete payload below.
+                row = classify(f.read(256), offset, carve_stored.get(name, size))
+                if row["signature"] == "bink2":
+                    rows.append(row)
+                    continue
+                f.seek(0)
             data = f.read()
         stored = carve_stored.get(name, len(data))
         if len(data) >= 3 and data[:3] == b"KB2":
