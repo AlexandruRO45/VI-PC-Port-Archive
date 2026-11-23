@@ -30,6 +30,7 @@ import re
 import shlex
 import signal
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -88,15 +89,26 @@ class DriveMap:
         if not os.path.isdir(dosdevices):
             self.note = f"no Wine prefix at {self.prefix}: drive {drive}: not mapped"
             return self
+        already_set = f"drive {drive}: is already set in {dosdevices}: left as it is"
         if os.path.lexists(link):
-            self.note = f"drive {drive}: is already set in {dosdevices}: left as it is"
+            self.note = already_set
             return self
         self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
-        parent = os.path.join(self.scratch, *rest[:-1])
-        os.makedirs(parent, exist_ok=True)
-        os.symlink(self.root, os.path.join(parent, rest[-1]))
-        os.symlink(self.scratch, link)
-        self.link = link
+        try:
+            parent = os.path.join(self.scratch, *rest[:-1])
+            os.makedirs(parent, exist_ok=True)
+            os.symlink(self.root, os.path.join(parent, rest[-1]))
+            try:
+                os.symlink(self.scratch, link)
+            except FileExistsError:
+                self.note = already_set
+                return self
+            self.link = link
+        finally:
+            # __exit__ only runs after a successful __enter__.
+            if self.link is None:
+                shutil.rmtree(self.scratch, ignore_errors=True)
+                self.scratch = None
         self.note = f"drive {drive}: maps {self.windows_root} to {self.root} for this run"
         return self
 
@@ -251,9 +263,11 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
     for a in command[1:]:
         mapped = map_path(a, args.windows_root, args.root)
         argv.append(wine_path(mapped) if mapped is not None else a)
-    cwd = props.get("WORKING_DIRECTORY")
-    cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
-    if not cwd or not os.path.isdir(cwd):
+    listed_cwd = props.get("WORKING_DIRECTORY")
+    cwd = map_path(listed_cwd, args.windows_root, args.root) if listed_cwd else None
+    if cwd is not None and not os.path.isdir(cwd):
+        return "fail", f"CTest working directory is not a directory: {listed_cwd} (mapped to {cwd})"
+    if cwd is None:
         cwd = os.path.dirname(exe)
     assignments = props.get("ENVIRONMENT", [])
     if not isinstance(assignments, list):
@@ -276,9 +290,18 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
             return "fail", "invalid CTest TIMEOUT"
         if ctest_timeout > 0:
             timeout = min(timeout, ctest_timeout)
+    skip_code = props.get("SKIP_RETURN_CODE")
+    if skip_code is not None:
+        error = "invalid CTest SKIP_RETURN_CODE: expected an integer from 0 to 255"
+        try:
+            skip_code = int(str(skip_code))
+        except ValueError:
+            return "fail", error
+        if not 0 <= skip_code <= 255:
+            return "fail", error
     start = time.monotonic()
     try:
-        proc = launch(argv, cwd=cwd, env=env, timeout=timeout)
+        proc = run_test_process(argv, cwd=cwd, env=env, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
         return "fail", f"timed out after {timeout} s\n{out}"
@@ -295,8 +318,7 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
         # Wine's own report of an unhandled exception. Before WineDebugger the crash debugger kept such a process
         # alive until the timeout, which is a failure whatever WILL_FAIL, the exit code or an output expression say.
         return "fail", f"aborted by Wine (exit {code} in {elapsed:.1f} s)\n{out}"
-    skip_code = props.get("SKIP_RETURN_CODE")
-    if skip_code is not None and code == int(skip_code):
+    if code == skip_code:
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
     detail = f"exit {code} in {elapsed:.1f} s\n{out}"
     skip_patterns = regex_list(props.get("SKIP_REGULAR_EXPRESSION", []))
@@ -319,24 +341,32 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
 KILL_WAIT = 10.0   # seconds to collect a killed test's output before giving up on it
 
 
-def launch(argv, *, cwd, env, timeout) -> subprocess.CompletedProcess:
-    """subprocess.run for one test, in its own process group: at the timeout the test and everything it started (a
-    relaunched gta6rt, a helper) are stopped, so nothing of it runs on beside the next tests on the shared prefix.
-    Raises TimeoutExpired with the output so far, as subprocess.run does."""
+def run_test_process(argv: list[str], *, cwd: str, env: dict[str, str],
+                     timeout: float) -> subprocess.CompletedProcess:
+    """Runs one test in its own process group (its own session on POSIX): at the timeout, or on Ctrl-C, the test and
+    everything it started (Wine's Windows children, launcher wrappers, a relaunched gta6rt, a helper) are killed, so
+    nothing of it runs on beside the next tests on the shared prefix. The launcher may have exited while a helper
+    still holds the output pipe, so the output after the kill is read for at most KILL_WAIT seconds. Raises
+    TimeoutExpired with the output so far, as subprocess.run does."""
     group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
              else {"start_new_session": True})
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **group)
-    try:
-        stdout, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_tree(proc)
-        try:   # a descendant that escaped the kill may still hold the pipe: do not wait for it forever
-            stdout, _ = proc.communicate(timeout=KILL_WAIT)
-        except subprocess.TimeoutExpired as late:
-            proc.kill()
-            stdout = late.stdout
-        raise subprocess.TimeoutExpired(argv, timeout, output=stdout) from None
-    return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout)
+    options = dict(cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **group)
+    with subprocess.Popen(argv, **options) as proc:
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except KeyboardInterrupt:
+            kill_tree(proc)
+            proc.wait()
+            raise
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            try:   # a descendant that escaped the kill may still hold the pipe: do not wait for it forever
+                out, _ = proc.communicate(timeout=KILL_WAIT)
+            except subprocess.TimeoutExpired as late:
+                proc.kill()
+                out = late.stdout
+            raise subprocess.TimeoutExpired(argv, timeout, output=out) from None
+        return subprocess.CompletedProcess(argv, proc.returncode, out)
 
 
 def kill_tree(proc) -> None:
@@ -410,7 +440,7 @@ def run_tests(tests: list[dict], args, wine: list[str], report, order: list[int]
     With more, up to --jobs tests run at once (see plan_lanes; the setups and their consumers share the ordered lane,
     which keeps that order). Each test is bounded by its own timeout, so a test that hangs holds one worker for at most
     that long and the others go on; an error inside a worker fails that test, not the run."""
-    done: dict[str, str] = {}
+    done: dict[int, str] = {}   # by test index: two listed tests can share a name, and the setup that failed must count
     lock = threading.Lock()
     names = [test.get("name", "?") for test in tests]
     index_of = {id(test): index for index, test in enumerate(tests)}
@@ -419,7 +449,7 @@ def run_tests(tests: list[dict], args, wine: list[str], report, order: list[int]
         index = index_of[id(test)]
         name = names[index]
         with lock:
-            failed_setups = tuple(names[s] for s in dependencies.get(index, ()) if done.get(names[s]) == "fail")
+            failed_setups = tuple(names[s] for s in dependencies.get(index, ()) if done.get(s) == "fail")
         try:
             status, detail = run_test(test, args, wine, failed_setups=failed_setups)
         except Exception as e:
@@ -428,7 +458,7 @@ def run_tests(tests: list[dict], args, wine: list[str], report, order: list[int]
             # beside other tests a bug in the runner fails this test; it must not leave the others unreported
             status, detail = "fail", f"the runner raised {type(e).__name__}: {e}"
         with lock:
-            done[name] = status
+            done[index] = status
             report(name, status, detail)
 
     in_order = [tests[index] for index in order]
@@ -443,7 +473,7 @@ def run_tests(tests: list[dict], args, wine: list[str], report, order: list[int]
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             for future in [pool.submit(lambda lane=lane: [run_one(t) for t in lane]) for lane in lanes]:
                 future.result()
-    return {name: done[name] for name in names}
+    return {names[index]: done[index] for index in range(len(tests))}
 
 
 def positive_seconds(text: str) -> float:
@@ -470,6 +500,17 @@ def wine_command(text: str) -> list[str]:
     return parts
 
 
+def valid_test_property(entry) -> bool:
+    if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or "value" not in entry:
+        return False
+    name, value = entry["name"], entry["value"]
+    if name == "WORKING_DIRECTORY":
+        return isinstance(value, str) and "\0" not in value
+    if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
+        return isinstance(value, str) or (isinstance(value, list) and all(isinstance(p, str) for p in value))
+    return True
+
+
 def valid_test_row(test) -> bool:
     if not isinstance(test, dict) or not isinstance(test.get("name"), str):
         return False
@@ -478,10 +519,7 @@ def valid_test_row(test) -> bool:
     if not isinstance(command, list) or not all(isinstance(arg, str) and "\0" not in arg for arg in command):
         return False
     entries = test.get("properties", [])
-    return isinstance(entries, list) and all(
-        isinstance(entry, dict) and isinstance(entry.get("name"), str) and "value" in entry
-        for entry in entries
-    )
+    return isinstance(entries, list) and all(valid_test_property(entry) for entry in entries)
 
 
 def read_tests(path: str) -> list[dict] | None:
@@ -503,7 +541,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tests", required=True, help="ctest --show-only=json-v1 output from the Windows build")
     ap.add_argument("--windows-root", required=True, help="the Windows checkout the tests were listed in")
-    ap.add_argument("--root", default=ROOT, help="the Linux checkout (default: this repository)")
+    ap.add_argument("--root", type=os.path.abspath, default=ROOT, help="the Linux checkout (default: this repository)")
     ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
                     help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
@@ -521,11 +559,17 @@ def main() -> int:
     tests = read_tests(args.tests)
     if tests is None:
         return 2
-    dependencies = fixture_dependencies(tests)
+    names = [test.get("name", "?") for test in tests]
+    indices = {name: index for index, name in enumerate(names)}
+    setups = fixture_dependencies(tests)
+    sorter = TopologicalSorter(setups)
+    for index, test in enumerate(tests):
+        # DEPENDS controls order. Only failed fixture setups block a consumer.
+        sorter.add(index, *(indices[name] for name in properties(test).get("DEPENDS", []) if name in indices))
     try:
-        order = list(TopologicalSorter(dependencies).static_order())
+        order = list(sorter.static_order())
     except CycleError:
-        print("ERROR: CTest fixture setup dependencies form a cycle", file=sys.stderr)
+        print("ERROR: CTest test dependencies form a cycle", file=sys.stderr)
         return 2
     wine = args.wine
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
@@ -540,7 +584,7 @@ def main() -> int:
                 for line in detail.rstrip().splitlines()[-40:]:
                     print(f"    {line}")
 
-        results = run_tests(tests, args, wine, report, order, dependencies)
+        results = run_tests(tests, args, wine, report, order, setups)
 
     missing = [n for n in args.require if n not in results]
     failed_required = [n for n in args.require if results.get(n) != "pass"]
