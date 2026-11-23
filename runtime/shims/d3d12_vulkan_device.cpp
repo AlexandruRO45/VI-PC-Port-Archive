@@ -2120,6 +2120,10 @@ public:
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
         if (image_) {
+            if (subresource == leonida::all_subresources) return E_INVALIDARG;
+            const UINT orig_layers = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc_.DepthOrArraySize;
+            const UINT total_subresources = desc_.MipLevels * orig_layers;
+            if (subresource >= total_subresources) return E_INVALIDARG;
             if (mips_dropped_ > 0) {
                 const UINT orig_mips = desc_.MipLevels;
                 const UINT mip = subresource % orig_mips;
@@ -2131,8 +2135,7 @@ public:
                 subresource = slice * new_mips + (mip - mips_dropped_);
             }
             VkImageSubresourceRange range{};
-            return !data && cpu_visible() && subresource != leonida::all_subresources &&
-                           leonida::image_range(binding_, subresource, range)
+            return !data && cpu_visible() && leonida::image_range(binding_, subresource, range)
                        ? S_OK
                        : E_INVALIDARG;
         }
@@ -2200,6 +2203,10 @@ private:
     HRESULT cpu_copy(bool write, UINT subresource, const D3D12_BOX* box, void* data, UINT row_pitch,
                      UINT depth_pitch) {
         if (!image_ || !data) return E_INVALIDARG;
+        if (subresource == leonida::all_subresources) return E_INVALIDARG;
+        const UINT orig_layers = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc_.DepthOrArraySize;
+        const UINT total_subresources = desc_.MipLevels * orig_layers;
+        if (subresource >= total_subresources) return E_INVALIDARG;
         if (mips_dropped_ > 0) {
             const UINT orig_mips = desc_.MipLevels;
             const UINT mip = subresource % orig_mips;

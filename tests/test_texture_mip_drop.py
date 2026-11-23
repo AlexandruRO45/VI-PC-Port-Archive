@@ -50,7 +50,13 @@ class TextureCreateInfoModel:
         """Maps an incoming D3D12 subresource index to the shrunken Vulkan image subresource.
 
         Returns None if the subresource was dropped (upload discarded).
+        Raises ValueError if subresource_index is out of range or all_subresources.
         """
+        all_subresources = 0xFFFFFFFF
+        total_subresources = self.original_mips * self.array_layers
+        if subresource_index == all_subresources or subresource_index >= total_subresources:
+            raise ValueError("Invalid subresource index")
+
         orig_mips = self.original_mips
         mip = subresource_index % orig_mips
         slice_idx = subresource_index // orig_mips
@@ -227,6 +233,25 @@ class TestTextureMipDrop(unittest.TestCase):
         self.assertEqual(buffer[:256], b"\x00" * 256)
         # Tail bytes (256..512) must remain untouched at 0xCD
         self.assertEqual(buffer[256:], b"\xCD" * 256)
+
+    def test_map_and_copy_reject_out_of_range_and_sentinel(self):
+        """Map and copy queries for subresources beyond total layers/mips or UINT_MAX return E_INVALIDARG."""
+        # 1-layer, 3-mip texture: valid subresources are 0, 1, 2.
+        t = TextureCreateInfoModel(8, 8, 1, 3, flags=D3D12ResourceFlags.NONE, mip_drop_env=1)
+        # Subresource 0 is dropped (returns None)
+        self.assertIsNone(t.map_subresource(0))
+        # Subresource 1 maps to physical mip 0
+        self.assertEqual(t.map_subresource(1), 0)
+        # Subresource 2 maps to physical mip 1
+        self.assertEqual(t.map_subresource(2), 1)
+
+        # Subresource 3 is out of range (only 3 subresources exist: 0, 1, 2)
+        with self.assertRaises(ValueError):
+            t.map_subresource(3)
+
+        # Subresource UINT_MAX (all_subresources) is invalid
+        with self.assertRaises(ValueError):
+            t.map_subresource(0xFFFFFFFF)
 
 
 if __name__ == "__main__":
