@@ -41,6 +41,8 @@
 #include <memory>
 #include <utility>
 
+#include "d3d12_xs_command_list_iid.h"
+
 namespace rt::d3d12_xs {
 namespace {
 
@@ -1212,7 +1214,10 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
-    return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+    // The console's command-list IIDs have no PC counterpart under the same GUID: map the known pairs (table in
+    // d3d12_xs_command_list_iid.h); any other IID is forwarded as it is.
+    const IID& pc_riid = command_list_iid_for_pc(*riid);
+    return self->real->CreateCommandList(0, type, allocator, initial_state, pc_riid, out);
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.

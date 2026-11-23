@@ -22,6 +22,7 @@
 #include <wrl/client.h>
 
 #include "d3d12_trace.h"
+#include "d3d12_xs_command_list_iid.h"
 #include "d3d12_xs_device.h"
 #include "shims.h"
 
@@ -104,6 +105,38 @@ bool load_compute_shader(ComPtr<ID3DBlob>& bytecode) {
     }
     check(SUCCEEDED(hr) && bytecode, "trivial compute shader compiles (cs_5_0)");
     return SUCCEEDED(hr) && bytecode;
+}
+
+// Console command-list IIDs (device slot 73): the table maps the measured pair, and the PC device accepts
+// the mapped IID where it refuses the console one. The PC device is created here, on the default adapter.
+void check_command_list_iids() {
+    const GUID console6{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    const GUID unknown{0xc3827890, 0x4024, 0x474c, {0x00, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    bool mapped = false;
+    const GUID& pc6 = rt::d3d12_xs::command_list_iid_for_pc(console6, &mapped);
+    check(mapped && IsEqualGUID(pc6, __uuidof(ID3D12GraphicsCommandList6)),
+          "console IID c3827890-...-98cf-645b51dc4874 maps to ID3D12GraphicsCommandList6");
+    const GUID& same = rt::d3d12_xs::command_list_iid_for_pc(unknown, &mapped);
+    check(!mapped && &same == &unknown, "an unknown IID with a known Data1 is forwarded unchanged");
+    const GUID& pc_own = rt::d3d12_xs::command_list_iid_for_pc(__uuidof(ID3D12GraphicsCommandList6), &mapped);
+    check(!mapped && IsEqualGUID(pc_own, __uuidof(ID3D12GraphicsCommandList6)),
+          "a PC IID is not remapped");
+
+    ComPtr<ID3D12Device> device;
+    const HRESULT created = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
+    check(SUCCEEDED(created) && device, "PC device created for the command-list IID check");
+    if (!SUCCEEDED(created) || !device) return;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))),
+          "direct allocator created for the command-list IID check");
+    void* list = nullptr;
+    const HRESULT refused = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                                      console6, &list);
+    check(refused == E_NOINTERFACE && list == nullptr, "PC device refuses the console IID (E_NOINTERFACE)");
+    const HRESULT accepted = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                                       pc6, &list);
+    check(SUCCEEDED(accepted) && list != nullptr, "PC device creates a list with the mapped IID");
+    if (list) static_cast<IUnknown*>(list)->Release();
 }
 
 }  // namespace
@@ -516,6 +549,7 @@ int main(int argc, char** argv) {
         real->Release();
     }
 
+    check_command_list_iids();
     std::printf("device_proxy_test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;

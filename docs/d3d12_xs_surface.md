@@ -459,6 +459,15 @@ SCARAB's interception logic
 
 For Leonida, the transferable facts are the rule and the IID, not the wrapper:
 
+- Slot 73 (`CreateCommandListX`, the console's list call) maps the console IID the 1.0.2.1 executable passes,
+  `c3827890-4024-474c-98cf-645b51dc4874` (its only GUID of that form in `.rdata`, also in TomBox's console
+  QueryInterface list, `perfctr_xs.rs` line 230, commit `f89e4106fe`), to `ID3D12GraphicsCommandList6`
+  (`c3827890-e548-4cfa-96cf-5689a9370f80`, Windows SDK 10.0.26100.0 `d3d12.h`), which has the same first 32 bits.
+  Only measured pairs go in the table. The table is `runtime/shims/d3d12_xs_command_list_iid.h`. Other IIDs
+  are forwarded unchanged and logged once. Without the mapping the PC device returns `E_NOINTERFACE` (0x80004002)
+  for the console IID, and the title asserts on that result. The mapping is needed but not enough: right after
+  creation the title calls list slots 132 and 131, then slot 9 (`Close` in the PC table), so the list also needs a
+  console-ABI wrapper.
 - On `CreateCommandList`, log `(nodeMask, type, riid)` once. If `type` is outside 0–5, or `riid` is
   not a standard GCL IID, treat it as a console list.
 - If `type == 6` **and** `riid == 30bc77b9-8379-4b25-95de-b8588c42275d`, implement it as a copy
