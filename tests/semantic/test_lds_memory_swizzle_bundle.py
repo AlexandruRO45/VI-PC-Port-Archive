@@ -519,6 +519,20 @@ class TestDsReadI16AST(unittest.TestCase):
         expr = LdsReadI16Expr(offset=0)
         self.assertEqual(expr.eval(lds, 0x30), 0xFFFFF000)
 
+class TestDsReadI16SIMD(unittest.TestCase):
+    def test_simd_read_i16_divergent_signs(self) -> None:
+        lds = LdsModel()
+        for l in range(32):
+            val = 0x8000 + l if l % 2 == 1 else 0x1000 + l
+            lds.write_u16(l * 4, val)
+        expr = LdsReadI16Expr(offset=0)
+        for l in range(32):
+            got = expr.eval(lds, l * 4)
+            if l % 2 == 1:
+                self.assertEqual(got, (0xFFFF8000 + l) & MASK32)
+            else:
+                self.assertEqual(got, 0x1000 + l)
+
 
 if __name__ == "__main__":
     unittest.main()
