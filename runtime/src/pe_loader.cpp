@@ -135,6 +135,7 @@ void __cdecl on_host_thread_event(DWORD reason);
 struct TlsHostModule {
     HMODULE module = nullptr;
     DWORD index = TLS_OUT_OF_INDEXES;
+    DWORD load_error = ERROR_SUCCESS;
 };
 
 std::filesystem::path tls_host_base_path() {
@@ -241,7 +242,10 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
     // The helper is linked with the static CRT (/MT), so it needs only system DLLs. Restricting the dependency search
     // to System32 keeps a game-supplied vcruntime next to the executable from being picked up.
     host.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!host.module) return host;
+    if (!host.module) {
+        host.load_error = GetLastError();
+        return host;
+    }
 
     auto* base = reinterpret_cast<uint8_t*>(host.module);
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -284,7 +288,7 @@ TlsHostModule ensure_tls_host(size_t slot) {
     // Ensure slot 0 is loaded first so thread attach/detach events are hooked.
     if (g_tls_hosts[0].index == TLS_OUT_OF_INDEXES) {
         g_tls_hosts[0] = load_tls_host_image(primary, true);
-        if (g_tls_hosts[0].index == TLS_OUT_OF_INDEXES) return {};
+        if (g_tls_hosts[0].index == TLS_OUT_OF_INDEXES) return g_tls_hosts[0];
     }
 
     // Clone gta6rt_tls_host.dll to a distinct path using CopyFileW (Wine 9 lacks CopyFile2 used by std::filesystem).
@@ -322,7 +326,7 @@ TlsHostModule ensure_tls_host(size_t slot) {
 
     if (loaded.index == TLS_OUT_OF_INDEXES) {
         DeleteFileW(clone_path.c_str());
-        return {};
+        return loaded;
     }
     for (size_t i = 0; i < kMaxMappedTlsModules; ++i) {
         if (i != slot && g_tls_hosts[i].index == loaded.index) {
@@ -1422,7 +1426,12 @@ void Loader::initialize_tls(Module& m) {
 
         // Load/clone gta6rt_tls_host.dll OUTSIDE ExclusiveTlsLock so LoadLibraryExW cannot deadlock with
         // on_host_thread_event (which runs under the Windows loader lock and takes SharedTlsLock).
-        index = ensure_tls_host(slot).index;
+        const auto host = ensure_tls_host(slot);
+        if (host.load_error != ERROR_SUCCESS)
+            throw std::runtime_error(m.name + ": cannot load gta6rt_tls_host.dll (Win32 error " +
+                                     std::to_string(host.load_error) + "): " +
+                                     std::system_category().message(static_cast<int>(host.load_error)));
+        index = host.index;
         if (index == TLS_OUT_OF_INDEXES)
             throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
         if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
