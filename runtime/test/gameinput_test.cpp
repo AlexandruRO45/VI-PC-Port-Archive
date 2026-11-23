@@ -1108,6 +1108,31 @@ void test_aggregate_device(IGameInput* input) {
         check(input->CreateAggregateDevice(GameInputKindGamepad, &agg2) == S_OK && agg2 == agg,
               "CreateAggregateDevice returns existing aggregate instance for the same kind");
         if (agg2) agg2->Release();
+        
+        // RT-731: aggregate devices for different kinds must have distinct deviceIds (bits 16-31 matter)
+        const uint32_t kKinds[] = {
+            GameInputKindGamepad, GameInputKindArcadeStick, GameInputKindFlightStick,
+            GameInputKindRacingWheel, GameInputKindKeyboard, GameInputKindMouse,
+        };
+        IGameInputDevice* aggs[std::size(kKinds)] = {};
+        bool created_all = true;
+        for (size_t i = 0; i < std::size(kKinds); ++i) {
+            created_all &= input->CreateAggregateDevice(kKinds[i], &aggs[i]) == S_OK && aggs[i] != nullptr;
+        }
+        bool distinct_ids = created_all;
+        for (size_t i = 0; i < std::size(kKinds) && distinct_ids; ++i) {
+            IGameInputDevice* found = nullptr;
+            HRESULT hr_find = input->FindDeviceFromId(&aggs[i]->GetDeviceInfo()->deviceId, &found);
+            distinct_ids &= (hr_find == S_OK && found == aggs[i]);
+            if (found) found->Release();
+            for (size_t j = i + 1; j < std::size(kKinds); ++j) {
+                distinct_ids &= !same_id(aggs[i]->GetDeviceInfo()->deviceId, aggs[j]->GetDeviceInfo()->deviceId);
+            }
+        }
+        check(distinct_ids, "CreateAggregateDevice assigns distinct deviceIds across all allowed kinds");
+        for (IGameInputDevice* d : aggs) {
+            if (d) d->Release();
+        }
 
         // Reading test with no connected pad
         IGameInputReading* r = nullptr;

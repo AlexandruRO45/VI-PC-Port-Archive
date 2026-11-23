@@ -2490,6 +2490,9 @@ public:
         std::memcpy(agg->info.deviceId.value, "LEONIDA_AGGREGATE_DEVICE_ID\0\0\0\0", 32);
         agg->info.deviceId.value[28] = static_cast<uint8_t>(kind & 0xff);
         agg->info.deviceId.value[29] = static_cast<uint8_t>((kind >> 8) & 0xff);
+        agg->info.deviceId.value[30] = static_cast<uint8_t>((kind >> 16) & 0xff);
+        agg->info.deviceId.value[31] = static_cast<uint8_t>((kind >> 24) & 0xff);
+
 
         g().devices.push_back(agg);
         agg->AddRef();
