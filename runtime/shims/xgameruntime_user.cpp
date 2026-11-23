@@ -10,7 +10,7 @@
 // Offline there is one local user, always signed in: the default user XUserAddAsync returns (with or without
 // AddDefaultUserSilently), with a fixed Xbox user id and local id, and a gamertag from LEONIDA_GAMERTAG (15 ASCII
 // characters at most, "Player" otherwise). Nothing goes online: token and gamer-picture requests fail as they would
-// without a network, and the user never changes, so registered change callbacks are never called.
+// without a network, and the user never changes unless a future offline transition raises an event.
 //
 // The executable links thunks for IXUserImpl slots 3-5, 7-14, 19-25 and 33-34 and IXUserGamertagImpl slot 3
 // (tools/gdk_runtime_calls.py, from the file alone; docs/runtime_imports.md). None of them is a private or PC-only
@@ -19,6 +19,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <condition_variable>
+#include <memory>
+#include <unordered_map>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -322,27 +326,88 @@ HRESULT STDMETHODCALLTYPE user_resolve_privilege_result(void*, XAsyncBlock* asyn
 // 33: HRESULT XUserRegisterForChangeEvent(XTaskQueueHandle queue, void* context, XUserChangeEventCallback* callback,
 //                                         XTaskQueueRegistrationToken* token)
 // 34: bool XUserUnregisterForChangeEvent(XTaskQueueRegistrationToken token, bool wait)
-// The user never changes offline, so the callbacks are kept only as tokens.
+// Queue references and registration state survive queued notifications and concurrent unregister.
+struct UserRegistration {
+    XTaskQueueHandle queue = nullptr;
+    void* context = nullptr;
+    XUserChangeEventCallback callback = nullptr;
+    bool active = true;
+    size_t running = 0;
+    ~UserRegistration() { if (queue) XTaskQueueCloseHandle(queue); }
+};
 std::mutex g_tokens_mutex;
-std::set<uint64_t> g_tokens;
+std::condition_variable g_tokens_cv;
+std::unordered_map<uint64_t, std::shared_ptr<UserRegistration>> g_tokens;
 uint64_t g_next_token = 1;
+thread_local UserRegistration* g_current_user_callback = nullptr;
 
-HRESULT STDMETHODCALLTYPE user_register_change(void*, XTaskQueueHandle, void*, XUserChangeEventCallback callback,
+HRESULT STDMETHODCALLTYPE user_register_change(void*, XTaskQueueHandle queue, void* context, XUserChangeEventCallback callback,
                                                XTaskQueueRegistrationToken* token) {
     if (!callback || !token) return E_POINTER;
+    auto registration = std::make_shared<UserRegistration>();
+    registration->context = context;
+    registration->callback = callback;
+    if (queue) XTaskQueueDuplicateHandle(queue, &registration->queue);
+    else XTaskQueueGetCurrentProcessTaskQueue(&registration->queue);
     std::lock_guard<std::mutex> lock(g_tokens_mutex);
     token->token = g_next_token++;
-    g_tokens.insert(token->token);
+    g_tokens.emplace(token->token, registration);
     return S_OK;
 }
 
-// false means "wait was false and the unregistration is still pending"; nothing is ever pending offline, so it is
-// true for every token, including one already unregistered or never handed out (a title polling with wait = false
-// would otherwise spin).
-bool STDMETHODCALLTYPE user_unregister_change(void*, XTaskQueueRegistrationToken token, bool) {
-    std::lock_guard<std::mutex> lock(g_tokens_mutex);
-    g_tokens.erase(token.token);
-    return true;
+bool STDMETHODCALLTYPE user_unregister_change(void*, XTaskQueueRegistrationToken token, bool wait) {
+    std::unique_lock<std::mutex> lock(g_tokens_mutex);
+    auto it = g_tokens.find(token.token);
+    if (it == g_tokens.end()) return true;
+    auto registration = it->second;
+    registration->active = false;
+    if (wait && g_current_user_callback != registration.get())
+        g_tokens_cv.wait(lock, [&] { return registration->running == 0; });
+    const bool done = registration->running == 0;
+    if (done) g_tokens.erase(token.token);
+    return done;
+}
+
+struct UserNotification {
+    std::shared_ptr<UserRegistration> registration;
+    XUserChangeEvent event;
+    static void CALLBACK run(void* context, bool canceled) {
+        std::unique_ptr<UserNotification> notification(static_cast<UserNotification*>(context));
+        auto registration = notification->registration;
+        {
+            std::lock_guard<std::mutex> lock(g_tokens_mutex);
+            if (canceled || !registration->active) return;
+            ++registration->running;
+        }
+        auto* previous = g_current_user_callback;
+        g_current_user_callback = registration.get();
+        registration->callback(registration->context, XUserLocalId{kOfflineLocalId}, notification->event);
+        g_current_user_callback = previous;
+        {
+            std::lock_guard<std::mutex> lock(g_tokens_mutex);
+            --registration->running;
+            if (!registration->active && registration->running == 0) {
+                for (auto it = g_tokens.begin(); it != g_tokens.end(); ++it) {
+                    if (it->second == registration) { g_tokens.erase(it); break; }
+                }
+            }
+        }
+        g_tokens_cv.notify_all();
+    }
+};
+
+void raise_user_change(XUserChangeEvent event) {
+    std::vector<std::shared_ptr<UserRegistration>> registrations;
+    {
+        std::lock_guard<std::mutex> lock(g_tokens_mutex);
+        for (const auto& entry : g_tokens) registrations.push_back(entry.second);
+    }
+    for (const auto& registration : registrations) {
+        if (!registration->queue) continue;
+        auto* notification = new UserNotification{registration, event};
+        if (FAILED(XTaskQueueSubmitCallback(registration->queue, XTaskQueuePort::Completion,
+                                            notification, &UserNotification::run))) delete notification;
+    }
 }
 
 // 35: HRESULT XUserGetSignOutDeferral(XUserSignOutDeferralHandle* deferral): nothing signs out offline, so there is
@@ -523,6 +588,8 @@ UserObject* user_object() {
 }  // namespace
 
 namespace rt::shims {
+
+void xgameruntime_user_raise_change_for_test(uint32_t event) { raise_user_change(static_cast<XUserChangeEvent>(event)); }
 
 // Called by xgameruntime.cpp's QueryApiImpl for every class: true when the class is XUserImpl, with *hr set.
 bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr) {

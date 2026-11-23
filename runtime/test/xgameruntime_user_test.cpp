@@ -18,6 +18,7 @@
 
 namespace rt::shims {
 long xgameruntime_user_open_handles();
+void xgameruntime_user_raise_change_for_test(uint32_t);
 }
 
 namespace {
@@ -166,6 +167,25 @@ int main(int argc, char** argv) {
               at<Unregister>(user, 34)(user, XTaskQueueRegistrationToken{999}, false),
           "XUserUnregisterForChangeEvent: true, also with wait = false for a token already gone or never issued "
           "(false would mean still pending, which never happens offline)");
+    struct EventResult { int calls; uint64_t id; uint32_t event; } result{};
+    auto record_change = [](void* ctx, XUserLocalId id, uint32_t event) {
+        auto* r = static_cast<EventResult*>(ctx);
+        ++r->calls; r->id = id.value; r->event = event;
+    };
+    XTaskQueueHandle manual = nullptr;
+    check(SUCCEEDED(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &manual)),
+          "create manual user event queue");
+    XTaskQueueRegistrationToken event_token{};
+    check(at<Register>(user, 33)(user, manual, &result, record_change, &event_token) == S_OK,
+          "register user event callback");
+    rt::shims::xgameruntime_user_raise_change_for_test(0);
+    while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
+    check(result.calls == 1 && result.id == 1 && result.event == 0, "user event delivered with id and event");
+    check(at<Unregister>(user, 34)(user, event_token, true), "unregister user event callback");
+    rt::shims::xgameruntime_user_raise_change_for_test(0);
+    while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
+    check(result.calls == 1, "unregistered user callback stays silent");
+    XTaskQueueCloseHandle(manual);
     void* deferral = reinterpret_cast<void*>(1);
     check(at<Deferral>(user, 35)(user, &deferral) == E_GAMEUSER_DEFERRAL_NOT_AVAILABLE && deferral == nullptr,
           "XUserGetSignOutDeferral: E_GAMEUSER_DEFERRAL_NOT_AVAILABLE (nothing signs out offline)");
