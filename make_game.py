@@ -851,11 +851,14 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         missing.append("Visual Studio 2022 with 'Desktop development with C++'")
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         missing.extend(f"{s} (for the runtime stage, or pass --runtime-build)" for s in cross_build_missing())
+    # Remember whether the Linux checker is already usable: it is an optional prerequisite when present, and
+    # the build can take time, so preflight will recheck before compiling in case another process builds it.
+    linux_checker = pipeline_check_exe(runtime_build) if "pipelines" in stages and os.name != "nt" else None
     # The pipelines stage needs a checker the runtime stage builds (on Windows only with VULKAN_SDK set).
     # Without this check a build with shaders and pipelines spends hours before failing at the very end.
     if "pipelines" in stages and (os.name != "nt" or not pipeline_check_exe(runtime_build)):
         if os.name != "nt":
-            if not shutil.which("cmake"):
+            if linux_checker is None and not shutil.which("cmake"):
                 missing.append("CMake 3.24 or newer, a C++20 compiler and the Vulkan headers, to build "
                                "vk_pipeline_check for the pipelines stage")
         else:
@@ -898,8 +901,10 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
              "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
-    if "pipelines" in stages and os.name != "nt":
-        build_pipeline_check(jobs)
+    if "pipelines" in stages and os.name != "nt" and linux_checker is None:
+        # Another process may have completed the checker while the rest of preflight ran.
+        if not pipeline_check_exe():
+            build_pipeline_check(jobs)
         if not pipeline_check_exe():
             fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
                  "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
@@ -2109,8 +2114,9 @@ def cross_build_runtime(jobs: int) -> str:
 def build_pipeline_check(jobs: int) -> None:
     build = os.path.join(ROOT, "runtime", "build", "linux")
     log("pipelines: building vk_pipeline_check")
-    if not os.path.isfile(os.path.join(build, "CMakeCache.txt")):
-        cmake_configure(build)
+    # Reconfigure even when a cache exists: a failed/interrupted configure can leave CMakeCache.txt
+    # without generating the Makefile/build.ninja needed by cmake --build.
+    cmake_configure(build)
     cmake_build(build, ["vk_pipeline_check"], jobs,
                 "It needs a C++20 compiler and the Vulkan headers (your distribution's Vulkan headers package, "
                 "or VULKAN_SDK); the CMake output above says which is missing.")
