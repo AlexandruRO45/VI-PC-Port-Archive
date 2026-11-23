@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
@@ -27,6 +28,8 @@ constexpr Results expected{{
     {patterns[0], 0, patterns[2], patterns[2]},
     {0, patterns[1], 0, 0},
 }};
+
+enum class Submission { original, held_cpu, held_copy_queue };
 
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes) {
     D3D12_RESOURCE_DESC desc{};
@@ -48,7 +51,13 @@ struct Gate {
     ~Gate() { if (fence) fence->Signal(1); }
 };
 
-bool run(ID3D12Device& device, Results& result, bool layer = false) {
+bool run(ID3D12Device& device, bool layer, Submission submission) {
+    const bool held = submission != Submission::original;
+    const char* backend = layer ? "Vulkan replay" : "Native D3D12";
+    const char* scenario = submission == Submission::held_copy_queue ? "held batch, copy-queue Signal" :
+                           held ? "held batch, CPU Signal" : "original mapping order";
+    std::printf("%s (%s)\n", backend, scenario);
+    std::fflush(stdout);
     ComPtr<ID3D12Resource> a, b, upload, readback;
     const auto reserved = buffer_desc(buffer_bytes);
     EXPECT(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a))));
@@ -96,6 +105,15 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
     ComPtr<ID3D12CommandQueue> queue;
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     EXPECT(SUCCEEDED(device.CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))));
+    ComPtr<ID3D12CommandQueue> producer;
+    if (submission == Submission::held_copy_queue) {
+        D3D12_COMMAND_QUEUE_DESC producer_desc{};
+        producer_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        if (FAILED(device.CreateCommandQueue(&producer_desc, IID_PPV_ARGS(&producer)))) {
+            std::puts("  Skipped: a second queue is unavailable");
+            return true;
+        }
+    }
     Event event;
     EXPECT(event.handle);
     Gate open_on_exit{gate.Get()};
@@ -103,14 +121,21 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
 
     // Map disjoint tiles in a different order, using the default one-tile resource regions.
     const D3D12_TILED_RESOURCE_COORDINATE starts[] = {{2, 0, 0, 0}, {0, 0, 0, 0}, {1, 0, 0, 0}};
-    const UINT heap_offsets[] = {2, 0, 1}, heap_counts[] = {1, 1, 1};
+    UINT heap_offsets[] = {2, 0, 1};
+    const UINT heap_counts[] = {1, 1, 1};
     queue->UpdateTileMappings(a.Get(), 3, starts, nullptr, heap.Get(), 3, nullptr, heap_offsets, heap_counts,
                               D3D12_TILE_MAPPING_FLAG_NONE);
     EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
     const D3D12_TILED_RESOURCE_COORDINATE origin{};
     const D3D12_TILE_REGION_SIZE all{tiles_per_buffer, FALSE, 0, 0, 0};
-    queue->CopyTileMappings(b.Get(), &origin, a.Get(), &origin, &all, D3D12_TILE_MAPPING_FLAG_NONE);
+    auto copy_origin = origin;
+    queue->CopyTileMappings(b.Get(), &copy_origin, a.Get(), &copy_origin, &all, D3D12_TILE_MAPPING_FLAG_NONE);
     EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
+    if (held) {
+        // The caller can reuse its input storage as soon as either mapping call returns.
+        heap_offsets[0] = 1;
+        copy_origin.X = 1;
+    }
     lists[0]->CopyTiles(a.Get(), &origin, &all, upload.Get(), tile_bytes,
                         D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
     D3D12_RESOURCE_BARRIER alias{};
@@ -125,6 +150,10 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
         queue->ExecuteCommandLists(1, batch);
         return true;
     };
+    // The initial bind used to consume the first Wait even though its fence had no Signal.
+    // Another Wait puts this upload/readback in the held FIFO on the base. The later
+    // remap must stay behind it, and the first CopyTileMappings must see the initial bind.
+    if (held) EXPECT(SUCCEEDED(queue->Wait(gate.Get(), 1)));
     EXPECT(submit(0));
     EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
 
@@ -163,22 +192,50 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
                      static_cast<unsigned long long>(before_open), static_cast<unsigned long>(device.GetDeviceRemovedReason()));
         return false;
     }
-    EXPECT(SUCCEEDED(gate->Signal(1)));
+    if (producer) {
+        if (FAILED(producer->Signal(gate.Get(), 1))) {
+            // A failed queue Signal may have claimed the value. A CPU Signal is no
+            // longer a reliable guard against blocking in the queue destructor.
+            std::fputs("  Producer Signal failed\n", stderr);
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+    } else {
+        EXPECT(SUCCEEDED(gate->Signal(1)));
+    }
     open_on_exit.fence = nullptr;
     EXPECT(SUCCEEDED(done->SetEventOnCompletion(1, event.handle)));
-    EXPECT(WaitForSingleObject(event.handle, 15000) == WAIT_OBJECT_0);
+    if (WaitForSingleObject(event.handle, 15000) != WAIT_OBJECT_0) {
+        std::fputs("  Timed out waiting for the tile readbacks\n", stderr);
+        std::fflush(stderr);
+        std::_Exit(1);  // The live event or GPU Wait can outlast the failed case.
+    }
 
     EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
     const auto* data = static_cast<const std::uint32_t*>(mapped);
     for (UINT i = 0; i < snapshots; ++i) {
         for (UINT tile = 0; tile < tiles_per_buffer; ++tile) {
             const auto* first = data + (i * tiles_per_buffer + tile) * words_per_tile;
-            result[i][tile] = *first;
-            EXPECT(std::all_of(first, first + words_per_tile, [&](auto word) { return word == expected[i][tile]; }));
+            const auto* mismatch = std::find_if(first, first + words_per_tile,
+                                                [&](auto word) { return word != expected[i][tile]; });
+            if (mismatch != first + words_per_tile) {
+                std::fprintf(stderr, "  Snapshot %u, tile %u, word %zu: got %#x, expected %#x\n",
+                             i, tile, std::size_t(mismatch - first), *mismatch, expected[i][tile]);
+                readback->Unmap(0, &empty);
+                return false;
+            }
         }
     }
     readback->Unmap(0, &empty);
+    std::printf("  %u full tiles match across all readbacks\n", snapshots * tiles_per_buffer);
     return true;
+}
+
+bool run_all(ID3D12Device& device, bool layer) {
+    bool ok = true;
+    for (const auto submission : {Submission::original, Submission::held_cpu, Submission::held_copy_queue})
+        if (!run(device, layer, submission)) ok = false;
+    return ok;
 }
 
 ComPtr<ID3D12Device> native_device() {
@@ -212,13 +269,8 @@ int main() {
         std::puts("Vulkan device lacks sparse buffer residency with aliasing and strict unbound reads");
         return 77;
     }
-    Results observed{}, native{};
-    if (!run(*vulkan.Get(), observed, true)) return 1;
-    std::puts("Vulkan replay: 12 full tiles matched across aliased, skipped, unmapped, reused and remapped ranges");
-    std::puts("A rejected update left all tile mappings intact");
-    if (auto device = native_device()) {
-        if (!run(*device.Get(), native) || native != observed) return 1;
-        std::puts("Native D3D12 matched all three GPU readbacks");
-    }
-    return 0;
+    bool ok = run_all(*vulkan.Get(), true);
+    if (auto device = native_device())
+        ok = run_all(*device.Get(), false) && ok;
+    return ok ? 0 : 1;
 }
