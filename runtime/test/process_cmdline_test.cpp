@@ -310,7 +310,7 @@ int main() {
     }
 
     // The retail title pins threads with SetThreadGroupAffinity. A GROUP_AFFINITY of cores or a group the PC lacks must
-    // succeed, leave the thread where it is and hand back the affinity it had; an empty mask still fails.
+    // succeed, leave the thread where it is and hand back the affinity it had; an empty mask gets the host's own answer.
     {
         using SetGroup = BOOL(WINAPI*)(HANDLE, const GROUP_AFFINITY*, PGROUP_AFFINITY);
         const auto set_group = reinterpret_cast<SetGroup>(rt::shims::find("kernel32.dll", "SetThreadGroupAffinity"));
@@ -364,13 +364,30 @@ int main() {
                 ++failures;
             }
             set_group(self, &own, nullptr);
-            // An empty mask names no CPU: it fails with ERROR_INVALID_PARAMETER, as on Windows.
+            // An empty mask is not substituted: the shim answers what the host answers (Windows 10 and 11 return TRUE
+            // and leave the thread alone, as testers measured on #6942), and the thread keeps its affinity.
+            const auto host_set_group = reinterpret_cast<SetGroup>(
+                GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadGroupAffinity"));
             GROUP_AFFINITY empty = {0, own.Group, {}};
             SetLastError(ERROR_SUCCESS);
-            if (set_group(self, &empty, nullptr) || GetLastError() != ERROR_INVALID_PARAMETER) {
-                std::fprintf(stderr, "FAIL SetThreadGroupAffinity with an empty mask did not fail with ERROR_INVALID_PARAMETER\n");
+            const BOOL host_ok = host_set_group ? host_set_group(self, &empty, nullptr) : FALSE;
+            const DWORD host_error = GetLastError();
+            set_group(self, &own, nullptr);
+            SetLastError(ERROR_SUCCESS);
+            const BOOL shim_ok = set_group(self, &empty, nullptr);
+            const DWORD shim_error = GetLastError();
+            GROUP_AFFINITY kept = {};
+            if (!host_set_group || shim_ok != host_ok || shim_error != host_error) {
+                std::fprintf(stderr, "FAIL SetThreadGroupAffinity with an empty mask: shim %d/%lu, host %d/%lu\n",
+                             static_cast<int>(shim_ok), static_cast<unsigned long>(shim_error),
+                             static_cast<int>(host_ok), static_cast<unsigned long>(host_error));
                 ++failures;
             }
+            if (!host_ok && (!GetThreadGroupAffinity(self, &kept) || kept.Mask != own.Mask || kept.Group != own.Group)) {
+                std::fprintf(stderr, "FAIL a refused empty mask moved the thread\n");
+                ++failures;
+            }
+            set_group(self, &own, nullptr);
         }
     }
 

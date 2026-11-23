@@ -206,8 +206,8 @@ DWORD_PTR __stdcall game_set_thread_affinity_mask(HANDLE thread, DWORD_PTR mask)
 }
 // The retail title imports the group form (processtopology API sets), not SetThreadAffinityMask. The same rule holds: a
 // GROUP_AFFINITY naming cores or a processor group the PC lacks is answered, not failed. The thread stays where it is,
-// the call returns TRUE and the out parameter gets the affinity the thread had. An empty mask names no CPU on any
-// machine and a bad handle is the host's own error: both are passed to the host and fail as on Windows.
+// the call returns TRUE and the out parameter gets the affinity the thread had. An empty mask and a bad handle get
+// the host's own answer (an empty mask returns TRUE on Windows 10 and 11, as testers measured on #6942).
 BOOL __stdcall game_set_thread_group_affinity(HANDLE thread, const GROUP_AFFINITY* requested, PGROUP_AFFINITY previous) {
     if (SetThreadGroupAffinity(thread, requested, previous)) return TRUE;
     if (!requested || requested->Mask == 0 || GetLastError() != ERROR_INVALID_PARAMETER) return FALSE;
