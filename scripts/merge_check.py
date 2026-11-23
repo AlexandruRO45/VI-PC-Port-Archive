@@ -38,7 +38,10 @@ class GitError(Exception):
 
 
 def git(repo, *args, check=True):
-    r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    try:
+        r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    except OSError as e:
+        raise GitError(f"could not start git: {e.strerror or e}") from e
     # Decode without universal-newline translation: a bare CR inside a Git line is content.
     r.stdout = r.stdout.decode("utf-8", "replace")
     r.stderr = r.stderr.decode("utf-8", "replace")

@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -219,6 +219,16 @@ class MergeCheckTest(unittest.TestCase):
         with mock.patch("sys.stderr", err):
             self.assertEqual(mc.main(["--repo", self.repo, "--main", "main", "1=no-such-ref"]), 2)
         self.assertIn("merge_check:", err.getvalue())
+
+
+class MergeCheckCliTest(unittest.TestCase):
+    def test_git_launch_failure_returns_the_git_error_status(self):
+        error = io.StringIO()
+        with redirect_stderr(error), mock.patch.object(
+            mc.subprocess, "run", side_effect=FileNotFoundError(2, "git not found")
+        ):
+            self.assertEqual(mc.main(["1=HEAD"]), 2)
+        self.assertEqual(error.getvalue().splitlines(), ["merge_check: could not start git: git not found"])
 
 
 if __name__ == "__main__":
