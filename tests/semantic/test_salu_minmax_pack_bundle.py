@@ -300,5 +300,12 @@ class SMaxI32AstInterpreterTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr(2), 15)
         self.assertEqual(state.scc, 1)
 
+class SMaxI32SimdDivergenceTests(unittest.TestCase):
+    def test_max_i32_scc_extrema(self):
+        # 0x7FFFFFFF > 0x80000000 -> max is 0x7FFFFFFF, SCC = 1
+        res, scc = oracle_max_i32(0x7FFFFFFF, 0x80000000)
+        self.assertEqual(res, 0x7FFFFFFF)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
