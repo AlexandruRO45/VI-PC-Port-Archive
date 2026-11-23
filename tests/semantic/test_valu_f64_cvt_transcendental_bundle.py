@@ -342,6 +342,24 @@ class VCvtF64U32OracleTests(unittest.TestCase):
         # 0x80000000 = 2147483648.0
         self.assertEqual(oracle_cvt_f64_u32(0x80000000), f64_to_u64(2147483648.0))
 
+class VCvtF64U32AstInterpreterTests(unittest.TestCase):
+    def test_cvt_f64_u32_ast_construction(self):
+        ast = Instruction64AST(
+            "v_cvt_f64_u32",
+            Operand64(RegKind.VGPR_PAIR, 0),
+            Operand64(RegKind.VGPR_SINGLE, 2),
+        )
+        self.assertEqual(ast.mnemonic, "v_cvt_f64_u32")
+        self.assertEqual(ast.dst.index, 0)
+        self.assertEqual(ast.src0.index, 2)
+
+    def test_cvt_f64_u32_scalar_execution(self):
+        wave = SimdWaveState64(lane_count=1)
+        wave.set_u32(0, 2, 3000000000)
+        res = oracle_cvt_f64_u32(wave.get_u32(0, 2))
+        wave.set_f64(0, 0, res)
+        self.assertEqual(wave.get_f64(0, 0), f64_to_u64(3000000000.0))
+
 
 if __name__ == "__main__":
     unittest.main()
