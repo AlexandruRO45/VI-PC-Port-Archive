@@ -30,6 +30,21 @@ import winbatch  # noqa: E402
 
 
 class DecodeQueueTest(unittest.TestCase):
+    def test_failure_summary_counts_all_but_prints_only_ten_first_lines(self):
+        items = [(str(i), str(i)) for i in range(13)]
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(audio_wav, "collect", return_value=(items, 0)), \
+                mock.patch.object(audio_wav, "plan_outputs", return_value=(items, 0, 0)), \
+                mock.patch.object(audio_wav, "find_ffmpeg", return_value="unused"), \
+                mock.patch.object(audio_wav, "decode", return_value=(False, "\n  first line\nextra detail")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            status = audio_wav.main([root, "--jobs", "2"])
+        self.assertEqual(status, 1)
+        self.assertIn("13 failed", out.getvalue())
+        self.assertEqual(out.getvalue().count(": first line"), 10)
+        self.assertNotIn("extra detail", out.getvalue())
+        self.assertIn("and 3 more failures", out.getvalue())
+
     def test_submission_stays_within_worker_window(self):
         workers, consumed = 2, 0
         expected = {str(i) for i in range(1000)}

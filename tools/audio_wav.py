@@ -514,13 +514,22 @@ def main(argv=None) -> int:
     t0 = time.time()
     written = skipped = 0
     todo = []
-    failures: list[tuple[str, str]] = []
+    failed = 0
+    failure_samples: list[tuple[str, str]] = []
+
+    def record_failure(rel: str, message: str) -> None:
+        nonlocal failed
+        failed += 1
+        if len(failure_samples) < 10:
+            first = next((line.strip() for line in message.splitlines() if line.strip()), "unknown error")
+            failure_samples.append((rel, first))
+
     for path, rel in items:
         dst = os.path.join(out, rel + ".wav")
         if os.path.isfile(dst):
             skipped += 1
         elif os.path.exists(dst):
-            failures.append((rel, f"output path is not a file: {dst}"))
+            record_failure(rel, f"output path is not a file: {dst}")
         else:
             todo.append((path, rel, dst))
 
@@ -538,23 +547,22 @@ def main(argv=None) -> int:
             if ok:
                 written += 1
             else:
-                failures.append((rel, message))
+                record_failure(rel, message)
             if done % 200 == 0:
                 print(f"  {done}/{len(todo)} decoded", flush=True)
 
     seconds = time.time() - t0
     summary = f"{len(items)} Ogg Opus file(s): {written} WAV written, {skipped} already present"
-    if failures:
-        summary += f", {len(failures)} failed"
+    if failed:
+        summary += f", {failed} failed"
     print(summary + f" ({seconds:.1f}s)")
     if not_opus:
         print(f"  {not_opus} .ogg/.opus file(s) skipped: not Ogg Opus")
-    for rel, message in failures[:10]:
-        first = next((line.strip() for line in message.splitlines() if line.strip()), "unknown error")
+    for rel, first in failure_samples:
         print(f"  FAILED {rel}: {first}")
-    if len(failures) > 10:
-        print(f"  ... and {len(failures) - 10} more failures")
-    return 1 if failures else 0
+    if failed > len(failure_samples):
+        print(f"  ... and {failed - len(failure_samples)} more failures")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
