@@ -855,8 +855,7 @@ def _staged_entity_report(path):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved file, or a directory of carved files")
-    ap.add_argument("--out", default=os.path.join("reports", "world_index.json"),
-                    help="JSON output (default: reports/world_index.json)")
+    ap.add_argument("--out", help="JSON output; without it only the summary is printed")
     ap.add_argument("--csv", help="optional CSV output")
     ap.add_argument("--start", type=_count(0), help="first byte of an RPF9 data-area window")
     ap.add_argument("--limit", type=_count(1), help="window size in bytes (default: to end of archive)")
@@ -895,9 +894,10 @@ def _write_reports(a, rows, stats, agg):
     summary["entities"] = sum(r.get("entities") or 0 for r in rows)
     summary["versions"] = sorted({r["version"] for r in rows})
     doc = {"summary": summary, "resources": rows}
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=1, sort_keys=True, allow_nan=False)
+    if a.out:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=1, sort_keys=True, allow_nan=False)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
                 "root_objects", "entities", "entity_size", "archetypes", "map_name", "map_name64", "parent",
