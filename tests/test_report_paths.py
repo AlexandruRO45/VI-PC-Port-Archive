@@ -107,6 +107,27 @@ class WindowsTrailingNameTests(unittest.TestCase):
             self.assertTrue(report_paths.same_report_path(r"C:\carve\world\out.json",
                                                           r"C:\carve\world.\out.json "))
 
+    def test_an_extended_length_path_keeps_them(self):
+        # A \\?\ prefix exists to make the name literal, so a trailing dot there is part of the name.
+        with self.windows():
+            self.assertFalse(report_paths.same_report_path(r"\\?\C:\world\index.json",
+                                                           r"\\?\C:\world\index.json."))
+
+    def test_a_name_on_another_volume_keeps_a_trailing_dot(self):
+        # The negative control: a trailing dot is part of the name everywhere else.
+        with mock.patch.object(report_paths, "sys", mock.Mock(platform="linux")):
+            self.assertFalse(report_paths.same_report_path(r"C:\world\index.json", r"C:\world\index.json."))
+
+    @unittest.skipUnless(os.name == "nt", "only Windows drops the dot when it opens the name")
+    def test_windows_really_creates_the_undotted_file(self):
+        # What the fold is for: the write really lands on the undotted name, so the guard must treat it as one.
+        with tempfile.TemporaryDirectory() as tmp:
+            undotted = os.path.join(tmp, "new.json")
+            with open(undotted + ".", "w", encoding="utf-8") as f:
+                f.write("x")
+            self.assertTrue(os.path.exists(undotted))
+            self.assertTrue(report_paths.same_report_path(undotted, undotted + "."))
+
 
 class MacVolumeTests(unittest.TestCase):
     """The macOS branch: pathconf says whether the volume folds case. Patched, so it runs anywhere."""
