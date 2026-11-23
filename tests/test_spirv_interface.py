@@ -1218,16 +1218,25 @@ class StageInterfacesAndLayoutTest(unittest.TestCase):
                     with self.assertRaisesRegex(spv.InterfaceError, "Index is only supported on fragment outputs"):
                         b.reflect()
 
-        # Also rejected on Block members outside fragment outputs.
-        for stage, storage in (("vs", spv.STORAGE_OUTPUT), ("ps", spv.STORAGE_INPUT)):
-            with self.subTest(block_stage=stage, storage=storage):
+        # Index is rejected on any structure member (Block or non-Block), even on fragment outputs.
+        for stage, storage, is_block in (
+            ("vs", spv.STORAGE_OUTPUT, True),
+            ("ps", spv.STORAGE_INPUT, True),
+            ("ps", spv.STORAGE_OUTPUT, True),
+            ("ps", spv.STORAGE_OUTPUT, False),
+        ):
+            with self.subTest(struct_stage=stage, storage=storage, is_block=is_block):
                 b = SpirvBuilder(stage)
-                blk = b.struct_type(b.numeric("f", 32, 4))
-                b.decorate(blk, spv.DEC_BLOCK)
-                b.member_decorate(blk, 0, spv.DEC_LOCATION, 0)
-                b.member_decorate(blk, 0, spv.DEC_INDEX, 1)
-                b.variable(storage, blk)
-                with self.assertRaisesRegex(spv.InterfaceError, "Index is only supported on fragment outputs"):
+                s = b.struct_type(b.numeric("f", 32, 4))
+                if is_block:
+                    b.decorate(s, spv.DEC_BLOCK)
+                    b.member_decorate(s, 0, spv.DEC_LOCATION, 0)
+                    b.member_decorate(s, 0, spv.DEC_INDEX, 1)
+                    b.variable(storage, s)
+                else:
+                    b.member_decorate(s, 0, spv.DEC_INDEX, 1)
+                    b.variable(storage, s, location=0)
+                with self.assertRaisesRegex(spv.InterfaceError, "Index cannot be applied to structure members"):
                     b.reflect()
 
     def test_rejects_per_primitive_on_invalid_stages_and_with_per_vertex(self):
@@ -1339,7 +1348,7 @@ class StageInterfacesAndLayoutTest(unittest.TestCase):
                 with self.assertRaisesRegex(spv.InterfaceError, "BuiltIn cannot be combined"):
                     b.reflect()
 
-    def test_rejects_out_of_range_struct_member_decorations_and_non_block_member_component(self):
+    def test_rejects_out_of_range_struct_member_decorations_and_allows_non_block_member_component(self):
         # Out-of-range OpMemberDecorate on a reflected Block struct.
         for dec, args in (
             (spv.DEC_LOCATION, (2,)),
@@ -1356,15 +1365,13 @@ class StageInterfacesAndLayoutTest(unittest.TestCase):
                 with self.assertRaisesRegex(spv.InterfaceError, "member index 1 is out of range"):
                     b.reflect()
 
-        # Component or Index on a non-Block structure member.
-        for dec, val in ((spv.DEC_COMPONENT, 2), (spv.DEC_INDEX, 1)):
-            with self.subTest(non_block_member_dec=dec):
-                b = SpirvBuilder("ps")
-                s = b.struct_type(b.numeric("f", 32, 2))
-                b.member_decorate(s, 0, dec, val)
-                b.variable(spv.STORAGE_OUTPUT, s, location=0)
-                with self.assertRaisesRegex(spv.InterfaceError, "non-block structure member"):
-                    b.reflect()
+        # Component on a non-Block structure member is valid when Location is supplied by the variable.
+        b = SpirvBuilder("ps")
+        s = b.struct_type(b.numeric("f", 32, 2))
+        b.member_decorate(s, 0, spv.DEC_COMPONENT, 2)
+        b.variable(spv.STORAGE_OUTPUT, s, location=0)
+        iface = b.reflect()
+        self.assertEqual(iface.outputs[0].varyings[0].address, spv.Address(0, 2, 0))
 
     def test_rejects_out_of_bound_variable_initializer_id(self):
         for bad_init, bound in ((0, None), (99, 10)):

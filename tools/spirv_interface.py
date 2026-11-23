@@ -516,9 +516,9 @@ class Module:
         members = []
         next_location = base_location
         for child, member in zip(args, member_decs):
+            if DEC_INDEX in member:
+                raise InterfaceError("Index cannot be applied to structure members")
             self.check_modes(member, stage, storage, per_vertex=per_vertex)
-            if not is_block and (DEC_COMPONENT in member or DEC_INDEX in member):
-                raise InterfaceError("Component or Index on a non-block structure member is unsupported")
             address = self.address(member, next_location)
             shape = self.shape(child, (type_id,))
             members.append(Varying(address, shape, per_primitive or DEC_PER_PRIMITIVE in member))
