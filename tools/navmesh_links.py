@@ -51,8 +51,9 @@ def verify_tile(b, stats):
     pool = nd._u32(b, 0x90)
     a8, b0 = nd._u64(b, 0xA8), nd._u64(b, 0xB0)
 
-    # Cross-check u32@0x90 (pool) against +0x80 (2-byte vertex indices), +0x88 (12-byte edges),
-    # and the sum of polygon vertex counts in +0x98 (44-byte polygons).
+    # Cross-check u32@0xC0 (c0) and u32@0x90 (pool) against +0x70 (6-byte vertices),
+    # +0x80 (2-byte vertex indices < c0), +0x88 (12-byte edges), and the sum of polygon vertex counts in +0x98.
+    b70 = nd.split_array(b, 0x70, 6, c0)
     b80 = nd.split_array(b, 0x80, 2, pool)
     b88 = nd.split_array(b, 0x88, 12, pool)
     b98 = nd.split_array(b, 0x98, 44, c4)
@@ -61,7 +62,8 @@ def verify_tile(b, stats):
         for po, pcnt in b98:
             for pi in range(pcnt):
                 poly_vert_sum += struct.unpack_from("<I", b, po + 44 * pi + 4)[0] & 0xF
-    pool_confirmed = b80 is not None and b98 is not None and poly_vert_sum == pool
+    vidx_in_bounds = b80 is not None and all(nd._u16_max(b, o, n) < c0 for o, n in b80)
+    pool_confirmed = b70 is not None and vidx_in_bounds and b98 is not None and poly_vert_sum == pool
 
     # 1. 12-byte adjacent-polygon edges at +0x88 (count = pool = u32@0x90).
     edges_ok = b88 is not None and pool_confirmed
@@ -366,6 +368,11 @@ def main(argv=None):
         if same_report_path(args.out, args.input):
             sys.stderr.write("error: --out must not overwrite the input path\n")
             return 2
+        if os.path.isdir(args.input):
+            for fname in os.listdir(args.input):
+                if fname.endswith(".bin") and same_report_path(args.out, os.path.join(args.input, fname)):
+                    sys.stderr.write("error: --out must not overwrite a carved input stream\n")
+                    return 2
 
     doc = scan(args.input, start=args.start, limit=args.limit)
     if args.out is not None:

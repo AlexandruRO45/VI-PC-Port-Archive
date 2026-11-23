@@ -290,6 +290,9 @@ class NavmeshLinksTest(unittest.TestCase):
             rpf = os.path.join(tmp, "nav.rpf")
             make_rpf(rpf, build_tile())
             rpf_upper = os.path.join(tmp, "NAV.RPF")
+            carved_bin = os.path.join(tmp, "0000.bin")
+            with open(carved_bin, "wb") as fh:
+                fh.write(build_tile()[0])
             missing = os.path.join(tmp, "no_such.rpf")
             for argv in (
                 [missing],
@@ -299,9 +302,11 @@ class NavmeshLinksTest(unittest.TestCase):
                 [tmp, "--limit", "64"],
                 [rpf, "--out", tmp],
                 [rpf, "--out", rpf],
+                [tmp, "--out", carved_bin],
             ):
                 rc = nl.main(argv)
                 self.assertEqual(rc, 2, f"expected exit code 2 for {argv}")
+            self.assertEqual(os.path.getsize(carved_bin), len(build_tile()[0]))
             if os.name == "nt" or sys.platform == "darwin":
                 self.assertEqual(nl.main([rpf, "--out", rpf_upper]), 2)
                 with open(rpf, "rb") as fh:
