@@ -378,5 +378,26 @@ class VMadU32U24TranslatorTests(unittest.TestCase):
         val = mrt0_words(spv)[0]
         self.assertEqual(val, 205)
 
+# -----------------------------------------------------------------------------
+# Opcode 6: v_mad_i32_i24
+# -----------------------------------------------------------------------------
+def oracle_mad_i32_i24(s0: int, s1: int, s2: int) -> int:
+    """Reference mathematical oracle for v_mad_i32_i24: D = sext24(S0) * sext24(S1) + S2."""
+    i0 = sext24(s0)
+    i1 = sext24(s1)
+    s2_val = s2 & MASK32
+    prod = i0 * i1
+    return (prod + s2_val) & MASK32
+
+
+class VMadI32I24OracleTests(unittest.TestCase):
+    def test_mad_i24_basic(self):
+        # -10 * 20 + 5 = -195 (0xFFFFFF3D)
+        self.assertEqual(oracle_mad_i32_i24(-10, 20, 5), u32(-195))
+
+    def test_mad_i24_negative_factors(self):
+        # -5 * -10 + 2 = 52
+        self.assertEqual(oracle_mad_i32_i24(-5, -10, 2), 52)
+
 if __name__ == "__main__":
     unittest.main()
