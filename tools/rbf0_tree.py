@@ -569,12 +569,27 @@ def _xml_node(parent, node, tag=None):
     return el
 
 
+def xml_names(docs):
+    """The file name each resource gets under --xml, in the same order as `docs`.
+
+    The directory and the guard that refuses to replace a stream both read this list, so they cannot disagree.
+    """
+    names = []
+    used = set()
+    for i, doc in enumerate(docs):
+        name = f"{doc['offset']:08x}.xml"
+        if name in used:
+            name = f"{doc['offset']:08x}-{i:04d}.xml"
+        used.add(name)
+        names.append(name)
+    return names
+
+
 def write_xml(directory, docs):
     """Write one generic XML file per resource. Element names are fixed, so any descriptor name is safe."""
     os.makedirs(directory, exist_ok=True)
     paths = []
-    used = set()
-    for i, doc in enumerate(docs):
+    for name, doc in zip(xml_names(docs), docs):
         root = ET.Element("rbf0", {
             "root": _xml_safe(doc["root_name"]), "layout": doc["layout"],
             "offset": f"0x{doc['offset']:x}",
@@ -585,10 +600,6 @@ def write_xml(directory, docs):
         if doc["tree"] is not None:
             _xml_node(root, doc["tree"])
         ET.indent(root, space=" ")
-        name = f"{doc['offset']:08x}.xml"
-        if name in used:
-            name = f"{doc['offset']:08x}-{i:04d}.xml"
-        used.add(name)
         path = os.path.join(directory, name)
         # XML readers normalize literal carriage returns. Escape them after serializing ordinary XML text.
         xml = ET.tostring(root, encoding="utf-8", xml_declaration=True).replace(b"\r", b"&#13;")
@@ -719,6 +730,13 @@ def main(argv=None):
     try:
         docs, summary = decode_source(path, roots=args.root, offset=args.offset,
                                       limit=args.limit, progress=progress)
+        if args.xml:
+            # A stream named 00000000.xml is also the first XML export name, so --xml on its folder replaced it
+            # with XML and exited 0. Refuse before the reports are published, with the source bytes intact.
+            for name in xml_names(docs):
+                target = os.path.join(args.xml, name)
+                if any(other and same_report_path(target, other) for other in (args.source, args.out, args.csv)):
+                    ap.error(f"--xml would overwrite {target}")
         path = args.out
         write_json(path, docs, summary)
         if args.csv:
