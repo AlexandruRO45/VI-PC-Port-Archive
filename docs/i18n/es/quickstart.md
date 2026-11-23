@@ -26,9 +26,9 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 
 - **Su propia copia** del paquete de Xbox Series, versión `1.0.2.1`: la carpeta que contiene `MicrosoftGame.Config`
   y los archivos `.rpf`, como ficheros legibles en el disco.
-- **Windows 10/11 x64**, con unos **350 GB libres** para una compilación completa. Los archivos de trabajo pueden
-  ir a otra unidad con `--work`; más abajo se explica cómo omitir la exportación de recursos y usar unos 30 GB.
-- **Windows 10/11 x64**, con unos **400 GB libres** para los archivos de trabajo. Pueden ir a otra unidad con
+- **Windows 10/11 x64**, con unos **400 GB libres** para los archivos de trabajo (solo la exportación de recursos
+  midió unos 337 GB antes de su etapa de audio, en unas 2 h 35 min). Los tamaños de disco son los que muestra el
+  Explorador de Windows, que son GiB: 400 GiB son unos 430 GB en unidades decimales. Pueden ir a otra unidad con
   `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (marque «Add python.exe to PATH» durante la instalación).
 - [SDK de .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
@@ -76,7 +76,7 @@ empezar comprueba los requisitos y el espacio libre, y enumera de una vez todo l
 
 ### Si dispone de poco espacio
 
-Los 350 GB corresponden a la compilación completa. Puede omitir la exportación de recursos con
+Los 400 GB corresponden a la compilación completa. Puede omitir la exportación de recursos con
 `--stages check,shaders,runtime`, que necesita unos **30 GB**. La etapa `assets` (unos 300 GB) sirve para las
 herramientas de recursos; `--wav` añade varias veces el tamaño de los archivos Ogg Opus. La comprobación previa
 ofrece la alternativa sin `assets` cuando esa etapa no cabe. Puede situar tanto `--work` como `--out` en otra
