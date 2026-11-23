@@ -90,8 +90,20 @@ class ImageAtomicBoundsTests(unittest.TestCase):
                      defs[defs[v][1][1]] == ("OpCompositeExtract", ["%int", coord, str(axis)]) and
                      defs[defs[v][1][2]] == ("OpCompositeExtract", ["%int", size, str(axis)])]
             self.assertTrue(tests, f"axis {axis}: the branch does not test coordinate < size (unsigned)")
-        self.assertIn("%active", seen, "the branch must keep the EXEC test")
-        return tp, merge_lbl
+        # the EXEC test is the branch around this one: an inactive lane never reaches the descriptor lookup
+        outer = next(i for i in range(branch - 1, -1, -1) if lines[i][1] == "OpBranchConditional"
+                     and lines[i][2][2] not in (merge_lbl,))
+        outer_seen, todo = set(), [lines[outer][2][0]]
+        while todo:
+            v = todo.pop()
+            if v in outer_seen or v not in defs:
+                continue
+            outer_seen.add(v)
+            todo += defs[v][1]
+        loads = [res for res in outer_seen if defs[res][0] == "OpLoad" and defs[res][1][1] == "%active"]
+        # (a kernel that never changes EXEC folds the test to the constant %true)
+        self.assertTrue(loads or lines[outer][2][0] == "%true", "the branch around the bounds test must be the EXEC test")
+        return tp, branch, outer
 
     def test_every_image_atomic_is_skipped_outside_the_image(self):
         for op in OPS:
@@ -101,20 +113,16 @@ class ImageAtomicBoundsTests(unittest.TestCase):
                         spv = translate(op, dim, glc)
                         check_cfg(spv)
                         lines = parse(spv)
-                        tp, merge = self.guard_of(lines, n)
-                        # the result is chosen where the guarded block ends: 0 for a lane that skipped it
-                        at = next(i for i, (res, op_, _a) in enumerate(lines) if res == merge and op_ == "OpLabel")
-                        self.assertGreater(at, tp)
-                        phi_res, phi_op, phi_args = lines[at + 1]
-                        self.assertEqual(phi_op, "OpPhi")
-                        self.assertEqual(phi_args[0], "%uint")
-                        self.assertIn("%c0", phi_args[1::2], "a lane outside the image must get 0")
-                        written = [i for i, (_r, o, a) in enumerate(lines)
-                                   if i > at and o == "OpSelect" and phi_res in a]
+                        tp, branch, outer = self.guard_of(lines, n)
+                        self.assertLess(outer, branch)
+                        # with glc a lane that is active but outside the image gets 0 in vdata: written before
+                        # the bounds branch, overwritten by the old value inside it
+                        zero_stores = [i for i in range(outer, branch)
+                                       if lines[i][1] == "OpStore" and lines[i][2][1] == "%c0"]
                         if glc:
-                            self.assertTrue(written, "glc must return the phi (0 out of range) in vdata")
+                            self.assertTrue(zero_stores, "glc must write 0 to vdata before the bounds branch")
                         else:
-                            self.assertFalse(written)
+                            self.assertFalse(zero_stores)
 
 
 if __name__ == "__main__":
