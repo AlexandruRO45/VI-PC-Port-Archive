@@ -51,6 +51,31 @@ class ManifestEnumerationTest(unittest.TestCase):
                 self.assertEqual(f.read(), b"existing dictionary")
 
 
+class ErrorTextTest(unittest.TestCase):
+    def test_paths_are_printed_as_typed(self):
+        path, other = os.path.join("C:\\", "no such", "d.json"), os.path.join("C:\\", "out dir")
+        self.assertEqual(WN.error_text(FileNotFoundError(2, "No such file", path)), f"{path}: No such file")
+        self.assertEqual(WN.error_text(PermissionError(13, "Access is denied", path, None, other)),
+                         f"{path} -> {other}: Access is denied")
+        self.assertEqual(WN.error_text(OSError("no filename")), "no filename")
+        self.assertEqual(WN.error_text(ValueError("bad dictionary")), "bad dictionary")
+
+    def test_an_out_folder_is_named_in_the_error(self):
+        # _write_json ends in os.replace(<staged file>, --out); when --out is a folder the message must still name
+        # the folder the user typed, not only the staged file (already deleted by then).
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            with open(dictionary, "w", encoding="utf-8") as handle:
+                json.dump(WN.NameDictionary().to_json(), handle)
+            out = os.path.join(tmp, "outdir")
+            os.mkdir(out)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["resolve", "--dict", dictionary, "--out", out]), 1)
+            self.assertIn(f"-> {out}: ", err.getvalue())
+            self.assertNotIn("\\\\", err.getvalue())
+
+
 class HashTest(unittest.TestCase):
     def test_joaat_case_sensitive_field_names(self):
         # Confirmed by the 0x7a schema member tables.

@@ -61,8 +61,10 @@ REPORT_FIELDS = ["source", "offset", "size", "width", "height", "frames"]
 
 
 def error_text(error):
-    """`path: reason` for an OSError, without the repr() that doubles every backslash of a Windows path."""
+    """`path: reason` (`path -> path2: reason` for a rename) for an OSError, without repr()'s doubled backslashes."""
     if isinstance(error, OSError) and error.filename is not None and error.strerror:
+        if error.filename2 is not None:  # os.replace, os.rename: name both, as str() does
+            return f"{error.filename} -> {error.filename2}: {error.strerror}"
         return f"{error.filename}: {error.strerror}"
     return str(error)
 

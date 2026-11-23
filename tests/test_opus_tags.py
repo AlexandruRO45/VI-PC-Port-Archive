@@ -355,5 +355,15 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), [])     # nothing was tagged
 
 
+class TestErrorText(unittest.TestCase):
+    def test_paths_are_printed_as_typed(self):
+        path, other = r"C:\no such\list.xml", r"C:\out dir"
+        self.assertEqual(T.error_text(FileNotFoundError(2, "No such file", path)), f"{path}: No such file")
+        self.assertEqual(T.error_text(PermissionError(13, "Access is denied", path, None, other)),
+                         f"{path} -> {other}: Access is denied")
+        self.assertEqual(T.error_text(OSError("no filename")), "no filename")
+        self.assertEqual(T.error_text(ValueError("bad list")), "bad list")
+
+
 if __name__ == "__main__":
     unittest.main()
