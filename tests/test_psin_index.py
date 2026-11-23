@@ -412,6 +412,15 @@ class TestCli(unittest.TestCase):
                     self.assertIn(f"ERROR: {path}: not a PSIN container", p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
 
+    def test_folder_of_non_psin_files_is_still_zero(self):
+        # A carve folder mixes PSIN and non-PSIN .bin streams: skipping the others stays a 0 exit.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+                f.write(b"not a psin")
+            p = subprocess.run([sys.executable, "-I", TOOL, tmp], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("0 PSIN files", p.stdout)
+
     def test_unlistable_folder_is_one_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             # A folder that cannot be listed (no permission); patched so the test runs the same on every OS.
