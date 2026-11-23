@@ -976,6 +976,64 @@ class TestVerifyCache(unittest.TestCase):
         with open(self.cache, "rb") as f:
             self.assertNotIn(b"\r\n", f.read())
 
+    def test_save_cache_leaves_neighbor_dot_tmp_untouched(self) -> None:
+        base = os.path.dirname(self.cache)
+        neighbor = self.cache + ".tmp"
+        with open(neighbor, "w", encoding="utf-8", newline="\n") as f:
+            f.write("unrelated user file\n")
+        before = set(os.listdir(base))
+        mv.save_cache(self.cache, {"a": {"stamp": [1, 2, 3, 4, 5], "sha256": "0" * 64}})
+        with open(neighbor, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "unrelated user file\n")
+        self.assertEqual(set(os.listdir(base)) - before, {os.path.basename(self.cache)})
+
+    def test_save_cache_applies_published_mode_without_flipping_umask(self) -> None:
+        import file_mode
+        cache_dir = os.path.join(os.path.dirname(self.cache), "isolated_cache")
+        cache = os.path.join(cache_dir, "verify.json")
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def record_chmod(p: str, mode: int) -> None:
+            chmod_calls.append((p, mode))
+            real_chmod(p, mode)
+
+        with patch.object(mv, "published_mode", wraps=mv.published_mode) as pub, \
+                patch.object(mv.os, "chmod", side_effect=record_chmod), \
+                patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+            mv.save_cache(cache, {"a": {"stamp": [1, 2, 3, 4, 5], "sha256": "0" * 64}})
+        self.assertEqual(pub.call_count, 1)
+        self.assertEqual(len(chmod_calls), 1)
+        staged_path, staged_mode = chmod_calls[0]
+        self.assertNotEqual(os.path.abspath(staged_path), os.path.abspath(cache))
+        self.assertEqual(staged_mode, file_mode.published_mode(cache))
+        self.assertEqual(os.listdir(cache_dir), ["verify.json"])
+
+    def test_save_cache_failed_replace_cleans_read_only_staging_file(self) -> None:
+        cache_dir = os.path.join(os.path.dirname(self.cache), "ro_cache")
+        os.makedirs(cache_dir)
+        cache = os.path.join(cache_dir, "verify.json")
+        with open(cache, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"version": 1, "files": {}}\n')
+        os.chmod(cache, 0o444)
+        self.addCleanup(lambda: os.path.exists(cache) and os.chmod(cache, 0o600))
+        with patch.object(mv.os, "replace", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                mv.save_cache(cache, {"a": {"stamp": [1, 2, 3, 4, 5], "sha256": "0" * 64}})
+        self.assertEqual(os.listdir(cache_dir), ["verify.json"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_save_cache_new_and_replaced_posix_bits(self) -> None:
+        import file_mode
+        cache_dir = os.path.join(os.path.dirname(self.cache), "posix_cache")
+        os.makedirs(cache_dir)
+        cache = os.path.join(cache_dir, "verify.json")
+        mv.save_cache(cache, {"a": {"stamp": [1, 2, 3, 4, 5], "sha256": "0" * 64}})
+        self.assertEqual(os.stat(cache).st_mode & 0o777, file_mode.new_file_mode(cache_dir))
+        os.chmod(cache, 0o640)
+        mv.save_cache(cache, {"b": {"stamp": [1, 2, 3, 4, 5], "sha256": "1" * 64}})
+        self.assertEqual(os.stat(cache).st_mode & 0o777, 0o640)
+
 
 if __name__ == "__main__":
     unittest.main()

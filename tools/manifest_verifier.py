@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -25,8 +26,14 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 from typing import Callable, Optional, TextIO
+
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from file_mode import published_mode  # noqa: E402
 
 CHUNK = 8 * 1024 * 1024
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
@@ -142,21 +149,34 @@ def load_cache(path: str) -> dict[str, dict]:
 
 
 def save_cache(path: str, entries: dict[str, dict]) -> None:
-    """Saves the cache via a temp file + replace, so if it gets interrupted the old one is still there."""
-    directory = os.path.dirname(os.path.abspath(path))
+    """Saves the cache via a unique staging file + replace, so concurrent runs and interrupted writes stay safe."""
+    abs_path = os.path.abspath(path)
+    directory = os.path.dirname(abs_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
+    tmp: Optional[str] = None
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=".manifest_cache-",
+            suffix=".tmp",
+            dir=directory,
+            delete=False,
+        ) as f:
+            tmp = f.name
             json.dump({"version": CACHE_VERSION, "files": dict(sorted(entries.items()))}, f, indent=1)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+        os.chmod(tmp, published_mode(abs_path))
+        os.replace(tmp, abs_path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            with suppress(OSError):
+                # The staging file may have inherited a read-only cache's mode; make it
+                # deletable first, or Windows strands it beside the cache when replace fails.
+                os.chmod(tmp, 0o600)
+                os.unlink(tmp)
 
 
 def walk(target_dir: str, *, exclude: str | tuple[str, ...] | None = None):
