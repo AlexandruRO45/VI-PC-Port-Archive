@@ -248,6 +248,20 @@ class TestWriteLaneExecIndependence(unittest.TestCase):
         self.assertIn("OpSelect", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestWriteLaneAliasing(unittest.TestCase):
+    def test_multiple_writes(self):
+        lanes = [0] * 64
+        lanes = model_writelane(lanes, 10, 0)
+        lanes = model_writelane(lanes, 20, 1)
+        self.assertEqual(lanes[0], 10)
+        self.assertEqual(lanes[1], 20)
+
+    def test_translator_writelane_aliasing(self):
+        prog = ["s_mov_b32 s0, 10", "s_mov_b32 s1, 0", "v_writelane_b32 v0, s0, s1", "s_endpgm"]
+        spv = support.translate_lines("cs_wl_alias", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpSelect", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
