@@ -384,10 +384,9 @@ def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
     if base_name in ("image_load_mip", "image_store_mip"):
         packable += 1
     if a16:
-        # On GFX10, a16 packs coordinates (and lod/clamp after coords) two 16-bit values per VGPR; clamp/lod
-        # after 2D coords starts a new VGPR when coords are even (e.g., 2D + cl -> 1 + 1 = 2 VGPRs).
-        packed = (base + 1) // 2 + (packable - base)
-        return fixed32 + packed
+        # On GFX10, a16 packs coordinates and trailing lod/clamp/mip continuously, two 16-bit values per VGPR
+        # (e.g., 2D + lod -> (3 + 1) // 2 = 2 VGPRs; 2D_ARRAY/CUBE + lod -> (4 + 1) // 2 = 2 VGPRs).
+        return fixed32 + (packable + 1) // 2
     return fixed32 + packable
 
 
