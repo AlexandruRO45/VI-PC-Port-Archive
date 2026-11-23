@@ -236,6 +236,25 @@ class Program:
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
+
+@dataclasses.dataclass(frozen=True)
+class LdsSubU32ConditionCodes:
+    """Condition codes resulting from atomic subtraction."""
+    zero: bool
+    negative: bool
+    positive: bool
+    borrow_wrapped: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class LdsSubU32StatusFlags:
+    """Execution status and address resolution metadata."""
+    effective_byte_address: int
+    dword_index: int
+    old_value: int
+    sub_value: int
+    new_value: int
+
 class ScalarLDSInterpreter:
     """Deterministic scalar interpreter for ds_sub_u32."""
 
@@ -266,10 +285,26 @@ class ScalarLDSInterpreter:
         """Executes a single ds_sub_u32 instruction."""
         vaddr = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
         vdata = self.read_reg_u32(RegKind.VGPR, inst.vdata.index)
+        eff_byte, idx = calc_lds_address(vaddr, inst.offset.offset, self.lds.capacity_dwords)
+        old_val = self.lds.memory[idx]
         res = self.lds.atomic_sub_u32(
             vaddr=vaddr,
             sub_val=vdata,
             offset=inst.offset.offset,
+        )
+        borrow = (old_val < vdata)
+        self.last_condition_codes = LdsSubU32ConditionCodes(
+            zero=(res == 0),
+            negative=bool(res & SIGN_BIT32),
+            positive=(res > 0 and not bool(res & SIGN_BIT32)),
+            borrow_wrapped=borrow,
+        )
+        self.last_status_flags = LdsSubU32StatusFlags(
+            effective_byte_address=eff_byte,
+            dword_index=idx,
+            old_value=old_val,
+            sub_value=vdata,
+            new_value=res,
         )
         self.trace.append(f"{inst.to_assembly()} => new_val={res:#010x}")
         return res
@@ -606,6 +641,81 @@ class TestLdsSubU32RegisterAliasing(unittest.TestCase):
         res = interp.step(inst)
         self.assertEqual(res, 100 - 0x10)
         self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 0x10)
+
+
+
+class TestLdsSubU32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(capacity_dwords=1024)
+
+    def test_zero_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 50)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 50)
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 0)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.positive)
+        self.assertFalse(cc.borrow_wrapped)
+
+    def test_positive_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 40)
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 60)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        self.assertFalse(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertTrue(cc.positive)
+        self.assertFalse(cc.borrow_wrapped)
+
+    def test_negative_and_borrow_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 40)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 50)
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 0xFFFFFFF6)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.negative)
+        self.assertFalse(cc.positive)
+        self.assertTrue(cc.borrow_wrapped)
+
+    def test_vcc_isolation(self) -> None:
+        self.interp.vcc = 0xCAFEBABE
+        self.interp.lds.write_dword(0x10, 20)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 10)
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, 0xCAFEBABE)
 
 
 if __name__ == "__main__":
