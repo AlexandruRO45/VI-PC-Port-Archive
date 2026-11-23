@@ -1602,7 +1602,7 @@ def drop_staged(*paths: str) -> "tuple[int, int]":
     return removed, size
 
 
-SHARD_PLAN ="shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
+SHARD_PLAN = "shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
 
 
 def drop_index(index: str) -> str:
