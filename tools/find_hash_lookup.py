@@ -11,6 +11,7 @@ the whole image makes to them. RAGE's archetype lookup by hash takes the hash an
 so it should rank first; pass its RVA to `gta6rt --archetype-lookup`.
 
 Standard library only. No game data is written: the report holds RVAs and counts.
+A `--json` path that is a folder, aliases the input image, or cannot be written is one `ERROR:` line with exit 2.
 """
 import argparse
 import json
