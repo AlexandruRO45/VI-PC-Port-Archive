@@ -12,14 +12,19 @@ Reads an ``make_game.py`` export folder (``<work>/assets``), listing folders wit
 * material references: every ``<archive>/models/manifest.json`` (streamed item by item; the levels manifest is several
   GB), each material texture's ``Id64`` and ``Name``, and the textures embedded in models (``Embedded``).
 
-Each distinct material reference (``Id64``) is looked up in three places: the pools by ``AssetKey == Id64`` (exact
-64-bit), the embedded textures by ``Key == Id64`` or ``joaat(Name) == Hash``, and the dictionaries by
-``joaat(Name) == Hash`` (32-bit, so a name-hash match, not proof of the same asset). It is counted for every source it
-resolves in, and as unresolved when it resolves in none, per referencing archive and overall.
+``rpf9dump`` writes a material binding's ``Name`` as its stored 32-bit name hash in eight hex digits; dictionary and
+embedded rows carry a stored ``Hash``. Those stored values are compared as they are (a name that is not eight hex
+digits, in a hand-written file, is hashed with joaat). Each distinct material reference (``Id64``) is then an exact
+64-bit key match (pool ``AssetKey`` or embedded ``Key``), else a 32-bit name-hash candidate (embedded or dictionary
+``Hash``; not proof of the same asset, and ambiguous when the hash is on more than one entry), else unresolved; the
+three add up to the total, and per-source counts (which can overlap) are listed too. A manifest whose ``Count`` is
+above the rows it holds is reported as export coverage (failed rows can be left out); more rows than ``Count`` is a
+problem.
 
     python -I tools/texture_dicts.py <export dir> [--json FILE]
 
-Prints counts only: no texture, model or shader names. ``--json`` may not overwrite an input. Standard library only.
+Prints counts only: no texture, model or shader names. ``--json`` may not be inside the export folder (drives other
+than the export's count as outside). Standard library only.
 """
 import argparse
 import json
@@ -36,6 +41,7 @@ CHUNK = 8 << 20
 
 
 _WS_RUN = re.compile(r"[ \t\r\n]*")
+_NUMBER_TAIL = re.compile(r"[0-9eE.+\-]*")
 
 
 class _Stream:
@@ -78,6 +84,11 @@ class _Stream:
             except json.JSONDecodeError:
                 val, end = None, None
             if end is not None and end < len(self.buf):
+                # a number cut at the buffer end decodes as a shorter one ("1e" of "1e3" gives 1): when the number
+                # characters run on to the end of the buffer, read more before accepting it
+                if (isinstance(val, (int, float)) and not isinstance(val, bool)
+                        and _NUMBER_TAIL.match(self.buf, end).end() == len(self.buf) and self.fill()):
+                    continue
                 self.pos = end
                 return val
             if not self.fill():
@@ -254,13 +265,56 @@ def pool_manifests(export):
     return found
 
 
-def census(export):
-    problems = []
-    report = {"dictionaries": {}, "pools": {"manifests": 0, "textures": 0, "distinct_keys": 0},
-              "references": {}, "problems": problems}
+def stored_hash(t, name_key="Name", hash_key="Hash"):
+    """The 32-bit name hash a row stores, and how it was found.
 
-    # texture dictionaries
+    ``rpf9dump`` writes a material binding's ``Name`` as the stored name hash in eight hex digits
+    (``NameHash.ToString("X8")``), and dictionary and embedded rows carry a separate stored ``Hash``. So the stored
+    value is used as is; only a name that is not eight hex digits (a hand-written file) is hashed with joaat."""
+    h = t.get(hash_key) if hash_key else None
+    if isinstance(h, int) and not isinstance(h, bool):
+        return h & 0xFFFFFFFF, "stored"
+    if isinstance(h, str) and re.fullmatch(r"(0x)?[0-9a-fA-F]{1,8}", h.strip()):
+        return int(h.strip(), 16), "stored"
+    name = t.get(name_key)
+    if isinstance(name, str) and name.strip():
+        n = name.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{8}", n):
+            return int(n, 16), "stored"
+        return joaat(n), "joaat"
+    return None, None
+
+
+def inside(path, folder):
+    """True when ``path`` lies in ``folder`` (or is it). Paths on different Windows drives are separate trees."""
+    p, f = os.path.realpath(os.path.abspath(path)), os.path.realpath(os.path.abspath(folder))
+    if os.path.splitdrive(p)[0].lower() != os.path.splitdrive(f)[0].lower():
+        return False
+    try:
+        return os.path.normcase(os.path.commonpath([p, f])) == os.path.normcase(f)
+    except ValueError:
+        return False
+
+
+def check_count(label, rows, declared, problems, coverage, unit):
+    """A manifest ``Count`` above the rows read is export coverage (``rpf9dump`` can leave out rows that failed to
+    decode); more rows than ``Count`` cannot happen and is a problem."""
+    if declared is None or declared == rows:
+        return
+    if rows > declared:
+        problems.append(f"{label}: {rows} {unit}, more than the manifest Count {declared}")
+    else:
+        coverage[label] = {"declared": declared, "rows": rows, "missing": declared - rows}
+
+
+def census(export):
+    problems, coverage = [], {}
+    report = {"dictionaries": {}, "pools": {"manifests": 0, "textures": 0, "distinct_keys": 0},
+              "references": {}, "coverage": coverage, "problems": problems}
+
+    # texture dictionaries: stored hashes, and how many entries carry each (more than one = an ambiguous candidate)
     dict_hashes = {}                  # archive -> set of 32-bit hashes
+    entries_per_hash = Counter()      # dictionary and embedded entries per stored hash
     for arc in archives(export):
         m = os.path.join(export, arc, "textures", "manifest.json")
         if not os.path.isfile(m):
@@ -268,18 +322,14 @@ def census(export):
         with open(m, encoding="utf-8") as f:
             doc = json.load(f)
         items = doc.get("Items") or []
-        if doc.get("Count") is not None and doc["Count"] != len(items):
-            problems.append(f"{arc}/textures: {len(items)} dictionaries, manifest Count {doc['Count']}")
+        check_count(f"{arc}/textures", len(items), doc.get("Count"), problems, coverage, "dictionaries")
         textures = [t for it in items for t in (it.get("Textures") or [])]
         hashes, formats, named, joaat_ok, with_key = set(), Counter(), 0, 0, 0
         for t in textures:
-            h = t.get("Hash")
-            try:
-                hv = int(h, 16) if isinstance(h, str) else int(h)
-            except (TypeError, ValueError):
-                hv = None
+            hv, _ = stored_hash(t, name_key=None)
             if hv is not None:
                 hashes.add(hv)
+                entries_per_hash[hv] += 1
             formats[str(t.get("Format"))] += 1
             if t.get("Name"):
                 named += 1
@@ -302,14 +352,13 @@ def census(export):
         }
     all_dict_hashes = set().union(*dict_hashes.values()) if dict_hashes else set()
 
-    # texture pools
+    # texture pools: exact 64-bit keys
     pool_keys = set()
     for label, m in pool_manifests(export):
         with open(m, encoding="utf-8") as f:
             doc = json.load(f)
         tex = doc.get("Textures") or []
-        if doc.get("Count") is not None and doc["Count"] != len(tex):
-            problems.append(f"{label}: {len(tex)} textures, manifest Count {doc['Count']}")
+        check_count(label, len(tex), doc.get("Count"), problems, coverage, "textures")
         report["pools"]["manifests"] += 1
         report["pools"]["textures"] += len(tex)
         for t in tex:
@@ -320,12 +369,13 @@ def census(export):
 
     # embedded textures (in model items), then material references, per referencing archive
     emb_keys, emb_hashes, emb_textures = set(), set(), 0
+    name_forms = Counter()
     overall_refs = {}
     for arc in archives(export):
         m = os.path.join(export, arc, "models", "manifest.json")
         if not os.path.isfile(m):
             continue
-        refs = {}                     # Id64 -> set of name hashes seen with it
+        refs = {}                     # Id64 -> set of stored name hashes seen with it
         bindings = no_key = models = 0
         gen = iter_items(m)
         declared = None
@@ -345,8 +395,10 @@ def census(export):
                     k = key64(t.get("Key"))
                     if k:
                         emb_keys.add(k)
-                    if t.get("Name"):
-                        emb_hashes.add(joaat(t["Name"]))
+                    hv, _ = stored_hash(t)
+                    if hv is not None:
+                        emb_hashes.add(hv)
+                        entries_per_hash[hv] += 1
             for mat in item.get("Materials") or []:
                 for t in mat.get("Textures") or []:
                     bindings += 1
@@ -354,60 +406,75 @@ def census(export):
                     if not k:
                         no_key += 1
                         continue
-                    nh = joaat(t["Name"]) if t.get("Name") else None
-                    refs.setdefault(k, set()).add(nh)
-        if declared is not None and declared != models:
-            problems.append(f"{arc}/models: {models} models, manifest Count {declared}")
+                    hv, form = stored_hash(t, hash_key=None)
+                    name_forms[form or "none"] += 1
+                    refs.setdefault(k, set()).add(hv)
+        check_count(f"{arc}/models", models, declared, problems, coverage, "models")
         report["references"][arc] = (refs, bindings, no_key, models)
-        for k, names in refs.items():
-            overall_refs.setdefault(k, set()).update(names)
+        for k, hashes in refs.items():
+            overall_refs.setdefault(k, set()).update(hashes)
     report["embedded"] = {"textures": emb_textures, "distinct_keys": len(emb_keys),
                           "distinct_name_hashes": len(emb_hashes)}
-    emb = (emb_keys, emb_hashes)
+    report["material_name_hashes"] = dict(name_forms)
+    sources = (pool_keys, emb_keys, emb_hashes, all_dict_hashes, dict_hashes, entries_per_hash)
     for arc, (refs, bindings, no_key, models) in list(report["references"].items()):
-        report["references"][arc] = summarise(refs, pool_keys, emb, all_dict_hashes, dict_hashes, bindings, no_key,
-                                              models)
-    report["references"]["total"] = summarise(overall_refs, pool_keys, emb, all_dict_hashes, dict_hashes,
+        report["references"][arc] = summarise(refs, sources, bindings, no_key, models)
+    report["references"]["total"] = summarise(overall_refs, sources,
                                               sum(r["bindings"] for r in report["references"].values()),
                                               sum(r["bindings_without_key"] for r in report["references"].values()),
                                               sum(r["models"] for r in report["references"].values()))
     return report
 
 
-def summarise(refs, pool_keys, emb, all_dict_hashes, dict_hashes, bindings, no_key, models):
-    emb_keys, emb_hashes = emb
-    found = Counter()
-    by_dict_archive = Counter()
-    for k, names in refs.items():
-        hashes = {h for h in names if h is not None}
-        in_pool = k in pool_keys
-        in_emb = k in emb_keys or bool(hashes & emb_hashes)
-        hit = hashes & all_dict_hashes
-        found["pool"] += in_pool
-        found["embedded"] += in_emb
-        found["dictionary"] += bool(hit)
-        found["unresolved"] += not (in_pool or in_emb or hit)
+def summarise(refs, sources, bindings, no_key, models):
+    """Per distinct reference: an exact 64-bit key match (pool ``AssetKey`` or embedded ``Key``), else a 32-bit
+    name-hash candidate (embedded or dictionary stored ``Hash``), else unresolved. The three add up to the total;
+    the per-source counts below them can overlap."""
+    pool_keys, emb_keys, emb_hashes, all_dict_hashes, dict_hashes, entries_per_hash = sources
+    part, source, by_dict_archive = Counter(), Counter(), Counter()
+    for k, hashes in refs.items():
+        hashes = {h for h in hashes if h is not None}
+        in_pool, in_emb_key = k in pool_keys, k in emb_keys
+        emb_cand, dict_cand = hashes & emb_hashes, hashes & all_dict_hashes
+        source["pool key"] += in_pool
+        source["embedded key"] += in_emb_key
+        source["pool and embedded key"] += in_pool and in_emb_key
+        source["embedded name hash"] += bool(emb_cand)
+        source["dictionary name hash"] += bool(dict_cand)
+        if in_pool or in_emb_key:
+            part["exact 64-bit key"] += 1
+        elif emb_cand or dict_cand:
+            part["32-bit name-hash candidate only"] += 1
+            if any(entries_per_hash[h] > 1 for h in emb_cand | dict_cand) or len(emb_cand | dict_cand) > 1:
+                part["  of which ambiguous (hash on more than one entry)"] += 1
+        else:
+            part["unresolved"] += 1
         for arc, hs in dict_hashes.items():
-            if hit & hs:
+            if dict_cand & hs:
                 by_dict_archive[arc] += 1
+    order = ("exact 64-bit key", "32-bit name-hash candidate only", "  of which ambiguous (hash on more than one entry)",
+             "unresolved")
+    src_order = ("pool key", "embedded key", "pool and embedded key", "embedded name hash", "dictionary name hash")
     return {"models": models, "bindings": bindings, "bindings_without_key": no_key, "distinct_references": len(refs),
-            "resolution": {c: found.get(c, 0) for c in ("pool", "embedded", "dictionary", "unresolved")},
-            "dictionary_by_archive": dict(by_dict_archive)}
+            "resolution": {c: part.get(c, 0) for c in order},
+            "by_source": {c: source.get(c, 0) for c in src_order},
+            "dictionary_candidates_by_archive": dict(by_dict_archive)}
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("export", help="the make_game assets folder (<work>/assets)")
-    ap.add_argument("--json", metavar="FILE", help="write the full report as JSON")
+    ap.add_argument("--json", metavar="FILE", help="write the full report as JSON (not inside the export folder)")
     a = ap.parse_args(argv)
     if not os.path.isdir(a.export):
         ap.error(f"{a.export}: not a folder")
-    if a.json and os.path.exists(a.json) and os.path.commonpath(
-            [os.path.realpath(a.json), os.path.realpath(a.export)]) == os.path.realpath(a.export):
+    if a.json and (inside(a.json, a.export) or same_report_path(a.json, a.export)):
         ap.error(f"--json {a.json} is inside the export folder; write the report elsewhere")
-    if a.json and same_report_path(a.json, a.export):
-        ap.error(f"--json {a.json} would overwrite an input")
-    r = census(a.export)
+    try:
+        r = census(a.export)
+    except ValueError as e:
+        print(f"error: invalid manifest JSON: {e}", file=sys.stderr)
+        return 2
     for arc, d in r["dictionaries"].items():
         print(f"dictionaries {arc}: {d['dictionaries']} (Count {d['declared_count']}), {d['textures']} textures, "
               f"{d['single_texture']} single-texture, {d['empty']} empty, {d['distinct_hashes']} distinct hashes, "
@@ -418,15 +485,19 @@ def main(argv=None) -> int:
     print(f"texture pools: {p['manifests']} manifests, {p['textures']} textures, {p['distinct_keys']} distinct keys")
     e = r["embedded"]
     print(f"embedded textures: {e['textures']}, {e['distinct_keys']} distinct keys, "
-          f"{e['distinct_name_hashes']} distinct name hashes")
+          f"{e['distinct_name_hashes']} distinct stored hashes")
+    print(f"material name hashes: {r['material_name_hashes']}")
     for arc, s in r["references"].items():
         print(f"references {arc}: {s['models']} models, {s['bindings']} bindings ({s['bindings_without_key']} without key), "
-              f"{s['distinct_references']} distinct keys: {s['resolution']}"
-              + (f", dictionary matches by archive {s['dictionary_by_archive']}" if s["dictionary_by_archive"] else ""))
+              f"{s['distinct_references']} distinct keys: {s['resolution']}; by source {s['by_source']}"
+              + (f"; dictionary candidates by archive {s['dictionary_candidates_by_archive']}"
+                 if s["dictionary_candidates_by_archive"] else ""))
+    for label, c in r["coverage"].items():
+        print(f"coverage {label}: {c['rows']} of {c['declared']} rows ({c['missing']} not exported)")
     for msg in r["problems"]:
         print("problem:", msg, file=sys.stderr)
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(r, f, indent=1)
         print("wrote", a.json)
     return 1 if r["problems"] else 0

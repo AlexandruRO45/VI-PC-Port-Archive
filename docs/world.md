@@ -388,12 +388,16 @@ Hash-only or opaque:
   hold 1,013 textures with only 9 distinct name hashes (1,008 dictionaries have one texture). They are not the
   dictionaries embedded in models: none of the 1,293 levels models with embedded textures lies in that band (those
   sit at 62.9-70.6 GiB), and the two sets share no name hash. Whether they are what a `.#td` entry name labels can't
-  be told until the RPF9 directory is decoded. No model material references them: of the 418,714 distinct material
-  texture keys in all ten `rpf9dump models` manifests (20,781,927 bindings), **0** resolve to a dictionary texture,
-  by `joaat(Name)` (equal to the entry's `Hash` for all 1,013) or by exact name, and `textures.rpf`'s 1,356
-  dictionaries (4,604 textures) also give 0. **296,785** resolve to the 57 texture pools by 64-bit key, 137 to
-  textures embedded in models, and **121,925** (29.1%) to none of these. So the material textures that resolve come
-  from the loose RDS5 pools (46 under `data/ttdb`, 11 under `pack/`), and placement records do not carry texture
+  be told until the RPF9 directory is decoded. No model material names them: a material binding stores its texture's
+  32-bit name hash (`rpf9dump` writes it as eight hex digits) and a dictionary entry its `Hash` (equal to
+  `joaat(Name)` for all 1,013), and none of the 418,714 distinct material texture keys in all ten `rpf9dump models`
+  manifests (20,781,927 bindings) has the hash of a `levels.rpf` dictionary entry. Of those keys, **296,789** match
+  exactly by 64-bit key (296,785 a texture-pool `AssetKey`, 137 an embedded texture's `Key`, 133 both), **8** only
+  by a 32-bit name hash in a dictionary (2 of them ambiguous: the hash is on more than one entry), and
+  **121,917** (29.1%) match nothing. Name-hash candidates are not proof of the same asset; overall 50 keys share a
+  hash with a dictionary entry (38 in `core_restofworld`'s dictionaries, 12 in `textures.rpf`'s), and 42 of those
+  also match a pool key exactly. So the material textures that resolve exactly come from the loose RDS5 pools (46
+  under `data/ttdb`, 11 under `pack/`) and a few embedded textures, and placement records do not carry texture
   names, only material/asset keys in the model resources (`python -I tools/texture_dicts.py <export dir>`; counts
   only).
 

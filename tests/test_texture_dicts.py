@@ -77,16 +77,85 @@ class CensusTests(unittest.TestCase):
             self.assertEqual(s["bindings"], 9)
             self.assertEqual(s["bindings_without_key"], 1)
             self.assertEqual(s["distinct_references"], 7)
-            # AA, BB, CC in pools; F01 by embedded key, F02 by embedded name; D01 and BB by dictionary name; E01 nowhere
-            self.assertEqual(s["resolution"], {"pool": 3, "embedded": 2, "dictionary": 2, "unresolved": 1})
-            self.assertEqual(s["dictionary_by_archive"], {"lv": 2})
+            # exact 64-bit: AA, BB, CC (pools) and F01 (embedded Key); name-hash candidates only: D01 (dictionary),
+            # F02 (embedded stored Hash); E01 nowhere. The partition adds up; the per-source counts overlap (BB).
+            self.assertEqual(s["resolution"], {"exact 64-bit key": 4, "32-bit name-hash candidate only": 2,
+                                               "  of which ambiguous (hash on more than one entry)": 0,
+                                               "unresolved": 1})
+            self.assertEqual(s["by_source"], {"pool key": 3, "embedded key": 1, "pool and embedded key": 0,
+                                              "embedded name hash": 1, "dictionary name hash": 2})
+            self.assertEqual(s["dictionary_candidates_by_archive"], {"lv": 2})
 
-    def test_count_mismatches_are_problems(self):
+    def test_stored_hex_name_is_compared_not_hashed_again(self):
+        # review on #4980 (whattheflop, kacper-serewis): rpf9dump writes a binding's Name as NameHash.ToString("X8")
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = os.path.join(tmp, "assets")
+            decoy = {"Index": 1, "Name": "decoy", "Hash": f"{joaat('6BACDAD2'):08X}", "Format": "BC1_UNORM", "Key": None}
+            real = {"Index": 0, "Name": "real", "Hash": "6BACDAD2", "Format": "BC1_UNORM", "Key": None}
+            dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 1, "Items": [
+                {"Offset": 16, "Textures": [real, decoy]}]})
+            dump(os.path.join(exp, "lv", "models", "manifest.json"), {"Count": 1, "Items": [
+                {"Name": "m", "Materials": [{"Textures": [{"Param": "C8E8C282", "Id64": "00000000000000A1",
+                                                           "Name": "6BACDAD2"}]}]}]})
+            r = td.census(exp)
+            s = r["references"]["lv"]
+            self.assertEqual(s["by_source"]["dictionary name hash"], 1)
+            self.assertEqual(s["resolution"]["32-bit name-hash candidate only"], 1)
+            self.assertEqual(s["resolution"]["unresolved"], 0)
+            self.assertEqual(r["material_name_hashes"], {"stored": 1})
+            # with only the decoy (whose hash is joaat of the hex text), the binding must not match
+            dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 1, "Items": [
+                {"Offset": 16, "Textures": [decoy]}]})
+            s = td.census(exp)["references"]["lv"]
+            self.assertEqual((s["by_source"]["dictionary name hash"], s["resolution"]["unresolved"]), (0, 1))
+
+    def test_a_hash_on_two_entries_is_an_ambiguous_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = os.path.join(tmp, "assets")
+            a = {"Index": 0, "Name": "one", "Hash": "11111111", "Format": "BC1_UNORM", "Key": None}
+            b = {"Index": 0, "Name": "two", "Hash": "11111111", "Format": "BC7_UNORM", "Key": None}
+            dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 2, "Items": [
+                {"Offset": 16, "Textures": [a]}, {"Offset": 4112, "Textures": [b]}]})
+            dump(os.path.join(exp, "lv", "models", "manifest.json"), {"Count": 1, "Items": [
+                {"Name": "m", "Materials": [{"Textures": [{"Id64": "00000000000000B2", "Name": "11111111"}]}]}]})
+            s = td.census(exp)["references"]["lv"]
+            self.assertEqual(s["resolution"]["32-bit name-hash candidate only"], 1)
+            self.assertEqual(s["resolution"]["  of which ambiguous (hash on more than one entry)"], 1)
+
+    def test_count_above_rows_is_coverage_rows_above_count_a_problem(self):
+        # review on #4980 (whattheflop): rpf9dump can leave out rows that failed to decode
         with tempfile.TemporaryDirectory() as tmp:
             exp = build_export(tmp)
             dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 9, "Items": [dictionary(16, ["x"])]})
             r = td.census(exp)
-            self.assertTrue(any("manifest Count 9" in p for p in r["problems"]))
+            self.assertEqual(r["problems"], [])
+            self.assertEqual(r["coverage"]["lv/textures"], {"declared": 9, "rows": 1, "missing": 8})
+            dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 0, "Items": [dictionary(16, ["x"])]})
+            r = td.census(exp)
+            self.assertTrue(any("more than the manifest Count 0" in p for p in r["problems"]))
+
+    def test_number_cut_at_a_read_boundary(self):
+        # review on #4980 (shdann): a read that ends at the e of 1e3 must not give 1
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.json")
+            for text in ('{"scale":1e3,"Items":[{}],"Count":1}', '{"scale":-1.5E-3,"Items":[{}],"Count":1}',
+                         '{"Items":[{}],"Count":1,"scale":12e+3}'):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                for chunk in range(1, len(text) + 2):
+                    gen = td.iter_items(path, chunk)
+                    while True:
+                        try:
+                            next(gen)
+                        except StopIteration as stop:
+                            self.assertEqual(stop.value, 1, (text, chunk))
+                            break
+
+    @unittest.skipUnless(os.name == "nt", "drive letters")
+    def test_other_drive_is_outside(self):
+        self.assertFalse(td.inside(r"Z:\reports\r.json", r"C:\work\assets"))
+        self.assertTrue(td.inside(r"C:\work\assets\lv\r.json", r"C:\work\assets"))
+        self.assertFalse(td.inside(r"C:\work\assets2\r.json", r"C:\work\assets"))
 
     def test_dot_named_archive_is_listed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -188,10 +257,16 @@ class CliTests(unittest.TestCase):
             self.assertIn("texture pools: 2 manifests, 3 textures", out)
             with open(report, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["references"]["total"]["distinct_references"], 7)
-            inside = os.path.join(exp, "lv", "textures", "manifest.json")
-            code, _, err = self.run_cli([exp, "--json", inside])
-            self.assertNotEqual(code, 0)
-            self.assertIn("inside the export folder", err)
+            code, _, _ = self.run_cli([exp, "--json", report])     # refreshing the same report works
+            self.assertEqual(code, 0)
+            with open(report, "rb") as f:
+                self.assertNotIn(b"\r", f.read())                   # LF only
+            for inside in (os.path.join(exp, "lv", "textures", "manifest.json"),   # existing input
+                           os.path.join(exp, "new_report.json")):                  # new path inside
+                code, _, err = self.run_cli([exp, "--json", inside])
+                self.assertNotEqual(code, 0)
+                self.assertIn("inside the export folder", err)
+            self.assertFalse(os.path.exists(os.path.join(exp, "new_report.json")))
 
     def test_output_has_no_names(self):
         with tempfile.TemporaryDirectory() as tmp:
