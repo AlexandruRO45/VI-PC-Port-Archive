@@ -10,7 +10,8 @@ writes the interpolated TEXCOORD, so the first image is the model's own UV map. 
 `--vs` and `--ps` take other names from the carve index.
 
 Usage:
-    python -I first_light.py --game "<package>" --obj <model.obj> --work <dir> [--out <dir>] [--run]
+    python -I first_light.py --game "<package>" --obj <model.obj> --work <dir> [--out <dir>] [--run [--png]]
+    python -I first_light.py --check --out <prepared-dir> [--png]
     python -I first_light.py --game "<package>" --work <dir> --list          # show VS/PS candidates
 
 The mesh file the harness reads is: u32 vertex_count, u32 index_count, vertex_count x (x,y,z,u,v) f32, then
@@ -38,9 +39,12 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 from compute_fixture import find_test_program  # noqa: E402
 
@@ -294,8 +298,6 @@ def write_mesh(path: str, vertices, indices) -> None:
 
 def decode_dds_to_rgba(path: str) -> tuple[int, int, bytes, str]:
     """Decode a DDS texture (BC1/BC3/BC7/RGBA8/etc.) via tools/dds_png.py."""
-    if TOOLS not in sys.path:
-        sys.path.insert(0, TOOLS)
     import dds_png
 
     with open(path, "rb") as f:
@@ -617,17 +619,31 @@ def check_image(data: bytes, manifest: dict) -> dict:
     return {"covered": covered, "ratio": ratio, "pixels": pixels}
 
 
-def write_ppm(path: str, pixels, width: int, height: int) -> None:
-    """Write RGB bytes, saturating infinities and rendering NaN as zero."""
-    def channel_byte(value: float) -> int:
-        return round(min(1.0, value) * 255) if value > 0.0 else 0
+def channel_byte(value: float) -> int:
+    """Clamp to UNORM8, saturating infinities and mapping NaN to zero."""
+    return round(min(1.0, value) * 255) if value > 0.0 else 0
 
+
+def write_ppm(path: str, pixels, width: int, height: int) -> None:
     with open(path, "wb") as f:
         f.write(f"P6\n{width} {height}\n255\n".encode())
         f.writelines(
             bytes(channel_byte(pixels[i + c]) for c in range(3))
             for i in range(0, len(pixels), 4)
         )
+
+
+def write_png(path: str, pixels, width: int, height: int) -> None:
+    """Use the PPM's RGB mapping and preserve alpha, including transparent black for the clear marker."""
+    from dds_png import encode_png
+
+    rgba = bytes(channel_byte(value) for value in pixels)
+    encoded = encode_png(width, height, rgba)
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(path), prefix=".first-light-") as scratch:
+        staged = os.path.join(scratch, "image.png")
+        with open(staged, "wb") as f:
+            f.write(encoded)
+        os.replace(staged, path)
 
 
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
@@ -671,6 +687,10 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
     }
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
+    if args.png:
+        png = os.path.join(out_dir, "image.png")
+        write_png(png, result["pixels"], manifest["width"], manifest["height"])
+        print(png)
     return result
 
 
@@ -758,19 +778,39 @@ def main(argv=None) -> int:
         action="store_true",
         help="run the draw and fail if the coverage is too low",
     )
+    ap.add_argument("--png", action="store_true", help="also write a validated image.png with --run or --check")
     ap.add_argument(
         "--list",
         action="store_true",
         help="list VS/PS names in the carve index and exit",
     )
     a = ap.parse_args(argv)
+    if a.png and (a.list or not (a.run or a.check)):
+        ap.error("--png requires --run or --check and cannot be used with --list")
+    if a.png and a.check and a.game:
+        ap.error("--check --png uses an existing preparation in --out and cannot be used with --game")
     work = os.path.abspath(os.path.expanduser(a.work))
     out_dir = (
         os.path.abspath(os.path.expanduser(a.out))
         if a.out
         else os.path.join(work, "first_light", "out")
     )
+    if not a.png:
+        return prepare_or_check(a, work, out_dir)
+    png = os.path.join(out_dir, "image.png")
+    try:
+        os.unlink(png)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise SystemExit(f"cannot remove the previous preview {png}: {e}") from e
+    try:
+        return prepare_or_check(a, work, out_dir)
+    except (OSError, subprocess.CalledProcessError, ValueError) as e:
+        raise SystemExit(f"first-light PNG preview in {out_dir}: {e}") from e
 
+
+def prepare_or_check(a, work: str, out_dir: str) -> int:
     if a.list:
         if not a.game:
             raise SystemExit("--list needs --game")
@@ -780,7 +820,7 @@ def main(argv=None) -> int:
                 print(f"{e['stage']} {e['name']}")
         return 0
     existing = os.path.join(out_dir, "manifest.json")
-    if a.check and not a.game and os.path.isfile(existing):
+    if a.check and not a.game and (a.png or os.path.isfile(existing)):
         manifest = load_json(existing, "first-light manifest", dict, keys=("width", "height"))
         run_draw(a, manifest, out_dir)
         return 0

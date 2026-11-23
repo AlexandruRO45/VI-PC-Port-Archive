@@ -83,6 +83,35 @@ are removed at the start of a run, so they hold that run's two shaders and nothi
 keep files there. The output folder (`first_light/out` or `--out`) and `<work>/shaders` are not emptied. If either
 folder is a symlink or a junction, or a file in it cannot be removed, the run stops and names it.
 
+### Native shader preview for the viewer
+
+Choose an OBJ with faces and UVs and a compatible translated VS/PS pair with the harness's POSITION float3
+and TEXCOORD float2 layout. The UV recipe below assumes the VS forwards clip-space position and UV and the PS
+writes `(u, v, 0, 1)`. This is a still image of one known pair on one mesh. The textured recipe in section 6 can show
+one material sample. Authored multipass effects, animated pedestrians and full-map shader replay are outside
+this preview's scope.
+
+Use the preparation command in section 3 without `--run`, or assemble a replay folder directly from a suitable
+OBJ and an existing translated pair. For the UV recipe, place the existing binaries in the folder as `vs.spv`
+and `ps.spv`. Use `read_obj`, `fit` and `write_mesh` from `tools/first_light.py` to create `mesh.bin` (skip
+the fit for positions already in NDC). In `manifest.json`, set `width`, `height`, `vertex_count`, `index_count`
+and `"files": {"mesh": "mesh.bin"}`. Set `min_coverage` and `max_coverage` for the expected geometry, and use
+`uv_at`, `clear_pixel` and `uv_probes` on the staged vertices and indices to populate `centre_uv` (at
+`[width // 2, height // 2]`), `clear_pixel` and `uv_probes` for the readback check.
+
+```sh
+python -I tools/first_light.py --check --png --out "<prepared-folder>" --harness "<vk_harness>"
+```
+
+This uses the prepared files and oracle values as supplied. On success it also writes `image.png`, with the
+same RGB bytes as the PPM and transparent background where the harness left its clear marker. A new
+`--png` invocation removes the previous PNG before starting and publishes its replacement only after the
+fresh readback passes. Add `--png` to `--run` to export during preparation and draw in one command.
+Start the local viewer with `python -I viewer/serve.py --world "<work>/world"` and open
+`http://127.0.0.1:8765/`. Use **Assets** to open the Props, Ped parts or Vehicles library and add GLBs
+or a folder. Select the model and attach `image.png`, or save it as `<model-stem>.shader.png` beside the
+GLB and select both together. **Translated Vulkan preview** displays the saved image.
+
 ## 4. The harness mode
 
 `runtime/test/vk_harness.cpp` gained two environment options, inert when unset (the existing three-vertex and
