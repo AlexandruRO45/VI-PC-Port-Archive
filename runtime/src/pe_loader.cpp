@@ -360,7 +360,9 @@ ExistingThreads& existing_threads() {
     return *state;
 }
 #ifdef LEONIDA_LOADER_TEST_HOOKS
-std::atomic<bool> g_fail_next_existing_thread_tls_record{false};
+std::atomic<uint32_t> g_fail_existing_thread_tls_record{0};
+std::atomic<uint32_t> g_failed_existing_thread_tls_index{kNoTlsIndex};
+std::atomic<void*> g_failed_existing_thread_tls_saved{nullptr};
 #endif
 struct ExistingThreadsLock {
     ExistingThreadsLock() { AcquireSRWLockExclusive(&existing_threads().lock); }
@@ -641,7 +643,12 @@ void install_on_existing_threads(Module& m) {
             }
             try {
 #ifdef LEONIDA_LOADER_TEST_HOOKS
-                if (g_fail_next_existing_thread_tls_record.exchange(false)) throw std::bad_alloc();
+                if (g_fail_existing_thread_tls_record.load() == c.id &&
+                    g_fail_existing_thread_tls_record.exchange(0) == c.id) {
+                    g_failed_existing_thread_tls_index.store(m.tls_index);
+                    g_failed_existing_thread_tls_saved.store(saved);
+                    throw std::bad_alloc();
+                }
 #endif
                 state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block});
             } catch (...) {
@@ -865,7 +872,17 @@ void redirect_pc_to_file_header_at(const void* resolved) {
 void cleanup_tls_clones() { cleanup_tls_clones_internal(); }
 
 #ifdef LEONIDA_LOADER_TEST_HOOKS
-void fail_next_existing_thread_tls_record_for_test() { g_fail_next_existing_thread_tls_record.store(true); }
+void fail_existing_thread_tls_record_for_test(uint32_t thread) {
+    g_failed_existing_thread_tls_index.store(kNoTlsIndex);
+    g_failed_existing_thread_tls_saved.store(nullptr);
+    g_fail_existing_thread_tls_record.store(thread);
+}
+
+bool failed_existing_thread_tls_record_for_test(uint32_t& index, void*& saved) {
+    index = g_failed_existing_thread_tls_index.load();
+    saved = g_failed_existing_thread_tls_saved.load();
+    return index != kNoTlsIndex && saved != nullptr;
+}
 #endif
 
 namespace {

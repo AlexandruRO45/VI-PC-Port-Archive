@@ -677,9 +677,23 @@ void test_failed_existing_thread_tls_record_rolls_back() {
     const char* what = "a failed existing-thread TLS record rolls the map back for retry";
     std::atomic<bool> ready{false};
     std::atomic<bool> stop{false};
+    std::atomic<bool> probe{false};
+    std::atomic<bool> probed{false};
+    std::atomic<DWORD> worker_id{0};
+    std::atomic<uint32_t> probe_index{rt::kNoTlsIndex};
+    std::atomic<void*> observed_slot{nullptr};
     std::thread worker([&] {
+        worker_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
         ready.store(true, std::memory_order_release);
-        while (!stop.load(std::memory_order_acquire)) Sleep(1);
+        while (!stop.load(std::memory_order_acquire)) {
+            if (probe.exchange(false, std::memory_order_acq_rel)) {
+                const uint32_t index = probe_index.load(std::memory_order_relaxed);
+                auto** slots = reinterpret_cast<void**>(__readgsqword(0x58));
+                observed_slot.store(slots && index < 64 ? slots[index] : nullptr, std::memory_order_relaxed);
+                probed.store(true, std::memory_order_release);
+            }
+            Sleep(1);
+        }
     });
     while (!ready.load(std::memory_order_acquire)) Sleep(0);
 
@@ -690,7 +704,7 @@ void test_failed_existing_thread_tls_record_rolls_back() {
     std::string why;
     try {
         rt::Loader loader(g_dir);
-        rt::fail_next_existing_thread_tls_record_for_test();
+        rt::fail_existing_thread_tls_record_for_test(worker_id.load(std::memory_order_relaxed));
         try {
             loader.load(path);
             why = "the injected record failure did not reject the first map";
@@ -702,9 +716,22 @@ void test_failed_existing_thread_tls_record_rolls_back() {
             else if (loader.find_address(preferred, module, rva))
                 why = "find_address retained the failed TLS image";
             else {
-                rt::Module& retried = loader.load(path);
-                ok = retried.tls_index != rt::kNoTlsIndex;
-                if (!ok) why = "the corrected retry did not install TLS";
+                uint32_t index = rt::kNoTlsIndex;
+                void* saved = nullptr;
+                if (!rt::failed_existing_thread_tls_record_for_test(index, saved)) {
+                    why = "the injected failure did not capture the worker's original helper slot";
+                } else {
+                    probe_index.store(index, std::memory_order_relaxed);
+                    probe.store(true, std::memory_order_release);
+                    while (!probed.load(std::memory_order_acquire)) Sleep(0);
+                    if (observed_slot.load(std::memory_order_relaxed) != saved) {
+                        why = "the worker's TLS slot still held the failed image block before retry";
+                    } else {
+                        rt::Module& retried = loader.load(path);
+                        ok = retried.tls_index != rt::kNoTlsIndex;
+                        if (!ok) why = "the corrected retry did not install TLS";
+                    }
+                }
             }
         }
     } catch (const std::exception& e) {

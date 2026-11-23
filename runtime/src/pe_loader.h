@@ -155,9 +155,11 @@ private:
 void cleanup_tls_clones();
 
 #ifdef LEONIDA_LOADER_TEST_HOOKS
-// Makes the next existing-thread TLS record fail after its block has been installed. The loader_test target alone
-// enables this, to exercise rollback at the last allocation boundary without changing production behaviour.
-void fail_next_existing_thread_tls_record_for_test();
+// Makes recording TLS for `thread` fail after its block has been installed. The loader_test target alone enables
+// this, to exercise rollback at the last allocation boundary without changing production behaviour. After it fires,
+// returns the helper slot that the failed block had replaced so the target thread can verify its own slot was restored.
+void fail_existing_thread_tls_record_for_test(uint32_t thread);
+bool failed_existing_thread_tls_record_for_test(uint32_t& index, void*& saved);
 #endif
 
 std::string lower(std::string s);
