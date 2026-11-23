@@ -44,9 +44,35 @@ should reach the driver as few calls per frame. A remap between two dispatches a
 (64 scattered pages; 0.012 ms without one), and returned on the CPU in 0.1 ms while the first dispatch was still
 running: the bind waits on the GPU, not on the CPU.
 
+## Physical pages on the CPU
+
+On the console a physical page is one piece of memory that the CPU and GPU both address. Here the GPU side must be
+device-local, so `runtime/src/xbox_physical.h` gives each physical page two halves and keeps them coherent:
+
+- **CPU half** (`PhysicalPageStore`): a 64 KiB slot of one pagefile-backed section, committed when the page is
+  allocated. Views of it are placed at the title's VAs over placeholder reservations (`VirtualAlloc2` with
+  `MEM_RESERVE_PLACEHOLDER`, then `MapViewOfFile3` with `MEM_REPLACE_PLACEHOLDER`), so one page can be mapped at
+  several VAs, as the console allows. A slot is split out of its reservation's placeholder only when it is first
+  mapped; a slot whose neighbours were split already is a placeholder of its own and is not split again.
+- **GPU half** (`PhysicalGpu`): a `PagePool` page, allocated when the page is first uploaded or bound.
+- **CPU to GPU**: clean pages are read-only in every view. The first write faults, a vectored exception handler marks
+  the page dirty and makes that view writable, and the write resumes. `take_dirty()` lists the dirty pages and
+  write-protects them again; `record_upload` copies them into their GPU halves ahead of the title's commands on the
+  same queue.
+- **GPU to CPU**: only on request (readbacks, query results), with `record_readback` then `finish_readback`.
+
+`runtime/test/vk_xbox_physical_test.cpp` (Windows only) checks a page mapped at two VAs, CPU writes read back through
+the arena after one upload, and a GPU fill read through a CPU view. Measured on the GTX 1660 SUPER (median of 8): the
+first write to a clean page costs 3.5 µs (fault and unprotect), `take_dirty` of 256 pages 0.24 ms, and an upload of
+256 dirty pages (16 MiB: copy to staging, GPU copy, wait) 9.3 ms, about 1.8 GB/s (8.0 to 10.6 ms over the runs).
+
+The staging buffer is used from offset 0 by every record call, so a command buffer holds one upload or readback,
+and it completes before the next one is recorded. A ring per frame in flight lifts that once the device proxy drives
+it.
+
 ## Not done
 
 - Wiring into `d3d12_xs_device` once the slots are measured from a real run.
-- The CPU side of physical pages: on the console the CPU and GPU see the same page; here CPU writes need a host copy
-  uploaded before the GPU reads the page.
+- Wiring `xbox_physical.h` to `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages[Scatter]` once a call site shows
+  their arguments.
 - The `XALLOC_ATTRIBUTES` layout that tells `XMemAlloc` to hand out physical pages is not public.

@@ -1074,6 +1074,20 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_xbox_paging COMMAND vk_xbox_paging_test)
     set_tests_properties(vk_xbox_paging PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # Xbox physical pages (src/xbox_physical.h): CPU halves on placeholders, write-fault dirty tracking, uploads and
+  # readbacks against the GPU halves. Windows only (VirtualAlloc2/MapViewOfFile3).
+  if(WIN32)
+    add_executable(vk_xbox_physical_test test/vk_xbox_physical_test.cpp)
+    target_link_libraries(vk_xbox_physical_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_compile_definitions(vk_xbox_physical_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(vk_xbox_physical_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    if(BUILD_TESTING)
+      add_test(NAME vk_xbox_physical COMMAND vk_xbox_physical_test)
+      set_tests_properties(vk_xbox_physical PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+  endif()
   # With LEONIDA_VK_VALIDATION=1: synchronization validation reports a missing barrier (and not a present one), so
   # the other GPU tests' "0 validation errors" was checked by an active layer. 77 without validation or a device.
   add_executable(vk_sync_validation_selftest test/vk_sync_validation_selftest.cpp)
