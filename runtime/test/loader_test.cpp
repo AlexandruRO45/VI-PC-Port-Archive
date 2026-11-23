@@ -1296,9 +1296,28 @@ void test_packaged_loader_directories() {
     auto overlay = g_dir / L"dll_overlay";
     std::filesystem::create_directories(game / L"x");
     rt::fs::configure(game, overlay);
+    // The host loader searches user directories only when explicitly requested. Give it a
+    // hand-built DLL that exists only in the directory resolved from the console path.
+    auto fixture = make_image();
+    auto* fixture_nt = nt_of(fixture);
+    fixture_nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL;
+    fixture_nt->OptionalHeader.AddressOfEntryPoint = 0;
+    fixture_nt->OptionalHeader.SectionAlignment = 0x1000;
+    fixture_nt->OptionalHeader.FileAlignment = 0x200;
+    auto fixture_path = game / L"x" / L"leonida_directory_fixture.dll";
+    std::ofstream fixture_out(fixture_path, std::ios::binary);
+    fixture_out.write(reinterpret_cast<const char*>(fixture.data()), static_cast<std::streamsize>(fixture.size()));
+    fixture_out.close();
     auto cookie = add(L"GAME:\\x");
+    HMODULE found = LoadLibraryExW(L"leonida_directory_fixture.dll", nullptr, LOAD_LIBRARY_SEARCH_USER_DIRS);
+    if (cookie && found) pass("console DLL directory makes fixture searchable");
+    else failed("console DLL directory makes fixture searchable", "registration or load failed");
+    if (found) FreeLibrary(found);
     if (cookie && remove(cookie) && !remove(cookie)) pass("console DLL directory round trip");
     else failed("console DLL directory round trip", "add or remove failed");
+    HMODULE removed = LoadLibraryExW(L"leonida_directory_fixture.dll", nullptr, LOAD_LIBRARY_SEARCH_USER_DIRS);
+    if (!removed) pass("removed console DLL directory is no longer searchable");
+    else { failed("removed console DLL directory is no longer searchable", "fixture still loaded"); FreeLibrary(removed); }
     cookie = add(game.c_str());
     if (cookie && remove(cookie)) pass("host DLL directory round trip");
     else failed("host DLL directory round trip", "add or remove failed");
