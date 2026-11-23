@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -934,6 +935,17 @@ class JsonDepthTest(unittest.TestCase):
             value = [value]
         self.assertEqual(saves.json_depth(value), 100_000)   # measured without recursion
 
+    def test_json_depth_storage_follows_the_depth_not_the_width(self):
+        # shdann's measurement on #5240: queueing every child took 7 MB for 100,000 empty arrays at depth 2.
+        value = json.loads("[" + ",".join(["[]"] * 100_000) + "]")
+        tracemalloc.start()
+        try:
+            self.assertEqual(saves.json_depth(value), 2)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 64 * 1024)
+
     def test_body_at_the_limit_is_read_and_extracted(self):
         data = jsav_nested(saves.MAX_JSON_DEPTH)
         self.assertEqual(jsav_body_depth(data), saves.MAX_JSON_DEPTH)
@@ -979,6 +991,22 @@ class JsonDepthTest(unittest.TestCase):
                 self.assertNotIn("Traceback", result.stderr)
                 self.assertIn("payload looks like text but did not parse as JSON", result.stdout)
                 self.assertEqual(rd(os.path.join(out, "payload.bin")), payload)
+                self.assertFalse(os.path.exists(os.path.join(out, "payload.json")))
+
+    def test_a_later_extract_leaves_no_stale_payload_json(self):
+        # shdann on #5240: extracting into a folder that holds an earlier payload.json kept that file next to the
+        # new payload.bin. A payload that isn't written as JSON (too deep, not JSON, not text) removes it.
+        deep = b'{"a":' + b"[" * saves.MAX_JSON_DEPTH + b"0" + b"]" * saves.MAX_JSON_DEPTH + b"}"
+        for second in (deep, b'{"broken": ', b"\x0a\x00\x00\x00"):
+            with self.subTest(second=second[:12]), tempfile.TemporaryDirectory() as tmp:
+                source, out = os.path.join(tmp, "input.asav"), os.path.join(tmp, "x")
+                write(source, make_asav(kind=2, payload=b'{"revision": 1}'))
+                self.assertEqual(self.run_tool("extract", source, out).returncode, 0)
+                self.assertEqual(rd_json(os.path.join(out, "payload.json")), {"revision": 1})
+                write(source, make_asav(kind=2, payload=second))
+                result = self.run_tool("extract", source, out)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(rd(os.path.join(out, "payload.bin")), second)
                 self.assertFalse(os.path.exists(os.path.join(out, "payload.json")))
 
     def test_asav_payload_at_the_limit_is_written_as_json(self):

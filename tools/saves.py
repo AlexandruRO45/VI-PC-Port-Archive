@@ -45,11 +45,16 @@ def json_depth(value):
     recursion, so it can measure any document the decoder accepted."""
     if not isinstance(value, (list, dict)):
         return 0
-    deepest, stack = 0, [(value, 1)]
+    # One child iterator per open level: the storage follows the depth, not how many children a level has.
+    deepest, stack = 1, [iter(value.values() if isinstance(value, dict) else value)]
     while stack:
-        v, depth = stack.pop()
-        deepest = max(deepest, depth)
-        stack.extend((c, depth + 1) for c in (v.values() if isinstance(v, dict) else v) if isinstance(c, (list, dict)))
+        for child in stack[-1]:
+            if isinstance(child, (list, dict)):
+                stack.append(iter(child.values() if isinstance(child, dict) else child))
+                deepest = max(deepest, len(stack))
+                break
+        else:
+            stack.pop()
     return deepest
 
 # ---------------------------------------------------------------------------------------------- ASAV
@@ -366,13 +371,16 @@ def extract(p, out):
             f.write(d[:h['payload_offset']])
         with open(os.path.join(out, 'payload.bin'), 'wb') as f:
             f.write(pl)
+        pretty = os.path.join(out, 'payload.json')
+        written = False
         if pl[:1] == b'{':
             try:
                 obj = json.loads(pl.rstrip(b'\0').decode('utf-8'))
                 if (depth := json_depth(obj)) > MAX_JSON_DEPTH:
                     raise ValueError(f'it nests {depth} levels deep, more than the {MAX_JSON_DEPTH} this tool reads')
-                with open(os.path.join(out, 'payload.json'), 'w', encoding='utf-8', newline="\n") as f:
+                with open(pretty, 'w', encoding='utf-8', newline="\n") as f:
                     json.dump(obj, f, indent=1)
+                written = True
             except (ValueError, RecursionError) as ex:   # RecursionError: 3.12's decoder past its own depth
                 print('payload looks like text but did not parse as JSON:', ex)
         elif h['kind'] == 3 and len(pl) >= 8:
@@ -382,6 +390,12 @@ def extract(p, out):
                     json.dump(prof, f, indent=1)
             except ValueError as ex:
                 print('profile payload did not parse:', ex)
+        if not written:
+            # A payload.json left by an earlier extract into this folder describes another payload than payload.bin.
+            try:
+                os.remove(pretty)
+            except FileNotFoundError:
+                pass
         print(f'ASAV kind {h["kind"]} ({h["slot_name"]}) -> {out}')
     else:
         sys.exit(f'{p}: extract supports JSAV and ASAV')
