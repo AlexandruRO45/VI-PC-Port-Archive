@@ -137,6 +137,23 @@ class Kind0AndCode(unittest.TestCase):
 
     def test_short_kind0_keeps_the_words(self):
         self.assertEqual(fspx_unpack.decode_kind0(struct.pack("<2I", 1, 2)), {"words": [1, 2]})
+        # Four words: word 4 is missing, so neither the group size nor the wave size is known (docs/fspx.md).
+        self.assertEqual(fspx_unpack.decode_kind0(kind0()[:16]), {"words": list(struct.unpack("<4I", kind0()[:16]))})
+
+    def test_kind0_with_word_4_has_threads_and_wave_size(self):
+        """Words 3 and 4 hold the group size and the wave size, so a 20- to 27-byte kind 0 still gives both; RSRC1,
+        RSRC2 and what is read from them need words 5 and 6."""
+        full = kind0(threads=(32, 2, 1), wave32=True)
+        for size in (20, 24, 27):
+            with self.subTest(size=size):
+                m = fspx_unpack.decode_kind0(full[:size])
+                self.assertEqual(m["words"], list(struct.unpack_from(f"<{size // 4}I", full)))
+                self.assertEqual(m["threads"], [32, 2, 1])
+                self.assertIs(m["wave32"], True)
+                for key in ("rsrc1", "rsrc2", "vgprs", "user_sgprs", "tgid_enable", "tidig_comp_cnt", "lds_bytes"):
+                    self.assertNotIn(key, m)
+        self.assertIs(fspx_unpack.decode_kind0(kind0(wave32=False)[:20])["wave32"], False)
+        self.assertEqual(fspx_unpack.decode_kind0(full + b"\xff" * 4)["words"], list(struct.unpack("<7I", full)))
 
     def test_code_range(self):
         code = program()
@@ -322,6 +339,30 @@ class Cli(unittest.TestCase):
             with open(os.path.join(out, "fspx", "short.json"), encoding="utf-8") as f:
                 meta = json.load(f)
             self.assertEqual(meta["words"], [1, 2])
+
+    def test_kind0_without_rsrc_words_keeps_threads_and_wave_size(self):
+        """A 20-byte kind 0 ends after word 4: index.json and fspx/<name>.json still carry the group size and the
+        wave size, and the translator takes the wave size from it instead of guessing from the code."""
+        import rdna2spirv
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "five.fspx")
+            with open(src, "wb") as f:
+                f.write(make_fspx([(0, kind0(threads=(32, 1, 1), wave32=True)[:20]), (6, program())]))
+            out = os.path.join(t, "out")
+            code, _, err = self.run_tool(src, "--out", out)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual(index[0]["threads"], [32, 1, 1])
+            self.assertIs(index[0]["wave32"], True)
+            with open(os.path.join(out, "fspx", "five.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+            self.assertEqual(meta["threads"], [32, 1, 1])
+            self.assertIs(meta["wave32"], True)
+            self.assertNotIn("rsrc2", meta)
+            listing = os.path.join(out, "disasm", "five.s")
+            self.assertEqual(rdna2spirv.fspx_wave_size(listing, "five"), 32)
 
     @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
     def test_locked_input_is_counted_as_failed(self):

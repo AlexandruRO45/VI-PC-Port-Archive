@@ -120,16 +120,25 @@ def find_containers(data: bytes):
 
 def decode_kind0(b: bytes) -> dict:
     """The kind-0 words and the fields docs/fspx.md describes. `threads` is measured against PSV0; the rest is the
-    reading that fits the code (wave size, RSRC1/RSRC2), see docs/fspx.md for how far each one was checked."""
-    w = struct.unpack_from("<7I", b) if len(b) >= 28 else ()
-    if not w:
-        return {"words": list(struct.unpack_from(f"<{len(b) // 4}I", b))}
-    rsrc1, rsrc2 = w[5], w[6]
+    reading that fits the code (wave size, RSRC1/RSRC2), see docs/fspx.md for how far each one was checked.
+
+    The thread-group size and the wave size are words 3 and 4, so a kind 0 of 20 to 27 bytes still has them; only one
+    too short for word 4 leaves the wave size to the code (docs/fspx.md). RSRC1, RSRC2 and the fields read from them
+    need all seven words."""
+    w = struct.unpack_from(f"<{min(len(b) // 4, 7)}I", b)
+    if len(w) < 5:
+        return {"words": list(w)}
     wave32 = bool((w[4] >> 20) & 1)
-    return {
+    state = {
         "words": list(w),
         "threads": [w[3] & 0xFFFF, w[3] >> 16, w[4] & 0xFFFF],
         "wave32": wave32,
+    }
+    if len(w) < 7:
+        return state
+    rsrc1, rsrc2 = w[5], w[6]
+    return {
+        **state,
         "rsrc1": rsrc1,
         "rsrc2": rsrc2,
         "vgprs": ((rsrc1 & 63) + 1) * (8 if wave32 else 4),
