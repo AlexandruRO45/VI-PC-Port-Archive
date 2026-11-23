@@ -18,14 +18,16 @@ constexpr unsigned max_params = 32;
 using LocationWords = std::array<std::size_t, max_params>;
 
 // Find direct Location literals on the entry point's ordinary per-vertex float vec4 parameters.
-// The mesh has arrays of vec4, the fragment has individual vec4s. Built-ins have no Location.
+// The mesh has arrays of vec4. A fragment reads a vec4 directly or indexes one per triangle vertex
+// (PerVertexKHR). Both address one varying location. Built-ins have no Location.
 inline bool locations(std::span<const std::uint32_t> words, bool mesh, LocationWords& result) {
     using namespace spirv_detail;
-    constexpr unsigned mesh_ext = 5365, op_type_array = 28;
+    constexpr unsigned mesh_ext = 5365, op_type_array = 28, op_constant = 43;
     constexpr unsigned component = 31, index = 32, per_primitive = 5271, per_vertex = 5285;
     if (words.size() < 5 || words[0] != kSpirvMagic) return false;
     const unsigned storage = mesh ? kStorageOutput : kStorageInput;
     std::set<unsigned> interfaces, floats, vectors, arrays, pointers, unsupported;
+    std::set<unsigned> threes, triangle_arrays, triangle_pointers, vertex_indexed;
     std::map<unsigned, std::size_t> decorations;
     bool entry = false;
     for (std::size_t at = 5; at < words.size();) {
@@ -46,7 +48,9 @@ inline bool locations(std::span<const std::uint32_t> words, bool mesh, LocationW
             if (size < 3) return false;
             if (ins[2] == kDecorationLocation) {
                 if (size != 4 || !decorations.emplace(ins[1], at + 3).second) return false;
-            } else if (ins[2] == per_primitive || ins[2] == per_vertex || ins[2] == component || ins[2] == index) {
+            } else if (ins[2] == per_vertex) {
+                vertex_indexed.insert(ins[1]);
+            } else if (ins[2] == per_primitive || ins[2] == component || ins[2] == index) {
                 unsupported.insert(ins[1]);
             }
             break;
@@ -61,11 +65,20 @@ inline bool locations(std::span<const std::uint32_t> words, bool mesh, LocationW
         case kOpTypeVector:
             if (size == 4 && floats.contains(ins[2]) && ins[3] == 4) vectors.insert(ins[1]);
             break;
+        case op_constant:
+            if (size == 4 && ins[3] == 3) threes.insert(ins[2]);
+            break;
         case op_type_array:
-            if (size == 4 && vectors.contains(ins[2])) arrays.insert(ins[1]);
+            if (size == 4 && vectors.contains(ins[2])) {
+                arrays.insert(ins[1]);
+                if (threes.contains(ins[3])) triangle_arrays.insert(ins[1]);
+            }
             break;
         case kOpTypePointer:
-            if (size == 4 && ins[2] == storage && (mesh ? arrays : vectors).contains(ins[3])) pointers.insert(ins[1]);
+            if (size == 4 && ins[2] == storage) {
+                if ((mesh ? arrays : vectors).contains(ins[3])) pointers.insert(ins[1]);
+                if (!mesh && triangle_arrays.contains(ins[3])) triangle_pointers.insert(ins[1]);
+            }
             break;
         case kOpVariable:
             if (size < 4) return false;
@@ -73,7 +86,8 @@ inline bool locations(std::span<const std::uint32_t> words, bool mesh, LocationW
                 const auto d = decorations.find(ins[2]);
                 if (d == decorations.end()) break;
                 const auto slot = words[d->second];
-                if (slot >= result.size() || result[slot] || !pointers.contains(ins[1]) ||
+                const auto& types = vertex_indexed.contains(ins[2]) ? triangle_pointers : pointers;
+                if (slot >= result.size() || result[slot] || !types.contains(ins[1]) ||
                     unsupported.contains(ins[2])) return false;
                 result[slot] = d->second;
             }

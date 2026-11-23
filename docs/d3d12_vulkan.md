@@ -1715,7 +1715,8 @@ The trace will enumerate them.
 - For an ordinary native mesh/fragment pair the submitted FSSM tables identify which mesh export feeds each dense
   fragment input. Each 6-byte mesh row at `0x1dc` (count at `0x29c`) gives a semantic key and export number.
   Each 8-byte fragment row at `0x138` gives the key, ordinal and one-based export. When both tables and the
-  standalone per-vertex SPIR-V `vec4` declarations agree, the PSO sets the fragment input locations on its own
+  SPIR-V declarations agree (standalone `vec4` values, including fragment `PerVertexKHR` triangle arrays),
+  the PSO sets the fragment input locations on its own
   copy before creating the module. Other pipelines can reuse the original fragment shader. Unrecognized sparse
   interfaces keep the existing locations and produce a diagnostic.
 - **`DispatchMesh`:** recorded as a `Draw` with `mesh` set; the thread-group counts go in `count`/`instances`/`first`.
