@@ -384,8 +384,16 @@ def main(argv):
     asm = os.environ.get("SPIRV_AS", "spirv-as")
     # The disassembly is assembly source that goes back to spirv-as (OpEntryPoint and OpName strings are UTF-8 in
     # SPIR-V), so both legs are UTF-8 and strict: a byte that doesn't decode is an error, not a silent replacement.
-    text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True, encoding="utf-8",
-                          errors="strict").stdout
+    # spirv-dis is read as bytes and its stdout decoded here: in text mode CPython decodes on the reader threads, where
+    # a stray byte in stderr (a warning in the console code page) loses that stream and one in stdout leaves None.
+    dis_run = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True)
+    try:
+        text = dis_run.stdout.decode("utf-8")
+    except UnicodeDecodeError as e:
+        warning = dis_run.stderr.decode("utf-8", errors="replace").strip()
+        print(f"{args[0]}: spirv-dis output is not UTF-8 ({e})" + (f"; spirv-dis said: {warning}" if warning else ""),
+              file=sys.stderr)
+        return 2
     ver = re.search(r"; Version: (\d+)\.(\d+)", text)
     version = (int(ver[1]), int(ver[2])) if ver else (1, 5)
     try:

@@ -380,3 +380,28 @@ def test_entry_debug_lines_keep_locals_before_capture_setup(tmp_path: Path, befo
 
     assert lowered.index("%first = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
     assert lowered.index("%second = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
+
+
+def test_cli_reports_disassembly_that_is_not_utf8(tmp_path: Path) -> None:
+    # A stand-in spirv-dis: stdout is not UTF-8 and stderr is a warning in a console code page (CP936 "警告").
+    # The tool reads both as bytes and decodes stdout itself, so it exits 2 with one message, not a traceback.
+    fake = tmp_path / "fake_dis.py"
+    fake.write_text(r'''import sys
+sys.stdout.buffer.write(b'; Version: 1.0\n\xff\xfe OpName')
+sys.stderr.buffer.write(b'\xbe\xaf\xb8\xe6')
+''', encoding="utf-8")
+    if os.name == "nt":
+        launcher = tmp_path / "fake_dis.cmd"
+        launcher.write_text(f'@"{sys.executable}" -I "{fake}" %*\n', encoding="utf-8")
+    else:
+        launcher = tmp_path / "fake_dis"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I "{fake}" "$@"\n', encoding="utf-8")
+        launcher.chmod(0o755)
+    source = tmp_path / "gs.spv"
+    source.write_bytes(b"\x03\x02\x23\x07")
+    tool = os.path.join(ROOT, "tools", "spirv_gs_to_compute.py")
+    result = subprocess.run([sys.executable, "-I", tool, str(source), str(tmp_path / "cs.spv")], capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", env=dict(os.environ, SPIRV_DIS=str(launcher)))
+    assert result.returncode == 2, result.stderr
+    assert "spirv-dis output is not UTF-8" in result.stderr
+    assert "Traceback" not in result.stderr
