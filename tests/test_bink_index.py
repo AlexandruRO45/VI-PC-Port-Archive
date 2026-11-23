@@ -408,7 +408,10 @@ class TestCommandLine(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(bink.main([path, "--out", out]), 2)
-        self.assertIn("not a Bink 2 stream or an RPF archive", err.getvalue())
+        # A junk first-four-bytes file is refused by target_problem(), whose one-line reason
+        # names the expected KB2 magic; the other wording is only for a file whose header
+        # looked right but yielded no streams.
+        self.assertIn("not a Bink 2 stream (KB2) or an RPF archive", err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
