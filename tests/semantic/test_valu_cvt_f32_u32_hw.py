@@ -141,5 +141,42 @@ class TestVCvtF32U32AST(unittest.TestCase):
             inst.dst = Operand(RegType.VGPR, 2)  # type: ignore
 
 
+class ScalarMachine:
+    def __init__(self):
+        self.vgprs: dict[int, int] = {i: 0 for i in range(256)}
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs.get(op.index, 0)
+        return op.val & MASK32
+
+    def write_vgpr(self, op: Operand, val: int):
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[op.index] = val & MASK32
+
+    def step(self, inst: VCvtF32U32Inst):
+        s0 = self.read_operand(inst.src0)
+        res = ref_cvt_f32_u32(s0)
+        self.write_vgpr(inst.dst, res)
+
+
+class TestVCvtF32U32ScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar instruction interpreter."""
+
+    def test_scalar_conversion_pipeline(self):
+        mach = ScalarMachine()
+        mach.vgprs[1] = 42
+        inst = VCvtF32U32Inst(Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 1))
+        mach.step(inst)
+        self.assertEqual(mach.vgprs[0], ref_cvt_f32_u32(42))
+
+    def test_scalar_max_u32_conversion(self):
+        mach = ScalarMachine()
+        mach.vgprs[5] = 0xFFFFFFFF
+        inst = VCvtF32U32Inst(Operand(RegType.VGPR, 4), Operand(RegType.VGPR, 5))
+        mach.step(inst)
+        self.assertEqual(mach.vgprs[4], 0x4F800000)
+
+
 if __name__ == '__main__':
     unittest.main()
