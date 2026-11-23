@@ -596,6 +596,13 @@ of that same archive path, resource offset, drawable offset and name. If N is ab
 candidates remain. Distinct sources still compete. Placement `--lod-levels` filters map entities
 by streaming tier independently of this preference.
 
+Add `--report-model-lod` to publish `stats.placements.geometry_lod` in the built
+`world.json`. Its `placed_by_lod` histogram counts successfully placed instances by
+source manifest LOD. Legacy manifests without `Lod` count as 0. An invalid value counts
+as `unknown`. With an explicit `requested` preference, `preferred` counts placements at
+that level and `fallback` counts placements at another known level. Without a preference,
+`requested` is null. Unresolved ties stay in `stats.placements.ambiguous_model`.
+
 On a private CPU-only `--lod-sets --no-textures` run, one export placed 1,488 of 75,551 rows. Adding two
 windows with no complementary matches gave the same count. Adding a complementary export and its repeat
 placed 1,663 rows using 1,501 distinct models (+175 placements, +63 models). The other 73,888 rows had

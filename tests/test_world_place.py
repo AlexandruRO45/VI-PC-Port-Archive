@@ -313,6 +313,18 @@ class PlacedBuildTest(unittest.TestCase):
                             stats = doc["stats"]["placements"]
                             self.assertEqual((stats["placed"], stats["ambiguous_model"], stats["key_mismatch"]),
                                              (placed, 4 - placed, 1))
+                            self.assertNotIn("geometry_lod", stats)
+                            self.assertEqual(world_build.main(args + ["--report-model-lod"]), 0)
+                            reported = json.loads((out / "world.json").read_text())
+                            summary = reported["stats"]["placements"].pop("geometry_lod")
+                            self.assertEqual(reported, doc)
+                            histogram = {"0": 1 + int(lod == 0), "1": int(lod == 1),
+                                         "2": 0, "3": 0, "unknown": 0}
+                            expected = {"requested": lod, "placed_by_lod": histogram}
+                            if lod is not None:
+                                hits = histogram[str(lod)]
+                                expected.update(preferred=hits, fallback=placed - hits)
+                            self.assertEqual(summary, expected)
 
     def test_counts_and_bounds(self):
         rows = [

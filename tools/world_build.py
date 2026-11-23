@@ -567,9 +567,26 @@ def _run_jobs(fn, jobs, workers: int):
             raise
 
 
+class _GeometryLodReport:
+    def __init__(self, preference):
+        self.preference = preference
+        self.placed = {key: 0 for key in ("0", "1", "2", "3", "unknown")}
+
+    def add_placement(self, lod):
+        self.placed[str(lod) if lod >= 0 else "unknown"] += 1
+
+    def summary(self):
+        result = {"requested": self.preference, "placed_by_lod": self.placed}
+        if self.preference is not None:
+            hits = self.placed[str(self.preference)]
+            result["preferred"] = hits
+            result["fallback"] = sum(self.placed.values()) - hits - self.placed["unknown"]
+        return result
+
+
 def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, region, out_dir, chunk_size,
                            textures, max_tex_size, base_color_param, workers, mode, glb_mod, limit,
-                           lod_sets=False) -> dict:
+                           lod_sets=False, lod_report=None) -> dict:
     """``build_world --placements`` with shared geometry: memory holds about 100 bytes per placement plus the
     models of the chunk being written, not a copy of every placed model."""
     counts = _placement_counts()
@@ -579,6 +596,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
     index = model_name_index(entries, _get_world_names())
     model_ids: dict[tuple[str, str], int] = {}
     model_src: list[tuple[str, dict]] = []
+    geometry_lods = array.array("b")
     inst_model = array.array("l")
     inst_flags = array.array("b")          # bit 0 mirrored, bit 1 unverified
     inst_trs = array.array("d")            # 10 per instance: translation xyz, rotation xyzw, scale xyz
@@ -606,6 +624,8 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
         if mid is None:
             mid = model_ids[ck] = len(model_src)
             model_src.append(found)
+        if lod_report is not None:
+            geometry_lods.append(item["_geometry_lod"])
         inst_model.append(mid)
         inst_flags.append((1 if mirrored else 0) | (2 if outcome == "placed_unverified" else 0))
         inst_trs.extend(t + q + sc)
@@ -639,6 +659,8 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
                 counts["model_not_loadable"] += 1
                 continue
             counts["placed_unverified" if inst_flags[i] & 2 else "placed"] += 1
+            if lod_report is not None:
+                lod_report.add_placement(geometry_lods[i])
             counts["mirrored"] += inst_flags[i] & 1
             box = summary["box"]
             if inst_flags[i] & 1:
@@ -650,6 +672,8 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
             cells.setdefault(key, array.array("l")).append(i)
         used = {inst_model[i] for arr in cells.values() for i in arr}
         counts["distinct_models"] = len(used)
+        if lod_report is not None:
+            counts["geometry_lod"] = lod_report.summary()
         if not cells and limit != 0:
             raise ValueError(f"No entity in {placements} could be placed ({counts}); output left unchanged")
 
@@ -1440,6 +1464,7 @@ def build_world(
     base_color_param: str | None = None,
     extra_assets=(),
     prefer_model_lod: int | None = None,
+    report_model_lod: bool = False,
     placements: str | None = None,
     lod_levels=DEFAULT_LOD_LEVELS,
     region=None,
@@ -1507,6 +1532,9 @@ def build_world(
     if prefer_model_lod is not None:
         if placements is None or type(prefer_model_lod) is not int or prefer_model_lod not in range(4):
             raise ValueError("--prefer-model-lod requires --placements and a geometry LOD in 0..3")
+    if report_model_lod and placements is None:
+        raise ValueError("--report-model-lod requires --placements")
+    lod_report = _GeometryLodReport(prefer_model_lod) if report_model_lod else None
     if extra_assets and placements is None:
         raise ValueError("--extra-assets requires --placements")
     manifests = discover_model_manifests(assets_dir)
@@ -1540,6 +1568,8 @@ def build_world(
         for item in items:
             if not isinstance(item, dict):
                 continue
+            if lod_report is not None:
+                item["_geometry_lod"] = lod if type(lod) is int and lod in range(4) else -1
             identity = _drawable_source(source, lod, item) if source is not None else None
             if identity is not None:
                 previous = source_entries.get(identity)
@@ -1576,7 +1606,7 @@ def build_world(
             entries, ttpf_index, placements=placements, lod_levels=lod_levels, region=region, out_dir=out_dir,
             chunk_size=chunk_size, textures=textures, max_tex_size=max_tex_size,
             base_color_param=base_color_param, workers=workers, mode=instancing, glb_mod=glb_mod, limit=limit,
-            lod_sets=lod_sets,
+            lod_sets=lod_sets, lod_report=lod_report,
         )
 
     def load_model(models_dir: str, item: dict, axis: str) -> dict | None:
@@ -1639,6 +1669,10 @@ def build_world(
             loaded_models.append({"prims": prims, "bounds": bounds, "mat_to_dds": model["mat_to_dds"]})
             placement_stats[outcome] += 1
             used.add(ck)
+            if lod_report is not None:
+                lod_report.add_placement(item["_geometry_lod"])
+        if lod_report is not None:
+            placement_stats["geometry_lod"] = lod_report.summary()
         placement_stats["distinct_models"] = len(used)
 
     if not loaded_models and limit != 0 and placements is not None:
@@ -1898,6 +1932,8 @@ def main(argv: list[str] | None = None) -> int:
         "assets_dir",
         help="Path to a models/ dir, an archive dir, or a full <work>\\assets tree.",
     )
+    ap.add_argument("--report-model-lod", action="store_true",
+                    help="Include aggregate geometry LOD counts for successful placements in world.json.")
     ap.add_argument("--prefer-model-lod", type=int, choices=range(4),
                     help="Prefer this cached geometry LOD among variants of the same placement model.")
     ap.add_argument("--extra-assets", action="append", default=[], metavar="ROOT",
@@ -2018,7 +2054,7 @@ def main(argv: list[str] | None = None) -> int:
             base_color_param=args.base_color_param,
             placements=args.placements,
             extra_assets=args.extra_assets,
-            prefer_model_lod=args.prefer_model_lod,
+            prefer_model_lod=args.prefer_model_lod, report_model_lod=args.report_model_lod,
             lod_levels=lod_levels,
             region=args.region,
             instancing=args.instancing,
