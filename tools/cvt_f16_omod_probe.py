@@ -14,6 +14,10 @@ Usage:
 Exit 0 when all hardware results match the model across requested modes (with wave32 and wave64 agreeing bit-for-bit),
 1 on a model mismatch or wave32/wave64 difference, 2 on a harness/CLI error, and 77 when the hardware oracle is
 unavailable or the GPU is not GFX10. Nothing here reads game files.
+
+A --json path is checked before the hardware oracle is opened: an empty path, a NUL byte, a directory, or a parent
+component that is not a directory is one ERROR line on stderr and exit 2. Missing parent folders are created when the
+report is written; a report that cannot be written is one ERROR line and exit 2 as well.
 """
 import argparse
 import json
