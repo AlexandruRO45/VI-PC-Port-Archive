@@ -67,9 +67,12 @@ Usage:
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 """
 import argparse
+import array
+import itertools
 import json
 import math
 import mmap
+import operator
 import os
 import re
 import struct
@@ -185,13 +188,16 @@ def positions_4240(data, block):
     scale = struct.unpack_from("<3f", data, at + 0x70)
     if axis > 2:
         raise PageError(f"42 40 block at +0x{at:x}: axis word {axis} is not 0, 1 or 2")
-    out = []
-    for (q,) in struct.iter_unpack("<Q", data[at + slots[0][1]:at + slots[0][1] + 8 * n]):
-        a = bias[0] + scale[0] * ((q >> 8) & 0xFFFFFF)
-        b = bias[1] + scale[1] * (((q >> 32) & 0xFFFF) << 8 | (q & 0xFF))
-        c = bias[2] + scale[2] * (q >> 48)
-        out.append((c, b, a) if axis == 0 else (b, c, a) if axis == 1 else (a, b, c))
-    return out
+    b0, b1, b2 = bias
+    s0, s1, s2 = scale
+    # q is read as a u32 (low) and two u16 (middle, high), which keeps every shift inside one machine word:
+    # a = q >> 8 & 0xFFFFFF = low >> 8, b = (q >> 32 & 0xFFFF) << 8 | q & 0xFF, c = q >> 48.
+    packed = struct.iter_unpack("<IHH", data[at + slots[0][1]:at + slots[0][1] + 8 * n])
+    if axis == 0:
+        return [(b2 + s2 * hi, b1 + s1 * (mid << 8 | low & 0xFF), b0 + s0 * (low >> 8)) for low, mid, hi in packed]
+    if axis == 1:
+        return [(b1 + s1 * (mid << 8 | low & 0xFF), b2 + s2 * hi, b0 + s0 * (low >> 8)) for low, mid, hi in packed]
+    return [(b0 + s0 * (low >> 8), b1 + s1 * (mid << 8 | low & 0xFF), b2 + s2 * hi) for low, mid, hi in packed]
 
 
 def group_triangles(data, group):
@@ -208,29 +214,49 @@ def face_agreement(positions, triangles):
     """Count edges shared by exactly two triangles, and how many of those pairs have face normals within ~25 degrees
     (dot > 0.9) or opposed (dot < -0.9). A wrong position decode scatters the normals; a right one leaves most
     neighbours agreeing and almost none opposed."""
+    count = len(positions)
+    sqrt, isfinite = math.sqrt, math.isfinite
     normals = []
     for a, b, c in triangles:
-        if max(a, b, c) >= len(positions):
+        if a >= count or b >= count or c >= count:
             raise PageError("triangle references a vertex past its block")
-        p, q, r = positions[a], positions[b], positions[c]
-        u = (q[0] - p[0], q[1] - p[1], q[2] - p[2])
-        v = (r[0] - p[0], r[1] - p[1], r[2] - p[2])
-        n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
-        length = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
-        normals.append((n[0] / length, n[1] / length, n[2] / length) if length and math.isfinite(length) else None)
+        px, py, pz = positions[a]
+        qx, qy, qz = positions[b]
+        rx, ry, rz = positions[c]
+        ux, uy, uz = qx - px, qy - py, qz - pz
+        vx, vy, vz = rx - px, ry - py, rz - pz
+        nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        length = sqrt(nx * nx + ny * ny + nz * nz)
+        normals.append((nx / length, ny / length, nz / length) if length and isfinite(length) else None)
+    # Every index is in [-count, count) here, so shifted by count they are in [0, 2 count) and lo * 2 count + hi names
+    # an edge uniquely. An edge is a face number while one face has it and a list of faces from the second one on.
+    width = 2 * count
     faces = {}
     for i, (a, b, c) in enumerate(triangles):
-        for e in ((a, b), (b, c), (c, a)):
-            faces.setdefault((min(e), max(e)), []).append(i)
-    out = {"shared_edges": 0, "agree": 0, "opposed": 0}
+        a += count
+        b += count
+        c += count
+        for key in (a * width + b if a < b else b * width + a, b * width + c if b < c else c * width + b,
+                    c * width + a if c < a else a * width + c):
+            seen = faces.get(key)
+            if seen is None:
+                faces[key] = i
+            elif seen.__class__ is int:
+                faces[key] = [seen, i]
+            else:
+                seen.append(i)
+    shared = agree = opposed = 0
     for pair in faces.values():
-        if len(pair) != 2 or normals[pair[0]] is None or normals[pair[1]] is None:
+        if pair.__class__ is int or len(pair) != 2:
             continue
-        d = sum(x * y for x, y in zip(normals[pair[0]], normals[pair[1]]))
-        out["shared_edges"] += 1
-        out["agree"] += d > 0.9
-        out["opposed"] += d < -0.9
-    return out
+        n0, n1 = normals[pair[0]], normals[pair[1]]
+        if n0 is None or n1 is None:
+            continue
+        d = sum((n0[0] * n1[0], n0[1] * n1[1], n0[2] * n1[2]))
+        shared += 1
+        agree += d > 0.9
+        opposed += d < -0.9
+    return {"shared_edges": shared, "agree": agree, "opposed": opposed}
 
 
 def centre_step(w2):
@@ -334,6 +360,10 @@ def _unorm10(x):
     return x / 511.5 - 1
 
 
+_UNORM10 = tuple(_unorm10(x) for x in range(1024))   # _unorm10 of every 10-bit field, looked up in the decoders
+_SIGN_BITS = (-1, 0, 0, 1)   # a tangent's bitangent sign by bits 30-31: 0 is -1, 3 is +1, 1 and 2 are 0
+
+
 def _octahedral(u, v):
     z = 1 - abs(u) - abs(v)
     x, y = u, v
@@ -351,14 +381,24 @@ def normals_4240(data, block):
         return None
     tag, off = slots[2]
     at, n = block["offset"] + off, block["vertices"]
+    words = (w for (w,) in struct.iter_unpack("<I", data[at:at + 4 * n]))
+    unorm, sqrt, copysign = _UNORM10, math.sqrt, math.copysign
+    if tag & 15 == 1:
+        out = []
+        for w in words:   # _octahedral(u, v) written out
+            x = u = unorm[w & 1023]
+            y = v = unorm[(w >> 10) & 1023]
+            z = 1 - abs(u) - abs(v)
+            if z < 0:
+                x, y = (1 - abs(v)) * copysign(1, u), (1 - abs(u)) * copysign(1, v)
+            length = sqrt(x * x + y * y + z * z)
+            out.append((x / length, y / length, z / length))
+        return out
     out = []
-    for (w,) in struct.iter_unpack("<I", data[at:at + 4 * n]):
-        if tag & 15 == 1:
-            out.append(_octahedral(_unorm10(w & 1023), _unorm10((w >> 10) & 1023)))
-        else:
-            v = [_unorm10((w >> s) & 1023) for s in (0, 10, 20)]
-            length = math.sqrt(sum(c * c for c in v)) or 1.0
-            out.append(tuple(c / length for c in v))
+    for w in words:
+        x, y, z = unorm[w & 1023], unorm[(w >> 10) & 1023], unorm[(w >> 20) & 1023]
+        length = sqrt(sum((x * x, y * y, z * z))) or 1.0
+        out.append((x / length, y / length, z / length))
     return out
 
 
@@ -371,29 +411,72 @@ def tangents_4240(data, block):
             continue
         at, n = block["offset"] + off, block["vertices"]
         rows = []
+        unorm, sqrt, signs = _UNORM10, math.sqrt, _SIGN_BITS
         for (w,) in struct.iter_unpack("<I", data[at:at + 4 * n]):
-            v = [_unorm10((w >> s) & 1023) for s in (0, 10, 20)]
-            length = math.sqrt(sum(c * c for c in v)) or 1.0
-            rows.append((v[0] / length, v[1] / length, v[2] / length, {3: 1, 0: -1}.get(w >> 30, 0)))
+            x, y, z = unorm[w & 1023], unorm[(w >> 10) & 1023], unorm[(w >> 20) & 1023]
+            length = sqrt(sum((x * x, y * y, z * z))) or 1.0
+            rows.append((x / length, y / length, z / length, signs[w >> 30]))
         out[slot] = rows
     return out
 
 
 def tangent_agreement(normals, tangents):
     """Counts for tangents against the same vertex's stored normal: |dot| < 0.05 (perpendicular) and the sign bits."""
-    out = {"vertices": 0, "perpendicular": 0, "sign_plus": 0, "sign_minus": 0}
+    vertices = perpendicular = plus = minus = 0
     for rows in tangents.values():
-        for nrm, (x, y, z, sign) in zip(normals, rows):
-            out["vertices"] += 1
-            out["perpendicular"] += abs(nrm[0] * x + nrm[1] * y + nrm[2] * z) < 0.05
-            out["sign_plus"] += sign == 1
-            out["sign_minus"] += sign == -1
-    return out
+        for (nx, ny, nz), (x, y, z, sign) in zip(normals, rows):
+            vertices += 1
+            perpendicular += abs(nx * x + ny * y + nz * z) < 0.05
+            plus += sign == 1
+            minus += sign == -1
+    return {"vertices": vertices, "perpendicular": perpendicular, "sign_plus": plus, "sign_minus": minus}
 
 
 def normal_agreement(positions, normals, triangles):
     """For each vertex the triangles use, compare its stored normal with the sum of its faces' (area-weighted)
     normals. Counts vertices, dot > 0.99, dot > 0.9 and dot < 0."""
+    limit = min(len(positions), len(normals))
+    sqrt, isfinite = math.sqrt, math.isfinite
+    # Per-vertex running sums in three arrays of doubles; a vertex no triangle uses keeps (0, 0, 0) and is skipped below, as
+    # a vertex whose faces cancel exactly is.
+    sum_x, sum_y, sum_z = (array.array("d", bytes(8 * limit)) for _ in range(3))
+    for a, b, c in triangles:
+        if not (0 <= a < limit and 0 <= b < limit and 0 <= c < limit):
+            if max(a, b, c) >= limit:
+                raise PageError("triangle references a vertex past its block")
+            return _normal_agreement_signed(positions, normals, triangles)   # a negative reference
+        px, py, pz = positions[a]
+        qx, qy, qz = positions[b]
+        rx, ry, rz = positions[c]
+        ux, uy, uz = qx - px, qy - py, qz - pz
+        vx, vy, vz = rx - px, ry - py, rz - pz
+        nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        sum_x[a] += nx
+        sum_y[a] += ny
+        sum_z[a] += nz
+        sum_x[b] += nx
+        sum_y[b] += ny
+        sum_z[b] += nz
+        sum_x[c] += nx
+        sum_y[c] += ny
+        sum_z[c] += nz
+    vertices = within_8 = within_25 = opposed = 0
+    for k, (sx, sy, sz) in enumerate(zip(sum_x, sum_y, sum_z)):
+        length = sqrt(sx * sx + sy * sy + sz * sz)
+        if not length or not isfinite(length):
+            continue
+        x, y, z = normals[k]
+        d = sum((x * sx / length, y * sy / length, z * sz / length))
+        vertices += 1
+        within_8 += d > 0.99
+        within_25 += d > 0.9
+        opposed += d < 0
+    return {"vertices": vertices, "within_8_degrees": within_8, "within_25_degrees": within_25, "opposed": opposed}
+
+
+def _normal_agreement_signed(positions, normals, triangles):
+    """normal_agreement for triangles that name a vertex by a negative (from-the-end) index, which the list-based
+    sums of normal_agreement would fold onto the vertex of the same position from the other end."""
     acc = {}
     for a, b, c in triangles:
         if max(a, b, c) >= min(len(positions), len(normals)):
@@ -592,6 +675,11 @@ def parse_page(data):
     return chunks
 
 
+def _lanes(values, stride):
+    """The interleaved lanes of a packed sequence as `stride` iterators (xs, ys, zs of a flat xyz tuple), with no copy."""
+    return [itertools.islice(values, lane, None, stride) for lane in range(stride)]
+
+
 def block_checks(data, block):
     """Count-only plausibility checks for one block's streams. Returns a dict of counts."""
     n = block["vertices"]
@@ -600,28 +688,29 @@ def block_checks(data, block):
     out = {"vertices": n, "positions_finite": 0, "positions_within_300m": 0, "normals_unit": 0,
            "colour_alpha_255": 0, "colour_vertices": 0, "uv_finite": 0, "uv_vertices": 0,
            "position_low_byte_zero": 0}
+    isfinite, sqrt, add = math.isfinite, math.sqrt, operator.add
     pos = struct.unpack_from(f"<{3 * n}f", data, at + slots[0])
-    for v in range(n):
-        p = pos[3 * v:3 * v + 3]
-        if all(math.isfinite(c) for c in p):
-            out["positions_finite"] += 1
-            out["positions_within_300m"] += all(abs(c) <= 300 for c in p)
+    # A sum of finite floats is finite (these are doubles holding f32 values), and one infinity or NaN makes it not.
+    xs, ys, zs = _lanes(pos, 3)
+    out["positions_finite"] = sum(map(isfinite, map(add, map(add, xs, ys), zs)))
+    # A NaN fails every comparison, an infinity fails the range, so this counts the finite vertices inside 300 m.
+    out["positions_within_300m"] = sum(1 for x, y, z in zip(*_lanes(pos, 3))
+                                       if -300 <= x <= 300 and -300 <= y <= 300 and -300 <= z <= 300)
     if 2 in slots:
         nrm = struct.unpack_from(f"<{3 * n}f", data, at + slots[2])
-        for v in range(n):
-            q = nrm[3 * v:3 * v + 3]
-            if all(math.isfinite(c) for c in q) and abs(math.sqrt(sum(c * c for c in q)) - 1) < 0.02:
-                out["normals_unit"] += 1
-    raw = data[at + slots[0]:at + slots[0] + 12 * n]
-    out["position_low_byte_zero"] = sum(1 for i in range(0, len(raw), 4) if raw[i] == 0)
+        # No isfinite test: a NaN or infinite component makes the length NaN or infinite, which is not within 0.02 of 1.
+        out["normals_unit"] = sum(1 for x, y, z in zip(*_lanes(nrm, 3))
+                                  if abs(sqrt(sum((x * x, y * y, z * z))) - 1) < 0.02)
+    raw = bytes(data[at + slots[0]:at + slots[0] + 12 * n])
+    out["position_low_byte_zero"] = raw[0::4].count(0)
     if 1 in slots:
         out["colour_vertices"] = n
-        out["colour_alpha_255"] = sum(1 for i in range(3, 4 * n, 4) if data[at + slots[1] + i] == 255)
+        out["colour_alpha_255"] = bytes(data[at + slots[1]:at + slots[1] + 4 * n])[3::4].count(255)
     for s in (3, 4):
         if s in slots:
             uv = struct.unpack_from(f"<{2 * n}f", data, at + slots[s])
             out["uv_vertices"] += n
-            out["uv_finite"] += sum(1 for v in range(n) if math.isfinite(uv[2 * v]) and math.isfinite(uv[2 * v + 1]))
+            out["uv_finite"] += sum(map(isfinite, map(add, *_lanes(uv, 2))))
     return out
 
 
