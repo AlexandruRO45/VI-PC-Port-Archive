@@ -335,5 +335,21 @@ class VFrexpExpI32F32AstInterpreterTests(unittest.TestCase):
         res = oracle_frexp_exp_i32_f32(0x41800000)
         self.assertEqual(res, 5)
 
+class VFrexpExpI32F32SimdDivergenceTests(unittest.TestCase):
+    def test_frexp_exp_f32_simd_exec_masking(self):
+        wave = WavefrontSimdState(lane_count=32)
+        wave.exec_mask = 0xAAAAAAAA
+        for i in range(32):
+            wave.set_vgpr(i, 0, 0x99999999)
+            if (wave.exec_mask >> i) & 1:
+                # 2.0^i in f32
+                f_val = f32_to_bits(math.pow(2.0, i))
+                wave.set_vgpr(i, 0, oracle_frexp_exp_i32_f32(f_val))
+        for i in range(32):
+            if (0xAAAAAAAA >> i) & 1:
+                self.assertEqual(wave.get_vgpr(i, 0), i + 1)
+            else:
+                self.assertEqual(wave.get_vgpr(i, 0), 0x99999999)
+
 if __name__ == "__main__":
     unittest.main()
