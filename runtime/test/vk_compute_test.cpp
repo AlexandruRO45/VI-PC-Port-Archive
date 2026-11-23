@@ -39,10 +39,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <memory>
+#include <shellapi.h>
+#endif
 
 static PFN_vkGetInstanceProcAddr gipa;
 #define CHECK(x)                                                                         \
@@ -108,6 +114,18 @@ static bool parse_user_sgprs(const char* s, uint32_t* pc) {
         if (i == 32 || !parse_u32(s, pc[i]) || !next_item(s)) return false;
     }
     return true;
+}
+
+static std::filesystem::path shader_argument([[maybe_unused]] const char* argument) {
+#ifdef _WIN32
+    // The CRT's narrow argv can replace characters outside the active code page.
+    int count = 0;
+    const std::unique_ptr<wchar_t*, decltype(&LocalFree)> wide_args(
+        CommandLineToArgvW(GetCommandLineW(), &count), LocalFree);
+    return wide_args && count > 1 ? std::filesystem::path(wide_args.get()[1]) : std::filesystem::path{};
+#else
+    return argument;
+#endif
 }
 
 static int run(int argc, char** argv) {
@@ -198,7 +216,7 @@ static int run(int argc, char** argv) {
         }
         out_words = uint32_t(n);
     }
-    std::ifstream f(argv[1], std::ios::binary);
+    std::ifstream f(shader_argument(argv[1]), std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     uint32_t local[3];
     const uint32_t spirv_version = spirv_local_size(code, local);
