@@ -267,10 +267,6 @@ class LocalDecoder:
         )
         if expected > ttpf.MAX_OUTPUT:
             raise ValueError("DDS exceeds output limit")
-        grids = [
-            ((max(1, width >> i) + 3) // 4, (max(1, height >> i) + 3) // 4)
-            for i in range(levels)
-        ]
         if faces > 1 and d["mode"] == 1:
             # Mode-1 arrays group source slices by mip. DDS groups mips by slice.
             layout = ttpf.array_surface_layout(width, height, faces, levels, bs, 4, tile)
@@ -280,33 +276,12 @@ class LocalDecoder:
             }
         else:
             layout = ttpf.surface_layout(width, height, fmt, levels, tile)
-            bw, bh = layout["block_w"], layout["block_h"]
-            capacity = 12 if tile == 65536 else 8
-            tail = next(
-                (
-                    i
-                    for i, (w, h) in enumerate(grids)
-                    if w <= bw // 2 and h <= bh and levels - i <= capacity
-                ),
-                levels,
-            )
-            offsets = {}
-            stride = tile if tail < levels else 0
-            for i in reversed(range(tail)):
-                w, h = grids[i]
-                offsets[i] = (stride, 0, 0)
-                stride += ((w + bw - 1) // bw) * ((h + bh - 1) // bh) * tile
-            for i in range(tail, levels):
-                bits = capacity - 1 - (i - tail)
-                packed = 16 << bits if bits > 6 else bits << 8
-                x = sum(((packed >> (9 + 2 * j)) & 1) << j for j in range(6)) * (
-                    4 if bs == 16 else 8
-                )
-                y = sum(((packed >> (8 + 2 * j)) & 1) << j for j in range(6)) * 4
-                offsets[i] = (0, x, y)
-            if levels == 1:
-                offsets[0] = (0, 0, 0)
-            offsets = {i: (offset, x, y, stride) for i, (offset, x, y) in offsets.items()}
+            # The layout already knows where every mip sits: the standalone mips above the packed tail,
+            # and the tail mips' tile origin. Re-deriving them here disagreed with it on NPOT chains.
+            offsets = {
+                mip["index"]: (mip["offset"], mip["tile_x"], mip["tile_y"], layout["size"])
+                for mip in layout["mips"]
+            }
         bw, bh = layout["block_w"], layout["block_h"]
         profile = (
             self.cal.get("entries", {})
@@ -318,10 +293,10 @@ class LocalDecoder:
             raise ValueError("Texture has no mapped allocation")
         payload = bytearray()
         for face in range(faces):
-            for i, (w, h) in enumerate(grids[:count]):
-                offset, x, y, slice_stride = offsets[i]
+            for mip in layout["mips"][:count]:
+                offset, x, y, slice_stride = offsets[mip["index"]]
                 at = (
-                    addresses(tile, bs, bw, bh, w, h, x, y)
+                    addresses(tile, bs, bw, bh, mip["blocks_w"], mip["blocks_h"], x, y)
                     + d["base"]
                     + face * slice_stride
                     + offset
