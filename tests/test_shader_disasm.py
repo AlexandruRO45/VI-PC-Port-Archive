@@ -43,9 +43,9 @@ class DisasmFailureTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_tool(self, llvm_mc: str, out: str) -> subprocess.CompletedProcess:
+    def run_tool(self, llvm_mc: str, out: str, *args: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, LLVM_MC=llvm_mc)
-        return subprocess.run([sys.executable, "-I", TOOL, self.fssm, "--out", out, "--jobs", "1"],
+        return subprocess.run([sys.executable, "-I", TOOL, self.fssm, "--out", out, "--jobs", "1", *args],
                               capture_output=True, text=True, errors="replace", env=env)
 
     def fake(self, body: str) -> str:
@@ -173,6 +173,32 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stdout)
         self.assertIn("error: disassembler unavailable", p.stderr)
         self.assertEqual(os.listdir(out), [])
+
+    def test_failed_fallback_removes_its_listing_before_skip_existing(self):
+        with open(self.fssm, "wb") as f:
+            f.write(bytes(0x100) + b"\x01\x02\x03\x04" + CODE)
+        mc = self.fake("import sys\n"
+                       "tokens = sys.stdin.read().split()\n"
+                       "if len(tokens) == 4:\n"
+                       "    print('s_endpgm')\n"
+                       "elif len(tokens) == 8:\n"
+                       "    print(%r, end='')\n"
+                       "else:\n"
+                       "    sys.stderr.write('error: disassembler unavailable\\n')\n"
+                       "    sys.exit(1)\n" % ASM)
+        out = os.path.join(self.dir, "out")
+        os.mkdir(out)
+        with open(os.path.join(out, "one.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("; one  code 0x100..0x10c (scan), gfx1013, 1 invalid words\n" + ASM)
+        with open(os.path.join(out, "other.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(ASM)
+
+        for args in ((), ("--skip-existing",)):
+            with self.subTest(args=args):
+                p = self.run_tool(mc, out, *args)
+                self.assertEqual(p.returncode, 1, p.stdout)
+                self.assertIn("error: disassembler unavailable", p.stderr)
+                self.assertEqual(os.listdir(out), ["other.s"])
 
     def test_fallback_without_a_listing_reports_the_tool_error(self):
         with open(self.fssm, "wb") as f:
@@ -387,14 +413,15 @@ class DisasmInputTest(unittest.TestCase):
         self.write("one.fssm", fssm())
         out = os.path.join(self.dir, "out")
         os.makedirs(out)
-        with open(os.path.join(out, "old.s"), "w", encoding="utf-8") as f:
-            f.write("; usable\n")
+        for name in ("one.s", "old.s"):
+            with open(os.path.join(out, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write("; usable\n")
         env = dict(os.environ, LLVM_MC="definitely-not-an-llvm-mc")
         p = subprocess.run([sys.executable, "-I", TOOL, self.src, "--out", out],
                            capture_output=True, text=True, errors="replace", env=env)
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn("could not be started", p.stderr)
-        self.assertTrue(os.path.isfile(os.path.join(out, "old.s")))   # pruning waits for a successful decode
+        self.assertEqual(sorted(os.listdir(out)), ["old.s", "one.s"])
 
     def test_jobs_and_limit_must_be_at_least_one(self):
         self.write("one.fssm", fssm())
