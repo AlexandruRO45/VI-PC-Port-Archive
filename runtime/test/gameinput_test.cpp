@@ -1375,7 +1375,7 @@ void test_force_feedback(IGameInput* input) {
           "force feedback: the output state reports the effect SDL created and is running");
     check(g_fake.last.type == SDL_HAPTIC_CONSTANT && g_fake.last.constant.level == 16384,
           "force feedback: a constant 0.5 becomes SDL_HAPTIC_CONSTANT level 16384");
-    check(g_fake.last.constant.length == 60000 && g_fake.last_iterations == 0,
+    check(g_fake.last.constant.length == 60000 && g_fake.last_iterations == SDL_HAPTIC_INFINITY,
           "force feedback: no duration in GameInput is SDL's 60 s hold, run until stopped");
     rt::gameinput::poll();
     check(g_fake.runs == runs0 + 1, "force feedback: an unchanged effect is not re-sent every poll");
@@ -1491,6 +1491,11 @@ void test_force_feedback(IGameInput* input) {
         rt::gameinput::poll();
         check(g_fake.runs == runs2 + 5 && g_fake.last_iterations == 2 && g_fake.last.periodic.length == 5000,
               "force feedback: the same total length with a new play count runs the effect again with it");
+        pulse.data.sineWave.envelope.playCount = 0;
+        check(timed->SetParams(&pulse), "force feedback: SetParams with a play count of 0");
+        rt::gameinput::poll();
+        check(g_fake.runs == runs2 + 6 && g_fake.last_iterations == SDL_HAPTIC_INFINITY,
+              "force feedback: a play count of 0 runs the effect with SDL_HAPTIC_INFINITY iterations, not 0");
         timed->Release();
         rt::gameinput::poll();
     }

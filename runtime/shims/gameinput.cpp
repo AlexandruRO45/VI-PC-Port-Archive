@@ -2198,13 +2198,13 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
         note_effect(d, sdl_effect_, false);
         return;
     }
-    // GameInput's playCount 0 means "until stopped", which is what SDL's 0 iterations means.
+    // GameInput's playCount 0 means "until stopped": SDL_HAPTIC_INFINITY, as evdev (native or under Wine) stops at 0.
     const uint32_t iterations = endless ? 0 : play_count(params);
     const uint64_t run_for = endless || iterations == 0 ? 0 : static_cast<uint64_t>(length_ms) * 1000ull * iterations;
     // SetParams' reference: a finite effect's timer is only refreshed by a new duration or a stop and restart.
     const bool same_run = sdl_running_ && !endless_ && !endless && run_for == run_for_ &&
                           iterations == iterations_ && starts == started_;
-    if (!same_run && !haptics().run_effect(d->haptic, sdl_effect_, iterations)) {
+    if (!same_run && !haptics().run_effect(d->haptic, sdl_effect_, iterations ? iterations : SDL_HAPTIC_INFINITY)) {
         note_effect(d, sdl_effect_, false);
         return;
     }
