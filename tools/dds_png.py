@@ -602,9 +602,15 @@ def _bc_interp_lut(v0: int, v1: int) -> tuple[int, int, int, int, int, int, int,
 
 
 def _bc_interp_lut_snorm(b0: int, b1: int) -> tuple[int, int, int, int, int, int, int, int]:
-    """Build the 8-entry BC4_SNORM / BC5_SNORM table mapped from [-1, 1] to [0, 255]."""
+    """Build the 8-entry BC4_SNORM / BC5_SNORM table mapped from [-1, 1] to [0, 255].
+
+    The palette mode comes from the raw signed endpoints, before -128 is read as -127 (DirectXTex's
+    D3DX_BC4S compares the int8 values): endpoints 0x81, 0x80 are -127 > -128, the eight-value
+    palette, all -1.0, not the six-value one whose index 7 is +1.0.
+    """
     s0 = b0 - 256 if b0 >= 128 else b0
     s1 = b1 - 256 if b1 >= 128 else b1
+    eight_values = s0 > s1
     if s0 == -128:
         s0 = -127
     if s1 == -128:
@@ -614,7 +620,7 @@ def _bc_interp_lut_snorm(b0: int, b1: int) -> tuple[int, int, int, int, int, int
         # Map [-127.0, 127.0] -> [0, 255]
         return int(round((v / 127.0 * 0.5 + 0.5) * 255.0))
 
-    if s0 > s1:
+    if eight_values:
         return (
             to_u8(s0),
             to_u8(s1),

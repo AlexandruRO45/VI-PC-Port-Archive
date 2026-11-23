@@ -742,6 +742,21 @@ class Bc4Tests(unittest.TestCase):
         # 129 as int8 is -127, which maps to 0; 64 maps to round(191.75) = 192.
         self.assertEqual(pixels(rgba), [(0, 0, 0, 255), (192, 192, 192, 255)])
 
+    def test_snorm_mode_compares_the_raw_endpoints(self):
+        # 0x81 is -127 and 0x80 is -128: -127 > -128 picks the eight-value palette, every entry -1.0 (0).
+        # Reading -128 as -127 before the comparison took the six-value one, whose index 7 is +1.0 (255).
+        payload = bc4_block(0x81, 0x80, 6 | (7 << 3))
+        _, _, rgba = dds.decode_dds(dds_buffer(
+            2, 1, payload, flags=DDPF_FOURCC, fourcc=b"BC4S",
+        ))
+        self.assertEqual(pixels(rgba), [(0, 0, 0, 255), (0, 0, 0, 255)])
+        # 0x80, 0x81 (-128 <= -127) stays the six-value palette: index 6 is -1.0, index 7 is +1.0.
+        payload = bc4_block(0x80, 0x81, 6 | (7 << 3))
+        _, _, rgba = dds.decode_dds(dds_buffer(
+            2, 1, payload, flags=DDPF_FOURCC, fourcc=b"BC4S",
+        ))
+        self.assertEqual(pixels(rgba), [(0, 0, 0, 255), (255, 255, 255, 255)])
+
 
 class Bc5Tests(unittest.TestCase):
     def test_two_channel_z_reconstruction(self):
