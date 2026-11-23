@@ -393,11 +393,14 @@ body.card-mode .card-url { display: block; }
    status left, the short rate summary right (the full one is its tooltip). */
 .netbar { background: rgb(19,12,44); border-top: 1px solid var(--line); font-size: 12.5px; }
 .netbar .wrap { display: flex; align-items: center; gap: 4px 18px; justify-content: space-between; padding-top: 5px; padding-bottom: 5px; }
-.nb-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-status { min-width: 0; display: flex; align-items: center; gap: 2px 12px; }
+.nb-msg { min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }   /* two lines at most */
+.nb-offer { flex-shrink: 0; white-space: nowrap; }
 .nb-rates { flex-shrink: 0; white-space: nowrap; }
 @media (max-width: 760px) {
   .netbar .wrap { flex-direction: column; align-items: stretch; gap: 1px; }
-  .nb-status { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .nb-status { flex-wrap: wrap; }
+  .nb-msg { flex: 1 1 16em; }
   .nb-rates { overflow: hidden; text-overflow: ellipsis; }
 }
 .nb-status .ok { color: var(--done); }
@@ -524,7 +527,7 @@ body.card-mode .card-url { display: block; }
       <button class="btn" id="refreshBtn" type="button" title="Refresh now">↻</button>
     </div>
   </div>
-  <div class="netbar" id="netbar" aria-live="polite"><div class="wrap"><div class="nb-status"><span class="busy">↻ Loading from GitHub…</span></div></div></div>
+  <div class="netbar" id="netbar" aria-live="polite"><div class="wrap"><div class="nb-status"><span class="nb-msg"><span class="busy">↻ Loading from GitHub…</span></span></div></div></div>
 </header>
 <div class="banner" id="banner" role="status" hidden></div>
 

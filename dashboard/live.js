@@ -670,14 +670,16 @@ function renderParts() {
   else if (waiting.length) {
     const next = Math.min(...waiting.map(k => parts[k].until));
     const res = waiting.some(k => parts[k].res === 'core') ? 'core' : 'search';
-    status = `<span class="wait">⏳ Still loading: ${esc(list)}. GitHub allows ${esc(limitText(res))}, so the rest continues in <b>${mmss(next - Date.now())}</b>, by itself.</span>`;
+    // The countdown first: the end of a long list is what the bar cuts off.
+    status = `<span class="wait">⏳ More in <b>${mmss(next - Date.now())}</b>, by itself · still loading: ${esc(list)} (GitHub allows ${esc(limitText(res))})</span>`;
   } else status = `<span class="busy">↻ Loading: ${esc(list)}…</span>`;
-  const offer = !activeToken() && pending.length ? ' <button class="linkbtn" id="offerToken" type="button">Load faster with a free token</button>' : '';
+  // Outside the message, so a long message never pushes it out of sight.
+  const offer = !activeToken() && pending.length ? '<button class="linkbtn nb-offer" id="offerToken" type="button">Load faster with a free GitHub token</button>' : '';
   // The bar shows a short summary; the full sentence is its tooltip.
   const full = `GitHub requests ${activeToken() ? 'with your token' : 'without a token'} · this page made <b>${fmt(apiCalls)}</b> · ${rateLine('search', 'search', 'minute')} · ${rateLine('core', 'other', 'hour')}${rate.graphql ? ' · ' + rateLine('graphql', 'GraphQL', 'hour') : ''}${coreSpare() ? '' : ' · <span class="low">saving the hourly allowance: claims and commits wait</span>'} · ${attention() === 'active' ? 'updates every minute' : 'idle: updates every 5 minutes'}`;
   const short = `${activeToken() ? 'token' : 'no token'} · <b>${fmt(apiCalls)}</b> calls · ${rateShort('search', 'search')} · ${rateShort('core', 'other')}${rate.graphql ? ' · ' + rateShort('graphql', 'GraphQL') : ''}${coreSpare() ? '' : ' · <span class="low">saving</span>'} · ${attention() === 'active' ? '1' : '5'} min`;
   const html = `<div class="wrap">
-      <div class="nb-status" title="${esc(status.replace(/<[^>]+>/g, ''))}">${status}${offer}</div>
+      <div class="nb-status"><span class="nb-msg" title="${esc(status.replace(/<[^>]+>/g, ''))}">${status}</span>${offer}</div>
       <div class="nb-rates" title="${esc(full.replace(/<[^>]+>/g, ''))}">${short}</div>
     </div>`;
   // This runs every second: writing the same HTML or text again would still make the browser lay out and repaint.
