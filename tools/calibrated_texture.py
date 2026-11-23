@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import bcpack
+from file_mode import published_mode
 import bcpack_tables
 import ttpf_mips as ttpf
 
@@ -433,6 +434,7 @@ def export_file(pool, index, target, mips, force, profile):
         try:
             f.write(data)
             f.close()
+            os.chmod(tmp, published_mode(target))   # NamedTemporaryFile creates 0600
             if force:
                 os.replace(tmp, target)
             else:

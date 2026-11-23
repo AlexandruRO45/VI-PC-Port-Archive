@@ -2210,5 +2210,44 @@ class TestExportFileAndCli(unittest.TestCase):
         self.assertNotIn("Traceback", err5)
 
 
+@unittest.skipIf(os.name == "nt", "POSIX permission bits")
+class ExportModeTests(unittest.TestCase):
+    """export_file stages the DDS through NamedTemporaryFile (0600): the published file gets the bits a plain open()
+    would give it, or those of the file --force replaces, as every other staged writer does through file_mode."""
+
+    class _Decoder:
+        def __init__(self, pool, profile):
+            self.read_chunk = lambda: None
+            self.read_chunk.cache_clear = lambda: None
+
+        def dds(self, index, mips):
+            return b"DDS new"
+
+    def export(self, tmp, target, force):
+        profile = os.path.join(tmp, "profile.json")
+        with open(profile, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}")
+        with mock.patch.object(ct, "LocalDecoder", self._Decoder):
+            ct.export_file(None, 0, target, 1, force, profile)
+
+    def test_a_new_dds_gets_the_bits_of_a_plain_open(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "out.dds")
+            self.export(tmp, target, force=False)
+            self.assertEqual(os.stat(target).st_mode & 0o777, file_mode.new_file_mode(tmp))
+
+    def test_a_forced_replace_keeps_the_bits_of_the_replaced_dds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "out.dds")
+            with open(target, "wb") as f:
+                f.write(b"old")
+            os.chmod(target, 0o640)
+            self.export(tmp, target, force=True)
+            self.assertEqual(os.stat(target).st_mode & 0o777, 0o640)
+            with open(target, "rb") as f:
+                self.assertEqual(f.read(), b"DDS new")
+
+
 if __name__ == "__main__":
     unittest.main()
