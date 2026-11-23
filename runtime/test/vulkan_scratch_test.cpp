@@ -7,7 +7,9 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -16,6 +18,23 @@
 } while (0)
 
 using leonida::ScratchBuffers;
+
+// This test is single-threaded. Only collect() runs with injection enabled; its device procs do not allocate.
+static int g_allocations_before_failure = -1;
+void* operator new(std::size_t size) {
+    if (g_allocations_before_failure == 0) {
+        g_allocations_before_failure = -1;
+        throw std::bad_alloc();
+    }
+    if (g_allocations_before_failure > 0) --g_allocations_before_failure;
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) { return operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -217,6 +236,49 @@ int main() {
             VkBuffer buf = VK_NULL_HANDLE;
             VkDeviceSize off = 0;
             EXPECT(!no_alloc.get(256, buf, off));
+            EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
+        }
+    }
+
+    // An allocation failure while collecting a multi-chunk batch must not leave the same handles owned by
+    // both retired_ and spare_. Check destruction after the failure and recovery followed by distinct reuse.
+    for (bool retry : {false, true}) {
+        for (int fail_after : {0, 1}) {
+            FakeVulkan vk;
+            g_vk = &vk;
+            {
+                ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+                constexpr VkDeviceSize chunk_bytes = 5u << 20;
+                VkBuffer first = VK_NULL_HANDLE, second = VK_NULL_HANDLE;
+                VkDeviceSize offset = 0;
+                EXPECT(scratch.get(chunk_bytes, first, offset));
+                EXPECT(scratch.get(chunk_bytes, second, offset));
+                EXPECT(first != second);
+                scratch.retire(VK_NULL_HANDLE, 0);
+
+                bool failed = false;
+                g_allocations_before_failure = fail_after;
+                try {
+                    scratch.collect();
+                } catch (const std::bad_alloc&) {
+                    failed = true;
+                }
+                g_allocations_before_failure = -1;
+                if (fail_after == 0) EXPECT(failed);  // exercise the failed reserve, not just successful collection
+                EXPECT(vk.destroy_buffer_calls == 0 && vk.free_memory_calls == 0);
+
+                if (retry) {
+                    scratch.collect();
+                    VkBuffer reused_first = VK_NULL_HANDLE, reused_second = VK_NULL_HANDLE;
+                    EXPECT(scratch.get(chunk_bytes, reused_first, offset));
+                    EXPECT(scratch.get(chunk_bytes, reused_second, offset));
+                    EXPECT(reused_first != reused_second);
+                    EXPECT((reused_first == first || reused_first == second) &&
+                           (reused_second == first || reused_second == second));
+                    EXPECT(vk.create_buffer_calls == 2 && vk.allocate_calls == 2);
+                }
+            }
+            EXPECT(vk.destroy_buffer_calls == 2 && vk.free_memory_calls == 2);
             EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
         }
     }

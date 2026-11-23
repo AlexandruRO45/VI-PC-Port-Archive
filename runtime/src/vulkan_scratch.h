@@ -103,6 +103,9 @@ public:
                     continue;
                 }
             }
+            // Grow before copying any handles: if allocation throws mid-batch, retired_ and spare_ would both
+            // own earlier chunks. The cache holds at most four, so no push below can allocate after this reserve.
+            spare_.reserve(4);
             for (auto& chunk : retired_[i].chunks) {
                 chunk.used = 0;
                 if (spare_.size() < 4) spare_.push_back(chunk);
