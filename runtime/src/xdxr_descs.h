@@ -97,18 +97,17 @@ constexpr uint32_t kBuildFlagMinimizeMemory = 0x10;
 constexpr uint32_t kPostbuildInfoOfflineStatistics = 0x10;
 
 // The record a setting is read from, the way the DLL finds it: the first record of `type` from the start, stepping
-// over types 0, 1 and 2, and stopping at any other type. Null when there is none.
+// over types 0, 1 and 2, and stopping at any other type (or before incomplete trailing bytes). Null when none.
 inline const StreamRecord* find_stream_record(const StreamDesc& desc, uint32_t type) {
-    if (desc.size_in_bytes == 0 || desc.stream == nullptr)
+    if (type > 2 || desc.stream == nullptr)
         return nullptr;
-    const auto* record = static_cast<const StreamRecord*>(desc.stream);
-    const auto* end = reinterpret_cast<const StreamRecord*>(static_cast<const uint8_t*>(desc.stream) +
-                                                            desc.size_in_bytes);
-    for (; record < end; ++record) {
-        if (record->type == type)
-            return record;
-        if (record->type > 2)
+    const uint64_t count = desc.size_in_bytes / sizeof(StreamRecord);
+    const auto* records = static_cast<const StreamRecord*>(desc.stream);
+    for (uint64_t i = 0; i < count; ++i) {
+        if (records[i].type > 2)
             return nullptr;
+        if (records[i].type == type)
+            return &records[i];
     }
     return nullptr;
 }

@@ -69,6 +69,35 @@ int stream_lookup() {
     records[1].type = 0;
     CHECK(find_stream_record(stream_of(records, 1), 0) == nullptr);
     CHECK(find_stream_record(stream_of(records, 2), 0) == &records[1]);
+
+    // A partial leading record (< 16 B) or trailing partial record must not be inspected or returned.
+    const size_t rems[] = {1, 4, 8, sizeof(StreamRecord) - 1};
+    for (size_t rem : rems) {
+        records[0].type = 0;
+        CHECK(find_stream_record(StreamDesc{rem, records}, 0) == nullptr);
+
+        records[0].type = 1;
+        records[1].type = 0;
+        const StreamDesc one_plus{sizeof(StreamRecord) + rem, records};
+        CHECK(find_stream_record(one_plus, 1) == &records[0]);
+        CHECK(find_stream_record(one_plus, 0) == nullptr);
+    }
+
+    // Large size_in_bytes must not wrap pointer arithmetic; walk still stops cleanly at an unknown type.
+    records[0].type = 0;
+    records[1].type = 3;
+    CHECK(find_stream_record(StreamDesc{~uint64_t{0}, records}, 0) == &records[0]);
+    CHECK(find_stream_record(StreamDesc{~uint64_t{0}, records}, 2) == nullptr);
+
+    // Unknown requested types (> 2) must return nullptr even when a matching record type sits in the stream.
+    const uint32_t unknowns[] = {3, 7, 0xFFFFFFFFu};
+    for (uint32_t unknown : unknowns) {
+        records[0].type = 0;
+        records[1].type = unknown;
+        CHECK(find_stream_record(stream_of(records, 2), unknown) == nullptr);
+        records[0].type = unknown;
+        CHECK(find_stream_record(stream_of(records, 1), unknown) == nullptr);
+    }
     return 0;
 }
 
