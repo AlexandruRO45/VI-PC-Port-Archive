@@ -298,5 +298,27 @@ class TestSTtraceDataImmPipeline(unittest.TestCase):
         self.assertEqual(words, [0x99, 0x99, 0x99, 0x99])
 
 
+class TestSTtraceDataImmRejection(unittest.TestCase):
+    def test_invalid_opcode_imm_rejection(self):
+        bad_lines = [
+            "s_ttracedata_imm_bad 42",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_ttrace_imm_opcode", bad_lines)
+        self.assertIn("s_ttracedata_imm_bad", str(cm.exception))
+
+    def test_mutated_mnemonic_imm_rejection(self):
+        bad_lines = [
+            "s_ttracedata_imm32 42",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_ttrace_imm_mutated", bad_lines)
+        self.assertIn("s_ttracedata_imm32", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
