@@ -397,5 +397,25 @@ class TestSFf1I32B64Reference(unittest.TestCase):
         self.assertEqual(ref_ff1_i32_b64(1 << 63), 63)
 
 
+def step_scalar_ff1_i32_b64(state: SaluState, instr: Instruction) -> None:
+    if instr.opcode != "s_ff1_i32_b64":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    src0 = state.read_u64(instr.src0)
+    res = ref_ff1_i32_b64(src0)
+    state.write_u32(instr.dst.index_or_val, res)
+
+
+class TestSFf1I32B64ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for s_ff1_i32_b64."""
+
+    def test_scalar_interpreter_execution(self):
+        state = SaluState()
+        state.write_u32(0, 0)
+        state.write_u32(1, 1 << (44 - 32))  # bit 44
+        instr = Instruction("s_ff1_i32_b64", Operand.sgpr32(2), Operand.sgpr64(0))
+        step_scalar_ff1_i32_b64(state, instr)
+        self.assertEqual(state.sgprs[2], 44)
+
+
 if __name__ == "__main__":
     unittest.main()
