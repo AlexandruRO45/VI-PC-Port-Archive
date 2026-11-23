@@ -469,6 +469,31 @@ class DisasmOutputCollisionTest(unittest.TestCase):
         self.assert_unchanged(inp, data)
         self.assertTrue(os.path.isfile(os.path.join(self.dir, "foo.s")))
 
+    def test_unpack_index_named_like_a_listing_is_not_overwritten(self):
+        self.write(os.path.join(self.src, "one.fssm"))
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        idx = os.path.join(out, "one.s")
+        data = b'[{"name": "one"}]\n'
+        with open(idx, "wb") as f:
+            f.write(data)
+        self.assert_refused(self.run_tool(self.src, "--unpack-index", idx, "--out", out), "would overwrite input")
+        self.assert_unchanged(idx, data)
+
+    def test_unpack_index_ending_in_s_is_not_pruned_as_stale(self):
+        self.write(os.path.join(self.src, "one.fssm"))
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        idx = os.path.join(out, "stale.s")
+        data = b'[{"name": "one"}]\n'
+        with open(idx, "wb") as f:
+            f.write(data)
+        p = self.run_tool(self.src, "--unpack-index", idx, "--out", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(out, "one.s")))
+        self.assertTrue(os.path.isfile(idx))
+        self.assert_unchanged(idx, data)
+
 
 if __name__ == "__main__":
     unittest.main()

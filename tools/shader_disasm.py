@@ -43,11 +43,13 @@ def output_path(path: str, out: str) -> str:
     return os.path.join(out, os.path.splitext(os.path.basename(path))[0] + ".s")
 
 
-def validate_output(out: str, files: list) -> None:
+def validate_output(out: str, files: list, unpack_index: str | None = None) -> None:
     """Refuse a planned <out>/<stem>.s that is a folder or names an input, before probing llvm-mc or creating --out.
     A single `foo.s` given with --out at its own folder (or the default ../disasm of a file already in disasm/) was
     replaced by its own listing; on Windows and macOS `FOO.S` is the same file as the `FOO.s` written for it."""
     inputs = {path_key(p): p for p in files}
+    if unpack_index:
+        inputs.setdefault(path_key(unpack_index), unpack_index)
     for src in files:
         dst = output_path(src, out)
         if os.path.isdir(dst):
@@ -55,6 +57,8 @@ def validate_output(out: str, files: list) -> None:
         hit = inputs.get(path_key(dst))
         if hit is None and same_report_path(src, dst):  # a hard link or another spelling the name rules missed
             hit = src
+        if hit is None and unpack_index and same_report_path(unpack_index, dst):
+            hit = unpack_index
         if hit is not None:
             fail(f"output {dst} would overwrite input {hit}")
 
@@ -225,7 +229,7 @@ def main():
         fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files
     out = a.out or os.path.join(os.path.dirname(files[0]), "..", "disasm")
-    validate_output(out, files)
+    validate_output(out, files, a.unpack_index)
     try:
         os.makedirs(out, exist_ok=True)
     except OSError as e:
@@ -266,7 +270,8 @@ def main():
         try:
             with os.scandir(out) as entries:
                 stale = sorted(e.path for e in entries
-                               if e.name.endswith(".s") and e.is_file() and e.name[:-2] not in stems)
+                               if e.name.endswith(".s") and e.is_file() and e.name[:-2] not in stems
+                               and not (a.unpack_index and same_report_path(e.path, a.unpack_index)))
             for path in stale:
                 os.remove(path)
         except OSError as e:
