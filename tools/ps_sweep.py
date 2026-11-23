@@ -254,8 +254,15 @@ def cmd_compare(a):
             print(f"    {c} / {sc}: {n}")
 
 
+WARNING = ("warning (run): a few sampled shaders hang NVIDIA GPUs with the zeroed heap (VK_ERROR_DEVICE_LOST, a\n"
+           "driver reset, TDR). --timeout only bounds the wait on the host side. On a GPU that drives your display\n"
+           "the desktop freezes until each reset, so run on a GPU with no display attached, or expect a freeze of a\n"
+           "few seconds per hang. --lo/--hi/--only run part of the sample.")
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=WARNING)
     ap.add_argument("cmd", choices=["sample", "run", "compare"])
     ap.add_argument("--spirv", help="the translated SPIR-V folder (index.json and the .spv files)")
     ap.add_argument("--out", required=True)

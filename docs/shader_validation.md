@@ -1715,6 +1715,12 @@ tolerance (1e-3 absolute plus relative), NaN or all-zero on one GPU only, fails 
 Variant `t` (`VKS_TEX=1`) replaces the fallback images with an 8x8 gradient (2D, 2D array, 1D, 3D) and a linear
 sampler so sampled values are not all zero.
 
+Warning: a few sampled shaders hang NVIDIA GPUs with the zeroed heap (see "Fails on one GPU, NVIDIA" below). The
+`--timeout` of `ps_sweep.py run` only bounds the wait on the host side; the driver resets the GPU (TDR). On a GPU that
+also drives the display the desktop freezes until each reset (a tester saw five in six minutes on an RTX 3060 around
+shaders 120 to 310 of the 480). Run it on a GPU with no display attached, or expect a freeze of a few seconds per hang;
+`--lo`/`--hi`/`--only` run part of the sample.
+
 RTX 4080 SUPER and Intel UHD 770 (32.0.101.6129), Windows 11, 480 of 12,101 pixel shaders (seed 20261122):
 
 | class | variant z (fallback images) | variant t (gradient textures) |

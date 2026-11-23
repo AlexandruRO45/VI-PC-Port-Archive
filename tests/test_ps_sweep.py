@@ -173,6 +173,13 @@ class CompareCommand(unittest.TestCase):
             self.assertIn("OK on both: 2", buf.getvalue())
             self.assertNotIn("timeout", buf.getvalue())
 
+    def test_help_warns_about_nvidia_resets(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            ps_sweep.main(["--help"])
+        self.assertIn("TDR", buf.getvalue())
+        self.assertIn("display", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
