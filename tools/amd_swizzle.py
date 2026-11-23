@@ -188,7 +188,13 @@ def main():
     if a.out and res:
         import io
         import struct
-        from PIL import Image
+        try:
+            from PIL import Image
+        except ModuleNotFoundError as e:
+            if e.name != "PIL":
+                raise
+            print("ERROR: --out requires Pillow (pip install Pillow)", file=sys.stderr)
+            return 1
         bits = res[0][4]
         lin = detile(data, equation(nibbles, res[0][3], bits), a.bpe, wb, hb, 1 << bits)
         if a.bpe == 1:

@@ -100,6 +100,31 @@ def test_out_directory_is_a_message_not_a_traceback(tmp_path):
     assert "Traceback" not in p.stderr
 
 
+
+def test_missing_pillow_only_prevents_preview(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    header_path = tmp_path / "swizzle.h"
+    header_path.write_text(header(["X0", "Y0"] + ["0"] * 6), encoding="utf-8", newline="\n")
+    load_header = A.load
+    monkeypatch.setattr(A, "load", lambda: load_header(header_path))
+    blob = tmp_path / "blob.bin"
+    blob.write_bytes(bytes(65536))
+    output = tmp_path / "preview.png"
+    args = ["amd_swizzle.py", str(blob), "--bpe", "1", "--width", "2", "--height", "2"]
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    monkeypatch.setattr(sys, "argv", args)
+    assert A.main() in (0, None)
+    score_output = capsys.readouterr()
+    assert "GFX10_SW_64K_D_X_PATINFO" in score_output.out
+    assert not score_output.err
+
+    monkeypatch.setattr(sys, "argv", [*args, "--out", str(output)])
+    assert A.main() == 1
+    assert capsys.readouterr().err == "ERROR: --out requires Pillow (pip install Pillow)\n"
+    assert not output.exists()
+
+
 def test_uncompressed_feature_uses_raw_rgb_bytes():
     import numpy as np
     raw = np.arange(8, dtype=np.uint8).reshape(-1, 4)
