@@ -299,6 +299,10 @@ def main(argv=None) -> int:
                 print(f"ERROR: cannot write {a.extract}: {e}", file=sys.stderr)
                 return 2
 
+    # A partial scan can still print per-image diagnostics, but is not a complete inventory.
+    if status:
+        return status
+
     if a.extract:
         try:
             with open(index_path, "w", encoding="utf-8", newline="\n") as f:
@@ -318,7 +322,7 @@ def main(argv=None) -> int:
             print(f"ERROR: cannot write {a.json}: {e}", file=sys.stderr)
             return 2
         print(f"wrote {a.json}")
-    return status
+    return 0
 
 
 if __name__ == "__main__":

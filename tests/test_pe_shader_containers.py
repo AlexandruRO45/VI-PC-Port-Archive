@@ -276,6 +276,26 @@ class ReportPathTests(unittest.TestCase):
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
 
+    def test_failed_image_read_preserves_previous_inventory_and_extract_index(self):
+        out = os.path.join(self.dir, "out")
+        os.mkdir(out)
+        index = os.path.join(out, "index.json")
+        report = os.path.join(self.dir, "containers.json")
+        previous = b'[{"name": "previous complete scan"}]\n'
+        for path in (index, report):
+            with open(path, "wb") as f:
+                f.write(previous)
+
+        missing = os.path.join(self.dir, "missing.exe")
+        code, stdout, err = self.run_main([self.image, missing, "--extract", out, "--json", report])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot read", err)
+        self.assertIn(missing, err)
+        self.assertIn("1 container(s)", stdout)
+        for path in (index, report):
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), previous)
+
 
 def psv0(stage_code: int) -> bytes:
     """Build a minimal PSV0 chunk payload whose ShaderStage byte is `stage_code`."""
