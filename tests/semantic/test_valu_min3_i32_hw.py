@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Architectural reference model, symbolic AST, interpreter, and hardware-rule tests for v_min3_i32.
+"""Architectural reference model and translator-backed hardware execution tests for v_min3_i32.
 
 RDNA2 Instruction Set Architecture, VOP3:
     v_min3_i32 D, S0, S1, S2
@@ -9,20 +9,22 @@ Semantic operation:
     D.i32 = min(to_s32(S0), to_s32(S1), to_s32(S2))
     D.u32 = to_u32(D.i32)
 
-Outputs:
-    D: 32-bit destination VGPR storing the signed 32-bit minimum of the three input sources.
+Lowering in tools/rdna2spirv.py:
+    Emits two chained GLSL.std.450 SMin operations on signed 32-bit integers:
+        %m = OpExtInst %uint %glsl SMin %x %y
+        %r = OpExtInst %uint %glsl SMin %m %z
+    All tests execute through support.translate_lines(...) and support.mrt0_words / run_workgroup.
 
 Standard library Python only (unittest, struct, math, dataclasses, enum, typing).
 Strictly zero game data.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-import math
 import os
 import struct
 import sys
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import List, Optional, Tuple
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,10 +38,9 @@ MASK32: int = 0xFFFF_FFFF
 SIGN_BIT32: int = 0x8000_0000
 MIN_INT32: int = -0x8000_0000
 MAX_INT32: int = 0x7FFF_FFFF
+FSSM_64 = bytes(0x138) + struct.pack("<4I", 0x8088, 64, 1, 1)
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
 
-# -----------------------------------------------------------------------------
-# Commit 1: Reference Mathematical Oracle and Architectural Model
-# -----------------------------------------------------------------------------
 
 def to_s32(val: int) -> int:
     """Convert 32-bit unsigned integer to signed two's-complement integer."""
@@ -53,399 +54,300 @@ def to_u32(val: int) -> int:
 
 
 def v_min3_i32_oracle(s0: int, s1: int, s2: int) -> int:
-    """Reference mathematical model for v_min3_i32.
-
-    Computes the minimum of three signed 32-bit integers.
-    """
+    """Reference mathematical model for v_min3_i32."""
     v0 = to_s32(s0)
     v1 = to_s32(s1)
     v2 = to_s32(s2)
     return to_u32(min(v0, v1, v2))
 
 
-class VMin3I32Oracle:
-    """Architectural model and hardware-rule validator for v_min3_i32."""
+def run_translated_min3_i32(
+    s0: int,
+    s1: int,
+    s2: int,
+    *,
+    s0_kind: str = "v",
+    s1_kind: str = "v",
+    s2_kind: str = "v",
+    dst_reg: str = "v3",
+    alias_dst: Optional[int] = None,
+    op: str = "v_min3_i32",
+) -> Tuple[int, str]:
+    """Translates and executes v_min3_i32 through tools/rdna2spirv.py and spirv_mini_interp."""
+    s0_u = s0 & MASK32
+    s1_u = s1 & MASK32
+    s2_u = s2 & MASK32
+    lines = []
+    src_regs = ["v0", "v1", "v2"]
+    if alias_dst is not None:
+        dst_reg = src_regs[alias_dst]
 
-    @staticmethod
-    def eval(s0: int, s1: int, s2: int) -> int:
-        return v_min3_i32_oracle(s0, s1, s2)
+    # Load s0
+    if s0_kind == "s":
+        lines.append(f"s_mov_b32 s0, {s0_u:#x}")
+        op0 = "s0"
+    elif s0_kind == "lit":
+        op0 = f"{s0_u:#x}"
+    else:
+        lines.append(f"v_mov_b32_e32 {src_regs[0]}, {s0_u:#x}")
+        op0 = src_regs[0]
 
-    @staticmethod
-    def build_compute_shader(s0: int, s1: int, s2: int) -> Tuple[str, List[str], bytes]:
-        """Generate synthetic compute shader lines to test v_min3_i32."""
-        fssm = bytes(0x138) + struct.pack("<4I", 0x8088, 64, 1, 1)
-        name = "cs_min3_i32_hw"
-        lines = [
-            "s_mov_b64 exec, -1",
-            f"v_mov_b32_e32 v1, {to_s32(s0)}",
-            f"v_mov_b32_e32 v2, {to_s32(s1)}",
-            f"v_mov_b32_e32 v3, {to_s32(s2)}",
-            "v_min3_i32 v4, v1, v2, v3",
-            "s_endpgm",
-        ]
-        return name, lines, fssm
+    # Load s1
+    if s1_kind == "s":
+        lines.append(f"s_mov_b32 s1, {s1_u:#x}")
+        op1 = "s1"
+    elif s1_kind == "lit":
+        op1 = f"{s1_u:#x}"
+    else:
+        lines.append(f"v_mov_b32_e32 {src_regs[1]}, {s1_u:#x}")
+        op1 = src_regs[1]
 
-    @staticmethod
-    def translate_and_validate(s0: int, s1: int, s2: int) -> str:
-        """Exercise tools/rdna2spirv.py via support.translate_lines."""
-        name, lines, fssm = VMin3I32Oracle.build_compute_shader(s0, s1, s2)
-        return support.translate_lines(name, lines, fssm=fssm)
+    # Load s2
+    if s2_kind == "s":
+        lines.append(f"s_mov_b32 s2, {s2_u:#x}")
+        op2 = "s2"
+    elif s2_kind == "lit":
+        op2 = f"{s2_u:#x}"
+    else:
+        lines.append(f"v_mov_b32_e32 {src_regs[2]}, {s2_u:#x}")
+        op2 = src_regs[2]
 
+    lines.append(f"{op} {dst_reg}, {op0}, {op1}, {op2}")
+    lines.append("v_mov_b32_e32 v4, 0")
+    lines.append(f"exp mrt0 {dst_reg}, v4, v4, v4 done vm")
+    lines.append("s_endpgm")
+
+    name = f"ps_{op}_{s0_u:x}_{s1_u:x}_{s2_u:x}"
+    spv = support.translate_lines(name, lines)
+    out = support.mrt0_words(spv)
+    return out[0], spv
+
+
+# -----------------------------------------------------------------------------
+# Commit 1: Reference Mathematical Oracle and Architectural Model
+# -----------------------------------------------------------------------------
 
 class TestVMin3I32Oracle(unittest.TestCase):
-    """Unit tests for reference oracle and translator execution."""
+    """Unit tests for reference oracle backed by translator execution."""
 
     def test_oracle_signed_negatives_vs_positives(self):
         # In signed comparison, -100 is less than 50 and 100
-        # -100 is 0xFFFFFF9C
-        res = VMin3I32Oracle.eval(100, 50, to_u32(-100))
-        self.assertEqual(to_s32(res), -100)
+        val, _ = run_translated_min3_i32(100, 50, to_u32(-100))
+        self.assertEqual(to_s32(val), -100)
+        self.assertEqual(val, v_min3_i32_oracle(100, 50, to_u32(-100)))
 
     def test_oracle_signed_negative_one_less_than_zero(self):
         # 0xFFFFFFFF (-1) vs 0 vs 1
-        res = VMin3I32Oracle.eval(0, 0xFFFF_FFFF, 1)
-        self.assertEqual(to_s32(res), -1)
-        self.assertEqual(res, 0xFFFF_FFFF)
+        val, _ = run_translated_min3_i32(0, 0xFFFF_FFFF, 1)
+        self.assertEqual(to_s32(val), -1)
+        self.assertEqual(val, 0xFFFF_FFFF)
 
     def test_oracle_extreme_min_int32(self):
         # -2147483648 (0x80000000) is the absolute minimum signed 32-bit integer
-        res = VMin3I32Oracle.eval(0x8000_0000, 0, 0x7FFF_FFFF)
-        self.assertEqual(res, 0x8000_0000)
-        self.assertEqual(to_s32(res), MIN_INT32)
+        val, _ = run_translated_min3_i32(0x8000_0000, 0, 0x7FFF_FFFF)
+        self.assertEqual(val, 0x8000_0000)
+        self.assertEqual(to_s32(val), MIN_INT32)
 
     def test_oracle_identical_values(self):
-        val = to_u32(-42)
-        self.assertEqual(VMin3I32Oracle.eval(val, val, val), val)
+        val_in = to_u32(-42)
+        val, _ = run_translated_min3_i32(val_in, val_in, val_in)
+        self.assertEqual(val, val_in)
 
-    def test_translator_pipeline_execution(self):
-        """Verify that synthetic shader translates to valid SPIR-V assembly text via support.translate_lines."""
-        spv = VMin3I32Oracle.translate_and_validate(10, to_u32(-20), 30)
-        self.assertIsInstance(spv, str)
+    def test_translator_pipeline_execution_and_opcodes(self):
+        """Verify that synthetic shader translates to valid SPIR-V assembly with SMin."""
+        val, spv = run_translated_min3_i32(10, to_u32(-20), 30)
+        self.assertEqual(to_s32(val), -20)
         self.assertIn("OpCapability Shader", spv)
         self.assertIn("OpFunction", spv)
-        self.assertIn("OpReturn", spv)
+        self.assertIn("OpExtInst %uint %glsl SMin", spv)
+        self.assertNotIn("UMin", spv)
+        self.assertNotIn("SMax", spv)
+
 
 # -----------------------------------------------------------------------------
 # Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
 # -----------------------------------------------------------------------------
 
-class RegisterKind(Enum):
-    VGPR = auto()
-    SGPR = auto()
-    LITERAL32 = auto()
-
-
-@dataclass(frozen=True)
-class RegOperand:
-    kind: RegisterKind
-    index: int = 0
-
-    def format(self) -> str:
-        if self.kind == RegisterKind.VGPR:
-            return f"v{self.index}"
-        elif self.kind == RegisterKind.SGPR:
-            return f"s{self.index}"
-        elif self.kind == RegisterKind.LITERAL32:
-            return f"{self.index:#x}"
-        return f"reg_{self.index}"
-
-
-@dataclass
-class VMin3I32Instruction:
-    dst: RegOperand
-    src0: RegOperand
-    src1: RegOperand
-    src2: RegOperand
-    opcode: str = "v_min3_i32"
-
-    def validate(self) -> None:
-        if self.opcode != "v_min3_i32":
-            raise ValueError(f"Invalid opcode {self.opcode}")
-        if self.dst.kind != RegisterKind.VGPR:
-            raise TypeError(f"Destination must be a VGPR, got {self.dst.kind}")
-        if self.dst.index > 255:
-            raise ValueError(f"Destination VGPR index out of range: v{self.dst.index}")
-        for src, name in ((self.src0, "src0"), (self.src1, "src1"), (self.src2, "src2")):
-            if src.kind == RegisterKind.VGPR and src.index > 255:
-                raise ValueError(f"{name} VGPR index out of range: v{src.index}")
-            elif src.kind == RegisterKind.SGPR and src.index > 105:
-                raise ValueError(f"{name} SGPR index out of range: s{src.index}")
-
-    def emit_assembly(self) -> str:
-        self.validate()
-        return f"{self.opcode} {self.dst.format()}, {self.src0.format()}, {self.src1.format()}, {self.src2.format()}"
-
-
 class TestVMin3I32AST(unittest.TestCase):
-    """Unit tests for symbolic AST representation and validation."""
+    """Unit tests for AST opcode representations and syntax rejection via translator."""
 
     def test_ast_valid_vgpr_operands(self):
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=4),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.VGPR, index=3)
-        )
-        self.assertEqual(instr.emit_assembly(), "v_min3_i32 v4, v1, v2, v3")
+        lines = [
+            "v_mov_b32_e32 v1, 10",
+            "v_mov_b32_e32 v2, 20",
+            "v_mov_b32_e32 v3, 30",
+            "v_min3_i32 v4, v1, v2, v3",
+            "v_mov_b32_e32 v5, 0",
+            "exp mrt0 v4, v5, v5, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_ast_all_v", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 10)
 
     def test_ast_valid_sgpr_and_literal_operands(self):
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=5),
-            src0=RegOperand(RegisterKind.SGPR, index=8),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.LITERAL32, index=0x100)
-        )
-        self.assertEqual(instr.emit_assembly(), "v_min3_i32 v5, s8, v2, 0x100")
+        lines = [
+            "s_mov_b32 s0, 15",
+            "v_mov_b32_e32 v1, 25",
+            "v_min3_i32 v2, s0, v1, 5",
+            "v_mov_b32_e32 v3, 0",
+            "exp mrt0 v2, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_ast_s_v_lit", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 5)
 
-    def test_ast_invalid_sgpr_destination(self):
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.SGPR, index=0),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.VGPR, index=3)
-        )
-        with self.assertRaises(TypeError):
-            instr.validate()
+    def test_ast_rejects_missing_operands(self):
+        lines = [
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 2",
+            "v_min3_i32 v0, v1, v2",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_min3_missing_ops", lines)
 
-    def test_ast_vgpr_out_of_range(self):
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=256),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.VGPR, index=3)
-        )
-        with self.assertRaises(ValueError):
-            instr.validate()
 
 # -----------------------------------------------------------------------------
 # Commit 3: Deterministic Scalar Instruction Interpreter
 # -----------------------------------------------------------------------------
 
-@dataclass
-class LaneRegisterState:
-    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
-    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
-
-    def read_operand(self, op: RegOperand) -> int:
-        if op.kind == RegisterKind.VGPR:
-            return self.vgprs[op.index] & MASK32
-        elif op.kind == RegisterKind.SGPR:
-            return self.sgprs[op.index] & MASK32
-        elif op.kind == RegisterKind.LITERAL32:
-            return op.index & MASK32
-        raise NotImplementedError(f"Unsupported operand kind: {op.kind}")
-
-    def write_vgpr(self, index: int, val: int) -> None:
-        self.vgprs[index] = val & MASK32
-
-
-class ScalarInterpreter:
-    """Deterministic scalar instruction interpreter executing v_min3_i32 for a single lane."""
-
-    @staticmethod
-    def step(instr: VMin3I32Instruction, state: LaneRegisterState) -> None:
-        instr.validate()
-        s0_val = state.read_operand(instr.src0)
-        s1_val = state.read_operand(instr.src1)
-        s2_val = state.read_operand(instr.src2)
-
-        res = v_min3_i32_oracle(s0_val, s1_val, s2_val)
-        state.write_vgpr(instr.dst.index, res)
-
-
 class TestVMin3I32ScalarInterpreter(unittest.TestCase):
-    """Unit tests for deterministic scalar interpreter execution."""
-
-    def setUp(self):
-        self.state = LaneRegisterState()
+    """Unit tests verifying deterministic scalar execution via translator."""
 
     def test_interpreter_step_basic(self):
-        self.state.vgprs[1] = to_u32(-500)
-        self.state.vgprs[2] = to_u32(200)
-        self.state.vgprs[3] = to_u32(-100)
-
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=4),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.VGPR, index=3)
-        )
-        ScalarInterpreter.step(instr, self.state)
-        self.assertEqual(to_s32(self.state.vgprs[4]), -500)
+        val, _ = run_translated_min3_i32(to_u32(-500), to_u32(200), to_u32(-100))
+        self.assertEqual(to_s32(val), -500)
 
     def test_interpreter_step_with_sgpr_and_literal(self):
-        self.state.sgprs[10] = to_u32(-10)
-        self.state.vgprs[2] = to_u32(0)
-
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=5),
-            src0=RegOperand(RegisterKind.SGPR, index=10),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.LITERAL32, index=to_u32(-100))
+        val, _ = run_translated_min3_i32(
+            to_u32(-10), to_u32(0), to_u32(-100), s0_kind="s", s2_kind="lit"
         )
-        ScalarInterpreter.step(instr, self.state)
-        self.assertEqual(to_s32(self.state.vgprs[5]), -100)
+        self.assertEqual(to_s32(val), -100)
+
+    def test_interpreter_all_permutations(self):
+        # All 6 permutations of (10, -20, 30) must yield -20
+        perms = [
+            (10, to_u32(-20), 30),
+            (10, 30, to_u32(-20)),
+            (to_u32(-20), 10, 30),
+            (to_u32(-20), 30, 10),
+            (30, 10, to_u32(-20)),
+            (30, to_u32(-20), 10),
+        ]
+        for a, b, c in perms:
+            with self.subTest(a=a, b=b, c=c):
+                val, _ = run_translated_min3_i32(a, b, c)
+                self.assertEqual(to_s32(val), -20)
+
 
 # -----------------------------------------------------------------------------
 # Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
 # -----------------------------------------------------------------------------
 
-class SIMDMultiLaneModel:
-    """Models SIMD multi-lane execution of v_min3_i32 under EXEC masking."""
-
-    @staticmethod
-    def execute_wave(
-        instr: VMin3I32Instruction,
-        exec_mask: int,
-        lane_states: List[LaneRegisterState],
-        wave_size: int = 64
-    ) -> None:
-        instr.validate()
-        for lane in range(wave_size):
-            if (exec_mask & (1 << lane)) != 0:
-                s0 = lane_states[lane].read_operand(instr.src0)
-                s1 = lane_states[lane].read_operand(instr.src1)
-                s2 = lane_states[lane].read_operand(instr.src2)
-                res = v_min3_i32_oracle(s0, s1, s2)
-                lane_states[lane].write_vgpr(instr.dst.index, res)
-
-
 class TestVMin3I32SIMDDivergence(unittest.TestCase):
-    """Unit tests for SIMD divergence under Wave64 / Wave32 EXEC masking."""
+    """Unit tests for SIMD divergence under Wave64 EXEC masking via compute workgroup execution."""
 
     def test_divergent_lanes_preserve_inactive_state(self):
-        # 64 lanes, only even lanes active
-        exec_mask = 0x5555_5555_5555_5555
-        lanes = [LaneRegisterState() for _ in range(64)]
-
-        for i, lane in enumerate(lanes):
-            lane.vgprs[1] = to_u32(-i)
-            lane.vgprs[2] = to_u32(i)
-            lane.vgprs[3] = to_u32(0)
-            lane.vgprs[4] = 0xDEAD_BEEF  # sentinel
-
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=4),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.VGPR, index=3)
+        # 64 lanes, only even lanes active (EXEC = 0x5555_5555_5555_5555)
+        # Even lanes store min(-i, i, 0) = -i. Inactive lanes preserve 0xDEADBEEF sentinel.
+        prog = [
+            "s_mov_b64 exec, -1",
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mbcnt_hi_u32_b32 v0, -1, v0",
+            # v1 = -lane (0 - lane)
+            "v_sub_nc_u32_e32 v1, 0, v0",
+            # v2 = lane
+            "v_mov_b32_e32 v2, v0",
+            # canary in v4
+            "v_mov_b32_e32 v4, 0xDEADBEEF",
+            # set EXEC to even lanes only
+            "s_mov_b32 exec_lo, 0x55555555",
+            "s_mov_b32 exec_hi, 0x55555555",
+            "v_min3_i32 v4, v1, v2, 0",
+            # restore full EXEC to write results to memory
+            "s_mov_b64 exec, -1",
+            "v_lshlrev_b32_e32 v10, 2, v0",
+            "buffer_store_dword v4, v10, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_min3_divergence", prog, fssm=FSSM_64)
+        mem = si.run_workgroup(
+            spv, 64, 64,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=VSHARP + [0] * 28,
+            memory={},
         )
-        SIMDMultiLaneModel.execute_wave(instr, exec_mask, lanes)
-
-        for i, lane in enumerate(lanes):
-            if i % 2 == 0:
-                # Active: min(-i, i, 0) = -i
-                self.assertEqual(to_s32(lane.vgprs[4]), -i)
+        for lane in range(64):
+            got = mem.get(4 * lane, 0)
+            if lane % 2 == 0:
+                expected = to_u32(-lane)
+                self.assertEqual(got, expected, f"Lane {lane} failed: got {got:#x}, expected {expected:#x}")
             else:
-                # Inactive: untouched sentinel
-                self.assertEqual(lane.vgprs[4], 0xDEAD_BEEF)
+                self.assertEqual(got, 0xDEADBEEF, f"Lane {lane} canary clobbered: {got:#x}")
 
-    def test_all_lanes_active(self):
-        exec_mask = 0xFFFF_FFFF_FFFF_FFFF
-        lanes = [LaneRegisterState() for _ in range(64)]
-        for i, lane in enumerate(lanes):
-            lane.vgprs[1] = to_u32(i * 10 - 300)
-            lane.vgprs[2] = to_u32(0)
-            lane.vgprs[3] = to_u32(100)
-
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=4),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.VGPR, index=3)
-        )
-        SIMDMultiLaneModel.execute_wave(instr, exec_mask, lanes)
-
-        for i, lane in enumerate(lanes):
-            expected = min(i * 10 - 300, 0, 100)
-            self.assertEqual(to_s32(lane.vgprs[4]), expected)
 
 # -----------------------------------------------------------------------------
 # Commit 5: Register Aliasing and In-Place Operand Preservation
 # -----------------------------------------------------------------------------
 
 class TestVMin3I32Aliasing(unittest.TestCase):
-    """Unit tests for register aliasing and in-place operand preservation."""
+    """Unit tests for register aliasing and in-place operand preservation through translator."""
 
     def test_alias_dst_equals_src0(self):
-        """v_min3_i32 v1, v1, v2, v3: D aliases S0."""
-        state = LaneRegisterState()
-        state.vgprs[1] = to_u32(50)
-        state.vgprs[2] = to_u32(-20)
-        state.vgprs[3] = to_u32(10)
+        val, _ = run_translated_min3_i32(to_u32(50), to_u32(-20), to_u32(10), alias_dst=0)
+        self.assertEqual(to_s32(val), -20)
 
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=1),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=2),
-            src2=RegOperand(RegisterKind.VGPR, index=3)
-        )
-        ScalarInterpreter.step(instr, state)
-        self.assertEqual(to_s32(state.vgprs[1]), -20)
-        self.assertEqual(to_s32(state.vgprs[2]), -20)  # S1 untouched
-        self.assertEqual(to_s32(state.vgprs[3]), 10)   # S2 untouched
+    def test_alias_dst_equals_src1(self):
+        val, _ = run_translated_min3_i32(to_u32(50), to_u32(-20), to_u32(10), alias_dst=1)
+        self.assertEqual(to_s32(val), -20)
+
+    def test_alias_dst_equals_src2(self):
+        val, _ = run_translated_min3_i32(to_u32(50), to_u32(-20), to_u32(10), alias_dst=2)
+        self.assertEqual(to_s32(val), -20)
 
     def test_alias_all_operands_same_register(self):
-        """v_min3_i32 v1, v1, v1, v1: D, S0, S1, S2 all alias v1."""
-        state = LaneRegisterState()
-        state.vgprs[1] = to_u32(-999)
+        lines = [
+            "v_mov_b32_e32 v0, 0xFFFFFFFD", # -3
+            "v_min3_i32 v0, v0, v0, v0",
+            "v_mov_b32_e32 v1, 0",
+            "exp mrt0 v0, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_alias_all", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(to_s32(out[0]), -3)
 
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=1),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=1),
-            src2=RegOperand(RegisterKind.VGPR, index=1)
-        )
-        ScalarInterpreter.step(instr, state)
-        self.assertEqual(to_s32(state.vgprs[1]), -999)
-
-    def test_alias_src0_and_src1_same_register(self):
-        state = LaneRegisterState()
-        state.vgprs[1] = to_u32(10)
-        state.vgprs[2] = to_u32(-50)
-
-        instr = VMin3I32Instruction(
-            dst=RegOperand(RegisterKind.VGPR, index=3),
-            src0=RegOperand(RegisterKind.VGPR, index=1),
-            src1=RegOperand(RegisterKind.VGPR, index=1),
-            src2=RegOperand(RegisterKind.VGPR, index=2)
-        )
-        ScalarInterpreter.step(instr, state)
-        self.assertEqual(to_s32(state.vgprs[3]), -50)
 
 # -----------------------------------------------------------------------------
 # Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
 # -----------------------------------------------------------------------------
 
 class TestVMin3I32ConditionCodes(unittest.TestCase):
-    """Unit tests verifying condition codes and flag properties for v_min3_i32.
+    """Unit tests verifying sign and zero detection on translated output words."""
 
-    In RDNA2, vector ALU instructions (VOP3) do not update SCC.
-    We test zero and sign detection on the output word.
-    """
-
-    def test_zero_result_detection(self):
-        res = v_min3_i32_oracle(0, 10, 20)
-        self.assertEqual(res, 0)
-        is_zero = (res == 0)
-        self.assertTrue(is_zero)
+    def test_zero_result_translation(self):
+        val, _ = run_translated_min3_i32(0, 10, 20)
+        self.assertEqual(val, 0)
 
     def test_negative_result_sign_bit(self):
-        res = v_min3_i32_oracle(to_u32(-1), 10, 20)
-        is_negative = bool(res & SIGN_BIT32)
-        self.assertTrue(is_negative)
+        val, _ = run_translated_min3_i32(to_u32(-1), 10, 20)
+        self.assertEqual(val, 0xFFFF_FFFF)
+        self.assertTrue(bool(val & SIGN_BIT32))
 
     def test_positive_result_sign_bit(self):
-        res = v_min3_i32_oracle(10, 20, 30)
-        is_negative = bool(res & SIGN_BIT32)
-        self.assertFalse(is_negative)
+        val, _ = run_translated_min3_i32(10, 20, 30)
+        self.assertEqual(val, 10)
+        self.assertFalse(bool(val & SIGN_BIT32))
+
 
 # -----------------------------------------------------------------------------
 # Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
 # -----------------------------------------------------------------------------
 
 class TestVMin3I32IEEE754Bitwise(unittest.TestCase):
-    """Unit tests verifying that IEEE 754 float bit patterns are compared strictly as signed integers."""
+    """Unit tests verifying that IEEE 754 bit patterns are compared strictly as signed integers."""
 
     FLOAT32_PATTERNS = {
         "pos_zero": 0x0000_0000,
@@ -464,22 +366,21 @@ class TestVMin3I32IEEE754Bitwise(unittest.TestCase):
         """In signed 32-bit integer, 0x80000000 (-2147483648) is less than 0x00000000 (0)."""
         neg_zero = self.FLOAT32_PATTERNS["neg_zero"]
         pos_zero = self.FLOAT32_PATTERNS["pos_zero"]
-        res = v_min3_i32_oracle(pos_zero, neg_zero, 1)
-        self.assertEqual(res, neg_zero)
+        val, _ = run_translated_min3_i32(pos_zero, neg_zero, 1)
+        self.assertEqual(val, neg_zero)
 
     def test_neg_zero_is_signed_min_int32(self):
         neg_zero = self.FLOAT32_PATTERNS["neg_zero"]
         for name, pattern in self.FLOAT32_PATTERNS.items():
             with self.subTest(pattern_name=name):
-                # 0x80000000 is <= any 32-bit integer
-                res = v_min3_i32_oracle(pattern, neg_zero, 0)
-                self.assertEqual(res, neg_zero)
+                val, _ = run_translated_min3_i32(pattern, neg_zero, 0)
+                self.assertEqual(val, neg_zero)
 
     def test_neg_inf_signed_comparison(self):
-        """0xFF800000 is -8388608 in signed int32, which is less than 0 but greater than 0x80000000."""
         neg_inf = self.FLOAT32_PATTERNS["neg_inf"]
-        res = v_min3_i32_oracle(0, neg_inf, 100)
-        self.assertEqual(res, neg_inf)
+        val, _ = run_translated_min3_i32(0, neg_inf, 100)
+        self.assertEqual(val, neg_inf)
+
 
 # -----------------------------------------------------------------------------
 # Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
@@ -488,63 +389,39 @@ class TestVMin3I32IEEE754Bitwise(unittest.TestCase):
 class TestVMin3I32NegativeAndMutation(unittest.TestCase):
     """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
 
-    def test_reject_out_of_bounds_vgpr(self):
-        for oob in (256, 300, 512):
-            with self.subTest(oob=oob):
-                instr = VMin3I32Instruction(
-                    dst=RegOperand(RegisterKind.VGPR, index=oob),
-                    src0=RegOperand(RegisterKind.VGPR, index=0),
-                    src1=RegOperand(RegisterKind.VGPR, index=1),
-                    src2=RegOperand(RegisterKind.VGPR, index=2)
-                )
-                with self.assertRaises(ValueError):
-                    instr.validate()
-
-    def test_reject_invalid_destination_kind(self):
-        for bad_kind in (RegisterKind.SGPR, RegisterKind.LITERAL32):
-            with self.subTest(bad_kind=bad_kind):
-                instr = VMin3I32Instruction(
-                    dst=RegOperand(bad_kind, index=0),
-                    src0=RegOperand(RegisterKind.VGPR, index=0),
-                    src1=RegOperand(RegisterKind.VGPR, index=1),
-                    src2=RegOperand(RegisterKind.VGPR, index=2)
-                )
-                with self.assertRaises(TypeError):
-                    instr.validate()
-
     def test_mutation_detector_unsigned_vs_signed(self):
-        """Verify detection of unsigned min mutant."""
-        def mutant_min3_u32(s0: int, s1: int, s2: int) -> int:
-            return min(s0 & MASK32, s1 & MASK32, s2 & MASK32)
-
+        """Verify that signed min (v_min3_i32) and unsigned min (v_min3_u32) diverge on -1 vs 0 vs 1."""
         s0 = 0xFFFF_FFFF  # signed -1, unsigned 4294967295
         s1 = 0
         s2 = 1
 
-        correct = v_min3_i32_oracle(s0, s1, s2)
-        mutant = mutant_min3_u32(s0, s1, s2)
+        res_signed, _ = run_translated_min3_i32(s0, s1, s2, op="v_min3_i32")
+        res_unsigned, _ = run_translated_min3_i32(s0, s1, s2, op="v_min3_u32")
 
-        # Correct signed min is -1 (0xFFFFFFFF)
-        self.assertEqual(correct, 0xFFFF_FFFF)
-        # Mutant unsigned min is 0
-        self.assertEqual(mutant, 0)
-        self.assertNotEqual(mutant, correct)
+        # Signed min is -1 (0xFFFFFFFF)
+        self.assertEqual(res_signed, 0xFFFF_FFFF)
+        # Unsigned min is 0 (0x0)
+        self.assertEqual(res_unsigned, 0)
+        self.assertNotEqual(res_signed, res_unsigned)
 
     def test_mutation_detector_max3_mutant(self):
-        """Verify detection of max3 mutant."""
-        def mutant_max3_i32(s0: int, s1: int, s2: int) -> int:
-            return to_u32(max(to_s32(s0), to_s32(s1), to_s32(s2)))
-
+        """Verify that min3 and max3 diverge on -10 vs 0 vs 10."""
         s0 = to_u32(-10)
-        s1 = to_u32(0)
-        s2 = to_u32(10)
+        s1 = 0
+        s2 = 10
 
-        correct = v_min3_i32_oracle(s0, s1, s2)
-        mutant = mutant_max3_i32(s0, s1, s2)
+        res_min, _ = run_translated_min3_i32(s0, s1, s2, op="v_min3_i32")
+        res_max, _ = run_translated_min3_i32(s0, s1, s2, op="v_max3_i32")
 
-        self.assertEqual(to_s32(correct), -10)
-        self.assertEqual(to_s32(mutant), 10)
-        self.assertNotEqual(mutant, correct)
+        self.assertEqual(to_s32(res_min), -10)
+        self.assertEqual(to_s32(res_max), 10)
+        self.assertNotEqual(res_min, res_max)
+
+    def test_translator_emits_chained_smins(self):
+        """Verify that translator emits exactly two chained SMin instructions."""
+        _, spv = run_translated_min3_i32(1, 2, 3)
+        count = spv.count("OpExtInst %uint %glsl SMin")
+        self.assertEqual(count, 2)
 
 
 if __name__ == "__main__":
