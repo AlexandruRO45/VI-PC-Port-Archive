@@ -285,5 +285,48 @@ class VSubCoU32TranslatorIntegrationTests(unittest.TestCase):
         self.assertNotEqual(out_sub[0], out_subrev[0])
 
 
+class VSubrevCoU32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_subrev_co_u32 with translator execution."""
+
+    def test_basic_reverse_subtraction(self):
+        out = run_prog([
+            "v_mov_b32 v0, 30",
+            "v_mov_b32 v1, 80",
+            "v_subrev_co_u32 v2, vcc, v0, v1",
+            "v_mov_b32 v0, v2",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        d, b = ref_subrev_co_u32(30, 80)
+        self.assertEqual(out[0], d)
+        self.assertEqual(out[1], b)
+        self.assertEqual(out[0], 50)
+        self.assertEqual(out[1], 0)
+
+    def test_borrow_generation(self):
+        out = run_prog([
+            "v_mov_b32 v0, 80",
+            "v_mov_b32 v1, 30",
+            "v_subrev_co_u32 v2, vcc, v0, v1",
+            "v_mov_b32 v0, v2",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        d, b = ref_subrev_co_u32(80, 30)
+        self.assertEqual(out[0], d)
+        self.assertEqual(out[1], b)
+        self.assertEqual(out[0], 0xFFFFFFCE)
+        self.assertEqual(out[1], 1)
+
+    def test_zero_identity(self):
+        out = run_prog([
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 500",
+            "v_subrev_co_u32 v2, vcc, v0, v1",
+            "v_mov_b32 v0, v2",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 500)
+        self.assertEqual(out[1], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
