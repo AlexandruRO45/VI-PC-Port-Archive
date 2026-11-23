@@ -415,5 +415,20 @@ class VMinF64SimdIeeeTests(unittest.TestCase):
     def test_min_infinities(self):
         self.assertEqual(oracle_min_f64(F64_NEG_INF, f64_to_u64(0.0)), F64_NEG_INF)
 
+class VMinF64TranslatorTests(unittest.TestCase):
+    def test_min_f64_translation_or_refusal(self):
+        lines = [
+            "v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3FF00000",
+            "v_mov_b32 v2, 0", "v_mov_b32 v3, 0x40000000",
+            "v_min_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        try:
+            spv = translate_lines("ps_min_f64_test", lines)
+            self.assertIn("OpCapability", spv)
+        except rdna2spirv.Unsupported as caught:
+            self.assertIn("v_min_f64", str(caught))
+
 if __name__ == "__main__":
     unittest.main()
