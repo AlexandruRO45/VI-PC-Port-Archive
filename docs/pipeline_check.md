@@ -358,9 +358,9 @@ compiles in 5.0 s. Twelve compute shaders with 18 to 40 typed stores took 1,739 
 search of branches since the branch-per-format change, about 900 instructions, 500 more inline for d16) and cost the
 NVIDIA driver 0.5 to 0.8 s each. The load is now a call to one branch-free function per (component count, d16) that
 reads only the channels it writes from a per-format table. On an RTX 4080 SUPER (one module at a time, `--jobs 1`, no
-cache file, a fresh generator word per module and run), six compute modules with 66 to 96 such loads (1.0 to 4.8 MB):
+cache file, a fresh generator word per module and run), six compute modules with 66 to 96 such loads (1.6 to 4.8 MB on main):
 main 189 s and 383 s in two rounds, with the typed-store change alone 100 s and 215 s, with this change 43 s and 91 s
-(the 3 to 5 MB modules are also smaller by 5%, the 1.0 to 1.8 MB ones by 36 to 57% in bytes). Six pixel shaders with 7 to
+(in bytes the 4 to 5 MB modules shrink 12 to 14%, the 1.6 to 1.8 MB ones 56 to 57%). Six pixel shaders with 7 to
 113 loads: 61 s (main), 56 to 66 s (stores only), 33 to 40 s. Six larger modules (7 to 13 MB, 85 loads each) went past 8 GB
 of driver memory on main and on both changes and were not timed; they shrink 1.1% in bytes.
 
