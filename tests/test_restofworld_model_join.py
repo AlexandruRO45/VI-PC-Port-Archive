@@ -775,6 +775,38 @@ class ModelJoinTests(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             self.assertFalse(os.path.exists(out_ok))
 
+    def test_uses_shared_same_report_path_and_rejects_carved_payload_alias(self):
+        import report_paths
+        self.assertIs(joiner.same_report_path, report_paths.same_report_path)
+        carved_dir = os.path.join(self.root, "carved_alias_src")
+        os.makedirs(carved_dir)
+        carved_bin = os.path.join(carved_dir, "00001010.bin")
+        payload = b"\x00" * 64
+        with open(carved_bin, "wb") as fh:
+            fh.write(payload)
+
+        with (unittest.mock.patch.object(report_paths, "path_key", side_effect=str),
+              unittest.mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+              unittest.mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe):
+            self.assertTrue(joiner._aliases_input(os.path.join(carved_dir, "INDEX.JSON"), carved_dir))
+        self.assertGreaterEqual(probe.call_count, 1)
+
+        alias_json = os.path.join(self.root, "alias_report.json")
+        try:
+            os.link(carved_bin, alias_json)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"hard links unavailable: {exc}")
+        proc = subprocess.run(
+            [sys.executable, "-I", TOOL, carved_dir, alias_json],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("output must not overwrite the source", proc.stderr)
+        with open(carved_bin, "rb") as fh:
+            self.assertEqual(fh.read(), payload)
+
 
 if __name__ == "__main__":
     unittest.main()
