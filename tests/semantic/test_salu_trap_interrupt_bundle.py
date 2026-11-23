@@ -112,5 +112,43 @@ class TestSTtraceDataOperands(unittest.TestCase):
         self.assertEqual(words, [0x55555555, 0x55555555, 0x55555555, 0x55555555])
 
 
+class TestSTtraceDataPreservation(unittest.TestCase):
+    def test_scc_preservation(self):
+        lines = [
+            "s_cmp_eq_u32 5, 5",              # sets SCC = 1
+            "s_ttracedata 0x123",
+            "s_cselect_b32 s0, 0x111, 0x222",  # reads SCC -> 0x111
+            "s_cmp_lg_u32 5, 5",              # sets SCC = 0
+            "s_ttracedata s0",
+            "s_cselect_b32 s1, 0x111, 0x222",  # reads SCC -> 0x222
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ]
+        words = run_ps(lines, ("v0", "v1", "v0", "v1"))
+        self.assertEqual(words, [0x111, 0x222, 0x111, 0x222])
+
+    def test_vcc_preservation(self):
+        lines = [
+            "v_cmp_eq_u32_e32 vcc, 0, 0",      # VCC = all ones
+            "s_ttracedata 0",
+            "v_cndmask_b32_e64 v0, 0xAA, 0xBB, vcc",  # picks 0xBB
+            "v_cmp_lg_u32_e32 vcc, 0, 0",      # VCC = all zeros
+            "s_ttracedata 1",
+            "v_cndmask_b32_e64 v1, 0xAA, 0xBB, vcc",  # picks 0xAA
+        ]
+        words = run_ps(lines, ("v0", "v1", "v0", "v1"))
+        self.assertEqual(words, [0xBB, 0xAA, 0xBB, 0xAA])
+
+    def test_vgpr_sgpr_preservation(self):
+        lines = [
+            "s_mov_b32 s0, 0xCAFEBABE",
+            "v_mov_b32 v0, 0xFEEDFACE",
+            "s_ttracedata s0",
+            "v_mov_b32 v1, s0",
+        ]
+        words = run_ps(lines, ("v0", "v1", "v0", "v1"))
+        self.assertEqual(words, [0xFEEDFACE, 0xCAFEBABE, 0xFEEDFACE, 0xCAFEBABE])
+
+
 if __name__ == "__main__":
     unittest.main()
