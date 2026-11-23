@@ -232,3 +232,88 @@ class TestASTDefinitions(unittest.TestCase):
         spv = support.translate_lines("ps_ast_min3_valid", lines)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 20)
+
+
+# ==============================================================================
+# SECTION 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    vgprs: Dict[int, int] = field(default_factory=dict)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0)
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = u32(val)
+
+
+class ScalarInterpreter:
+    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
+        if op.kind == OperandKind.VGPR:
+            return state.get_vgpr(op.value)
+        elif op.kind == OperandKind.SGPR:
+            return state.get_sgpr(op.value)
+        elif op.kind == OperandKind.IMMEDIATE:
+            return u32(op.value)
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def step(self, instr: VMin3I32Instruction, state: ScalarMachineState) -> int:
+        val0 = self.resolve_operand(instr.src0, state)
+        val1 = self.resolve_operand(instr.src1, state)
+        val2 = self.resolve_operand(instr.src2, state)
+        res = oracle_min3_i32(val0, val1, val2)
+        state.set_vgpr(instr.dst.value, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_execution(self) -> None:
+        """Verify interpreter correctly executes across VGPR, SGPR, and Immediate inputs."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, 35)
+        state.set_sgpr(4, from_signed_i32(-15))
+
+        interp = ScalarInterpreter()
+        instr = VMin3I32Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=SGPR(4),
+            src2=Immediate(10),
+        )
+        res = interp.step(instr, state)
+        self.assertEqual(res, from_signed_i32(-15))
+        self.assertEqual(state.get_vgpr(0), from_signed_i32(-15))
+
+    def test_scalar_interpreter_cross_validation_with_translator(self) -> None:
+        """Verify scalar interpreter exactly matches translated SPIR-V execution."""
+        state = ScalarMachineState()
+        v1_val = from_signed_i32(-500)
+        v2_val = from_signed_i32(-200)
+        v3_val = from_signed_i32(100)
+        state.set_vgpr(1, v1_val)
+        state.set_vgpr(2, v2_val)
+        state.set_vgpr(3, v3_val)
+
+        interp = ScalarInterpreter()
+        instr = VMin3I32Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=VGPR(2),
+            src2=VGPR(3),
+        )
+        interp_res = interp.step(instr, state)
+        spv_res = run_translator_min3_i32(v1_val, v2_val, v3_val, name="ps_scalar_min3_cross")
+        self.assertEqual(interp_res, spv_res)
+        self.assertEqual(interp_res, from_signed_i32(-500))
