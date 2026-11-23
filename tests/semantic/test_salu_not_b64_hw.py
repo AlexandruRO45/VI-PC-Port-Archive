@@ -210,5 +210,44 @@ class TestSNotB64ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.rf.scc, 0)
 
 
+class MultiWaveScalarState:
+    """SALU state across wavefronts: scalar registers are wavefront-wide and lane-invariant."""
+
+    def __init__(self, num_lanes: int = 32):
+        self.num_lanes = num_lanes
+        self.sgprs = [0] * 106
+        self.scc = 0
+
+    def write_sgpr64(self, idx: int, val64: int) -> None:
+        self.sgprs[idx] = val64 & MASK32
+        self.sgprs[idx + 1] = (val64 >> 32) & MASK32
+
+    def read_sgpr64(self, idx: int) -> int:
+        return (self.sgprs[idx] & MASK32) | ((self.sgprs[idx + 1] & MASK32) << 32)
+
+
+class TestSNotB64WaveInvariance(unittest.TestCase):
+    """Scalar ALU operations are shared across all lanes regardless of vector EXEC mask."""
+
+    def test_wave32_uniform_scalar_state(self):
+        wave = MultiWaveScalarState(num_lanes=32)
+        val = 0xAAAAAAAAAAAAAAAA
+        wave.write_sgpr64(4, val)
+        res = ref_not_b64(wave.read_sgpr64(4))
+        wave.write_sgpr64(0, res)
+        # All 32 lanes observe identical scalar result
+        for lane in range(32):
+            self.assertEqual(wave.read_sgpr64(0), 0x5555555555555555)
+
+    def test_wave64_uniform_scalar_state(self):
+        wave = MultiWaveScalarState(num_lanes=64)
+        val = 0x0123456789ABCDEF
+        wave.write_sgpr64(2, val)
+        res = ref_not_b64(wave.read_sgpr64(2))
+        wave.write_sgpr64(0, res)
+        for lane in range(64):
+            self.assertEqual(wave.read_sgpr64(0), 0xFEDCBA9876543210)
+
+
 if __name__ == "__main__":
     unittest.main()
