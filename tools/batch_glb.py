@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 from collections import OrderedDict
+from contextlib import nullcontext
 import os
 import sys
 import threading
@@ -73,13 +74,15 @@ _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 class TextureCache:
     """Retain at most 256 MiB of completed PNG payloads per batch, evicting the least recently used.
 
-    Workers reading the same texture at the same size share one load. In-flight work and textures held
-    by models being written are outside the cache budget. Keep read errors for the batch so an
-    unreadable texture is reported for each model without repeatedly decoding it.
+    Workers reading the same texture at the same size share one load. An evicted DDS is decoded
+    again if another model needs it. At most two DDS decodes run at once per batch. Their working
+    memory and textures held by models being written are outside the cache budget. Keep read errors
+    for the batch so an unreadable texture is reported for each model without repeatedly decoding it.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._dds_slots = threading.Semaphore(2)
         self._images: OrderedDict[tuple[str, int], bytes] = OrderedDict()
         self._cached_bytes = 0
         self._errors: dict[tuple[str, int], str] = {}
@@ -102,7 +105,8 @@ class TextureCache:
             return pending.result()
 
         try:
-            data, reason = _load_png_bytes(path, max_size=max_size)
+            with self._dds_slots if path.lower().endswith(".dds") else nullcontext():
+                data, reason = _load_png_bytes(path, max_size=max_size)
             with self._lock:
                 if data is None:
                     self._errors[key] = reason
@@ -257,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         "--jobs",
         type=_positive_jobs,
         default=None,
-        help="Number of parallel worker threads (default: CPU count)",
+        help="Number of parallel model workers (default: CPU count); at most two DDS textures decode at once",
     )
     parser.add_argument(
         "--up",

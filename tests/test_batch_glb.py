@@ -9,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import queue
 import struct
 import subprocess
 import sys
@@ -44,7 +45,7 @@ def _create_minimal_bc1_dds(color: int = 0xF800) -> bytes:
 
 class TestBatchGlb(unittest.TestCase):
     def test_cache_evicts_least_recent_payload_and_keeps_errors(self) -> None:
-        loader_results = {"a": b"aa", "b": b"bb", "c": b"ccc", "big": b"123456", "bad": None}
+        loader_results = {"a": b"aa", "b": b"bb", "c": b"ccc", "full": b"12345", "big": b"123456", "bad": None}
         loads = []
 
         def load(path, max_size=0):
@@ -55,9 +56,34 @@ class TestBatchGlb(unittest.TestCase):
         with mock.patch.object(batch_glb, "_PNG_CACHE_BUDGET", 5), \
                 mock.patch.object(batch_glb, "_load_png_bytes", load):
             cache = batch_glb.TextureCache()
-            for path in ("bad", "a", "b", "a", "c", "big", "big", "a", "b", "bad"):
+            for path in ("bad", "a", "b", "a", "c", "big", "big", "a", "b", "bad", "full", "full"):
                 self.assertEqual(cache.get_or_load(path)[0], loader_results[path])
-        self.assertEqual(loads, ["bad", "a", "b", "c", "big", "big", "b"])
+        self.assertEqual(loads, ["bad", "a", "b", "c", "big", "big", "b", "full"])
+
+    def test_parallel_png_read_while_two_dds_decodes_are_busy(self) -> None:
+        started = queue.Queue()
+        release = threading.Event()
+
+        def load(path, max_size=0):
+            started.put(path)
+            if path.endswith(".dds") and not release.wait(timeout=5):
+                raise TimeoutError("DDS decode was not released")
+            return b"image", ""
+
+        cache = batch_glb.TextureCache()
+        with mock.patch.object(batch_glb, "_load_png_bytes", load), ThreadPoolExecutor(4) as pool:
+            try:
+                futures = [pool.submit(cache.get_or_load, path) for path in ("a.dds", "b.dds")]
+                self.assertEqual({started.get(timeout=5), started.get(timeout=5)}, {"a.dds", "b.dds"})
+                futures.append(pool.submit(cache.get_or_load, "c.dds"))
+                png = pool.submit(cache.get_or_load, "d.png")
+                self.assertEqual(png.result(timeout=5), (b"image", ""))
+                self.assertEqual(started.get(timeout=5), "d.png")
+            finally:
+                release.set()
+            for future in futures:
+                self.assertEqual(future.result(timeout=5), (b"image", ""))
+            self.assertEqual(started.get(timeout=5), "c.dds")
 
     def test_cache_separates_dds_decode_sizes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
