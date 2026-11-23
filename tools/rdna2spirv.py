@@ -218,12 +218,12 @@ class Gen:
         self.stage = stage
         self.body = []
         self.consts = {}
-        # tof/tou results -> the id they were bitcast from. A bitcast of a bitcast gives the original id back: wherever
-        # the key is valid its source is too (the key's own definition uses it), so no dominance is lost.
-        self.bitcast_from = {}
         self.n = 0
         self.outputs = {}
         self.inputs = {}
+        # tof/tou results -> the id they were bitcast from. A bitcast of a bitcast gives the original id back: wherever
+        # the key is valid its source is too (the key's own definition uses it), so no dominance is lost.
+        self.bitcast_from = {}
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
         self.f16_halves = set()     # PS, --f16-interp-fallback: the same attributes, read from decoded-half inputs
