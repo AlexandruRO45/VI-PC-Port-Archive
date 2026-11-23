@@ -78,7 +78,7 @@ target_link_options(xmem_shim_check PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi
 target_include_directories(xmem_shim_check PRIVATE src)
 target_compile_features(xmem_shim_check PRIVATE cxx_std_17)
 # working_set_aggregation feeds synthetic adapter readings to src/xmem_gpu_usage.h.
-foreach(scenario IN ITEMS exports allocation default_allocation query working_set working_set_aggregation)
+foreach(scenario IN ITEMS exports allocation default_allocation query working_set working_set_aggregation physical_pages)
     add_test(NAME xmem_shim_${scenario} COMMAND xmem_shim_check ${scenario})
 endforeach()
 # XMemGetWorkingSetStatistics differences around D3D12 heap and committed-resource lifetimes.

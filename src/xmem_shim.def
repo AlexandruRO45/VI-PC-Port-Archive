@@ -6,3 +6,10 @@ EXPORTS
     XMemFreeDefault=XMemFree @6
     XMemVirtualQuery @4
     XMemGetWorkingSetStatistics @3
+    XMemAllocatePhysicalPages @7
+    XMemFreePhysicalPages @8
+    XMemMapPhysicalPages @9
+    XMemVirtualAlloc @10
+    XMemIsToolsMemAvailable @11
+    XMemMapPhysicalPagesScatter @12
+    XMemTransferMemory @13

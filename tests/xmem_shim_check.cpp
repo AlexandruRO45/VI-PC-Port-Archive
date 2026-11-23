@@ -31,6 +31,13 @@ extern "C" __declspec(dllimport) void* XMemAllocDefault(SIZE_T bytes, ULONGLONG 
 extern "C" __declspec(dllimport) void XMemFreeDefault(void* allocation, ULONGLONG attributes);
 extern "C" __declspec(dllimport) BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer);
 extern "C" __declspec(dllimport) BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics);
+extern "C" __declspec(dllimport) BOOL XMemAllocatePhysicalPages(UINT32 attributes, ULONG_PTR* page_count, ULONG_PTR* physical_pages);
+extern "C" __declspec(dllimport) BOOL XMemFreePhysicalPages(ULONG_PTR page_count, const ULONG_PTR* physical_pages);
+extern "C" __declspec(dllimport) BOOL XMemMapPhysicalPages(void* virtual_address, SIZE_T page_count, const ULONG_PTR* physical_pages);
+extern "C" __declspec(dllimport) void* XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type, DWORD protect, ULONGLONG attributes);
+extern "C" __declspec(dllimport) BOOL XMemIsToolsMemAvailable();
+extern "C" __declspec(dllimport) BOOL XMemMapPhysicalPagesScatter(void** virtual_addresses, SIZE_T page_count, const ULONG_PTR* physical_pages);
+extern "C" __declspec(dllimport) BOOL XMemTransferMemory(void* destination, const void* source, SIZE_T bytes, ULONGLONG attributes);
 
 using namespace std::literals;
 using Byte = unsigned char;
@@ -68,7 +75,10 @@ bool export_checks()
     if (!module) return false;
     unsigned found = 0;
     for (const char* name : {"XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
-                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics"}) {
+                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics",
+                             "XMemAllocatePhysicalPages", "XMemFreePhysicalPages",
+                             "XMemMapPhysicalPages", "XMemVirtualAlloc", "XMemIsToolsMemAvailable",
+                             "XMemMapPhysicalPagesScatter", "XMemTransferMemory"}) {
         if (!GetProcAddress(module, name)) return false;
         ++found;
     }
@@ -462,6 +472,86 @@ int working_set_gpu_checks(bool warp)
     });
     return passed ? 0 : 1;
 }
+
+bool physical_pages_checks()
+{
+    if (XMemAllocatePhysicalPages(0x280, nullptr, nullptr) || GetLastError() != ERROR_INVALID_PARAMETER)
+        return false;
+    ULONG_PTR count = 4;
+    if (XMemAllocatePhysicalPages(0x280, &count, nullptr) || GetLastError() != ERROR_INVALID_PARAMETER)
+        return false;
+    ULONG_PTR dummy[4] = {};
+    if (XMemAllocatePhysicalPages(0x280, nullptr, dummy) || GetLastError() != ERROR_INVALID_PARAMETER)
+        return false;
+
+    count = 4;
+    ULONG_PTR pages[4] = {};
+    if (!XMemAllocatePhysicalPages(0x280, &count, pages) || count != 4)
+        return false;
+
+    for (int i = 0; i < 4; ++i) {
+        if (!pages[i]) return false;
+        const auto pfn = pages[i] >> 4;
+        if (pfn == 0) return false;
+        for (int j = i + 1; j < 4; ++j) {
+            if (pages[i] == pages[j]) return false;
+        }
+    }
+
+    constexpr SIZE_T total_bytes = 4 * 64 * 1024;
+    void* va = XMemVirtualAlloc(nullptr, total_bytes, MEM_RESERVE, PAGE_NOACCESS, 0);
+    if (!va) return false;
+
+    if (!XMemMapPhysicalPages(va, count, pages)) {
+        VirtualFree(va, 0, MEM_RELEASE);
+        return false;
+    }
+
+    auto* bytes = static_cast<unsigned char*>(va);
+    bytes[0] = 0x42;
+    bytes[total_bytes - 1] = 0x84;
+    if (bytes[0] != 0x42 || bytes[total_bytes - 1] != 0x84) {
+        VirtualFree(va, 0, MEM_RELEASE);
+        return false;
+    }
+
+    if (!XMemMapPhysicalPages(va, count, nullptr)) {
+        VirtualFree(va, 0, MEM_RELEASE);
+        return false;
+    }
+    VirtualFree(va, 0, MEM_RELEASE);
+
+    if (!XMemFreePhysicalPages(count, pages))
+        return false;
+
+    if (XMemFreePhysicalPages(count, pages) || GetLastError() != ERROR_INVALID_PARAMETER)
+        return false;
+    ULONG_PTR bogus[1] = { 0xdeadbeef };
+    if (XMemFreePhysicalPages(1, bogus) || GetLastError() != ERROR_INVALID_PARAMETER)
+        return false;
+
+    if (XMemIsToolsMemAvailable() != FALSE)
+        return false;
+
+    // 7. Scatter mapping and memory transfer
+    void* va_scatter[2] = {
+        XMemVirtualAlloc(nullptr, 64 * 1024, MEM_RESERVE, PAGE_NOACCESS, 0),
+        XMemVirtualAlloc(nullptr, 64 * 1024, MEM_RESERVE, PAGE_NOACCESS, 0)
+    };
+    if (!va_scatter[0] || !va_scatter[1]) return false;
+    ULONG_PTR scatter_pages[2] = { pages[0], pages[1] };
+    if (!XMemMapPhysicalPagesScatter(va_scatter, 2, scatter_pages)) return false;
+
+    unsigned char src[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    if (!XMemTransferMemory(va_scatter[0], src, sizeof(src), 0)) return false;
+    if (std::memcmp(va_scatter[0], src, sizeof(src)) != 0) return false;
+
+    if (!XMemMapPhysicalPagesScatter(va_scatter, 2, nullptr)) return false;
+    VirtualFree(va_scatter[0], 0, MEM_RELEASE);
+    VirtualFree(va_scatter[1], 0, MEM_RELEASE);
+
+    return true;
+}
 }
 
 int main(int argc, char** argv)
@@ -483,6 +573,8 @@ int main(int argc, char** argv)
         passed = working_set_checks();
     } else if (scenario == "working_set_aggregation"sv) {
         passed = aggregation_checks();
+    } else if (scenario == "physical_pages"sv) {
+        passed = physical_pages_checks();
     } else if (scenario == "working_set_warp"sv || scenario == "working_set_hardware"sv) {
         const int result = working_set_gpu_checks(scenario == "working_set_warp"sv);
         if (result == 77) return result;
