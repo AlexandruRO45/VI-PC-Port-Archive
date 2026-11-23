@@ -528,6 +528,13 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIn("is a file, not a folder", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
 
+        # A folder under that file can't be created: a usage error too, not an OSError traceback.
+        under_file = os.path.join(out_file, "sub")
+        res = self.run_carve(self.archive, under_file)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn(f"cannot create {under_file}", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
     def test_carve_preserves_existing_index_temp_sibling(self):
         dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
         with open(self.archive, "wb") as f:
