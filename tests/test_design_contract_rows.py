@@ -61,6 +61,7 @@ class DesignTable(unittest.TestCase):
         self.assertIn("ps_wqm.asm", row)
         self.assertIn("fully covered", row)
         self.assertIn("Helper lanes at a triangle edge, measured on RDNA2", row)
+        self.assertIn("GPU testing of translated WQM at a partly covered triangle edge remains open", row)
         self.assertNotIn("helper-invocation behaviour at triangle edges is untested", row)
 
     def test_design_md_has_no_row_twice(self):
