@@ -529,6 +529,17 @@ int main() {
         write(dir / "fspx" / "index.json", "{broken");
         CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 1 && bvh.fspx_size() == 0 &&
               bvh.program_candidates("cs", program).size() == 1);
+        // The executable's own containers (<dir>/exe, entries named "exe/<name>"): found by fssm_sha256 like the
+        // builder's programs, counted apart from them, and a broken exe/index.json leaves the others loaded.
+        std::filesystem::create_directories(dir / "exe");
+        write(dir / "exe" / "index.json",
+              "{\"container_00\": {\"stage\": \"vs\", \"fssm_sha256\": \"" + builder_hash + "\"}}");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 3 && bvh.bvh_size() == 1 && bvh.exe_size() == 1);
+        CHECK(bvh.find("vs", builder_hash) && bvh.find("vs", builder_hash)->name == "exe/container_00");
+        CHECK(bvh.find("cs", builder_hash) && bvh.find("cs", builder_hash)->name == "bvh/BuilderProgram");
+        write(dir / "exe" / "index.json", "{broken");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.exe_size() == 0 && bvh.bvh_size() == 1 &&
+              bvh.find("cs", hash));
         std::filesystem::remove_all(dir);
     }
 

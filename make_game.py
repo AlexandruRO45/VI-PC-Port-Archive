@@ -1502,7 +1502,8 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
         # A work folder used before with a package that had the DLL still holds that run's index, and the runtime
         # loads <shaders>/bvh/index.json whenever it is there. Without the index the old modules are not found.
         drop(translated, settings_file)
-        log(f"shaders: no {binary} in the game folder, so no {"BVH builder" if folder == "bvh" else "embedded"} programs to translate")
+        kind = "BVH builder" if folder == "bvh" else "embedded"
+        log(f"shaders: no {binary} in the game folder, so no {kind} programs to translate")
         return
     settings = bvh_settings(dll, mc_signature, emulate, fallbacks)
     programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None

@@ -761,6 +761,8 @@ public:
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
     std::size_t bvh_size() const { return bvh_count_; }
+    // Entries loaded from <dir>/exe/index.json: the game executable's own containers, which no RPF holds either.
+    std::size_t exe_size() const { return exe_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -864,6 +866,7 @@ private:
             count_ = 0;
             fspx_count_ = 0;
             bvh_count_ = 0;
+            exe_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -929,6 +932,7 @@ private:
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && prefix == "fspx/") ++fspx_count_;
             if (prefix == "bvh/") ++bvh_count_;
+            if (prefix == "exe/") ++exe_count_;
             ++count_;
         }
         return true;
@@ -938,6 +942,7 @@ private:
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
     std::size_t bvh_count_ = 0;
+    std::size_t exe_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;
