@@ -16408,10 +16408,22 @@ def cs_dispatch_state(path, name):
     if os.path.isfile(fssm) or not os.path.isfile(meta):
         with open(fssm, "rb") as f:
             hdr = f.read(0x148)
+        if len(hdr) < 0x148:
+            raise Unsupported("truncated FSSM compute dispatch state")
         return struct.unpack_from("<4I", hdr, 0x138)
-    with open(meta, encoding="utf-8") as f:
-        m = _json.load(f)
-    return (m["rsrc2"], *m["threads"])
+    try:
+        with open(meta, encoding="utf-8") as f:
+            state = _json.load(f)
+    except ValueError as exc:
+        raise Unsupported("invalid FSPX compute dispatch state JSON") from exc
+    if not isinstance(state, dict):
+        raise Unsupported("invalid FSPX compute dispatch state: expected an object")
+    rsrc2, threads = state.get("rsrc2"), state.get("threads")
+    if type(rsrc2) is not int or not 0 <= rsrc2 < 1 << 32:
+        raise Unsupported("invalid FSPX compute dispatch state: expected a 32-bit unsigned rsrc2")
+    if not isinstance(threads, list) or len(threads) != 3 or any(type(axis) is not int or axis < 1 for axis in threads):
+        raise Unsupported("invalid FSPX compute dispatch state: expected three positive thread dimensions")
+    return (rsrc2, *threads)
 
 
 def fspx_wave_size(path, name):

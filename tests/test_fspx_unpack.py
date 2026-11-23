@@ -481,6 +481,52 @@ class TranslatorSidecars(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 self.tr.cs_dispatch_state(s, "cs_x")
 
+    def test_truncated_fssm_dispatch_state_is_a_shader_refusal(self):
+        with tempfile.TemporaryDirectory() as t:
+            s = self.layout(t, fssm=b"FSSM" + bytes(0x147 - 4))
+            with self.assertRaisesRegex(self.tr.Unsupported, "truncated FSSM compute dispatch state"):
+                self.tr.cs_dispatch_state(s, "cs_x")
+
+    def test_invalid_fspx_dispatch_fields_are_shader_refusals(self):
+        cases = (
+            {},
+            {"rsrc2": 0, "threads": [32, 1]},
+            {"rsrc2": 0, "threads": [-32, -1, 1]},
+            {"rsrc2": 0, "threads": [True, 32, 1]},
+            {"rsrc2": 0, "threads": [32.0, 1, 1]},
+            {"rsrc2": "0", "threads": [32, 1, 1]},
+            {"rsrc2": 1 << 32, "threads": [32, 1, 1]},
+        )
+        with tempfile.TemporaryDirectory() as t:
+            for meta in cases:
+                with self.subTest(meta=meta):
+                    s = self.layout(t, fspx_meta=meta)
+                    with self.assertRaisesRegex(self.tr.Unsupported, "invalid FSPX compute dispatch state"):
+                        self.tr.cs_dispatch_state(s, "cs_x")
+
+    def test_invalid_dispatch_state_does_not_abort_translation_batch(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.layout(t, fssm=b"FSSM")
+            disasm = os.path.join(t, "disasm")
+            for name in ("cs_x", "cs_bad_fspx", "cs_good"):
+                with open(os.path.join(disasm, name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\ts_endpgm\n")
+            for name, contents in (("cs_bad_fspx", "{"), ("cs_good", '{"rsrc2": 0, "threads": [32, 1, 1]}')):
+                with open(os.path.join(t, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(contents)
+            out = os.path.join(t, "spirv")
+            result = subprocess.run(
+                [sys.executable, "-I", os.path.join(ROOT, "tools", "rdna2spirv.py"), disasm,
+                 "--out", out, "--assembler", "python", "--no-asm", "--no-validate"],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("truncated FSSM compute dispatch state", result.stdout)
+            self.assertIn("invalid FSPX compute dispatch state JSON", result.stdout)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual(list(json.load(f)), ["cs_good"])
+            self.assertTrue(os.path.isfile(os.path.join(out, "cs_good.spv")))
+
 
 if __name__ == "__main__":
     unittest.main()
