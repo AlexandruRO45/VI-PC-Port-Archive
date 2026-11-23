@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -265,10 +266,81 @@ uint64_t g_next_slot = 1;
 std::unordered_map<uintptr_t, uint64_t> g_mapped;  // mapped 64 KiB address -> page number
 std::map<uintptr_t, SIZE_T> g_reservations;  // base -> size of each placeholder reservation XMemVirtualAlloc made
 
+struct OwnedSpan {
+    uintptr_t first;
+    uintptr_t last;
+};
+
+struct PendingRelease {
+    SIZE_T size;  // the original full-size call remains valid after its base has been released
+    bool independent;  // a carved window belongs to its outer reservation; a new nested reserve does not
+    std::vector<OwnedSpan> spans;  // only memory whose release has not been confirmed
+};
+
+std::map<uintptr_t, PendingRelease> g_pending_releases;
+
+void append_span(std::vector<OwnedSpan>& spans, OwnedSpan span) {
+    if (span.first >= span.last) return;
+    if (!spans.empty() && spans.back().last == span.first) {
+        spans.back().last = span.last;
+    } else {
+        spans.push_back(span);
+    }
+}
+
+void subtract_span(std::vector<OwnedSpan>& spans, OwnedSpan removed) {
+    std::vector<OwnedSpan> kept;
+    kept.reserve(spans.size() + 1);
+    for (const auto span : spans) {
+        if (span.last <= removed.first || span.first >= removed.last) {
+            append_span(kept, span);
+        } else {
+            append_span(kept, {span.first, (std::min)(span.last, removed.first)});
+            append_span(kept, {(std::max)(span.first, removed.last), span.last});
+        }
+    }
+    spans = std::move(kept);
+}
+
+// With g_phys_mutex held. Keep the protection of both sides of a partly released window.
+void trim_windows(OwnedSpan removed) {
+    auto it = g_windows.lower_bound(removed.first);
+    if (it != g_windows.begin()) {
+        const auto prev = std::prev(it);
+        if (prev->first + prev->second.size > removed.first) it = prev;
+    }
+    while (it != g_windows.end() && it->first < removed.last) {
+        const uintptr_t first = it->first;
+        const uintptr_t last = first + it->second.size;
+        const DWORD protect = it->second.protect;
+        it = g_windows.erase(it);
+        if (first < removed.first) g_windows.emplace(first, Window{removed.first - first, protect});
+        if (last > removed.last) g_windows.emplace(removed.last, Window{last - removed.last, protect});
+    }
+}
+
+// A successful release can also finish a span referenced by another retry alias.
+void forget_released_span(OwnedSpan released) {
+    trim_windows(released);
+    for (auto it = g_mapped.begin(); it != g_mapped.end();) {
+        it = it->first >= released.first && it->first < released.last ? g_mapped.erase(it) : std::next(it);
+    }
+    for (auto it = g_pending_releases.begin(); it != g_pending_releases.end();) {
+        subtract_span(it->second.spans, released);
+        if (it->second.spans.empty()) {
+            if (it->second.independent) g_reservations.erase(it->first);
+            it = g_pending_releases.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 #ifdef LEONIDA_XMEM_TEST_HOOKS
 rt::shims::testing::XmemMemoryHooks g_memory_hooks;
 #endif
 
+// Called with g_phys_mutex held. Only xmem_test compiles the controlled-failure callbacks.
 BOOL release_virtual_free(LPVOID address, SIZE_T size, DWORD flags) {
 #ifdef LEONIDA_XMEM_TEST_HOOKS
     if (g_memory_hooks.virtual_free) return g_memory_hooks.virtual_free(address, size, flags);
@@ -292,17 +364,54 @@ BOOL release_unmap_view2(PVOID address) {
     return placeholder_api().unmap_view2(GetCurrentProcess(), address, MEM_PRESERVE_PLACEHOLDER);
 }
 
-// With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
-// kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
-void record_window(void* base, SIZE_T size, DWORD protect) {
-    const uintptr_t start = reinterpret_cast<uintptr_t>(base);
-    const uintptr_t end = start + size;
-    auto it = g_windows.lower_bound(start);
+// With g_phys_mutex held. Discard an overlapping old window on a new reserve, as after an unseen title free.
+// A topology change within the same owner uses trim_windows instead.
+void erase_overlapping_windows(OwnedSpan replacement) {
+    auto it = g_windows.lower_bound(replacement.first);
     if (it != g_windows.begin()) {
         const auto prev = std::prev(it);
-        if (prev->first + prev->second.size > start) it = prev;
+        if (prev->first + prev->second.size > replacement.first) it = prev;
     }
-    while (it != g_windows.end() && it->first < end) it = g_windows.erase(it);
+    while (it != g_windows.end() && it->first < replacement.last) it = g_windows.erase(it);
+}
+
+// A normal stale window is discarded in full. A pending release still owns its unaffected pieces: retain only
+// those intersections, not arbitrary old left/right window fragments after an unseen host free.
+void invalidate_reserved_windows(OwnedSpan replacement) {
+    std::vector<std::pair<uintptr_t, Window>> kept;
+    auto it = g_windows.lower_bound(replacement.first);
+    if (it != g_windows.begin()) {
+        const auto prev = std::prev(it);
+        if (prev->first + prev->second.size > replacement.first) it = prev;
+    }
+    for (; it != g_windows.end() && it->first < replacement.last; ++it) {
+        const uintptr_t first = it->first;
+        const uintptr_t last = first + it->second.size;
+        std::vector<OwnedSpan> owned;
+        for (const auto& entry : g_pending_releases) {
+            for (const auto span : entry.second.spans) {
+                const OwnedSpan part{(std::max)(first, span.first), (std::min)(last, span.last)};
+                if (part.first < part.last) owned.push_back(part);
+            }
+        }
+        std::sort(owned.begin(), owned.end(), [](OwnedSpan a, OwnedSpan b) { return a.first < b.first; });
+        std::vector<OwnedSpan> merged;
+        for (const auto part : owned) {
+            if (!merged.empty() && part.first <= merged.back().last) {
+                merged.back().last = (std::max)(merged.back().last, part.last);
+            } else {
+                merged.push_back(part);
+            }
+        }
+        for (const auto span : merged) kept.emplace_back(span.first, Window{span.last - span.first, it->second.protect});
+    }
+    erase_overlapping_windows(replacement);
+    for (const auto& entry : kept) g_windows.emplace(entry);
+}
+
+void record_window(void* base, SIZE_T size, DWORD protect) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(base);
+    erase_overlapping_windows({start, start + size});
     g_windows[start] = Window{size, protect};
 }
 
@@ -324,15 +433,59 @@ bool inside_reservation(uintptr_t address) {
     return address - it->first < it->second;
 }
 
-// A new host reservation (`result`, asked for at `address` with `size`) that lands in a hole the title released inside
-// a recorded reservation is recorded too, so that releasing the outer reservation leaves it alone (release_range).
+// With g_phys_mutex held across the native reserve and this update. A new reservation is a new owner even when
+// an unseen host free made its address available. Replacing/committing an existing placeholder does not call here.
 void note_nested_allocation(void* result, void* address, SIZE_T size) {
     if (!result) return;
     const uintptr_t start = reinterpret_cast<uintptr_t>(result);
     const uintptr_t asked = address ? reinterpret_cast<uintptr_t>(address) : start;
-    const uintptr_t end = (asked + size + 0xfff) & ~uintptr_t{0xfff};
-    const std::lock_guard lock(g_phys_mutex);
-    if (end > start && inside_reservation(start)) g_reservations[start] = static_cast<SIZE_T>(end - start);
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    SIZE_T end_size = 0;
+    if (size > (std::numeric_limits<uintptr_t>::max)() - asked ||
+        !round_up_size(asked + size, info.dwPageSize, end_size) || end_size <= start) return;
+    const uintptr_t end = end_size;
+    const OwnedSpan replacement{start, end};
+    std::vector<std::pair<OwnedSpan, bool>> detached;
+    for (auto it = g_pending_releases.begin(); it != g_pending_releases.end();) {
+        subtract_span(it->second.spans, replacement);
+        if (it->first >= start && it->first < end) {
+            for (const auto span : it->second.spans) detached.emplace_back(span, it->second.independent);
+            if (it->second.independent) g_reservations.erase(it->first);
+            it = g_pending_releases.erase(it);
+        } else if (it->second.spans.empty()) {
+            if (it->second.independent) g_reservations.erase(it->first);
+            it = g_pending_releases.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Reusing an alias's original base retires that alias. Its other owned pieces can be freed at their own bases.
+    for (const auto& [span, independent] : detached) {
+        auto [it, inserted] =
+            g_pending_releases.try_emplace(span.first, PendingRelease{span.last - span.first, independent, {}});
+        (void)inserted;
+        it->second.independent |= independent;
+        if (independent) g_reservations[span.first] = span.last - span.first;
+        auto& spans = it->second.spans;
+        spans.push_back(span);
+        std::sort(spans.begin(), spans.end(), [](OwnedSpan a, OwnedSpan b) { return a.first < b.first; });
+        std::vector<OwnedSpan> merged;
+        for (const auto part : spans) {
+            if (!merged.empty() && part.first <= merged.back().last) {
+                merged.back().last = (std::max)(merged.back().last, part.last);
+            } else {
+                merged.push_back(part);
+            }
+        }
+        spans = std::move(merged);
+    }
+    invalidate_reserved_windows(replacement);
+    for (auto it = g_mapped.begin(); it != g_mapped.end();) {
+        it = it->first >= start && it->first < end ? g_mapped.erase(it) : std::next(it);
+    }
+    g_reservations.erase(g_reservations.lower_bound(start), g_reservations.lower_bound(end));
+    if (inside_reservation(start)) g_reservations[start] = static_cast<SIZE_T>(end - start);
 }
 
 // [address, address + size) as one placeholder of its own: split it out of the placeholder that holds it. Fails when
@@ -447,16 +600,19 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         if (!isolate_placeholder(address, size)) return nullptr;
         if (window) {
             // A reserve-only replacement stays a placeholder: the physical pages are mapped into it.
-            record_window(address, size, host_prot);
+            const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+            trim_windows({start, start + size});
+            g_windows[start] = Window{size, host_prot};
             return address;
         }
         return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
                                                 nullptr, 0);
     }
     if (new_placeholder || window) {
+        const std::lock_guard lock(g_phys_mutex);
         void* const result = reserve_placeholder(address, size, base_granularity);
         if (result) {
-            const std::lock_guard lock(g_phys_mutex);
+            note_nested_allocation(result, address, size);
             g_reservations[reinterpret_cast<uintptr_t>(result)] = size;
             if (window) record_window(result, size, host_prot);
         }
@@ -468,11 +624,13 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
+        const std::lock_guard lock(g_phys_mutex);
         void* const result = placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size,
                                                               host_type | MEM_RESERVE, host_prot, &parameter, 1);
         note_nested_allocation(result, nullptr, size);
         return result;
     }
+    const std::lock_guard lock(g_phys_mutex);
     void* const result = VirtualAlloc(address, size, host_type, host_prot);
     if (host_type & MEM_RESERVE) note_nested_allocation(result, address, size);
     return result;
@@ -741,64 +899,134 @@ constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
+    const std::lock_guard lock(g_phys_mutex);
     void* const result =
         VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
     if (allocation_type & MEM_RESERVE) note_nested_allocation(result, address, size);
     return result;
 }
 
-// With g_phys_mutex held: where the host allocation that starts at `owner` ends.
-uintptr_t allocation_end(uintptr_t owner) {
+// With g_phys_mutex held. A failed query does not establish the allocation's end.
+bool allocation_end(uintptr_t owner, uintptr_t& end, DWORD& error) {
     uintptr_t a = owner;
     for (;;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (!release_virtual_query(reinterpret_cast<void*>(a), &info, sizeof(info)) || info.State == MEM_FREE ||
-            reinterpret_cast<uintptr_t>(info.AllocationBase) != owner) {
-            return a;
+        if (!release_virtual_query(reinterpret_cast<void*>(a), &info, sizeof(info))) {
+            error = GetLastError();
+            return false;
         }
-        a = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (info.State == MEM_FREE || reinterpret_cast<uintptr_t>(info.AllocationBase) != owner) {
+            end = a;
+            return true;
+        }
+        const uintptr_t first = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        if (info.RegionSize > (std::numeric_limits<uintptr_t>::max)() - first || first + info.RegionSize <= a) {
+            error = ERROR_INVALID_ADDRESS;
+            return false;
+        }
+        a = first + info.RegionSize;
     }
 }
 
-// With g_phys_mutex held. Unmaps every physical page mapped in [base, base + size), releases every host allocation in
-// it (the placeholders the map calls split it into, and any committed replacement), and forgets the windows and the
-// reservation. A reservation recorded inside this one was made later, in a hole the title had released, and is left
-// alone with everything in it; so is an allocation that does not end inside the range. Keeps going past a failure,
-// so as much as possible is released.
-bool release_range(uintptr_t base, SIZE_T size) {
-    const uintptr_t end = base + size;
-    std::vector<std::pair<uintptr_t, uintptr_t>> nested;
-    for (auto it = g_reservations.upper_bound(base); it != g_reservations.end() && it->first < end; ++it) {
-        nested.emplace_back(it->first, it->first + it->second);
+// With g_phys_mutex held. A retry visits only spans still owned by this release, querying their current native
+// topology: mapping a retained placeholder may have split it since the previous call. Successfully freed pieces
+// immediately lose their window and pending ownership. Failed or unmeasured pieces keep an original-base retry
+// alias; a later new reservation invalidates that ownership rather than being freed by this old release.
+bool release_range(uintptr_t base, SIZE_T size, DWORD& error) {
+    std::vector<OwnedSpan> spans;
+    bool independent = g_reservations.count(base) != 0;
+    if (const auto pending = g_pending_releases.find(base); pending != g_pending_releases.end()) {
+        spans = pending->second.spans;
+        independent = pending->second.independent;
+    } else {
+        if (size > (std::numeric_limits<uintptr_t>::max)() - base) {
+            error = ERROR_INVALID_ADDRESS;
+            return false;
+        }
+        const uintptr_t end = base + size;
+        spans.push_back({base, end});
+        // Independent reservations in released holes are new owners, not part of the old outer reservation.
+        for (auto it = g_reservations.upper_bound(base); it != g_reservations.end() && it->first < end; ++it) {
+            const uintptr_t last = it->second > end - it->first ? end : it->first + it->second;
+            subtract_span(spans, {it->first, last});
+        }
     }
-    const auto is_nested = [&nested](uintptr_t address) {
-        for (const auto& [first, last] : nested) {
-            if (address >= first && address < last) return true;
+    bool ok = true;
+    const auto failed = [&](DWORD native_error) {
+        if (ok) error = native_error;
+        ok = false;
+    };
+    const auto owns = [&spans](uintptr_t address) {
+        for (const auto span : spans) {
+            if (address >= span.first && address < span.last) return true;
         }
         return false;
     };
-    bool ok = true;
     std::vector<uintptr_t> mapped;
     for (const auto& entry : g_mapped) {
-        if (entry.first >= base && entry.first < end && !is_nested(entry.first)) mapped.push_back(entry.first);
+        if (owns(entry.first)) mapped.push_back(entry.first);
     }
-    for (const uintptr_t address : mapped) ok &= unmap_page(address);
-    for (uintptr_t a = base; a < end;) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!release_virtual_query(reinterpret_cast<void*>(a), &info, sizeof(info))) return false;
-        const uintptr_t next = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
-        const uintptr_t owner = reinterpret_cast<uintptr_t>(info.AllocationBase);
-        if (info.State != MEM_FREE && !is_nested(owner)) {
-            if (owner < base || allocation_end(owner) > end || !release_virtual_free(info.AllocationBase, 0, MEM_RELEASE)) {
-                ok = false;
+    for (const uintptr_t address : mapped) {
+        if (!unmap_page(address)) failed(GetLastError());
+    }
+    std::vector<OwnedSpan> remaining;
+    for (const auto span : spans) {
+        for (uintptr_t a = span.first; a < span.last;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (!release_virtual_query(reinterpret_cast<void*>(a), &info, sizeof(info))) {
+                failed(GetLastError());
+                append_span(remaining, {a, span.last});
+                break;  // keep this unmeasured suffix, but still process the other independent spans
             }
+            const uintptr_t first = reinterpret_cast<uintptr_t>(info.BaseAddress);
+            if (info.RegionSize > (std::numeric_limits<uintptr_t>::max)() - first || first + info.RegionSize <= a) {
+                failed(ERROR_INVALID_ADDRESS);
+                append_span(remaining, {a, span.last});
+                break;
+            }
+            const uintptr_t next = (std::min)(first + info.RegionSize, span.last);
+            if (info.State == MEM_FREE) {
+                forget_released_span({a, next});
+                a = next;
+                continue;
+            }
+            const uintptr_t owner = reinterpret_cast<uintptr_t>(info.AllocationBase);
+            if (owner < span.first) {
+                failed(ERROR_INVALID_ADDRESS);
+                append_span(remaining, {a, next});
+                a = next;
+                continue;
+            }
+            uintptr_t last = 0;
+            DWORD query_error = ERROR_SUCCESS;
+            if (!allocation_end(owner, last, query_error)) {
+                failed(query_error);
+                append_span(remaining, {a, span.last});
+                break;
+            }
+            if (last <= a || last > span.last) {
+                failed(ERROR_INVALID_ADDRESS);
+                append_span(remaining, {a, span.last});
+                break;
+            }
+            if (release_virtual_free(info.AllocationBase, 0, MEM_RELEASE)) {
+                forget_released_span({owner, last});
+            } else {
+                failed(GetLastError());
+                append_span(remaining, {a, last});
+            }
+            a = last;
         }
-        a = next > a ? next : a + kPhysicalPageSize;
     }
-    for (auto it = g_windows.lower_bound(base); it != g_windows.end() && it->first < end;) {
-        it = is_nested(it->first) ? std::next(it) : g_windows.erase(it);
+    if (remaining.empty()) {
+        g_reservations.erase(base);
+        g_pending_releases.erase(base);
+    } else {
+        // Preserve an independent nested owner's boundary for a later outer release. Its own retry still visits
+        // only `remaining`, never the released holes inside this original boundary.
+        if (independent) g_reservations[base] = size;
+        g_pending_releases[base] = PendingRelease{size, independent, std::move(remaining)};
     }
-    g_reservations.erase(base);
     return ok;
 }
 
@@ -809,17 +1037,28 @@ bool release_range(uintptr_t base, SIZE_T size) {
 BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
     if (free_type == MEM_RELEASE) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(address);
-        const std::lock_guard lock(g_phys_mutex);
-        SIZE_T recorded = 0;
-        if (const auto it = g_reservations.find(base); it != g_reservations.end()) {
-            recorded = it->second;
-        } else if (const auto window = g_windows.find(base); window != g_windows.end()) {
-            recorded = window->second.size;
+        bool handled = false;
+        bool ok = false;
+        DWORD error = ERROR_SUCCESS;
+        {
+            const std::lock_guard lock(g_phys_mutex);
+            SIZE_T recorded = 0;
+            if (const auto pending = g_pending_releases.find(base); pending != g_pending_releases.end()) {
+                recorded = pending->second.size;
+            } else if (const auto it = g_reservations.find(base); it != g_reservations.end()) {
+                recorded = it->second;
+            } else if (const auto window = g_windows.find(base); window != g_windows.end()) {
+                recorded = window->second.size;
+            }
+            if (recorded != 0 && (size == 0 || size == recorded)) {
+                handled = true;
+                ok = release_range(base, recorded, error);
+            }
         }
-        if (recorded != 0 && (size == 0 || size == recorded)) {
-            if (release_range(base, recorded)) return TRUE;
-            SetLastError(ERROR_INVALID_ADDRESS);
-            return FALSE;
+        if (handled) {
+            // Native calls and mutex cleanup may change the thread's last error after the first failure.
+            if (!ok) SetLastError(error);
+            return ok ? TRUE : FALSE;
         }
     }
     return VirtualFree(address, size, free_type);
