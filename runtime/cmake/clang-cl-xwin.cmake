@@ -56,9 +56,17 @@ set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
 # The Vulkan headers are the same on every platform, but /usr/include also holds glibc's, which must not shadow the
 # MSVC CRT. Point Vulkan_INCLUDE_DIR at a folder that holds only vulkan/ and vk_video/ (links to $ENV{VULKAN_SDK} or
 # the host copies), unless another folder was given (-DVulkan_INCLUDE_DIR=<Vulkan-Headers>/include). The links are
-# refreshed on every configure, and FORCE replaces a stale Vulkan_INCLUDE_DIR-NOTFOUND cache entry.
+# refreshed on every configure, and FORCE replaces a stale Vulkan_INCLUDE_DIR-NOTFOUND cache entry. A custom folder
+# without vulkan/vulkan.h (moved or deleted since it was cached) is dropped too, so the lookup below and find_path in
+# CMakeLists.txt search again instead of reusing it; make_game.py's preflight only trusts a cached folder that has it.
 if(CMAKE_BINARY_DIR)
   set(_xwin_vulkan "${CMAKE_BINARY_DIR}/xwin-vulkan-include")
+  if(Vulkan_INCLUDE_DIR AND NOT Vulkan_INCLUDE_DIR STREQUAL _xwin_vulkan
+     AND NOT EXISTS "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.h")
+    message(STATUS "Ignoring Vulkan_INCLUDE_DIR=${Vulkan_INCLUDE_DIR}: it has no vulkan/vulkan.h")
+    unset(Vulkan_INCLUDE_DIR CACHE)
+    unset(Vulkan_INCLUDE_DIR)
+  endif()
   if(NOT Vulkan_INCLUDE_DIR OR Vulkan_INCLUDE_DIR STREQUAL _xwin_vulkan)
     set(_xwin_vulkan_sources)
     if(DEFINED ENV{VULKAN_SDK} AND NOT "$ENV{VULKAN_SDK}" STREQUAL "")

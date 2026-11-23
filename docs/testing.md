@@ -211,7 +211,8 @@ The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `
 there (`--runtime-build runtime/build/windows` takes a folder made by hand like a Windows build); it passes
 `-DLEONIDA_REQUIRE_VULKAN=ON` so `gta6rt.exe` is never built without `LEONIDA_D3D12=vulkan`, and accepts Vulkan
 headers from `/usr/include` or `/usr/local/include`, `VULKAN_SDK`, or `LEONIDA_VULKAN_HEADERS_FETCH=1` (forwarded to
-CMake to download the pinned Khronos headers). CMake packages are
+CMake to download the pinned Khronos headers; `=0` turns off an earlier opt-in cached in the build folder). A cached
+`Vulkan_INCLUDE_DIR` without `vulkan/vulkan.h` is searched again rather than reused. CMake packages are
 looked up only inside the SDK folder, so a Windows SDL3 for the GameInput shim is passed as `-DSDL3_DIR=<its
 cmake folder>` (`CMAKE_PREFIX_PATH` is not searched here).
 

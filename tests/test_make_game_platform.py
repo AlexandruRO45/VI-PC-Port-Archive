@@ -218,6 +218,24 @@ class CrossBuildMissingTest(unittest.TestCase):
         with open(cache, "w", encoding="utf-8") as f:
             f.write("LEONIDA_VULKAN_HEADERS_FETCH:BOOL=ON\n")
         self.assertEqual(self.missing(vulkan_sdk=None), [])
+        # An explicit opt-out in the environment beats a cached opt-in (cross_configure() passes OFF).
+        for falsy in ("0", "OFF"):
+            with self.subTest(fetch=falsy):
+                self.assertEqual(len(self.missing(vulkan_sdk=None, fetch=falsy)), 1)
+        # A cached folder without vulkan/vulkan.h (moved or deleted) is not trusted.
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(f"Vulkan_INCLUDE_DIR:PATH={os.path.join(self.vulkan_sdk, 'gone')}\n")
+        self.assertEqual(len(self.missing(vulkan_sdk=None)), 1)
+        # FETCHCONTENT_SOURCE_DIR_VULKANHEADERS must be a Vulkan-Headers checkout (a CMake project), not an SDK-style
+        # include folder; VulkanHeaders_SOURCE_DIR alone does not reach the FetchContent route in CMakeLists.txt.
+        for key in ("FETCHCONTENT_SOURCE_DIR_VULKANHEADERS", "VulkanHeaders_SOURCE_DIR"):
+            with self.subTest(key=key), open(cache, "w", encoding="utf-8") as f:
+                f.write(f"{key}:PATH={self.vulkan_sdk}\n")
+            self.assertEqual(len(self.missing(vulkan_sdk=None)), 1)
+        open(os.path.join(self.vulkan_sdk, "CMakeLists.txt"), "w").close()
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(f"VulkanHeaders_SOURCE_DIR:PATH={self.vulkan_sdk}\n")
+        self.assertEqual(len(self.missing(vulkan_sdk=None)), 1)
         with open(cache, "w", encoding="utf-8") as f:
             f.write(f"FETCHCONTENT_SOURCE_DIR_VULKANHEADERS:PATH={self.vulkan_sdk}\n")
         self.assertEqual(self.missing(vulkan_sdk=None), [])
@@ -480,7 +498,11 @@ class CrossBuildTest(unittest.TestCase):
             with self.subTest(fetch=falsy):
                 configure, _ = self.runtime(fetch=falsy)
                 self.assertIn("-DLEONIDA_REQUIRE_VULKAN=ON", configure)
+                self.assertIn("-DLEONIDA_VULKAN_HEADERS_FETCH=OFF", configure)
                 self.assertNotIn("-DLEONIDA_VULKAN_HEADERS_FETCH=ON", configure)
+        with self.subTest(fetch="unset"):
+            configure, _ = self.runtime()
+            self.assertFalse([a for a in configure if a.startswith("-DLEONIDA_VULKAN_HEADERS_FETCH")])
 
     def test_versioned_tools_are_passed_until_the_folder_records_its_tools(self):
         for cache in (False, True):

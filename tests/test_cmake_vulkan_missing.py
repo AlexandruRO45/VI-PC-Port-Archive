@@ -138,13 +138,29 @@ class ClangClXwinVulkanTest(unittest.TestCase):
             sdk = tmp / "vksdk"
             (sdk / "include" / "vulkan").mkdir(parents=True)
             (sdk / "include" / "vulkan" / "vulkan.h").write_text("// synth\n", encoding="utf-8")
-            custom = (tmp / "custom-headers").as_posix()
+            custom = tmp / "custom-headers"
+            (custom / "vulkan").mkdir(parents=True)
+            (custom / "vulkan" / "vulkan.h").write_text("// synth\n", encoding="utf-8")
             _, result = self.run_toolchain(
                 tmp,
                 vulkan_sdk=sdk,
-                prelude=f'set(Vulkan_INCLUDE_DIR "{custom}" CACHE PATH "")',
+                prelude=f'set(Vulkan_INCLUDE_DIR "{custom.as_posix()}" CACHE PATH "")',
             )
-            self.assertEqual(result, custom)
+            self.assertEqual(result, custom.as_posix())
+
+    def test_replaces_stale_custom_vulkan_include_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            sdk = tmp / "vksdk"
+            (sdk / "include" / "vulkan").mkdir(parents=True)
+            (sdk / "include" / "vulkan" / "vulkan.h").write_text("// synth\n", encoding="utf-8")
+            stale = (tmp / "moved-headers").as_posix()
+            build, result = self.run_toolchain(
+                tmp,
+                vulkan_sdk=sdk,
+                prelude=f'set(Vulkan_INCLUDE_DIR "{stale}" CACHE PATH "")',
+            )
+            self.assertEqual(result, (build / "xwin-vulkan-include").as_posix())
 
 
 if __name__ == "__main__":

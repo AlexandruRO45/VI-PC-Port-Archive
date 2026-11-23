@@ -997,17 +997,26 @@ def cmake_bool(value: str) -> bool:
     return bool(re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", v)) and float(v) != 0.0
 
 
-def vulkan_headers_fetch_enabled() -> bool:
-    """True when LEONIDA_VULKAN_HEADERS_FETCH is set to a truthy value in the environment."""
-    return cmake_bool(os.environ.get("LEONIDA_VULKAN_HEADERS_FETCH", ""))
+def vulkan_headers_fetch_setting() -> "bool | None":
+    """LEONIDA_VULKAN_HEADERS_FETCH from the environment as a CMake bool, or None when it is unset or empty.
+
+    An explicit value overrides the build folder's cached option in both the preflight and the configure, so an
+    opt-out (=0/OFF) after an earlier opt-in really turns the download off."""
+    value = os.environ.get("LEONIDA_VULKAN_HEADERS_FETCH", "").strip()
+    return cmake_bool(value) if value else None
 
 
 def has_vulkan_header(include_dir: str) -> bool:
     return bool(include_dir) and os.path.isfile(os.path.join(include_dir, "vulkan", "vulkan.h"))
 
 
-def cross_vulkan_cache_ready(build: str | None = None) -> bool:
-    """True if an existing cross-build folder already has usable Vulkan headers or fetch configured."""
+def cross_vulkan_cache_ready(build: str | None = None, fetch: "bool | None" = None) -> bool:
+    """True if an existing cross-build folder already has usable Vulkan headers or fetch configured.
+
+    Mirrors runtime/CMakeLists.txt: a cached Vulkan_INCLUDE_DIR that holds vulkan/vulkan.h, the cached
+    LEONIDA_VULKAN_HEADERS_FETCH option (unless ``fetch`` overrides it, as cross_configure() then does), or a
+    FETCHCONTENT_SOURCE_DIR_VULKANHEADERS that is a Vulkan-Headers checkout (a CMake project providing
+    Vulkan::Headers, not just an SDK-style include folder)."""
     cache = os.path.join(build or cross_build_dir(), "CMakeCache.txt")
     try:
         with open(cache, encoding="utf-8", errors="replace") as f:
@@ -1023,25 +1032,24 @@ def cross_vulkan_cache_ready(build: str | None = None) -> bool:
     inc = entries.get("Vulkan_INCLUDE_DIR", "")
     if inc and not inc.endswith("-NOTFOUND") and has_vulkan_header(inc):
         return True
-    if cmake_bool(entries.get("LEONIDA_VULKAN_HEADERS_FETCH", "")):
+    if fetch is None and cmake_bool(entries.get("LEONIDA_VULKAN_HEADERS_FETCH", "")):
         return True
-    for key in ("FETCHCONTENT_SOURCE_DIR_VULKANHEADERS", "VulkanHeaders_SOURCE_DIR"):
-        src = entries.get(key, "")
-        if src and has_vulkan_header(os.path.join(src, "include")):
-            return True
-    return False
+    src = entries.get("FETCHCONTENT_SOURCE_DIR_VULKANHEADERS", "")
+    return bool(src) and os.path.isfile(os.path.join(src, "CMakeLists.txt")) and \
+        has_vulkan_header(os.path.join(src, "include"))
 
 
 def cross_vulkan_headers_ready() -> bool:
     """True when the Linux cross-build can find Vulkan headers (or is allowed to fetch them)."""
-    if vulkan_headers_fetch_enabled():
+    fetch = vulkan_headers_fetch_setting()
+    if fetch:
         return True
     sdk = os.environ.get("VULKAN_SDK", "").strip()
     if sdk and any(has_vulkan_header(os.path.join(sdk, sub)) for sub in ("Include", "include")):
         return True
     if any(has_vulkan_header(d) for d in CROSS_VULKAN_INCLUDE_DIRS):
         return True
-    return cross_vulkan_cache_ready()
+    return cross_vulkan_cache_ready(fetch=fetch)
 
 
 def cross_build_missing() -> list:
@@ -2146,8 +2154,9 @@ def cross_configure() -> str:
     tools = [f"-DCMAKE_{var}={shutil.which(name + suffix) or name + suffix}" for var, name in CROSS_VARS.items()
              ] if suffix else []
     vulkan = ["-DLEONIDA_REQUIRE_VULKAN=ON"]
-    if vulkan_headers_fetch_enabled():
-        vulkan.append("-DLEONIDA_VULKAN_HEADERS_FETCH=ON")
+    fetch = vulkan_headers_fetch_setting()
+    if fetch is not None:
+        vulkan.append(f"-DLEONIDA_VULKAN_HEADERS_FETCH={'ON' if fetch else 'OFF'}")
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
                     f"-DXWIN_DIR={xwin}", *tools, *vulkan,
                     hint="CMake's error above says what the cross-build lacks "
