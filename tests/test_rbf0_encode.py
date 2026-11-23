@@ -265,6 +265,18 @@ class Refusals(unittest.TestCase):
         doc["tree"]["attributes"][0]["descriptor"] = True
         self.assertEqual(self.reason(doc=doc), "descriptor")
 
+    def test_malformed_document_shape_is_refused(self):
+        """A report edited into a table that is not an array of objects is refused, not read with .get()."""
+        doc = rbf0_tree.parse_resource(every_record(True))
+        for value in ("not-an-array", 5, ["name"]):
+            with self.subTest(key="descriptors", value=repr(value)):
+                self.assertEqual(self.reason(doc=dict(doc, descriptors=value)), "value")
+        for key, value in (("attributes", 3), ("content", 3), ("content", [0])):
+            with self.subTest(key=key, value=repr(value)):
+                broken = json.loads(json.dumps(doc))
+                broken["tree"][key] = value
+                self.assertEqual(self.reason(doc=broken), "value")
+
     def test_non_dict_doc_and_non_str_text(self):
         self.assertEqual(self.reason(doc="not-a-dict"), "value")
         doc = rbf0_tree.parse_resource(Stream(True).open("r").text(b"hi\x00").close().bytes())

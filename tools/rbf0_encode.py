@@ -56,10 +56,20 @@ class EncodeError(ValueError):
 class _Writer:
     def __init__(self, doc):
         self.wide = doc.get("layout") == "wide-64"
+        descriptors = doc.get("descriptors") or []
+        if not isinstance(descriptors, list) or not all(isinstance(d, dict) for d in descriptors):
+            raise EncodeError("value", "the descriptor table is not an array of objects")
         self.out = bytearray(MAGIC + (PROLOGUE if self.wide else b""))
-        self.names = [d.get("name") for d in doc.get("descriptors") or []]
-        self.bad_names = {d["index"] for d in doc.get("descriptors") or [] if d.get("utf8_valid") is False}
+        self.names = [d.get("name") for d in descriptors]
+        self.bad_names = {d.get("index") for d in descriptors if d.get("utf8_valid") is False}
         self.emitted = 0
+
+    def children(self, node, key):
+        """An element's `key` array: a list of objects, or the record cannot be written as the tree describes it."""
+        listed = node.get(key, [])
+        if not isinstance(listed, list) or not all(isinstance(c, dict) for c in listed):
+            raise EncodeError("value", f"element {node.get('name')!r} '{key}' is not an array of objects")
+        return listed
 
     def record(self, node, kind):
         index = node.get("descriptor")
@@ -154,22 +164,23 @@ class _Writer:
     def element(self, node):
         if node.get("attribute_order_violation"):
             raise EncodeError("order", f"element {node.get('name')!r} has a value attribute after its content")
-        attrs = node.get("attrs_declared", len(node.get("attributes", [])))
+        attributes, content = self.children(node, "attributes"), self.children(node, "content")
+        attrs = node.get("attrs_declared", len(attributes))
         if not isinstance(attrs, int) or isinstance(attrs, bool) or not 0 <= attrs <= 0xFFFF:
             raise EncodeError("value", f"attribute count {attrs!r}")
         # The header word says how many of the following value records are attributes. One record more would decode
         # as the element's first content value; with fewer, the next content value would decode as an attribute.
-        listed = len(node.get("attributes", []))
+        listed = len(attributes)
         if listed > attrs:
             raise EncodeError("value", f"element {node.get('name')!r} has {listed} attribute records, count {attrs}")
-        if listed < attrs and any(c.get("kind") == "value" for c in node.get("content", [])):
+        if listed < attrs and any(c.get("kind") == "value" for c in content):
             raise EncodeError("order", f"element {node.get('name')!r} is short of its {attrs} attributes and has a "
                                        "value in its content")
         self.record(node, 0x00)
         self.out += struct.pack("<HHH", 0, 0, attrs)
-        for child in node.get("attributes", []):
+        for child in attributes:
             self.value(child)
-        for child in node.get("content", []):
+        for child in content:
             kind = child.get("kind")
             if kind == "element":
                 self.element(child)
