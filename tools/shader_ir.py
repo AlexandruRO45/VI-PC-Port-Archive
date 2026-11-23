@@ -15,7 +15,8 @@ import sys
 from collections import Counter
 
 ENC = re.compile(r";\s*encoding:\s*\[([^\]]*)\]")
-HDR = re.compile(r"^;\s*(\S+)\s+code 0x([0-9a-f]+)\.\.0x([0-9a-f]+)")
+# Header-only readers also use HDR and may decode the first line as plain UTF-8.
+HDR = re.compile(r"^\ufeff?;\s*(\S+)\s+code 0x([0-9a-f]+)\.\.0x([0-9a-f]+)")
 SPECIAL = {"vcc", "vcc_lo", "vcc_hi", "exec", "exec_lo", "exec_hi", "m0", "scc", "null", "off", "src_scc",
            "src_execz", "src_vccz", "src_lds_direct", "src_shared_base", "src_shared_limit",
            "src_private_base", "src_private_limit", "src_pops_exiting_wave_id", "lds", "flat_scratch",
@@ -236,7 +237,7 @@ def parse_line(line):
 
 
 def parse_file(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
         lines = f.read().splitlines()
     info = {"name": os.path.splitext(os.path.basename(path))[0], "insns": [], "invalid": 0}
     m = HDR.match(lines[0]) if lines else None

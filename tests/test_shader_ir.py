@@ -322,6 +322,15 @@ class ParseFileTests(unittest.TestCase):
         self.assertEqual(info["insns"][0]["pc"], 0)
         self.assertEqual(info["insns"][0]["enc"], "aabb")
 
+    def test_utf8_bom_preserves_header_and_first_instruction(self):
+        instruction = "\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
+        for header, start, end in (("; sample code 0x100..0x104\n", 0x100, 0x104), ("", 0, None)):
+            with self.subTest(header=bool(header)):
+                info = shader_ir.parse_file(self.write("\ufeff" + header + instruction))
+                self.assertEqual(info["code_start"], start)
+                self.assertEqual(info["code_end"], end)
+                self.assertEqual([(ins["op"], ins["pc"]) for ins in info["insns"]], [("s_endpgm", start)])
+
     def test_header_only_file_has_no_instructions(self):
         path = self.write("; shader.cs_6_0 code 0x00001000..0x00001008\n")
         info = shader_ir.parse_file(path)

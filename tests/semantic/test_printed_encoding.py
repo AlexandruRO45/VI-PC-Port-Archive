@@ -8,6 +8,7 @@ is checked too, with the same exceptions (same_encoding). Hand-built listing and
 
     python -I tests/semantic/test_printed_encoding.py -v
 """
+import codecs
 import os
 import sys
 import unittest
@@ -73,6 +74,13 @@ class PrintedEncodingTest(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported) as cm:
             self.translate(listing(PROGRAM), blob(stored))
         self.assertIn("v_cndmask_b32_e64 at 0x108", str(cm.exception))
+
+    def test_utf8_bom_preserves_blob_validation(self):
+        printed = codecs.BOM_UTF8 + listing(PROGRAM)
+        self.assertEqual(self.translate(printed, blob(PROGRAM)), self.translate(listing(PROGRAM), blob(PROGRAM)))
+        stored = with_byte(PROGRAM, 1, 4, 0x81)
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "v_cndmask_b32_e64 at 0x108"):
+            self.translate(printed, blob(stored))
 
     def test_same_encoding_exceptions_still_apply(self):
         # LLVM 23 prints an unused VOP3 SRC2 as 0x80 where the compiler stored 0 (same_encoding's exception).
