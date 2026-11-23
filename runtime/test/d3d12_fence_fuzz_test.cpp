@@ -10,7 +10,9 @@
 //
 // Default (what ctest runs): monotonic values, no fence released while in use, steps below 2^31. Options for cases
 // the layer is known to differ on: --rewinds (a signaller goes back, D3D-472), --release (a fence released while queue
-// waits or events use it, D3D-496), --big (steps above 2^31-1, the timeline limit; #4609). --seeds N --start S
+// waits or events use it, D3D-496), --big (steps above 2^31-1, the timeline limit; #4609). --wide adds fences
+// created above 0, SetEventOnMultipleFenceCompletion (ALL and ANY) and cross-queue Wait-before-Signal (a queue waits
+// for a value a higher-numbered queue is given later, so no cycle forms). --seeds N --start S
 // --ops N choose the programs; --verbose prints each program. A mismatch prints the seed and the program up to the
 // first settle point that differs. LEONIDA_VK_VALIDATION=1 runs the test-made device under the validation layer, and
 // any validation error fails the seed. Needs a Vulkan GPU and a host D3D12 adapter (exit 77 otherwise). No game data.
@@ -36,21 +38,25 @@ namespace {
 
 struct Options {
     unsigned seeds = 40, start = 1, ops = 48;
-    bool rewinds = false, release = false, big = false, verbose = false;
+    bool rewinds = false, release = false, big = false, wide = false, standalone = false, verbose = false;
     std::string fixed;  // --case NAME: run one fixed program instead of the seeds
 };
 
-constexpr int queue_count = 3;  // DIRECT, COMPUTE, COPY
+constexpr int max_queues = 6;  // DIRECT, COMPUTE, COPY, then a second queue of each type with --queues 6
+int queue_count = 3;
 constexpr int fence_slots = 4;
-constexpr D3D12_COMMAND_LIST_TYPE queue_type[queue_count] = {
+constexpr D3D12_COMMAND_LIST_TYPE queue_type[max_queues] = {
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY,
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY};
-constexpr const char* queue_name[queue_count] = {"DIRECT", "COMPUTE", "COPY"};
+constexpr const char* queue_name[max_queues] = {"DIRECT", "COMPUTE", "COPY", "DIRECT2", "COMPUTE2", "COPY2"};
 constexpr int cpu = -1;
 
 struct Op {
-    enum Kind { queue_signal, queue_wait, cpu_signal, event, execute, release, settle } kind;
+    enum Kind { queue_signal, queue_wait, cpu_signal, event, execute, release, settle, multi_event } kind;
     int queue = 0, fence = 0;
-    UINT64 value = 0;
+    UINT64 value = 0;      // release: the new fence's initial value
+    int fence2 = 0;        // multi_event: the second fence, `value2` its value, `queue` 1 for ANY and 0 for ALL
+    UINT64 value2 = 0;
 };
 
 // Fixed programs for findings, run with --case NAME.
@@ -70,8 +76,12 @@ std::string describe(const Op& op) {
     case Op::cpu_signal: std::snprintf(text, sizeof text, "CPU f%d->Signal(%llu)", op.fence, v); break;
     case Op::event: std::snprintf(text, sizeof text, "f%d->SetEventOnCompletion(%llu, e)", op.fence, v); break;
     case Op::execute: std::snprintf(text, sizeof text, "%s ExecuteCommandLists(empty list)", queue_name[op.queue]); break;
-    case Op::release: std::snprintf(text, sizeof text, "release f%d (a new fence at 0 takes the slot)", op.fence); break;
+    case Op::release: std::snprintf(text, sizeof text, "release f%d (a new fence at %llu takes the slot)", op.fence, v); break;
     case Op::settle: std::snprintf(text, sizeof text, "-- settle"); break;
+    case Op::multi_event:
+        std::snprintf(text, sizeof text, "SetEventOnMultipleFenceCompletion({f%d, f%d}, {%llu, %llu}, %s, e)", op.fence,
+                      op.fence2, v, static_cast<unsigned long long>(op.value2), op.queue ? "ANY" : "ALL");
+        break;
     }
     return text;
 }
@@ -85,6 +95,11 @@ std::vector<Op> generate(std::uint64_t seed, const Options& o) {
     UINT64 issued[fence_slots] = {}, waited[fence_slots] = {};
     for (int& w : owner) w = pick(2) ? cpu : pick(queue_count);
     std::vector<Op> program;
+    if (o.wide)  // fences that start above 0
+        for (int f = 0; f < fence_slots; ++f) {
+            issued[f] = rng() % 4;
+            program.push_back({Op::release, 0, f, issued[f]});
+        }
     const auto step = [&]() -> UINT64 {
         if (o.big && pick(8) == 0) return 0x80000000ull + rng() % 0x100000000ull;
         return 1 + rng() % 3;
@@ -113,6 +128,10 @@ std::vector<Op> generate(std::uint64_t seed, const Options& o) {
             if (owner[f] == cpu) {
                 v = issued[f] + rng() % 3;  // may be ahead of every CPU signal so far
                 if (v == 0) v = 1;
+            } else if (o.wide && owner[f] > q && pick(2)) {
+                // Wait-before-Signal across queues: only on a higher-numbered queue's fence, so no cycle can form;
+                // the end of the program has the owner signal it.
+                v = issued[f] + 1 + rng() % 2;
             } else {
                 if (issued[f] == 0) continue;
                 v = 1 + rng() % issued[f];
@@ -124,6 +143,16 @@ std::vector<Op> generate(std::uint64_t seed, const Options& o) {
         case 6: case 7: {  // an event, possibly for a value nothing will reach
             UINT64 v = issued[f] + rng() % 3;
             if (v == 0) v = 1;
+            if (o.wide && pick(2)) {  // the same through SetEventOnMultipleFenceCompletion, ALL or ANY
+                const int g = (f + 1 + pick(fence_slots - 1)) % fence_slots;
+                UINT64 w = issued[g] + rng() % 3;
+                if (w == 0) w = 1;
+                Op op{Op::multi_event, pick(2), f, v};
+                op.fence2 = g;
+                op.value2 = w;
+                program.push_back(op);
+                break;
+            }
             program.push_back({Op::event, 0, f, v});
             break;
         }
@@ -137,9 +166,12 @@ std::vector<Op> generate(std::uint64_t seed, const Options& o) {
             break;
         }
     }
-    // Release every queue still waiting on a CPU fence, then a final settle point.
+    // Release every queue still waiting on a CPU fence, then every Wait-before-Signal on a queue fence (each owner
+    // signals the highest value waited for), then a final settle point.
     for (int f = 0; f < fence_slots; ++f)
         if (owner[f] == cpu && waited[f] > issued[f]) program.push_back({Op::cpu_signal, 0, f, waited[f]});
+    for (int f = 0; f < fence_slots; ++f)
+        if (owner[f] != cpu && waited[f] > issued[f]) program.push_back({Op::queue_signal, owner[f], f, waited[f]});
     program.push_back({Op::settle});
     return program;
 }
@@ -165,9 +197,9 @@ std::atomic<const char*> current_device{"start"};
 
 Run execute(ID3D12Device* device, const std::vector<Op>& program) {
     Run run;
-    ComPtr<ID3D12CommandQueue> queues[queue_count];
-    ComPtr<ID3D12CommandAllocator> allocators[queue_count];
-    ComPtr<ID3D12GraphicsCommandList> lists[queue_count];
+    ComPtr<ID3D12CommandQueue> queues[max_queues];
+    ComPtr<ID3D12CommandAllocator> allocators[max_queues];
+    ComPtr<ID3D12GraphicsCommandList> lists[max_queues];
     for (int q = 0; q < queue_count; ++q) {
         D3D12_COMMAND_QUEUE_DESC desc{};
         desc.Type = queue_type[q];
@@ -180,7 +212,11 @@ Run execute(ID3D12Device* device, const std::vector<Op>& program) {
         }
     }
     ComPtr<ID3D12Fence> fences[fence_slots];
-    const auto fresh = [&](int f) { return SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fences[f]))); };
+    const auto fresh = [&](int f, UINT64 initial = 0) {
+        return SUCCEEDED(device->CreateFence(initial, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fences[f])));
+    };
+    ComPtr<ID3D12Device1> device1;
+    device->QueryInterface(IID_PPV_ARGS(&device1));
     for (int f = 0; f < fence_slots; ++f)
         if (!fresh(f)) {
             run.error = "CreateFence failed";
@@ -212,8 +248,23 @@ Run execute(ID3D12Device* device, const std::vector<Op>& program) {
         }
         case Op::release:
             fences[op.fence].Reset();
-            if (!fresh(op.fence)) run.error = "CreateFence failed";
+            if (!fresh(op.fence, op.value)) run.error = "CreateFence failed";
             break;
+        case Op::multi_event: {
+            HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            ID3D12Fence* pair[2] = {fences[op.fence].Get(), fences[op.fence2].Get()};
+            const UINT64 values[2] = {op.value, op.value2};
+            if (!device1) {
+                run.error = "no ID3D12Device1";
+                CloseHandle(h);
+                break;
+            }
+            device1->SetEventOnMultipleFenceCompletion(pair, values, 2,
+                                                       op.queue ? D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY
+                                                                : D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, h);
+            events.push_back({op.fence, h});
+            break;
+        }
         case Op::settle: {
             // Stable for three reads 20 ms apart, within 3 s.
             Snapshot last = snapshot();
@@ -297,6 +348,9 @@ int main(int argc, char** argv) {
         else if (a == "--rewinds") o.rewinds = true;
         else if (a == "--release") o.release = true;
         else if (a == "--big") o.big = true;
+        else if (a == "--wide") o.wide = true;
+        else if (a == "--standalone") o.standalone = true;
+        else if (a == "--queues" && i + 1 < argc) queue_count = std::atoi(argv[++i]) >= 6 ? 6 : 3;
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--case" && i + 1 < argc) o.fixed = argv[++i];
         else {
@@ -328,8 +382,11 @@ int main(int argc, char** argv) {
     info.queue = d.queue;
     info.queue_family = d.family;
     ComPtr<ID3D12Device> layer;
-    if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&layer)))) {
-        std::fprintf(stderr, "create_vulkan_device failed\n");
+    // --standalone: the layer's own Vulkan device, whose D3D12 queues can map to distinct VkQueues (the test device
+    // has one); its validation messages are printed but not counted.
+    if (FAILED(o.standalone ? rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&layer))
+                            : rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&layer)))) {
+        std::fprintf(stderr, "creating the layer device failed\n");
         return 1;
     }
     // Under Wine the "host" D3D12 is vkd3d, itself a translation layer: no reference to compare with.

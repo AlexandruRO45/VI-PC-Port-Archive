@@ -2299,7 +2299,10 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   what the layer is known to differ on: `--release` (fences released while queues or events use them, D3D-496;
   on `main` `3faac557` a satisfied queue `Wait`, the fence released and the queue's next submission crash, the
   fixed case `--case pending-wait-release`), `--rewinds` (D3D-472) and `--big` (steps beyond the 2^31-1 timeline
-  limit). A mismatch prints the seed and the program up to the first settle point that differs.
+  limit). `--wide` adds fences created above 0, `SetEventOnMultipleFenceCompletion` (ALL and ANY) and cross-queue
+  Wait-before-Signal; `--queues 6` a second queue of each type; `--standalone` runs the layer's own device, whose
+  queues can map to distinct VkQueues. All of these match the host on `main` `3faac557` (RTX 5060 Ti, 40-60
+  seeds each). A mismatch prints the seed and the program up to the first settle point that differs.
 - The swapchain owns acquire/present semaphores and N frames in flight. A present waits for the frame's
   render-finished semaphore; the next acquire waits for the image's present-complete semaphore.
 - Queue types: a direct queue maps to a graphics+compute queue, a compute queue to a compute-only family if one
