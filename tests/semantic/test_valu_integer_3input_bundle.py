@@ -479,5 +479,23 @@ class TestLshlOrB32ASTInterpreter(unittest.TestCase):
         self.assertEqual(res, 0xABCD)
         self.assertEqual(interp.vgprs[0], 0xABCD)
 
+# ---------------------------------------------------------------------------
+# Opcode 4: v_lshl_or_b32 - SIMD and Boundary Tests
+# ---------------------------------------------------------------------------
+
+class TestLshlOrB32SIMDBoundaries(unittest.TestCase):
+    def test_simd_wave_bit_shuffling(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        s0 = [1] * 32
+        s1 = [lane for lane in range(32)]
+        s2 = [0x5555_5555] * 32
+        res = wave.execute(oracle_lshl_or_b32, s0, s1, s2)
+        for lane in range(32):
+            self.assertEqual(res[lane], (1 << lane) | 0x5555_5555)
+
+    def test_boundary_shift_counts(self) -> None:
+        self.assertEqual(oracle_lshl_or_b32(1, 31, 0), 0x8000_0000)
+        self.assertEqual(oracle_lshl_or_b32(1, 32, 0), 1)
+
 if __name__ == "__main__":
     unittest.main()
