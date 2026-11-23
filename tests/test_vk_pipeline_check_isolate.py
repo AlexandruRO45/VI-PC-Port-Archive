@@ -71,7 +71,7 @@ class IsolateTest(unittest.TestCase):
             raise unittest.SkipTest("no usable Vulkan device (exit %d): %s" % (probe.returncode, probe.stderr.strip()[-300:]))
 
     @classmethod
-    def run_tool(cls, args, crash=None, cache=None, *, device=None):
+    def run_tool(cls, args, crash=None, cache=None, *, device=None, directory=None, timeout=300):
         env = dict(os.environ)
         env.pop("VK_PIPELINE_CHECK_SIMULATE_CRASH", None)
         if crash:
@@ -79,9 +79,9 @@ class IsolateTest(unittest.TestCase):
         if device:
             env["LEONIDA_VK_DEVICE"] = device
         # Windows paths ending in a backslash must survive the parent's command-line quoting too.
-        directory = str(cls.dir) + (os.sep if WINDOWS else "")
+        directory = str(cls.dir if directory is None else directory) + (os.sep if WINDOWS else "")
         cmd = [str(cls.exe), directory] + ([str(cache)] if cache else []) + ["--jobs", "2"] + args
-        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
 
     def cache(self, name):
         return Path(self.tmp.name) / name
@@ -91,6 +91,29 @@ class IsolateTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("cs: 5 modules ok, 0 failed", r.stdout)
         self.assertIn("cs pipelines: 5 ok, 0 failed, 0 skipped", r.stdout)
+
+    def test_oversized_skips_do_not_block_remaining_pipelines(self):
+        # Two oversized modules fill the two-place gate if their early skips leak reservations.
+        # The other three modules also use the gate and must still reach pipeline creation.
+        directory = Path(self.tmp.name) / "mixed sizes"
+        directory.mkdir()
+        index = {}
+        for i, name in enumerate(NAMES):
+            source = ASM.format(size=1 << i)
+            if i < 2:
+                source = source.replace("%void =", 'OpName %main "' + "x" * 4096 + '"\n%void =')
+            module = assemble(source, target_env="vulkan1.1")
+            self.assertEqual(len(module) > 1024, i < 2)
+            (directory / (name + ".spv")).write_bytes(module)
+            index[name] = {"stage": "cs", "subgroup_size": None, "features": []}
+        (directory / "index.json").write_text(json.dumps(index), encoding="utf-8", newline="\n")
+
+        r = self.run_tool(["--large-module-bytes", "1", "--large-parallel", "2", "--max-bytes", "1024"],
+                          cache=self.cache("mixed.cache"), directory=directory, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("big modules skipped: 2 (limit 1024 bytes)", r.stdout)
+        self.assertIn("cs: 3 modules ok, 0 failed", r.stdout)
+        self.assertIn("cs pipelines: 3 ok, 0 failed, 0 skipped", r.stdout)
 
     def test_isolate_without_a_crash_matches_normal_counts(self):
         r = self.run_tool(["--isolate", "--isolate-batch", "2"], cache=self.cache("isolated clean.cache"))
