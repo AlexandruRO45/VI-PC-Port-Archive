@@ -17542,6 +17542,11 @@ def main():
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
                          "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
+    ap.add_argument("--gs-compute", action="store_true",
+                    help="a geometry shader also gets its compute capture module (tools/spirv_gs_to_compute.py; "
+                         "metadata: gs_compute), for devices without the Vulkan geometry stage (e.g. Apple GPUs): "
+                         "the native module is unchanged, the capture module goes next to it as "
+                         "<name>.gs_compute.spv")
     ap.add_argument("--fma", choices=("glsl", "khr", "exact"), default="glsl",
                     help="how fused multiply-adds (v_fma_f32, v_fmac_f32, v_fmaak/fmamk_f32, v_fma_mix*) are emitted: "
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
@@ -17668,6 +17673,9 @@ def main():
         # module, and the index merge below drops its entry, exactly like a spirv-as/val rejection. The
         # .spvasm text stays for diagnosis, as it does on a rejection.
         Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
+        # The --gs-compute sidecar is published with the module, so it goes the same way.
+        Path(os.path.join(a.out, name + ".gs_compute.spv")).unlink(missing_ok=True)
+        Path(os.path.join(a.out, name + ".gs_compute.spvasm")).unlink(missing_ok=True)
         invalid.add(name)
 
     for p in files:
@@ -17713,6 +17721,28 @@ def main():
                 meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
+            # --gs-compute: publish the capture module next to a valid geometry shader (SHADER-159). The native
+            # module is unchanged; a device without the geometry stage runs the capture pass and draws the records.
+            if a.gs_compute and isinstance(meta[name], dict) and "gs_inputs" in meta[name]:
+                import spirv_gs_to_compute as _gsc
+                try:
+                    cap_asm, cap_lay = _gsc.rewrite(asm)
+                    cap_sa = os.path.join(a.out, name + ".gs_compute.spvasm")
+                    cap_sv = os.path.join(a.out, name + ".gs_compute.spv")
+                    with open(cap_sa, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(cap_asm)
+                    cr = assemble_spirv(cap_sa, cap_sv, asm_text=cap_asm, assembler=a.assembler)
+                    if cr.returncode == 0:
+                        lay = dict(cap_lay)
+                        lay["num_inputs"] = len(cap_lay["inputs"])
+                        lay["record_stride"] = 16 * len(cap_lay["outputs"])
+                        lay["meta_words"] = cap_lay["max_verts"] + 1
+                        meta[name]["gs_compute"] = lay
+                    else:
+                        why["INVALID gs_compute: " + (cr.stderr.strip().splitlines() or ["?"])[0][:80]] += 1
+                except (_gsc.Unsupported, ValueError, KeyError, IndexError) as e:
+                    why[f"gs_compute unsupported: {str(e)[:70]}"] += 1
+                    Path(os.path.join(a.out, name + ".gs_compute.spv")).unlink(missing_ok=True)
         else:
             if not write_asm:
                 with open(sa, "w", encoding="utf-8", newline="\n") as f:

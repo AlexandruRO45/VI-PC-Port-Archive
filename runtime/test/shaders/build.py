@@ -177,6 +177,9 @@ def translate_tests(work, names):
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
     if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--pc-tail-ubo")
+    # The geometry-shader capture module next to a translated GS (SHADER-159), for devices without the stage.
+    if (os.environ.get("LEONIDA_GS_COMPUTE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        cmd.append("--gs-compute")
     return subprocess.run(cmd).returncode
 
 
@@ -233,6 +236,11 @@ def main():
             for suffix in (".spv", ".spvasm"):
                 artifact = built / (n + suffix)
                 artifact.replace(spirv / artifact.name)
+            # The --gs-compute capture sidecar (SHADER-1092), published only when it was built.
+            for suffix in (".gs_compute.spv", ".gs_compute.spvasm"):
+                artifact = built / (n + suffix)
+                if artifact.is_file():
+                    artifact.replace(spirv / artifact.name)
             sidecar = work / "fssm" / (n + ".fssm")
             published = not n.startswith("cs_") or cs_fssm_extra(os.path.join(HERE, n + ".asm"))
             if published and sidecar.is_file():
