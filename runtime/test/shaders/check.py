@@ -662,8 +662,9 @@ def mesh_v5_test(tools, spirv, raw):
         return "missing fs_passthru.spv"
     code, out = run_readback(raw, run, os.path.join(tools, "vk_harness" + EXE), shader, fs, raw,
                              "--mesh-group-readback", "2", "3", "4", env=mesh_env(spirv, "ms_v5_workgroup"))
-    if code == UNSUPPORTED:
-        return Skip("SKIP (mesh shading unavailable)")
+    if code == UNSUPPORTED:   # vk_harness says why: no VK_EXT_mesh_shader, too few push-constant bytes, ...
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'mesh shading unavailable'})")
     if code:
         return failure(code, out, 3)
     return check_mesh_v5(raw.read_bytes())

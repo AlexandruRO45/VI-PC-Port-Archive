@@ -322,6 +322,20 @@ class MeshWorkgroupChecks(unittest.TestCase):
                 self.assertIn("missing readback: groups.raw", check.mesh_v5_test(tmp, spirv, raw))
             self.assertFalse(raw.exists())
 
+    def test_an_unsupported_harness_gives_its_own_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp)
+            (spirv / "ms_v5_workgroup.spv").touch()
+            (spirv / "fs_passthru.spv").touch()
+            raw = spirv / "groups.raw"
+            reason = "unsupported: need 144 push constant bytes, device has 128"
+            with patch.object(check, "run", return_value=(check.UNSUPPORTED, f"device: X\n{reason}\n")):
+                result = check.mesh_v5_test(tmp, spirv, raw)
+                self.assertIsInstance(result, check.Skip)
+                self.assertEqual(result, f"SKIP ({reason})")
+            with patch.object(check, "run", return_value=(check.UNSUPPORTED, "")):
+                self.assertEqual(str(check.mesh_v5_test(tmp, spirv, raw)), "SKIP (mesh shading unavailable)")
+
     def test_readback_cleanup_failure_does_not_start_the_harness(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw = Path(tmp) / "groups.raw"
