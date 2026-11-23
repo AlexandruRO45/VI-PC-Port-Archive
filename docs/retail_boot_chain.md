@@ -103,8 +103,9 @@ beyond "the title goes on to the next call". Nothing has reached a draw or a pre
 
 ## 5. The device slots the executable calls, from the file (RT-566)
 
-The chain above finds the next slot by running the title; `tools/d3d12_device_calls.py` lists, from the file alone
-and without running anything, every `ID3D12Device` vtable slot the executable calls where it can follow the device:
+The chain above finds the next slot by running the title; `tools/d3d12_device_calls.py` reads the file alone,
+without running anything, and reports the statically resolved `ID3D12Device` vtable call sites for the device paths
+it follows:
 
 ```sh
 python -I tools/d3d12_device_calls.py <game>/game_scarlett_master.exe --out <work>/device_calls
@@ -129,11 +130,12 @@ a fact at a join only when both paths agree. What it doesn't see, and says so: t
 member, a function parameter or a getter's return value; a path it loses, such as a loop's back edge; an indexed
 method load. The report counts the vtable loads with no matched call, the calls with a method in `rax`
 to a target that isn't a verified dispatch routine, the calls that are handed the device (not followed into), and
-the stores of the device to non-stack memory, so each slot's count is a lower bound.
+the stores of the device to non-stack memory. A slot can be called more often than the report says, or on a
+path it doesn't follow, so a slot with no row (12 and 51, for example) isn't shown to be uncalled.
 
-On the 1.0.2.1 executable it finds one `D3D12XboxCreateDevice` call site writing a global, 95 call sites across
-42 slots, all of them the `call [vtable+disp]` form (none through a dispatch routine), the `rdx` form at slots 25,
-26 and 108 only, and 12 sites it reports as not resolved. Every device slot
+On the 1.0.2.1 executable it finds one `D3D12XboxCreateDevice` call site writing a global and 95 sites across
+42 slots: 94 indirect vtable calls and one indirect vtable tail jump (at slot 2), with no dispatch call resolved;
+the `rdx` form at slots 25, 26 and 108 only; and 12 sites it reports as not resolved. Every device slot
 the chain above reached (8, 26, 48, 73, 133) is among them; slots like 49, 55, 57, 61, 70, 71, 74, 81, 86, 101,
 108, 119, 127 and 132 are called but have no name in this repository yet.
 

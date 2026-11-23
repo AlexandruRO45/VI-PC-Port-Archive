@@ -1,4 +1,5 @@
-"""Count the ID3D12Device vtable slots an x86-64 PE image calls, from the file alone (RT-566).
+"""Report the statically resolved ID3D12Device vtable call sites of an x86-64 PE image, for the device paths it
+follows, from the file alone (RT-566).
 
 Usage:
     python -I tools/d3d12_device_calls.py <image> --out DIR
@@ -39,8 +40,9 @@ loses, such as a loop's back edge), a direct call with a method in
 rax whose target isn't a verified dispatch routine, a call with the
 device in an argument register that isn't a vtable call (the device handed to another function, which is not
 followed into), the device stored to non-stack memory (followed only within the function), and creator calls whose
-out-pointer isn't followed. Devices reached only through those paths (a member of an object, a function parameter,
-a getter's return value) are missed, so the counts are a lower bound for each slot.
+out-pointer isn't followed. The report holds the statically resolved sites for the device paths it follows; a
+device reached only through those paths (a member of an object, a function parameter, a getter's return value) is
+not followed, so a slot can be called more often than the report says, or at all when the report has no row for it.
 
 Slot names: slots 0-43 carry the PC ID3D12Device method names (public d3d12.h order). The console keeps that order
 where it was measured (slots 8, 9, 14, 26, 36: docs/retail_boot_chain.md, runtime/shims/d3d12_xs_device.h); the
@@ -287,16 +289,16 @@ class Census:
             if op in (0xE8, 0xE9) or indirect:
                 tail = op == 0xE9 or (indirect and i.reg & 7 == 4)
                 slot = None
-                vload = None
+                vload = via = None
                 if indirect and mod != 3 and base in vt:
                     if i.index is None and i.disp >= 0 and i.disp % 8 == 0:
-                        slot, vload = i.disp // 8, vt[base]            # call [vtable+disp]
+                        slot, vload, via = i.disp // 8, vt[base], "vtable"  # call [vtable+disp]
                 elif indirect and mod == 3 and i.rm in meth:
-                    slot, vload = meth[i.rm]                           # call reg
+                    slot, vload, via = *meth[i.rm], "register"         # call reg
                 elif (op in (0xE8, 0xE9) or (indirect and base == RIP)) and RAX in meth:
                     target = i.target if op in (0xE8, 0xE9) else self.code_pointer(i.target)
                     if self.is_dispatcher(target):
-                        slot, vload = meth[RAX]                        # dispatch routine, method in rax
+                        slot, vload, via = *meth[RAX], "dispatch"      # dispatch routine, method in rax
                     elif not (i.target in self.thunks or (indirect and i.target in self.creators)):
                         self.unverified.add(i.rva)
                         mark_used(meth[RAX][1])                        # reported here, not as an unused load
@@ -316,14 +318,16 @@ class Census:
                     elif out and out[0] == "g":
                         record["out"] = "global"
                         self.new_holders.add(out[1])
-                    elif out and out[0] == "m" and (survives_call(out[1]) or out[1] not in VOLATILE):
-                        record["out"] = "memory slot"
+                    elif out and out[0] == "m" and survives_call(out[1]):
+                        record["out"] = "stack slot"
+                    elif out and out[0] == "m" and out[1] not in VOLATILE:
+                        record["out"] = "object member (followed until the next call)"
                     self.creator_calls[i.rva] = record
                 if slot is not None:
                     this = "rcx" if RCX in dev else "rdx" if RDX in dev else "other"
                     args = argument_count(written, stack)
                     self.sites[i.rva] = {"rva": i.rva, "slot": slot, "kind": "jmp" if tail else "call",
-                                         "this": this, "args": args}
+                                         "via": via, "this": this, "args": args}
                     mark_used(vload)
                 elif (creator is None and not (indirect and mod != 3 and base in vt) and i.rva not in self.unverified
                       and dev & {RCX, RDX, 8, 9}):
@@ -340,13 +344,13 @@ class Census:
                 if tail:
                     clear()
                     dead = True
-                    if window:
+                    if window and not pending:
                         return
                 continue
             if i.ends_flow():
                 clear()
                 dead = True
-                if window:
+                if window and not pending:
                     return
                 continue
 
@@ -488,6 +492,9 @@ def scan(data: bytes) -> dict:
         "undecodable_walks": c.undecodable,
         "rounds_exhausted": getattr(c, "rounds_exhausted", False),
         "sites": len(c.sites),
+        "calls": sum(1 for s in c.sites.values() if s["kind"] == "call"),
+        "tail_jumps": sum(1 for s in c.sites.values() if s["kind"] == "jmp"),
+        "dispatch_sites": sum(1 for s in c.sites.values() if s["via"] == "dispatch"),
         "slots": table,
         "unresolved": {
             "vtable_loads_without_matched_call": unused,
@@ -522,7 +529,9 @@ def to_text(file: str, r: dict) -> str:
         lines.append(f"{s['slot']:>4}  {s['sites']:>5}  {s['calls']:>4}  {s['tail_jumps']:>3}  {s['this_rcx']:>3}  "
                      f"{s['this_rdx']:>3}  {s['this_other']:>3}  {args:>5}  {name}")
     lines.append("")
-    lines.append(f"{r['sites']} site(s) across {len(r['slots'])} slot(s)")
+    lines.append(f"{r['sites']} site(s) across {len(r['slots'])} slot(s): {r['calls']} indirect vtable call(s) and "
+                 f"{r['tail_jumps']} indirect vtable tail jump(s), {r['dispatch_sites']} of them through a verified "
+                 f"dispatch routine")
     u = r["unresolved"]
     lines.append("not resolved (no slot guessed):")
     lines.append(f"  device vtable loads with no matched call: {u['vtable_loads_without_matched_call']}")

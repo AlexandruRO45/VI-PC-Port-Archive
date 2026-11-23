@@ -38,6 +38,7 @@ DEVICE = DATA_RVA + 0x00        # the creator's out-pointer
 COPY = DATA_RVA + 0x08          # a global the device is copied to
 OTHER = DATA_RVA + 0x10         # an unrelated object
 GUARD = DATA_RVA + 0x18         # the dispatch routine's pointer (to a `jmp rax` stub)
+EXTRA = TEXT_RVA + 0xC00        # free .text space for the code a test adds
 
 
 class Asm:
@@ -276,10 +277,69 @@ class DeviceCallsTest(unittest.TestCase):
         self.assertEqual(r["unresolved"]["device_passed_to_other_calls"], 1)
         self.assertNotIn(14, {s["slot"] for s in r["slots"]})   # past a backward jump nothing is known
 
+    def with_code(self, emit, pdata=True):
+        """The fixture with one more stretch of code at a free .text address, as a .pdata function or without an
+        entry (walked as a byte window from its device reference). Returns the scan."""
+        a = Asm(EXTRA)
+        emit(a)
+        data = bytearray(self.data)
+        data[EXTRA:EXTRA + len(a.code)] = a.code
+        if pdata:
+            size = struct.unpack_from("<I", data, 0x58 + 112 + 3 * 8 + 4)[0]
+            struct.pack_into("<III", data, PDATA_RVA + size, EXTRA, a.here, 0)
+            struct.pack_into("<I", data, 0x58 + 112 + 3 * 8 + 4, size + 12)
+        return ddc.scan(bytes(data))
+
+    @staticmethod
+    def early_return(a, overwrite=False):
+        a.rip(b"\x48\x8b\x0d", DEVICE)                   # mov rcx,[rip+DEVICE]
+        a.raw(b"\x80\x79\x18\x00")                       # cmp byte [rcx+0x18],0
+        if overwrite:
+            a.raw(b"\x74\x03")                           # je +3
+            a.raw(b"\x48\x89\xd1")                       # mov rcx,rdx: the fall-through loses the device
+        else:
+            a.raw(b"\x75\x01")                           # jne +1
+            a.raw(b"\xc3")                               # ret
+        a.raw(b"\x48\x8b\x01")                           # mov rax,[rcx]
+        a.raw(b"\xff\x90\xc0\x00\x00\x00")               # call [rax+0xc0]: slot 24
+        a.raw(b"\xc3")
+
+    def test_a_conditional_branch_carries_the_device_past_an_early_return(self):
+        for pdata in (True, False):                      # a .pdata function, and a byte window without an entry
+            r = self.with_code(self.early_return, pdata)
+            self.assertIn(24, {s["slot"] for s in r["slots"]}, pdata)
+            self.assertEqual(r["sites"], self.r["sites"] + 1)
+
+    def test_a_join_keeps_only_what_both_paths_agree_on(self):
+        r = self.with_code(lambda a: self.early_return(a, overwrite=True))
+        self.assertNotIn(24, {s["slot"] for s in r["slots"]})
+        self.assertEqual(r["sites"], self.r["sites"])
+
+    def test_an_object_member_out_pointer_is_followed_until_the_next_call(self):
+        def emit(a):
+            a.raw(b"\x4c\x8d\x4b\x40")                   # lea r9,[rbx+0x40]
+            a.rip(b"\xff\x15", IAT)                      # call [rip+IAT]
+            a.raw(b"\x48\x8b\x4b\x40")                   # mov rcx,[rbx+0x40]
+            a.raw(b"\x48\x8b\x01")                       # mov rax,[rcx]
+            a.raw(b"\xff\x90\x48\x01\x00\x00")           # call [rax+0x148]: slot 41
+            a.raw(b"\x48\x8b\x4b\x40")                   # mov rcx,[rbx+0x40]: after a call, not known
+            a.raw(b"\x48\x8b\x01")                       # mov rax,[rcx]
+            a.raw(b"\xff\x90\x50\x01\x00\x00")           # call [rax+0x150]: slot 42, not counted
+            a.raw(b"\xc3")
+        r = self.with_code(emit)
+        slots = {s["slot"] for s in r["slots"]}
+        self.assertIn(41, slots)
+        self.assertNotIn(42, slots)
+        self.assertEqual(r["creators"][0]["out"],
+                         {"global": 1, "stack slot": 1, "object member (followed until the next call)": 1})
+
     def test_creators_and_globals(self):
         self.assertEqual(self.r["creators"], [{"import": "d3d12_xs.dll!D3D12XboxCreateDevice", "call_sites": 2,
-                                               "out": {"global": 1, "memory slot": 1}}])
+                                               "out": {"global": 1, "stack slot": 1}}])
         self.assertEqual(self.r["device_globals"], 2)
+
+    def test_calls_tail_jumps_and_dispatch_sites_are_counted_apart(self):
+        self.assertEqual((self.r["calls"], self.r["tail_jumps"], self.r["dispatch_sites"]), (4, 1, 2))
 
     def test_unresolved_sites_are_reported_not_guessed(self):
         self.assertEqual(self.r["unresolved"], {
@@ -334,7 +394,8 @@ class DeviceCallsTest(unittest.TestCase):
             self.assertEqual(outputs[0], outputs[1])
             text, raw = outputs[0]
             self.assertNotIn("0x", text)
-            self.assertIn("5 site(s) across 5 slot(s)", text)
+            self.assertIn("5 site(s) across 5 slot(s): 4 indirect vtable call(s) and 1 indirect vtable tail jump(s), "
+                          "2 of them through a verified dispatch routine", text)
             self.assertEqual(json.loads(raw)["sites"], 5)
 
     def test_cli_refuses_a_missing_image(self):
