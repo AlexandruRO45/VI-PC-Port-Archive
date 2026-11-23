@@ -42,6 +42,7 @@ CAUGHT = [
     ("shader.txt", b"XBCH" + (3).to_bytes(4, "little") + bytes(8), "XBCH shader container"),
     ("shader2.txt", b"FSSM" + bytes(12), "FSSM shader"),
     ("container.txt", b"DXBC" + bytes(12), "DXBC container"),
+    ("cache.txt", b"PS\x00\x09" + bytes(12), "PSO/shader cache"),
     ("module.txt", bytes.fromhex("03022307") + bytes(12), "SPIR-V module"),
     ("module_be.txt", bytes.fromhex("07230203") + bytes(12), "SPIR-V module"),
     ("texture.png.txt", b"DDS " + (124).to_bytes(4, "little") + bytes(8), "DDS texture"),
@@ -78,6 +79,10 @@ PASSED = [
     ("bones.md", b"# SKEL_HEAD, MoVE and SCRP name formats; none of them starts this file\n"),
     ("riff.bin", b"RIFF" + bytes(4) + b"AVI LIST"),
     ("empty.txt", b""),
+    ("cache_short.txt", b"PS\x00"),
+    ("cache_other_version.txt", b"PS\x00\x08" + bytes(12)),
+    ("cache_offset.txt", b"\x00PS\x00\x09" + bytes(12)),
+    ("cache_notes.md", b"PS\\0\\x09 is the documented cache magic.\n"),
     ("mz_past_end.txt", pe_header(0x80)[:0x40]),  # e_lfanew points past the end of the file
     ("mz_cut_signature.txt", pe_header(0x300)[:-2]),  # only "PE" of the signature is there
     ("mz_not_pe.txt", pe_header(0x80)[:-4] + b"NE\0\0"),
@@ -131,6 +136,9 @@ RPF = b"9FPR" + bytes(12)
 CAUGHT_IN_ARCHIVES = [
     ("notes.zip.txt", zipped({"readme.txt": b"text\n", "tex/a.png": DDS}), "DDS texture in zip archive (tex/a.png)"),
     ("data.bin", gzip.compress(FSSM), "FSSM shader in gzip stream"),
+    ("cache.zip.txt", zipped({"cache.bin": b"PS\x00\x09" + bytes(12)}),
+     "PSO/shader cache in zip archive (cache.bin)"),
+    ("cache.gz.txt", gzip.compress(b"PS\x00\x09" + bytes(12)), "PSO/shader cache in gzip stream"),
     ("tool.bin", bz2.compress(pe_header()), "PE executable in bzip2 stream"),
     ("pack.bin", lzma.compress(RPF), "RPF9 archive in xz stream"),
     ("far.bin", gzip.compress(pe_header(0x400)), "PE executable in gzip stream"),
