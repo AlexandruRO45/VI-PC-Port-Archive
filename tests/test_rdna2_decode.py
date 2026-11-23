@@ -218,9 +218,14 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 return (k, tuple(a["r"]))
             if k == "attr":
                 return ("attr", a["a"], a["c"])
+            if k == "special" and op == "exp" and a.get("t") == "null":
+                # LLVM 23 prints exp's null target the way it prints the null register; the decoder names it a
+                # target, as LLVM 21 does. One operand either way.
+                k = "target"
             return (k, a.get("t", ""), bool(a.get("neg")), bool(a.get("abs")))
 
         checked = 0
+        renormalized = 0
         for path in asms:
             with open(path, encoding="utf-8") as f:
                 txt = f.read()
@@ -259,15 +264,27 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             dec = rdna2_decode.decode_bytes(bytes(raw), wave32=wave32)
             self.assertEqual(dec["invalid"], 0, path)
             self.assertEqual(len(dec["insns"]), len(llvm_insns), path)
+            at = 0
             for li, di in zip(llvm_insns, dec["insns"]):
-                self.assertEqual(di["enc"], li["enc"], path)
+                # The decoder's bytes are checked against the assembled bytes, not against the encoding llvm-mc
+                # prints after disassembling: LLVM 21 re-encodes some operands it prints the same way (an SDWA
+                # integer source written 1.0 comes back as a literal, ff...003c0000, for the inline f2...).
+                size = len(di["enc"]) // 2
+                self.assertEqual(di["enc"], raw[at:at + size].hex(), f"{path}: {li['op']}")
+                at += size
                 self.assertEqual(norm_op(di["op"]), norm_op(li["op"]), path)
+                if li["enc"] != di["enc"]:
+                    # llvm-mc printed other bytes than it read, so its operand text describes that re-encoding
+                    # (LLVM 21 prints the SDWA source above as 15360); compare operands only where it round-trips.
+                    renormalized += 1
+                    continue
                 self.assertEqual([norm_arg(x, di["op"]) for x in di["args"]],
                                  [norm_arg(x, li["op"]) for x in li["args"]],
                                  f"{path}: {li['op']}")
                 self.assertEqual(sorted(di["mods"]), sorted(li["mods"]), f"{path}: {li['op']}")
                 checked += 1
         self.assertGreater(checked, 5000)
+        self.assertLess(renormalized, 5)   # a handful at most: more would mean the comparison stopped meaning much
 
     def test_sdwa_inline_constants_and_sgpr(self):
         # Exact encodings from runtime/test/shaders/ps_sdwa_f16_const.asm:
