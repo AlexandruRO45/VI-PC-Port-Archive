@@ -237,5 +237,18 @@ class TestVDivScaleF32SIMD(unittest.TestCase):
                 self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 999.0)
 
 
+class TestVDivScaleF32HardwareTranslator(unittest.TestCase):
+    """Translator rejection and boundary tests for v_div_scale_f32."""
+
+    def test_translator_unsupported_rejection(self):
+        lines = [
+            "v_div_scale_f32 v0, s[0:1], v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_scale_unsupported", lines)
+
+
 if __name__ == "__main__":
     unittest.main()
