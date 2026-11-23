@@ -3,16 +3,19 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
     python -I scripts/run_semantic_tests.py tests/semantic          # one file per core
     python -I scripts/run_semantic_tests.py tests/semantic -j 4     # four at a time
     python -I scripts/run_semantic_tests.py tests/semantic -v       # also print the output of the files that pass
+    python -I scripts/run_semantic_tests.py tests/semantic --timeout 120  # limit each unittest subprocess
 
 It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each as
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
-or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
+or on a single core, it runs that discover command itself and the timeout covers the whole discovery run.
+Prints the output of every failing file and one summary
 line, and exits 1 if a file fails or none is found. Standard library only.
 """
 import argparse
 import concurrent.futures
 import fnmatch
+import locale
 import os
 import re
 import subprocess
@@ -32,11 +35,15 @@ def test_modules(directory):
     return names
 
 
-def run_module(directory, module, verbose):
+def run_module(directory, module, verbose, timeout=None):
     """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
-    p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                       errors="replace")
+    try:
+        p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or b"").decode(locale.getpreferredencoding(False), errors="replace").rstrip()
+        return 1, 0, "\n".join(filter(None, (output, f"timed out after {timeout} s")))
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
     return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
 
@@ -46,11 +53,18 @@ def main(argv=None):
     ap.add_argument("directory", help="the suite's folder, tests/semantic")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="files at a time (default: cores)")
     ap.add_argument("-v", "--verbose", action="store_true", help="unittest -v, and print passing files' output")
+    ap.add_argument("--timeout", type=int, help="seconds per unittest subprocess (whole discovery run with -j 1)")
     a = ap.parse_args(argv)
+    if a.timeout is not None and a.timeout < 1:
+        ap.error("--timeout must be at least 1 second")
     directory = os.path.abspath(a.directory)
     if a.jobs <= 1:
-        return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
-                                *(["-v"] if a.verbose else [])])
+        try:
+            return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
+                                    *(["-v"] if a.verbose else [])], timeout=a.timeout)
+        except subprocess.TimeoutExpired:
+            print(f"unittest discovery timed out after {a.timeout} s", file=sys.stderr)
+            return 1
     modules = test_modules(directory)
     if not modules:
         print(f"no test*.py files in {directory}")
@@ -59,7 +73,7 @@ def main(argv=None):
     modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
     start, total, failed = time.monotonic(), 0, []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        jobs = {pool.submit(run_module, directory, m, a.verbose): m for m in modules}
+        jobs = {pool.submit(run_module, directory, m, a.verbose, a.timeout): m for m in modules}
         for job in concurrent.futures.as_completed(jobs):
             code, ran, out = job.result()
             total += ran

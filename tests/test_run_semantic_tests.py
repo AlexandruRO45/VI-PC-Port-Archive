@@ -6,6 +6,8 @@ or unimportable file always makes it exit 1 with that file named, in parallel an
 import contextlib
 import io
 import os
+from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -76,6 +78,48 @@ class RunnerTest(unittest.TestCase):
             code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 1)
             self.assertIn("no test*.py files", out)
+
+
+class SemanticRunnerTimeout(unittest.TestCase):
+    def setUp(self):
+        self.suite = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.suite / "test_slow.py").write_text(
+            "import time\nimport unittest\n\n"
+            "class Slow(unittest.TestCase):\n"
+            "    def test_slow(self):\n"
+            "        time.sleep(30)\n",
+            encoding="utf-8", newline="\n",
+        )
+        (self.suite / "test_quick.py").write_text(
+            "import unittest\n\n"
+            "class Quick(unittest.TestCase):\n"
+            "    def test_quick(self):\n"
+            "        pass\n",
+            encoding="utf-8", newline="\n",
+        )
+
+    def run_suite(self, jobs, timeout):
+        return subprocess.run(
+            [sys.executable, "-I", str(Path(ROOT) / "scripts" / "run_semantic_tests.py"), str(self.suite), "-j", str(jobs), "--timeout", str(timeout)],
+            capture_output=True, text=True, timeout=10,
+        )
+
+    def test_parallel_timeout_fails_the_module_and_reports_completed_work(self):
+        result = self.run_suite(2, 2)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("==== FAILED: test_slow", result.stdout)
+        self.assertIn("timed out after 2 s", result.stdout)
+        self.assertIn("2 files, 1 tests, 1 files failed", result.stdout)
+
+    def test_serial_discovery_respects_the_timeout(self):
+        result = self.run_suite(1, 2)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unittest discovery timed out after 2 s", result.stderr)
+
+    def test_timeout_must_be_positive(self):
+        result = self.run_suite(2, 0)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--timeout must be at least 1 second", result.stderr)
 
 
 if __name__ == "__main__":
