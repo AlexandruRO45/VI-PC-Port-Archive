@@ -1,0 +1,213 @@
+/** Public project metadata only. Game files, traces and credentials never enter this API. */
+export const REPOSITORY = "tudorek12345/Leonida";
+export const REPOSITORY_URL = `https://github.com/${REPOSITORY}`;
+export const SNAPSHOT_DATE = "2026-11-23";
+export const EVIDENCE_URL = "https://github.com/ItsNotRexed/Leonida/blob/8e3c7c72b79cabfbe8a2059fce56a5b99d6ddb51/docs/retail_boot_chain.md";
+
+export type ProjectCommit = {
+  sha: string;
+  message: string;
+  author: string;
+  date: string;
+  url: string;
+};
+
+export type ProjectData = {
+  repo: {
+    name: string;
+    fullName: string;
+    url: string;
+    defaultBranch: string;
+    pushedAt: string | null;
+    stars: number | null;
+    forks: number | null;
+  };
+  commits: ProjectCommit[];
+  source: "github" | "snapshot";
+  fetchedAt: string | null;
+  snapshotDate: string;
+  notice?: string;
+};
+
+export const PROJECT_SNAPSHOT: ProjectData = {
+  repo: {
+    name: "Leonida",
+    fullName: REPOSITORY,
+    url: REPOSITORY_URL,
+    defaultBranch: "main",
+    pushedAt: "2026-11-23T11:36:50Z",
+    stars: null,
+    forks: null,
+  },
+  commits: [{
+    sha: "561b65a832218fbb9e6d2effd392a8eef093a3f8",
+    message: "Merge remote-tracking branch 'origin/main' into triage-r44",
+    author: "ItsNotRexed",
+    date: "2026-11-23T11:28:03Z",
+    url: `${REPOSITORY_URL}/commit/561b65a832218fbb9e6d2effd392a8eef093a3f8`,
+  }],
+  source: "snapshot",
+  fetchedAt: null,
+  snapshotDate: SNAPSHOT_DATE,
+  notice: "Showing the repository snapshot checked on 23 November 2026. Live GitHub activity is temporarily unavailable.",
+};
+
+export const PROJECT_STATUS = {
+  project: "Leonida · Heperkoo experimental fork",
+  lastReviewed: SNAPSHOT_DATE,
+  evidenceScope: "A pinned upstream report, not an independently reproduced run of this fork or a live assessment of the latest upstream branches.",
+  headline: "Working toward the first real frame",
+  renderedGameplayVerified: false,
+  forkFirstFrameVerified: false,
+  verificationScope: "this-fork-and-cited-report",
+  currentBlocker: {
+    label: "Documented upstream checkpoint",
+    title: "Descriptor heap address contract",
+    detail: "The pinned upstream experiment stopped on a CPU descriptor-handle assertion after creating its first descriptor heap. The documented resource stand-in also lacks the required connection between CPU virtual-address writes and GPU resource backing. Later branches may have progressed further; GitHub activity refresh does not update this curated runtime assessment.",
+    classification: "observed-upstream",
+    sourceUrl: EVIDENCE_URL,
+  },
+  experiment: {
+    date: "2026-11-23",
+    baselineCommit: "1cc6e3c12",
+    locallyCombinedPullRequests: [6709, 4531, 6582, 4313, 4348, 2490],
+    additionalLocalStandIns: true,
+    environment: "Windows 11 · RTX 4090 · Vulkan backend",
+    note: "Local experimental fixes were combined for this report; this is not a claim that the same result is available from a clean upstream or fork checkout.",
+  },
+  milestones: [
+    { id: "image", title: "Executable mapped", state: "observed-upstream" },
+    { id: "startup", title: "Startup entered", state: "observed-upstream" },
+    { id: "graphics", title: "Device and queues created", state: "observed-upstream" },
+    { id: "heap", title: "Descriptor heap assertion", state: "blocked-upstream" },
+    { id: "frame", title: "Real game draw and presentation", state: "goal" },
+    { id: "play", title: "Repeatable playable session", state: "goal" },
+  ],
+  priorities: [
+    "Reconcile the fork with current upstream fixes and reproduce the startup trace.",
+    "Implement the measured descriptor and CPU/GPU memory semantics.",
+    "Capture a real game-generated frame with reproducible evidence.",
+  ],
+  sources: [
+    { title: "Pinned retail boot-chain report", url: EVIDENCE_URL },
+    { title: "Fork source", url: REPOSITORY_URL },
+    { title: "Upstream project", url: "https://github.com/ItsNotRexed/Leonida" },
+    { title: "Startup tracing runbook", url: "https://github.com/ItsNotRexed/Leonida/blob/main/docs/boot.md" },
+  ],
+};
+
+type Fetcher = (input: string, init?: RequestInit) => Promise<Response>;
+type ServiceOptions = { fetcher?: Fetcher; now?: () => number; timeoutMs?: number; cacheMs?: number; fallbackCacheMs?: number };
+
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+function cleanText(value: unknown, maxLength: number): string {
+  return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maxLength) : "";
+}
+
+function dateValue(value: unknown): string | null {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : null;
+}
+
+function count(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/** Dependency injection keeps timeout, caching and outage behavior testable without GitHub. */
+export function createProjectService(options: ServiceOptions = {}) {
+  const fetcher: Fetcher = options.fetcher ?? ((url, init) => fetch(url, init));
+  const now = options.now ?? Date.now;
+  const timeoutMs = options.timeoutMs ?? 3500;
+  const cacheMs = options.cacheMs ?? 300_000;
+  const fallbackCacheMs = options.fallbackCacheMs ?? 30_000;
+  let cache: { value: ProjectData; expiresAt: number } | null = null;
+  let lastGood: ProjectData | null = null;
+  let inFlight: Promise<ProjectData> | null = null;
+
+  async function requestLive(): Promise<ProjectData> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const headers = { Accept: "application/vnd.github+json", "User-Agent": "Leonida-Heperkoo-Project-Hub" };
+    try {
+      const data = await Promise.race([
+        Promise.all([
+          fetcher(`https://api.github.com/repos/${REPOSITORY}`, { headers, signal: controller.signal, redirect: "error" }),
+          fetcher(`https://api.github.com/repos/${REPOSITORY}/commits?per_page=5`, { headers, signal: controller.signal, redirect: "error" }),
+        ]).then(async ([repoResponse, commitsResponse]) => {
+          if (!repoResponse.ok || !commitsResponse.ok) throw new Error("GitHub response unavailable");
+          const [repository, commits] = await Promise.all([repoResponse.json(), commitsResponse.json()]);
+          return { repository, commits };
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => { controller.abort(); reject(new Error("GitHub request timed out")); }, timeoutMs);
+        }),
+      ]);
+      const repository = record(data.repository);
+      if (repository.full_name !== REPOSITORY || !Array.isArray(data.commits)) throw new Error("Unexpected GitHub response");
+      const commits = data.commits.slice(0, 5).flatMap((value: unknown): ProjectCommit[] => {
+        const item = record(value);
+        if (typeof item.sha !== "string" || !/^[a-f0-9]{40}$/i.test(item.sha)) return [];
+        const commit = record(item.commit);
+        const author = record(commit.author);
+        const date = dateValue(author.date);
+        if (!date) return [];
+        const message = typeof commit.message === "string" ? commit.message.split(/\r?\n/, 1)[0] : "";
+        return [{
+          sha: item.sha,
+          message: cleanText(message, 260) || "Repository update",
+          author: cleanText(record(item.author).login, 80) || cleanText(author.name, 80) || "Contributor",
+          date,
+          url: `${REPOSITORY_URL}/commit/${item.sha}`,
+        }];
+      });
+      if (commits.length === 0) throw new Error("No valid activity returned");
+      return {
+        repo: {
+          name: "Leonida",
+          fullName: REPOSITORY,
+          url: REPOSITORY_URL,
+          defaultBranch: cleanText(repository.default_branch, 120) || "main",
+          pushedAt: dateValue(repository.pushed_at),
+          stars: count(repository.stargazers_count),
+          forks: count(repository.forks_count),
+        },
+        commits,
+        source: "github",
+        fetchedAt: new Date(now()).toISOString(),
+        snapshotDate: SNAPSHOT_DATE,
+      };
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      controller.abort();
+    }
+  }
+
+  return async function getProject(): Promise<ProjectData> {
+    if (cache && cache.expiresAt > now()) return cache.value;
+    if (inFlight) return inFlight;
+    inFlight = (async () => {
+      try {
+        const value = await requestLive();
+        lastGood = value;
+        cache = { value, expiresAt: now() + cacheMs };
+        return value;
+      } catch {
+        const value: ProjectData = lastGood ? {
+          ...lastGood,
+          source: "snapshot",
+          snapshotDate: lastGood.fetchedAt ?? SNAPSHOT_DATE,
+          notice: "Live GitHub activity is temporarily unavailable. Showing the most recent successful server snapshot.",
+        } : { ...PROJECT_SNAPSHOT };
+        cache = { value, expiresAt: now() + fallbackCacheMs };
+        return value;
+      } finally {
+        inFlight = null;
+      }
+    })();
+    return inFlight;
+  };
+}
+
+export const getProject = createProjectService();

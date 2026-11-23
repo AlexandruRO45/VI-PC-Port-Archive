@@ -1,3 +1,5 @@
+> **Heperkoo experimental fork:** [project website](https://leonida-heperkoo.meshedgoby9.chatgpt.site) · [fork focus and collaboration](FORK.md) · [first-frame developer handoff](website/public/handoff.md). Experimental runtime work; no rendered gameplay has been verified in this fork.
+
 <h1 align="center">
   <br>
   <a>
