@@ -5721,12 +5721,19 @@ class Gen:
         return lo
 
     def mixed_pair_words(self, a):
-        """(lo, hi) of an SGPR pair that holds a lane mask in one word and data in the other (SHADER-823): the mask
-        word as the whole wave's bits (lane_mask_word), the data word as it is, in either order. A register holds
-        only this lane's 0 / ~0 of a mask, so loading both words as data gave every lane its own count (a comparison
-        mask beside the scalar 5). None unless `a` is such a pair: an SGPR pair with at least one word that is a
-        mask on every path. A whole mask (holds_lane_mask) takes wave_mask before this is asked."""
+        """(lo, hi) of an SGPR pair read by a 64-bit mask-word op (s_bcnt0/1_i32_b64, s_ff0/1_i32_b64) word by word
+        (SHADER-823): each word that is a lane mask as the whole wave's bits of its own half (lane_mask_word), every
+        other word (data, or a constant 0 / -1) as it is. A register holds only this lane's 0 / ~0 of a mask, so
+        loading a mask word as data gave every lane its own count (a comparison mask beside the scalar 5), and
+        wave_mask reads lanes 0-31 from the first word and 32-63 from the second whatever they hold: a wave32 pair
+        lost its high word, and a wave64 pair with swapped, duplicated or misplaced halves read the wrong lanes
+        (@limpan1212's review of #7224). None unless `a` is an SGPR pair with a mask word, and for the one layout
+        wave_mask reads right in a single exchange, a wave64 (MASK_LO, MASK_HI) pair in place (as s_cmp_eq_u64's
+        _is_full_wave_mask)."""
         if a["k"] != "sgpr" or a.get("n") != 2 or not any(a["r"] + i in self.cur_masks for i in range(2)):
+            return None
+        if self.wave64 and self.cur_masks.get(a["r"]) == lane_masks.MASK_LO and \
+                self.cur_masks.get(a["r"] + 1) == lane_masks.MASK_HI:
             return None
         return tuple(self.lane_mask_word({"k": "sgpr", "r": a["r"] + i, "n": 1}) if a["r"] + i in self.cur_masks
                      else self.load_reg("sgpr", a["r"] + i) for i in range(2))
@@ -7516,15 +7523,17 @@ class Gen:
             self.emit(f"{r} = OpShiftLeftLogical %uint {mask} {shift}")
             self.dst(a[0], r)
         elif op in ("s_bcnt1_i32_b64", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt0_i32_b32"):
-            if self.holds_lane_mask(a[1]):
+            pair_words = self.mixed_pair_words(a[1]) if op.endswith("b64") else None
+            if pair_words:
+                lo, hi = pair_words
+            elif self.holds_lane_mask(a[1]):
                 lo, hi = self.wave_mask(a[1])
                 if op.endswith("b32") and self.wave64:
                     half = self.mask_half(a[1])
                     if half is not None:
                         lo, hi = (hi if half == "hi" else lo), self.cu(0)
             elif op.endswith("b64") and a[1]["k"] == "sgpr" and a[1].get("n") == 2:
-                lo, hi = self.mixed_pair_words(a[1]) or \
-                    (self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1))
+                lo, hi = self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1)
             elif op.endswith("b64") and a[1]["k"] == "imm":
                 lo, hi = self.src64_data(a[1], op)      # a constant's own 64 bits, as s_ff1_i32_b64 reads them
             else:
@@ -7631,7 +7640,10 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("s_ff1_i32_b64", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff0_i32_b32"):
             # Lowest set (ff1) or zero (ff0) bit of a mask, -1 if none. For a lane mask that is the wave's first lane.
-            if self.holds_lane_mask(a[1]):
+            pair_words = self.mixed_pair_words(a[1]) if op.endswith("b64") else None
+            if pair_words:
+                lo, hi = pair_words
+            elif self.holds_lane_mask(a[1]):
                 lo, hi = self.wave_mask(a[1])
                 if op.endswith("b32") and self.wave64:
                     half = self.mask_half(a[1])
@@ -7647,8 +7659,7 @@ class Gen:
             elif a[1]["k"] != "sgpr" or a[1].get("n") != 2:
                 lo, hi = self.mask_src(a[1]), self.cu(0)
             else:
-                lo, hi = self.mixed_pair_words(a[1]) or \
-                    (self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1))
+                lo, hi = self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1)
             if "ff0" in op:
                 nlo = self.tmp()
                 self.emit(f"{nlo} = OpNot %uint {lo}")

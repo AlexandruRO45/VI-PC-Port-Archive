@@ -103,6 +103,59 @@ class MixedPairEveryLaneTests(unittest.TestCase):
                                               f"want (bcnt1, bcnt0, ff1, ff0, scc) = {want}")
 
 
+def fssm_wave(wave64):
+    """A compute FSSM header for wave64 or wave32 (0x20 at +0xD4 marks wave32), 64 or 32 threads."""
+    h = bytearray(0x148)
+    struct.pack_into("<I", h, 0xD4, 0 if wave64 else 0x20)
+    struct.pack_into("<4I", h, 0x138, 0x8088, 64 if wave64 else 32, 1, 1)
+    return bytes(h)
+
+
+# @limpan1212's review of #7224: layouts that are not "one mask word beside data", which wave_mask read wrong.
+# Wave32: s10 = lanes 10..19, s14 = lanes 0..4. Wave64: s[14:15] = lanes 10..39, s[16:17] = lanes 2..33.
+W32_SETUP = ["v_cmp_le_u32_e64 s10, 10, v1", "v_cmp_gt_u32_e64 s12, 20, v1", "s_and_b32 s10, s10, s12",
+             "v_cmp_gt_u32_e64 s14, 5, v1"]
+W64_SETUP = ["v_cmp_le_u32_e64 s[14:15], 10, v1", "v_cmp_gt_u32_e64 s[18:19], 40, v1",
+             "s_and_b64 s[14:15], s[14:15], s[18:19]", "v_cmp_le_u32_e64 s[16:17], 2, v1",
+             "v_cmp_gt_u32_e64 s[18:19], 34, v1", "s_and_b64 s[16:17], s[16:17], s[18:19]"]
+# (name, wave64, setup of s[10:11], (s_bcnt1_i32_b64, s_ff1_i32_b64) from the ISA)
+LAYOUTS = (
+    ("w32 mask, 5", False, W32_SETUP + ["s_mov_b32 s11, 5"], (12, 10)),
+    ("w32 mask, -1", False, W32_SETUP + ["s_mov_b32 s11, -1"], (42, 10)),
+    ("w32 two masks", False, W32_SETUP + ["s_mov_b32 s11, s14"], (15, 10)),
+    ("w32 0, mask", False, W32_SETUP + ["s_mov_b32 s10, 0", "s_mov_b32 s11, s14"], (5, 32)),
+    ("w64 hi half low, 5", True, W64_SETUP + ["s_mov_b32 s10, s15", "s_mov_b32 s11, 5"], (10, 0)),
+    ("w64 hi half low, 0", True, W64_SETUP + ["s_mov_b32 s10, s15", "s_mov_b32 s11, 0"], (8, 0)),
+    ("w64 0, lo half high", True, W64_SETUP + ["s_mov_b32 s10, 0", "s_mov_b32 s11, s14"], (22, 42)),
+    ("w64 hi, lo swapped", True, W64_SETUP + ["s_mov_b32 s10, s15", "s_mov_b32 s11, s16"], (38, 0)),
+    ("w64 lo half twice", True, W64_SETUP + ["s_mov_b32 s10, s14", "s_mov_b32 s11, s14"], (44, 10)),
+    ("w64 canonical lo, hi", True, W64_SETUP + ["s_mov_b64 s[10:11], s[14:15]"], (30, 10)),
+)
+
+
+def run_layout(wave64, setup):
+    n = 64 if wave64 else 32
+    lines = ["v_mbcnt_lo_u32_b32 v1, -1, 0", *(["v_mbcnt_hi_u32_b32 v1, -1, v1"] if wave64 else []), *setup,
+             "s_bcnt1_i32_b64 s20, s[10:11]", "s_ff1_i32_b64 s21, s[10:11]",
+             "v_mov_b32_e32 v20, s20", "v_mov_b32_e32 v21, s21", "v_mul_u32_u24_e32 v22, 8, v1",
+             "buffer_store_dword v20, v22, s[0:3], 0 offen", "v_add_nc_u32_e32 v23, 4, v22",
+             "buffer_store_dword v21, v23, s[0:3], 0 offen", "s_endpgm"]
+    spv = support.translate_lines("cs_salu64_pair_layout", lines, fssm=fssm_wave(wave64))
+    memory = si.run_workgroup(spv, n, n, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0),
+                                                               "%sg_lane": i},
+                              push_constants=VSHARP + [0] * 28, memory={})
+    return [(memory[8 * lane], memory[8 * lane + 4]) for lane in range(n)]
+
+
+class PairLayoutTests(unittest.TestCase):
+    def test_every_layout_on_every_lane(self):
+        for name, wave64, setup, want in LAYOUTS:
+            with self.subTest(layout=name):
+                got = run_layout(wave64, setup)
+                bad = [lane for lane, g in enumerate(got) if g != want]
+                self.assertFalse(bad, f"lane {bad[:1]} got {got[bad[0]] if bad else ''}, want (bcnt1, ff1) = {want}")
+
+
 def _ins(op, src):
     return {"op": op, "args": [{"k": "sgpr", "r": 20, "n": 1}, src], "mods": set()}
 
