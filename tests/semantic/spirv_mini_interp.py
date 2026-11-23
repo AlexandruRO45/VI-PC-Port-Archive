@@ -190,7 +190,7 @@ def fma_f64(x, y, z):
     try:
         return float(exact)
     except OverflowError:
-        return math.copysign(math.inf, exact)
+        return -math.inf if exact < 0 else math.inf
 
 
 def f32_bits(x):
@@ -1132,7 +1132,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             elif name == "Fma":
                 # Exact product and sum, one rounding to the result type (fma_f32, or fma_f64 for v_fma_f64).
                 x, y, z = args
-                fma = fma_f64 if types.t[a[0]] == ("float", 64) else fma_f32
+                rt = types.t[a[0]]
+                fma = fma_f64 if (types.t[rt[1]] if rt[0] == "vec" else rt) == ("float", 64) else fma_f32
                 if isinstance(x, tuple):
                     values[res] = tuple(fma(p, q, s) for p, q, s in zip(x, y, z))
                 else:

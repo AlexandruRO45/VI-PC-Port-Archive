@@ -329,25 +329,36 @@ OpStore %f32_control %control
     def test_binary64_fma_sqrt_inverse_sqrt_stay_binary64(self):
         # A %double result keeps binary64 (v_fma_f64, v_sqrt_f64, v_rsq_f64). Fma rounds once: with
         # x = 1 + 2**-26, y = 1 + 2**-27 the product's tail is exactly half an ulp, and z = 2**-100 breaks the tie
-        # upward; rounding the product first would lose it.
+        # upward; rounding the product first would lose it. A finite Fma past the binary64 range is a signed
+        # infinity, and a %v2double Fma rounds each component to binary64.
         x, y, z = 1 + 2 ** -26, 1 + 2 ** -27, 2 ** -100
-        cases = (("Sqrt %d3", math.sqrt(3.0)), ("InverseSqrt %d3", 1.0 / math.sqrt(3.0)),
-                 ("Fma %dx %dy %dz", float(Fraction(x) * Fraction(y) + Fraction(z))))
-        for inst, want in cases:
-            with self.subTest(inst=inst):
+        fused = float(Fraction(x) * Fraction(y) + Fraction(z))
+        vec = ("%vx = OpCompositeConstruct %v2double %dx %dx\n%vy = OpCompositeConstruct %v2double %dy %dy\n"
+               "%vz = OpCompositeConstruct %v2double %dz %dz\n%rv = OpExtInst %v2double %glsl Fma %vx %vy %vz\n"
+               "%r = OpCompositeExtract %double %rv 1\n")
+        cases = (("Sqrt", "%r = OpExtInst %double %glsl Sqrt %d3\n", math.sqrt(3.0)),
+                 ("InverseSqrt", "%r = OpExtInst %double %glsl InverseSqrt %d3\n", 1.0 / math.sqrt(3.0)),
+                 ("Fma", "%r = OpExtInst %double %glsl Fma %dx %dy %dz\n", fused),
+                 ("Fma overflow", "%r = OpExtInst %double %glsl Fma %dbig %dbig %d3\n", math.inf),
+                 ("Fma negative overflow", "%r = OpExtInst %double %glsl Fma %dnbig %dbig %d3\n", -math.inf),
+                 ("Fma v2double", vec, fused))
+        for name, body, want in cases:
+            with self.subTest(name=name):
                 lo, hi = struct.unpack("<II", struct.pack("<d", want))
-                types = (f"%double = OpTypeFloat 64\n%v2uint = OpTypeVector %uint 2\n%d3 = OpConstant %double 3\n"
+                types = (f"%double = OpTypeFloat 64\n%v2uint = OpTypeVector %uint 2\n"
+                         f"%v2double = OpTypeVector %double 2\n%d3 = OpConstant %double 3\n"
                          f"%dx = OpConstant %double {x!r}\n%dy = OpConstant %double {y!r}\n"
-                         f"%dz = OpConstant %double {z!r}\n"
+                         f"%dz = OpConstant %double {z!r}\n%dbig = OpConstant %double 1e200\n"
+                         f"%dnbig = OpConstant %double -1e200\n"
                          f"%wlo = OpConstant %uint {lo}\n%whi = OpConstant %uint {hi}\n")
-                text = (HEADER.replace("%main = OpFunction", types + "%main = OpFunction") +
-                        f"%r = OpExtInst %double %glsl {inst}\n%w = OpBitcast %v2uint %r\n"
+                text = (HEADER.replace("%main = OpFunction", types + "%main = OpFunction") + body +
+                        "%w = OpBitcast %v2uint %r\n"
                         "%lo = OpCompositeExtract %uint %w 0\n%hi = OpCompositeExtract %uint %w 1\n"
                         "%e1 = OpIEqual %bool %lo %wlo\n%e2 = OpIEqual %bool %hi %whi\n"
                         "%e = OpLogicalAnd %bool %e1 %e2\n"
                         "%res = OpSelect %uint %e %c1 %c0\nOpStore %out %res\n" + FOOTER)
                 self.assertEqual(si.run_fragment(text)["%out"][0], 1)
-        self.assertNotEqual(float(Fraction(x) * Fraction(y) + Fraction(z)), x * y + z)   # the tie case is one
+        self.assertNotEqual(fused, x * y + z)   # the tie case is one
 
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
