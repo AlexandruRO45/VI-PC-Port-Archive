@@ -85,6 +85,16 @@ def _value(b, base, member):
     return WI._value(b, base, member)
 
 
+def _finite_or_null(v):
+    """Strict JSON has no NaN or infinity: such a float is written as null (per component in a vector), as
+    world_index.py does for placement floats."""
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if isinstance(v, list):
+        return [_finite_or_null(x) for x in v]
+    return v
+
+
 def parse_archetypes(b):
     """One dict per archetype instance in a validated 0x7a resource (empty when it has none)."""
     if WI.parse_resource(b) is None:
@@ -101,7 +111,7 @@ def parse_archetypes(b):
         for k in range(size // ssize):
             base = off + k * ssize
             row = {key: _value(b, base, members.get(h)) for key, h in FIELDS.items()}
-            row = {key: v for key, v in row.items() if v is not None}
+            row = {key: _finite_or_null(v) for key, v in row.items() if v is not None}
             row["kind"] = kind
             out.append(row)
     return out
@@ -185,11 +195,26 @@ def _union_error(entities, defs, ref_lo, ref_hi, conjugate, use_scale):
     return err, inside
 
 
+def _finite(values):
+    """True for a non-empty vector of finite numbers (world_index.py writes a non-finite component as None)."""
+    return bool(values) and all(isinstance(v, (int, float)) and math.isfinite(v) for v in values)
+
+
+def _finite_placement(entity, d):
+    """True when the entity's archetype box and its position, rotation and scales (absent ones take their defaults)
+    are finite: one NaN or infinity would make every error of its map NaN or infinity."""
+    vectors = [d["bb_min"], d["bb_max"]] + [entity[k] for k in ("position", "rotation") if entity.get(k)]
+    scales = [entity[k] for k in ("scale_xy", "scale_z") if entity.get(k) is not None]
+    return all(_finite(v) for v in vectors) and _finite(scales or [1.0])
+
+
 def check_extents(maps, defs):
     """Compare each fully-defined map's stored entitiesExtents with the union of its transformed archetype boxes.
 
     ``maps`` = [(map row, [entity dicts from world_index.parse_resource(collect=...)])]; ``defs`` = {name hash:
-    first definition}. A map matches a variant when every bound is within TOLERANCE metres.
+    first definition}. A map matches a variant when every bound is within TOLERANCE metres. A map whose stored
+    extents, entity placements or archetype boxes hold a NaN, an infinity or None is not judged, like one with an
+    undefined archetype, so the report stays strict JSON.
     """
     out = {"tolerance_m": TOLERANCE, "maps": len(maps), "maps_fully_defined": 0,
            "rotation": {"maps": 0, "stored_matches": 0, "conjugate_matches": 0,
@@ -200,11 +225,13 @@ def check_extents(maps, defs):
     errs = {False: [], True: []}
     for row, ents in maps:
         ref_lo, ref_hi = row.get("entities_min"), row.get("entities_max")
-        if not ref_lo or not ref_hi or not ents:
+        if not _finite(ref_lo) or not _finite(ref_hi) or not ents:
             continue
         if any(e.get("archetype") not in defs or not e.get("complete", True) for e in ents):
             continue
         if any("bb_min" not in defs[e["archetype"]] or "bb_max" not in defs[e["archetype"]] for e in ents):
+            continue
+        if not all(_finite_placement(e, defs[e["archetype"]]) for e in ents):
             continue
         out["maps_fully_defined"] += 1
         rotated = any(e.get("rotation") and [round(c, 6) for c in e["rotation"]] != [0, 0, 0, 1] for e in ents)
@@ -302,9 +329,15 @@ def main(argv=None):
         ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
     doc = run(a.path, a.start, a.limit, a.check_extents)
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
+    # The whole text first, as glb_inspect.py does: a value strict JSON cannot hold is one error line, never
+    # NaN/Infinity in the report or a truncated file.
+    try:
+        text = json.dumps(doc, indent=1, sort_keys=True, allow_nan=False)
+    except ValueError as e:
+        ap.error("--out %s: %s" % (a.out, e))
     try:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1, sort_keys=True)
+            f.write(text)
     except OSError as e:
         ap.error("--out %s: %s" % (a.out, e.strerror or e))
     print(json.dumps({k: doc[k] for k in ("summary", "extents") if k in doc}, indent=1, sort_keys=True))

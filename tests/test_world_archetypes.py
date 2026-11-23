@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -148,6 +149,31 @@ def scene():
     return defs, m
 
 
+def strict_json(text):
+    """json.loads that rejects NaN and Infinity, as a strict reader (JSON.parse) does."""
+    def reject(constant):
+        raise ValueError("non-finite %s in the report" % constant)
+    return json.loads(text, parse_constant=reject)
+
+
+def nonfinite_scenes():
+    """(label, maptypes, map) variants of scene() with one NaN or infinity in what check_extents reads."""
+    defs, m = scene()
+    ents = []
+    row = WI.parse_resource(m, collect=ents)
+    lo, hi = row["entities_min"], row["entities_max"]
+    rock = [entity(ROCK, [100.0, 50.0, 10.0], [0.0, 0.0, S, S])]
+    crate = [entity(CRATE, [0.0, 0.0, 0.0], sxy=2.0, sz=2.0)]
+    return [
+        ("NaN extent", defs, mapfile(rock + crate, [math.nan] + lo[1:], hi)),
+        ("+inf extent", defs, mapfile(rock + crate, lo, hi[:2] + [math.inf])),
+        ("-inf position", defs, mapfile([entity(ROCK, [-math.inf, 50.0, 10.0], [0.0, 0.0, S, S])] + crate, lo, hi)),
+        ("NaN rotation", defs, mapfile([entity(ROCK, [100.0, 50.0, 10.0], [0.0, 0.0, math.nan, S])] + crate, lo, hi)),
+        ("+inf scale", defs, mapfile(rock + [entity(CRATE, [0.0, 0.0, 0.0], sxy=math.inf, sz=2.0)], lo, hi)),
+        ("NaN archetype box", maptypes([(ROCK, 2, (math.nan, -2.0, 0.0), ROCK_BOX[1]), (CRATE, 1, *CRATE_BOX)]), m),
+    ]
+
+
 def rpf(parts, start=0x40):
     out = bytearray(start)
     out[:4] = b"9FPR"
@@ -270,6 +296,36 @@ class ExtentsTest(unittest.TestCase):
                     self.assertEqual(res["scale"], {"maps": 1, "scaled_matches": 0, "unscaled_matches": 1,
                                                    "scaled_exceeds_extents": 0, "unscaled_exceeds_extents": 0})
 
+    def test_nonfinite_or_none_inputs_leave_only_that_map_unjudged(self):
+        defs_b, finite = scene()
+        cases = [(label, m, None) for label, d, m in nonfinite_scenes() if d is defs_b]
+        # world_index.py with #5629 writes a non-finite extent component as None
+        cases += [("None in " + key, finite, key) for key in ("entities_min", "entities_max")]
+        defs = {d["name"]: d for d in WA.parse_archetypes(defs_b)}
+        for label, m, none_key in cases:
+            with self.subTest(label):
+                maps = []
+                for data in (m, finite):
+                    ents = []
+                    maps.append((WI.parse_resource(data, collect=ents), ents))
+                if none_key:
+                    maps[0][0][none_key] = [None] + maps[0][0][none_key][1:]
+                res = WA.check_extents(maps, defs)
+                strict_json(json.dumps(res))
+                self.assertEqual((res["maps"], res["maps_fully_defined"]), (2, 1))
+                self.assertEqual((res["rotation"]["maps"], res["rotation"]["conjugate_matches"]), (1, 1))
+                self.assertLess(res["rotation"]["conjugate_median_error_m"], 1e-4)
+                self.assertEqual(res["scale"]["maps"], 1)
+
+    def test_nonfinite_archetype_box_is_null_and_its_maps_unjudged(self):
+        (label, defs_b, m), = [c for c in nonfinite_scenes() if c[0] == "NaN archetype box"]
+        defs = {d["name"]: d for d in WA.parse_archetypes(defs_b)}
+        self.assertEqual(defs[ROCK]["bb_min"], [None, -2.0, 0.0])
+        ents = []
+        res = WA.check_extents([(WI.parse_resource(m, collect=ents), ents)], defs)
+        strict_json(json.dumps(res))
+        self.assertEqual(res["maps_fully_defined"], 0)
+
     def test_missing_and_none_scales_are_not_counted_as_scaled(self):
         defs = {CRATE: {"bb_min": CRATE_BOX[0], "bb_max": CRATE_BOX[1]}}
         row = {"entities_min": CRATE_BOX[0], "entities_max": CRATE_BOX[1]}
@@ -292,7 +348,7 @@ class CliTest(unittest.TestCase):
         with open(out, "rb") as f:
             raw = f.read()
         self.assertNotIn(b"\r\n", raw)
-        return json.loads(raw)
+        return strict_json(raw)
 
     def check(self, doc):
         s = doc["summary"]
@@ -316,6 +372,39 @@ class CliTest(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(rpf([defs, m]))
         self.check(self.run_cli(path))
+
+    def test_nonfinite_map_or_archetype_gives_strict_json(self):
+        _, finite = scene()
+        for k, (label, defs, m) in enumerate(nonfinite_scenes()):
+            with self.subTest(label):
+                folder = os.path.join(self.tmp.name, "carved%d" % k)
+                os.makedirs(folder)
+                for name, data in (("a.bin", defs), ("b.bin", m), ("c.bin", finite)):
+                    with open(os.path.join(folder, name), "wb") as f:
+                        f.write(data)
+                ext = self.run_cli(folder)["extents"]  # exit 0, no NaN/Infinity
+                self.assertEqual(ext["maps"], 2)
+                judged = 0 if label == "NaN archetype box" else 1
+                self.assertEqual((ext["maps_fully_defined"], ext["rotation"]["conjugate_matches"]), (judged, judged))
+
+    def test_unwritable_value_is_one_error_and_no_partial_report(self):
+        _, m = scene()
+        path = os.path.join(self.tmp.name, "b.bin")
+        with open(path, "wb") as f:
+            f.write(m)
+        out = os.path.join(self.tmp.name, "r.json")
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write("old")
+        real = WA.run
+
+        def run_with_nan(*args):
+            doc = real(*args)
+            doc["archetypes"] = [{"lod_dist": math.nan}]
+            return doc
+        with mock.patch.object(WA, "run", run_with_nan):
+            self.assertIn("--out", self.cli_error([path, "--out", out]))
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old")
 
     def cli_error(self, argv):
         err = io.StringIO()
