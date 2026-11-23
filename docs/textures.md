@@ -631,7 +631,9 @@ left returns to `hdr0` and reads a new 2/3-byte header. The public MDU tables us
 
 The header is followed by a single byte stream, not per-lane streams: every lane that still
 needs input reads one byte in lane order each round. Entropy on 300 sampled chunks per codec is
-7.96–7.99 bits/byte. No general-purpose wrapper was found; zlib, gzip, bzip2 and LZMA reject
+7.96–7.99 bits/byte; over all 108,605 BCPack chunks of the 57 pools the per-codec medians are 7.974 (BC4) to
+7.995 (BC3) bits/byte, 108,498 chunks are at 7.9 or above, and the lowest is one BC1 chunk at 6.998 (BC1 102,725
+chunks, BC7 5,167, BC5 333, BC6H 268, BC4 77, BC3 35). No general-purpose wrapper was found; zlib, gzip, bzip2 and LZMA reject
 the first bytes, and raw-deflate attempts on random data are not a valid stream.
 
 ### Block sizes and counts
