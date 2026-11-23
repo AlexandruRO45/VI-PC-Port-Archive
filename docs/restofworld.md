@@ -577,6 +577,14 @@ down to 233) all come from one-pair blocks: a four-influence vertex whose weight
 levels (first 400 streams) has 9 skinned blocks (3,910 vertices), all one pair, and every vertex there
 passes: one weight of 255 on joint 0. The colour control never sums to 255 in either sample.
 
+Over the whole game (seven archives, 47,161 skinned blocks: 28,746 with one pair, 18,415 with two; 89,319,658
+vertices): weights sum to 255 on 88,907,223 (99.54%) and to 247-255 on 89,126,631 (99.78%); they are in
+descending order on 88,870,070 (99.50%); no joint repeats among the non-zero weights on all 89,319,658 (100%);
+every zero weight has joint index 0 on 68,724,971 (76.9%). The slot-1 colour control does sum to 255 on 1,931,374
+of 89,259,237 vertices (2.2%) over the whole game, so the samples' 0 was an accident of the sample; it stays far
+below the weights. The highest joint used by a non-zero weight is below 16 in 35,716 blocks and reaches the
+240-255 band in 7, so a block's joint list can be up to 256 entries long.
+
 Slot usage (block counts): slot 0 tag `0x42` in all 60,442; slot 2 `0x21` in 57,925; slot 1 `0x26` in
 57,873; slot 3 `0x28` in 49,294 and slot 4 `0x28` in 29,379; then slot 12 `0x26` (25,239), slot 6 `0x26`
 (24,876), slot 8 `0x25` (21,519), slot 13 `0x26` (17,928), slot 11 `0x27` (11,120) and 21 rarer slot/tag
