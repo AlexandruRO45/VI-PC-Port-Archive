@@ -85,6 +85,7 @@ class FirstLightTests(unittest.TestCase):
             self.manifest = json.load(f)
 
     def test_draw_matches_the_manifest(self):
+        shaders = fl.draw_shader_paths(self.manifest, self.out)
         raw = os.path.join(self.out, "image_first_light.raw")
         if os.path.exists(raw):
             os.unlink(
@@ -94,8 +95,7 @@ class FirstLightTests(unittest.TestCase):
         subprocess.run(
             [
                 self.harness,
-                os.path.join(self.out, "vs.spv"),
-                os.path.join(self.out, "ps.spv"),
+                *shaders,
                 raw,
                 str(self.manifest["width"]),
                 str(self.manifest["height"]),
@@ -406,6 +406,61 @@ class TexturedOracleTests(unittest.TestCase):
                 blob = f.read()
             self.assertEqual(blob[:8], struct.pack("<II", 2, 2))
             self.assertEqual(blob[8:], pixels)
+
+
+class ShaderReplayTests(unittest.TestCase):
+    def setUp(self):
+        self.out = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.harness = self.out / "synthetic-harness"
+        self.harness.touch()
+        (self.out / "stages").mkdir()
+        for name in ("vs.spv", "ps.spv", "stages/vertex.spv", "stages/pixel.spv"):
+            (self.out / name).touch()
+        self.launch = self.enterContext(patch.object(fl.subprocess, "run", side_effect=self.draw))
+
+    def draw(self, command, *, check, env):
+        self.assertTrue(check)
+        self.assertEqual(command[0], str(self.harness))
+        vs, ps = (Path(path).relative_to(self.out).as_posix() for path in command[1:3])
+        u = 0.25
+        if vs == "stages/vertex.spv":
+            u += 0.25
+        if ps == "stages/pixel.spv":
+            u += 0.125
+        pixels = [(CLEAR,) * 4] + [(u, 0.75, 0.0, 1.0)] * 15
+        Path(command[3]).write_bytes(b"".join(struct.pack("<4f", *pixel) for pixel in pixels))
+
+    def check(self, stages, expected_u):
+        manifest = {
+            "width": 4,
+            "height": 4,
+            "clear_pixel": [0, 0],
+            "centre_uv": [expected_u, 0.75],
+            "files": {"mesh": "mesh.bin", **stages},
+        }
+        (self.out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+        with redirect_stdout(io.StringIO()):
+            return fl.main(["--check", "--out", str(self.out), "--harness", str(self.harness)])
+
+    def test_check_uses_both_declared_shader_files(self):
+        stages = {"vs": "stages/vertex.spv", "ps": "stages/pixel.spv"}
+        with self.assertRaisesRegex(SystemExit, "centre"):
+            self.check(stages, 0.25)
+        self.assertEqual(self.check(stages, 0.625), 0)
+
+    def test_check_defaults_only_the_omitted_shader(self):
+        self.assertEqual(self.check({"ps": "stages/pixel.spv"}, 0.375), 0)
+        self.assertEqual(self.check({}, 0.25), 0)
+
+    def test_check_rejects_invalid_explicit_paths_before_redrawing(self):
+        raw = self.out / "image.raw"
+        raw.write_bytes(b"previous readback")
+        for name in (None, 123, "", "missing.spv", "stages", "../outside.spv", str(self.out / "vs.spv")):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(SystemExit, r"files\.vs"):
+                    self.check({"vs": name}, 0.25)
+        self.assertEqual(self.launch.call_count, 0)
+        self.assertEqual(raw.read_bytes(), b"previous readback")
 
 
 if __name__ == "__main__":

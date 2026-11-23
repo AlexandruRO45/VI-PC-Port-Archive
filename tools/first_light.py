@@ -33,6 +33,7 @@ import argparse
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import struct
 import subprocess
@@ -492,7 +493,30 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
         )
 
 
+def draw_shader_paths(manifest: dict, out_dir: str) -> list[str]:
+    """Resolve the replay stages within the run directory, in VS/PS order."""
+    directory = Path(out_dir).resolve()
+    files = manifest["files"]
+    paths = []
+    for stage in ("vs", "ps"):
+        name = files.get(stage, f"{stage}.spv")
+        field = f"files.{stage}"
+        if not isinstance(name, str) or not name or Path(name).anchor:
+            raise SystemExit(f"{field}: expected a relative shader filename, got {name!r}")
+        try:
+            path = (directory / name).resolve()
+            if not path.is_relative_to(directory):
+                raise SystemExit(f"{field}: shader path {name!r} is outside the run directory")
+            if stage in files and not path.is_file():
+                raise SystemExit(f"{field}: shader file {name!r} is missing or is not a regular file")
+        except (OSError, RuntimeError, ValueError) as error:
+            raise SystemExit(f"{field}: invalid shader path {name!r}: {error}") from None
+        paths.append(str(path))
+    return paths
+
+
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
+    shaders = draw_shader_paths(manifest, out_dir)
     harness = find_harness(args.harness)
     raw = os.path.join(out_dir, "image.raw")
     if os.path.exists(raw):
@@ -502,8 +526,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
     env = harness_env(manifest, out_dir)
     cmd = [
         harness,
-        os.path.join(out_dir, "vs.spv"),
-        os.path.join(out_dir, "ps.spv"),
+        *shaders,
         raw,
         str(manifest["width"]),
         str(manifest["height"]),
