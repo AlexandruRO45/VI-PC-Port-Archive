@@ -651,5 +651,47 @@ class TestVPkMadI16ASTAndInterpreter(unittest.TestCase):
         res = ScalarInterpreter().step(inst, state)
         self.assertEqual(res, pack16(9, 11))
 
+class TestVPkMadI16SIMDAndEdgeCases(unittest.TestCase):
+    def test_simd_divergence_exec_mask(self) -> None:
+        simd = SIMDWavefront(wave_size=32, exec_mask=0x0F0F0F0F)
+        s0_lanes = [pack16(i, i) for i in range(32)]
+        s1_lanes = [pack16(2, 2) for _ in range(32)]
+        s2_lanes = [pack16(1, 1) for _ in range(32)]
+        orig_dst = [0x55555555] * 32
+        res = simd.execute(ref_v_pk_mad_i16, s0_lanes, s1_lanes, s2_lanes, orig_dst=orig_dst)
+        for i in range(32):
+            if (0x0F0F0F0F >> i) & 1:
+                self.assertEqual(res[i], pack16(i * 2 + 1, i * 2 + 1))
+            else:
+                self.assertEqual(res[i], 0x55555555)
+
+    def test_signed_overflow_wrapping(self) -> None:
+        # Check signed 16-bit wrap arithmetic
+        s0 = pack16(32767, u16(-32768))
+        s1 = pack16(2, 2)
+        s2 = pack16(0, 0)
+        res = ref_v_pk_mad_i16(s0, s1, s2)
+        # 32767*2 = 65534 & 0xFFFF = 0xFFFE (-2)
+        # -32768*2 = -65536 & 0xFFFF = 0x0000
+        self.assertEqual(res, pack16(0xFFFE, 0x0000))
+
+    def test_condition_code_neutrality(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+        state.write_vgpr(1, pack16(1, 1))
+        state.write_vgpr(2, pack16(1, 1))
+        state.write_vgpr(3, pack16(1, 1))
+        inst = ASTInstruction(
+            Opcode.V_PK_MAD_I16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(3),
+        )
+        ScalarInterpreter().step(inst, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+
 if __name__ == "__main__":
     unittest.main()
