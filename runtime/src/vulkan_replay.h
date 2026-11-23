@@ -771,7 +771,7 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
-    std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    std::uint32_t samples = 1;  // expected bound attachment sample count (SampleDesc.Count; differs from rasterizationSamples under ForcedSampleCount TIR)
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
