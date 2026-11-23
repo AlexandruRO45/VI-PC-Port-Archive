@@ -1284,9 +1284,10 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
 }
 
 // Device slot 8: CreateCommandQueue(desc, riid, out). Without an output it is the device's own capability answer
-// (S_FALSE for a valid description on the PC), as #558 does for slot 14.
+// (S_FALSE for a valid description on the PC), as #558 does for slot 14. `console_route` is true only for the Xbox
+// slot 48: the retail exe's descriptor there carries console values in the PC fields.
 HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
-                                   void** out) {
+                                   void** out, bool console_route) {
     note_slot(8);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
@@ -1294,32 +1295,35 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     // The retail exe's slot-48 descriptor carries console values in the PC fields (observed type 2 with a
     // non-PC priority/flags/node mask). Keep the type and translate the rest to the PC runtime's accepted range;
     // the queue's behaviour is the same for the first frame. A valid PC description is passed through untouched
-    // (the tests rely on the pointer identity).
+    // (the tests rely on the pointer identity), and the PC slot 8 path is not translated at all: its invalid
+    // arguments must reach the PC runtime so it answers as Windows does.
     D3D12_COMMAND_QUEUE_DESC normalized = *desc;
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: queue desc type=%d priority=%d flags=0x%x node=%u; translating console "
-                     "priority/flags/node to PC values\n",
-                     static_cast<int>(normalized.Type), static_cast<int>(normalized.Priority), normalized.Flags,
-                     normalized.NodeMask);
+    if (console_route) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: queue desc type=%d priority=%d flags=0x%x node=%u; translating console "
+                         "priority/flags/node to PC values\n",
+                         static_cast<int>(normalized.Type), static_cast<int>(normalized.Priority), normalized.Flags,
+                         normalized.NodeMask);
+        }
+        bool changed = false;
+        if (normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
+            normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
+            normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+            normalized.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+            changed = true;
+        }
+        if (normalized.Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) {
+            normalized.Flags &= D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+            changed = true;
+        }
+        if (normalized.NodeMask != 1 && normalized.NodeMask != 0) {
+            normalized.NodeMask = 1;
+            changed = true;
+        }
+        if (changed) desc = &normalized;
     }
-    bool changed = false;
-    if (normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
-        normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
-        normalized.Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
-        normalized.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-        changed = true;
-    }
-    if (normalized.Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) {
-        normalized.Flags &= D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
-        changed = true;
-    }
-    if (normalized.NodeMask != 1) {
-        normalized.NodeMask = 1;
-        changed = true;
-    }
-    if (changed) desc = &normalized;
     // The caller's null output goes to the real device on purpose: its answer (S_FALSE, E_UNEXPECTED, ...) is the
     // one to give, although the SDK annotates the parameter as required.
 #pragma warning(suppress : 6387)
@@ -1338,9 +1342,12 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     note_slot(41);
     if (out) *out = nullptr;
     if (!riid) return E_POINTER;
-    if (!out) return E_POINTER;
+    // A null output goes to the real device: its answer is the one Windows gives (E_UNEXPECTED), and the
+    // validation suite compares it. The console IID still maps to the PC signature IID.
     const IID& create_iid =
         IsEqualIID(*riid, kXboxCommandSignatureIid) ? __uuidof(ID3D12CommandSignature) : *riid;
+#pragma warning(suppress : 6387)
+    if (!out) return self->real->CreateCommandSignature(desc, root, create_iid, nullptr);
     const HRESULT hr = self->real->CreateCommandSignature(desc, root, create_iid, out);
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -1421,13 +1428,19 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     // The retail exe asks for the console command-list interface {c3827890-4024-474c-98cf-645b51dc4874}. The PC
     // runtime does not know it; the base ID3D12GraphicsCommandList vtable is the same prefix, so create the PC list
-    // and wrap it in the list proxy, which answers the Xbox IID and forwards the PC slots. Other IIDs keep the
-    // caller's choice.
-    const IID& create_iid =
-        IsEqualIID(*riid, kXboxGraphicsCommandListIid) ? __uuidof(ID3D12GraphicsCommandList) : *riid;
+    // and wrap it in the list proxy, which answers the Xbox IID and forwards the PC slots. A caller that asks for a
+    // PC list interface gets the real PC list: the console proxy is only needed to answer the Xbox IID and to
+    // unwrap an allocator proxy at Reset.
+    const bool xbox_iid = IsEqualIID(*riid, kXboxGraphicsCommandListIid);
+    const IID& create_iid = xbox_iid ? __uuidof(ID3D12GraphicsCommandList) : *riid;
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, create_iid, &created);
     if (FAILED(hr)) return hr;
+    if (!xbox_iid) {
+        if (!created) return E_FAIL;
+        *out = created;
+        return S_OK;
+    }
     return wrap_child<ChildKind::list>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
@@ -1837,7 +1850,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return proxy_release(self);
     } else if constexpr (Slot == 8) {
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                    reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+                                                    reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3),
+                                                    /*console_route=*/false));
     } else if constexpr (Slot == 9) {
         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
@@ -1922,7 +1936,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
             return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                         reinterpret_cast<const IID*>(a2),
-                                                        reinterpret_cast<void**>(a3)));
+                                                        reinterpret_cast<void**>(a3), /*console_route=*/true));
         }
         if (Slot == routes.list_x) {
             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);

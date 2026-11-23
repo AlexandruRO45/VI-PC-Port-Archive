@@ -22,6 +22,9 @@ namespace {
 
 struct Factory {
     const void** vtable;
+    // The observed caller AddRefs/Releases the factory like any COM object (the registry classifies the import as
+    // HRESULT, not void); the object itself is process-wide, so the count exists only to balance those calls.
+    std::atomic<LONG> refs{1};
 };
 
 struct StorageFile {
@@ -31,12 +34,17 @@ extern StorageFile g_storage_file;
 
 HRESULT __stdcall factory_query_interface(Factory* self, const IID* /*iid*/, void** out) {
     if (!out) return E_POINTER;
+    self->refs.fetch_add(1, std::memory_order_relaxed);
     *out = self;
     return S_OK;
 }
 
-ULONG __stdcall factory_add_ref(Factory* /*self*/) { return 1; }
-ULONG __stdcall factory_release(Factory* /*self*/) { return 1; }
+ULONG __stdcall factory_add_ref(Factory* self) {
+    return static_cast<ULONG>(self->refs.fetch_add(1, std::memory_order_relaxed) + 1);
+}
+ULONG __stdcall factory_release(Factory* self) {
+    return static_cast<ULONG>(self->refs.fetch_sub(1, std::memory_order_relaxed) - 1);
+}
 
 // Observed slot 8: SetStagingBufferSize-like, one integer argument, HRESULT. A PC has no staging buffer to size, so
 // accepting it is safe.

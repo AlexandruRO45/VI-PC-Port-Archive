@@ -443,9 +443,10 @@ void* find_loaded_bundled_module(const std::string& dll_lower) {
     // No allocation: this is reached from GetModuleHandleW during a title's CRT startup (RT-5's
     // api-ms-win-core-synch-l1-2-0.dll probe), before its heap is necessarily usable. The copy that
     // snapshot_bundled_loaders() makes was the first allocation on that path and faulted there. The loader's
-    // find_loaded only reads its module map, so holding the mutex across it is safe and stays allocation-free.
-    std::lock_guard lock(bundled_loader_mutex());
-    for (const auto& entry : bundled_loaders())
+    // find_loaded only reads its module map, so holding the lock across it is safe and stays allocation-free.
+    SrwLockGuard lock(g_bundled_lock);
+    if (!g_bundled_loaders) return nullptr;
+    for (const auto& entry : *g_bundled_loaders)
         if (void* h = entry.ops->find_loaded(entry.ctx, dll_lower)) return h;
     return nullptr;
 }
@@ -467,8 +468,9 @@ void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_
     owns_handle = false;
     // Same early-CRT path as find_loaded_bundled_module: GetProcAddress during the title's static
     // initialisation reaches this before its heap is dependable, so no vector copy here either.
-    std::lock_guard lock(bundled_loader_mutex());
-    for (const auto& entry : bundled_loaders()) {
+    SrwLockGuard lock(g_bundled_lock);
+    if (!g_bundled_loaders) return nullptr;
+    for (const auto& entry : *g_bundled_loaders) {
         bool loader_owns = false;
         void* fn = entry.ops->get_proc(entry.ctx, module, sym, loader_owns);
         if (loader_owns) {
