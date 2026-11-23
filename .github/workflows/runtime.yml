@@ -241,7 +241,9 @@ jobs:
       # Every run that builds the shim compiles SDL3 from the pinned release. Cache the fetched sources and that
       # build tree so a run with the same tarball and the same toolchain reuses them. The toolchain versions are in
       # the key as well as the salt, so a new cl, CMake or Ninja, or a changed SDL3 build option, starts empty instead
-      # of reusing objects and generated files another toolchain wrote.
+      # of reusing objects and generated files another toolchain wrote. Ninja's own log and deps database sit in
+      # runtime/build, not in _deps, and ninja treats an output with no log entry as dirty: without them a restored
+      # _deps tree is recompiled edge by edge, which was measured at 246 of 246 SDL3 edges against 6 with them.
       - name: Read the tool versions for the SDL3 cache key
         id: sdl3-toolset
         shell: pwsh
@@ -264,6 +266,8 @@ jobs:
             runtime/build/_deps/sdl3-src
             runtime/build/_deps/sdl3-subbuild
             runtime/build/_deps/sdl3-build
+            runtime/build/.ninja_log
+            runtime/build/.ninja_deps
           key: sdl3-3.4.20-${{ env.SDL3_TARBALL_SHA256 }}-${{ env.SDL3_CACHE_SALT }}-${{ steps.sdl3-toolset.outputs.version }}
       - name: Configure
         env:
