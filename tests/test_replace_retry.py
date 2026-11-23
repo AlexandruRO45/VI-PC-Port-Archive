@@ -147,6 +147,22 @@ class ReplaceRetryTests(unittest.TestCase):
 
 
 class CallSiteTests(unittest.TestCase):
+    def test_shader_disasm_survives_a_transient_rename_failure(self):
+        import shader_disasm
+        from test_shader_disasm import fssm
+
+        with tempfile.TemporaryDirectory() as folder:
+            src = os.path.join(folder, "example.fssm")
+            with open(src, "wb") as f:
+                f.write(fssm())
+            fake = flaky(1, win_error(32))
+            with mock.patch.object(replace_retry.os, "replace", fake), mock.patch.object(replace_retry.time, "sleep"):
+                self.assertEqual(shader_disasm.one(src, folder, "gfx1013", backend="python"), "clean")
+            self.assertEqual(len(fake.calls), 2)
+            with open(os.path.join(folder, "example.s"), encoding="utf-8") as f:
+                self.assertIn("s_endpgm", f.read())
+            self.assertEqual(sorted(os.listdir(folder)), ["example.fssm", "example.s"])
+
     def test_fssm_unpack_survives_a_transient_rename_failure(self):
         # The crash seen on Windows: os.replace(fssm_index.json.tmp, fssm_index.json) raising WinError 32.
         with tempfile.TemporaryDirectory() as src:

@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc_command import mc_command  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 import rdna2_decode  # noqa: E402
@@ -179,7 +180,7 @@ def one(path, out, mcpu, backend="llvm-mc"):
             listing.write(asm)
             if err.strip():
                 listing.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
-        os.replace(listing.name, output_path(path, out))
+        replace_retry(listing.name, output_path(path, out))
     finally:
         if os.path.exists(listing.name):
             os.unlink(listing.name)
