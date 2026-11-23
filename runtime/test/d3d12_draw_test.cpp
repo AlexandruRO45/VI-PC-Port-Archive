@@ -1009,12 +1009,12 @@ int main() {
                         unsigned(std::size(casts)));
         }
 
-        // A draw without a topology is invalid; Close reports it.
+        // A draw without a topology is dropped without failing Close (matching native D3D12).
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->SetGraphicsRootSignature(root.p);
         list->DrawInstanced(3, 1, 0, 0);
-        EXPECT(list->Close() == E_INVALIDARG);
-        // So is binding more than eight render targets.
+        EXPECT(list->Close() == S_OK);
+        // Binding more than eight render targets is invalid; Close reports it.
         EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->OMSetRenderTargets(9, &rtv, TRUE, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);

@@ -1117,10 +1117,16 @@ private:
         return is_compute(state) ? p.compute_offset : p.user_offset;
     }
 
-    // The parameter, if it exists and has the expected type; null after recording an invalid call.
+    // The parameter, if it exists and has the expected type. Native D3D12 does not fail Close when a root argument is
+    // written before any root signature is bound, so that call is ignored; once a root signature is bound, an
+    // out-of-range index or mismatched parameter type still invalidates the list.
     const RootArgumentLayout::Parameter* parameter(RootState& state, UINT index, rt::rootsig::ParamType type) {
-        if (!state.layout || index >= state.layout->parameters.size() ||
-            state.layout->parameters[index].type != type) {
+        if (list_.closed()) {
+            check(false);
+            return nullptr;
+        }
+        if (!state.layout) return nullptr;
+        if (index >= state.layout->parameters.size() || state.layout->parameters[index].type != type) {
             check(false);
             return nullptr;
         }
@@ -1316,8 +1322,11 @@ private:
                       : leonida::IndexBufferView{};
     }
 
+    // A dispatch needs a compute pipeline and a compute root signature; native D3D12 does not fail Close when either
+    // is unbound, so an un-runnable dispatch is dropped rather than poisoning the list.
     void record_dispatch(UINT x, UINT y, UINT z) {
-        if (!compute_pipeline_ || !compute_.layout) return check(false);
+        if (list_.closed()) return check(false);
+        if (!compute_pipeline_ || !compute_.layout) return;
         note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
@@ -1335,9 +1344,11 @@ private:
         return draw_views_;
     }
 
-    // A draw needs a graphics pipeline, a graphics root signature and a topology.
+    // A draw needs a graphics pipeline, a graphics root signature and a topology; native D3D12 does not fail Close
+    // when any of them is unbound, so an un-runnable draw is dropped rather than poisoning the list.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        if (list_.closed()) return check(false);
+        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return;
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
