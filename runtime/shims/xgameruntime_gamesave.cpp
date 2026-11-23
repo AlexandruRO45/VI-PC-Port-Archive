@@ -107,14 +107,12 @@ bool device_name(std::string_view name) {
 
 std::string encode_name(std::string_view name) {
     static const char hex[] = "0123456789ABCDEF";
-    const bool device = device_name(name);
     std::string out;
-    for (size_t i = 0; i < name.size(); ++i) {
-        const char ch = name[i];
+    for (const char ch : name) {
         const auto c = static_cast<unsigned char>(ch);
         const bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
-                          c == '-' || (c == '.' && i != 0 && i + 1 != name.size());
-        if (keep && !(device && i == 0)) {
+                          c == '-' || (c == '.' && !out.empty());
+        if (keep) {
             out += ch;
         } else {
             out += '%';
@@ -124,6 +122,18 @@ std::string encode_name(std::string_view name) {
     }
     return out;
 }
+
+std::string escape_reserved(std::string encoded) {
+    if (device_name(encoded)) {
+        static const char hex[] = "0123456789ABCDEF";
+        const auto c = static_cast<unsigned char>(encoded[0]);
+        encoded = std::string{'%', hex[c >> 4], hex[c & 15]} + encoded.substr(1);
+    }
+    if (!encoded.empty() && encoded.back() == '.') encoded.replace(encoded.size() - 1, 1, "%2E");
+    return encoded;
+}
+
+std::string storage_name(std::string_view name) { return escape_reserved(encode_name(name)); }
 
 // The inverse; false for a file name encode_name could not have produced (temporary files, .display, strays).
 bool decode_name(std::string_view encoded, std::string& out) {
@@ -141,7 +151,7 @@ bool decode_name(std::string_view encoded, std::string& out) {
         out += static_cast<char>(hi << 4 | lo);
         i += 2;
     }
-    return encode_name(out) == encoded;   // one spelling per name
+    return storage_name(out) == encoded;   // one spelling per name
 }
 
 // XGameSaveCreateContainer's rule: at most 256 characters; a path part (up to the last '/') of [A-Za-z0-9_/], then a
@@ -202,7 +212,7 @@ struct XGameSaveContainer {
     fs::path user_dir;   // the provider's, copied: a container outlives a closed provider safely
     std::string name;
     uint64_t serial = 0;
-    fs::path dir() const { return user_dir / widen(encode_name(name)); }
+    fs::path dir() const { return user_dir / widen(storage_name(name)); }
 };
 struct Op {
     bool write;
@@ -376,7 +386,7 @@ HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32
         for (const BlobFile& b : list_blobs(dir)) wanted.push_back(b.name);
     }
     for (const std::string& name : wanted) {
-        std::ifstream f(dir / widen(encode_name(name)), std::ios::binary);
+        std::ifstream f(dir / widen(storage_name(name)), std::ios::binary);
         if (!f) return E_GS_BLOB_NOT_FOUND;
         out.push_back({name, std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>())});
     }
@@ -392,7 +402,7 @@ HRESULT commit(XGameSaveUpdate* u) {
     uint64_t after = used_bytes(c->user_dir);
     for (const auto& [name, op] : u->ops) {
         std::error_code ec;
-        const fs::path p = dir / widen(encode_name(name));
+        const fs::path p = dir / widen(storage_name(name));
         const uint64_t old = fs::is_regular_file(p, ec) ? static_cast<uint64_t>(fs::file_size(p, ec)) : 0;
         after = after - old + (op.write ? op.data.size() : 0);
     }
@@ -404,7 +414,7 @@ HRESULT commit(XGameSaveUpdate* u) {
     std::vector<std::pair<fs::path, fs::path>> renames;   // temporary -> final
     for (const auto& [name, op] : u->ops) {
         if (!op.write) continue;
-        const fs::path final_path = dir / widen(encode_name(name));
+        const fs::path final_path = dir / widen(storage_name(name));
         fs::path temp = final_path;
         temp += L"~";
         if (!write_file(temp, op.data.data(), op.data.size())) {
@@ -418,7 +428,7 @@ HRESULT commit(XGameSaveUpdate* u) {
         if (!MoveFileExW(temp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
             return E_GS_OUT_OF_LOCAL_STORAGE;
     for (const auto& [name, op] : u->ops)
-        if (!op.write) fs::remove(dir / widen(encode_name(name)), ec);
+        if (!op.write) fs::remove(dir / widen(storage_name(name)), ec);
     if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
     return S_OK;
 }
@@ -461,7 +471,7 @@ HRESULT delete_container(XGameSaveProviderHandle p, const char* name) {
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
     std::error_code ec;
-    fs::remove_all(p->user_dir / widen(encode_name(name)), ec);
+    fs::remove_all(p->user_dir / widen(storage_name(name)), ec);
     return ec ? E_FAIL : S_OK;
 }
 
@@ -537,7 +547,7 @@ HRESULT do_work(Job& job, size_t& size) {
     if (job.identity == &kFolderIdentity) {
         const fs::path root = save_root();
         if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
-        const fs::path dir = root / L"files" / widen(encode_name(job.text));
+        const fs::path dir = root / L"files" / widen(storage_name(job.text));
         std::error_code ec;
         fs::create_directories(dir, ec);
         if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
@@ -680,7 +690,7 @@ HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, 
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
-    const fs::path dir = p->user_dir / widen(encode_name(name));
+    const fs::path dir = p->user_dir / widen(storage_name(name));
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) return S_OK;
     const ContainerRecord c = describe(name, dir);
@@ -896,7 +906,7 @@ HRESULT STDMETHODCALLTYPE files_quota(void*, XUserHandle user, const char* confi
     if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
     uint64_t used = 0;
     std::error_code ec;
-    for (const auto& e : fs::recursive_directory_iterator(root / L"files" / widen(encode_name(config_id)), ec))
+    for (const auto& e : fs::recursive_directory_iterator(root / L"files" / widen(storage_name(config_id)), ec))
         if (e.is_regular_file(ec)) used += static_cast<uint64_t>(e.file_size(ec));
     *remaining = used >= kQuotaBytes ? 0 : static_cast<int64_t>(kQuotaBytes - used);
     return S_OK;

@@ -501,25 +501,33 @@ def diff(pa, pb):
 
 
 # ---------------------------------------------------------------------------------------------- import
-WINDOWS_DEVICE_NAMES = {b'CON', b'PRN', b'AUX', b'NUL'} | {b'%s%d' % (p, d) for p in (b'COM', b'LPT')
-                                                           for d in range(1, 10)}
+WINDOWS_DEVICE_NAMES = {'CON', 'PRN', 'AUX', 'NUL'} | {f'{p}{d}' for p in ('COM', 'LPT') for d in range(1, 10)}
 
 
 def xgs_encode(name):
     """Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp: keep
-    [A-Za-z0-9_-] and '.' except as the first or last character; everything else becomes %XX (uppercase hex) per UTF-8
-    byte, and so does the first character when the part before the first '.' is a Windows device name (any case)."""
-    raw = name.encode('utf-8')
-    device = raw.split(b'.', 1)[0].upper() in WINDOWS_DEVICE_NAMES
+    [A-Za-z0-9_-] and '.' except as the first character; everything else becomes %XX (uppercase hex) per UTF-8 byte."""
     out = []
-    for i, c in enumerate(raw):
+    for c in name.encode('utf-8'):
         ch = chr(c)
-        keep = (ch.isascii() and ch.isalnum()) or ch in '_-' or (ch == '.' and 0 < i < len(raw) - 1)
-        if keep and not (device and i == 0):
+        if (ch.isascii() and ch.isalnum()) or ch in '_-' or (ch == '.' and out):
             out.append(ch)
         else:
             out.append('%%%02X' % c)
     return ''.join(out)
+
+
+def xgs_escape(encoded):
+    """Same rule as escape_reserved() in the shim: the first character of a Windows device name (the part before the
+    first '.', any case) and a trailing '.' become %XX too."""
+    if encoded.split('.', 1)[0].upper() in WINDOWS_DEVICE_NAMES:
+        encoded = '%%%02X' % ord(encoded[0]) + encoded[1:]
+    return encoded[:-1] + '%2E' if encoded.endswith('.') else encoded
+
+
+def xgs_storage_name(name):
+    """Same as storage_name() in the shim: the file or folder name a container or blob is saved under."""
+    return xgs_escape(xgs_encode(name))
 
 
 def save_slot(folder):
@@ -621,7 +629,7 @@ def import_saves(args):
             files.append(('chives.dat', 'chives.dat'))
         for src_name, blob_name in files:
             src = os.path.join(folder, src_name)
-            dst = os.path.join(root, xgs_encode(container), xgs_encode(blob_name))
+            dst = os.path.join(root, xgs_storage_name(container), xgs_storage_name(blob_name))
             plan.append((src, dst))
             data = read(src)
             manifest['entries'].append({'folder': sd, 'source': src_name, 'title': title, 'container': container,
