@@ -117,6 +117,14 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"awc_shorts: cannot list {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
+    catalog = os.path.join(a.out, "shorts.csv")
+    # The catalog is written through a symlinked shorts.csv (below), so the link must not lead to a bank this
+    # run reads: the swap would turn that bank into a CSV.
+    catalog_key = path_key(catalog)
+    for path, _bank in banks:
+        if path_key(path) == catalog_key:
+            print(f"awc_shorts: error: {catalog} would overwrite an input bank: {path}", file=sys.stderr)
+            return 2
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
@@ -163,10 +171,16 @@ def main(argv=None) -> int:
     if io_failed:
         return 1
     rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))
-    catalog = os.path.join(a.out, "shorts.csv")
     # A symlinked shorts.csv keeps its link: the catalog replaces the file it points to (created if the link
-    # dangles), staged beside that file so the replace stays on one volume.
+    # dangles), staged beside that file so the replace stays on one volume. A link to a clip this run just
+    # exported is refused like a link to a bank.
     target = os.path.realpath(catalog)
+    catalog_key = path_key(target)
+    for row in rows:
+        clip = os.path.join(a.out, *row["file"].split("/"))
+        if path_key(clip) == catalog_key:
+            print(f"awc_shorts: error: {catalog} would overwrite an exported clip: {clip}", file=sys.stderr)
+            return 2
     try:
         with tempfile.TemporaryDirectory(dir=os.path.dirname(target), prefix=".shorts-") as staging:
             staged = os.path.join(staging, "shorts.csv")

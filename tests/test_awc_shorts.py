@@ -193,6 +193,63 @@ class ShortsTest(unittest.TestCase):
             self.assertEqual(f.readline().strip().split(","), list(shorts.FIELDS))
         self.assertEqual(os.listdir(shared), ["shorts.csv"])
 
+    def _refuses(self, argv, expected):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(shorts.main(argv), 2)
+        self.assertIn(expected, err.getvalue())
+
+    def _resolving(self, catalog, target):
+        """os.path.realpath with `catalog` sent to `target`, as a link there would; runs where links can't be made."""
+        real = os.path.realpath
+
+        def resolve(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(catalog)):
+                return real(target, *args, **kwargs)
+            return real(path, *args, **kwargs)
+
+        return mock.patch("os.path.realpath", side_effect=resolve)
+
+    def test_symlinked_catalog_to_an_input_bank_is_refused(self):
+        # Following the link would turn the bank into a CSV with exit 0; refuse it as the other report tools do.
+        bank = self.write("cli.awc", 0xFC, 480000)
+        with open(bank, "rb") as f:
+            original = f.read()
+        os.makedirs(self.out)
+        link = os.path.join(self.out, "shorts.csv")
+        try:
+            os.symlink(bank, link)
+        except (OSError, NotImplementedError) as e:      # Windows without Developer Mode or the privilege
+            self.skipTest(f"symlinks unavailable: {e}")
+        for jobs in ("1", "2"):
+            with self.subTest(jobs=jobs):
+                self._refuses([bank, self.out, "--min-seconds", "4", "--max-seconds", "6", "--jobs", jobs],
+                              "would overwrite an input bank")
+                self.assertTrue(os.path.islink(link))
+                self.assertEqual(os.listdir(self.out), ["shorts.csv"])
+                with open(bank, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_catalog_resolving_to_an_input_bank_is_refused(self):
+        bank = self.write("cli.awc", 0xFC, 480000)
+        with open(bank, "rb") as f:
+            original = f.read()
+        with self._resolving(os.path.join(self.out, "shorts.csv"), bank):
+            self._refuses([self.tmp.name, self.out, "--min-seconds", "4", "--max-seconds", "6", "--jobs", "1"],
+                          bank)
+        self.assertFalse(os.path.exists(self.out))
+        with open(bank, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_catalog_resolving_to_an_exported_clip_is_refused(self):
+        bank = self.write("cli.awc", 0xFC, 480000)
+        clip = os.path.join(self.out, "cli", "00001234.ogg")
+        with self._resolving(os.path.join(self.out, "shorts.csv"), clip):
+            self._refuses([bank, self.out, "--min-seconds", "4", "--max-seconds", "6", "--jobs", "1"],
+                          "would overwrite an exported clip")
+        with open(clip, "rb") as f:
+            self.assertEqual(f.read(4), b"OggS")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "shorts.csv")))
+
     def test_bank_extensions_cannot_collapse_two_banks_into_one_export(self):
         first = self.write("clip.awc", 0x78, 480000)
         second = os.path.join(self.tmp.name, "clip.AWC")
