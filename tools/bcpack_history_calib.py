@@ -2178,7 +2178,7 @@ def apply_ref_pairs_file(pairs_path, calibrators):
     try:
         with open(pairs_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, RecursionError) as exc:
         raise CliError(f"{pairs_path}: {exc}")
     items = data.get("pairs") if isinstance(data, dict) else data
     if not isinstance(items, list):
@@ -2778,7 +2778,7 @@ def run(argv=None):
 def main(argv=None):
     try:
         return run(argv)
-    except (CliError, ValueError, OSError, json.JSONDecodeError, bcpack.BcpackError) as exc:
+    except (CliError, ValueError, OSError, json.JSONDecodeError, RecursionError, bcpack.BcpackError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

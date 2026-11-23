@@ -1137,6 +1137,17 @@ class PoolSelfCalibrationTest(unittest.TestCase):
                 self.assertEqual(calib.main(["--verify", bad_bc7, "--codec", "bc7"]), 2)
             self.assertIn("ERROR:", err_s.getvalue())
 
+    def test_verify_deeply_nested_json_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deep = os.path.join(tmp, "deep.json")
+            with open(deep, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("[" * 50_000 + "]" * 50_000)
+            err_s = io.StringIO()
+            with redirect_stderr(err_s):
+                self.assertEqual(calib.main(["--verify", deep, "--codec", "bc7"]), 2)
+            self.assertIn("ERROR:", err_s.getvalue())
+            self.assertNotIn("Traceback", err_s.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
