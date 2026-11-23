@@ -408,6 +408,25 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("compatible (1 links checked)", result.stdout)
 
+    def test_array_length_uses_computed_specialization_default(self):
+        producer = ModuleFixture("vs")
+        default = producer.allocate()
+        producer.emit(50, producer.uint, default, 1)  # OpSpecConstant
+        producer.decorate(default, 1, 7)  # SpecId 7
+        one = producer.literal(1)
+        length = producer.allocate()
+        producer.emit(52, producer.uint, length, 128, default, one)  # OpSpecConstantOp IAdd
+        shape = producer.emit_type(spv.OP_TYPE_ARRAY, producer.numeric(components=4), length)
+        producer.variable(spv.STORAGE_OUTPUT, shape, location=0)
+        vertex = self.module("vertex_computed_length", producer)
+
+        for count, expected, diagnostic in ((2, 0, "compatible (1 links checked)"), (3, 1, "[type-mismatch]")):
+            with self.subTest(count=count):
+                pixel = self.module(f"pixel_{count}", input(array_count=count))
+                result = self.command("check", "--vs", vertex, "--ps", pixel)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stdout)
+
     def test_direct_entry_overrides(self):
         vertex, pixel = output(), input()
         vertex.entry("Vertex", vertex.ids)

@@ -52,9 +52,10 @@ same pipeline. Use it before driver compilation to locate missing varyings, over
 mismatches and per-primitive mesh declarations. It reads local modules and needs only Python.
 
 The declarations come from `tools/spirv_interface.py`, a standard-library reader of one module's interface
-(the normalized `Location`/`Component` model, one array level and literal specialization defaults) with its
-tests in `tests/test_spirv_interface.py`. It reflects declarations only, not instructions, device features or
-resource bindings, so it does not replace `spirv-val`.
+(the normalized `Location`/`Component` model, one array level and specialization defaults) with its
+tests in `tests/test_spirv_interface.py`. Array lengths support integer literals and scalar integer
+addition, subtraction and multiplication using declared defaults. It reflects declarations only, not
+instructions, device features or resource bindings, so it does not replace `spirv-val`.
 
 ```powershell
 python -I tools/shader_link_check.py check --vs <vertex.spv> --ps <pixel.spv>

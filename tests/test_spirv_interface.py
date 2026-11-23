@@ -603,7 +603,7 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
         b = SpirvBuilder("vs")
         arr_t = b.emit_type(spv.OP_TYPE_ARRAY, b.numeric("f", 32), b.alloc())
         b.variable(spv.STORAGE_OUTPUT, arr_t, location=0)
-        with self.assertRaisesRegex(spv.InterfaceError, "not a literal OpConstant"):
+        with self.assertRaisesRegex(spv.InterfaceError, "not a supported SPIR-V constant"):
             b.reflect()
 
         # Non-integer constant (float).
@@ -649,6 +649,25 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
                 b.variable(spv.STORAGE_OUTPUT, arr_t, location=0)
                 with self.assertRaisesRegex(spv.InterfaceError, "must be positive"):
                     b.reflect()
+
+    def test_array_length_arithmetic_uses_integer_bit_width(self):
+        b = SpirvBuilder("vs")
+        signed = b.int_type(32, signed=True)
+        negative_one = b.alloc()
+        b.emit(50, signed, negative_one, 0xFFFFFFFF)  # OpSpecConstant
+        three = b.u32_const(3)
+        two = b.u32_const(2)
+        zero = b.alloc()
+        b.emit(46, signed, zero)  # OpConstantNull
+        added, scaled, reduced, length = b.alloc(), b.alloc(), b.alloc(), b.alloc()
+        b.emit(52, signed, added, 128, negative_one, three)  # IAdd
+        b.emit(52, signed, scaled, 132, added, two)  # IMul
+        b.emit(52, signed, reduced, 130, scaled, two)  # ISub
+        b.emit(52, signed, length, 128, reduced, zero)  # IAdd
+        array = b.emit_type(spv.OP_TYPE_ARRAY, b.numeric("f", 32), length)
+        b.variable(spv.STORAGE_OUTPUT, array, location=0)
+
+        self.assertEqual(b.reflect().outputs[0].varyings[0].type.count, 2)
 
     def test_all_numeric_types_matrices_and_nested_aggregates(self):
         b = SpirvBuilder("vs")

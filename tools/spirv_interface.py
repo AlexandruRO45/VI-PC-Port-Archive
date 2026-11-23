@@ -3,13 +3,14 @@
 This reader is deliberately limited to declarations used for Vulkan stage linking. It does not
 validate shader instructions, device features, or resource bindings. IDs and debug names are local
 to each module; the result uses normalized types and Location/Component decorations instead.
-Literal specialization constants in array lengths use their declared defaults.
+Interface array lengths can use literal defaults and scalar integer add, subtract and multiply expressions.
 """
 from __future__ import annotations
 
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass
+import operator
 import struct
 
 
@@ -30,7 +31,9 @@ OP_TYPE_ARRAY = 28
 OP_TYPE_STRUCT = 30
 OP_TYPE_POINTER = 32
 OP_CONSTANT = 43
+OP_CONSTANT_NULL = 46
 OP_SPEC_CONSTANT = 50
+OP_SPEC_CONSTANT_OP = 52
 OP_VARIABLE = 59
 OP_DECORATE = 71
 OP_MEMBER_DECORATE = 72
@@ -40,11 +43,14 @@ OP_GROUP_MEMBER_DECORATE = 75
 
 TYPE_OPS = {OP_TYPE_INT, OP_TYPE_FLOAT, OP_TYPE_VECTOR, OP_TYPE_MATRIX,
             OP_TYPE_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER}
-DECLARATION_OPS = TYPE_OPS | {OP_ENTRY_POINT, OP_CONSTANT, OP_SPEC_CONSTANT, OP_VARIABLE,
-                             OP_DECORATE, OP_MEMBER_DECORATE, OP_DECORATION_GROUP,
-                             OP_GROUP_DECORATE, OP_GROUP_MEMBER_DECORATE}
+CONSTANT_OPS = {OP_CONSTANT, OP_CONSTANT_NULL, OP_SPEC_CONSTANT, OP_SPEC_CONSTANT_OP}
+DECLARATION_OPS = TYPE_OPS | CONSTANT_OPS | {
+    OP_ENTRY_POINT, OP_VARIABLE, OP_DECORATE, OP_MEMBER_DECORATE,
+    OP_DECORATION_GROUP, OP_GROUP_DECORATE, OP_GROUP_MEMBER_DECORATE,
+}
 TYPE_OPERANDS = {OP_TYPE_INT: 3, OP_TYPE_FLOAT: 2, OP_TYPE_VECTOR: 3, OP_TYPE_MATRIX: 3,
                  OP_TYPE_ARRAY: 3, OP_TYPE_POINTER: 3}
+INTEGER_ARITHMETIC = {128: operator.add, 130: operator.sub, 132: operator.mul}  # IAdd, ISub, IMul
 EXECUTION_STAGES = {0: "vs", 3: "gs", 4: "ps", 5268: "ms", 5365: "ms"}  # MeshNV and MeshEXT
 STORAGE_INPUT = 1
 STORAGE_OUTPUT = 3
@@ -232,6 +238,7 @@ class Module:
         self.bound = words[3]
         self.types = {}
         self.constants = {}
+        self.integer_defaults = {}
         self.variables = {}
         self.entry_points = []
         self.decorations = defaultdict(dict)
@@ -268,12 +275,15 @@ class Module:
             identifier, *args = operands
             self.define(identifier)
             self.types[identifier] = (opcode, tuple(args))
-        elif opcode in (OP_CONSTANT, OP_SPEC_CONSTANT):
-            self.require_operands(operands, at, 3)
-            type_id, identifier, *literal = operands
+        elif opcode in CONSTANT_OPS:
+            if opcode == OP_CONSTANT_NULL:
+                self.require_operands(operands, at, 2, 2)
+            else:
+                self.require_operands(operands, at, 3)
+            type_id, identifier, *args = operands
             self.require_id(type_id)
             self.define(identifier)
-            self.constants[identifier] = (type_id, tuple(literal))
+            self.constants[identifier] = (opcode, type_id, tuple(args))
         elif opcode == OP_VARIABLE:
             self.require_operands(operands, at, 3, 4)
             pointer, identifier, storage = operands[:3]
@@ -349,20 +359,44 @@ class Module:
         except KeyError:
             raise InterfaceError(f"missing or unsupported varying type %{identifier}") from None
 
-    def array_count(self, identifier):
+    def integer_default(self, identifier, depth=0):
+        if identifier in self.integer_defaults:
+            return self.integer_defaults[identifier]
+        if depth == MAX_TYPE_DEPTH:
+            raise InterfaceError("cyclic or excessively deep varying array length expression")
         try:
-            type_id, literal = self.constants[identifier]
+            opcode, type_id, operands = self.constants[identifier]
         except KeyError:
             raise InterfaceError(
-                f"varying array length %{identifier} is not a literal OpConstant or OpSpecConstant"
+                f"varying array length %{identifier} is not a supported SPIR-V constant"
             ) from None
-        opcode, args = self.type_declaration(type_id)
-        if opcode != OP_TYPE_INT or args[0] not in (8, 16, 32, 64) or args[1] not in (0, 1):
+        type_opcode, args = self.type_declaration(type_id)
+        if type_opcode != OP_TYPE_INT or args[0] not in (8, 16, 32, 64) or args[1] not in (0, 1):
             raise InterfaceError("varying array length must be an integer")
         width, signed = args
-        if len(literal) != (width + 31) // 32:
-            raise InterfaceError("invalid literal width for varying array length")
-        count = sum(word << (32 * i) for i, word in enumerate(literal)) & ((1 << width) - 1)
+        if opcode == OP_SPEC_CONSTANT_OP:
+            arithmetic = INTEGER_ARITHMETIC.get(operands[0])
+            if arithmetic is None:
+                raise InterfaceError(f"unsupported specialization operation {operands[0]} in varying array length")
+            if len(operands) != 3:
+                raise InterfaceError("invalid specialization operands in varying array length")
+            left_width, _, left = self.integer_default(operands[1], depth + 1)
+            right_width, _, right = self.integer_default(operands[2], depth + 1)
+            if left_width != width or right_width != width:
+                raise InterfaceError("specialization operand width does not match varying array length")
+            value = arithmetic(left, right)
+        elif opcode == OP_CONSTANT_NULL:
+            value = 0
+        else:
+            if len(operands) != (width + 31) // 32:
+                raise InterfaceError("invalid literal width for varying array length")
+            value = sum(word << (32 * i) for i, word in enumerate(operands))
+        result = (width, signed, value & ((1 << width) - 1))
+        self.integer_defaults[identifier] = result
+        return result
+
+    def array_count(self, identifier):
+        width, signed, count = self.integer_default(identifier)
         if not count or (signed and count >> (width - 1)):
             raise InterfaceError("varying array length must be positive")
         return count
