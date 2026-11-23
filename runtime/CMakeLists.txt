@@ -2712,12 +2712,24 @@ if(TARGET Vulkan::Headers)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
         COMMENT "Compiling the mesh test shader ms_draw.mesh"
         VERBATIM)
+      # SHADER-67: an MS that reads its code base (dwords 34-35) next to ps_code.frag (38-39).
+      set(LEONIDA_TEST_MS_CODE ${CMAKE_CURRENT_BINARY_DIR}/generated/ms_code.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_MS_CODE}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -o ${LEONIDA_TEST_MS_CODE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_code.mesh
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_code.mesh
+        COMMENT "Compiling the mesh test shader ms_code.mesh"
+        VERBATIM)
       add_executable(d3d12_mesh_test test/d3d12_mesh_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_MS}
-                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN})
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_MS_CODE}
+                     ${LEONIDA_TEST_PS_CODE})
       target_link_libraries(d3d12_mesh_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
-                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
+                                 LEONIDA_TEST_MS_CODE_SPV="${LEONIDA_TEST_MS_CODE}"
+                                 LEONIDA_TEST_PS_CODE_SPV="${LEONIDA_TEST_PS_CODE}")
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)

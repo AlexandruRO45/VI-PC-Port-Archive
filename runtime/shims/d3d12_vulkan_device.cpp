@@ -3166,9 +3166,9 @@ public:
     // multisample pattern, two stages whose index entries name the same code-base slot (an index translated before
     // SHADER-67), and state that needs a Vulkan feature the device lacks (including the geometryShader feature a GS
     // needs). A GS takes triangles; the sample count may be above one. Each stage that reads its code base gets its
-    // own FSSM blob in the arena: the VS's at push-constant dwords 34-35, the PS's at 38-39 (SHADER-67). Viewport,
-    // scissor, topology, vertex strides, stencil reference and blend factor are dynamic, set from the list's state
-    // at each draw.
+    // own FSSM blob in the arena: the VS's (or the MS's) at push-constant dwords 34-35, the PS's at 38-39
+    // (SHADER-67). Viewport, scissor, topology, vertex strides, stencil reference and blend factor are dynamic, set
+    // from the list's state at each draw.
     // With `ms` (a pipeline state stream's MS subobject) it is an MS (+ PS) pipeline on VK_EXT_mesh_shader instead:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.

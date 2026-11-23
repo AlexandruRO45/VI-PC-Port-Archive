@@ -9,10 +9,14 @@
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
 //     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
 //     Y and Z counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
-//     bottom-left quadrant (yellow). Each pixel is read back and compared.
+//     bottom-left quadrant (yellow). An MS + PS PSO whose two stages each read a constant from their own program
+//     (SHADER-67: the MS through its code base in push-constant dwords 34-35, the PS through its own in 38-39)
+//     fills the bottom half of the bottom-right quadrant yellow: red from the MS's blob, green from the PS's, so a
+//     stage given the other's address, or the wrong slot, loses its channel. Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
-// The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
+// The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert,
+// ms_code.mesh, ps_code.frag).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -23,8 +27,9 @@
 #include <array>
 #include <cstring>
 
-#if !defined(LEONIDA_TEST_MS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_FULLSCREEN_SPV)
-#error "LEONIDA_TEST_MS_SPV, LEONIDA_TEST_PS_SPV and LEONIDA_TEST_VS_FULLSCREEN_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_MS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_FULLSCREEN_SPV) || \
+    !defined(LEONIDA_TEST_MS_CODE_SPV) || !defined(LEONIDA_TEST_PS_CODE_SPV)
+#error "LEONIDA_TEST_*_SPV must name the compiled test shaders (MS, PS, VS_FULLSCREEN, MS_CODE, PS_CODE)"
 #endif
 
 #define EXPECT(condition) do { \
@@ -110,11 +115,21 @@ int main() {
     const auto vs_program = fssm_program({0x56530002, 0xbf810000});
     const auto ms_container = shader_container(ms_program), ps_container = shader_container(ps_program);
     const auto vs_container = shader_container(vs_program);
+    // Programs whose constants the code-base shaders read: the MS 1.0 at byte 12 (red), the PS 1.0 at byte 16
+    // (green). Each finds 0 at the other's offset, so a stage reading the other's blob leaves its channel black.
+    const auto ms_code_program = fssm_program({0x4d530003, 0xbf810000, 0x3f800000, 0});
+    const auto ps_code_program = fssm_program({0x50530003, 0xbf810000, 0, 0x3f800000});
+    const auto ms_code_container = shader_container(ms_code_program);
+    const auto ps_code_container = shader_container(ps_code_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_MS_CODE_SPV, library / "ms_code.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_PS_CODE_SPV, library / "ps_code.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -124,7 +139,13 @@ int main() {
                  " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
                  " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
+                 " \"ms_code\": {\"stage\": \"ms\", \"fssm_sha256\": \"" << leonida::sha256_hex(ms_code_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"uses_code_base\": true, "
+                 "\"code_base_dword\": 34, \"local_size\": [32, 1, 1], \"max_vertices\": 4, \"max_primitives\": 2},\n"
+                 " \"ps_code\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_code_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 160, \"uses_code_base\": true, "
+                 "\"code_base_dword\": 38, \"outputs\": [0]}}";
     }
 
     const auto device_info = [&](bool mesh) {
@@ -167,6 +188,8 @@ int main() {
     const D3D12_SHADER_BYTECODE ms{ms_container.data(), ms_container.size()};
     const D3D12_SHADER_BYTECODE ps{ps_container.data(), ps_container.size()};
     const D3D12_SHADER_BYTECODE vs{vs_container.data(), vs_container.size()};
+    const D3D12_SHADER_BYTECODE ms_code{ms_code_container.data(), ms_code_container.size()};
+    const D3D12_SHADER_BYTECODE ps_code{ps_code_container.data(), ps_code_container.size()};
 
     // Without the extension: no tier, and a mesh PSO is refused as not implemented.
     {
@@ -200,7 +223,7 @@ int main() {
 
         // The PSOs. Every other subobject takes its default: back-face culling, depth test on (no DSV here), no
         // blending, all samples.
-        Ref<ID3D12PipelineState> mesh_pso, vs_pso, refused;
+        Ref<ID3D12PipelineState> mesh_pso, vs_pso, code_pso, refused;
         Stream mesh_stream;
         mesh_stream.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms}).add(PsSubobject{.inner = ps});
         mesh_stream.add(TargetsSubobject{.inner = one_target()});
@@ -210,6 +233,11 @@ int main() {
         vs_stream.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
         vs_stream.add(TargetsSubobject{.inner = one_target()});
         EXPECT(SUCCEEDED(create(device.p, vs_stream, vs_pso)));
+        // SHADER-67: an MS and a PS that each read their own code base, in one pipeline (a 160-byte block).
+        Stream code_stream;
+        code_stream.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms_code});
+        code_stream.add(PsSubobject{.inner = ps_code}).add(TargetsSubobject{.inner = one_target()});
+        EXPECT(SUCCEEDED(create(device.p, code_stream, code_pso)));
 
         // Streams the PC runtime refuses.
         Stream bad = mesh_stream;
@@ -350,6 +378,13 @@ int main() {
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
         list->DrawInstanced(3, 1, 0, 0);
+        // The code-base MS + PS: groups (0,0,0) and (0,0,1) moved by (1, -1.5) -> the bottom half of the
+        // bottom-right quadrant, red from the MS's program and green from the PS's: yellow.
+        const float lower_right[2] = {1, -1.5f};
+        list->RSSetViewports(1, &viewport);
+        list->SetPipelineState(code_pso.p);
+        list->SetGraphicsRoot32BitConstants(0, 2, lower_right, 0);
+        list6->DispatchMesh(1, 1, 2);
 
         D3D12_RESOURCE_BARRIER to_copy =
             transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -482,7 +517,7 @@ int main() {
         }
 
         for (auto* r : {&upload, &readback, &target}) r->reset();
-        for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
+        for (auto* p : {&mesh_pso, &vs_pso, &code_pso, &refused}) p->reset();
         root.reset();
         rtv_heap.reset();
         list6.reset();
@@ -502,6 +537,7 @@ int main() {
             const Pixel want = top && left                            ? Pixel{255, 0, 0, 255}
                                : !top && left                         ? Pixel{255, 255, 0, 255}
                                : !top && !left && row < size * 3 / 4  ? Pixel{0, 255, 0, 255}
+                               : !top && !left                        ? Pixel{255, 255, 0, 255}
                                                                       : Pixel{0, 0, 255, 255};
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
@@ -517,7 +553,8 @@ int main() {
     }
     std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
                 "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
-                "draws fail at execution, oversized grids at Close; statistics queries around mesh draws resolve\n",
+                "draws fail at execution, oversized grids at Close; statistics queries around mesh draws resolve; an MS and a "
+                "PS that each read their own code base (dwords 34-35 and 38-39) drew their quads yellow\n",
                 size * size);
     return 0;
 }

@@ -1,0 +1,47 @@
+#version 460
+// A mesh shader that reads a constant from its own program, as translated shaders read code-embedded data through
+// s_getpc_b64 (docs/design.md, "Code-embedded data"). Like a vertex shader, an MS has its code base at push-constant
+// dwords 34-35 (SHADER-67); the PS of the same pipeline has its own at 38-39. The float at byte 12 of this shader's
+// FSSM blob becomes the red channel of every vertex; ps_code.frag adds green from its own blob, so the quad is yellow
+// only if each stage got its own address. The quad layout is ms_draw.mesh's: column = WorkgroupId.x + WorkgroupId.z,
+// row = WorkgroupId.y, moved by (s0, s1). Stands in for a translated MS in d3d12_mesh_test.
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 4, max_primitives = 2) out;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Floats {
+    float f[];
+};
+
+layout(location = 0) out vec4 out_color[];
+
+layout(push_constant) uniform UserData {
+    uint s[32];
+    uvec2 heap_base;
+    uvec2 code_base;
+} pc;
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+void main() {
+    SetMeshOutputsEXT(4, 2);
+    const uint i = gl_LocalInvocationIndex;
+    const float column = float(gl_WorkGroupID.x + gl_WorkGroupID.z), row = float(gl_WorkGroupID.y);
+    const vec2 offset = vec2(uintBitsToFloat(pc.s[0]), uintBitsToFloat(pc.s[1]));
+    if (i < 4) {
+        const vec2 corner = vec2(float(i & 1u), float(i >> 1));
+        const vec2 top_left = vec2(-1.0 + 0.5 * column, 1.0 - 0.5 * row);
+        gl_MeshVerticesEXT[i].gl_Position = vec4(top_left + vec2(0.5, -0.5) * corner + offset, 0.0, 1.0);
+        Floats code = Floats(add64(pc.heap_base, pc.code_base));
+        out_color[i] = vec4(code.f[3], 0.0, 0.0, 1.0);
+    }
+    if (i == 0) gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+    if (i == 1) gl_PrimitiveTriangleIndicesEXT[1] = uvec3(2, 1, 3);
+}
