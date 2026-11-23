@@ -76,6 +76,11 @@ Useful switches:
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
+* `LEONIDA_TLS_GA_PATCH=0` turns off the loader's `/GA` TLS rewrite (on by default, `runtime/src/pe_loader.cpp`). An
+  EXE built with `/GA` reads its TLS from slot 0 (`mov r64, gs:[58h]`); when its module TLS index is not 0, the loader
+  rewrites each such read in its executable sections to read a `TlsAlloc` slot of its own (`TlsSlots[n]`), and logs
+  `N index-0 TLS reads (gs:[58h]) now read its own TLS (TlsSlots[n])`. Without the rewrite the retail executable's
+  allocator faults at `exe+0x104075` (stop 4 in [retail_boot_chain.md](retail_boot_chain.md)).
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
