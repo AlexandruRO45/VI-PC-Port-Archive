@@ -97,6 +97,17 @@ class TestPackB32F16HighHalf(unittest.TestCase):
         res = run_ps_pack(0x1234_5678, 0xABCD_EF01, op_sel="[1,1,0]", name="ps_pack_opsel_11")
         self.assertEqual(res, 0xABCD_1234)
 
+class TestPackB32F16IEEE754(unittest.TestCase):
+    def test_subnormal_and_nan(self):
+        # Subnormal 0x0001, NaN 0x7E00
+        res = run_ps_pack(0x0001, 0x7E00, name="ps_pack_subnorm_nan")
+        self.assertEqual(res, 0x7E00_0001)
+
+    def test_infinities(self):
+        # +Inf 0x7C00, -Inf 0xFC00
+        res = run_ps_pack(0x7C00, 0xFC00, name="ps_pack_infs")
+        self.assertEqual(res, 0xFC00_7C00)
+
 
 if __name__ == "__main__":
     unittest.main()
