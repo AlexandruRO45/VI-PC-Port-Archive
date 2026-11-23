@@ -26,6 +26,7 @@ import collections
 import json
 import mmap
 import os
+import sqlite3
 import struct
 import sys
 
@@ -285,13 +286,26 @@ def main(argv=None):
     ap.add_argument("--json", help="write rows and summary here (offsets, sizes, counts and check results only)")
     ap.add_argument("--start", type=_nonneg)
     ap.add_argument("--limit", type=_positive)
+    ap.add_argument("--payload-identity", action="store_true",
+                    help="compare whole inflated BLAS streams for shared instance208 header/transform groups "
+                         "and report only aggregate counts")
     a = ap.parse_args(argv)
     if a.json and os.path.exists(a.json) and os.path.exists(a.archive) and os.path.samefile(a.json, a.archive):
         print("bvh_groups: --json would replace the archive", file=sys.stderr)
         return 2
     try:
+        if a.payload_identity:
+            import bvh_payload_identity
+            counts = bvh_payload_identity.scan(a.archive, a.start, a.limit)
+            if a.json:
+                with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(counts, f, indent=2)
+                    f.write("\n")
+            for key, value in counts.items():
+                print("%8d  %s" % (value, key))
+            return 0
         rows, summary = scan(a.archive, a.start, a.limit)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, sqlite3.Error) as e:
         print("bvh_groups: %s" % e, file=sys.stderr)
         return 2
     for k, v in summary["counts"].items():

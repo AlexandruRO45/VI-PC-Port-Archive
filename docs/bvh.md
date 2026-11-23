@@ -729,6 +729,20 @@ Measured with the tool on `shared_minigame000_bvh4.rpf`: 2,560 streams, 59,142,7
 checks every instance descriptor against the BVH stream after it: N BLAS at the offsets its entries give. On the
 shared pack it reports 1,233 + 4 instance descriptors (1,233 + 8 BLAS tied) and 81 table streams with 317 items.
 
+Run `python -I tools/bvh_groups.py <archive.rpf> --payload-identity` for aggregate counts over
+single-instance descriptors. A candidate group has at least two distinct descriptor keys with identical
+64-byte headers (BLAS offsets 0x100 through 0x13f) and identical 48-byte transforms. Within each group,
+the tool compares the entire inflated stream, including the wrapper and trailing bytes. A digest selects
+possible matches and a second read verifies their bytes in 64 KiB blocks. Repeated occurrences of one
+key contribute to a cross-key match only when another key has the same payload. Split or missing buffers
+and descriptor size mismatches contribute to the uncompared count. The temporary on-disk index holds
+metadata and compressed stream locations. The optional JSON report contains only counts.
+
+Across the retail core archive, 269,096 descriptor/buffer pairs were complete and 10 were split. Among
+the 1,007 candidate groups, 733 contained a single exact payload and 274 contained multiple payloads.
+Across all candidate groups, 809 distinct (payload, transform) pairs occurred under more than one key.
+A group with multiple payloads can still contribute a cross-key byte match.
+
 `tools/bvh_rehydrate.py` (standard library only) turns a dehydrated BLAS back into the runtime layout on the CPU,
 from float3 vertices, `uint16`/`uint32` or no indices and an optional 3x4 geometry transform, following the packing
 in §4a. On the 8 samples whose geometry was identified first, its output is byte-identical to what

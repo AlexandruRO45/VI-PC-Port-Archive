@@ -106,6 +106,74 @@ def make_rpf(payloads):
     return bytes(head) + body
 
 
+class PayloadIdentityTest(unittest.TestCase):
+    @staticmethod
+    def pair(key, body):
+        desc = bytearray(instance_desc([bvh_groups.round256(len(body))]))
+        struct.pack_into("<Q", desc, 0x40, key)
+        return [bytes(desc), body]
+
+    def counts(self, archive):
+        with tempfile.TemporaryDirectory() as folder:
+            src = os.path.join(folder, "synthetic.rpf")
+            report = os.path.join(folder, "counts.json")
+            with open(src, "wb") as f:
+                f.write(archive)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bvh_groups.main([src, "--payload-identity", "--json", report]), 0)
+            with open(report, encoding="utf-8") as f:
+                return json.load(f)
+
+    def test_exact_and_divergent_overlapping_keys(self):
+        a = blas(2048)
+        b = a[:-1] + b"x"
+        c = blas(2)
+        records = (self.pair(1, a) * 2 + self.pair(2, a) + self.pair(2, b)
+                   + self.pair(3, c) * 2 + self.pair(4, blas(3)) + self.pair(5, blas(3)))
+        self.assertEqual(self.counts(make_rpf(records)), {
+            "complete_pairs": 8, "uncompared_instances": 0, "shared_header_transform_groups": 2,
+            "groups_with_multiple_payloads": 1, "exact_payloads_shared_across_keys": 2})
+
+    def test_trailing_bytes_count_and_same_key_repeats_do_not_cross_keys(self):
+        a = blas(2)
+        c = self.counts(make_rpf(self.pair(1, a) * 2 + self.pair(2, a + b"x")))
+        self.assertEqual(c["groups_with_multiple_payloads"], 1)
+        self.assertEqual(c["exact_payloads_shared_across_keys"], 0)
+
+    def test_zlib_header_at_read_window_boundary(self):
+        import bvh_payload_identity
+        boundary = bvh_payload_identity._Archive.WINDOW
+        desc, body = self.pair(1, blas(2))
+        src = make_rpf([desc, body] + self.pair(2, body))
+        archive = src[:64] + bytes(boundary - 1 - 64) + src[64:]
+        self.assertEqual(self.counts(archive)["exact_payloads_shared_across_keys"], 1)
+
+    def test_compare_exact_transform_bytes_and_skip_split_stream(self):
+        desc, body = self.pair(1, blas(1100))
+        altered = bytearray(desc)
+        struct.pack_into("<Q", altered, 0x40, 2)
+        altered[0x50] ^= 1  # same float after the ordinary census rounds to four places
+        counts = self.counts(make_rpf([desc, body, altered, body, desc, body[:65536]]))
+        self.assertEqual(counts["shared_header_transform_groups"], 0)
+        self.assertEqual(counts["complete_pairs"], 2)
+        self.assertEqual(counts["uncompared_instances"], 1)
+
+    def test_nonpadding_gap_invalidates_pending_descriptor(self):
+        desc, body = self.pair(1, blas(3))
+        archive = make_rpf([desc]) + b"broken stream header" + zlib.compress(body)
+        self.assertEqual(self.counts(archive)["uncompared_instances"], 1)
+
+    def test_reject_incomplete_and_malformed_without_bridging(self):
+        desc, a = self.pair(1, blas(2))
+        bad = bytearray(desc)
+        struct.pack_into("<I", bad, 0xa0, 0)
+        archive = (make_rpf([desc, a[:-1], bad, a, desc]) + b"\x78\xdaBAD"
+                   + zlib.compress(a) + zlib.compress(desc) + zlib.compress(a)[:-2])
+        counts = self.counts(archive)
+        self.assertEqual(counts["complete_pairs"], 0)
+        self.assertEqual(counts["uncompared_instances"], 4)
+
+
 class ParseTest(unittest.TestCase):
     def test_single_entry_instance_is_the_208_byte_record(self):
         buf, sizes = buffer_for([20])
