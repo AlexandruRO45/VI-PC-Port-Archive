@@ -389,5 +389,27 @@ class TestSSendMsgPreservation(unittest.TestCase):
         self.assertEqual(words, [0x55667788, 0x11223344, 0x55667788, 0x11223344])
 
 
+class TestSSendMsgChaining(unittest.TestCase):
+    def test_repeated_sendmsg_calls(self):
+        lines = [
+            "v_mov_b32 v0, 0x50",
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x50, 0x50, 0x50, 0x50])
+
+    def test_sendmsg_in_branch_divergence(self):
+        lines = [
+            "s_mov_b32 s0, 1",
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "v_cndmask_b32_e64 v0, 0x111, 0x222, s0",
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x222, 0x222, 0x222, 0x222])
+
+
 if __name__ == "__main__":
     unittest.main()
