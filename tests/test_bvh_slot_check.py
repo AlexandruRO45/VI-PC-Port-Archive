@@ -10,6 +10,7 @@ import unittest
 import zlib
 from collections import Counter
 from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(ROOT, "tools"), os.path.join(ROOT, "tests")]
@@ -84,6 +85,37 @@ def export_fixture(root, swapped=False):
 
 
 class SlotControls(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_saved_evidence_uses_normal_permissions_and_preserves_existing_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "evidence.json"
+            control = root / "control.json"
+            old_umask = os.umask(0o027)
+            try:
+                control.write_text("{}", encoding="utf-8", newline="\n")
+                S.save_evidence(path, {"manifest_items": 1})
+            finally:
+                os.umask(old_umask)
+            self.assertEqual(path.stat().st_mode & 0o777, control.stat().st_mode & 0o777)
+
+            path.chmod(0o660)
+            S.save_evidence(path, {"manifest_items": 2})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o660)
+            self.assertEqual(json.loads(path.read_bytes()), {"manifest_items": 2})
+            self.assertEqual(set(root.iterdir()), {path, control})
+
+    def test_failed_evidence_replace_keeps_existing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "evidence.json"
+            path.write_text("{}", encoding="utf-8", newline="\n")
+            with mock.patch.object(S.os, "replace", side_effect=PermissionError("replace denied")):
+                with self.assertRaisesRegex(PermissionError, "replace denied"):
+                    S.save_evidence(path, {"manifest_items": 1})
+            self.assertEqual(path.read_bytes(), b"{}")
+            self.assertEqual(list(root.iterdir()), [path])
+
     def test_census_with_known_source_and_swapped_blocks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

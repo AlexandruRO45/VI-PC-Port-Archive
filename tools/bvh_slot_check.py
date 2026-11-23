@@ -17,6 +17,7 @@ import tempfile
 import zlib
 from bisect import bisect_left
 from collections import Counter, defaultdict
+from contextlib import suppress
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +25,7 @@ import bvh_geometry_check as C
 import bvh_index as I
 import bvh_match as M
 import bvh_rehydrate as R
+from file_mode import published_mode
 
 
 # Bump when signature ordering, source matching or matrix verdict semantics change.
@@ -228,9 +230,14 @@ def save_evidence(path, record):
     try:
         with f:
             json.dump(record, f)
+        os.chmod(temporary, published_mode(path))
         os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    except BaseException:
+        with suppress(OSError):
+            # A read-only mode copied from the destination can block cleanup on Windows.
+            os.chmod(temporary, 0o600)
+            temporary.unlink()
+        raise
 
 
 def census(archive, index, manifests, prior=(), save=None):
