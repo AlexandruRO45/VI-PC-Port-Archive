@@ -426,12 +426,22 @@ int queue_calls(const QueueRig& rig) {
     return calls;
 }
 
+int check_undecided_queue_desc(const QueueRig& rig) {
+    std::uint32_t desc[] = {0x12345678, 0xabcdef01, 0x12345678, 0xabcdef01};
+    const std::uint32_t expected[] = {0x12345678, 0xabcdef01, 0x12345678, 0xabcdef01};
+    static_assert(sizeof(desc) == sizeof(D3D12_COMMAND_QUEUE_DESC));
+    for (unsigned slot : {26u, 28u}) {
+        EXPECT(raw(rig.queue, slot, word(desc)) == word(desc));
+        EXPECT(std::memcmp(desc, expected, sizeof(desc)) == 0 && queue_calls(rig) == 0);
+    }
+    return 0;
+}
+
 int check_queue_kit2020() {
     QueueRig rig;
     if (make_rig(rig)) return 1;
+    if (check_undecided_queue_desc(rig)) return 1;
     D3D12_COMMAND_QUEUE_DESC desc{};
-    // Before the layout is known, a slot that differs between the layouts does nothing.
-    EXPECT(hr_of(raw(rig.queue, 26, word(&desc))) == S_OK && queue_calls(rig) == 0);
     // Signal at 14 with a fence decides it, and reaches the PC Signal with the real fence.
     EXPECT(hr_of(raw(rig.queue, 14, word(rig.fence), 5)) == S_OK);
     EXPECT(rig.queue_mock->calls[14] == 1 && rig.queue_mock->args[14][0] == rig.real_fence &&

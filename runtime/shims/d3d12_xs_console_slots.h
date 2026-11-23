@@ -112,7 +112,7 @@ enum class QueueMethod : std::uint8_t {
     accepted,   // no effect here: S_OK, counted
     refused,    // named, not implemented: E_NOTIMPL, reported
     unknown,    // not named: E_NOTIMPL, reported
-    undecided,  // means different things in the two layouts, and the layout is not known yet: S_OK, reported
+    undecided,  // layout unknown: reported, with S_OK or the hidden return pointer for a possible GetDesc
 };
 
 struct QueueSlot {
