@@ -395,3 +395,17 @@ def test_bom_from_a_hand_written_file_is_read(tmp_path: Path, bom_file: str) -> 
     assert r.returncode == 0, r.stdout + r.stderr
     assert "1 shaders: 1 compatible, 0 contradictory" in r.stdout
     assert "BOM" not in r.stderr
+
+
+@pytest.mark.parametrize("bad_body", ["", "not json", "[]"])
+def test_bom_does_not_hide_a_broken_body(tmp_path: Path, bad_body: str) -> None:
+    # Tolerating the BOM must not soften the parse or the shape checks into a silent success.
+    index_path = tmp_path / "index.json"
+    index_path.write_text("{}", encoding="utf-8")
+    sig_path = tmp_path / "sig.json"
+    _write_utf8_bom(sig_path, bad_body)
+    r = subprocess.run([sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
+                       capture_output=True, text=True)
+    assert r.returncode == 2
+    assert "ERROR:" in r.stderr
+    assert "Traceback" not in r.stderr
