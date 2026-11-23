@@ -329,5 +329,14 @@ class SCbranchScc1AstTests(unittest.TestCase):
         self.assertEqual(ast.mnemonic, "s_cbranch_scc1")
         self.assertEqual(ast.target_offset, 12)
 
+class SCbranchScc1ScalarInterpreterTests(unittest.TestCase):
+    def test_step_scc1(self):
+        state1 = SaluMachineState(pc=10, scc=1)
+        instr = BranchInstructionAST("s_cbranch_scc1", target_offset=4)
+        self.assertEqual(step_branch(instr, state1), 15)  # 10 + 1 + 4
+
+        state0 = SaluMachineState(pc=10, scc=0)
+        self.assertEqual(step_branch(instr, state0), 11)  # 10 + 1
+
 if __name__ == '__main__':
     unittest.main()
