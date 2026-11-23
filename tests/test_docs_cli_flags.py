@@ -5,7 +5,7 @@
 `tests/test_docs_repo_paths.py` checks the paths the docs name; this checks the options. A renamed or removed
 argparse option leaves `python -I tools/x.py --old` in a README or guide that no longer runs. Three checks:
 
-1. a `--flag` anywhere in a Markdown page appears as a string in some tracked non-Markdown source file;
+1. a `--flag` anywhere in a Markdown page appears as a complete token in some tracked non-Markdown source file;
 2. in a fenced command that starts `python [-I] tools/x.py` (or `scripts/`, or `make_game.py`), every flag appears in
    that script (a script that builds flags as `"--" + name` is skipped; `--help` is argparse's own);
 3. in a fenced command running a PowerShell script (`scripts/` or `tools/`), every flag appears in that script's
@@ -127,11 +127,12 @@ def extract_ps1_params(content):
 
 def unknown_flags(pages, code):
     """[(page:line, flag)] for flags in `pages` ({name: text}) that do not occur in `code` (one string)."""
+    known_flags = set(FLAG.findall(code))
     out = []
     for page, text in sorted(pages.items()):
         for n, line in enumerate(text.split("\n"), 1):
             for flag in sorted(set(FLAG.findall(line))):
-                if flag not in FOREIGN and flag not in code:
+                if flag not in FOREIGN and flag not in known_flags:
                     out.append((f"{page}:{n}", flag))
     return out
 
@@ -166,6 +167,7 @@ DEV_PRODUCERS = {
 def tool_flag_mismatches(pages, sources):
     """[(page:line, tool, flag)] for fenced commands running one tool with a flag its source lacks.
     `sources` maps a tool path to its text."""
+    flags_by_tool = {tool: set(FLAG.findall(source)) for tool, source in sources.items()}
     out = []
     for page, text in sorted(pages.items()):
         for n, cmd in fenced_commands(text):
@@ -179,8 +181,9 @@ def tool_flag_mismatches(pages, sources):
             source = sources.get(tool, "")
             if '"--" +' in source or "'--' +" in source:
                 continue
+            known_flags = flags_by_tool.get(tool, ())
             for flag in sorted(set(FLAG.findall(cmd))):
-                if flag not in FOREIGN and flag not in source:
+                if flag not in FOREIGN and flag not in known_flags:
                     out.append((f"{page}:{n}", tool, flag))
     return out
 
@@ -209,6 +212,13 @@ def ps1_flag_mismatches(pages, sources):
 
 
 class DocsCliFlags(unittest.TestCase):
+    def test_flags_must_match_complete_tokens(self):
+        pages = {"docs/a.md": "```sh\npython -I tools/x.py --jobs 4 --job-status --job\n```\n"}
+        source = 'add("--jobs")\nadd("--job-status")'
+        self.assertEqual(unknown_flags(pages, source), [("docs/a.md:2", "--job")])
+        self.assertEqual(tool_flag_mismatches(pages, {"tools/x.py": source}),
+                         [("docs/a.md:2", "tools/x.py", "--job")])
+
     def test_dev_inherits_only_the_selected_producer_flags(self):
         pages = {"docs/dev.md": ("```\n"
                                  "python -I scripts/dev.py boot-trace --d3d12 --negative-controls\n"
