@@ -387,6 +387,23 @@ class XmlGroupingRegressionTest(GamedataIndexTest):
             ],
         )
 
+    def test_whitespace_in_xml_end_tag_keeps_exact_64k_document_separate(self):
+        prefix, suffix = b"<Example>", b"</Example \t\r\n>"
+        doc = prefix + b"x" * (65536 - len(prefix) - len(suffix)) + suffix
+        self.add(doc)
+        self.add(b"unrelated text")
+        self.finish()
+
+        out = os.path.join(self.root, "index.json")
+        result = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual(
+            [(r["type"], r["root"], r["complete"], r["chunks"]) for r in rows],
+            [("xml", "Example", True, 1), ("text", "", True, 1)],
+        )
+
     def test_declarationless_xml_keeps_utf8_continuation_stream(self):
         # A 64 KiB continuation of non-ASCII UTF-8 text falls below printable()'s ASCII ratio
         # and classifies as "binary", yet must stay part of the open declarationless XML document.

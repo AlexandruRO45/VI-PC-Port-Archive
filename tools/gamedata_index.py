@@ -41,7 +41,7 @@ CARVER = os.path.join(ROOT, "rpf9_carve.py")
 BOM = b"\xef\xbb\xbf"
 XML_DECL = re.compile(rb"<\?xml[^>]*\?>")
 XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
-XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
+XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)[ \t\r\n]*>\s*$")
 # Tag-like text inside these cannot open or close an element.
 XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
 MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1": "SPS1", b"RBF0": "RBF0", b"PSIN": "PSIN"}
