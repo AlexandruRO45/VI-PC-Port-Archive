@@ -318,13 +318,29 @@ void test_relocations() {
             else
                 pass("a valid relocation is applied");
             const auto* mapped = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + 0x80);
-            if (mapped->OptionalHeader.ImageBase != reinterpret_cast<uint64_t>(m.base))
-                failed("a relocated image's headers name the base it was mapped at",
-                       "OptionalHeader.ImageBase is still the file's");
+            if (mapped->OptionalHeader.ImageBase != 0)
+                failed("a relocated image without DYNAMIC_BASE keeps the file's ImageBase",
+                       "OptionalHeader.ImageBase was rewritten to the load address");
             else
-                pass("a relocated image's headers name the base it was mapped at");
+                pass("a relocated image without DYNAMIC_BASE keeps the file's ImageBase");
         } catch (const std::exception& e) {
             failed("a valid relocation is applied", e.what());
+        }
+    }
+    {
+        auto img = relocated;
+        nt_of(img)->OptionalHeader.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(write_image(img));
+            const auto* mapped = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + 0x80);
+            if (mapped->OptionalHeader.ImageBase != reinterpret_cast<uint64_t>(m.base))
+                failed("a relocated DYNAMIC_BASE image's headers name the base it was mapped at",
+                       "OptionalHeader.ImageBase is still the file's");
+            else
+                pass("a relocated DYNAMIC_BASE image's headers name the base it was mapped at");
+        } catch (const std::exception& e) {
+            failed("a relocated DYNAMIC_BASE image's headers name the base it was mapped at", e.what());
         }
     }
     {

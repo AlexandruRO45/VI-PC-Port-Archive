@@ -100,7 +100,8 @@ through it.
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
 that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` relocations (and,
-as the Windows loader does, writes the new base into the mapped headers' `ImageBase`), binds
+as Windows does, writes the new base into the mapped headers' `ImageBase` when the image has
+`IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE`; a relocated image without that flag keeps the file's), binds
 imports by name or ordinal, parses the export table, sets section protections, and registers the
 image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
 through a mapped image are dispatched and stack walks can step over its frames. The table is validated
