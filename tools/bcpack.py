@@ -309,14 +309,15 @@ _NATIVE = []
 
 
 def _native_unpack():
-    """The `unpack` entry of the optional Rust lane decoder, or None.
+    """`(unpack_model, tables)` of the optional Rust lane decoder, or None.
 
     `tools/bcpack_calibration` (built with Cargo, see its README.md) exports
-    `unpack`, which runs `third_party/bcpack-rs`. It is about 60 times faster
-    than `_decode_lanes_raw`. Set `LEONIDA_BCPACK_NATIVE=0` to use Python only.
+    `unpack_model`, a port of `_decode_lanes_raw` that is fed this module's
+    probability tables, so it accepts the same streams and gives the same
+    symbols. Set `LEONIDA_BCPACK_NATIVE=0` to use Python only.
     """
     if not _NATIVE:
-        fn = None
+        found = None
         if os.environ.get("LEONIDA_BCPACK_NATIVE", "1") != "0":
             import ctypes
             name = {"win32": "bcpack_calibration.dll",
@@ -325,36 +326,44 @@ def _native_unpack():
                                 "bcpack_calibration", "target", "release", name)
             if os.path.isfile(path):
                 try:
-                    fn = ctypes.CDLL(path).unpack
+                    fn = ctypes.CDLL(path).unpack_model
                 except (OSError, AttributeError):
                     fn = None
-                else:
-                    fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
-                                   ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p]
+                if fn is not None:
+                    fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t,
+                                   ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
                     fn.restype = ctypes.c_ssize_t
-        _NATIVE.append(fn)
+                    side = MAX_WIDTH + 1
+                    flat = [-1] * (side * 16 * side)
+                    for (w, q), freq in _tables.PROB_TABLES.items():
+                        if 0 <= w <= MAX_WIDTH and 0 <= q < 16 and len(freq) == w + 1:
+                            flat[(w * 16 + q) * side:(w * 16 + q) * side + w + 1] = freq
+                    found = fn, (ctypes.c_int32 * len(flat))(*flat)
+        _NATIVE.append(found)
     return _NATIVE[0]
 
 
 def _decode_lanes_native(raw, widths, nsym):
-    """`(lanes, bytes_used)` from the Rust decoder, or None where it refuses the stream.
+    """`(lanes, bytes_used)` from the Rust port of `_decode_lanes_raw`, or None.
 
-    The Rust decoder refuses some streams the Python model accepts; where both
-    accept one they give the same symbols and byte count
-    (`tests/test_bcpack_native.py`). So a refusal only means: ask Python.
+    None means the library is not built or the stream is refused (or is one
+    the port leaves to Python); `decode_lanes` then runs the Python model,
+    which raises its usual error. `tests/test_bcpack_native.py` checks that the
+    two agree.
     """
-    fn = _native_unpack()
-    if fn is None or nsym <= 0 or max(widths) > 8:
+    native = _native_unpack()
+    if native is None or nsym <= 0:
         return None
     import ctypes
+    fn, tables = native
     nl = len(widths)
     data = bytes(raw)
-    out = ctypes.create_string_buffer(nsym * nl)
-    used = fn(data, len(data), bytes(w - 1 for w in widths), nl, nsym, out)
+    out = (ctypes.c_uint16 * (nsym * nl))()
+    used = fn(data, len(data), bytes(widths), nl, nsym, tables, len(tables), out)
     if used < 0:
         return None
-    flat = out.raw
-    return [list(flat[i::nl]) for i in range(nl)], used
+    flat = memoryview(out).cast("B").cast("H")
+    return [flat[i * nsym:(i + 1) * nsym].tolist() for i in range(nl)], used
 
 
 def decode_lanes(raw, codec, out_size):

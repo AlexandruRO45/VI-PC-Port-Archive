@@ -1,4 +1,4 @@
-"""The Rust lane decoder agrees with the Python one wherever it accepts a stream.
+"""The Rust port of the lane model accepts exactly the streams Python accepts, with the same symbols.
 
 Builds BCPack chunks with the synthetic encoder of `test_bcpack.py` (no game
 files), some of them corrupted or cut short, and decodes each one both ways.
@@ -22,7 +22,7 @@ import test_bcpack as synth  # noqa: E402
 def _python(raw, codec, size):
     try:
         lanes, used = bcpack._decode_lanes_raw(memoryview(raw), bcpack.LANE_WIDTHS[codec], size // 8)
-    except bcpack.BcpackError:
+    except (bcpack.BcpackError, ZeroDivisionError, IndexError):
         return None
     return None if any(memoryview(raw)[used:]) else (lanes, used)
 
@@ -52,19 +52,32 @@ def _cases(seed, count):
 
 @unittest.skipIf(bcpack._native_unpack() is None, "tools/bcpack_calibration is not built")
 class NativeLaneDecoderTest(unittest.TestCase):
-    def test_native_never_disagrees_with_python(self):
-        accepted = 0
+    def test_native_accepts_exactly_what_python_accepts(self):
+        accepted = refused = 0
         for codec, size, raw, lanes in _cases(20261123, 160):
             with self.subTest(codec=codec, size=size, raw=raw.hex()[:32]):
                 fast = bcpack._decode_lanes_native(raw, bcpack.LANE_WIDTHS[codec], size // 8)
                 slow = _python(raw, codec, size)
-                if fast is not None:
-                    accepted += 1
-                    self.assertIsNotNone(slow, "native accepted a stream Python refuses")
-                    self.assertEqual(fast, slow)
+                self.assertEqual(fast, slow)
                 if lanes is not None and slow is not None:
                     self.assertEqual(slow[0], lanes)
-        self.assertGreater(accepted, 20, "the native decoder should accept many of these streams")
+                accepted += fast is not None
+                refused += fast is None
+        self.assertGreater(accepted, 40)
+        self.assertGreater(refused, 20)
+
+    def test_uniform_model_and_virtual_zeros(self):
+        # q = 0 fragments end on a zero byte the encoder leaves out; the model
+        # shifts it back in (docs/textures.md, flush = 1). third_party/bcpack-rs,
+        # which follows the hardware RTL, refuses these.
+        widths = bcpack.LANE_WIDTHS[4]
+        for sym in (0, 1, 3, 63):
+            lanes = [[min(sym, (1 << w) - 1)] * 16 for w in widths]
+            raw = synth.encode_lanes(lanes, 4, q=0)
+            fast = bcpack._decode_lanes_native(raw, widths, 16)
+            self.assertIsNotNone(fast)
+            self.assertEqual(fast, _python(raw, 4, 128))
+            self.assertEqual(fast[0], lanes)
 
     def test_decode_lanes_falls_back_and_raises_like_python(self):
         for codec, size, raw, _ in _cases(7, 60):

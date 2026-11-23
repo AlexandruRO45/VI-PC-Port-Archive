@@ -2,6 +2,8 @@
 // of bits established by an archive observation or an earlier decoded block.
 use std::slice;
 
+mod model;
+
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct Cell {
@@ -266,4 +268,33 @@ pub unsafe extern "C" fn unpack(
         }
     }
     decoded.consumed as isize
+}
+
+// The lane-array model of tools/bcpack.py: same streams accepted, same symbols.
+// `tables` is the flat i32 table of `model::Tables::new`; `output` receives
+// `lanes * target` u16 symbols, lane-major. Returns the bytes used, or -1.
+#[no_mangle]
+pub unsafe extern "C" fn unpack_model(
+    data: *const u8,
+    size: usize,
+    widths: *const u8,
+    lanes: usize,
+    target: usize,
+    tables: *const i32,
+    tables_len: usize,
+    output: *mut u16,
+) -> isize {
+    let stream = slice::from_raw_parts(data, size);
+    let bits = slice::from_raw_parts(widths, lanes);
+    let Some(t) = model::Tables::new(slice::from_raw_parts(tables, tables_len)) else {
+        return -1;
+    };
+    let Some((symbols, used)) = model::decode(stream, bits, target, &t) else {
+        return -1;
+    };
+    if stream[used..].iter().any(|&b| b != 0) {
+        return -1;
+    }
+    slice::from_raw_parts_mut(output, lanes * target).copy_from_slice(&symbols);
+    used as isize
 }

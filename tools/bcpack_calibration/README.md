@@ -15,7 +15,9 @@ The synthetic test constructs its own BC1 pool and profile, runs the CLI and com
 
 ## Faster strict decoding
 
-Once built, the same library also speeds up the default strict path: `tools/bcpack.py` decodes the lane symbols with its `unpack` export (about 60 times faster than the Python model on synthetic chunks, about 12 times end to end for BC1) and uses Python for the streams the Rust reader refuses, so the output does not change. NumPy is not needed for this. `python -I tests/test_bcpack_native.py` checks that the two agree; `LEONIDA_BCPACK_NATIVE=0` turns it off.
+Once built, the same library also speeds up the default strict path. Its `unpack_model` export (`src/model.rs`) is a line-by-line port of the lane-array model in `tools/bcpack.py` (`_decode_lanes_raw`, virtual zero bytes included), and `tools/bcpack.py` passes it its own probability tables. It therefore accepts exactly the streams the Python model accepts, with the same symbols. It is about 30 times faster than the Python model on synthetic chunks, and NumPy is not needed. When the library is not built, or a stream is refused, Python decodes the stream as before and raises its usual error. `python -I tests/test_bcpack_native.py` checks that the two agree, and `LEONIDA_BCPACK_NATIVE=0` turns the native path off.
+
+The `unpack` export above runs `third_party/bcpack-rs`, which follows the hardware RTL. It is faster but refuses some streams the model accepts, for example every `q = 0` fragment whose omitted trailing zero byte comes before a symbol. That is why the strict path does not use it.
 
 ## Automatic asset export
 
