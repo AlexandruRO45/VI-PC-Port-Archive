@@ -396,5 +396,43 @@ class TestVMax3F16RegisterAliasing(unittest.TestCase):
         self.assertEqual(support.mrt0_words(spv)[0], 0x12344000)
 
 
+@dataclasses.dataclass(frozen=True)
+class Max3F16StatusFlags:
+    is_zero: bool
+    is_negative: bool
+    is_nan: bool
+    is_inf: bool
+
+
+def compute_status_flags(res_bits: int) -> Max3F16StatusFlags:
+    v = f16_to_float(res_bits)
+    return Max3F16StatusFlags(
+        is_zero=(v == 0.0),
+        is_negative=((res_bits & 0x8000) != 0),
+        is_nan=math.isnan(v),
+        is_inf=math.isinf(v),
+    )
+
+
+class TestVMax3F16ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and classification."""
+
+    def test_positive_normal_flags(self):
+        flags = compute_status_flags(0x4000)  # 2.0
+        self.assertFalse(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertFalse(flags.is_nan)
+        self.assertFalse(flags.is_inf)
+
+    def test_negative_zero_flags(self):
+        flags = compute_status_flags(0x8000)  # -0.0
+        self.assertTrue(flags.is_zero)
+        self.assertTrue(flags.is_negative)
+
+    def test_nan_flags(self):
+        flags = compute_status_flags(0x7E00)  # qNaN
+        self.assertTrue(flags.is_nan)
+
+
 if __name__ == "__main__":
     unittest.main()
