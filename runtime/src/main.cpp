@@ -20,6 +20,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cwchar>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -88,8 +89,9 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--archetype-lookup" && i + 1 < argc) {
             const std::wstring v = argv[++i];
             const auto comma = v.find(L',');
+            const std::wstring address = v.substr(0, comma);
             wchar_t* end = nullptr;
-            const unsigned long rva = std::wcstoul(v.substr(0, comma).c_str(), &end, 16);
+            const unsigned long rva = std::wcstoul(address.c_str(), &end, 16);
             if (!end || *end || rva == 0) return usage();
             archetype_lookup_rva = static_cast<uint32_t>(rva);
             if (comma != std::wstring::npos) archetype_lookup_arg = v.substr(comma + 1) == L"1" ? 1 : 0;
