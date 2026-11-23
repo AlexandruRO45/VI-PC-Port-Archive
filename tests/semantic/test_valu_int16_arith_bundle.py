@@ -257,6 +257,25 @@ class TestVSubI16Translator(unittest.TestCase):
         words = mrt0_words(spv)
         self.assertEqual(words, [300, 0x8000, 300, 0x8000])
 
+def ref_v_sub_u16(s0: int, s1: int, clamp: bool = False) -> int:
+    x = s0 & MASK16
+    y = s1 & MASK16
+    res = x - y
+    if clamp:
+        res = max(0, res)
+    return res & MASK16
+
+
+class TestVSubU16Reference(unittest.TestCase):
+    def test_ref_sub_u16(self):
+        self.assertEqual(ref_v_sub_u16(500, 200), 300)
+
+    def test_ref_sub_u16_borrow(self):
+        self.assertEqual(ref_v_sub_u16(100, 200), 0xFF9C)  # wrapped borrow
+
+    def test_ref_sub_u16_clamp(self):
+        self.assertEqual(ref_v_sub_u16(100, 200, clamp=True), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
