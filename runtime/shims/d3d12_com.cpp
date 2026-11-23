@@ -440,12 +440,8 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
-        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
-                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
-        draw.mesh = true;
-        check(list_.draw(std::move(draw)));
+        if (defer([=](GraphicsCommandList& l) { l.record_mesh_draw(x, y, z); }, true)) return;
+        record_mesh_draw(x, y, z);
     }
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
@@ -1201,6 +1197,16 @@ private:
             draw_views_stale_ = false;
         }
         return draw_views_;
+    }
+
+    // A mesh draw needs a graphics pipeline and a graphics root signature; it has no topology or vertex input.
+    void record_mesh_draw(UINT x, UINT y, UINT z) {
+        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_, scissor_,
+                           blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+        draw.mesh = true;
+        check(list_.draw(std::move(draw)));
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
