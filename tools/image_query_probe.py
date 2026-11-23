@@ -194,8 +194,11 @@ def run(oracle, waves):
     for wave in waves:
         kernels = [resinfo_kernel(tsharp_words(arch, w, h, typ, d, b, l), lv, typ, wave)
                    for _, w, h, typ, d, b, l, lv in rcases]
-        for case, got in zip(rcases, oracle.run(kernels)):
-            if isinstance(got, str) or len(got) < 4:
+        rgot = oracle.run(kernels)
+        if len(rgot) != len(rcases):
+            raise RuntimeError(f"resinfo wave{wave}: the oracle returned {len(rgot)} results for {len(rcases)} kernels")
+        for case, got in zip(rcases, rgot):
+            if got is None or isinstance(got, str) or len(got) < 4:
                 raise RuntimeError(f"{case[0]} wave{wave}: {got}")
             ok, want = compare_resinfo(case, got)
             bad += not ok
@@ -204,8 +207,11 @@ def run(oracle, waves):
                 print(f"MISMATCH resinfo wave{wave} {case[0]}: got {got[:4]}, rule {want}")
         kernels = [lod_kernel(tsharp_words(arch, w, h, last=l), ssharp_words(*s), du, dv, wave)
                    for _, w, h, l, du, dv, s, _ in lcases]
-        for case, got in zip(lcases, oracle.run(kernels, words=16)):
-            if isinstance(got, str) or len(got) < 16:
+        lgot = oracle.run(kernels, words=16)
+        if len(lgot) != len(lcases):
+            raise RuntimeError(f"get_lod wave{wave}: the oracle returned {len(lgot)} results for {len(lcases)} kernels")
+        for case, got in zip(lcases, lgot):
+            if got is None or isinstance(got, str) or len(got) < 16:
                 raise RuntimeError(f"{case[0]} wave{wave}: {got}")
             ok, want, lanes = compare_lod(case, got)
             bad += not ok

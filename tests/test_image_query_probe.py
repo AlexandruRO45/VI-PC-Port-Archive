@@ -163,6 +163,26 @@ class Comparison(unittest.TestCase):
                 self.assertIn(str(report), error.getvalue())
                 self.assertIn("cannot write", error.getvalue())
 
+    def test_short_or_none_oracle_results_are_harness_errors(self):
+        rcases, lcases = pr.resinfo_cases(), pr.lod_cases()
+        for responses, match in (
+            ([[]], f"resinfo wave32: the oracle returned 0 results for {len(rcases)} kernels"),
+            ([[None] * len(rcases)], f"{rcases[0][0]} wave32: None"),
+            ([[[16, 4, 0, 5]] * len(rcases), []],
+             f"get_lod wave32: the oracle returned 0 results for {len(lcases)} kernels"),
+            ([[[16, 4, 0, 5]] * len(rcases), [None] * len(lcases)],
+             f"{lcases[0][0]} wave32: None"),
+        ):
+            with self.subTest(match=match):
+                oracle = mock.MagicMock(arch="gfx1036")
+                oracle.run.side_effect = responses
+                out = io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=oracle), redirect_stdout(out):
+                    self.assertEqual(pr.main(["--waves", "32"]), 2)
+                self.assertIn("harness error:", out.getvalue())
+                self.assertIn(match, out.getvalue())
+                oracle.close.assert_called_once()
+
 
 class Hardware(unittest.TestCase):
     def test_on_the_gpu(self):
