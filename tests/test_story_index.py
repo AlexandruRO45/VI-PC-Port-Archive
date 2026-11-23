@@ -6,6 +6,7 @@ Every byte here is built by the test. No game file or game asset name is used.
 """
 import contextlib
 import csv
+import errno
 import io
 import json
 import os
@@ -350,6 +351,26 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["signatures"]["clip-stream"]["files"], 2)
         clips = [row for row in doc["files"] if row["signature"] == "clip-stream"]
         self.assertEqual([(row["count"], row["version"]) for row in clips], [(3, None), (2, None)])
+
+    def test_cli_reports_source_directory_listing_errors(self):
+        source = os.path.join(self.root, "synthetic")
+        os.mkdir(source)
+        previous = os.path.join(self.root, "previous.json")
+        new = os.path.join(self.root, "new.json")
+        with open(previous, "wb") as f:
+            f.write(b"previous report\n")
+        for error in (PermissionError(errno.EACCES, "synthetic access denied", source),
+                      FileNotFoundError(errno.ENOENT, "synthetic disappearance", source)):
+            for out in (previous, new):
+                with self.subTest(error=error, out=out):
+                    err = io.StringIO()
+                    with (mock.patch.object(story_index.os, "listdir", side_effect=error),
+                          contextlib.redirect_stderr(err)):
+                        self.assertEqual(story_index.main([source, out, "--quiet"]), 2)
+                    self.assertEqual(err.getvalue().splitlines(), [f"{source}: {error}"])
+                    with open(previous, "rb") as f:
+                        self.assertEqual(f.read(), b"previous report\n")
+                    self.assertFalse(os.path.exists(new))
 
     def test_cli_reports_a_report_write_error(self):
         out = os.path.join(self.root, "index.json")

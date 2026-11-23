@@ -364,17 +364,17 @@ def main(argv=None):
         manifest = os.path.join(a.source, "index.json")
         if same_report_path(manifest, a.out):
             ap.error(f"output would overwrite the carve manifest: {a.out}")
-        if os.path.isfile(a.out):
-            for name in os.listdir(a.source):
-                inp = os.path.join(a.source, name)
-                if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
-                    if same_report_path(inp, a.out):
-                        ap.error(f"output would overwrite an input file: {a.out}")
     folder = os.path.dirname(os.path.abspath(a.out))
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
     try:
         if os.path.isdir(a.source):
+            if os.path.isfile(a.out):
+                for name in os.listdir(a.source):
+                    inp = os.path.join(a.source, name)
+                    if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
+                        if same_report_path(inp, a.out):
+                            ap.error(f"output would overwrite an input file: {a.out}")
             rows, summary = scan_dir(a.source, output=a.out)
         else:
             def progress(n, pos, end):
