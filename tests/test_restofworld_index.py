@@ -504,14 +504,14 @@ class FolderModeStoredBytesTest(unittest.TestCase):
     """A carve folder's stored (compressed) sizes and span come from rpf9_carve.py's index.json, as in archive mode;
     without an index the length on disk is all there is."""
 
-    def make(self, tmp, with_index):
+    def make(self, tmp, with_index, encoding="utf-8"):
         data = b"raw bytes " * 100                                   # 1,000 inflated bytes
         with open(os.path.join(tmp, "000000001000.bin"), "wb") as f:
             f.write(data)
         if with_index:
             index = {"summary": {"span": 2000, "zero_padding": 500, "unread_bytes": 1200},
                      "files": [{"off": 0x1000, "stored": 300, "size": 1000}]}
-            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(tmp, "index.json"), "w", encoding=encoding) as f:
                 json.dump(index, f)
 
     def test_index_json_supplies_stored_bytes_and_span(self):
@@ -521,6 +521,16 @@ class FolderModeStoredBytesTest(unittest.TestCase):
         self.assertEqual(rows[0]["stored"], 300)
         self.assertEqual((summary["compressed_bytes"], summary["inflated_bytes"]), (300, 1000))
         self.assertAlmostEqual(summary["readable_fraction"], 300 / 2000, places=4)
+
+    def test_index_json_saved_with_a_bom_supplies_stored_bytes(self):
+        """A carve index.json saved with a UTF-8 BOM (PowerShell 5.1's default) still supplies the stored sizes.
+        Read as plain UTF-8, json.load failed, _carve_index returned {}, and the inflated length on disk was
+        reported as the stored size."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, with_index=True, encoding="utf-8-sig")
+            rows, summary = restofworld_index.scan_dir(tmp)
+        self.assertEqual(rows[0]["stored"], 300)
+        self.assertEqual(summary["compressed_bytes"], 300)
 
     def test_without_an_index_the_length_on_disk_is_used(self):
         with tempfile.TemporaryDirectory() as tmp:
