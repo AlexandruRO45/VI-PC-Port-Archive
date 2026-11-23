@@ -235,7 +235,7 @@ def _temp_stream(path, offset, size):
             while left:
                 chunk = fh.read(min(left, 1 << 20))
                 if not chunk:
-                    break
+                    raise OSError("source ended before the full Bink stream could be copied")
                 out.write(chunk)
                 left -= len(chunk)
     except BaseException:

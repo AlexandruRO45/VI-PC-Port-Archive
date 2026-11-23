@@ -183,6 +183,26 @@ class TestScanAndWrite(unittest.TestCase):
              (60000, 1001, 59.94, 2.002)],
         )
 
+    def test_probe_rejects_stream_truncated_after_scan(self):
+        path = os.path.join(self.dir, "shrinking.bk2")
+        stream = make_stream()
+        with open(path, "wb") as fh:
+            fh.write(stream)
+        rows, _ = bink.scan_target(path)
+        self.assertEqual(len(rows), 1)
+        with open(path, "r+b") as fh:
+            fh.truncate(len(stream) - 1)
+
+        probe_result = subprocess.CompletedProcess(
+            ["ffprobe"], 0, '{"streams":[{"codec_type":"video","codec_name":"bink2"}]}',
+        )
+        with mock.patch.object(bink.subprocess, "run", return_value=probe_result) as run, \
+                mock.patch.object(bink.tempfile, "tempdir", self.dir):
+            row = bink.probe_row(rows[0], "ffprobe")
+        run.assert_not_called()
+        self.assertEqual((row["decodes"], row["codec"], row["probe_duration_s"]), ("no", "", ""))
+        self.assertFalse(any(name.startswith("bink_index_") for name in os.listdir(self.dir)))
+
     def test_probe_handles_failed_or_malformed_results(self):
         rows, _ = bink.scan_target(self.dir)
         valid_info = {"streams": [{"codec_type": "video", "codec_name": "bink2"}],
