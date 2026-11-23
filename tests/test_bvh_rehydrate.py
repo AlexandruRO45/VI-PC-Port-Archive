@@ -265,6 +265,27 @@ class TestErrorsAndCli(unittest.TestCase):
                 self.assertEqual(R.main([paths["in.bin"], "--geom", geo, "--out", paths["out.bin"]]), 0)
             self.assertIn("rehydrated", text.getvalue())
 
+    def test_out_uses_same_report_path_for_folding_alias(self):
+        src, _, _ = build([(0, 0x01, 0, None, 0x09), (0, 0x81, 0, 1, 0x09)])
+        with tempfile.TemporaryDirectory() as d:
+            in_bin = os.path.join(d, "in.bin")
+            vb_bin = os.path.join(d, "vb.bin")
+            ib_bin = os.path.join(d, "ib.bin")
+            for p, data in ((in_bin, src), (vb_bin, QUADS.vertices), (ib_bin, QUADS.indices)):
+                with open(p, "wb") as f:
+                    f.write(data)
+            alias = os.path.join(d, "alias_out.bin")
+            geo = vb_bin + "," + ib_bin
+            orig = R.same_report_path
+            try:
+                R.same_report_path = lambda a, b: os.path.basename(a) == "alias_out.bin" and b == ib_bin
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(R.main([in_bin, "--geom", geo, "--out", alias]), 2)
+                self.assertIn("must not overwrite", err.getvalue())
+            finally:
+                R.same_report_path = orig
+
 
 if __name__ == "__main__":
     unittest.main()

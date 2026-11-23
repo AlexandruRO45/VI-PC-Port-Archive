@@ -57,6 +57,11 @@ import struct
 import sys
 import tempfile
 
+_TOOLS = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+from report_paths import same_report_path  # noqa: E402
+
 FLAG_DEHYDRATED = 0x01000000
 FLAG_UPDATABLE = 0x00040000
 NO_TRANSFORM = 0x007F7F7F
@@ -473,17 +478,15 @@ def main(argv=None):
     if os.path.isdir(a.out):
         print("error: --out is a folder, not a file: %s" % a.out, file=sys.stderr)
         return 2
-    # The output must never replace a file the tool was asked to read. samefile also catches a
-    # case-only difference on Windows and macOS's default volume (tools/hashdict.py).
-    if os.path.exists(a.out):
-        inputs = [a.dehydrated]
-        inputs += [p for spec in a.geom for p in spec.split(",") if p]
-        if a.compare:
-            inputs.append(a.compare)
-        for path in inputs:
-            if os.path.isfile(path) and os.path.samefile(a.out, path):
-                print("error: --out must not overwrite the input %s" % path, file=sys.stderr)
-                return 2
+    # The output must never replace a file the tool was asked to read.
+    inputs = [a.dehydrated]
+    inputs += [p for spec in a.geom for p in spec.split(",") if p]
+    if a.compare:
+        inputs.append(a.compare)
+    for path in inputs:
+        if same_report_path(a.out, path):
+            print("error: --out must not overwrite the input %s" % path, file=sys.stderr)
+            return 2
     try:
         transform = parse_transform(a.transform) if a.transform else None
         geometries = []
