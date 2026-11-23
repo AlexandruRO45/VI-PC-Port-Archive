@@ -186,6 +186,17 @@ class SlotControls(unittest.TestCase):
         self.assertEqual(list(S.source_candidates(sig, [0, 1, 2], groups)), [(0, 2)])
         self.assertEqual(list(S.source_candidates(sig, [0, 1], groups)), [])
 
+    def test_match_exports_reads_a_manifest_at_the_current_geometry_arity(self):
+        # model_geometries returns (mesh, model, geometry, tris, shader hash, bucket); a five-name unpack made every
+        # manifest run exit 2 with "too many values to unpack (expected 5)" after #6330 added the bucket.
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(json.dumps({"Items": [{"File": "tiles.obj", "MeshTris": [1]}]}),
+                                encoding="utf-8", newline="\n")
+            stats = Counter()
+            self.assertEqual(S.match_exports({}, [manifest], stats), {})
+            self.assertEqual(stats["manifest_items"], 1)
+
     def test_empty_entry_keeps_matrix_index(self):
         body = build(LEAVES, bounds=BOUNDS)[0]
         wrapper = bytearray(256)
