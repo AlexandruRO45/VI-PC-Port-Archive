@@ -553,7 +553,7 @@ def main(argv=None) -> int:
                     help="target SPIR-V / Vulkan environment (default: vulkan1.2)")
     args = ap.parse_args(argv)
     try:
-        with open(args.src, encoding="utf-8") as f:
+        with open(args.src, encoding="utf-8-sig") as f:
             text = f.read()
         data = assemble(text, target_env=args.target_env)
         with open(args.out, "wb") as f:

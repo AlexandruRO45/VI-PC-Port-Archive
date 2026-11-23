@@ -1,4 +1,5 @@
 """Tests for tools/spirv_asm.py (pure-Python SPIR-V binary assembler)."""
+import codecs
 import os
 import shutil
 import struct
@@ -394,18 +395,37 @@ OpFunctionEnd
             with open(dst, "rb") as f:
                 self.assertEqual(f.read(), b"existing output")
 
+    def test_cli_accepts_utf8_with_or_without_bom(self):
+        text = "OpCapability Shader\nOpMemoryModel Logical GLSL450\n"
+        expected = spirv_asm.assemble(text)
+        with tempfile.TemporaryDirectory() as d:
+            for encoding in ("utf-8", "utf-8-sig"):
+                with self.subTest(encoding=encoding):
+                    src = os.path.join(d, f"{encoding}.spvasm")
+                    dst = os.path.join(d, f"{encoding}.spv")
+                    with open(src, "w", encoding=encoding, newline="\n") as f:
+                        f.write(text)
+                    result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    with open(dst, "rb") as f:
+                        self.assertEqual(f.read(), expected)
+
     def test_cli_source_that_is_not_utf8_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "bad.spvasm")
             dst = os.path.join(d, "bad.spv")
-            with open(src, "wb") as f:
-                f.write(b"OpCapability Shader\n; \xb1\xff\n")
-            r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
-                               capture_output=True, text=True)
-            self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertNotIn("Traceback", r.stderr)
-            self.assertIn("ERROR:", r.stderr)
-            self.assertFalse(os.path.exists(dst))
+            for prefix in (b"", codecs.BOM_UTF8):
+                with self.subTest(bom=bool(prefix)):
+                    with open(src, "wb") as f:
+                        f.write(prefix + b"OpCapability Shader\n; \xb1\xff\n")
+                    r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 1, r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertIn("ERROR:", r.stderr)
+                    self.assertEqual(len(r.stderr.splitlines()), 1)
+                    self.assertFalse(os.path.exists(dst))
 
 
 _INT_HEAD = (
