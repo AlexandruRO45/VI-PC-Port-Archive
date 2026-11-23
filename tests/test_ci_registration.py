@@ -119,9 +119,9 @@ def git_bash():
 
 def tracked_under_tests(root):
     try:
-        result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
+        result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True)
         if result.returncode == 0:
-            return [n for n in result.stdout.split("\0") if n]
+            return [os.fsdecode(name) for name in result.stdout.split(b"\0") if name]
     except OSError:
         pass
     names = []                                     # no git: walk, as tests/test_docs_links.py does
@@ -340,6 +340,12 @@ class RepositoryRegistrationTest(unittest.TestCase):
             files = tracked_under_tests(ROOT)
             self.assertGreaterEqual(len(files), 300)
             self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
+
+    def test_the_scan_preserves_non_ascii_git_paths(self):
+        name = "tests/test_\u4e2d.py"
+        listing = subprocess.CompletedProcess([], 0, stdout=os.fsencode(name) + b"\0")
+        with mock.patch("subprocess.run", return_value=listing):
+            self.assertEqual(tracked_under_tests(ROOT), [name])
 
     def test_every_test_file_is_selected_by_a_job(self):
         unselected = [f for f in self.files if job_of(ROOT, f, self.rules) is None]

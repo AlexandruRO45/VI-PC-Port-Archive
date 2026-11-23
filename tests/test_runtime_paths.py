@@ -78,9 +78,9 @@ def covered(path, patterns):
 
 
 def tracked(root, top):
-    result = subprocess.run(["git", "ls-files", "-z", "--", top], cwd=root, capture_output=True, text=True)
+    result = subprocess.run(["git", "ls-files", "-z", "--", top], cwd=root, capture_output=True)
     if result.returncode == 0 and result.stdout:
-        return [n for n in result.stdout.split("\0") if n]
+        return [os.fsdecode(name) for name in result.stdout.split(b"\0") if name]
     names = []                                     # no git: walk, as tests/test_docs_links.py does
     for base, dirs, files in os.walk(os.path.join(root, top)):
         dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "build")]
