@@ -95,5 +95,71 @@ class PsModelTest(unittest.TestCase):
         self.assertEqual(off, [])
 
 
+class VsModelTest(unittest.TestCase):
+    ON = (1, 1, 1, 1)
+    N = export_diff.D3D_NAME
+
+    def svs(self, clip=0, cull=0, misc=()):
+        return [export_diff.Osg1Element(self.N["clip"], i, 0, 0x1, 0) for i in range(clip)] + \
+               [export_diff.Osg1Element(self.N["cull"], i, 0, 0x1, 0) for i in range(cull)] + \
+               [export_diff.Osg1Element(self.N[m], 0, 1, 0x1, 0) for m in misc]
+
+    def pos(self, i, comps=ON):
+        return export_diff.VsExport("pos", i, comps)
+
+    def test_distances_start_at_pos1(self):
+        shape = export_diff.VsShape(self.svs(clip=2, cull=1), True)
+        pred = export_diff.vs_model(shape, [self.pos(i) for i in range(4)])
+        self.assertEqual(pred.distances, [(1, 0, "clip", 0), (1, 1, "clip", 1), (1, 2, "cull", 0)])
+        self.assertIsNone(pred.misc)
+        self.assertEqual((pred.clip_count, pred.cull_count), (2, 1))
+        self.assertEqual(export_diff.vs_structure(pred), sorted([
+            "BuiltIn %out_pos Position", "BuiltIn %out_clip ClipDistance", "Array %out_clip 2",
+            "BuiltIn %out_cull CullDistance", "Array %out_cull 1"]))
+
+    def test_misc_vector_shifts_to_pos2(self):
+        shape = export_diff.VsShape(self.svs(clip=1, misc=("rtai",)), True)
+        pred = export_diff.vs_model(shape, [self.pos(i) for i in range(4)])
+        self.assertEqual(pred.misc, "pos1")
+        self.assertEqual(pred.distances, [(2, 0, "clip", 0)])
+        self.assertTrue(pred.layer)
+        self.assertFalse(pred.viewport)
+        self.assertIn("BuiltIn %out_layer Layer", export_diff.vs_structure(pred))
+
+    def test_misc_pos1_z_off_writes_no_misc_builtin(self):
+        shape = export_diff.VsShape(self.svs(clip=1, misc=("rtai", "vai")), True)
+        pred = export_diff.vs_model(shape, [self.pos(0), self.pos(1, (1, 1, 0, 1)), self.pos(2)])
+        self.assertFalse(pred.layer)
+        self.assertFalse(pred.viewport)
+        self.assertEqual(pred.distances, [(2, 0, "clip", 0)])
+
+    def test_no_osg1_discards(self):
+        pred = export_diff.vs_model(export_diff.VsShape([], False), [self.pos(i) for i in range(4)])
+        self.assertEqual(pred.discarded, [1, 2, 3])
+        self.assertEqual(export_diff.vs_structure(pred), ["BuiltIn %out_pos Position"])
+
+    def test_empty_osg1_vs(self):
+        pred = export_diff.vs_model(export_diff.VsShape([], True), [self.pos(i) for i in range(4)])
+        self.assertEqual(pred.discarded, [1, 2, 3])
+        self.assertEqual(export_diff.vs_structure(pred), ["BuiltIn %out_pos Position"])
+
+    def test_over_eight_floats_clamps(self):
+        # "up to 8 floats total": the ninth clip component is dropped, nothing is refused.
+        shape = export_diff.VsShape(self.svs(clip=9, cull=1), True)
+        pred = export_diff.vs_model(shape, [self.pos(i) for i in range(4)])
+        self.assertEqual((pred.clip_count, pred.cull_count), (8, 0))
+        self.assertEqual(len(pred.distances), 8)
+        self.assertEqual(pred.distances[:4], [(1, c, "clip", c) for c in range(4)])
+        self.assertEqual(pred.distances[4:], [(2, c, "clip", 4 + c) for c in range(4)])
+        self.assertEqual(pred.refusals, [])
+
+    def test_params(self):
+        shape = export_diff.VsShape(self.svs(), True)
+        pred = export_diff.vs_model(shape, [self.pos(0), export_diff.VsExport("param", 0, self.ON),
+                                            export_diff.VsExport("param", 5, self.ON)])
+        self.assertEqual(pred.params, {0: 0, 5: 5})
+        self.assertIn("Location %out_param5 5", export_diff.vs_structure(pred))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
