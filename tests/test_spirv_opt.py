@@ -22,7 +22,7 @@ SPIRV_AS = shutil.which("spirv-as")
 SPIRV_VAL = shutil.which("spirv-val")
 
 
-def _validate(spvasm: str) -> None:
+def _validate(spvasm: str, target_env: str = "vulkan1.2") -> None:
     if not (SPIRV_AS and SPIRV_VAL):
         return
     with tempfile.TemporaryDirectory() as d:
@@ -30,8 +30,8 @@ def _validate(spvasm: str) -> None:
         with open(sa, "w", encoding="utf-8", newline="\n") as f:
             f.write(spvasm)
         for cmd in (
-            [SPIRV_AS, sa, "-o", sv, "--target-env", "vulkan1.2"],
-            [SPIRV_VAL, "--target-env", "vulkan1.2", "--allow-offset-texture-operand", sv],
+            [SPIRV_AS, sa, "-o", sv, "--target-env", target_env],
+            [SPIRV_VAL, "--target-env", target_env, "--allow-offset-texture-operand", sv],
         ):
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
@@ -340,6 +340,76 @@ class SpirvOptTests(unittest.TestCase):
         self.assertIn("OpStore %a %a22", opt_agg)
         self.assertIn("%r = OpLoad %uint %p0", opt_agg)
         self.assertIn("OpCompositeConstruct %v4uint %r %u0 %u0 %u0", opt_agg)
+
+    def test_volatile_helper_invocation_reads_survive(self):
+        for member, grouped in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(member=member, grouped=grouped):
+                if member:
+                    builtin = "OpDecorate %state_block Block\nOpMemberDecorate %state_block 0 BuiltIn HelperInvocation"
+                    state_types = "%state_block = OpTypeStruct %bool\n%block_ptr = OpTypePointer Input %state_block"
+                    state_var = "%state = OpVariable %block_ptr Input"
+                    state_access = "%member_ptr = OpAccessChain %input_ptr %state %zero"
+                    state_ptr = "%member_ptr"
+                    direct = "OpMemberDecorate %state_block 0 Volatile"
+                    application = "OpGroupMemberDecorate %volatile_group %state_block 0"
+                else:
+                    builtin = "OpDecorate %state BuiltIn HelperInvocation"
+                    state_types = state_access = ""
+                    state_var = "%state = OpVariable %input_ptr Input"
+                    state_ptr = "%state"
+                    direct = "OpDecorate %state Volatile"
+                    application = "OpGroupDecorate %volatile_group %state"
+                volatile = ("OpDecorate %volatile_group Volatile\n"
+                            f"%volatile_group = OpDecorationGroup\n{application}") if grouped else direct
+                raw = f"""
+                    OpCapability Shader
+                    OpCapability DemoteToHelperInvocation
+                    OpMemoryModel Logical GLSL450
+                    OpEntryPoint Fragment %main "main" %state %front %color
+                    OpExecutionMode %main OriginUpperLeft
+                    {builtin}
+                    {volatile}
+                    OpDecorate %front BuiltIn FrontFacing
+                    OpDecorate %color Location 0
+                    %void = OpTypeVoid
+                    %fn = OpTypeFunction %void
+                    %bool = OpTypeBool
+                    %uint = OpTypeInt 32 0
+                    %zero = OpConstant %uint 0
+                    %one = OpConstant %uint 1
+                    %input_ptr = OpTypePointer Input %bool
+                    {state_types}
+                    %output_ptr = OpTypePointer Output %uint
+                    {state_var}
+                    %front = OpVariable %input_ptr Input
+                    %color = OpVariable %output_ptr Output
+                    %main = OpFunction %void None %fn
+                    %entry = OpLabel
+                    {state_access}
+                    %before = OpLoad %bool {state_ptr}
+                    %front_before = OpLoad %bool %front
+                    OpSelectionMerge %merge None
+                    OpBranchConditional %front_before %demote %merge
+                    %demote = OpLabel
+                    OpDemoteToHelperInvocation
+                    OpBranch %merge
+                    %merge = OpLabel
+                    %after = OpLoad %bool {state_ptr}
+                    %unused = OpLoad %bool {state_ptr}
+                    %front_after = OpLoad %bool %front
+                    %changed = OpLogicalNotEqual %bool %before %after
+                    %visible = OpLogicalAnd %bool %changed %front_after
+                    %out = OpSelect %uint %visible %one %zero
+                    OpStore %color %out
+                    OpReturn
+                    OpFunctionEnd
+                """
+                _validate(raw, "vulkan1.3")
+                opt = spirv_opt.optimize(raw)
+                _validate(opt, "vulkan1.3")
+                self.assertEqual(opt.count(f"OpLoad %bool {state_ptr}"), 3)
+                self.assertIn("OpLogicalNotEqual %bool %before %after", opt)
+                self.assertEqual(opt.count("OpLoad %bool %front"), 1)
 
     def test_wave64_emulated_compute_validates_and_shrinks(self):
         cs_lines = [

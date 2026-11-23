@@ -1032,7 +1032,11 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
     array_elem_type: dict[str, str] = {}                    # arr_type_id -> elem_type_id
     zero_const_of_type: dict[str, str] = {}                 # scalar_type_id -> zero_const_id
     const_null_type: dict[str, str] = {}                    # null_const_id -> array_type_id
-    readonly_global_vars: set[str] = set()                  # PushConstant and Input OpVariables
+    readonly_candidates: dict[str, str] = {}              # Input/PushConstant variable -> pointer type
+    pointer_pointees: dict[str, str] = {}                   # pointer type -> pointee type
+    volatile_ids: set[str] = set()
+    volatile_structs: set[str] = set()
+    group_decorations: list[tuple[str, list[str]]] = []
     glsl_sets: set[str] = set()
     decorated_ids: set[str] = set()
 
@@ -1061,15 +1065,19 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 continue
             if op == "OpDecorate" and args:
                 decorated_ids.add(args[0])
+                if len(args) >= 2 and args[1] == "Volatile":
+                    volatile_ids.add(args[0])
+            elif op == "OpMemberDecorate" and len(args) >= 3 and args[2] == "Volatile":
+                volatile_structs.add(args[0])
             elif op == "OpDecorateId" and args:
                 decorated_ids.add(args[0])
                 for tok in args[2:]:
                     if tok.startswith("%"):
                         decorated_ids.add(tok)
-            elif op == "OpGroupDecorate" and len(args) >= 2:
-                for tok in args[1:]:
-                    if tok.startswith("%"):
-                        decorated_ids.add(tok)
+            elif op in ("OpGroupDecorate", "OpGroupMemberDecorate") and len(args) >= 2:
+                group_decorations.append((op, args))
+                if op == "OpGroupDecorate":
+                    decorated_ids.update(tok for tok in args[1:] if tok.startswith("%"))
             elif op == "OpTypeInt" and res and len(args) >= 2:
                 try:
                     w, s = int(args[0]), int(args[1])
@@ -1110,8 +1118,10 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 const_null_type[res] = args[0]
             elif op == "OpTypeArray" and res and args:
                 array_elem_type[res] = args[0]
+            elif op == "OpTypePointer" and res and len(args) >= 2 and args[0] in ("PushConstant", "Input"):
+                pointer_pointees[res] = args[1]
             elif op == "OpVariable" and res and len(args) >= 2 and args[1] in ("PushConstant", "Input"):
-                readonly_global_vars.add(res)
+                readonly_candidates[res] = args[0]
         else:
             parsed = _parse_line(raw)
             if parsed is not None and parsed[1] == "OpFunctionEnd":
@@ -1120,6 +1130,21 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
 
     if not func_ranges:
         return spvasm
+
+    for op, args in group_decorations:
+        group, *targets = args
+        if group in volatile_ids:
+            if op == "OpGroupDecorate":
+                volatile_ids.update(targets)
+            else:
+                volatile_structs.update(targets[::2])
+
+    # HelperInvocation may change at demote. Neither CSE nor DCE may remove a volatile read.
+    # Readonly-load analysis follows a pointer back to its whole variable, including input blocks.
+    readonly_global_vars = {
+        var_id for var_id, pointer_type in readonly_candidates.items()
+        if var_id not in volatile_ids and pointer_pointees.get(pointer_type) not in volatile_structs
+    }
 
     const_null_elem_zero: dict[str, str] = {}
     for null_id, arr_ty in const_null_type.items():
