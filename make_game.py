@@ -61,7 +61,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
     sys.exit("ERROR: Python 3.12 or newer is needed: https://www.python.org/downloads/")
@@ -2620,35 +2620,26 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
     failed = False
     ex = ThreadPoolExecutor(max_workers=max(1, len(work_items) + (1 if "pipelines" in stages else 0)))
     try:
-        futures = {name: ex.submit(_invoke_stage, name, fn) for name, fn in work_items}
-
-        def wait(name: str) -> bool:
-            """True when the stage finished cleanly. Marks the build failed on error."""
-            nonlocal failed
-            try:
-                futures[name].result()
-                progress.complete(name)
-                return True
-            except Exception:
-                failed = True
-                return False
-
-        if "pipelines" in stages:
-            shaders_ok = wait("shaders") if "shaders" in futures else True
-            if shaders_ok:
-                # When runtime is in this run it rebuilds vk_pipeline_check at the same path: wait for it so
-                # pipelines does not validate with a stale binary or race the Windows linker. A checker already
-                # on disk is enough only when this run is not rebuilding it.
-                runtime_ok = wait("runtime") if "runtime" in futures else True
-                if runtime_ok:
-                    futures["pipelines"] = ex.submit(_invoke_stage, "pipelines", fn_pipelines)
-
-        for name, fut in list(futures.items()):
-            try:
-                fut.result()
-                progress.complete(name)
-            except Exception:
-                failed = True
+        pending = {ex.submit(_invoke_stage, name, fn): name for name, fn in work_items}
+        start_pipelines = "pipelines" in stages
+        # A selected runtime rebuild replaces vk_pipeline_check at the same path. Require successful
+        # completion of both selected prerequisites before pipelines uses their outputs.
+        pipeline_prerequisites = {"shaders", "runtime"}.intersection(stages)
+        while True:
+            if start_pipelines and not pipeline_prerequisites:
+                pending[ex.submit(_invoke_stage, "pipelines", fn_pipelines)] = "pipelines"
+                start_pipelines = False
+            if not pending:
+                break
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                name = pending.pop(future)
+                try:
+                    future.result()
+                    progress.complete(name)
+                    pipeline_prerequisites.discard(name)
+                except Exception:
+                    failed = True
         ex.shutdown(wait=True)
     except KeyboardInterrupt:
         # Default ThreadPoolExecutor.__exit__ waits for workers; a worker blocked in
