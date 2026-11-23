@@ -4,6 +4,7 @@ Each tool can be: found automatically, pointed to by the user ("Locate"), or dow
 their normal window so the user sees and accepts each one's licence and the Windows admin prompt themselves.
 """
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -44,7 +45,10 @@ TOOLS = [
      "why": "Shader disassembler, built from source (20-40 min)",
      "get": ("script", "scripts\\build_llvm_mc.ps1"), "locate": ("file", "llvm-mc.exe")},
     {"key": "ffmpeg", "label": "ffmpeg", "required": False, "why": "Decodes XMA2 audio, needed for WAV",
-     "get": ("zip", "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip", "ffmpeg.exe"),
+     # Pinned build: the ZIP isn't signed, so its SHA-256 is checked before unpacking. The hash is gyan.dev's
+     # published one for this file, confirmed against a download. To bump: new packages/ URL + its .sha256.
+     "get": ("zip", "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.1-essentials_build.zip", "ffmpeg.exe"),
+     "sha256": "b9bbbb3acece000cbeec994f856649354e52c773807841e78908374b24d658fd",
      "locate": ("file", "ffmpeg.exe")},
 ]
 BY_KEY = {t["key"]: t for t in TOOLS}
@@ -280,6 +284,22 @@ def run_installer(path, args=()):
     k32.GetExitCodeProcess(ctypes.c_void_p(sei.hProcess), ctypes.byref(code))
     k32.CloseHandle(ctypes.c_void_p(sei.hProcess))
     return code.value
+
+
+def verify_sha256(path, want):
+    """Refuse a download whose SHA-256 isn't the pinned one (and delete it). Raises with the reason."""
+    if not want:
+        return
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest().lower() != want.lower():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise RuntimeError("The download doesn't match its pinned SHA-256, so it wasn't unpacked")
 
 
 def unzip_tool(zpath, exe_name):

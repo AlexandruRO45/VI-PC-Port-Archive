@@ -758,7 +758,8 @@ class App(tk.Tk):
             try:
                 path = toolbox.download(t["get"][1], lambda d, tot: self.q.put(("tprog", key, d, tot)), cancel)
                 if kind == "zip":
-                    self.q.put(("tstate", key, "installing", "Unpacking…"))
+                    self.q.put(("tstate", key, "installing", "Checking and unpacking…"))
+                    toolbox.verify_sha256(path, t.get("sha256"))
                     exe = toolbox.unzip_tool(path, t["get"][2])
                     self.q.put(("tlocated", key, exe))
                 else:
