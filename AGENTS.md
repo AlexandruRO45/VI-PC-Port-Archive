@@ -97,5 +97,10 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
   are the texture and model tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
   `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `world_grid_atlas.py`,
   `tex_headers.py` and `skinned_glb.py` (which fall back to the standard library when numpy is absent).
+- A JSON, CSV or word-list file the user wrote (a carve `index.json`, a pins list, a dictionary) may start with a byte
+  order mark. Windows PowerShell 5.1 and Notepad write one, and `json.load` then fails with `Unexpected UTF-8 BOM`
+  (verified: `b'\xef\xbb\xbf{"a": 1}'` read as `utf-8` raises that, read as `utf-8-sig` returns `{"a": 1}`). Our own
+  `json.dump` writes none, so a BOM means the file was edited or redirected by hand. Open those inputs as
+  `encoding="utf-8-sig"`; a list written with `>` in Windows PowerShell 5.1 is UTF-16LE (`ff fe`), not UTF-8.
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.
