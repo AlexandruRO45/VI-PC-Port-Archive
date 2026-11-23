@@ -224,5 +224,14 @@ class SMinU32AstInterpreterTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr(2), 0x40000000)
         self.assertEqual(state.scc, 0)
 
+class SMinU32SimdDivergenceTests(unittest.TestCase):
+    def test_min_u32_scc_transitions(self):
+        # Non-zero SCC
+        res1, scc1 = oracle_min_u32(0x10, 0x20)
+        self.assertEqual(scc1, 1)
+        # Zero SCC
+        res2, scc2 = oracle_min_u32(0x20, 0x10)
+        self.assertEqual(scc2, 0)
+
 if __name__ == "__main__":
     unittest.main()
