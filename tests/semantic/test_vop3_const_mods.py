@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -178,13 +179,34 @@ class F16AndMixConstModifierTests(unittest.TestCase):
         ])
         self.assertEqual(got[:3], [0x4000BC00, 0x00007C01, 0x7C01FC01])
 
-    def test_v_pack_b32_f16_abs_is_still_rejected(self):
-        # Only `neg` is measured on this instruction; `abs` would be a guessed sign clear, so it stays refused.
-        with self.assertRaises(rdna2spirv.Unsupported):
-            translate(["v_pack_b32_f16 v0, abs(0x3c00), 1.0"])
-
+    def test_v_pack_b32_f16_abs_clears_the_sign_of_the_packed_half(self):
+        # `abs` is the ISA's sign clear (|S|), applied before `neg`; it has no hardware run of this instruction yet.
+        got = run([
+            "v_mov_b32 v1, 0xbc00",
+            "v_pack_b32_f16 v0, abs(0xbc00), 0x4000",     # +1.0h in the low half, 2.0h in the high one
+            "v_pack_b32_f16 v2, -abs(v1), v1",            # clear then flip the low half; src1 stays -1.0h
+        ])
+        self.assertEqual(got[:3], [0x40003C00, 0x0000BC00, 0xBC00BC00])
 
 class F64ConstModifierStructureTests(unittest.TestCase):
+    def test_f64_literal_and_inline_source_words(self) -> None:
+        fixture = Path(HERE) / "fixtures" / "f64_literals.asm"
+        instructions = [line for line in fixture.read_text(encoding="utf-8").splitlines()
+                        if line and not line.startswith(";")]
+        spv = translate(instructions)
+        words = {name: int(value) for name, value in
+                 re.findall(r"(%\w+) = OpConstant %uint (\d+)", spv)}
+        pairs = {name: (words[high] << 32) | words[low] for name, low, high in
+                 re.findall(r"(%\w+) = OpCompositeConstruct %v2uint_d (%\w+) (%\w+)", spv)}
+        doubles = {name: pairs[pair] for name, pair in
+                   re.findall(r"(%\w+) = OpBitcast %double (%\w+)", spv)}
+        conversions = re.findall(r"OpFConvert %float (%\w+)", spv)
+        additions = re.findall(r"OpFAdd %double (%\w+) (%\w+)", spv)
+        self.assertEqual([doubles[source] for source in conversions],
+                         [0x3FF8000000000000, 0xFFF0000000000000, 64, 0xFFFFFFFFFFFFFFFF])
+        self.assertEqual([(doubles[left], doubles[right]) for left, right in additions],
+                         [(0x0000000100000000, 1), (0x3FF0000000000000, 0xBFF8000000000000)])
+
     def test_f64_emits_fabs_then_fnegate_for_neg_abs_const(self):
         spv = translate([
             "v_cvt_f32_f64 v0, -|1.0|",
