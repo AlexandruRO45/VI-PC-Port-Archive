@@ -18,6 +18,7 @@ unavailable or the GPU is not GFX10. Nothing here reads game files.
 A --json path is checked before the hardware oracle is opened: an empty path, a NUL byte, a directory, or a parent
 component that is not a directory is one ERROR line on stderr and exit 2. Missing parent folders are created when the
 report is written; a report that cannot be written is one ERROR line and exit 2 as well.
+Usage: `python -I tools/cvt_f16_omod_probe.py --help` lists the options.
 """
 import argparse
 import json
