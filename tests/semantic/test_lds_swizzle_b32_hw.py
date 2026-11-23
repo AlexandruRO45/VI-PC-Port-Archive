@@ -377,3 +377,57 @@ class TestDsSwizzleB32FlagsAndCondition(unittest.TestCase):
         self.assertEqual(initial_scc, 1)
         self.assertEqual(initial_vcc, 0x12345678)
         self.assertEqual(state.exec_mask, initial_exec)
+
+# -----------------------------------------------------------------------------
+# Commit 7: Subgroup Routing, Boundary Extremes, and Translator Validation
+# -----------------------------------------------------------------------------
+def make_fssm_header(threads: int = 32, rsrc2: int = 0x8088) -> bytes:
+    h = bytearray(0x148)
+    struct.pack_into("<4I", h, 0x138, rsrc2, threads, 1, 1)
+    return bytes(h)
+
+
+class TestDsSwizzleB32Translator(unittest.TestCase):
+    def _run_cs_swizzle(self, swizzle_line: str, wave: int = 32) -> list[int]:
+        lines = [
+            "v_add_nc_u32_e32 v1, 100, v0",
+            swizzle_line,
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        fssm = make_fssm_header(wave)
+        spvasm = support.translate_lines("cs_swizzle_val", lines, fssm=fssm)
+        mem = {4 * i: 0xEEEEEEEE for i in range(wave)}
+        si.run_workgroup(
+            spvasm,
+            wave,
+            wave,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28,
+            memory=mem,
+        )
+        return [mem[4 * i] for i in range(wave)]
+
+    def test_translator_swap_1(self) -> None:
+        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,1)")
+        # Lanes 0..3: 101, 100, 103, 102
+        self.assertEqual(res[0:4], [101, 100, 103, 102])
+
+    def test_translator_swap_2(self) -> None:
+        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,2)")
+        # Lanes 0..3: 102, 103, 100, 101
+        self.assertEqual(res[0:4], [102, 103, 100, 101])
+
+    def test_translator_reverse_4(self) -> None:
+        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:swizzle(REVERSE,4)")
+        self.assertEqual(res[0:4], [103, 102, 101, 100])
+
+    def test_translator_broadcast_quad(self) -> None:
+        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:swizzle(BROADCAST,4,0)")
+        self.assertEqual(res[0:4], [100, 100, 100, 100])
+
+    def test_translator_numeric_quad_perm(self) -> None:
+        # 0x801F = QUAD_PERM(3, 3, 1, 0)
+        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:0x801f")
+        self.assertEqual(res[0:4], [103, 103, 101, 100])
