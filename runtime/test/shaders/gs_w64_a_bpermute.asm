@@ -1,5 +1,6 @@
 ; SHADER-10 tier A, geometry stage: ds_bpermute_b32 in a wave64 legacy (LDS-ring) geometry shader (the geometry
-; counterpart of vs_w64_a_bpermute and ps_w64_a_bpermute). Drawn with vs_ids (param1 = 0x101 + vertex index): triangle
+; counterpart of ps_w64_a_bpermute, and of the vertex fixture vs_w64_a_bpermute in the separate pull request #7311,
+; which this file does not depend on). Drawn with vs_ids (param1 = 0x101 + vertex index): triangle
 ; p = (TEXCOORD0.x of input vertex 0 - 0x101) / 3, as in gs_w64_a_ring. Triangle p sends values to the lane that reads
 ; them. Measured with gs_w64_c_lane_id on one GPU only (RADV Mesa 26.3.1, gfx1036; other GPUs may pack differently), the
 ; 320 triangles of the draw go to waves of 42 invocations at wave64 (first triangles 0, 42, 84, 126, ...) and, at wave32,

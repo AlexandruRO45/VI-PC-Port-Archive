@@ -174,6 +174,7 @@ def test_expected_words_of_the_gpu_fixtures():
     assert w64_graphics._vs_a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)
     assert w64_graphics._vs_b_readlane_uniform(70) == (6 + 123, 200, 6 + 123, 277)
     assert w64_graphics._vs_c_lane_id(700) == (None, None, 700, 0)
+    assert w64_graphics._gs_a_bpermute(43) == (42, 133, 43, 21)                       # lane ^ 1 pairs triangle 43 with 42
 
 
 def test_vs_probe_and_radv_perftest(monkeypatch):
