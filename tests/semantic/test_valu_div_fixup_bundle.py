@@ -632,5 +632,24 @@ class TestVDivFixupF64HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_div_fixup_f64(2.5, 2.0, 5.0), 2.5)
 
 
+def ref_rcp_iflag_f32(src: float) -> float:
+    """Reference mathematical oracle for RDNA2 v_rcp_iflag_f32."""
+    if math.isnan(src):
+        return float("nan")
+    if src == 0.0:
+        return math.copysign(float("inf"), src)
+    if math.isinf(src):
+        return math.copysign(0.0, src)
+    return 1.0 / src
+
+
+class TestVRcpIflagF32Reference(unittest.TestCase):
+    """Reference oracle unit tests for v_rcp_iflag_f32."""
+
+    def test_reference_canonical(self):
+        self.assertEqual(ref_rcp_iflag_f32(2.0), 0.5)
+        self.assertEqual(ref_rcp_iflag_f32(4.0), 0.25)
+
+
 if __name__ == "__main__":
     unittest.main()
