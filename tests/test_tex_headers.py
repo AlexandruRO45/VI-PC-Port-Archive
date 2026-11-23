@@ -4,6 +4,7 @@ GFX10 format mapping, and texture descriptor parsing from synthetic blobs.
     python -I tests/test_tex_headers.py
 """
 import contextlib
+import errno
 import io
 import json
 import os
@@ -896,6 +897,70 @@ class CliInputTest(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "tex_headers.py"), *args],
                               capture_output=True, text=True, timeout=60)
+
+    def check_directory_read_error(self, discovery=False, existing_report=True, iteration=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "a")
+            os.makedirs(archive)
+            manifest = os.path.join(archive, "index.json")
+            with open(manifest, "wb") as f:
+                f.write(b'{"files": []}')
+            output = os.path.join(tmp, "textures.json")
+            if existing_report:
+                with open(output, "wb") as f:
+                    f.write(b"previous report\n")
+            failed_path = tmp if discovery else archive
+            error = PermissionError(errno.EACCES, "synthetic directory read failure", failed_path)
+            operation = "listdir" if discovery else "scandir"
+            argv = ["tex_headers.py", tmp, "--out", output]
+            if not discovery:
+                argv += ["--archives", "a"]
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(tex_headers.os, operation) as listing, \
+                    mock.patch.object(tex_headers, "scan_archive") as scan, \
+                    mock.patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                if iteration:
+                    # scandir can open successfully and fail while advancing its iterator.
+                    def failed_entries():
+                        entry = mock.Mock()
+                        entry.name = "unrelated.txt"
+                        entry.is_symlink.return_value = False
+                        entry.is_file.return_value = False
+                        yield entry
+                        raise error
+                    listing.return_value.__enter__.return_value = failed_entries()
+                else:
+                    listing.side_effect = error
+                result = tex_headers.main()
+            self.assertEqual(result, 2)
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            self.assertIn("ERROR: cannot read", stderr.getvalue())
+            self.assertIn(failed_path, stderr.getvalue())
+            self.assertIn(error.strerror, stderr.getvalue())
+            self.assertEqual(stdout.getvalue(), "")
+            scan.assert_not_called()
+            if existing_report:
+                with open(output, "rb") as f:
+                    self.assertEqual(f.read(), b"previous report\n")
+            else:
+                self.assertFalse(os.path.exists(output))
+            with open(manifest, "rb") as f:
+                self.assertEqual(f.read(), b'{"files": []}')
+
+    def test_unreadable_carve_discovery_is_one_error_line(self):
+        self.check_directory_read_error(discovery=True)
+
+    def test_unreadable_archive_preflight_is_one_error_line(self):
+        # Existing reports use the symlink prefilter; missing reports enumerate all input files.
+        for existing in (True, False):
+            with self.subTest(existing_report=existing):
+                self.check_directory_read_error(existing_report=existing)
+
+    def test_archive_preflight_iteration_error_is_one_error_line(self):
+        for existing in (True, False):
+            with self.subTest(existing_report=existing):
+                self.check_directory_read_error(existing_report=existing, iteration=True)
 
     def test_out_in_a_missing_folder_is_created(self):
         # Before: main() opened --out directly after the scan, so this ended in a FileNotFoundError traceback.
