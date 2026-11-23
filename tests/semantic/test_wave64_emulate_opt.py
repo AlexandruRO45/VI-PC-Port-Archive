@@ -1711,6 +1711,77 @@ class StructuredEmulationTests(unittest.TestCase):
         self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
         self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
 
+    def test_bitset_dest_read_prevents_unsafe_execz_fold(self):
+        # SHADER-767: s_bitset0/1_b32/b64 read-modify-write their destination SGPR(s). If _scalar_rw omits
+        # that destination read, find_local_exec_folds folds an EXECZ region whose only live-out consumer in
+        # the join block is s_bitset*, leaving the 63 inactive lanes per wave64 with the pre-region value.
+        cases = (
+            ("s_bitset0_b32", "b32", "s_bitset0_b32 s16, 2", 0x15 & ~(1 << 2)),
+            ("s_bitset1_b32", "b32", "s_bitset1_b32 s16, 3", 0x15 | (1 << 3)),
+            ("s_bitset0_b64", "b64", "s_bitset0_b64 s[16:17], 33", 0x15 + (0x2A & ~(1 << 1))),
+            ("s_bitset1_b64", "b64", "s_bitset1_b64 s[16:17], 34", 0x15 + (0x2A | (1 << 2))),
+            ("s_bitset1_b64_hi_only", "b64_hi", "s_bitset1_b64 s[16:17], 34", 0x2A | (1 << 2)),
+        )
+        for op_name, mode, bitset_asm, want in cases:
+            if mode == "b32":
+                insns = [
+                    ("s_mov_b64 exec, -1", 4),
+                    ("s_mov_b32 s16, 0", 4),
+                    ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+                    ("v_and_b32_e32 v1, 63, v0", 4),
+                    ("v_cmp_eq_u32_e64 s[6:7], 0, v1", 8),
+                    ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+                    ("s_cbranch_execz 1", 4),
+                    ("s_mov_b32 s16, 21", 4),
+                    ("s_or_b64 exec, exec, s[8:9]", 4),
+                    (bitset_asm, 4),
+                    ("v_mov_b32_e32 v4, s16", 4),
+                    ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+                    ("s_endpgm", 4),
+                ]
+            elif mode == "b64_hi":
+                insns = [
+                    ("s_mov_b64 exec, -1", 4),
+                    ("s_mov_b32 s16, 0", 4),
+                    ("s_mov_b32 s17, 0", 4),
+                    ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+                    ("v_and_b32_e32 v1, 63, v0", 4),
+                    ("v_cmp_eq_u32_e64 s[6:7], 0, v1", 8),
+                    ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+                    ("s_cbranch_execz 1", 4),
+                    ("s_mov_b32 s17, 42", 4),
+                    ("s_or_b64 exec, exec, s[8:9]", 4),
+                    (bitset_asm, 4),
+                    ("v_mov_b32_e32 v4, s17", 4),
+                    ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+                    ("s_endpgm", 4),
+                ]
+            else:
+                insns = [
+                    ("s_mov_b64 exec, -1", 4),
+                    ("s_mov_b32 s16, 0", 4),
+                    ("s_mov_b32 s17, 0", 4),
+                    ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+                    ("v_and_b32_e32 v1, 63, v0", 4),
+                    ("v_cmp_eq_u32_e64 s[6:7], 0, v1", 8),
+                    ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+                    ("s_cbranch_execz 2", 4),
+                    ("s_mov_b32 s16, 21", 4),
+                    ("s_mov_b32 s17, 42", 4),
+                    ("s_or_b64 exec, exec, s[8:9]", 4),
+                    (bitset_asm, 4),
+                    ("s_add_u32 s18, s16, s17", 4),
+                    ("v_mov_b32_e32 v4, s18", 4),
+                    ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+                    ("s_endpgm", 4),
+                ]
+            for lx in (64, 128):
+                with self.subTest(op=op_name, threads=lx):
+                    spv, _ = _translate_encoded(f"cs_{op_name}_{lx}", insns, (lx, 1, 1), emulate=True, rsrc2=0x20088)
+                    mem, _ = run_emulated_workgroup(spv, (lx, 1, 1), push_constants=VSHARP + [0] * 28)
+                    for lane in range(lx):
+                        self.assertEqual(mem[lane * 4], want, f"{op_name} lx={lx} lane={lane}")
+
 
 if __name__ == "__main__":
     unittest.main()

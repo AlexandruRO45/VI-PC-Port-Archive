@@ -296,7 +296,7 @@ def _get_op_meta(raw_op):
             scratch_acc = (True, False)
 
     flags = 0
-    if op == "s_cmov_b32" or op == "s_cmov_b64":
+    if op in ("s_cmov_b32", "s_cmov_b64", "s_bitset0_b32", "s_bitset0_b64", "s_bitset1_b32", "s_bitset1_b64"):
         flags |= _FLAG_CMOV_RD_DEST | _FLAG_NO_KILL_DEST
     elif op == "s_cmovk_i32":
         flags |= _FLAG_NO_KILL_DEST
