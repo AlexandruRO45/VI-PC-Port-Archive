@@ -186,8 +186,10 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
 
 ## Shader translation (RDNA → SPIR-V)
 
-`tools\rdna2spirv.py` (needs `spirv-as`/`spirv-val` on PATH: Vulkan SDK, or `spirv-tools` in WSL) translates parsed RDNA
-code to SPIR-V assembly, assembles it with `spirv-as`, and validates it with `spirv-val` (Vulkan 1.2). It runs one
+`tools\rdna2spirv.py` translates parsed RDNA code to SPIR-V assembly, assembles it with `spirv-as` (or, with
+`--assembler python`, in-process through `tools/spirv_asm.py`, which needs no external `spirv-as`) and validates it
+with `spirv-val` (Vulkan 1.2). `spirv-val`, and `spirv-as` unless `--assembler python` is given, must be on PATH
+(Vulkan SDK, or `spirv-tools` in WSL). It runs one
 lane per invocation and keeps VGPRs and SGPRs as uint arrays with exact bit patterns. Version 0 treated EXEC as
 all-ones and covered only branch-free vertex and pixel shaders with no memory loads: common float and integer ALU
 ops and exports to `gl_Position`, params and MRTs. Unsupported instructions are reported by name, never guessed.
