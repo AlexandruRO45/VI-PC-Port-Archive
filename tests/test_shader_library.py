@@ -252,6 +252,15 @@ class Main(unittest.TestCase):
             with open(os.path.join(out, "fspx", "lib_ps_00000.json"), encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["digest"], [D_PS.hex()])
 
+    def test_carve_index_with_utf8_bom(self):
+        """A carve index.json re-saved with a UTF-8 BOM still names the programs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "PS_A.dxbc"), "wb") as f:
+                f.write(dxbc(D_PS))
+            with open(os.path.join(tmp, "index.json"), "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps([{"name": "PS_A", "file": "PS_A.dxbc"}]).encode("utf-8"))
+            self.assertEqual({k: [n for n, _ in v] for k, v in sl.carve_digests(tmp).items()}, {D_PS: ["PS_A"]})
+
     def test_translator_reads_compute_sidecar(self):
         import rdna2spirv
         with tempfile.TemporaryDirectory() as tmp:

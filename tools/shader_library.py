@@ -193,7 +193,7 @@ def carve_digests(folder: str) -> dict:
     """digest -> [(shader name, container path)] over a tools/shader_carve.py output folder (its index.json and
     .dxbc files)."""
     import shader_carve
-    with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(folder, "index.json"), encoding="utf-8-sig") as f:
         index = json.load(f)
     out = {}
     for e in index:
