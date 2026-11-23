@@ -665,7 +665,11 @@ device destruction, once each queue's submissions up to then have completed, whi
 the one every other queue's next submission waits for, as for storage images moved to `GENERAL` (D3D-314). A device
 whose update-after-bind pool limit has no room for a second set falls back to changing the set in place after
 waiting on the progress timelines of the queues with submissions still pending (`wait_retire_ticket`), not for
-the device. `d3d12_bindless_retire_test` grows the table while another queue's submission waits on a fence.
+the device. `d3d12_bindless_retire_test` grows the table while another queue's dispatch is pending on the GPU with
+the old set bound: it waits for a fence a COPY queue signals after about 300 ms of copies, submitted first, so the
+dispatch's batch reaches Vulkan at once instead of being held on the CPU (`rt::d3d12::submitted_retire_ticket`
+advances at its `ExecuteCommandLists`); the flush must return, and the retired set survive the next
+`ExecuteCommandLists`, while that dispatch still waits.
 
 A typed 3D color target supports default and explicit RTVs. The default covers mip 0; `FirstWSlice` and
 `WSize` select the depth slices in an explicit view's mip. `d3d12_clear_test --volume` checks full and

@@ -1,32 +1,40 @@
-// D3D-314: a bindless flush that replaces the set (the table grows) does not wait for the device. Two D3D12 queues on
-// two Vulkan queues, through the Xbox-ABI proxy, with the set-0 compute shader of d3d12_set0_compute_test
+// D3D-314: a bindless flush that replaces the set (the table grows) does not wait for the device. D3D12 queues on
+// distinct Vulkan queues, through the Xbox-ABI proxy, with the set-0 compute shader of d3d12_set0_compute_test
 // (test/glsl/cs_set0_sample.comp: the T# and the S# from the descriptor tables, looked up in binding 2):
-//   1. queue A executes a dispatch that samples the gradient behind a Wait on a gate fence nobody has signalled, so
-//      the submission stays pending with the set and table as they were;
+//   1. queue A executes a dispatch that samples the gradient behind a Wait on a gate fence the GPU signals: queue C
+//      (COPY) runs 64 MiB copies between host buffers, sized from a measured run to last about 300 ms, then signals
+//      the gate. C's Signal is submitted first, so A's batch reaches Vulkan at once, with a Vulkan wait and the set
+//      as it is bound (rt::d3d12::submitted_retire_ticket advances at its ExecuteCommandLists: nothing is held on the
+//      CPU, queue_holds.h). With two Vulkan queues only, the gate runs on A itself, ahead of the dispatch;
 //   2. 40 more textures get views: the hash table outgrows its buffer, so the next flush replaces the set;
-//   3. queue B executes a dispatch that samples the reflected texture: the ExecuteCommandLists returns and B's work
-//      completes while A still waits (before D3D-314 the flush waited for the device, here forever), and the old set
-//      and table are still alive (rt::d3d12::bindless_retired_count);
-//   4. the gate is signalled: A's dispatch reads the old table and gives the gradient; the next ExecuteCommandLists
-//      frees what was retired.
-// A watchdog signals the gate after 10 s so a flush that waits for A fails the test instead of hanging it. No game
-// data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation with synchronization validation
-// (0 errors required).
+//   3. queue B executes a dispatch that samples the reflected texture: its ExecuteCommandLists returns while the gate
+//      is still closed and A's dispatch pending on the GPU (a flush that waits for A, in place or for the device,
+//      returns only once the gate has opened), with the old set and table retired, not freed
+//      (rt::d3d12::bindless_retired_count);
+//   4. queue A executes a second dispatch of the reflected texture, through the new set: that ExecuteCommandLists,
+//      while the first dispatch still waits, keeps what was retired, and its batch waits for B's, which uploads the
+//      new table;
+//   5. B's work completes while the gate is closed; the gate opens: A's first dispatch reads the gradient through the
+//      old set and table, the second the reflected texture through the new ones; the next ExecuteCommandLists, once
+//      both have completed, frees what was retired;
+//   6. 40 more views, and B's next batch waits for a second gate: B's flush replaces the set again and B's batch
+//      uploads the new table only once the gate opens. A's next dispatch binds the new set while the gate is still
+//      closed: it must complete after the gate (it waits for B's batch), with the reflected texture.
+// No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation with synchronization validation
+// (0 errors required): it also reports a set or table freed under A's pending dispatch.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
 
+#include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -46,6 +54,9 @@ namespace {
 using Texel = std::array<std::uint8_t, 4>;
 constexpr UINT texture_size = 8, texels = texture_size * texture_size, run_bytes = texels * 4;
 constexpr UINT extra_textures = 40;  // with the four keys of the setup, past half of the table's first 64 slots
+constexpr UINT views = 2 + 2 * extra_textures;  // twice 40 extra textures: the table grows twice
+constexpr UINT64 gate_bytes = 64ull << 20;
+constexpr double gate_target_ms = 300;
 
 Texel gradient(UINT x, UINT y) {
     return {std::uint8_t(x * 36), std::uint8_t(y * 36), std::uint8_t(255 - (x + y) * 16), 255};
@@ -62,46 +73,14 @@ bool wait_for(ID3D12Fence* fence, UINT64 value, std::chrono::milliseconds timeou
     return true;
 }
 
-// Opens the gate (signals 1) after 10 s unless stopped first, and when destroyed with the gate still closed: a flush
-// that waits for the gated queue fails the test instead of hanging it, and an early return leaves no queue waiting.
-class Watchdog {
-public:
-    explicit Watchdog(ID3D12Fence* gate) : gate_(gate), thread_([this] {
-        std::unique_lock lock(mutex_);
-        if (wake_.wait_for(lock, std::chrono::seconds(10), [this] { return stop_; })) return;
-        fired_ = true;
-        gate_->Signal(1);
-    }) {}
-    ~Watchdog() {
-        stop();
-        if (gate_->GetCompletedValue() == 0) gate_->Signal(1);
-    }
-    Watchdog(const Watchdog&) = delete;
-    Watchdog& operator=(const Watchdog&) = delete;
-
-    void stop() {
-        {
-            std::lock_guard lock(mutex_);
-            stop_ = true;
-        }
-        wake_.notify_all();
-        if (thread_.joinable()) thread_.join();
-    }
-    bool fired() const { return fired_; }
-
-private:
-    ID3D12Fence* gate_;
-    std::mutex mutex_;
-    std::condition_variable wake_;
-    bool stop_ = false;
-    std::atomic<bool> fired_{false};
-    std::thread thread_;  // last: starts once the members above exist
-};
+double ms_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
 }  // namespace
 
 int main() {
     vktest::Device d;
-    d.queue_count_wanted = 2;
+    d.queue_count_wanted = 3;  // B, A and the gate's queue C; with two, the gate runs on A
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -127,10 +106,10 @@ int main() {
                  "\"uses_code_base\": false, \"wave64\": false}}";
     }
 
-    std::vector<std::uint8_t> results[2];
-    double execute_ms = 0;
-    std::size_t retired_while_pending = 0, retired_after = 0;
+    std::vector<std::uint8_t> results[4];  // A's first dispatch, B's, A's second, A's third
+    std::size_t retired_at_flush = 0, retired_while_pending = 0, retired_after = 0;
     UINT keys_found = 0;
+    bool third_waited = false;  // step 6: A's third dispatch waited for B's batch, which uploads the table
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -188,7 +167,7 @@ int main() {
         texture_desc.MipLevels = 1;
         texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         texture_desc.SampleDesc.Count = 1;
-        Ref<ID3D12Resource> textures[2], upload, outputs[2], readbacks[2];
+        Ref<ID3D12Resource> textures[2], upload, outputs[4], readbacks[4];
         for (auto& texture : textures)
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -200,7 +179,7 @@ int main() {
                                                          IID_PPV_ARGS(&upload.p))));
         const auto output_desc = buffer_desc(run_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         const auto readback_desc = buffer_desc(run_bytes);
-        for (UINT q = 0; q < 2; ++q) {
+        for (UINT q = 0; q < 4; ++q) {
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &output_desc,
                                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                              IID_PPV_ARGS(&outputs[q].p))));
@@ -221,7 +200,7 @@ int main() {
             }
 
         // Views: the two textures in slots 0 and 1, the extra textures after them. Samplers: one that wraps.
-        const D3D12_DESCRIPTOR_HEAP_DESC view_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 + extra_textures,
+        const D3D12_DESCRIPTOR_HEAP_DESC view_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, views,
                                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1,
                                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -250,22 +229,66 @@ int main() {
         sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
         device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu)});
 
-        // Queue B takes the first Vulkan queue, queue A the second.
+        // Queue B takes the first Vulkan queue, queue A the second, the gate's COPY queue C the third; with two
+        // Vulkan queues the gate runs on A, ahead of A's dispatch.
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
-        Ref<ID3D12CommandQueue> queue_b, queue_a;
+        Ref<ID3D12CommandQueue> queue_b, queue_a, queue_c;
         EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue_b.p))));
         EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue_a.p))));
-        Ref<ID3D12CommandAllocator> allocators[3];
-        Ref<ID3D12GraphicsCommandList> lists[3];
-        for (UINT i = 0; i < 3; ++i) {
+        D3D12_COMMAND_LIST_TYPE gate_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (d.queues.size() >= 3) {
+            gate_type = D3D12_COMMAND_LIST_TYPE_COPY;
+            const D3D12_COMMAND_QUEUE_DESC copy_desc{D3D12_COMMAND_LIST_TYPE_COPY};
+            EXPECT(SUCCEEDED(device->CreateCommandQueue(&copy_desc, IID_PPV_ARGS(&queue_c.p))));
+        }
+        ID3D12CommandQueue* gate_queue = queue_c.p ? queue_c.p : queue_a.p;
+        std::printf("gate on %s\n", queue_c.p ? "a COPY queue of its own" : "queue A, ahead of its dispatch");
+        Ref<ID3D12CommandAllocator> allocators[4], gate_allocator;
+        Ref<ID3D12GraphicsCommandList> lists[4], gate_list;
+        for (UINT i = 0; i < 4; ++i) {
             EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                             IID_PPV_ARGS(&allocators[i].p))));
             EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[i].p, nullptr,
                                                        IID_PPV_ARGS(&lists[i].p))));
         }
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(gate_type, IID_PPV_ARGS(&gate_allocator.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandList(0, gate_type, gate_allocator.p, nullptr,
+                                                   IID_PPV_ARGS(&gate_list.p))));
+        EXPECT(gate_list->Close() == S_OK);
         Ref<ID3D12Fence> uploaded, gate, done_a, done_b;
         for (auto* fence : {&uploaded, &gate, &done_a, &done_b})
             EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence->p))));
+        const auto gate_desc = buffer_desc(gate_bytes);
+        Ref<ID3D12Resource> gate_src, gate_dst;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &gate_desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         IID_PPV_ARGS(&gate_src.p))));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &gate_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&gate_dst.p))));
+
+        // The gate: `copies` copies of 64 MiB from an upload to a readback buffer, one after the other (a null
+        // aliasing barrier between them is a full memory barrier), then Signal(gate). Returns the value, 0 on failure.
+        UINT64 gate_value = 0;
+        const auto submit_gate = [&](UINT copies) -> UINT64 {
+            if (gate_list->Reset(gate_allocator.p, nullptr) != S_OK) return 0;
+            D3D12_RESOURCE_BARRIER between{};
+            between.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+            for (UINT i = 0; i < copies; ++i) {
+                if (i) gate_list->ResourceBarrier(1, &between);
+                gate_list->CopyBufferRegion(gate_dst.p, 0, gate_src.p, 0, gate_bytes);
+            }
+            if (gate_list->Close() != S_OK) return 0;
+            ID3D12CommandList* batch[] = {gate_list.p};
+            gate_queue->ExecuteCommandLists(1, batch);
+            return SUCCEEDED(gate_queue->Signal(gate.p, ++gate_value)) ? gate_value : 0;
+        };
+        // Two copies, timed, size the gate to about gate_target_ms.
+        const auto calibration_start = std::chrono::steady_clock::now();
+        const UINT64 calibrated = submit_gate(2);
+        EXPECT(calibrated && wait_for(gate.p, calibrated, std::chrono::seconds(30)));
+        const double two_copies_ms = std::max(ms_since(calibration_start), 0.5);
+        const UINT gate_copies = std::clamp(UINT(2 * gate_target_ms / two_copies_ms) + 1, 2u, 400u);
 
         // The uploads, on B.
         for (UINT i = 0; i < 2; ++i) {
@@ -309,46 +332,80 @@ int main() {
             return list->Close() == S_OK;
         };
 
-        // 1. A: the gradient, held back by the gate.
+        // 1. A: the gradient, behind the gate. The gate's Signal is submitted first, so A's batch goes to Vulkan now
+        // with a Vulkan wait for it, bound to the set as it is: the ticket of the last submission advances at A's
+        // ExecuteCommandLists. A batch held on the CPU would bind the set as it is when the gate releases it.
         EXPECT(record(lists[0].p, 0, 0));
-        Watchdog watchdog(gate.p);
-        EXPECT(SUCCEEDED(queue_a->Wait(uploaded.p, 1)) && SUCCEEDED(queue_a->Wait(gate.p, 1)));
+        const auto gate_start = std::chrono::steady_clock::now();
+        const UINT64 gate_open = submit_gate(gate_copies);
+        EXPECT(gate_open);
+        EXPECT(SUCCEEDED(queue_a->Wait(uploaded.p, 1)) && SUCCEEDED(queue_a->Wait(gate.p, gate_open)));
         ID3D12CommandList* a_lists[] = {lists[0].p};
+        const std::uint64_t ticket_before_a = rt::d3d12::submitted_retire_ticket(device.p);
         queue_a->ExecuteCommandLists(1, a_lists);
+        const std::uint64_t ticket_after_a = rt::d3d12::submitted_retire_ticket(device.p);
         EXPECT(rt::d3d12::last_execute_result(queue_a.p) == leonida::ReplayResult::success);
         EXPECT(SUCCEEDED(queue_a->Signal(done_a.p, 1)));
+        const bool gate_closed_at_a = gate->GetCompletedValue() < gate_open;
+        std::printf("A's ExecuteCommandLists behind the gate: submitted retire ticket %llu -> %llu (%s), gate %s\n",
+                    static_cast<unsigned long long>(ticket_before_a), static_cast<unsigned long long>(ticket_after_a),
+                    ticket_after_a > ticket_before_a ? "submitted to Vulkan" : "HELD on the CPU",
+                    gate_closed_at_a ? "closed" : "ALREADY OPEN");
+        EXPECT(ticket_after_a > ticket_before_a);
+        EXPECT(gate_closed_at_a);  // else the gate is too short to show anything
         const std::size_t retired_before = rt::d3d12::bindless_retired_count(device.p);
 
         // 2. More views than the table's first buffer holds.
-        Ref<ID3D12Resource> extra[extra_textures];
-        for (UINT i = 0; i < extra_textures; ++i) {
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
-                                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                                             IID_PPV_ARGS(&extra[i].p))));
-            device->CreateShaderResourceView(extra[i].p, &srv,
-                                             D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(view_cpu + (2 + i) * view_step)});
-        }
+        Ref<ID3D12Resource> extra[2 * extra_textures];
+        const auto add_views = [&](UINT first) {
+            for (UINT i = first; i < first + extra_textures; ++i) {
+                if (FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+                                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                           IID_PPV_ARGS(&extra[i].p))))
+                    return false;
+                device->CreateShaderResourceView(extra[i].p, &srv,
+                                                 D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(view_cpu + (2 + i) * view_step)});
+            }
+            return true;
+        };
+        EXPECT(add_views(0));
 
-        // 3. B: the reflected texture through the new set, while A still waits.
+        // 3. B: the reflected texture through the new set, while A's dispatch is pending on the GPU.
         EXPECT(record(lists[1].p, 1, 1));
         ID3D12CommandList* b_lists[] = {lists[1].p};
         const auto start = std::chrono::steady_clock::now();
         queue_b->ExecuteCommandLists(1, b_lists);
-        execute_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        const double execute_ms = ms_since(start);
+        const bool a_pending_after_b = gate->GetCompletedValue() < gate_open && done_a->GetCompletedValue() == 0;
         const bool b_executed = rt::d3d12::last_execute_result(queue_b.p) == leonida::ReplayResult::success;
         const bool b_signalled = SUCCEEDED(queue_b->Signal(done_b.p, 1));
-        const bool b_done = b_signalled && wait_for(done_b.p, 1, std::chrono::seconds(10));
-        const bool a_waiting = done_a->GetCompletedValue() == 0 && !watchdog.fired();
-        retired_while_pending = rt::d3d12::bindless_retired_count(device.p);
-        watchdog.stop();
+        retired_at_flush = rt::d3d12::bindless_retired_count(device.p);
 
-        // 4. Open the gate: A samples through the set it bound.
-        if (!watchdog.fired()) EXPECT(SUCCEEDED(gate->Signal(1)));
-        EXPECT(wait_for(done_a.p, 1, std::chrono::seconds(10)));
-        std::printf("flush with a pending submission on another queue: ExecuteCommandLists took %.2f ms, the other "
-                    "queue's submission %s\n", execute_ms, a_waiting ? "still pending" : "NOT pending");
-        EXPECT(b_executed && b_done && a_waiting);
-        EXPECT(retired_before == 0 && retired_while_pending >= 1);
+        // 4. A: the reflected texture through the new set, after A's first dispatch. This ExecuteCommandLists polls
+        // the retired sets and tables while the first dispatch still binds the old ones.
+        EXPECT(record(lists[3].p, 1, 2));
+        ID3D12CommandList* a2_lists[] = {lists[3].p};
+        queue_a->ExecuteCommandLists(1, a2_lists);
+        const bool a2_executed = rt::d3d12::last_execute_result(queue_a.p) == leonida::ReplayResult::success;
+        const bool a2_signalled = SUCCEEDED(queue_a->Signal(done_a.p, 2));
+        retired_while_pending = rt::d3d12::bindless_retired_count(device.p);
+        const bool a_pending_after_a2 = gate->GetCompletedValue() < gate_open && done_a->GetCompletedValue() == 0;
+
+        // 5. B completes while the gate is closed; then the gate opens and A's dispatches run.
+        const bool b_done = b_signalled && wait_for(done_b.p, 1, std::chrono::seconds(10));
+        const bool b_done_while_gated = b_done && gate->GetCompletedValue() < gate_open;
+        EXPECT(wait_for(gate.p, gate_open, std::chrono::seconds(30)));
+        const double gate_ms = ms_since(gate_start);
+        EXPECT(a2_signalled && wait_for(done_a.p, 2, std::chrono::seconds(30)));
+        std::printf("gate: 2 copies of 64 MiB took %.1f ms, so %u copies; it opened %.1f ms after it was submitted\n",
+                    two_copies_ms, gate_copies, gate_ms);
+        std::printf("flush that replaced the set with A's dispatch pending on the GPU: ExecuteCommandLists took %.2f "
+                    "ms; A's dispatch %s when it returned and %s after A's next ExecuteCommandLists; B's work %s\n",
+                    execute_ms, a_pending_after_b ? "still pending" : "NOT pending",
+                    a_pending_after_a2 ? "still pending" : "NOT pending",
+                    b_done_while_gated ? "completed while the gate was closed" : "did NOT complete while gated");
+        EXPECT(b_executed && a2_executed && a_pending_after_b && a_pending_after_a2 && b_done_while_gated);
+        EXPECT(retired_before == 0 && retired_at_flush >= 1 && retired_while_pending >= 1);
 
         // The next ExecuteCommandLists frees what was retired: every submission that could bind it is done.
         EXPECT(lists[2]->Reset(allocators[2].p, nullptr) == S_OK && lists[2]->Close() == S_OK);
@@ -358,13 +415,40 @@ int main() {
         EXPECT(SUCCEEDED(queue_b->Signal(done_b.p, 2)));
         EXPECT(wait_for(done_b.p, 2, std::chrono::seconds(10)));
 
+        // 6. The cross-queue wait. 40 more views after the gate's ExecuteCommandLists (which would flush them): B's
+        // next flush replaces the set again, and B's batch waits for the gate, so the copy in it that uploads the new
+        // table runs only once the gate opens. A's next dispatch, of the reflected texture, binds the new set right
+        // after: its batch must wait for B's, not look up a table that is not uploaded yet (it would find the
+        // fallback).
+        const UINT64 gate_again = submit_gate(gate_copies);
+        EXPECT(gate_again && SUCCEEDED(queue_b->Wait(gate.p, gate_again)));
+        EXPECT(add_views(extra_textures));
+        EXPECT(lists[2]->Reset(allocators[2].p, nullptr) == S_OK && lists[2]->Close() == S_OK);
+        queue_b->ExecuteCommandLists(1, upload_lists);
+        EXPECT(rt::d3d12::last_execute_result(queue_b.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue_b->Signal(done_b.p, 3)));
+        const std::size_t retired_second = rt::d3d12::bindless_retired_count(device.p);
+        EXPECT(lists[0]->Reset(allocators[0].p, nullptr) == S_OK && record(lists[0].p, 1, 3));
+        queue_a->ExecuteCommandLists(1, a_lists);
+        EXPECT(rt::d3d12::last_execute_result(queue_a.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue_a->Signal(done_a.p, 3)));
+        const bool gated_at_a3 = gate->GetCompletedValue() < gate_again;
+        EXPECT(wait_for(done_a.p, 3, std::chrono::seconds(30)));
+        const bool a3_done_while_gated = gate->GetCompletedValue() < gate_again;
+        EXPECT(wait_for(done_b.p, 3, std::chrono::seconds(30)));
+        std::printf("second replacement, B's upload behind the gate: %zu retired after B's flush; A's next "
+                    "ExecuteCommandLists with the gate %s, its dispatch completed %s\n", retired_second,
+                    gated_at_a3 ? "closed" : "ALREADY OPEN",
+                    a3_done_while_gated ? "BEFORE the gate opened (no wait for B)" : "after the gate opened");
+        third_waited = retired_second >= 1 && gated_at_a3 && !a3_done_while_gated;
+
         // Every key the views made is in the table the device keeps.
-        for (UINT i = 0; i < 2 + extra_textures; ++i) {
+        for (UINT i = 0; i < views; ++i) {
             std::uint32_t key[8];
             std::memcpy(key, reinterpret_cast<const void*>(view_cpu + i * view_step), sizeof(key));
             keys_found += rt::d3d12::bindless_hash_lookup(device.p, key) != 0;
         }
-        for (UINT q = 0; q < 2; ++q) {
+        for (UINT q = 0; q < 4; ++q) {
             void* mapped = nullptr;
             EXPECT(SUCCEEDED(readbacks[q]->Map(0, nullptr, &mapped)));
             results[q].assign(static_cast<const std::uint8_t*>(mapped), static_cast<const std::uint8_t*>(mapped) +
@@ -373,24 +457,27 @@ int main() {
     }
     std::filesystem::remove_all(library);
 
+    static const char* const names[4] = {"A's first dispatch", "B's dispatch", "A's second dispatch",
+                                         "A's third dispatch"};
     unsigned mismatches = 0;
-    for (UINT q = 0; q < 2; ++q)
+    for (UINT q = 0; q < 4; ++q)
         for (UINT i = 0; i < texels; ++i) {
             const UINT x = i % texture_size, y = i / texture_size;
             const Texel want = q ? reflected(x, y) : gradient(x, y);
             const std::uint8_t* got = results[q].data() + i * 4;
             if (std::memcmp(got, want.data(), 4) == 0) continue;
             if (mismatches++ < 8)
-                std::fprintf(stderr, "queue %c, texel %u: got %u,%u,%u,%u want %u,%u,%u,%u\n", q ? 'B' : 'A', i, got[0],
-                             got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                std::fprintf(stderr, "%s, texel %u: got %u,%u,%u,%u want %u,%u,%u,%u\n", names[q], i, got[0], got[1],
+                             got[2], got[3], want[0], want[1], want[2], want[3]);
         }
-    std::printf("retired sets and tables: %zu while the old submission was pending, %zu after it completed; %u of %u "
-                "keys found; %u texel mismatches\n", retired_while_pending, retired_after, keys_found,
-                2 + extra_textures, mismatches);
-    EXPECT(retired_after == 0 && keys_found == 2 + extra_textures && !mismatches);
+    std::printf("retired sets and tables: %zu after the flush, %zu after A's next ExecuteCommandLists with its first "
+                "dispatch pending, %zu once both completed; %u of %u keys found; %u texel mismatches\n",
+                retired_at_flush, retired_while_pending, retired_after, keys_found, views, mismatches);
+    EXPECT(retired_after == 0 && keys_found == views && !mismatches && third_waited);
     std::printf("validation errors: %u\n", d.validation_errors());
     if (d.validation_errors()) return 1;
-    std::printf("bindless set replaced without waiting for the device: the pending dispatch read the old table "
-                "(gradient), the new one the grown table (reflected)\n");
+    std::printf("bindless set replaced while a dispatch that bound the old one was pending on the GPU: it read the "
+                "gradient through the old set and table, B and A's next dispatches the reflected texture through the "
+                "new ones, the last one after the upload in B's batch that waited for the gate\n");
     return 0;
 }

@@ -246,6 +246,10 @@ std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&k
 // Sets and tables replaced by a flush that a submission still pending may use, not freed yet. For tests, with no
 // other thread executing.
 std::size_t bindless_retired_count(ID3D12Device* device);
+// The retire ticket of the last submission the device's queues have made to Vulkan
+// (VulkanContext::submitted_retire_ticket): an ExecuteCommandLists advances it when its batch reaches Vulkan, not
+// when the batch is held on the CPU behind a Wait whose Signal is not submitted yet (queue_holds.h). For tests.
+std::uint64_t submitted_retire_ticket(ID3D12Device* device);
 // The free indices of that set's 2D image and sampler arrays: how many more distinct 2D T#s and S#s
 // CreateShaderResourceView and CreateSampler can register before they log that the array is full. Zeros when
 // `device` has no such set. For tests.

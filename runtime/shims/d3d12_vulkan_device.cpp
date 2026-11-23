@@ -7752,6 +7752,13 @@ std::size_t bindless_retired_count(ID3D12Device* device) {
     return set ? set->retired_count() : 0;
 }
 
+std::uint64_t submitted_retire_ticket(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    const Device* d = Device::from<Device>(real ? real : device);
+    return d && d->state().context ? d->state().context->submitted_retire_ticket() : 0;
+}
+
 BindlessRoom bindless_room(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     if (!set) return {};
