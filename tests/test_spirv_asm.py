@@ -281,6 +281,48 @@ class SpirvAsmUnitTests(unittest.TestCase):
             with open(dst, "rb") as f:
                 _validate(f.read())
 
+    def test_alias_domain_and_scope_optional_name(self):
+        # Issue #4375: OpAliasDomainDeclINTEL and OpAliasScopeDeclINTEL support optional alias name
+        asm_with_name = (
+            "OpCapability Shader\n"
+            "OpCapability MemoryAccessAliasingINTEL\n"
+            'OpExtension "SPV_INTEL_memory_access_aliasing"\n'
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%n = OpTypeVoid\n"
+            "%d = OpAliasDomainDeclINTEL %n\n"
+            "%x = OpAliasScopeDeclINTEL %n %n\n"
+            "%main = OpFunction %void None %fn\n"
+            "%l = OpLabel\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        asm_without_name = (
+            "OpCapability Shader\n"
+            "OpCapability MemoryAccessAliasingINTEL\n"
+            'OpExtension "SPV_INTEL_memory_access_aliasing"\n'
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%n = OpTypeVoid\n"
+            "%d = OpAliasDomainDeclINTEL\n"
+            "%x = OpAliasScopeDeclINTEL %n\n"
+            "%main = OpFunction %void None %fn\n"
+            "%l = OpLabel\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        spv1 = spirv_asm.assemble(asm_with_name, target_env="vulkan1.2")
+        spv2 = spirv_asm.assemble(asm_without_name, target_env="vulkan1.2")
+        self.assertEqual(len(spv1) - len(spv2), 8)  # 2 words (8 bytes) for the two optional name IDs
+        _validate(spv1, target_env="vulkan1.2")
+        _validate(spv2, target_env="vulkan1.2")
+
     def test_cli_source_that_is_not_utf8_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "bad.spvasm")
