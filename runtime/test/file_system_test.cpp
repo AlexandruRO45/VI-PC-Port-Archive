@@ -1386,6 +1386,57 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a case rename of a package folder is refused like any other move of one");
     }
+
+    // A host path inside --game-dir names a package file too (a title can build one from GetModuleFileName). It reads
+    // the title's view and writes to the overlay, so the package is never written whichever spelling reaches it.
+    {
+        write_path(package / "host" / "file.txt", "package");
+        write_path(package / "host" / "gone.txt", "package");
+        const std::filesystem::path in_package = package / "host" / "file.txt";
+        HANDLE h = create_w(in_package.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
+              "a host path into the game folder reads the package file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        h = create_w(in_package.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "a write-open through a host path into the game folder succeeds");
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            ::WriteFile(h, "host", 4, &written, nullptr);
+            ::CloseHandle(h);
+        }
+        check(read_path(in_package) == "package", "the package file is not modified by a host-path write");
+        check(read_path(overlay / "host" / "file.txt") == "host", "the host-path write landed in the overlay copy");
+        h = create_w(L"GAME:\\host\\file.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "host", "GAME: sees what the host path wrote");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const std::filesystem::path host_new = package / "host" / "new.txt";
+        h = create_w(host_new.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(h != INVALID_HANDLE_VALUE && !std::filesystem::exists(host_new) &&
+                  std::filesystem::exists(overlay / "host" / "new.txt"),
+              "a file created through a host path into the game folder is made in the overlay");
+        const std::filesystem::path host_gone = package / "host" / "gone.txt";
+        check(delete_w(host_gone.c_str()) != FALSE && std::filesystem::exists(host_gone),
+              "DeleteFileW through a host path leaves the package file in place");
+        check(attributes_w(host_gone.c_str()) == INVALID_FILE_ATTRIBUTES, "and the name is gone for the title");
+        const std::filesystem::path in_overlay = overlay / "host" / "direct.txt";
+        std::filesystem::create_directories(in_overlay.parent_path());
+        h = create_w(in_overlay.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(h != INVALID_HANDLE_VALUE && std::filesystem::exists(in_overlay),
+              "a host path into the overlay stays a host path");
+        const std::filesystem::path climb = package / ".." / "outside.txt";
+        h = create_w(climb.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(h != INVALID_HANDLE_VALUE && std::filesystem::exists(root / "outside.txt") &&
+                  !std::filesystem::exists(overlay / "outside.txt"),
+              "a host path that climbs out of the game folder with .. is a host path again");
+        const std::filesystem::path inside = package / "host" / "sub" / ".." / "file.txt";
+        h = create_w(inside.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "host",
+              "a host path with .. that stays inside reads the overlay copy");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
 }
 
 }  // namespace

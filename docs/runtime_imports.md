@@ -189,14 +189,17 @@ A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file 
 `GetFileAttributesExA/W` and `DeleteFileA/W` (`runtime/shims/file_system.cpp`), under `kernel32.dll`, `kernelbase.dll`
 and the `api-ms-win-core-file-*` sets a GDK title links against.
 
-- A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. A path without the prefix is a host path and is
-  passed to the host unchanged. `--game-dir` defaults to the image's folder. `gta6rt` makes it and `--overlay`
-  absolute at startup, so a bare image name (`gta6rt --run game.exe` from the game folder) and a relative folder
-  both keep naming the same place after the title changes its current directory (CTest `run_tiny_game_dir`).
+- A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. An absolute host path inside `--game-dir` (after
+  `..` is resolved; not inside the overlay) is the same package file by its host name, as a title gets from
+  `GetModuleFileName`, and follows the same rules, so it cannot write the package either. Any other path without the
+  prefix is a host path and is passed to the host unchanged. `--game-dir` defaults to the image's folder. `gta6rt`
+  makes it and `--overlay` absolute at startup, so a bare image name (`gta6rt --run game.exe` from the game folder)
+  and a relative folder both keep naming the same place after the title changes its current directory (CTest
+  `run_tiny_game_dir`).
   `G:\` is the same folder as `GAME:`, and `T:\` is a scratch folder, `<overlay>\.gta6rt-temp`, that `GAME:` does
   not see (RT-218; the other console layers map those two drives this way, and only the executable can say which
-  spelling GTA VI uses). A path under `--game-dir` or the overlay is always a host path, so a package that sits on
-  a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
+  spelling GTA VI uses). A path under `--game-dir` or the overlay is never read as a console drive, so a package
+  that sits on a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
   `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything
   is written there, and removing or moving it fails with `ERROR_ACCESS_DENIED`.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
