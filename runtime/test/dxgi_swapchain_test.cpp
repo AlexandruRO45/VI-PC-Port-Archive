@@ -1055,13 +1055,18 @@ int main() {
             return fail("Non-waitable SetMaximumFrameLatency should return DXGI_ERROR_INVALID_CALL");
     }
 
-    // IDXGIObject private data on the swapchain, the factory and an adapter.
+    // IDXGIObject private data on the swapchain, the factory, an adapter and an output.
     {
         if (const char* step = check_private_data(sc)) return fail(step);
         if (const char* step = check_private_data(factory)) return fail(step);
         IDXGIAdapter1* pd_adapter = nullptr;
         if (FAILED(factory->EnumAdapters1(0, &pd_adapter)) || !pd_adapter) return fail("EnumAdapters1(0) for private data");
         if (const char* step = check_private_data(pd_adapter)) return fail(step);
+        IDXGIOutput* pd_output = nullptr;
+        if (SUCCEEDED(pd_adapter->EnumOutputs(0, &pd_output)) && pd_output) {
+            if (const char* step = check_private_data(pd_output)) return fail(step);
+            pd_output->Release();
+        }
         pd_adapter->Release();
     }
 

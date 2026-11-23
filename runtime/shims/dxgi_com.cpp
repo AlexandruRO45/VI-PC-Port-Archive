@@ -907,9 +907,15 @@ public:
     }
 
     // IDXGIObject
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
+        return private_data_.set(guid, size, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
+        return private_data_.set_interface(guid, object);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
+        return private_data_.get(guid, size, data);
+    }
     HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -1045,6 +1051,7 @@ private:
     std::atomic<ULONG> refs_{1};
     IDXGIAdapter* parent_ = nullptr;
     DisplayInfo info_{};
+    PrivateDataStore private_data_;
 };
 
 

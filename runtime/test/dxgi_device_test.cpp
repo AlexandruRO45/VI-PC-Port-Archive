@@ -167,6 +167,19 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     size = sizeof(read);
     EXPECT(FAILED(dxgi->GetPrivateData(kTestData, &size, &read)));
 
+    // An output, when present, stores its own private data independently.
+    if (output.p) {
+        const std::uint32_t out_written = 0x87654321;
+        std::uint32_t out_read = 0;
+        UINT out_size = sizeof(out_read);
+        EXPECT(output->SetPrivateData(kTestData, sizeof(out_written), &out_written) == S_OK);
+        EXPECT(output->GetPrivateData(kTestData, &out_size, &out_read) == S_OK && out_size == sizeof(out_read) &&
+               out_read == out_written);
+        EXPECT(output->SetPrivateData(kTestData, 0, nullptr) == S_OK);
+        out_size = sizeof(out_read);
+        EXPECT(output->GetPrivateData(kTestData, &out_size, &out_read) == DXGI_ERROR_NOT_FOUND);
+    }
+
     // The adapter does not keep the device alive, and the device outlives its DXGI pointer's last use.
     adapter.reset();
     output.reset();
