@@ -120,6 +120,20 @@ def f32(x):
         return float("inf") if x > 0 else float("-inf")
 
 
+# IEEE 754 leaves the sign of a NaN that an operation makes from non-NaN operands (inf - inf, 0 * inf) to the
+# implementation, and Python takes it from the host CPU: negative on x86-64 (0xFFC00000), positive on arm64
+# (0x7FC00000). Pin it to the negative one, which the RDNA2-measured words in test_alu_*_hw expect and x86-64 CI
+# already gets, so the suite gives the same words on any host. A NaN operand still propagates as before.
+_MADE_NAN = struct.unpack("<f", struct.pack("<I", 0xFFC00000))[0]
+
+
+def _pin_nan(r, *operands):
+    """r, or the pinned NaN when r is a NaN that none of the operands was."""
+    if math.isnan(r) and not any(math.isnan(v) for v in operands):
+        return _MADE_NAN
+    return r
+
+
 class _F32(float):
     """A binary32 value that came from a bit pattern (OpBitcast) and still carries that exact pattern.
 
@@ -142,7 +156,7 @@ def fma_f32(x, y, z):
     The product and sum are exact rationals; rounding them through a double first could land on a binary32
     midpoint and round the wrong way (for example (1 + 2**-12)**2 + 2**-70)."""
     if not all(math.isfinite(v) for v in (x, y, z)):
-        return f32(x * y + z)                 # inf/NaN rules: Python's float arithmetic follows IEEE here
+        return f32(_pin_nan(x * y + z, x, y, z))  # inf/NaN rules: Python's float arithmetic follows IEEE here
     exact = Fraction(x) * Fraction(y) + Fraction(z)
     if exact == 0:
         product_zero = x == 0.0 or y == 0.0
@@ -942,7 +956,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if types.t[a[0]] == ("float", 64):
                 if op != "OpFMul":
                     raise UnsupportedConstruct(f"{op} on binary64")
-                values[res] = x * y
+                values[res] = _pin_nan(x * y, x, y)
                 continue
 
             def _fdiv(p, q):
@@ -953,8 +967,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     return math.nan
                 return f32(p / q)       # x/inf is a signed zero, as in Python
 
-            fn = {"OpFAdd": (lambda p, q: f32(p + q)), "OpFSub": (lambda p, q: f32(p - q)),
-                  "OpFMul": (lambda p, q: f32(p * q)), "OpFDiv": _fdiv}[op]
+            fn = {"OpFAdd": (lambda p, q: f32(_pin_nan(p + q, p, q))),
+                  "OpFSub": (lambda p, q: f32(_pin_nan(p - q, p, q))),
+                  "OpFMul": (lambda p, q: f32(_pin_nan(p * q, p, q))), "OpFDiv": _fdiv}[op]
             if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
                     isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
                 values[res] = tuple(fn(p, q) for p, q in zip(x, y))
