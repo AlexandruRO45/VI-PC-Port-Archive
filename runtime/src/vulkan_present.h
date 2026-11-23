@@ -478,7 +478,9 @@ private:
             return VK_SUCCESS;
         }
         if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
-        if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
+        // VK_SUBOPTIMAL_KHR means the swapchain is still usable (e.g., after a resize that hasn't
+        // been processed yet). It does NOT require a rebuild — only VK_ERROR_OUT_OF_DATE_KHR does.
+        // stale_ = true would trigger an unnecessary recreate on the next frame.
         // An out-of-date retry above may have given the swapchain another extent: the compose target follows it.
         if (planes && !prepare_compose()) return give_back(frame, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
