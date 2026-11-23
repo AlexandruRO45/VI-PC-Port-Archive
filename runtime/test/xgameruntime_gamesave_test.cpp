@@ -248,6 +248,86 @@ int main() {
               std::strcmp(aout[0].info.name, "story") == 0 && std::memcmp(aout[0].data, story.data(), story.size()) == 0,
           "ReadBlobDataResult fills the title's buffer with one blob");
 
+    // ---- a read with nothing to write, and a null buffer ----
+    // A container with no blobs yet (a first boot) reads to a 0-byte result: XAsyncGetResultSize answers 0, so a
+    // title that allocates what it was told passes size 0 and may pass a null buffer (an empty std::vector's data()).
+    // A null buffer is accepted only then; whenever the read has bytes to write, or fails, it stays E_POINTER.
+    {
+        Handle empty = nullptr;
+        check(at<Create>(save, 16)(save, provider, "empty", &empty) == S_OK && empty,
+              "a container with no blobs (never updated)");
+        XAsyncBlock zero{};
+        size_t zero_size = 99;
+        uint32_t zero_count = 7;
+        check(at<ReadAsync>(save, 21)(save, empty, nullptr, 0, &zero) == S_OK && finished(&zero) &&
+                  XAsyncGetStatus(&zero, false) == S_OK && XAsyncGetResultSize(&zero, &zero_size) == S_OK &&
+                  zero_size == 0,
+              "ReadBlobDataAsync of a container with no blobs completes with a 0-byte result");
+        check(at<ReadResult>(save, 22)(save, &zero, 0, nullptr, &zero_count) == S_OK && zero_count == 0,
+              "ReadBlobDataResult of a 0-byte result takes size 0 and a null buffer: S_OK, 0 blobs");
+        uint32_t sync_count = 0;
+        check(at<Read>(save, 20)(save, empty, nullptr, &sync_count, 0, nullptr) == S_OK && sync_count == 0,
+              "ReadBlobData of a container with no blobs takes size 0 and a null buffer: S_OK, 0 blobs");
+        sync_count = 0;
+        check(at<Read>(save, 20)(save, container, names, &sync_count, 0, nullptr) == S_OK && sync_count == 0,
+              "ReadBlobData of 0 named blobs takes size 0 and a null buffer: S_OK, 0 blobs");
+
+        // What does not change: a null count, a null buffer for a read that has bytes or fails, an expired handle.
+        check(at<Read>(save, 20)(save, empty, nullptr, nullptr, buffer.size() * 8, out) == E_POINTER,
+              "ReadBlobData without countOfBlobs is still E_POINTER");
+        check(at<ReadResult>(save, 22)(save, &zero, 0, nullptr, nullptr) == E_POINTER,
+              "ReadBlobDataResult without countOfBlobs is still E_POINTER");
+        sync_count = 1;
+        check(at<Read>(save, 20)(save, container, names, &sync_count, 0, nullptr) == E_POINTER && sync_count == 1 &&
+                  at<Read>(save, 20)(save, container, names, &sync_count, buffer.size() * 8, nullptr) == E_POINTER &&
+                  sync_count == 1,
+              "ReadBlobData of a blob into a null buffer is still E_POINTER (size 0 or not), count untouched");
+        sync_count = 0;
+        check(at<Read>(save, 20)(save, container, nullptr, &sync_count, 0, nullptr) == E_POINTER,
+              "ReadBlobData of every blob of a container that has blobs into a null buffer is still E_POINTER");
+        sync_count = 1;
+        check(at<Read>(save, 20)(save, container, absent, &sync_count, 0, nullptr) == E_POINTER,
+              "ReadBlobData of a missing blob into a null buffer is still E_POINTER");
+
+        XAsyncBlock one{};
+        size_t one_size = 0;
+        uint32_t one_count = 7;
+        check(at<ReadAsync>(save, 21)(save, container, names, 1, &one) == S_OK && finished(&one) &&
+                  XAsyncGetResultSize(&one, &one_size) == S_OK && one_size > story.size(),
+              "ReadBlobDataAsync of a container that has a blob");
+        check(at<ReadResult>(save, 22)(save, &one, 0, nullptr, &one_count) == E_POINTER &&
+                  at<ReadResult>(save, 22)(save, &one, one_size, nullptr, &one_count) == E_POINTER &&
+                  at<ReadResult>(save, 22)(save, &one, one_size, out, nullptr) == E_POINTER,
+              "ReadBlobDataResult of a result with bytes into a null buffer, or without a count, is still E_POINTER");
+        std::vector<uint64_t> one_buf((one_size + 7) / 8);
+        auto* one_out = reinterpret_cast<Blob*>(one_buf.data());
+        check(at<ReadResult>(save, 22)(save, &one, one_size, one_out, &one_count) == S_OK && one_count == 1 &&
+                  std::strcmp(one_out[0].info.name, "story") == 0 && one_out[0].info.size == story.size() &&
+                  std::memcmp(one_out[0].data, story.data(), story.size()) == 0,
+              "the refused calls left the result in place: ReadBlobDataResult then returns the blob");
+        check(at<ReadResult>(save, 22)(save, &one, 0, nullptr, &one_count) == E_POINTER,
+              "ReadBlobDataResult with a null buffer after the result was collected is still E_POINTER");
+        XAsyncBlock small_read{};
+        uint32_t small_count = 7;
+        check(at<ReadAsync>(save, 21)(save, container, names, 1, &small_read) == S_OK && finished(&small_read) &&
+                  at<ReadResult>(save, 22)(save, &small_read, 8, one_out, &small_count) ==
+                      E_GS_PROVIDED_BUFFER_TOO_SMALL,
+              "ReadBlobDataResult into a buffer too small is still E_GS_PROVIDED_BUFFER_TOO_SMALL");
+
+        XAsyncBlock failed{};
+        uint32_t failed_count = 7;
+        check(at<ReadAsync>(save, 21)(save, container, absent, 1, &failed) == S_OK && finished(&failed) &&
+                  XAsyncGetStatus(&failed, false) == E_GS_BLOB_NOT_FOUND &&
+                  at<ReadResult>(save, 22)(save, &failed, 0, nullptr, &failed_count) == E_POINTER,
+              "ReadBlobDataResult of a failed read into a null buffer is still E_POINTER");
+
+        at<Close>(save, 17)(save, empty);
+        sync_count = 0;
+        check(at<Read>(save, 20)(save, empty, nullptr, &sync_count, 0, nullptr) == E_POINTER &&
+                  at<Read>(save, 20)(save, empty, nullptr, &sync_count, buffer.size() * 8, out) == E_GS_HANDLE_EXPIRED,
+              "ReadBlobData of a closed container: still E_POINTER with a null buffer, E_GS_HANDLE_EXPIRED with one");
+    }
+
     // ---- delete a blob, async submit ----
     check(at<Create>(save, 23)(save, container, nullptr, &update) == S_OK, "a second update");
     check(at<ByName>(save, 26)(save, update, "profile/main") == S_OK, "SubmitBlobDelete");
