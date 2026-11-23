@@ -356,6 +356,22 @@ int main() {
             EXPECT(output[0].UnalignedBlockTexturesSupported == 83 && output[1].UnalignedBlockTexturesSupported == 42);
         }
 
+        // --- A shader-visible sampler heap holds at most D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE (2048) samplers,
+        // the size OPTIONS19 reports; the host runtime refuses one more (compare_invalid_arguments, "descriptor heap:
+        // shader-visible 2049 samplers"). A non-shader-visible sampler heap has no such limit, on the host as here.
+        {
+            const auto create = [&](UINT count, D3D12_DESCRIPTOR_HEAP_FLAGS flags) {
+                const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, count, flags, 0};
+                Ref<ID3D12DescriptorHeap> heap;
+                const HRESULT hr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap.p));
+                return SUCCEEDED(hr) == (heap.p != nullptr) ? hr : E_FAIL;
+            };
+            constexpr UINT limit = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+            EXPECT(create(limit, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == S_OK);
+            EXPECT(create(limit + 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == E_INVALIDARG);
+            EXPECT(create(limit + 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE) == S_OK);
+        }
+
         // --- Copies. Two host-side heaps; slot i of the source holds 32 bytes of (0x10 * (i + 1) + byte index).
         {
             const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);

@@ -5059,6 +5059,16 @@ public:
             log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
+        // A shader-visible sampler heap holds at most D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE samplers, the size
+        // OPTIONS19 reports and the bindless set is built for; the host refuses one more (compare_invalid_arguments,
+        // "descriptor heap: shader-visible 2049 samplers"). A non-shader-visible sampler heap has no such limit.
+        if (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
+            (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+            desc->NumDescriptors > D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE) {
+            log_once("CreateDescriptorHeap refused (shader-visible sampler heap larger than 2048), size",
+                     int(desc->NumDescriptors));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
         auto* heap = new DescriptorHeap(state_, *desc);
         heap->attach_device(identity());
         if (!heap->ok()) {
