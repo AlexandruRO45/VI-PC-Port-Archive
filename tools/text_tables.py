@@ -59,6 +59,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from file_mode import published_mode  # noqa: E402
 from hashdict import joaat  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 RESOURCE_MAGIC = b"0DRP"
 RPF9_MAGIC = b"9FPR"
@@ -421,12 +422,7 @@ def _write_csv(path, fields, rows):
 
 
 def _same_output_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
+    return same_report_path(first, second)
 
 
 def main(argv=None) -> int:
@@ -452,7 +448,7 @@ def main(argv=None) -> int:
         if not os.path.exists(path):
             print(f"text_tables: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-        if any(os.path.exists(o) and os.path.samefile(path, o) for o in outs):
+        if any(same_report_path(path, o) for o in outs):
             ap.error("an output must not overwrite an input")
     for source in a.sources:
         index = os.path.join(source, "index.json")
