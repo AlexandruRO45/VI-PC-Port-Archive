@@ -3031,8 +3031,9 @@ HRESULT command_list1(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_T
     Ref<ID3D12Device4> device4;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) return E_NOINTERFACE;
     void* out = nullptr;
-    return released(device4->CreateCommandList1(node_mask, type, D3D12_COMMAND_LIST_FLAG_NONE,
-                                                __uuidof(ID3D12GraphicsCommandList), output ? &out : nullptr),
+    // CreateCommandList1 is PC slot 51; device_method maps it on the Xbox proxy.
+    return released(xs_test::device_method(device4.p, 51, node_mask, type, D3D12_COMMAND_LIST_FLAG_NONE,
+                                           &__uuidof(ID3D12GraphicsCommandList), output ? &out : nullptr),
                     &out);
 }
 
