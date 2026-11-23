@@ -24,9 +24,7 @@ class CarveAllBracketPathTest(unittest.TestCase):
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
                  "-Game", str(game), "-Out", str(out)], cwd=tmp, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            text = (out / "coverage.json").read_text(encoding="utf-8-sig").strip()
-            rows = json.loads(text) if text else []
-            rows = rows if isinstance(rows, list) else [rows]
+            rows = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
             self.assertEqual([r["archive"] for r in rows], ["common.rpf"])
 
 

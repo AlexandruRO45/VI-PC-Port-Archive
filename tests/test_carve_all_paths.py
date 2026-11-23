@@ -59,9 +59,31 @@ class CarveAllGamePathTest(unittest.TestCase):
                  "-Game", str(game), "-Out", str(out)], capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            row = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
-            self.assertEqual(row, {"archive": "empty.rpf", "files": 0, "bink2": 0, "span": 0,
-                                   "readable": 0, "unread": 0, "inflated": 0})
+            rows = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
+            self.assertEqual(rows, [{"archive": "empty.rpf", "files": 0, "bink2": 0, "span": 0,
+                                     "readable": 0, "unread": 0, "inflated": 0}])
+
+    def test_coverage_is_a_json_array_for_any_number_of_archives(self):
+        # ConvertTo-Json on a piped list unrolls it: one row became a bare object, no rows an empty file.
+        cases = {"no archives": [], "one archive": ["only.rpf"], "two archives": ["a.rpf", "b.rpf"]}
+        for label, archives in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                game, out = Path(tmp, "game"), Path(tmp, "out")
+                game.mkdir()
+                out.mkdir()
+                for name in archives:
+                    (game / name).write_bytes(b"x")
+                    (out / Path(name).stem).mkdir()
+                    (out / Path(name).stem / "index.json").write_text(
+                        json.dumps(INDEX), encoding="utf-8", newline="\n")
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                     "-Game", str(game), "-Out", str(out)], capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rows = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
+                self.assertIsInstance(rows, list)
+                self.assertEqual(sorted(row["archive"] for row in rows), archives)
 
     def test_inconsistent_cached_summary_does_not_replace_coverage(self):
         summary = INDEX["summary"]
@@ -121,7 +143,7 @@ class CarveAllGamePathTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(result.stderr, "")
-                    row = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
+                    row, = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
                     self.assertEqual((row["files"], row["bink2"], row["span"], row["inflated"]),
                                      tuple(summary[key] for key in ("files", "bink2_files", "span", "inflated_bytes")))
                     self.assertEqual(row["readable"], round(summary["compressed_bytes"] / summary["span"], 4))

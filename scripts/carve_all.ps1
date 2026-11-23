@@ -59,5 +59,5 @@ foreach ($archive in $archives) {
                                readable = [math]::Round($s.compressed_bytes / $denominator, 4)
                                unread = [math]::Round($s.unread_bytes / $denominator, 4); inflated = $s.inflated_bytes }
 }
-$rows | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $Out "coverage.json")
+ConvertTo-Json -InputObject @($rows) | Set-Content -Encoding utf8 -LiteralPath (Join-Path $Out "coverage.json")
 $rows | Format-Table archive, files, bink2, @{n = "GiB"; e = { [math]::Round($_.span / 1GB, 2) } }, readable, unread -AutoSize | Out-String -Width 200
