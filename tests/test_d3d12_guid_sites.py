@@ -187,5 +187,33 @@ class GuidSites(unittest.TestCase):
             data = json.load(f)
 
         self.assertEqual({c["value"] for c in data["images"][0]["guid_candidates"]}, {str(QUEUE), str(UNKNOWN)})
+    def test_missing_image_is_one_error_line(self):
+        missing = os.path.join(self.tmp.name, "no_such.dll")
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"), missing,
+             "--header", os.path.join(self.tmp.name, "none.h")],
+            capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith(f"ERROR: cannot read {missing}:"), lines[0])
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_json_in_a_missing_folder_is_one_error_line(self):
+        rdata = QUEUE.bytes_le + UNKNOWN.bytes_le
+        text = lea(0x2000, 0x1000) + lea(0x2010, 0x1007)
+        image, _ = pe32plus(text, rdata)
+        path = self.write("t7.dll", image)
+        out = os.path.join(self.tmp.name, "no_such_folder", "out.json")
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"), path,
+             "--header", os.path.join(self.tmp.name, "none.h"), "--json", out],
+            capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith(f"ERROR: cannot write {out}:"), lines[0])
+        self.assertNotIn("Traceback", result.stderr)
+
 if __name__ == "__main__":
     unittest.main()

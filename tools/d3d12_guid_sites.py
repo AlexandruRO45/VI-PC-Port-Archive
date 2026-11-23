@@ -368,6 +368,9 @@ def main(argv: list[str] | None = None) -> int:
     for path in args.images:
         try:
             r = scan(path, known)
+        except OSError as e:  # a missing, locked or folder image used to end the run in a traceback
+            print(f"ERROR: cannot read {path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         except (ValueError, struct.error) as e:
             print(f"== {os.path.basename(path)}: skipped ({e})")
             continue
@@ -386,9 +389,13 @@ def main(argv: list[str] | None = None) -> int:
         for line in r["imports_of_note"]:
             print(f"   GUID-named imports: {line}")
     if args.json:
-        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"known": len(known), "images": results}, f, indent=2)
-            f.write("\n")
+        try:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"known": len(known), "images": results}, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 
