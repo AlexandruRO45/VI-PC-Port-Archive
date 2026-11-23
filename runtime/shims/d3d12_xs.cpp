@@ -150,8 +150,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }
 
-    static std::atomic<bool> proxy_logged{false};
-    if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
+    static const bool proxy_logged = [] {
         std::fprintf(stderr,
                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
                      "(console slot order, d3d12_xs_console_slots.h).\n");
@@ -161,7 +160,9 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
             std::uint64_t base = 0;
             return rt::shims::mapped_image_base(address, base);
         });
-    }
+        return true;
+    }();
+    (void)proxy_logged;
 
 #ifdef LEONIDA_VULKAN_DEVICE
     // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
