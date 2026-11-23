@@ -311,5 +311,40 @@ class TestVPkAshrrevI16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0xFFFCFFFC)
 
+def ref_v_pk_lshlrev_b16(s0: int, s1: int) -> int:
+    """Logical left shift reversed on packed 16-bit values.
+    s0: shift count (each half masked to 15).
+    s1: values (each half 16-bit unsigned).
+    """
+    amt_lo = s0 & 15
+    amt_hi = (s0 >> 16) & 15
+    val_lo = s1 & MASK16
+    val_hi = (s1 >> 16) & MASK16
+    res_lo = (val_lo << amt_lo) & MASK16
+    res_hi = (val_hi << amt_hi) & MASK16
+    return pack16(res_lo, res_hi)
+
+
+class TestVPkLshlrevB16Oracle(unittest.TestCase):
+    def test_oracle_basic_shifts(self) -> None:
+        s0 = pack16(2, 4)
+        s1 = pack16(3, 5)
+        self.assertEqual(ref_v_pk_lshlrev_b16(s0, s1), pack16(12, 80))
+
+    def test_oracle_shift_wrap_16bit(self) -> None:
+        s0 = pack16(1, 2)
+        s1 = pack16(0x8000, 0xC000)
+        # 0x8000 << 1 wraps to 0x0000; 0xC000 << 2 == 0x30000 wraps to 0x0000
+        self.assertEqual(ref_v_pk_lshlrev_b16(s0, s1), pack16(0x0000, 0x0000))
+
+    def test_oracle_shift_amount_masking(self) -> None:
+        s0 = pack16(16, 33)
+        s1 = pack16(0x1234, 0x0001)
+        # 16 & 15 == 0, 33 & 15 == 1
+        self.assertEqual(ref_v_pk_lshlrev_b16(s0, s1), pack16(0x1234, 0x0002))
+
+    def test_oracle_zero_inputs(self) -> None:
+        self.assertEqual(ref_v_pk_lshlrev_b16(0, 0), 0)
+
 if __name__ == "__main__":
     unittest.main()
