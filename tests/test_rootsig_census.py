@@ -237,6 +237,21 @@ class TestCensus(unittest.TestCase):
         self.assertEqual(data["summary"]["parsed"], 1)
         self.assertEqual(data["summary"]["user_sgprs"], {"8": 1})
 
+    def test_a_json_it_cannot_write_is_one_error_line_before_the_census(self):
+        # open() on a folder, or in a folder that does not exist, ended the run in a traceback after the whole
+        # census had been printed; the target is now checked before the scan.
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        folder = os.path.join(self.tmp.name, "reports")
+        os.makedirs(folder)
+        for target in (folder, os.path.join(self.tmp.name, "missing", "r.json")):
+            with self.subTest(target=target):
+                r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", target],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("error: --json ", r.stderr.splitlines()[-1], r.stderr)
+                self.assertEqual(r.stdout, "")  # nothing was scanned
+
     def test_a_broken_signature_exits_one(self):
         self.write("broken", [(b"RTS0", rts0()[:10])])
         r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name], capture_output=True, text=True)
