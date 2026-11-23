@@ -62,14 +62,22 @@ class CpuScore(unittest.TestCase):
 
     def test_ultra_desktop_scores_unchanged(self):
         self.assertEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 9 285KF"), 195)
+        self.assertEqual(pc.cpu_score("Intel Core Ultra 9 285KS"), 195)
         self.assertAlmostEqual(pc.cpu_score("Intel Core Ultra 7 265"), 178 * 0.95)
         self.assertAlmostEqual(pc.cpu_score("Intel Core Ultra 5 245F"), 150 * 0.95)
+        # T is a 35 W desktop part, not a laptop one: it keeps the desktop estimate.
+        self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 9 285T"), 195 * 0.95)
+        self.assertAlmostEqual(pc.cpu_score("Intel Core Ultra 7 265T"), 178 * 0.95)
+        self.assertAlmostEqual(pc.cpu_score("Intel Core Ultra 5 245T"), 150 * 0.95)
 
     def test_ultra_laptop_suffix_lowers_the_score(self):
         # The same suffix rule as the Core i names: a laptop Core Ultra is not a desktop one.
         self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 5 125U"), 150 * 0.95 * 0.55)
         self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 7 155H"), 178 * 0.95 * 0.85)
         self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 9 275HX"), 195 * 0.95)
+        # Only K, KF and KS are desktop: HK is a laptop suffix, as for the Core i names (i9-8950HK).
+        self.assertAlmostEqual(pc.cpu_score("Intel Core Ultra 7 155HK"), 178 * 0.95 * 0.9)
+        self.assertAlmostEqual(pc.cpu_score("Intel Core Ultra 9 185HK"), 195 * 0.95 * 0.9)
         # Lunar Lake's V parts are low-power laptop chips, scored in the U class.
         self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) Ultra 7 258V"), 178 * 0.95 * 0.55)
         self.assertLess(pc.cpu_score("Intel Core Ultra 7 155H"), pc.cpu_score("Intel Core Ultra 7 265K"))

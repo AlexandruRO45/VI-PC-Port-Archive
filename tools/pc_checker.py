@@ -259,9 +259,12 @@ def cpu_lookup(name: str):
 
     m = re.search(r"core\s*ultra\s*([3579])\s*(\d{3})([a-z]*)", s)
     if m:
-        base = ULTRA_BASE[int(m[1])]
-        # A laptop suffix (H, U, V...) lowers the score as it does for the Core i names below.
-        return (base if "k" in m[3] else base * 0.95 * _mobile_mult(m[3])), False
+        base, suf = ULTRA_BASE[int(m[1])], m[3]
+        if suf in ("k", "kf", "ks"):            # the desktop K parts, as for the Core i names below
+            return base, False
+        # A laptop suffix (H, HK, U, V...) lowers the score as it does for the Core i names below. T is a 35 W
+        # desktop part, so it keeps the desktop estimate.
+        return base * 0.95 * (1.0 if suf.startswith("t") else _mobile_mult(suf)), False
 
     m = re.search(r"\bi([3579])[- ]?(\d{4,5})([a-z]{0,2})\d?\b", s)
     if m:
