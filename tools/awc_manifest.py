@@ -155,11 +155,10 @@ def collect(src: str, *, out: str | None = None):
     """
     recursive = os.path.isdir(src)
     if recursive:
+        def scan_failed(error):
+            raise error
+
         banks = []
-
-        def scan_failed(error: OSError) -> None:
-            raise error   # an unreadable sub-folder must not pass for "no banks there"
-
         for root, dirs, files in os.walk(src, onerror=scan_failed):
             dirs.sort()
             banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
@@ -217,6 +216,12 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
         if f is not sys.stdout:
             f.close()
         if tmp:
+            # The staging file may have inherited a read-only destination's mode; make it deletable
+            # first, or Windows strands it beside the manifest when the replace fails.
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             try:
                 os.unlink(tmp)
             except OSError:
