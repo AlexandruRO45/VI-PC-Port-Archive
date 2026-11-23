@@ -34,8 +34,10 @@ struct TileGrid {
 static TileGrid tile_grid(ID3D12Resource* resource) {
     if (!resource) return {};
     const auto desc = resource->GetDesc();
-    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width)
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width) {
+        if (SUCCEEDED(resource->GetHeapProperties(nullptr, nullptr))) return {};
         return {1 + (desc.Width - 1) / leonida::tile_size_in_bytes, 1};
+    }
     if (!is_sparse_image(resource)) return {};
     constexpr auto shape = leonida::element_tile_shape(false, 4);
     return {1 + (desc.Width - 1) / shape.width, 1 + (desc.Height - 1) / shape.height};
@@ -49,7 +51,8 @@ static bool append_tile_regions(const D3D12_TILED_RESOURCE_COORDINATE* start, co
     const auto first = y * grid.columns + x;
     if (size && size->UseBox) {
         if (size->Depth != 1 || !size->Width || !size->Height ||
-            size->Width > grid.columns - x || size->Height > grid.rows - y) return false;
+            size->Width > grid.columns - x || size->Height > grid.rows - y ||
+            std::uint64_t(size->Width) * size->Height * size->Depth != size->NumTiles) return false;
         for (UINT row = 0; row < size->Height; ++row)
             regions.push_back({first + row * grid.columns, size->Width});
         return true;
@@ -1859,21 +1862,24 @@ private:
         ranges.reserve(range_count);
         std::uint64_t remaining = total, heap_tiles_required = 0;
         for (UINT i = 0; i < range_count; ++i) {
+            const auto flag = flags ? flags[i] : D3D12_TILE_RANGE_FLAG_NONE;
+            if (flag != D3D12_TILE_RANGE_FLAG_NONE && flag != D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE &&
+                flag != D3D12_TILE_RANGE_FLAG_NULL && flag != D3D12_TILE_RANGE_FLAG_SKIP)
+                return false;
             const auto count = counts ? counts[i] : (range_count == 1 ? total : 1);
             if (!count) continue;
             if (count > remaining) return false;
             remaining -= count;
             using leonida::TileRangeMode;
-            const auto flag = flags ? flags[i] : D3D12_TILE_RANGE_FLAG_NONE;
             switch (flag) {
             case D3D12_TILE_RANGE_FLAG_NONE:
             case D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE: {
-                if (!offsets) return false;
+                const UINT offset = offsets ? offsets[i] : 0;
                 const auto used = flag == D3D12_TILE_RANGE_FLAG_NONE ? count : 1;
-                if (used > UINT64_MAX - offsets[i]) return false;
-                heap_tiles_required = std::max(heap_tiles_required, offsets[i] + used);
+                if (used > UINT64_MAX - offset) return false;
+                heap_tiles_required = std::max(heap_tiles_required, offset + used);
                 ranges.push_back({flag == D3D12_TILE_RANGE_FLAG_NONE ? TileRangeMode::sequential : TileRangeMode::reuse,
-                                  offsets[i], count});
+                                  offset, count});
                 break;
             }
             case D3D12_TILE_RANGE_FLAG_NULL:
