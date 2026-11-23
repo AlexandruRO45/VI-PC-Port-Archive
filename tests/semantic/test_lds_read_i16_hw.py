@@ -423,5 +423,89 @@ class TestDSReadI16BoundaryExtremes(unittest.TestCase):
                 self.assertEqual(val, expected32)
 
 
+class TestDSReadI16NegativeAndMutation(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            OffsetImmediate(-1)
+        with self.assertRaises(ValueError):
+            OffsetImmediate(0x10000)
+
+    def test_syntax_rejection_invalid_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            VGPR(256)
+
+    def test_mutation_detection_zero_extension(self) -> None:
+        class ZeroExtensionMutant(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSReadInstruction) -> int:
+                addr = state.rf.get_vgpr(inst.vaddr)
+                eff_addr = (addr + inst.offset.value) & MASK32
+                b0 = eff_addr & (state.lds.size_bytes - 1)
+                b1 = (eff_addr + 1) & (state.lds.size_bytes - 1)
+                val = (state.lds.bytes[b0] | (state.lds.bytes[b1] << 8)) & 0xFFFF
+                state.rf.set_vgpr(inst.vdst, val)
+                return val
+
+        lds = LDSMemory(num_dwords=1024)
+        lds.write_u16(0x40, 0x8000)
+        state = ScalarThreadState(lds)
+        state.rf.set_vgpr(VGPR(1), 0x40)
+
+        inst = DSReadInstruction(DSOpcode.DS_READ_I16, vdst=VGPR(5), vaddr=VGPR(1))
+        mutant_val = ZeroExtensionMutant().execute(state, inst)
+        correct_val = ScalarDSInterpreter().execute(state, inst)
+        self.assertEqual(mutant_val, 0x00008000)
+        self.assertEqual(correct_val, 0xFFFF8000)
+        self.assertNotEqual(mutant_val, correct_val)
+
+
+class TestDSReadI16TranslatorIntegration(unittest.TestCase):
+    """Hardware translator integration: tools/rdna2spirv.py and spirv_mini_interp."""
+
+    def test_translator_aligned_and_unaligned_read(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 0x80007FFF",   # low 16: 0x7FFF (+32767), high 16: 0x8000 (-32768)
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_i16 v5, v1",              # offset 0: +32767 (0x00007FFF)
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_i16 v6, v1 offset:2",     # offset 2: -32768 (0xFFFF8000)
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v31, 0",
+            "buffer_store_dword v5, v31, s[0:3], 0 offen",
+            "v_mov_b32_e32 v31, 4",
+            "buffer_store_dword v6, v31, s[0:3], 0 offen",
+        ]
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 0x00007FFF)
+        self.assertEqual(mem.get(4), 0xFFFF8000)
+
+    def test_translator_cross_dword_read(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 0xAA000000",   # byte 3 is 0xAA
+            "ds_write_b32 v1, v2",
+            "v_mov_b32_e32 v1, 0x44",
+            "v_mov_b32_e32 v2, 0x000000BB",   # byte 0 is 0xBB
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v1, 0x43",
+            "ds_read_i16 v5, v1",              # crosses 0x43 (0xAA) and 0x44 (0xBB) -> 0xBBAA -> 0xFFFFBBAA
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v31, 0",
+            "buffer_store_dword v5, v31, s[0:3], 0 offen",
+        ]
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 0xFFFFBBAA)
+
+    def test_translator_rejects_malformed_syntax(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("bad_syntax", ["ds_read_i16 v1"])
+
+
 if __name__ == "__main__":
     unittest.main()
