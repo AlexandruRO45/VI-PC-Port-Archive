@@ -190,16 +190,24 @@ def scan(path, start=None, limit=None, jobs=1):
     return found
 
 
+class _Obj(dict):
+    """A JSON object that keeps the values of repeated keys apart (``repeats``) instead of letting the last win."""
+    repeats = None
+
+
 def _pairs(pairs):
-    out = {}
+    out = _Obj()
+    out.repeats = {}
     for k, v in pairs:
-        if k in out:  # a repeated key keeps all its items and is counted, not silently replaced
-            out.setdefault("\0duplicates", []).append(k)
-            prev = out[k] if isinstance(out[k], list) else [out[k]]
-            out[k] = prev + (v if isinstance(v, list) else [v])
+        if k in out:  # counted and kept, not silently replaced
+            out.repeats.setdefault(k, []).append(v)
         else:
             out[k] = v
     return out
+
+
+def _repeats(obj):
+    return sum(map(len, obj.repeats.values())) if isinstance(obj, _Obj) else 0
 
 
 def _position(pos):
@@ -225,23 +233,38 @@ def _json_type(v):
 
 
 def load_names(path):
-    """({key: [position]}, repeated keys in the InteriorNames section, positions that are not three numbers).
+    """({key: [position]}, repeated JSON keys, positions that are not three numbers).
 
-    Raises ValueError (with OSError and json.JSONDecodeError, which is one) when the file is not such a table."""
+    A key repeated in the InteriorNames section (or a repeated section) keeps the items of every copy. A key repeated inside one item is
+    counted too; an item that repeats ``Pos`` gives no position, since it names two. Raises ValueError (with OSError
+    and json.JSONDecodeError, which is one) when the file is not such a table."""
     with open(path, encoding="utf-8") as f:
         doc = json.load(f, object_pairs_hook=_pairs)
     if not isinstance(doc, dict):
         raise ValueError(f"expected a JSON object, found {_json_type(doc)}")
-    section = doc.get("InteriorNames", doc)
-    if not isinstance(section, dict):
-        raise ValueError(f"InteriorNames is {_json_type(section)}, not an object")
-    duplicates = len(section.pop("\0duplicates", []))
+    copies = [doc["InteriorNames"]] + doc.repeats.get("InteriorNames", []) if "InteriorNames" in doc else [doc]
+    for c in copies:
+        if not isinstance(c, dict):
+            raise ValueError(f"InteriorNames is {_json_type(c)}, not an object")
+    section = copies[0]
+    for c in copies[1:]:  # a repeated InteriorNames section: its keys join the first copy's as repeats
+        for k, v in list(c.items()) + [(k, v) for k, vs in c.repeats.items() for v in vs]:
+            if k in section:
+                section.repeats.setdefault(k, []).append(v)
+            else:
+                section[k] = v
+    duplicates = len(copies) - 1 + _repeats(section)
     out, malformed = {}, 0
-    for key, items in section.items():
-        items = items if isinstance(items, list) else [items]
+    for key, first in section.items():
+        items = []
+        for v in [first] + section.repeats.get(key, []):
+            items.extend(v if isinstance(v, list) else [v])
         out[key] = []
         for it in items:
-            if not isinstance(it, dict) or "Pos" not in it:
+            if not isinstance(it, dict):
+                continue
+            duplicates += _repeats(it)
+            if "Pos" not in it or "Pos" in it.repeats:
                 continue
             pos = _position(it["Pos"])
             if pos is None:
@@ -261,8 +284,10 @@ def _outside(v, lo, hi):
 
 
 def _scaled(lo, hi, p):
-    """Box [lo, hi] scaled by placement p (scaleXY on X and Y, scaleZ on Z; a missing or zero scale is 1)."""
-    sxy, sz = p.get("scale_xy") or 1.0, p.get("scale_z") or 1.0
+    """Box [lo, hi] scaled by placement p (scaleXY on X and Y, scaleZ on Z).
+
+    A missing scale is 1; an explicit zero collapses the axis, as ``world_archetypes.world_box`` does."""
+    sxy, sz = (1.0 if p.get(k) is None else p[k] for k in ("scale_xy", "scale_z"))
     s = (sxy, sxy, sz)
     a, b = [lo[i] * s[i] for i in range(3)], [hi[i] * s[i] for i in range(3)]
     return [min(a[i], b[i]) for i in range(3)], [max(a[i], b[i]) for i in range(3)]

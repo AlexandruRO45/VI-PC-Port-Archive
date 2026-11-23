@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -250,7 +251,18 @@ class ResolveTest(unittest.TestCase):
     def test_scaled_box_negative_and_missing_scale(self):
         lo, hi = [-1.0, -2.0, 0.0], [3.0, 2.0, 4.0]
         self.assertEqual(T._scaled(lo, hi, {"scale_xy": -2.0, "scale_z": 0.5}), ([-6.0, -4.0, 0.0], [2.0, 4.0, 2.0]))
-        self.assertEqual(T._scaled(lo, hi, {"scale_xy": None, "scale_z": 0.0}), (lo, hi))
+        # A missing scale is 1; an explicit zero collapses the axis, as world_archetypes.world_box does.
+        self.assertEqual(T._scaled(lo, hi, {"scale_xy": None, "scale_z": 0.0}), ([-1.0, -2.0, 0.0], [3.0, 2.0, 0.0]))
+
+    def test_zero_scale_collapses_the_axis(self):
+        # Box [-1, 1] placed at the origin with scaleZ 0: the box is the z = 0 plane, so a point 0.5 m up is 0.5 m
+        # outside. Read as scale 1 (the old rule), it was inside.
+        unit = ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])
+        d = {"name": HA, "keys": {}, "bb_min": unit[0], "bb_max": unit[1], "rooms": []}
+        p = {"archetype": HA, "position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0],
+             "scale_xy": 1.0, "scale_z": 0.0}
+        _, rows = T.resolve({KEY_A: [[0.5, 0.0, 0.5], [0.5, 0.0, 0.0]]}, {0: ([d], [p])})
+        self.assertEqual(rows[KEY_A]["outside_box_m_stored"], [0.5, 0.0])
 
     def test_unknown_placements_are_not_counted_as_placed_interiors(self):
         found = {0: T.parse(interiors()), 1: T.parse(placements()),
@@ -265,6 +277,99 @@ class ResolveTest(unittest.TestCase):
         s, _ = T.resolve({}, found)
         self.assertEqual((s["interior_definitions"], s["interior_names"]), (4, 2))
         self.assertEqual(s["duplicate_interior_definitions"], 2)
+
+
+def _qmul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz)
+
+
+def _turn(q, v):
+    """v rotated by unit quaternion q as q v q* (Hamilton product; independent of the tool's matrix)."""
+    x, y, z, w = q
+    return _qmul(_qmul(q, (v[0], v[1], v[2], 0.0)), (-x, -y, -z, w))[:3]
+
+
+def _f32(values):
+    return list(struct.unpack("<%df" % len(values), struct.pack("<%df" % len(values), *values)))
+
+
+class ForwardConstructionTest(unittest.TestCase):
+    """Points built in a placed box's own scaled frame from a known answer, mapped to world space, then measured.
+
+    Seeded, 600 cases: 30% axis-aligned rotations, scales including negative, 0.998 and 0, float32 quaternions and
+    positions up to 13 km. Expected bounds and rotations are computed here, not with the tool's helpers."""
+
+    SCALES = (1.0, -1.0, 2.0, -2.0, 0.998, 1.5, 0.5, 0.0)
+
+    def case(self, rng):
+        lo = [rng.uniform(-10, 0) for _ in range(3)]
+        hi = [lo[i] + rng.uniform(1, 20) for i in range(3)]
+        rlo = [rng.uniform(lo[i], hi[i] - 0.5) for i in range(3)]
+        rhi = [rng.uniform(rlo[i] + 0.25, hi[i]) for i in range(3)]
+        if rng.random() < 0.3:
+            axis, turns = rng.randrange(3), rng.randrange(4)
+            q = [0.0, 0.0, 0.0, math.cos(turns * math.pi / 4)]
+            q[axis] = math.sin(turns * math.pi / 4)
+        else:
+            q = [rng.gauss(0, 1) for _ in range(4)]
+        q = _f32(q)
+        n = math.sqrt(sum(c * c for c in q))
+        unit = [c / n for c in q]
+        sxy, sz = rng.choice(self.SCALES), rng.choice(self.SCALES)
+        s = (sxy, sxy, sz)
+        blo = [min(lo[i] * s[i], hi[i] * s[i]) for i in range(3)]
+        bhi = [max(lo[i] * s[i], hi[i] * s[i]) for i in range(3)]
+        mlo = [min(rlo[i] * s[i], rhi[i] * s[i]) for i in range(3)]
+        mhi = [max(rlo[i] * s[i], rhi[i] * s[i]) for i in range(3)]
+        kind = rng.choice(("inside", "face", "edge", "corner", "room face", "out"))
+        u, gap, room = [rng.uniform(blo[i], bhi[i]) for i in range(3)], 0.0, None
+        if kind in ("face", "edge", "corner", "out"):
+            for i in rng.sample(range(3), {"face": 1, "edge": 2, "corner": 3, "out": 1}[kind]):
+                u[i] = rng.choice((blo[i], bhi[i]))
+                if kind == "out":
+                    gap = rng.choice((5e-6, 1e-4, 0.01, 0.5, 3.0))  # the small ones pin EPS from above
+                    u[i] += gap if u[i] == bhi[i] else -gap
+        elif kind == "room face":
+            u = [rng.uniform(mlo[i], mhi[i]) for i in range(3)]
+            i = rng.randrange(3)
+            u[i] = rng.choice((mlo[i], mhi[i]))
+            room = 1
+        if room is None:  # decided on exact values: random points are not within 1e-6 m of a room face
+            room = int(all(mlo[i] < u[i] < mhi[i] for i in range(3)))
+            if any(abs(u[i] - mlo[i]) < 1e-5 or abs(u[i] - mhi[i]) < 1e-5 for i in range(3)):
+                return None
+        conj = rng.random() < 0.5
+        r = [-unit[0], -unit[1], -unit[2], unit[3]] if conj else unit
+        pos = _f32([rng.uniform(-13000, 13000) for _ in range(3)])
+        world = [pos[i] + c for i, c in enumerate(_turn(r, u))]
+        d = {"name": HA, "keys": {}, "bb_min": lo, "bb_max": hi, "rooms": [[J("a"), rlo, rhi, 0]]}
+        p = {"archetype": HA, "position": pos, "rotation": q, "scale_xy": sxy, "scale_z": sz}
+        # The other convention, measured here from the world point: inverse-rotate by its quaternion and take
+        # the distance to the scaled box, so a swap of the two conventions shows.
+        other = unit if conj else [-unit[0], -unit[1], -unit[2], unit[3]]
+        v = _turn([-other[0], -other[1], -other[2], other[3]], [world[i] - pos[i] for i in range(3)])
+        other_gap = math.sqrt(sum(max(blo[i] - v[i], 0.0, v[i] - bhi[i]) ** 2 for i in range(3)))
+        return ("conjugate" if conj else "stored"), world, gap, room, d, p, kind, other_gap
+
+    def test_tool_recovers_constructed_distances_and_room_hits(self):
+        rng, done = random.Random(3813), 0
+        while done < 600:
+            c = self.case(rng)
+            if c is None:
+                continue
+            tag, world, gap, room, d, p, kind, other_gap = c
+            s, rows = T.resolve({KEY_A: [world]}, {0: ([d], [p])})
+            got = rows[KEY_A]["outside_box_m_" + tag][0]
+            self.assertAlmostEqual(got, gap, delta=1.5e-3, msg=(done, kind, p))
+            # The "inside" bucket, not only the rounded distance: a face point left 1e-17 m out reads 0.0 above.
+            self.assertEqual(s["distance_outside_own_interior_box"][tag]["within_m"]["0"], int(gap == 0), (done, kind, p))
+            self.assertEqual(s["positions_in_a_room_box"][tag], room, (done, kind, p))
+            other = "stored" if tag == "conjugate" else "conjugate"
+            self.assertAlmostEqual(rows[KEY_A]["outside_box_m_" + other][0], other_gap, delta=1.5e-3, msg=(done, kind))
+            done += 1
 
 
 class HelperTest(unittest.TestCase):
@@ -284,6 +389,33 @@ class HelperTest(unittest.TestCase):
             names, dup, malformed = T.load_names(path)
         self.assertEqual((dup, malformed), (1, 0))
         self.assertEqual(names, {"K": [[1, 2, 3], [4, 5, 6]], "J": [[0, 0, 0]]})
+
+    def test_keys_repeated_inside_an_item_are_duplicates_not_malformed(self):
+        # Review note on 7651e788: a repeated Pos inside one item was joined into a six-number list and counted as
+        # malformed. It names two positions, so it is counted as a repeated key and gives none; a repeated Name
+        # is counted and the item's Pos kept. No bookkeeping key leaks into the result.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "names.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"InteriorNames": {"K": [{"Pos": [1, 2, 3], "Pos": [4, 5, 6]},'
+                        ' {"Name": "a", "Name": "b", "Pos": [7, 8, 9]}]}}')
+            names, dup, malformed = T.load_names(path)
+        self.assertEqual((names, dup, malformed), ({"K": [[7.0, 8.0, 9.0]]}, 2, 0))
+
+    def test_repeated_section_keeps_both_and_is_counted(self):
+        # Review note: a repeated InteriorNames section was dropped without a count. Both copies are kept now.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "names.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"InteriorNames": {"A": [{"Pos": [1, 2, 3]}]},'
+                        ' "InteriorNames": {"B": [{"Pos": [4, 5, 6]}], "A": {"Pos": [7, 8, 9]}}}')
+            names, dup, malformed = T.load_names(path)
+            self.assertEqual((names, dup, malformed), ({"A": [[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]],
+                                                        "B": [[4.0, 5.0, 6.0]]}, 2, 0))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"InteriorNames": {"A": []}, "InteriorNames": 5}')
+            with self.assertRaises(ValueError):
+                T.load_names(path)
 
     def test_malformed_positions_are_counted_not_kept(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -427,6 +427,7 @@ and joins them with the `InteriorNames` section (full archive, `--jobs 15`, abou
 | ... with fewer positions than placements | 24 |
 | ... whose placements have no `position` to measure from | 0 |
 | inner-item `Pos` values that are not three numbers (dropped) | 0 |
+| repeated keys in the `InteriorNames` section or directly inside an item (`duplicate_keys`; a repeated `Pos` gives no position) | 0 |
 
 So a key selects one interior archetype, and its inner items are, in most cases, one per placed copy of that
 interior: the `Name` of each item labels that copy.
@@ -445,7 +446,8 @@ positions to the nearest placed copy of its own interior's box (0 = inside):
 | stored quaternion | 315 | 1,015 | 1,189 | 1,443 | 1,867 | 2,199 | 1.72 m | 215 |
 | conjugated | 571 | 950 | 1,121 | 1,416 | 1,863 | 2,199 | 2.10 m | 484 |
 
-The interior and room boxes are scaled by each placement's `scaleXY` and `scaleZ` before measuring. Only 6 of
+The interior and room boxes are scaled by each placement's `scaleXY` and `scaleZ` before measuring (a missing
+scale is 1 and an explicit zero collapses the axis, as in `world_archetypes.py`). Only 6 of
 the 2,590 placements are scaled at all (`scaleZ` 0.998), so this changes two room hits per convention and none
 of the distances. A point within 1e-6 m of an interior or room face counts as inside it (`EPS`), since the
 inverse of a float32 rotation can leave a face point about 1e-17 m outside. Positions are float32 and resolve to
