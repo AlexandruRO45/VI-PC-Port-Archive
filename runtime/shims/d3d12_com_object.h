@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <memory>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -58,7 +59,7 @@ public:
     // keeps a pointer-sized entry that reads back as null.
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
         if (!size) return E_INVALIDARG;
-        std::lock_guard lock(data_mutex_);
+        std::unique_lock lock(data_mutex_);
         for (const auto& entry : data_) {
             if (entry.key != guid) continue;
             const UINT bytes = entry.is_interface ? UINT(sizeof(IUnknown*)) : UINT(entry.bytes.size());
@@ -68,8 +69,16 @@ public:
             }
             if (data) {
                 if (entry.is_interface) {
-                    if (entry.object) entry.object->AddRef();
-                    std::memcpy(data, &entry.object, sizeof(IUnknown*));
+                    // Copy ownership without calling foreign code under the mutex. AddRef may reenter this
+                    // store and remove/replace the entry, so neither its lifetime nor its vector slot may be
+                    // borrowed across the call. The stored reference stays live until this snapshot is gone.
+                    auto held = entry.object;
+                    IUnknown* object = held.get();
+                    lock.unlock();
+                    if (object) object->AddRef();
+                    std::memcpy(data, &object, sizeof(object));
+                    *size = bytes;
+                    return S_OK;
                 } else if (bytes) {
                     std::memcpy(data, entry.bytes.data(), bytes);
                 }
@@ -92,8 +101,12 @@ public:
 
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
         IUnknown* held = const_cast<IUnknown*>(object);
-        if (held) held->AddRef();
-        store(PrivateData{guid, {}, held, true});
+        std::shared_ptr<IUnknown> reference;
+        if (held) {
+            held->AddRef();
+            reference = std::shared_ptr<IUnknown>(held, [](IUnknown* p) { p->Release(); });
+        }
+        store(PrivateData{guid, {}, std::move(reference), true});
         return S_OK;
     }
 
@@ -120,16 +133,14 @@ public:
     }
 
 protected:
-    virtual ~Object() {
-        for (auto& entry : data_)
-            if (entry.object) entry.object->Release();
-    }
+    virtual ~Object() = default;
 
 private:
     struct PrivateData {
         GUID key;
         std::vector<std::uint8_t> bytes;
-        IUnknown* object;  // SetPrivateDataInterface: one reference held (null for a null interface)
+        // Owns one COM reference. GetPrivateData copies this owner under the lock, then invokes AddRef outside it.
+        std::shared_ptr<IUnknown> object;
         bool is_interface;  // set by SetPrivateDataInterface, even with null: reads back as a pointer
     };
 
@@ -141,20 +152,21 @@ private:
         replace(key, &entry);
     }
     bool replace(REFGUID key, PrivateData* entry) {
-        IUnknown* released = nullptr;
+        std::shared_ptr<IUnknown> released;
         bool found = false;
         {
             std::lock_guard lock(data_mutex_);
             for (auto it = data_.begin(); it != data_.end(); ++it) {
                 if (it->key != key) continue;
-                released = it->object;
-                data_.erase(it);
+                released = std::move(it->object);
+                if (entry) *it = std::move(*entry);
+                else data_.erase(it);
                 found = true;
                 break;
             }
-            if (entry) data_.push_back(std::move(*entry));
+            if (entry && !found) data_.push_back(std::move(*entry));
         }
-        if (released) released->Release();
+        // Destruction releases the old COM reference after the mutex is unlocked and all readers let it go.
         return found;
     }
 
