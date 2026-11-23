@@ -2009,12 +2009,13 @@ def mark(path: str, what: str) -> None:
 
 
 def marker_matches(path: str, what: str) -> bool:
-    expected = f"{what} finished"
+    expected = f"{what} finished".encode()
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read(len(expected) + 2).strip() == expected
+        with open(path, "rb") as f:
+            data = f.read(len(expected) + 2)
     except OSError:
         return False
+    return data in (expected, expected + b"\n")
 
 
 def pending_xma(xma_dir: str) -> list:

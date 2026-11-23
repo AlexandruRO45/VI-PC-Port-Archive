@@ -209,7 +209,8 @@ class AudioStageResumeTest(unittest.TestCase):
     def test_marker_matches_reads_only_the_marker_length(self):
         p = os.path.join(self.audio, "probe.done")
         cases = (("tool finished\n", True), ("tool finished", True), ("tool finish", False),
-                 ("tool finished" + "x" * (1 << 20), False), ("tool finished\n" + "x" * (1 << 20), False))
+                 ("tool finished" + "x" * (1 << 20), False), ("tool finished\n" + "x" * (1 << 20), False),
+                 ("tool finished\n\nforeign\n", False), ("tool finished\n\n", False), (" tool finished\n", False))
         for text, want in cases:
             with self.subTest(size=len(text), want=want):
                 with open(p, "w", encoding="utf-8") as f:
