@@ -291,6 +291,15 @@ int main() {
             const BOOL proxy_result = detect_proxy(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url);
             check(!proxy_result && GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url &&
                       g_native_auto_proxy_calls == 0, "auto proxy fails offline without native DHCP discovery");
+            g_native_auto_proxy_calls = 0;
+            const BOOL dns_proxy_result = detect_proxy(WINHTTP_AUTO_DETECT_TYPE_DNS_A, &url);
+            check(!dns_proxy_result && GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url &&
+                      g_native_auto_proxy_calls == 0, "auto proxy fails offline without native DNS discovery");
+            g_native_auto_proxy_calls = 0;
+            const BOOL combined_proxy_result = detect_proxy(
+                WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A, &url);
+            check(!combined_proxy_result && GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url &&
+                      g_native_auto_proxy_calls == 0, "auto proxy fails offline without native combined discovery");
 
         }
         check(add_headers(request, L"X-Test: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
