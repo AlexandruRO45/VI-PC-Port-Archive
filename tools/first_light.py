@@ -687,7 +687,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
     }
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
-    if args.png:
+    if getattr(args, "png", False):
         png = os.path.join(out_dir, "image.png")
         write_png(png, result["pixels"], manifest["width"], manifest["height"])
         print(png)

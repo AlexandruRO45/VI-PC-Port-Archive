@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zlib
@@ -72,6 +73,14 @@ class FirstLightMeshDrawTests(unittest.TestCase):
         self.prepare_replay()
         self.assertEqual(first_light.main(["--check", "--out", str(self.out)]), 0)
         self.draw.assert_called_once()
+        self.assertTrue((self.out / "image.ppm").is_file())
+        self.assertFalse((self.out / "image.png").exists())
+
+    def test_run_draw_defaults_to_no_png_without_png_option(self) -> None:
+        self.prepare_replay()
+        manifest = json.loads((self.out / "manifest.json").read_text(encoding="utf-8"))
+        result = first_light.run_draw(SimpleNamespace(harness=None), manifest, str(self.out))
+        self.assertEqual(result["covered"], 2)
         self.assertTrue((self.out / "image.ppm").is_file())
         self.assertFalse((self.out / "image.png").exists())
 
