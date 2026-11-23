@@ -593,9 +593,9 @@ It sets a flag byte at `+0x140`, stores a flag at `+0x141` from the
 pipeline, and copies 32 bytes of the pipeline object (from its `+0x10`) to `+0x544`. These are the fields
 section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x544`).
 **With the cursor at the limit, every command goes through the vtable**: that is how `fsr_dispatch_test` records
-them, and it is the simplest contract for a layer that does not want to decode these packets. Whether the game's
-executable makes the same check before writing is unknown until it is available; it is compiled against the same
-console headers.
+them, and it is the simplest contract for a layer that does not want to decode these packets. The retail
+executable makes the same check before every one of its inline writes (section 3.3, measured on 1.0.2.1); it is
+compiled against the same console headers.
 
 **Every inline write in the package's DLLs checks first.** `tools/inline_scan.py` finds each cursor store-back
 (`mov [list+18h],reg` after stores through the cursor) and looks for the compare in front of it. On the 1.0.2.1
@@ -605,6 +605,7 @@ DLLs (dumpbin 14.44 listings):
 |---|---:|---:|---:|---|---|
 | `XboxBvhBuilder.dll` | 196 | 196 | 0 | `+0x30` ×165, `+0x28` ×30, a register loaded in another block ×1 | 45 ×71, 37 ×35, 25 ×34, 14 ×24, 39 ×16, 43 ×9, 80 ×4; 3 reach theirs through a shared jump the tool does not follow |
 | `amd_fidelityfx_upscaler_xbox.dll` | 9 | 9 | 0 | `+0x30` ×8, `+0x28` ×1 | 35 ×6, 25, 41, 14 |
+| `game_scarlett_master.exe` | 110 | 110 | 0 | `+0x8` ×51, `+0x20` ×33, `+0x30` ×12, `+0x10` ×9, `+0x28` ×2, `+0x40` ×2, `+0xd0` ×1 | 6 sites name one (35, 43, 45 ×2 each; 20, 47, 24 ×1); the other 101 reach theirs by a tail jump, which the tool does not follow |
 
 **Measured.** The packet headers it reads back are the two dispatch forms above: `0x4002c400` (26 four-word
 dispatches in the builder, one in FSR) and `0x4003cc00` (the builder's four five-word ones). The other 14 DLLs have
@@ -613,10 +614,23 @@ result as an upper bound of about one site per image. Removing the compare and b
 `0x14972` write turns exactly that site into "not checked", so a missing check is visible.
 
 On the executable, `python -I tools/inline_scan.py <exe> --sites` answers the question in one pass (see the day-one
-list in `docs/design.md`): no unchecked site means a cursor-at-limit layer sees every command the game records; each
-unchecked site is listed by RVA and is a write that layer never sees. Its fallback-slot line is the set of console
-list methods the game reaches through the vtable. Limit offsets other than `+0x28`/`+0x30` would be command kinds
-the DLLs never write (draws, input-assembler and output-merger state); read a few of those sites by hand.
+list in `docs/design.md`). It was run on the retail 1.0.2.1 `game_scarlett_master.exe` (120,181,760 bytes, dumpbin
+14.39): **26,674,075 instructions, 110 list sites, 110 guarded, none unchecked**, and the 2,720 further cursor-like
+stores touch no list field, so they are not lists. A cursor-at-limit layer therefore sees every inline command write
+the executable makes, on the same evidence as the DLLs.
+
+Two things that run turned up, both now in the tool's output. The exe's limits are mostly not the DLLs': `+0x8` ×51,
+`+0x20` ×33, `+0x30` ×12, `+0x10` ×9, `+0x28` ×2, `+0x40` ×2, `+0xd0` ×1, so the offsets other than `+0x28`/`+0x30`
+are command kinds the DLLs never write and are worth reading by hand. And only 31 of the 110 load the cursor from
+`[list+18h]` inside the window (all 31 checked); the other 79 are guarded stores to `+0x18` whose cursor load is in
+another block or a shared prologue, so the tool no longer folds them into "checked": the summary prints the split
+and `--sites` prints `cursor loaded` / `cursor outside`.
+
+One `+0x28` site, `0x56b78`, is the four-word dispatch this page measured in the DLLs: 16 bytes, cursor `+0x18`
+advanced by 16, `+0x140` cleared, header `0x4002c400` when either of the flag bytes `+0x140`/`+0x143` is set and
+otherwise `0x4002e800 + 4·(byte +0x141 & 1)`, the `(flag | 0x1000ba00) << 2` form above. Its fallback column is
+empty because the executable reaches vtable slots by tail jump here (`mov rax,[rax]; jmp rax` ending the block before
+the dispatch, slot 14), and the tool follows only a `call` within 16 instructions of the branch target.
 
 **The five-word dispatch.** The BVH builder also writes `0x4003cc00, x, 1, 1, W`:
 

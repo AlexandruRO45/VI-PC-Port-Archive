@@ -23,7 +23,10 @@ works too, on any OS. Nothing is executed. The output is RVAs, counts and consta
 An input with no instructions in it (an empty or other text file, a PE dumpbin prints no code for) exits 2
 instead of reporting zero sites, so "UNCHECKED 0" always means something was scanned.
 The matcher knows the instruction shapes MSVC emits for these writes (see tests/test_inline_scan.py); a shape it
-does not know shows up as `unrelated`, so read a few of those by hand on a new image.
+does not know shows up as `unrelated`, so read a few of those by hand on a new image. A `checked` site whose cursor
+load from `[list+18h]` is outside the scanned window (a shared prologue, another block, a tail jump) is guarded, but
+what it stores is not proven to be the cursor; the summary counts those on their own line and `--sites` prints
+`cursor loaded` or `cursor outside` for each site.
 """
 import argparse
 import collections
@@ -193,6 +196,10 @@ def summarize(sites, instructions=None):
     out = [] if instructions is None else [f"instructions scanned: {instructions}"]
     out += [f"list sites {len(checked) + len(unchecked)}: checked {len(checked)}, UNCHECKED {len(unchecked)} "
             f"(plus {len(unrelated)} cursor-like stores with no list field nearby, likely other structures)"]
+    traced = [s for s in checked if s["load_traced"]]
+    if len(traced) != len(checked):
+        out.append(f"checked with the cursor loaded from the list: {len(traced)}, checked with the cursor load "
+                   f"outside the scanned window: {len(checked) - len(traced)}")
     for title, key, group, fmt in (("limit offsets (checked)", "limit", checked, limit_text),
                                    ("fallback vtable slots (checked)", "fallback_slot", checked, plain),
                                    ("packet sizes, checked", "size", checked, plain),
@@ -226,8 +233,9 @@ def main() -> int:
         for s in sites:
             state = f"checked {limit_text(s['limit'])}" if s["checked"] else "UNCHECKED" if s["list"] else "unrelated"
             header = "-" if s["header"] is None else f"0x{s['header']:08x}"
+            cursor = "loaded" if s["load_traced"] else "outside"
             print(f"  load {rva(s['load'])} store {rva(s['store_back'])} [{s['base']}] {state} size {s['size']} "
-                  f"stores {s['stores']} header {header} fallback {s['fallback_slot']}")
+                  f"stores {s['stores']} header {header} fallback {s['fallback_slot']} cursor {cursor}")
     return 0
 
 

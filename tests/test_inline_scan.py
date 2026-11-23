@@ -151,6 +151,26 @@ class InlineScanTests(unittest.TestCase):
         self.assertIn("checked 1, UNCHECKED 1", text)
         self.assertIn("+0x28 x1", text)
 
+    def test_a_guarded_store_whose_cursor_load_is_outside_the_window_is_counted_separately(self):
+        # The retail executable's common shape: the compare is here, the `[list+18h]` load is in another block.
+        rows = (
+            "cmp rsi,qword ptr [rbx+28h]",
+            "jae 0000000140002000",
+            "mov dword ptr [rsi],4002C400h",
+            "mov qword ptr [rbx+18h],rsi",
+        )
+        (site,) = sites(rows)
+        self.assertTrue(site["checked"])
+        self.assertFalse(site["load_traced"])
+        text = inline_scan.summarize([site])
+        self.assertIn("checked 1, UNCHECKED 0", text)
+        self.assertIn("cursor loaded from the list: 0", text)
+        self.assertIn("cursor load outside the scanned window: 1", text)
+
+    def test_a_checked_site_that_loaded_its_cursor_adds_no_second_line(self):
+        text = inline_scan.summarize(sites(GUARDED))
+        self.assertNotIn("outside the scanned window", text)
+
     def test_scan_counts_the_instructions_it_read(self):
         stats = {}
         sites = list(inline_scan.scan(listing(*GUARDED), stats))
