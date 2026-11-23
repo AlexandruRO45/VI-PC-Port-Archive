@@ -391,5 +391,26 @@ class TestAddLshlU32ASTInterpreter(unittest.TestCase):
         self.assertEqual(res, 80)
         self.assertEqual(interp.vgprs[0], 80)
 
+# ---------------------------------------------------------------------------
+# Opcode 3: v_add_lshl_u32 - SIMD and Boundary Tests
+# ---------------------------------------------------------------------------
+
+class TestAddLshlU32SIMDBoundaries(unittest.TestCase):
+    def test_simd_wave_divergence(self) -> None:
+        wave = SIMDWavefront(wave_size=32, exec_mask=0x00FF_00FF)
+        s0 = [2] * 32
+        s1 = [3] * 32
+        s2 = [1] * 32
+        res = wave.execute(oracle_add_lshl_u32, s0, s1, s2)
+        for lane in range(32):
+            if ((0x00FF_00FF >> lane) & 1):
+                self.assertEqual(res[lane], 10)
+            else:
+                self.assertEqual(res[lane], 0)
+
+    def test_boundary_shift_out(self) -> None:
+        self.assertEqual(oracle_add_lshl_u32(1, 0, 31), 0x8000_0000)
+        self.assertEqual(oracle_add_lshl_u32(2, 0, 31), 0)
+
 if __name__ == "__main__":
     unittest.main()
