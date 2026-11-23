@@ -161,5 +161,111 @@ class TestValuMin3F16Oracle(unittest.TestCase):
         self.assertEqual(ref_min3_f16(QNAN_CANONICAL, QNAN_ALT, SNAN, clamp=True), POS_ZERO)
         self.assertEqual(ref_min3_f16(POS_HALF, POS_ONE, POS_TWO, clamp=True), POS_HALF)
 
+
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST opcode definitions and typed expressions
+# -----------------------------------------------------------------------------
+from dataclasses import dataclass
+from typing import Optional, List
+
+
+@dataclass
+class F16Operand:
+    reg: str
+    is_vgpr: bool
+    is_sgpr: bool
+    is_literal: bool
+    literal_value: int = 0
+    neg: bool = False
+    abs_val: bool = False
+    hi: bool = False
+
+
+@dataclass
+class VMin3F16AST:
+    dst_reg: str
+    dst_hi: bool
+    src0: F16Operand
+    src1: F16Operand
+    src2: F16Operand
+    clamp: bool = False
+
+    @classmethod
+    def parse(cls, line: str) -> VMin3F16AST:
+        tokens = line.strip().split()
+        if not tokens or tokens[0] != "v_min3_f16":
+            raise ValueError(f"Invalid mnemonic for v_min3_f16: {line}")
+
+        op_sel = [0, 0, 0, 0]
+        m_sel = re.search(r"op_sel:\s*\[([0-9,\s]+)\]", line)
+        if m_sel:
+            op_sel = [int(x.strip()) for x in m_sel.group(1).split(",")]
+            line_clean = re.sub(r"op_sel:\s*\[[0-9,\s]+\]", "", line)
+        else:
+            line_clean = line
+
+        clamp = "clamp" in line_clean.split()
+        words = [w for w in line_clean.split() if w != "clamp"]
+        clean_args = " ".join(words[1:])
+
+        parts = [p.strip() for p in clean_args.split(",") if p.strip()]
+        if len(parts) < 4:
+            raise ValueError(f"Insufficient operands for v_min3_f16: {line}")
+
+        dst_str = parts[0]
+        s0_str = parts[1]
+        s1_str = parts[2]
+        s2_str = parts[3]
+
+        def parse_src(s: str, sel_bit: int) -> F16Operand:
+            neg = False
+            abs_val = False
+            s = s.strip()
+            if s.startswith("-"):
+                neg = True
+                s = s[1:].strip()
+            if s.startswith("|") and s.endswith("|"):
+                abs_val = True
+                s = s[1:-1].strip()
+                if s.startswith("-"):
+                    neg = True
+                    s = s[1:].strip()
+            if s.startswith("v"):
+                return F16Operand(reg=s, is_vgpr=True, is_sgpr=False, is_literal=False, neg=neg, abs_val=abs_val, hi=bool(sel_bit))
+            elif s.startswith("s"):
+                return F16Operand(reg=s, is_vgpr=False, is_sgpr=True, is_literal=False, neg=neg, abs_val=abs_val, hi=bool(sel_bit))
+            else:
+                val = int(s, 0)
+                return F16Operand(reg="", is_vgpr=False, is_sgpr=False, is_literal=True, literal_value=val, neg=neg, abs_val=abs_val, hi=bool(sel_bit))
+
+        s0 = parse_src(s0_str, op_sel[0])
+        s1 = parse_src(s1_str, op_sel[1])
+        s2 = parse_src(s2_str, op_sel[2])
+        return cls(dst_reg=dst_str, dst_hi=bool(op_sel[3]), src0=s0, src1=s1, src2=s2, clamp=clamp)
+
+
+class TestValuMin3F16AST(unittest.TestCase):
+    """Commit 2: Symbolic AST parsing and typed representations."""
+
+    def test_ast_parsing_basic(self):
+        ast = VMin3F16AST.parse("v_min3_f16 v0, s0, s1, s2")
+        self.assertEqual(ast.dst_reg, "v0")
+        self.assertFalse(ast.dst_hi)
+        self.assertEqual(ast.src0.reg, "s0")
+        self.assertEqual(ast.src1.reg, "s1")
+        self.assertEqual(ast.src2.reg, "s2")
+        self.assertFalse(ast.clamp)
+
+    def test_ast_parsing_op_sel_and_modifiers(self):
+        ast = VMin3F16AST.parse("v_min3_f16 v5, -|v0|, s1, 0x3c00 clamp op_sel:[1, 0, 0, 1]")
+        self.assertEqual(ast.dst_reg, "v5")
+        self.assertTrue(ast.dst_hi)
+        self.assertTrue(ast.src0.neg)
+        self.assertTrue(ast.src0.abs_val)
+        self.assertTrue(ast.src0.hi)
+        self.assertTrue(ast.clamp)
+        self.assertTrue(ast.src2.is_literal)
+        self.assertEqual(ast.src2.literal_value, 0x3C00)
+
 if __name__ == '__main__':
     unittest.main()
