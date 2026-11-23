@@ -1668,7 +1668,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     ogg = os.path.join(out, "audio", "ogg")
     ogg_done = os.path.join(out, "audio", "ogg.done")
     ogg_what = ogg_marker()
-    if read_shader_setting(ogg_done) != f"{ogg_what} finished":
+    if not marker_matches(ogg_done, ogg_what):
         if os.path.isfile(ogg_done):
             # awc_opus.py leaves the files it no longer writes, and audio_wav.py keeps every WAV it finds.
             log("assets: no matching awc_opus.py fingerprint for the audio streams: exporting again")
@@ -1709,6 +1709,15 @@ def mark(path: str, what: str) -> None:
     """Write a step's completion marker; call it only after the step succeeded."""
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{what} finished\n")
+
+
+def marker_matches(path: str, what: str) -> bool:
+    expected = f"{what} finished"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(len(expected) + 2).strip() == expected
+    except OSError:
+        return False
 
 
 def pending_xma(xma_dir: str) -> list:
