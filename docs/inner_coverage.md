@@ -96,7 +96,9 @@ python -I runtime/test/inner_coverage/run.py --harness runtime/build-inner/Relea
 ```
 
 Set `VK_LAYER_PATH` if the layer is not installed globally; select an adapter with `LEONIDA_VK_DEVICE`.
-Missing GPU properties or validation are reported as an unavailable prerequisite, not a successful comparison.
+Missing GPU properties or validation propagate exit code 77 through the harness, child suite and top-level
+runner, with a SKIP diagnostic; the incomplete matrix is not reported as a pass. Real execution/readback errors
+remain failures, and validation diagnostics remain failures even if the harness also returns 77.
 The default run deletes temporary synthetic artifacts; `--work <directory>` retains them. Do not run with
 Python optimization, since assertions are the readback oracle. The CPU layout test is also registered in the
 normal runtime CTest build on all platforms. The Vulkan fixture executable is also built by the normal runtime

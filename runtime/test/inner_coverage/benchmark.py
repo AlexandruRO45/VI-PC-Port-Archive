@@ -30,9 +30,9 @@ for size in (int(os.environ['PROBE_BENCH_SIZE']),) if 'PROBE_BENCH_SIZE' in os.e
                 if mode == 'batch':
                     env['VKH_BATCH_MASK'] = '1'
                 r = subprocess.run([exe, vs, fs, str(art / 'pixels.raw'), str(size), str(size)], env=env, capture_output=True, text=True, timeout=30)
-                if r.returncode or 'PROBE_VALIDATION:' in r.stderr:
-                    raise RuntimeError(r.stderr)
+                b.check_harness_result(r)
                 assert 'PROBE validation enabled' in r.stderr
+                assert 'PROBE sync validation enabled' in r.stderr
                 count = struct.unpack_from('<I', (art / 'counter.heap').read_bytes())[0]
                 assert count == (26 if size == 8 else 274) * triangles, (size, triangles, mode, count)
                 ns = float(re.search('PROBE_GPU_NS ([0-9.]+)', r.stderr).group(1))

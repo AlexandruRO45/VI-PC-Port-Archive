@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'tools'))
 import ps_oracle as p
+from harness_result import check_harness_result
 root = Path(os.environ['LEONIDA_INNER_WORK'])
 exe = os.environ['LEONIDA_INNER_HARNESS']
 compiler = os.environ['LEONIDA_INNER_GLSLANG']
@@ -344,10 +345,7 @@ def run(vs, fs, label, combine, msaa, depth, isolate, extra=None):
         env.update(extra)
     raw = art / (label + '.raw')
     r = subprocess.run([exe, vs, fs, str(raw), '8', '8'], env=env, capture_output=True, text=True, timeout=30)
-    if r.returncode == 77:
-        raise RuntimeError('Required GPU capability or validation layer unavailable: ' + r.stderr)
-    if r.returncode or 'PROBE_VALIDATION:' in r.stderr:
-        raise RuntimeError(r.stderr)
+    check_harness_result(r)
     assert 'PROBE validation enabled' in r.stderr
     assert 'PROBE sync validation enabled' in r.stderr
     words = p.pixels(str(raw), (8, 8))

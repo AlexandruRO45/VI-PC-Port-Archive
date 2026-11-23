@@ -7,6 +7,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from harness_result import run_suite_command
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -40,9 +43,9 @@ def main():
         for name in ("check_basic.py", "check_batched_coverage.py", "check_batch_regressions.py",
                      "check_scratch_reuse.py", "check_generated_geometry.py", "check_geometry_capture.py",
                      "check_helper_counter.py"):
-            subprocess.run([sys.executable, str(root / name)], env=env, check=True)
+            run_suite_command([sys.executable, str(root / name)], env)
         if args.benchmark:
-            subprocess.run([sys.executable, str(root / "benchmark.py")], env=env, check=True)
+            run_suite_command([sys.executable, str(root / "benchmark.py")], env)
         modules = list(work.rglob("*.spv"))
         for module in modules:
             subprocess.run([validator, "--target-env", "vulkan1.2", str(module)], check=True)

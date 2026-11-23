@@ -502,13 +502,17 @@ int main(int argc, char** argv) {
     const bool probe_combine = std::getenv("VKH_COMBINE") != nullptr;
     const bool probe_conservative = std::getenv("VKH_CONSERVATIVE") != nullptr;
     if (probe_conservative) {
-        if (!has(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME)) return 77;
+        if (!has(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME)) {
+            std::fprintf(stderr,"SKIP: VK_EXT_conservative_rasterization unavailable\n"); return 77;
+        }
         enable.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
         VkPhysicalDeviceConservativeRasterizationPropertiesEXT crp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 crq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; crq.pNext = &crp;
         vkGetPhysicalDeviceProperties2(pd, &crq);
         std::fprintf(stderr, "experiment properties: under=%u fullyCovered=%u overestimate=%.9g uncertainty=%.9g\n", crp.primitiveUnderestimation, crp.fullyCoveredFragmentShaderInputVariable, crp.primitiveOverestimationSize, crp.maxExtraPrimitiveOverestimationSize);
-        if ((probe_combine || std::strcmp(std::getenv("VKH_CONSERVATIVE"), "under") == 0) && !crp.primitiveUnderestimation) return 77;
+        if ((probe_combine || std::strcmp(std::getenv("VKH_CONSERVATIVE"), "under") == 0) && !crp.primitiveUnderestimation) {
+            std::fprintf(stderr,"SKIP: InnerCoverage mask requires primitiveUnderestimation=1; device reports 0\n"); return 77;
+        }
 
         std::fprintf(stderr, "experiment: conservative overestimate enabled\n");
     }
