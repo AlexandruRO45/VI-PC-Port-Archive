@@ -285,6 +285,22 @@ class TestSXorB32ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(state.sgprs[0], 0x1d3b5977)
         self.assertEqual(state.scc, scc)
 
+class TestSXorB32SIMDAndIEEE(unittest.TestCase):
+    def test_aliasing_preservation(self) -> None:
+        state = ScalarMachineState()
+        state.write_sgpr(0, 0x12345678)
+        state.write_sgpr(1, 0x0F0F0F0F)
+        inst = ASTInstruction(Opcode.S_XOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
+        res, scc = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x1d3b5977)
+        self.assertEqual(state.sgprs[0], 0x1d3b5977)
+
+    def test_ieee754_bit_transparency(self) -> None:
+        qnan = 0x7FC00000
+        snan = 0x7F800001
+        res, _ = ref_s_xor_b32(qnan, snan)
+        self.assertIsInstance(res, int)
+
 
 if __name__ == "__main__":
     unittest.main()
