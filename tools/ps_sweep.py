@@ -134,11 +134,12 @@ def gs_for(spirv, name):
     return path if os.path.isfile(path) else None
 
 
-JOB_VARS = ("VKS_GS", "VKS_TEX", "VKS_NEED_MAINTENANCE8")
+JOB_VARS = ("VKS_GS", "VKS_TEX", "VKS_NEED_MAINTENANCE8", "VKS_SUBGROUP")
 
 
-def job_env(base, timeout, variant, meta, gs):
-    """The environment of one draw: the parent's, minus every per-job variable it may have inherited, plus this job's."""
+def job_env(base, timeout, variant, meta, gs, subgroup=0):
+    """The environment of one draw: the parent's, minus every per-job variable it may have inherited, plus this job's.
+    A VKS_SUBGROUP left in the shell is dropped too, so only run --subgroup asks for a required size."""
     env = {k: v for k, v in base.items() if k not in JOB_VARS}
     env.update(VKS_TIMEOUT_S=str(timeout), VKS_HEAP_KB="1024")
     if variant == "t":
@@ -149,6 +150,8 @@ def job_env(base, timeout, variant, meta, gs):
         env["VKS_GS"] = gs
     if meta.get("needs_maintenance8"):
         env["VKS_NEED_MAINTENANCE8"] = "1"
+    if subgroup:
+        env["VKS_SUBGROUP"] = str(subgroup)
     return env
 
 
@@ -240,9 +243,7 @@ def cmd_run(a):
             with open(log, "a", encoding="utf-8", newline="\n") as f:
                 f.write(json.dumps({"i": i, "code": NOT_TRANSLATED, "reason": "no bary_gs companion", "targets": 0, "sec": 0}) + "\n")
             continue
-        env = job_env(os.environ, a.timeout, a.variant, meta, gs)
-        if a.subgroup:
-            env["VKS_SUBGROUP"] = str(a.subgroup)
+        env = job_env(os.environ, a.timeout, a.variant, meta, gs, a.subgroup)
         cmd = [a.exe, make_vs(a.glslang, meta, cache), os.path.join(a.spirv, s["name"] + ".spv"), raw,
                str(W), str(H), str(targets)]
         if a.depth:

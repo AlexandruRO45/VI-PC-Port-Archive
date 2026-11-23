@@ -142,6 +142,11 @@ class GeometryShaderLookup(unittest.TestCase):
         env = ps_sweep.job_env(base, 9, "t", {"needs_maintenance8": True}, "g.spv")
         self.assertEqual((env["VKS_GS"], env["VKS_TEX"], env["VKS_NEED_MAINTENANCE8"]), ("g.spv", "1", "1"))
 
+    def test_subgroup_is_set_only_when_asked(self):
+        base = {"PATH": "p", "VKS_SUBGROUP": "64"}   # left in the shell by an earlier run
+        self.assertNotIn("VKS_SUBGROUP", ps_sweep.job_env(base, 9, "z", {}, None))
+        self.assertEqual(ps_sweep.job_env(base, 9, "z", {}, None, 32)["VKS_SUBGROUP"], "32")
+
     def test_gs_is_the_bary_gs_file_beside_the_pixel_shader(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(ps_sweep.gs_for(d, "x1"))
@@ -288,6 +293,27 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(report["rows"][0]["samples_passed"], [None, 0])
             self.assertEqual(report["rows"][-1]["samples_passed"], [None, 0])
             self.assertNotIn("samples_passed", report["rows"][6])
+
+    def test_tier_breakdown(self):
+        sample = [{"tier": "A"}, {"tier": "B"}, {"tier": "C", "reasons": ["r1", "r2"]},
+                  {"tier": "C", "reasons": ["r1"]}, {"tier": "C"}]
+        rows = [{"class": c} for c in ("OK on both", "differs", "differs", "OK on both", "OK on both")]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ps_sweep.print_tier_breakdown(sample, rows)
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(lines, [
+            "  tier A: OK on both 1",
+            "  tier B: differs 1",
+            "  tier C: OK on both 2, differs 1",
+            "    tier C reason (none): OK on both 1",
+            "    tier C reason r1: OK on both 1, differs 1",   # a shader with two reasons counts under each
+            "    tier C reason r2: differs 1",
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ps_sweep.print_tier_breakdown([{}, {}], rows[:2])   # a sample made without --tier-n prints nothing
+        self.assertEqual(buf.getvalue(), "")
 
     def test_incomplete_depth_measurements(self):
         with tempfile.TemporaryDirectory() as tmp:
