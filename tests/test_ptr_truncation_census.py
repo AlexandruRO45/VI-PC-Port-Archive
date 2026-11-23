@@ -208,6 +208,15 @@ class LimitTests(unittest.TestCase):
                 self.run_main([self.disasm, "--jobs", "1", "--limit", bad])
             self.assertEqual(raised.exception.code, 2, bad)
 
+    def test_positive_limit_keeps_the_first_n_listings(self):
+        out = os.path.join(self.tmp, "s.json")
+        self.assertEqual(self.run_main([self.disasm, "--jobs", "1", "--limit", "1", "--json", out]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["total"], 1)
+        self.assertEqual(self.run_main([self.disasm, "--jobs", "1", "--limit", "2", "--json", out]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["total"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
