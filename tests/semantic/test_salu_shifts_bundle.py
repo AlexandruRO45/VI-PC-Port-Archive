@@ -178,6 +178,18 @@ class TestSLshrB32SCCAndMask(unittest.TestCase):
         res, _ = ref_s_lshr_b32(0x80000000, 1)
         self.assertEqual(res, 0x40000000)
 
+class TestSLshrB32Translator(unittest.TestCase):
+    def test_translator_s_lshr_b32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0x12345678",
+            "s_lshr_b32 s5, s4, 4",
+            "v_mov_b32_e32 v1, s5",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_lshr_b32")
+        for l in range(32):
+            self.assertEqual(results[l], 0x01234567)
+
 
 if __name__ == "__main__":
     unittest.main()
