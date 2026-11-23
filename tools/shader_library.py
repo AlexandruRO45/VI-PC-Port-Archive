@@ -21,7 +21,7 @@ and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
 
 Usage:
     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
-                                [--mcpu gfx1013] [--jobs N]
+                                [--mcpu gfx1013] [--jobs N] [--skip-existing]
     python -I shader_library.py <shaders.rpf> --save library.bin       # the reassembled file, nothing else
 
 DIR/library.json gets the header, both pipeline tables (stage -> program name) and the per-program stage. Programs
@@ -259,6 +259,8 @@ def main(argv=None) -> int:
                                     "copy that container to <name>.dxbc for the translator's signature reads")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="llvm-mc processes for --disasm (default: half the CPUs)")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="keep the listings already in <out>/disasm, so a stopped --disasm run resumes")
     a = ap.parse_args(argv)
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
@@ -328,13 +330,33 @@ def main(argv=None) -> int:
         with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(meta, f, indent=1)
         if disasm and end:
+            listing = os.path.join(a.out, "disasm", name + ".s")
+            if a.skip_existing and os.path.exists(listing):
+                # A listing a stopped run left behind from an llvm-mc that could not start (0xC0000142
+                # STATUS_DLL_INIT_FAILED, seen when many --jobs processes launch at once on Windows) is a
+                # ~134-byte stub: header and the failure line, no instructions. Re-disasm those instead of
+                # keeping them, so a resumed run also repairs what the stopped one broke.
+                stub = False
+                if os.path.getsize(listing) < 512:
+                    with open(listing, encoding="utf-8", errors="replace") as f:
+                        stub = "llvm-mc exited" in f.read()
+                if not stub:
+                    index.append(entry)
+                    written += 1
+                    continue
             work.append((entry, name, code[start:end], start, end))
         index.append(entry)
         written += 1
 
     def one(job):
         entry, name, code, start, end = job
-        asm, invalid, err = disasm.disasm(code, a.mcpu)
+        # An llvm-mc that cannot start returns no assembly at all. Under a process-launch storm (many --jobs
+        # workers on Windows) these starts fail transiently with 0xC0000142, so give each program three tries
+        # before writing the failure into the listing; a later --skip-existing run re-disasms the stubs anyway.
+        for attempt in range(3):
+            asm, invalid, err = disasm.disasm(code, a.mcpu)
+            if asm.strip():
+                break
         entry["invalid_words"] = invalid
         with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
