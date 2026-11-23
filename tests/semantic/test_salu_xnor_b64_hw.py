@@ -193,5 +193,47 @@ class SXnorB64SimdDivergenceTests(unittest.TestCase):
         for lane in range(32):
             self.assertEqual(wave.vgprs[lane][0], 0)
 
+class SXnorB64RegisterAliasingTests(unittest.TestCase):
+    def test_dst_aliases_src0(self):
+        state = ScalarRegisterState()
+        state.set_sgpr_pair(0, 0x0F0F0F0F0F0F0F0F)
+        state.set_sgpr_pair(2, 0xF0F0F0F0F0F0F0F0)
+        ast = InstructionAST(
+            "s_xnor_b64",
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 2),
+        )
+        execute_scalar_xnor_b64(state, ast)
+        self.assertEqual(state.get_sgpr_pair(0), 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_dst_aliases_src1(self):
+        state = ScalarRegisterState()
+        state.set_sgpr_pair(0, 0x1111111111111111)
+        state.set_sgpr_pair(2, 0x1111111111111111)
+        ast = InstructionAST(
+            "s_xnor_b64",
+            Operand64(RegKind.SGPR, 2),
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 2),
+        )
+        execute_scalar_xnor_b64(state, ast)
+        self.assertEqual(state.get_sgpr_pair(2), MASK64)
+        self.assertEqual(state.scc, 1)
+
+    def test_all_operands_alias(self):
+        state = ScalarRegisterState()
+        state.set_sgpr_pair(0, 0x1234567890ABCDEF)
+        ast = InstructionAST(
+            "s_xnor_b64",
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 0),
+        )
+        execute_scalar_xnor_b64(state, ast)
+        self.assertEqual(state.get_sgpr_pair(0), MASK64)
+        self.assertEqual(state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
