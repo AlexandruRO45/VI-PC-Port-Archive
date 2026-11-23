@@ -877,6 +877,22 @@ void test_process_detach_without_entry() {
 // DllMain docs (learn.microsoft.com/windows/win32/dlls/dllmain): "If fdwReason is DLL_PROCESS_ATTACH, lpvReserved is
 // NULL for dynamic loads and non-NULL for static loads." Loader::load() from the host is the process-start graph (the
 // executable and the DLLs it imports), a run-time LoadLibrary of a bundled DLL is a dynamic load.
+void test_datafile_load() {
+    write_image_as(make_image(), "a.dll");
+    rt::Loader loader(g_dir);
+    using LoadW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+    const auto load = reinterpret_cast<LoadW>(rt::shims::find("kernel32.dll", "LoadLibraryExW"));
+    HMODULE h = load(L"a.dll", nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    if (h && (reinterpret_cast<uintptr_t>(h) & 1)) pass("datafile bare name loads from game directory");
+    else failed("datafile bare name loads from game directory", "missing or untagged handle");
+    if (h) FreeLibrary(h);
+    SetLastError(0);
+    h = load(L"leonida_missing_datafile_987.dll", nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    if (!h) pass("missing datafile falls back to host");
+    else failed("missing datafile falls back to host", "unexpected result");
+    if (h) FreeLibrary(h);
+}
+
 void test_attach_reserved() {
     reset_notifications();
     try {
@@ -1346,6 +1362,7 @@ int main() {
         test_process_detach_invalid_tls();
         test_process_detach_without_entry();
         test_attach_reserved();
+        test_datafile_load();
         test_process_detach_dependencies();
         test_failed_dependency_not_registered();
         test_delay_descriptor_fields();

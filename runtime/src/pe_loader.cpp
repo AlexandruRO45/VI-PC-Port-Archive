@@ -1061,7 +1061,16 @@ void* Loader::find_loaded_module(const std::string& dll_lower) const {
 
 void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
     handled = false;
-    if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
+    if (dll_lower.empty()) return nullptr;
+    constexpr uint32_t data_flags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+    if (flags & data_flags) {
+        const auto candidate = game_dir_ / dll_lower;
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(candidate, ec)) return nullptr;
+        handled = true;
+        return LoadLibraryExW(candidate.c_str(), nullptr, flags);
+    }
+    if (prefer_host_copy(dll_lower)) return nullptr;
 
     std::lock_guard lock(mutex_);
     const RuntimeLoadScope dynamic(runtime_loads_);
@@ -1078,6 +1087,14 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
 void* Loader::load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled) {
     handled = false;
     if (basename.empty()) return nullptr;
+    constexpr uint32_t data_flags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+    if (flags & data_flags) {
+        const auto candidate = game_dir_ / basename;
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(candidate, ec)) return nullptr;
+        handled = true;
+        return LoadLibraryExW(candidate.c_str(), nullptr, flags);
+    }
     // A name the code page can spell takes the narrow path's host-copy rule as well.
     if (const std::string narrow = narrow_module_key(std::filesystem::path(basename)); !narrow.empty())
         if (prefer_host_copy(narrow)) return nullptr;

@@ -14,6 +14,8 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
+#include <cwchar>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -181,6 +183,14 @@ HMODULE WINAPI load_library_w(LPCWSTR name) {
 }
 
 HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
+    if (name && !file && (flags & kDataFileLoadFlags) && !std::strpbrk(name, "\\/:")) {
+        bool handled = false;
+        const std::string dll = module_name(name);
+        if (!dll.empty()) {
+            HMODULE h = reinterpret_cast<HMODULE>(load_bundled_module(dll, flags, handled));
+            if (handled) return h;
+        }
+    }
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
         HMODULE h = load_shim_or_bundled(name, flags, handled);
@@ -190,6 +200,11 @@ HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
 }
 
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
+    if (name && !file && (flags & kDataFileLoadFlags) && !std::wcspbrk(name, L"\\/:")) {
+        bool handled = false;
+        HMODULE h = load_bundled_w(name, flags, handled);
+        if (handled) return h;
+    }
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
         HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), flags, handled)
