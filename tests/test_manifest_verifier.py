@@ -852,5 +852,158 @@ class TestStableHashing(unittest.TestCase):
             mv.sha256_file(path)
 
 
+class TestManifestVerifierCache(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.game_dir = os.path.join(self.root, "game")
+        os.makedirs(self.game_dir, exist_ok=True)
+        self.payloads = {rel: make_payload(size, rel) for rel, size in SYNTHETIC_SIZES.items()}
+        for rel, data in self.payloads.items():
+            abs_p = os.path.join(self.game_dir, *rel.split("/"))
+            os.makedirs(os.path.dirname(abs_p), exist_ok=True)
+            with open(abs_p, "wb") as f:
+                f.write(data)
+        self.manifest_path = os.path.join(self.root, "manifest.json")
+        self.write_manifest(self.manifest_path, self.payloads)
+        self.cache_path = os.path.join(self.root, "verify.cache.json")
+        self.age_files(self.game_dir, seconds=10)
+
+    def write_manifest(self, dest: str, files_map: dict[str, bytes]) -> None:
+        entries = {
+            rel: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            for rel, data in files_map.items()
+        }
+        with open(dest, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": entries}, f, indent=2)
+
+    def age_files(self, folder: str, seconds: int = 10) -> None:
+        import time
+        past_ns = time.time_ns() - seconds * 1_000_000_000
+        for root, _, files in os.walk(folder):
+            for name in files:
+                p = os.path.join(root, name)
+                os.utime(p, ns=(past_ns, past_ns))
+
+    def test_second_run_skips_hashing_serial_and_parallel(self) -> None:
+        import time
+        total_bytes = sum(SYNTHETIC_SIZES.values())
+        future_ns = time.time_ns() + 10_000_000_000
+        with patch.object(mv.time, "time_ns", return_value=future_ns):
+            for jobs in (1, 4):
+                with self.subTest(jobs=jobs):
+                    cache = os.path.join(self.root, f"cache_{jobs}.json")
+                    r1 = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=jobs, cache_path=cache)
+                    self.assertTrue(r1.passed)
+                    self.assertEqual(r1.bytes_verified, total_bytes)
+                    self.assertEqual(r1.bytes_cached, 0)
+                    self.assertEqual(len(r1.cached), 0)
+
+                    with patch.object(mv, "sha256_file", side_effect=AssertionError("should not hash")) as mock_hash:
+                        r2 = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=jobs, cache_path=cache)
+                    mock_hash.assert_not_called()
+                    self.assertTrue(r2.passed)
+                    self.assertEqual(r2.bytes_verified, 0)
+                    self.assertEqual(r2.bytes_cached, total_bytes)
+                    self.assertEqual(len(r2.cached), len(SYNTHETIC_SIZES))
+                    self.assertEqual(r2.to_dict()["cached_count"], len(SYNTHETIC_SIZES))
+                    self.assertEqual(r2.to_dict()["bytes_cached"], total_bytes)
+
+    def test_same_size_rewrite_is_detected_as_changed(self) -> None:
+        import time
+        future_ns = time.time_ns() + 10_000_000_000
+        with patch.object(mv.time, "time_ns", return_value=future_ns):
+            r1 = mv.verify_manifest(self.game_dir, self.manifest_path, cache_path=self.cache_path)
+            self.assertTrue(r1.passed)
+            target = os.path.join(self.game_dir, "delta.bin")
+            old_data = self.payloads["delta.bin"]
+            new_data = (b"X" if old_data[:1] != b"X" else b"Y") + old_data[1:]
+            st_before = os.stat(target)
+            with open(target, "wb") as f:
+                f.write(new_data)
+            new_ns = st_before.st_mtime_ns + 5_000_000_000
+            os.utime(target, ns=(new_ns, new_ns))
+
+            r2 = mv.verify_manifest(self.game_dir, self.manifest_path, cache_path=self.cache_path)
+            self.assertFalse(r2.passed)
+            self.assertEqual(r2.hash_mismatch, ["delta.bin"])
+            self.assertEqual(len(r2.cached), len(SYNTHETIC_SIZES) - 1)
+
+    def test_mismatched_file_is_never_cached(self) -> None:
+        import time
+        target = os.path.join(self.game_dir, "alpha.bin")
+        with open(target, "wb") as f:
+            f.write(b"corrupt" + self.payloads["alpha.bin"][7:])
+        future_ns = time.time_ns() + 10_000_000_000
+        with patch.object(mv.time, "time_ns", return_value=future_ns):
+            r1 = mv.verify_manifest(self.game_dir, self.manifest_path, cache_path=self.cache_path)
+        self.assertFalse(r1.passed)
+        with open(self.cache_path, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertNotIn("alpha.bin", doc["entries"])
+        self.assertIn("bravo.bin", doc["entries"])
+
+    def test_recent_file_within_racy_window_is_not_cached(self) -> None:
+        import time
+        future_ns = time.time_ns() + 10_000_000_000
+        fresh = os.path.join(self.game_dir, "bravo.bin")
+        with open(fresh, "wb") as f:
+            f.write(self.payloads["bravo.bin"])
+        recent_ns = future_ns - 1_000_000_000  # 1s before simulated now (< 3s racy window)
+        os.utime(fresh, ns=(recent_ns, recent_ns))
+        with patch.object(mv.time, "time_ns", return_value=future_ns):
+            r1 = mv.verify_manifest(self.game_dir, self.manifest_path, cache_path=self.cache_path)
+        self.assertTrue(r1.passed)
+        with open(self.cache_path, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertNotIn("bravo.bin", doc["entries"])
+        self.assertIn("alpha.bin", doc["entries"])
+
+    def test_manifest_change_invalidates_cache(self) -> None:
+        import time
+        future_ns = time.time_ns() + 10_000_000_000
+        with patch.object(mv.time, "time_ns", return_value=future_ns):
+            r1 = mv.verify_manifest(self.game_dir, self.manifest_path, cache_path=self.cache_path)
+            self.assertTrue(r1.passed)
+            other_manifest = os.path.join(self.root, "manifest2.json")
+            subset = {k: v for k, v in self.payloads.items() if k != "delta.bin"}
+            self.write_manifest(other_manifest, subset)
+            r2 = mv.verify_manifest(self.game_dir, other_manifest, cache_path=self.cache_path)
+            self.assertTrue(r2.passed)
+            self.assertEqual(r2.bytes_cached, 0)
+            self.assertEqual(r2.bytes_verified, sum(len(v) for v in subset.values()))
+
+    def test_corrupt_cache_is_ignored_and_rewritten_with_lf(self) -> None:
+        import time
+        future_ns = time.time_ns() + 10_000_000_000
+        with patch.object(mv.time, "time_ns", return_value=future_ns):
+            for junk in (b"{not json", b'{"version": 999}', b"[]"):
+                with self.subTest(junk=junk):
+                    with open(self.cache_path, "wb") as f:
+                        f.write(junk)
+                    r = mv.verify_manifest(self.game_dir, self.manifest_path, cache_path=self.cache_path)
+                    self.assertTrue(r.passed)
+                    self.assertEqual(r.bytes_cached, 0)
+                    with open(self.cache_path, "rb") as f:
+                        raw = f.read()
+                    self.assertNotIn(b"\r\n", raw)
+
+    def test_cache_inside_target_dir_passes_strict_and_cli_json(self) -> None:
+        inside_cache = os.path.join(self.game_dir, ".manifest_cache.json")
+        # Subprocess uses real wall-clock time; wait 3.1s or test CLI exclusion directly + cached_count via API.
+        p1 = subprocess.run(
+            [sys.executable, "-I", TOOL, self.game_dir, "--manifest", self.manifest_path,
+             "--cache", inside_cache, "--strict", "--json"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(p1.returncode, 0, p1.stdout + p1.stderr)
+        d1 = json.loads(p1.stdout)
+        self.assertTrue(d1["passed"])
+        self.assertEqual(d1["untracked"], [])
+        self.assertIn("cached_count", d1)
+        self.assertIn("bytes_cached", d1)
+
+
 if __name__ == "__main__":
     unittest.main()

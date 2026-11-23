@@ -6,8 +6,9 @@ Live progress is reported continuously during verification.
 
 Usage:
     python -I manifest_verifier.py <target_dir> [--manifest FILE] [--jobs N]
-                                   [--quiet] [--verbose] [--json] [--strict]
+                                   [--cache FILE] [--quiet] [--verbose] [--json] [--strict]
     python -I manifest_verifier.py verify <target_dir> [--manifest FILE] [--jobs N]
+                                   [--cache FILE]
 """
 from __future__ import annotations
 
@@ -20,11 +21,14 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
-from typing import Callable, Optional, TextIO
+from typing import Callable, Iterable, Optional, TextIO
 
 CHUNK = 8 * 1024 * 1024
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
+CACHE_VERSION = 1
+CACHE_MIN_AGE_NS = 3_000_000_000  # skip files modified within the last 3s (git racy-clean guard)
 
 
 def default_jobs() -> int:
@@ -91,26 +95,105 @@ def sha256_file(path: str, chunk_size: int = CHUNK, *, expected_size: int | None
     return h.hexdigest()
 
 
-def walk(target_dir: str, *, exclude: str | None = None):
-    """Yields (relative_path, absolute_path) using forward slashes, excluding the selected manifest."""
+def walk(target_dir: str, *, exclude: str | Iterable[str] | None = None):
+    """Yields (relative_path, absolute_path) using forward slashes, excluding any listed paths."""
     def scan_failed(error: OSError) -> None:
         raise error
 
-    excluded_dir = excluded_name = None
+    excluded: set[tuple[str, str]] = set()
     if exclude is not None:
-        directory, name = os.path.split(os.path.abspath(exclude))
-        excluded_dir = os.path.normcase(os.path.realpath(directory))
-        excluded_name = os.path.normcase(name)
+        items = [exclude] if isinstance(exclude, str) else list(exclude)
+        for item in items:
+            if not item:
+                continue
+            directory, name = os.path.split(os.path.abspath(item))
+            excluded.add((os.path.normcase(os.path.realpath(directory)), os.path.normcase(name)))
 
     # os.walk otherwise treats missing or unreadable directories as empty.
     for root, _, files in os.walk(target_dir, onerror=scan_failed):
-        contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
+        real_root = os.path.normcase(os.path.realpath(root)) if excluded else ""
         for name in sorted(files):
-            if contains_manifest and os.path.normcase(name) == excluded_name:
+            if excluded and (real_root, os.path.normcase(name)) in excluded:
                 continue
             abs_p = os.path.join(root, name)
             rel_p = os.path.relpath(abs_p, target_dir).replace(os.sep, "/")
             yield rel_p, abs_p
+
+
+def _manifest_fingerprint(want: dict[str, dict]) -> str:
+    payload = json.dumps(want, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _stat_cache_fields(st: os.stat_result) -> dict[str, int]:
+    return {
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+        "ctime_ns": st.st_ctime_ns,
+        "dev": st.st_dev,
+        "ino": st.st_ino,
+    }
+
+
+def _valid_cache_entry(entry: object) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if not isinstance(entry.get("sha256"), str):
+        return False
+    for key in ("size", "mtime_ns", "ctime_ns", "dev", "ino"):
+        val = entry.get(key)
+        if not isinstance(val, int) or isinstance(val, bool):
+            return False
+    return True
+
+
+def _load_cache(cache_path: str, manifest_fp: str) -> dict[str, dict]:
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    if doc.get("version") != CACHE_VERSION or doc.get("manifest_sha256") != manifest_fp:
+        return {}
+    raw_entries = doc.get("entries")
+    if not isinstance(raw_entries, dict):
+        return {}
+    return {rel: entry for rel, entry in raw_entries.items() if isinstance(rel, str) and _valid_cache_entry(entry)}
+
+
+def _save_cache(cache_path: str, manifest_fp: str, entries: dict[str, dict]) -> None:
+    abs_cache = os.path.abspath(cache_path)
+    parent = os.path.dirname(abs_cache) or "."
+    os.makedirs(parent, exist_ok=True)
+    doc = {
+        "version": CACHE_VERSION,
+        "manifest_sha256": manifest_fp,
+        "entries": {rel: entries[rel] for rel in sorted(entries.keys())},
+    }
+    tmp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=parent,
+            prefix=".manifest_cache_",
+            suffix=".tmp",
+            delete=False,
+        ) as tf:
+            tmp_path = tf.name
+            json.dump(doc, tf, indent=2)
+            tf.write("\n")
+        os.replace(tmp_path, abs_cache)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def load_manifest(path: str) -> dict[str, dict]:
@@ -208,6 +291,8 @@ class ManifestReport:
     untracked: list[str] = field(default_factory=list)
     problems: dict[str, str] = field(default_factory=dict)
     bytes_verified: int = 0
+    cached: list[str] = field(default_factory=list)
+    bytes_cached: int = 0
     elapsed_seconds: float = 0.0
     strict: bool = False
 
@@ -228,6 +313,7 @@ class ManifestReport:
             "passed": self.passed,
             "total_manifest_files": self.total_manifest_files,
             "matched_count": len(self.matched),
+            "cached_count": len(self.cached),
             "problem_count": self.problem_count,
             "missing": self.missing,
             "size_mismatch": self.size_mismatch,
@@ -236,6 +322,7 @@ class ManifestReport:
             "untracked": self.untracked,
             "problems": self.problems,
             "bytes_verified": self.bytes_verified,
+            "bytes_cached": self.bytes_cached,
             "elapsed_seconds": round(self.elapsed_seconds, 4),
         }
 
@@ -247,6 +334,7 @@ def verify_manifest(
     progress_callback: Optional[Callable[[ProgressInfo], None]] = None,
     progress_stream: Optional[TextIO] = None,
     strict: bool = False,
+    cache_path: Optional[str] = None,
 ) -> ManifestReport:
     """Verifies target_dir against manifest_path, optionally in parallel."""
     try:
@@ -259,15 +347,25 @@ def verify_manifest(
         raise ManifestError(f"target path is not a directory: {target_dir}")
 
     want = load_manifest(manifest_path)
-    have = dict(walk(target_dir, exclude=manifest_path))
+    excludes = [manifest_path]
+    if cache_path:
+        excludes.append(cache_path)
+    have = dict(walk(target_dir, exclude=excludes))
     if not want and have:
         # A cut-short create or a mistyped --manifest would otherwise print OK without checking a file.
         raise ManifestError(f"{manifest_path} lists no files, but {target_dir} holds {len(have)}")
     untracked = sorted(set(have.keys()) - set(want.keys()))
 
+    manifest_fp = _manifest_fingerprint(want) if cache_path else ""
+    old_cache = _load_cache(cache_path, manifest_fp) if cache_path else {}
+    new_cache: dict[str, dict] = {}
+    now_ns = time.time_ns()
+
     problems: dict[str, str] = {}
     unreadable_map: dict[str, str] = {}
     pending: list[tuple[str, str, int, str]] = []
+    cached: list[str] = []
+    bytes_cached = 0
     total_manifest_bytes = 0
 
     for rel in sorted(want.keys()):
@@ -277,16 +375,32 @@ def verify_manifest(
             problems[rel] = "MISSING"
             continue
         try:
-            actual_size = os.path.getsize(abs_p)
+            st = os.stat(abs_p)
         except OSError as err:
             problems[rel] = "UNREADABLE"
             unreadable_map[rel] = str(err)
             continue
+        actual_size = st.st_size
         expected_size = info.get("size")
         if expected_size is not None and actual_size != expected_size:
             problems[rel] = "SIZE"
             continue
         expected_sha256 = info["sha256"]
+        c_entry = old_cache.get(rel) if cache_path else None
+        if (
+            c_entry is not None
+            and c_entry["sha256"] == expected_sha256
+            and c_entry["size"] == actual_size
+            and c_entry["mtime_ns"] == st.st_mtime_ns
+            and c_entry["ctime_ns"] == st.st_ctime_ns
+            and c_entry["dev"] == st.st_dev
+            and c_entry["ino"] == st.st_ino
+            and max(st.st_mtime_ns, st.st_ctime_ns) <= now_ns
+        ):
+            cached.append(rel)
+            bytes_cached += actual_size
+            new_cache[rel] = c_entry
+            continue
         pending.append((rel, abs_p, actual_size, expected_sha256))
         total_manifest_bytes += actual_size
 
@@ -315,6 +429,13 @@ def verify_manifest(
             problems[rel] = status
             if status == "UNREADABLE" and err_msg:
                 unreadable_map[rel] = err_msg
+        elif cache_path:
+            try:
+                post_st = os.stat(have[rel])
+                if now_ns - max(post_st.st_mtime_ns, post_st.st_ctime_ns) >= CACHE_MIN_AGE_NS:
+                    new_cache[rel] = {**_stat_cache_fields(post_st), "sha256": want[rel]["sha256"]}
+            except OSError:
+                pass
 
         elapsed = max(time.time() - t0, 1e-6)
         rate_mib = (completed_bytes / elapsed) / (1024 * 1024)
@@ -376,6 +497,9 @@ def verify_manifest(
     passed = (problem_count == 0) and (not strict or len(untracked) == 0)
     elapsed_total = time.time() - t0
 
+    if cache_path:
+        _save_cache(cache_path, manifest_fp, new_cache)
+
     return ManifestReport(
         passed=passed,
         total_manifest_files=len(want),
@@ -387,6 +511,8 @@ def verify_manifest(
         untracked=untracked,
         problems={rel: problems[rel] for rel in sorted(problems.keys())},
         bytes_verified=bytes_verified,
+        cached=cached,
+        bytes_cached=bytes_cached,
         elapsed_seconds=elapsed_total,
         strict=strict,
     )
@@ -414,7 +540,8 @@ def print_report(
     if bad == 0:
         if verbose:
             gib = report.bytes_verified / (1024**3)
-            out.write(f"OK ({len(report.matched)} files, {gib:.2f} GiB in {report.elapsed_seconds:.2f}s)\n")
+            cached_note = f", {len(report.cached)} cached" if report.cached else ""
+            out.write(f"OK ({len(report.matched)} files{cached_note}, {gib:.2f} GiB in {report.elapsed_seconds:.2f}s)\n")
         else:
             out.write("OK\n")
     else:
@@ -435,6 +562,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--jobs", "-j", type=positive_int, default=default_jobs(), metavar="N",
         help="Hash up to N files concurrently (default: %(default)s; 1 = serial)",
     )
+    ap.add_argument("--cache", default=None, metavar="FILE",
+                    help="Cache verified file metadata (size, mtime, ctime, dev, ino) to skip unchanged files")
     ap.add_argument("--quiet", "-q", action="store_true", help="Suppress live progress output")
     ap.add_argument("--progress-stream", choices=["stderr", "stdout"], default="stderr",
                     help="Stream for live progress reporting (default: stderr)")
@@ -470,6 +599,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             jobs=args.jobs,
             progress_stream=progress_stream,
             strict=args.strict,
+            cache_path=args.cache,
         )
     except ManifestError as err:
         print(f"ERROR: {err}", file=sys.stderr)
