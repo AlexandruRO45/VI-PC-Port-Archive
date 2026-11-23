@@ -535,5 +535,37 @@ class TestAndOrB32Oracle(unittest.TestCase):
         insert = 0x0000_ABCD
         self.assertEqual(oracle_and_or_b32(val, mask, insert), 0x1234_ABCD)
 
+# ---------------------------------------------------------------------------
+# Opcode 5: v_and_or_b32 - AST and Interpreter
+# ---------------------------------------------------------------------------
+
+class TestAndOrB32ASTInterpreter(unittest.TestCase):
+    def test_ast_construction(self) -> None:
+        inst = VOP3Instruction(
+            TriOpcode.V_AND_OR_B32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        self.assertEqual(inst.opcode, TriOpcode.V_AND_OR_B32)
+
+    def test_interpreter_step(self) -> None:
+        interp = BundleInterpreter()
+        interp.vgprs[1] = 0xAA
+        interp.vgprs[2] = 0x55
+        interp.vgprs[3] = 0x11
+        inst = VOP3Instruction(
+            TriOpcode.V_AND_OR_B32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        res = interp.step(inst)
+        # (0xAA & 0x55) | 0x11 = 0 | 0x11 = 0x11
+        self.assertEqual(res, 0x11)
+        self.assertEqual(interp.vgprs[0], 0x11)
+
 if __name__ == "__main__":
     unittest.main()
