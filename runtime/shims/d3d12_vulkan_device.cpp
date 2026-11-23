@@ -5287,26 +5287,29 @@ public:
     // vkAllocateMemory stays usable by the device until vkFreeMemory, and paging under pressure is the kernel
     // driver's job (WDDM on Windows), invisible to the application. So every pageable object of this device is
     // always resident, MakeResident has nothing to do and Evict, which D3D12 documents as a hint the runtime may
-    // defer, can be dropped. Only the arguments are checked; the objects themselves are not touched.
+    // defer, can be dropped. The array, every entry and its owning device are validated (the host faults on null
+    // entries or foreign objects on RTX 5090, and removes the device on WARP; the layer returns E_INVALIDARG).
     HRESULT STDMETHODCALLTYPE MakeResident(UINT count, ID3D12Pageable* const* objects) override {
-        return count && !objects ? E_INVALIDARG : S_OK;
+        return validate_residency_objects(count, objects);
     }
 
     HRESULT STDMETHODCALLTYPE Evict(UINT count, ID3D12Pageable* const* objects) override {
-        return count && !objects ? E_INVALIDARG : S_OK;
+        return validate_residency_objects(count, objects);
     }
 
     // Device1: priorities only order what the OS evicts first under memory pressure. VK_EXT_pageable_device_local_memory
     // could pass them on, but it is optional and changes no result, so they are accepted and dropped. Any UINT is a
     // valid priority (the D3D12_RESIDENCY_PRIORITY values are named points, the low 24 bits a refinement). As on the
     // host runtime (d3d12_residency_test, RTX 3060 / 610.88), only objects that own their memory take one: committed
-    // resources and heaps. A placed resource (a reserved one too, by the same rule; not measured), a descriptor heap, a query heap or a fence is E_INVALIDARG.
+    // resources and heaps belonging to this device. A placed resource (a reserved one too, by the same rule; not measured),
+    // a descriptor heap, a query heap, a fence, or a foreign device's object is E_INVALIDARG.
     // The host also removes its device then (DXGI_ERROR_INVALID_CALL); the layer doesn't, since a console title that
     // sets priorities on its placed resources would lose its device over a hint.
     HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT count, ID3D12Pageable* const* objects,
                                                    const D3D12_RESIDENCY_PRIORITY* priorities) override {
         if (count && (!objects || !priorities)) return E_INVALIDARG;
         for (UINT i = 0; i < count; ++i) {
+            if (!owns_child(objects[i])) return E_INVALIDARG;
             if (from<Heap>(objects[i])) continue;
             const Resource* resource = from<Resource>(objects[i]);
             if (!resource || !resource->committed()) return E_INVALIDARG;
@@ -5317,12 +5320,20 @@ public:
     // Device3: the asynchronous MakeResident. The objects are already resident, so the work is complete at once
     // and the fence is signalled from the CPU now. The caller's queue Wait on it must not hang, which is why the
     // signal is kept although the residency part is a no-op. DENY_OVERBUDGET cannot fail: nothing is paged in. A
-    // null fence is accepted, as the host runtime does: there is nothing to signal.
+    // null fence is accepted, as the host runtime does: there is nothing to signal. Foreign fences, invalid flags,
+    // null arrays/entries and foreign objects return E_INVALIDARG without signalling the fence.
     HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS flags, UINT count,
                                                   ID3D12Pageable* const* objects, ID3D12Fence* fence,
                                                   UINT64 value) override {
-        if ((count && !objects) || (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)) return E_INVALIDARG;
-        return fence ? fence->Signal(value) : S_OK;
+        if (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET) return E_INVALIDARG;
+        if (FAILED(validate_residency_objects(count, objects))) return E_INVALIDARG;
+        if (!fence) return S_OK;
+        if (!owns_child(fence)) return E_INVALIDARG;
+        ID3D12Fence* verified = nullptr;
+        if (FAILED(fence->QueryInterface(IID_PPV_ARGS(&verified))) || !verified) return E_INVALIDARG;
+        const HRESULT hr = verified->Signal(value);
+        verified->Release();
+        return hr;
     }
 
     // Stable power state pins GPU clocks for profiling, a developer-mode feature on Windows. Vulkan has no clock
@@ -7731,6 +7742,26 @@ public:
 
 private:
     IUnknown* identity() { return outer_ ? outer_ : static_cast<ID3D12Device*>(this); }
+
+    bool owns_child(ID3D12DeviceChild* object) {
+        if (!object) return false;
+        IUnknown* owner = nullptr;
+        if (FAILED(object->GetDevice(IID_PPV_ARGS(&owner))) || !owner) return false;
+        IUnknown* self = nullptr;
+        const HRESULT hr = identity()->QueryInterface(IID_PPV_ARGS(&self));
+        const bool same = SUCCEEDED(hr) && owner == self;
+        if (self) self->Release();
+        owner->Release();
+        return same;
+    }
+
+    HRESULT validate_residency_objects(UINT count, ID3D12Pageable* const* objects) {
+        if (!count) return S_OK;
+        if (!objects) return E_INVALIDARG;
+        for (UINT i = 0; i < count; ++i)
+            if (!owns_child(objects[i])) return E_INVALIDARG;
+        return S_OK;
+    }
 
     static constexpr D3D12_RESOURCE_ALLOCATION_INFO kInvalidAllocation{UINT64_MAX,
                                                                        D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};

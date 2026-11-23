@@ -41,7 +41,50 @@ struct Objects {
     ID3D12Device3* device3 = nullptr;
     ID3D12Device* device = nullptr;
     ID3D12Pageable* all[6] = {};  // buffer, heap, placed, descriptor heap, query heap, fence
+    ID3D12CommandAllocator* allocator = nullptr;
     ID3D12Fence* fence = nullptr;
+    ID3D12Fence* dummy_fence = nullptr;
+};
+
+// Minimal COM object implementing ID3D12Fence/ID3D12Pageable that does not belong to any D3D12 device.
+class DummyFence final : public ID3D12Fence {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
+            riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12Pageable) ||
+            riid == __uuidof(ID3D12Fence)) {
+            *ppv = static_cast<ID3D12Fence*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refs_;
+        if (r == 0) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void** ppv) override {
+        if (ppv) *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    UINT64 STDMETHODCALLTYPE GetCompletedValue() override { return value_; }
+    HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64, HANDLE) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Signal(UINT64 v) override {
+        value_ = v;
+        return S_OK;
+    }
+
+private:
+    ULONG refs_ = 1;
+    UINT64 value_ = 0;
 };
 
 using Call = HRESULT (*)(Objects&);
@@ -154,6 +197,20 @@ const Step kSteps[] = {
     {"EnqueueMakeResident the same value again [backwards], value 3", [](Objects& o) {
          return o.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, o.all, o.fence, 3);
      }, 3},
+    {"MakeResident the command allocator", [](Objects& o) {
+         ID3D12Pageable* a[] = {o.allocator};
+         return o.device->MakeResident(1, a);
+     }},
+    {"Evict the command allocator", [](Objects& o) {
+         ID3D12Pageable* a[] = {o.allocator};
+         return o.device->Evict(1, a);
+     }},
+    {"EnqueueMakeResident a foreign COM fence, count 1", [](Objects& o) {
+         return o.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, o.all, o.dummy_fence, 21);
+     }},
+    {"EnqueueMakeResident a foreign COM fence, count 0", [](Objects& o) {
+         return o.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 0, nullptr, o.dummy_fence, 22);
+     }},
 
     // Steps after which the host runtime isn't usable any more. On the host each runs in a process of its own with a
     // fresh device (--host-step): SetResidencyPriority on anything but a committed resource or a heap (the host
@@ -233,7 +290,9 @@ struct Holder {
     Ref<ID3D12Heap> heap;
     Ref<ID3D12DescriptorHeap> descriptors;
     Ref<ID3D12QueryHeap> queries;
+    Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12Fence> fence;
+    Ref<ID3D12Fence> dummy_fence;
     Objects o;
 };
 
@@ -267,15 +326,19 @@ bool make(ID3D12Device* device, Holder& h) {
                                             IID_PPV_ARGS(&h.placed.p))) ||
         FAILED(device->CreateDescriptorHeap(&dh, IID_PPV_ARGS(&h.descriptors.p))) ||
         FAILED(device->CreateQueryHeap(&qh, IID_PPV_ARGS(&h.queries.p))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&h.allocator.p))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&h.fence.p))))
         return false;
+    h.dummy_fence.p = new DummyFence();
     h.o.all[0] = h.buffer.p;
     h.o.all[1] = h.heap.p;
     h.o.all[2] = h.placed.p;
     h.o.all[3] = h.descriptors.p;
     h.o.all[4] = h.queries.p;
     h.o.all[5] = h.fence.p;
+    h.o.allocator = h.allocator.p;
     h.o.fence = h.fence.p;
+    h.o.dummy_fence = h.dummy_fence.p;
     return true;
 }
 
@@ -347,6 +410,103 @@ int host_step(std::size_t index) {
     return int(guarded(kSteps[index].call, &h.o));
 }
 
+// Explicit layer validation checks: null arrays, null entries, foreign-device objects/fences, dummy COM objects/fences,
+// non-fence objects cast to ID3D12Fence*, and verifying EnqueueMakeResident never signals the fence on error.
+int verify_layer_validation(ID3D12Device* device, ID3D12Device* foreign_device) {
+    Holder h, fh;
+    EXPECT(make(device, h));
+    EXPECT(make(foreign_device, fh));
+
+    Ref<ID3D12CommandQueue> queue;
+    const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p))));
+
+    D3D12_INDIRECT_ARGUMENT_DESC iad{};
+    iad.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    const D3D12_COMMAND_SIGNATURE_DESC csd{sizeof(D3D12_DRAW_ARGUMENTS), 1, &iad, 0};
+    Ref<ID3D12CommandSignature> cmd_sig;
+    EXPECT(SUCCEEDED(device->CreateCommandSignature(&csd, nullptr, IID_PPV_ARGS(&cmd_sig.p))));
+
+    // Valid pageables of this device succeed.
+    ID3D12Pageable* own_valid[] = {h.buffer.p, h.heap.p, h.placed.p, h.descriptors.p, h.queries.p,
+                                   h.allocator.p, queue.p, cmd_sig.p, h.fence.p};
+    EXPECT(device->MakeResident(UINT(sizeof(own_valid) / sizeof(own_valid[0])), own_valid) == S_OK);
+    EXPECT(device->Evict(UINT(sizeof(own_valid) / sizeof(own_valid[0])), own_valid) == S_OK);
+    EXPECT(device->MakeResident(0, nullptr) == S_OK);
+    EXPECT(device->Evict(0, nullptr) == S_OK);
+
+    // Null array, null entry, mixed valid+null, foreign-device object, and dummy COM object -> E_INVALIDARG.
+    ID3D12Pageable* single_null[] = {nullptr};
+    ID3D12Pageable* mixed_null[] = {h.buffer.p, nullptr};
+    ID3D12Pageable* foreign_obj[] = {fh.buffer.p};
+    ID3D12Pageable* mixed_foreign[] = {h.buffer.p, fh.heap.p};
+    ID3D12Pageable* dummy_obj[] = {h.dummy_fence.p};
+
+    EXPECT(device->MakeResident(1, nullptr) == E_INVALIDARG);
+    EXPECT(device->MakeResident(1, single_null) == E_INVALIDARG);
+    EXPECT(device->MakeResident(2, mixed_null) == E_INVALIDARG);
+    EXPECT(device->MakeResident(1, foreign_obj) == E_INVALIDARG);
+    EXPECT(device->MakeResident(2, mixed_foreign) == E_INVALIDARG);
+    EXPECT(device->MakeResident(1, dummy_obj) == E_INVALIDARG);
+
+    EXPECT(device->Evict(1, nullptr) == E_INVALIDARG);
+    EXPECT(device->Evict(1, single_null) == E_INVALIDARG);
+    EXPECT(device->Evict(2, mixed_null) == E_INVALIDARG);
+    EXPECT(device->Evict(1, foreign_obj) == E_INVALIDARG);
+    EXPECT(device->Evict(2, mixed_foreign) == E_INVALIDARG);
+    EXPECT(device->Evict(1, dummy_obj) == E_INVALIDARG);
+
+    // SetResidencyPriority rejects foreign-device objects even when they are heaps or committed buffers.
+    const D3D12_RESIDENCY_PRIORITY normal = D3D12_RESIDENCY_PRIORITY_NORMAL;
+    EXPECT(h.device1->SetResidencyPriority(1, foreign_obj, &normal) == E_INVALIDARG);
+    ID3D12Pageable* foreign_heap[] = {fh.heap.p};
+    EXPECT(h.device1->SetResidencyPriority(1, foreign_heap, &normal) == E_INVALIDARG);
+
+    // EnqueueMakeResident: error paths must return E_INVALIDARG and NEVER signal the fence.
+    EXPECT(h.fence->GetCompletedValue() == 0);
+    EXPECT(fh.fence->GetCompletedValue() == 0);
+    EXPECT(h.dummy_fence->GetCompletedValue() == 0);
+
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, own_valid, h.fence.p, 10) == E_INVALIDARG);
+    EXPECT(h.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 0, nullptr, h.fence.p, 11) == E_INVALIDARG);
+    EXPECT(h.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, h.fence.p, 12) == E_INVALIDARG);
+    EXPECT(h.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, single_null, h.fence.p, 13) == E_INVALIDARG);
+    EXPECT(h.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, mixed_null, h.fence.p, 14) == E_INVALIDARG);
+    EXPECT(h.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, foreign_obj, h.fence.p, 15) == E_INVALIDARG);
+    EXPECT(h.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, mixed_foreign, h.fence.p, 16) == E_INVALIDARG);
+    EXPECT(h.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, dummy_obj, h.fence.p, 17) == E_INVALIDARG);
+    EXPECT(h.fence->GetCompletedValue() == 0);
+
+    // Foreign-device fence and dummy COM fence must return E_INVALIDARG without signalling.
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, own_valid, fh.fence.p, 18) == E_INVALIDARG);
+    EXPECT(fh.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 0, nullptr, fh.fence.p, 19) == E_INVALIDARG);
+    EXPECT(fh.fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, own_valid, h.dummy_fence.p, 20) == E_INVALIDARG);
+    EXPECT(h.dummy_fence->GetCompletedValue() == 0);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 0, nullptr, h.dummy_fence.p, 21) == E_INVALIDARG);
+    EXPECT(h.dummy_fence->GetCompletedValue() == 0);
+
+    // Non-fence child of this device cast to ID3D12Fence* must return E_INVALIDARG.
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, own_valid,
+                                          reinterpret_cast<ID3D12Fence*>(h.buffer.p), 22) == E_INVALIDARG);
+
+    // Valid EnqueueMakeResident with count == 0 + valid fence signals the fence; null fence succeeds.
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 0, nullptr, nullptr, 23) == S_OK);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 0, nullptr, h.fence.p, 24) == S_OK);
+    EXPECT(h.fence->GetCompletedValue() == 24);
+    EXPECT(h.device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 1, own_valid, h.fence.p, 25) == S_OK);
+    EXPECT(h.fence->GetCompletedValue() == 25);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -365,8 +525,10 @@ int main(int argc, char** argv) {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;  // heaps live in the GPU address arena
-        Ref<ID3D12Device> device;
+        Ref<ID3D12Device> device, foreign_device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&foreign_device.p))));
+        EXPECT(verify_layer_validation(device.p, foreign_device.p) == 0);
         Record ours;
         EXPECT(run(device.p, false, ours));
 
