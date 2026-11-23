@@ -483,5 +483,34 @@ class TestVExpF32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_exp_f32(float("-inf")), 0.0)
 
 
+def ref_log_f32(src: float) -> float:
+    """Bit-accurate reference oracle for RDNA2 v_log_f32 (log2(x))."""
+    if math.isnan(src) or src < 0.0:
+        return float("nan")
+    if src == 0.0:
+        return float("-inf")
+    if math.isinf(src):
+        return float("inf")
+    return math.log2(src)
+
+
+class TestVLogF32Reference(unittest.TestCase):
+    """Reference mathematical oracle verification for v_log_f32."""
+
+    def test_reference_powers_of_two(self):
+        self.assertEqual(ref_log_f32(1.0), 0.0)
+        self.assertEqual(ref_log_f32(2.0), 1.0)
+        self.assertEqual(ref_log_f32(4.0), 2.0)
+        self.assertEqual(ref_log_f32(8.0), 3.0)
+        self.assertEqual(ref_log_f32(0.5), -1.0)
+        self.assertEqual(ref_log_f32(0.25), -2.0)
+
+    def test_reference_edge_cases(self):
+        self.assertEqual(ref_log_f32(0.0), float("-inf"))
+        self.assertTrue(math.isnan(ref_log_f32(-1.0)))
+        self.assertEqual(ref_log_f32(float("inf")), float("inf"))
+        self.assertTrue(math.isnan(ref_log_f32(float("nan"))))
+
+
 if __name__ == "__main__":
     unittest.main()
