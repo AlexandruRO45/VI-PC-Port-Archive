@@ -72,6 +72,27 @@ class Tests(unittest.TestCase):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])
 
+    def test_lasttest_duration_does_not_hide_verdicts(self):
+        cases = (
+            ("malformed", "1.2.3", "Test Failed.", "fail", None),
+            ("overflow", "9" * 400, "Test Not Run.", "skip", None),
+            ("garbage", "garbage", "Test Passed.", "pass", None),
+            ("missing", None, "Test Failed.", "fail", None),
+            ("zero", "0.00", "Test Passed.", "pass", 0.0),
+        )
+        for label, duration, verdict, expected_status, expected_seconds in cases:
+            with self.subTest(label=label):
+                time_line = "" if duration is None else f"Test time = {duration} sec\n"
+                log = (
+                    f"1/2 Test: first\n{time_line}{verdict}\n"
+                    "2/2 Test: next\nTest time =   0.125 sec\nTest Passed.\n"
+                )
+                rows = pd.parse_lasttest(log)
+                json.dumps(rows, allow_nan=False)
+                self.assertEqual(rows, [
+                    ("first", expected_status, expected_seconds), ("next", "pass", 0.125),
+                ])
+
     def test_ci_selection_matches_the_workflow_rule(self):
         files = pd.ci_test_files()
         self.assertIn("tests/test_progress_dashboard.py", files)
