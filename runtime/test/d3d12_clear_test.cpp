@@ -418,8 +418,9 @@ int main(int argc, char** argv) {
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
             FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
             FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
-            std::fprintf(stderr, "WARP reference unavailable: differential test cannot run\n");
-            return 1;
+            // No reference device (e.g. Wine without a host D3D12): nothing to compare against, so ctest skips.
+            std::puts("SKIP d3d12_clear_test: no WARP reference device (differential test cannot run)");
+            return 77;
         }
         if (!check_volume_rtvs(host.p, ours.p)) return 1;
         if (volume_only) return 0;
