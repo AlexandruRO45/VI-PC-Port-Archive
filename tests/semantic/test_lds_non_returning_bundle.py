@@ -122,6 +122,21 @@ class TestLdsAddU32Divergence(unittest.TestCase):
             expected = 75 if (lane % 2 == 0) else 50
             self.assertEqual(L.out(mem, lane, 0), expected)
 
+class TestLdsAddU32Aliasing(unittest.TestCase):
+    def test_aliased_address_and_data_registers(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 10",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_add_u32 v1, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v3", 0)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(L.out(mem, 0, 0), 10 + 0x40)
+
 
 if __name__ == "__main__":
     unittest.main()
