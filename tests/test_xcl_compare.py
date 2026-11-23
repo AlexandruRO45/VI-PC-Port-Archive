@@ -85,6 +85,16 @@ class Report(unittest.TestCase):
 class Transcript(unittest.TestCase):
     """run_title streams the title's output to the transcript file and keeps none of it on the Run."""
 
+    def test_unopenable_transcript_prevents_title_launch(self):
+        run = xc.Run("synthetic")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "transcript.txt"
+            transcript.mkdir()
+            with mock.patch.object(xc.subprocess, "Popen",
+                                   side_effect=AssertionError("title launched before opening the transcript")):
+                with self.assertRaises(OSError):
+                    xc.run_title([sys.executable], {}, tmp, run, [], 15, None, Sink(), [], transcript)
+
     def test_output_goes_to_the_file(self):
         class Sink:
             def put(self, event):
