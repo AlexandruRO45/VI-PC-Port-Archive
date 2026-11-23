@@ -654,6 +654,7 @@ CS, 10,974 PS).
 | `valu_fuzz.py --family f16` signed zero on MoltenVK | `v_mul_f16` 124 shaders, `v_fma_f16` 124, `v_fmac_f16` 130, `v_pk_mul_f16` 55, `v_pk_fma_f16` 47, mostly PS (113–115 for the scalar forms). |
 | `ps_interp_f16_high` on MoltenVK (16-bit interpolation) | `v_interp_p1ll_f16` / `v_interp_p2_f16` in 4,776 PS (679 wave32, 4,097 wave64), 59,367 instructions each. The count is the instruction, not the `high` operand. |
 | `gs_tri` and `ms_tri` on a Mac | 195 GS and 9,282 MS, all wave64. |
+| `vk_pipeline_check` (the `pipelines` stage) dies with `0xC0000005` (exit status `3221225477` on Windows) after several thousand pipelines on an Intel Arc A770 under the Windows driver, and `make_game.py` stops there | Seen once, on `426023a`, while `+spec_CS_RaytracingResolve_ae7b7f3c_Wrapped` (a 4.5 MB module) compiled among 6 threads: 8,000 pipelines had been created with no other failure (TEST-862). It does not reproduce: the same module alone compiles in 326 s at about 4.5 GB peak with no fault, and a full `--jobs 6 --large-parallel 1` run on `3faac55` passes that module and the rest of the `CS_RaytracingResolve` family, which take 60-250 s each; a second Arc A770 on driver 32.0.101.9175 confirms it alone (449 s, no fault) | Nothing on current `main`. If it comes back, pass `--inflight-file F`: the module in the driver when the process died is named in `F`, and `make_game.py` retries it alone on the next run |
 
 ## Posting your result
 
