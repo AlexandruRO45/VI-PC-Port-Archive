@@ -450,12 +450,30 @@ def check(tools, spirv, name):
     return ""
 
 
+# A multi-config CMake generator (Visual Studio, Xcode, Ninja Multi-Config) puts vk_harness in build/<Config>, not in
+# build/ itself. check.py resolves that for its programs (TEST-38); this does the same for the one program used here.
+CONFIG_DIRS = ("RelWithDebInfo", "Release", "Debug", "MinSizeRel")
+
+
+def resolve_tools(tools):
+    """`tools`, or its configuration subfolder that holds vk_harness, which is printed when it is used."""
+    if os.path.isfile(os.path.join(tools, "vk_harness" + EXE)):
+        return tools
+    for config in CONFIG_DIRS:
+        candidate = os.path.join(tools, config)
+        if os.path.isfile(os.path.join(candidate, "vk_harness" + EXE)):
+            print(f"build folder: {candidate}")
+            return candidate
+    return tools
+
+
 def main(argv):
     if not argv:
         sys.exit(__doc__)
     spirv = os.path.join(argv[0], "spirv")
     tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
     start = 2 if len(argv) > 1 and os.path.isdir(argv[1]) else 1
+    tools = resolve_tools(tools)
     requested = argv[start:]
     unknown = [a for a in requested if a not in FIXTURES]
     if unknown:
