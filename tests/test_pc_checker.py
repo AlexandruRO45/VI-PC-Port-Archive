@@ -1,7 +1,11 @@
 """Tests for tools/pc_checker.py. Run with: python -I tests/test_pc_checker.py"""
+import contextlib
+import io
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -63,6 +67,29 @@ class CpuScore(unittest.TestCase):
     def test_unknown(self):
         self.assertIsNone(pc.cpu_score("Mystery CPU"))
         self.assertIsNone(pc.cpu_score(""))
+
+
+class RamInput(unittest.TestCase):
+    def test_gui_accepts_only_positive_finite_capacity(self):
+        for value, expected in (("32", 32), ("0", None), ("-8", None),
+                                ("nan", None), ("inf", None), ("-1e999", None)):
+            with self.subTest(value=value):
+                app = SimpleNamespace(ram_var=SimpleNamespace(get=lambda: value))
+                self.assertEqual(pc.App.get_ram(app), expected)
+
+    def test_cli_rejects_nonpositive_overrides_before_running_checks(self):
+        for mode in ("--cli", "--check"):
+            for value in ("0", "-8"):
+                with self.subTest(mode=mode, value=value), \
+                        patch.object(sys, "argv", ["pc_checker.py", mode, "--ram", value]), \
+                        patch.object(pc, "run_cli") as cli, patch.object(pc, "run_check") as check, \
+                        contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as exit:
+                        pc.main()
+                    self.assertEqual(exit.exception.code, 2)
+                    self.assertIn("RAM must be at least 1 GB", stderr.getvalue())
+                    cli.assert_not_called()
+                    check.assert_not_called()
 
 
 class Evaluate(unittest.TestCase):
