@@ -19,6 +19,8 @@ import struct
 import sys
 import unittest
 
+sys.dont_write_bytecode = True
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
@@ -74,16 +76,18 @@ class TestValuSubCoU32ReferenceOracle(unittest.TestCase):
     """Stage 1: Reference mathematical oracle and architectural model for v_sub_co_u32."""
 
     def test_oracle_basic_subtraction(self) -> None:
-        self.assertEqual(oracle_sub_co_u32(10, 3), (7, 0))
-        self.assertEqual(oracle_sub_co_u32(100, 100), (0, 0))
-        self.assertEqual(oracle_sub_co_u32(0, 0), (0, 0))
-        self.assertEqual(oracle_sub_co_u32(1000, 400), (600, 0))
+        cases = [(10, 3), (100, 100), (0, 0), (1000, 400)]
+        for a, b in cases:
+            expected = oracle_sub_co_u32(a, b)
+            actual = run_translated_sub_co_u32(a, b)
+            self.assertEqual(actual, expected, f"Mismatch on {a} - {b}")
 
     def test_oracle_borrow_subtraction(self) -> None:
-        self.assertEqual(oracle_sub_co_u32(3, 10), (MASK32 - 6, 1))
-        self.assertEqual(oracle_sub_co_u32(0, 1), (MASK32, 1))
-        self.assertEqual(oracle_sub_co_u32(0, MASK32), (1, 1))
-        self.assertEqual(oracle_sub_co_u32(MASK32, 0), (MASK32, 0))
+        cases = [(3, 10), (0, 1), (0, MASK32), (MASK32, 0)]
+        for a, b in cases:
+            expected = oracle_sub_co_u32(a, b)
+            actual = run_translated_sub_co_u32(a, b)
+            self.assertEqual(actual, expected, f"Borrow mismatch on {a} - {b}")
 
     def test_oracle_matches_translated_execution(self) -> None:
         pairs = [
@@ -161,6 +165,8 @@ class TestValuSubCoU32ASTDefinitions(unittest.TestCase):
     """Stage 2: Symbolic AST definitions and typed expressions for v_sub_co_u32."""
 
     def test_ast_construction_and_formatting(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
         vdst = Register(RegKind.VGPR, 0)
         sdst = Register(RegKind.SPECIAL, 0, "vcc_lo")
         src0 = Register(RegKind.VGPR, 1)
@@ -173,7 +179,22 @@ class TestValuSubCoU32ASTDefinitions(unittest.TestCase):
         self.assertEqual(str(inst.src0), "v1")
         self.assertEqual(str(inst.src1), "v2")
 
+        # Verify through translator
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 3",
+            f"{inst.opcode.value} {inst.vdst}, {inst.sdst}, {inst.src0}, {inst.src1}",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_co_ast_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 7)
+
     def test_ast_with_literal_and_sgpr(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
         vdst = Register(RegKind.VGPR, 5)
         sdst = Register(RegKind.SGPR, 4)
         src0 = Register(RegKind.SGPR, 2)
@@ -183,6 +204,18 @@ class TestValuSubCoU32ASTDefinitions(unittest.TestCase):
         self.assertEqual(str(inst.sdst), "s4")
         self.assertEqual(str(inst.src0), "s2")
         self.assertEqual(inst.src1, 42)
+
+        # Verify through translator
+        lines = [
+            "s_mov_b32 s2, 50",
+            f"{inst.opcode.value} {inst.vdst}, {inst.sdst}, {inst.src0}, {inst.src1}",
+            "exp mrt0 v5, v5, v5, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_co_ast_lit_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 8)
 
 # ---------------------------------------------------------------------------
 # Stage 3: Deterministic instruction interpreter
@@ -241,7 +274,14 @@ class TestValuSubCoU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(interp.vgprs[0], 30)
         self.assertEqual(interp.vcc_lo, 0)
 
+        # Cross-check through translator
+        t_diff, t_borrow = run_translated_sub_co_u32(50, 20)
+        self.assertEqual(t_diff, diff)
+        self.assertEqual(t_borrow, borrow)
+
     def test_interpreter_borrow_into_sgpr(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
         interp = ValuSubCoInterpreter()
         interp.vgprs[1] = 10
         interp.vgprs[2] = 25
@@ -259,7 +299,25 @@ class TestValuSubCoU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(interp.vgprs[3], (10 - 25) & MASK32)
         self.assertEqual(interp.sgprs[8], MASK32)
 
+        # Cross-check with translated execution routing borrow into SGPR s8
+        lines = [
+            "s_mov_b32 s8, 0",
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 25",
+            "v_sub_co_u32 v3, s8, v1, v2",
+            "v_cndmask_b32 v4, 0, 1, s8",
+            "exp mrt0 v3, v4, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_sgpr_borrow_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, diff)
+        self.assertEqual(words[1] & 1, 1)
+
     def test_interpreter_literal_subtraction(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
         interp = ValuSubCoInterpreter()
         interp.vgprs[1] = 100
 
@@ -273,6 +331,18 @@ class TestValuSubCoU32ScalarInterpreter(unittest.TestCase):
         diff, borrow = interp.step(inst)
         self.assertEqual(diff, 70)
         self.assertEqual(borrow, 0)
+
+        # Cross-check with translated execution
+        lines = [
+            "v_mov_b32 v1, 100",
+            "v_sub_co_u32 v0, vcc_lo, v1, 30",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_lit_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 70)
 
 # ---------------------------------------------------------------------------
 # Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking
@@ -321,6 +391,15 @@ class TestValuSubCoU32SIMDDivergence(unittest.TestCase):
             self.assertEqual(diffs[lane], lane * 10 - 5)
             self.assertEqual((vcc >> lane) & 1, 0)
 
+        # Cross-check lane 0 and lane 31 through translated execution
+        t0_diff, t0_borrow = run_translated_sub_co_u32(s0[0], s1[0])
+        self.assertEqual(t0_diff, diffs[0])
+        self.assertEqual(t0_borrow, 1)
+
+        t31_diff, t31_borrow = run_translated_sub_co_u32(s0[31], s1[31])
+        self.assertEqual(t31_diff, diffs[31])
+        self.assertEqual(t31_borrow, 0)
+
     def test_wave64_divergence_masking(self) -> None:
         # Alternating even lanes enabled
         mask = 0x5555_5555_5555_5555
@@ -338,6 +417,11 @@ class TestValuSubCoU32SIMDDivergence(unittest.TestCase):
                 self.assertEqual((vcc >> lane) & 1, 0)
         self.assertEqual(vcc, mask)
 
+        # Cross-check active lane through translator
+        t_diff, t_borrow = run_translated_sub_co_u32(0, 1)
+        self.assertEqual(t_diff, MASK32)
+        self.assertEqual(t_borrow, 1)
+
 # ---------------------------------------------------------------------------
 # Stage 5: Register aliasing and in-place operand preservation
 # ---------------------------------------------------------------------------
@@ -346,6 +430,8 @@ class TestValuSubCoU32RegisterAliasing(unittest.TestCase):
     """Stage 5: Register aliasing and in-place operand preservation for v_sub_co_u32."""
 
     def test_inplace_dst_equals_src0(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
         # v0 = v0 - v1
         interp = ValuSubCoInterpreter()
         interp.vgprs[0] = 100
@@ -364,7 +450,22 @@ class TestValuSubCoU32RegisterAliasing(unittest.TestCase):
         self.assertEqual(interp.vgprs[0], 60)
         self.assertEqual(interp.vgprs[1], 40)
 
+        # Translated cross-check
+        lines = [
+            "v_mov_b32 v0, 100",
+            "v_mov_b32 v1, 40",
+            "v_sub_co_u32 v0, vcc_lo, v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_co_alias_s0_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 60)
+
     def test_inplace_dst_equals_src1(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
         # v1 = v0 - v1
         interp = ValuSubCoInterpreter()
         interp.vgprs[0] = 50
@@ -383,7 +484,24 @@ class TestValuSubCoU32RegisterAliasing(unittest.TestCase):
         self.assertEqual(interp.vgprs[1], (50 - 80) & MASK32)
         self.assertEqual(interp.vgprs[0], 50)
 
+        # Translated cross-check
+        lines = [
+            "v_mov_b32 v0, 50",
+            "v_mov_b32 v1, 80",
+            "v_sub_co_u32 v1, vcc_lo, v0, v1",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "exp mrt0 v1, v3, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_co_alias_s1_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, (50 - 80) & MASK32)
+        self.assertEqual(words[1] & 1, 1)
+
     def test_inplace_all_aliased(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
         # v0 = v0 - v0
         interp = ValuSubCoInterpreter()
         interp.vgprs[0] = 0xDEADBEEF
@@ -399,6 +517,20 @@ class TestValuSubCoU32RegisterAliasing(unittest.TestCase):
         self.assertEqual(diff, 0)
         self.assertEqual(borrow, 0)
         self.assertEqual(interp.vgprs[0], 0)
+
+        # Translated cross-check
+        lines = [
+            "v_mov_b32 v0, 0xdeadbeef",
+            "v_sub_co_u32 v0, vcc_lo, v0, v0",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "exp mrt0 v0, v3, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_co_alias_all_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 0)
+        self.assertEqual(words[1] & 1, 0)
 
     def test_aliased_translated_execution(self) -> None:
         global _TRANSLATE_ID
@@ -451,12 +583,22 @@ class TestValuSubCoU32ConditionCodes(unittest.TestCase):
         self.assertFalse(flags.borrow)
         self.assertFalse(flags.overflow)
 
+        # Cross-check through translator
+        diff, borrow = run_translated_sub_co_u32(0x1234, 0x1234)
+        self.assertEqual(diff, 0)
+        self.assertEqual(borrow, 0)
+
     def test_negative_and_borrow(self) -> None:
         flags = compute_sub_status_flags(5, 10)
         self.assertFalse(flags.zero)
         self.assertTrue(flags.negative)
         self.assertTrue(flags.borrow)
         self.assertFalse(flags.overflow)
+
+        # Cross-check through translator
+        diff, borrow = run_translated_sub_co_u32(5, 10)
+        self.assertEqual(diff, (5 - 10) & MASK32)
+        self.assertEqual(borrow, 1)
 
     def test_signed_overflow_without_unsigned_borrow(self) -> None:
         # 0x8000_0000 (-2147483648) - 1 => 0x7FFF_FFFF (+2147483647)
@@ -468,7 +610,14 @@ class TestValuSubCoU32ConditionCodes(unittest.TestCase):
         self.assertFalse(flags.borrow)
         self.assertTrue(flags.overflow)
 
+        # Cross-check through translator
+        diff, borrow = run_translated_sub_co_u32(0x8000_0000, 1)
+        self.assertEqual(diff, 0x7FFF_FFFF)
+        self.assertEqual(borrow, 0)
+
     def test_multi_precision_64bit_borrow_chain(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
         # Compute 64-bit subtraction using two 32-bit steps:
         # A = 0x0000_0002_0000_0001, B = 0x0000_0001_0000_0005
         # Lower: 1 - 5 = 0xFFFF_FFFC with borrow = 1
@@ -488,6 +637,23 @@ class TestValuSubCoU32ConditionCodes(unittest.TestCase):
         expected64 = (((a_hi << 32) | a_lo) - ((b_hi << 32) | b_lo)) & MASK64
         self.assertEqual(res64, expected64)
 
+        # Verify through translator-backed multi-precision subtraction chain
+        lines = [
+            f"v_mov_b32 v0, {a_lo}",
+            f"v_mov_b32 v1, {a_hi}",
+            f"v_mov_b32 v2, {b_lo}",
+            f"v_mov_b32 v3, {b_hi}",
+            "v_sub_co_u32 v4, vcc_lo, v0, v2",
+            "v_sub_co_ci_u32 v5, vcc_lo, v1, v3, vcc_lo",
+            "exp mrt0 v4, v5, 0, 0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_chain_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 0xFFFF_FFFC)
+        self.assertEqual(words[1] & MASK32, 0)
+
 # ---------------------------------------------------------------------------
 # Stage 7: IEEE 754 boundary extremes, integer boundaries, and bitwise limits
 # ---------------------------------------------------------------------------
@@ -496,14 +662,19 @@ class TestValuSubCoU32IEEE754EdgeCases(unittest.TestCase):
     """Stage 7: Boundary extremes, integer limits, and bit-pattern invariance for v_sub_co_u32."""
 
     def test_integer_boundary_extremes(self) -> None:
-        # Max unsigned boundary
-        self.assertEqual(oracle_sub_co_u32(MASK32, MASK32), (0, 0))
-        self.assertEqual(oracle_sub_co_u32(MASK32, 0), (MASK32, 0))
-        self.assertEqual(oracle_sub_co_u32(0, MASK32), (1, 1))
-
-        # Sign bit boundaries
-        self.assertEqual(oracle_sub_co_u32(0x8000_0000, 1), (0x7FFF_FFFF, 0))
-        self.assertEqual(oracle_sub_co_u32(0x7FFF_FFFF, 0x8000_0000), (MASK32, 1))
+        boundary_cases = [
+            (MASK32, MASK32, 0, 0),
+            (MASK32, 0, MASK32, 0),
+            (0, MASK32, 1, 1),
+            (0x8000_0000, 1, 0x7FFF_FFFF, 0),
+            (0x7FFF_FFFF, 0x8000_0000, MASK32, 1),
+        ]
+        for src0, src1, exp_diff, exp_borrow in boundary_cases:
+            self.assertEqual(oracle_sub_co_u32(src0, src1), (exp_diff, exp_borrow))
+            # Cross-check through translator
+            t_diff, t_borrow = run_translated_sub_co_u32(src0, src1)
+            self.assertEqual(t_diff, exp_diff, f"Diff mismatch for {src0:#x} - {src1:#x}")
+            self.assertEqual(t_borrow, exp_borrow, f"Borrow mismatch for {src0:#x} - {src1:#x}")
 
     def test_float_bitpatterns_treated_as_integers(self) -> None:
         pos_inf = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
@@ -573,6 +744,98 @@ class TestValuSubCoU32NegativeControls(unittest.TestCase):
             content = f.read()
         self.assertIn("import support", content)
         self.assertIn("support.translate_lines", content)
+
+# ---------------------------------------------------------------------------
+# Stage 9: Translator lowering, SPIR-V opcode assertions, and modifier verification
+# ---------------------------------------------------------------------------
+
+class TestValuSubCoU32TranslatorLowering(unittest.TestCase):
+    """Stage 9: Direct translator lowering tests asserting OpISubBorrow generation and modifiers."""
+
+    def test_translator_emits_op_isub_borrow(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        lines = [
+            "v_mov_b32 v1, 20",
+            "v_mov_b32 v2, 5",
+            "v_sub_co_u32 v0, vcc_lo, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_lowering_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        self.assertNotIn("OpIAddCarry", spv)
+        self.assertIn("OpCompositeExtract %uint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 15)
+
+    def test_translator_clamp_modifier_saturates_to_zero_on_borrow(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        # 10 - 20 with clamp => saturates to 0, vcc_lo borrow is 1
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 20",
+            "v_sub_co_u32 v0, vcc_lo, v1, v2 clamp",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "exp mrt0 v0, v3, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_clamp_borrow_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 0, "Clamped subtraction with borrow must saturate to 0")
+        self.assertEqual(words[1] & 1, 1, "Carry/borrow flag must still reflect true borrow under clamp")
+
+    def test_translator_clamp_modifier_without_borrow(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        # 30 - 12 with clamp => 18, vcc_lo borrow is 0
+        lines = [
+            "v_mov_b32 v1, 30",
+            "v_mov_b32 v2, 12",
+            "v_sub_co_u32 v0, vcc_lo, v1, v2 clamp",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "exp mrt0 v0, v3, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_clamp_noborrow_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 18)
+        self.assertEqual(words[1] & 1, 0)
+
+    def test_translator_null_sdst(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        # When sdst is 'null', borrow is discarded and only vdst is written
+        lines = [
+            "v_mov_b32 v1, 45",
+            "v_mov_b32 v2, 15",
+            "v_sub_co_u32 v0, null, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_null_sdst_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 30)
+
+    def test_translator_sgpr_src0_and_literal_src1(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        lines = [
+            "s_mov_b32 s2, 75",
+            "v_sub_co_u32 v0, vcc_lo, s2, 25",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "exp mrt0 v0, v3, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_sgpr_src_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpISubBorrow", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 50)
+        self.assertEqual(words[1] & 1, 0)
 
 if __name__ == "__main__":
     unittest.main()
