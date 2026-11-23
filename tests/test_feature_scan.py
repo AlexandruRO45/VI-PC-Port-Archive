@@ -466,6 +466,27 @@ def test_typed_buffers_and_psv0():
     assert failures == 0, f"{failures} typed-buffer check(s) failed"
 
 
+def test_unreadable_disasm_listing_is_counted_not_a_traceback():
+    """One .s listing that cannot be opened used to end the whole scan in an OSError traceback (exit 1), while an
+    unreadable .dxbc is only counted. Both listing scans now count it in "unreadable" and the CLI prints the count.
+    A directory named *.s cannot be opened as a file on any platform, so no permission bits are needed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        sh, index = build(tmp)
+        dis = os.path.join(sh, "dxbc", "disasm")
+        stage_of = {e["name"]: e["stage"] for e in index}
+        os.mkdir(os.path.join(dis, "unreadable.s"))
+        s = F.scan_disasm(dis, stage_of)
+        tb = F.scan_typed_buffers(dis, stage_of)
+        check(s["files"] == 5 and s["unreadable"] == 1, f"scan_disasm counts the unreadable listing ({s['files']}, {s['unreadable']})")
+        check(s["gds_shaders"] == {"gs": 1}, "the readable listings are still scanned")
+        check(tb["unreadable"] == 1, f"scan_typed_buffers counts the unreadable listing ({tb['unreadable']})")
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh],
+                           capture_output=True, text=True)
+        check(r.returncode == 0 and "Traceback" not in r.stderr and "1 unreadable" in r.stdout,
+              f"the CLI reports the unreadable listing (rc={r.returncode})")
+    assert failures == 0, f"{failures} unreadable-listing check(s) failed"
+
+
 def test_a_test_that_raises_fails_the_run_and_the_rest_still_run():
     """The plain-script run used to hold every test in one try block that swallowed AssertionError: a failing bare
     assert (test_duplicate_shader_names_keep_file_stages has one) skipped the tests after it and printed OK, exit 0."""

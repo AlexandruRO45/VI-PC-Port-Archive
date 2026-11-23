@@ -19,7 +19,7 @@ Reads what the shaders stage of make_game.py leaves in <work>/shaders, and print
 
 InnerCoverage metadata is cross-tabulated by stage: SFI0 set/clear/unknown versus ISG1
 present/absent/unknown. Unknown includes missing or truncated parts; unreadable containers
-remain in the existing unreadable count. DXIL permits InnerCoverage outside the signature,
+remain in the existing unreadable counts. DXIL permits InnerCoverage outside the signature,
 so ISG1 absence is not evidence of non-use. These counts do not identify an Xbox input VGPR.
 
 Standard library only. Nothing from the game is printed or written: names, code and data stay in the work folder.
@@ -291,62 +291,67 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
     vperm_insns = vperm_imm = vperm_creg = vperm_unres = 0
     vperm_sext_shaders = vperm_sext_insns = 0
     vperm_classes = {"0_7": 0, "8_11": 0, "12": 0, "13_plus": 0}
-    files = 0
+    files = unreadable = 0
     for fn in sorted(os.listdir(disasm_dir)):
         if not fn.endswith(".s"):
+            continue
+        try:
+            with open(os.path.join(disasm_dir, fn), encoding="utf-8", errors="replace") as f:
+                lines = list(f)
+        except (OSError, ValueError):  # an unreadable listing is counted, not a traceback, like scan_dxbc's .dxbc
+            unreadable += 1
             continue
         files += 1
         stage = stage_of.get(fn[:-2], "?")
         seen_mma = seen_ord = seen_gds = seen_vperm = seen_vperm_sext = False
         ops = []
         const_reg = {}
-        with open(os.path.join(disasm_dir, fn), encoding="utf-8", errors="replace") as f:
-            for line in f:
-                code = line.split(";", 1)[0].strip()
-                head = code.split(None, 1)
-                if head and not head[0].startswith("."):
-                    op = head[0]
-                    ops.append(op)
-                    operands = [x.strip() for x in head[1].split(",")] if len(head) > 1 else []
-                    if op in ("v_perm_b32", "v_perm_b32_e64") and len(operands) >= 4:
-                        seen_vperm = True
-                        vperm_insns += 1
-                        sel_tok = operands[3].split()[0] if operands[3].split() else ""
-                        sel_val = _parse_imm(sel_tok)
-                        if sel_val is not None:
-                            vperm_imm += 1
-                        elif sel_tok in const_reg:
-                            sel_val = const_reg[sel_tok]
-                            vperm_creg += 1
-                        else:
-                            vperm_unres += 1
-                        if sel_val is not None:
-                            has_sext = False
-                            for shift in (0, 8, 16, 24):
-                                b = (sel_val >> shift) & 0xFF
-                                if b <= 7:
-                                    vperm_classes["0_7"] += 1
-                                elif b <= 11:
-                                    vperm_classes["8_11"] += 1
-                                    has_sext = True
-                                elif b == 12:
-                                    vperm_classes["12"] += 1
-                                else:
-                                    vperm_classes["13_plus"] += 1
-                            if has_sext:
-                                vperm_sext_insns += 1
-                                seen_vperm_sext = True
-                    _update_const_regs(const_reg, op, operands)
-                m = MMA.match(line)
-                if m:
-                    mma_ops[m.group(1)] += 1
-                    seen_mma = True
-                m = ORDERED.match(line)
-                if m:
-                    ordered_ops[m.group(1)] += 1
-                    seen_ord = True
-                if GDS.match(line):
-                    seen_gds = True
+        for line in lines:
+            code = line.split(";", 1)[0].strip()
+            head = code.split(None, 1)
+            if head and not head[0].startswith("."):
+                op = head[0]
+                ops.append(op)
+                operands = [x.strip() for x in head[1].split(",")] if len(head) > 1 else []
+                if op in ("v_perm_b32", "v_perm_b32_e64") and len(operands) >= 4:
+                    seen_vperm = True
+                    vperm_insns += 1
+                    sel_tok = operands[3].split()[0] if operands[3].split() else ""
+                    sel_val = _parse_imm(sel_tok)
+                    if sel_val is not None:
+                        vperm_imm += 1
+                    elif sel_tok in const_reg:
+                        sel_val = const_reg[sel_tok]
+                        vperm_creg += 1
+                    else:
+                        vperm_unres += 1
+                    if sel_val is not None:
+                        has_sext = False
+                        for shift in (0, 8, 16, 24):
+                            b = (sel_val >> shift) & 0xFF
+                            if b <= 7:
+                                vperm_classes["0_7"] += 1
+                            elif b <= 11:
+                                vperm_classes["8_11"] += 1
+                                has_sext = True
+                            elif b == 12:
+                                vperm_classes["12"] += 1
+                            else:
+                                vperm_classes["13_plus"] += 1
+                        if has_sext:
+                            vperm_sext_insns += 1
+                            seen_vperm_sext = True
+                _update_const_regs(const_reg, op, operands)
+            m = MMA.match(line)
+            if m:
+                mma_ops[m.group(1)] += 1
+                seen_mma = True
+            m = ORDERED.match(line)
+            if m:
+                ordered_ops[m.group(1)] += 1
+                seen_ord = True
+            if GDS.match(line):
+                seen_gds = True
         mma[stage] += seen_mma
         ordered[stage] += seen_ord
         gds[stage] += seen_gds
@@ -354,7 +359,7 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
         vperm_sext_shaders += int(seen_vperm_sext)
         code_data[stage] += getpc_for_data(ops)
     nz = lambda c: {k: v for k, v in c.items() if v}
-    return {"files": files, "wave_mma_shaders": nz(mma), "wave_mma_ops": dict(mma_ops),
+    return {"files": files, "unreadable": unreadable, "wave_mma_shaders": nz(mma), "wave_mma_ops": dict(mma_ops),
             "ordered_or_gws_shaders": nz(ordered), "ordered_or_gws_ops": dict(ordered_ops), "gds_shaders": nz(gds),
             "getpc_for_data_shaders": nz(code_data),
             "v_perm_b32": {
@@ -481,15 +486,20 @@ def scan_typed_buffers(disasm_dir: str, stage_of: dict) -> dict:
     import shader_ir
     table, names = translator_formats()
     total, shaders = Counter(), defaultdict(Counter)
+    unreadable = 0
     for fn in sorted(os.listdir(disasm_dir)):
         if not fn.endswith(".s"):
             continue
         path = os.path.join(disasm_dir, fn)
-        with open(path, encoding="utf-8", errors="replace") as f:
-            if "_format_" not in f.read():      # no typed buffer op: skip the slower full parse
-                continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                if "_format_" not in f.read():      # no typed buffer op: skip the slower full parse
+                    continue
+            c = typed_buffer_ops(shader_ir.parse_file(path)["insns"], table, names)
+        except (OSError, ValueError, RecursionError):  # counted, not a traceback, like scan_dxbc's .dxbc
+            unreadable += 1
+            continue
         stage = stage_of.get(fn[:-2], "?")
-        c = typed_buffer_ops(shader_ir.parse_file(path)["insns"], table, names)
         total.update(c)
         for what in {k[0] for k in c}:
             shaders[what][stage] += 1
@@ -497,6 +507,7 @@ def scan_typed_buffers(disasm_dir: str, stage_of: dict) -> dict:
             shaders["mubuf_runtime_format"][stage] += 1
     group = lambda what: {f"{k[1]} {k[2].lstrip('!')}": n for k, n in sorted(total.items()) if k[0] == what}
     return {"mtbuf": group("mtbuf"), "mubuf_word3": group("mubuf"), "mubuf_literal_formats": group("mubuf_literal"),
+            "unreadable": unreadable,
             "not_in_translator": {f"{k[0]} {k[1]} {k[2][1:]}": n for k, n in sorted(total.items())
                                   if k[0] != "mubuf" and k[2].startswith("!")},
             "shaders": {w: dict(s) for w, s in sorted(shaders.items())}}
@@ -616,7 +627,9 @@ def main() -> int:
           + (f" | {pv['unreadable']} unreadable PSV0" if pv["unreadable"] else ""))
     if "disasm" in result:
         s = result["disasm"]
-        print(f"disasm: {s['files']} files | wave MMA shaders {s['wave_mma_shaders'] or 0} | ordered-count/GWS shaders "
+        print(f"disasm: {s['files']} files"
+              + (f" | {s['unreadable']} unreadable" if s["unreadable"] else "")
+              + f" | wave MMA shaders {s['wave_mma_shaders'] or 0} | ordered-count/GWS shaders "
               f"{s['ordered_or_gws_shaders'] or 0} {s['ordered_or_gws_ops'] or ''} | GDS shaders {s['gds_shaders'] or 0}")
         print("s_getpc_b64 used for code-embedded data (not a far branch), by stage:", s["getpc_for_data_shaders"] or 0)
         vp = s["v_perm_b32"]
