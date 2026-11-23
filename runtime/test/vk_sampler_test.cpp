@@ -20,12 +20,13 @@
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 
+#include <charconv>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #define CHECK(x)                                                                     \
@@ -40,6 +41,13 @@
 namespace {
 
 constexpr int unsupported = 77;
+
+bool parse_unsigned(std::string_view text, int base, std::uint32_t& value) {
+    if (base == 16 && (text.starts_with("0x") || text.starts_with("0X"))) text.remove_prefix(2);
+    const auto end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value, base);
+    return result.ec == std::errc{} && result.ptr == end;
+}
 
 std::vector<std::uint32_t> read_spv(const char* path) {
     std::ifstream f(path, std::ios::binary);
@@ -60,14 +68,25 @@ int main(int argc, char** argv) {
     constexpr std::uint32_t W = 64, H = 64, TW = 128, levels = 2;
     constexpr std::uint32_t table_va = 256;  // console VA of the T# (8 dwords); the S# follows at +32
     gfx10::SamplerWords ssharp{};
-    for (int i = 0; i < 4; ++i) ssharp[i] = std::uint32_t(std::strtoul(argv[4 + i], nullptr, 16));
+    for (int i = 0; i < 4; ++i) {
+        if (!parse_unsigned(argv[4 + i], 16, ssharp[i])) {
+            std::fprintf(stderr, "s%d must be an unsigned 32-bit hexadecimal word\n", i);
+            return 2;
+        }
+    }
+    std::uint32_t base = 0, last = levels - 1;
+    if (argc == 10 && (!parse_unsigned(argv[8], 10, base) || !parse_unsigned(argv[9], 10, last)
+                       || base > last || last >= levels)) {
+        std::fprintf(stderr, "expected decimal mip levels with 0 <= base <= last < %u\n", levels);
+        return 2;
+    }
     gfx10::Image image;
     image.address = 0x100000;
     image.format = gfx10::format_from_vulkan(VK_FORMAT_R8G8B8A8_UNORM);
     image.width = image.height = TW;
     image.resource_mips = levels;
-    image.first_mip = argc == 10 ? std::uint32_t(std::atoi(argv[8])) : 0;
-    image.mip_count = (argc == 10 ? std::uint32_t(std::atoi(argv[9])) : levels - 1) - image.first_mip + 1;
+    image.first_mip = base;
+    image.mip_count = last - base + 1;
     const gfx10::ImageWords tsharp = gfx10::encode(image);
     gfx10::Image view_of;
     if (!gfx10::decode(tsharp, view_of) || view_of.first_mip + view_of.mip_count > levels) {
