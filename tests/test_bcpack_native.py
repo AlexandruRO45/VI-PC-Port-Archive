@@ -103,5 +103,61 @@ class NativeLaneDecoderTest(unittest.TestCase):
                 os.environ["LEONIDA_BCPACK_NATIVE"] = saved[1]
 
 
+def _python_chunk(raw, codec, size, provisional):
+    """`decode_with_info` with both native paths switched off, or the exception it raises."""
+    saved = bcpack._decode_blocks_native, bcpack._decode_lanes_native
+    bcpack._decode_blocks_native = lambda *a: None
+    bcpack._decode_lanes_native = lambda *a: None
+    try:
+        return bcpack.decode_with_info(raw, codec, size, allow_provisional=provisional)
+    except Exception as exc:  # noqa: BLE001 - the comparison includes the error
+        return type(exc), str(exc)
+    finally:
+        bcpack._decode_blocks_native, bcpack._decode_lanes_native = saved
+
+
+def _chunk(raw, codec, size, provisional):
+    try:
+        return bcpack.decode_with_info(raw, codec, size, allow_provisional=provisional)
+    except Exception as exc:  # noqa: BLE001
+        return type(exc), str(exc)
+
+
+@unittest.skipIf(bcpack._native_unpack() is None, "tools/bcpack_calibration is not built")
+class NativeBlockRebuildTest(unittest.TestCase):
+    """BC1 and BC4 chunks give the same bytes, provisional entries and errors with the native rebuild."""
+
+    def test_bc1_bc4_match_python(self):
+        rng = random.Random(4242)
+        native = 0
+        for _ in range(120):
+            codec = rng.choice([1, 4])
+            n = rng.choice([1, 3, 64, 300])
+            widths = bcpack.LANE_WIDTHS[codec]
+            lanes = [[rng.randrange(1 << w) if rng.random() < 0.5 else min((1 << w) - 1, int(rng.expovariate(0.3)))
+                      for _ in range(n)] for w in widths]
+            lanes[1] = [0] * n if rng.random() < 0.9 else [rng.randrange(4) for _ in range(n)]
+            for i in range(n):
+                r = rng.random()
+                d = 0 if r < 0.3 else rng.randint(1, max(1, min(i, 20))) if i and r < 0.9 else rng.randint(1, 255)
+                lanes[0][i] = (d << 1) if d <= 127 else ((256 - d) << 1) - 1
+            raw = bytearray(synth.encode_lanes(lanes, codec, q=rng.randrange(16)))
+            if rng.random() < 0.15:
+                raw[rng.randrange(len(raw))] ^= 1 << rng.randrange(8)
+            raw = bytes(raw)
+            provisional = rng.random() < 0.4
+            with self.subTest(codec=codec, n=n, provisional=provisional):
+                self.assertEqual(_chunk(raw, codec, n * 8, provisional),
+                                 _python_chunk(raw, codec, n * 8, provisional))
+            native += bcpack._decode_blocks_native(raw, codec, n * 8, None) is not None
+        self.assertGreater(native, 20, "the native rebuild should take many of these chunks")
+
+    def test_bc1_round_trip(self):
+        rng = random.Random(5)
+        blocks = bytes(rng.randrange(256) for _ in range(8 * 256))
+        raw = synth.encode_bc1_blocks(blocks)
+        self.assertEqual(bcpack._decode_blocks_native(raw, 1, len(blocks), None), blocks)
+
+
 if __name__ == "__main__":
     unittest.main()

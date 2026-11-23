@@ -326,7 +326,9 @@ def _native_unpack():
                                 "bcpack_calibration", "target", "release", name)
             if os.path.isfile(path):
                 try:
-                    fn = ctypes.CDLL(path).unpack_model
+                    lib = ctypes.CDLL(path)
+                    fn = lib.unpack_model
+                    blocks = lib.decode_blocks
                 except (OSError, AttributeError):
                     fn = None
                 if fn is not None:
@@ -338,7 +340,12 @@ def _native_unpack():
                     for (w, q), freq in _tables.PROB_TABLES.items():
                         if 0 <= w <= MAX_WIDTH and 0 <= q < 16 and len(freq) == w + 1:
                             flat[(w * 16 + q) * side:(w * 16 + q) * side + w + 1] = freq
-                    found = fn, (ctypes.c_int32 * len(flat))(*flat)
+                    blocks.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_char_p,
+                                       ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                       ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                       ctypes.c_void_p, ctypes.c_size_t]
+                    blocks.restype = ctypes.c_ssize_t
+                    found = fn, (ctypes.c_int32 * len(flat))(*flat), blocks
         _NATIVE.append(found)
     return _NATIVE[0]
 
@@ -355,7 +362,7 @@ def _decode_lanes_native(raw, widths, nsym):
     if native is None or nsym <= 0:
         return None
     import ctypes
-    fn, tables = native
+    fn, tables, _ = native
     nl = len(widths)
     data = bytes(raw)
     out = (ctypes.c_uint16 * (nsym * nl))()
@@ -364,6 +371,49 @@ def _decode_lanes_native(raw, widths, nsym):
         return None
     flat = memoryview(out).cast("B").cast("H")
     return [flat[i * nsym:(i + 1) * nsym].tolist() for i in range(nl)], used
+
+
+_NATIVE_BLOCKS = {
+    # codec: (lookup table bytes, confirmed defaults, provisional defaults, values per entry)
+    1: (lambda: bytes(_tables.BC1_QUADRANT), "BC1_HISTORY_CONFIRMED", "BC1_HISTORY_PROVISIONAL", 6),
+    4: (lambda: bytes(v for pair in _tables.BC4_PAIR for v in pair), "BC4_HISTORY_CONFIRMED",
+        "BC4_HISTORY_PROVISIONAL", 2),
+}
+_NATIVE_BUILTIN = {}
+
+
+def _decode_blocks_native(raw, codec, out_size, history):
+    """BC1/BC4 bytes from the Rust lanes + strict rebuild, or None to decode in Python.
+
+    Rust only takes the strict path: a stream it refuses, a non-zero lane 1 or
+    a history entry that is not confirmed returns None, and Python decodes the
+    chunk itself, so its errors and provisional entries are unchanged.
+    """
+    native = _native_unpack()
+    spec = _NATIVE_BLOCKS.get(codec)
+    if native is None or spec is None or out_size <= 0 or out_size % BLOCK_BYTES[codec]:
+        return None
+    import ctypes
+    _, tables, blocks = native
+    lut, conf_name, prov_name, k = spec
+    cached = _NATIVE_BUILTIN.get(codec) if history is None else None
+    if cached is None:
+        confirmed, _ = _resolve_bc_history(
+            codec, getattr(_tables, conf_name), getattr(_tables, prov_name), history)
+        flat = [-1] * (256 * k)
+        for entry, values in confirmed.items():
+            if 0 <= entry < 256 and len(values) == k:
+                flat[entry * k:entry * k + k] = values
+        cached = lut(), (ctypes.c_int32 * len(flat))(*flat)
+        if history is None:
+            _NATIVE_BUILTIN[codec] = cached
+    table, builtin = cached
+    widths = LANE_WIDTHS[codec]
+    data = bytes(raw)
+    out = ctypes.create_string_buffer(out_size)
+    used = blocks(data, len(data), codec, bytes(widths), len(widths), out_size // ELEMENT_BYTES,
+                  tables, len(tables), table, len(table), builtin, len(builtin), out, out_size)
+    return out.raw if used >= 0 else None
 
 
 def decode_lanes(raw, codec, out_size):
@@ -1401,6 +1451,9 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
     if rebuilder is None:
         name = CODEC_NAMES.get(codec, str(codec))
         raise BcpackUnsupportedCodec(f"BCPack block rebuilder for codec {codec} ({name}) is not implemented yet")
+    fast = _decode_blocks_native(raw, codec, out_size, history)
+    if fast is not None:
+        return fast, set()
     lanes, _ = decode_lanes(raw, codec, out_size)
     nblocks = out_size // BLOCK_BYTES[codec]
     prov = set() if allow_provisional else None
