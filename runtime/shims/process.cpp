@@ -168,6 +168,34 @@ void __cdecl game_cexit() {
 }
 void __cdecl game_c_exit() {}
 void __stdcall game_exit_process(UINT code) { end_run(static_cast<int>(code)); }
+
+// ---- threads and processors
+// The console has cores a PC may lack, and a title pins its threads to them with masks the host rejects: Windows
+// answers a mask with no CPU of the process (or one outside it) with 0 and ERROR_INVALID_PARAMETER, and a title that
+// checks the previous mask then aborts. The call succeeds on the console, so it does here: the thread stays where it
+// is and the answer is the process mask (the mask a thread starts with). A bad handle still fails. The fact (answer with the
+// process mask when the host call returns 0) is from sammwyy/xvalkyrie src/runtime/modules/kernel.cpp (commit
+// 53af7df77c10, GPL-3.0), reimplemented here in our own words and checked against the Win32 behaviour.
+DWORD_PTR __stdcall game_set_thread_affinity_mask(HANDLE thread, DWORD_PTR mask) {
+    DWORD_PTR previous = SetThreadAffinityMask(thread, mask);
+    if (previous != 0) return previous;
+    DWORD_PTR process = 0, system = 0;
+    if (GetLastError() == ERROR_INVALID_PARAMETER && GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) {
+        SetLastError(ERROR_SUCCESS);
+        // The first boot shows which masks the title asks for: the first few are named, the rest only counted.
+        static std::atomic<int> substituted{0};
+        const int n = ++substituted;
+        if (n <= 8)
+            std::fprintf(stderr, "[rt] process: SetThreadAffinityMask(0x%llx) names cores the host lacks; the thread stays, "
+                                 "answered the process mask 0x%llx (call %d)\n",
+                         static_cast<unsigned long long>(mask), static_cast<unsigned long long>(process), n);
+        return process;
+    }
+    return 0;
+}
+// A console-only kernel32 export that pins a thread pool to cores. The host has no such call, and a pool with the
+// host's own affinity runs the same work, so it succeeds and changes nothing.
+BOOL __stdcall game_set_threadpool_affinity_mask(PTP_POOL, DWORD_PTR) { return TRUE; }
 void __cdecl game_abort() {
     std::fprintf(stderr, "[rt] process: the game called abort()\n");
     // The game's signal() import is not shimmed: its handler goes into the host CRT's process-wide table, which
@@ -352,6 +380,9 @@ using namespace rt::process;
     {dll, "_get_narrow_winmain_command_line", reinterpret_cast<void*>(&game_get_narrow_winmain_command_line)}, \
     {dll, "_get_wide_winmain_command_line", reinterpret_cast<void*>(&game_get_wide_winmain_command_line)}
 #define EXIT_PROCESS(dll) {dll, "ExitProcess", reinterpret_cast<void*>(&game_exit_process)}
+#define THREAD_AFFINITY(dll) {dll, "SetThreadAffinityMask", reinterpret_cast<void*>(&game_set_thread_affinity_mask)}
+#define POOL_AFFINITY(dll) \
+    {dll, "SetThreadpoolAffinityMask", reinterpret_cast<void*>(&game_set_threadpool_affinity_mask)}
 #define COMMAND_LINE(dll) \
     {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
@@ -373,6 +404,11 @@ SHIM_TABLE(process,
     EXIT_PROCESS("kernel32.dll"),
     EXIT_PROCESS("kernelbase.dll"),
     EXIT_PROCESS("api-ms-win-core-processthreads-l1-1-0.dll"),
+    THREAD_AFFINITY("kernel32.dll"),
+    THREAD_AFFINITY("kernelbase.dll"),
+    THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-0.dll"),
+    POOL_AFFINITY("kernel32.dll"),
+    POOL_AFFINITY("kernelbase.dll"),
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),

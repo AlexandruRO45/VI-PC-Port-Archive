@@ -204,6 +204,51 @@ int main() {
         }
     }
 
+    // A console title pins threads to cores the host may lack. SetThreadAffinityMask must then not fail: it leaves the
+    // thread where it is and answers with the process mask. A bad handle still fails, and a mask the host accepts is
+    // applied and answers with the mask the thread had. SetThreadpoolAffinityMask (console-only) succeeds.
+    {
+        using SetMask = DWORD_PTR(WINAPI*)(HANDLE, DWORD_PTR);
+        using SetPool = BOOL(WINAPI*)(PTP_POOL, DWORD_PTR);
+        const auto set_mask = reinterpret_cast<SetMask>(rt::shims::find("kernel32.dll", "SetThreadAffinityMask"));
+        const auto set_pool = reinterpret_cast<SetPool>(rt::shims::find("kernel32.dll", "SetThreadpoolAffinityMask"));
+        DWORD_PTR process_mask = 0, system_mask = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+        const DWORD_PTR missing = ~system_mask & (system_mask + 1);  // the lowest core the machine lacks, 0 if none
+        const DWORD_PTR lowest = process_mask & (~process_mask + 1);
+        if (!set_mask || !set_pool) {
+            std::fprintf(stderr, "FAIL SetThreadAffinityMask or SetThreadpoolAffinityMask is not served\n");
+            ++failures;
+        } else {
+            const HANDLE self = GetCurrentThread();
+            if (missing) {
+                SetLastError(ERROR_GEN_FAILURE);
+                const DWORD_PTR previous = set_mask(self, missing);
+                if (previous != process_mask) {
+                    std::fprintf(stderr, "FAIL a mask of cores the host lacks answered 0x%llx, want the process mask 0x%llx\n",
+                                 static_cast<unsigned long long>(previous), static_cast<unsigned long long>(process_mask));
+                    ++failures;
+                }
+            }
+            const DWORD_PTR first = set_mask(self, lowest);
+            const DWORD_PTR second = set_mask(self, process_mask);
+            if (first != process_mask || second != lowest) {
+                std::fprintf(stderr, "FAIL a valid mask answered 0x%llx then 0x%llx, want 0x%llx then 0x%llx\n",
+                             static_cast<unsigned long long>(first), static_cast<unsigned long long>(second),
+                             static_cast<unsigned long long>(process_mask), static_cast<unsigned long long>(lowest));
+                ++failures;
+            }
+            if (set_mask(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-7)), lowest) != 0) {
+                std::fprintf(stderr, "FAIL SetThreadAffinityMask on a bad handle did not fail\n");
+                ++failures;
+            }
+            if (!set_pool(nullptr, ~DWORD_PTR{0})) {
+                std::fprintf(stderr, "FAIL SetThreadpoolAffinityMask did not succeed\n");
+                ++failures;
+            }
+        }
+    }
+
     // The game thread that ends a run must park, not ExitProcess, even when run_entry has already returned and
     // cleared the run: main.cpp still prints "game exited with code N" and cleans up after it. On one CPU the
     // host preempts the game thread right after SetEvent(g_done), and Sleep lets the game thread run again before
