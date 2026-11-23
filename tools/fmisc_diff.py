@@ -794,6 +794,12 @@ def main(argv=None):
         except runner.Unavailable as e:
             print(f"hardware oracle unavailable: {e}")
             return 77
+        from hw_oracle import asm
+        why = asm.modes_skip_reason([HW_MODE], oracle.arch)
+        if why:                         # every kernel (hw_kernel) sets IEEE and DX10_CLAMP, which gfx1170+ fixes
+            oracle.close()
+            print(f"hardware oracle unavailable: {why}")
+            return 77
         print(f"hardware oracle: {oracle.device}")
     try:
         counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle, a.wave, a.build, a.work)

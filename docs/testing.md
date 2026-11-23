@@ -506,10 +506,10 @@ match supports the model and does not prove RDNA2. Run these one at a time: a se
 On RDNA4 (gfx12xx) only part of this runs, and a tool that cannot run there exits 77 with the reason
 (`tests/test_hw_oracle_gfx12_unavailable.py`; measured on an RX 9060 XT, gfx1200, AMD 26.11.2):
 
-- **Run:** `salu_diff.py`, `vint_diff.py`, `wint_diff.py`, `pk16_diff.py`, `fmisc_diff.py`, `crosslane_fuzz.py` and
+- **Run:** `salu_diff.py`, `vint_diff.py`, `wint_diff.py`, `pk16_diff.py`, `crosslane_fuzz.py` and
   `int_hw_probe.py` (opcodes GFX12 removed are skipped or rejected one by one and counted).
-- **Exit 77, fixed MODE:** `f32_fuzz.py`, `f16_trans_sweep.py`, `pknorm_probe.py`, `fma_mix_probe.py` and
-  `vinterp_hw_probe.py`. Every kernel of theirs sets IEEE and DX10_CLAMP, which gfx1170+ fixes,
+- **Exit 77, fixed MODE:** `f32_fuzz.py`, `f16_trans_sweep.py`, `fmisc_diff.py`, `pknorm_probe.py`, `fma_mix_probe.py`
+  and `vinterp_hw_probe.py`. Every kernel of theirs sets IEEE and DX10_CLAMP, which gfx1170+ fixes,
   so the game's MODE cannot be set there.
 - **Exit 77, kernel text of an older family:** `buffer_swizzle_probe.py` and `smem_neg_probe.py` (GFX12 has no
   MUBUF/MTBUF forms; gfx1150 still assembles them), `vcmp16_opsel_probe.py` (raw GFX10 compare opcodes, which GFX11

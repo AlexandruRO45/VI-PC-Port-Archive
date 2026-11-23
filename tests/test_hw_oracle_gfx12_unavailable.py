@@ -3,7 +3,7 @@
     python -I tests/test_hw_oracle_gfx12_unavailable.py
 
 docs/testing.md: a tool that cannot use the hardware oracle prints `hardware oracle unavailable: ...` and exits 77.
-On an RDNA4 card (measured on gfx1200) ten tools did something else: an uncaught RuntimeError or ValueError, a
+On an RDNA4 card (measured on gfx1200) eleven tools did something else: an uncaught RuntimeError or ValueError, a
 "harness error" exit 2, or rows printed as MISMATCH whose hardware value was the reason text. Their kernels cannot
 run there for one of three reasons, each known before a kernel is assembled:
 
@@ -35,6 +35,7 @@ from hw_oracle import asm, runner as package_runner  # noqa: E402
 TOOLS_UNAVAILABLE_ON_GFX12 = [
     ("f32_fuzz", ["--oracle", "hw", "--programs", "4"], "MODE"),
     ("f16_trans_sweep", [], "MODE"),
+    ("fmisc_diff", ["--oracle", "hw", "--programs", "4"], "MODE"),
     ("pknorm_probe", ["--oracle", "hw"], "MODE"),
     ("fma_mix_probe", ["--oracle", "hw"], "MODE"),
     ("vinterp_hw_probe", ["--oracle", "hw"], "MODE"),
@@ -136,7 +137,7 @@ class ToolsOnGfx12(unittest.TestCase):
     def test_gfx11_keeps_what_its_assembler_takes(self):
         # gfx1150 has the same fixed-MODE-free descriptor as RDNA2 and still assembles the MUBUF text, but the raw
         # 16-bit compare words and the GFX10 mip fields are not its own.
-        still_run = ("f32_fuzz", "pknorm_probe", "fma_mix_probe", "buffer_swizzle_probe",
+        still_run = ("f32_fuzz", "fmisc_diff", "pknorm_probe", "fma_mix_probe", "buffer_swizzle_probe",
                      "smem_neg_probe")
         gfx10_only = ("vcmp16_opsel_probe", "sampler_lod_probe")
         for module, argv, _reason in TOOLS_UNAVAILABLE_ON_GFX12:
