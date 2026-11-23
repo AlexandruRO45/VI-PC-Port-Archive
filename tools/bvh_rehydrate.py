@@ -68,6 +68,7 @@ HALF_MIN_NORMAL = 2.0 ** -14
 NAN32 = struct.unpack("<f", struct.pack("<I", 0x7FC00000))[0]
 LEAVES_PER_CHUNK, CHUNK_STRIDE = 2048, 1 << 17
 GROUP = 64
+PARENT_TABLE_START = 64            # the parent table begins after the 64-byte XboxBvh4Header and ends at offsetToElements
 SLOT_OF_ORDER = (2, 0, 1)          # vertex-order value -> leaf vertex slot
 M32 = 0xFFFFFFFF
 
@@ -166,9 +167,19 @@ class Header:
         return (n + 15) & ~15
 
     def parent_entry(self, node_offset):
-        """Address of the parent-table entry for the node at node_offset (all arithmetic is 32-bit)."""
+        """Address of the parent-table entry for the node at node_offset (all arithmetic is 32-bit), or None when the
+        unit lands outside the table.
+
+        The table is one dword per 64-byte unit of the elements-to-end range, so it spans
+        [offset_to_parents, offset_to_elements). A pointer below the elements region, or one far enough above it,
+        wraps the 32-bit unit arithmetic and lands the entry inside the 64-byte header or the node/element payload;
+        writing there corrupts the structure the caller asked to rebuild, so the caller skips such an entry instead.
+        """
         unit = ((node_offset - self.offset_to_elements) & M32) >> 6
-        return (self.offset_to_parents + 4 * unit) & M32
+        entry = (self.offset_to_parents + 4 * unit) & M32
+        if entry < PARENT_TABLE_START or entry + 4 > self.offset_to_elements:
+            return None
+        return entry
 
 
 def rotation(index):
@@ -396,7 +407,7 @@ def write_box_groups(src, dst, hdr, start, count, wide):
             for child in children:
                 if (child & 6) == 4 or ((child & 7) == TRI0 and hdr.flags & FLAG_UPDATABLE):
                     entry = hdr.parent_entry(((child >> 3) << 6) & M32)
-                    if entry + 4 <= len(dst):
+                    if entry is not None and entry + 4 <= len(dst):
                         struct.pack_into("<I", dst, entry, me)
 
 
@@ -415,7 +426,7 @@ def rehydrate(dehydrated, geometries, header_offset=0):
     dst[:kept] = src[:kept]
     struct.pack_into("<I", dst, 0, hdr.flags & ~FLAG_DEHYDRATED & M32)
     root_entry = hdr.parent_entry(((hdr.root >> 3) << 6) & M32)
-    if root_entry + 4 <= len(dst):
+    if root_entry is not None and root_entry + 4 <= len(dst):
         struct.pack_into("<I", dst, root_entry, INVALID)
     write_leaves(src, dst, hdr, list(geometries), LeafFrame(hdr))
     if hdr.root & 7 in (BOX16, BOX32):

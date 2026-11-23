@@ -184,6 +184,31 @@ class TestBoxes(unittest.TestCase):
         self.assertEqual(R.half_to_float(R.half_up(1e-6)), 2 ** -14)
 
 
+class TestParentTableBounds(unittest.TestCase):
+    """The parent table spans [64, offsetToElements); a wrapped unit must not write into the header or the payload."""
+
+    def test_an_entry_outside_the_table_is_none(self):
+        src, _, _ = build([(0, 0x01, 0, None, 0x09)])
+        hdr = R.Header(src)                     # parent table 0x40..0x100, 64-byte units from 0x100
+        self.assertEqual(hdr.parent_entry(0x200), 0x40 + 4 * 4)          # unit 4: the node at 0x200
+        self.assertEqual(hdr.parent_entry(0x100 + 64 * 47), 0x40 + 4 * 47)  # the last unit of the table
+        # one unit past the table's end, and a pointer below the elements region, whose 32-bit unit wraps to a
+        # dword at 0x34 -- inside the 64-byte header
+        self.assertIsNone(hdr.parent_entry(0x100 + 64 * 48))
+        self.assertIsNone(hdr.parent_entry(0x40))
+
+    def test_a_root_below_the_elements_region_does_not_touch_the_header(self):
+        src, root, _ = build([(0, 0x01, 0, None, 0x09)], flags=BLAS_DEHYDRATED | R.FLAG_UPDATABLE)
+        bad = bytearray(src)
+        # A root that addresses the parent table itself: its unit wraps to a dword at 0x34, in the header.
+        struct.pack_into("<I", bad, 0x30, ptr(0x40, R.BOX32))
+        out = R.rehydrate(bytes(bad), [QUADS])
+        self.assertEqual(out[4:64], bytes(bad[4:64]))           # only the flags word at 0 is rewritten
+        self.assertEqual(struct.unpack_from("<I", out, 0x40 + 4 * 4)[0], 0)   # no entry written for the root
+        # The same structure with its real root still writes that entry (unit 4 of the table).
+        self.assertEqual(struct.unpack_from("<I", R.rehydrate(src, [QUADS]), 0x40 + 4 * 4)[0], R.INVALID)
+
+
 class TestLeafFrame(unittest.TestCase):
     def test_scale_and_translation(self):
         # scale bytes 0x80, 0x81, 0x7f -> 2, 4, 1; translation on: x bounds [10, 12] -> centre 11, y and z straddle 0
