@@ -1136,6 +1136,76 @@ void run_checks(const std::filesystem::path& root) {
         const BOOL removed_by_game_path = rmdir_w(L"GAME:\\.gta6rt-temp");
         check(removed_by_game_path != FALSE || GetLastError() != ERROR_ACCESS_DENIED,
               "only a T: path names the T:\\ root: GAME:\\.gta6rt-temp is not refused as a drive root");
+
+        // T: and T:\ are drive roots like GAME: and GAME:\ across listing, write-open, delete, copy and attributes.
+        fresh = fresh_overlay();
+        {
+            const std::vector<std::wstring> bare_t = list(first_w, next_w, find_close, L"T:");
+            check(bare_t.size() == 2 && count(bare_t, L".") == 1 && count(bare_t, L"..") == 1,
+                  "FindFirstFileW(T:) lists the scratch root like GAME:");
+            const std::vector<std::wstring> norm_t = list(first_w, next_w, find_close, L"T:\\sub\\..");
+            check(norm_t.size() == 2 && count(norm_t, L".") == 1 && count(norm_t, L"..") == 1,
+                  "FindFirstFileW(T:\\sub\\..) lists the scratch root after collapsing ..");
+
+            SetLastError(0);
+            HANDLE w_root = create_w(L"T:\\", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(w_root == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+                  "CreateFileW(T:\\, GENERIC_WRITE) fails with ERROR_INVALID_NAME like GAME:\\");
+            if (w_root != INVALID_HANDLE_VALUE) ::CloseHandle(w_root);
+
+            SetLastError(0);
+            HANDLE del_root = create_w(L"T:\\", DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING,
+                                       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+            check(del_root == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME &&
+                      std::filesystem::is_directory(fresh / ".gta6rt-temp"),
+                  "CreateFileW(T:\\, DELETE | DELETE_ON_CLOSE) cannot open or remove the scratch root");
+            if (del_root != INVALID_HANDLE_VALUE) ::CloseHandle(del_root);
+
+            SetLastError(0);
+            check(delete_w(L"T:\\") == FALSE && GetLastError() == ERROR_INVALID_NAME &&
+                      std::filesystem::is_directory(fresh / ".gta6rt-temp"),
+                  "DeleteFileW(T:\\) fails with ERROR_INVALID_NAME like GAME:\\");
+            SetLastError(0);
+            check(delete_w(L"T:") == FALSE && GetLastError() == ERROR_INVALID_NAME,
+                  "DeleteFileW(T:) fails with ERROR_INVALID_NAME like GAME:");
+
+            SetLastError(0);
+            check(copy_w(L"GAME:\\data\\hello.txt", L"T:\\", FALSE) == FALSE && GetLastError() == ERROR_INVALID_NAME,
+                  "CopyFileW(..., T:\\) fails with ERROR_INVALID_NAME like GAME:\\");
+            SetLastError(0);
+            check(copy_w(L"GAME:\\data\\hello.txt", L"T:", FALSE) == FALSE && GetLastError() == ERROR_INVALID_NAME,
+                  "CopyFileW(..., T:) fails with ERROR_INVALID_NAME like GAME:");
+
+            const DWORD before_attr = ::GetFileAttributesW((fresh / ".gta6rt-temp").c_str());
+            SetLastError(0);
+            check(setattr_w(L"T:\\", FILE_ATTRIBUTE_HIDDEN) == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
+                      ::GetFileAttributesW((fresh / ".gta6rt-temp").c_str()) == before_attr,
+                  "SetFileAttributesW(T:\\) is refused with ERROR_ACCESS_DENIED and leaves .gta6rt-temp unchanged");
+            SetLastError(0);
+            check(setattr_w(L"T:", FILE_ATTRIBUTE_HIDDEN) == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
+                      ::GetFileAttributesW((fresh / ".gta6rt-temp").c_str()) == before_attr,
+                  "SetFileAttributesW(T:) is refused with ERROR_ACCESS_DENIED");
+
+            // Internal runtime folder names (.gta6rt-*) are only hidden at the GAME:\ overlay root, not inside
+            // subdirectories or under T:\.
+            HANDLE nested_t = create_w(L"T:\\.gta6rt-temp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            check(nested_t != INVALID_HANDLE_VALUE, "a file named .gta6rt-temp can be created inside T:\\");
+            if (nested_t != INVALID_HANDLE_VALUE) ::CloseHandle(nested_t);
+            check(contains(list(first_w, next_w, find_close, L"T:\\*"), L".gta6rt-temp"),
+                  "FindFirstFileW(T:\\*) lists a nested .gta6rt-temp entry");
+            check(contains(list(first_w, next_w, find_close, L"T:"), L".gta6rt-temp"),
+                  "FindFirstFileW(T:) lists the same nested entry");
+
+            HANDLE nested_game =
+                create_w(L"GAME:\\data\\.gta6rt-temp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            check(nested_game != INVALID_HANDLE_VALUE, "a file named .gta6rt-temp can be created in a GAME: subfolder");
+            if (nested_game != INVALID_HANDLE_VALUE) ::CloseHandle(nested_game);
+            check(contains(list(first_w, next_w, find_close, L"GAME:\\data\\*"), L".gta6rt-temp"),
+                  "FindFirstFileW(GAME:\\data\\*) lists a nested .gta6rt-temp entry");
+            check(!contains(list(first_w, next_w, find_close, L"GAME:\\*"), L".gta6rt-temp"),
+                  "while GAME:\\* still hides the overlay root's own .gta6rt-temp folder");
+        }
         rt::fs::configure(package, overlay);
 
         h = create_w(L"T:\\cache\\scratch.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);

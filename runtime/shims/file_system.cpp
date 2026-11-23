@@ -377,7 +377,7 @@ Target write_target(const std::wstring& path, bool copy_up) {
 
     const Roots r = roots();
     if (r.overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
-    if (parts.empty()) return fail(ERROR_INVALID_NAME);  // "GAME:" is a folder, not a file
+    if (drive_root(path, parts)) return fail(ERROR_INVALID_NAME);  // "GAME:" and "T:" are folders, not files
 
     // The folder has to exist in the title's view, as CreateDirectory, MoveFile and CopyFile require: without the
     // check a failed open left the missing folders behind, and a create succeeded in a folder that was never made,
@@ -486,7 +486,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
     std::vector<std::wstring> dirs;
     std::wstring leaf;
     const bool trailing_separator = !pattern.empty() && (pattern.back() == L'\\' || pattern.back() == L'/');
-    if (parts.empty() || trailing_separator) {
+    if (drive_root(pattern, parts) || trailing_separator) {
         dirs = parts;
         leaf = L"*";
     } else {
@@ -586,7 +586,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         const HANDLE h = ::FindFirstFileW(search.c_str(), &found);
         if (h == INVALID_HANDLE_VALUE) return;
         do {
-            if (overlay_root && internal_dir(found.cFileName)) continue;
+            if (overlay_root && dirs.empty() && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
             if (!overlay_root && !dot && entry_deleted(found.cFileName)) continue;
             if (seen.insert(found.cFileName).second) out.push_back(found);
@@ -910,7 +910,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
     }
 
     const Roots r = roots();
-    if (r.overlay.empty() || parts.empty()) {
+    if (r.overlay.empty() || drive_root(name, parts)) {
         SetLastError(ERROR_INVALID_NAME);
         return FALSE;
     }
@@ -1146,7 +1146,7 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
         return true;
     }
     error = ERROR_INVALID_NAME;
-    if (parsed == Parsed::Refused || parts.empty()) return false;
+    if (parsed == Parsed::Refused || drive_root(to, parts)) return false;
     const Roots r = roots();
     error = ERROR_PATH_NOT_FOUND;
     if (r.game.empty() || r.overlay.empty()) return false;
@@ -1310,7 +1310,7 @@ BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);
+    if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
 
