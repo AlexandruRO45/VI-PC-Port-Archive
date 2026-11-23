@@ -19,16 +19,18 @@ are offset-based (`recovered/...`), not the original paths.
 
 The recovery view names streams by offset, but some original paths can be read from the payload itself:
 mount XMLs and similar text in the data area list them in plain text, directory form included. #1790 ran one
-name-recovery walker over all 22 archives of a retail package (150.2 GiB) and reports how far that gets. These
-counts are as reported there; they were not re-run for this page.
+name-recovery walker over a retail package (150.2 GiB): a first pass over 123.0 GiB, then the remaining 27.2 GiB.
+These counts are as reported there; they were not re-run for this page.
 
-| | Count |
-|---|---:|
-| Streams | 1,489,677 |
-| Streams with a name | 177,087 (11.89%) |
-| Unique paths | 155,214 |
-| Unique identifiers | 200,184 |
-| Path mentions | 526,581 |
+| Measure | First pass (123.0 GiB) | Complete index (150.2 GiB) |
+|---|---:|---:|
+| Streams | 1,489,677 | 2,235,084 |
+| Streams with a name | 177,087 (11.89%) | 215,028 (9.62%) |
+| Unique paths | 155,214 | 168,660 |
+| Unique identifiers | 200,184 | 511,526 |
+| Path mentions | 526,581 | not reported |
+
+The stream-type breakdown is from the first pass only:
 
 | Stream type (walker's classes) | Named / streams | Share |
 |---|---:|---:|
@@ -40,7 +42,7 @@ counts are as reported there; they were not re-run for this page.
 | `PSIN` | 465 / 15,380 | 3.02% |
 | `0DRP` | 624 / 227,045 | 0.27% |
 
-Three findings from the same run:
+Three findings from the first pass:
 
 - The paths come from the payload, not the TOC. One 8 KB stream in `common.head.bin` declares 473 `.bk2` paths on its
   own.
@@ -48,11 +50,13 @@ Three findings from the same run:
   but not in `levels.rpf` (8 of 26), `packs.rpf` (0 of 301) or `textures.rpf` (0 of 3), so a walker that assumes
   4 KiB steps misses most streams in three of those four. `tools/rpf9_carve.py` does not assume an alignment: it
   continues after the bytes each stream consumed.
-- `anim.rpf` is the richest archive for names (64,785 named streams, 367,190 path mentions, almost all `.clip`).
-  `movies.rpf` produced no zlib streams, and `script.rpf` and `story000_script.rpf` no names.
+- `anim.rpf` is the richest archive for names in the first pass (64,785 named streams, 367,190 path mentions,
+  almost all `.clip`). `movies.rpf` produces zero zlib streams across its whole 8.8 GiB, and `script.rpf` and
+  `story000_script.rpf` no names.
 
-The 11.89% is the ceiling of this method, not a progress figure: the rest of the names are in the encrypted TOC,
-which this project does not decode. #1790 also confirms the TOC is not ECB (no duplicate 16-byte blocks in 62,487).
+The 9.62% (11.89% on the first pass) is the ceiling of this method, not a progress figure: the rest of the names
+are in the encrypted TOC, which this project does not decode. #1790 also confirms the TOC is not ECB (no duplicate
+16-byte blocks in 62,487).
 The full name index is not published; the issue offers salted hashes of the paths and identifiers so that another
 run can be compared without publishing a name.
 
