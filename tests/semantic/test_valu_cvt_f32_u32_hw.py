@@ -79,11 +79,23 @@ class TestVCvtF32U32Reference(unittest.TestCase):
     def test_translator_hw_cvt_f32_u32(self):
         if support is None or getattr(support, "translate_lines", None) is None:
             self.skipTest("support/rdna2spirv requires Python 3.10+ (dict | None union syntax)")
-        cases = [0, 1, 100, 16777216, 0x80000000, 0xFFFFFFFF]
+        cases = [0, 1, 100, 16777215, 16777216, 16777217, 16777219, 0x80000000, 0xFFFFFFFF]
         for val in cases:
             with self.subTest(val=hex(val)):
                 got = run_hw_cvt_f32_u32(val)
                 self.assertEqual(got, ref_cvt_f32_u32(val))
+
+    def test_translator_hw_clamp(self):
+        if support is None or getattr(support, "translate_lines", None) is None:
+            self.skipTest("support/rdna2spirv requires Python 3.10+ (dict | None union syntax)")
+        lines = [
+            "v_mov_b32 v1, 100",
+            "v_cvt_f32_u32 v0, v1 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_clamp", lines)
+        self.assertEqual(support.mrt0_words(spv)[0], 0x3F800000)
 
 
 class RegType(enum.Enum):
@@ -270,10 +282,17 @@ class TestVCvtF32U32IEEE754(unittest.TestCase):
 class TestVCvtF32U32NegativeAndMutation(unittest.TestCase):
     """Negative controls, syntax rejection, and mutation detection."""
 
-    def test_syntax_rejection_extra_operands(self):
+    def test_syntax_extra_operands_accepted_by_translator(self):
+        """The translator accepts surplus operands in VOP1 assembly and emits OpConvertUToF."""
+        if support is not None and getattr(support, "translate_lines", None) is not None:
+            spv = support.translate_lines("ps_extra", ["v_cvt_f32_u32 v0, v1, v2", "s_endpgm"])
+            self.assertIn("OpConvertUToF", spv)
+
+    def test_syntax_rejection_insufficient_operands(self):
+        """Missing source operand is rejected during translation."""
         if support is not None and getattr(support, "translate_lines", None) is not None:
             with self.assertRaises(Exception):
-                support.translate_lines("ps_invalid", ["v_cvt_f32_u32 v0, v1, v2", "s_endpgm"])
+                support.translate_lines("ps_invalid", ["v_cvt_f32_u32 v0", "s_endpgm"])
 
     def test_mutation_signed_vs_unsigned_conversion(self):
         # Mutation: uses signed int conversion (converting 0xFFFFFFFF to -1.0)
