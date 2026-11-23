@@ -435,3 +435,82 @@ class TestSubrevCoU32FlagsAndBorrow(unittest.TestCase):
         d, b = ref_subrev_co_u32(100, 50)
         self.assertEqual(initial_scc, 1)
         self.assertEqual(b, 1)
+
+# -----------------------------------------------------------------------------
+# Commit 7: Boundary Extremes, Borrow Generation, Clamps, and Translator Validation
+# -----------------------------------------------------------------------------
+class TestSubrevCoU32Translator(unittest.TestCase):
+    def _run_ps(self, lines: list[str]) -> list[int]:
+        spvasm = support.translate_lines("ps_subrev_co_test", lines)
+        return support.mrt0_words(spvasm)
+
+    def test_translator_basic_difference(self) -> None:
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 25",
+            "v_subrev_co_u32 v0, vcc_lo, v1, v2",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "exp mrt0, v0, v1, v2, v3 done",
+            "s_endpgm",
+        ]
+        words = self._run_ps(lines)
+        # v0 = 25 - 10 = 15, v3 = borrow = 0
+        self.assertEqual(words[0], 15)
+        self.assertEqual(words[3], 0)
+
+    def test_translator_borrow_generation(self) -> None:
+        lines = [
+            "v_mov_b32 v1, 25",
+            "v_mov_b32 v2, 10",
+            "v_subrev_co_u32 v0, vcc_lo, v1, v2",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "exp mrt0, v0, v1, v2, v3 done",
+            "s_endpgm",
+        ]
+        words = self._run_ps(lines)
+        # v0 = 10 - 25 = 0xFFFFFFF1, v3 = borrow = 1
+        self.assertEqual(words[0], 0xFFFFFFF1)
+        self.assertEqual(words[3], 1)
+
+    def test_translator_clamp_saturation(self) -> None:
+        lines = [
+            "v_mov_b32 v1, 50",
+            "v_mov_b32 v2, 20",
+            "v_subrev_co_u32 v0, vcc_lo, v1, v2 clamp",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "exp mrt0, v0, v1, v2, v3 done",
+            "s_endpgm",
+        ]
+        words = self._run_ps(lines)
+        # Underflow with clamp saturates v0 to 0, v3 = borrow = 1
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[3], 1)
+
+    def test_translator_boundary_extremes(self) -> None:
+        pairs = [
+            (0, 0, 0, 0),
+            (0xFFFFFFFF, 0, 1, 1),
+            (0, 0xFFFFFFFF, 0xFFFFFFFF, 0),
+            (0x80000000, 0x80000000, 0, 0),
+        ]
+        for s0, s1, exp_d, exp_b in pairs:
+            with self.subTest(s0=hex(s0), s1=hex(s1)):
+                lines = [
+                    f"v_mov_b32 v1, {s0:#x}",
+                    f"v_mov_b32 v2, {s1:#x}",
+                    "v_subrev_co_u32 v0, vcc_lo, v1, v2",
+                    "v_cndmask_b32 v3, 0, 1, vcc_lo",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "exp mrt0, v0, v1, v2, v3 done",
+                    "s_endpgm",
+                ]
+                words = self._run_ps(lines)
+                self.assertEqual(words[0], exp_d)
+                self.assertEqual(words[3], exp_b)
