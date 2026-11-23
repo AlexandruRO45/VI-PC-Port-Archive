@@ -212,6 +212,14 @@ class TestSAddU32AST(unittest.TestCase):
         expr = SAddU32Expr(0xFFFFFFFF, 2)
         self.assertEqual(expr.eval(), (1, 1))
 
+class TestSAddU32CarryAndSCC(unittest.TestCase):
+    def test_no_carry_just_below_limit(self) -> None:
+        self.assertEqual(ref_s_add_u32(0xFFFFFFFE, 1), (0xFFFFFFFF, 0))
+
+    def test_carry_with_zero(self) -> None:
+        self.assertEqual(ref_s_add_u32(0, 0), (0, 0))
+        self.assertEqual(ref_s_add_u32(0xFFFFFFFF, 0), (0xFFFFFFFF, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
