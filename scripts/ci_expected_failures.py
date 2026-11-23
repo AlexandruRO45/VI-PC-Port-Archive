@@ -12,10 +12,15 @@ from a completed run gets a GitHub Actions notice so the list in the workflow ca
 import sys
 
 
+def escape_annotation(message: str) -> str:
+    """Escape GitHub Actions workflow command data."""
+    return message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def judge(failed: list[str], status: int, expected: list[str]) -> tuple[int, list[str]]:
     """(exit status, GitHub Actions workflow commands to print)."""
     unexpected = [name for name in failed if name not in expected]
-    lines = [f"::error::{name} failed" for name in unexpected]
+    lines = [f"::error::{escape_annotation(name)} failed" for name in unexpected]
     # subprocess reports a signal as -N; the shell pipelines in runtime.yml report it as 128+N.
     if status < 0 or 128 < status <= 255:
         lines.append(f"::error::abnormal test runner exit {status}; the failure list may be incomplete")
@@ -23,10 +28,11 @@ def judge(failed: list[str], status: int, expected: list[str]) -> tuple[int, lis
     if status != 0 and not failed:
         lines.append(f"::error::the test runner exited with {status} without naming a failed test")
     for name in expected:
+        escaped = escape_annotation(name)
         if name in failed:
-            lines.append(f"::warning::{name} failed, as expected until its fix is merged")
+            lines.append(f"::warning::{escaped} failed, as expected until its fix is merged")
         else:
-            lines.append(f"::notice::{name} passed: drop it from the expected failures")
+            lines.append(f"::notice::{escaped} passed: drop it from the expected failures")
     return (1 if unexpected or (status != 0 and not failed) else 0), lines
 
 

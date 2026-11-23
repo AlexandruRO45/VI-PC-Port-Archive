@@ -51,6 +51,15 @@ class Judge(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(lines, ["::notice::xdxr_build_check passed: drop it from the expected failures"])
 
+    def test_annotation_names_preserve_literal_escapes_and_line_breaks(self):
+        code, lines = cef.judge(["current%0A", "known\r\n"], 1, ["known\r\n", "old%25"])
+        self.assertEqual(code, 1)
+        self.assertEqual(lines, [
+            "::error::current%250A failed",
+            "::warning::known%0D%0A failed, as expected until its fix is merged",
+            "::notice::old%2525 passed: drop it from the expected failures",
+        ])
+
 
 class Main(unittest.TestCase):
     def run_main(self, failed: str, *args: str) -> int:
