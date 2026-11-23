@@ -141,7 +141,7 @@ _SOPP_BRANCHES = frozenset({
 
 # SOPP instructions that take no operand at all.
 _SOPP_NO_OPERAND = frozenset({
-    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata",
+    "s_barrier", "s_icache_inv", "s_ttracedata", "s_wait_idle",
     "s_wakeup", "s_endpgm_saved", "s_code_end", "s_endpgm_ordered_ps_done",
 })
 
@@ -274,6 +274,37 @@ def _format_waitcnt(simm16: int) -> list[dict]:
     if not parts:
         parts.append({"k": "imm", "v": simm16})
     return parts
+
+
+def _format_depctr(simm16: int, mcpu: str) -> list[dict]:
+    # GFX10 s_waitcnt_depctr fields in LLVM print order (AMDGPUBaseInfo.cpp DepCtrInfo):
+    # hold_cnt (GFX10.3+ only): bit 7; sa_sdst: bit 0; va_vdst: [15:12]; va_sdst: [11:9];
+    # va_ssrc: bit 8; va_vcc: bit 1; vm_vsrc: [4:2]. Unused bits ([7:5] on GFX10.1, [6:5] on GFX10.3)
+    # force a raw immediate fallback.
+    fields = (
+        (("depctr_hold_cnt", 7, 1, 1),) if not mcpu.startswith("gfx101") else ()
+    ) + (
+        ("depctr_sa_sdst", 0, 1, 1),
+        ("depctr_va_vdst", 12, 0xF, 15),
+        ("depctr_va_sdst", 9, 0x7, 7),
+        ("depctr_va_ssrc", 8, 1, 1),
+        ("depctr_va_vcc", 1, 1, 1),
+        ("depctr_vm_vsrc", 2, 0x7, 7),
+    )
+    used_mask = 0
+    for _, shift, mask, _ in fields:
+        used_mask |= mask << shift
+    if simm16 & ~used_mask:
+        return [{"k": "imm", "v": simm16}]
+    non_default = []
+    all_parts = []
+    for fname, shift, mask, default in fields:
+        val = (simm16 >> shift) & mask
+        entry = {"k": "special", "t": f"{fname}({val})"}
+        all_parts.append(entry)
+        if val != default:
+            non_default.append(entry)
+    return non_default if non_default else all_parts
 
 
 def _format_sendmsg(simm16: int) -> str:
@@ -754,8 +785,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             name, spec = entry
             if name in _SOPP_NO_OPERAND:
                 return finish(name, [], [], 4)
+            if name == "s_endpgm":
+                return finish(name, [{"k": "imm", "v": simm16}] if simm16 else [], [], 4)
             if name == "s_waitcnt":
                 return finish(name, _format_waitcnt(simm16), [], 4)
+            if name == "s_waitcnt_depctr":
+                return finish(name, _format_depctr(simm16, mcpu), [], 4)
             if name == "s_waitcnt_vscnt":
                 # s_waitcnt_vscnt is SOPK, not SOPP; kept defensive.
                 return finish(name, [{"k": "imm", "v": simm16}], [], 4)

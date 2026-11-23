@@ -727,6 +727,7 @@ SOPP = {
     0x1f: ('s_code_end', ()),
     0x20: ('s_inst_prefetch', (('SIMM16', 1, 'i'),)),
     0x21: ('s_clause', (('SIMM16', 1, 'i'),)),
+    0x22: ('s_wait_idle', ()),
     0x23: ('s_waitcnt_depctr', (('SIMM16', 1, 'i'),)),
     0x24: ('s_round_mode', (('SIMM16', 1, 'i'),)),
     0x25: ('s_denorm_mode', (('SIMM16', 1, 'i'),)),

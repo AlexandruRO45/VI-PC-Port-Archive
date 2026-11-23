@@ -107,6 +107,56 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertIn("s_cbranch_scc1 -4", text)
         self.assertIn("s_branch -20", text)
 
+    def test_sopp_wait_idle_endpgm_imm_and_depctr(self):
+        # LLVM GFX10/GFX10.30 disassembler vectors (gfx10_sopp.txt / gfx1030_new.txt):
+        # - s_wait_idle (SOPP 0x22) is valid on GFX10.1 and GFX10.3 with no operands.
+        # - s_endpgm (SOPP 0x01) omits 0 and prints non-zero simm16 immediates.
+        # - s_waitcnt_depctr (SOPP 0x23) decodes named depctr_* counters (with depctr_hold_cnt on GFX10.3+
+        #   only) and falls back to the raw immediate when unused bits are set.
+        for hexcode, mcpu, asm in (
+            # s_wait_idle (SOPP 0x22)
+            ("0000a2bf", "gfx1013", "s_wait_idle"),
+            ("0000a2bf", "gfx1030", "s_wait_idle"),
+            # s_endpgm (0 omitted control, non-zero immediates preserved)
+            ("000081bf", "gfx1013", "s_endpgm"),
+            ("010081bf", "gfx1013", "s_endpgm 1"),
+            ("ffff81bf", "gfx1013", "s_endpgm 65535"),
+            # s_waitcnt_depctr on GFX10.1 (no depctr_hold_cnt; bits [7:5] unused)
+            ("1effa3bf", "gfx1013", "s_waitcnt_depctr depctr_sa_sdst(0)"),
+            ("1f0fa3bf", "gfx1013", "s_waitcnt_depctr depctr_va_vdst(0)"),
+            ("1ff1a3bf", "gfx1013", "s_waitcnt_depctr depctr_va_sdst(0)"),
+            ("1ffea3bf", "gfx1013", "s_waitcnt_depctr depctr_va_ssrc(0)"),
+            ("1dffa3bf", "gfx1013", "s_waitcnt_depctr depctr_va_vcc(0)"),
+            ("03ffa3bf", "gfx1013", "s_waitcnt_depctr depctr_vm_vsrc(0)"),
+            ("0713a3bf", "gfx1013", "s_waitcnt_depctr depctr_va_vdst(1) depctr_va_sdst(1) depctr_vm_vsrc(1)"),
+            ("0000a3bf", "gfx1013", "s_waitcnt_depctr depctr_sa_sdst(0) depctr_va_vdst(0) depctr_va_sdst(0) depctr_va_ssrc(0) depctr_va_vcc(0) depctr_vm_vsrc(0)"),
+            ("1fffa3bf", "gfx1013", "s_waitcnt_depctr depctr_sa_sdst(1) depctr_va_vdst(15) depctr_va_sdst(7) depctr_va_ssrc(1) depctr_va_vcc(1) depctr_vm_vsrc(7)"),
+            ("2000a3bf", "gfx1013", "s_waitcnt_depctr 0x20"),
+            ("8000a3bf", "gfx1013", "s_waitcnt_depctr 0x80"),
+            ("9fffa3bf", "gfx1013", "s_waitcnt_depctr 0xff9f"),
+            ("ffffa3bf", "gfx1013", "s_waitcnt_depctr 0xffff"),
+            # s_waitcnt_depctr on GFX10.3 (depctr_hold_cnt at bit 7; bits [6:5] unused)
+            ("1fffa3bf", "gfx1030", "s_waitcnt_depctr depctr_hold_cnt(0)"),
+            ("9fffa3bf", "gfx1030", "s_waitcnt_depctr depctr_hold_cnt(1) depctr_sa_sdst(1) depctr_va_vdst(15) depctr_va_sdst(7) depctr_va_ssrc(1) depctr_va_vcc(1) depctr_vm_vsrc(7)"),
+            ("0000a3bf", "gfx1030", "s_waitcnt_depctr depctr_hold_cnt(0) depctr_sa_sdst(0) depctr_va_vdst(0) depctr_va_sdst(0) depctr_va_ssrc(0) depctr_va_vcc(0) depctr_vm_vsrc(0)"),
+            ("8713a3bf", "gfx1030", "s_waitcnt_depctr depctr_va_vdst(1) depctr_va_sdst(1) depctr_vm_vsrc(1)"),
+            ("2000a3bf", "gfx1030", "s_waitcnt_depctr 0x20"),
+            ("ffffa3bf", "gfx1030", "s_waitcnt_depctr 0xffff"),
+        ):
+            with self.subTest(hexcode=hexcode, mcpu=mcpu, asm=asm):
+                raw = bytes.fromhex(hexcode)
+                dec = rdna2_decode.decode_bytes(raw, mcpu=mcpu)
+                self.assertEqual(dec["invalid"], 0)
+                (ins,) = dec["insns"]
+                expected = shader_ir.parse_line(asm)
+                for field in ("op", "args", "mods"):
+                    self.assertEqual(ins[field], expected[field])
+                text, bad = rdna2_decode.disasm_bytes(raw, mcpu=mcpu)
+                self.assertEqual(bad, 0)
+                reparsed = shader_ir.parse_line(text.strip())
+                for field in ("op", "args", "mods"):
+                    self.assertEqual(reparsed[field], expected[field])
+
     def test_s_ttracedata_imm_keeps_simm16(self):
         for word, value in ((0xBFA80000, 0x0), (0xBFA80001, 0x1),
                             (0xBFA80063, 0x63), (0xBFA80064, 0x64),
