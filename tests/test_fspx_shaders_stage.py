@@ -27,6 +27,7 @@ import shader_meta  # noqa: E402
 from test_fspx_unpack import kind0, make_dxbc, make_fspx, program, psv0  # noqa: E402
 
 UNPACK = os.path.join(ROOT, "tools", "fspx_unpack.py")
+SPIRV_HEADER = struct.pack("<5I", 0x07230203, 0x00010000, 0, 1, 0)
 
 
 def container(code, state=None, **fspx):
@@ -216,7 +217,7 @@ class FspxStage(unittest.TestCase):
             self.assertEqual(self.calls, [])
 
     def test_missing_cached_module_is_rebuilt(self) -> None:
-        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, SPIRV_HEADER)}
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         self.assertEqual(self.run_step(), [])
         module = os.path.join(self.spirv, "upscaler_00.spv")
@@ -224,7 +225,23 @@ class FspxStage(unittest.TestCase):
 
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         with open(module, "rb") as f:
-            self.assertEqual(f.read(), b"synthetic module")
+            self.assertEqual(f.read(), SPIRV_HEADER)
+        self.assertEqual(self.run_step(), [])
+
+    def test_cached_module_with_bad_framing_is_rebuilt(self) -> None:
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, SPIRV_HEADER)}
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        module = os.path.join(self.spirv, "upscaler_00.spv")
+
+        for label, damaged in (("short header", SPIRV_HEADER[:16]),
+                               ("partial word", SPIRV_HEADER + b"x"),
+                               ("bad magic", b"xxxx" + SPIRV_HEADER[4:])):
+            with self.subTest(label=label):
+                with open(module, "wb") as f:
+                    f.write(damaged)
+                self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+                with open(module, "rb") as f:
+                    self.assertEqual(f.read(), SPIRV_HEADER)
         self.assertEqual(self.run_step(), [])
 
     def test_no_dll_no_step(self):

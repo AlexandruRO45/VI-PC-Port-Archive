@@ -1118,12 +1118,23 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
 
 
 def fspx_cache_complete(spirv: str) -> bool:
-    """Check that the FSPX translation index and its named modules are present."""
+    """Check the FSPX index and the SPIR-V framing of every module it names."""
     try:
         index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
-    except ValueError:
+        if not isinstance(index, dict):
+            return False
+        for name in index:
+            module = os.path.join(spirv, name + ".spv")
+            if not os.path.isfile(module):
+                return False
+            with open(module, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                # Match the runtime's read_spirv_words framing check.
+                if size < 20 or size % 4 or f.read(4) != b"\x03\x02\x23\x07":
+                    return False
+    except (OSError, ValueError):
         return False
-    return isinstance(index, dict) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    return True
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
