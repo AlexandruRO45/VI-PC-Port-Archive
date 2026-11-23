@@ -511,8 +511,9 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
                 continue
             materials[key] = _material_spec(key, dds, png)
     path = os.path.join(staging_dir, f"{chunk_id}.glb")
+    expected = _binding_expectations([m["primitives"] for m in meshes], materials) if textures else None
     info = glb_mod.write_instanced_glb(path, meshes, materials or None, mode=mode)
-    _verify_staged_chunk(path, int(info["bytes"]), glb_mod)
+    bindings = _verify_staged_chunk(path, int(info["bytes"]), glb_mod, expected)
     rec = {
         "id": chunk_id,
         "url": f"world/chunks/{chunk_id}.glb",
@@ -522,6 +523,8 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
         "distinct_models": info["meshes"],
         "stored_triangles": info["stored_triangles"],
     }
+    if bindings is not None:
+        rec["material_bindings"] = bindings
     return rec, int(info.get("textures", 0)), len(failed), int(info["bytes"])
 
 
@@ -1396,13 +1399,76 @@ def _remove_stale_staging(out_dir: str) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _verify_staged_chunk(path: str, expected_size: int, glb_mod) -> None:
+def _binding_expectations(meshes, materials):
+    """Snapshot each source primitive's resolved bucket key and decoded PNG before calling the writer."""
+    by_key = {key: (_material_alpha_mode(key) or "OPAQUE", hashlib.sha256(spec["png_bytes"]).digest())
+              for key, spec in materials.items()}
+    return [[by_key.get(p["material"]) for p in prims] for prims in meshes]
+
+
+def _check_material_bindings(doc, binary, expected, glb_mod):
+    def record(table, index):
+        rows = doc.get(table)
+        if (not isinstance(rows, list) or type(index) is not int or not 0 <= index < len(rows)
+                or not isinstance(rows[index], dict)):
+            raise glb_mod.GlbError(f"invalid world material binding reference into {table}")
+        return rows[index]
+
+    checked = unverifiable = 0
+    digests = {}
+    meshes = doc.get("meshes")
+    if not isinstance(meshes, list) or len(meshes) != len(expected):
+        raise glb_mod.GlbError("staged world mesh count differs from source")
+    for mesh, rows in zip(meshes, expected):
+        prims = mesh.get("primitives") if isinstance(mesh, dict) else None
+        if not isinstance(prims, list) or len(prims) != len(rows):
+            raise glb_mod.GlbError("staged world primitive count differs from source")
+        for prim, binding in zip(prims, rows):
+            if binding is None:
+                unverifiable += 1
+                continue
+            mode, digest = binding
+            try:
+                mat = record("materials", prim["material"])
+                tex_ref = mat["pbrMetallicRoughness"]["baseColorTexture"]
+                tex = record("textures", tex_ref["index"])
+                img = record("images", tex["source"])
+                view_id = img["bufferView"]
+                view = record("bufferViews", view_id)
+                uv_set = tex_ref.get("texCoord", 0)
+                if type(uv_set) is not int or uv_set != 0:
+                    raise glb_mod.GlbError("staged world texture uses the wrong UV set")
+                record("accessors", prim["attributes"]["TEXCOORD_0"])
+            except (KeyError, TypeError) as exc:
+                raise glb_mod.GlbError("incomplete staged world material binding") from exc
+            if mat.get("alphaMode", "OPAQUE") != mode:
+                raise glb_mod.GlbError(f"staged world primitive expected alphaMode {mode}")
+            if mode == "MASK" and mat.get("alphaCutoff", 0.5) != 0.5:
+                raise glb_mod.GlbError("staged world MASK cutoff differs from source")
+            if (img.get("mimeType") != "image/png" or "uri" in img or view.get("buffer") != 0
+                    or "uri" in record("buffers", 0)):
+                raise glb_mod.GlbError("staged world texture is not an embedded PNG")
+            if view_id not in digests:
+                start = view.get("byteOffset", 0)
+                digests[view_id] = hashlib.sha256(binary[start:start + view["byteLength"]]).digest()
+            if digests[view_id] != digest:
+                raise glb_mod.GlbError("staged world primitive references different texture bytes")
+            checked += 1
+    return {"verified": checked, "unverifiable": unverifiable}
+
+
+def _verify_staged_chunk(path: str, expected_size: int, glb_mod, expected=None):
     """Raise GlbError unless the staged file is the complete GLB that write_glb reported."""
     with open(path, "rb") as f:
         data = f.read()
     if len(data) != expected_size:
         raise glb_mod.GlbError(f"staged chunk {path} is {len(data)} bytes, expected {expected_size}")
-    glb_mod.read_glb_summary(data)
+    summary = glb_mod.read_glb_summary(data)
+    if expected is not None:
+        # The BIN payload immediately follows the padded JSON and its 8-byte BIN header.
+        start = 28 + int.from_bytes(data[12:16], "little")
+        binary = memoryview(data)[start:start + summary["bin_bytes"]]
+        return _check_material_bindings(summary["json"], binary, expected, glb_mod)
 
 
 def _publish_world(
@@ -1728,7 +1794,7 @@ def _build_staged_world(
             ev.set()
         return png_bytes
 
-    def build_cell(cell_key: tuple[int, int], cell_models: list[dict]) -> tuple[dict, int, int, int]:
+    def build_cell(cell_key: tuple[int, int], cell_models: list[dict]) -> tuple[dict, int, int, int, list | None]:
         ix, iz = cell_key
         cell_prims: list[dict] = []
         cell_dds: dict[str, str] = {}
@@ -1757,6 +1823,10 @@ def _build_staged_world(
 
         chunk_id = f"c_{ix}_{iz}"
         glb_path = os.path.join(staging_dir, f"{chunk_id}.glb")
+        expected = None
+        if textures:
+            emitted = [p for p in cell_prims if p.get("positions") and p.get("indices")]
+            expected = _binding_expectations([emitted], materials)
         info = glb_mod.write_glb(glb_path, cell_prims, materials=materials if materials else None)
         chunk_rec = {
             "id": chunk_id,
@@ -1765,7 +1835,7 @@ def _build_staged_world(
             "models": len(cell_models),
             "triangles": info["triangles"],
         }
-        return chunk_rec, int(info.get("textures", 0)), len(failed_dds), int(info["bytes"])
+        return chunk_rec, int(info.get("textures", 0)), len(failed_dds), int(info["bytes"]), expected
 
     sorted_cells = sorted(cells.items(), key=lambda kv: kv[0])
     chunks: list[dict] = []
@@ -1785,10 +1855,13 @@ def _build_staged_world(
                     f.cancel()  # stop cells that have not started; running ones finish before cleanup
                 raise
 
-    for chunk_rec, _, _, size in cell_results:
-        _verify_staged_chunk(os.path.join(staging_dir, f"{chunk_rec['id']}.glb"), size, glb_mod)
+    for chunk_rec, _, _, size, expected in cell_results:
+        path = os.path.join(staging_dir, f"{chunk_rec['id']}.glb")
+        bindings = _verify_staged_chunk(path, size, glb_mod, expected)
+        if bindings is not None:
+            chunk_rec["material_bindings"] = bindings
 
-    for chunk_rec, embedded_count, skipped_count, _ in cell_results:
+    for chunk_rec, embedded_count, skipped_count, _, _ in cell_results:
         chunks.append(chunk_rec)
         total_triangles += int(chunk_rec["triangles"])
         textures_embedded += embedded_count

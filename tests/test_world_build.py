@@ -968,7 +968,7 @@ class GlbWriterTest(unittest.TestCase):
         self.assertEqual(prims[1]["name"], "")
 
     def test_textured_material_without_uvs_omits_base_color_texture_and_unused_png(self):
-        # glTF 2.0 §3.8.2: a primitive without TEXCOORD_0 MUST NOT bind a material with baseColorTexture.
+        # glTF 2.0 Â§3.8.2: a primitive without TEXCOORD_0 MUST NOT bind a material with baseColorTexture.
         prims = glb_writer.parse_obj("usemtl wall\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", is_path=False)
         self.assertEqual(prims[0]["uvs"], [])
         png_bytes = dds_png.encode_png(2, 2, bytes([255, 0, 0, 255] * 4))
@@ -1387,9 +1387,33 @@ class RenderBucketAlphaTest(unittest.TestCase):
                 f.write(b"synthetic unsupported DDS")
             world = world_build.build_world(assets, out)
             self.assertEqual(world["stats"]["textures_skipped"], 1)
+            self.assertEqual(world["chunks"][0]["material_bindings"], {"verified": 0, "unverifiable": 3})
             with open(_chunk_disk_path(out, world["chunks"][0]["url"]), "rb") as f:
                 gltf, _ = parse_and_validate_glb(f.read())
             self.assertEqual(gltf.get("images", []), [])  # every material keeps the clay fallback
+
+    def test_staging_checks_shared_image_per_primitive(self):
+        original = glb_writer._MaterialTable.get_material_index
+
+        for change, message in (("alphaMode", "alphaMode"), ("alphaCutoff", "cutoff"),
+                                ("texture", "binding")):
+            def damaged(table, prim, *, has_uv):
+                index = original(table, prim, has_uv=has_uv)
+                mat = table.gltf_materials[index]
+                if mat.get("alphaMode") == "MASK":
+                    if change == "texture":
+                        mat["pbrMetallicRoughness"].pop("baseColorTexture", None)
+                    else:
+                        mat[change] = "OPAQUE" if change == "alphaMode" else 0.25
+                return index
+
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                assets, out = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+                _write_bucket_fixture(assets, [1, 3])
+                with unittest.mock.patch.object(glb_writer._MaterialTable, "get_material_index", damaged):
+                    with self.assertRaisesRegex(glb_writer.GlbError, message):
+                        world_build.build_world(assets, out)
+                self.assertFalse(os.path.exists(os.path.join(out, "world.json")))
 
     def test_baked_world_keeps_modes_separate_for_one_dds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1401,6 +1425,7 @@ class RenderBucketAlphaTest(unittest.TestCase):
             self.assertEqual(world["stats"]["textures_embedded"], 1)  # one deduped image
             with open(_chunk_disk_path(out, world["chunks"][0]["url"]), "rb") as f:
                 gltf, _ = parse_and_validate_glb(f.read())
+            self.assertEqual(world["chunks"][0]["material_bindings"], {"verified": 4, "unverifiable": 0})
             assert_bucket_materials(self, gltf)
             self.assertEqual(len(gltf["meshes"][0]["primitives"]), 4)
 
