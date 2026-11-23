@@ -2322,8 +2322,10 @@ public:
                 best = d->latest();
             }
         } else {
-            for (Device* d : g().connected)  // the most recent reading from any gamepad
+            for (Device* d : g().connected) {  // the most recent reading from any device that supports the kind
+                if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput)) continue;
                 if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+            }
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();

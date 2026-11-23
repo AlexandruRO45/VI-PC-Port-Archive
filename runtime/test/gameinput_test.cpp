@@ -515,6 +515,12 @@ void test_motion(IGameInput* input) {
           "motion: sensors the shim does not provide report Unknown");
 
     r = nullptr;
+    check(input->GetCurrentReading(GameInputKindMotion, nullptr, &r) == S_OK && r &&
+              (r->GetInputKind() & GameInputKindMotion),
+          "motion: GetCurrentReading(Motion, any device) finds the gyro pad");
+    if (r) r->Release();
+
+    r = nullptr;
     check(input->GetCurrentReading(GameInputKindMotion, pdev, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
           "motion: a motion query on the plain pad is READING_NOT_FOUND");
     check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r && !r->GetMotionState(nullptr) &&
@@ -1541,6 +1547,19 @@ int main() {
         if (rd) rd->Release();
     }
     const uint64_t seq0 = reading ? reading->GetSequenceNumber(GameInputKindGamepad) : 0;
+
+    // A null device asks any device for the requested kind. The only pad here has no sensors and no raw HID, so neither
+    // kind has a reading; returning its gamepad reading would be a reading of the wrong kind.
+    IGameInputReading* unsupported = nullptr;
+    check(input->GetCurrentReading(GameInputKindMotion, nullptr, &unsupported) == GAMEINPUT_E_READING_NOT_FOUND &&
+              !unsupported,
+          "GetCurrentReading(Motion, any device) is READING_NOT_FOUND without a sensor pad");
+    if (unsupported) unsupported->Release();
+    unsupported = nullptr;
+    check(input->GetCurrentReading(GameInputKindRawDeviceReport, nullptr, &unsupported) == GAMEINPUT_E_READING_NOT_FOUND &&
+              !unsupported,
+          "GetCurrentReading(RawDeviceReport, any device) is READING_NOT_FOUND without a raw pad");
+    if (unsupported) unsupported->Release();
 
     // Press A, push the left stick up-right, pull the left trigger, press the right shoulder and dpad down.
     const int reading_events_before = g_reading_events;
