@@ -58,6 +58,9 @@ class Sdl3FetchOptionsTest(unittest.TestCase):
 class CMakeListsUsesTheModuleTest(unittest.TestCase):
     def test_the_fetch_calls_the_module_before_sdl3_is_configured(self):
         text = CMAKE_LISTS.read_text(encoding="utf-8")
+        # One SDL3 fetch: with a second one, index() would check only the first.
+        self.assertEqual(text.count("FetchContent_Declare(SDL3"), 1)
+        self.assertEqual(text.count("FetchContent_MakeAvailable(SDL3)"), 1)
         start = text.index("FetchContent_Declare(SDL3")
         end = text.index("FetchContent_MakeAvailable(SDL3)", start)
         block = text[start:end]
