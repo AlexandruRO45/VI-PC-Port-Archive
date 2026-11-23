@@ -77,8 +77,8 @@ class PipelinesJobsTest(unittest.TestCase):
         self.assertEqual(self.jobs_of(run.call_args.args[0]), "3")
 
     def test_the_default_matches_the_checker_default(self):
-        # vk_pipeline_check's own default is half the hardware threads, as is make_game.py's --jobs.
-        want = str(max(1, (os.cpu_count() or 2) // 2))
+        # vk_pipeline_check's own default is every hardware thread, as is make_game.py's --jobs.
+        want = str(os.cpu_count() or 1)
         self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with())), want)
 
     def test_the_stage_log_names_compute_and_graphics_pipelines(self):

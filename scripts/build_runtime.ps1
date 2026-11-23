@@ -1,4 +1,4 @@
-﻿﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores by default.
+﻿﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on every core by default.
 # Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed (or native Windows cmake + ninja on PATH),
 # otherwise calls cl.exe directly.
 # The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
@@ -6,7 +6,7 @@
 param(
     [switch]$Debug,
     [switch]$FetchSdl3,
-    [ValidateRange(1, 2147483647)][int]$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
+    [ValidateRange(1, 2147483647)][int]$jobs = [Math]::Max(1, [Environment]::ProcessorCount)
 )
 $ErrorActionPreference = "Stop"
 

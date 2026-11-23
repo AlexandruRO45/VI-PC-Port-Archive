@@ -254,8 +254,8 @@ def main(argv=None) -> int:
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
                                     "digest its resource-layout blob ends with (the container's HASH part), and "
                                     "copy that container to <name>.dxbc for the translator's signature reads")
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
-                    help="llvm-mc processes for --disasm (default: half the CPUs)")
+    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
+                    help="llvm-mc processes for --disasm (default: all CPUs)")
     a = ap.parse_args(argv)
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")

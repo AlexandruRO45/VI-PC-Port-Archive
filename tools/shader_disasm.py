@@ -196,7 +196,7 @@ def main():
     ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
                     help="disassembler backend: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
     ap.add_argument("--limit", type=positive_int)
-    ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("-j", "--jobs", type=positive_int, default=os.cpu_count() or 1)
     a = ap.parse_args()
     if os.path.isfile(a.src):
         if a.unpack_index:

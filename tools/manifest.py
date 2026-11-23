@@ -4,7 +4,7 @@ Usage:
     python -I manifest.py create <game_dir> [--out FILE] [--jobs N]
     python -I manifest.py verify <game_dir> [--manifest FILE] [--jobs N]
 
-Files are hashed with up to --jobs threads (default: half the CPU count; 1 = serial).
+Files are hashed with up to --jobs threads (default: all CPUs; 1 = serial).
 The manifest itself is excluded when its path is inside the scanned folder.
 On Windows it lowers its own priority to BelowNormal so the PC stays usable.
 """
@@ -26,7 +26,7 @@ class ManifestError(Exception):
 
 
 def default_jobs() -> int:
-    return max(1, (os.cpu_count() or 2) // 2)
+    return os.cpu_count() or 1
 
 
 def positive_int(text: str) -> int:
@@ -255,9 +255,9 @@ def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
 
 def add_jobs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--jobs", type=positive_int, default=default_jobs(), metavar="N",
+        "--jobs", "-j", type=positive_int, default=default_jobs(), metavar="N",
         help="hash up to N files concurrently with threads; 1 hashes serially "
-             "(default: half the CPU count = %(default)s)")
+             "(default: all CPUs = %(default)s)")
 
 
 def main() -> int:

@@ -54,7 +54,7 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
         self.assertFalse(a.full_check)
         self.assertFalse(a.wav)
         self.assertFalse(a.find)
-        expected_default_jobs = max(1, (os.cpu_count() or 2) // 2)
+        expected_default_jobs = os.cpu_count() or 1
         self.assertEqual(a.jobs, expected_default_jobs)
 
     def test_custom_arguments_parsed_correctly(self):
@@ -295,16 +295,16 @@ class JobsHandlingTest(unittest.TestCase):
         scenarios = [
             (None, 1),
             (1, 1),
-            (2, 1),
-            (4, 2),
-            (8, 4),
-            (16, 8),
-            (64, 32),
+            (2, 2),
+            (4, 4),
+            (8, 8),
+            (16, 16),
+            (64, 64),
         ]
         for cpus, expected in scenarios:
             with self.subTest(cpus=cpus, expected=expected):
                 with patch("os.cpu_count", return_value=cpus):
-                    calc = max(1, (os.cpu_count() or 2) // 2)
+                    calc = os.cpu_count() or 1
                     self.assertEqual(calc, expected)
 
     def test_custom_jobs_forwarded_to_shaders(self):

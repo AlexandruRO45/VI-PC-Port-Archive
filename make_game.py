@@ -1939,7 +1939,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
-    # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
+    # --jobs: make_game.py's own; without it vk_pipeline_check uses every hardware thread whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
         # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
@@ -2116,7 +2116,7 @@ def main() -> int:
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
-    ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("-j", "--jobs", type=positive_int, default=os.cpu_count() or 1)
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     ap.add_argument("--runtime-build", metavar="DIR",
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "

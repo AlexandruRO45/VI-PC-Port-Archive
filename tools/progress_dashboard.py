@@ -996,7 +996,7 @@ def main(argv=None):
     ap.add_argument("--work", help="make_game.py work folder, for corpus counts (numbers only)")
     ap.add_argument("--run-tests", action="store_true", help="run the unit tests now (CI selection) and keep the outcome")
     ap.add_argument("--tests", metavar="REGEX", help="with --run-tests, only the test files matching REGEX")
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="test processes at a time")
+    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="test processes at a time")
     ap.add_argument("--test-timeout", type=int, default=300, help="seconds per test file")
     ap.add_argument("--junit", nargs="*", metavar="FILE", help="CTest --output-junit or pytest --junitxml files")
     ap.add_argument("--gpu-log", nargs="*", metavar="FILE[=LABEL]",

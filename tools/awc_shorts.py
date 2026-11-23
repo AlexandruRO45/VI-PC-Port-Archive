@@ -96,7 +96,7 @@ def main(argv=None) -> int:
     ap.add_argument("out", help="output directory")
     ap.add_argument("--min-seconds", type=float, default=5.0)
     ap.add_argument("--max-seconds", type=float, default=60.0)
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1)
     a = ap.parse_args(argv)
     if a.jobs < 1:
         print("awc_shorts: error: --jobs must be at least 1", file=sys.stderr)

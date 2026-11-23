@@ -791,7 +791,7 @@ def main(argv=None):
     ap.add_argument("archive")
     ap.add_argument("--out", default=os.path.join("work", "world", "census"))
     ap.add_argument("--shard-size", type=positive_int, default=2 << 30)
-    ap.add_argument("--jobs", type=job_count, default=max(1, min(12, (os.cpu_count() or 2) // 2)))
+    ap.add_argument("-j", "--jobs", type=job_count, default=max(1, min(12, os.cpu_count() or 1)))
     ap.add_argument("--start", type=int)
     ap.add_argument("--limit", type=int)
     ap.add_argument("--resume", action="store_true")

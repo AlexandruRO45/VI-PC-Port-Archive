@@ -11,7 +11,7 @@
 // whose required features or partner stubs are unavailable are reported as skipped rather than failed.
 //   [cache.bin]   loaded first if it exists (a stopped run resumes: cached pipelines are instant), saved every
 //                 10 minutes and at the end
-//   --jobs N      compile on up to N worker threads (default: half the hardware threads)
+//   --jobs N      compile on up to N worker threads (default: every hardware thread)
 //   --large-module-bytes N  modules larger than N bytes are "large" (default: 4194304; 0 disables the gate)
 //   --large-parallel N  how many large modules may be in the driver at once: 0 (default) = as many as fit 3/4 of
 //                 the memory available at start, at large_module_gate.h's estimate per module, up to --jobs, with the
@@ -796,7 +796,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
     std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path;
     bool cache_given = false;   // an empty cache_path alone can't tell "not given" from an empty argument
-    uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
+    uint32_t jobs = std::max(1u, std::thread::hardware_concurrency());
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
     unsigned large_parallel = 0;   // 0 = by the memory budget

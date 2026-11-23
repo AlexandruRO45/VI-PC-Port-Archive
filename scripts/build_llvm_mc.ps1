@@ -36,7 +36,7 @@ $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
 $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
+$jobs = [Math]::Max(1, [Environment]::ProcessorCount)
 
 $cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
 $cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"

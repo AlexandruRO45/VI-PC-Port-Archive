@@ -392,8 +392,8 @@ def main(argv=None) -> int:
     ap.add_argument("src")
     ap.add_argument("out")
     ap.add_argument("--limit", type=int, help="maximum number of banks to export (default: all)")
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
-                    help="banks to export at once (default: half the CPU count)")
+    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
+                    help="banks to export at once (default: all CPUs)")
     ap.add_argument("--pre-skip", type=int, default=OPUS_PRE_SKIP,
                     help="Opus encoder lookahead in 48 kHz samples written to OpusHead (default: 312)")
     a = ap.parse_args(argv)

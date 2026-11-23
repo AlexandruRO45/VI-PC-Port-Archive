@@ -1,7 +1,7 @@
 """Parallel SHA-256 manifest integrity verifier with progress reporting.
 
 Verifies a target directory against a SHA-256 JSON manifest. Files are verified
-concurrently using up to --jobs threads (defaulting to half the CPU count; 1 = serial).
+concurrently using up to --jobs threads (defaulting to all CPUs; 1 = serial).
 Live progress is reported continuously during verification.
 
 Usage:
@@ -28,7 +28,7 @@ DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "man
 
 
 def default_jobs() -> int:
-    return max(1, (os.cpu_count() or 2) // 2)
+    return os.cpu_count() or 1
 
 
 def positive_int(text: str) -> int:

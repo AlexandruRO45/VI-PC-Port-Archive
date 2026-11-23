@@ -31,7 +31,7 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | Option | Meaning |
 |---|---|
 | `cache.bin` | Optional positional pipeline cache. Loaded first if it exists, saved every 10 minutes and at the end, so a stopped run resumes. |
-| `--jobs N` | Compile on N threads (default: half the hardware threads). |
+| `--jobs N` | Compile on N threads (default: every hardware thread). |
 | `--start I`, `--count N` | Check only the sorted index entries `[I, I+N)`. |
 | `--stage all\|cs\|graphics` | Which stages to check. `--compute-only` and `--graphics-only` are aliases. |
 | `--slow SEC` | Print pipelines slower than SEC (default 30); compiles past 60 s are named while running. |

@@ -438,8 +438,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Decode Ogg Opus audio to 16-bit PCM WAV with ffmpeg.")
     ap.add_argument("src", help="a directory to search recursively, or one .ogg/.opus file")
     ap.add_argument("--out", help="output directory (default: <src>/wav for a directory, next to a single file)")
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
-                    help="ffmpeg processes to run at once (default: half the CPU count)")
+    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
+                    help="ffmpeg processes to run at once (default: all CPUs)")
     ap.add_argument("--ffmpeg", help="ffmpeg executable (default: ffmpeg on PATH)")
     a = ap.parse_args(argv)
     if a.jobs < 1:
