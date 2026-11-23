@@ -942,7 +942,7 @@ The compute path, end to end:
     place plus the placed offset as its console VA. A placed texture keeps its own `VkDeviceMemory` and a null VA,
     1D, 2D and 3D alike (arrays and mips included), and a dimension outside the enum is `E_INVALIDARG`, as on the
     host (RTX 2080 Ti and WARP, `d3d12_placed_dimensions_test`);
-    tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures are backed the same way with
+    tiled (`64KB_UNDEFINED_SWIZZLE`, Xbox `0x101`, and Xbox `0x105` for `TEXTURE3D`) 2D/3D placed textures are backed the same way with
     tile-multiple `GetResourceAllocationInfo`, `GetResourceTiling`, and host-matched `E_INVALIDARG` checks
     (D3D-191). `CreatePlacedResource2`'s castable-format list reaches the placed texture's image as the committed
     path's does (D3D-90). `CreateHeap` refuses with `E_INVALIDARG`, as the host does (RX 5700 and WARP, D3D-238),
@@ -2336,8 +2336,8 @@ The trace will enumerate them.
     heap reads back 0.
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
     committed resources instead. Buffer mappings alone do not implement a full tiled-resources tier.
-    The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**ASSUMPTION**:
-    that the console uses it for reserved resources too).
+    The Xbox tiled layout words `0x101` and `0x105` (the volume form on `TEXTURE3D`, bit 2 set) are accepted as
+    `64KB_UNDEFINED_SWIZZLE` (**ASSUMPTION**: that the console uses them for reserved resources too).
   - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip stays standard while it is
     wider than half the tile or taller than the tile, depth not counting, as AMD's PC runtime does on RDNA2 and RDNA4
     and so, most likely, the console (D3D-65); an NVIDIA GPU packs from the first mip smaller than a tile on any axis.

@@ -283,13 +283,95 @@ int main() {
             return 1;
         }
         UINT64 fence_value = 0;
+        D3D12_RESOURCE_DESC xbox_3d = texture(t3, 8, 8, 4, 2, DXGI_FORMAT_R8G8B8A8_UNORM);
+        xbox_3d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
         const Case trips[] = {
             {"placed 3D R8G8B8A8_UNORM 8x8x4, 2 mips", texture(t3, 8, 8, 4, 2, DXGI_FORMAT_R8G8B8A8_UNORM)},
+            {"placed 3D R8G8B8A8_UNORM 8x8x4, 2 mips (Xbox 0x105)", xbox_3d},
             {"placed 3D R16G16B16A16_FLOAT 4x4x4", texture(t3, 4, 4, 4, 1, DXGI_FORMAT_R16G16B16A16_FLOAT)},
             {"placed 1D array R8G8B8A8_UNORM 64 x3, 3 mips", texture(t1, 64, 1, 3, 3, DXGI_FORMAT_R8G8B8A8_UNORM)},
         };
         for (const Case& c : trips)
             if (!round_trip(ours.p, queue.p, fence.p, fence_value, c.name, c.desc)) ++failures;
+
+        // Xbox volume tiled layout word 0x105 on TEXTURE3D: allocation/tiling parity with 64KB_UNDEFINED_SWIZZLE,
+        // 4 KiB alignment refusal, CreatePlacedResource/CreateReservedResource{,1,2} acceptance, and 2D refusal.
+        {
+            D3D12_RESOURCE_DESC ref3d = texture(t3, 64, 64, 32, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            ref3d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+            D3D12_RESOURCE_DESC xbox3d = ref3d;
+            xbox3d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+            const D3D12_RESOURCE_ALLOCATION_INFO ref_ai = ours->GetResourceAllocationInfo(0, 1, &ref3d);
+            const D3D12_RESOURCE_ALLOCATION_INFO xbox_ai = ours->GetResourceAllocationInfo(0, 1, &xbox3d);
+            if (ref_ai.SizeInBytes == UINT64_MAX || xbox_ai.SizeInBytes != ref_ai.SizeInBytes ||
+                xbox_ai.Alignment != k64) {
+                std::fprintf(stderr, "0x105 TEXTURE3D allocation mismatch: got (%llu, %llu), want (%llu, %llu)\n",
+                             static_cast<unsigned long long>(xbox_ai.SizeInBytes),
+                             static_cast<unsigned long long>(xbox_ai.Alignment),
+                             static_cast<unsigned long long>(ref_ai.SizeInBytes),
+                             static_cast<unsigned long long>(k64));
+                ++failures;
+            }
+            D3D12_RESOURCE_DESC small3d = texture(t3, 16, 16, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+            small3d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+            small3d.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+            if (ours->GetResourceAllocationInfo(0, 1, &small3d).SizeInBytes != UINT64_MAX) {
+                std::fprintf(stderr, "0x105 TEXTURE3D unexpectedly accepted 4 KiB small alignment\n");
+                ++failures;
+            }
+            Ref<ID3D12Device4> dev4;
+            Ref<ID3D12Device10> dev10;
+            if (FAILED(ours->QueryInterface(IID_PPV_ARGS(&dev4.p))) ||
+                FAILED(ours->QueryInterface(IID_PPV_ARGS(&dev10.p)))) {
+                std::fprintf(stderr, "0x105 check: ID3D12Device4/10 unavailable\n");
+                ++failures;
+            } else {
+                D3D12_RESOURCE_ALLOCATION_INFO1 ai1{};
+                const D3D12_RESOURCE_ALLOCATION_INFO tot1 = dev4->GetResourceAllocationInfo1(0, 1, &xbox3d, &ai1);
+                if (tot1.SizeInBytes != ref_ai.SizeInBytes || ai1.SizeInBytes != ref_ai.SizeInBytes ||
+                    ai1.Alignment != k64) {
+                    std::fprintf(stderr, "0x105 GetResourceAllocationInfo1 mismatch\n");
+                    ++failures;
+                }
+                Ref<ID3D12Resource> ref_res, xbox_res, xbox_res1, xbox_res2, bad_2d_res;
+                D3D12_RESOURCE_DESC bad2d = texture(t2, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+                bad2d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+                if (ours->CreateReservedResource(&bad2d, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                 IID_PPV_ARGS(&bad_2d_res.p)) != E_INVALIDARG ||
+                    bad_2d_res.p != nullptr) {
+                    std::fprintf(stderr, "0x105 TEXTURE2D reserved resource was not refused with E_INVALIDARG\n");
+                    ++failures;
+                }
+                if (FAILED(ours->CreateReservedResource(&ref3d, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                        IID_PPV_ARGS(&ref_res.p))) ||
+                    FAILED(ours->CreateReservedResource(&xbox3d, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                        IID_PPV_ARGS(&xbox_res.p))) ||
+                    FAILED(dev4->CreateReservedResource1(&xbox3d, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr,
+                                                         IID_PPV_ARGS(&xbox_res1.p))) ||
+                    FAILED(dev10->CreateReservedResource2(&xbox3d, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0,
+                                                          nullptr, IID_PPV_ARGS(&xbox_res2.p)))) {
+                    std::fprintf(stderr, "0x105 TEXTURE3D CreateReservedResource{,1,2} failed\n");
+                    ++failures;
+                } else {
+                    UINT ref_tiles = 0, xbox_tiles = 0;
+                    D3D12_TILE_SHAPE ref_shape{}, xbox_shape{};
+                    ours->GetResourceTiling(ref_res.p, &ref_tiles, nullptr, &ref_shape, nullptr, 0, nullptr);
+                    ours->GetResourceTiling(xbox_res2.p, &xbox_tiles, nullptr, &xbox_shape, nullptr, 0, nullptr);
+                    if (!ref_tiles || xbox_tiles != ref_tiles ||
+                        xbox_shape.WidthInTexels != ref_shape.WidthInTexels ||
+                        xbox_shape.HeightInTexels != ref_shape.HeightInTexels ||
+                        xbox_shape.DepthInTexels != ref_shape.DepthInTexels ||
+                        static_cast<UINT>(xbox_res->GetDesc().Layout) != 0x105 ||
+                        static_cast<UINT>(xbox_res2->GetDesc().Layout) != 0x105) {
+                        std::fprintf(stderr, "0x105 TEXTURE3D tiling or layout readback mismatch\n");
+                        ++failures;
+                    } else {
+                        std::printf("xbox 0x105 TEXTURE3D: allocation (%llu B), reserved{,1,2} and tiling (%u tiles) OK\n",
+                                    static_cast<unsigned long long>(xbox_ai.SizeInBytes), xbox_tiles);
+                    }
+                }
+            }
+        }
     }
 
     // A desc with a dimension outside the enum, which the host refuses.

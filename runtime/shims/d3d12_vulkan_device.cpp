@@ -438,12 +438,20 @@ bool xr_bias_compatible(const D3D12_RESOURCE_DESC& desc) {
     return mips == 1;
 }
 
-// The Xbox tiled layout word (slot 76, docs/d3d12_vulkan.md section 4.2) is outside D3D12_TEXTURE_LAYOUT's
-// enumerators, so compare as an integer.
+// Xbox tiled layout words (docs/d3d12_vulkan.md section 4.2) are outside D3D12_TEXTURE_LAYOUT's enumerators, so
+// compare as integers. 0x101 is the general tiled word; 0x105 (bit 2 set) is the volume form the retail executable
+// writes into TEXTURE3D descriptions before slots 25/108.
 constexpr UINT kXboxTiledLayout = 0x101;
+constexpr UINT kXboxTiledVolumeLayout = 0x105;
 
-bool is_tiled_layout(D3D12_TEXTURE_LAYOUT layout) {
-    return layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE || static_cast<UINT>(layout) == kXboxTiledLayout;
+bool is_xbox_tiled_layout(D3D12_RESOURCE_DIMENSION dimension, D3D12_TEXTURE_LAYOUT layout) {
+    const UINT word = static_cast<UINT>(layout);
+    return word == kXboxTiledLayout ||
+           (dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && word == kXboxTiledVolumeLayout);
+}
+
+bool is_tiled_layout(D3D12_RESOURCE_DIMENSION dimension, D3D12_TEXTURE_LAYOUT layout) {
+    return layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE || is_xbox_tiled_layout(dimension, layout);
 }
 
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
@@ -2089,7 +2097,7 @@ public:
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
         D3D12_RESOURCE_DESC desc = desc_;
         if (!desc.Alignment) {
-            desc.Alignment = (desc.SampleDesc.Count > 1 && !is_tiled_layout(desc.Layout))
+            desc.Alignment = (desc.SampleDesc.Count > 1 && !is_tiled_layout(desc.Dimension, desc.Layout))
                                  ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                  : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         }
@@ -6567,8 +6575,8 @@ public:
     // Reserved buffers use sparse binding where available. Textures and fallback buffers are fully backed.
     // The description rules are D3D12's: buffers are ROW_MAJOR, textures 64KB_UNDEFINED_SWIZZLE with a tile shape
     // (64KB_STANDARD_SWIZZLE needs StandardSwizzle64KBSupported, which CheckFeatureSupport reports as FALSE). The
-    // Xbox tiled layout word 0x101 (slot 76, section 4.2) is accepted as 64KB_UNDEFINED_SWIZZLE; that the console
-    // uses it for reserved resources too is an assumption.
+    // Xbox tiled layout words 0x101 (and 0x105 for TEXTURE3D; section 4.2) are accepted as 64KB_UNDEFINED_SWIZZLE;
+    // that the console uses them for reserved resources too is an assumption.
     HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                                                      const D3D12_CLEAR_VALUE* clear, REFIID riid,
                                                      void** out) override {
@@ -6612,8 +6620,9 @@ public:
                                              D3D12_SUBRESOURCE_TILING* tilings) override {
         leonida::ResourceTiling tiling;
         Resource* r = Resource::from<Resource>(resource);
-        const bool ok = r && (r->reserved() || is_tiled_layout(r->GetDesc().Layout)) &&
-                        resource_tiling(r->GetDesc(), tiling);
+        const D3D12_RESOURCE_DESC r_desc = r ? r->GetDesc() : D3D12_RESOURCE_DESC{};
+        const bool ok = r && (r->reserved() || is_tiled_layout(r_desc.Dimension, r_desc.Layout)) &&
+                        resource_tiling(r_desc, tiling);
         if (total) *total = ok ? tiling.total_tiles : 0;
         if (packed)
             *packed = ok ? D3D12_PACKED_MIP_INFO{UINT8(tiling.standard_mips), UINT8(tiling.packed_mips),
@@ -6829,7 +6838,7 @@ public:
             log_once((std::string(method) + " refused (" + why + "), dimension").c_str(), int(desc->Dimension));
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        const bool tiled = is_tiled_layout(desc->Layout);
+        const bool tiled = is_tiled_layout(desc->Dimension, desc->Layout);
         const bool msaa = desc->SampleDesc.Count > 1;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (heap->flags() & D3D12_HEAP_FLAG_DENY_BUFFERS) return d3d12_trace::result(method, E_INVALIDARG);
@@ -6875,7 +6884,7 @@ public:
                          int(desc->Dimension));
                 return d3d12_trace::result(method, E_INVALIDARG);
             }
-            if (tiled && static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+            if (tiled && is_xbox_tiled_layout(desc->Dimension, desc->Layout)) {
                 log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          int(desc->Dimension));
             }
@@ -7824,7 +7833,7 @@ private:
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
             (volume && depth_stencil))
             return kInvalidAllocation;
-        const bool tiled = is_tiled_layout(desc.Layout);
+        const bool tiled = is_tiled_layout(desc.Dimension, desc.Layout);
         if (tiled) {
             if (one_d || (samples > 1 && samples != 4)) return kInvalidAllocation;
             if (desc.Alignment && desc.Alignment != align_64k) return kInvalidAllocation;
@@ -8101,7 +8110,7 @@ private:
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return d3d12_trace::result(method, E_INVALIDARG);
         } else {
-            if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+            if (is_xbox_tiled_layout(desc->Dimension, desc->Layout)) {
                 log_once("reserved resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          desc->Dimension);
             } else if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {

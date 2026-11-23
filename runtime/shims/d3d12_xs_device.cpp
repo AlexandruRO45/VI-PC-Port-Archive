@@ -1463,8 +1463,9 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     if (!riid) return E_POINTER;
 
     // The measured description is 56 bytes plus Xbox extension words; D3D12_RESOURCE_DESC is exactly 56 bytes.
-    // The Xbox layout word is 0x101 (tiled) or 0x1 (row-major buffer), and is not a PC layout value. Committed
-    // resources take ROW_MAJOR for buffers and UNKNOWN for everything else, so the word is ignored and replaced.
+    // The Xbox layout word is 0x101 (tiled), 0x105 (tiled 3D volume) or 0x1 (row-major buffer), and is not a PC
+    // layout value. Committed resources take ROW_MAJOR for buffers and UNKNOWN for everything else, so the word is
+    // ignored and replaced.
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
