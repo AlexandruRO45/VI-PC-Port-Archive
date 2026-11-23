@@ -37,6 +37,7 @@ Usage:
     python -I tools/ped_catalogues.py census  <file|dir|archive.rpf> [--json] [--out FILE]
                                               [--start N] [--limit BYTES] [--max-inflate BYTES]
     python -I tools/ped_catalogues.py inspect <file> [--json] [--out FILE] [--limit N]
+    python -I tools/ped_catalogues.py kit     <file> --id ID [--json] [--out FILE]
     python -I tools/ped_catalogues.py resolve <file|dir|archive.rpf> [--name NAME ...]
                                               [--names-file FILE] [--hash HEX ...] [--cull-only]
                                               [--require-textures] [--json] [--out FILE]
@@ -70,6 +71,10 @@ PRESET_BUCKET_HASH = 0x60BCB6F3
 SECONDARY_BUCKET_HASH = 0x4C70A132
 PRESET_STRUCT_HASH = 0xF795E8BA
 PRESET_STRIDE = 88
+KIT_STRUCT_HASH = 0xA9D57751
+KIT_STRIDE = 80
+KIT_MEMBER_STRUCT_HASH = 0x67E54CB2
+KIT_MEMBER_STRIDE = 8
 STATE_STRUCT_HASH = 0x37E52277
 STATE_STRIDE = 184
 STATE_INNER_HASH = 0x147FDAB5
@@ -484,12 +489,85 @@ def read_cull_drawable(
     return cull_ref, tuple(keys)
 
 
+def _typed_array_window(
+    blocks: dict[int, tuple[int, memoryview]],
+    header: memoryview,
+    header_offset: int,
+    expected_type: int,
+    stride: int,
+) -> tuple[int, int, int]:
+    """Read a 0x5c header and validate its occupied byte interval inside the target block."""
+    count, capacity, ptr = struct.unpack_from("<IIQ", header, header_offset)
+    if count > capacity:
+        raise ValueError(f"array of 0x{expected_type:08x}: count {count} exceeds capacity {capacity}")
+    block, start = decode_ptr(ptr)
+    stop = start + count * stride
+    if count:
+        if block not in blocks:
+            raise ValueError(f"array of 0x{expected_type:08x} points to missing block {block}")
+        kind, data = blocks[block]
+        if kind != expected_type:
+            raise ValueError(f"array points to block {block} of type 0x{kind:08x}, expected 0x{expected_type:08x}")
+        if stop > len(data):
+            raise ValueError(f"array of 0x{kind:08x} truncated at block {block}+0x{start:x} (count={count})")
+    return block, start, stop
+
+
+def iter_root_bucket_rows(
+    blocks: dict[int, tuple[int, memoryview]], root_block: int, target_type: int
+) -> Iterator[tuple[int, int]]:
+    """Yield distinct (block, byte offset) rows reached through the two root buckets of one type."""
+    if root_block not in blocks or blocks[root_block][0] != CATALOG_ROOT_HASH:
+        raise ValueError(f"block {root_block} is not a ped catalogue root")
+    root = blocks[root_block][1]
+    if len(root) < CATALOG_ROOT_SIZE:
+        raise ValueError(f"catalogue root truncated: {len(root)} of {CATALOG_ROOT_SIZE} bytes")
+    if target_type == KIT_STRUCT_HASH:
+        headers, stride = (0x68, 0x98), KIT_STRIDE
+    elif target_type == PRESET_STRUCT_HASH:
+        headers, stride = (0x08, 0x38), PRESET_STRIDE
+    else:
+        raise ValueError(f"unknown catalogue root bucket type 0x{target_type:08x}")
+    seen = set()
+    for header_offset in headers:
+        block, start, stop = _typed_array_window(blocks, root, header_offset, target_type, stride)
+        for offset in range(start, stop, stride):
+            location = (block, offset)
+            if location not in seen:
+                seen.add(location)
+                yield location
+
+
+def parse_kit_members(
+    blocks: dict[int, tuple[int, memoryview]], root_block: int
+) -> dict[int, tuple[tuple[int, int], ...]]:
+    """Read each reachable kit's ordered (member ID, selected state) pairs."""
+    kits = {}
+    members_by_window = {}
+    for block, offset in iter_root_bucket_rows(blocks, root_block, KIT_STRUCT_HASH):
+        data = blocks[block][1]
+        kit_id, = struct.unpack_from("<I", data, offset)
+        if kit_id in kits:
+            raise ValueError(f"ambiguous duplicate kit definition 0x{kit_id:08x}")
+        window = _typed_array_window(blocks, data, offset + 0x38, KIT_MEMBER_STRUCT_HASH, KIT_MEMBER_STRIDE)
+        member_block, start, stop = window
+        if start == stop:
+            kits[kit_id] = ()
+        else:
+            if window not in members_by_window:
+                rows = blocks[member_block][1][start:stop]
+                members_by_window[window] = tuple(struct.iter_unpack("<II", rows))
+            kits[kit_id] = members_by_window[window]
+    return kits
+
+
 def parse_catalogue_blocks(
     blocks: dict[int, tuple[int, memoryview]],
     root_block: int,
     *,
     framing: str,
     source: str = "",
+    rooted_presets_only: bool = False,
 ) -> CatalogueContainer:
     """Parse a `0x8dcb4cf5` ped appearance catalogue from a validated 1-based block dictionary."""
     if root_block not in blocks:
@@ -523,14 +601,20 @@ def parse_catalogue_blocks(
     states_with_cull_drawable = 0
     cull_nonzero_hashes = 0
 
-    for bnum in sorted(blocks):
+    rooted_offsets: dict[int, list[int]] = collections.defaultdict(list)
+    if rooted_presets_only:
+        for block, offset in iter_root_bucket_rows(blocks, root_block, PRESET_STRUCT_HASH):
+            rooted_offsets[block].append(offset)
+
+    for bnum in sorted(rooted_offsets if rooted_presets_only else blocks):
         bk, data = blocks[bnum]
         if bk != PRESET_STRUCT_HASH:
             continue
-        if len(data) % PRESET_STRIDE != 0:
+        if not rooted_presets_only and len(data) % PRESET_STRIDE != 0:
             warnings.append(f"0xf795e8ba block {bnum} size {len(data)} is not a multiple of {PRESET_STRIDE}")
-        for idx in range(len(data) // PRESET_STRIDE):
-            base = idx * PRESET_STRIDE
+        offsets = (rooted_offsets[bnum] if rooted_presets_only
+                   else range(0, len(data) - PRESET_STRIDE + 1, PRESET_STRIDE))
+        for base in offsets:
             pid, parent_id, c1, _cap1, p1, cat = struct.unpack_from("<IIIIQI", data, base)
             p2 = struct.unpack_from("<Q", data, base + 48)[0]
             c2 = struct.unpack_from("<H", data, base + 56)[0]
@@ -538,7 +622,10 @@ def parse_catalogue_blocks(
 
             states: list[StateRecord] = []
             if c1:
-                rb, ro = decode_ptr(p1)
+                if rooted_presets_only:
+                    rb, ro, _ = _typed_array_window(blocks, data, base + 0x08, STATE_STRUCT_HASH, STATE_STRIDE)
+                else:
+                    rb, ro = decode_ptr(p1)
                 if rb not in blocks:
                     warnings.append(f"preset 0x{pid:08x} state array points to missing block {rb}")
                 elif blocks[rb][0] != STATE_STRUCT_HASH:
@@ -605,7 +692,7 @@ def parse_catalogue_blocks(
 
             rec = PresetRecord(
                 block=bnum,
-                index=idx,
+                index=base // PRESET_STRIDE,
                 preset_id=pid,
                 parent_id=parent_id,
                 category=cat,
@@ -614,6 +701,8 @@ def parse_catalogue_blocks(
             )
             presets.append(rec)
             if pid in presets_by_id:
+                if rooted_presets_only:
+                    raise ValueError(f"ambiguous duplicate preset definition 0x{pid:08x}")
                 duplicate_preset_ids += 1
             else:
                 presets_by_id[pid] = rec
@@ -692,26 +781,31 @@ def parse_catalogue_blocks(
     )
 
 
+def _catalogue_block_table(
+    data: bytes | bytearray | memoryview,
+) -> tuple[str, int, dict[int, tuple[int, memoryview]]]:
+    mv = memoryview(data)
+    if len(mv) >= 16 and mv[:4].tobytes() == odrp_7a.PSIN_MAGIC:
+        framing = "psin"
+        status, rblk, _rtype, blocks, err = _parse_psin_blocks_state(mv)
+    elif len(mv) >= 20 and mv[16:20].tobytes() == odrp_7a.SIGNATURE:
+        framing = "0drp"
+        status, rblk, _rtype, blocks, err = _parse_0drp_blocks_state(mv)
+    else:
+        raise ValueError("input is neither a PSIN container nor a standalone 0DRP/0x7a resource")
+    if status != "ok":
+        raise ValueError(f"{framing.upper()} parse failed ({status}): {err}")
+    return framing, rblk, blocks
+
+
 def parse_catalogue_strict(
     data: bytes | bytearray | memoryview,
     *,
     source: str = "",
 ) -> CatalogueContainer:
     """Parse one `0DRP` v122 or `PSIN` `0x8dcb4cf5` catalogue; raise `ValueError` on any format error."""
-    mv = memoryview(data)
-    if len(mv) >= 16 and mv[:4].tobytes() == odrp_7a.PSIN_MAGIC:
-        status, rblk, _rtype, blocks, err = _parse_psin_blocks_state(mv)
-        if status != "ok":
-            raise ValueError(f"PSIN parse failed ({status}): {err}")
-        return parse_catalogue_blocks(blocks, rblk, framing="psin", source=source)
-
-    if len(mv) >= 20 and mv[16:20].tobytes() == odrp_7a.SIGNATURE:
-        status, rblk, _rtype, blocks, err = _parse_0drp_blocks_state(mv)
-        if status != "ok":
-            raise ValueError(f"0DRP parse failed ({status}): {err}")
-        return parse_catalogue_blocks(blocks, rblk, framing="0drp", source=source)
-
-    raise ValueError("input is neither a PSIN container nor a standalone 0DRP/0x7a resource")
+    framing, rblk, blocks = _catalogue_block_table(data)
+    return parse_catalogue_blocks(blocks, rblk, framing=framing, source=source)
 
 
 def parse_catalogue(
@@ -727,6 +821,104 @@ def parse_catalogue(
 
 
 # ---------------------------------------------------------------- inheritance & resolution
+
+
+@dataclass(frozen=True)
+class KitMember:
+    preset_id: int
+    state_id: int
+    drawable_hash: int
+    albedo_hash: int
+    normal_hash: int
+    extra_hash: int
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "preset_id": f"0x{self.preset_id:08x}",
+            "state_id": f"0x{self.state_id:08x}",
+            "drawable_hash": f"{self.drawable_hash:016x}",
+            "albedo_hash": f"{self.albedo_hash:016x}",
+            "normal_hash": f"{self.normal_hash:016x}",
+            "extra_hash": f"{self.extra_hash:016x}",
+        }
+
+
+def _selected_kit_member(
+    presets: dict[int, PresetRecord], preset_id: int, state_id: int, warnings: list[str]
+) -> KitMember:
+    preset = presets[preset_id]
+    visited: set[int] = set()
+    drawable = albedo = normal = extra = 0
+    found = False
+    while True:
+        if preset.preset_id in visited:
+            warnings.append(f"parent cycle at preset 0x{preset.preset_id:08x} for member 0x{preset_id:08x}")
+            break
+        visited.add(preset.preset_id)
+        matches = [state for state in preset.states if state.state_id == state_id]
+        if len(matches) > 1:
+            raise ValueError(f"ambiguous state 0x{state_id:08x} in preset 0x{preset.preset_id:08x}")
+        if matches:
+            found = True
+            state = matches[0]
+            drawable = drawable or state.drawable_hash
+            albedo = albedo or state.albedo_hash
+            normal = normal or state.normal_hash
+            extra = extra or state.extra_hash
+        if not preset.parent_id:
+            break
+        if preset.parent_id not in presets:
+            warnings.append(f"preset 0x{preset.preset_id:08x} references missing parent 0x{preset.parent_id:08x}")
+            break
+        preset = presets[preset.parent_id]
+    if not found:
+        warnings.append(f"state 0x{state_id:08x} missing from preset 0x{preset_id:08x} and its parents")
+    return KitMember(preset_id, state_id, drawable, albedo, normal, extra)
+
+
+def resolve_kit(
+    data: bytes | bytearray | memoryview, kit_id: int
+) -> tuple[list[KitMember], list[str]]:
+    """Expand one kit in first-visit order and resolve its selected states in the same catalogue."""
+    framing, root_block, blocks = _catalogue_block_table(data)
+    kits = parse_kit_members(blocks, root_block)
+    if kit_id not in kits:
+        raise ValueError(f"unknown kit 0x{kit_id:08x}")
+    catalogue = parse_catalogue_blocks(blocks, root_block, framing=framing, rooted_presets_only=True)
+    presets = catalogue.presets_by_id
+    overlap = kits.keys() & presets.keys()
+    if overlap:
+        raise ValueError(f"ambiguous ID 0x{min(overlap):08x} refers to both kit and preset")
+
+    warnings = list(catalogue.warnings)
+    members: list[KitMember] = []
+    selected: set[tuple[int, int]] = set()
+    active = {kit_id}
+    expanded: set[int] = set()
+    stack = [(kit_id, iter(kits[kit_id]))]
+    while stack:
+        current, children = stack[-1]
+        edge = next(children, None)
+        if edge is None:
+            active.remove(current)
+            expanded.add(current)
+            stack.pop()
+            continue
+        child, state_id = edge
+        if child in kits:
+            if state_id:
+                warnings.append(f"kit 0x{current:08x}: unsupported selector 0x{state_id:08x} on nested kit 0x{child:08x}")
+            elif child in active:
+                warnings.append(f"kit cycle from 0x{current:08x} to 0x{child:08x}")
+            elif child not in expanded:
+                active.add(child)
+                stack.append((child, iter(kits[child])))
+        elif child not in presets:
+            warnings.append(f"kit 0x{current:08x} references missing member 0x{child:08x}")
+        elif edge not in selected:
+            selected.add(edge)
+            members.append(_selected_kit_member(presets, child, state_id, warnings))
+    return members, list(dict.fromkeys(warnings))
 
 
 def resolve_ancestor_tags(
@@ -1323,6 +1515,13 @@ def _nonneg_int(text: str) -> int:
     return value
 
 
+def _kit_id(text: str) -> int:
+    value = _nonneg_int(text)
+    if value > 0xffffffff:
+        raise argparse.ArgumentTypeError("kit ID must fit in 32 bits")
+    return value
+
+
 def _pos_int(text: str) -> int:
     try:
         value = int(text, 0)
@@ -1430,6 +1629,16 @@ def _cmd_census(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_catalogue_file(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x5E, 0x9C, 0xDA):
+        inflated = _inflate_at(data, 0, len(data), MAX_INFLATE)
+        if inflated is not None:
+            return inflated[0]
+    return data
+
+
 def _cmd_inspect(args: argparse.Namespace) -> int:
     if args.out:
         err = _check_out_path(args.out, [args.file])
@@ -1440,13 +1649,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         print(f"ERROR: {args.file}: no such file", file=sys.stderr)
         return 2
     try:
-        with open(args.file, "rb") as fh:
-            data = fh.read()
-        if len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x5E, 0x9C, 0xDA):
-            inflated = _inflate_at(data, 0, len(data), MAX_INFLATE)
-            if inflated is not None:
-                data = inflated[0]
-        cat = parse_catalogue_strict(data, source=args.file)
+        cat = parse_catalogue_strict(_read_catalogue_file(args.file), source=args.file)
     except (OSError, ValueError) as exc:
         print(f"ERROR: {args.file}: {exc}", file=sys.stderr)
         return 2
@@ -1476,6 +1679,36 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
                 f"    preset 0x{p.preset_id:08x} parent=0x{p.parent_id:08x} "
                 f"cat=0x{p.category:08x} tags={len(p.tags)} states={len(p.states)} culls={culls}"
             )
+    return 0
+
+
+def _cmd_kit(args: argparse.Namespace) -> int:
+    try:
+        if args.out:
+            error = _check_out_path(args.out, [args.file])
+            if error:
+                raise ValueError(error)
+        members, warnings = resolve_kit(_read_catalogue_file(args.file), args.id)
+        payload = {
+            "kit_id": f"0x{args.id:08x}",
+            "members": [member.to_dict() for member in members],
+            "warnings": warnings,
+        }
+        if args.out:
+            _write_json(args.out, payload)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {args.file}: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        json.dump(payload, sys.stdout, indent=1)
+        sys.stdout.write("\n")
+    else:
+        print(f"kit 0x{args.id:08x} ({len(members)} members)")
+        for row in members:
+            print(f"  preset=0x{row.preset_id:08x} state=0x{row.state_id:08x} drawable={row.drawable_hash:016x} "
+                  f"albedo={row.albedo_hash:016x} normal={row.normal_hash:016x} extra={row.extra_hash:016x}")
+        for warning in warnings:
+            print(f"  warning: {warning}")
     return 0
 
 
@@ -1586,6 +1819,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ins.add_argument("--out", help="write JSON result to FILE")
     p_ins.add_argument("--limit", type=_nonneg_int, default=10, help="number of presets to include (default 10, 0 for summary)")
     p_ins.set_defaults(func=_cmd_inspect)
+
+    p_kit = sub.add_parser("kit", help="expand an outfit kit and resolve its selected drawable and texture hashes")
+    p_kit.add_argument("file", help="path to one .pso or .0drp catalogue")
+    p_kit.add_argument("--id", required=True, type=_kit_id, help="32-bit kit ID in decimal or 0x-prefixed hex")
+    p_kit.add_argument("--json", action="store_true", help="print the kit as JSON")
+    p_kit.add_argument("--out", help="write the kit as JSON to FILE")
+    p_kit.set_defaults(func=_cmd_kit)
 
     p_res = sub.add_parser("resolve", help="resolve preset inheritance, textures, and cull_drawable swaps")
     p_res.add_argument("source", help=".pso/.0drp file, carved directory, or .rpf archive")
