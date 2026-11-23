@@ -45,6 +45,28 @@ class DocsTableRowsTest(unittest.TestCase):
                     block = []
             check(block)
 
+    def test_readme_status_table_has_one_row_per_topic(self):
+        # Merges that keep both sides of the status table leave two rows for one topic with different text, which
+        # the identical-row check above can't see (PROC-234: 16 rows for 6 topics on 561b65a8).
+        lines = (ROOT / "README.md").read_text(encoding="utf-8").splitlines()
+        tables, block = [], []
+        for i, line in enumerate(lines, 1):
+            if line.startswith("|"):
+                block.append((i, line))
+            elif block:
+                tables.append(block)
+                block = []
+        if block:
+            tables.append(block)
+        status = [t for t in tables if any("Shaders: RDNA2" in row for _, row in t)]
+        self.assertEqual(len(status), 1, "README.md: the status table (with the shader translation row) not found")
+        seen = {}
+        for lineno, row in status[0][2:]:   # skip the header and its separator
+            topic = row.split("|")[1].strip()
+            if topic in seen:
+                self.fail(f"README.md:{seen[topic]} and {lineno}: two status rows for {topic!r}")
+            seen[topic] = lineno
+
 
 if __name__ == "__main__":
     unittest.main()
