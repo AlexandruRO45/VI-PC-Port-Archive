@@ -216,8 +216,10 @@ python -I tools/awc_markers.py <game>\audio.rpf --out <temp>\awc_markers.json
 (the same 7,162 banks), jumps over each parsed bank and reads only the `0xBD` chunks and the stream lengths:
 under a minute for the 28.5 GB archive on an NVMe drive (10 s once the file is cached). It prints the two
 groups and their 20 most frequent types; the JSON has every type with its events, chunks, value range and,
-for a type with at most 8 distinct values, the value bits. It also takes one `.awc` bank or a directory of
-them. The report is counts, hashes and numeric ranges; it has no names and no audio.
+for a type with at most 8 distinct values, the value bits. `--out` creates its parent folder when that is
+missing, and is refused when it names a folder or the bank being scanned (one error line, exit 2). It also
+takes one `.awc` bank or a directory of them. The report is counts, hashes and numeric ranges; it has no names
+and no audio.
 `tests/test_awc_markers.py` builds its banks by hand.
 
 Not reproduced by the tool: the track-marker cross-checks (the link by `value`, the stretch lengths, the
