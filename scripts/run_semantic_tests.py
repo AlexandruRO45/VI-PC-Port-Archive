@@ -7,7 +7,8 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
 It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each as
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
-or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
+or on a single core, it runs that discover command itself. The cores are the ones this process may run on (taskset, a
+container's cpuset), not every core of the machine. Prints the output of every failing file and one summary
 line, and exits 1 if a file fails or none is found. Standard library only.
 """
 import argparse
@@ -41,12 +42,28 @@ def run_module(directory, module, verbose):
     return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
 
 
+def usable_cpus():
+    """CPUs this process may run on: on Linux its affinity mask (taskset, a container's cpuset), not the host's count.
+    A mask that cannot be read (EPERM under a seccomp or LSM policy) or gives no answer falls back to the host's
+    count, then to 1."""
+    try:
+        if hasattr(os, "process_cpu_count"):  # Python 3.13+: the mask, or os.cpu_count() where there is none
+            count = os.process_cpu_count()
+        else:
+            count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+    except OSError:
+        count = None
+    return count or os.cpu_count() or 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("directory", help="the suite's folder, tests/semantic")
-    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="files at a time (default: cores)")
+    ap.add_argument("-j", "--jobs", type=int, help="files at a time (default: the cores this process may use)")
     ap.add_argument("-v", "--verbose", action="store_true", help="unittest -v, and print passing files' output")
     a = ap.parse_args(argv)
+    if a.jobs is None:  # only the default asks the system: --help and an explicit -j never depend on the probe
+        a.jobs = usable_cpus()
     directory = os.path.abspath(a.directory)
     if a.jobs <= 1:
         return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
