@@ -553,6 +553,30 @@ class ParsingTests(unittest.TestCase):
                 with self.assertRaises(smh_groom.GroomError):
                     list(smh_groom.scan_offsets(raw, chunk=bad_chunk))
 
+    def test_resource_readers_use_byte_offsets_for_memoryviews(self):
+        system, gpu = build_synthetic_groom_buffers(flags=0x440, seeds=(0x111, 0x222))
+        offset = 32
+        raw = bytes(offset) + pack_native_resource(system, gpu)
+        raw += bytes((-len(raw)) % 4)
+        interleaved = bytearray(2 * len(raw))
+        interleaved[::2] = raw
+        expected_page = smh_groom.inflate_stream(raw, offset + 16)
+
+        for label, view in (
+            ("typed", memoryview(raw).cast("I")),
+            ("two-dimensional", memoryview(raw).cast("B", shape=(2, len(raw) // 2))),
+            ("strided", memoryview(interleaved)[::2]),
+        ):
+            with self.subTest(view=label):
+                found, = smh_groom.scan_offsets(view)
+                self.assertEqual(found, offset)
+                resource = smh_groom.read_resource(view, found)
+                self.assertEqual(resource.flags, 0x440)
+                self.assertEqual(resource.seed(0), 0x111)
+                self.assertEqual(smh_groom.inflate_stream(view, offset + 16), expected_page)
+
+        self.assertTrue(smh_groom.system_page_is_groom(memoryview(system).cast("I")))
+
     def test_load_groom_all_file_formats(self):
         sysd, gpu = build_synthetic_groom_buffers()
         native = pack_native_resource(sysd, gpu)

@@ -146,8 +146,18 @@ def _clean_zero(value: float) -> float:
     return 0.0 if value == 0.0 else value
 
 
+def _byte_source(src):
+    """Return a contiguous byte source for checks and slices that use byte offsets."""
+    if not isinstance(src, memoryview):
+        return src
+    if not src.c_contiguous or not src.nbytes or 0 in src.strides:
+        return src.tobytes()
+    return src if src.ndim == 1 and src.format == "B" else src.cast("B")
+
+
 def inflate_stream(src: bytes | bytearray | memoryview | mmap.mmap, pos: int) -> tuple[bytes, int]:
     """Inflate one zlib stream at ``pos`` -> ``(raw_bytes, next_16_aligned_offset)``."""
+    src = _byte_source(src)
     decoder = zlib.decompressobj()
     out = bytearray()
     size = len(src)
@@ -177,6 +187,7 @@ def _sys_ptr(sysd: bytes, at: int) -> int:
 
 def system_page_is_groom(sysd: bytes | bytearray | memoryview) -> bool:
     """Return True if ``sysd`` starts like an inflated smh groom LOD system page."""
+    sysd = _byte_source(sysd)
     if len(sysd) < 0xE0 or bytes(sysd[:8]) != b"\x00" * 8:
         return False
     if struct.unpack_from("<I", sysd, 0x1C)[0] != TYPE_ID:
@@ -202,13 +213,9 @@ def scan_offsets(
     """Yield the byte offset of every groom LOD resource in ``src`` (16-aligned zero prefix + zlib page)."""
     if isinstance(chunk, bool) or chunk <= 0:
         raise GroomError(f"scan chunk size must be positive, got {chunk}")
-    if isinstance(src, memoryview):
-        if src.nbytes == 0:
-            return
-        if src.c_contiguous and 0 not in src.strides:
-            src = src.cast("B")
-        elif not (src.ndim == 1 and src.itemsize == 1):
-            src = src.tobytes()
+    # Strided byte views can still be searched one window at a time.
+    if isinstance(src, memoryview) and (src.c_contiguous or src.ndim != 1 or src.itemsize != 1):
+        src = _byte_source(src)
     size = len(src)
     stop = size if stop is None else min(stop, size)
     first = (max(start, 0) + 15) & -16
@@ -674,6 +681,7 @@ def read_resource(
     archive: str = "",
 ) -> Groom:
     """Read one groom LOD resource whose 16-byte zero prefix starts at ``offset``."""
+    src = _byte_source(src)
     if offset < 0 or offset + 17 > len(src):
         raise GroomError(f"resource offset {offset:#x} out of range")
     if bytes(src[offset:offset + 16]) != b"\x00" * 16:
