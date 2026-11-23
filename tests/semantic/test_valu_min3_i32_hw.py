@@ -481,5 +481,71 @@ class TestVMin3I32IEEE754Bitwise(unittest.TestCase):
         res = v_min3_i32_oracle(0, neg_inf, 100)
         self.assertEqual(res, neg_inf)
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+class TestVMin3I32NegativeAndMutation(unittest.TestCase):
+    """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
+
+    def test_reject_out_of_bounds_vgpr(self):
+        for oob in (256, 300, 512):
+            with self.subTest(oob=oob):
+                instr = VMin3I32Instruction(
+                    dst=RegOperand(RegisterKind.VGPR, index=oob),
+                    src0=RegOperand(RegisterKind.VGPR, index=0),
+                    src1=RegOperand(RegisterKind.VGPR, index=1),
+                    src2=RegOperand(RegisterKind.VGPR, index=2)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_invalid_destination_kind(self):
+        for bad_kind in (RegisterKind.SGPR, RegisterKind.LITERAL32):
+            with self.subTest(bad_kind=bad_kind):
+                instr = VMin3I32Instruction(
+                    dst=RegOperand(bad_kind, index=0),
+                    src0=RegOperand(RegisterKind.VGPR, index=0),
+                    src1=RegOperand(RegisterKind.VGPR, index=1),
+                    src2=RegOperand(RegisterKind.VGPR, index=2)
+                )
+                with self.assertRaises(TypeError):
+                    instr.validate()
+
+    def test_mutation_detector_unsigned_vs_signed(self):
+        """Verify detection of unsigned min mutant."""
+        def mutant_min3_u32(s0: int, s1: int, s2: int) -> int:
+            return min(s0 & MASK32, s1 & MASK32, s2 & MASK32)
+
+        s0 = 0xFFFF_FFFF  # signed -1, unsigned 4294967295
+        s1 = 0
+        s2 = 1
+
+        correct = v_min3_i32_oracle(s0, s1, s2)
+        mutant = mutant_min3_u32(s0, s1, s2)
+
+        # Correct signed min is -1 (0xFFFFFFFF)
+        self.assertEqual(correct, 0xFFFF_FFFF)
+        # Mutant unsigned min is 0
+        self.assertEqual(mutant, 0)
+        self.assertNotEqual(mutant, correct)
+
+    def test_mutation_detector_max3_mutant(self):
+        """Verify detection of max3 mutant."""
+        def mutant_max3_i32(s0: int, s1: int, s2: int) -> int:
+            return to_u32(max(to_s32(s0), to_s32(s1), to_s32(s2)))
+
+        s0 = to_u32(-10)
+        s1 = to_u32(0)
+        s2 = to_u32(10)
+
+        correct = v_min3_i32_oracle(s0, s1, s2)
+        mutant = mutant_max3_i32(s0, s1, s2)
+
+        self.assertEqual(to_s32(correct), -10)
+        self.assertEqual(to_s32(mutant), 10)
+        self.assertNotEqual(mutant, correct)
+
+
 if __name__ == "__main__":
     unittest.main()
