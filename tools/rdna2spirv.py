@@ -34,6 +34,7 @@ import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
+import spirv_tools_lib  # noqa: E402
 import wave64_emulate_opt  # noqa: E402
 import wave64_halves  # noqa: E402
 
@@ -17408,10 +17409,14 @@ def _run_spirv_tool(cmd, **kwargs):
 def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
     """Keep the assembled module out of the final path until validation succeeds.
 
-    `assembler="spirv-as"` invokes the external spirv-as binary on `sa` (default);
+    `assembler="spirv-as"` assembles as the spirv-as binary does (default);
     `assembler="python"` encodes `asm_text` (or reads `sa`) directly in memory with
     tools/spirv_asm.py, avoiding the spirv-as subprocess and temporary .spvasm I/O.
+    Where the SPIRV-Tools shared library of the spirv-as and spirv-val on PATH is found (tools/spirv_tools_lib.py),
+    spirv-as and spirv-val run in this process through it: the same bytes and the same verdict without two process
+    launches per module. Otherwise the two programs are launched.
     """
+    lib = spirv_tools_lib.load()
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
     # spirv-as reads the .spvasm from stdin, and both tools run in the output folder with the staging file's bare
@@ -17429,22 +17434,35 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
                 result = subprocess.CompletedProcess(["spirv_asm"], 1, "", str(exc))
         else:
             try:
-                with open(sa, "rb") as f:
-                    source = f.read()
+                if asm_text is not None:
+                    source = asm_text.encode("utf-8")
+                else:
+                    with open(sa, "rb") as f:
+                        source = f.read()
             except OSError as exc:
                 result = subprocess.CompletedProcess(["spirv-as"], 1, "", f"error: cannot read {sa}: {exc}")
             else:
-                result = _run_spirv_tool(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
-                                        input=source, capture_output=True, cwd=folder)
+                if lib is not None:
+                    status, module, err = lib.assemble(source)
+                    if status == 0:
+                        tmp.write_bytes(module)
+                    result = subprocess.CompletedProcess(["spirv-as"], status, "", err)
+                else:
+                    result = _run_spirv_tool(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
+                                            input=source, capture_output=True, cwd=folder)
                 # stdin is bytes, so the output is too; a test double may already answer in text.
                 if isinstance(result.stdout, bytes):
                     result.stdout = result.stdout.decode("utf-8", "replace")
                 if isinstance(result.stderr, bytes):
                     result.stderr = result.stderr.decode("utf-8", "replace")
         if result.returncode == 0:
-            # Offset on non-gather: VK_KHR_maintenance8
-            result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
-                                     tmp.name], capture_output=True, text=True, cwd=folder)
+            # Offset on non-gather: VK_KHR_maintenance8 (spirv_tools_lib.load() sets the same option)
+            if lib is not None:
+                status, err = lib.validate(tmp.read_bytes())
+                result = subprocess.CompletedProcess(["spirv-val"], status, "", err)
+            else:
+                result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
+                                         tmp.name], capture_output=True, text=True, cwd=folder)
         if result.returncode == 0:
             tmp.replace(sv)
         else:
@@ -17692,7 +17710,8 @@ def main():
         ok += 1
         sa = os.path.join(a.out, name + ".spvasm")
         sv = os.path.join(a.out, name + ".spv")
-        write_asm = not (a.no_asm and a.assembler == "python")
+        # assemble_spirv takes the text from memory with the Python assembler or the in-process SPIRV-Tools.
+        write_asm = not (a.no_asm and (a.assembler == "python" or spirv_tools_lib.load() is not None))
         if write_asm:
             with open(sa, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
