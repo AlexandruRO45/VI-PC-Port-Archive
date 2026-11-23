@@ -44,7 +44,7 @@ def run(directory, dxc, mapper, exe, lifted, companion, io, xmem, d3d12):
     mapped = [sys.executable, "-B", Path(__file__).with_name("shim_startup_check.py"), "--map",
               mapper, exe, companion, io, xmem, d3d12, ""]
     markers = sorted(f"bound {dll}!{symbol}" for dll, symbols in SHIM_IMPORTS.items() for symbol in symbols)
-    for case, expected in (("shadow", current), ("shadow-stale", stale)):
+    for case, expected in (("shadow", current), ("shadow-stale", stale), ("shadow-reject", b"")):
         env = dict(os.environ, X2W_SHIM_DRAW_CASE=case, X2W_SHIM_COMPUTE_CASE="", X2W_SHIM_CHAIN_DIR=str(directory))
         for runner, command in (("native", [exe]), ("pe_map", mapped), ("AOT", [lifted])):
             child = subprocess.run(command, env=env, capture_output=True, timeout=120)
@@ -52,11 +52,17 @@ def run(directory, dxc, mapper, exe, lifted, companion, io, xmem, d3d12):
             if child.returncode == 77 and case == "shadow" and runner == "native":
                 print("skip:", child.stdout.decode(errors="replace"), lines)
                 return 77
-            check(f"{case} {runner} diagnostics", sorted(lines),
-                  sorted([*markers, "mapped host returned"]) if runner == "pe_map" else [])
-            check(f"{case} {runner} exit", child.returncode, 42)
+            diagnostics = [*markers, "mapped host returned"] if runner == "pe_map" else []
+            if case == "shadow-reject":
+                diagnostics.append("Xbox device rejected: no device, released adapter and factory")
+            check(f"{case} {runner} diagnostics", sorted(lines), sorted(diagnostics))
+            check(f"{case} {runner} exit", child.returncode, 20 if case == "shadow-reject" else 42)
             check(f"{case} {runner} startup", child.stdout[:len(EXPECTED.output)], EXPECTED.output)
             payload = child.stdout[len(EXPECTED.output):]
+            if case == "shadow-reject":
+                check(f"{case} {runner} publishes no frame data", payload, b"")
+                print(f"{case} {runner}: adapter and factory released, no frame payload, exit=20")
+                continue
             check(f"{case} {runner} frame payload length", len(payload), len(expected) + 1)
             check(f"{case} {runner} tracked surface releases", payload[-1], 4)
             check(f"{case} {runner} readback mismatch count", shadow.differences(payload[:-1], expected), 0)

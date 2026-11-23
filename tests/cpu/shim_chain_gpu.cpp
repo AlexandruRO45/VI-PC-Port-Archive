@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 
+extern "C" HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+
 namespace {
 using Microsoft::WRL::ComPtr;
 
@@ -65,7 +67,7 @@ std::vector<char> read_input(const char* name)
 // WARP by default. "hardware" takes the first physical D3D12 adapter in high-performance
 // order or, with XBOX2WINDOWS_ADAPTER, the first whose description contains that value.
 // No physical adapter is a capability skip (77); a filter that matches none is an error.
-ComPtr<ID3D12Device> create_device()
+ComPtr<ID3D12Device> create_device(bool xbox_shim = false, bool reject = false)
 {
     ComPtr<IDXGIFactory6> factory;
     require(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
@@ -106,7 +108,21 @@ ComPtr<ID3D12Device> create_device()
         require(E_INVALIDARG, "Select draw adapter");
     }
     ComPtr<ID3D12Device> device;
-    require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+    if (!xbox_shim) {
+        require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+        return device;
+    }
+    if (reject) {
+        void* rejected = adapter.Get();
+        const auto hr = D3D12XboxCreateDevice(adapter.Get(), nullptr, __uuidof(IDXGIFactory6), &rejected);
+        if (hr != E_NOINTERFACE || rejected || !adapter || !factory)
+            fail("Unexpected rejected shim device or missing adapter ownership");
+        adapter.Reset();
+        factory.Reset();
+        std::fputs("Xbox device rejected: no device, released adapter and factory\n", stderr);
+        throw Failure{};
+    }
+    require(D3D12XboxCreateDevice(adapter.Get(), nullptr, IID_PPV_ARGS(&device)), "D3D12XboxCreateDevice");
     return device;
 }
 
@@ -380,13 +396,13 @@ bool shim_chain_gpu(unsigned mode, std::vector<unsigned char>& published, unsign
     }
 }
 
-bool shim_shadow_gpu(bool stale, std::vector<unsigned char>& output)
+bool shim_shadow_gpu(bool stale, bool reject, std::vector<unsigned char>& output)
 {
     try {
         const auto* path = std::getenv("X2W_SHIM_CHAIN_DIR");
         if (!path || !*path) return false;
         const auto directory = std::filesystem::path(path);
-        auto device = create_device();
+        auto device = create_device(true, reject);
         if (!check_mesh_shadow_draw(device.Get(), (directory / "mesh.dxil").string().c_str(),
                                     (directory / "receiver.dxil").string().c_str(),
                                     (directory / "caster.dxil").string().c_str(),

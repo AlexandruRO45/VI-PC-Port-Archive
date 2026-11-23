@@ -3831,3 +3831,11 @@ GPU fence, and verifies exit code 42. The stale binding changes only the
 second color frame and is checked against its own reference.
 
 Run `ctest --preset release --no-tests=error -R '^cpu_shim_shadow_(warp|hardware)$' -V`.
+
+The EXE shadow path selects an adapter in the host and calls the
+`d3d12_xs.dll!D3D12XboxCreateDevice` shim to create the actual device at feature
+level 12.0. The fixture uses a null parameter block and the desktop
+`ID3D12Device` interface. A non-null Xbox parameter block or unsupported
+interface is rejected. The negative case supplies an unsupported IID after
+adapter selection. It checks the cleared device output, release of the adapter
+and factory references, zero frame bytes and exit code 20 on all three runners.

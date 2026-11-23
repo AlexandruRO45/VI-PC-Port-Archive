@@ -10,7 +10,7 @@
 bool shim_draw_gpu(unsigned mode, std::vector<unsigned char>& rgba);
 bool shim_chain_gpu(unsigned mode, std::vector<unsigned char>& published, unsigned& mismatches);
 
-bool shim_shadow_gpu(bool stale, std::vector<unsigned char>& output);
+bool shim_shadow_gpu(bool stale, bool reject, std::vector<unsigned char>& output);
 
 namespace {
 constexpr unsigned side = 64;
@@ -54,6 +54,7 @@ extern "C" __declspec(dllexport) DWORD draw_request()
         if (!std::strcmp(mode, "fail-second")) return 8;
         if (!std::strcmp(mode, "shadow")) return 14;
         if (!std::strcmp(mode, "shadow-stale")) return 15;
+        if (!std::strcmp(mode, "shadow-reject")) return 16;
         if (!std::strcmp(mode, "texture")) return 10;
         if (!std::strcmp(mode, "texture-stale")) return 12;
     }
@@ -69,9 +70,9 @@ extern "C" __declspec(dllexport) DWORD draw_frame(DWORD mode)
         if (!publish(published.data(), static_cast<DWORD>(published.size()))) ExitProcess(23);
         return count;
     }
-    if (mode == 14 || mode == 15) {
+    if (mode >= 14 && mode <= 16) {
         std::vector<unsigned char> output;
-        if (!shim_shadow_gpu(mode == 15, output)) return 0xFFFFFFFF;
+        if (!shim_shadow_gpu(mode == 15, mode == 16, output)) return 0xFFFFFFFF;
         if (!publish(output.data(), static_cast<DWORD>(output.size()))) ExitProcess(23);
         return 0;
     }
