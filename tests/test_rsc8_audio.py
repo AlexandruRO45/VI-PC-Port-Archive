@@ -657,6 +657,34 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual((w["rsc8_outside_adat"], w["window_starts_in_bank"]), (1, None))
             self.assertEqual((full["adat_banks_past_window"], full["window_starts_in_bank"]), (0, None))
 
+    def test_window_end_inside_a_magic(self):
+        """A window that ends 1-3 bytes into an ADAT magic, or a few bytes into a stray RSC8 header, still finds it:
+        the bank (or header) starts inside the window, so the two adjacent windows add up to the whole archive."""
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=142)
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 89600}])
+        stray = build_synthetic_rsc8(stream_hash=0x11112222, frames=61)
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                boff = f.tell()
+                f.write(bank)
+                f.write(bytes(0x80))
+                soff = f.tell()
+                f.write(stray)
+            _, full = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual((full["adat_banks"], full["rsc8_in_adat"], full["rsc8_outside_adat"]), (1, 1, 1))
+            for cut in [boff + k for k in range(5)] + [soff + k for k in range(9)]:
+                with self.subTest(cut=cut):
+                    _, a = rsc8_audio.scan_rpf(rpf, limit=cut)
+                    _, b = rsc8_audio.scan_rpf(rpf, start=cut)
+                    for key in ("adat_banks", "adat_bytes", "rsc8_in_adat", "rsc8_outside_adat"):
+                        self.assertEqual(a[key] + b[key], full[key], key)
+                    self.assertEqual(a["span"] + b["span"], full["span"])
+                    # A match is taken only when it starts inside the window.
+                    self.assertEqual(a["adat_banks"], int(cut > boff))
+                    self.assertEqual(a["rsc8_outside_adat"], int(cut > soff))
+
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.rpf")

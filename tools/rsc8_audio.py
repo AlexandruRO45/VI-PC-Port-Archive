@@ -1446,10 +1446,13 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
         next_prog = start + 2 * 1024 * 1024 * 1024
         while pos < scan_end:
             f.seek(pos)
-            buf = f.read(min(SCAN_CHUNK_BYTES + 16, scan_end - pos))
+            # The 16 bytes past the chunk are read even past the window end: a magic or an RSC8 version word that
+            # starts inside the window and ends past it must still match, or the bank or header would be counted
+            # in neither of two adjacent windows. Only a match that starts before chunk_lim is taken.
+            buf = f.read(min(SCAN_CHUNK_BYTES + 16, sz - pos))
             if not buf:
                 break
-            chunk_lim = min(len(buf), SCAN_CHUNK_BYTES)
+            chunk_lim = min(len(buf), SCAN_CHUNK_BYTES, scan_end - pos)
 
             # 1. Discover valid ADAT banks in [pos, pos + chunk_lim)
             cur = 0
