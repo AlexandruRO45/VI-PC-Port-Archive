@@ -1556,9 +1556,12 @@ class Gen:
         text = line + " " + str(ins.get("raw", ""))
         bm = _re.search(r'swizzle\(BITMASK_PERM,\s*"([01pi]{5})"\)', text)
         m = _re.search(r"swizzle\((\w+)((?:,\s*\d+)*)\)", text)
-        if not m and not bm:
+        numeric = _re.search(r"\boffset:(0[xX][0-9a-fA-F]+|[0-9]+)\b", text)
+        offset = int(numeric.group(1), 0) if numeric else 0
+        numeric_mode = offset & 0xe000 if 0 <= offset <= 0xffff else 0
+        if not m and not bm and numeric_mode not in (0xc000, 0xe000):
             raise Unsupported("ds_swizzle pattern")
-        kind = "BITMASK_PERM" if bm else m.group(1)
+        kind = "BITMASK_PERM" if bm else m.group(1) if m else "ROTATE" if numeric_mode == 0xc000 else "FFT"
         args = [int(x) for x in m.group(2).split(",")[1:]] if m and m.group(2) else []
         self.uses_subgroup = True
         lane = self.tmp()
@@ -1601,6 +1604,23 @@ class Gen:
             src, keep = self.tmp(), self.tmp()
             self.emit(f"{keep} = OpBitwiseAnd %uint {lane} {self.cu(~(args[0] - 1) & 0xFFFFFFFF)}")
             self.emit(f"{src} = OpBitwiseOr %uint {keep} {self.cu(args[1])}")
+        elif kind in ("ROTATE", "FFT"):
+            low, preserved, shuffled, src = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            mask = offset & 31
+            self.emit(f"{low} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            self.emit(f"{preserved} = OpBitwiseAnd %uint {lane} {self.cu(0xffffffe0 | mask)}")
+            if kind == "ROTATE":
+                amount = (offset >> 5) & 31
+                if offset & 0x400:
+                    amount = (-amount) & 31
+                added = self.tmp()
+                self.emit(f"{added} = OpIAdd %uint {low} {self.cu(amount)}")
+                self.emit(f"{shuffled} = OpBitwiseAnd %uint {added} {self.cu(31 ^ mask)}")
+            else:
+                reversed_bits = self.tmp()
+                self.emit(f"{reversed_bits} = OpBitReverse %uint {low}")
+                self.emit(f"{shuffled} = OpShiftRightLogical %uint {reversed_bits} {self.cu(27 + mask.bit_count())}")
+            self.emit(f"{src} = OpBitwiseOr %uint {preserved} {shuffled}")
         else:
             raise Unsupported("ds_swizzle " + kind)
         self.ds_lane_read(a[0], self.src_u(a[1]), src, lane)
