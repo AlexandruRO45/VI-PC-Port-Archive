@@ -151,5 +151,47 @@ class SchedulerSegments(unittest.TestCase):
         self.assertEqual(self.measure(assembly), (16_384, 1))
 
 
+class MismatchCount(unittest.TestCase):
+    """run() parses the harness mismatch total as a whole number: a count of 10, 20 or 100 is a
+    failure, never a pass (SHADER-749). The harness output is stubbed; no GPU, LLVM or Vulkan SDK."""
+    BASE = ("bench ms: median=1.000 min=0.900 max=1.100 n=4\n"
+            "bench out fnv1a: cafe1234\n"
+            "device: stub GPU (subgroup 64)\n")
+
+    @staticmethod
+    def run_with(stdout="", stderr="", returncode=0):
+        from types import SimpleNamespace
+        proc = SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+        with patch.object(bench_wave64.subprocess, "run", return_value=proc):
+            return bench_wave64.run("tools", "x.spv", 2, 4, "stub", False)
+
+    def test_clean_output_passes(self):
+        timings, why, _ = self.run_with(stdout=self.BASE + "2 groups x 64: 0 mismatches\n")
+        self.assertEqual(timings, (1.0, 0.9))
+        self.assertEqual(why, "cafe1234")
+    def test_ten_mismatches_fails(self):
+        timings, why, _ = self.run_with(stdout=self.BASE + "2 groups x 64: 10 mismatches\n")
+        self.assertIsNone(timings)
+        self.assertIn("10 mismatches", why)
+    def test_twenty_mismatches_fails(self):
+        timings, why, _ = self.run_with(stdout=self.BASE + "2 groups x 64: 20 mismatches (first at 5)\n")
+        self.assertIsNone(timings)
+        self.assertIn("20 mismatches", why)
+    def test_hundred_mismatches_fails(self):
+        timings, why, _ = self.run_with(stdout=self.BASE + "2 groups x 64: 100 mismatches\n")
+        self.assertIsNone(timings)
+        self.assertIn("100 mismatches", why)
+
+    def test_missing_mismatches_line_fails(self):
+        timings, why, _ = self.run_with(stdout=self.BASE)
+        self.assertIsNone(timings)
+        self.assertIn("mismatches line", why)
+
+    def test_nonzero_exit_fails_before_the_count(self):
+        timings, why, _ = self.run_with(stdout=self.BASE + "2 groups x 64: 0 mismatches\n", returncode=1)
+        self.assertIsNone(timings)
+        self.assertIn("exit 1", why)
+
+
 if __name__ == "__main__":
     unittest.main()
