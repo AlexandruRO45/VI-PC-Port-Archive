@@ -619,6 +619,21 @@ class TestDsWriteB32Oracle(unittest.TestCase):
         ref_ds_write_b32(lds, LDS_SIZE + 8, 0x12345678)
         self.assertEqual(lds.read_u32(8), 0x12345678)
 
+class LdsWriteB32Expr(ASTNode):
+    def __init__(self, offset: int = 0) -> None:
+        self.offset = offset
+
+    def eval(self, lds: LdsModel, addr: int, val: int) -> None:
+        ref_ds_write_b32(lds, addr, val, self.offset)
+
+
+class TestDsWriteB32AST(unittest.TestCase):
+    def test_write_b32_ast_eval(self) -> None:
+        lds = LdsModel()
+        expr = LdsWriteB32Expr(offset=16)
+        expr.eval(lds, 0x20, 0xCAFEBABE)
+        self.assertEqual(lds.read_u32(0x30), 0xCAFEBABE)
+
 
 if __name__ == "__main__":
     unittest.main()
