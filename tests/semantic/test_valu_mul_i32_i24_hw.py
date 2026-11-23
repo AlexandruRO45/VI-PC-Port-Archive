@@ -302,5 +302,22 @@ class TestMul24BoundaryAndExtremes(unittest.TestCase):
                 self.assertEqual(words[0], expected)
 
 
-if __name__ == '__main__':
+class TestMul24NegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: negative controls, syntax rejection, and mutation detection for v_mul_i32_i24."""
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_mul24_bad_nop", ["v_mul_i32_i24 v0", "s_endpgm"])
+
+    def test_syntax_rejection_invalid_opcode(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_mul24_bad_op", ["v_mul_i32_i24_nonexistent v0, v1, v2", "s_endpgm"])
+
+    def test_mutation_detection_unsigned_multiplication(self):
+        # Oracle catches mutation if unsigned 24-bit multiplication is used instead of signed
+        unsigned_oracle = lambda a, b: ((a & 0xFFFFFF) * (b & 0xFFFFFF)) & MASK32
+        self.assertNotEqual(v_mul_i32_i24_oracle(0xFFFFFF, 5), unsigned_oracle(0xFFFFFF, 5))
+
+
+if __name__ == "__main__":
     unittest.main()
