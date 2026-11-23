@@ -7,6 +7,7 @@
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <array>
+#include <span>
 #include <vector>
 #include <cstring>
 #include <cstdint>
@@ -28,10 +29,11 @@ struct Event {
     ~Event() { if (handle) CloseHandle(handle); }
 };
 
-// With `cast` set, the texture lists it as its castable format (CreateCommittedResource3) and the clears go through an
-// RTV in it.
+// With `cast` set, CreateCommittedResource3 uses the supplied castable list (or just `cast` by default).
+// The clears go through an RTV in `cast`.
 bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, const FLOAT* full, const FLOAT* part,
-                    std::vector<unsigned char>& pixels, bool volume = false, DXGI_FORMAT cast = DXGI_FORMAT_UNKNOWN) {
+                    std::vector<unsigned char>& pixels, bool volume = false, DXGI_FORMAT cast = DXGI_FORMAT_UNKNOWN,
+                    std::span<const DXGI_FORMAT> castable = {}) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -70,8 +72,10 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, co
         texture1.Format = texture.Format;
         texture1.SampleDesc = texture.SampleDesc;
         texture1.Flags = texture.Flags;
+        if (castable.empty()) castable = {&cast, 1};
         CHECK(SUCCEEDED(device10->CreateCommittedResource3(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture1,
-            D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &cast, IID_PPV_ARGS(&image.p))));
+            D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, UINT(castable.size()), castable.data(),
+            IID_PPV_ARGS(&image.p))));
     }
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed[2]{};
     UINT64 total = 0;
@@ -491,6 +495,33 @@ int main(int argc, char** argv) {
                     break; // first mismatch per format; keep checking the other formats
                 }
                 ++cases_checked;
+            }
+        }
+        // The two RTVs share a resource format and castable list. Check the exact stored bits for each view.
+        constexpr DXGI_FORMAT r32_castable[] = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT};
+        struct R32Clear { DXGI_FORMAT view; FLOAT red; std::uint32_t bits; };
+        constexpr R32Clear r32_clears[] = {
+            {DXGI_FORMAT_R32_FLOAT, 1.0f, 0x3f800000},
+            {DXGI_FORMAT_R32_UINT, 5.0f, 5},
+        };
+        for (const auto& test : r32_clears) {
+            const FLOAT color[4]{test.red, 0, 0, 0};
+            std::vector<unsigned char> actual;
+            if (!clear_and_read(ours.p, DXGI_FORMAT_R32_FLOAT, 4, color, color, actual, false,
+                                test.view, r32_castable)) {
+                std::fprintf(stderr, "castable R32 RTV %d: clear or readback failed\n", int(test.view));
+                ++format_failures;
+                continue;
+            }
+            for (std::size_t offset = 0; offset < actual.size(); offset += sizeof(test.bits)) {
+                std::uint32_t bits;
+                std::memcpy(&bits, actual.data() + offset, sizeof(bits));
+                if (bits != test.bits) {
+                    std::fprintf(stderr, "castable R32 RTV %d at byte %zu: got %08x, expected %08x\n",
+                                 int(test.view), offset, unsigned(bits), unsigned(test.bits));
+                    ++format_failures;
+                    break;
+                }
             }
         }
         // RTVs through a castable-format list in another channel order or family, or a typed BGRA8 texture's sRGB

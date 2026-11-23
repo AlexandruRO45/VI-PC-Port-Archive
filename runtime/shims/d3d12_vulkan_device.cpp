@@ -5946,15 +5946,9 @@ public:
                                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
-            // An RGBA8 or BGRA8 texture whose castable list names the RTV's format in the other channel order, or
-            // across B8G8R8X8 and B8G8R8A8, gets an RTV in that format.
             const DXGI_FORMAT asked = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
-            const bool cast_listed = r && asked != rd.Format && rgba8_any_order(rd.Format) && rgba8_any_order(asked) &&
-                                     r->lists_castable_format(asked);
-            // A typed BGRA8 or B8G8R8X8 texture with a castable list refuses an RTV in another format the list
-            // doesn't name, as a typed RGBA8 texture does. Without a list it keeps the image's format, as before.
-            const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
-                                            r->has_castable_formats();
+            const bool has_castable_formats = r && r->has_castable_formats();
+            const bool cast_listed = has_castable_formats && asked != rd.Format && r->lists_castable_format(asked);
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
                 view = {};
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
@@ -5962,17 +5956,9 @@ public:
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                     (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format))
                     view = {};
-            } else if (typeless_color || typed_rgba8 || cast_listed || typed_bgra8_listed) {
+            } else if (typeless_color || typed_rgba8 || has_castable_formats) {
                 const DXGI_FORMAT requested = asked;
-                // A typed UNORM RGBA8 resource with a castable list may be viewed in a listed family format
-                // (D3D-85's committed path, D3D-90's placed one): its image is mutable and lists the view
-                // format, so the reinterpretation is the typeless path's. Only a UNORM image is advertised,
-                // as that is what the clear path reinterprets.
-                const bool listed = requested == rd.Format ||
-                                    (r && r->has_view_format_list() &&
-                                     r->allows_view_format(vulkan_format(requested, false).format));
-                if (typeless_color || cast_listed ||
-                    (requested != rd.Format && listed && rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
+                if (typeless_color || cast_listed) {
                     const bool msaa = rd.SampleDesc.Count > 1;
                     const bool plain_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D;
                     const bool array_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
@@ -6000,21 +5986,23 @@ public:
                         const bool same_family =
                             alpha_unused(requested) == alpha_unused(rd.Format) &&
                             family == leonida::detail::typeless_view_family(vulkan_format(rd.Format, false).format);
-                        if (named.typeless || named.rgb96 || !family || !(same_family || cast_listed))
+                        const bool rgba8_cast = cast_listed && rgba8_any_order(rd.Format) &&
+                                                rgba8_any_order(requested);
+                        if (named.typeless || named.rgb96 || !family || !(same_family || rgba8_cast) ||
+                            (r && !r->allows_view_format(named.format)))
                             view = {};
                         else
                             view.format = static_cast<leonida::ColorViewFormat>(named.format);
                         if (view.resource) {
-                            const auto format = vulkan_format(requested, false);
                             VkFormatProperties properties{};
-                            state_.format_properties(state_.info.physical, format.format, &properties);
+                            state_.format_properties(state_.info.physical, named.format, &properties);
                             if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) view = {};
                         }
                     }
                 } else if (requested != rd.Format) {
-                    view = {}; // No typed-resource format casting is advertised by this backend.
+                    view = {}; // The typed resource does not list this view format.
                 }
-                if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                if (!view.resource) log_once("unsupported RTV format/subresource:", int(requested));
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");
