@@ -20,6 +20,10 @@ class CarveAllGamePathTest(unittest.TestCase):
             game.mkdir()
             out.mkdir()
             (game / "readme.txt").touch()
+            # The cached result must not turn a directory ending in .rpf into an archive.
+            (game / "decoy.rpf").mkdir()
+            (out / "decoy").mkdir()
+            (out / "decoy" / "index.json").write_text(json.dumps(INDEX), encoding="utf-8", newline="\n")
             coverage = out / "coverage.json"
             previous = b'[{"archive": "previous.rpf"}]\n'
             coverage.write_bytes(previous)

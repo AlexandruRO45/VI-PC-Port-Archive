@@ -11,7 +11,7 @@ $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 $prefix = (Get-Item -LiteralPath $Game).FullName.TrimEnd('\') + '\'
 $destinations = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
 # Validate every destination before accepting any cached index or starting a carve.
-$archives = foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -Filter *.rpf | Sort-Object Length) {
+$archives = foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -File -Filter *.rpf | Sort-Object Length) {
     $rel = $f.FullName.Substring($prefix.Length)
     $name = [IO.Path]::GetFileNameWithoutExtension(($rel -replace "[\\/]", "_"))
     if ($destinations.ContainsKey($name)) {
