@@ -135,20 +135,37 @@ $null = $p.Handle  # keeps the exit code readable after WaitForExit
 try { $p.PriorityClass = "BelowNormal" } catch {}
 
 function Emit-NewLogLines {
-    param([ref]$Offset, [string]$Path)
+    param([ref]$Offset, [string]$Path, [switch]$Final)
     if (-not (Test-Path -LiteralPath $Path)) { return }
     $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
         [System.IO.FileShare]::ReadWrite)
+    $pending = [System.IO.MemoryStream]::new()
     try {
         if ($fs.Length -lt $Offset.Value) { $Offset.Value = 0 }
         [void]$fs.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
-        $sr = New-Object System.IO.StreamReader($fs)
-        while (($line = $sr.ReadLine()) -ne $null) {
-            Write-Output $line
+        $fs.CopyTo($pending)
+        $end = [int]$pending.Length
+        if (-not $Final -and $end -gt 0) {
+            # Find a complete line boundary in the UTF-8 bytes before decoding. Hold a final CR
+            # for the next poll in case the matching LF arrives in a separate write.
+            $bytes = $pending.GetBuffer()
+            if ($bytes[$end - 1] -eq 13) { $end-- }
+            while ($end -gt 0 -and $bytes[$end - 1] -ne 10 -and $bytes[$end - 1] -ne 13) { $end-- }
         }
-        # Keep a partial trailing line for the next poll (ReadLine consumed only complete lines).
-        $Offset.Value = $fs.Position
+        if ($end -eq 0) { return }
+        $pending.SetLength($end)
+        $pending.Position = 0
+        $sr = [System.IO.StreamReader]::new($pending, [System.Text.Encoding]::UTF8, ($Offset.Value -eq 0))
+        try {
+            while (($line = $sr.ReadLine()) -ne $null) {
+                Write-Output $line
+            }
+        } finally {
+            $sr.Dispose()
+        }
+        $Offset.Value += $end
     } finally {
+        $pending.Dispose()
         $fs.Dispose()
     }
 }
@@ -160,7 +177,8 @@ while (-not $p.HasExited) {
     Emit-NewLogLines -Offset ([ref]$errOff) -Path $stderrLog
     Start-Sleep -Milliseconds 150
 }
-Emit-NewLogLines -Offset ([ref]$outOff) -Path $stdoutLog
-Emit-NewLogLines -Offset ([ref]$errOff) -Path $stderrLog
+$p.WaitForExit()  # Wait for the redirected output to finish draining.
+Emit-NewLogLines -Offset ([ref]$outOff) -Path $stdoutLog -Final
+Emit-NewLogLines -Offset ([ref]$errOff) -Path $stderrLog -Final
 if ($p.ExitCode -ne 0) { throw "build failed ($($p.ExitCode))" }
 Write-Output "built $out\gta6rt.exe"
