@@ -1,9 +1,11 @@
-"""docs/design.md: no table row is in the file twice.
+"""Check the translator contract table in docs/design.md.
 
 A merge of two pull requests that edited the same row of the translator contract table keeps both versions, one
 under the other, and nothing notices: the older text stays in the table and contradicts the newer one (the gather
 row said `RoundEven` and `Floor(LOD + 0.5)` at once). This reads the table as it is in the repository. Standard
 library only; no game data.
+
+The whole-quad row records a fully covered translated fixture and a separate RDNA2 triangle-edge measurement.
 
 Run from the repository root:  python -I tests/test_design_contract_rows.py
 """
@@ -53,6 +55,14 @@ class RepeatedRowNames(unittest.TestCase):
 
 
 class DesignTable(unittest.TestCase):
+    def test_whole_quad_row_distinguishes_helper_probe_and_translation_fixture(self):
+        with open(DESIGN, encoding="utf-8") as f:
+            row = next(line for line in f if line.startswith("| Whole-quad mode ("))
+        self.assertIn("ps_wqm.asm", row)
+        self.assertIn("fully covered", row)
+        self.assertIn("Helper lanes at a triangle edge, measured on RDNA2", row)
+        self.assertNotIn("helper-invocation behaviour at triangle edges is untested", row)
+
     def test_design_md_has_no_row_twice(self):
         with open(DESIGN, encoding="utf-8") as f:
             repeated = repeated_row_names(f.read())
