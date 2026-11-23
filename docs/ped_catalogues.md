@@ -202,3 +202,21 @@ Build the local SQLite index with `viewer_parts_index.py` from [ASSET-375](https
 The exporter matches a selected drawable to the indexed 64-bit hash of its original-case name stem. It looks up each selected albedo and normal by its full TTPF asset key, decodes the DDS to PNG and embeds it in the corresponding component material. It uses the first UV set and preserves the skin, weights and bind matrices. The fourth catalogue hash has no established glTF material slot.
 
 Each component-wide texture override needs an unambiguous material slot. The exporter honors an explicit source material's alpha mode and mask cutoff. Conflicting selections on the same drawable, missing inputs, ambiguous matches and catalogue warnings are reported before the output is written. An entirely empty member contributes no geometry. A component with no selected textures uses the default clay material.
+
+#### Select a physical model when a drawable has several matches
+
+Several resources can share a drawable's name and hash. To inspect the candidates, run this query on your parts index with the sixteen-digit hash from the catalogue report:
+
+```sql
+SELECT archive, offset, drawable FROM models
+WHERE murmur64 = '0123456789ABCDEF'
+ORDER BY archive, offset, drawable;
+```
+
+After identifying the export you want, pass the hash and all three fields on the kit export command. For example, if the chosen row contains `c:/example packs/models.rpf`, `4096` and `-1`, append this option:
+
+```text
+--model-source 0123456789ABCDEF "c:/example packs/models.rpf" 4096 -1
+```
+
+Copy the archive string exactly as stored in the index. Both numeric fields accept decimal or `0x` hex. A drawable value of `-1` denotes a manifest entry with no `Drawable` field. Repeat the option for each drawable that needs an explicit choice. The exporter still requires a ready, uniquely owned component GLB and checks its sidecar. The source coordinates stay valid when the same manifests are reindexed in a different order.
