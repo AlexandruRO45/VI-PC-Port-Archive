@@ -106,7 +106,7 @@ class ShaderStemsTests(unittest.TestCase):
     def test_rejects_windows_device_names_with_or_without_suffix(self):
         devices = ("NUL", "con", "PRN", "AUX", "CONIN$", "CONOUT$",
                    "COM1", "com9", "LPT1", "lpt9", "COM¹", "LPT²", "COM³",
-                   "NUL.extra", "NUL .extra")
+                   "NUL.extra", "NUL .extra", "NUL.tar.gz", "LPT¹", "COM²", "LPT³")
         for device in devices:
             for field, suffix in (("file", ".dxbc"), ("name", "")):
                 with self.subTest(device=device, field=field):
