@@ -351,6 +351,14 @@ def test_index_saved_with_a_utf8_bom_is_read(tmp_path, capsys):
     assert "ERROR" not in out.err
 
 
+def test_bom_does_not_hide_broken_json(tmp_path, capsys):
+    """Skipping the BOM still leaves a strict JSON parse: a broken index is one ERROR line and exit 2."""
+    p = tmp_path / "index.json"
+    p.write_bytes(b"\xef\xbb\xbf{\"a.ps\": }")
+    assert usc.main([str(p)]) == 2
+    assert "ERROR: cannot read" in capsys.readouterr().err
+
+
 def test_pairs_cli_writes_the_report_and_no_names():
     with tempfile.TemporaryDirectory() as tmp:
         index = Path(tmp, "index.json")
