@@ -409,6 +409,10 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 // `list` is not one of this module's command lists.
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands);
 
+// The graphics/compute pipeline IDs currently bound directly on `list` (always 0 on a bundle, which defers pipeline
+// binds to its parent). False when `list` is not one of this module's command lists.
+bool bound_pipelines(ID3D12GraphicsCommandList* list, std::uintptr_t& graphics, std::uintptr_t& compute);
+
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
 }

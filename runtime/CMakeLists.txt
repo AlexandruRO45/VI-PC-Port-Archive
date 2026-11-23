@@ -2662,6 +2662,19 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_bundle_forbidden_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bundle_forbidden COMMAND d3d12_bundle_forbidden_test)
       set_tests_properties(d3d12_bundle_forbidden PROPERTIES SKIP_RETURN_CODE 77)
+      # CreateCommandList & GraphicsCommandList::Reset initial-PSO handling, precedence, foreign PSO guard, and bundle Reset regression.
+      add_executable(d3d12_cl_reset_pso_test test/d3d12_cl_reset_pso_test.cpp
+                     ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_cl_reset_pso_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_cl_reset_pso_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}"
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_cl_reset_pso_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_cl_reset_pso COMMAND d3d12_cl_reset_pso_test)
+      set_tests_properties(d3d12_cl_reset_pso PROPERTIES
+                           SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
       # A pixel shader with a writable storage image (an image atomic) needs fragmentStoresAndAtomics: refused on a
       # device without it, created on the runtime's own device, under the validation layer where it is installed.
       set(LEONIDA_TEST_PS_ATOMIC ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_image_atomic.spv)

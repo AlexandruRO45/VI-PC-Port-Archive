@@ -204,6 +204,8 @@ public:
     UINT back_stencil_ref() const { return back_stencil_ref_; }
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base() const { return cbv_srv_uav_base_; }
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base() const { return sampler_base_; }
+    std::uintptr_t graphics_pipeline() const { return graphics_pipeline_; }
+    std::uintptr_t compute_pipeline() const { return compute_pipeline_; }
 
     D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override {
         d3d12_trace::record("ID3D12CommandList::GetType");
@@ -224,27 +226,32 @@ public:
 
     HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator* allocator, ID3D12PipelineState* state) override {
         constexpr auto method = "ID3D12GraphicsCommandList::Reset";
+        // D3D12 checks whether the list is closed before inspecting the allocator (measured on RTX 5090 and
+        // Windows 11 WARP: Reset on an open list returns E_FAIL even with a null, mismatched, or busy allocator).
+        if (!list_.closed()) return d3d12_trace::result(method, E_FAIL);
         CommandAllocator* command_allocator = CommandAllocator::from(allocator);
         if (!command_allocator || command_allocator->type() != type_)
             return d3d12_trace::result(method, E_INVALIDARG);
         // Another list recording into the allocator: E_INVALIDARG, as on the PC runtime (D3D-51).
         if (command_allocator->recording() && command_allocator->recording() != this)
             return d3d12_trace::result(method, E_INVALIDARG);
-        if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
+        if (state && !compute_pipeline_id(state) && !graphics_pipeline_id(state))
+            return d3d12_trace::result(method, E_INVALIDARG);
+        if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);
         record_into(command_allocator);
         invalid_ = false;
         calls_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
-        reset_state(state);  // Reset returns every list state to its default
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
+        reset_state();   // Reset returns every list state to its default
+        set_initial_pipeline(state);
         return d3d12_trace::result(method, S_OK);
     }
 
-    // CreateCommandList's pipeline state. As SetPipelineState on a direct list; on a bundle it is the first deferred
-    // call, which the application did not make, so it is not traced.
+    // CreateCommandList / Reset's initial pipeline state. Binds directly on non-bundle lists; on a bundle it is the
+    // first deferred call. Neither traces a synthetic SetPipelineState call the application did not make.
     void set_initial_pipeline(ID3D12PipelineState* state) {
         if (!state) return;
-        if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) return SetPipelineState(state);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) return set_pipeline(state);
         defer([=](GraphicsCommandList& l) { l.set_pipeline(state); });
         hold(state);
     }
@@ -376,7 +383,8 @@ public:
         if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!list_.closed()) check(list_.set_predication({0, 0, 0}));
-        reset_state(state);
+        reset_state();
+        if (state) set_pipeline(state);
     }
 
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
@@ -1351,10 +1359,12 @@ private:
         }
     }
 
-    void reset_state(ID3D12PipelineState* state) {
+    void reset_state() {
         front_stencil_ref_ = back_stencil_ref_ = 0;
         compute_ = {};
         graphics_ = {};
+        compute_pipeline_ = 0;
+        graphics_pipeline_ = 0;
         cbv_srv_uav_heap_ = nullptr;
         sampler_heap_ = nullptr;
         cbv_srv_uav_base_ = 0;
@@ -1369,7 +1379,6 @@ private:
         draw_views_stale_ = true;
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
-        set_pipeline(state);
     }
 
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
@@ -1949,10 +1958,13 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
     if (out) *out = nullptr;
     CommandAllocator* command_allocator = CommandAllocator::from(allocator);
     if (!command_allocator || command_allocator->type() != type) return E_INVALIDARG;
+    if (initial_state && !compute_pipeline_id(initial_state) && !graphics_pipeline_id(initial_state))
+        return E_INVALIDARG;
+    // A null output only after the arguments, as the host runtime answers ("command list:" cases), and before
+    // the allocator-busy check (measured on RTX 5090 and Windows 11 WARP).
+    if (!out) return E_UNEXPECTED;
     // A list is created open, so the allocator must be free: E_INVALIDARG as on the PC runtime (D3D-51).
     if (command_allocator->recording()) return E_INVALIDARG;
-    // A null output only after the arguments, as the host runtime answers ("command list:" cases).
-    if (!out) return E_UNEXPECTED;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
         type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY)
         stub("create_command_list(non-direct type)");
@@ -1960,7 +1972,8 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
     object->record_into(command_allocator);
     object->attach_device(device);
     const HRESULT hr = hand_out(object, riid, out);  // releases the creation reference, so a failure frees the list
-    // The initial pipeline state only once the list exists for the caller, as SetPipelineState on it would be.
+    // The initial pipeline state only once the list exists for the caller, without tracing a synthetic
+    // SetPipelineState call.
     if (SUCCEEDED(hr) && initial_state)
         if (GraphicsCommandList* list = GraphicsCommandList::from(static_cast<IUnknown*>(*out)))
             list->set_initial_pipeline(initial_state);
@@ -2063,6 +2076,14 @@ bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRT
     if (!l) return false;
     cbv_srv_uav = l->cbv_srv_uav_base();
     sampler = l->sampler_base();
+    return true;
+}
+
+bool bound_pipelines(ID3D12GraphicsCommandList* list, std::uintptr_t& graphics, std::uintptr_t& compute) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    graphics = l->graphics_pipeline();
+    compute = l->compute_pipeline();
     return true;
 }
 
