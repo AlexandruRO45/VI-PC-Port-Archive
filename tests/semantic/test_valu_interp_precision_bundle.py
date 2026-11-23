@@ -280,6 +280,19 @@ class TestInterpP1LVF16Weighting(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP1LVF16Channels(unittest.TestCase):
+    def test_p1lv_f16_all_channels(self):
+        for chan in ("x", "y"):
+            code = [
+                f"v_interp_p1lv_f16 v2, v0, attr4.{chan}",
+                f"v_interp_p2_f16 v2, v1, attr4.{chan}, v2",
+                "exp mrt0, v2, v2, v2, v2 done",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_p1lv_ch_{chan}", code)
+            words = support.mrt0_words(spv)
+            self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
