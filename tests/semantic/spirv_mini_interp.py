@@ -722,6 +722,24 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                     raise UnsupportedConstruct("loop iteration limit exceeded")
             pc = labels[target]
             continue
+        if op == "OpSwitch":
+            # OpSwitch selector default (literal label)*: a 32-bit integer selector, literals as the module prints them.
+            sel = val(a[0])
+            if isinstance(sel, bool) or not isinstance(sel, int):
+                raise UnsupportedConstruct("OpSwitch with a non-integer selector")
+            target = a[1]
+            for literal, label in zip(a[2::2], a[3::2]):
+                if int(literal, 0) & 0xFFFFFFFF == sel & 0xFFFFFFFF:
+                    target = label
+                    break
+            if target not in labels:
+                raise UnsupportedConstruct(f"unknown branch target {target}")
+            if labels[target] < pc:
+                back_edges += 1
+                if back_edges > 10000:
+                    raise UnsupportedConstruct("loop iteration limit exceeded")
+            pc = labels[target]
+            continue
         if op == "OpPhi":
             # The OpPhi of a block all read the values from before the block (a later one that names an earlier
             # one, as in a swap in a loop header, gets its old value), so the first evaluates the whole run.
