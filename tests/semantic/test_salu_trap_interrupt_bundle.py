@@ -176,5 +176,27 @@ class TestSTtraceDataChaining(unittest.TestCase):
         self.assertEqual(words, [20, 20, 20, 20])
 
 
+class TestSTtraceDataRejection(unittest.TestCase):
+    def test_invalid_opcode_rejection(self):
+        bad_lines = [
+            "s_ttracedata_invalid s0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_ttrace_opcode", bad_lines)
+        self.assertIn("s_ttracedata_invalid", str(cm.exception))
+
+    def test_mutated_mnemonic_rejection(self):
+        bad_lines = [
+            "s_ttrace_data s0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_ttrace_mutated", bad_lines)
+        self.assertIn("s_ttrace_data", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
