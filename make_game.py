@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
@@ -245,8 +246,9 @@ def run(args: list, hint: str = "", check: bool = True, **kw) -> int:
     log("  " + " ".join(os.path.basename(str(a)) if i == 0 else str(a) for i, a in enumerate(args)))
     board = leonida_tui.current_board()
     # Capture into the stage pane when the LEONIDA board is up and the caller did not set its own pipes.
+    # Popen takes neither timeout nor input, so those callers keep the plain subprocess.run path below.
     if (board is not None and kw.get("stdout") is None and kw.get("stderr") is None
-            and not kw.get("capture_output")):
+            and not kw.get("capture_output") and "timeout" not in kw and "input" not in kw):
         cmd = [str(a) for a in args]
         capture = leonida_tui.capture_popen_kwargs()
         # Caller flags (cwd, env, …) merge in; capture owns the stdio / console-detach bits.
@@ -1324,6 +1326,22 @@ FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
 FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py")   # with TRANSLATION_SOURCES, what the FSPX outputs come from
 
 
+def remove_tree(path: str) -> None:
+    """shutil.rmtree that stops the build with a readable message when a file is locked (antivirus, a viewer
+    that has it open) or read-only, instead of a raw traceback."""
+    def clear_readonly(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)   # read-only attribute on Windows; the retry below still fails if it is locked
+        func(p)
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=clear_readonly)
+        else:
+            shutil.rmtree(path, onerror=clear_readonly)
+    except OSError as error:
+        fail(f"could not remove {path} ({error.strerror or error}): close whatever has it open, or delete the "
+             f"folder by hand, then run the build again.")
+
+
 def file_sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -1734,13 +1752,15 @@ def drop_index(index: str) -> str:
 def translator_digest() -> str:
     """SHA-256 over every file directly in tools/: rdna2spirv.py, the modules it imports and the data it reads
     (gfx10_formats.json). Any change there counts, so parts made by other code are never merged with new ones."""
-    import hashlib
     h = hashlib.sha256()
     for name in sorted(os.listdir(TOOLS)):
         path = os.path.join(TOOLS, name)
         if os.path.isfile(path):
+            h.update(name.encode("utf-8") + b"\0")
             with open(path, "rb") as f:
-                h.update(name.encode("utf-8") + b"\0" + f.read() + b"\0")
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            h.update(b"\0")
     return h.hexdigest()
 
 
@@ -2001,7 +2021,7 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
                 # built before that: a build that fails leaves the old export in place.
                 get_exporter(work)
                 log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
-                shutil.rmtree(folder)
+                remove_tree(folder)
             elif os.path.isfile(os.path.join(folder, "manifest.json")):
                 continue
             archive_todo.append((rel, mode, folder, record, src))
@@ -2043,7 +2063,7 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         record = os.path.join(pool_dir, DECODER_RECORD)
         if os.path.isdir(pool_dir) and read_shader_setting(record) != decoder:
             log(f"assets: no matching decoder fingerprint for texture pool {os.path.relpath(p, game)}: exporting again")
-            shutil.rmtree(pool_dir)
+            remove_tree(pool_dir)
         pool_jobs.append((p, name, root, pool_dir, record))
 
     pool_todo = [(p, name, root, pool_dir, record) for p, name, root, pool_dir, record in pool_jobs
@@ -2279,8 +2299,14 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         if not os.path.exists(os.path.join(out, os.path.basename(built))) or \
                 not os.path.samefile(built, os.path.join(out, os.path.basename(built))):
             shutil.copy2(built, out)
-    with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(os.path.abspath(game))
+    game_path_tmp = tempfile.NamedTemporaryFile(dir=out, delete=False)
+    try:
+        with game_path_tmp:
+            game_path_tmp.write(os.path.abspath(game).encode("utf-8"))
+        os.replace(game_path_tmp.name, os.path.join(out, "game_path.txt"))
+    finally:
+        if os.path.exists(game_path_tmp.name):
+            os.unlink(game_path_tmp.name)
     if work is not None:
         shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
@@ -2542,6 +2568,11 @@ def _invoke_stage(name: str, fn) -> None:
             if e.code in (0, None):
                 return
             raise RuntimeError(f"stage exited with {e.code}") from e
+        except Exception:
+            # A bug (not a fail() message): the callers below only record that the stage failed, so the
+            # traceback is logged here or it is lost.
+            log(f"{name}: unexpected error\n" + traceback.format_exc())
+            raise
 
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
