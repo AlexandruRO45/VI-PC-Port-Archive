@@ -319,6 +319,18 @@ class TestInterpP2F16Reference(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP2F16Accumulator(unittest.TestCase):
+    def test_p2_f16_accumulator_pairing(self):
+        code = [
+            "v_interp_p1ll_f16 v7, v0, attr5.y",
+            "v_interp_p2_f16 v7, v1, attr5.y, v7",
+            "exp mrt0, v7, v7, v7, v7 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p2_f16_accum", code)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
