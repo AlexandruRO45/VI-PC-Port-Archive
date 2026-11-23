@@ -418,4 +418,7 @@ inline leonida::QueryHeapId query_heap_id(const ID3D12QueryHeap* heap) {
     return reinterpret_cast<leonida::QueryHeapId>(heap);
 }
 
+// The description a query heap from create_vulkan_device* was created with. False for null or another heap.
+bool query_heap_desc(ID3D12QueryHeap* heap, D3D12_QUERY_HEAP_DESC* out);
+
 }  // namespace rt::d3d12

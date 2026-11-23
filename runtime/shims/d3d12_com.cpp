@@ -753,21 +753,29 @@ public:
         return type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE && type == D3D12_QUERY_TYPE_TIMESTAMP;
     }
 
-    // Queries (docs/d3d12_vulkan.md section 4.6). Heap types, index ranges and the destination buffer are checked
-    // at ExecuteCommandLists, when the heap and the buffer are known.
+    // Queries (docs/d3d12_vulkan.md section 4.6). Heap types and index ranges are checked here when the heap is
+    // one of this device's query heaps; the destination buffer and copy-queue timestamp heap pairing are checked
+    // at ExecuteCommandLists.
+    static bool query_range_valid(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT first, UINT count) {
+        D3D12_QUERY_HEAP_DESC desc{};
+        if (!query_heap_desc(heap, &desc)) return true;
+        if (!leonida::query_fits_heap(desc.Type, u(type))) return false;
+        return first < desc.Count && count <= desc.Count - first;
+    }
+
     void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
-        if (!query_allowed(type)) return check(false);
+        if (!query_allowed(type) || !query_range_valid(heap, type, index, 1)) return check(false);
         check(list_.begin_query({query_heap_id(heap), u(type), index}));
     }
 
     void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
-        if (!query_allowed(type)) return check(false);
+        if (!query_allowed(type) || !query_range_valid(heap, type, index, 1)) return check(false);
         check(list_.end_query({query_heap_id(heap), u(type), index}));
     }
 
     void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT first, UINT count,
                                             ID3D12Resource* dst, UINT64 offset) override {
-        if (!query_allowed(type)) return check(false);
+        if (!query_allowed(type) || !query_range_valid(heap, type, first, count)) return check(false);
         check(list_.resolve_queries({query_heap_id(heap), u(type), first, count, resource_id(dst), offset}));
     }
 

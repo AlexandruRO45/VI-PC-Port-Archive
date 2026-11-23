@@ -396,14 +396,18 @@ std::vector<Case> cases() {
          CALLS(e.list->BeginQuery(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
                e.list->BeginQuery(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
                e.list->EndQuery(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0))},
-        {"BeginQuery and EndQuery at index 100 of 8", false, looser,
+        {"BeginQuery and EndQuery at index 100 of 8", false, match,
          CALLS(e.list->BeginQuery(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 100);
                e.list->EndQuery(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 100))},
-        {"BeginQuery OCCLUSION, EndQuery BINARY_OCCLUSION", true, stricter,
+        {"BeginQuery OCCLUSION, EndQuery BINARY_OCCLUSION", true, match,
          CALLS(e.list->BeginQuery(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
                e.list->EndQuery(e.occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0))},
         {"ResolveQueryData of 0 queries", true, match,
          CALLS(e.list->ResolveQueryData(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0, 0, e.readback.p, 0))},
+        {"ResolveQueryData past the end of the heap", false, match,
+         CALLS(e.list->ResolveQueryData(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 6, 4, e.readback.p, 0))},
+        {"ResolveQueryData of 0 queries past the end of the heap", false, match,
+         CALLS(e.list->ResolveQueryData(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 100, 0, e.readback.p, 0))},
         {"ResolveQueryData at offset 4", false, match,
          CALLS(e.list->ResolveQueryData(e.occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, e.readback.p, 4))},
         {"ResolveQueryData of a query never begun", true, match,

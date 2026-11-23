@@ -280,14 +280,14 @@ int main() {
     CHECK(list.end_query({heap, q::timestamp, 3}));  // a timestamp can be written again
     CHECK(!list.end_query({heap, q::occlusion, 1}));  // never begun
     CHECK(list.begin_query({heap, q::occlusion, 1}));
-    CHECK(!list.begin_query({heap, q::binary_occlusion, 1}));  // already running
-    CHECK(list.begin_query({other, q::occlusion, 1}));         // same index, another heap
-    CHECK(!list.end_query({heap, q::binary_occlusion, 1}));    // begun with another type
+    CHECK(!list.begin_query({heap, q::binary_occlusion, 1}));   // already running
+    CHECK(list.begin_query({other, q::occlusion, 1}));          // same index, another heap
+    CHECK(!list.end_query({heap, q::pipeline_statistics, 1}));  // begun with another type
     CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 9, 0}));  // query 1 is running
     CHECK(list.resolve_queries({heap, q::occlusion, 2, 2, 9, 0}));
     CHECK(list.queries_open());
     CHECK(list.end_query({heap, q::occlusion, 1}));
-    CHECK(list.end_query({other, q::occlusion, 1}));
+    CHECK(list.end_query({other, q::binary_occlusion, 1}));     // OCCLUSION and BINARY_OCCLUSION pair
     CHECK(!list.queries_open());
     CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 9, 4}));  // offset not a multiple of 8
     CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 0, 8}));  // no destination

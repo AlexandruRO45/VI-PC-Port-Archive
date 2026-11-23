@@ -4665,6 +4665,7 @@ public:
     }
 
     leonida::QueryHeapId id() const { return query_heap_id(this); }
+    const D3D12_QUERY_HEAP_DESC& desc() const { return desc_; }
 
     HRESULT create(const D3D12_QUERY_HEAP_DESC& desc) {
         namespace h = leonida::d3d12_query_heap;
@@ -4710,6 +4711,7 @@ public:
 
 private:
     HRESULT register_pool(const D3D12_QUERY_HEAP_DESC& desc) {
+        desc_ = desc;
         leonida::QueryPool pool{};
         pool.pool = pool_;
         pool.heap_type = desc.Type;
@@ -4728,6 +4730,7 @@ private:
     static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 11 * sizeof(UINT64));
 
     DeviceState& device_;
+    D3D12_QUERY_HEAP_DESC desc_{};
     VkQueryPool pool_ = VK_NULL_HANDLE;  // null for a stream-output heap (no Vulkan query behind it)
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
@@ -8278,6 +8281,13 @@ std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, c
 bool is_sparse_image(ID3D12Resource* resource) {
     const auto* object = Resource::from<Resource>(resource);
     return object && object->sparse_image();
+}
+
+bool query_heap_desc(ID3D12QueryHeap* heap, D3D12_QUERY_HEAP_DESC* out) {
+    const QueryHeap* q = QueryHeap::from<QueryHeap>(heap);
+    if (!q) return false;
+    if (out) *out = q->desc();
+    return true;
 }
 
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {

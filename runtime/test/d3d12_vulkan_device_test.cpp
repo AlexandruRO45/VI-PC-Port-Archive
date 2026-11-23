@@ -6838,13 +6838,18 @@ int main() {
                           [&] { list->BeginQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
             EXPECT(refuse(E_INVALIDARG, R::unsupported,  // offset not a multiple of 8; invalid list is refused at execution
                           [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, readback.p, 4); }));
-            EXPECT(refuse(S_OK, R::invalid_query,  // past the end of the heap
+            EXPECT(refuse(E_INVALIDARG, R::unsupported,  // past the end of the heap
                           [&] { list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 3, 2, readback.p, 0); }));
-            EXPECT(refuse(S_OK, R::invalid_query,  // a type the heap does not hold
+            EXPECT(refuse(E_INVALIDARG, R::unsupported,  // a type the heap does not hold
                           [&] { list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
-            EXPECT(refuse(S_OK, R::invalid_query, [&] {  // a stream-output query in an occlusion heap
+            EXPECT(refuse(E_INVALIDARG, R::unsupported, [&] {  // a stream-output query in an occlusion heap
                 list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 0);
                 list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 0);
+            }));
+            EXPECT(refuse(S_OK, R::success, [&] {  // OCCLUSION <-> BINARY_OCCLUSION pairing
+                list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+                list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0);
+                list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.p, 0);
             }));
             EXPECT(refuse(E_INVALIDARG, R::unsupported,  // a stream-output query begun and never ended; invalid list is refused
                           [&] { list->BeginQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2, 0); }));

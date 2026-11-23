@@ -832,7 +832,14 @@ public:
     }
 
     // Queries. D3D12 rules for the calls themselves: timestamps have only an EndQuery; any other query is begun and
-    // ended in the same list, with the same type, and is not begun again while it is running.
+    // ended in the same list, with a compatible type (OCCLUSION and BINARY_OCCLUSION share one occlusion pool and may
+    // pair across BeginQuery/EndQuery), and is not begun again while it is running.
+    static constexpr bool query_types_match(std::uint32_t begin_type, std::uint32_t end_type) {
+        if (begin_type == end_type) return true;
+        return (begin_type == d3d12_query::occlusion || begin_type == d3d12_query::binary_occlusion) &&
+               (end_type == d3d12_query::occlusion || end_type == d3d12_query::binary_occlusion);
+    }
+
     bool begin_query(const BeginQuery& query) {
         if (closed_ || !query.heap || query.type == d3d12_query::timestamp) return false;
         if (find_active(query.heap, query.index) != active_.end()) return false;
@@ -844,7 +851,7 @@ public:
         if (closed_ || !query.heap) return false;
         if (query.type != d3d12_query::timestamp) {
             const auto it = find_active(query.heap, query.index);
-            if (it == active_.end() || it->type != query.type) return false;
+            if (it == active_.end() || !query_types_match(it->type, query.type)) return false;
             active_.erase(it);
         }
         return append(query);

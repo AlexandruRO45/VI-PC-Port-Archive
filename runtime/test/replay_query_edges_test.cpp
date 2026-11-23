@@ -810,11 +810,11 @@ void test_predicated_copies() {
     expect(!validation.begin_query({1, d3d12_query::timestamp, 0}), "timestamp begin rejected");
     expect(validation.begin_query({1, d3d12_query::occlusion, 0}), "ordinary begin");
     expect(!validation.begin_query({1, d3d12_query::occlusion, 0}), "duplicate active slot rejected");
-    expect(!validation.end_query({1, d3d12_query::binary_occlusion, 0}), "mismatched end type rejected");
+    expect(!validation.end_query({1, d3d12_query::pipeline_statistics, 0}), "mismatched end type rejected");
     expect(!validation.resolve_queries({1, d3d12_query::occlusion, 0, 1, 2, 0}), "active slot resolve rejected");
     expect(validation.end_query({1, d3d12_query::occlusion, 0}), "rejected operations preserve matching end");
     expect(validation.begin_query({1, d3d12_query::occlusion, 0}) && validation.end_query({1,
-           d3d12_query::occlusion, 0}), "same-list slot reuse");
+           d3d12_query::binary_occlusion, 0}), "same-list slot reuse with binary occlusion end");
     expect(!validation.resolve_queries({1, d3d12_query::occlusion, UINT32_MAX, 2, 2, 0}),
            "overflowing query range rejected");
     expect(!validation.resolve_queries({1, d3d12_query::occlusion, 0, 1, 2, 1}), "unaligned resolve offset rejected");
