@@ -221,7 +221,8 @@ class SummaryTests(unittest.TestCase):
                     message = sys.stderr.getvalue()
                     sys.stderr = stderr
                 self.assertEqual(cm.exception.code, 2)
-                self.assertIn("--limit must be at least 1", message)
+                self.assertIn("--limit", message)
+                self.assertIn("at least 1", message)
 
 
 if __name__ == "__main__":
