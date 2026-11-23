@@ -279,6 +279,87 @@ class TestDSIncU32ASTAndOpcodeDefinitions(unittest.TestCase):
         with self.assertRaises(ValueError):
             DSIncU32Instruction.parse("ds_inc_u32 s1, v2")
 
+class ScalarThreadState:
+    """State of a single hardware execution lane / thread."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.lds = lds
+        self.lgkm_cnt = 0
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarDSInterpreter:
+    """Deterministic instruction interpreter for scalar LDS increment executions."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.lds = lds
+
+    def execute(self, state: ScalarThreadState, inst: DSIncU32Instruction) -> Optional[int]:
+        addr = state.get_vgpr(inst.vaddr)
+        data = state.get_vgpr(inst.vdata0)
+
+        old_val, new_val = self.lds.atomic_inc_u32(addr, data, offset=inst.offset, rtn=inst.is_return)
+
+        if inst.is_return and inst.vdst is not None:
+            assert old_val is not None
+            state.set_vgpr(inst.vdst, old_val)
+
+        state.lgkm_cnt += 1
+        return old_val
+
+
+class TestDSIncU32ScalarInterpreter(unittest.TestCase):
+    """Part 3: Deterministic scalar instruction interpreter tests."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_bytes=4096)
+        self.interp = ScalarDSInterpreter(self.lds)
+        self.state = ScalarThreadState(self.lds)
+
+    def test_scalar_execution_non_returning(self) -> None:
+        self.lds.write_dword(0x10, 5)
+        self.state.set_vgpr(VGPR(1), 0x10)
+        self.state.set_vgpr(VGPR(2), 10)
+
+        inst = DSIncU32Instruction.parse("ds_inc_u32 v1, v2")
+        res = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(res)
+        self.assertEqual(self.lds.read_dword(0x10), 6)
+
+    def test_scalar_execution_returning(self) -> None:
+        self.lds.write_dword(0x20, 10)
+        self.state.set_vgpr(VGPR(10), 0x20)
+        self.state.set_vgpr(VGPR(11), 10)
+        self.state.set_vgpr(VGPR(12), 0xDEADBEEF)
+
+        # 10 >= 10 -> resets to 0
+        inst = DSIncU32Instruction.parse("ds_inc_rtn_u32 v12, v10, v11")
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 10)
+        self.assertEqual(self.state.get_vgpr(VGPR(12)), 10)
+        self.assertEqual(self.lds.read_dword(0x20), 0)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        self.lds.write_dword(0x34, 0)
+        self.state.set_vgpr(VGPR(1), 0x30)
+        self.state.set_vgpr(VGPR(2), 5)
+
+        inst = DSIncU32Instruction.parse("ds_inc_rtn_u32 v0, v1, v2 offset:4")
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 0)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 0)
+        self.assertEqual(self.lds.read_dword(0x34), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
