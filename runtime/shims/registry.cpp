@@ -323,29 +323,28 @@ void add_module_lookup(void* ctx, ModuleLookup fn) {
     g_lookups.push_back({ctx, fn});
 }
 
+bool lookup_mapped_module(uint64_t address, std::string& module, uint32_t& rva) {
+    std::lock_guard lock(g_lookup_mutex);
+    for (auto& l : g_lookups)
+        if (l.fn(l.ctx, address, module, rva)) return true;
+    return false;
+}
+
 bool mapped_image_base(uint64_t address, uint64_t& base) {
     std::string module;
     uint32_t rva = 0;
-    std::lock_guard lock(g_lookup_mutex);
-    for (auto& l : g_lookups)
-        if (l.fn(l.ctx, address, module, rva)) {
-            base = address - rva;
-            return true;
-        }
-    return false;
+    if (!lookup_mapped_module(address, module, rva)) return false;
+    base = address - rva;
+    return true;
 }
 
 std::string module_offset(uint64_t address) {
     char b[48];
     std::string module;
     uint32_t rva = 0;
-    {
-        std::lock_guard lock(g_lookup_mutex);
-        for (auto& l : g_lookups)
-            if (l.fn(l.ctx, address, module, rva)) {
-                std::snprintf(b, sizeof b, "+0x%x", rva);
-                return module + b;
-            }
+    if (lookup_mapped_module(address, module, rva)) {
+        std::snprintf(b, sizeof b, "+0x%x", rva);
+        return module + b;
     }
     HMODULE host = nullptr;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,

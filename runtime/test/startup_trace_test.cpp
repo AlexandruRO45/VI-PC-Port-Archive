@@ -11,6 +11,7 @@
 // LEONIDA_TEST_DIR names the folder for the image and the trace, as for loader_test; the default is the temp folder.
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -52,6 +53,12 @@ constexpr uint32_t kFaultRva = kTextRva + 0x220;
 constexpr const char* kImageName = "trace_image.bin";
 constexpr const char* kDebugText = "leonida trace probe \"quoted\"";
 constexpr const char* kAnsiText = "caf\xe9 probe";  // 0xE9: 'é' in code page 1252, never valid alone in UTF-8
+
+void WINAPI trace_probe_export() {}
+
+SHIM_TABLE(trace_export_probe,
+    {"leonida_export_probe.dll", "TraceProbePresent", reinterpret_cast<void*>(&trace_probe_export)},
+);
 
 uint32_t caller_rva(int i) { return kCallerBase + 0x10u * static_cast<uint32_t>(i); }
 uint32_t return_rva(int i) { return caller_rva(i) + kCallRetOffset; }
@@ -189,6 +196,68 @@ void test_existing_file_is_kept(const fs::path& dir) {
     check(after == bytes, "the existing file's bytes survive");
 }
 
+void test_dynamic_export_trace(const fs::path& dir) {
+    const auto load = reinterpret_cast<decltype(&LoadLibraryA)>(rt::shims::find("kernel32.dll", "LoadLibraryA"));
+    const auto proc = reinterpret_cast<decltype(&GetProcAddress)>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+    check(load && proc, "the registered loader exports are available");
+    if (!load || !proc) return;
+
+    const fs::path image = write_file(dir / "dynamic_exports.bin", make_image());
+    rt::Loader loader(dir);
+    rt::Module& mapped = loader.load(image);
+    const auto mapped_handle = reinterpret_cast<HMODULE>(mapped.base);
+    HMODULE pseudo = load("leonida_export_probe.dll");
+    HMODULE host = GetModuleHandleW(L"kernel32.dll");
+    check(pseudo && host, "the loader provides a pseudo-handle and a native handle is available");
+    if (!pseudo || !host) return;
+
+    const auto missing = [&](HMODULE module, LPCSTR name) {
+        SetLastError(ERROR_INVALID_DATA);
+        const auto result = proc(module, name);
+        const auto error = GetLastError();
+        return !result && error == ERROR_PROC_NOT_FOUND;
+    };
+    const char lookup[] = "Missing\"Export";
+    check(missing(pseudo, lookup), "trace-off pseudo lookup preserves ERROR_PROC_NOT_FOUND");
+    const fs::path trace = dir / "dynamic_exports.jsonl";
+    const bool opened = rt::startup_trace::open(trace.c_str());
+    check(opened, "open the dynamic export trace");
+    if (!opened) return;
+
+    check(missing(pseudo, lookup) && missing(pseudo, lookup), "named pseudo lookup still fails with the native error");
+    check(missing(pseudo, MAKEINTRESOURCEA(60000)), "a missing pseudo ordinal preserves the error");
+    check(missing(mapped_handle, "MissingMappedExport"), "a missing mapped export preserves the error");
+    check(missing(pseudo, nullptr), "a null name is still rejected");
+    check(missing(host, "LeonidaMissingHostExport"), "an unknown host export still uses native lookup");
+    check(proc(pseudo, "TraceProbePresent") == reinterpret_cast<FARPROC>(&trace_probe_export),
+          "a present pseudo export still resolves");
+    check(proc(host, "GetTickCount") == GetProcAddress(host, "GetTickCount"),
+          "a present host export still resolves natively");
+    bool all_missing = true;
+    for (WORD ordinal = 1; ordinal <= 300; ++ordinal) {
+        const bool failed = missing(mapped_handle, MAKEINTRESOURCEA(ordinal));
+        all_missing = all_missing && failed;
+    }
+    check(all_missing, "misses above the trace limit return the same error");
+    rt::startup_trace::close();
+
+    const auto lines = read_lines(trace);
+    const auto count = [&](const char* needle) {
+        return std::count_if(lines.begin(), lines.end(), [&](const auto& line) {
+            return line.find(needle) != std::string::npos;
+        });
+    };
+    check(count("\"kind\":\"get_proc_address_failed\"") == 256, "one bounded event per distinct failed lookup");
+    check(count("\"module\":\"leonida_export_probe.dll\",\"name\":\"Missing\\\"Export\"") == 1,
+          "a repeated pseudo export is escaped and traced once, even if queried before tracing");
+    check(count("\"module\":\"leonida_export_probe.dll\",\"ordinal\":60000,") == 1, "an ordinal is numeric");
+    check(count("\"module\":\"dynamic_exports.bin\",\"name\":\"MissingMappedExport\"") == 1,
+          "the lookup names the mapped module");
+    check(count("\"caller\":\"host:startup_trace_test.exe+0x") == 256, "the events name the caller");
+    check(!count("LeonidaMissingHostExport") && !count("TraceProbePresent") && !count("GetTickCount"),
+          "host and successful lookups do not add events");
+}
+
 // What a strict reader expects for OutputDebugStringA text: the ANSI code page converted to UTF-8.
 std::string ansi_as_utf8(const char* a) {
     const int len = static_cast<int>(std::strlen(a));
@@ -285,6 +354,7 @@ int wmain() {
         test_disabled_is_silent();
         test_existing_file_is_kept(dir);
         test_trace(dir);
+        test_dynamic_export_trace(dir);
         std::error_code ec;
         fs::remove_all(dir, ec);
     } catch (const std::exception& e) {

@@ -92,6 +92,8 @@ Read the startup trace first; the first event that is not the expected one is th
 2. **`unimplemented_call`** — the first `dll!name` and its `caller` (module+RVA). Add a shim, a host binding or a
    deliberate failure in `runtime/shims/registry.cpp`; rerun with `LEONIDA_UNIMPLEMENTED=stop` to halt at the first
    remaining blocker.
+   The separate **`get_proc_address_failed`** events record failed dynamic export lookups on shim-owned or mapped
+   modules. A miss can be an optional probe. Compare it with the subsequent events to see whether startup continued.
 3. **`tls_callback` / `dllmain`** — a failed DllMain, or a TLS callback that faults, usually points at the CRT or
    TLS index. The summary shows the address and phase of the last observed TLS callback
    (`last_tls_callback` in JSON). The loader records it before invoking the callback, so the record gives no

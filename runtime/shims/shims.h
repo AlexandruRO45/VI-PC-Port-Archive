@@ -50,6 +50,7 @@ ReturnClass classify_import(const std::string& dll, const std::string& name);
 // fills the module's file name and the address's RVA when the address is inside one of its modules.
 using ModuleLookup = bool (*)(void* ctx, uint64_t address, std::string& module, uint32_t& rva);
 void add_module_lookup(void* ctx, ModuleLookup fn);
+bool lookup_mapped_module(uint64_t address, std::string& module, uint32_t& rva);
 // "a.dll+0x1234" for an address inside a mapped module, "host:ntdll.dll+0x1234" inside a host module, else the bare
 // address in hex. Used by the startup trace (startup_trace.h).
 std::string module_offset(uint64_t address);

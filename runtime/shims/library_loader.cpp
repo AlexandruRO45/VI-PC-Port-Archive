@@ -12,6 +12,7 @@
 // other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
 #include <windows.h>
+#include <intrin.h>
 
 #include <cstdio>
 #include <deque>
@@ -19,9 +20,11 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::shims::library_loader {
 
@@ -44,6 +47,42 @@ std::mutex& loader_mutex() {
 std::deque<Pseudo>& pseudos() {   // a deque never moves its elements, so handed-out handles stay valid
     static auto* d = new std::deque<Pseudo>;
     return *d;
+}
+
+using FailedLookups = std::set<std::tuple<std::string, bool, std::string>>;
+constexpr std::size_t kMaxFailedLookupEvents = 256;
+// Guarded by loader_mutex(). Lazy and immortal like the pseudo handles, without a guest-thread CRT guard.
+constinit FailedLookups* g_traced_failed_lookups = nullptr;
+
+void trace_failed_lookup(HMODULE module, const std::string* module_name, LPCSTR name, const std::string& what,
+                         const void* caller) noexcept {
+    if (!startup_trace::enabled()) return;
+    try {
+        std::string mapped_name;
+        if (!module_name) {
+            uint32_t rva = 0;
+            if (!lookup_mapped_module(reinterpret_cast<uintptr_t>(module), mapped_name, rva) || rva != 0) return;
+            module_name = &mapped_name;
+        }
+        const bool by_ordinal = IS_INTRESOURCE(name);
+        {
+            const std::lock_guard lock(loader_mutex());
+            if (!g_traced_failed_lookups) g_traced_failed_lookups = new FailedLookups;
+            if (g_traced_failed_lookups->size() >= kMaxFailedLookupEvents ||
+                !g_traced_failed_lookups->emplace(*module_name, by_ordinal, what).second)
+                return;
+        }
+        std::string fields = "\"module\":" + startup_trace::quote(*module_name);
+        if (by_ordinal)
+            fields += ",\"ordinal\":" + std::to_string(reinterpret_cast<uintptr_t>(name));
+        else
+            fields += ",\"name\":" + startup_trace::quote(
+                startup_trace::detail::utf8_from_ansi(what.data(), static_cast<int>(what.size())));
+        fields += ",\"caller\":" + startup_trace::quote(startup_trace::where(reinterpret_cast<uintptr_t>(caller)));
+        startup_trace::event("get_proc_address_failed", fields);
+    } catch (...) {
+        // A diagnostic must not change the result of GetProcAddress.
+    }
 }
 
 std::string lower_ascii(std::string s) {
@@ -239,6 +278,7 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         const std::string what =
             IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
         if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
+        trace_failed_lookup(module, &p->dll, name, what, _ReturnAddress());
         {
             static auto* m = new std::mutex;
             static auto* seen = new std::set<std::string>;
@@ -263,6 +303,7 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     void* fn = get_bundled_proc_address(module, what, owns_handle);
     if (owns_handle) {
         if (fn) return reinterpret_cast<FARPROC>(fn);
+        trace_failed_lookup(module, nullptr, name, what, _ReturnAddress());
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }

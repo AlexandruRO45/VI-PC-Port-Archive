@@ -62,6 +62,8 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "dllmain": {"ok": 0, "failed": 0, "failed_modules": []},
         "unimplemented": [],
         "unimplemented_by_dll": {},
+        "get_proc_address_failed": [],
+        "get_proc_address_failed_count": 0,
         "debug_strings": 0,
         "file_open_failed": [],
         "file_open_failed_count": 0,
@@ -129,6 +131,12 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     dll = name.split("!", 1)[0]
                     trace["unimplemented_by_dll"][dll] = (
                         trace["unimplemented_by_dll"].get(dll, 0) + 1
+                    )
+            elif kind == "get_proc_address_failed":
+                trace["get_proc_address_failed_count"] += 1
+                if len(trace["get_proc_address_failed"]) < limit:
+                    trace["get_proc_address_failed"].append(
+                        {key: event.get(key) for key in ("module", "name", "ordinal", "caller")}
                     )
             elif kind == "debug_string":
                 trace["debug_strings"] += 1
@@ -267,6 +275,15 @@ def format_text(summary: dict, limit: int) -> str:
             out.append(f"  by dll (unique imports): {by_dll}")
         else:
             out.append("  unimplemented: none")
+        if startup["get_proc_address_failed_count"]:
+            count = startup["get_proc_address_failed_count"]
+            out.append(f"  failed export lookups (GetProcAddress): {count}")
+            for item in startup["get_proc_address_failed"][:limit]:
+                ordinal = item["ordinal"]
+                symbol = f"#{ordinal}" if ordinal is not None else item["name"]
+                out.append(f"    {item['module']}!{symbol} from {item['caller']}")
+            if count > limit:
+                out.append(f"    ... {count - limit} more")
         if startup["debug_strings"]:
             out.append(f"  debug strings: {startup['debug_strings']} (text not shown)")
         if startup["file_open_failed_count"]:

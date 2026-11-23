@@ -458,6 +458,32 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("GAME:/probe/missing.bin error 2 from game.exe+0x20", text)
         self.assertIn("game.exe+0x1330", text)
 
+    def test_failed_dynamic_export_lookups_are_reported_separately(self):
+        named = {"kind": "get_proc_address_failed", "module": "fixture.dll",
+                 "name": "OptionalExport", "caller": "guest.exe+0x20"}
+        ordinal = {"kind": "get_proc_address_failed", "module": "fixture.dll",
+                   "ordinal": 7, "caller": "guest.exe+0x40"}
+        self.write(self.startup, [STARTUP[0], named, ordinal])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(bt.main([self.startup, "--json"]), 0)
+        trace = json.loads(output.getvalue())["startup"]
+        self.assertEqual(trace["unimplemented"], [])
+        self.assertEqual(trace["get_proc_address_failed_count"], 2)
+        self.assertEqual(trace["get_proc_address_failed"], [
+            {"module": "fixture.dll", "name": "OptionalExport", "ordinal": None, "caller": "guest.exe+0x20"},
+            {"module": "fixture.dll", "name": None, "ordinal": 7, "caller": "guest.exe+0x40"},
+        ])
+
+        text = bt.format_text(bt.summarize(trace, None), 10)
+        self.assertIn("failed export lookups (GetProcAddress): 2", text)
+        self.assertIn("fixture.dll!OptionalExport from guest.exe+0x20", text)
+        self.assertIn("fixture.dll!#7 from guest.exe+0x40", text)
+        limited = bt.parse_startup(self.startup, 1)
+        self.assertEqual(limited["get_proc_address_failed_count"], 2)
+        self.assertEqual(limited["get_proc_address_failed"], trace["get_proc_address_failed"][:1])
+        self.assertIn("... 1 more", bt.format_text(bt.summarize(limited, None), 1))
+
     def test_last_observed_tls_callback_in_incomplete_startup(self):
         first = {"kind": "tls_callback", "module": "first.dll", "at": "first.dll+0x1100", "reason": 1}
         for fields, reason, phase in (
