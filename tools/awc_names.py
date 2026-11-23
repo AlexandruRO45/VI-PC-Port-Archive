@@ -114,6 +114,10 @@ def bank_ids(path: str) -> list:
     return [v & M29 for v in struct.unpack(f"<{n}I", table)]
 
 
+def _walk_error(exc: OSError):
+    raise exc
+
+
 def load_banks(source: str) -> dict:
     """{bank label: [stream ids]} from AWC banks, a Python inventory, or an rpf9dump manifest."""
     if os.path.isfile(source) and source.lower().endswith(".json"):
@@ -139,7 +143,7 @@ def load_banks(source: str) -> dict:
     if os.path.isfile(source):
         return {os.path.splitext(os.path.basename(source))[0]: bank_ids(source)}
     out = {}
-    for root, _dirs, files in os.walk(source):
+    for root, _dirs, files in os.walk(source, onerror=_walk_error):
         for name in sorted(files):
             if name.lower().endswith(".awc"):
                 full = os.path.join(root, name)
@@ -163,7 +167,7 @@ class Index:
 # ---- dictionary ----
 def _files(path: str):
     if os.path.isdir(path):
-        for root, _dirs, files in os.walk(path):
+        for root, _dirs, files in os.walk(path, onerror=_walk_error):
             for name in sorted(files):
                 yield os.path.join(root, name)
     else:
@@ -394,6 +398,8 @@ def main(argv=None) -> int:
         if not os.path.exists(path):
             print(f"awc_names: error: {path}: no such file or directory", file=sys.stderr)
             return 2
+    if a.out and os.path.isdir(a.out):
+        ap.error(f"--out is a directory: {a.out}")
     if a.out and os.path.exists(a.out):
         protected = inputs.copy()
         for sources, suffix in ((a.banks, ".awc"), (a.conversations, "")):

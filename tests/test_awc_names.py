@@ -480,6 +480,62 @@ class TestCli(unittest.TestCase):
             path = write(os.path.join(tmp, "words.json"), json.dumps(["a_word", 2]))
             self.assertEqual(A.read_words(path), ["a_word", "2"])
 
+    def test_out_directory_rejected_as_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "t.awc"), make_bank(["foo"]))
+            words = write(os.path.join(tmp, "words.txt"), "foo\n")
+            out_dir = os.path.join(tmp, "out_folder")
+            os.makedirs(out_dir)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--out", out_dir])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--out is a directory", err.getvalue())
+
+    def test_load_banks_walk_error_propagates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "sub"))
+            def broken_walk(top, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", top))
+                return iter([])
+
+            with mock.patch("os.walk", side_effect=broken_walk):
+                with self.assertRaises(PermissionError):
+                    A.load_banks(tmp)
+
+    def test_main_reports_unlistable_bank_dir_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.txt"), "foo\n")
+            bank_dir = os.path.join(tmp, "banks")
+            os.makedirs(bank_dir)
+            def broken_walk(top, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", top))
+                return iter([])
+
+            err = io.StringIO()
+            with mock.patch("os.walk", side_effect=broken_walk):
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = A.main([bank_dir, "--words", words])
+            self.assertEqual(rc, 2)
+            self.assertIn("awc_names: error:", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_conversation_walk_error_propagates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "dialogue"))
+            def broken_walk(top, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", top))
+                return iter([])
+
+            with mock.patch("os.walk", side_effect=broken_walk):
+                with self.assertRaises(PermissionError):
+                    list(A._files(tmp))
+
 
 if __name__ == "__main__":
     unittest.main()
