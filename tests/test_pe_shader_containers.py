@@ -108,6 +108,29 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertEqual(len(rejected), 1)
 
+    def test_scan_rejects_overlapping_chunks(self):
+        good = container([(b"SFI0", bytes(16)), (b"PSV0", bytes(32))])
+        first, second = struct.unpack_from("<II", good, 32)
+        # A chunk may overlap just the next header, or contain the entire next
+        # chunk. Both fit within total_size and have sorted, unique offsets.
+        for first_end in (second + 4, len(good)):
+            with self.subTest(first_end=first_end):
+                data = bytearray(good)
+                struct.pack_into("<I", data, first + 4, first_end - first - 8)
+                with self.assertRaisesRegex(psc.ContainerError, "overlap"):
+                    psc.parse_container(bytes(data), 0)
+                found, rejected = psc.inspect(b"prefix" + bytes(data), "fake.dll")
+                self.assertEqual(found, [])
+                self.assertEqual(rejected, [6])
+
+    def test_adjacent_and_padded_chunks_are_valid(self):
+        for payload in (b"", b"a", bytes(4)):
+            with self.subTest(payload=payload):
+                data = container([(b"SFI0", payload), (b"PSV0", bytes(4))])
+                total, chunks = psc.parse_container(data, 0)
+                self.assertEqual(total, len(data))
+                self.assertEqual(len(chunks), 2)
+
     def test_fspx_is_reported_and_has_no_xbch(self):
         data = container([(b"SFI0", bytes(8)), (b"ACCC", b"FSPX" + bytes(12))])
         found, _ = psc.inspect(data, "fsr.dll")
