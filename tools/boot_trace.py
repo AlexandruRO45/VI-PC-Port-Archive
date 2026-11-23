@@ -83,7 +83,9 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 continue
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+            except ValueError:
+                # JSONDecodeError is a ValueError; the decoder also raises ValueError directly
+                # when an integer exceeds Python's conversion limit.
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
                     trace["bad_line_numbers"].append(number)

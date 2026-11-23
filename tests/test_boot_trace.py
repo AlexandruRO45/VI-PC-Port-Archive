@@ -143,6 +143,29 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("debug strings: 1", text)
         self.assertNotIn("secret game text", text)
 
+    def test_oversized_integer_line_does_not_hide_valid_events(self):
+        previous = sys.get_int_max_str_digits()
+        limit = sys.int_info.str_digits_check_threshold
+        try:
+            sys.set_int_max_str_digits(limit)
+            invalid = '{"kind":"trace_open","pid":' + "9" * (limit + 1) + "}"
+            self.write_lines(self.startup, [
+                '{"kind":"trace_open","pid":123}', invalid, '{"kind":"exit","code":7}'])
+            trace = bt.parse_startup(self.startup)
+            self.assertEqual(trace["events"], 2)
+            self.assertEqual(trace["pid"], 123)
+            self.assertEqual(trace["exit"], 7)
+            self.assertEqual(trace["bad_lines"], 1)
+            self.assertEqual(trace["bad_line_numbers"], [2])
+
+            self.write_lines(self.startup, [invalid])
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error):
+                self.assertEqual(bt.main([self.startup]), 2)
+            self.assertIn("no valid startup event", error.getvalue())
+        finally:
+            sys.set_int_max_str_digits(previous)
+
     def test_truncated_line_is_counted_not_fatal(self):
         self.write(self.startup, STARTUP)
         with open(self.startup, "a", encoding="utf-8") as f:
