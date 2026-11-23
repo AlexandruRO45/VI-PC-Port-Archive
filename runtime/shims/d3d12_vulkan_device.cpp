@@ -2964,6 +2964,8 @@ public:
         recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
+        graphics_.viewport_slots = device_.info.features.multiViewport
+            ? D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE : 1;
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
@@ -3151,8 +3153,9 @@ private:
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
         vertex_input.pVertexAttributeDescriptions = r.attributes.data();
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        viewport.viewportCount = 1;
-        viewport.scissorCount = 1;
+        viewport.viewportCount = unbound & leonida::GraphicsPipeline::multi_viewport
+            ? graphics_.viewport_slots : 1;
+        viewport.scissorCount = viewport.viewportCount;
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
         VkPipelineRasterizationStateCreateInfo raster = r.raster;
         VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{
@@ -7858,6 +7861,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
     VkPhysicalDeviceFeatures enable{};
+    // D3D12 exposes 16 viewport/scissor slots; translated vertex shaders can export SV_ViewportArrayIndex.
+    enable.multiViewport = chosen_features.multiViewport;
     enable.sparseBinding = chosen_features.sparseBinding;
     enable.sparseResidencyBuffer = chosen_features.sparseResidencyBuffer;
     enable.sparseResidencyAliased = chosen_features.sparseResidencyAliased;

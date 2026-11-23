@@ -756,8 +756,10 @@ struct GraphicsPipeline {
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
+    static constexpr std::uint32_t multi_viewport = 1u << 9;  // pipeline variant with 16 rasterizer slots
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    std::uint32_t viewport_slots = 1;  // 16 with the enabled Vulkan multiViewport feature, otherwise 1
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -981,6 +983,7 @@ struct PreparedDraw {
     // lock across both), so it is not copied.
     const GraphicsPipeline* graphics = nullptr;
     VkPipeline pipeline = VK_NULL_HANDLE;  // graphics->pipeline, or its variant for the slots the draw leaves unbound
+    std::uint32_t viewport_slots = 1;      // the chosen variant's rasterizer viewport/scissor slot count
     std::vector<Attachment> colors;  // by slot; id 0 = unbound
     Attachment depth;
     std::vector<VkBuffer> vertex_buffers;
@@ -995,6 +998,7 @@ struct PreparedDraw {
     void reset() {
         graphics = nullptr;
         pipeline = VK_NULL_HANDLE;
+        viewport_slots = 1;
         colors.clear();
         depth = {};
         vertex_buffers.clear();
@@ -1921,6 +1925,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    if ((draw.viewport_count > 1 && draw.viewports.size() < draw.viewport_count) ||
+        (draw.scissor_count > 1 && draw.scissors.size() < draw.scissor_count))
+        return ReplayResult::unsupported;
+    p.viewport_slots = draw.viewport_count > 1 || draw.scissor_count > 1 ? 16u : 1u;
+    if (p.viewport_slots > pipeline->viewport_slots)
+        return ReplayResult::unsupported;  // do not emulate a missing Vulkan multiViewport feature with slot zero
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
@@ -1969,8 +1979,15 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         shrink(a.binding, draw.depth, a.range);
     }
     if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
-        p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
-                  std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
+        p.area = {0, 0};
+        const std::uint32_t count = draw.viewport_count ? draw.viewport_count : 1;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const Viewport& v = draw.viewport_count > 1 ? draw.viewports[i] : draw.viewport;
+            p.area.width = std::max(p.area.width,
+                std::uint32_t(std::max(0.0f, v.x + v.width)));
+            p.area.height = std::max(p.area.height,
+                std::uint32_t(std::max(0.0f, v.y + v.height)));
+        }
     }
     p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
@@ -1980,6 +1997,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+    if (p.viewport_slots > 1) unbound |= GraphicsPipeline::multi_viewport;
     if (unbound) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
         if (!p.pipeline) return ReplayResult::unsupported;
@@ -3720,14 +3738,31 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
-            const Viewport& v = draw->viewport;
-            const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-            vk.set_viewport(command_buffer, 0, 1, &viewport);
-            const Rect& s = draw->scissor;
-            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-            vk.set_scissor(command_buffer, 0, 1, &scissor);
+            std::array<VkViewport, 16> viewports{};
+            std::array<VkRect2D, 16> scissors{};
+            const auto slots = std::min<std::uint32_t>(d.viewport_slots, 16);
+            const auto bound_viewports = draw->viewport_count ? draw->viewport_count : 1;
+            const auto bound_scissors = draw->scissor_count ? draw->scissor_count : 1;
+            for (std::uint32_t slot = 0; slot < slots; ++slot) {
+                Viewport v{};  // unused D3D12 slots must never read past the compact snapshot
+                if (slot < bound_viewports)
+                    v = draw->viewport_count > 1 ? draw->viewports[slot] : draw->viewport;
+                // Vulkan forbids zero-width/height viewports; absent D3D12 slots clip via empty scissors.
+                viewports[slot] = v.width > 0 && v.height > 0
+                    ? VkViewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth}
+                    : VkViewport{0, 1, 1, -1, 0, 1};
+                if (slot >= bound_viewports || slot >= bound_scissors || !(v.width > 0 && v.height > 0)) {
+                    scissors[slot] = {{0, 0}, {0, 0}};
+                    continue;
+                }
+                const Rect& s = draw->scissor_count > 1 ? draw->scissors[slot] : draw->scissor;
+                const auto left = std::max(0, s.left), top = std::max(0, s.top);
+                scissors[slot] = {{left, top},
+                    {std::uint32_t(std::max(0, s.right - left)),
+                     std::uint32_t(std::max(0, s.bottom - top))}};
+            }
+            vk.set_viewport(command_buffer, 0, slots, viewports.data());
+            vk.set_scissor(command_buffer, 0, slots, scissors.data());
             const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
             vk.set_primitive_topology(command_buffer, topology);
             const bool restart = draw->indexed && detail::strip_topology(topology) &&

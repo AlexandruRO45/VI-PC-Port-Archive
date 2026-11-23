@@ -374,6 +374,7 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        enable12.shaderOutputViewportIndex = features12.shaderOutputViewportIndex;
         buffer_device_address = request_buffer_device_address && features12.bufferDeviceAddress == VK_TRUE;
         enable12.bufferDeviceAddress = buffer_device_address;
         storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
@@ -423,6 +424,7 @@ public:
             sharing_.push_back(f);
         }
         VkPhysicalDeviceFeatures enable{};
+        enable.multiViewport = features.features.multiViewport;
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
         bc = features.features.textureCompressionBC == VK_TRUE;

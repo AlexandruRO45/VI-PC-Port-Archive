@@ -405,8 +405,8 @@ struct Draw {
     std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
     IndexBufferView index{};
     std::uint32_t topology = 0;  // D3D_PRIMITIVE_TOPOLOGY
-    Viewport viewport{};       // the first; more viewports are not modelled yet
-    Rect scissor{};            // the first; D3D12 always scissors
+    Viewport viewport{};       // legacy slot zero, also used by internal synthetic callers
+    Rect scissor{};            // legacy slot zero
     std::array<float, 4> blend_factor{1, 1, 1, 1};
     std::uint32_t stencil_front = 0;
     std::uint32_t stencil_back = 0;
@@ -417,6 +417,14 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     std::uint32_t render_target_count = 8;
+    // D3D12 RS slot snapshot. A zero count retains legacy single-slot behaviour for internal
+    // synthetic Draw callers that initialize only viewport/scissor above.
+    // Large slot arrays are allocated only when multiple slots are bound. A normal single-viewport
+    // draw retains the inline viewport/scissor above and does not allocate a 16-slot snapshot.
+    std::vector<Viewport> viewports;
+    std::vector<Rect> scissors;
+    std::uint32_t viewport_count = 0;
+    std::uint32_t scissor_count = 0;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.

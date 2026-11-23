@@ -346,19 +346,29 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!count) {
             viewport_ = {};
+            viewports_ = {};
+            viewport_count_ = 0;
             return;
         }
         if (!viewports || count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetViewports (more than one viewport; the first is used)");
-        const D3D12_VIEWPORT& v = viewports[0];
-        viewport_ = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        viewports_ = {};
+        viewport_count_ = count;
+        for (UINT i = 0; i < count; ++i) {
+            const D3D12_VIEWPORT& v = viewports[i];
+            viewports_[i] = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        }
+        viewport_ = viewports_[0];
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!count || !rects) return;
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
-        scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
+        scissors_ = {};
+        scissor_count_ = count;
+        for (UINT i = 0; i < count; ++i)
+            scissors_[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
+        scissor_ = scissors_[0];
     }
 
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
@@ -987,6 +997,10 @@ private:
     leonida::IndexBufferView index_{};
     leonida::Viewport viewport_{};
     leonida::Rect scissor_{};
+    std::array<leonida::Viewport, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_{};
+    std::array<leonida::Rect, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors_{};
+    UINT viewport_count_ = 0;
+    UINT scissor_count_ = 0;
     std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
     UINT render_target_count_ = 0;
     leonida::TargetView depth_{};
@@ -1051,6 +1065,9 @@ private:
         index_ = {};
         viewport_ = {};
         scissor_ = {};
+        viewports_ = {};
+        scissors_ = {};
+        viewport_count_ = scissor_count_ = 0;
         render_targets_.fill({});
         render_target_count_ = 0;
         depth_ = {};
@@ -1080,11 +1097,20 @@ private:
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        if (!viewport_count_ ||
+            !std::any_of(viewports_.begin(), viewports_.begin() + viewport_count_,
+                         [](const leonida::Viewport& v) { return v.width > 0 && v.height > 0; }))
+            return;
         leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
                            vertex_buffers_, index_, topology_, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
                            base_vertex, first_instance, render_target_count_};
+        if (viewport_count_ > 1)
+            draw.viewports.assign(viewports_.begin(), viewports_.begin() + viewport_count_);
+        if (scissor_count_ > 1)
+            draw.scissors.assign(scissors_.begin(), scissors_.begin() + scissor_count_);
+        draw.viewport_count = viewport_count_;
+        draw.scissor_count = scissor_count_;
         check(list_.draw(std::move(draw)));
     }
 };
