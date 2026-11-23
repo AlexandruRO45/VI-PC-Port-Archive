@@ -662,6 +662,14 @@ class TestReadGlbSummaryValidation(unittest.TestCase):
         with self.assertRaises(glb_writer.GlbError):
             glb_writer.read_glb_summary(raw)
 
+    def test_json_chunk_rejects_non_json_number_tokens(self):
+        for number, token in ((float("nan"), "NaN"), (float("inf"), "Infinity"),
+                              (float("-inf"), "-Infinity")):
+            with self.subTest(token=token):
+                data = self._container({"asset": {"version": "2.0"}, "extras": {"value": number}})
+                with self.assertRaisesRegex(glb_writer.GlbError, f"invalid JSON chunk: {token}"):
+                    glb_writer.read_glb_summary(data)
+
     def test_json_root_not_object_rejected(self):
         jb = b"[1, 2, 3] "
         total = 12 + 8 + len(jb)

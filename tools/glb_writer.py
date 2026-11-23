@@ -1296,8 +1296,12 @@ def read_glb_summary(data: bytes) -> dict:
         raise GlbError(f"JSON chunk length {json_len} exceeds total length {total_length}")
 
     json_raw = bytes(buf[20:20 + json_len])
+
+    def reject_constant(token: str) -> None:
+        raise GlbError(f"invalid JSON chunk: {token} is not a JSON number")
+
     try:
-        gltf = json.loads(json_raw.decode("utf-8"))
+        gltf = json.loads(json_raw.decode("utf-8"), parse_constant=reject_constant)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise GlbError(f"invalid JSON chunk: {exc}") from exc
     if not isinstance(gltf, dict):
