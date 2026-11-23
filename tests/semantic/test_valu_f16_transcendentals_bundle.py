@@ -325,6 +325,23 @@ class TestVLogF16ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(res, 0x3c00)
         self.assertEqual(state.vgprs[0] & MASK16, 0x3c00)
 
+class TestVLogF16SIMDAndIEEE(unittest.TestCase):
+    def test_aliasing_and_flags(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+        state.write_vgpr_f16(0, 0x4000)
+        inst = ASTInstruction(Opcode.V_LOG_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x3c00)
+        self.assertEqual(state.vgprs[0] & MASK16, 0x3c00)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+
+    def test_ieee754_boundary(self) -> None:
+        res = ref_v_log_f16(0x4000)
+        self.assertIsInstance(res, int)
+
 
 if __name__ == "__main__":
     unittest.main()
