@@ -60,6 +60,13 @@ python -I tools/sandbox.py --work <work> --entities <work>/entities.jsonl --mode
     --textures <work>/ttpf_maps --textures <work>/ttpf_terrain [--center X Y] --window
 ```
 
+`vk_sandbox` needs `VkPhysicalDeviceVulkan11Features.shaderDrawParameters`; a device without it prints
+`unsupported: shaderDrawParameters` and exits 77. Sampler anisotropy is used when `samplerAnisotropy` is present and
+falls back to a non-anisotropic sampler otherwise, so frames still render on devices without it.
+
+Exit codes: 0 frame passed, 1 frame check failed, 77 unsupported (tool not built, no shader pair, no entities or
+props, or the device lacks a required feature).
+
 Window keys: WASD move, right mouse button held to look, Q/E down/up (fly), Shift faster, 1 fly, 2 walk (eye 1.7 m
 over the highest scene triangle under the camera), 3 drive (eye 1.2 m, accelerates and steers), P screenshot,
 Esc quit. `--center` is in RAGE world metres; without it the densest 50 m cell of resolved props is used.
