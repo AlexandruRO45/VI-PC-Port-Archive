@@ -21,6 +21,10 @@
 inline constexpr size_t pipeline_cache_io_chunk_size = size_t{16} << 20;
 
 inline std::vector<char> read_pipeline_cache_file(const std::filesystem::path& path) {
+    // Directory and device stream positions do not describe cache files.
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) return {};
+
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     const std::streamoff size = file.tellg();
     std::vector<char> data;
