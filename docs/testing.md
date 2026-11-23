@@ -326,6 +326,29 @@ Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixt
 3. Add it to `EXPECT` in `tests/test_wave64_halves_fixtures.py` with the tier, reasons and idioms the translator
    should give it, and run `python -m pytest tests/test_wave64_halves_fixtures.py`.
 4. Run `w64_graphics.py` on a RADV GPU and say which GPU and Mesa version in the pull request.
+
+`w64_tier_c_cost.py` (SHADER-836) puts a number on tier C for these fixtures: for each `ps_w64_c_*` it counts the
+pixels (of 64 x 64) whose partition-dependent words, the `None` entries of `FIXTURES`, differ from a reference run.
+On a device that can require both sizes (RADV) the reference is its own run required to 64 and the run is the one
+required to 32. A device that cannot require 64 compares its default-size draw with a reference directory: the
+`W64G_SAVE_REF` files of a 64-lane device, or `--save` files of any device.
+
+```sh
+python3 -I runtime/test/shaders/w64_tier_c_cost.py /tmp/w64g runtime/build/linux                     # RADV
+LEONIDA_VK_DEVICE=4080 python3 -I runtime/test/shaders/w64_tier_c_cost.py /tmp/w64g runtime/build/linux --save /tmp/ref32
+LEONIDA_VK_DEVICE=arc python3 -I runtime/test/shaders/w64_tier_c_cost.py /tmp/w64g runtime/build/linux --ref /tmp/ref32
+```
+
+Measured on `main` 26e56f594 with an RTX 4080 Laptop (NVIDIA 621.24, 32 live lanes) as the reference and an Intel Arc
+Graphics iGPU (Meteor Lake, Intel 101.6314, 16 live lanes, Windows 11) as the run. Both are narrower than a wave64, so
+this shows how far tier C words move with the partition width (32 to 16 lanes), not what they cost against a real
+wave64; no 64-lane device was available. A vote read as data (`ps_w64_c_scc_vote`, `_vote_else`, `_vote_stale`,
+`_execz_sgpr`) changed in 16 of 4,096 pixels (0.4%), a lane id
+(`_lane_id`) in 3,584 (87.5%), and a count or a `v_readlane` of a varying value (`_bcnt_export`, `_readlane`,
+`_waterfall_count`) in all 4,096. The fixtures are synthetic: they say which kinds of tier C change a few pixels and
+which change all of them, not how many game shaders are in each. A 64-lane run is still wanted (a RADV GPU), as is the
+corpus count of SHADER-836, which needs your own copy of the game.
+
 ## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
 
 The translated shaders take 144 bytes of push constants: s0..s31, then the heap base and the code base. A device whose
