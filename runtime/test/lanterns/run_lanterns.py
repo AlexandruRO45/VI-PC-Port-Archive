@@ -88,10 +88,11 @@ PASS_LINES = {
         rf"pixels as predicted", lambda a, b, c, d, moved: a == b and c == d and moved >= 1000),
     9: (rf"Lanterns stage 9: PASS, G-buffer of 3 MRTs \(RGBA8 albedo {N} of {N} exact, RGB10A2 normal and R32F depth "
         rf"{N} of {N} probes\), {N} of {N} single-colour pixels exact through tiled culling with LDS atomics \({F} of "
-        rf"256 lights per tile, the exact set in {N} of {N} tiles\), culling off gave the same image bit for bit "
+        rf"256 lights per tile, the exact set in {N} of {N} tiles, {N} light-tile pairs within 2e-3 of the box test left "
+        rf"free\), culling off gave the same image bit for bit "
         rf"from poisoned buffers, one light moved changed {N} of {N} predicted pixels",
-        lambda a, b, p, q, s, t, per_tile, sets, tiles, moved, predicted: a == b and p == q and q >= 50000
-        and s == t and per_tile < 128 and sets == tiles and moved == predicted and predicted >= 500),
+        lambda a, b, p, q, s, t, per_tile, sets, tiles, free, moved, predicted: a == b and p == q and q >= 50000
+        and s == t and per_tile < 128 and sets == tiles and free <= 32 and moved == predicted and predicted >= 500),
     10: (rf"Lanterns stage 10: PASS, 4x MSAA resolved by ResolveSubresource: {N} of {N} certain pixels exact at the "
          rf"standard sample positions \({N} edge pixels blended exactly\), the 1x render differs on {N} of {N} predicted "
          rf"edge pixels and nowhere else certain; {N} of {N} uncertain pixels are one of their enumerated averages; "

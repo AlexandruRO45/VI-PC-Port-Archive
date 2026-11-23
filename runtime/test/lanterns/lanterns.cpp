@@ -675,17 +675,18 @@ int stage9(const std::filesystem::path& shader_dir, const std::filesystem::path&
         return 1;
     if (!ca.pass() || !c.pass() || !cm.pass() || exact != singles || same_as_all != frame.size() ||
         all_full != counts.size() || poisoned || probes < 50000 || worst > 0.5 || probes_ok != probes || sets_ok != counts.size() ||
-        sets_all_ok != counts.size() || sets_moved_ok != counts.size() || expected < 500 || changed != expected || kept_still != still ||
+        sets_either > lanterns::kMaxEitherPairs || sets_all_ok != counts.size() || sets_moved_ok != counts.size() || expected < 500 || changed != expected || kept_still != still ||
         kept_total >= std::uint64_t(lanterns::kLights) * counts.size() / 2) {
         std::fprintf(stderr, "lanterns: stage 9 FAILED\n");
         return 1;
     }
     std::printf("Lanterns stage 9: PASS, G-buffer of 3 MRTs (RGBA8 albedo %u of %u exact, RGB10A2 normal and R32F depth "
                 "%u of %u probes), %u of %u single-colour pixels exact through tiled culling with LDS atomics (%.1f of "
-                "256 lights per tile, the exact set in %u of %zu tiles), culling off gave the same image bit for bit "
+                "256 lights per tile, the exact set in %u of %zu tiles, %u light-tile pairs within 2e-3 of the box test left free), "
+                "culling off gave the same image bit for bit "
                 "from poisoned buffers, one light moved changed %u of %u predicted pixels\n",
                 ca.certain_exact, ca.certain, probes_ok, probes, exact, singles,
-                double(kept_total) / double(counts.size()), sets_ok, counts.size(), changed, expected);
+                double(kept_total) / double(counts.size()), sets_ok, counts.size(), sets_either, changed, expected);
     return 0;
 }
 
