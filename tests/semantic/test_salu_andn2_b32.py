@@ -627,5 +627,109 @@ class TestSAndn2B32IEEE754Bitwise(unittest.TestCase):
         self.assertEqual(d, expected)
         self.assertEqual(scc, 1 if expected != 0 else 0)
 
+# -----------------------------------------------------------------------------
+# Commit 8: Translator-Backed Execution and Hardware Lowering Verification
+# -----------------------------------------------------------------------------
+
+class TestSAndn2B32TranslatorExecution(unittest.TestCase):
+    """Unit tests executing translated SPIR-V via spirv_mini_interp."""
+
+    def test_translator_mrt0_execution_matrix(self):
+        test_pairs = [
+            (0x1234_5678, 0x00FF_00FF),
+            (0xFFFF_FFFF, 0x0000_0000),
+            (0x0000_0000, 0xFFFF_FFFF),
+            (0x5555_5555, 0xAAAA_AAAA),
+            (0x1234_5678, 0x1234_5678),
+            (0x8000_0000, 0x0000_0000),
+            (0x0000_0001, 0x0000_0000),
+        ]
+        for idx, (s0, s1) in enumerate(test_pairs):
+            with self.subTest(idx=idx, s0=hex(s0), s1=hex(s1)):
+                lines = [
+                    f"s_mov_b32 s0, {s0:#x}",
+                    f"s_mov_b32 s1, {s1:#x}",
+                    "s_andn2_b32 s2, s0, s1",
+                    "v_mov_b32 v0, s2",
+                    "s_cselect_b32 s3, 1, 0",
+                    "v_mov_b32 v1, s3",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_andn2_b32_mrt_{idx}", lines)
+                out = support.mrt0_words(spv)
+                expected_d, expected_scc = s_andn2_b32_oracle(s0, s1)
+                self.assertEqual(out[0], expected_d)
+                self.assertEqual(out[1], expected_scc)
+
+    def test_translator_destination_aliasing_execution(self):
+        s0 = 0xF0F0_F0F0
+        s1 = 0x0F0F_0000
+        lines = [
+            f"s_mov_b32 s0, {s0:#x}",
+            f"s_mov_b32 s1, {s1:#x}",
+            "s_andn2_b32 s0, s0, s1",
+            "v_mov_b32 v0, s0",
+            "s_cselect_b32 s2, 1, 0",
+            "v_mov_b32 v1, s2",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_andn2_b32_alias", lines)
+        out = support.mrt0_words(spv)
+        expected_d, expected_scc = s_andn2_b32_oracle(s0, s1)
+        self.assertEqual(out[0], expected_d)
+        self.assertEqual(out[1], expected_scc)
+
+    def test_translator_null_destination(self):
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x12345678",
+            "s_andn2_b32 null, s0, s1",
+            "s_cselect_b32 s2, 1, 0",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_andn2_b32_null", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0)
+
+    def test_translator_emitted_spirv_opcodes(self):
+        lines = [
+            "s_andn2_b32 s0, s1, s2",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_andn2_b32_opcodes", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("OpStore %scc", spv)
+
+    def test_mutation_detection(self):
+        def mutant_and(s0: int, s1: int):
+            d = (s0 & s1) & MASK32
+            return d, int(d != 0)
+
+        def mutant_orn2(s0: int, s1: int):
+            d = (s0 | (~s1 & MASK32)) & MASK32
+            return d, int(d != 0)
+
+        s0 = 0x1234_5678
+        s1 = 0x00FF_00FF
+        correct_d, correct_scc = s_andn2_b32_oracle(s0, s1)
+        m_and_d, _ = mutant_and(s0, s1)
+        m_orn2_d, _ = mutant_orn2(s0, s1)
+        self.assertNotEqual(m_and_d, correct_d)
+        self.assertNotEqual(m_orn2_d, correct_d)
+
+
 if __name__ == "__main__":
     unittest.main()
