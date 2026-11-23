@@ -158,5 +158,114 @@ class SaluAddU32ReferenceOracleTests(unittest.TestCase):
         self.assertEqual(info2["wrapped_result"], 0x68AC)
 
 
+
+# --- Section 2: Symbolic AST Opcode Definitions ---
+
+class RegKind(enum.Enum):
+    SGPR = "sgpr"
+    VGPR = "vgpr"
+    IMM = "imm"
+    LITERAL = "literal"
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+
+
+def parse_salu_instruction(line: str) -> InstructionAST:
+    """Parse a single SALU SOP2 assembly line into an InstructionAST."""
+    line = line.split(";")[0].strip()
+    if not line:
+        raise ValueError("Empty instruction line")
+    parts = line.replace(",", " ").split()
+    if len(parts) != 4:
+        raise ValueError(f"SOP2 instruction requires 3 operands, got: {line}")
+    mnemonic, d_str, s0_str, s1_str = parts
+    if mnemonic != "s_add_u32":
+        raise ValueError(f"Expected s_add_u32 mnemonic, got {mnemonic}")
+
+    def parse_op(tok: str) -> Operand:
+        tok = tok.strip()
+        if tok.startswith("s"):
+            return Operand(RegKind.SGPR, index=int(tok[1:]))
+        elif tok.startswith("v"):
+            return Operand(RegKind.VGPR, index=int(tok[1:]))
+        else:
+            val = int(tok, 0)
+            if -16 <= val <= 64:
+                return Operand(RegKind.IMM, raw_val=val & MASK32)
+            return Operand(RegKind.LITERAL, raw_val=val & MASK32)
+
+    dst = parse_op(d_str)
+    if dst.kind != RegKind.SGPR:
+        raise ValueError(f"Destination must be an SGPR, got: {d_str}")
+
+    return InstructionAST(mnemonic, dst, parse_op(s0_str), parse_op(s1_str))
+
+
+class SaluAddU32AstValidationTests(unittest.TestCase):
+    """Commit 2: AST definition and parsing tests for s_add_u32."""
+
+    def test_ast_construction_sgpr_operands(self) -> None:
+        ast = InstructionAST(
+            mnemonic="s_add_u32",
+            dst=Operand(RegKind.SGPR, index=4),
+            src0=Operand(RegKind.SGPR, index=2),
+            src1=Operand(RegKind.SGPR, index=3),
+        )
+        self.assertEqual(ast.mnemonic, "s_add_u32")
+        self.assertEqual(ast.dst.kind, RegKind.SGPR)
+        self.assertEqual(ast.dst.index, 4)
+        self.assertEqual(ast.src0.index, 2)
+        self.assertEqual(ast.src1.index, 3)
+
+    def test_ast_imm_and_literal_operands(self) -> None:
+        ast = InstructionAST(
+            mnemonic="s_add_u32",
+            dst=Operand(RegKind.SGPR, index=0),
+            src0=Operand(RegKind.SGPR, index=1),
+            src1=Operand(RegKind.IMM, raw_val=42),
+        )
+        self.assertEqual(ast.src1.kind, RegKind.IMM)
+        self.assertEqual(ast.src1.raw_val, 42)
+
+    def test_parser_valid_sop2_instructions(self) -> None:
+        cases = [
+            ("s_add_u32 s4, s2, s3", 4, RegKind.SGPR, 2, RegKind.SGPR, 3),
+            ("s_add_u32 s0, s1, 1", 0, RegKind.SGPR, 1, RegKind.IMM, 1),
+            ("s_add_u32 s10, 0x1000, s5", 10, RegKind.LITERAL, 0x1000, RegKind.SGPR, 5),
+        ]
+        for line, dst_idx, s0_k, s0_val, s1_k, s1_val in cases:
+            ast = parse_salu_instruction(line)
+            self.assertEqual(ast.mnemonic, "s_add_u32")
+            self.assertEqual(ast.dst.index, dst_idx)
+            self.assertEqual(ast.src0.kind, s0_k)
+            self.assertEqual(ast.src1.kind, s1_k)
+
+    def test_parser_syntax_rejection(self) -> None:
+        invalid = [
+            "s_add_u32",
+            "s_add_u32 s0",
+            "s_add_u32 s0, s1",
+            "s_add_u32 s0, s1, s2, s3",
+            "s_add_u32 v0, s1, s2",  # dst must be SGPR
+            "v_add_u32 s0, s1, s2",  # wrong mnemonic
+        ]
+        for line in invalid:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_salu_instruction(line)
+
 if __name__ == "__main__":
     unittest.main()
