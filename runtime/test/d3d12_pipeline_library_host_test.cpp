@@ -106,8 +106,8 @@ const Step kSteps[] = {
          longer.resize(longer.size() + 64, 0);
          return create(c, longer.data(), longer.size());
      }},
-    // Whether a changed last byte is caught depends on the driver's own blob format: NVIDIA's (and the layer's) checks
-    // cover it, AMD's D3D12 (26.11.2, RX 9070 XT) accepts the blob. Recorded, not compared. A changed first byte (the
+    // Whether a changed last byte is caught depends on the driver's own blob format: the layer's checks cover it, while
+    // the AMD and NVIDIA hosts measured accept the blob (#5873). Recorded, not compared. A changed first byte (the
     // header) is refused by every host measured, so that step stays compared.
     {"create: its own blob, last byte flipped [own format]", [](Context& c) {
          std::vector<std::uint8_t> flipped(c.own);

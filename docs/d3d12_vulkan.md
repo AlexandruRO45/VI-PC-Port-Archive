@@ -2032,8 +2032,9 @@ Pipeline creation:
   one failing fast; RTX 3060, driver 610.88):
   - `CreatePipelineLibrary`: a foreign, truncated or corrupt blob, the other device's blob, or a null pointer with a
     size is `E_INVALIDARG`, and `*ppPipelineLibrary` is left as it was. Each device's own blob with its last byte
-    changed is recorded but not compared: whether that byte is covered depends on the driver's blob format, and AMD's
-    D3D12 (26.11.2, RX 9070 XT) accepts it where NVIDIA's and the layer refuse it (#5781). One of the layer's own blobs
+    changed is recorded but not compared: whether that byte is covered depends on the driver's blob format. The layer
+    refuses it, while the hosts measured accept it: AMD's D3D12 (26.11.2, RX 9070 XT and RX 7800 XT) and NVIDIA's (RTX
+    5060 and RTX 5070 Ti) (#5781, #5873). One of the layer's own blobs
     from another format version is `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, the documented code for a cache from another
     driver. A pointer with size 0 is an empty library; a longer blob than the header is accepted; a null output is
     `S_FALSE`.
