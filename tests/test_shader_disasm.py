@@ -8,11 +8,11 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 """
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "shader_disasm.py")
