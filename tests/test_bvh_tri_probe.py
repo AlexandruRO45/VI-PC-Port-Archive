@@ -211,6 +211,25 @@ class CommandLine(unittest.TestCase):
                     self.assertEqual(probe.main(argv), 2)
                 self.assertIn("error:", err.getvalue())
 
+    def test_write_kernels_unusable_dir_is_exit_2_with_one_error_line(self):
+        # a --write-kernels path that cannot hold the output (an existing file, or a path under one) is a CLI
+        # error: one "error:" line and exit 2, not a traceback and exit 1 (the --json write path behaves this way)
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = os.path.join(tmp, "plain-file")
+            with open(plain, "w", encoding="utf-8") as f:
+                f.write("x")
+            for bad in (plain, os.path.join(plain, "sub")):
+                with self.subTest(write_kernels=bad):
+                    err = io.StringIO()
+                    with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                        rc = probe.main(["--write-kernels", bad])
+                    self.assertEqual(rc, 2, err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    lines = err.getvalue().strip().splitlines()
+                    self.assertEqual(len(lines), 1, err.getvalue())
+                    self.assertTrue(lines[0].startswith("error:"), err.getvalue())
+                    self.assertIn(bad, lines[0])
+
     def test_write_kernels(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
             self.assertEqual(probe.main(["--write-kernels", tmp, "--kernel", "tri_g4b"]), 0)

@@ -1016,7 +1016,11 @@ def main(argv=None):
                 print(f"    {c['label']}")
         return 0
     if args.write_kernels:
-        return write_kernels(kernels, args.write_kernels)
+        try:
+            return write_kernels(kernels, args.write_kernels)
+        except OSError as e:
+            print(f"error: cannot write --write-kernels {args.write_kernels}: {e}", file=sys.stderr)
+            return 2
     tr = run_translator(kernels) if "translator" in backends else None
     hw, device = None, None
     if "hw" in backends:
