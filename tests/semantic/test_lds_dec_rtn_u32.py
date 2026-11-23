@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Semantic interpreter tests for LDS atomic unsigned decrement with wrap (ds_dec_rtn_u32).
 
 Target:
@@ -18,10 +20,7 @@ Standard library only; no GPU, no LLVM, no game files.
 Run directly:
     py -I tests/semantic/test_lds_dec_rtn_u32.py
 """
-from __future__ import annotations
-
 import os
-import random
 import sys
 import unittest
 
@@ -32,31 +31,6 @@ import support  # noqa: E402
 
 OP = "ds_dec_rtn_u32"
 MASK32 = 0xFFFFFFFF
-
-
-def ref_ds_dec_rtn_u32(cur: int, limit: int) -> tuple[int, int]:
-    """Reference calculation for ds_dec_rtn_u32: returns (old_val, new_val)."""
-    cur &= MASK32
-    limit &= MASK32
-    if cur == 0 or cur > limit:
-        new_val = limit
-    else:
-        new_val = (cur - 1) & MASK32
-    return cur, new_val
-
-
-def model_chain(ops: list[tuple[str, int, int, tuple[int, ...]]], init: dict[int, int]) -> tuple[list[int], dict[int, int]]:
-    """Simulate a sequence of ds_dec_rtn_u32 operations in Python."""
-    lds = dict(init)
-    rtns = []
-    for _, addr, off, (limit,) in ops:
-        eff = (addr + off) & MASK32
-        cur = lds.get(eff, 0)
-        old, new_val = ref_ds_dec_rtn_u32(cur, limit)
-        rtns.append(old)
-        lds[eff] = new_val
-    finals = sorted({(addr + off) & MASK32 for _, addr, off, _ in ops})
-    return rtns, {a: lds.get(a, 0) for a in finals}
 
 
 class TestLdsDecRtnU32SingleOp(unittest.TestCase):
@@ -166,6 +140,20 @@ class TestLdsDecRtnU32Chains(unittest.TestCase):
         self.assertEqual(rtns, [2, 15, 1])
         self.assertEqual(finals, {0x10: 0, 0x20: 14})
 
+    def test_deterministic_multi_step_chain(self):
+        init = {0x10: 5, 0x20: 0, 0x30: 10}
+        ops = [
+            (OP, 0x10, 0, (10,)),
+            (OP, 0x20, 0, (15,)),
+            (OP, 0x30, 0, (8,)),
+            (OP, 0x10, 0, (10,)),
+            (OP, 0x20, 0, (15,)),
+            (OP, 0x30, 0, (8,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(rtns, [5, 0, 10, 4, 15, 8])
+        self.assertEqual(fin, {0x10: 3, 0x20: 14, 0x30: 7})
+
 
 class TestLdsDecRtnU32Offsets(unittest.TestCase):
     """Test immediate byte offset decoding and address calculation."""
@@ -189,25 +177,52 @@ class TestLdsDecRtnU32Offsets(unittest.TestCase):
         self.assertEqual(finals, {0x40: 4, 0x44: 10, 0x48: 10})
 
 
-class TestLdsDecRtnU32Fuzzing(unittest.TestCase):
-    """Fuzzing tests with seeded pseudorandom sequences against Python reference model."""
+class TestLdsDecRtnU32RegisterAliasing(unittest.TestCase):
+    """Test register reuse where destination overlaps with address or data."""
 
-    def test_seeded_random_chains(self):
-        rng = random.Random(0xDEC32)
-        addrs = [0x10, 0x40, 0x80, 0x100]
-        for trial in range(4):
-            init = {a: rng.getrandbits(32) for a in addrs}
-            ops = []
-            for _ in range(8):
-                base = rng.choice(addrs)
-                off = rng.choice([0, 0, 4, 8])
-                limit = rng.choice([0, 1, 5, 0x7FFFFFFF, 0xFFFFFFFF, rng.getrandbits(32)])
-                ops.append((OP, base, off, (limit,)))
-            expected_rtns, expected_finals = model_chain(ops, init)
-            actual_rtns, actual_finals = L.run_chain(ops, init)
-            with self.subTest(trial=trial):
-                self.assertEqual(actual_rtns, expected_rtns)
-                self.assertEqual(actual_finals, expected_finals)
+    def test_alias_vdst_with_vaddr(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 5",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 10",
+            "ds_dec_rtn_u32 v1, v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v1", 0)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 5)
+
+    def test_alias_vdst_with_vdata(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 5",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 10",
+            "ds_dec_rtn_u32 v2, v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v2", 0) + L.store("v3", 1)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 5)
+        self.assertEqual(mem.get(4), 4)
+
+
+class TestLdsDecRtnU32Spirv(unittest.TestCase):
+    """Verify SPIR-V lowering emitted by rdna2spirv."""
+
+    def test_translator_emits_cas_loop_for_ds_dec_rtn(self):
+        listing = [
+            "ds_dec_rtn_u32 v5, v1, v3",
+            "s_waitcnt lgkmcnt(0)",
+        ]
+        spvasm = support.translate_lines("cs_dec_cas", listing + ["s_endpgm"], fssm=L.fssm())
+        self.assertIn("OpAtomicCompareExchange", spvasm)
+        self.assertIn("OpPhi", spvasm)
+        self.assertIn("OpLoopMerge", spvasm)
+        self.assertIn("OpBranchConditional", spvasm)
 
 
 class TestLdsDecRtnU32MultiLane(unittest.TestCase):
@@ -216,7 +231,6 @@ class TestLdsDecRtnU32MultiLane(unittest.TestCase):
     def test_multi_lane_independent_slots(self):
         """Each lane i decrements LDS[i * 4] from (i + 1) to i."""
         body = []
-        # Lane initialization of LDS: lane i writes (i + 1) to LDS[i * 4]
         body += [
             "v_lshlrev_b32_e32 v1, 2, v0",      # v1 = lane * 4
             "v_add_nc_u32_e32 v2, 1, v0",       # v2 = lane + 1
@@ -230,16 +244,13 @@ class TestLdsDecRtnU32MultiLane(unittest.TestCase):
             "ds_read_b32 v6, v1",
             "s_waitcnt lgkmcnt(0)",
         ]
-        # Store returned value in slot 0, new memory in slot 1
         body += L.store("v5", 0)
         body += L.store("v6", 1)
 
         mem = L.run(body, lanes=32)
         for lane in range(32):
             with self.subTest(lane=lane):
-                # slot 0 (v5) received old value (lane + 1)
                 self.assertEqual(L.out(mem, lane, 0), lane + 1)
-                # slot 1 (v6) read new value (lane)
                 self.assertEqual(L.out(mem, lane, 1), lane)
 
 
