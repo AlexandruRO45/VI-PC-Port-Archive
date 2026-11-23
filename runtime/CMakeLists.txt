@@ -1129,7 +1129,7 @@ endif()
 # -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time
 # (hash-checked), or pass -DFETCHCONTENT_SOURCE_DIR_VULKANHEADERS=<path> to use a local copy without downloading.
 option(LEONIDA_VULKAN_HEADERS_FETCH "Download the pinned Khronos Vulkan-Headers release if no Vulkan headers are found" OFF)
-option(LEONIDA_REQUIRE_VULKAN "Fail the configure instead of warning when no Vulkan headers are found" OFF)
+option(LEONIDA_REQUIRE_VULKAN "Fail the configure instead of warning when no Vulkan headers, or no Python 3 for the D3D12 COM objects, are found" OFF)
 find_package(Vulkan QUIET)
 if(NOT TARGET Vulkan::Headers)
   find_path(Vulkan_INCLUDE_DIR
@@ -2756,7 +2756,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(fsr_dispatch_test PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
   elseif(TARGET gta6rt)
-    message(STATUS "Python 3 or d3d12.h missing: the D3D12 COM objects and d3d12_com_test are not built")
+    if(NOT Python3_FOUND)
+      # Not a STATUS line: it drops the Vulkan D3D12 device and most of ctest (cmake/python_missing.cmake).
+      include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/python_missing.cmake")
+      leonida_python_missing()
+    else()
+      message(STATUS "d3d12.h missing: the D3D12 COM objects and d3d12_com_test are not built")
+    endif()
   endif()
 
   # Needs only the Vulkan headers, not a GPU.
