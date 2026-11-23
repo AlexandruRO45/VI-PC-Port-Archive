@@ -22,6 +22,7 @@
 #pragma once
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <set>
 
 #include <atomic>
@@ -164,6 +165,31 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
+// One "thread" event per other thread of this process: its id and stack, read while it is suspended.
+inline void log_all_threads() {
+    const DWORD self = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = Thread32First(snap, &entry); more; more = Thread32Next(snap, &entry)) {
+        if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+                              entry.th32ThreadID);
+        if (!t) continue;
+        if (SuspendThread(t) != static_cast<DWORD>(-1)) {
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_FULL;
+            std::string stack = GetThreadContext(t, &c) ? stack_from(c) : std::string("[]");
+            ResumeThread(t);
+            event("thread", "\"id\":" + std::to_string(entry.th32ThreadID) + ",\"stack\":" + stack);
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+}
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
@@ -196,6 +222,11 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
+            // A write to address 0 is how the title's watchdog stops the process when a thread stops making progress
+            // (RVA 0x2215c35). The faulting thread's stack names only the watchdog, so log every other thread's.
+            if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters >= 2 &&
+                r.ExceptionInformation[0] == 1 && r.ExceptionInformation[1] == 0)
+                log_all_threads();
         }
     } catch (...) {
         // Out of memory while formatting: drop the event rather than disturb the process.

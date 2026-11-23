@@ -740,6 +740,8 @@ public:
         try {
             const auto ignore = [](const std::string&) { return false; };
             if (std::ifstream(dir / "fspx/index.json", std::ios::binary)) load_index(dir / "fspx", "fspx/", ignore);
+            // XboxBvhBuilder.dll's embedded FSSM programs (docs/embedded_shaders.md), translated into <dir>/bvh.
+            if (std::ifstream(dir / "bvh/index.json", std::ios::binary)) load_index(dir / "bvh", "bvh/", ignore);
         } catch (...) {
         }
         return true;
