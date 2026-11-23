@@ -77,8 +77,6 @@ class CliHelpTests(unittest.TestCase):
     def test_every_cli_tool_answers_dash_h(self):
         self.loop("-h")
 
-
-
     def test_short_help_works_from_an_unrelated_cwd(self):
         self.loop_from_tempdir("-h")
 
