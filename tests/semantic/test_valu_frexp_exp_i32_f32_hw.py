@@ -446,5 +446,39 @@ class TestFrexpExpI32F32RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.machine.vgprs[2], 0x2222_2222)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestFrexpExpI32F32StatusFlags(unittest.TestCase):
+    def setUp(self):
+        self.machine = ScalarMachine()
+
+    def test_scc_invariance(self):
+        # VALU instructions do not modify scalar condition code SCC
+        for initial_scc in (0, 1):
+            self.machine.scc = initial_scc
+            self.machine.vgprs[1] = f32_to_bits(16.0)
+            insn = VFrexpExpI32F32Instruction(
+                dst=RegisterOperand(OperandType.VGPR, 0),
+                src0=RegisterOperand(OperandType.VGPR, 1),
+            )
+            self.machine.step(insn)
+            self.assertEqual(self.machine.scc, initial_scc)
+
+    def test_status_flags_unmodified_on_special_inputs(self):
+        # Zero, NaN, Inf do not set error flags or alter SCC
+        for special_val in (POS_ZERO, NEG_ZERO, POS_INF, NEG_INF, QNAN, SNAN):
+            self.machine.scc = 1
+            self.machine.vgprs[1] = special_val
+            insn = VFrexpExpI32F32Instruction(
+                dst=RegisterOperand(OperandType.VGPR, 0),
+                src0=RegisterOperand(OperandType.VGPR, 1),
+            )
+            self.machine.step(insn)
+            self.assertEqual(self.machine.vgprs[0], 0)
+            self.assertEqual(self.machine.scc, 1)
+
+
 if __name__ == '__main__':
     unittest.main()
