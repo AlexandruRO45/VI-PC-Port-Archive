@@ -10,7 +10,10 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import re
 import sys
 import tempfile
 import unittest
@@ -65,7 +68,7 @@ class RunPassTest(unittest.TestCase):
         self.assertEqual(self.run_with(Completed(1, stderr="[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed"))[1], 77)
 
     def test_access_violation_fails(self) -> None:
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(AssertionError), contextlib.redirect_stderr(io.StringIO()):
             self.run_with(Completed(0xC0000005, PASS_OUT))
 
     def test_missing_case_fails(self) -> None:
@@ -73,7 +76,45 @@ class RunPassTest(unittest.TestCase):
             self.run_with(Completed(0, PASS_OUT.replace("LAYER_MAP_COPY", "LAYER_MAP_OTHER")))
 
 
+EXCLUSIVE_TRACE = (checker.SPARSE_FLAGS + ")\n"
+                   "    sharingMode: VkSharingMode = VK_SHARING_MODE_EXCLUSIVE (0)\n"
+                   "    queueFamilyIndexCount: uint32_t = 0\n") * 6
+CONCURRENT_TRACE = (checker.SPARSE_FLAGS + ")\n"
+                    "    sharingMode: VkSharingMode = VK_SHARING_MODE_CONCURRENT (1)\n"
+                    "    queueFamilyIndexCount: uint32_t = 2\n"
+                    "    pQueueFamilyIndices[0]: const uint32_t = 0\n"
+                    "    pQueueFamilyIndices[1]: const uint32_t = 1\n"
+                    # check_trace reads the 12 lines after each flags line; real records are longer than that.
+                    + "    pNext: const void* = NULL\n" * 12) * 6
+
+
 class MainTest(unittest.TestCase):
+    def run_main(self, fake_run) -> int:
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "t.exe"
+            exe.write_bytes(b"")
+            with mock.patch.object(checker.subprocess, "run", side_effect=fake_run), \
+                 mock.patch.object(sys, "argv", ["check", str(exe)]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                return checker.main()
+
+    def test_broken_trace_fails_even_when_validation_skips(self) -> None:
+        # Review on #4900: a skip from the validation run must not hide EXCLUSIVE sparse buffers from the first run.
+        def fake_run(argv, cwd, env, **kwargs):
+            if env.get("VK_INSTANCE_LAYERS") == "VK_LAYER_LUNARG_api_dump":
+                (Path(cwd) / "sparse_create_info.log").write_text(EXCLUSIVE_TRACE, encoding="utf-8")
+                return Completed(0, PASS_OUT)
+            return Completed(77)
+
+        with self.assertRaises(AssertionError):
+            self.run_main(fake_run)
+
+    def test_both_runs_fit_the_ctest_timeout(self) -> None:
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        limit = re.search(r"d3d12_sparse_queue_family_contract PROPERTIES[^)]*TIMEOUT (\d+)", cmake)
+        self.assertIsNotNone(limit)
+        self.assertLess(2 * checker.RUN_TIMEOUT, int(limit.group(1)))
+
     def test_validation_errors_fail_the_check(self) -> None:
         calls = []
 
@@ -81,15 +122,11 @@ class MainTest(unittest.TestCase):
             calls.append(dict(env))
             if env.get("LEONIDA_VK_VALIDATION") == "1":
                 return Completed(0, PASS_OUT + "Validation Error: [ VUID-vkCmdDraw-None-02699 ] synthetic\n")
+            (Path(cwd) / "sparse_create_info.log").write_text(CONCURRENT_TRACE, encoding="utf-8")
             return Completed(0, PASS_OUT)
 
-        with tempfile.TemporaryDirectory() as td:
-            exe = Path(td) / "t.exe"
-            exe.write_bytes(b"")
-            with mock.patch.object(checker.subprocess, "run", side_effect=fake_run), \
-                 mock.patch.object(sys, "argv", ["check", str(exe)]):
-                with self.assertRaises(AssertionError):
-                    checker.main()
+        with self.assertRaises(AssertionError):
+            self.run_main(fake_run)
         self.assertEqual(len(calls), 2)
         self.assertEqual([c.get("VK_INSTANCE_LAYERS") for c in calls], ["VK_LAYER_LUNARG_api_dump", None])
 

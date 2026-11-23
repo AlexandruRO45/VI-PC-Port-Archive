@@ -28,6 +28,8 @@ SPARSE_FLAGS = "VkBufferCreateFlags = 7 (VK_BUFFER_CREATE_SPARSE_BINDING_BIT"
 MODE = re.compile(r"sharingMode:\s+VkSharingMode = (VK_SHARING_MODE_\w+)")
 COUNT = re.compile(r"queueFamilyIndexCount:\s+uint32_t = (\d+)")
 INDICES = re.compile(r"pQueueFamilyIndices\[(\d+)\]:\s+const uint32_t = (\d+)")
+# Each of the two runs gets 30 s, so both together stay inside the CTest TIMEOUT of 65 s (runtime/CMakeLists.txt).
+RUN_TIMEOUT = 30
 CASE = re.compile(r"^RESULT (LAYER_MAP_(?:DIRECT|COPY|COMPUTE)_COPY_COMPUTE) PASS mapped_mismatch=0/65536 unmapped_nonzero=0/65536$", re.M)
 
 
@@ -83,17 +85,18 @@ def main() -> int:
         dump_out, skip = run_pass(exe, dump_env, path)
         if skip:
             return skip
+        # Check the trace before the validation run: a skip there must not hide a contract the trace has broken.
+        candidates = list(path.glob("sparse_create_info.log*"))
+        if not candidates:
+            print("SKIP 77: Vulkan SDK VK_LAYER_LUNARG_api_dump unavailable or did not write trace")
+            return 77
+        calls, infos = check_trace(candidates[0], args.expect_baseline_exclusive)
         validation_out, skip = run_pass(exe, validation_env, path)
         if skip:
             return skip
         errors = [line for line in validation_out.splitlines() if "Validation Error" in line or "VUID-" in line]
         if errors:
             raise AssertionError(f"Khronos validation reported {len(errors)} error line(s); first: {errors[0][:300]}")
-        candidates = list(path.glob("sparse_create_info.log*"))
-        if not candidates:
-            print("SKIP 77: Vulkan SDK VK_LAYER_LUNARG_api_dump unavailable or did not write trace")
-            return 77
-        calls, infos = check_trace(candidates[0], args.expect_baseline_exclusive)
         kinds = sorted(CASE.findall(dump_out))
         print(f"GPU PASS: {len(kinds)} COPY/COMPUTE sparse queue cases, mapped 65,536 bytes exact, unmapped 65,536 zeros")
         print(f"VK API CONTRACT PASS: {calls} sparse VkBuffer creations / {infos} create-info records = "
@@ -118,7 +121,7 @@ def pass_envs(base: Mapping[str, str], settings_dir: Path) -> tuple[dict[str, st
 def run_pass(exe: Path, env: Mapping[str, str], cwd: Path) -> tuple[str, int]:
     """Run the GPU test once: (output, 77) for a skip, (output, 0) when all three cases passed."""
     run = subprocess.run([str(exe)], cwd=cwd, env=dict(env), capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", timeout=40)
+                         text=True, encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
     out = run.stdout + "\n" + run.stderr
     if run.returncode == 77:
         print("SKIP 77: Leonida Vulkan device / sparse features unavailable")
