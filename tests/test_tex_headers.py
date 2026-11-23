@@ -1207,5 +1207,19 @@ class TestTextureDictionaryParsing(unittest.TestCase):
         self.assertEqual(res[1]["width"], 512)
 
 
+class TestWriteJsonReportPreserve(unittest.TestCase):
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '[{"previous": true}]'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(tex_headers, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    tex_headers.write_json_report(path, [{"new": True}])
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
