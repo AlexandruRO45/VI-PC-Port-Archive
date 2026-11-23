@@ -12,7 +12,7 @@ d3d12_depth_resolve_test: PASS (51/51 depth/stencil resolves matched NVIDIA GeFo
 d3d12_predication_atomic_copy_test: PASS (59/59 checks passed)
 xg_xs_test: PASS (16/16 checks passed)
 Failed:     none
-Skipped:    12 skips are package-dependent tests requiring retail package or movie assets (shader_library_corpus, bink_decode, bink_abi, bink_play_headless, fsr_dispatch, bvh_builder, bink_audio, vk_sync_validation, d3d12_sparse_queue_family_contract, d3d12_rgb9e5_rtv, d3d12_boot_movie, d3d12_first_light).
+Skipped:    12 (shader_library_corpus, bink_decode, bink_abi, bink_play_headless, fsr_dispatch, bvh_builder, bink_audio, vk_sync_validation, d3d12_sparse_queue_family_contract, d3d12_rgb9e5_rtv, d3d12_boot_movie, d3d12_first_light). The vk_sync_validation self-test can skip when validation is disabled or no Vulkan device is available.
 Notes:
 - Built runtime with MSVC Developer Tools x64 in RelWithDebInfo configuration.
 - Resizable BAR is active (BAR1: 8192 MiB), upload heaps in VRAM (DEVICE_LOCAL | HOST_VISIBLE).

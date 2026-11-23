@@ -7,7 +7,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | GPU | Driver, OS | Commit | build.py | check.py | run_gpu_tests.py | Failed | Entry |
 |---|---|---|---|---|---|---|---|
 | AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](../gpu-test-results/RX9070GRE.txt) |
-| NVIDIA GeForce RTX 5060 (Blackwell), subgroup 32..32 | NVIDIA 616.56, Vulkan 1.4.312, Windows 11 | `867d922` | N/A (Windows host) | N/A (Windows host) | 228/240 ctest passed, 12 skipped, 0 failed | none | [local note](../gpu-test-results/RTX5060.txt) |
+| NVIDIA GeForce RTX 5060 (Blackwell), subgroup 32..32 | NVIDIA 616.56, Vulkan 1.4.312, Windows 11 | `867d922` | Not run | Not run | Not run (CTest: 228/240 passed, 12 skipped) | none | [local note](../gpu-test-results/RTX5060.txt) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -50,9 +50,9 @@ d3d12_depth_resolve_test: PASS (51/51 depth/stencil resolves matched NVIDIA GeFo
 d3d12_predication_atomic_copy_test: PASS (59/59 checks passed)
 xg_xs_test: PASS (16/16 checks passed)
 Failed:     none
-Skipped:    12 skips are package-dependent tests requiring retail package or movie assets.
+Skipped:    12 (see linked test report for names).
 ```
 
 Setup: built runtime with MSVC x64 in `RelWithDebInfo` configuration (`cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo`).
-Ran full CTest suite on native Windows 11 host (`ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure -j 4`): 228 passed, 12 skipped (retail package / assets required), 0 failed.
+Ran full CTest suite on native Windows 11 host (`ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure -j 4`): 228 passed, 12 skipped, 0 failed.
 Verified all 75 copy and 60 resolve comparisons in `d3d12_vulkan_device_test`, 51/51 depth/stencil resolves in `d3d12_depth_resolve_test`, and 59/59 checks in `d3d12_predication_atomic_copy_test`. Resizable BAR is active (8192 MiB BAR1), placing upload heaps directly into device-local memory.
