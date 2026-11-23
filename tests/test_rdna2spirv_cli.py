@@ -68,7 +68,7 @@ class SourceDiscovery(unittest.TestCase):
 
     def run_main(self, src, out):
         def spirv_tool(cmd, **kwargs):
-            tool = cmd[0]
+            tool = os.path.basename(cmd[0])
             if tool == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
@@ -308,7 +308,7 @@ class OutputInsideInput(unittest.TestCase):
         out = self.tmp / "spirv"
 
         def spirv_tool(cmd, **kwargs):
-            if cmd[0] == "spirv-as":
+            if os.path.basename(cmd[0]) == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -333,7 +333,7 @@ class ValidatedOutput(unittest.TestCase):
 
     def translate(self, *, reject_at=None):
         def spirv_tool(cmd, **kwargs):
-            tool = cmd[0]
+            tool = os.path.basename(cmd[0])
             if tool == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
@@ -479,7 +479,7 @@ class ValidatedOutput(unittest.TestCase):
 
     def test_missing_validator_does_not_publish_the_module(self):
         def spirv_tool(cmd, **kwargs):
-            if cmd[0] == "spirv-as":
+            if os.path.basename(cmd[0]) == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             raise FileNotFoundError(2, "No such file or directory", "spirv-val")
@@ -568,7 +568,7 @@ class UnreadableInput(unittest.TestCase):
         readable shader next to the bad one, so it reaches spirv-as, and neither that nor spirv-val is required to
         test how an unreadable input is reported. Returns (exit code, stderr)."""
         def spirv_tool(cmd, **kwargs):
-            if cmd[0] == "spirv-as":
+            if os.path.basename(cmd[0]) == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -705,7 +705,7 @@ class UnreadableInput(unittest.TestCase):
             self.shader(root, "ps_ok")
 
             def spirv_tool(cmd, **kwargs):
-                if cmd[0] == "spirv-as":
+                if os.path.basename(cmd[0]) == "spirv-as":
                     Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
 
