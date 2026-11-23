@@ -50,7 +50,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gdk_runtime_calls import RIP, Code, Insn, writes  # noqa: E402
+from gdk_runtime_calls import _PREFIXES, RIP, Code, Insn, writes  # noqa: E402
 from pe_inspect import PeFormatError, PeImage  # noqa: E402
 
 CHECK_FEATURE_SUPPORT_SLOT = 13
@@ -131,9 +131,29 @@ class Tracker:
         data, base = self.code.view(i.rva)
         return int.from_bytes(data[i.end - base - size:i.end - base], "little")
 
+    def word_sized(self, i: Insn) -> bool:
+        """An operand-size prefix (66) without REX.W: the instruction writes 16 bits and keeps the upper half."""
+        if i.wide:
+            return False
+        data, base = self.code.view(i.rva)
+        at = i.rva - base
+        while at < i.end - base and data[at] in _PREFIXES:
+            if data[at] == 0x66:
+                return True
+            at += 1
+        return False
+
     def step(self, i: Insn) -> None:
         known = self.known
         op = i.op
+        if op < 0x100 and self.word_sized(i):
+            # mov dx, imm16 or xor dx, dx changes only the low half; the tracker keeps 32-bit values, so the
+            # register is no longer known rather than wrongly known
+            for r in writes(i):
+                known.pop(r, None)
+            if op in (0x29, 0x2B, 0x31, 0x33, 0x89, 0x8B, 0x8D) and i.reg is not None:
+                known.pop(i.reg if op in (0x2B, 0x33, 0x8B, 0x8D) else i.rm, None)
+            return
         if i.mod is None and 0xB8 <= op <= 0xBF:                          # mov r32/r64, imm
             reg = (op & 7) | ((i.rex & 1) << 3)
             known[reg] = self.imm(i, 8 if i.wide else 4) & 0xFFFFFFFF
@@ -360,4 +380,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

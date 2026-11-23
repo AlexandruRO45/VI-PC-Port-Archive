@@ -51,6 +51,10 @@ FUNCTIONS = {
     "hidden": "B8 00 FF 50 68 C3",
     # a wrapper called directly with OPTIONS5 and its size: mov edx,1Bh; mov r9d,0Ch; call rel32 (to itself)
     "wrapper": "BA 1B 00 00 00 41 B9 0C 00 00 00 E8 00 00 00 00 C3",
+    # 16-bit writes keep edx's upper half: mov edx,1001Bh; xor dx,dx leaves 10000h, not 0 (review of #7447)
+    "xor_dx": "BA 1B 00 01 00 66 31 D2 41 B9 0C 00 00 00 " + LOAD_DEVICE + " " + CALL_SLOT13 + " C3",
+    # mov dx,1Bh is a 2-byte immediate: reading 4 bytes would take the next instruction's bytes as the value
+    "mov_dx": "BA 00 00 01 00 66 BA 1B 00 41 B9 0C 00 00 00 " + LOAD_DEVICE + " " + CALL_SLOT13 + " C3",
     # slot 20 through r10 with a disp32: call qword ptr [r10+0A0h]
     "slot20": "BA 01 00 00 00 41 B9 10 00 00 00 41 FF 92 A0 00 00 00 C3",
 }
@@ -132,11 +136,15 @@ class ScanTest(unittest.TestCase):
         across = fq.scan(self.img, across_labels=True)
         self.assertEqual(calls_in(across, self.bounds, "label"), [(27, 12)])
 
+    def test_a_16_bit_write_forgets_instead_of_guessing(self):
+        self.assertEqual(calls_in(self.found, self.bounds, "xor_dx"), [(None, 12)])
+        self.assertEqual(calls_in(self.found, self.bounds, "mov_dx"), [(None, 12)])
+
     def test_a_pattern_inside_another_instruction_is_not_a_call(self):
         self.assertEqual(calls_in(self.found, self.bounds, "hidden"), [])
 
     def test_slot_calls_are_counted_once_each(self):
-        self.assertEqual(len(self.found["calls"]), 7)
+        self.assertEqual(len(self.found["calls"]), 9)
         self.assertEqual(self.found["undecoded_functions"], 0)
 
     def test_another_slot_with_a_disp32(self):
@@ -148,7 +156,7 @@ class ScanTest(unittest.TestCase):
         found = fq.scan(self.img, any_call=True)
         self.assertEqual(calls_in(found, self.bounds, "wrapper", "other_calls"), [(27, 12)])
         self.assertEqual(calls_in(found, self.bounds, "options5_lea", "other_calls"), [])
-        self.assertEqual(len(found["calls"]), 7)
+        self.assertEqual(len(found["calls"]), 9)
 
     def test_without_any_call_the_wrapper_is_not_read(self):
         self.assertEqual(self.found["other_calls"], [])
@@ -176,7 +184,7 @@ class SummaryTest(unittest.TestCase):
 
     def test_one_sided_rows(self):
         self.assertEqual(self.r["feature_only"], [])
-        self.assertEqual(self.r["size_only"], [{"size": 12, "calls": 3}])
+        self.assertEqual(self.r["size_only"], [{"size": 12, "calls": 5}])
         self.assertEqual(self.r["neither"], 0)
 
     def test_other_calls_are_numbers_with_a_pc_size_mark(self):
@@ -210,14 +218,14 @@ class CliTest(unittest.TestCase):
             path = self.write(d, "synthetic.exe", build_image()[0])
             rc, out, _ = self.run_main(path)
             self.assertEqual(rc, 0)
-            self.assertIn("synthetic.exe: 7 call(s) through slot 13 (+0x68)", out)
+            self.assertIn("synthetic.exe: 9 call(s) through slot 13 (+0x68)", out)
             self.assertIn("D3D12_OPTIONS5 (27), 12 bytes (the PC size): 1", out)
             self.assertIn("D3D12_OPTIONS5 (27) in edx: 1", out)
             self.assertNotIn("0x1", out.split("sites")[0].split("+0x68")[1])   # no RVA without --sites
             rc, out, _ = self.run_main(path, "--json")
             self.assertEqual(rc, 0)
             r = json.loads(out)[0]
-            self.assertEqual(r["slot_calls"], 7)
+            self.assertEqual(r["slot_calls"], 9)
             self.assertNotIn("sites", r)
 
     def test_sites_and_any_call(self):
