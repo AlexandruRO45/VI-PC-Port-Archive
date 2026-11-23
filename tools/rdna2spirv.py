@@ -66,6 +66,10 @@ BARY_FALLBACK = False
 SHADER_CLOCK = False
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
 FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from single-rounded f32 ops (Gen.fma_exact)
+# --snan-minmax: each f32 NMin/NMax of the min/max/min3/max3/med3 ALU ops is followed by `IsNan(x) ? y : r`. GLSL.std.450
+# says the other operand wins for any NaN, but the AMD Windows driver (RX 7700 XT, 26.11.2) returns a quiet NaN when the
+# first operand is a signalling NaN, where RDNA2 returns the other operand. Off by default: the output is unchanged.
+SNAN_MINMAX = False
 # --texel-offset-fallback: image_sample*_o without VK_KHR_maintenance8. The run-time texel offset is folded into the
 # coordinate (coordinate + offset / size of the sampled mip level) instead of the SPIR-V Offset operand, which needs
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
@@ -6294,9 +6298,20 @@ class Gen:
 
     def nminmax_f32(self, glsl_op, x, y, y_src=None, nan_y=None):
         """GLSL.std.450 ``NMin``/``NMax`` returning ``x`` with its bits intact whenever ``y`` is NaN."""
+        r = self.nminmax_raw(glsl_op, x, y)
+        return self._select_nan_first(r, x, nan_y, y, y_src)
+
+    def nminmax_raw(self, glsl_op, x, y):
+        """``NMin``/``NMax`` of two floats; under --snan-minmax a NaN ``x`` gives ``y`` by an explicit select, since
+        the AMD Windows driver returns a NaN when ``x`` is a signalling one (see SNAN_MINMAX)."""
         r = self.tmp()
         self.emit(f"{r} = OpExtInst %float %glsl {glsl_op} {x} {y}")
-        return self._select_nan_first(r, x, nan_y, y, y_src)
+        if not SNAN_MINMAX:
+            return r
+        n, s = self.tmp(), self.tmp()
+        self.emit(f"{n} = OpIsNan %bool {x}")
+        self.emit(f"{s} = OpSelect %float {n} {y} {r}")
+        return s
 
     def _read_f16_minmax_srcs(self, srcs, sels, mods):
         """Read f16 min/max/med3 sources and track raw modified ``src0`` half when ``clamp`` is absent."""
@@ -6329,8 +6344,12 @@ class Gen:
         An inline or literal constant that is not a NaN gets no OpIsNan; with no operand left to check there is no
         select."""
         x, y, z = vals
-        lo, hi, m1, m = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{lo} = OpExtInst %float %glsl NMin {x} {y}")
+        if sel is None:     # f32: `lo` also starts the NaN result min3, so it takes the --snan-minmax select
+            lo = self.nminmax_raw("NMin", x, y)
+            hi, m1, m = self.tmp(), self.tmp(), self.tmp()
+        else:
+            lo, hi, m1, m = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{lo} = OpExtInst %float %glsl NMin {x} {y}")
         self.emit(f"{hi} = OpExtInst %float %glsl NMax {x} {y}")
         self.emit(f"{m1} = OpExtInst %float %glsl NMax {z} {lo}")
         self.emit(f"{m} = OpExtInst %float %glsl NMin {m1} {hi}")
@@ -17996,6 +18015,10 @@ def main():
     ap.add_argument("--shader-clock", choices=("off", "khr"), default="off",
                     help="s_memtime / s_memrealtime: off = Unsupported (default), khr = OpReadClockKHR (needs "
                          "VK_KHR_shader_clock; feature shaderSubgroupClock / shaderDeviceClock in the metadata)")
+    ap.add_argument("--snan-minmax", action="store_true",
+                    help="f32 v_min/v_max/v_min3/v_max3/v_med3 select the other operand explicitly when the first "
+                         "NMin/NMax operand is a NaN, for drivers that return a NaN for a signalling one (the AMD "
+                         "Windows driver); off by default, the output is otherwise unchanged")
     ap.add_argument("--fma", choices=("glsl", "khr", "exact"), default="glsl",
                     help="how fused multiply-adds (v_fma_f32, v_fmac_f32, v_fmaak/fmamk_f32, v_fma_mix*) are emitted: "
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
@@ -18044,7 +18067,8 @@ def main():
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
-    global FMA_EXACT
+    global FMA_EXACT, SNAN_MINMAX
+    SNAN_MINMAX = a.snan_minmax
     FMA_KHR = a.fma == "khr"
     SHADER_CLOCK = a.shader_clock == "khr"
     FMA_EXACT = a.fma == "exact"
