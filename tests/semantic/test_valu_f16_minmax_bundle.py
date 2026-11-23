@@ -177,5 +177,56 @@ class TestMinF16ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[0], 0xAAAA_0000 | f16_to_bits(2.5))
 
 
+# ------------------------------------------------------------------------------
+# v_min_f16 SIMD & IEEE 754
+# ------------------------------------------------------------------------------
+
+class SIMDWaveMinF16:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step(self, insn: VMinF16Instruction):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.vgprs[insn.src0.index][lane] & MASK16
+                s1 = self.vgprs[insn.src1.index][lane] & MASK16
+                res = ref_min_f16(s0, s1)
+                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res
+
+
+class TestMinF16SIMDAndIEEE(unittest.TestCase):
+    def test_simd_divergence(self):
+        wave = SIMDWaveMinF16(wave_size=32)
+        for lane in range(32):
+            wave.vgprs[1][lane] = f16_to_bits(float(lane))
+            wave.vgprs[2][lane] = f16_to_bits(16.0)
+            wave.vgprs[0][lane] = 0
+
+        wave.exec_mask = 0x5555_5555
+        insn = VMinF16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        wave.step(insn)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                expected = f16_to_bits(min(float(lane), 16.0))
+                self.assertEqual(wave.vgprs[0][lane], expected)
+            else:
+                self.assertEqual(wave.vgprs[0][lane], 0)
+
+    def test_nan_and_infinities(self):
+        # One NaN returns other operand
+        self.assertEqual(ref_min_f16(QNAN16, f16_to_bits(3.0)), f16_to_bits(3.0))
+        self.assertEqual(ref_min_f16(f16_to_bits(-5.0), QNAN16), f16_to_bits(-5.0))
+        # Infinities
+        self.assertEqual(ref_min_f16(POS_INF16, f16_to_bits(100.0)), f16_to_bits(100.0))
+        self.assertEqual(ref_min_f16(NEG_INF16, f16_to_bits(-100.0)), NEG_INF16)
+
+
 if __name__ == '__main__':
     unittest.main()
