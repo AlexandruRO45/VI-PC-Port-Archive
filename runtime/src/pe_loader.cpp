@@ -397,6 +397,8 @@ struct ExistingThreadBlock {
     void*** vector = nullptr;  // that thread's TEB->ThreadLocalStoragePointer field; the array itself can be replaced
     void* saved = nullptr;     // what the block replaced
     void* block = nullptr;
+    void* ga_view = nullptr;   // the thread's view for a /GA image (Module::tls_ga_slot), when it has one
+    uint32_t ga_slot = kNoTlsIndex;
 };
 
 // Immortal, like the thread events that use them. `ended` holds the ids of threads whose DLL_THREAD_DETACH has run:
@@ -642,10 +644,40 @@ void restore_thread_slot(void*** vector, uint32_t index, void* block, void* save
     }
 }
 
+// Another thread's TlsAlloc slots (TEB->TlsSlots, an inline array at 0x1480 for indices below 64), addressed through
+// the same TEB field as the module TLS array above. The /GA rewrite reads them with gs:[1480h + 8 * slot].
+void** thread_alloc_slots(void*** vector) {
+    return reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(vector) - 0x58 + 0x1480);
+}
+
+bool write_thread_alloc_slot(void*** vector, uint32_t index, void* value) noexcept {
+    if (index >= kMaxModuleTlsSlots) return false;
+    __try {
+        thread_alloc_slots(vector)[index] = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Clears a TlsAlloc slot of another thread if it still holds `view`.
+void restore_thread_alloc_slot(void*** vector, uint32_t index, void* view) noexcept {
+    if (index >= kMaxModuleTlsSlots) return;
+    __try {
+        void** slots = thread_alloc_slots(vector);
+        if (slots[index] == view) slots[index] = nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 // Takes a block out of its slot and frees it. The existing-threads lock is held; b.vector is null when the thread
 // is gone.
 void remove_existing_block(const ExistingThreadBlock& b) {
-    if (b.vector && b.index < kMaxModuleTlsSlots) restore_thread_slot(b.vector, b.index, b.block, b.saved);
+    if (b.vector) {
+        if (b.index < kMaxModuleTlsSlots) restore_thread_slot(b.vector, b.index, b.block, b.saved);
+        if (b.ga_view) restore_thread_alloc_slot(b.vector, b.ga_slot, b.ga_view);
+    }
+    if (b.ga_view) VirtualFree(b.ga_view, 0, MEM_RELEASE);
     VirtualFree(b.block, 0, MEM_RELEASE);
 }
 
@@ -740,7 +772,30 @@ void install_on_existing_threads(Module& m) {
                                  m.name.c_str());
                 continue;
             }
-            state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block});
+            // A /GA image's rewritten reads take the thread's view from TlsSlots, which a new thread gets in
+            // install_thread_block. This one predates the map, so its view is made here, in the same TEB.
+            void* view = nullptr;
+            if (m.tls_ga_slot != kNoTlsIndex) {
+                view = VirtualAlloc(nullptr, kMaxModuleTlsSlots * sizeof(void*), MEM_RESERVE | MEM_COMMIT,
+                                    PAGE_READWRITE);
+                if (view) {
+                    static_cast<void**>(view)[0] = block;
+                    static_cast<void**>(view)[m.tls_index] = block;
+                }
+                if (!view || !write_thread_alloc_slot(vector, m.tls_ga_slot, view)) {
+                    if (view) VirtualFree(view, 0, MEM_RELEASE);
+                    restore_thread_slot(vector, m.tls_index, block, saved);
+                    VirtualFree(block, 0, MEM_RELEASE);
+                    static std::atomic<bool> logged_view{false};
+                    if (!logged_view.exchange(true))
+                        std::fprintf(stderr, "[rt] loader: %s: a running thread did not take its index-0 TLS view; "
+                                             "its rewritten TLS reads are not valid\n",
+                                     m.name.c_str());
+                    continue;
+                }
+            }
+            state.blocks.push_back(
+                {c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block, view, m.tls_ga_slot});
         }
     }
 }
@@ -775,7 +830,10 @@ void forget_ended_thread_id() {
             ++it;
             continue;
         }
-        VirtualFree(it->block, 0, MEM_RELEASE);
+        // The id was handed to this new thread: its TEB is not the one the block was put into, so nothing is written
+        // there, but the block and the /GA view still have to go.
+        it->vector = nullptr;
+        remove_existing_block(*it);
         it = state.blocks.erase(it);
     }
 }

@@ -1,0 +1,5 @@
+LIBRARY tiny_ga_exe
+EXPORTS
+  tiny_ga_get
+  tiny_ga_set
+  tiny_ga_bad_attach_count

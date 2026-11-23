@@ -756,6 +756,29 @@ if(BUILD_TESTING)
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
 
+    add_executable(tiny_ga_exe test/fixtures/tiny_ga_exe.cpp test/fixtures/tiny_ga_exe.def)
+    target_compile_definitions(tiny_ga_exe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_ga_exe PRIVATE /W4 /permissive- /utf-8 /EHsc /GA)
+    set_target_properties(tiny_ga_exe PROPERTIES
+      OUTPUT_NAME tiny_ga_exe
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    add_executable(loader_ga_test
+      test/loader_ga_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(loader_ga_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_compile_definitions(loader_ga_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(loader_ga_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_dependencies(loader_ga_test tiny_ga_exe gta6rt_tls_host)
+    add_test(NAME loader_ga
+      COMMAND loader_ga_test "$<TARGET_FILE:tiny_ga_exe>"
+    )
+
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
     # DllMain's only work is that one call. No game files.
     add_library(dll_thread_calls SHARED test/fixtures/dll_thread_calls.cpp)
