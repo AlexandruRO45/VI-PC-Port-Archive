@@ -227,6 +227,30 @@ bool write_marker(const std::filesystem::path& mark, DWORD& error) {
 // created for this attempt; a pre-existing tombstone still belongs to an earlier successful operation.
 class PendingMarker {
 public:
+    bool lock_overlay(const std::filesystem::path& overlay, DWORD& error) {
+        const auto directory = overlay / kCopyDir;
+        std::error_code ec;
+        std::filesystem::create_directories(directory, ec);
+        if (ec) {
+            error = static_cast<DWORD>(ec.value());
+            return false;
+        }
+        // The persistent file lives outside the mirrored tree, beside copy-up staging files. Do not delete it:
+        // replacing the lock file could let two processes lock different files at the same name.
+        guard_ = ::CreateFileW((directory / L".marker-lock").c_str(), GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN,
+                                nullptr);
+        if (guard_ == INVALID_HANDLE_VALUE) {
+            error = ::GetLastError();
+            return false;
+        }
+        if (!::LockFileEx(guard_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &range_)) {
+            error = ::GetLastError();
+            return false;
+        }
+        guard_locked_ = true;
+        return true;
+    }
     bool prepare(const std::filesystem::path& path, DWORD& error) {
         std::error_code ec;
         if (std::filesystem::is_regular_file(path, ec)) return true;
@@ -236,16 +260,19 @@ public:
     }
     void commit() { path_.clear(); }
     ~PendingMarker() {
-        if (path_.empty()) return;
         const DWORD error = ::GetLastError();
-        if (!::DeleteFileW(path_.c_str())) {
+        if (!path_.empty() && !::DeleteFileW(path_.c_str())) {
             const DWORD rollback_error = ::GetLastError();
             std::fprintf(stderr, "[rt] file_system: cannot roll back deletion marker %ls (error %lu); "
                                  "original operation error %lu\n", path_.c_str(), rollback_error, error);
         }
+        if (guard_ != INVALID_HANDLE_VALUE) {
+            if (guard_locked_) ::UnlockFileEx(guard_, 0, 1, 0, &range_);
+            ::CloseHandle(guard_);
+        }
         ::SetLastError(error);
     }
-    // Keep another delete/move from adopting a temporary marker that this attempt might roll back.
+    // The mutex covers this process's threads; lock_overlay also covers other processes sharing the overlay.
     PendingMarker() : lock_(mutex()) {}
     PendingMarker(const PendingMarker&) = delete;
     PendingMarker& operator=(const PendingMarker&) = delete;
@@ -257,6 +284,9 @@ private:
     }
     std::unique_lock<std::mutex> lock_;
     std::filesystem::path path_;
+    HANDLE guard_ = INVALID_HANDLE_VALUE;
+    OVERLAPPED range_{};
+    bool guard_locked_ = false;
 };
 
 // Flushes a file the shim wrote on the title's behalf, for MOVEFILE_WRITE_THROUGH. On failure `error` holds the reason.
@@ -812,6 +842,8 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
     std::error_code ec;
     const std::filesystem::path overlay_path = join(r.overlay, parts);
     PendingMarker deletion;
+    DWORD lock_error = 0;
+    if (!deletion.lock_overlay(r.overlay, lock_error)) return fail_bool(lock_error);
     if (!r.game.empty() && !deleted(r.overlay, parts)) {
         const std::filesystem::path package_path = join(r.game, parts);
         if (std::filesystem::exists(package_path, ec)) {
@@ -912,6 +944,8 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" itself stays
     PendingMarker deletion;
+    DWORD lock_error = 0;
+    if (!deletion.lock_overlay(r.overlay, lock_error)) return fail_bool(lock_error);
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
@@ -951,6 +985,8 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (src.empty() || dst.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     PendingMarker deletion;
+    DWORD lock_error = 0;
+    if (!deletion.lock_overlay(r.overlay, lock_error)) return fail_bool(lock_error);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     const View to_view = view(r, dst);

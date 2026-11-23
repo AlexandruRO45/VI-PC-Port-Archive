@@ -127,7 +127,12 @@ host operation fails, newly created markers are removed while pre-existing marke
 reported filesystem failures; it is not a power-loss recovery scheme.
 These operations share a process-wide lock, held through any package-file copy and write-through flush, so a large
 move can delay unrelated `GAME:` deletes and moves. This keeps one operation from adopting a marker another might
-roll back. If marker rollback itself fails, the runtime reports it and retains the original operation's Windows
+roll back. They also hold an exclusive Windows byte-range lock on `<overlay>\.gta6rt-copy\.marker-lock` before
+reading marker state, through commit or rollback. Processes sharing the overlay therefore wait for each other's
+marker transactions, including when the overlay path has different spellings. The persistent empty lock file stays
+inside the private copy directory; closing the handle releases its lock even if a process exits.
+If the lock cannot be acquired, the operation fails before changing the source or destination.
+If marker rollback itself fails, the runtime reports it and retains the original operation's Windows
 error. Empty parent directories created for markers may remain; they do not hide package entries.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.

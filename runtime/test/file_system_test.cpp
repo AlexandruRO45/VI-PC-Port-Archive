@@ -6,6 +6,8 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdint>
+#include <cwchar>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -220,9 +222,119 @@ void check_marker_failures(const std::filesystem::path& root) {
     }
 }
 
+int marker_child(const wchar_t* package, const wchar_t* overlay, const wchar_t* operation, HANDLE ready) {
+    rt::fs::configure(package, overlay);
+    if (!::SetEvent(ready)) return 3;
+    ::CloseHandle(ready);
+    if (std::wcscmp(operation, L"delete") == 0) {
+        const auto del = resolve<DeleteFileWFn>("kernel32.dll", "DeleteFileW");
+        return del && del(L"GAME:\\source") ? 0 : 2;
+    }
+    const auto move = resolve<MoveFileExWFn>("kernel32.dll", "MoveFileExW");
+    return move && move(L"GAME:\\source", L"GAME:\\destination", MOVEFILE_REPLACE_EXISTING) ? 0 : 2;
+}
+
+// Process A holds a marker transaction and then rolls it back. B must wait before deciding that A's marker was
+// committed. Otherwise B deletes/moves the overlay source, A removes the marker, and the packaged source returns.
+void check_cross_process_markers(const std::filesystem::path& root) {
+    std::wstring executable(32768, L'\0');
+    const DWORD length = ::GetModuleFileNameW(nullptr, executable.data(), DWORD(executable.size()));
+    check(length && length < executable.size(), "locate this test's child-process executable");
+    if (!length || length >= executable.size()) return;
+    executable.resize(length);
+    const auto attrs = resolve<GetFileAttributesWFn>("kernel32.dll", "GetFileAttributesW");
+    if (!attrs) return;
+    for (const wchar_t* operation : {L"delete", L"move"}) {
+        const auto directory = root / (std::wstring(L"cross-process-") + operation);
+        const auto package = directory / "package", overlay = directory / "overlay";
+        write_path(package / "source", "package-old");
+        write_path(overlay / "source", "overlay-new");
+        write_path(overlay / "destination", "destination-old");
+        const auto guard_path = overlay / ".gta6rt-copy" / ".marker-lock";
+        std::filesystem::create_directories(guard_path.parent_path());
+        const HANDLE guard = ::CreateFileW(guard_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                            OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+        check(guard != INVALID_HANDLE_VALUE, "open the shared overlay transaction lock");
+        if (guard == INVALID_HANDLE_VALUE) continue;
+        OVERLAPPED range{};
+        const BOOL locked = ::LockFileEx(guard, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &range);
+        check(locked != FALSE, "process A locks its pending marker transaction");
+        if (!locked) { ::CloseHandle(guard); continue; }
+        const auto pending = overlay / ".gta6rt-deleted" / "source";
+        write_path(pending, "");
+        SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+        const HANDLE ready = ::CreateEventW(&security, TRUE, FALSE, nullptr);
+        check(ready != nullptr, "create the child-ready event");
+        if (!ready) { ::UnlockFileEx(guard, 0, 1, 0, &range); ::CloseHandle(guard); continue; }
+        // A different spelling must still lock the same overlay, rather than hashing its path text.
+        const auto child_overlay = overlay / L".." / L"overlay";
+        std::wstring command = L"\"" + executable + L"\" --marker-child \"" + package.wstring() + L"\" \"" +
+                               child_overlay.wstring() + L"\" " + operation + L" " +
+                               std::to_wstring(reinterpret_cast<std::uintptr_t>(ready));
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION child{};
+        const BOOL started = ::CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
+                                               CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child);
+        check(started != FALSE, "start process B using the production file shims");
+        if (started) {
+            ::CloseHandle(child.hThread);
+            check(::WaitForSingleObject(ready, 10000) == WAIT_OBJECT_0, "process B reaches its file operation");
+            check(::WaitForSingleObject(child.hProcess, 500) == WAIT_TIMEOUT,
+                  "process B cannot adopt process A's uncommitted marker");
+        }
+        // Rollback while still holding the transaction lock, then let B compute the committed view.
+        check(::DeleteFileW(pending.c_str()) != FALSE, "process A rolls back its own pending marker");
+        ::UnlockFileEx(guard, 0, 1, 0, &range);
+        ::CloseHandle(guard);
+        if (started) {
+            const DWORD wait = ::WaitForSingleObject(child.hProcess, 10000);
+            check(wait == WAIT_OBJECT_0, "process B finishes after the rollback releases the lock");
+            if (wait != WAIT_OBJECT_0) {
+                ::TerminateProcess(child.hProcess, 4);
+                ::WaitForSingleObject(child.hProcess, 10000);
+            }
+            DWORD code = 0;
+            check(::GetExitCodeProcess(child.hProcess, &code) && code == 0,
+                  "process B's delete or move succeeds");
+            ::CloseHandle(child.hProcess);
+        }
+        ::CloseHandle(ready);
+        rt::fs::configure(package, overlay);
+        check(attrs(L"GAME:\\source") == INVALID_FILE_ATTRIBUTES && std::filesystem::is_regular_file(pending),
+              "the successful child operation keeps the packaged source hidden");
+        check(read_path(package / "source") == "package-old", "the child never changes the package source");
+        if (std::wcscmp(operation, L"move") == 0)
+            check(read_path(overlay / "destination") == "overlay-new", "the child moves the newer overlay bytes");
+    }
+    const auto package = root / "lock-unavailable" / "package";
+    const auto overlay = root / "lock-unavailable" / "overlay";
+    write_path(package / "source", "package-old");
+    write_path(overlay / "source", "overlay-new");
+    write_path(overlay / "destination", "destination-old");
+    write_path(overlay / ".gta6rt-copy", "obstructed lock directory");
+    rt::fs::configure(package, overlay);
+    const auto del = resolve<DeleteFileWFn>("kernel32.dll", "DeleteFileW");
+    const auto move = resolve<MoveFileExWFn>("kernel32.dll", "MoveFileExW");
+    check(del && !del(L"GAME:\\source") && GetLastError() != ERROR_SUCCESS,
+          "delete refuses an unavailable transaction lock");
+    check(move && !move(L"GAME:\\source", L"GAME:\\destination", MOVEFILE_REPLACE_EXISTING) &&
+              GetLastError() != ERROR_SUCCESS, "move refuses an unavailable transaction lock");
+    check(read_path(overlay / "source") == "overlay-new" &&
+              read_path(overlay / "destination") == "destination-old" &&
+              read_path(package / "source") == "package-old",
+          "lock failure preserves both overlay files and the package");
+}
+
 }  // namespace
 
-int main() {
+int wmain(int argc, wchar_t** argv) {
+    if (argc > 1) {
+        if (argc != 6 || std::wcscmp(argv[1], L"--marker-child") != 0) return 2;
+        const auto ready = reinterpret_cast<HANDLE>(std::uintptr_t(std::wcstoull(argv[5], nullptr, 10)));
+        return marker_child(argv[2], argv[3], argv[4], ready);
+    }
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() / ("leonida_file_system_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::remove_all(root);
@@ -792,7 +904,12 @@ int main() {
         check(all_opened, "two threads write-opening one package file both succeed");
         check(all_intact, "the overlay copy made under two threads holds the whole package file");
         std::error_code ec;
-        check(std::filesystem::is_empty(overlay / ".gta6rt-copy", ec) && !ec, "copy-up leaves no staging file behind");
+        bool no_staging_files = true;
+        for (auto it = std::filesystem::directory_iterator(overlay / ".gta6rt-copy", ec);
+             !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            if (it->path().filename() != L".marker-lock") no_staging_files = false;
+        }
+        check(no_staging_files && !ec, "copy-up leaves no staging file behind (only the persistent marker lock)");
 
         // A leftover from a process killed mid-copy stays out of the title's view.
         write_path(overlay / ".gta6rt-copy" / "123-1", "half");
@@ -857,6 +974,7 @@ int main() {
     }
 
     check_marker_failures(root);
+    check_cross_process_markers(root);
     rt::fs::configure({}, {});
     std::filesystem::remove_all(root);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
