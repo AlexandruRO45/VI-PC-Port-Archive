@@ -57,11 +57,13 @@ def parse_types(text):
     return sorted(set(types))
 
 
-def extract_names(prefix, types):
-    """Return the sorted unique full names in ``prefix`` whose suffix is in ``types``."""
+def extract_names(prefix, types, max_end=None):
+    """Return sorted unique names ending by max_end, using any following byte for the suffix boundary."""
     found = {}
     wanted = set(types)
     for match in NAME.finditer(prefix):
+        if max_end is not None and match.end() > max_end:
+            break
         suffix = match.group(2).decode("ascii").lower()
         if suffix not in wanted:
             continue
@@ -124,6 +126,8 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                     continue
                 d = zlib.decompressobj()
                 prefix = bytearray()
+                # One lookahead byte distinguishes a complete suffix from a cut through a longer token.
+                prefix_limit = max_inflate + 1
                 total = 0
                 p = s
                 pending = b""
@@ -139,8 +143,8 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                             feed_size = min(feed_size * 2, DECOMPRESS_MAX)
                         data = d.decompress(pending, DECOMPRESS_MAX)
                         total += len(data)
-                        if len(prefix) < max_inflate:
-                            prefix.extend(data[:max_inflate - len(prefix)])
+                        if len(prefix) < prefix_limit:
+                            prefix.extend(data[:prefix_limit - len(prefix)])
                         pending = d.unconsumed_tail
                 except zlib.error:
                     pos = s + 1
@@ -156,7 +160,7 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                 zero += gap_zero
                 unread += gap_unread
                 streams += 1
-                names = extract_names(prefix, types) if b".#" in prefix else []
+                names = extract_names(prefix, types, max_end=max_inflate) if b".#" in prefix else []
                 if names:
                     name_hits += len(names)
                     for name, suffix in names:

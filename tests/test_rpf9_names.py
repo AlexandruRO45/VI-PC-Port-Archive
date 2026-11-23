@@ -133,6 +133,20 @@ class NamesTest(unittest.TestCase):
             self.assertEqual(names, ["bravo.#ft"])
             self.assertEqual(doc["summary"]["by_type"], {"ft": 1})
 
+    def test_max_inflate_preserves_suffix_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "tiny.rpf")
+            make_blob(archive, stream(b"alpha.#dr2 bravo.#dr "))
+            rows, _ = rpf9_names.scan_archive(archive, max_inflate=len(b"alpha.#dr"), types=("dr",))
+            self.assertEqual(rows, [])
+
+            cap = len(b"alpha.#dr2 bravo.#dr")
+            rows, _ = rpf9_names.scan_archive(archive, max_inflate=cap - 1, types=("dr",))
+            self.assertEqual(rows, [])
+
+            rows, _ = rpf9_names.scan_archive(archive, max_inflate=cap, types=("dr",))
+            self.assertEqual([name for row in rows for name in row["names"]], ["bravo.#dr"])
+
     def test_max_inflate_hides_late_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             arc = os.path.join(tmp, "tiny.rpf")
