@@ -274,5 +274,29 @@ class TestSTtraceDataImmPreservation(unittest.TestCase):
         self.assertEqual(words, [0x00AA00AA, 0x55AA55AA, 0x00AA00AA, 0x55AA55AA])
 
 
+class TestSTtraceDataImmPipeline(unittest.TestCase):
+    def test_interleaved_valu_salu(self):
+        lines = [
+            "v_mov_b32 v0, 1",
+            "s_ttracedata_imm 1",
+            "v_add_nc_u32 v0, v0, 2",
+            "s_ttracedata_imm 2",
+            "v_add_nc_u32 v0, v0, 3",
+            "s_ttracedata_imm 3",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [6, 6, 6, 6])
+
+    def test_multiple_immediate_trace_events(self):
+        lines = [
+            "s_ttracedata_imm 0x10",
+            "s_ttracedata_imm 0x20",
+            "s_ttracedata_imm 0x30",
+            "v_mov_b32 v0, 0x99",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x99, 0x99, 0x99, 0x99])
+
+
 if __name__ == "__main__":
     unittest.main()
