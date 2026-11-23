@@ -263,14 +263,28 @@ class Operands(list):
 
     def __getitem__(self, i):
         if isinstance(i, slice):
-            stop = i.stop
-            if i.step is None and stop is not None and stop > len(self) and (i.start or 0) < stop:
-                self.short = stop if self.short is None else max(self.short, stop)
+            start, stop, wanted = i.start or 0, i.stop, None
+            if i.step is None and start >= 0:
+                if stop is not None and stop > len(self) and start < stop:
+                    wanted = stop                     # a[1:4] with three operands
+                elif stop is None and start >= len(self):
+                    wanted = start + 1                # a[2:] with two: empty, and its first item is missing
+            if wanted is not None:
+                self.short = wanted if self.short is None else max(self.short, wanted)
             return list.__getitem__(self, i)
         try:
             return list.__getitem__(self, i)
         except IndexError:
             raise MissingOperand(f"{self.op}: missing operand {i}") from None
+
+
+def _short_read_error(e):
+    """True for the errors a handler raises when a slice of its operands came back short (see Gen._insn)."""
+    if isinstance(e, IndexError):
+        return True
+    if isinstance(e, ValueError):
+        return str(e).startswith("not enough values to unpack")
+    return isinstance(e, TypeError) and "required positional argument" in str(e)
 
 
 class Gen:
@@ -1748,6 +1762,10 @@ class Gen:
         """v_cmp_* / s_cmp_*: lane result into VCC/SGPR mask (vector), SCC (scalar), or EXEC (v_cmpx)."""
         parts = op.split("_")          # v_cmp_lt_f32 / s_cmp_eq_u32
         cond, ty = parts[2], parts[3]
+        # Sources are the first two (scalar) or the last two (vector, after the destination): count first, or
+        # `v_cmp_eq_f32 vcc, v0` would compare the destination with v0. compare_x counts its own operands.
+        if not exec_only and len(a) < (2 if scalar else 3):
+            raise MissingOperand(f"{getattr(a, 'op', op)}: missing operand {len(a)}")
         srcs = a[0:2] if scalar else a[-2:]
         dst = None if (scalar or exec_only) else a[0]
         if not scalar and ty in ("f64", "i64", "u64") and cond in ("f", "tru" if ty == "f64" else "t"):
@@ -1910,6 +1928,8 @@ class Gen:
     def compare_x(self, op, a, mods=()):
         """v_cmpx_*: like v_cmp but the result ANDs into EXEC. e32 form has only the two sources; e64 also names
         a destination (vcc/sgpr) which gets the compare result too."""
+        if len(a) < 2:
+            raise MissingOperand(f"{getattr(a, 'op', op)}: missing operand {len(a)}")
         srcs = a[-2:]
         self.compare("v_cmp_" + op[len("v_cmpx_"):], [None] + list(srcs), scalar=False, exec_only=True, mods=mods)
 
@@ -6755,16 +6775,20 @@ class Gen:
 
     def _insn(self, ins):
         """Translate one instruction. Its operands become an Operands list (in place, so self.cur_ins sees it too),
-        and an instruction with fewer operands than its handler reads raises MissingOperand, not a bare IndexError
-        or an unpacking ValueError."""
+        and an instruction with fewer operands than its handler reads raises MissingOperand, not a bare IndexError.
+
+        A handler that slices the sources first (`vals = [... for s in a[1:3]]`, `srcs = a[2:]`) reads a plain list,
+        so the short read fails there as an IndexError, an unpacking ValueError or, spread into a call, a TypeError
+        for a missing positional argument. Those three are renamed too, but only after a slice of this instruction's
+        operands ran past their end (Operands.short); any other error keeps its type."""
         a = ins["args"]
         if type(a) is not Operands:
             a = ins["args"] = Operands(ins["op"], a)
         a.short = None
         try:
             return self._insn_op(ins)
-        except ValueError as e:
-            if a.short is None or not str(e).startswith("not enough values to unpack"):
+        except (IndexError, ValueError, TypeError) as e:
+            if isinstance(e, MissingOperand) or a.short is None or not _short_read_error(e):
                 raise
             raise MissingOperand(f"{ins['op']}: missing operand {a.short - 1}") from e
 
@@ -16531,7 +16555,8 @@ def translate(path):
         g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
                            (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
     g.round_mode = any(i["op"] == "s_round_mode" or
-                       (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
+                       (i["op"].startswith("s_setreg") and
+                        "HW_REG_MODE" in Operands(i["op"], i["args"])[0].get("t", ""))   # bare: MissingOperand
                        for i in insns)
     w64_marks = {base_op(i["op"]) for i in insns
                  if WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]]))}
