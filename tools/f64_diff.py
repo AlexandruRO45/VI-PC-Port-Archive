@@ -469,9 +469,14 @@ HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0}
 
 
 def hw_kernel(lines):
-    """A raw tools/hw_oracle kernel: the program on one lane, then v8..v11 stored at the output pointer."""
+    """A raw tools/hw_oracle kernel: the program on one lane, then v8..v11 stored at the output pointer.
+
+    v8..v11 start at zero, which is how ref_program reads a register the program never writes. An allocated but
+    unset VGPR keeps whatever an earlier wave left there, so a program the minimizer shortened past its last write
+    to one of them still "mismatched" and shrank to nothing (#6784)."""
     from hw_oracle import asm
-    return asm.Kernel(list(lines) + ["v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"],
+    return asm.Kernel([f"v_mov_b32 v{r}, 0" for r in range(8, 12)] + list(lines) +
+                      ["v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"],
                       wave=32, threads=1, words=4, raw=True, mode=HW_MODE)
 
 
