@@ -252,10 +252,42 @@ class TestGalleryServer(unittest.TestCase):
                 self.assertEqual(get(f"{url}?mip={mip}&layer={layer}"), expected)
                 if mip == layer == 0:
                     self.assertEqual(get(url), expected)
-        for query in ("layer=2", "mip=2", "mip=-1", "layer=1.5", "mip=", "mip=0&mip=1", "other=0"):
+        for query in ("face=px", "layer=2", "mip=2", "mip=-1", "layer=1.5", "mip=", "mip=0&mip=1", "other=0"):
             with self.subTest(query=query), self.assertRaises(urllib.error.HTTPError) as caught:
                 get(url + "?" + query)
             self.assertEqual(caught.exception.code, 400)
+
+    def test_cube_face_selection(self) -> None:
+        all_faces = ("px", "nx", "py", "ny", "pz", "nz")
+        for cubes, faces in ((1, all_faces), (2, all_faces), (1, ("nx", "pz"))):
+            data = bytearray(_make_1x1_rgba_dds()[:128])
+            struct.pack_into("<II", data, 12, 2, 2)
+            if faces == all_faces:
+                struct.pack_into("<I4s", data, 80, 4, b"DX10")
+                data += struct.pack("<5I", 28, 3, 4, cubes, 0)
+            else:
+                struct.pack_into("<I", data, 112, 0x200 | 0x800 | 0x4000)
+            expected = {}
+            for cube in range(cubes):
+                for face in faces:
+                    rgba = bytes(c for p in range(4) for c in (cube, all_faces.index(face), p, 255))
+                    expected[cube, face] = gallery.dds_png.encode_png(2, 2, rgba)
+                    # The legacy fixture has BGRA masks.
+                    for r, g, b, a in struct.iter_unpack("4B", rgba):
+                        data.extend((r, g, b, a) if faces == all_faces else (b, g, r, a))
+            with open(os.path.join(self.textures_dir, "cube.dds"), "wb") as f:
+                f.write(data)
+            url = "/api/dds/cube.dds"
+            info = json.loads(_raw_get(self.port, url + "?info")[2])
+            self.assertEqual((info["array_size"], tuple(info["faces"])), (cubes, faces))
+            self.assertEqual(_raw_get(self.port, url)[2], expected[0, faces[0]])
+            for (cube, face), png in expected.items():
+                with self.subTest(cubes=cubes, cube=cube, face=face):
+                    self.assertEqual(_raw_get(self.port, f"{url}?layer={cube}&face={face}")[2], png)
+            for query in ("face=", "face=x", "face=nx&face=pz", f"layer={cubes}&face=nx"):
+                self.assertEqual(_raw_get(self.port, url + "?" + query)[0], 400)
+            if faces != all_faces:
+                self.assertEqual(_raw_get(self.port, url + "?face=px")[0], 400)
 
     def test_volume_z_selection(self) -> None:
         # Tight R16_FLOAT rows. Each 3x2 plane has a different pixel pattern.

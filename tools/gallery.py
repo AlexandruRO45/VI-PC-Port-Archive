@@ -274,10 +274,15 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                 mime = "application/json"
             else:
                 pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=True,
-                                               max_num_fields=3)
+                                               max_num_fields=4)
                 selection = {}
                 for key, value in pairs:
-                    if (key not in ("mip", "layer", "z") or key in selection or
+                    if key in selection:
+                        raise ValueError("Duplicate DDS selector")
+                    if key == "face":
+                        selection[key] = value
+                        continue
+                    if (key not in ("mip", "layer", "z") or
                             not value.isascii() or not value.isdecimal()):
                         raise ValueError("Expected a single unsigned index per selector")
                     selection[key] = int(value)

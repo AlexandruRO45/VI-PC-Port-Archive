@@ -1014,6 +1014,7 @@ async function openModal(texture) {
     const info = await response.json();
     if (version !== modalVersion) return;
     const volume = info.dimension === '3d';
+    const faces = info.faces || [];
     const axis = volume ? 'z' : 'layer';
     const indices = {mip: 0, [axis]: 0};
     let sliceInput;
@@ -1032,6 +1033,7 @@ async function openModal(texture) {
       image.src = texture.ddsPreview + '?' + new URLSearchParams(indices);
     }
     const axisLabel = volume ? (currentLang === 'ru' ? 'Срез Z ' : 'Z slice ') :
+                      faces.length ? (currentLang === 'ru' ? 'Куб ' : 'Cube ') :
                                (currentLang === 'ru' ? 'Слой ' : 'Layer ');
     for (const [key, count] of [['mip', info.mip_count], [axis, volume ? info.depth : info.array_size]]) {
       if (count <= 1) continue;
@@ -1052,6 +1054,24 @@ async function openModal(texture) {
         updatePreview();
       };
       label.appendChild(input);
+      controls.appendChild(label);
+    }
+    if (faces.length) {
+      const label = document.createElement('label');
+      label.textContent = currentLang === 'ru' ? 'Грань ' : 'Face ';
+      const select = document.createElement('select');
+      for (const face of faces) {
+        const option = document.createElement('option');
+        option.value = face;
+        option.textContent = (face[0] === 'p' ? '+' : '-') + face[1].toUpperCase();
+        select.appendChild(option);
+      }
+      indices.face = select.value = faces[0];
+      select.onchange = () => {
+        indices.face = select.value;
+        updatePreview();
+      };
+      label.appendChild(select);
       controls.appendChild(label);
     }
     if (controls.childElementCount) {

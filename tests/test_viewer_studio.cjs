@@ -162,3 +162,28 @@ test('volume slices shrink with the selected mip', async () => {
     select(mip.children[0], 0);
     assert.equal(z.disabled, false);
 });
+
+test('cube inspector labels cube indices and lists only stored face orientations', async () => {
+    const { context, elements, run } = loadStudio();
+    const info = {width: 2, height: 2, mip_count: 1, array_size: 2,
+        faces: ['px', 'nx', 'py', 'ny', 'pz', 'nz']};
+    context.fetch = async () => ({ok: true, json: async () => info});
+    const open = () => run("openModal({name:'c', preview:'/c.png', ddsPreview:'/api/dds/c.dds'})");
+    run("currentLang = 'en'");
+    await open();
+    const controls = elements.get('dds-controls');
+    const [cube, face] = controls.children;
+    assert.equal(cube.textContent.trim(), 'Cube');
+    const select = face.children[0];
+    assert.deepEqual(select.children.map(o => o.textContent), ['+X', '-X', '+Y', '-Y', '+Z', '-Z']);
+    Object.assign(cube.children[0], {value: '1', valueAsNumber: 1, validity: {valid: true}});
+    cube.children[0].onchange();
+    select.value = 'nz';
+    select.onchange();
+    const image = elements.get('modal-img');
+    assert.equal(image.src, '/api/dds/c.dds?mip=0&layer=1&face=nz');
+    Object.assign(info, {array_size: 1, faces: ['nx', 'pz']});
+    await open();
+    assert.deepEqual(controls.children[0].children[0].children.map(o => o.value), ['nx', 'pz']);
+    assert.equal(image.src, '/api/dds/c.dds?mip=0&layer=0&face=nx');
+});
