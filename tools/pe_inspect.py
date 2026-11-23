@@ -272,6 +272,245 @@ def _exports(img: PeImage) -> list[str]:
     return names
 
 
+# The resource directory (data directory 2) and its RT_VERSION block. The version block names the build, and its
+# values are free UTF-16 text that can name the title, so the report never holds a value: the fixed info's numbers,
+# the languages, the standard key names and, per value, its length and SHA-256. Neither are the names of named
+# resource types or of a key outside VERSION_KEYS, which are counted or hashed instead. A damaged tree or block is
+# reported in "problems" (offsets and counts only) and never stops the report.
+DIR_RESOURCE = 2
+RT_VERSION = 16
+RT_NAMES = {1: "CURSOR", 2: "BITMAP", 3: "ICON", 4: "MENU", 5: "DIALOG", 6: "STRING", 7: "FONTDIR", 8: "FONT",
+            9: "ACCELERATOR", 10: "RCDATA", 11: "MESSAGETABLE", 12: "GROUP_CURSOR", 14: "GROUP_ICON", 16: "VERSION",
+            17: "DLGINCLUDE", 19: "PLUGPLAY", 20: "VXD", 21: "ANICURSOR", 22: "ANIICON", 23: "HTML", 24: "MANIFEST"}
+# The StringFileInfo keys the VERSIONINFO documentation defines; any other key is reported by its hash.
+VERSION_KEYS = frozenset({"Comments", "CompanyName", "FileDescription", "FileVersion", "InternalName",
+                          "LegalCopyright", "LegalTrademarks", "OriginalFilename", "PrivateBuild", "ProductName",
+                          "ProductVersion", "SpecialBuild"})
+VS_FIXED_SIGNATURE = 0xFEEF04BD
+VS_FF = {0x01: "DEBUG", 0x02: "PRERELEASE", 0x04: "PATCHED", 0x08: "PRIVATEBUILD", 0x10: "INFOINFERRED",
+         0x20: "SPECIALBUILD"}
+VOS = {0x00000: "UNKNOWN", 0x00004: "WINDOWS32", 0x10000: "DOS", 0x40000: "NT", 0x10001: "DOS_WINDOWS16",
+       0x10004: "DOS_WINDOWS32", 0x40004: "NT_WINDOWS32"}
+VFT = {0: "UNKNOWN", 1: "APP", 2: "DLL", 3: "DRV", 4: "FONT", 5: "VXD", 7: "STATIC_LIB"}
+VERSION_KEY_LIMIT = 256  # characters; a block key longer than this is not a key
+
+
+def _sha256(text: str) -> str:
+    import hashlib  # here, not with the imports at the top, which other open changes edit
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _align4(at: int) -> int:
+    return (at + 3) & ~3
+
+
+def _vs_block(data: bytes, at: int, end: int) -> dict | None:
+    """One version block (wLength, wValueLength, wType, szKey, Value, Children) at `at`, read no further than `end`:
+    the key, where its value and children start and where it ends. None when the header or key doesn't fit, or the
+    length is shorter than a header."""
+    if at + 6 > end:
+        return None
+    length, value_length, kind = struct.unpack_from("<HHH", data, at)
+    if length < 6:
+        return None
+    stop = min(at + length, end)
+    key_end = None
+    for i in range(at + 6, min(stop - 1, at + 6 + 2 * VERSION_KEY_LIMIT), 2):
+        if data[i] == 0 and data[i + 1] == 0:
+            key_end = i
+            break
+    if key_end is None:
+        return None
+    value = _align4(key_end + 2)
+    value_size = value_length * 2 if kind == 1 else value_length
+    return {"key": data[at + 6:key_end].decode("utf-16-le", errors="replace"), "kind": kind,
+            "value": min(value, stop), "value_end": min(value + value_size, stop),
+            "children": min(_align4(value + value_size), stop), "end": stop, "cut": at + length > end}
+
+
+def _vs_children(data: bytes, block: dict, what: str, problems: list[str]) -> list[dict]:
+    """The child blocks of `block`. Zero bytes after the last child are padding; a child that can't be read ends the
+    list with a problem."""
+    out, at = [], block["children"]
+    while at + 6 <= block["end"] and len(out) < MAX_ENTRIES:
+        if not struct.unpack_from("<H", data, at)[0]:
+            break
+        child = _vs_block(data, at, block["end"])
+        if child is None:
+            problems.append(f"version block: {what} child at +{at:#x} is malformed")
+            break
+        if child["cut"]:
+            problems.append(f"version block: {what} child at +{at:#x} runs past its parent")
+        out.append(child)
+        at = _align4(child["end"])
+    return out
+
+
+def _version_info(data: bytes, problems: list[str]) -> dict:
+    """VS_VERSIONINFO read from the bytes of one RT_VERSION resource. String values are returned as length and
+    SHA-256 (of the value as UTF-8, without its terminating NUL), never as text."""
+    out = {"fixed": None, "translations": [], "string_tables": [], "string_count": 0, "other_blocks": 0}
+    root = _vs_block(data, 0, len(data))
+    if root is None:
+        problems.append("version block: VS_VERSIONINFO header is malformed")
+        return out
+    if root["cut"]:
+        problems.append(f"version block: declares more bytes than the resource's {len(data)}")
+    if root["key"] != "VS_VERSION_INFO":
+        problems.append("version block: key is not VS_VERSION_INFO")
+    fixed_at, fixed_end = root["value"], root["value_end"]
+    if fixed_end - fixed_at >= 52:
+        (signature, struct_version, file_ms, file_ls, product_ms, product_ls, flags_mask, flags, os_id, file_type,
+         subtype, date_ms, date_ls) = struct.unpack_from("<13I", data, fixed_at)
+        if signature != VS_FIXED_SIGNATURE:
+            problems.append(f"version block: VS_FIXEDFILEINFO signature {signature:#x} is not "
+                            f"{VS_FIXED_SIGNATURE:#x}")
+        else:
+            out["fixed"] = {
+                "file_version": f"{file_ms >> 16}.{file_ms & 0xFFFF}.{file_ls >> 16}.{file_ls & 0xFFFF}",
+                "product_version": f"{product_ms >> 16}.{product_ms & 0xFFFF}.{product_ls >> 16}."
+                                   f"{product_ls & 0xFFFF}",
+                "struct_version": f"{struct_version >> 16}.{struct_version & 0xFFFF}",
+                "flags_mask": flags_mask, "flags": flags,
+                "flag_names": [name for bit, name in VS_FF.items() if flags & flags_mask & bit],
+                "os": os_id, "os_name": VOS.get(os_id),
+                "type": file_type, "type_name": VFT.get(file_type), "subtype": subtype,
+                "date": (date_ms << 32) | date_ls,
+            }
+    elif fixed_end > fixed_at:
+        problems.append(f"version block: VS_FIXEDFILEINFO is {fixed_end - fixed_at} bytes, not 52")
+    for child in _vs_children(data, root, "VS_VERSIONINFO", problems):
+        if child["key"] == "StringFileInfo":
+            for table in _vs_children(data, child, "StringFileInfo", problems):
+                key = table["key"]
+                lang = key.lower() if re.fullmatch(r"[0-9A-Fa-f]{8}", key) else None
+                if lang is None:
+                    problems.append("version block: a string table's key is not 8 hex digits")
+                strings = []
+                for s in _vs_children(data, table, "string table", problems):
+                    raw = data[s["value"]:s["end"]]
+                    value = raw[:len(raw) & ~1].decode("utf-16-le", errors="replace").split("\0", 1)[0]
+                    entry = {"key": s["key"]} if s["key"] in VERSION_KEYS else {"key": None,
+                                                                               "key_sha256": _sha256(s["key"])}
+                    entry.update({"chars": len(value), "sha256": _sha256(value)})
+                    strings.append(entry)
+                out["string_tables"].append({"lang_codepage": lang, "strings": strings})
+                out["string_count"] += len(strings)
+        elif child["key"] == "VarFileInfo":
+            for var in _vs_children(data, child, "VarFileInfo", problems):
+                if var["key"] != "Translation":
+                    out["other_blocks"] += 1
+                    continue
+                for at in range(var["value"], var["value_end"] - 3, 4):
+                    lang, codepage = struct.unpack_from("<HH", data, at)
+                    out["translations"].append(f"{lang:04x}{codepage:04x}")
+        else:
+            out["other_blocks"] += 1
+    return out
+
+
+def _resources(img: PeImage) -> dict:
+    """The resource directory: the types it holds and the first RT_VERSION block (_version_info). The tree is read
+    three levels deep (type, name, language) inside the file bytes the directory's RVA maps to; a directory reached
+    a second time (a loop, or two entries sharing a subdirectory) is not read again."""
+    out = {"present": False, "types": [], "named_types": 0, "version": None, "problems": []}
+    problems = out["problems"]
+    rva, size = img.directory(DIR_RESOURCE)
+    if not rva or not size:
+        return out
+    out["present"] = True
+    bounds = img._range(rva)
+    if bounds is None:
+        problems.append(f"resource directory RVA {rva:#x} has no file bytes")
+        return out
+    base, end = bounds
+    data = img.data
+    seen: set[int] = set()
+    budget = [MAX_ENTRIES]
+
+    def entries(offset: int, level: str) -> list[tuple[int | None, int, bool]]:
+        """(id, None for a named entry; child offset; child is a directory) of the directory at `offset`."""
+        if offset in seen:
+            problems.append(f"resource tree: {level} directory at +{offset:#x} is reached a second time "
+                            "(a loop or a shared subdirectory)")
+            return []
+        seen.add(offset)
+        at = base + offset
+        if at + 16 > end:
+            problems.append(f"resource tree: {level} directory at +{offset:#x} is past the end of its file bytes")
+            return []
+        named, ids = struct.unpack_from("<HH", data, at + 12)
+        rows = []
+        for i in range(named + ids):
+            entry = at + 16 + i * 8
+            if entry + 8 > end:
+                problems.append(f"resource tree: {level} directory at +{offset:#x} is cut short after {i} of "
+                                f"{named + ids} entries")
+                break
+            if budget[0] <= 0:
+                problems.append(f"resource tree: more than {MAX_ENTRIES} entries; the rest are not read")
+                break
+            budget[0] -= 1
+            name, child = struct.unpack_from("<II", data, entry)
+            rows.append((None if name & 0x80000000 else name, child & 0x7FFFFFFF, bool(child & 0x80000000)))
+        return rows
+
+    # (type id or None, language, data entry offset) of every leaf, in tree order
+    leaves: list[tuple[int | None, int | None, int]] = []
+    for type_id, type_at, type_dir in entries(0, "type"):
+        if type_id is None:
+            out["named_types"] += 1
+        if not type_dir:
+            problems.append(f"resource tree: a type entry points at data (+{type_at:#x}), not a directory")
+            continue
+        for _name, name_at, name_dir in entries(type_at, "name"):
+            if not name_dir:
+                leaves.append((type_id, None, name_at))
+                continue
+            for lang, leaf_at, leaf_dir in entries(name_at, "language"):
+                if leaf_dir:
+                    problems.append(f"resource tree: a language entry points at a directory (+{leaf_at:#x}); "
+                                    "only three levels are read")
+                    continue
+                leaves.append((type_id, lang, leaf_at))
+
+    types: dict[int | None, dict] = {}
+    for type_id, lang, leaf_at in leaves:
+        at = base + leaf_at
+        name = "(named)" if type_id is None else RT_NAMES.get(type_id, f"#{type_id}")
+        row = types.setdefault(type_id, {"type": name, "id": type_id, "entries": 0, "bytes": 0})
+        row["entries"] += 1
+        if at + 16 > end:
+            problems.append(f"resource tree: data entry at +{leaf_at:#x} is past the end of its file bytes")
+            continue
+        data_rva, data_size, codepage = struct.unpack_from("<III", data, at)
+        row["bytes"] += data_size
+        if type_id != RT_VERSION or out["version"] is not None:
+            continue
+        span = img._range(data_rva) if data_size else None
+        if span is None:
+            problems.append(f"version block: data RVA {data_rva:#x} ({data_size} bytes) has no file bytes")
+            continue
+        start, stop = span
+        avail = min(data_size, stop - start)
+        if avail < data_size:
+            problems.append(f"version block: {data_size} bytes declared, {avail} in the file")
+        version = {"language": lang, "codepage": codepage, "size": data_size}
+        version.update(_version_info(bytes(data[start:start + avail]), problems))
+        out["version"] = version
+    out["types"] = sorted(types.values(), key=lambda t: (t["id"] is None, t["id"] or 0))
+    return out
+
+
+def resources(img: PeImage) -> dict:
+    """_resources, with a table it misreads anyway reported as a problem instead of stopping the report."""
+    try:
+        return _resources(img)
+    except (struct.error, IndexError) as e:
+        return {"present": True, "types": [], "named_types": 0, "version": None,
+                "problems": [f"resource directory: truncated or corrupt table ({e})"]}
+
+
 def _export_module_name(img: PeImage) -> str:
     """The module name the export directory records (its Name field), or "" when there is none."""
     rva, size = img.directory(DIR_EXPORT)
@@ -427,6 +666,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "entry_rva": hex(img.entry_rva),
         "has_relocs": bool(reloc_rva and reloc_size),
         "dynamic_base": bool(img.dll_characteristics & 0x40),
+        "resources": resources(img),
         "sections": sections,
         "imports": imports,
         "export_count": len(exports),
@@ -471,7 +711,57 @@ def to_markdown(r: dict) -> str:
             out.append("")
             out.append(", ".join(f"`{f}`" for f in imp["functions"]))
             out.append("")
+    out += resources_markdown(r.get("resources"))
     return "\n".join(out) + "\n"
+
+
+def resources_markdown(res: dict | None) -> list[str]:
+    """The resource section of the Markdown report: types and counts, then the version block without its values."""
+    if not res or not res["present"]:
+        return ["", "## Resources", "", "none"]
+    out = ["", "## Resources", ""]
+    types = ", ".join(f"{t['type']} {t['entries']} ({t['bytes']:,} bytes)" for t in res["types"])
+    out.append(f"- types: {types or 'none'}" + (f"; named types: {res['named_types']}" if res["named_types"] else ""))
+    out += [f"- problem: {p}" for p in res["problems"]]
+    v = res["version"]
+    if v is None:
+        out += ["", "No version block (RT_VERSION)."]
+        return out
+    out += ["", "### Version block", ""]
+    lang = "-" if v["language"] is None else f"{v['language']:#06x}"
+    out.append(f"- resource language {lang}, code page {v['codepage']}, {v['size']:,} bytes")
+    f = v["fixed"]
+    if f:
+        out.append(f"- file version {f['file_version']}, product version {f['product_version']}")
+        out.append(f"- flags: {', '.join(f['flag_names']) or 'none'} (flags {f['flags']:#x}, mask "
+                   f"{f['flags_mask']:#x}); OS {f['os_name'] or hex(f['os'])}; type "
+                   f"{f['type_name'] or f['type']}, subtype {f['subtype']}; date {f['date']}")
+    else:
+        out.append("- no VS_FIXEDFILEINFO")
+    out.append(f"- translations: {', '.join(v['translations']) or 'none'}; string tables: "
+               f"{', '.join(t['lang_codepage'] or '?' for t in v['string_tables']) or 'none'}; "
+               f"other blocks: {v['other_blocks']}")
+    if v["string_count"]:
+        out += ["", f"{v['string_count']} string values, not shown: each is listed by key with its length and the "
+                "start of its SHA-256 (the JSON has the full hash). A key outside the standard names is listed by "
+                "its hash too.", "", "| table | key | chars | sha256 |", "|---|---|---|---|"]
+        for t in v["string_tables"]:
+            for s in t["strings"]:
+                key = s["key"] or f"(other, {s['key_sha256'][:16]})"
+                out.append(f"| {t['lang_codepage'] or '?'} | {key} | {s['chars']} | {s['sha256'][:16]} |")
+    return out
+
+
+def version_summary(r: dict) -> str | None:
+    """The stdout line for an image with a version block: numbers and counts only."""
+    res = r.get("resources") or {}
+    v = res.get("version")
+    if v is None:
+        return f"{r['file']}: resource directory problems: {len(res['problems'])}" if res.get("problems") else None
+    f = v["fixed"]
+    numbers = f"file {f['file_version']}, product {f['product_version']}" if f else "no fixed info"
+    return (f"{r['file']}: version block {numbers}, {v['string_count']} string keys (values not shown)"
+            + (f", problems: {len(res['problems'])}" if res["problems"] else ""))
 
 
 def same_output_path(first: str, second: str) -> bool:
@@ -550,6 +840,9 @@ def main(argv: list[str] | None = None) -> int:
                 json.dump(r, f, indent=1)
             with open(md_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(to_markdown(r))
+            version = version_summary(r)  # numbers and counts only, never a value of the block
+            if version:
+                print(version)
         except OSError as e:
             print(f"{img}: cannot write report ({e.strerror or e})", file=sys.stderr)
             rc = 1

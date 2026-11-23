@@ -77,6 +77,17 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
 Then `runtime\build\gta6rt.exe --dry-run <exe>` maps the image and binds every import to the shim table without
 running any game code. It reports what it couldn't bind.
 
+The PE report's `resources` field (the Markdown's "Resources" section) lists the resource types with entry and
+byte counts and reads the first `RT_VERSION` block. It gives the fixed file info's numbers (`file_version`,
+`product_version`, `flags` and `flag_names`, `os`, `type`, `subtype`, `date`), the `translations`, and per string
+table (`lang_codepage`) each standard key with its value's length (`chars`) and SHA-256 (of the value as UTF-8,
+without its NUL). The values are never written, as they can name the title: two builds compare by hash. A key
+outside the standard names, and a named resource type, are hashed or counted instead. A damaged tree or block
+(cut short, a loop, a bad signature) is listed in `problems` and the rest of the report is still written. stdout
+gets one line per image with a version block: its two versions and its key count. The 1.0.2.1 executable has no
+resource directory (data directory 2 is zero and no `VS_VERSION_INFO` key is anywhere in the file), so its report
+says `none`; 14 of the package's other 16 PE files carry a version block.
+
 ## Reproduce the shader tests
 
 Build the hand-written tests where LLVM supports AMDGPU and SPIRV-Tools is available. Run the generated shaders
