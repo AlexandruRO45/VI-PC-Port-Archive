@@ -7,9 +7,10 @@
 //
 // Nothing here goes online.
 //
-// ASSUMPTION: the console executable is not available, so the DLL name it imports these through is unknown.
-// "xgameruntime.dll" is the name the PC GDK uses. If the executable's import table names another module, register
-// the same functions under that name too; nothing else changes.
+// Measured on the retail executable (docs/runtime_imports.md, "The retail executable's runtime classes"): it does not
+// import xgameruntime.dll. Its 161 runtime thunks are linked into the image and reach the classes through
+// QueryApiImpl, as libHttpClient.GDK.dll's do, so "xgameruntime.dll" below is the only module name needed. The name
+// occurs in the image as a UTF-16 string, which would be a run-time load.
 #include <windows.h>
 
 #include <algorithm>
@@ -247,6 +248,11 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
     return S_OK;
 }
+
+// The same function as a DLL export: xgameruntime.lib's XGameRuntimeInitialize looks up "XErrorReport" with
+// GetProcAddress next to QueryApiImpl, the InitializeApiImpl* and UninitializeApiImpl, and refuses to initialise when it
+// is missing (retail executable: the lookup at +0x55e2b7e, the null check at +0x55e2c08, then an int3 at +0x5a91c21).
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
     std::lock_guard<std::mutex> lock(g_error_mutex);
     g_error_context = context;
@@ -1323,6 +1329,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    XGR(XErrorReport),
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
