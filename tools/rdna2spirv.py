@@ -10597,9 +10597,8 @@ class Gen:
         elif op in ("v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32"):
             # D = {sat16(S1), sat16(S0)} (RDNA ISA pseudocode: u32_to_u16 / i32_to_i16 saturate): the low half from
             # S0, the high half from S1; u16 clamps to [0, 0xFFFF], i16 to [-32768, 32767]. The whole dword is
-            # written. clamp is not modelled: rejected rather than guessed.
-            if "clamp" in mods:
-                raise Unsupported(op + " clamp")
+            # written. VOP3-only integer op: no _e32/_dpp/_sdwa, no source neg/abs/sext, no clamp/omod/op_sel.
+            self._validate_cvt_pk(ins, op, a, mods)
             halves = []
             for src in a[1:3]:
                 halves.append(self.saturate_int16(self.src_u(src), signed=(op == "v_cvt_pk_i16_i32")))
@@ -10619,8 +10618,7 @@ class Gen:
             # Measured natively on RDNA2 (gfx1036, wave32 & wave64 across 6 HW_REG_MODE configs): VOP3
             # clamp is a hardware no-op on v_cvt_pknorm_{i16,u16}_f32 (each lane is already clamped to
             # [-1, 1] / [0, 1] and packed to 16-bit integer). Reject other unexpected modifiers.
-            if any(m != "clamp" for m in mods):
-                raise Unsupported(op + " modifiers")
+            self._validate_cvt_pk(ins, op, a, mods, allow_src_fmods=True, allow_clamp=True)
             snorm = op == "v_cvt_pknorm_i16_f32"
             halves = []
             for src in a[1:3]:
@@ -10666,21 +10664,8 @@ class Gen:
             # 65,536 f16 values (wave32 & wave64): VOP3 clamp is a hardware no-op, and op_sel[2] = 1 shifts the
             # 32-bit packed result left by 16 bits (D[31:16] = norm16(S0.f16), D[15:0] = 0, overwriting D).
             # Reserved VOP3 omod bits [60:59] are rejected by llvm-mc (gfx1036) and ignored by silicon, so
-            # mul:*/div:*, VOP3P modifiers, _dpp/_sdwa, and malformed op_sel lists are refused.
-            opsel_mods = [m for m in mods if m.startswith("op_sel:")]
-            if (ins["op"].endswith(("_dpp", "_sdwa")) or len(opsel_mods) > 1 or
-                    any(m != "clamp" and not m.startswith("op_sel:") for m in mods)):
-                raise Unsupported(op + " modifier")
-            if opsel_mods:
-                m_sel = opsel_mods[0]
-                if not (m_sel.startswith("op_sel:[") and m_sel.endswith("]")):
-                    raise Unsupported(op + " op_sel")
-                try:
-                    raw_bits = [int(x) for x in m_sel[len("op_sel:["):-1].split(",")]
-                except ValueError:
-                    raise Unsupported(op + " op_sel") from None
-                if not raw_bits or len(raw_bits) > 3 or any(b not in (0, 1) for b in raw_bits):
-                    raise Unsupported(op + " op_sel")
+            # mul:*/div:*, VOP3P modifiers, _e32/_dpp/_sdwa, and malformed op_sel lists are refused.
+            self._validate_cvt_pk(ins, op, a, mods, allow_src_fmods=True, allow_clamp=True, allow_opsel=True)
             sel, dhi = self.opsel_bits(mods, 2)
             snorm = op == "v_cvt_pknorm_i16_f16"
             lo_f = self.fconst(-1.0) if snorm else "%f0"
@@ -10721,6 +10706,9 @@ class Gen:
         elif op == "v_cvt_pkrtz_f16_f32":
             # Packs two f32 as f16 into one dword with round-toward-zero (exact, see f16_rtz). The earlier
             # round-to-nearest version produced inf where hardware gives 65504 (found by the GPU smoke test).
+            # RDNA2 has both VOP2 (_e32, opcode 0x2f) and VOP3 (_e64 / bare, opcode 0x12f); _dpp/_sdwa and
+            # unmodelled output/VOP3P modifiers (clamp, mul:*, div:*, op_sel:*, ...) are rejected.
+            self._validate_cvt_pk(ins, op, a, mods, allow_e32=True, allow_src_fmods=True)
             x, y = self.src_f(a[1]), self.src_f(a[2])
             lo, hi = self.f16_rtz(x), self.f16_rtz(y)
             sh, r = self.tmp(), self.tmp()
@@ -12994,6 +12982,49 @@ class Gen:
         else:
             self.emit(f"{half} = OpExtInst %uint %glsl UMin {bits} {self.cu(0xFFFF)}")
         return half
+
+    @staticmethod
+    def _validate_cvt_pk(ins, op, a, mods, *, allow_e32=False, allow_src_fmods=False,
+                         allow_clamp=False, allow_opsel=False):
+        """Validate encoding, operand arity/shapes, source modifiers, and instruction modifiers for packed-conversion
+        VALU ops (`v_cvt_pk_{u16_u32,i16_i32}`, `v_cvt_pknorm_{i16,u16}_{f32,f16}`, `v_cvt_pkrtz_f16_f32`)."""
+        raw_op = ins["op"]
+        is_e32 = raw_op.endswith("_e32")
+        if raw_op.endswith(("_dpp", "_sdwa")) or (is_e32 and not allow_e32):
+            raise Unsupported(op + " encoding")
+        if len(a) != 3:
+            raise Unsupported(op + " operands")
+        dst = a[0]
+        if dst.get("k") != "vgpr" or dst.get("n", 1) != 1 or dst.get("neg") or dst.get("abs") or dst.get("sext"):
+            raise Unsupported(op + " destination")
+        src_fmods = allow_src_fmods and not is_e32
+        for s in a[1:3]:
+            if s.get("n", 1) != 1 or s.get("k") == "vlist" or s.get("sext"):
+                raise Unsupported(op + " source")
+            if not src_fmods and (s.get("neg") or s.get("abs")):
+                raise Unsupported(op + " source modifier")
+        if is_e32:
+            if mods:
+                raise Unsupported(op + " modifiers")
+            return
+        clamp_seen = False
+        opsel_seen = False
+        for m in mods:
+            if m == "clamp":
+                if not allow_clamp or clamp_seen:
+                    raise Unsupported(op + " clamp")
+                clamp_seen = True
+            elif m.startswith("op_sel:"):
+                if not allow_opsel or opsel_seen:
+                    raise Unsupported(op + " op_sel")
+                if not (m.startswith("op_sel:[") and m.endswith("]")):
+                    raise Unsupported(op + " op_sel")
+                raw_tokens = m[len("op_sel:["):-1].split(",")
+                if not raw_tokens or len(raw_tokens) > 3 or any(tok not in ("0", "1") for tok in raw_tokens):
+                    raise Unsupported(op + " op_sel")
+                opsel_seen = True
+            else:
+                raise Unsupported(op + " modifiers")
 
     def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, lod, d16=False):
         def fetch(image, _cls, ty):
