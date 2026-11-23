@@ -26,7 +26,7 @@ At start the runtime prints what it loaded, for example:
 ```text
 [rt] mods: Mandy in the prison intro
 [rt] mods:   archetype player_story000_00 (0xE472B687) -> cs_mandy (0xD7C0CDFF)
-[rt] mods: 1 archetype swap(s) loaded; not applied yet: the archetype lookup hook for this executable is not known
+[rt] mods: 1 archetype swap(s) loaded; not applied: no --archetype-lookup RVA for this executable (docs/modding.md)
 ```
 
 ## mod.json
@@ -46,7 +46,7 @@ At start the runtime prints what it loaded, for example:
 |---|---|
 | `name` | Shown in the log and the launcher. Defaults to the folder name. |
 | `enabled` | `false` keeps the mod installed but off. |
-| `game_version` | The package version the mod was made for. |
+| `game_version` | The package version the mod was made for. Recorded, not checked: the runtime stores it and loads the mod whatever it says, so a mod built for another version loads without a warning (`runtime/src/mods.h` parses the key and nothing compares it). |
 | `archetype_swaps` | Each entry: when the game asks for the model `from`, it gets `to`. |
 
 `from` and `to` are model names, hashed with `joaat` (lower case, as the game does), or 32-bit hashes
