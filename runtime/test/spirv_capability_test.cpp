@@ -65,6 +65,20 @@ int main() {
     std::memcpy(bytes.data(), m.data(), m.size() * 4);
     expect("bytes with a partial word", needs_shader_int64(bytes.data(), bytes.size()), true);
 
+    // Subgroup operations (vk_harness refuses them in a stage the device's supportedStages leaves out).
+    expect("no subgroup capability", uses_subgroup_operations(module({shader, spirv_capability_int64})), false);
+    expect("GroupNonUniform", uses_subgroup_operations(module({shader, spirv_capability_group_non_uniform})), true);
+    expect("GroupNonUniformBallot (64)", uses_subgroup_operations(module({shader, 64})), true);
+    expect("GroupNonUniformQuad (68)", uses_subgroup_operations(module({shader, 68})), true);
+    expect("SubgroupBallotKHR", uses_subgroup_operations(module({shader, spirv_capability_subgroup_ballot_khr})), true);
+    expect("SubgroupVoteKHR", uses_subgroup_operations(module({shader, spirv_capability_subgroup_vote_khr})), true);
+    expect("69 is not a subgroup capability", uses_subgroup_operations(module({shader, 69})), false);
+    std::vector<std::uint32_t> late_ballot = module({shader});
+    late_ballot.push_back(2u << 16 | 17u);
+    late_ballot.push_back(64);
+    expect("a subgroup capability after OpMemoryModel is ignored", uses_subgroup_operations(late_ballot), false);
+    expect("empty module uses no subgroups", uses_subgroup_operations(std::vector<std::uint32_t>{}), false);
+
     if (failures) return 1;
     std::printf("spirv_capability: all checks passed\n");
     return 0;

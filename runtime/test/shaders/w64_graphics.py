@@ -29,7 +29,9 @@ runs 16 live lanes (lane ids 0..15), so a read of lane L ^ 16 returns garbage th
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
 Each draws 960 vertices with zero area (VKH_VERTICES) and stores four words per vertex to the heap; vs_w64_c_lane_id
-doubles as the probe that the wave size really changed, and without RADV only the default-size checks run. RADV packs
+doubles as the probe that the wave size really changed, and without RADV only the default-size checks run. A device
+with no subgroup operations in the vertex stage (MoltenVK: supportedStages lacks it) cannot run them at all; vk_harness
+answers 77 and they SKIP. RADV packs
 62 or 64 vertices into a wave64 and 30 or 32 into a wave32, so the 32-lane run is a repacking, not the two halves of
 the 64-lane waves: a stricter test of tiers A and B, which key every word on the vertex index.
 

@@ -521,6 +521,35 @@ int main(int argc, char** argv) {
         }
         feats.shaderInt64 = VK_TRUE;
     }
+    // A stage that uses subgroup operations needs the device to list it in VkPhysicalDeviceSubgroupProperties::
+    // supportedStages; a pipeline that uses them in another stage is invalid. MoltenVK lists no vertex stage, and its
+    // SPIR-V to MSL conversion stops a wave64 vertex fixture with "Subgroup builtins are not available in this type of
+    // function", so w64_graphics.py's vs_w64_* fixtures failed there instead of skipping. 77, as vk_ps_sweep refuses a
+    // fragment stage without them.
+    if (props.apiVersion >= VK_API_VERSION_1_1) {
+        VkPhysicalDeviceSubgroupProperties sub{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 sub_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        sub_query.pNext = &sub;
+        vkGetPhysicalDeviceProperties2(pd, &sub_query);
+        struct StageModule { const char* path; VkShaderStageFlags stage; const char* name; };
+        const StageModule stages[] = {
+            // --mesh-compute dispatches the first shader as compute; VKH_MESH draws it as a mesh shader.
+            {argv[1], mesh_compute ? VkShaderStageFlags(VK_SHADER_STAGE_COMPUTE_BIT)
+                      : mesh ? VkShaderStageFlags(VK_SHADER_STAGE_MESH_BIT_EXT) : VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT),
+             mesh_compute ? "compute" : mesh ? "mesh" : "vertex"},
+            {mesh_vs_path, VK_SHADER_STAGE_VERTEX_BIT, "vertex"},
+            {gs_path, VK_SHADER_STAGE_GEOMETRY_BIT, "geometry"},
+            {argv[2], VK_SHADER_STAGE_FRAGMENT_BIT, "fragment"},
+        };
+        for (const StageModule& s : stages) {
+            if (!s.path || !*s.path || (sub.supportedStages & s.stage)) continue;
+            if (leonida::vk_test::uses_subgroup_operations(s.path == argv[2] ? fs_code : read_spv(s.path))) {
+                std::fprintf(stderr, "unsupported: %s uses subgroup operations and the device has none in the %s stage\n",
+                             s.path, s.name);
+                return 77;
+            }
+        }
+    }
     if (tex_rgba_path) {
         if (!f2q.features.shaderSampledImageArrayDynamicIndexing) {
             std::fprintf(stderr, "unsupported: VKH_TEX_RGBA needs shaderSampledImageArrayDynamicIndexing\n");

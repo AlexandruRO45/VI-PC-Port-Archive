@@ -46,4 +46,24 @@ inline bool needs_shader_int64(const std::vector<std::uint32_t>& spv) {
     return needs_shader_int64(spv.data(), spv.size() * 4);
 }
 
+// Subgroup operations: GroupNonUniform and its Vote, Arithmetic, Ballot, Shuffle, ShuffleRelative, Clustered and Quad
+// forms (61..68), or the older SubgroupBallotKHR (4423) and SubgroupVoteKHR (4431). rdna2spirv.py declares them only for
+// a shader that uses them. A stage that does needs the device to list it in VkPhysicalDeviceSubgroupProperties::
+// supportedStages (MoltenVK lists no vertex stage).
+inline constexpr std::uint32_t spirv_capability_group_non_uniform = 61;
+inline constexpr std::uint32_t spirv_capability_group_non_uniform_quad = 68;
+inline constexpr std::uint32_t spirv_capability_subgroup_ballot_khr = 4423;
+inline constexpr std::uint32_t spirv_capability_subgroup_vote_khr = 4431;
+
+inline bool uses_subgroup_operations(const void* code, std::size_t bytes) {
+    for (std::uint32_t cap = spirv_capability_group_non_uniform; cap <= spirv_capability_group_non_uniform_quad; ++cap)
+        if (declares_capability(code, bytes, cap)) return true;
+    return declares_capability(code, bytes, spirv_capability_subgroup_ballot_khr) ||
+           declares_capability(code, bytes, spirv_capability_subgroup_vote_khr);
+}
+
+inline bool uses_subgroup_operations(const std::vector<std::uint32_t>& spv) {
+    return uses_subgroup_operations(spv.data(), spv.size() * 4);
+}
+
 }  // namespace leonida::vk_test
