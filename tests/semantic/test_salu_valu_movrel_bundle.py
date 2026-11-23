@@ -241,3 +241,41 @@ class TestSMovrelsB32Integration(unittest.TestCase):
         ]
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("ps_smovrels_lit_src", lines)
+
+
+class TestSMovrelsB64Oracle(unittest.TestCase):
+    def test_oracle_model_against_translator(self):
+        for m0 in (0, 2):
+            with self.subTest(m0=m0):
+                sgprs = [0] * NUM_SGPRS
+                sgprs[20] = 0x11223344
+                sgprs[21] = 0x55667788
+                sgprs[22] = 0x99AABBCC
+                sgprs[23] = 0xDDEEFF00
+                expected = oracle_s_movrels_b64(10, 20, m0, sgprs)
+                lines = [
+                    "s_mov_b32 s20, 0x11223344",
+                    "s_mov_b32 s21, 0x55667788",
+                    "s_mov_b32 s22, 0x99AABBCC",
+                    "s_mov_b32 s23, 0xDDEEFF00",
+                    f"s_mov_b32 m0, {m0}",
+                    "s_movrels_b64 s[10:11], s[20:21]",
+                    "v_mov_b32 v0, s10",
+                    "v_mov_b32 v1, s11",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_smovrels_b64_oracle_{m0}", lines)
+                out = support.mrt0_words(spv)
+                self.assertEqual(out[0], expected[10])
+                self.assertEqual(out[1], expected[11])
+
+    def test_oracle_consecutive_words(self):
+        sgprs = [0] * NUM_SGPRS
+        sgprs[30] = 0xDEADBEEF
+        sgprs[31] = 0xFEEDFACE
+        expected = oracle_s_movrels_b64(12, 30, 0, sgprs)
+        self.assertEqual(expected[12], 0xDEADBEEF)
+        self.assertEqual(expected[13], 0xFEEDFACE)
