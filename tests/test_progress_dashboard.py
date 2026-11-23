@@ -5,12 +5,14 @@
 Every input is written here by hand (Markdown tables, JUnit XML, a CTest log, a fake work folder whose shader names
 are sentinels). No game files, no GPU, no network: the GitHub path is exercised through its parsers only.
 """
+import codecs
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -127,6 +129,28 @@ class GpuLog(unittest.TestCase):
         self.assertEqual([(n, r) for n, r, _ in rows], [("cs_bounds", "pass"), ("ps_texoff", "skip"), ("cs_bpermute32", "fail")])
         self.assertIn("want 0x00000007", rows[2][2])
         self.assertEqual(summary, (2, 3, 1))
+
+    def test_collect_gpu_reads_utf8_and_bom_marked_logs(self):
+        log_text = "\r\n".join((
+            f"{'cs_first':20} ok",
+            f"{'ps_skip':20} SKIP (fixture)",
+            f"{'cs_fail':20} écart",
+            "1 of 3 pass, 1 skipped",
+        ))
+        encodings = (("utf-8", b""), ("utf-8", codecs.BOM_UTF8),
+                     ("utf-16-le", codecs.BOM_UTF16_LE), ("utf-16-be", codecs.BOM_UTF16_BE))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(pd, "last_commit_time", return_value=None):
+            log = os.path.join(tmp, "check.txt")
+            for encoding, bom in encodings:
+                with self.subTest(encoding=encoding, bom=bom):
+                    with open(log, "wb") as f:
+                        f.write(bom + log_text.encode(encoding))
+                    col = pd.Collector()
+                    pd.collect_gpu(col, [log])
+                    self.assertEqual([(c["name"], c["status"]) for c in col.components],
+                                     [("cs_first", "verified"), ("ps_skip", "unknown"), ("cs_fail", "failed")])
+                    self.assertEqual(col.components[-1]["detail"], "écart")
+                    self.assertEqual((col.sources[0]["status"], col.sources[0]["records"]), ("ok", 3))
 
     def test_panel_groups_by_gpu_label(self):
         with tempfile.TemporaryDirectory() as tmp:

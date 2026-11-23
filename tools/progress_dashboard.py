@@ -26,6 +26,7 @@ own document text; never a shader name, a carved file name or a path into the ga
 """
 import argparse
 import base64
+import codecs
 import datetime as dt
 import hashlib
 import json
@@ -432,6 +433,15 @@ GPU_LINE = re.compile(r"^(\S+)\s+(ok|SKIP \(.*\)|.+)$")
 GPU_SUMMARY = re.compile(r"^(\d+) of (\d+) pass, (\d+) skipped")
 
 
+def read_gpu_log(path):
+    """Windows PowerShell 5.1 redirects output to UTF-16 with a byte-order mark."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("utf-8-sig", errors="replace")
+
+
 def parse_gpu_log(text):
     """[(shader test, result, detail)] from the output of runtime/test/shaders/check.py (one line per test,
     "<name> ok", "<name> SKIP (why)" or "<name> <what came back>", then "N of M pass, K skipped")."""
@@ -467,7 +477,7 @@ def collect_gpu(col, logs):
         if not os.path.isfile(path):
             col.source("gpu_log", path, "missing")
             continue
-        rows, summary = parse_gpu_log(read_utf8(path))
+        rows, summary = parse_gpu_log(read_gpu_log(path))
         label = label or os.path.splitext(os.path.basename(path))[0]
         note = None
         if summary and summary[1] != len(rows):

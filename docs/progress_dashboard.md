@@ -29,6 +29,9 @@ Each source is optional. A missing one is listed under "Sources" on the page; it
 | D3D12 layer | `--github`: the `D3D-` table of [#313](https://github.com/ItsNotRexed/Leonida/issues/313), read through `gh` and checked against the merged and open pull requests | item |
 | CI on main | `--github`: the latest completed run of each workflow on `main` | workflow |
 
+`--gpu-log` accepts UTF-8 with or without a byte-order mark and UTF-16 with a byte-order mark, including logs
+saved with `>` in Windows PowerShell 5.1.
+
 Every run with `--github` reads the pull requests again, so a merge into `main` shows up on the next run as
 IMPLEMENTED, even before a tracking table (such as #313's PR column) is edited. A pull request closed without merging is
 left out. The page also lists the 30 latest merges, and the trend chart follows the share of pull requests merged and
