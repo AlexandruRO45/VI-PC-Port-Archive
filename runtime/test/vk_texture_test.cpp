@@ -29,12 +29,18 @@
 #include "spirv_capability.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -47,13 +53,70 @@ static PFN_vkGetInstanceProcAddr gipa;
         }                                                                            \
     } while (0)
 
-static std::vector<uint32_t> read_spv(const char* p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f.good()) return {};
-    std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
-    std::vector<uint32_t> w(b.size() / 4);
-    std::memcpy(w.data(), b.data(), w.size() * 4);
-    return w;
+static int usage() {
+    std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
+    return 2;
+}
+
+static bool parse_dec_range(std::string_view s, uint32_t max_value, uint32_t& out) {
+    if (s.empty()) return false;
+    const auto end = s.data() + s.size();
+    const auto [ptr, ec] = std::from_chars(s.data(), end, out, 10);
+    return ec == std::errc{} && ptr == end && out <= max_value;
+}
+
+static bool parse_hex_u32(std::string_view s, uint32_t& out) {
+    if (s.starts_with("0x") || s.starts_with("0X")) s.remove_prefix(2);
+    if (s.empty()) return false;
+    const auto end = s.data() + s.size();
+    const auto [ptr, ec] = std::from_chars(s.data(), end, out, 16);
+    return ec == std::errc{} && ptr == end;
+}
+
+static bool same_or_equivalent_path(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    std::error_code ec;
+    if (std::filesystem::equivalent(a, b, ec)) return true;
+    const auto norm = [](const std::string& p) {
+        std::error_code e;
+        const auto abs = std::filesystem::absolute(p, e);
+        return (e ? std::filesystem::path(p) : abs).lexically_normal();
+    };
+    return norm(a) == norm(b);
+}
+
+static bool read_spv(const char* p, std::vector<uint32_t>& out) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(p, ec)) {
+        std::fprintf(stderr, "%s: cannot read SPIR-V module\n", p);
+        return false;
+    }
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::fprintf(stderr, "%s: cannot read SPIR-V module\n", p);
+        return false;
+    }
+    const std::streamoff size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (!f || size < 0) {
+        std::fprintf(stderr, "%s: cannot read SPIR-V module\n", p);
+        return false;
+    }
+    std::vector<char> b(static_cast<size_t>(size));
+    if (size > 0 && (!f.read(b.data(), size) || f.gcount() != size)) {
+        std::fprintf(stderr, "%s: cannot read SPIR-V module\n", p);
+        return false;
+    }
+    constexpr uint32_t spirv_magic = 0x07230203u;
+    uint32_t magic = 0;
+    if (b.size() >= sizeof(magic)) std::memcpy(&magic, b.data(), sizeof(magic));
+    if (b.size() < 20 || (b.size() % 4) != 0 || magic != spirv_magic) {
+        std::fprintf(stderr, "%s: not a SPIR-V module\n", p);
+        return false;
+    }
+    out.resize(b.size() / 4);
+    std::memcpy(out.data(), b.data(), b.size());
+    return true;
 }
 
 #include "../src/descriptor_table.h"
@@ -85,6 +148,8 @@ static int cube_alpha_self_test() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--self-test-cube-alpha") == 0)
         return cube_alpha_self_test();
+    if (argc == 2 && argv[1][0] == '-')
+        return usage();
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
     const bool uint_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-uint") == 0;
@@ -93,15 +158,15 @@ int main(int argc, char** argv) {
     const uint32_t texture_side = two_mip ? 2 * W : TW;
     const uint32_t levels = two_mip ? 2 : 1;
     std::string vs_path, fs_path, out_path;
-    int ptr_sgpr = 0;
+    uint32_t ptr_sgpr = 0;
     // Fixed shader only: fetch (0,0) is in bounds on both the fallback and the integer image.
-    const bool fetch_uint = argc >= 2 && !std::strcmp(argv[1], "fetch-uint");
-    const bool fetch_miss = argc >= 2 && !std::strcmp(argv[1], "fetch-miss");
-    const bool fetch = fetch_uint || fetch_miss || (argc >= 2 && !std::strcmp(argv[1], "fetch-sint"));
-    const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
+    const bool fetch_uint = argc <= 3 && argc >= 2 && !std::strcmp(argv[1], "fetch-uint");
+    const bool fetch_miss = argc <= 3 && argc >= 2 && !std::strcmp(argv[1], "fetch-miss");
+    const bool fetch = fetch_uint || fetch_miss || (argc <= 3 && argc >= 2 && !std::strcmp(argv[1], "fetch-sint"));
+    const bool cube = argc <= 3 && argc >= 2 && !std::strcmp(argv[1], "cube");
     // dref_c / dref_c_b: image_sample_c / image_sample_c_b (implicit LOD, bias), same texture and expected results.
     const char* dref_ps = nullptr;
-    if (argc >= 2) {
+    if (argc <= 3 && argc >= 2) {
         if (!std::strcmp(argv[1], "dref")) dref_ps = "ps_sample_c_lz.spv";
         else if (!std::strcmp(argv[1], "dref_a16")) dref_ps = "ps_sample_c_lz_a16.spv";
         else if (!std::strcmp(argv[1], "dref_c")) dref_ps = "ps_sample_c.spv";
@@ -111,13 +176,21 @@ int main(int argc, char** argv) {
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-    if (!fetch && (argc == 9 || two_mip)) {
+    if (argc == 9 || two_mip) {
         vs_path = argv[1];
         fs_path = argv[2];
         out_path = argv[3];
-        ptr_sgpr = std::atoi(argv[4]);
-        for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
-    } else if (argc <= 2 || ((cube || dref || fetch) && argc == 3)) {
+        if (!parse_dec_range(argv[4], 31, ptr_sgpr)) {
+            std::fprintf(stderr, "invalid ptr_sgpr '%s' (expected 0..31)\n", argv[4]);
+            return 2;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (!parse_hex_u32(argv[5 + i], ssharp[i])) {
+                std::fprintf(stderr, "invalid S# word s%d '%s' (expected 32-bit hex)\n", i, argv[5 + i]);
+                return 2;
+            }
+        }
+    } else if (argc <= 2 || ((cube || dref || fetch) && argc == 3 && argv[2][0] != '-')) {
         // Autonomous mode using synthetic hand-written shaders (no game files required)
         autonomous = true;
         auto find_spv = [](const char* name) -> std::string {
@@ -130,8 +203,8 @@ int main(int argc, char** argv) {
             };
             for (const char* prefix : candidates) {
                 std::string p = std::string(prefix) + name;
-                std::ifstream f(p, std::ios::binary);
-                if (f.good()) return p;
+                std::error_code ec;
+                if (std::filesystem::is_regular_file(p, ec)) return p;
             }
             return std::string("runtime/build/shaders/spirv/") + name;
         };
@@ -143,9 +216,15 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
+        return usage();
+    }
+    if (same_or_equivalent_path(out_path, vs_path) || same_or_equivalent_path(out_path, fs_path)) {
+        std::fprintf(stderr, "output path must not overwrite shader input: %s\n", out_path.c_str());
         return 2;
     }
+    std::vector<uint32_t> vertex_code, fragment_code;
+    if (!autonomous && (!read_spv(vs_path.c_str(), vertex_code) || !read_spv(fs_path.c_str(), fragment_code)))
+        return 2;
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
     // at 0, as the views here start at level 0: image_get_resinfo minifies a 2D array's layers from BASE_LEVEL.
     const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
@@ -223,7 +302,8 @@ int main(int argc, char** argv) {
                  pdp.limits.minTexelOffset, int(pdp.limits.maxTexelOffset),
                  pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
     VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
-    const auto fragment_code = read_spv(fs_path.c_str());
+    if (autonomous && (!read_spv(vs_path.c_str(), vertex_code) || !read_spv(fs_path.c_str(), fragment_code)))
+        return 2;
     using leonida::vk_test::spirv_declares_capability;
     const bool dynamic_sampled = spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4,
         leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
@@ -235,7 +315,7 @@ int main(int argc, char** argv) {
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
     f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
     // shaderInt64 only when a stage has 64-bit integers: SHADER-423's address pairs need none (TEST-468).
-    const bool int64 = leonida::vk_test::needs_shader_int64(read_spv(vs_path.c_str())) ||
+    const bool int64 = leonida::vk_test::needs_shader_int64(vertex_code) ||
                        leonida::vk_test::needs_shader_int64(fragment_code);
     if (int64 && !have.shaderInt64) {
         std::printf("unsupported: shaderInt64 (a stage declares Int64)\n");
@@ -251,7 +331,9 @@ int main(int argc, char** argv) {
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
     // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
-    if (!fma.accepts_file(vs_path.c_str()) || !fma.accepts_file(fs_path.c_str())) return 77;
+    if (!fma.accepts(vertex_code.data(), vertex_code.size() * 4, vs_path.c_str()) ||
+        !fma.accepts(fragment_code.data(), fragment_code.size() * 4, fs_path.c_str()))
+        return 77;
     if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
@@ -477,18 +559,13 @@ int main(int argc, char** argv) {
     vkUpdateDescriptorSets(dev, 4, wr, 0, nullptr);
     // Pipeline.
     bool tail_block = false;   // a stage reads the --pc-tail-ubo block (declares set 1)
-    auto module = [&](const char* p, VkShaderModule* m) {
-        auto code = read_spv(p);
-        if (code.empty()) {
-            std::fprintf(stderr, "failed to read shader module: %s\n", p);
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
+    auto module = [&](const std::vector<uint32_t>& code, VkShaderModule* m) {
         if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
             tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; smi.codeSize = code.size() * 4; smi.pCode = code.data();
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
-    VkShaderModule vs, fs; CHECK(module(vs_path.c_str(), &vs)); CHECK(module(fs_path.c_str(), &fs));
+    VkShaderModule vs, fs; CHECK(module(vertex_code, &vs)); CHECK(module(fragment_code, &fs));
     VkPipelineShaderStageCreateInfo st[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
