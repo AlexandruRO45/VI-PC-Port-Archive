@@ -109,5 +109,61 @@ class TestSOrn2B32Reference(unittest.TestCase):
                 self.assertEqual(scc, exp_scc)
 
 
+class RegType(enum.Enum):
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    val: int = 0
+
+    def format(self) -> str:
+        if self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        return f"{self.val:#x}"
+
+
+@dataclasses.dataclass(frozen=True)
+class SOrn2B32Inst:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+
+    def emit_asm(self) -> str:
+        return f"s_orn2_b32 {self.dst.format()}, {self.src0.format()}, {self.src1.format()}"
+
+
+class TestSOrn2B32AST(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self):
+        inst = SOrn2B32Inst(
+            dst=Operand(RegType.SGPR, 4),
+            src0=Operand(RegType.SGPR, 2),
+            src1=Operand(RegType.SGPR, 3),
+        )
+        self.assertEqual(inst.emit_asm(), "s_orn2_b32 s4, s2, s3")
+
+    def test_ast_with_literal(self):
+        inst = SOrn2B32Inst(
+            dst=Operand(RegType.SGPR, 4),
+            src0=Operand(RegType.SGPR, 2),
+            src1=Operand(RegType.IMM, 0, 0x1234),
+        )
+        self.assertEqual(inst.emit_asm(), "s_orn2_b32 s4, s2, 0x1234")
+
+    def test_ast_immutability(self):
+        inst = SOrn2B32Inst(
+            dst=Operand(RegType.SGPR, 0),
+            src0=Operand(RegType.SGPR, 1),
+            src1=Operand(RegType.SGPR, 2),
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            inst.dst = Operand(RegType.SGPR, 5)  # type: ignore
+
+
 if __name__ == '__main__':
     unittest.main()
