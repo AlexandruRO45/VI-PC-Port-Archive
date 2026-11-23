@@ -108,5 +108,53 @@ class TestSadReferenceOracle(unittest.TestCase):
                 self.assertEqual(words[0], expected)
 
 
+class Vop3Opcode:
+    """Symbolic AST opcode descriptor for VOP3 3-source instructions."""
+
+    def __init__(self, mnemonic: str, dst: str, src0: str, src1: str, src2: str) -> None:
+        self.mnemonic = mnemonic
+        self.dst = dst
+        self.src0 = src0
+        self.src1 = src1
+        self.src2 = src2
+
+    def emit_assembly(self) -> str:
+        return f"{self.mnemonic} {self.dst}, {self.src0}, {self.src1}, {self.src2}"
+
+
+class TestSadASTAndTypes(unittest.TestCase):
+    """Commit 2: symbolic AST opcode definitions and typed expressions for v_sad_u32."""
+
+    def test_ast_emission_and_translation(self):
+        op = Vop3Opcode("v_sad_u32", "v0", "v1", "v2", "v3")
+        self.assertEqual(op.emit_assembly(), "v_sad_u32 v0, v1, v2, v3")
+        lines = [
+            "v_mov_b32 v1, 80",
+            "v_mov_b32 v2, 30",
+            "v_mov_b32 v3, 5",
+            op.emit_assembly(),
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        spv = support.translate_lines("ps_sad_ast", lines + ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"])
+        self.assertIn("UMax", spv)
+        self.assertIn("UMin", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 55)
+
+    def test_ast_literal_constant_operands(self):
+        op = Vop3Opcode("v_sad_u32", "v0", "20", "v1", "10")
+        lines = [
+            "v_mov_b32 v1, 5",
+            op.emit_assembly(),
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_sad_ps(lines, "ps_sad_ast_lit")
+        self.assertEqual(words[0], 25)
+
+
 if __name__ == '__main__':
     unittest.main()
