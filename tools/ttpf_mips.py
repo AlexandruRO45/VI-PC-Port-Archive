@@ -92,14 +92,16 @@ PATTERNS_64K = {
     3: (0, 0, 0, 1, -1, 2, 3, -2, -3, 4, -4, 5, -5, 6, -6, 7),
     4: (0, 0, 0, 0, 1, -1, 2, -2, -3, 3, -4, 4, -5, 5, -6, 6),
 }
-# AMD Gfx10 3D SW_4KB_S intra-tile bit order (addrlib GFX10_SW_4K_S 3D):
-# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101).
+# AMD Gfx10 3D SW_4KB_S intra-tile bit order: Mesa addrlib GFX10_SW_4K_S3_PATINFO (and the identical
+# GFX10_SW_4K_S3_RBPLUS_PATINFO), first nibble01 + nibble2 entries per element size.
+# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101). The tile extents in
+# tex_headers._VOLUME_4K_TILE are 2**(number of X, Y and Z bits) of each row.
 VOLUME_PATTERNS_4K = {
     0: (1, 2, 101, -1, 102, -2, 3, 103, -3, 4, 104, -4),
-    1: (0, 1, 2, 101, -1, 102, 3, -2, 103, 4, -3, 104),
-    2: (0, 0, 1, 2, 101, -1, 102, -2, 3, 103, -3, 104),
+    1: (0, 1, 101, -1, 102, -2, 2, 103, -3, 3, 104, -4),
+    2: (0, 0, 1, -1, 101, -2, 2, 102, -3, 3, 103, -4),
     3: (0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3),
-    4: (0, 0, 0, 0, 1, -1, 101, 2, -2, 102, 3, 103),
+    4: (0, 0, 0, 0, 101, -1, 1, 102, -2, 2, 103, -3),
 }
 VOLUME_FLOAT_FORMATS = {10: 4, 54: 1}  # DXGI format -> float16 channels per voxel
 
@@ -801,6 +803,7 @@ class Pool:
     """Read-only RDS5 texture pool, mirroring TtpfReader's catalog checks."""
 
     def __init__(self, path):
+        self._cache_token = object()
         # A pool that fails a check used to keep its file open and mapped (locked on Windows).
         self._fh = self.data = None
         try:
@@ -873,15 +876,23 @@ class Pool:
         if self._fh is not None:
             self._fh.close()
 
+    def asset_key(self, index):
+        """The entry's 64-bit native asset key. The key array follows the 16-byte records and
+        is longer than the record area has room for in most pools, so it continues into the
+        32-byte ID region; TtpfReader reads it across that boundary, and so does this."""
+        at = self.textures * 16 + index * 8
+        if at + 8 <= len(self.records):
+            return u64(self.records, at)
+        if at >= len(self.records):
+            return u64(self.ids, at - len(self.records))
+        raise ValueError("ETPF asset key straddles the records/ids boundary")
+
     def descriptor(self, index):
         if not 0 <= index < self.textures:
             raise IndexError(index)
         d = parse_etpf_texture_record(self.records[index * 16:index * 16 + 16])
         d["index"] = index
-        d["asset_key_at"] = (
-            u64(self.records, self.textures * 16 + index * 8)
-            if (self.textures * 16 + index * 8 + 8 <= len(self.records))
-            else None)
+        d["asset_key_at"] = self.asset_key(index)
         return d
 
     def chunks_for(self, start, size):
@@ -917,16 +928,19 @@ class Pool:
             id(bcpack_history) if isinstance(bcpack_history, dict) else os.fspath(bcpack_history)
         )
         for virt, csize, src, packed, codec, pad in self.chunks_for(start, size):
-            key = (src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
+            key = (self._cache_token, src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
                    hist_key if codec not in (0, 8) else None)
             if key not in cache:
                 raw = self.data[src:src + packed]
                 if codec == 0:
-                    cache[key] = bytes(raw)
+                    decoded = bytes(raw)
                 elif codec == 8:
-                    cache[key] = zlib.decompress(raw)
+                    inflater = zlib.decompressobj()
+                    decoded = inflater.decompress(raw, csize + 1)
+                    if len(decoded) > csize or not inflater.eof:
+                        raise ValueError("zlib chunk is truncated or exceeds its declared size")
                 elif bcpack_mode != "off" and codec in bcpack.SUPPORTED_REBUILD_CODECS:
-                    cache[key] = bcpack.decode(
+                    decoded = bcpack.decode(
                         raw, codec, csize,
                         allow_provisional=(bcpack_mode == "provisional"),
                         history=bcpack_history,
@@ -935,8 +949,9 @@ class Pool:
                     raise BcpackRequired(
                         f"range touches a BCPack chunk (codec {codec})"
                     )
-                if len(cache[key]) != csize:
+                if len(decoded) != csize:
                     raise ValueError("decoded chunk length disagrees with its range")
+                cache[key] = decoded
             lo, hi = max(start, virt), min(start + size, virt + csize)
             out[lo - start:hi - start] = cache[key][lo - virt:hi - virt]
         return bytes(out)
@@ -1264,8 +1279,10 @@ def find_pools(arg):
     pools = sorted(glob.glob(os.path.join(root, "data", "ttdb", "**", "*.ttpf"), recursive=True))
     pools += sorted(glob.glob(os.path.join(root, "pack", "*", "data", "ttdb", "**", "*.ttpf"),
                                 recursive=True))
+    pools = [path for path in pools if os.path.isfile(path)]
     if not pools:
-        pools = sorted(glob.glob(os.path.join(root, "**", "*.ttpf"), recursive=True))
+        pools = sorted(path for path in glob.iglob(os.path.join(root, "**", "*.ttpf"), recursive=True)
+                       if os.path.isfile(path))
     return pools
 
 
@@ -1878,8 +1895,12 @@ def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=F
     d = a["descriptor"]
     count = d["mips"] if mips is None else mips
     shape = a.get("shape", "2d")
-    with open(out_path, "wb") as f:
-        f.write(blob)
+    try:
+        with open(out_path, "wb") as f:
+            f.write(blob)
+    except OSError as exc:
+        print(f"{out_path}: cannot write: {exc.strerror or exc}", file=sys.stderr)
+        return 1
     dims = (f"{d['width']}x{d['height']}x{d['depth']}" if shape in ("2d_array", "volume")
             else f"{d['width']}x{d['height']}")
     print(f"texture {index}: {shape} {dims} fmt {d['format']} {count} mips "

@@ -162,11 +162,21 @@ def motion_times(s, at):
     return out
 
 
+# Where a multi-axis node keeps its sample count (the number of +0x90 sample lists of a one-node `.motion`)
+NODE_SAMPLE_COUNT_AT = {4: 0x90, 5: 0x90, 6: 0x50, 8: 0xA0}
+
+
 def parameter_node(s, at, parameters):
     """The node that places a `.motion`'s children in parameter space: the pointer at +0x138 when +0x58 is 1;
     when +0x58 is 2, +0x120 points at a block whose +0x18 is the node. A node starts {u64 0, u32 type, u32 0}.
-    Type 3 is one sampled axis: {array of u32 name hashes, array of (u32 sample index, f32 value) sorted by
-    value, f32 min, f32 max}. Other types are not decoded. -> (type, axis or None) or None"""
+    Types 3, 4, 5, 6 and 8 have 1, 2, 3, 4 and 5 axes: +0x10 is an array of 8-byte {u32 name hash, u16, u16}.
+    Type 3 is one sampled axis: then an array of (u32 sample index, f32 value) sorted by value, f32 min, f32 max.
+    Types 4, 5, 6 and 8 keep their sample count at NODE_SAMPLE_COUNT_AT, and +0x20 is a {ptr, count} array of
+    16-byte items ("pairs": words 0 and 2; {u32, u32 0, u32, u32 0} on types 6 and 8, null on type 4, not decoded);
+    the rest of them is not decoded.
+    Type 1 has no axes and its sample count (1) at +0x20.
+    -> (type, axis or None) or None; axis = {names, slots, sample_count, and samples, min, max for type 3 or
+    pairs for types 4-8}"""
     if parameters == 1:
         node = s.ptr(at + 0x138)
     elif parameters == 2:
@@ -177,21 +187,47 @@ def parameter_node(s, at, parameters):
     if node is None or s.u64(node) != 0 or s.u32(node + 12) != 0:
         return None
     kind, axis = s.u32(node + 8), None
-    if kind == 3:
+    if kind == 1:
+        axis = {"names": [], "slots": [], "sample_count": s.u32(node + 0x20)}
+    elif kind == 3 or kind in NODE_SAMPLE_COUNT_AT:
         names, nn = s.array(node + 0x10)
-        samples, ns = s.array(node + 0x20)
-        if names is not None and samples is not None:
-            axis = {"names": [s.u32(names + 4 * i) for i in range(nn)],
-                    "samples": [(s.u32(samples + 8 * i), s.f32(samples + 8 * i + 4)) for i in range(ns)],
-                    "min": s.f32(node + 0x30), "max": s.f32(node + 0x34)}
+        if names is not None:
+            axis = {"names": [s.u32(names + 8 * i) for i in range(nn)],
+                    "slots": [(s.u16(names + 8 * i + 4), s.u16(names + 8 * i + 6)) for i in range(nn)]}
+            if kind == 3:
+                samples, ns = s.array(node + 0x20)
+                if samples is None:
+                    return kind, None
+                axis.update(samples=[(s.u32(samples + 8 * i), s.f32(samples + 8 * i + 4)) for i in range(ns)],
+                            min=s.f32(node + 0x30), max=s.f32(node + 0x34), sample_count=ns)
+            else:
+                axis["sample_count"] = s.u32(node + NODE_SAMPLE_COUNT_AT[kind])
+                pairs, npairs = s.array(node + 0x20)     # null on type 4 and most type 5
+                axis["pairs"] = None if pairs is None else [(s.u32(pairs + 16 * i), s.u32(pairs + 16 * i + 8))
+                                                            for i in range(npairs)]
     return kind, axis
+
+
+def motion_samples(s, at):
+    """`.motion` +0x90: one {ptr, u16 count} list per sample of the parameter node, each item a 12-byte
+    {u32 child index, f32, f32}. A one-node `.motion` has as many lists as its node has samples, so type-3 sample
+    index k plays child list[k][0]. -> [[(child, f32, f32)]] ([] when +0x90 is null)"""
+    p, n = s.array(at + 0x90)
+    out = []
+    for i in range(n if p is not None else 0):
+        items, count = s.array(p + 16 * i)
+        out.append([(s.u32(items + 12 * j), s.f32(items + 12 * j + 4), s.f32(items + 12 * j + 8))
+                    for j in range(count)] if items is not None else [])
+    return out
 
 
 def parse_clip(s, at):
     kind = s.u32(at + 0x20)
     if kind >= 16:  # +0x20 is a pointer: a parametric clip that refers to packs outside the dictionary
-        name_at = s.u64(at + 0x30)
-        if SYSTEM <= name_at < SYSTEM + len(s.d):      # `.motion`: name at +0x30
+        name_at, tag = s.u64(at + 0x30), s.d[at + 0x3F]
+        # `.motion`: name at +0x30, a pointer or inline (+0x3F 0x80 | length). For a `.motionmatcher` +0x3F is
+        # byte 7 of its name at +0x38: a pointer's zero high byte or an inline character.
+        if SYSTEM <= name_at < SYSTEM + len(s.d) or tag & 0x80 and tag & 0x7F <= 15:
             motion = {"kind": "motion", "name": s.string(at + 0x30), "animations": [], "children": None,
                       "parameters": None}
             try:
@@ -205,11 +241,18 @@ def parse_clip(s, at):
                     motion["parameters"] = s.u32(at + 0x58)
             except (DecodeError, struct.error):
                 pass
-            try:
+            try:  # read apart: a malformed node must not mark a readable time table unreadable
                 motion["times"] = motion_times(s, at)
+            except (DecodeError, struct.error):
+                motion["times"] = None
+            try:
                 motion["node"] = parameter_node(s, at, motion["parameters"])
             except (DecodeError, struct.error):
-                motion["times"], motion["node"] = None, None
+                motion["node"] = None
+            try:
+                motion["samples"] = motion_samples(s, at)
+            except (DecodeError, struct.error):
+                motion["samples"] = None
             return motion
         # `.motionmatcher`: a 16-byte id at +0x28, name at +0x38
         return {"kind": "motionmatcher", "name": s.string(at + 0x38), "animations": []}
@@ -507,6 +550,34 @@ def is_root(head):
             and struct.unpack_from("<Q", head, 8)[0] >> 28 == 5)
 
 
+def _named_root_hash(page):
+    """Return the verified page-local name hash shared by dictionary and pack headers."""
+    if len(page) < 0x6C or not is_root(page):
+        return None
+    s = System(page)
+    try:
+        name = s.string(0x38)
+    except DecodeError:
+        return None
+    stored = s.u32(0x68)
+    return stored if name and anim_index.joaat32(name) == stored else None
+
+
+def _local_packs(data):
+    """Referenced (system pointer, name hash) pairs, or None until the table is available."""
+    if len(data) < 0x7a:
+        return None
+    refs, count = struct.unpack_from("<QH", data, 0x70)
+    if not count or refs < SYSTEM:
+        return set()
+    start = refs - SYSTEM
+    end = start + count * 16
+    if end > len(data):
+        return None
+    return {(ptr, name_hash) for ptr, name_hash in struct.iter_unpack("<QI4x", memoryview(data)[start:end])
+            if ptr}
+
+
 def _inflate(m, row):
     return zlib.decompressobj().decompress(m[row["offset"]:row["offset"] + row["stored"]])
 
@@ -551,11 +622,25 @@ def segment(rows, k):
     return rows[k]["offset"], rows[k]["stored"], False
 
 
-def group(m, rows, *, first_row_only: bool = False):
+# A continuation can start with pack:/ paths or bone names inside the dictionary.
+_MAP_BOUNDARIES = anim_index.STOP_SIGNATURES - {"name-table", "skeleton-names"}
+
+
+def group(m, rows, *, first_row_only: bool = False, continuation_rows=None):
     """-> ([(root index, [stream indices or gap pages])], unresolved count by reason, gap pages by kind). A
     dictionary takes the page map's system page count of back-to-back streams. When the last page is not the next
     listed stream, the bytes right after the stream are tried (`_gap_page`); otherwise the root is reported.
-    With first_row_only, later rows supply continuation pages but cannot start other dictionaries."""
+    With first_row_only, later rows supply continuation pages but cannot start other dictionaries.
+    A selected-root caller can supply continuation_rows to discover rows on demand."""
+    def has_next(k):
+        if k + 1 < len(rows):
+            return True
+        row = next(continuation_rows, None) if continuation_rows is not None else None
+        if row is None:
+            return False
+        rows.append(row)
+        return True
+
     out, unresolved, taken, gaps = [], collections.Counter(), set(), collections.Counter()
     for i, row in enumerate(rows[:1] if first_row_only else rows):
         if i in taken or row["signature"] != "zero-prefix":
@@ -565,29 +650,68 @@ def group(m, rows, *, first_row_only: bool = False):
             continue
         pm = struct.unpack_from("<Q", data, 8)[0] - SYSTEM
         parts, k = [i], i
-        while pm + 10 > len(data) and k + 1 < len(rows) and _next_to(rows[k], rows[k + 1]) and len(parts) < 4:
+        def separate_root(page, offset):
+            name_hash = _named_root_hash(page)
+            if name_hash is None:
+                return None  # Unnamed: use the existing page-map discovery rules.
+            # Only pages already accepted for this owner may establish membership.
+            # The candidate and its successors could belong to a different dictionary.
+            packs = _local_packs(data)
+            if packs is None and len(parts) > 1:
+                prefix = data + b"".join(_inflate(m, rows[j]) for j in parts[1:])
+                packs = _local_packs(prefix)
+            return packs is None or (SYSTEM + offset, name_hash) not in packs
+
+        # Only the two count bytes are needed. Locate them by inflated size,
+        # including when they straddle a listed stream boundary.
+        count_at = pm + 8
+        counts = data[count_at:count_at + 2]
+        end = len(data)
+        while len(counts) < 2 and len(parts) < 255 and has_next(k):
+            following = rows[k + 1]
+            if not _next_to(rows[k], following) or following["signature"] in _MAP_BOUNDARIES:
+                break
+            start, end = end, end + following["size"]
+            page = None
+            if following["signature"] == "zero-prefix":
+                page = _inflate(m, following)
+                # Short continuation pages can resemble an unnamed root. Within
+                # the original four-page window, check the root name or local map.
+                if is_root(page) and (len(parts) >= 4 or any(page[0x38:0x40])
+                                      or struct.unpack_from("<Q", page, 8)[0] - SYSTEM + 10 <= len(page)):
+                    if separate_root(page, start) is not False:
+                        break
             k += 1
             parts.append(k)
-            data += _inflate(m, rows[k])
-        if pm + 10 > len(data):
+            if end > count_at:
+                if page is None:
+                    page = _inflate(m, following)
+                counts += page[max(0, count_at - start):count_at + 2 - start]
+        if len(counts) != 2:
             unresolved["page map not in the next stream"] += 1
             continue
-        pages, graphics = data[pm + 8], data[pm + 9]
+        pages, graphics = counts
         if graphics:
             unresolved["graphics pages"] += 1
             continue
-        while len(parts) < pages and k + 1 < len(rows) and _next_to(rows[k], rows[k + 1]):
+        while len(parts) < pages and has_next(k) and _next_to(rows[k], rows[k + 1]):
+            following = rows[k + 1]
+            if following["signature"] == "zero-prefix" and separate_root(_inflate(m, following), end):
+                break
+            end += following["size"]
             k += 1
             parts.append(k)
-        if len(parts) == pages - 1:
+        # A listed adjacent root cannot also be an unlisted gap page.
+        if len(parts) == pages - 1 and (k + 1 == len(rows) or not _next_to(rows[k], rows[k + 1])):
             joined = b"".join(_inflate(m, rows[j]) for j in parts)
             gap = _gap_page(m, rows[k], joined)
             if gap is not None:
                 parts.append(gap)
-                gaps[gap["kind"]] += 1
         if len(parts) != pages:
             unresolved["system page not the next stream"] += 1
             continue
+        if isinstance(parts[-1], dict):
+            gaps[parts[-1]["kind"]] += 1
         taken.update(p for p in parts if not isinstance(p, dict))
         out.append((i, parts))
     return out, unresolved, gaps
@@ -623,6 +747,15 @@ def count_motion_blend(c, stats):
     stats[f"motion_node_type:{kind}"] += 1
     if axis is None:
         return
+    count_motion_samples(c, kind, axis, stats)
+    if kind != 3:
+        stats[f"motion_node_axes:{kind}:{len(axis['names'])}"] += 1
+        if kind != 1:
+            pairs = axis["pairs"]
+            stats[f"motion_node_pairs:{kind}:" + ("null" if pairs is None else str(len(pairs)))] += 1
+        for h in axis["names"]:
+            stats[f"motion_node_axis_name:{kind}:" + AXIS_NAMES.get(h, "unresolved")] += 1
+        return
     values = [v for _i, v in axis["samples"]]
     stats["motion_axes"] += 1
     stats["motion_axis_samples"] += len(values)
@@ -634,6 +767,29 @@ def count_motion_blend(c, stats):
     stats[f"motion_axis_sample_count:{len(values)}"] += 1
     for h in axis["names"]:
         stats["motion_axis_name:" + AXIS_NAMES.get(h, f"0x{h:08x}")] += 1
+
+
+def count_motion_samples(c, kind, axis, stats):
+    """Counts for the +0x90 sample lists of a one-node `.motion` (+0x58 == 1) against its node (no values)."""
+    lists = c.get("samples")
+    if c["parameters"] != 1 or lists is None:
+        return
+    children = len(c["children"])
+    mapped = [items[0][0] for items in lists if items]
+    pre = f"motion_samples:{kind}:"
+    stats[pre + "motions"] += 1
+    stats[pre + "lists_equal_node_samples"] += len(lists) == axis["sample_count"]
+    stats[pre + "lists_more_than_children"] += len(lists) > children
+    stats[pre + "every_list_one_item"] += all(len(items) == 1 for items in lists)
+    stats[pre + "children_in_range"] += all(ch < children for items in lists for ch, _a, _b in items)
+    stats[pre + "every_child_sampled"] += {ch for items in lists for ch, _a, _b in items} == set(range(children))
+    stats[pre + "sample_k_is_child_k"] += (len(lists) == children and all(len(items) == 1 for items in lists) and
+                                           mapped == list(range(children)))
+    for items in lists:
+        for _ch, a, b in items:
+            stats[pre + "items"] += 1
+            stats[pre + "items_first_float_1"] += a == 1.0
+            stats[pre + "items_second_float_1"] += b == 1.0
 
 
 def new_stats():
