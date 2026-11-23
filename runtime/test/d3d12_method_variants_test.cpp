@@ -670,6 +670,129 @@ int main() {
             srv.Format = DXGI_FORMAT_R8G8B8A8_UINT;
             device->CreateShaderResourceView(reserved_srgb.p, &srv, slot);
             EXPECT(slot_is_zero(slot));
+
+            // Depth images and cross-aspect castable lists (VUID-VkImageCreateInfo-pNext-06722): a depth image's
+            // VkImageFormatListCreateInfo must list only its own depth VkFormat (never a colour VkFormat such as
+            // R32_SFLOAT or R16_UNORM, and never D24_UNORM_S8_UINT when D24 falls back to D32_SFLOAT_S8_UINT), and a
+            // colour image's format list must not include a depth VkFormat when D3D12's castable list names one.
+            struct FormatListCapture {
+                PFN_vkGetInstanceProcAddr real_gipa = nullptr;
+                PFN_vkGetDeviceProcAddr real_gdpa = nullptr;
+                PFN_vkGetPhysicalDeviceFormatProperties real_format_props = nullptr;
+                PFN_vkCreateImage real_create_image = nullptr;
+                bool hide_d24 = false;
+                VkFormat last_image_format = VK_FORMAT_UNDEFINED;
+                std::vector<VkFormat> last_view_formats;
+
+                static FormatListCapture& instance() {
+                    static FormatListCapture s{};
+                    return s;
+                }
+                static VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice dev, const VkImageCreateInfo* create_info,
+                                                                   const VkAllocationCallbacks* alloc, VkImage* image) {
+                    auto& c = instance();
+                    c.last_image_format = create_info ? create_info->format : VK_FORMAT_UNDEFINED;
+                    c.last_view_formats.clear();
+                    for (const auto* next =
+                             create_info ? static_cast<const VkBaseInStructure*>(create_info->pNext) : nullptr;
+                         next; next = next->pNext) {
+                        if (next->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+                            const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
+                            c.last_view_formats.assign(list->pViewFormats, list->pViewFormats + list->viewFormatCount);
+                        }
+                    }
+                    return c.real_create_image(dev, create_info, alloc, image);
+                }
+                static VKAPI_ATTR void VKAPI_CALL format_props(VkPhysicalDevice phys, VkFormat fmt,
+                                                               VkFormatProperties* props) {
+                    auto& c = instance();
+                    c.real_format_props(phys, fmt, props);
+                    if (c.hide_d24 && fmt == VK_FORMAT_D24_UNORM_S8_UINT && props)
+                        props->optimalTilingFeatures &=
+                            ~VkFormatFeatureFlags(VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+                }
+                static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL gdpa(VkDevice dev, const char* name) {
+                    if (name && std::strcmp(name, "vkCreateImage") == 0)
+                        return reinterpret_cast<PFN_vkVoidFunction>(&create_image);
+                    return instance().real_gdpa(dev, name);
+                }
+                static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL gipa(VkInstance inst, const char* name) {
+                    if (name && std::strcmp(name, "vkGetDeviceProcAddr") == 0)
+                        return reinterpret_cast<PFN_vkVoidFunction>(&gdpa);
+                    if (name && std::strcmp(name, "vkGetPhysicalDeviceFormatProperties") == 0)
+                        return reinterpret_cast<PFN_vkVoidFunction>(&format_props);
+                    return instance().real_gipa(inst, name);
+                }
+            };
+            auto& capture = FormatListCapture::instance();
+            capture.real_gipa = d.instance_proc;
+            capture.real_gdpa = d.device_proc;
+            capture.real_format_props =
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+            capture.real_create_image = d.fn<PFN_vkCreateImage>("vkCreateImage");
+
+            rt::d3d12::VulkanDeviceInfo hook_info = info;
+            hook_info.get_instance_proc = &FormatListCapture::gipa;
+            hook_info.bindless = d.bindless;
+            capture.hide_d24 = true;  // force the D24 -> D32_SFLOAT_S8_UINT fallback on every GPU
+            Ref<ID3D12Device11> hooked;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(hook_info, IID_PPV_ARGS(&hooked.p))));
+
+            const D3D12_RESOURCE_DESC1 d32_desc =
+                desc1(texture_desc(4, 4, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+            const DXGI_FORMAT d32_cast[] = {DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT};
+            Ref<ID3D12Resource> d32_tex;
+            EXPECT(SUCCEEDED(hooked->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &d32_desc,
+                                                              D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2,
+                                                              d32_cast, IID_PPV_ARGS(&d32_tex.p))));
+            EXPECT(capture.last_image_format == VK_FORMAT_D32_SFLOAT);
+            EXPECT(capture.last_view_formats.size() == 1 && capture.last_view_formats[0] == VK_FORMAT_D32_SFLOAT);
+            srv.Format = DXGI_FORMAT_R32_FLOAT;
+            hooked->CreateShaderResourceView(d32_tex.p, &srv, slot);
+            EXPECT(!slot_is_zero(slot));
+            srv.Format = DXGI_FORMAT_R32_UINT;
+            hooked->CreateShaderResourceView(d32_tex.p, &srv, slot);
+            EXPECT(slot_is_zero(slot));
+
+            const D3D12_RESOURCE_DESC1 d16_desc =
+                desc1(texture_desc(4, 4, DXGI_FORMAT_D16_UNORM, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+            const DXGI_FORMAT r16_cast[] = {DXGI_FORMAT_R16_UNORM};
+            Ref<ID3D12Resource> d16_tex;
+            EXPECT(SUCCEEDED(hooked->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &d16_desc,
+                                                              D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 1,
+                                                              r16_cast, IID_PPV_ARGS(&d16_tex.p))));
+            EXPECT(capture.last_image_format == VK_FORMAT_D16_UNORM);
+            EXPECT(capture.last_view_formats.size() == 1 && capture.last_view_formats[0] == VK_FORMAT_D16_UNORM);
+            EXPECT(hooked->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &d16_desc,
+                                                    D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2, d32_cast,
+                                                    IID_PPV_ARGS(&d16_tex.p)) == E_INVALIDARG);
+
+            const D3D12_RESOURCE_DESC1 d24_desc =
+                desc1(texture_desc(4, 4, DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+            const DXGI_FORMAT d24_cast[] = {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R32_FLOAT};
+            Ref<ID3D12Resource> d24_tex;
+            EXPECT(SUCCEEDED(hooked->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &d24_desc,
+                                                              D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2,
+                                                              d24_cast, IID_PPV_ARGS(&d24_tex.p))));
+            EXPECT(capture.last_image_format == VK_FORMAT_D32_SFLOAT_S8_UINT);
+            EXPECT(capture.last_view_formats.size() == 1 &&
+                   capture.last_view_formats[0] == VK_FORMAT_D32_SFLOAT_S8_UINT);
+
+            const D3D12_RESOURCE_DESC1 r32_color_desc =
+                desc1(texture_desc(4, 4, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE));
+            const DXGI_FORMAT depth_on_color[] = {DXGI_FORMAT_D32_FLOAT};
+            Ref<ID3D12Resource> r32_color_tex;
+            EXPECT(SUCCEEDED(hooked->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &r32_color_desc,
+                                                              D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 1,
+                                                              depth_on_color, IID_PPV_ARGS(&r32_color_tex.p))));
+            EXPECT(capture.last_image_format == VK_FORMAT_R32_SFLOAT);
+            EXPECT(capture.last_view_formats.size() == 1 && capture.last_view_formats[0] == VK_FORMAT_R32_SFLOAT);
+            srv.Format = DXGI_FORMAT_R32_FLOAT;
+            hooked->CreateShaderResourceView(r32_color_tex.p, &srv, slot);
+            EXPECT(!slot_is_zero(slot));
+            srv.Format = DXGI_FORMAT_R32_UINT;
+            hooked->CreateShaderResourceView(r32_color_tex.p, &srv, slot);
+            EXPECT(slot_is_zero(slot));
         }
 
         // A texture from CreateCommittedResource3 (a castable count with a null list, which is no list) is

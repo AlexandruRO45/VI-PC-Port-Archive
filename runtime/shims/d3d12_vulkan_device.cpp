@@ -1371,7 +1371,10 @@ Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc
 // The castable-format list a committed or placed texture was created with, mapped to Vulkan (D3D-85's committed
 // path, D3D-90's placed one). Each format must map and be the same texel size as the resource's: the host PC
 // runtime refuses other sizes, and a size-mismatched VkImageFormatListCreateInfo is a Vulkan validation error
-// (VUID-VkImageCreateInfo-pNext-06722). A nonzero count with a null list is no list. E_INVALIDARG on a bad format.
+// (VUID-VkImageCreateInfo-pNext-06722). A depth image's views always keep the image's own depth format (including
+// D24 stored as D32_SFLOAT_S8_UINT), and a colour image cannot be viewed as a depth format, so cross-aspect casts
+// record the image's own format instead of putting an incompatible format in VkImageFormatListCreateInfo. A
+// nonzero count with a null list is no list. E_INVALIDARG on a bad format.
 HRESULT castable_view_formats(const Format& format, UINT32 count, const DXGI_FORMAT* castable,
                               std::vector<VkFormat>& out) {
     if (!count || !castable) return S_OK;
@@ -1388,7 +1391,9 @@ HRESULT castable_view_formats(const Format& format, UINT32 count, const DXGI_FOR
             log_once("castable format is a different texel size than the resource:", castable[i]);
             return E_INVALIDARG;
         }
-        if (std::find(out.begin(), out.end(), cast.format) == out.end()) out.push_back(cast.format);
+        const bool cast_depth = (cast.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+        const VkFormat view_format = (depth || cast_depth) ? format.format : cast.format;
+        if (std::find(out.begin(), out.end(), view_format) == out.end()) out.push_back(view_format);
     }
     return S_OK;
 }
