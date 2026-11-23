@@ -143,6 +143,22 @@ class TestSSubI32Oracle(unittest.TestCase):
         # 0x7FFFFFFF - (-1) -> 0x80000000 (overflow)
         self.assertEqual(ref_s_sub_i32(0x7FFFFFFF, 0xFFFFFFFF), (0x80000000, 1))
 
+class SSubI32Expr(ASTNode):
+    def __init__(self, src0: int, src1: int) -> None:
+        self.src0 = src0
+        self.src1 = src1
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_sub_i32(self.src0, self.src1)
+
+
+class TestSSubI32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SSubI32Expr(100, 40)
+        self.assertEqual(expr.eval(), (60, 0))
+        expr_ovf = SSubI32Expr(0x80000000, 1)
+        self.assertEqual(expr_ovf.eval(), (0x7FFFFFFF, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
