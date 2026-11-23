@@ -57,6 +57,11 @@ wrong class is visible and the rule list in the tool (`CONFIRMATION`) can be cor
 Each metric is a ratio with its numerator, denominator and formula on the page. There is no overall percentage: the
 panels count different things. The trend chart breaks a line where a metric's formula changed between snapshots.
 
+Runtime imports shows the binding rate for the named consumer/import pairs. For an executable whose documented
+dry-run includes all four counts, a separate metric divides its shim, host and module bindings by its total
+imports, including unimplemented ones. The counts describe the revision measured in the document. A dry-run
+checks mapping and binding before the executable's entry point runs.
+
 ## No game data
 
 The page and the JSON carry counts, pass/fail, error classes and the project's own document text. The corpus panel

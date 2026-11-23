@@ -38,6 +38,33 @@ class Markdown(unittest.TestCase):
         self.assertEqual(pd.plain("**GPU-checked** ([measurement](http://x)) `v_mac_f32`"), "GPU-checked (measurement) v_mac_f32")
 
 
+class Imports(unittest.TestCase):
+    def test_named_bindings_and_executable_dry_run_have_separate_denominators(self):
+        tables = (
+            "| Consumer | Import | Binding |\n|---|---|---|\n| example.dll | alpha | shim |\n"
+            "\n| Image | Unimplemented | Host | Module | Shim |\n|---|---|---|---|---|\n"
+            "| `example.exe` | **3** | 1,000 | 4 | 6 |\n"
+            "| helper.dll | 0 | 200 | 3 | 1 |\n"
+            "| incomplete.exe | 4 | not measured | 0 | 1 |\n"
+            "| empty.exe | 0 | 0 | 0 | 0 |\n"
+            "\n| Image | Unimplemented |\n|---|---|\n| old.exe | 2 |\n")
+        col = pd.Collector()
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(pd, "ROOT", root):
+            docs = Path(root, "docs")
+            docs.mkdir()
+            (docs / "runtime_imports.md").write_text(tables, encoding="utf-8", newline="\n")
+            pd.collect_imports(col)
+        metrics = {m["id"]: (m["numerator"], m["denominator"], m["value"]) for m in col.metrics}
+        self.assertEqual(metrics, {
+            "imports.bound": (1, 1, 1.0),
+            "imports.image.example.exe.bound": (1010, 1013, round(1010 / 1013, 6)),
+            "imports.image.empty.exe.bound": (0, 0, None),
+        })
+        statuses = {c["name"]: c["status"] for c in col.components}
+        self.assertEqual(statuses["old.exe"], "missing")
+        self.assertEqual(statuses["incomplete.exe"], "missing")
+
+
 class Contract(unittest.TestCase):
     def test_classification_order_and_evidence(self):
         cases = {

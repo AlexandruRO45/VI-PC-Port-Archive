@@ -196,6 +196,7 @@ class Collector:
             c["weight"] = weight
         c.update({k: v for k, v in attrs.items() if v not in (None, "", [], {})})
         self.components.append(c)
+        return cid
 
     def metric(self, mid, panel, title, num, den, formula, note=None):
         val = None if num is None or not den else round(num / den, 6)
@@ -652,6 +653,13 @@ def kind_label(kind):
             "unstated": "Confirmation not stated"}.get(kind, kind)
 
 
+def import_count(cell):
+    value = plain(cell)
+    if re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)", value):
+        return int(value.replace(",", ""))
+    return None
+
+
 def collect_imports(col):
     col.panel("imports", "Runtime imports (docs/runtime_imports.md)", "imports")
     path = os.path.join(ROOT, "docs", "runtime_imports.md")
@@ -673,15 +681,24 @@ def collect_imports(col):
                 col.add(f"import.{plain(row[ci])}.{plain(row[ii])}", "imports", plain(row[ci]), plain(row[ii]), status,
                         detail=f"binding: {binding}")
         elif "unimplemented" in h and "image" in h:
-            ui, ii = h.index("unimplemented"), h.index("image")
             for row in rows:
-                if len(row) > ui and plain(row[ui]).replace(",", "").isdigit():
-                    k = int(plain(row[ui]).replace(",", ""))
-                    col.add(f"image.{plain(row[ii])}", "imports", "Images (unimplemented imports)", plain(row[ii]),
-                            "verified" if k == 0 else "missing", detail=f"{k} unimplemented import(s), as measured in the document")
+                cells_by_name = dict(zip(h, row))
+                image = plain(cells_by_name.get("image", ""))
+                missing = import_count(cells_by_name.get("unimplemented", ""))
+                if not image or missing is None:
+                    continue
+                cid = col.add(f"image.{image}", "imports", "Images (unimplemented imports)", image,
+                              "verified" if missing == 0 else "missing",
+                              detail=f"{missing} unimplemented import(s), as measured in the document")
+                if image.lower().endswith(".exe"):
+                    counts = [import_count(cells_by_name.get(name, "")) for name in ("shim", "host", "module")]
+                    if None not in counts:
+                        bound = sum(counts)
+                        col.metric(f"imports.{cid}.bound", "imports", f"{image}: imports bound in the documented dry-run",
+                                   bound, bound + missing, "(shim + host + module) / (shim + host + module + unimplemented)")
     col.source("imports", path, "ok", n)
     if n:
-        col.metric("imports.bound", "imports", "Measured imports with a binding", n - unimpl, n,
+        col.metric("imports.bound", "imports", "Named consumer/import pairs with a binding", n - unimpl, n,
                    "imports bound to a shim, the host or a shipped module / imports listed")
 
 
