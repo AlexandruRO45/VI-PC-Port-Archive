@@ -387,9 +387,12 @@ def _make_parent(path):
 def _publish(dest, write, newline):
     """Write a report next to `dest` and swap it in, so a run that fails or is interrupted while writing (a
     serialization error, a full disk, Ctrl+C) leaves the previous report as it was instead of a truncated one.
-    The result keeps the previous report's permission bits, or gets the usual ones for a new file."""
+    The result keeps the previous report's permission bits, or gets the usual ones for a new file.
+    A symlinked `dest` keeps its link: the report replaces the file the link points to (created if the link
+    dangles), as the plain open(dest, "w") this replaced did, instead of the link itself."""
+    dest = os.path.realpath(dest)
     _make_parent(dest)
-    directory = os.path.dirname(os.path.abspath(dest))
+    directory = os.path.dirname(dest)
     temp = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline=newline, dir=directory,

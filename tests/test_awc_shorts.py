@@ -136,6 +136,63 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(rows[0]["channels"], "2")
         self.assertTrue(rows[0]["file"].endswith("00001234.ogg"))
 
+    def _symlinked_catalog(self):
+        """out/shorts.csv as a link to a catalog kept in another folder; skipped where links can't be made."""
+        os.makedirs(self.out)
+        shared = os.path.join(self.tmp.name, "shared")
+        os.makedirs(shared)
+        target = os.path.join(shared, "shorts.csv")
+        try:
+            os.symlink(target, os.path.join(self.out, "shorts.csv"))
+        except (OSError, NotImplementedError) as e:      # Windows without Developer Mode or the privilege
+            self.skipTest(f"symlinks unavailable: {e}")
+        return shared, target
+
+    def _cli(self):
+        path = self.write("cli.awc", 0xFC, 480000)
+        argv = [path, self.out, "--min-seconds", "4", "--max-seconds", "6", "--jobs", "1"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shorts.main(argv), 0)
+
+    def test_symlinked_catalog_updates_its_target(self):
+        # os.replace on out/shorts.csv replaced the link with a file and left the linked catalog with the old rows.
+        shared, target = self._symlinked_catalog()
+        with open(target, "w", encoding="utf-8", newline="") as f:
+            f.write("old\n")
+        self._cli()
+        link = os.path.join(self.out, "shorts.csv")
+        self.assertTrue(os.path.islink(link))
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.readline().strip().split(","), list(shorts.FIELDS))
+        self.assertEqual(os.listdir(shared), ["shorts.csv"])
+
+    def test_dangling_symlinked_catalog_creates_its_target(self):
+        shared, target = self._symlinked_catalog()
+        self._cli()
+        self.assertTrue(os.path.islink(os.path.join(self.out, "shorts.csv")))
+        self.assertTrue(os.path.isfile(target))
+
+    def test_catalog_is_staged_and_swapped_where_its_path_resolves(self):
+        # The same decision without a real link, so it runs where symlinks can't be made: the catalog resolves
+        # to a file in another folder, which gets the rows; nothing is written at out/shorts.csv.
+        shared = os.path.join(self.tmp.name, "shared")
+        os.makedirs(shared)
+        target = os.path.join(shared, "shorts.csv")
+        catalog = os.path.join(self.out, "shorts.csv")
+        real = os.path.realpath
+
+        def resolve(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(catalog)):
+                return target
+            return real(path, *args, **kwargs)
+
+        with mock.patch("os.path.realpath", side_effect=resolve):
+            self._cli()
+        self.assertFalse(os.path.exists(catalog))
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.readline().strip().split(","), list(shorts.FIELDS))
+        self.assertEqual(os.listdir(shared), ["shorts.csv"])
+
     def test_bank_extensions_cannot_collapse_two_banks_into_one_export(self):
         first = self.write("clip.awc", 0x78, 480000)
         second = os.path.join(self.tmp.name, "clip.AWC")

@@ -164,15 +164,18 @@ def main(argv=None) -> int:
         return 1
     rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))
     catalog = os.path.join(a.out, "shorts.csv")
+    # A symlinked shorts.csv keeps its link: the catalog replaces the file it points to (created if the link
+    # dangles), staged beside that file so the replace stays on one volume.
+    target = os.path.realpath(catalog)
     try:
-        with tempfile.TemporaryDirectory(dir=a.out, prefix=".shorts-") as staging:
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(target), prefix=".shorts-") as staging:
             staged = os.path.join(staging, "shorts.csv")
             with open(staged, "w", encoding="utf-8", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=FIELDS, lineterminator="\n")
                 w.writeheader()
                 w.writerows(rows)
-            os.chmod(staged, published_mode(catalog))
-            os.replace(staged, catalog)
+            os.chmod(staged, published_mode(target))
+            os.replace(staged, target)
     except OSError as e:
         print(f"awc_shorts: cannot write {catalog}: {e}", file=sys.stderr)
         return 1

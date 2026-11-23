@@ -615,6 +615,66 @@ class PublishTest(unittest.TestCase):
         self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".navmesh_index-")], [])
 
 
+class SymlinkedReportTest(unittest.TestCase):
+    """_publish writes through a symlinked report path to the file it points to, as open(dest, "w") did before the
+    atomic swap; os.replace on the link replaced the link itself and left the target with the old report."""
+
+    def setUp(self):
+        self.tool = load_tool_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.reports = os.path.join(self.tmp.name, "reports")
+        self.shared = os.path.join(self.tmp.name, "shared")
+        os.makedirs(self.reports)
+        os.makedirs(self.shared)
+        self.link = os.path.join(self.reports, "index.json")
+        self.target = os.path.join(self.shared, "index.json")
+
+    def read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as e:      # Windows without Developer Mode or the privilege
+            self.skipTest(f"symlinks unavailable: {e}")
+
+    def test_publish_through_a_symlink_updates_its_target(self):
+        with open(self.target, "w", encoding="utf-8", newline="\n") as f:
+            f.write("old")
+        self.symlink(self.target, self.link)
+        self.tool._publish(self.link, lambda f: f.write("new"), "\n")
+        self.assertTrue(os.path.islink(self.link))
+        self.assertEqual(self.read(self.target), "new")
+        self.assertEqual(os.listdir(self.reports), ["index.json"])
+        self.assertEqual(os.listdir(self.shared), ["index.json"])
+
+    def test_publish_through_a_dangling_symlink_creates_its_target(self):
+        self.symlink(self.target, self.link)
+        self.tool._publish(self.link, lambda f: f.write("new"), "\n")
+        self.assertTrue(os.path.islink(self.link))
+        self.assertEqual(self.read(self.target), "new")
+
+    def test_publish_stages_and_swaps_where_the_path_resolves(self):
+        # The same decision without a real link, so it runs where symlinks can't be made: dest resolves elsewhere.
+        for path, text in ((self.link, "link"), (self.target, "old")):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        real = os.path.realpath
+
+        def resolve(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(path)) == os.path.normcase(self.link):
+                return self.target
+            return real(path, *args, **kwargs)
+
+        with mock.patch("os.path.realpath", side_effect=resolve):
+            self.tool._publish(self.link, lambda f: f.write("new"), "\n")
+        self.assertEqual(self.read(self.target), "new")
+        self.assertEqual(self.read(self.link), "link")
+        self.assertEqual(os.listdir(self.shared), ["index.json"])
+
+
 class OutputPathTest(unittest.TestCase):
     """A report path that is already a folder is a usage error, not a PermissionError traceback."""
 

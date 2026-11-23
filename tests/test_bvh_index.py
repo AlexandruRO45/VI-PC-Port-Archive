@@ -510,6 +510,66 @@ class ScanTest(unittest.TestCase):
         self.assertIn("is a folder, not a report file", err.getvalue())
 
 
+class SymlinkedReportTest(unittest.TestCase):
+    """_publish (bvh_index, bvh_geometry_check, bvh_packing_check) writes through a symlinked report path to the file
+    it points to, as open(dest, "w") did before the atomic swap; os.replace on the link replaced the link itself."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.reports = os.path.join(self.tmp.name, "reports")
+        self.shared = os.path.join(self.tmp.name, "shared")
+        os.makedirs(self.reports)
+        os.makedirs(self.shared)
+        self.link = os.path.join(self.reports, "index.json")
+        self.target = os.path.join(self.shared, "index.json")
+
+    def read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as e:      # Windows without Developer Mode or the privilege
+            self.skipTest(f"symlinks unavailable: {e}")
+
+    def test_publish_through_a_symlink_updates_its_target(self):
+        with open(self.target, "w", encoding="utf-8", newline="\n") as f:
+            f.write("old")
+        self.symlink(self.target, self.link)
+        bvh_index._publish(self.link, lambda f: f.write("new"), "\n")
+        self.assertTrue(os.path.islink(self.link))
+        self.assertEqual(self.read(self.target), "new")
+        self.assertEqual(self.read(self.link), "new")
+        self.assertEqual(os.listdir(self.reports), ["index.json"])
+        self.assertEqual(os.listdir(self.shared), ["index.json"])
+
+    def test_publish_through_a_dangling_symlink_creates_its_target(self):
+        self.symlink(self.target, self.link)
+        bvh_index._publish(self.link, lambda f: f.write("new"), "\n")
+        self.assertTrue(os.path.islink(self.link))
+        self.assertEqual(self.read(self.target), "new")
+
+    def test_publish_stages_and_swaps_where_the_path_resolves(self):
+        # The same decision without a real link, so it runs where symlinks can't be made: dest resolves elsewhere.
+        for path, text in ((self.link, "link"), (self.target, "old")):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        real = os.path.realpath
+
+        def resolve(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(path)) == os.path.normcase(self.link):
+                return self.target
+            return real(path, *args, **kwargs)
+
+        with mock.patch("os.path.realpath", side_effect=resolve):
+            bvh_index._publish(self.link, lambda f: f.write("new"), "\n")
+        self.assertEqual(self.read(self.target), "new")
+        self.assertEqual(self.read(self.link), "link")
+        self.assertEqual(os.listdir(self.shared), ["index.json"])
+
+
 class MissingTargetTest(unittest.TestCase):
     """A target that cannot be opened is one line naming the path once; the OSError text repeated it and repr'd it."""
 
