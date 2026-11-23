@@ -256,5 +256,87 @@ class TestValuDot4I32I8ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res, 72)
         self.assertEqual(state.vgprs[2], 72)
 
+MASK64: int = 0xFFFFFFFFFFFFFFFF
+
+
+class SIMDMachineState:
+    def __init__(self, num_lanes: int = 64, exec_mask: int = MASK64) -> None:
+        self.num_lanes = num_lanes
+        self.exec_mask = exec_mask
+        self.lanes_vgpr: list[list[int]] = [[0] * 256 for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * 106
+        self.scc: int = 0
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def read_lane_operand(self, lane: int, op: Operand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.lanes_vgpr[lane][op.index] & MASK32
+        if op.kind == OperandKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        return op.value & MASK32
+
+
+class SIMDInterpreter:
+    def step(self, instr: VDot4I32I8Instruction, state: SIMDMachineState) -> list[Optional[int]]:
+        results: list[Optional[int]] = []
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                s0 = state.read_lane_operand(lane, instr.src0)
+                s1 = state.read_lane_operand(lane, instr.src1)
+                s2 = state.read_lane_operand(lane, instr.src2)
+                res = ref_dot4_i32_i8(s0, s1, s2, clamp=instr.clamp)
+                if instr.dst.kind == OperandKind.VGPR:
+                    state.lanes_vgpr[lane][instr.dst.index] = res
+                results.append(res)
+            else:
+                results.append(None)
+        return results
+
+
+class TestValuDot4I32I8SIMDDivergence(unittest.TestCase):
+    """Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergence_even_odd_mask(self) -> None:
+        state = SIMDMachineState(num_lanes=32, exec_mask=0x55555555)
+        for lane in range(32):
+            state.lanes_vgpr[lane][1] = pack_i8(1, 1, 1, 1)
+            state.lanes_vgpr[lane][2] = pack_i8(lane, 0, 0, 0)
+            state.lanes_vgpr[lane][3] = 10
+            state.lanes_vgpr[lane][0] = 0xDEADBEEF
+
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        results = SIMDInterpreter().step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                expected = lane + 10
+                self.assertEqual(results[lane], expected)
+                self.assertEqual(state.lanes_vgpr[lane][0], expected)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.lanes_vgpr[lane][0], 0xDEADBEEF)
+
+    def test_wave64_zero_mask_preservation(self) -> None:
+        state = SIMDMachineState(num_lanes=64, exec_mask=0)
+        for lane in range(64):
+            state.lanes_vgpr[lane][0] = 0xCAFE0000 | lane
+
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.imm(pack_i8(1, 2, 3, 4)),
+            src1=Operand.imm(pack_i8(5, 6, 7, 8)),
+            src2=Operand.imm(0),
+        )
+        results = SIMDInterpreter().step(instr, state)
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(64):
+            self.assertEqual(state.lanes_vgpr[lane][0], 0xCAFE0000 | lane)
+
 if __name__ == "__main__":
     unittest.main()
