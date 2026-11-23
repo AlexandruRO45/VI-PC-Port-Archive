@@ -96,7 +96,35 @@ mapper (#5378) or an imported host allocation.
 The proxy's slot table must also be longer than the title's highest slot. A shorter table leaves a null pointer,
 not an `E_NOTIMPL`.
 
+### 3.5 The first UI draw reads its transform through a V# into the title's memory
+
+Measured once the frame loop runs (RT-753). Each frame clears the back buffer, draws two full-screen passes into
+an off-screen target, then makes one `DrawInstanced(3, 1)` on the back buffer: a position/colour/texture vertex
+shader, rectangle-list topology (PSO type 19, list topology 17), and one full-screen rectangle in pixel units in its
+vertex buffer. That draw writes no pixel. With every render-target clear forced to red, all 8,294,400 pixels of each
+captured `PresentX` frame stay red, also with blending forced off and with the pixel shader's one `OpKill` replaced
+by `OpReturn` (the module still passes `spirv-val`). The pipeline state is not the cause: the viewport and scissor
+cover the target, the write mask is 15, culling is off, and the pipeline is created.
+
+The vertex shader gets its pixel-to-clip transform through a V# in a descriptor table bound with
+`SetGraphicsRootDescriptorTable`. The table is in the title's own descriptor heap. The V#'s 48-bit base is an
+address in the title's own memory (a per-frame constant ring that advances 128 KiB a frame), not a VA in the layer's
+BDA arena, and it is outside the slot-133 buffer of section 3.4. The translated shader adds `heap_base` to it, which
+`docs/d3d12_vulkan.md` already measured as unreachable for a V# (D3D-53): the shader reads wild memory, so every
+vertex collapses. The fix belongs to the single address space of `docs/d3d12_vulkan.md`, not to the pipeline or the
+translator: a buffer a V# can reach has to be an arena range.
+
+Under Wine on AMD, slot 133's pages are not even imported: RADV refuses to import a view of a pagefile-backed section,
+which is how `xmem.dll` maps physical pages, while it imports private `VirtualAlloc` memory. With the plain fallback,
+every frame's `ExecuteCommandLists` fails at replay on a vertex-buffer VA and nothing is submitted. A shadow buffer at
+the title's VA, re-copied before each submission, gets the lists submitted (#8225).
+
+Base of the measurement: Linux, Wine 11.22, AMD Radeon RX 7900 XT (RADV, Mesa 26.2.5), `LEONIDA_D3D12=vulkan`, the
+game shaders translated (including the executable's own), on a local integration of the open boot-path pull requests
+plus diagnostics. Counts only; nothing of the game is quoted.
+
 ## 4. What this does not show
 
 These are one run's first failures, not a list of what is missing. Every stand-in above is local and untested
-beyond "the title goes on to the next call". Nothing has reached a draw or a present yet.
+beyond "the title goes on to the next call". Section 3.5 is the first measurement past a present: the frame loop
+runs and `PresentX` is reached, but the first draw on the back buffer still writes nothing.
