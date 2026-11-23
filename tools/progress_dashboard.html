@@ -146,7 +146,7 @@ td .minibar { width: 64px; margin-right: 8px; }
     <div class="note">A hollow point means the metric's formula changed there; the line breaks because the values on either side are not comparable.</div></div>
   <h3 id="mergedH" hidden>Latest merges into main <small id="mergedSub"></small></h3>
   <div class="card" id="merged" hidden></div>
-  <h3 id="mineH" hidden>Your claims and pull requests <small id="mineSub"></small></h3>
+  <h3 id="mineH" hidden>Your coordination activity <small id="mineSub"></small></h3>
   <div class="card" id="mine" hidden></div>
   <h3 id="sourcesH">Sources <small>a missing source is never counted as zero or as a failure</small></h3>
   <div class="card"><table id="sources"><thead><tr><th>Source</th><th>Status</th><th>Records</th><th>Path</th><th>Note</th></tr></thead><tbody></tbody></table>
@@ -403,9 +403,18 @@ function tables() {
     for (const id of ["mineH", "mine", "jumpMine"]) document.getElementById(id).hidden = false;
     const box = document.getElementById("mine");
     document.getElementById("mineSub").textContent = `@${mine.login}`;
-    box.append(el("table", {}, el("tbody", {},
+    const rows = el("tbody");
+    if (mine.assignments !== undefined) {
+      const ids = mine.assignments;
+      const detail = el("td", { colspan: 2 });
+      if (ids?.length) detail.append(...ids.map((id) => el("span", { class: "tag" }, id)));
+      else detail.textContent = ids === null ? "Open work unavailable" : "None";
+      rows.append(el("tr", {}, el("td", {}, "Current assignments"), detail));
+    }
+    rows.append(
       ...mine.claims.map((c) => el("tr", {}, el("td", {}, "claim"), el("td", {}, when(c.at)), el("td", {}, c.text))),
-      ...mine.pull_requests.map((p) => el("tr", {}, el("td", {}, `#${p.number}`), el("td", {}, p.state + (p.draft ? " (draft)" : "")), el("td", {}, p.title))))));
+      ...mine.pull_requests.map((p) => el("tr", {}, el("td", {}, `#${p.number}`), el("td", {}, p.state + (p.draft ? " (draft)" : "")), el("td", {}, p.title))));
+    box.append(el("table", {}, rows));
   }
 }
 function trend() {

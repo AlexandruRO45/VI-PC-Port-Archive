@@ -37,8 +37,9 @@ left out. The page also lists the 30 latest merges, and the trend chart follows 
 of item IDs with a merged pull request. `gh pr list` reads at most 5000 per state; the Sources table says when that
 limit is reached.
 
-With `--github --login <account>` the page also lists that account's claims in the coordination issue (and the issue
-it continues) and its pull requests. Nothing is posted: every `gh` call is a read.
+With `--github --login <account>` the page shows the account's current assignment IDs from **Open work** in the
+current coordination issue, along with its claim comments from that issue and the issue it continues, and its pull
+requests. Every `gh` call is a read.
 
 ## How a status is decided
 

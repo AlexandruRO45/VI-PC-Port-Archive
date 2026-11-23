@@ -19,7 +19,8 @@ Sources, each optional and reported as missing rather than counted as zero when 
     corpus          --work: counts per stage from <work>/shaders/dxbc/index.json and <work>/shaders/spirv/index.json
     github          --github, read-only through `gh`: every pull request into main (merged = implemented, open =
                     partial), latest CI runs on main, the D3D- table of #313 checked against those merges, the
-                    coordination issue's section sizes and, with --login, that account's claims and pull requests
+                    coordination issue's section sizes and, with --login, that account's current assignments,
+                    claim comments and pull requests
 
 No game data leaves the inputs: the page and the JSON carry counts, pass/fail, error classes and the project's
 own document text; never a shader name, a carved file name or a path into the game copy.
@@ -786,6 +787,77 @@ def d3d_item_ids(pulls):
     return {i for p in pulls for i in item_ids(p.get("title")) if i.startswith("D3D-")}
 
 
+ACCOUNT = r"@?[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?"
+OWNER_SEPARATOR = r"\s*[,/&+]\s*|\s+and\s+"
+COMPACT_ASSIGNMENT = re.compile(
+    rf"(?P<item>{ITEM_ID.pattern})\s+(?P<owners>`{ACCOUNT}`(?:(?:{OWNER_SEPARATOR}|\s+)`{ACCOUNT}`)*)"
+    r"(?:\s+\([^()]*\))?"
+)
+
+
+def open_work_lines(text):
+    """Lines belonging to the Open work heading, including its category subsections."""
+    lines, level, fence = [], None, None
+    for line in re.sub(r"<!--.*?-->", "", text, flags=re.S).splitlines():
+        marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)", line)
+        if fence:
+            if marker and marker[1].startswith(fence) and not marker[2].strip():
+                fence = None
+        elif marker and (marker[1].startswith("~") or "`" not in marker[2]):
+            fence = marker[1]
+        elif not line.startswith(("    ", "\t")):
+            heading = re.match(r" {0,3}(#{1,6})[ \t]+(.*)", line)
+            if heading:
+                depth = len(heading[1])
+                if level is not None and depth <= level:
+                    break
+                if level is None and re.sub(r"\s+#+$", "", heading[2].strip()).casefold() == "open work":
+                    level = depth
+            elif level is not None:
+                lines.append(line)
+                continue
+        if level is not None:
+            lines.append("")
+    return lines if level is not None else None
+
+
+def open_work_assignments(text, login):
+    """Item IDs explicitly owned by login, or None if the Open work section is unavailable."""
+    lines = open_work_lines(text)
+    if lines is None:
+        return None
+    tables = {start: (header, rows) for _, header, rows, start in md_tables("\n".join(lines))}
+    login = login.casefold()
+    assignments = []
+    for i, line in enumerate(lines, 1):
+        if i in tables:
+            header, rows = tables[i]
+            columns = [plain(h).casefold() for h in header]
+            if "id" not in columns or "owner" not in columns:
+                continue
+            item_col, owner_col = columns.index("id"), columns.index("owner")
+            for row in rows:
+                if len(row) <= max(item_col, owner_col):
+                    continue
+                item = plain(row[item_col])
+                owners = re.sub(r"\s+\([^()]*\)", "", row[owner_col])
+                # A profile link may use a display name. Compare the account in its URL.
+                owners = re.sub(rf"\[[^\]]+\]\(https://github\.com/({ACCOUNT})/?\)", r"\1", owners)
+                owners = re.split(OWNER_SEPARATOR, re.sub(r"\*\*|`", "", owners).strip(), flags=re.I)
+                if (ITEM_ID.fullmatch(item) and all(re.fullmatch(ACCOUNT, owner) for owner in owners)
+                        and any(owner.removeprefix("@").casefold() == login for owner in owners)):
+                    assignments.append(item)
+        else:
+            # A compact list line consists of complete entries. Ignore prose containing ID/name pairs.
+            entries = [COMPACT_ASSIGNMENT.fullmatch(part.strip()) for part in line.split("·")]
+            if all(entries):
+                for entry in entries:
+                    owners = re.findall(rf"`({ACCOUNT})`", entry["owners"])
+                    if any(owner.removeprefix("@").casefold() == login for owner in owners):
+                        assignments.append(entry["item"])
+    return list(dict.fromkeys(assignments))
+
+
 def collect_pulls(col, repo, merged, open_prs, limit=PR_LIMIT):
     """Every pull request into main: merged is IMPLEMENTED, open is PARTIAL; closed without merging is left out.
     Grouped by the item family its title names (D3D, SHADER, BUILD, ...)."""
@@ -895,7 +967,7 @@ def collect_github(col, repo, login):
     if coord:
         num = coord[0]["number"]
         body = gh_json(["issue", "view", str(num), "-R", repo, "--json", "body"]) or {}
-        text = body.get("body", "")
+        text = body.get("body") or ""
         sizes = {}
         for sec in ("Up for grabs", "Ready for review or a GPU test", "Needs a rebase on `main`"):
             m = re.search(r"### " + re.escape(sec) + r"(.*?)(?=\n### |\Z)", text, re.S)
@@ -904,7 +976,10 @@ def collect_github(col, repo, login):
                 sizes[plain(sec)] = (len(re.findall(r"^\|\s*(?:⭐\s*)?[A-Z]+-\d+", part, re.M)) if sec == "Up for grabs"
                                      else len(set(re.findall(r"#(\d+)", part))))
         summary["coordination"] = {"issue": num, "updated": coord[0]["updatedAt"], "sizes": sizes}
-        col.source("github_coordination", None, "ok", len(sizes), note=f"issue #{num}")
+        if text:
+            col.source("github_coordination", None, "ok", len(sizes), note=f"issue #{num}")
+        else:
+            col.source("github_coordination", None, "missing", note=f"could not read issue #{num} body")
         if login:
             # claims made in the issue this one continues still count (its own first paragraph says so)
             prev = re.search(r"continues #(\d+)", text)
@@ -918,7 +993,8 @@ def collect_github(col, repo, login):
                            "--json", "number,title,state,isDraft,updatedAt"]) or []
             summary["mine"] = {"login": login, "claims": claims,
                                "pull_requests": [{"number": p["number"], "title": p["title"][:120], "state": p["state"],
-                                                  "draft": p.get("isDraft"), "updated": p.get("updatedAt")} for p in prs]}
+                                                  "draft": p.get("isDraft"), "updated": p.get("updatedAt")} for p in prs],
+                               "assignments": open_work_assignments(text, login)}
     return summary
 
 
@@ -1004,7 +1080,7 @@ def main(argv=None):
                     help="saved output of runtime/test/shaders/check.py; LABEL names the GPU, driver and OS")
     ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs, #313 and the coordination issue through gh")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
-    ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
+    ap.add_argument("--login", help="with --github, show this account's current assignments, claim comments and pull requests")
     args = ap.parse_args(argv)
     if args.jobs < 1:
         ap.error("--jobs must be a positive integer")

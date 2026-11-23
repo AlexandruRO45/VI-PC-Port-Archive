@@ -336,6 +336,82 @@ class Github(unittest.TestCase):
         return [{"number": n, "title": t, "isDraft": False, "mergedAt": "2026-11-22T10:00:00Z", "author": {"login": "x"}}
                 for n, t in pairs]
 
+    def mock_coordination(self, body, comments=(), pulls=()):
+        def fake_gh(args, timeout=60):
+            if args[:2] == ["issue", "list"]:
+                return [{"number": 102, "updatedAt": "2026-11-22T00:00:00Z"}]
+            if args[:3] == ["issue", "view", "102"] and args[-1] == "body":
+                return body
+            if args[:3] == ["issue", "view", "101"] and args[-1] == "comments":
+                return {"comments": list(comments)}
+            if args[:2] == ["pr", "list"] and "--author" in args:
+                return list(pulls)
+            if args[:3] == ["issue", "view", "101"]:
+                self.fail("assignments must only use the current issue body")
+            return []
+
+        self.enterContext(mock.patch.object(pd, "gh_json", fake_gh))
+        self.enterContext(mock.patch.object(pd.shutil, "which", return_value="gh"))
+
+    def test_current_assignments_in_snapshot_and_page_without_comments_or_prs(self):
+        self.mock_coordination({"body": (
+            "This issue continues #101.\n"
+            "### Up for grabs\nBUILD-91 `Me`\n"
+            "### Open work\n"
+            "#### Build\n"
+            "BUILD-9 `ME` · BUILD-1 `Me-too` · BUILD-7 `Other`, `me` · BUILD-9 `me`\n"
+            "#### Tests\n"
+            "TEST-2 `Other` (released by `me`) · TEST-3 `me` (waits for someone)\n"
+            "See BUILD-90 `me` · TEST-91 `me` for examples.\n"
+            "```md\nTEST-92 `me`\n```\n"
+            "### Recently closed\nTEST-93 `me`\n"
+        )})
+        with tempfile.TemporaryDirectory() as out:
+            self.assertEqual(pd.main(["--out", out, "--github", "--login", "me"]), 0)
+            snapshot, = (Path(out) / "snapshots").glob("*.json")
+            mine = json.loads(snapshot.read_text(encoding="utf-8"))["github"]["mine"]
+            self.assertEqual(mine["assignments"], ["BUILD-9", "BUILD-7", "TEST-3"])
+            self.assertEqual(mine["claims"], [])
+            self.assertEqual(mine["pull_requests"], [])
+            page = (Path(out) / "progress.html").read_text(encoding="utf-8")
+            payload = page.split('<script type="application/json" id="data">', 1)[1].split("</script>", 1)[0]
+            self.assertEqual(json.loads(payload)["snapshot"]["github"]["mine"], mine)
+
+    def test_open_work_owner_column_and_board_order(self):
+        self.mock_coordination({"body": (
+            "This issue continues #101.\r\n"
+            "### Open work\r\n"
+            "#### Build\r\n"
+            "| ID | What | Owner |\r\n|---|---|---|\r\n"
+            "| `BUILD-5` | a | `other`, @ME |\r\n"
+            "| BUILD-6 | found by @me | @someone-else |\r\n"
+            "| BUILD-7 | b | @me-too |\r\n"
+            "| BUILD-8 | c | @other (asked @me) |\r\n"
+            "| BUILD-2 | d | [Display Name](https://github.com/ME) |\r\n"
+            "| BUILD-3 | e | [me](https://github.com/other) |\r\n\r\n"
+            "#### Process\r\n"
+            "PROC-4 `me` · BUILD-5 `me`\r\n\r\n"
+            "| Owner | ID | What |\r\n|---|---|---|\r\n| **Me** | PROC-1 | a |\r\n\r\n"
+            "## Previous items\r\n| ID | Owner |\r\n|---|---|\r\n| PROC-2 | @me |\r\n"
+        )}, comments=[{"author": {"login": "me"}, "body": "claiming: BUILD-99"}],
+            pulls=[{"number": 1, "title": "PROC-99: example", "state": "OPEN"}])
+        mine = pd.collect_github(pd.Collector(), "o/r", "me")["mine"]
+        self.assertEqual(mine["assignments"], ["BUILD-5", "BUILD-2", "PROC-4", "PROC-1"])
+        self.assertEqual([c["text"] for c in mine["claims"]], ["claiming: BUILD-99"])
+        self.assertEqual([p["number"] for p in mine["pull_requests"]], [1])
+
+    def test_empty_and_unavailable_open_work(self):
+        for body, expected in ((None, None), ({"body": None}, None), ({"body": "### Elsewhere"}, None),
+                               ({"body": "### Open work\nBUILD-1 `other`"}, [])):
+            with self.subTest(body=body):
+                self.mock_coordination(body)
+                col = pd.Collector()
+                mine = pd.collect_github(col, "o/r", "me")["mine"]
+                self.assertEqual(mine["assignments"], expected)
+                if not (body or {}).get("body"):
+                    source = next(s for s in col.sources if s["id"] == "github_coordination")
+                    self.assertEqual(source["status"], "missing")
+
     def test_d3d_id_with_an_open_pr_is_not_counted_as_merged(self):
         body = ("| ID | Title | Owner | PR | Status |\n|---|---|---|---|---|\n"
                 "| D3D-3 | a | @a | #819 | PR open |\n| D3D-4 | b | @b | #60 merged | merged |\n")
