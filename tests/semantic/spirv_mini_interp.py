@@ -19,7 +19,10 @@ Design rules (see tests/semantic/README.md):
     zero-initialised; run_workgroup shares them between its invocations, as a workgroup does (one invocation
     alone has its own). 32-bit atomics on them (and on Function variables) are read-combine-write like the
     physical-storage-buffer ones. OpControlBarrier is a point every invocation of run_workgroup must reach
-    together (run_fragment refuses it). Images are rejected.
+    together (run_fragment refuses it). Images are rejected unless the caller supplies them: `images` maps a
+    UniformConstant variable (a runtime array of images) to {element index: four 32-bit texel words}, and
+    OpImageFetch returns that element's words whatever the coordinates; `buffers` maps a StorageBuffer variable (a
+    block of one runtime array of 32-bit words) to its word list. An element or word not supplied raises.
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
@@ -350,7 +353,7 @@ class _Types:
         return k[1]
 
 
-def run_fragment(text, inputs=None, push_constants=None, memory=None):
+def run_fragment(text, inputs=None, push_constants=None, memory=None, images=None, buffers=None):
     """Execute the entry point of `text` once and return the words written to every Output variable.
 
     `inputs` maps an Input variable name (for example "%in_attr1") to its value (a tuple for vectors).
@@ -361,7 +364,7 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns.
     A module with a subgroup operation is rejected here; see run_workgroup.
     """
-    gen = _invocation(text, inputs, push_constants, memory)
+    gen = _invocation(text, inputs, push_constants, memory, images=images, buffers=buffers)
     try:
         req = next(gen)
     except StopIteration as done:
@@ -376,15 +379,17 @@ class UndefinedResult(Exception):
 
 
 def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
-                  out_of_range="raise", return_outputs=False):
+                  out_of_range="raise", return_outputs=False, images=None, buffers=None, absent=()):
     """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
 
     Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
     invocation order). When `invocations` is not a multiple of `subgroup_size` the last subgroup is partial: its
-    missing lanes are not running. `inputs_for(i)` gives invocation i's Input values (see run_fragment); push
-    constants and the physical-address memory are shared. Every invocation must reach every subgroup operation,
-    in the same order (the translator emits them in uniform control flow and models EXEC with a variable, so a
-    lane that is off in EXEC still executes them). Workgroup variables (LDS) are shared by all the invocations,
+    missing lanes are not running, and neither are the invocations listed in `absent` (a pixel quad a primitive
+    does not cover: the lane exists but no invocation runs in it). `inputs_for(i)` gives invocation i's Input
+    values (see run_fragment); push constants and the physical-address memory are shared. Every invocation must
+    reach every subgroup operation, in the same order (the translator emits them in uniform control flow and
+    models EXEC with a variable, so a lane that is off in EXEC still executes them). Workgroup variables (LDS) are
+    shared by all the invocations,
     and OpControlBarrier, like a subgroup operation, must be reached by every invocation at the same point.
     Invocations at the same instruction execute it in invocation order, so lanes racing on one LDS dword see a
     defined interleaving (see the lockstep note below).
@@ -399,14 +404,18 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
       * OpGroupNonUniformAny / All: the predicate of any / every running lane.
       * OpGroupNonUniformBitwiseOr Reduce: the OR of every running lane's value.
 
-    With `return_outputs=True`, also return each invocation's Output variables in invocation order.
+    With `return_outputs=True`, also return each invocation's Output variables in invocation order (None for an
+    absent one). `images` and `buffers` are shared, see the module docstring.
     """
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
     memory = {} if memory is None else memory
     workgroup = {}                             # Workgroup variable id -> its box, one per workgroup
-    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True,
-                        workgroup=workgroup)
+    absent = frozenset(absent)
+    present = [i for i in range(invocations) if i not in absent]
+    gens = [None if i in absent else
+            _invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True,
+                        workgroup=workgroup, images=images, buffers=buffers)
             for i in range(invocations)]
     pending = [None] * invocations             # what each invocation yielded last; None once it has returned
     invocation_outputs = [None] * invocations
@@ -418,7 +427,7 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
             pending[i] = None
             invocation_outputs[i] = done.value
 
-    for i in range(invocations):
+    for i in present:
         advance(i, None)
     while True:
         # One instruction per invocation per round, in invocation order: invocations at the same instruction
@@ -431,38 +440,39 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
         live = [i for i in range(invocations) if pending[i] is not None]
         if not live:
             break
-        if len(live) != invocations or len({pending[i][1] for i in live}) != 1:
+        if len(live) != len(present) or len({pending[i][1] for i in live}) != 1:
             raise UnsupportedConstruct("subgroup operation not reached by every invocation at the same point")
-        results = []
-        for i in range(invocations):
+        results = {}
+        for i in present:
             kind, _, _value, ident = pending[i]
             base = (i // subgroup_size) * subgroup_size
-            group = [pending[j] for j in range(base, min(base + subgroup_size, invocations))]
+            lanes = [pending[j] for j in range(base, min(base + subgroup_size, invocations))]
+            group = [req for req in lanes if req is not None]
             if kind == "OpGroupNonUniformBallot":
                 # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
-                bits = sum(1 << l for l, req in enumerate(group) if req[2])
-                results.append(tuple((bits >> (32 * w)) & MASK for w in range(4)))
+                bits = sum(1 << l for l, req in enumerate(lanes) if req is not None and req[2])
+                results[i] = tuple((bits >> (32 * w)) & MASK for w in range(4))
             elif kind == "OpGroupNonUniformAny":
-                results.append(any(req[2] for req in group))
+                results[i] = any(req[2] for req in group)
             elif kind == "OpGroupNonUniformAll":
-                results.append(all(req[2] for req in group))
+                results[i] = all(req[2] for req in group)
             elif kind == "OpGroupNonUniformBitwiseOr":
                 acc = 0
                 for req in group:
                     acc |= req[2]
-                results.append(acc)
+                results[i] = acc
             elif kind == "OpControlBarrier":
-                results.append(None)           # everyone is here: the "same point" check above is the barrier
+                results[i] = None             # everyone is here: the "same point" check above is the barrier
             elif kind == "OpGroupNonUniformShuffle":
                 if not 0 <= ident < subgroup_size:
                     if out_of_range == "raise":
                         raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a "
                                               f"{subgroup_size}-wide subgroup")
                     ident %= subgroup_size
-                results.append(group[ident][2] if ident < len(group) else UNDEF)
+                results[i] = lanes[ident][2] if ident < len(lanes) and lanes[ident] is not None else UNDEF
             else:
                 raise UnsupportedConstruct(kind)
-        for i in range(invocations):
+        for i in present:
             advance(i, results[i])
     return (memory, invocation_outputs) if return_outputs else memory
 
@@ -494,7 +504,7 @@ def _parsed_lines(text):
     return parsed
 
 
-def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None):
+def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None, images=None, buffers=None):
     """One invocation as a generator. It yields (opcode, instruction index, value, id) at each subgroup operation
     and at each OpControlBarrier, and expects that operation's result back; with `step` it also yields _TICK before
     each instruction. `workgroup` (run_workgroup's) maps a Workgroup variable id to the box all invocations
@@ -567,6 +577,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             types.t[res] = ("arr", a[0], int(constants[a[1]]))
         elif op == "OpTypeRuntimeArray":
             types.t[res] = ("rarr", a[0])
+        elif op in ("OpTypeImage", "OpTypeSampler", "OpTypeSampledImage"):
+            types.t[res] = ("image", op, *a)       # a handle: only OpLoad and OpImageFetch take one
         elif op == "OpTypeStruct":
             types.t[res] = ("struct", a)
         elif op == "OpTypePointer":
@@ -603,6 +615,20 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
             elif cls == "Workgroup" and workgroup is not None and res in workgroup:
                 var_box[res] = workgroup[res]          # another invocation of the workgroup made it
+            elif cls == "UniformConstant":
+                # A runtime array of image handles (res, index); only the elements the caller supplied exist.
+                k = types.t[pointee]
+                if k[0] != "rarr" or types.t[k[1]][0] != "image":
+                    raise UnsupportedConstruct("UniformConstant variable other than a runtime array of images")
+                supplied = (images or {}).get(res, {})
+                var_box[res] = [[(res, i) if i in supplied else UNDEF
+                                 for i in range(max(supplied, default=-1) + 1)]]
+            elif cls == "StorageBuffer":
+                k = types.t[pointee]
+                if k[0] != "struct" or len(k[1]) != 1 or types.t[k[1][0]][0] != "rarr" \
+                        or types.t[types.t[k[1][0]][1]][:2] != ("int", 32):
+                    raise UnsupportedConstruct("StorageBuffer variable other than a block of a 32-bit word array")
+                var_box[res] = [[list((buffers or {}).get(res, ()))]]
             elif cls in ("Function", "Output", "Workgroup", "Private"):
                 init = types.copy_value(pointee, values[a[2]]) if len(a) > 2 else types.zero(pointee)
                 var_box[res] = [init]
@@ -855,6 +881,13 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 values[res] = f32_bits(v)
             elif k[0] == "int" and isinstance(v, int):
                 values[res] = v & wmask(a[0])
+            elif k[0] == "vec" and isinstance(v, tuple) and len(v) == k[2] and types.t[k[1]][1] == 32 \
+                    and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v) \
+                    and source and source[0] == "vec" and types.t[source[1]][1] == 32:
+                # component-wise between 32-bit vectors of the same length (an image fetch's texel)
+                as_float = types.t[k[1]][0] == "float"
+                values[res] = tuple((bits_f32(x) if as_float else x) if isinstance(x, int)
+                                    else (x if as_float else f32_bits(x)) for x in v)
             else:
                 raise UnsupportedConstruct("OpBitcast between these types")
         elif op == "OpCompositeExtract":
@@ -961,6 +994,17 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             # every earlier instruction, and with shared Workgroup memory sees the others' writes). run_fragment
             # refuses it, as it does a subgroup operation: a barrier belongs to a workgroup.
             yield (op, pc - 1, None, None)
+        elif op == "OpImageFetch":
+            # <type> <image> <coordinate> [Lod <lod>]: the supplied element's texel words, as the result type.
+            handle = val(a[1])
+            if not isinstance(handle, tuple) or a[3:] not in ([], ["Lod", a[-1]]):
+                raise UnsupportedConstruct("OpImageFetch of an image that was not supplied, or with operands")
+            var, index = handle
+            k = types.t[a[0]]
+            if k[0] != "vec" or k[2] != 4:
+                raise UnsupportedConstruct("OpImageFetch other than a 4-component result")
+            texel = images[var][index]
+            values[res] = tuple(bits_f32(w) if types.t[k[1]][0] == "float" else w & MASK for w in texel)
         elif op == "OpGroupNonUniformShuffle":
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformShuffle other than a Subgroup-scope integer")

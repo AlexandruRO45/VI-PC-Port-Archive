@@ -92,6 +92,41 @@ class Wave32PixelSubgroupTests(unittest.TestCase):
             with self.subTest(subgroup_size=subgroup_size):
                 self.assertEqual(run_ps(spv, subgroup_size, inputs), expected)
 
+    def test_image_descriptor_comes_from_a_running_lane_of_each_half(self):
+        # At a primitive's edge a half can start with uncovered quads: no invocation runs in its first lanes, and a
+        # shuffle from one of them is undefined. Each half's descriptor (its own s0) must still pick its own image.
+        spv = support.translate_lines("ps_wave32_halves_image", [
+            "v_interp_mov_f32_e32 v2, p0, attr0.x",
+            "v_readfirstlane_b32 s0, v2",
+            "v_mov_b32_e32 v4, 0",
+            "v_mov_b32_e32 v5, 0",
+            "image_load v[0:3], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
+            "s_waitcnt vmcnt(0)",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ])
+        # The descriptor map: slot k is words 10k + 1 to 10k + 8 (the descriptor) and 10k + 9 (its bindless index);
+        # word 0 is the slot mask. Mask 1 gives two slots, both probed whatever the hash: half h's s0 (h + 1.0) finds
+        # image h + 1.
+        desc_map = []
+        for half in range(2):
+            desc_map += [1 if half == 0 else 0, fbits(half + 1.0)] + [0] * 7 + [half + 1]
+        texels = {1: (fbits(0.25), 0, 0, fbits(1.0)), 2: (0, fbits(0.75), 0, fbits(1.0))}
+        absent = set(range(0, 4)) | set(range(32, 36))       # the first quad of each half is not covered
+        expected = [None if i in absent else texels[i // 32 + 1] for i in range(64)]
+        for subgroup_size in (32, 64):
+            with self.subTest(subgroup_size=subgroup_size):
+                _, outputs = si.run_workgroup(
+                    spv, 64, subgroup_size,
+                    inputs_for=lambda i: {
+                        "%sg_lane": i % subgroup_size,
+                        "%in_attr0": (float(i // 32 + 1), 0.0, 0.0, 0.0),
+                    },
+                    images={"%images": texels}, buffers={"%desc_map": desc_map}, absent=absent,
+                    return_outputs=True,
+                )
+                self.assertEqual([out and out["%out_mrt0"] for out in outputs], expected)
+
 
 if __name__ == "__main__":
     unittest.main()
