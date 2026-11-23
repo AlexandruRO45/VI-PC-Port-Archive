@@ -423,6 +423,13 @@ class TestVSubNcI16Interpreter(unittest.TestCase):
         self.assertEqual(res, 0x8000)
         self.assertEqual(state.vgpr[1], 0x8000)
 
+class TestVSubNcI16EdgeCases(unittest.TestCase):
+    def test_self_sub_identity(self):
+        self.assertEqual(ref_v_sub_nc_i16(0x5678, 0x5678), 0)
+
+    def test_underflow_wrap(self):
+        self.assertEqual(ref_v_sub_nc_i16(0x8000, 1), 0x7FFF)
+
 
 if __name__ == "__main__":
     unittest.main()
