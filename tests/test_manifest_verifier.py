@@ -501,6 +501,38 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertEqual(data["problem_count"], 0)
         self.assertEqual(data["matched_count"], len(SYNTHETIC_SIZES))
 
+    def test_cli_preserves_missing_names_with_narrow_stdout(self) -> None:
+        target = os.path.join(self.root, "empty")
+        os.mkdir(target)
+        names = ["cafè.bin", "café.bin"]
+        manifest = self.write_manifest(self.manifest_path, {name: b"synthetic" for name in names})
+        launcher = (
+            "import runpy, sys; sys.stdout.reconfigure(encoding=sys.argv.pop(1)); "
+            "runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+        )
+        for encoding, expected_names in (
+            ("ascii", [r"caf\xe8.bin", r"caf\xe9.bin"]),
+            ("utf-8", names),
+        ):
+            for flags in ([], ["--json"]):
+                with self.subTest(encoding=encoding, flags=flags):
+                    res = subprocess.run(
+                        [sys.executable, "-I", "-c", launcher, encoding, TOOL,
+                         target, "--manifest", manifest, "--quiet", *flags],
+                        capture_output=True, text=True, encoding=encoding,
+                    )
+                    self.assertEqual(res.returncode, 1)
+                    self.assertEqual(res.stderr, "")
+                    if flags:
+                        report = json.loads(res.stdout)
+                        self.assertEqual(report["missing"], names)
+                        self.assertEqual(report["problem_count"], 2)
+                    else:
+                        self.assertEqual(res.stdout.splitlines(), [
+                            *(f"MISSING   {name}" for name in expected_names),
+                            "2 problem(s)",
+                        ])
+
     def test_cli_tampered_returns_exit_code_1(self) -> None:
         delta_p = os.path.join(self.game_dir, "delta.bin")
         with open(delta_p, "r+b") as f:
