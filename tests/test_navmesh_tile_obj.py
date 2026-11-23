@@ -1,16 +1,24 @@
 """Read back OBJ primitives from a synthetic archive, independently of the writer."""
+import contextlib
+import io
+import os
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from test_navmesh_decode import build_navmesh, make_rpf, nd
+sys.path.insert(0, str(HERE.parent / "tools"))
+import file_mode  # noqa: E402
+import navmesh_tile_obj as nto  # noqa: E402
+from test_navmesh_decode import build_navmesh, make_rpf, nd  # noqa: E402
 
 TOOL = HERE.parent / "tools" / "navmesh_tile_obj.py"
+SAMPLE_GEOMETRY = {"polygons": [([(0, 0, 0), (1, 0, 0), (0, 1, 0)], None, None)]}
 
 
 def read_obj(path):
@@ -62,6 +70,72 @@ class ExportTest(unittest.TestCase):
                 self.assertEqual(run(invalid, out).returncode, 2)
                 self.assertEqual(out.read_bytes(), original)
             self.assertEqual(run(1, archive).returncode, 2)
+
+    def test_directory_out_is_rejected_before_scanning_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "input.rpf"
+            archive.write_bytes(b"")
+            out_dir = Path(directory) / "existing_dir"
+            out_dir.mkdir()
+            stderr = io.StringIO()
+            with mock.patch.object(nto, "navmesh_resources",
+                                   side_effect=AssertionError("archive should not be scanned")), \
+                    contextlib.redirect_stderr(stderr):
+                rc = nto.main([str(archive), "--tile", "0", "--out", str(out_dir)])
+            self.assertEqual(rc, 2)
+            self.assertIn("directory", stderr.getvalue())
+            self.assertEqual(list(out_dir.iterdir()), [])
+
+    def test_publish_applies_published_mode_without_flipping_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "tile.obj"
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def record_chmod(path, mode):
+                chmod_calls.append((Path(path), mode))
+                return real_chmod(path, mode)
+
+            with mock.patch.object(nto, "published_mode", wraps=nto.published_mode) as pub, \
+                    mock.patch.object(nto.os, "chmod", side_effect=record_chmod), \
+                    mock.patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+                nto.publish_obj(out, SAMPLE_GEOMETRY, 0)
+            self.assertEqual(pub.call_count, 1)
+            self.assertEqual(pub.call_args.args, (out,))
+            self.assertEqual(len(chmod_calls), 1)
+            staged_path, staged_mode = chmod_calls[0]
+            self.assertNotEqual(staged_path, out)
+            self.assertEqual(staged_path.parent, out.parent)
+            self.assertEqual(staged_mode, nto.published_mode(out))
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["tile.obj"])
+
+    def test_failed_replace_cleans_read_only_staging_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "tile.obj"
+            out.write_text("existing\n", encoding="utf-8", newline="\n")
+            os.chmod(out, 0o444)
+            self.addCleanup(lambda: out.exists() and os.chmod(out, 0o600))
+            with mock.patch.object(nto.os, "replace", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    nto.publish_obj(out, SAMPLE_GEOMETRY, 0)
+            self.assertEqual(out.read_text(encoding="utf-8"), "existing\n")
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["tile.obj"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_new_output_gets_bits_of_a_plain_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "tile.obj"
+            nto.publish_obj(out, SAMPLE_GEOMETRY, 0)
+            self.assertEqual(os.stat(out).st_mode & 0o777, file_mode.new_file_mode(directory))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_replaced_output_keeps_its_bits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "tile.obj"
+            out.write_text("old\n", encoding="utf-8", newline="\n")
+            os.chmod(out, 0o640)
+            nto.publish_obj(out, SAMPLE_GEOMETRY, 0)
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
 
 
 if __name__ == "__main__":
