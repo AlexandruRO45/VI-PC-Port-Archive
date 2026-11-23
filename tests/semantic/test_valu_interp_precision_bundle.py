@@ -254,6 +254,19 @@ class TestInterpP1LLF16Translator(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP1LVF16Reference(unittest.TestCase):
+    def test_p1lv_f16_reference_translation(self):
+        code = [
+            "v_interp_p1lv_f16 v2, v0, attr0.x",
+            "v_interp_p2_f16 v2, v1, attr0.x, v2",
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p1lv_ref", code)
+        self.assertIn("OpCapability Shader", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
