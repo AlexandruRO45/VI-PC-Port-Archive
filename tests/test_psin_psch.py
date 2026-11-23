@@ -123,6 +123,20 @@ class PsinPschTests(unittest.TestCase):
         self.assertFalse(bad_pmap["valid"])
         self.assertTrue(any("not divisible" in e for e in bad_pmap["errors"]))
 
+    def test_rejects_overlapping_pmap_blocks_and_duplicate_sections(self):
+        # Two blocks where block 2 starts at 0x18 while block 1 covers 0x10..0x28.
+        pmap_hdr = struct.pack(">IHHH6s", 1, 1, 0, 2, b"pppppp")
+        rows = struct.pack(">4I", 0x11111111, 0x10, 0, 0x18) + struct.pack(">4I", 0x22222222, 0x18, 0, 0x18)
+        blob = b"PSIN" + struct.pack(">I", 0x30) + b"pppppppp" + bytes(0x20)
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            psin_psch.decode_pmap(pmap_hdr + rows, blob, 0x30)
+
+        # Duplicate PMAP section must raise ValueError rather than silently dropping the first.
+        valid = build_synthetic_psch_psin(with_stdn=False)
+        dup_sec = _sec("STFN", b"\x00" * 8)
+        with self.assertRaisesRegex(ValueError, "duplicate STFN"):
+            psin_psch.parse_psch_container(valid + dup_sec + dup_sec)
+
     def test_cli_scans_carve_dir_writes_lf_json_and_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")
