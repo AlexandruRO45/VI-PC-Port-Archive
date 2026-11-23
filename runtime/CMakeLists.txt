@@ -807,6 +807,12 @@ if(BUILD_TESTING)
     add_dependencies(unimplemented_policy_test gta6rt_tls_host)
     add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
 
+    add_executable(registry_apiset_test test/registry_apiset_test.cpp shims/registry.cpp)
+    target_include_directories(registry_apiset_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    target_compile_definitions(registry_apiset_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(registry_apiset_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME registry_apiset COMMAND registry_apiset_test)
+
     # gta6rt --trace FILE (shims/startup_trace.h): a synthetic image with an unimplemented import, an
     # OutputDebugStringA call and a read of address 0; checks the JSON lines. No game files, no GPU.
     add_executable(startup_trace_test

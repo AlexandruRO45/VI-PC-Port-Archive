@@ -10,6 +10,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "shims.h"
@@ -30,6 +31,27 @@ std::string lower_ascii(std::string s) {
 }
 
 bool starts_with(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
+
+bool is_decimal(std::string_view text) {
+    return !text.empty() && text.find_first_not_of("0123456789") == std::string_view::npos;
+}
+
+// The final version segment does not identify a distinct API-set contract.
+std::string_view apiset_version_prefix(std::string_view dll) {
+    constexpr std::string_view api_prefix = "api-ms-";
+    if ((!dll.starts_with(api_prefix) && !dll.starts_with("ext-ms-")) || !dll.ends_with(".dll")) return {};
+    dll.remove_suffix(4);
+    const auto level = dll.rfind("-l");
+    if (level == std::string_view::npos || level <= api_prefix.size()) return {};
+    const auto major_end = dll.find('-', level + 2);
+    if (major_end == std::string_view::npos) return {};
+    const auto minor_end = dll.find('-', major_end + 1);
+    if (minor_end == std::string_view::npos ||
+        !is_decimal(dll.substr(level + 2, major_end - level - 2)) ||
+        !is_decimal(dll.substr(major_end + 1, minor_end - major_end - 1)) ||
+        !is_decimal(dll.substr(minor_end + 1))) return {};
+    return dll.substr(0, minor_end + 1);
+}
 
 std::mutex g_called_mutex;
 std::set<std::string> g_called;
@@ -458,9 +480,24 @@ Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }
 
-void* find(const std::string& dll_lower, const std::string& name) {
-    auto it = table().find(dll_lower + "!" + name);
-    return it == table().end() ? nullptr : it->second;
+void* find(const std::string& dll, const std::string& name) {
+    const auto& entries = table();
+    const std::string key = lower_ascii(dll) + "!" + name;
+    const auto exact = entries.find(key);
+    if (exact != entries.end()) return exact->second;
+
+    const std::string prefix(apiset_version_prefix(std::string_view(key).substr(0, dll.size())));
+    if (prefix.empty()) return nullptr;
+
+    constexpr std::string_view dll_separator = ".dll!";
+    for (auto it = entries.lower_bound(prefix); it != entries.end() && it->first.starts_with(prefix); ++it) {
+        const auto suffix = std::string_view(it->first).substr(prefix.size());
+        const auto dot = suffix.find('.');
+        if (dot != std::string_view::npos && is_decimal(suffix.substr(0, dot)) &&
+            suffix.substr(dot).starts_with(dll_separator) && suffix.substr(dot + dll_separator.size()) == name)
+            return it->second;
+    }
+    return nullptr;
 }
 
 bool owns_dll(const std::string& dll_lower) {
