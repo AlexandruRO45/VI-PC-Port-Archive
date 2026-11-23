@@ -39,7 +39,7 @@ RSRC2 = 0x88                    # 4 user SGPRs (the output V#), workgroup id x i
 THREADS = 32
 
 
-def translate(body, wave32, name="cs_bfm"):
+def translate(body, wave32, name="cs_bfm", rsrc2=RSRC2):
     lines = list(body) + ["s_endpgm"]
     with tempfile.TemporaryDirectory() as tmp:
         for d in ("disasm", "fspx"):
@@ -49,7 +49,7 @@ def translate(body, wave32, name="cs_bfm"):
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)
         with open(os.path.join(tmp, "fspx", name + ".json"), "w", encoding="utf-8") as f:
-            json.dump({"stage": "cs", "rsrc2": RSRC2, "threads": [THREADS, 1, 1], "wave32": wave32}, f)
+            json.dump({"stage": "cs", "rsrc2": rsrc2, "threads": [THREADS, 1, 1], "wave32": wave32}, f)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)
             return rdna2spirv.translate(os.path.join(tmp, "disasm", name + ".s"))
@@ -92,9 +92,28 @@ class Wave32BfmTests(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported):
             translate(["s_bfm_b64 s[8:9], 2, 54", "s_and_saveexec_b64 s[10:11], vcc"], wave32=True)
 
-    def test_run_time_operand_refused(self):
-        with self.assertRaises(rdna2spirv.Unsupported):
-            translate(["s_mov_b32 s5, 2", "v_readfirstlane_b32 s6, v0", "s_bfm_b64 s[8:9], s6, 54"], wave32=True)
+    def test_runtime_words_alias_and_preserve_scc(self):
+        # Six user SGPRs: output V#, then offset and width. Both inputs overlap the destination.
+        spv = translate(["s_cmp_eq_u32 s4, s5", "s_bfm_b64 s[4:5], s5, s4",
+                         "s_cselect_b32 s6, 1, 0", "v_lshlrev_b32 v3, 4, v0",
+                         "v_mov_b32 v5, s4", "v_mov_b32 v6, s5", "v_mov_b32 v7, s6",
+                         "buffer_store_dwordx2 v[5:6], v3, s[0:3], 0 offen",
+                         "buffer_store_dword v7, v3, s[0:3], 0 offen offset:8"], wave32=True, rsrc2=0x8c)
+        for size, off in ((0, 0), (0, 63), (1, 63), (2, 54), (32, 0), (32, 32), (8, 28),
+                          (63, 1), (63, 63), (64, 32), (65, 66), (0xffffffff, 0xffffffff)):
+            with self.subTest(size=size, off=off):
+                memory = si.run_workgroup(spv, THREADS, 32, memory={},
+                                          push_constants=VSHARP + [off, size] + [0] * 26,
+                                          inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0),
+                                                                "%sg_lane": i})
+                bits = (((1 << (size & 63)) - 1) << (off & 63)) & 0xffffffffffffffff
+                want = (bits & 0xffffffff, bits >> 32, int(size == off))
+                self.assertEqual({tuple(memory[16 * i + k] for k in (0, 4, 8)) for i in range(THREADS)}, {want})
+
+    def test_runtime_source_must_be_a_scalar_word(self):
+        for source in ("v0", "s[4:5]"):
+            with self.subTest(source=source), self.assertRaises(rdna2spirv.Unsupported):
+                translate([f"s_bfm_b64 s[8:9], {source}, 54"], wave32=True)
 
     def test_lane_masks_leaves_wave32_result_data(self):
         ins = {"op": "s_bfm_b64", "args": [{"k": "sgpr", "r": 8, "n": 2}, {"k": "imm", "v": 2},

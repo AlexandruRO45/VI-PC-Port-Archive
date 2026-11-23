@@ -7783,9 +7783,30 @@ class Gen:
             # programs build the first two words of an S# this way (3,342 times `s_bfm_b64 s[N:N+1], 2, 54`, then
             # s_mov_b64 of the other two). SCC is not written. Every case seen has constant operands.
             size, off = self.imm_val(a[1]), self.imm_val(a[2])
-            if size is None or off is None:
-                raise Unsupported(op + " with a run-time operand in wave32")
-            self.mov64(a[0], {"k": "imm", "v": (((1 << (size & 63)) - 1) << (off & 63)) & 0xFFFFFFFFFFFFFFFF})
+            if size is not None and off is not None:
+                self.mov64(a[0], {"k": "imm", "v": (((1 << (size & 63)) - 1) << (off & 63)) & 0xFFFFFFFFFFFFFFFF})
+            else:
+                if any(self.imm_val(src) is None and
+                       (src["k"] != "sgpr" or src.get("n", 1) != 1 or src.get("abs") or src.get("neg"))
+                       for src in a[1:3]):
+                    raise Unsupported(op + " run-time width/offset needs scalar data registers")
+                # Intersect [offset, offset + width) with each destination word. Both inputs
+                # are read before either store (the destination can overlap either source).
+                width, start, end = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{width} = OpBitwiseAnd %uint {self.src_u(a[1])} {self.cu(63)}")
+                self.emit(f"{start} = OpBitwiseAnd %uint {self.src_u(a[2])} {self.cu(63)}")
+                self.emit(f"{end} = OpIAdd %uint {start} {width}")
+                words = []
+                for base in (0, 32):
+                    lo, hi, count, bit, word = (self.tmp() for _ in range(5))
+                    bounds = f"{self.cu(base)} {self.cu(base + 32)}"
+                    self.emit(f"{lo} = OpExtInst %uint %glsl UClamp {start} {bounds}")
+                    self.emit(f"{hi} = OpExtInst %uint %glsl UClamp {end} {bounds}")
+                    self.emit(f"{count} = OpISub %uint {hi} {lo}")
+                    self.emit(f"{bit} = OpBitwiseAnd %uint {lo} {self.cu(31)}")
+                    self.emit(f"{word} = OpBitFieldInsert %uint {self.cu(0)} {self.cu(0xffffffff)} {bit} {count}")
+                    words.append(word)
+                self.dst64_data(a[0], words[0], words[1], op)
         elif op == "s_bfm_b64":
             # D = ((1 << size) - 1) << offset as a lane mask: in the per-lane model this lane's bit is
             # offset <= lane < offset + size (size/offset taken mod 64).
