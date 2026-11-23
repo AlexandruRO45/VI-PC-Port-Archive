@@ -146,7 +146,9 @@ szczegóły (kolejność etapów, pipeline cache) w akapicie o etapach niżej.
 - **Flagi fallback** dla urządzeń bez danej funkcji Vulkan — przekazywane do tłumacza, zapisywane obok
   przetłumaczonych shaderów, a ich zmiana tłumaczy je od nowa: `--no-float-controls`, `--bary-fallback` (bez
   `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (bez `VK_KHR_maintenance8`) i
-  `--mesh-compute` (bez `VK_EXT_mesh_shader`). Szczegóły w [`docs/design.md`](../../design.md).
+  `--mesh-compute` (bez `VK_EXT_mesh_shader`; jest sam z siebie włączona na windowsowym sterowniku Intela, w którym
+  natywne rysowanie mesh wywala program, BUILD-2202, chyba że podano `--native-mesh`). Szczegóły w
+  [`docs/design.md`](../../design.md).
 - **Co jest robione od nowa automatycznie**: build zapisuje polecenie i wersję `llvm-mc`, które zrobiły
   disassembly, źródła tłumacza oraz decoder zasobów (commit submodułu `third_party/rpf9-explorer` i źródła
   `tools/rpf9dump`). Zmiana dowolnego z nich powtarza tylko dotyczący jej krok (disassembly, tłumaczenie albo
