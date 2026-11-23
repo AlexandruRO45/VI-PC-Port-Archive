@@ -10,6 +10,7 @@ import json
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -271,6 +272,18 @@ class TestCommandLine(unittest.TestCase):
         self.assertIn("would overwrite an input file", err.getvalue())
         with open(payload, "rb") as f:
             self.assertEqual(f.read(), make_stream())
+
+    def test_output_is_one_file_in_two_accent_spellings_on_a_mac_volume(self):
+        # APFS matches a composed and a decomposed accent as one name, so this --out would truncate the input:
+        # report_paths.py knows that, and this tool has to ask it instead of comparing the two strings itself.
+        tools = os.path.join(ROOT, "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import report_paths
+        composed = os.path.join(self.tmp.name, "caf\u00e9.json")
+        decomposed = os.path.join(self.tmp.name, "cafe\u0301.json")
+        with mock.patch.object(report_paths, "case_insensitive_volume", return_value=True):
+            self.assertTrue(bink.same_output_path(composed, decomposed))
 
     def test_output_folder_is_rejected(self):
         err = io.StringIO()

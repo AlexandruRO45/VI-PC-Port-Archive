@@ -26,6 +26,14 @@ import subprocess
 import sys
 import tempfile
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report_paths  # noqa: E402
+
+# bink_names.py imports this name. The shared helper also folds the case of a case-insensitive macOS volume and the
+# composed/decomposed spellings of one accent, so an --out in another spelling of an input is refused here too.
+same_output_path = report_paths.same_report_path
+
 SIG = re.compile(rb"KB2[a-z]")
 HDR = 0x2C
 MAX_FRAMES = 1_000_000
@@ -288,16 +296,6 @@ def write_json(path, target, rows, summary, probe):
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump({"target": target, "summary": summary, "streams": streams},
                   fh, indent=1)
-
-
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def main(argv=None):
