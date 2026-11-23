@@ -248,6 +248,32 @@ def test_rejects_whole_geometry_input_array_load_through_alias(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize(("targets", "remaining"), [
+    ("%v %array_alias %p %nested_alias", "%v %p"),
+    ("%array_alias %nested_alias", ""),
+    ("%v  %p", "%v  %p"),
+], ids=["mixed", "all-folded", "live-only"])
+def test_prunes_folded_input_aliases_from_decoration_groups(tmp_path, targets, remaining):
+    comment = "; keep %array_alias and %nested_alias here; comment only"
+    geometry = geometry_input_alias("OpInBoundsAccessChain").replace(
+        "%void = OpTypeVoid",
+        "%relaxed = OpDecorationGroup\n"
+        "OpDecorate %relaxed RelaxedPrecision\n"
+        f"OpGroupDecorate %relaxed {targets} {comment}\n"
+        "%void = OpTypeVoid",
+    )
+    validate_vulkan12(tmp_path / "geometry.spv", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    validate_vulkan12(tmp_path / "compute.spv", lowered)
+
+    group_uses = [line for line in lowered.splitlines() if line.startswith("OpGroupDecorate ")]
+    assert group_uses == ([f"OpGroupDecorate %relaxed {remaining} {comment}"] if remaining else [])
+    assert "OpDecorate %relaxed RelaxedPrecision" in lowered
+    assert 'OpName %p "vertex_ptr"' in lowered
+    assert "OpName %array_alias" not in lowered and "OpName %nested_alias" not in lowered
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
 @pytest.mark.parametrize("component_chain", ["OpAccessChain", "OpInBoundsAccessChain"])
 def test_lowers_copies_of_geometry_input_element_pointers(tmp_path, component_chain):
     geometry = PHI_GS.replace(

@@ -315,7 +315,23 @@ def rewrite(text):
         out.append(s)
     if folded_arrays := in_slot.keys() - gone:
         # Debug names and decorations precede the function, where the aliases are discovered.
-        out = [ln for ln in out if not ((m := id_metadata.match(ln)) and m.group(1) in folded_arrays)]
+        pruned = []
+        for ln in out:
+            m = id_metadata.match(ln)
+            if m and m.group(1) in folded_arrays:
+                continue
+            if re.match(r"\s*OpGroupDecorate\s", ln):
+                instruction, sep, comment = ln.partition(";")
+                opcode, group, *targets = instruction.split()
+                live_targets = [target for target in targets if target not in folded_arrays]
+                if not live_targets:
+                    continue
+                if live_targets != targets:
+                    ln = " ".join((opcode, group, *live_targets))
+                    if sep:
+                        ln += f" {sep}{comment}"
+            pruned.append(ln)
+        out = pruned
     public = {key: lay[key] for key in ("verts_in", "max_verts", "topology", "inputs", "outputs")}
     public["local_size"] = LOCAL_SIZE
     return "\n".join(out) + "\n", public
