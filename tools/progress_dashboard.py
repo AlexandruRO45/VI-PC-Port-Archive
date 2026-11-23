@@ -407,6 +407,7 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
 def _parse_lasttest(text: str) -> tuple[list[tuple[str, str, float | None]], bool]:
     """Return the observed verdicts and whether any outer test lacks a verdict."""
     out, name, secs = [], None, None
+    starting = None
     incomplete = False
     captured = False
     nested_runs = 0
@@ -422,10 +423,16 @@ def _parse_lasttest(text: str) -> tuple[list[tuple[str, str, float | None]], boo
             elif not nested_runs and line == "<end of output>" and next_line.startswith("Test time ="):
                 captured = False
             continue
-        m = re.match(r"^\d+/\d+ Test: (.+)$", line)
+        m = re.match(r"^(\d+/\d+) (Testing|Test): (.+)$", line)
         if m:
-            incomplete = incomplete or bool(name)
-            name, secs = m.group(1).strip(), None
+            number, header, test_name = m.groups()
+            incomplete = incomplete or bool(name) or (starting is not None and starting != number)
+            # CTest emits "Testing:" before "Test:" for the same test. Its log can stop between them.
+            if header == "Testing":
+                starting, name = number, None
+            else:
+                starting, name = None, test_name.strip()
+            secs = None
             continue
         if not name:
             continue
@@ -448,7 +455,7 @@ def _parse_lasttest(text: str) -> tuple[list[tuple[str, str, float | None]], boo
             continue
         out.append((name, res, secs))
         name = None
-    return out, incomplete or bool(name)
+    return out, incomplete or starting is not None or bool(name)
 
 
 def collect_ctest(col, args):
