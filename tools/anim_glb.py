@@ -517,6 +517,9 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
         timeline, keep, fallback = None, [], False
         if end > start:
             timeline = _clip_timeline(start, end, rate, step, frames)
+        elif end == start:
+            keep = [min(range(frames), key=lambda k: abs(k * step - start))]
+            fallback = True
         else:
             keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
             fallback = not keep
