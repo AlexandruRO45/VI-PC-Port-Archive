@@ -243,5 +243,76 @@ class TestFrexpExpI32F32AST(unittest.TestCase):
             LiteralOperand(-0x8000_0001)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachine:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.scc: int = 0
+
+    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
+        if isinstance(op, LiteralOperand):
+            return op.value & MASK32
+        elif op.op_type == OperandType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.op_type == OperandType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        raise TypeError(f"Unknown operand type: {type(op)}")
+
+    def write_vgpr(self, index: int, val32: int):
+        self.vgprs[index] = val32 & MASK32
+
+    def step(self, insn: VFrexpExpI32F32Instruction):
+        val_s0 = self.read_operand(insn.src0)
+        result = ref_frexp_exp_i32_f32(val_s0)
+        self.write_vgpr(insn.dst.index, result)
+
+
+class TestFrexpExpI32F32ScalarInterpreter(unittest.TestCase):
+    def setUp(self):
+        self.machine = ScalarMachine()
+
+    def test_scalar_execution_vgpr(self):
+        # 2.0f in v1 -> exp 2 in v0
+        self.machine.vgprs[1] = f32_to_bits(2.0)
+        insn = VFrexpExpI32F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[0], 2)
+
+    def test_scalar_execution_sgpr(self):
+        # 0.25f in s4 -> exp -1 (0xFFFFFFFF) in v5
+        self.machine.sgprs[4] = f32_to_bits(0.25)
+        insn = VFrexpExpI32F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 5),
+            src0=RegisterOperand(OperandType.SGPR, 4),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[5], 0xFFFF_FFFF)
+
+    def test_scalar_execution_literal(self):
+        # Literal 1.0f -> exp 1 in v2
+        insn = VFrexpExpI32F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            src0=LiteralOperand(f32_to_bits(1.0)),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[2], 1)
+
+    def test_scalar_zero_input(self):
+        self.machine.vgprs[1] = NEG_ZERO
+        insn = VFrexpExpI32F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[0], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
