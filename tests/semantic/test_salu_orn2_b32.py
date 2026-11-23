@@ -602,5 +602,66 @@ class TestSaluOrn2B32ConditionCodes(unittest.TestCase):
         self.interp.execute(inst_mov)
         self.assertEqual(self.interp.scc, 1, "s_mov_b32 must not corrupt existing SCC")
 
+def f32_to_bits(val: float) -> int:
+    """Convert 32-bit float to raw unsigned integer bit pattern."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Convert raw unsigned 32-bit integer bit pattern to float."""
+    return struct.unpack("<f", struct.pack("<I", u32(bits)))[0]
+
+
+class TestSaluOrn2B32IEEE754EdgeCases(unittest.TestCase):
+    """Unit tests for bitwise operations over IEEE 754 float bit patterns."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+
+    def test_ieee754_zeros_and_infinities(self) -> None:
+        pos_zero = f32_to_bits(0.0)             # 0x00000000
+        neg_zero = f32_to_bits(-0.0)            # 0x80000000
+        pos_inf = f32_to_bits(float("inf"))     # 0x7F800000
+        neg_inf = f32_to_bits(float("-inf"))    # 0xFF800000
+
+        # +0.0 | ~(-0.0) == 0x00000000 | 0x7FFFFFFF == 0x7FFFFFFF
+        res, scc = ref_orn2_b32(pos_zero, neg_zero)
+        self.assertEqual(res, 0x7FFFFFFF)
+        self.assertEqual(scc, 1)
+
+        # +inf | ~(-inf) == 0x7F800000 | 0x007FFFFF == 0x7FFFFFFF
+        res_inf, _ = ref_orn2_b32(pos_inf, neg_inf)
+        self.assertEqual(res_inf, 0x7FFFFFFF)
+
+        # Setting sign bit: (pos_zero | ~0x7FFFFFFF) = 0x80000000
+        res_sign, _ = ref_orn2_b32(pos_zero, 0x7FFFFFFF)
+        self.assertEqual(res_sign, 0x80000000)
+
+    def test_ieee754_nan_payloads(self) -> None:
+        qnan_bits = f32_to_bits(float("nan"))
+        snan_bits = 0x7F800001
+
+        res, scc = ref_orn2_b32(qnan_bits, 0)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(scc, 1)
+
+        res2, _ = ref_orn2_b32(snan_bits, 0xFFFFFFFF)
+        self.assertEqual(res2, snan_bits)
+
+    def test_ieee754_subnormals_and_denormals(self) -> None:
+        subnormal_min = 0x00000001
+        subnormal_max = 0x007FFFFF
+
+        res, scc = ref_orn2_b32(subnormal_min, subnormal_max)
+        self.assertEqual(res, 0xFF800001)
+        self.assertEqual(scc, 1)
+
+    def test_ieee754_exponent_masking(self) -> None:
+        exp_mask = 0x7F800000
+        float_one = f32_to_bits(1.0)  # 0x3F800000
+
+        res, _ = ref_orn2_b32(float_one, exp_mask)
+        self.assertEqual(res, float_one | (~exp_mask & MASK32))
+
 if __name__ == "__main__":
     unittest.main()
