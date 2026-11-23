@@ -4,6 +4,10 @@ Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
     python -m unittest discover -s tests/semantic -v
 
+or, one file per process on every CPU (what CI runs; about 1.5 minutes instead of 7 on 4 cores):
+
+    python -I scripts/run_semantic_tests.py
+
 Every file here must call `tools/rdna2spirv.py` (directly, through `support.py`, or by running the tool) and assert
 on what it emitted. A test that reimplements the instruction in Python passes whatever the translator does, so it is
 not a regression test. `tests/test_semantic_translator_use.py` enforces this; the interpreter self-tests and the
