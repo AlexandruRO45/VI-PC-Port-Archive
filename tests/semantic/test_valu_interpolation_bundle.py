@@ -815,5 +815,45 @@ class TestInterpP2F16ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[4], 0xDEAD_0000 | f16_to_bits(3.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p2_f16 SIMD & Narrowing / Clamp
+# ------------------------------------------------------------------------------
+
+class SIMDWaveInterpP2F16:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step(self, insn: VInterpP2F16Instruction, p0: float, p2: float):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                j_coord = bits_to_f32(self.vgprs[insn.src0.index][lane])
+                accum = bits_to_f32(self.vgprs[insn.accum.index][lane])
+                res16 = ref_interp_p2_f16(j_coord, p0, p2, accum, clamp=insn.clamp)
+                self.vgprs[insn.dst.index][lane] = (self.vgprs[insn.dst.index][lane] & 0xFFFF_0000) | res16
+
+
+class TestInterpP2F16SIMD(unittest.TestCase):
+    def test_simd_clamping(self):
+        wave = SIMDWaveInterpP2F16(wave_size=32)
+        for lane in range(32):
+            wave.vgprs[1][lane] = f32_to_bits(float(lane))
+            wave.vgprs[2][lane] = f32_to_bits(0.0)
+
+        insn = VInterpP2F16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            attr=AttrOperand(0, "x"),
+            accum=RegisterOperand(OperandType.VGPR, 2),
+            clamp=True,
+        )
+        wave.step(insn, p0=0.0, p2=1.0)
+
+        for lane in range(32):
+            expected = f16_to_bits(min(1.0, float(lane)))
+            self.assertEqual(wave.vgprs[2][lane] & 0xFFFF, expected)
+
+
 if __name__ == '__main__':
     unittest.main()
