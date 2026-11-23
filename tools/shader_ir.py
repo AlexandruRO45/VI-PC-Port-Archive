@@ -4,7 +4,7 @@ Each instruction: {"op": mnemonic, "args": [operand...], "mods": [modifier...], 
 Operand kinds: sgpr s5 / s[4:7], vgpr v3 / v[0:3], special (vcc, exec, m0, scc...), inline constant, literal,
 label/offset (for branches), hw register, and raw text for anything else.
 
-As a module: parse_file(path) -> {"name", "code_start", "insns": [...], "invalid": [pc...]}
+As a module: parse_file(path) -> {"name", "code_start", "insns": [...], "invalid": count}
 As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything and reports coverage)
 Usage: `python -I tools/shader_ir.py --help` lists the options.
 """
@@ -16,6 +16,7 @@ from collections import Counter
 
 ENC = re.compile(r";\s*encoding:\s*\[([^\]]*)\]")
 HDR = re.compile(r"^;\s*(\S+)\s+code 0x([0-9a-f]+)\.\.0x([0-9a-f]+)")
+INVALID_WORD_COUNT = re.compile(r",\s*(\d+) invalid words\s*$")
 SPECIAL = {"vcc", "vcc_lo", "vcc_hi", "exec", "exec_lo", "exec_hi", "m0", "scc", "null", "off", "src_scc",
            "src_execz", "src_vccz", "src_lds_direct", "src_shared_base", "src_shared_limit",
            "src_private_base", "src_private_limit", "src_pops_exiting_wave_id", "lds", "flat_scratch",
@@ -258,8 +259,11 @@ def parse_file(path):
         if ins["enc"]:
             pc += len(ins["enc"]) // 2
         info["insns"].append(ins)
-    tail = "\n".join(lines)
-    info["invalid"] = tail.count("invalid instruction encoding")
+    # The Python backend omits undecodable words without LLVM diagnostic lines.
+    count = INVALID_WORD_COUNT.search(lines[0], m.end()) if m else None
+    reported = int(count.group(1)) if count else 0
+    diagnosed = "\n".join(lines).count("invalid instruction encoding")
+    info["invalid"] = max(reported, diagnosed)
     return info
 
 

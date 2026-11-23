@@ -60,6 +60,16 @@ class PrintedEncodingTest(unittest.TestCase):
     def test_matching_blob_translates(self):
         self.assertIn("OpEntryPoint Fragment", self.translate(listing(PROGRAM), blob(PROGRAM)))
 
+    def test_invalid_word_count_in_header_reanchors_python_decoder_output(self):
+        # Both decoders omit the unknown dword. Only LLVM adds a warning line.
+        branch = ("s_branch 1", "01 00 82 bf")
+        unknown = ("", "ff ff ff ff")
+        native = blob([branch, unknown] + PROGRAM)
+        printed = listing([branch] + PROGRAM, end=len(native))
+        llvm = printed + b"; warning: invalid instruction encoding\n"
+        python = printed.replace(b"0 invalid words", b"1 invalid words")
+        self.assertEqual(self.translate(python, native), self.translate(llvm, native))
+
     def test_dropped_vopc_op_sel_is_refused(self):
         # The blob holds v_cmp_lt_f16_e64 with op_sel:[1,0] (word 0 bit 11); LLVM printed it without.
         stored = with_byte(PROGRAM, 0, 1, 0x08)
