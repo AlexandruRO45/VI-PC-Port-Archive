@@ -336,7 +336,6 @@ class ImageStoreD16Tests(unittest.TestCase):
 
     def test_unsupported_dims_and_modifiers_still_refused(self):
         for bad in (
-            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 tfe",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 lwe",
         ):
@@ -346,6 +345,17 @@ class ImageStoreD16Tests(unittest.TestCase):
                         "ps_img_d16_bad",
                         ["v_mov_b32_e32 v2, 0", bad, "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
                     )
+
+    def test_cube_d16_store_is_supported(self):
+        spv = support.translate_lines(
+            "ps_img_store_cube_d16",
+            ["v_mov_b32_e32 v2, 0", "v_mov_b32_e32 v3, 0", "v_mov_b32_e32 v4, 0",
+             "v_mov_b32_e32 v5, 0",
+             "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16",
+             "exp mrt0 v4, v4, v4, v4 done vm", "s_endpgm"],
+        )
+        _validate(spv)
+        self.assertIn("OpImageWrite", spv)
 
 
 if __name__ == "__main__":

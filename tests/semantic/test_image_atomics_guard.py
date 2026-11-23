@@ -32,10 +32,14 @@ SPIRV_VAL = shutil.which("spirv-val")
 FSSM = bytes(0x138) + struct.pack("<4I", 0x88 | (12 << 1), 32, 1, 1)
 
 
-def translate(lines, *, emulate=False):
+def translate(lines, *, emulate=False, masked_exec=True):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
+        if masked_exec:
+            # Make EXEC genuinely dynamic; without an EXEC writer active_b() correctly folds to %true.
+            lines = ["v_mov_b32_e32 v31, 0", "v_cmp_eq_u32 vcc_lo, v31, 0",
+                     "s_and_saveexec_b32 s30, vcc_lo"] + lines
         return support.translate_lines("cs_img_atomic_guard", lines + ["s_endpgm"], fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
@@ -107,6 +111,15 @@ def vgpr_ptrs(spv, reg_idx):
 
 
 class ImageAtomicsGuardTests(unittest.TestCase):
+    def test_statically_all_active_exec_does_not_need_a_dynamic_guard(self):
+        spv = translate([
+            "v_mov_b32_e32 v0, 5", "v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 2",
+            "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+        ], masked_exec=False)
+        self.assertNotIn("OpLoad %bool %active", spv)
+        self.assertIn("OpImageTexelPointer", spv)
+        self.assertIn("OpAtomicIAdd", spv)
+
     def test_all_image_atomics_2d_and_3d_guarded_and_valid(self):
         simple_ops = [
             ("image_atomic_add", "OpAtomicIAdd"),
