@@ -286,9 +286,17 @@ def main(argv=None):
     ap.add_argument("--start", type=_nonneg)
     ap.add_argument("--limit", type=_positive)
     a = ap.parse_args(argv)
-    if a.json and os.path.exists(a.json) and os.path.exists(a.archive) and os.path.samefile(a.json, a.archive):
-        print("bvh_groups: --json would replace the archive", file=sys.stderr)
-        return 2
+    if a.json:
+        folder = os.path.dirname(os.path.abspath(a.json))
+        if os.path.isdir(a.json):       # open() on a folder ends the run in an IsADirectoryError traceback
+            print("bvh_groups: --json is a folder, not a JSON file: %s" % a.json, file=sys.stderr)
+            return 2
+        if not os.path.isdir(folder):   # the scan can run for minutes before it reaches this write
+            print("bvh_groups: --json folder does not exist: %s" % folder, file=sys.stderr)
+            return 2
+        if os.path.exists(a.json) and os.path.exists(a.archive) and os.path.samefile(a.json, a.archive):
+            print("bvh_groups: --json would replace the archive", file=sys.stderr)
+            return 2
     try:
         rows, summary = scan(a.archive, a.start, a.limit)
     except (OSError, ValueError) as e:

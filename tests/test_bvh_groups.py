@@ -238,6 +238,16 @@ class ScanTest(unittest.TestCase):
             self.assertEqual(bvh_groups.main([self.rpf, "--start", str(10 ** 9)]), 2)
         self.assertIn("bvh_groups:", se.getvalue())
 
+    def test_main_refuses_a_json_path_it_cannot_write(self):
+        missing = os.path.join(self.tmp.name, "nope", "r.json")
+        with contextlib.redirect_stderr(io.StringIO()) as se:
+            self.assertEqual(bvh_groups.main([self.rpf, "--json", missing]), 2)
+            self.assertEqual(bvh_groups.main([self.rpf, "--json", self.tmp.name]), 2)
+        lines = [line for line in se.getvalue().splitlines() if line]
+        self.assertEqual(lines, ["bvh_groups: --json folder does not exist: %s" % os.path.dirname(missing),
+                                 "bvh_groups: --json is a folder, not a JSON file: %s" % self.tmp.name])
+        self.assertFalse(os.path.exists(os.path.dirname(missing)))     # the scan never ran, nothing was made
+
     def test_empty_archive(self):
         empty = os.path.join(self.tmp.name, "e.rpf")
         open(empty, "wb").close()
