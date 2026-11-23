@@ -1067,7 +1067,7 @@ int main(int argc, char** argv) {
             if (feat == "meshShader") want_mesh = true;
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
-            else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
+            else if (feat == "shaderFmaFloat32" || feat == "shaderFmaFloat64") want_fma = true;   // OpFmaKHR (--fma khr)
             else if (feat == "shaderSubgroupClock" || feat == "shaderDeviceClock") want_clock = true;
         }
     }
@@ -1292,6 +1292,13 @@ int main(int argc, char** argv) {
                 if (!(ext_fma && fma.shaderFmaFloat32)) return "no VK_KHR_shader_fma (shaderFmaFloat32)";
 #else
                 return "no VK_KHR_shader_fma (shaderFmaFloat32)";
+#endif
+            }
+            if (feat == "shaderFmaFloat64") {
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+                if (!(ext_fma && fma.shaderFmaFloat64)) return "no VK_KHR_shader_fma (shaderFmaFloat64)";
+#else
+                return "no VK_KHR_shader_fma (shaderFmaFloat64)";
 #endif
             }
             if (feat == "shaderSubgroupClock" && !(ext_clock && clock.shaderSubgroupClock)) return "no shaderSubgroupClock";
