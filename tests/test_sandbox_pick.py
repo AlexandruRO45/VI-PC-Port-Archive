@@ -80,6 +80,17 @@ class PickPair(unittest.TestCase):
         self.add("d_ps", {"stage": "ps", "input_signature": PS_SIG, "user_sgpr_reads": PTR8, "bindings": [0, 1, 2]}, PS_TEXT)
         self.assertEqual(self.names(), ("a_vs", "d_ps"))
 
+    def test_index_with_utf8_bom(self):
+        """A BOM left by a Windows editor must not hide the pair."""
+        self.add("a_vs", {"stage": "vs", "input_signature": VS_SIG, "user_sgpr_reads": PTR8, "bindings": []}, VS_TEXT)
+        self.add("b_ps", {"stage": "ps", "input_signature": PS_SIG, "user_sgpr_reads": PTR8, "bindings": [0, 1, 2]},
+                 PS_TEXT)
+        path = os.path.join(self.root, "spirv", "index.json")
+        with open(path, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(self.index).encode("utf-8"))
+        pair = sandbox.pick_pair(self.root)
+        self.assertEqual(tuple(os.path.splitext(os.path.basename(p))[0] for p in pair), ("a_vs", "b_ps"))
+
     def test_missing_index(self):
         self.assertIsNone(sandbox.pick_pair(os.path.join(self.root, "nowhere")))
 
