@@ -7,8 +7,8 @@
 // Each command list of an ExecuteCommandLists gets a slot of four 32-bit words (begin, end, progress, padding) in a
 // host-visible, coherent buffer owned by this ring (nothing the replay uses). Around the list's commands the backend
 // records
-//   vkCmdWriteBufferMarkerAMD(TOP_OF_PIPE,    slot.begin, tag)   the GPU reached the list's first command
-//   vkCmdWriteBufferMarkerAMD(BOTTOM_OF_PIPE, slot.end,   tag)   every command of the list completed
+//   vkCmdWriteBufferMarkerAMD(TOP_OF_PIPE,    slot.begin, tag)   every earlier command of the queue has started
+//   vkCmdWriteBufferMarkerAMD(BOTTOM_OF_PIPE, slot.end,   tag)   every command of the list (and before it) finished
 // `tag` is unique per submitted list (never 0) and is what the GPU writes, so the CPU never clears a slot: a word
 // counts only when it holds this list's own tag, and a late write from an older list that used the slot before can
 // never pass for progress of the current one. At level 2 the begin marker also clears the progress word on the GPU,
@@ -16,9 +16,13 @@
 //
 // States, from what is known and nothing more:
 //   recorded   the markers are in a command buffer, which was not (yet) submitted: such entries are not kept
-//   submitted  vkQueueSubmit succeeded (CPU knowledge); the GPU has written neither word
-//   started    the begin word holds the tag: the GPU front end reached the list
-//   completed  the end word holds the tag: all of the list's commands finished
+//   submitted  vkQueueSubmit succeeded (CPU knowledge); neither word holds the tag (yet, as the host sees it)
+//   started    the begin word holds the tag: the GPU got to the list's place in the queue (every earlier command
+//              had started). Vulkan does not order the list's own commands after that write, so this says where
+//              the GPU got, not that a command of the list ran; and a list can already run while it still reads
+//              `submitted`. Both are therefore lower bounds.
+//   completed  the end word holds the tag: all of the list's commands finished executing (which does not make
+//              their memory writes visible)
 // After a device loss no memory dependency can make the GPU's writes visible any more; what the mapped words hold
 // then is the best information there is (as with DRED on D3D12), and the report says so.
 #ifndef VK_NO_PROTOTYPES
@@ -34,6 +38,7 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -258,8 +263,11 @@ public:
     // GPU breadcrumbs. False (whatever was made is freed with the ring) when the marker command is missing or no
     // host-visible coherent memory fits; the caller may fall back to initialize_cpu_only().
     // `per_op`: a progress marker after every D3D12 operation (BUILD-1655), or only the two around each list.
+    // `queue_families`: the distinct families whose queues record markers. Every queue of the device writes the
+    // buffer and there are no ownership transfers, so with two or more it is VK_SHARING_MODE_CONCURRENT among them
+    // (as DeviceState::share does for the device's own resources); one family, or none given, keeps it EXCLUSIVE.
     bool initialize(VkDevice device, const VkPhysicalDeviceMemoryProperties& memory, const BreadcrumbFunctions& fn,
-                    bool per_op = true) {
+                    bool per_op = true, std::span<const std::uint32_t> queue_families = {}) {
         if (!fn.write_marker || !fn.create_buffer || !fn.map) return false;
         per_op_ = per_op;
         device_ = device;
@@ -268,6 +276,11 @@ public:
         info.size = VkDeviceSize(kSlots) * kWords * sizeof(std::uint32_t);
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;  // the usage buffer markers need
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (queue_families.size() >= 2) {
+            info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            info.queueFamilyIndexCount = static_cast<std::uint32_t>(queue_families.size());
+            info.pQueueFamilyIndices = queue_families.data();
+        }
         if (fn_.create_buffer(device_, &info, nullptr, &buffer_) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         fn_.requirements(device_, buffer_, &requirements);
