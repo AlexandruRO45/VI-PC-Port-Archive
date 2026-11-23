@@ -258,6 +258,14 @@ def describe(candidate, names):
     return "%sstream 0x%-10x model %d geometry %s%s" % (label, item["Offset"], candidate["model"], used, note)
 
 
+def at_least_one(text):
+    """--top: how many candidates to print; 0 or less used to print one anyway through max(1, a.top)."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Find the drawable geometry a dehydrated BLAS was built from.")
     ap.add_argument("dehydrated")
@@ -271,7 +279,7 @@ def main(argv=None):
                     help="shader name hashes of the geometries the BVH leaves out (game data; local use only)")
     ap.add_argument("--unordered", action="store_true", help="also try the geometries in any order")
     ap.add_argument("--embeddings", type=int, default=64, help="at most this many index choices per model")
-    ap.add_argument("--top", type=int, default=8, help="how many scored candidates to print")
+    ap.add_argument("--top", type=at_least_one, default=8, help="how many scored candidates to print")
     ap.add_argument("--names", action="store_true", help="print drawable names (game data: local use only)")
     ap.add_argument("--write", metavar="DIR", help="write the matched geometries here as float3/uint32 buffers "
                                                   "and an export.json for tools/bvh_rehydrate.py")
@@ -337,7 +345,7 @@ def main(argv=None):
         results.append((not report["consistent"], report["internal_area"], report, candidate))
     results.sort(key=lambda r: (r[0], r[1]))
     best = next((r[1] for r in results if not r[0]), None)
-    for bad, area, report, candidate in results[:max(1, a.top)]:
+    for bad, area, report, candidate in results[:a.top]:
         ratio = "" if best is None or not best else " (x%.3f)" % (area / best)
         print("   %-10s %s | outside %d of %d, gap %.1e, overrides %d/%d, area %.6g%s" % (
             "consistent" if not bad else "rejected", describe(candidate, a.names), report["leaves_outside"], report["leaves"],
