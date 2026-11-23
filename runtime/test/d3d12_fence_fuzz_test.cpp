@@ -341,7 +341,20 @@ int main(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        const auto number = [&](unsigned& out) { if (i + 1 < argc) out = unsigned(std::strtoul(argv[++i], nullptr, 10)); };
+        // A count is decimal digits that fit in 32 bits. Anything else (a missing value, the next option,
+        // "-1", "12x") is a usage error: "--seeds --verbose" used to read as 0 seeds and pass.
+        bool bad = false;
+        const auto number = [&](unsigned& out) {
+            const char* s = i + 1 < argc ? argv[i + 1] : "";
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(s, &end, 10);
+            if (*s < '0' || *s > '9' || *end || v > 0xffffffffull) {
+                bad = true;
+                return;
+            }
+            out = unsigned(v);
+            ++i;
+        };
         if (a == "--seeds") number(o.seeds);
         else if (a == "--start") number(o.start);
         else if (a == "--ops") number(o.ops);
@@ -350,11 +363,19 @@ int main(int argc, char** argv) {
         else if (a == "--big") o.big = true;
         else if (a == "--wide") o.wide = true;
         else if (a == "--standalone") o.standalone = true;
-        else if (a == "--queues" && i + 1 < argc) queue_count = std::atoi(argv[++i]) >= 6 ? 6 : 3;
+        else if (a == "--queues") {
+            unsigned q = 0;
+            number(q);
+            queue_count = q >= 6 ? 6 : 3;
+        }
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--case" && i + 1 < argc) o.fixed = argv[++i];
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
+            return 2;
+        }
+        if (bad) {
+            std::fprintf(stderr, "%s needs a decimal count\n", argv[i]);
             return 2;
         }
     }
