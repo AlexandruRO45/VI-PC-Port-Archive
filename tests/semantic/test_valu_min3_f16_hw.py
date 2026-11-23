@@ -481,5 +481,107 @@ class TestValuMin3F16Ieee754Boundaries(unittest.TestCase):
         self.assertEqual(ref_min3_f16(SNAN, QNAN_ALT, NEG_MAX_NORMAL), NEG_MAX_NORMAL)
         self.assertTrue(is_nan16(ref_min3_f16(SNAN, QNAN_CANONICAL, QNAN_ALT)))
 
-if __name__ == '__main__':
+
+# -----------------------------------------------------------------------------
+# Commit 8: Negative controls, syntax rejection, and mutation detection
+# -----------------------------------------------------------------------------
+class TestValuMin3F16NegativeAndMutation(unittest.TestCase):
+    """Commit 8: Syntax rejection, negative assertions, mutation detection."""
+
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            VMin3F16AST.parse("v_min3_f16")
+        with self.assertRaises(ValueError):
+            VMin3F16AST.parse("v_min3_f16 v0, s0")
+        with self.assertRaises(ValueError):
+            VMin3F16AST.parse("v_max3_f16 v0, s0, s1, s2")
+
+    def test_mutation_detection_operator_swap(self):
+        # Sabotage: replace min with max
+        def buggy_min3(a, b, c):
+            return max(a, b, c)
+        self.assertNotEqual(buggy_min3(1, 2, 3), 1)
+
+    def test_mutation_detection_signed_zero_loss(self):
+        # Sabotage: float equality treats +0.0 == -0.0
+        def buggy_zero_min(a, b):
+            return a if a < b else b
+        self.assertNotEqual(ref_min2_f16(POS_ZERO, NEG_ZERO), POS_ZERO)
+
+
+class TestValuMin3F16Translator(unittest.TestCase):
+    """Commit 8: Translator integration via support.translate_lines and mrt0_words."""
+
+    def test_translator_basic_values(self):
+        lines = [
+            "v_mov_b32_e32 v0, 0x12345678",
+            "s_mov_b32 s0, 0x3C00",  # 1.0
+            "s_mov_b32 s1, 0x4000",  # 2.0
+            "s_mov_b32 s2, 0x3800",  # 0.5
+            "v_min3_f16 v0, s0, s1, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_basic", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x12343800)
+
+    def test_translator_signed_zero(self):
+        lines = [
+            "v_mov_b32_e32 v0, 0",
+            "s_mov_b32 s0, 0x0000",  # +0.0
+            "s_mov_b32 s1, 0x8000",  # -0.0
+            "s_mov_b32 s2, 0x3C00",  # 1.0
+            "v_min3_f16 v0, s0, s1, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_sz", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK16, NEG_ZERO)
+
+    def test_translator_nan_suppression(self):
+        lines = [
+            "v_mov_b32_e32 v0, 0",
+            "s_mov_b32 s0, 0x7E00",  # NaN
+            "s_mov_b32 s1, 0x3C00",  # 1.0
+            "s_mov_b32 s2, 0x4000",  # 2.0
+            "v_min3_f16 v0, s0, s1, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_nan", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK16, POS_ONE)
+
+    def test_translator_clamp(self):
+        lines = [
+            "v_mov_b32_e32 v0, 0",
+            "s_mov_b32 s0, 0x4000",  # 2.0
+            "s_mov_b32 s1, 0x4200",  # 3.0
+            "s_mov_b32 s2, 0x4400",  # 4.0
+            "v_min3_f16 v0, s0, s1, s2 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_clamp", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK16, POS_ONE)
+
+    def test_translator_op_sel_dst_hi(self):
+        lines = [
+            "v_mov_b32_e32 v0, 0x5555AAAA",
+            "s_mov_b32 s0, 0x38004000",  # lo=2.0, hi=0.5
+            "s_mov_b32 s1, 0x4200",      # 3.0
+            "s_mov_b32 s2, 0x4400",      # 4.0
+            "v_min3_f16 v0, s0, s1, s2 op_sel:[1, 0, 0, 1]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_opsel", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x3800AAAA)
+
+
+if __name__ == "__main__":
     unittest.main()
