@@ -372,9 +372,15 @@ def print_report(
     verbose: bool = False,
     strict: Optional[bool] = None,
 ) -> None:
+    # Keep filename output on one line for every boundary recognized by str.splitlines().
+    path_escapes = str.maketrans({
+        "\\": r"\\", "\r": r"\r", "\n": r"\n",
+        "\v": r"\x0b", "\f": r"\x0c", "\x1c": r"\x1c", "\x1d": r"\x1d",
+        "\x1e": r"\x1e", "\x85": r"\x85", "\u2028": r"\u2028", "\u2029": r"\u2029",
+    })
+
     def write_result(kind: str, rel: str) -> None:
-        # Escape literal backslashes before escaping line breaks or encoding stdout.
-        display_path = rel.replace("\\", "\\\\").replace("\r", r"\r").replace("\n", r"\n")
+        display_path = rel.translate(path_escapes)
         out.write(f"{kind:<10}{display_path}\n")
 
     for rel in sorted(report.problems.keys()):

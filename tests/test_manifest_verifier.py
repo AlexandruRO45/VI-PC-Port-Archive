@@ -580,6 +580,26 @@ class TestManifestVerifier(unittest.TestCase):
             "1 problem(s)",
         ])
 
+    def test_text_report_escapes_remaining_filename_line_boundaries(self) -> None:
+        separators = "\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+        for separator in separators:
+            with self.subTest(separator=ord(separator)):
+                name = f"café{separator}sample.bin"
+                report = mv.ManifestReport(
+                    passed=False, total_manifest_files=1, untracked=[name], strict=True,
+                )
+                structured = json.loads(json.dumps(report.to_dict()))
+                self.assertEqual(structured["untracked"], [name])
+                self.assertEqual(structured["problem_count"], 1)
+
+                output = io.StringIO()
+                mv.print_report(report, out=output)
+                escaped = separator.encode("unicode_escape").decode("ascii")
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f"NEW       café{escaped}sample.bin",
+                    "1 problem(s)",
+                ])
+
     def test_cli_tampered_returns_exit_code_1(self) -> None:
         delta_p = os.path.join(self.game_dir, "delta.bin")
         with open(delta_p, "r+b") as f:
