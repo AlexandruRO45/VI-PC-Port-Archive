@@ -8769,12 +8769,15 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
     *out = nullptr;
     if (!device) return E_INVALIDARG;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
-    Device* d = Device::from<Device>(real ? real : device);
+    ID3D12Device* owner = real ? real : device;
+    Device* d = Device::from<Device>(owner);
     if (!d) return E_INVALIDARG;
     const auto& i = d->info();
     const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(i.get_instance_proc(i.instance, "vkGetDeviceProcAddr"));
     if (!gdpa) return E_FAIL;
-    return rt::dxgi::create_factory(d->context(), i.get_instance_proc, i.instance, i.physical, gdpa, i.queue,
+    // The factory and its adapters use this device's context and Vulkan handles, so the factory holds the device: an
+    // app may release its device before the factory. (~SwapChain's own teardown order is D3D-818's, #8176.)
+    return rt::dxgi::create_factory(owner, d->context(), i.get_instance_proc, i.instance, i.physical, gdpa, i.queue,
                                     i.queue_family, riid, out);
 }
 

@@ -1335,10 +1335,18 @@ private:
 
 class Factory final : public IDXGIFactory7 {
 public:
-    Factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
+    // `owner` owns `context` and the Vulkan handles; holding it keeps them valid after the app releases its device.
+    Factory(IUnknown* owner, leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
             VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
-        : context_(context), gipa_(gipa), instance_(instance), physical_(physical), gdpa_(gdpa),
-          queue_(queue), queue_family_(queue_family) {}
+        : owner_(owner), context_(context), gipa_(gipa), instance_(instance), physical_(physical), gdpa_(gdpa),
+          queue_(queue), queue_family_(queue_family) {
+        if (owner_) owner_->AddRef();
+    }
+    ~Factory() {
+        if (owner_) owner_->Release();
+    }
+    Factory(const Factory&) = delete;
+    Factory& operator=(const Factory&) = delete;
 
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override {
@@ -1665,6 +1673,7 @@ private:
 
     std::atomic<ULONG> refs_{1};
     PrivateDataStore private_data_;
+    IUnknown* owner_ = nullptr;
     leonida::VulkanContext& context_;
     PFN_vkGetInstanceProcAddr gipa_;
     VkInstance instance_;
@@ -1684,12 +1693,12 @@ private:
 
 }  // namespace
 
-HRESULT create_factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
-                       VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
+HRESULT create_factory(IUnknown* owner, leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa,
+                       VkInstance instance, VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
                        std::uint32_t queue_family, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* factory = new Factory(context, gipa, instance, physical, gdpa, queue, queue_family);
+    auto* factory = new Factory(owner, context, gipa, instance, physical, gdpa, queue, queue_family);
     const HRESULT hr = factory->QueryInterface(riid, out);
     factory->Release();
     return hr;

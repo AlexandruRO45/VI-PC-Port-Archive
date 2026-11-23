@@ -167,7 +167,8 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     size = sizeof(read);
     EXPECT(FAILED(dxgi->GetPrivateData(kTestData, &size, &read)));
 
-    // The adapter does not keep the device alive, and the device outlives its DXGI pointer's last use.
+    // The adapter does not keep the proxy alive (on the Vulkan device its factory holds the device behind the proxy),
+    // and the device outlives its DXGI pointer's last use.
     adapter.reset();
     output.reset();
     dxgi.reset();

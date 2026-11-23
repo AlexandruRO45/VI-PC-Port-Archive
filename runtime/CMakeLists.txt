@@ -1787,6 +1787,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(dxgi_device_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_device COMMAND dxgi_device_test)
     set_tests_properties(dxgi_device PROPERTIES SKIP_RETURN_CODE 77)
+    # The DXGI factory made from a Vulkan device holds that device: the app can release the device first and the
+    # factory and its adapters keep working on live Vulkan handles. 77: no Vulkan device.
+    add_executable(dxgi_factory_lifetime_test test/dxgi_factory_lifetime_test.cpp)
+    target_link_libraries(dxgi_factory_lifetime_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(dxgi_factory_lifetime_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_factory_lifetime_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_factory_lifetime COMMAND dxgi_factory_lifetime_test)
+    set_tests_properties(dxgi_factory_lifetime PROPERTIES SKIP_RETURN_CODE 77)
     # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
     add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
     target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
