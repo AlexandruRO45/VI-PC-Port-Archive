@@ -1672,16 +1672,39 @@ public:
         return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
     }
 
-    // One vkQueueBindSparse for any sparse buffer, ordered on this queue's timeline as bind_tiles' binds are (the
-    // Xbox page mapper's arena, xbox_paging.h). `keepalive` is held until the bind completes. Returns the bind's
-    // ticket on timeline(), or 0 if nothing was bound.
-    std::uint64_t bind_sparse_ordered(VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
-                                      std::shared_ptr<const void> keepalive = {}) {
-        if (!buffer || binds.empty()) return 0;
-        std::lock_guard state(state_mutex_);  // as update_tiles: submitted_, waits_ and the pending binds are shared
-        PendingBindings pending;
-        pending.keepalive = std::move(keepalive);
-        return submit_sparse_binds(buffer, binds, std::move(pending));
+    // One vkQueueBindSparse for any sparse buffer (the Xbox page mapper's arena, xbox_paging.h), after everything
+    // submitted to this queue and its pending Wait()s. While the queue holds work behind a Wait() whose Signal() is
+    // not submitted yet, the bind is held behind it too, in queue order. `submitted` is called with the bind's ticket
+    // on timeline() once it is submitted (now, or when it is released), or with 0 if it is dropped with the work it
+    // waits behind. `keepalive` is held until the bind completes. Returns false if the bind was neither submitted
+    // nor held, and then does not call `submitted`.
+    bool bind_sparse_ordered(VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
+                             std::function<void(std::uint64_t)> submitted = {},
+                             std::shared_ptr<const void> keepalive = {}) {
+        if (!buffer || binds.empty()) return false;
+        bool held = false;
+        {
+            std::lock_guard state(state_mutex_);  // as update_tiles: submitted_, waits_ and the held work are shared
+            if (context_.is_device_lost()) return false;
+            if (must_hold()) {
+                Deferred op;
+                op.kind = Deferred::Kind::bind;
+                op.sparse_buffer = buffer;
+                op.binds.assign(binds.begin(), binds.end());
+                op.keepalive = std::move(keepalive);
+                op.submitted = std::move(submitted);
+                hold(std::move(op));
+                held = true;
+            } else {
+                PendingBindings pending;
+                pending.keepalive = std::move(keepalive);
+                const std::uint64_t ticket = submit_sparse_binds(buffer, binds, std::move(pending));
+                if (!ticket) return false;
+                if (submitted) submitted(ticket);
+            }
+        }
+        if (held) context_.holds().pump_ready();  // a Signal may have been submitted since the check
+        return true;
     }
 
     // This queue's timeline semaphore: work submitted outside execute() orders itself against binds by waiting on it
@@ -2078,7 +2101,7 @@ private:
 
     // One held operation, with the waits that were pending when it was asked for.
     struct Deferred {
-        enum class Kind : std::uint8_t { batch, signal, marker };
+        enum class Kind : std::uint8_t { batch, signal, marker, bind };
         Kind kind = Kind::batch;
         std::vector<VkSemaphore> waits;
         std::vector<std::uint64_t> wait_values;
@@ -2087,7 +2110,16 @@ private:
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
         std::string label;
+        VkBuffer sparse_buffer = VK_NULL_HANDLE;  // bind (bind_sparse_ordered)
+        std::vector<VkSparseMemoryBind> binds;
+        std::shared_ptr<const void> keepalive;
+        std::function<void(std::uint64_t)> submitted;
     };
+
+    // A held bind that will never be submitted tells its caller so.
+    static void dropped(Deferred& op) {
+        if (op.kind == Deferred::Kind::bind && op.submitted) op.submitted(0);
+    }
 
     bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
         for (std::size_t i = 0; i < semaphores.size(); ++i)
@@ -2134,6 +2166,14 @@ private:
         case Deferred::Kind::marker:
             marker_now(op.marker_kind, op.label.c_str());
             break;
+        case Deferred::Kind::bind: {
+            PendingBindings pending;
+            pending.keepalive = std::move(op.keepalive);
+            const std::uint64_t ticket = submit_sparse_binds(op.sparse_buffer, op.binds, std::move(pending));
+            if (!ticket) std::fprintf(stderr, "[rt] d3d12: a held sparse bind failed when it was released\n");
+            if (op.submitted) op.submitted(ticket);
+            break;
+        }
         }
         waits_ = std::move(later_waits);  // a failed submission leaves its waits behind: drop them with the batch
         wait_values_ = std::move(later_values);
@@ -2165,6 +2205,7 @@ private:
             }
             std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work waiting on it; "
                                  "that work is dropped\n");
+            dropped(*it);
             it = held_.erase(it);
             context_.holds().held_changed(-1);
         }
@@ -2183,6 +2224,7 @@ private:
                              "fence value (%llu) that no Signal reached; the fence was never signaled\n",
                      held_.size(), static_cast<unsigned long long>(value));
         context_.holds().held_changed(-static_cast<std::int64_t>(held_.size()));
+        for (Deferred& op : held_) dropped(op);
         held_.clear();
     }
 

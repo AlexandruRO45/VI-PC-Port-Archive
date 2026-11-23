@@ -133,23 +133,50 @@ public:
         release_locked(pages);
     }
 
-    // The arena maps (or unmaps) a page with a bind that completes at `ticket` on the bind queue's timeline. A pool's
-    // binds all go through one queue: tickets of different timelines do not compare.
-    void note_mapped(PageId id, int delta, std::uint64_t ticket) {
+    // The arena maps (or unmaps) a page. The bind that does it is tracked by bind_started and bind_submitted.
+    void note_mapped(PageId id, int delta) {
         std::lock_guard lock(mutex_);
         if (!known(id)) return;
         auto& chunk = chunks_[page_chunk(id)];
         chunk.mapped += delta;
         chunk.mapped_pages[page_index(id)] += delta;
-        chunk.last_bind = std::max(chunk.last_bind, ticket);
     }
 
-    // Frees chunks with no allocated and no mapped pages whose last bind has completed. Returns bytes freed.
+    // A bind that references `chunks` is about to go to the queue whose timeline is `timeline`. A pool's binds all
+    // go through one queue, since tickets of different timelines do not compare: another timeline is refused, and
+    // nothing is noted. Until bind_submitted, trim() keeps the chunks, because a held bind has no ticket yet.
+    bool bind_started(VkSemaphore timeline, std::span<const std::uint32_t> chunks) {
+        std::lock_guard lock(mutex_);
+        if (!timeline || (timeline_ && timeline_ != timeline)) return false;
+        timeline_ = timeline;
+        for (std::uint32_t c : chunks)
+            if (c < chunks_.size()) ++chunks_[c].pending;
+        return true;
+    }
+
+    // The bind was submitted at `ticket` on the pool's timeline, or dropped (0) and never reaches the GPU.
+    void bind_submitted(std::span<const std::uint32_t> chunks, std::uint64_t ticket) {
+        std::lock_guard lock(mutex_);
+        for (std::uint32_t c : chunks) {
+            if (c >= chunks_.size() || !chunks_[c].pending) continue;
+            --chunks_[c].pending;
+            chunks_[c].last_bind = std::max(chunks_[c].last_bind, ticket);
+        }
+    }
+
+    // The timeline the pool's binds go through, once the first one did.
+    VkSemaphore timeline() const {
+        std::lock_guard lock(mutex_);
+        return timeline_;
+    }
+
+    // Frees chunks with no allocated and no mapped pages, no bind waiting for a ticket, and whose last bind has
+    // completed on the pool's timeline. Returns bytes freed.
     VkDeviceSize trim(std::uint64_t completed_ticket) {
         std::lock_guard lock(mutex_);
         VkDeviceSize freed = 0;
         for (auto& chunk : chunks_) {
-            if (!chunk.memory || chunk.free_count != kPagesPerChunk || chunk.mapped ||
+            if (!chunk.memory || chunk.free_count != kPagesPerChunk || chunk.mapped || chunk.pending ||
                 chunk.last_bind > completed_ticket)
                 continue;
             free_(device_, chunk.memory, nullptr);
@@ -193,6 +220,7 @@ private:
         std::vector<std::int32_t> mapped_pages;  // arena pages bound to each page
         std::uint32_t free_count = 0;
         std::int64_t mapped = 0;      // arena pages currently bound to pages of this chunk
+        std::uint32_t pending = 0;    // binds that reference this chunk and have no ticket yet
         std::uint64_t last_bind = 0;  // ticket of the last bind that referenced this chunk
     };
 
@@ -255,6 +283,7 @@ private:
         chunks_[c].mapped_pages.assign(kPagesPerChunk, 0);
         chunks_[c].free_count = kPagesPerChunk;
         chunks_[c].mapped = 0;
+        chunks_[c].pending = 0;
         chunks_[c].last_bind = 0;
         reserved_ += kChunkSize;
         return c;
@@ -270,6 +299,7 @@ private:
     std::vector<Chunk> chunks_;
     VkDeviceSize reserved_ = 0;
     std::uint64_t in_use_ = 0;
+    VkSemaphore timeline_ = VK_NULL_HANDLE;
 };
 
 // The sparse arena: console VA = offset, device address fixed for its lifetime. Its pages come from one PagePool,
@@ -284,7 +314,7 @@ public:
         // waits for it.
         if (pool_)
             for (PageId id : mapped_)
-                if (id) pool_->note_mapped(id, -1, 0);
+                if (id) pool_->note_mapped(id, -1);
         if (buffer_) destroy_(device_, buffer_, nullptr);
     }
 
@@ -365,13 +395,13 @@ public:
         return binds;
     }
 
-    // Records `changes` (as left by binds_for) once their bind was submitted at `ticket`.
-    void apply(const std::vector<Change>& changes, PagePool& pool, std::uint64_t ticket) {
+    // Records `changes` (as left by binds_for) once their bind was submitted or held.
+    void apply(const std::vector<Change>& changes, PagePool& pool) {
         pool_ = &pool;
         for (const auto& [page, id] : changes) {
             PageId& slot = mapped_[std::size_t(page)];
-            if (slot) pool.note_mapped(slot, -1, ticket);
-            if (id) pool.note_mapped(id, +1, ticket);
+            if (slot) pool.note_mapped(slot, -1);
+            if (id) pool.note_mapped(id, +1);
             slot = id;
         }
     }
@@ -403,8 +433,16 @@ struct PageMappingBatch {
     std::uint32_t range_count = 0;
 };
 
-// Submits the binds of one call on the right queue and returns its ticket (VulkanQueue::bind_sparse_ordered).
-using SubmitBinds = std::function<std::uint64_t(VkBuffer, std::span<const VkSparseMemoryBind>)>;
+// Where a mapper's binds go: a queue's timeline, and the call that binds on that queue
+// (VulkanQueue::bind_sparse_ordered). `submit` binds after everything already submitted or held on the queue, and
+// calls its last argument with the bind's ticket on `timeline` once the bind is submitted (at once, or when held
+// work ahead of it is released), or with 0 if it is dropped. It returns false if the bind was neither submitted nor
+// held, and then does not call it.
+struct BindQueue {
+    using Submitted = std::function<void(std::uint64_t)>;
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    std::function<bool(VkBuffer, std::span<const VkSparseMemoryBind>, Submitted)> submit;
+};
 
 class PageMapper {
 public:
@@ -425,7 +463,7 @@ public:
     // CopyPageMappingsBatchX: every batch maps destination_va + i pages to pool pages start + i. Validated in full
     // before anything is bound; one bind for the whole call.
     bool copy_page_mappings_batch(std::uint32_t pool_handle, std::span<const PageMappingBatch> batches,
-                                  const SubmitBinds& submit) {
+                                  const BindQueue& submit) {
         std::lock_guard lock(mutex_);
         const auto pool = pools_.find(pool_handle);
         if (pool == pools_.end()) return false;
@@ -450,7 +488,7 @@ public:
     }
 
     // ClearPageMappingsX: unbind [va, va + pages); reads return 0 afterwards.
-    bool clear_page_mappings(std::uint64_t va, std::uint64_t pages, const SubmitBinds& submit) {
+    bool clear_page_mappings(std::uint64_t va, std::uint64_t pages, const BindQueue& submit) {
         std::lock_guard lock(mutex_);
         const std::uint64_t first = va / kPageSize;
         if (va % kPageSize || first > region_.page_count() || pages > region_.page_count() - first) return false;
@@ -469,14 +507,27 @@ public:
     }
 
 private:
-    bool commit(std::vector<PagedRegion::Change>& changes, const SubmitBinds& submit) {
-        if (!submit) return false;
+    bool commit(std::vector<PagedRegion::Change>& changes, const BindQueue& queue) {
+        if (!queue.submit || !queue.timeline) return false;
         ++stats_.calls;
         auto binds = region_.binds_for(changes, pool_);
         if (binds.empty()) return true;  // nothing changes: no bind, as on the console's no-op remap
-        const std::uint64_t ticket = submit(region_.buffer(), binds);
-        if (!ticket) return false;
-        region_.apply(changes, pool_, ticket);
+        // The chunks of the pages the bind maps and of the ones it replaces: trim() keeps them until it has a ticket.
+        std::vector<std::uint32_t> chunks;
+        for (const auto& [page, id] : changes) {
+            if (const PageId old = region_.mapped(page)) chunks.push_back(page_chunk(old));
+            if (id) chunks.push_back(page_chunk(id));
+        }
+        std::sort(chunks.begin(), chunks.end());
+        chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
+        if (!pool_.bind_started(queue.timeline, chunks)) return false;
+        PagePool* const pool = &pool_;
+        const auto submitted = [pool, chunks](std::uint64_t ticket) { pool->bind_submitted(chunks, ticket); };
+        if (!queue.submit(region_.buffer(), binds, submitted)) {
+            pool_.bind_submitted(chunks, 0);
+            return false;
+        }
+        region_.apply(changes, pool_);
         ++stats_.submits;
         stats_.binds += binds.size();
         stats_.pages += changes.size();

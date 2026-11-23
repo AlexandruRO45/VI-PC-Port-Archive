@@ -19,9 +19,13 @@ vk_xbox_paging_test.cpp` checks it on a real device.
   the arena and in one chunk merge into one `VkSparseMemoryBind`, and changes that leave a page as it is bind nothing.
 - **Ordering**: `VulkanQueue::bind_sparse_ordered` submits the bind on the queue's timeline as `bind_tiles` does for
   D3D12 tiled resources. It waits for everything the queue submitted before it, and the next submission waits for
-  it, which is the console's GPU-timeline order for these calls.
+  it, which is the console's GPU-timeline order for these calls. While the queue holds work behind a `Wait()` whose
+  `Signal()` is not submitted yet, the bind is held behind it too and submitted in queue order when it is released;
+  its ticket reaches the pool then, and until it does `trim()` keeps the chunks it references. A bind dropped with
+  the fence it waits on is reported, so its chunks can go.
 - **Lifetimes**: a region's pages come from one `PagePool`, which outlives it, and one `PageMapper` changes it.
-  A pool's binds all go through one queue, since tickets of different timelines do not compare. Destroying a region
+  A pool's binds all go through one queue, since tickets of different timelines do not compare: the pool takes the
+  timeline of its first bind (`BindQueue::timeline`) and refuses another before anything is bound. Destroying a region
   gives back the mappings it still holds. A released page is not handed out again while an arena still maps it, so
   a stale mapping never shows a new owner's data. A call refuses pages that are free when it runs; a page id has no
   generation, though, so a title that maps from a pool after releasing its pages and allocating new ones maps the
@@ -78,9 +82,9 @@ it.
 
 ## Not done
 
-- Held batches: `bind_sparse_ordered`, like `update_tiles` for tiled resources, binds at once even while the queue holds
-  batches behind a `Wait()` whose `Signal()` is not submitted yet, so a bind can run ahead of work submitted before
-  it. Holding binds with the batches fixes both.
+- Held batches for D3D12 tiled resources: `update_tiles` and `copy_tile_mappings` still bind at once while the queue
+  holds work, so a tile remap can run ahead of work submitted before it. `bind_sparse_ordered` holds its binds;
+  `bind_tiles` can do the same.
 - Wiring into `d3d12_xs_device` once the slots are measured from a real run.
 - Wiring `xbox_physical.h` to `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages[Scatter]` once a call site shows
   their arguments.
