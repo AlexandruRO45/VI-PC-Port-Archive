@@ -497,7 +497,9 @@ def start_server(
     except OSError as error:
         raise GalleryListenError(f"can't listen on port {addr[1]}: {error}") from error
 
-    url = f"http://localhost:{addr[1]}"
+    # The address the server is bound to, not "localhost": a browser may try ::1 first, where another local
+    # account's server can listen on the same port.
+    url = f"http://127.0.0.1:{addr[1]}"
     print(f"======================================================")
     print(f"       LEONIDA 3D ASSET STUDIO (VICE CITY EDITION)    ")
     print(f"======================================================")

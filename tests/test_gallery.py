@@ -640,12 +640,32 @@ class TestGalleryCommandLine(unittest.TestCase):
                               side_effect=[OSError("address in use"), None]) as bind,
             mock.patch.object(gallery.http.server.HTTPServer, "server_port", 8081, create=True),
             mock.patch.object(gallery.http.server.HTTPServer, "serve_forever") as serve,
+            mock.patch.object(gallery.webbrowser, "open") as browser,
             mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
         ):
-            self.assertEqual(gallery.main(["--models-dir", assets, "--textures-dir", assets, "--no-browser"]), 0)
+            self.assertEqual(gallery.main(["--models-dir", assets, "--textures-dir", assets]), 0)
             self.assertEqual([attempt.args[0] for attempt in bind.call_args_list],
                              [("127.0.0.1", 8080), ("127.0.0.1", 8081)])
-            self.assertIn("http://localhost:8081", stdout.getvalue())
+            # The URL names the address the server is bound to: "localhost" may resolve to ::1 first, where
+            # another local account's server can listen on the same port.
+            self.assertIn("http://127.0.0.1:8081", stdout.getvalue())
+            self.assertNotIn("http://localhost", stdout.getvalue())
+            browser.assert_called_once_with("http://127.0.0.1:8081")
+            serve.assert_called_once_with()
+
+    def test_printed_and_opened_url_use_the_bound_loopback_address(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as assets,
+            mock.patch.object(gallery.http.server.HTTPServer, "__init__", return_value=None) as bind,
+            mock.patch.object(gallery.http.server.HTTPServer, "serve_forever") as serve,
+            mock.patch.object(gallery.webbrowser, "open") as browser,
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+        ):
+            self.assertEqual(gallery.main(["--port", "8090", "--models-dir", assets, "--textures-dir", assets]), 0)
+            self.assertEqual([attempt.args[0] for attempt in bind.call_args_list], [("127.0.0.1", 8090)])
+            self.assertIn("http://127.0.0.1:8090", stdout.getvalue())
+            self.assertNotIn("http://localhost", stdout.getvalue())
+            browser.assert_called_once_with("http://127.0.0.1:8090")
             serve.assert_called_once_with()
 
 
