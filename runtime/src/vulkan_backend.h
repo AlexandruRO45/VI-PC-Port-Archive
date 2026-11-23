@@ -1387,10 +1387,13 @@ public:
     }
 
     // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
-    // `allocate`. Without this such a copy is refused as unsupported.
-    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
+    // `allocate`. Without this such a copy is refused as unsupported. With `device_address` (the allocation must then
+    // carry VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) the same scratch also takes the output of --mesh-compute mesh
+    // shaders, by address.
+    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate,
+                             bool device_address = false) {
         std::unique_lock lock(resource_mutex_);
-        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
+        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), device_address);
         if (!scratch_->loaded()) scratch_.reset();
     }
 
@@ -2253,6 +2256,14 @@ private:
                     scratch_guard.active = true;
                 }
                 return context_.scratch_->get(bytes, buffer, offset);
+            };
+            replay.mesh_output = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkDeviceAddress& address) {
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!scratch_guard.active) {
+                    context_.scratch_->collect();
+                    scratch_guard.active = true;
+                }
+                return context_.scratch_->get_address(bytes, address);
             };
         }
         if (kind_ != QueueKind::copy && context_.counted_dispatch_) {

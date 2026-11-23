@@ -2052,7 +2052,8 @@ The trace will enumerate them.
 **Implemented (D3D-29): pipeline state streams, mesh PSOs and `DispatchMesh`.**
 - **Device:** `VK_EXT_mesh_shader` with `meshShader` is enabled where the GPU has it (`VulkanDeviceInfo::mesh_shader`).
   `taskShader` is not enabled, since the corpus has no amplification shaders. `D3D12_OPTIONS7` reports
-  `MeshShaderTier` 1 only then; without the extension it reports `NOT_SUPPORTED` and mesh PSOs are `E_NOTIMPL`.
+  `MeshShaderTier` 1 then. Without the extension it reports 1 where the index has `--mesh-compute` mesh shaders and
+  the device can run them (below), and `NOT_SUPPORTED` otherwise, with mesh PSOs `E_NOTIMPL`.
 - **Streams:** `CreatePipelineState` parses the stream in the d3dx12.h layout: a subobject type, then its
   description at that description's alignment, each subobject pointer-aligned.
   - Every type up to `RASTERIZER2` is read.
@@ -2095,6 +2096,24 @@ The trace will enumerate them.
   both APIs. A DISPATCH_MESH call with a VS PSO, or a draw signature with a mesh PSO and a topology set, is
   `ReplayResult::invalid_draw`; a draw signature with no topology set records the bare call, which replay refuses as
   `unsupported`, as for any draw signature without a topology.
+- **Mesh shaders without `VK_EXT_mesh_shader`** (RDNA1, NVIDIA Pascal, Intel UHD): through the translator's
+  `--mesh-compute` (docs/design.md, "Mesh shaders as compute").
+  - **PSO:** the MS entry must have a `mesh_compute` layout (`E_NOTIMPL` with a log otherwise). Its module becomes a
+    compute pipeline, with the device's set 0 where it declares bindings and its translated subgroup size. The
+    graphics pipeline gets, in place of the mesh stage, the vertex shader `runtime/src/mesh_compute_vs.h` builds
+    from the layout (the module `tools/mesh_compute_vs.py` writes, instruction for instruction): a vertex pipeline
+    with input assembly and no vertex input. Both layouts take the 152-byte block, the output address in dwords
+    36..37, so a device under 152 bytes of push constants refuses such PSOs. A PS that reads `--f16-interp-fallback`
+    halves at other locations than the layout exports them is `E_NOTIMPL` (per-pipeline pairing is not built).
+  - **`DispatchMesh`:** groups × `slot_bytes` of the queue's scratch (`vulkan_scratch.h`, device-local, with a
+    device address, alive until the submission completes), then `vkCmdDispatch` with the counts, a compute-write →
+    vertex-read barrier, and in the draw's rendering scope a triangle-list `vkCmdDraw(groups × max_primitives × 3)`.
+    A draw whose vertex count does not fit in 32 bits is `ReplayResult::unsupported`.
+  - **Not built:** `ExecuteIndirect` with `DISPATCH_MESH` (the group counts are GPU data, so the draw's vertex count
+    is too); its signatures stay `E_NOTIMPL` without the extension.
+  - **Test:** `d3d12_mesh_compute_test` makes the layer's device without the extension on any GPU and draws
+    `test/glsl/ms_draw_compute.comp`, `ms_draw.mesh` written to the `--mesh-compute` contract: tier 1, a stream PSO,
+    `DispatchMesh` over X, Y and Z, every pixel checked; a mesh shader without a layout is refused.
 - **Translated mesh shaders through the layer:** `d3d12_m5_mesh_test` (section 6, M5) draws `ms_m5.asm`, an NGG
   wave64 mesh shader of 128 threads written with the corpus's idioms (group index from `v5`, thread id from `s3` and
   `mbcnt`, `GS_ALLOC_REQ`, per-thread exports), translated by `rdna2spirv.py`; the mesh stage asks for subgroup size 64 (required on the RX 9070 XT), and the test

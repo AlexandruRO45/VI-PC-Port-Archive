@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -685,6 +686,28 @@ struct SignatureElement {
     std::string component_type;      // "float", "uint", "sint"
 };
 
+// A `--mesh-compute` mesh shader's output slot (index.json "mesh_compute", rdna2spirv.mesh_compute_layout): the
+// compute shader writes one slot per workgroup, the vertex shader mesh_compute_vs.h builds draws them. Byte offsets.
+struct MeshComputeLayout {
+    std::uint32_t slot_bytes = 0;
+    std::uint32_t vertices = 0;          // the first vertex, after the header (vertex count, primitive count)
+    std::uint32_t vertex_stride = 0;
+    std::uint32_t primitives = 0;        // the first primitive: three vertex indices, then 1 if culled
+    std::uint32_t primitive_stride = 0;
+    std::uint32_t max_vertices = 0;
+    std::uint32_t max_primitives = 0;
+    std::uint32_t clip_count = 0;        // distances, at clip_offset / cull_offset in each vertex
+    std::uint32_t clip_offset = 0;
+    std::uint32_t cull_count = 0;
+    std::uint32_t cull_offset = 0;
+    std::map<std::uint32_t, std::uint32_t> params;  // output location -> vec4 offset in each vertex
+    // --f16-interp-fallback: param location -> {low_half_location, high_half_location} the halves go out at.
+    std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
+    std::uint32_t push_constant_bytes = 0;  // 152: the output address in dwords 36..37
+    // Under --pc-tail-ubo the address is in the uniform tail block instead, which mesh_compute_vs.h does not read.
+    bool address_in_pc_tail = false;
+};
+
 struct ShaderEntry {
     std::string name;
     std::string stage;  // "vs", "ps", "cs", "ms", "gs"
@@ -718,6 +741,8 @@ struct ShaderEntry {
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
     std::uint32_t max_primitives = 0;
+    // A mesh shader translated with --mesh-compute: a compute module writing this slot layout (unset otherwise).
+    std::optional<MeshComputeLayout> mesh_compute;
 };
 
 class ShaderLibrary {
@@ -750,6 +775,8 @@ public:
     // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
     // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
     std::size_t fspx_size() const { return fspx_count_; }
+    // Mesh-shader entries translated with --mesh-compute (a "mesh_compute" layout).
+    std::size_t mesh_compute_count() const { return mesh_compute_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -815,6 +842,41 @@ private:
         return n >= 0 && n <= 4294967295.0 ? std::uint32_t(n) : 0;
     }
 
+    // An index entry's "mesh_compute" object. Keys of "params" and "f16_halves" are decimal locations; entries
+    // that are not are skipped, as for the entry's own f16_halves.
+    static MeshComputeLayout mesh_compute_layout(const Json& m) {
+        MeshComputeLayout l;
+        l.slot_bytes = u32(m.find("slot_bytes"));
+        l.vertices = u32(m.find("vertices"));
+        l.vertex_stride = u32(m.find("vertex_stride"));
+        l.primitives = u32(m.find("primitives"));
+        l.primitive_stride = u32(m.find("primitive_stride"));
+        l.max_vertices = u32(m.find("max_vertices"));
+        l.max_primitives = u32(m.find("max_primitives"));
+        l.clip_count = u32(m.find("clip_count"));
+        l.clip_offset = u32(m.find("clip_offset"));
+        l.cull_count = u32(m.find("cull_count"));
+        l.cull_offset = u32(m.find("cull_offset"));
+        l.push_constant_bytes = u32(m.find("push_constant_bytes"));
+        if (const Json* t = m.find("pc_tail_address_dwords"); t && t->kind == Json::Kind::array)
+            l.address_in_pc_tail = true;
+        const auto location = [](const std::string& key, std::uint32_t& out) {
+            char* end = nullptr;
+            const unsigned long n = std::strtoul(key.c_str(), &end, 10);
+            if (key.empty() || !end || *end != '\0') return false;
+            out = std::uint32_t(n);
+            return true;
+        };
+        if (const Json* p = m.find("params"); p && p->kind == Json::Kind::object)
+            for (const auto& [key, val] : p->object)
+                if (std::uint32_t loc; location(key, loc)) l.params[loc] = u32(&val);
+        if (const Json* h = m.find("f16_halves"); h && h->kind == Json::Kind::object)
+            for (const auto& [key, val] : h->object)
+                if (std::uint32_t loc; location(key, loc) && val.kind == Json::Kind::array && val.array.size() == 2)
+                    l.f16_halves[loc] = {u32(&val.array[0]), u32(&val.array[1])};
+        return l;
+    }
+
     using LookupKey = std::pair<std::string_view, std::string_view>;
     struct KeyLess {
         using is_transparent = void;
@@ -852,6 +914,7 @@ private:
             fspx_entries_.clear();
             count_ = 0;
             fspx_count_ = 0;
+            mesh_compute_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -913,6 +976,10 @@ private:
             }
             e.max_vertices = u32(meta.find("max_vertices"));
             e.max_primitives = u32(meta.find("max_primitives"));
+            if (const Json* m = meta.find("mesh_compute"); m && m->kind == Json::Kind::object) {
+                e.mesh_compute = mesh_compute_layout(*m);
+                if (e.stage == "ms") ++mesh_compute_count_;
+            }
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && prefix == "fspx/") ++fspx_count_;
@@ -924,6 +991,7 @@ private:
     std::filesystem::path dir_;
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
+    std::size_t mesh_compute_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;

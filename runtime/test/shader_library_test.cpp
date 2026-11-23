@@ -368,6 +368,11 @@ int main() {
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": null, \"wave64_exchange\": \"workgroup\", \"lds_bytes\": 33332},\n"
+                 " \"ms_compute\": {\"stage\": \"ms\", \"fssm_sha256\": \"" << hash2 << "\", \"mesh_compute\": {"
+                 "\"slot_bytes\": 4816, \"vertices\": 16, \"vertex_stride\": 48, \"primitives\": 6160, "
+                 "\"primitive_stride\": 16, \"max_vertices\": 128, \"max_primitives\": 128, \"clip_count\": 3, "
+                 "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 32, \"params\": {\"0\": 32, \"x\": 1}, "
+                 "\"f16_halves\": {\"0\": [28, 29]}, \"push_constant_bytes\": 152}},\n"
                  " \"ps_unhashed\": {\"stage\": \"ps\", \"bindings\": []}}";
         std::ofstream spv(dir / "cs_test.spv", std::ios::binary);
         const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
@@ -375,7 +380,7 @@ int main() {
     }
     ShaderLibrary library;
     std::string error;
-    CHECK(library.load(dir.string(), &error) && library.size() == 6);
+    CHECK(library.load(dir.string(), &error) && library.size() == 7);
     const ShaderEntry* vs = library.find("vs", hash);
     CHECK(vs && vs->input_signature.size() == 2 && vs->input_signature[0].semantic == "COLOR");
     CHECK(vs->input_signature[1].register_index == 2 && vs->input_signature[1].system_value == 6 &&
@@ -399,6 +404,15 @@ int main() {
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
     CHECK(!library.find("ms", hash));  // no mesh shader with this hash
+    // A --mesh-compute mesh shader's slot layout; a param key that is not a location is skipped.
+    const ShaderEntry* ms = library.find("ms", hash2);
+    CHECK(ms && ms->mesh_compute && library.mesh_compute_count() == 1);
+    const MeshComputeLayout& lay = *ms->mesh_compute;
+    CHECK(lay.slot_bytes == 4816 && lay.vertices == 16 && lay.vertex_stride == 48 && lay.primitives == 6160);
+    CHECK(lay.max_vertices == 128 && lay.max_primitives == 128 && lay.clip_count == 3 && lay.cull_offset == 32);
+    CHECK(lay.params.size() == 1 && lay.params.at(0) == 32 && lay.push_constant_bytes == 152);
+    CHECK(lay.f16_halves.size() == 1 && lay.f16_halves.at(0)[0] == 28 && !lay.address_in_pc_tail);
+    CHECK(!library.find("ps", hash)->mesh_compute);
     // The subgroup fields of the index (wave64 / subgroup_size / wave64_exchange): absent, native and emulated.
     CHECK(!entry->subgroup_size && entry->wave64_exchange.empty() && !entry->emulated());
     const ShaderEntry* native = library.find("ps", hash2);
