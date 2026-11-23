@@ -130,7 +130,11 @@ channel's subblock count and `+8` is a repeated-prefix sample count to skip. The
 2048-byte subblocks after the 2048-aligned header. The skipped samples repeat the previous chunk's tail. The
 exporter verifies that the skip ends on a packet boundary and that the repeated packets match the previous
 packets for that channel group, then writes each verified overlap once. Each descriptor channel becomes one Ogg
-Opus file. Invalid repeat counts or payloads reject that music descriptor so independent streams can still export.
+Opus file, named by `export_stems` after all of the bank's ordinary streams: `<id>.ogg`, or `<id>~2.ogg`, `~3`, ...
+when an ordinary stream or an earlier channel already has that id, so neither file overwrites the other and the
+stream names stay the ones `awc_manifest.py` reports (synthetic tests in `tests/test_awc_music_names.py`; how
+often real banks repeat an id this way has not been counted). Invalid repeat counts or payloads reject that music
+descriptor so independent streams can still export.
 The chunk size gives the distance between blocks. The final block may use fewer bytes. The channel table and
 all declared subblocks must fit within their own block and the `0x55` tag's data range.
 
