@@ -22,6 +22,11 @@ streamed, so an image of any size works in one pass; a saved dumpbin listing (wi
 works too, on any OS. Nothing is executed. The output is RVAs, counts and constants, no code bytes.
 An input with no instructions in it (an empty or other text file, a PE dumpbin prints no code for) exits 2
 instead of reporting zero sites, so "UNCHECKED 0" always means something was scanned.
+A `checked` site whose stores reach one of the list-only fields (`+140h`..`+143h`, `+344h`, `+544h`) is a
+command-list write (`fields`); one that stores only the list's common header is another bump allocator
+(`no-fields`). `--sites` prints `fields` or `no-fields` for each checked site, and the summary counts the two
+groups separately.
+
 The matcher knows the instruction shapes MSVC emits for these writes (see tests/test_inline_scan.py); a shape it
 does not know shows up as `unrelated`, so read a few of those by hand on a new image. A `checked` site whose cursor
 load from `[list+18h]` is outside the scanned window (a shared prologue, another block, a tail jump) is guarded, but

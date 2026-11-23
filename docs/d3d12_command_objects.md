@@ -618,14 +618,14 @@ list in `docs/design.md`). It was run on the retail 1.0.2.1 `game_scarlett_maste
 14.39): 26,674,075 instructions, **110 guarded cursor store-backs, none unchecked**, and 2,720 further cursor-like
 stores with neither a guard nor a list field.
 
-**Only 12 of those 110 are command-list writes.** They are the whole `+0x28` (2) and `+0x30` (10) families, and each
+**At least 12 of those 110 are command-list writes.** They are the whole `+0x28` (2) and `+0x30` (10) families, and each
 touches one of the fields only a D3D12.X list has (`+0x140`..`+0x143`, `+0x344`, `+0x544`) inside the window. So the
-executable's inline command writes are 12, not 110, and at those 12 it checks first: a cursor-at-limit layer sees
-every one, on the same evidence as the DLLs. The other 98 are guarded stores to `+0x18` of some other bump
+executable's inline command writes are at least 12 recognised sites, not 110, and at those 12 it checks first: a
+cursor-at-limit layer sees every one, on the same evidence as the DLLs. The other 98 are guarded stores to `+0x18` of some other bump
 allocator — limits at `+0x8` (51), `+0x20` (33), `+0x10` (9), `+0x40` (2), `+0xd0` (1), and 2 at `+0x30` whose field is
 outside the window — with nothing from this page in them. A compare alone does not make a command list, so the tool
 keeps the split (`checked with a D3D12.X list field in the window: 12, without one: 98`) and `--sites` prints
-`fields` / `no-fields` per site.
+`fields` / `no-fields` per site. A shape the matcher does not know lands in `unrelated`, so 12 is a lower bound.
 
 Cursor loads are separate again: 31 of the 110 load `[list+18h]` inside the window, and the other 79 are guarded with
 the load in another block or a shared prologue (`cursor loaded` / `cursor outside`). 12 sites touch a list field
