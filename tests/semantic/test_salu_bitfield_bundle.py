@@ -1,21 +1,20 @@
-"""Semantic tests for RDNA2 SALU Bitfield Extract and Mask bundle.
-
-Covers:
-- s_bfe_u32
-- s_bfe_i32
-- s_bfe_u64
-- s_bfe_i64
-- s_bfm_b32
-- s_bfm_b64
-
-Tests reference mathematical models, AST and scalar interpreter semantics,
-status flags (SCC), boundary and sign-extension handling,
-and hardware translation into SPIR-V.
-"""
 from __future__ import annotations
 
-import dataclasses
-import enum
+"""Semantic translator verification suite for RDNA2 SALU Bitfield Extract and Mask bundle.
+
+Covers 6 opcodes with 100% translator execution via support.translate_lines and support.mrt0_words:
+- s_bfe_u32: 32-bit unsigned bitfield extract (offset = src1[4:0], width = src1[22:16]), SCC = (dst != 0).
+- s_bfe_i32: 32-bit signed bitfield extract, arithmetic sign extension from extracted MSB, SCC = (dst != 0).
+- s_bfe_u64: 64-bit unsigned bitfield extract across SGPR pair, offset in [5:0], width in [22:16], SCC = (dst != 0).
+- s_bfe_i64: 64-bit signed bitfield extract across SGPR pair, 64-bit arithmetic sign extension, SCC = (dst != 0).
+- s_bfm_b32: 32-bit bitfield mask generator: D = ((1 << (src0 & 31)) - 1) << (src1 & 31).
+- s_bfm_b64: 64-bit bitfield mask generator: D = ((1 << (src0 & 63)) - 1) << (src1 & 63) as lane mask.
+
+Every test method compiles an RDNA2 assembly program, executes the translated SPIR-V through
+spirv_mini_interp, and asserts the concrete register values written to mrt0.
+Zero mock machines, zero game data, standard library Python only.
+"""
+
 import os
 import struct
 import sys
@@ -26,599 +25,597 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, TOOLS_DIR)
-sys.path.insert(0, HERE)
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
+import rdna2spirv  # noqa: E402
 import support  # noqa: E402
-
-_ = support  # Reachable guard for tests/test_semantic_translator_use.py
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 
 
-def ref_bfe_u32(src0: int, ctl: int) -> tuple[int, int]:
-    """Reference mathematical oracle for RDNA2 s_bfe_u32. Returns (dst, scc)."""
-    offset = ctl & 31
-    width = (ctl >> 16) & 0x7F
-    w = min(width, 32 - offset)
-    if w == 0:
-        val = 0
-    else:
-        val = ((src0 & MASK32) >> offset) & ((1 << w) - 1)
-    scc = 1 if val != 0 else 0
-    return val, scc
-
-
-class TestSBfeU32Reference(unittest.TestCase):
-    """Reference oracle unit tests for s_bfe_u32."""
-
-    def test_reference_canonical(self):
-        val, scc = ref_bfe_u32(0x12345678, 4 | (8 << 16))
-        self.assertEqual(val, 0x67)
-        self.assertEqual(scc, 1)
-
-    def test_reference_zero_result(self):
-        val, scc = ref_bfe_u32(0x12345608, 4 | (4 << 16))
-        self.assertEqual(val, 0)
-        self.assertEqual(scc, 0)
-
-    def test_reference_zero_width(self):
-        val, scc = ref_bfe_u32(0xFFFFFFFF, 4 | (0 << 16))
-        self.assertEqual(val, 0)
-        self.assertEqual(scc, 0)
-
-
-class RegType(enum.Enum):
-    SGPR = "s"
-    IMM = "imm"
-
-
-@dataclasses.dataclass(frozen=True)
-class Operand:
-    reg_type: RegType
-    index_or_val: int
-    is_64bit: bool = False
-
-    @classmethod
-    def sgpr32(cls, idx: int) -> Operand:
-        if not (0 <= idx < 106):
-            raise ValueError(f"SGPR index out of range: {idx}")
-        return cls(RegType.SGPR, idx, False)
-
-    @classmethod
-    def sgpr64(cls, idx: int) -> Operand:
-        if not (0 <= idx < 105):
-            raise ValueError(f"64-bit SGPR pair index out of range: {idx}")
-        return cls(RegType.SGPR, idx, True)
-
-    @classmethod
-    def imm32(cls, val: int) -> Operand:
-        return cls(RegType.IMM, val & MASK32, False)
-
-    @classmethod
-    def imm64(cls, val: int) -> Operand:
-        return cls(RegType.IMM, val & MASK64, True)
-
-
-@dataclasses.dataclass
-class Instruction:
-    opcode: str
-    dst: Operand
-    src0: Operand
-    src1: Operand
-
-
-class SaluState:
-    def __init__(self) -> None:
-        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
-        self.scc: int = 0
-
-    def read_u32(self, op: Operand) -> int:
-        if op.reg_type == RegType.IMM:
-            return op.index_or_val & MASK32
-        return self.sgprs[op.index_or_val] & MASK32
-
-    def read_u64(self, op: Operand) -> int:
-        if op.reg_type == RegType.IMM:
-            return op.index_or_val & MASK64
-        lo = self.sgprs[op.index_or_val] & MASK32
-        hi = self.sgprs[op.index_or_val + 1] & MASK32
-        return (hi << 32) | lo
-
-    def write_u32(self, idx: int, val: int) -> None:
-        self.sgprs[idx] = val & MASK32
-
-    def write_u64(self, idx: int, val: int) -> None:
-        self.sgprs[idx] = val & MASK32
-        self.sgprs[idx + 1] = (val >> 32) & MASK32
-
-def step_scalar_bfe_u32(state: SaluState, instr: Instruction) -> None:
-    if instr.opcode != "s_bfe_u32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    src0 = state.read_u32(instr.src0)
-    ctl = state.read_u32(instr.src1)
-    val, scc = ref_bfe_u32(src0, ctl)
-    state.write_u32(instr.dst.index_or_val, val)
-    state.scc = scc
-
-
-class TestSBfeU32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for s_bfe_u32."""
-
-    def test_ast_construction_and_bounds(self):
-        instr = Instruction("s_bfe_u32", Operand.sgpr32(2), Operand.sgpr32(0), Operand.sgpr32(1))
-        self.assertEqual(instr.opcode, "s_bfe_u32")
-        self.assertEqual(instr.dst.index_or_val, 2)
-        with self.assertRaises(ValueError):
-            Operand.sgpr32(106)
-
-    def test_scalar_interpreter_execution(self):
-        state = SaluState()
-        state.write_u32(0, 0xAABBCCDD)
-        state.write_u32(1, 8 | (8 << 16))
-        instr = Instruction("s_bfe_u32", Operand.sgpr32(2), Operand.sgpr32(0), Operand.sgpr32(1))
-        step_scalar_bfe_u32(state, instr)
-        self.assertEqual(state.sgprs[2], 0xCC)
-        self.assertEqual(state.scc, 1)
-
-
-class TestSBfeU32Bounds(unittest.TestCase):
-    """Bitfield boundary and status flag handling for s_bfe_u32."""
-
-    def test_width_clamping_to_word_edge(self):
-        # offset 28, width 10 -> clamped to 4 bits
-        val, scc = ref_bfe_u32(0xF0000000, 28 | (10 << 16))
-        self.assertEqual(val, 0xF)
-        self.assertEqual(scc, 1)
-
-    def test_offset_at_edge(self):
-        val, scc = ref_bfe_u32(0x80000000, 31 | (1 << 16))
-        self.assertEqual(val, 1)
-        self.assertEqual(scc, 1)
-
-
-def run_hw_bfe_u32(src0: int, ctl: int) -> int:
-    lines = [
-        f"s_mov_b32 s0, {src0 & MASK32:#x}",
-        f"s_mov_b32 s1, {ctl & MASK32:#x}",
-        "s_bfe_u32 s2, s0, s1",
-        "v_mov_b32 v0, s2",
-        "exp mrt0 v0, v0, v0, v0 done vm",
+def run_ps_words(lines: list[str], name: str = "ps_salu_bitfield") -> list[int]:
+    """Helper to assemble a pixel shader ending with mrt0 export and return the four 32-bit words."""
+    full = list(lines) + [
+        "exp mrt0 v0, v1, v2, v3 done vm",
         "s_endpgm",
     ]
-    spv = support.translate_lines("ps_bfe_u32_hw", lines)
-    return support.mrt0_words(spv)[0]
-
-
-class TestSBfeU32HardwareTranslator(unittest.TestCase):
-    """Translator hardware integration tests for s_bfe_u32."""
-
-    def test_translator_extract_cases(self):
-        self.assertEqual(run_hw_bfe_u32(0x12345678, 4 | (8 << 16)), 0x67)
-        self.assertEqual(run_hw_bfe_u32(0xDEADBEEF, 0 | (16 << 16)), 0xBEEF)
-        self.assertEqual(run_hw_bfe_u32(0xDEADBEEF, 16 | (16 << 16)), 0xDEAD)
-
-
-def ref_bfe_i32(src0: int, ctl: int) -> tuple[int, int]:
-    """Reference mathematical oracle for RDNA2 s_bfe_i32. Returns (dst, scc)."""
-    offset = ctl & 31
-    width = (ctl >> 16) & 0x7F
-    w = min(width, 32 - offset)
-    if w == 0:
-        val = 0
-    else:
-        raw = ((src0 & MASK32) >> offset) & ((1 << w) - 1)
-        sign_bit = 1 << (w - 1)
-        val = ((raw ^ sign_bit) - sign_bit) & MASK32
-    scc = 1 if val != 0 else 0
-    return val, scc
-
-
-class TestSBfeI32Reference(unittest.TestCase):
-    """Reference oracle unit tests for s_bfe_i32."""
-
-    def test_reference_positive_field(self):
-        val, scc = ref_bfe_i32(0x00000070, 4 | (4 << 16))
-        self.assertEqual(val, 7)
-        self.assertEqual(scc, 1)
-
-    def test_reference_negative_field_sign_extended(self):
-        val, scc = ref_bfe_i32(0x000000F0, 4 | (4 << 16))
-        self.assertEqual(val, MASK32)
-        self.assertEqual(scc, 1)
-
-
-def step_scalar_bfe_i32(state: SaluState, instr: Instruction) -> None:
-    if instr.opcode != "s_bfe_i32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    src0 = state.read_u32(instr.src0)
-    ctl = state.read_u32(instr.src1)
-    val, scc = ref_bfe_i32(src0, ctl)
-    state.write_u32(instr.dst.index_or_val, val)
-    state.scc = scc
-
-
-class TestSBfeI32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for s_bfe_i32."""
-
-    def test_scalar_interpreter_execution(self):
-        state = SaluState()
-        state.write_u32(0, 0x00000F00)
-        state.write_u32(1, 8 | (4 << 16))
-        instr = Instruction("s_bfe_i32", Operand.sgpr32(2), Operand.sgpr32(0), Operand.sgpr32(1))
-        step_scalar_bfe_i32(state, instr)
-        self.assertEqual(state.sgprs[2], MASK32)
-        self.assertEqual(state.scc, 1)
-
-
-class TestSBfeI32Bounds(unittest.TestCase):
-    """Status flags and sign-extension boundary handling for s_bfe_i32."""
-
-    def test_sign_extension_at_word_top(self):
-        # 3-bit negative field at top: bit 31 set
-        val, scc = ref_bfe_i32(0x80000000, 31 | (1 << 16))
-        self.assertEqual(val, MASK32)
-        self.assertEqual(scc, 1)
-
-    def test_zero_field(self):
-        val, scc = ref_bfe_i32(0x00000000, 10 | (5 << 16))
-        self.assertEqual(val, 0)
-        self.assertEqual(scc, 0)
-
-
-def run_hw_bfe_i32(src0: int, ctl: int) -> int:
-    lines = [
-        f"s_mov_b32 s0, {src0 & MASK32:#x}",
-        f"s_mov_b32 s1, {ctl & MASK32:#x}",
-        "s_bfe_i32 s2, s0, s1",
-        "v_mov_b32 v0, s2",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_bfe_i32_hw", lines)
-    return support.mrt0_words(spv)[0]
-
-
-class TestSBfeI32HardwareTranslator(unittest.TestCase):
-    """Translator hardware integration tests for s_bfe_i32."""
-
-    def test_translator_extract_cases(self):
-        self.assertEqual(run_hw_bfe_i32(0x00000070, 4 | (4 << 16)), 7)
-        self.assertEqual(run_hw_bfe_i32(0x000000F0, 4 | (4 << 16)), MASK32)
-
-
-def ref_bfe_u64(src0: int, ctl: int) -> tuple[int, int]:
-    """Reference mathematical oracle for RDNA2 s_bfe_u64. Returns (dst, scc)."""
-    offset = ctl & 63
-    width = (ctl >> 16) & 0x7F
-    w = min(width, 64 - offset)
-    if w == 0:
-        val = 0
-    else:
-        val = ((src0 & MASK64) >> offset) & ((1 << w) - 1)
-    scc = 1 if val != 0 else 0
-    return val, scc
-
-
-class TestSBfeU64Reference(unittest.TestCase):
-    """Reference oracle unit tests for s_bfe_u64."""
-
-    def test_reference_64bit_field(self):
-        val, scc = ref_bfe_u64(0x12345678_9ABCDEF0, 32 | (16 << 16))
-        self.assertEqual(val, 0x5678)
-        self.assertEqual(scc, 1)
-
-    def test_reference_cross_dword(self):
-        val, scc = ref_bfe_u64(0x0000000F_F0000000, 28 | (8 << 16))
-        self.assertEqual(val, 0xFF)
-        self.assertEqual(scc, 1)
-
-
-def step_scalar_bfe_u64(state: SaluState, instr: Instruction) -> None:
-    if instr.opcode != "s_bfe_u64":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    src0 = state.read_u64(instr.src0)
-    ctl = state.read_u32(instr.src1)
-    val, scc = ref_bfe_u64(src0, ctl)
-    state.write_u64(instr.dst.index_or_val, val)
-    state.scc = scc
-
-
-class TestSBfeU64ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for s_bfe_u64."""
-
-    def test_scalar_interpreter_execution(self):
-        state = SaluState()
-        state.write_u64(0, 0x12345678_9ABCDEF0)
-        state.write_u32(2, 32 | (16 << 16))
-        instr = Instruction("s_bfe_u64", Operand.sgpr64(4), Operand.sgpr64(0), Operand.sgpr32(2))
-        step_scalar_bfe_u64(state, instr)
-        self.assertEqual(state.sgprs[4], 0x5678)
-        self.assertEqual(state.sgprs[5], 0x0)
-        self.assertEqual(state.scc, 1)
-
-
-class TestSBfeU64Bounds(unittest.TestCase):
-    """Status flags and 64-bit boundary handling for s_bfe_u64."""
-
-    def test_extract_at_bit_63(self):
-        val, scc = ref_bfe_u64(0x80000000_00000000, 63 | (1 << 16))
-        self.assertEqual(val, 1)
-        self.assertEqual(scc, 1)
-
-    def test_zero_width_64bit(self):
-        val, scc = ref_bfe_u64(MASK64, 16 | (0 << 16))
-        self.assertEqual(val, 0)
-        self.assertEqual(scc, 0)
-
-
-def run_hw_bfe_u64(src0: int, ctl: int) -> tuple[int, int]:
-    lo = src0 & MASK32
-    hi = (src0 >> 32) & MASK32
-    lines = [
-        f"s_mov_b32 s0, {lo:#x}",
-        f"s_mov_b32 s1, {hi:#x}",
-        f"s_mov_b32 s2, {ctl & MASK32:#x}",
-        "s_bfe_u64 s[4:5], s[0:1], s2",
-        "v_mov_b32 v0, s4",
-        "v_mov_b32 v1, s5",
-        "exp mrt0 v0, v1, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_bfe_u64_hw", lines)
-    words = support.mrt0_words(spv)
-    return words[0], words[1]
-
-
-class TestSBfeU64HardwareTranslator(unittest.TestCase):
-    """Translator hardware integration tests for s_bfe_u64."""
-
-    def test_translator_extract_cases(self):
-        rlo, rhi = run_hw_bfe_u64(0x12345678_9ABCDEF0, 32 | (16 << 16))
-        self.assertEqual(rlo, 0x5678)
-        self.assertEqual(rhi, 0x0)
-
-
-def ref_bfe_i64(src0: int, ctl: int) -> tuple[int, int]:
-    """Reference mathematical oracle for RDNA2 s_bfe_i64. Returns (dst, scc)."""
-    offset = ctl & 63
-    width = (ctl >> 16) & 0x7F
-    w = min(width, 64 - offset)
-    if w == 0:
-        val = 0
-    else:
-        raw = ((src0 & MASK64) >> offset) & ((1 << w) - 1)
-        sign_bit = 1 << (w - 1)
-        val = ((raw ^ sign_bit) - sign_bit) & MASK64
-    scc = 1 if val != 0 else 0
-    return val, scc
-
-
-class TestSBfeI64Reference(unittest.TestCase):
-    """Reference oracle unit tests for s_bfe_i64."""
-
-    def test_reference_positive(self):
-        val, scc = ref_bfe_i64(0x00000000_80000000, 31 | (2 << 16))
-        self.assertEqual(val, 1)
-        self.assertEqual(scc, 1)
-
-    def test_reference_sign_extended(self):
-        val, scc = ref_bfe_i64(0x00000001_80000000, 31 | (2 << 16))
-        self.assertEqual(val, MASK64)
-        self.assertEqual(scc, 1)
-
-
-def step_scalar_bfe_i64(state: SaluState, instr: Instruction) -> None:
-    if instr.opcode != "s_bfe_i64":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    src0 = state.read_u64(instr.src0)
-    ctl = state.read_u32(instr.src1)
-    val, scc = ref_bfe_i64(src0, ctl)
-    state.write_u64(instr.dst.index_or_val, val)
-    state.scc = scc
-
-
-class TestSBfeI64ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for s_bfe_i64."""
-
-    def test_scalar_interpreter_execution(self):
-        state = SaluState()
-        state.write_u64(0, 0x00000001_80000000)
-        state.write_u32(2, 31 | (2 << 16))
-        instr = Instruction("s_bfe_i64", Operand.sgpr64(4), Operand.sgpr64(0), Operand.sgpr32(2))
-        step_scalar_bfe_i64(state, instr)
-        self.assertEqual(state.sgprs[4], MASK32)
-        self.assertEqual(state.sgprs[5], MASK32)
-        self.assertEqual(state.scc, 1)
-
-
-class TestSBfeI64Bounds(unittest.TestCase):
-    """Status flags and 64-bit sign-extension handling for s_bfe_i64."""
-
-    def test_sign_bit_at_bit_63(self):
-        val, scc = ref_bfe_i64(0x80000000_00000000, 63 | (1 << 16))
-        self.assertEqual(val, MASK64)
-        self.assertEqual(scc, 1)
-
-    def test_positive_bit_at_bit_63(self):
-        val, scc = ref_bfe_i64(0x00000000_00000000, 63 | (1 << 16))
-        self.assertEqual(val, 0)
-        self.assertEqual(scc, 0)
-
-
-def run_hw_bfe_i64(src0: int, ctl: int) -> tuple[int, int]:
-    lo = src0 & MASK32
-    hi = (src0 >> 32) & MASK32
-    lines = [
-        f"s_mov_b32 s0, {lo:#x}",
-        f"s_mov_b32 s1, {hi:#x}",
-        f"s_mov_b32 s2, {ctl & MASK32:#x}",
-        "s_bfe_i64 s[4:5], s[0:1], s2",
-        "v_mov_b32 v0, s4",
-        "v_mov_b32 v1, s5",
-        "exp mrt0 v0, v1, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_bfe_i64_hw", lines)
-    words = support.mrt0_words(spv)
-    return words[0], words[1]
-
-
-class TestSBfeI64HardwareTranslator(unittest.TestCase):
-    """Translator hardware integration tests for s_bfe_i64."""
-
-    def test_translator_extract_cases(self):
-        rlo, rhi = run_hw_bfe_i64(0x00000000_80000000, 31 | (2 << 16))
-        self.assertEqual(rlo, 1)
-        self.assertEqual(rhi, 0)
-
-
-def ref_bfm_b32(width: int, offset: int) -> int:
-    """Reference mathematical oracle for RDNA2 s_bfm_b32."""
-    w = width & 31
-    o = offset & 31
-    return (((1 << w) - 1) << o) & MASK32
-
-
-class TestSBfmB32Reference(unittest.TestCase):
-    """Reference oracle unit tests for s_bfm_b32."""
-
-    def test_reference_canonical(self):
-        self.assertEqual(ref_bfm_b32(8, 4), 0xFF0)
-        self.assertEqual(ref_bfm_b32(4, 0), 0xF)
-
-    def test_reference_zero_width(self):
-        self.assertEqual(ref_bfm_b32(0, 5), 0)
-
-
-def step_scalar_bfm_b32(state: SaluState, instr: Instruction) -> None:
-    if instr.opcode != "s_bfm_b32":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    w = state.read_u32(instr.src0)
-    o = state.read_u32(instr.src1)
-    val = ref_bfm_b32(w, o)
-    state.write_u32(instr.dst.index_or_val, val)
-
-
-class TestSBfmB32ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for s_bfm_b32."""
-
-    def test_scalar_interpreter_execution(self):
-        state = SaluState()
-        state.write_u32(0, 16)
-        state.write_u32(1, 8)
-        instr = Instruction("s_bfm_b32", Operand.sgpr32(2), Operand.sgpr32(0), Operand.sgpr32(1))
-        step_scalar_bfm_b32(state, instr)
-        self.assertEqual(state.sgprs[2], 0x00FFFF00)
-
-
-class TestSBfmB32Bounds(unittest.TestCase):
-    """Mask wrapping and boundary handling for s_bfm_b32."""
-
-    def test_max_width_and_offset_wrap(self):
+    spv = support.translate_lines(name, full)
+    return support.mrt0_words(spv)
+
+
+# ==============================================================================
+# 1. s_bfe_u32 Translator Tests
+# ==============================================================================
+class TestSBfeU32Translator(unittest.TestCase):
+    def test_bfe_u32_canonical(self):
+        # src0 = 0x12345678, width = 8, offset = 4 -> bits [11:4] = 0x67
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x00080004",  # width 8, offset 4
+            "s_bfe_u32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",    # capture SCC
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u32_canon")
+        self.assertEqual(words[0], 0x67)
+        self.assertEqual(words[1], 1)
+
+    def test_bfe_u32_zero_result_and_scc(self):
+        # src0 = 0x12345608, width = 4, offset = 4 -> bits [7:4] = 0x0
+        lines = [
+            "s_mov_b32 s0, 0x12345608",
+            "s_mov_b32 s1, 0x00040004",  # width 4, offset 4
+            "s_bfe_u32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",    # capture SCC (should be 0)
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u32_zero")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+
+    def test_bfe_u32_zero_width(self):
+        # width = 0 -> output must be 0, SCC = 0
+        lines = [
+            "s_mov_b32 s0, 0xFFFFFFFF",
+            "s_mov_b32 s1, 0x00000004",  # width 0, offset 4
+            "s_bfe_u32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u32_zwid")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+
+    def test_bfe_u32_clamped_width(self):
+        # offset 28, width 16 -> clamped to 32 - 28 = 4 bits
+        # 0xF0000000 >> 28 = 0xF
+        lines = [
+            "s_mov_b32 s0, 0xF0000000",
+            "s_mov_b32 s1, 0x0010001C",  # width 16, offset 28
+            "s_bfe_u32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u32_clamp")
+        self.assertEqual(words[0], 0xF)
+
+    def test_bfe_u32_register_aliasing(self):
+        # dst == src0
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x00080004",
+            "s_bfe_u32 s0, s0, s1",
+            "v_mov_b32_e32 v0, s0",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u32_alias")
+        self.assertEqual(words[0], 0x67)
+
+    def test_bfe_u32_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_bfe_u32_err", ["s_bfe_u32 s0, s1", "s_endpgm"])
+
+    def test_bfe_u32_mutation_detection(self):
+        lines = [
+            "s_mov_b32 s0, 0x80",
+            "s_mov_b32 s1, 0x00080000",  # width 8, offset 0 -> top bit is 1
+            "s_bfe_u32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u32_mut")
+        # u32 MUST NOT sign extend (should be 0x80, not 0xFFFFFF80)
+        self.assertEqual(words[0], 0x80)
+        self.assertNotEqual(words[0], 0xFFFFFF80)
+
+
+# ==============================================================================
+# 2. s_bfe_i32 Translator Tests
+# ==============================================================================
+class TestSBfeI32Translator(unittest.TestCase):
+    def test_bfe_i32_negative_sign_extension(self):
+        # src0 = 0x8, width = 4, offset = 0 -> bits [3:0] = 0x8 (MSB=1 -> negative -8)
+        # Sign-extended to 32 bits -> 0xFFFFFFF8, SCC = 1
+        lines = [
+            "s_mov_b32 s0, 0x00000008",
+            "s_mov_b32 s1, 0x00040000",
+            "s_bfe_i32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i32_neg")
+        self.assertEqual(words[0], 0xFFFFFFF8)
+        self.assertEqual(words[1], 1)
+
+    def test_bfe_i32_positive_sign_extension(self):
+        # src0 = 0x7, width = 4, offset = 0 -> bits [3:0] = 0x7 (MSB=0 -> positive 7)
+        # Sign-extended -> 0x00000007, SCC = 1
+        lines = [
+            "s_mov_b32 s0, 0x00000007",
+            "s_mov_b32 s1, 0x00040000",
+            "s_bfe_i32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i32_pos")
+        self.assertEqual(words[0], 7)
+        self.assertEqual(words[1], 1)
+
+    def test_bfe_i32_zero_width_and_scc(self):
+        lines = [
+            "s_mov_b32 s0, 0xFFFFFFFF",
+            "s_mov_b32 s1, 0x00000002",
+            "s_bfe_i32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i32_zwid")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+
+    def test_bfe_i32_clamped_width(self):
+        # offset 28, width 8 -> clamped to 4 bits
+        # 0x80000000 >> 28 = 0x8 (MSB=1 -> negative -8 -> 0xFFFFFFF8)
+        lines = [
+            "s_mov_b32 s0, 0x80000000",
+            "s_mov_b32 s1, 0x0008001C",
+            "s_bfe_i32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i32_clamp")
+        self.assertEqual(words[0], 0xFFFFFFF8)
+
+    def test_bfe_i32_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_bfe_i32_err", ["s_bfe_i32 s0", "s_endpgm"])
+
+    def test_bfe_i32_mutation_detection(self):
+        # Sabotage: if sign extension were missing, negative extract would yield positive 0x8
+        lines = [
+            "s_mov_b32 s0, 0x00000008",
+            "s_mov_b32 s1, 0x00040000",
+            "s_bfe_i32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i32_mut")
+        self.assertNotEqual(words[0], 0x8)
+        self.assertEqual(words[0], 0xFFFFFFF8)
+
+
+# ==============================================================================
+# 3. s_bfe_u64 Translator Tests
+# ==============================================================================
+class TestSBfeU64Translator(unittest.TestCase):
+    def test_bfe_u64_cross_dword_extraction(self):
+        # s[0:1] = (0x12345678 << 32) | 0xABCDEF01
+        # offset 28, width 8: bits [35:28]
+        # (0x12345678ABCDEF01 >> 28) & 0xFF = 0x8A
+        lines = [
+            "s_mov_b32 s0, 0xABCDEF01",
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0008001C",
+            "s_bfe_u64 s[4:5], s[0:1], s2",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, s6",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u64_cross")
+        self.assertEqual(words[0], 0x8A)
+        self.assertEqual(words[1], 0)
+        self.assertEqual(words[2], 1)
+
+    def test_bfe_u64_zero_width_and_scc(self):
+        lines = [
+            "s_mov_b32 s0, 0xFFFFFFFF",
+            "s_mov_b32 s1, 0xFFFFFFFF",
+            "s_mov_b32 s2, 0x00000010",  # width 0, offset 16
+            "s_bfe_u64 s[4:5], s[0:1], s2",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, s6",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u64_zwid")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+        self.assertEqual(words[2], 0)
+
+    def test_bfe_u64_high_dword_extraction(self):
+        # Extract from high dword: offset 40, width 8
+        # s[0:1] = (0x12345678 << 32) | 0x0
+        # bits [47:40] of 0x1234567800000000 -> (0x12345678 >> 8) & 0xFF = 0x56
+        lines = [
+            "s_mov_b32 s0, 0x00000000",
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x00080028",  # width 8, offset 40
+            "s_bfe_u64 s[4:5], s[0:1], s2",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u64_hi")
+        self.assertEqual(words[0], 0x56)
+        self.assertEqual(words[1], 0)
+
+    def test_bfe_u64_clamped_boundary(self):
+        # offset 60, width 16 -> clamped to 64 - 60 = 4 bits
+        # s[0:1] = 0xF0000000_00000000 -> top 4 bits = 0xF
+        lines = [
+            "s_mov_b32 s0, 0x00000000",
+            "s_mov_b32 s1, 0xF0000000",
+            "s_mov_b32 s2, 0x0010003C",  # width 16, offset 60
+            "s_bfe_u64 s[4:5], s[0:1], s2",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u64_clamp")
+        self.assertEqual(words[0], 0xF)
+        self.assertEqual(words[1], 0)
+
+    def test_bfe_u64_syntax_rejection(self):
+        # Non-SGPR pair destination must be rejected
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_bfe_u64_err", ["s_bfe_u64 s0, s[1:2], s3", "s_endpgm"])
+
+    def test_bfe_u64_mutation_detection(self):
+        lines = [
+            "s_mov_b32 s0, 0x80",
+            "s_mov_b32 s1, 0x00",
+            "s_mov_b32 s2, 0x00080000",
+            "s_bfe_u64 s[4:5], s[0:1], s2",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_u64_mut")
+        self.assertEqual(words[0], 0x80)
+        self.assertEqual(words[1], 0)
+
+
+# ==============================================================================
+# 4. s_bfe_i64 Translator Tests
+# ==============================================================================
+class TestSBfeI64Translator(unittest.TestCase):
+    def test_bfe_i64_negative_sign_extension(self):
+        # Extract 4 bits from bit 30 across dword boundary:
+        # s[0] = 0x80000000, s[1] = 0x00000000
+        # bits [33:30] of 0x0000000080000000 -> bit 31 is 1 -> value is 0x2
+        # But if bit 33 were 1 -> negative. Let's make bit 33 = 1:
+        # s[0] = 0x00000000, s[1] = 0x00000002 -> bit 33 is 1
+        # offset 30, width 4: field extracted has MSB=1 -> negative
+        lines = [
+            "s_mov_b32 s0, 0x00000000",
+            "s_mov_b32 s1, 0x00000002",
+            "s_mov_b32 s2, 0x0004001E",  # width 4, offset 30
+            "s_bfe_i64 s[4:5], s[0:1], s2",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, s6",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i64_neg")
+        # Field is 0x8 (binary 1000) -> -8 in 4-bit signed -> sign-extended to 64-bit 0xFFFFFFFFFFFFFFF8
+        self.assertEqual(words[0], 0xFFFFFFF8)
+        self.assertEqual(words[1], 0xFFFFFFFF)
+        self.assertEqual(words[2], 1)
+
+    def test_bfe_i64_positive_sign_extension(self):
+        lines = [
+            "s_mov_b32 s0, 0x00000000",
+            "s_mov_b32 s1, 0x00000001",
+            "s_mov_b32 s2, 0x0004001E",  # width 4, offset 30 -> field is 0x4 (MSB=0 -> positive 4)
+            "s_bfe_i64 s[4:5], s[0:1], s2",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, s6",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i64_pos")
+        self.assertEqual(words[0], 4)
+        self.assertEqual(words[1], 0)
+        self.assertEqual(words[2], 1)
+
+    def test_bfe_i64_zero_width_and_scc(self):
+        lines = [
+            "s_mov_b32 s0, 0xFFFFFFFF",
+            "s_mov_b32 s1, 0xFFFFFFFF",
+            "s_mov_b32 s2, 0x00000020",  # width 0, offset 32
+            "s_bfe_i64 s[4:5], s[0:1], s2",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, s6",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i64_zwid")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+        self.assertEqual(words[2], 0)
+
+    def test_bfe_i64_clamped_boundary(self):
+        # offset 60, width 8 -> clamped to 4 bits
+        # s[1] = 0x80000000 -> top 4 bits are 0x8 (MSB=1 -> negative -8)
+        lines = [
+            "s_mov_b32 s0, 0x00000000",
+            "s_mov_b32 s1, 0x80000000",
+            "s_mov_b32 s2, 0x0008003C",
+            "s_bfe_i64 s[4:5], s[0:1], s2",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i64_clamp")
+        self.assertEqual(words[0], 0xFFFFFFF8)
+        self.assertEqual(words[1], 0xFFFFFFFF)
+
+    def test_bfe_i64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_bfe_i64_err", ["s_bfe_i64 s[0:1], s[2:3]", "s_endpgm"])
+
+    def test_bfe_i64_mutation_detection(self):
+        # Mutating i64 to u64 would leave high dword as 0 instead of 0xFFFFFFFF
+        lines = [
+            "s_mov_b32 s0, 0x00000000",
+            "s_mov_b32 s1, 0x00000002",
+            "s_mov_b32 s2, 0x0004001E",
+            "s_bfe_i64 s[4:5], s[0:1], s2",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfe_i64_mut")
+        self.assertEqual(words[1], 0xFFFFFFFF)
+        self.assertNotEqual(words[1], 0x00000000)
+
+
+# ==============================================================================
+# 5. s_bfm_b32 Translator Tests
+# ==============================================================================
+class TestSBfmB32Translator(unittest.TestCase):
+    def test_bfm_b32_canonical(self):
+        # width = 8, offset = 4 -> ((1 << 8) - 1) << 4 = 0xFF << 4 = 0xFF0
+        lines = [
+            "s_mov_b32 s0, 8",
+            "s_mov_b32 s1, 4",
+            "s_bfm_b32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfm_b32_canon")
+        self.assertEqual(words[0], 0xFF0)
+
+    def test_bfm_b32_zero_width(self):
+        # width = 0 -> (1 << 0) - 1 = 0
+        lines = [
+            "s_mov_b32 s0, 0",
+            "s_mov_b32 s1, 8",
+            "s_bfm_b32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfm_b32_zwid")
+        self.assertEqual(words[0], 0)
+
+    def test_bfm_b32_width_modulo_32(self):
+        # width 32 mod 32 = 0 -> output 0
         # width 31, offset 0 -> 0x7FFFFFFF
-        self.assertEqual(ref_bfm_b32(31, 0), 0x7FFFFFFF)
-        # width 32 mod 32 = 0
-        self.assertEqual(ref_bfm_b32(32, 0), 0)
-        # offset 32 mod 32 = 0
-        self.assertEqual(ref_bfm_b32(8, 32), 0xFF)
+        lines1 = [
+            "s_mov_b32 s0, 32",
+            "s_mov_b32 s1, 0",
+            "s_bfm_b32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words1 = run_ps_words(lines1, "ps_bfm_b32_w32")
+        self.assertEqual(words1[0], 0)
+
+        lines2 = [
+            "s_mov_b32 s0, 31",
+            "s_mov_b32 s1, 0",
+            "s_bfm_b32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words2 = run_ps_words(lines2, "ps_bfm_b32_w31")
+        self.assertEqual(words2[0], 0x7FFFFFFF)
+
+    def test_bfm_b32_offset_modulo_32(self):
+        # offset 36 mod 32 = 4; width 4 -> 0xF << 4 = 0xF0
+        lines = [
+            "s_mov_b32 s0, 4",
+            "s_mov_b32 s1, 36",
+            "s_bfm_b32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfm_b32_off36")
+        self.assertEqual(words[0], 0xF0)
+
+    def test_bfm_b32_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_bfm_b32_err", ["s_bfm_b32 s0, s1", "s_endpgm"])
+
+    def test_bfm_b32_mutation_detection(self):
+        lines = [
+            "s_mov_b32 s0, 8",
+            "s_mov_b32 s1, 4",
+            "s_bfm_b32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfm_b32_mut")
+        self.assertNotEqual(words[0], 0xFF)
 
 
-def run_hw_bfm_b32(width: int, offset: int) -> int:
-    lines = [
-        f"s_mov_b32 s0, {width & MASK32:#x}",
-        f"s_mov_b32 s1, {offset & MASK32:#x}",
-        "s_bfm_b32 s2, s0, s1",
-        "v_mov_b32 v0, s2",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_bfm_b32_hw", lines)
-    return support.mrt0_words(spv)[0]
+# ==============================================================================
+# 6. s_bfm_b64 Translator Tests
+# ==============================================================================
+class TestSBfmB64Translator(unittest.TestCase):
+    def test_bfm_b64_lane_active(self):
+        # s_bfm_b64 produces a 64-bit lane mask.
+        # When width = 16, offset = 0: lane 0 is in [0, 16) -> selected
+        lines = [
+            "s_mov_b32 s0, 16",
+            "s_mov_b32 s1, 0",
+            "s_bfm_b64 s[2:3], s0, s1",
+            "v_cndmask_b32 v0, 0, 1, s[2:3]",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfm_b64_on")
+        self.assertEqual(words[0], 1)
 
+    def test_bfm_b64_lane_inactive(self):
+        # When width = 16, offset = 16: lane 0 is NOT in [16, 32) -> not selected (0)
+        lines = [
+            "s_mov_b32 s0, 16",
+            "s_mov_b32 s1, 16",
+            "s_bfm_b64 s[2:3], s0, s1",
+            "v_cndmask_b32 v0, 0, 1, s[2:3]",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfm_b64_off")
+        self.assertEqual(words[0], 0)
 
-class TestSBfmB32HardwareTranslator(unittest.TestCase):
-    """Translator hardware integration tests for s_bfm_b32."""
+    def test_bfm_b64_zero_width(self):
+        # width = 0 -> no lanes active
+        lines = [
+            "s_mov_b32 s0, 0",
+            "s_mov_b32 s1, 0",
+            "s_bfm_b64 s[2:3], s0, s1",
+            "v_cndmask_b32 v0, 0, 1, s[2:3]",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfm_b64_zwid")
+        self.assertEqual(words[0], 0)
 
-    def test_translator_mask_cases(self):
-        self.assertEqual(run_hw_bfm_b32(8, 4), 0xFF0)
-        self.assertEqual(run_hw_bfm_b32(16, 0), 0xFFFF)
+    def test_bfm_b64_modulo_64(self):
+        # width 64 mod 64 = 0 -> empty mask (0)
+        lines1 = [
+            "s_mov_b32 s0, 64",
+            "s_mov_b32 s1, 0",
+            "s_bfm_b64 s[2:3], s0, s1",
+            "v_cndmask_b32 v0, 0, 1, s[2:3]",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words1 = run_ps_words(lines1, "ps_bfm_b64_w64")
+        self.assertEqual(words1[0], 0)
 
+        # width 16, offset 64 mod 64 = 0 -> lane 0 is in [0, 16) -> 1
+        lines2 = [
+            "s_mov_b32 s0, 16",
+            "s_mov_b32 s1, 64",
+            "s_bfm_b64 s[2:3], s0, s1",
+            "v_cndmask_b32 v0, 0, 1, s[2:3]",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words2 = run_ps_words(lines2, "ps_bfm_b64_off64")
+        self.assertEqual(words2[0], 1)
 
-def ref_bfm_b64(width: int, offset: int) -> int:
-    """Reference mathematical oracle for RDNA2 s_bfm_b64."""
-    w = width & 63
-    o = offset & 63
-    return (((1 << w) - 1) << o) & MASK64
+    def test_bfm_b64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_bfm_b64_err", ["s_bfm_b64 s0, s1", "s_endpgm"])
 
-
-class TestSBfmB64Reference(unittest.TestCase):
-    """Reference oracle unit tests for s_bfm_b64."""
-
-    def test_reference_64bit_masks(self):
-        self.assertEqual(ref_bfm_b64(32, 0), 0xFFFFFFFF)
-        self.assertEqual(ref_bfm_b64(16, 32), 0x0000FFFF_00000000)
-
-    def test_reference_zero_width(self):
-        self.assertEqual(ref_bfm_b64(0, 10), 0)
-
-
-def step_scalar_bfm_b64(state: SaluState, instr: Instruction) -> None:
-    if instr.opcode != "s_bfm_b64":
-        raise ValueError(f"Unexpected opcode: {instr.opcode}")
-    w = state.read_u32(instr.src0)
-    o = state.read_u32(instr.src1)
-    val = ref_bfm_b64(w, o)
-    state.write_u64(instr.dst.index_or_val, val)
-
-
-class TestSBfmB64ASTInterpreter(unittest.TestCase):
-    """AST opcode definitions and scalar interpreter for s_bfm_b64."""
-
-    def test_scalar_interpreter_execution(self):
-        state = SaluState()
-        state.write_u32(0, 8)
-        state.write_u32(1, 32)
-        instr = Instruction("s_bfm_b64", Operand.sgpr64(2), Operand.sgpr32(0), Operand.sgpr32(1))
-        step_scalar_bfm_b64(state, instr)
-        self.assertEqual(state.sgprs[2], 0)
-        self.assertEqual(state.sgprs[3], 0xFF)
-
-
-class TestSBfmB64Bounds(unittest.TestCase):
-    """64-bit mask wrapping and boundary handling for s_bfm_b64."""
-
-    def test_width_and_offset_modulo_64(self):
-        # width 64 mod 64 = 0
-        self.assertEqual(ref_bfm_b64(64, 0), 0)
-        # width 63, offset 0 -> 0x7FFFFFFFFFFFFFFF
-        self.assertEqual(ref_bfm_b64(63, 0), 0x7FFFFFFF_FFFFFFFF)
-        # offset 64 mod 64 = 0
-        self.assertEqual(ref_bfm_b64(8, 64), 0xFF)
-
-
-def run_hw_bfm_b64(width: int, offset: int) -> int:
-    lines = [
-        f"s_mov_b32 s0, {width & MASK32:#x}",
-        f"s_mov_b32 s1, {offset & MASK32:#x}",
-        "s_bfm_b64 s[2:3], s0, s1",
-        "v_cndmask_b32 v0, 0, 1, s[2:3]",
-        "exp mrt0 v0, v0, v0, v0 done vm",
-        "s_endpgm",
-    ]
-    spv = support.translate_lines("ps_bfm_b64_hw", lines)
-    return support.mrt0_words(spv)[0]
-
-
-class TestSBfmB64HardwareTranslator(unittest.TestCase):
-    """Translator hardware integration tests for s_bfm_b64."""
-
-    def test_translator_mask_cases(self):
-        # Lane 0 selected when offset <= 0 < offset + width
-        self.assertEqual(run_hw_bfm_b64(16, 0), 1)
-        # Lane 0 not selected when offset = 16
-        self.assertEqual(run_hw_bfm_b64(16, 16), 0)
+    def test_bfm_b64_mutation_detection(self):
+        # Sabotage check: offset 10 with width 5 should NOT activate lane 0
+        lines = [
+            "s_mov_b32 s0, 5",
+            "s_mov_b32 s1, 10",
+            "s_bfm_b64 s[2:3], s0, s1",
+            "v_cndmask_b32 v0, 0, 1, s[2:3]",
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 0",
+        ]
+        words = run_ps_words(lines, "ps_bfm_b64_mut")
+        self.assertNotEqual(words[0], 1)
+        self.assertEqual(words[0], 0)
 
 
 if __name__ == "__main__":
