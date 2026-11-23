@@ -19,7 +19,6 @@ from hw_oracle import asm, runner, tsharp  # noqa: E402
 GFX11, GFX10, GFX101 = "gfx1150", "gfx1030", "gfx1010"
 
 
-####
 GFX12 = "gfx1201"
 
 
@@ -44,7 +43,6 @@ def test_t_sharp_gfx12_has_custom_pitch():
 
 
 
-####
 
 def test_t_sharp_gfx11_exact_words():
     # 16x8 R8G8B8A8_UNORM, linear: FORMAT 42 at [27:20], WIDTH_LO = 15 & 3 at [31:30], WIDTH_HI = 15 >> 2,
@@ -121,19 +119,38 @@ def case(fmt="R8G8B8A8_UNORM", width=8, height=8, dmask=0xf, wave=32, index=0, s
 
 def test_kernel_text_per_family():
     c = case(width=64, height=64, dmask=0x5)
+
     for arch in (GFX11, GFX10):
         k = imf.hw_kernel(arch, c)
         text = "\n".join(k.lines)
         assert k.threads == 1024 and k.words == 64 * 64 * 4 and k.raw and k.wave == 32
         assert "image_load v[8:9], v[2:3], s[8:15] dmask:0x5 dim:SQ_RSRC_IMG_2D unorm" in text
-        assert text.count("image_load") == 4                      # 4096 texels over 1024 lanes
-        assert "s_getpc_b64 s[4:5]" in text and ".p2align 8" in text and ".Ltex0:" in text
-        assert text.index("s_endpgm") < text.index(".Ltex0:")      # the texture sits behind the code
+        assert text.count("image_load") == 4
+        assert "s_getpc_b64 s[4:5]" in text
+        assert ".p2align 8" in text and ".Ltex0:" in text
+        assert text.index("s_endpgm") < text.index(".Ltex0:")
+
         full = asm.raw_kernel_text("k0", k.lines, arch)
         assert ("global_store_b128 v4, v[8:11], s[2:3]" in full) == (arch == GFX11)
         assert ("global_store_dwordx4 v4, v[8:11], s[2:3]" in full) == (arch == GFX10)
+
+    # GFX12 uses a different image_load coordinate operand.
+    k12 = imf.hw_kernel("gfx1201", c)
+    text12 = "\n".join(k12.lines)
+    loads12 = [line for line in k12.lines if "image_load" in line]
+
+    assert k12.threads == 1024 and k12.words == 64 * 64 * 4
+    assert len(loads12) == 4
+    assert all("[v2, v3]" in line for line in loads12)
+    assert all("v[2:3]" not in line for line in loads12)
+    assert all(" unorm" not in line for line in loads12)
+    assert all("dmask:0x5" in line for line in loads12)
+
     one = imf.hw_kernel(GFX11, case(dmask=0x2))
     assert "image_load v8, v[2:3]" in "\n".join(one.lines)
+
+    one12 = imf.hw_kernel("gfx1201", case(dmask=0x2))
+    assert "image_load v8, [v2, v3]" in "\n".join(one12.lines)
 
 
 def test_kernel_data_is_the_laid_out_texture():
@@ -309,7 +326,14 @@ def test_on_the_hardware_when_present(monkeypatch, capsys):
     assert "mismatch 0" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("arch,wave", [("gfx1030", 32), ("gfx1030", 64), ("gfx1150", 32), ("gfx1150", 64)])
+@pytest.mark.parametrize("arch,wave", [
+    ("gfx1030", 32),
+    ("gfx1030", 64),
+    ("gfx1150", 32),
+    ("gfx1150", 64),
+    ("gfx1201", 32),
+    ("gfx1201", 64),
+])
 def test_kernels_assemble_for_both_families(arch, wave, tmp_path):
     """Every format and dmask of the kernel text assembles with AMD clang for the family (no GPU needed)."""
     import subprocess

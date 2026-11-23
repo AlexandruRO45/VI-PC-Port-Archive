@@ -65,8 +65,8 @@ FORMATS = {
 }
 SIZES = (8, 16, 32, 64)
 DMASKS = (
-    0x5, 0xA, 0x6, 0x9, 0xB, 0xD, 0xE, 0xC,
-    0x3, 0x7, 0xF, 0x1, 0x2, 0x4, 0x8
+    0xF, 0x5, 0xA, 0x6, 0x9, 0xB, 0xD,
+    0xE, 0xC, 0x3, 0x7, 0x1, 0x2, 0x4, 0x8
 )
 STDERR_TAIL = 20  # lines of the harness's output a failure prints
 
@@ -515,11 +515,7 @@ def negative_control(oracle, cases, a):
     for name, what in PERTURBATIONS.items():
         PERTURB.add(name)
         try:
-            mismatched = [c for c in ran if compare_hw(c, words[c.index])]
-            n = len(mismatched)
-
-            
-                    
+            n = sum(1 for c in ran if compare_hw(c, words[c.index]))
         finally:
             PERTURB.discard(name)
         print(f"perturbation {name} ({what}): caught by {n} of {len(ran)} cases" + ("" if n else "   <-- NOT CAUGHT"))
