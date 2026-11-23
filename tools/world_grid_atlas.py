@@ -227,6 +227,8 @@ def load_manifests(work: str) -> list:
             continue
         with open(path, encoding="utf-8-sig") as f:
             manifest = json.load(f)
+        if not isinstance(manifest, dict):
+            raise ValueError(f"{path}: texture manifest must be a JSON object")
         for item in manifest.get("Items", []):
             for t in item.get("Textures", []):
                 out.append({"archive": archive, "offset": int(item["Offset"]), "dir": item["Dir"],

@@ -176,6 +176,21 @@ class PlainLogicTest(unittest.TestCase):
             self.assertEqual(len(recs), 1)
             self.assertEqual(recs[0]["name"], "watersystemheightmap")
 
+    def test_cli_rejects_a_texture_manifest_with_a_non_object_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve = os.path.join(td, "carve")
+            tex_dir = os.path.join(td, "assets", "sample", "textures")
+            os.mkdir(carve)
+            os.makedirs(tex_dir)
+            manifest = os.path.join(tex_dir, "manifest.json")
+            with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+                json.dump([], f)
+            result = subprocess.run([sys.executable, "-I", TOOL, td, "--carve", carve],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn(f"{manifest}: texture manifest must be a JSON object", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
 
 # ---- synthetic work folder and carve ---------------------------------------------------------------------------
 
