@@ -18,6 +18,10 @@
 // (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
 #include <windows.h>
 
+#if defined(LEONIDA_AVX2) && defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -59,6 +63,32 @@ int usage() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+#if defined(LEONIDA_AVX2)
+#if defined(_MSC_VER)
+    int cpu_info[4] = {};
+    __cpuid(cpu_info, 1);
+    const bool osxsave = (cpu_info[2] & (1 << 27)) != 0;
+    const bool fma = (cpu_info[2] & (1 << 12)) != 0;
+    const bool avx = (cpu_info[2] & (1 << 28)) != 0;
+    __cpuidex(cpu_info, 7, 0);
+    const bool avx2 = (cpu_info[1] & (1 << 5)) != 0;
+    const bool bmi2 = (cpu_info[1] & (1 << 8)) != 0;
+    bool xmm_ymm_supported = false;
+    if (osxsave) {
+        const unsigned long long xcr0 = _xgetbv(0);
+        xmm_ymm_supported = (xcr0 & 0x6) == 0x6;
+    }
+    if (!avx || !avx2 || !fma || !bmi2 || !xmm_ymm_supported) {
+        std::fprintf(stderr, "[rt] gta6rt: binary was compiled with LEONIDA_AVX2=ON, but the host CPU lacks required AVX2, FMA, or BMI2 support.\n");
+        return 1;
+    }
+#elif defined(__GNUC__) || defined(__clang__)
+    if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("bmi2")) {
+        std::fprintf(stderr, "[rt] gta6rt: binary was compiled with LEONIDA_AVX2=ON, but the host CPU lacks required AVX2, FMA, or BMI2 support.\n");
+        return 1;
+    }
+#endif
+#endif
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;

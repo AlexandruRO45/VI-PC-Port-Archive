@@ -22,7 +22,7 @@ cmake -S runtime -B runtime/build
 cmake --build runtime/build --config RelWithDebInfo
 ```
 
-Pass `-DLEONIDA_AVX2=ON` to enable AVX2, FMA and BMI2 vector acceleration for x86-64 host processors (Intel Haswell+, AMD Zen+).
+Pass `-DLEONIDA_AVX2=ON` to enable AVX2, FMA and BMI2 vector acceleration for x86-64 host processors (Intel Haswell+, AMD Zen+). When built with this option, `gta6rt` validates host AVX2/FMA/BMI2 CPUID features at startup and exits with a clear diagnostic on incompatible CPUs.
 
 Requirements: Windows x64, Visual Studio 2022 with the C++ desktop workload. The GPU tools need the
 Vulkan SDK; the runtime and CPU tests do not. The loader is x64-only and the PE mapper rejects any
