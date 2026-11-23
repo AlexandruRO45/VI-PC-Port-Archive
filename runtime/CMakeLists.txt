@@ -899,6 +899,8 @@ if(BUILD_TESTING)
   add_test(NAME shader_library COMMAND shader_library_test)
   # The byte budget around the runtime's compute-pipeline compiles (src/compile_gate.h); threads, no GPU.
   add_executable(compile_gate_test test/compile_gate_test.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(compile_gate_test PRIVATE Threads::Threads)
   add_test(NAME compile_gate COMMAND compile_gate_test)
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
