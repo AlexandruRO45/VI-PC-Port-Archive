@@ -220,12 +220,13 @@ void test_prefixes() {
     }
     const uint8_t stacked[] = {0x66, 0xF3, 0x2E, 0x48, 0x0F, 0x01, 0xFC};
     check(emulated_as(stacked, sizeof stacked), "CLZERO with 66 F3 2E and REX.W: emulated, 7 bytes long");
-    // REX is not a prefix the CPU lets stand before another prefix: it is then ignored, and the CPU still runs CLZERO.
-    // This emulator keeps to the encoding the compiler and the assembler produce and leaves the rest alone.
+    // AMD hardware counts every REX byte toward the instruction length.
     const uint8_t rex_then_legacy[] = {0x48, 0x66, 0x0F, 0x01, 0xFC};
-    check(declined(rex_then_legacy, sizeof rex_then_legacy), "REX before a legacy prefix: not emulated, nothing modified");
+    check(emulated_as(rex_then_legacy, sizeof rex_then_legacy), "REX before a legacy prefix: emulated, 5 bytes long");
     const uint8_t two_rex[] = {0x48, 0x48, 0x0F, 0x01, 0xFC};
-    check(declined(two_rex, sizeof two_rex), "two REX bytes: not emulated, nothing modified");
+    check(emulated_as(two_rex, sizeof two_rex), "two REX bytes: emulated, 5 bytes long");
+    const uint8_t three_rex[] = {0x40, 0x48, 0x4F, 0x0F, 0x01, 0xFC};
+    check(emulated_as(three_rex, sizeof three_rex), "three REX bytes: emulated, 6 bytes long");
     // LOCK on CLZERO is a real #UD, alone or among other prefixes.
     const uint8_t lock[] = {0xF0, 0x0F, 0x01, 0xFC};
     check(declined(lock, sizeof lock), "LOCK CLZERO: not emulated, nothing modified");
