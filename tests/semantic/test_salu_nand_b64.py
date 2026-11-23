@@ -355,6 +355,69 @@ class SaluNandB64InterpreterTests(unittest.TestCase):
             self.assertEqual(state.scc, ref_scc(expected))
             current = expected
 
+class SaluNandB64SimdDivergenceTests(unittest.TestCase):
+    """SIMD multi-lane divergence and Wave32/Wave64 EXEC masking tests for s_nand_b64."""
+
+    def test_wave64_divergent_branch_nand(self):
+        state = ScalarState()
+        state.exec = MASK64
+        state.vcc = 0x55555555_55555555
+
+        # s_nand_b64 exec, exec, vcc
+        state.execute_nand_b64("exec", "exec", "vcc")
+        # NAND(MASK64, 0x5555555555555555) = ~0x5555555555555555 = 0xAAAAAAAAAAAAAAAA
+        self.assertEqual(state.exec, 0xAAAAAAAA_AAAAAAAA)
+        self.assertEqual(state.scc, 1)
+
+    def test_wave32_lower_half_divergence(self):
+        state = ScalarState()
+        state.exec = 0x00000000_FFFFFFFF
+        state.vcc = 0x00000000_0000FFFF
+
+        # s_nand_b64 exec, exec, vcc
+        # ~(0x000000000000FFFF) & MASK64 = 0xFFFFFFFFFFFF0000
+        state.execute_nand_b64("exec", "exec", "vcc")
+        self.assertEqual(state.exec, 0xFFFFFFFF_FFFF0000)
+        self.assertEqual(state.scc, 1)
+
+    def test_checkerboard_non_overlapping_masks(self):
+        state = ScalarState()
+        even_lanes = 0x55555555_55555555
+        odd_lanes = 0xAAAAAAAA_AAAAAAAA
+        state.exec = even_lanes
+        state.vcc = odd_lanes
+
+        # NAND of disjoint lane sets produces all 1s (MASK64)
+        state.execute_nand_b64("exec", "exec", "vcc")
+        self.assertEqual(state.exec, MASK64)
+        self.assertEqual(state.scc, 1)
+
+    def test_single_lane_mask_nand(self):
+        state = ScalarState()
+        for lane in range(64):
+            with self.subTest(lane=lane):
+                mask = 1 << lane
+                state.exec = mask
+                state.vcc = mask
+                state.execute_nand_b64("exec", "exec", "vcc")
+                expected = (~mask) & MASK64
+                self.assertEqual(state.exec, expected)
+                self.assertEqual(state.scc, 1)
+
+    def test_all_lanes_active_all_disabled(self):
+        state = ScalarState()
+        state.exec = MASK64
+        state.vcc = MASK64
+        # All lanes active & true -> NAND disables all lanes!
+        state.execute_nand_b64("exec", "exec", "vcc")
+        self.assertEqual(state.exec, 0)
+        self.assertEqual(state.scc, 0)
+
+        # All lanes disabled -> NAND enables all lanes!
+        state.execute_nand_b64("exec", "exec", "vcc")
+        self.assertEqual(state.exec, MASK64)
+        self.assertEqual(state.scc, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
