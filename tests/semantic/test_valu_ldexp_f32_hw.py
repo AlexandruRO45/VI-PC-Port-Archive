@@ -233,5 +233,72 @@ class TestVLdexpF32AST(unittest.TestCase):
         with self.assertRaises(ValueError):
             instr.validate()
 
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ScalarVALUState:
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    exec_mask: int = MASK32
+
+    def read_operand(self, op: Operand) -> int:
+        if op.kind == RegKind.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.kind == RegKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        elif op.kind == RegKind.IMM:
+            return op.imm_val & MASK32
+        raise NotImplementedError(f"Unsupported operand kind: {op.kind}")
+
+    def write_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+
+class ScalarVALUInterpreter:
+    """Deterministic single-lane VALU interpreter for v_ldexp_f32."""
+
+    @staticmethod
+    def step(instr: VLdexpF32Instruction, state: ScalarVALUState) -> None:
+        instr.validate()
+        s0_val = state.read_operand(instr.src0)
+        s1_val = state.read_operand(instr.src1)
+        res = ref_ldexp_f32(s0_val, s1_val)
+        state.write_vgpr(instr.dst.index, res)
+
+
+class TestVLdexpF32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter execution."""
+
+    def setUp(self):
+        self.state = ScalarVALUState()
+
+    def test_interpreter_step_basic(self):
+        # v1 = 1.0f (0x3F80_0000), s2 = 3 -> v0 = 8.0f (0x4100_0000)
+        self.state.vgprs[1] = 0x3F80_0000
+        self.state.sgprs[2] = 3
+
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.SGPR, index=2),
+        )
+        ScalarVALUInterpreter.step(instr, self.state)
+        self.assertEqual(self.state.vgprs[0], 0x4100_0000)
+
+    def test_interpreter_step_negative_scale(self):
+        # v1 = 8.0f (0x4100_0000), v2 = -3 (0xFFFF_FFFD) -> v0 = 1.0f (0x3F80_0000)
+        self.state.vgprs[1] = 0x4100_0000
+        self.state.vgprs[2] = (-3) & MASK32
+
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.VGPR, index=2),
+        )
+        ScalarVALUInterpreter.step(instr, self.state)
+        self.assertEqual(self.state.vgprs[0], 0x3F80_0000)
+
 if __name__ == "__main__":
     unittest.main()
