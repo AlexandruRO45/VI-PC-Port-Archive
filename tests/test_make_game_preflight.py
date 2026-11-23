@@ -892,11 +892,11 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.assert_fails(self.run_preflight, work, free_gb=220, match="about 400 GB is needed")
 
     def test_stopped_export_counts_what_it_already_wrote(self):
-        # Before: a stopped export that had written 277 GB still asked for all 300 GB free, so it couldn't resume.
+        # Before: a stopped export that had written 277 GB still asked for all 370 GB free, so it couldn't resume.
         with tempfile.TemporaryDirectory() as work:
             with mock.patch("make_game.tree_bytes", return_value=277 * 2**30):
-                self.run_preflight(work, free_gb=60)  # 30 for the shaders + 300 - 277
-                self.assert_fails(self.run_preflight, work, free_gb=40, match="about 53 GB is needed")
+                self.run_preflight(work, free_gb=130)  # 30 for the shaders + 370 - 277
+                self.assert_fails(self.run_preflight, work, free_gb=100, match="about 123 GB is needed")
 
     def test_tree_bytes_sums_files_under_the_folder(self):
         with tempfile.TemporaryDirectory() as work:
