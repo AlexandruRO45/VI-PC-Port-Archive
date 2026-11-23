@@ -630,7 +630,7 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
         )
 
 
-def run_draw(args, manifest: dict, out_dir: str) -> dict:
+def run_draw(args, manifest: dict, out_dir: str, *, min_coverage: float | None = None) -> dict:
     if manifest.get("vertex_count") == 0 or manifest.get("index_count") == 0:
         raise SystemExit("first-light draw requires an OBJ with faces. Prepare this output with --obj before drawing.")
     harness = find_harness(args.harness)
@@ -653,8 +653,9 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         raise SystemExit(f"the harness exited successfully but did not write {raw}")
     with open(raw, "rb") as f:
         data = f.read()
+    criteria = manifest if min_coverage is None else {**manifest, "min_coverage": min_coverage}
     try:
-        result = check_image(data, manifest)
+        result = check_image(data, criteria)
     except AssertionError as e:
         raise SystemExit(str(e)) from e
     ppm = os.path.join(out_dir, "image.ppm")
@@ -667,6 +668,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         "covered": result["covered"],
         "total": manifest["width"] * manifest["height"],
         "ratio": result["ratio"],
+        "min_coverage": criteria.get("min_coverage", 0.0),
         "ppm": ppm,
     }
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
@@ -739,7 +741,10 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--width", type=int, default=128)
     ap.add_argument("--height", type=int, default=128)
-    ap.add_argument("--min-coverage", type=float, default=0.5)
+    ap.add_argument(
+        "--min-coverage", type=float,
+        help="minimum covered fraction (default 0.5 for a new draw; overrides the saved minimum for one recheck)",
+    )
     ap.add_argument(
         "--no-fit",
         action="store_true",
@@ -764,6 +769,8 @@ def main(argv=None) -> int:
         help="list VS/PS names in the carve index and exit",
     )
     a = ap.parse_args(argv)
+    if a.min_coverage is not None and not 0 <= a.min_coverage <= 1:
+        ap.error("--min-coverage must be between 0 and 1")
     work = os.path.abspath(os.path.expanduser(a.work))
     out_dir = (
         os.path.abspath(os.path.expanduser(a.out))
@@ -782,7 +789,7 @@ def main(argv=None) -> int:
     existing = os.path.join(out_dir, "manifest.json")
     if a.check and not a.game and os.path.isfile(existing):
         manifest = load_json(existing, "first-light manifest", dict, keys=("width", "height"))
-        run_draw(a, manifest, out_dir)
+        run_draw(a, manifest, out_dir, min_coverage=a.min_coverage)
         return 0
     if not a.game:
         raise SystemExit("--game is required")
@@ -853,7 +860,7 @@ def main(argv=None) -> int:
         "obj_sha256": obj_sha256,
         "width": a.width,
         "height": a.height,
-        "min_coverage": a.min_coverage,
+        "min_coverage": 0.5 if a.min_coverage is None else a.min_coverage,
         "max_coverage": 0.99,
         "centre_pixel": centre_pixel,
         "centre_uv": list(centre_uv) if centre_uv else None,

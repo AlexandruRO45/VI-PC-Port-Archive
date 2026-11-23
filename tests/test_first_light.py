@@ -11,7 +11,7 @@ all-opaque and swapped-UV negatives stay red.
 The image is written to the directory as image_first_light.raw/.ppm; no game data is in the repository.
 """
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -193,6 +193,7 @@ class ShaderPreparationTests(unittest.TestCase):
                                           "--vs", "shared", "--ps", "shared"]), 0)
             out = work / "first_light" / "out"
             manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["min_coverage"], 0.5)
             runtime_index = json.loads((out / "index.json").read_text(encoding="utf-8"))
             for stage, module in modules.items():
                 self.assertEqual((out / manifest["files"][stage]).read_bytes(), module)
@@ -406,6 +407,38 @@ class OracleTests(unittest.TestCase):
 
     def test_accepts_the_expected_image(self):
         check_image(self.image(), self.manifest)
+
+    def test_min_coverage_must_be_a_fraction(self):
+        for value in ("-inf", "nan", "inf", "-0.1", "1.1"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as stopped:
+                    fl.main(["--check", f"--min-coverage={value}"])
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn("--min-coverage must be between 0 and 1", stderr.getvalue())
+
+    def test_recheck_honors_explicit_coverage_without_changing_the_saved_minimum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps({**self.manifest, "files": {"mesh": "mesh.bin"}}),
+                                     encoding="utf-8", newline="\n")
+            original = manifest_path.read_bytes()
+            args = ["--check", "--out", tmp, "--harness", sys.executable]
+
+            def draw(cmd, **kwargs):
+                Path(cmd[3]).write_bytes(self.image())  # 4 of 16 pixels covered
+
+            with patch.object(fl.subprocess, "run", side_effect=draw), redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(SystemExit, "coverage 0.2500 outside"):
+                    fl.main([*args, "--min-coverage", "0.3"])
+                self.assertEqual(manifest_path.read_bytes(), original)
+                self.assertEqual(fl.main([*args, "--min-coverage", "0.25"]), 0)
+                self.assertEqual(fl.main([*args, "--min-coverage", "0"]), 0)
+                saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["min_coverage"], 0.2)
+                self.assertEqual(saved["result"]["min_coverage"], 0)
+                self.assertEqual(fl.main(args), 0)
+                saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["result"]["min_coverage"], 0.2)
 
     def test_rejects_an_all_opaque_image(self):
         with self.assertRaises(AssertionError):
