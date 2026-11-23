@@ -759,7 +759,8 @@ def _reads_mask_word(ins, x, lm_map):
     for the b64 forms an SGPR pair with a lane mask in either word (Gen.mixed_pair_words, SHADER-823)."""
     if _holds_lane_mask(ins, x, lm_map):
         return True
-    return base_op(ins["op"]) in _PAIR_MASK_WORD_READERS and x.get("k") == "sgpr" and x.get("n", 1) == 2 and         any(x["r"] + i in lm_map for i in range(2))
+    return (base_op(ins["op"]) in _PAIR_MASK_WORD_READERS and x.get("k") == "sgpr" and x.get("n", 1) == 2
+            and any(x["r"] + i in lm_map for i in range(2)))
 
 
 def _is_mask_op(ins, x, lm_map):
