@@ -77,6 +77,8 @@ PASSED = [
     ("mz.txt", b"MZ is not enough on its own\n"),
     ("metadata.txt", b"METADATA ADAT later in the line\n"),
     ("bones.md", b"# SKEL_HEAD, MoVE and SCRP name formats; none of them starts this file\n"),
+    ("cache.md", b"The cache starts with PS\x00\x09; see the PSO notes.\n"),
+    ("ps_short.bin", b"PS\x00"),  # three bytes of the cache magic, not four
     ("riff.bin", b"RIFF" + bytes(4) + b"AVI LIST"),
     ("empty.txt", b""),
     ("mz_past_end.txt", pe_header(0x80)[:0x40]),  # e_lfanew points past the end of the file
