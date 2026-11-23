@@ -434,6 +434,7 @@ def _iter_dir_stream_paths(path):
 
 
 def _collect_move_streams_dir(path):
+    """Read selected resources and continuations without retaining unrelated carved payloads."""
     entries = []
     for name, full in _iter_dir_stream_paths(path):
         size = os.path.getsize(full)
@@ -441,25 +442,32 @@ def _collect_move_streams_dir(path):
             continue
         m = re.search(r"0x([0-9a-fA-F]+)|([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1) or m.group(2), 16) if m else len(entries)
-        with open(full, "rb") as fh:
-            data = fh.read()
-        entries.append((offset, name, data))
+        entries.append((offset, name))
     entries.sort(key=lambda e: (e[0], e[1]))
     items = []
     i = 0
     while i < len(entries):
-        offset, _name, data = entries[i]
-        if not is_move_container(data):
-            i += 1
-            continue
-        blob = bytearray(data)
+        offset, name = entries[i]
+        with open(os.path.join(path, name), "rb") as fh:
+            header = fh.read(32)
+            if not is_move_container(header):
+                i += 1
+                continue
+            blob = bytearray(header)
+            blob.extend(fh.read())
         stream_count = 1
         want = expected_total_size(blob)
+        previous_size = len(blob)
         j = i + 1
         while (want is not None and len(blob) < want and j < len(entries)
-               and len(entries[j - 1][2]) == anim_index.MAX_CHUNK
-               and not is_move_container(entries[j][2])):
-            blob += entries[j][2]
+               and previous_size == anim_index.MAX_CHUNK):
+            with open(os.path.join(path, entries[j][1]), "rb") as fh:
+                header = fh.read(32)
+                if is_move_container(header):
+                    break
+                data = header + fh.read()
+            blob.extend(data)
+            previous_size = len(data)
             stream_count += 1
             j += 1
         items.append((offset, stream_count, len(blob), bytes(blob)))

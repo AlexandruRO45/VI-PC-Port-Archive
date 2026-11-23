@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -333,6 +334,40 @@ class AnimMoveTest(unittest.TestCase):
         self.assertEqual([row["streams"] for row in doc["move_resources"]], [1, 2])
         # Ensure per-asset hash arrays are not dumped in the summary JSON.
         self.assertNotIn("network_hash", json.dumps(doc["move_resources"]))
+
+    def test_directory_memory_does_not_retain_unrelated_streams(self):
+        unrelated = b"unrelated" + bytes((1 << 18) - 9)
+        for i in range(32):
+            with open(os.path.join(self.tmp.name, f"{i:08x}.bin"), "wb") as f:
+                f.write(unrelated)
+        resource = self._sample_state_machine_resource()
+        with open(os.path.join(self.tmp.name, "00000020.bin"), "wb") as f:
+            f.write(resource)
+
+        tracemalloc.start()
+        try:
+            items, total = anim_move._collect_move_streams_dir(self.tmp.name)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+        self.assertEqual(total, 33)
+        self.assertEqual(items, [(0x20, 1, len(resource), resource)])
+        # The directory holds 8 MiB of unrelated payloads. Selecting a small
+        # state machine should not retain those bytes in the Python heap.
+        self.assertLess(peak, 2 << 20)
+
+    def test_directory_numeric_order_and_next_root_stop(self):
+        first = self._sample_large_two_stream_resource()[:MAX_CHUNK]
+        second = self._sample_state_machine_resource()
+        for name, data in (("0x2.bin", first), ("0x10.bin", second), ("0x20.bin", b"other")):
+            with open(os.path.join(self.tmp.name, name), "wb") as f:
+                f.write(data)
+
+        items, total = anim_move._collect_move_streams_dir(self.tmp.name)
+
+        self.assertEqual(total, 3)
+        self.assertEqual(items, [(2, 1, len(first), first), (0x10, 1, len(second), second)])
 
     def test_corrupt_resource_is_reported_not_raised_in_scan(self):
         bad = bytearray(self._sample_state_machine_resource())
