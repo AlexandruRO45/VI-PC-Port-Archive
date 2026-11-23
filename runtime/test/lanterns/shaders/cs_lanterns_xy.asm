@@ -3,13 +3,24 @@
 ; s2 = TGID_X, s3 = TGID_Y. Each lane writes gx + 1000 gy (gx = 16 TGID_X + X, gy = 8 TGID_Y + Y) to LDS entry Y * 16 + X,
 ; meets the group at s_barrier, reads the entry of its point mirror in the group (15 - X, 7 - Y), and stores both values
 ; at (gy * 32 + gx) * 8 bytes of the output.
-; s[0:1]: the table (two user SGPRs, the current compute layout). Slot 0: a raw V# of the output.
+; s[0:1]: the table (two user SGPRs, the layout before D3D-448, which the moves below rebuild). Slot 0: a raw V# of
+; the output.
 ; stage: cs
 ; wave: 32
 ; group: 16,8,1
-; rsrc2: 0x8984
+; rsrc2: 0x898a
 ;
-; RSRC2 0x8984: two user SGPRs, TGID_X_EN and TGID_Y_EN (s2, s3), TIDIG_COMP_CNT 1 (v0, v1), LDS_SIZE 1 x 512 bytes.
+; RSRC2 0x8984 before D3D-448 (now 0x898a, see the moves below): two user SGPRs, TGID_X_EN and TGID_Y_EN (s2, s3),
+; TIDIG_COMP_CNT 1 (v0, v1), LDS_SIZE 1 x 512 bytes.
+; D3D-448: a D3D12 compute PSO gets its root arguments in the console layout (rt::rootsig::pack_stage,
+; docs/d3d12_vulkan.md section 3.5): from s4 in root-signature order, a descriptor table as ONE dword (the 32-bit
+; VA of its first descriptor; the heaps live below 4 GiB), a constant one dword per value; s0..s3 are the driver's.
+; RSRC2 0x898a therefore counts 5 user SGPRs (4 + 1), and the thread-group ids follow at s5. These moves rebuild the
+; layout the code below was written for: table s4 -> s[0:1] (high half 0); thread-group ids s5..s6 -> s2..s3.
+s_mov_b32 s0, s4
+s_mov_b32 s1, 0
+s_mov_b32 s2, s5
+s_mov_b32 s3, s6
 s_load_dwordx4 s[4:7], s[0:1], 0x0
 s_lshl_b32 s8, s2, 4
 s_lshl_b32 s9, s3, 3
