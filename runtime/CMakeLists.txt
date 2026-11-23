@@ -116,6 +116,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
     shims/xg_xs.cpp
+    shims/xcrdapi.cpp
     shims/library_loader.cpp
     shims/process.cpp
   )
