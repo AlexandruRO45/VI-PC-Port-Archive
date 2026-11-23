@@ -193,6 +193,43 @@ class ScanTest(unittest.TestCase):
         self.assertEqual((report["banks"], report["streamed_music"]["events"], report["other"]["chunks"]), (1, 1, 0))
         self.assertIsNone(report["other"]["events_per_chunk"])
 
+    def test_out_never_replaces_an_input(self):
+        bank = speech_bank(0x55, 48000, event(TICK, 1.0, 0))
+        one = self.write("one.awc", bank)
+        folder = os.path.join(self.tmp.name, "banks", "nested")
+        os.makedirs(folder)
+        inner = os.path.join(folder, "a.awc")
+        with open(inner, "wb") as f:
+            f.write(bank)
+        packed = self.archive()
+        archive = self.write("fake.rpf", packed)
+        spelled = os.path.join(self.tmp.name, "banks", "..", "one.awc")      # the same file under another spelling
+        cases = [(one, one, bank, "overwrite the input"), (one, spelled, bank, "overwrite the input"),
+                 (os.path.join(self.tmp.name, "banks"), inner, bank, "overwrite the input"),
+                 (archive, archive, packed, "overwrite the input"),
+                 (one, folder, None, "is a directory")]
+        for src, out, kept, message in cases:
+            with self.subTest(src=src, out=out):
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()) as text, contextlib.redirect_stderr(err):
+                    self.assertEqual(awc_markers.main([src, "--out", out]), 2)
+                self.assertEqual(text.getvalue(), "")
+                self.assertEqual(len(err.getvalue().splitlines()), 1)
+                self.assertTrue(err.getvalue().startswith("awc_markers: error: "), err.getvalue())
+                self.assertIn(message, err.getvalue())
+                if kept is not None:
+                    with open(out, "rb") as f:
+                        self.assertEqual(f.read(), kept)
+        self.assertTrue(os.path.isdir(folder))
+        # a report next to the banks, under a name the scan does not read, is still written
+        beside = os.path.join(folder, "report.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(awc_markers.main([os.path.join(self.tmp.name, "banks"), "--out", beside]), 0)
+        with open(beside, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["banks"], 1)
+        with open(inner, "rb") as f:
+            self.assertEqual(f.read(), bank)
+
     def test_runs_under_python_dash_i(self):
         path = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
         proc = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True, timeout=120)

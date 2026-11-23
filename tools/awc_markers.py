@@ -20,7 +20,8 @@ with the length of its own stream in 48 kHz frames: for streamed music the descr
 (interleaved samples divided by the packet channel count, read from the TOC stereo bit of the channel's first
 packet), otherwise the Opus format tag (samples / channels). Streams with neither have no length and are counted.
 
-The report holds counts, sizes, 32-bit hashes and numeric ranges only.
+The report holds counts, sizes, 32-bit hashes and numeric ranges only. `--out` is refused, before anything is read, when it names a
+directory or one of the files the scan reads.
 """
 import argparse
 import json
@@ -30,6 +31,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 from rsc8_audio import parse_adat_at_file  # noqa: E402
 
 TAG_MUSIC, TAG_DATA, TAG_FORMAT, TAG_MARKER = 0x48, 0x55, 0x76, 0xBD
@@ -169,13 +171,17 @@ def _finish(group: dict) -> dict:
     return group
 
 
+def input_paths(src: str) -> list:
+    """Every file a scan of `src` reads: the archive or bank itself, or each *.awc below a directory."""
+    if os.path.isdir(src):
+        return sorted(os.path.join(root, f) for root, _dirs, files in os.walk(src) for f in files
+                      if f.lower().endswith(".awc"))
+    return [src]
+
+
 def scan(src: str) -> dict:
     """The report for an archive, one bank or a directory of banks."""
-    if os.path.isdir(src):
-        paths = sorted(os.path.join(root, f) for root, _dirs, files in os.walk(src) for f in files
-                       if f.lower().endswith(".awc"))
-    else:
-        paths = [src]
+    paths = input_paths(src)
     groups = {"streamed_music": _new_group(), "other": _new_group()}
     banks = streams = 0
     for path in paths:
@@ -201,6 +207,14 @@ def main(argv=None) -> int:
     if not os.path.exists(a.src):
         print(f"awc_markers: error: {a.src}: no such file or directory", file=sys.stderr)
         return 2
+    if a.out:       # checked before the scan: the report is written after it, and must not replace what was read
+        if os.path.isdir(a.out):
+            print(f"awc_markers: error: --out {a.out} is a directory", file=sys.stderr)
+            return 2
+        for path in input_paths(a.src):
+            if same_report_path(a.out, path):
+                print(f"awc_markers: error: --out would overwrite the input {path}", file=sys.stderr)
+                return 2
     report = scan(a.src)
     if a.out:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
