@@ -277,10 +277,13 @@ On the measured package:
 
 The table names each record's hash A once more; it does not group them by station.
 
-### Where the station lists are not
+### Where the station lists were looked for
 
-Three places a station's track list could be, checked over the whole 54 MiB config (13,535,867
-aligned words) and ruled out on this package:
+Three layouts a station's track list could have, checked over the carved config (the 837 streams
+`rpf9_carve.py --until-adat` writes; the carver skips one 52-byte inflated stream below its 64-byte
+minimum) as direct u32 words, 13,535,867 aligned words in all. None of them holds a station list on
+this package. These checks do not rule out an indirect reference (through another table or an index)
+or another encoding:
 
 - **Hash A or V as list members.** Outside the entries, `V` values occur 412 times in 97 streams,
   never more than 8 within 64 words, and those few mix records hundreds of ids apart with repeated
@@ -292,8 +295,8 @@ aligned words) and ruled out on this package:
   ascending), and no entry field has anywhere near one value per station for the 19 descriptors:
   `+4` takes 3 values, `kind` 3, `flags` 8 and `V` 1,350.
 
-So, from the config alone, the VCRR anchor is still the only measured station-to-record mapping; the
-other stations need the executable, or a content-id base rule this page has not found.
+So the VCRR anchor is still the only measured station-to-record mapping. The other stations need a
+layout these checks did not cover, a content-id base rule this page has not found, or the executable.
 
 ## What a runtime needs
 
@@ -341,8 +344,9 @@ Measured:
 
 - Hash A entries: 1,589 of 1,589 records have exactly one 24-byte entry holding their hash A, with
   equal `V` words in all 1,589; the table does not group records by station.
-- Over the whole config: `V` values outside the entries never cluster beyond 8 within 64 words, and
-  no content-id word lies within four words of a record's hash A or hash B.
+- Over the carved config, as direct u32 words: `V` values outside the entries never cluster beyond 8
+  within 64 words, and no content-id word lies within four words of a record's hash A or hash B
+  (indirect references and other encodings not checked).
 
 Inferred:
 

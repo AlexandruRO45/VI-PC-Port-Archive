@@ -13,9 +13,10 @@ little-endian u32:
 
 The entries follow one another with no gap, and a table can continue from one carved stream into the next:
 an entry ends exactly at a stream's end and the following stream starts with the next entry's flags. The
-entries are listed in ascending record id, a V value can be shared by several entries, and no other part of
-the config lists the music records by these values. See docs/radio_stations.md ("Hash A entries") for the
-counts on the measured package.
+entries broadly follow ascending record id and a V value can be shared by several entries. Looked for as
+direct u32 lists, the config does not list the music records by these values; indirect references or other
+encodings were not ruled out. See docs/radio_stations.md ("Hash A entries") for the counts on the measured
+package.
 
 Entries are found by their shape and by the join (the word at +12 must be a record's hash A), not by a stream
 offset, so another carve order or an incomplete carve gives fewer matches, not wrong ones.
@@ -28,6 +29,7 @@ of its entry) and the summary. Hash values stay in your local output: never past
 request (CONTRIBUTING.md).
 """
 import argparse
+import array
 import json
 import os
 import struct
@@ -54,17 +56,36 @@ def entry_at(words, i, hash_a):
             "value_repeated": words[i + 2] == words[i + 1]}
 
 
+def _words(blob, align, n):
+    """`n` little-endian u32 words of `blob` from byte `align`, as a sequence that does not copy the buffer.
+
+    A tuple from struct.unpack_from holds one Python int per word (about 20 bytes of memory per input byte);
+    a memoryview cast reads the words in place. On a big-endian host the words are copied once into an array and
+    byte-swapped, which still keeps one machine word per input word.
+    """
+    view = memoryview(blob)[align:align + 4 * n]
+    if sys.byteorder == "little" and struct.calcsize("I") == 4:
+        return view.cast("B").cast("I")
+    words = array.array("I" if array.array("I").itemsize == 4 else "L")   # one of them is 32 bits wide
+    if words.itemsize != 4:
+        return struct.unpack_from(f"<{n}I", blob, align)                  # no 32-bit array type: tuple fallback
+    words.frombytes(view.tobytes())
+    if sys.byteorder != "little":
+        words.byteswap()
+    return words
+
+
 def scan(blob, hash_a):
     """Yield (byte offset of the entry, entry) for every entry in `blob` whose hash-A word is in `hash_a`.
 
     Each of the four byte alignments is read, because a carved stream does not always start on a word boundary
-    of the config.
+    of the config. The words are read in place (see _words), so memory stays near the size of `blob`.
     """
     for align in range(4):
         n = (len(blob) - align) // 4
         if n < ENTRY_BYTES // 4:
             continue
-        words = struct.unpack_from(f"<{n}I", blob, align)
+        words = _words(blob, align, n)
         for i, v in enumerate(words):
             if v in hash_a:
                 e = entry_at(words, i, hash_a)
@@ -78,7 +99,9 @@ def join(src, records):
     for r in records:
         by_hash.setdefault(r["hash_a"], []).append(r)
     found = {}                  # hash A -> list of (file, offset, entry)
-    for name, blob in audio_config.files_in(src):
+    for name, path in audio_config.paths_in(src):
+        with open(path, "rb") as f:
+            blob = f.read()
         for off, e in scan(blob, by_hash):
             found.setdefault(e["hash_a"], []).append((name, off, e))
     rows = []

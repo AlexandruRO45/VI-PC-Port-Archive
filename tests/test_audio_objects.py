@@ -108,6 +108,39 @@ class AudioObjectsTest(unittest.TestCase):
         self.assertEqual(s["values_shared"], 1)
         self.assertEqual(s["most_entries_per_value"], 4)
 
+    def test_scan_reads_the_buffer_in_place(self):
+        # A tuple of every word costs ~20 bytes per input byte; the scan must stay near the input's own size.
+        import tracemalloc
+        key = 0xAABBCCDD
+        blob = bytearray(b"X" * (1 << 20))               # the tuple version peaked near 20 MB here
+        offsets = [4096 + 65 * k for k in range(4)]      # three of them off the word grid
+        for pos in offsets:
+            blob[pos:pos + 24] = entry(key, 19)
+        tracemalloc.start()
+        try:
+            rows = sorted(O.scan(blob, {key}))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual([p for p, _ in rows], offsets)
+        self.assertTrue(all(e["value"] == 19 and e["value_repeated"] for _, e in rows))
+        self.assertLess(peak, 256 << 10, f"scan peaked at {peak} bytes for a 1 MiB input")
+
+    def test_join_needs_only_paths_in(self):
+        # Another branch drops audio_config.files_in; the join must not depend on it.
+        self.write("000000001000.bin", self.records_stream())
+        self.write("000000002000.bin", bytes(12) + table() + bytes(12))
+        records = audio_config.collect(self.dir, join=True)
+        saved = getattr(audio_config, "files_in", None)
+        if saved is not None:
+            del audio_config.files_in
+        try:
+            _, s = O.join(self.dir, records)
+        finally:
+            if saved is not None:
+                audio_config.files_in = saved
+        self.assertEqual(s["with_one_entry"], 4)
+
     def test_cli_summary_and_json(self):
         self.write("000000001000.bin", self.records_stream())
         self.write("000000002000.bin", bytes(12) + table() + bytes(12))
