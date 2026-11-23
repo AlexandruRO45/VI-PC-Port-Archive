@@ -3,6 +3,7 @@
 Usage:
     python -I scripts/run_wine_tests.py --tests ctest.json --windows-root D:/a/Leonida/Leonida
         [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--summary FILE] [--label TEXT]
+        [--virtual-desktop WIDTHxHEIGHT]
 
 --tests is the output of `ctest --show-only=json-v1` from the Windows build, and --windows-root the checkout it was
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
@@ -15,6 +16,11 @@ runtime/build/generated). For those, the drive of --windows-root is pointed at -
 Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
+
+--virtual-desktop runs every test inside a Wine virtual desktop of that size. Use it under a tiling window manager
+(Hyprland, Sway, i3): it resizes each new window when it is mapped, so the presentation tests' windows never keep the
+client size they ask for and their size checks fail, although the presenter follows the window correctly. The
+prefix's own desktop setting is put back afterwards.
 """
 import argparse
 from graphlib import CycleError, TopologicalSorter
@@ -109,6 +115,87 @@ class DriveMap:
             os.unlink(self.link)
         if self.scratch:
             shutil.rmtree(self.scratch, ignore_errors=True)   # removes the links, never what they point to
+        return False
+
+
+DESKTOP_KEY = r"HKCU\Software\Wine\Explorer"
+DESKTOPS_KEY = DESKTOP_KEY + r"\Desktops"
+DESKTOP_NAME = "LeonidaTests"
+TILING_WM_VARIABLES = ("HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK", "I3SOCK")
+
+
+def desktop_size(text: str) -> str:
+    """--virtual-desktop: WIDTHxHEIGHT, each from 1 to 16384."""
+    m = re.fullmatch(r"([1-9][0-9]{0,4})x([1-9][0-9]{0,4})", text.strip())
+    if not m or int(m.group(1)) > 16384 or int(m.group(2)) > 16384:
+        raise argparse.ArgumentTypeError(f"expected WIDTHxHEIGHT such as 1600x1000, got {text!r}")
+    return f"{int(m.group(1))}x{int(m.group(2))}"
+
+
+class VirtualDesktop:
+    """Runs the tests inside a Wine virtual desktop for the run (--virtual-desktop), then restores the prefix.
+
+    Sets HKCU\\Software\\Wine\\Explorer "Desktop" to a desktop of the given size, waits for the prefix's wineserver to
+    exit so the next program starts that desktop, and afterwards puts the previous "Desktop" value back (or removes
+    it) and deletes the desktop size it added. Without a size it does nothing.
+    """
+
+    def __init__(self, size: str | None, wine: list[str]):
+        self.size, self.wine = size, wine
+        self.previous: str | None = None
+        self.active = False
+        self.note = ""
+
+    def _reg(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([*self.wine, "reg", *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, errors="replace", timeout=120)
+
+    def _wait_for_server(self) -> None:
+        # The desktop is chosen when the first program of a wineserver session starts: wait for the server that
+        # ran reg.exe to exit. Look for wineserver next to the Wine command (Proton keeps both in files/bin).
+        exe = self.wine[0] if self.wine else "wine"
+        if os.path.dirname(exe):
+            server = os.path.join(os.path.dirname(exe), "wineserver")
+            server = server if os.access(server, os.X_OK) else None
+        else:
+            server = shutil.which("wineserver")
+        if server is None:
+            return
+        try:
+            subprocess.run([server, "-w"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def __enter__(self):
+        if not self.size:
+            return self
+        try:
+            query = self._reg("query", DESKTOP_KEY, "/v", "Desktop")
+            m = re.search(r"^\s*Desktop\s+REG_SZ\s+(.*?)\s*$", query.stdout, re.M) if query.returncode == 0 else None
+            self.previous = m.group(1) if m else None
+            added = (self._reg("add", DESKTOPS_KEY, "/v", DESKTOP_NAME, "/d", self.size, "/f").returncode == 0 and
+                     self._reg("add", DESKTOP_KEY, "/v", "Desktop", "/d", DESKTOP_NAME, "/f").returncode == 0)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            added, self.note = False, f"virtual desktop not set: {e}"
+        self.active = True  # restore whatever got written, even after a partial failure
+        if not added:
+            self.note = self.note or "virtual desktop not set: reg add failed"
+            return self
+        self._wait_for_server()
+        self.note = f"tests run in a {self.size} Wine virtual desktop"
+        return self
+
+    def __exit__(self, *exc):
+        if not self.active:
+            return False
+        try:
+            if self.previous is None:
+                self._reg("delete", DESKTOP_KEY, "/v", "Desktop", "/f")
+            else:
+                self._reg("add", DESKTOP_KEY, "/v", "Desktop", "/d", self.previous, "/f")
+            self._reg("delete", DESKTOPS_KEY, "/v", DESKTOP_NAME, "/f")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         return False
 
 
@@ -334,6 +421,8 @@ def main() -> int:
                     help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
+    ap.add_argument("--virtual-desktop", type=desktop_size, metavar="WIDTHxHEIGHT",
+                    help="run the tests inside a Wine virtual desktop of this size (for tiling window managers)")
     args = ap.parse_args()
 
     tests = read_tests(args.tests)
@@ -355,8 +444,13 @@ def main() -> int:
     results = {}
     results_by_index: dict[int, str] = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
-    with DriveMap(args.windows_root, args.root, prefix) as drive:
+    if not args.virtual_desktop and any(os.environ.get(v) for v in TILING_WM_VARIABLES):
+        print("note: a tiling window manager resizes the test windows, so d3d12_present and xbox_present fail "
+              "their size checks; --virtual-desktop 1600x1000 avoids that", flush=True)
+    with DriveMap(args.windows_root, args.root, prefix) as drive, VirtualDesktop(args.virtual_desktop, wine) as desktop:
         print(drive.note, flush=True)
+        if desktop.note:
+            print(desktop.note, flush=True)
         for index in order:
             name = names[index]
             failed_setups = tuple(names[setup] for setup in setups[index] if results_by_index[setup] == "fail")

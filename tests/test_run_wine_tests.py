@@ -685,5 +685,94 @@ class MainTest(unittest.TestCase):
             rwt.wine_command("   ")
 
 
+
+# A stand-in for Wine: "reg" calls are recorded (and "query" answers from a file), anything else runs as a Python
+# script, the way the other tests use the interpreter as Wine.
+FAKE_WINE = """import subprocess, sys
+from pathlib import Path
+here = Path(__file__).parent
+if sys.argv[1:2] == ["reg"]:
+    with (here / "reg.log").open("a", encoding="utf-8", newline="\\n") as f:
+        f.write(" ".join(sys.argv[2:]) + "\\n")
+    if sys.argv[2] == "query":
+        previous = here / "previous.txt"
+        if not previous.exists():
+            sys.exit(1)
+        print("HKEY_CURRENT_USER\\\\Software\\\\Wine\\\\Explorer")
+        print("    Desktop    REG_SZ    " + previous.read_text(encoding="utf-8"))
+    sys.exit(0)
+sys.exit(subprocess.run([sys.executable, *sys.argv[1:]]).returncode)
+"""
+
+
+class VirtualDesktopTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        (self.root / "ok.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+        (self.root / "fake_wine.py").write_text(FAKE_WINE, encoding="utf-8")
+        env = mock.patch.dict(os.environ, {"WINEPREFIX": str(self.root / "no-prefix")})
+        env.start()
+        self.addCleanup(env.stop)
+        for name in rwt.TILING_WM_VARIABLES:
+            hidden = mock.patch.dict(os.environ)
+            hidden.start()
+            self.addCleanup(hidden.stop)
+            os.environ.pop(name, None)
+
+    def run_main(self, *extra):
+        listing = self.root / "ctest.json"
+        listing.write_text(json.dumps({"tests": [ctest_entry("ok", [WINDOWS_ROOT + "/ok.py"])]}), encoding="utf-8")
+        wine = " ".join(p.replace(os.sep, "/") for p in (sys.executable, str(self.root / "fake_wine.py")))
+        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
+                "--root", str(self.root), "--wine", wine, *extra]
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
+            code = rwt.main()
+        log = self.root / "reg.log"
+        return code, out.getvalue(), log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+    def test_desktop_size_parses_and_rejects(self):
+        self.assertEqual(rwt.desktop_size("1600x1000"), "1600x1000")
+        self.assertEqual(rwt.desktop_size(" 800x600 "), "800x600")
+        for bad in ("", "1600", "0x600", "1600x0", "1600X1000", "20000x100", "16x9x2", "-1x5"):
+            with self.subTest(bad=bad), self.assertRaises(argparse.ArgumentTypeError):
+                rwt.desktop_size(bad)
+
+    def test_without_the_option_the_registry_is_not_touched(self):
+        code, out, calls = self.run_main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("[PASS] ok", out)
+        self.assertEqual(calls, [])
+
+    def test_the_desktop_is_set_for_the_run_and_removed_after(self):
+        code, out, calls = self.run_main("--virtual-desktop", "1600x1000")
+        self.assertEqual(code, 0, out)
+        self.assertIn("[PASS] ok", out)
+        self.assertIn("tests run in a 1600x1000 Wine virtual desktop", out)
+        key, sizes = rwt.DESKTOP_KEY, rwt.DESKTOPS_KEY
+        self.assertEqual(calls, [
+            f"query {key} /v Desktop",
+            f"add {sizes} /v {rwt.DESKTOP_NAME} /d 1600x1000 /f",
+            f"add {key} /v Desktop /d {rwt.DESKTOP_NAME} /f",
+            f"delete {key} /v Desktop /f",
+            f"delete {sizes} /v {rwt.DESKTOP_NAME} /f",
+        ])
+
+    def test_a_desktop_the_prefix_already_had_is_put_back(self):
+        (self.root / "previous.txt").write_text("Default", encoding="utf-8")
+        code, out, calls = self.run_main("--virtual-desktop", "1024x768")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"add {rwt.DESKTOP_KEY} /v Desktop /d Default /f", calls[-2:])
+        self.assertNotIn(f"delete {rwt.DESKTOP_KEY} /v Desktop /f", calls)
+
+    def test_a_tiling_window_manager_gets_a_hint(self):
+        with mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "x"}):
+            _, out, _ = self.run_main()
+            self.assertIn("--virtual-desktop", out)
+            _, out, _ = self.run_main("--virtual-desktop", "1600x1000")
+            self.assertNotIn("note: a tiling window manager", out)
+
 if __name__ == "__main__":
     unittest.main()

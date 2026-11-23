@@ -214,6 +214,14 @@ and `vk_presenter_sync`, `xbox_present` and `dxgi_swapchain` pass, while they fa
 compositor for those three. Six still failed with a real display: `device_proxy`, `d3d12_xs_root_signature`,
 `xdxr_build`, `d3d12_xdxr_rt`, `d3d12_present` and `d3d12_compute`.
 
+A tiling window manager (Hyprland, Sway, i3) is a second trap on a real display: it resizes every new window when it
+is mapped, so the 320x240 windows of `d3d12_present` and `xbox_present` never get the client size they ask for. The
+presenter follows the window correctly, but the tests' size checks then fail (`first.width == width` in
+`d3d12_present_test.cpp`, `grab(frame)` in `xbox_present_test.cpp`). Run the tests inside a Wine virtual desktop,
+which no window manager sees: `scripts/run_wine_tests.py --virtual-desktop 1600x1000 ...` sets one in the prefix for
+the run and restores the prefix's own setting afterwards (it prints a hint when it sees Hyprland, Sway or i3 without
+the option). On Hyprland with Wine 11.21 and RADV, both tests fail without it and pass with it.
+
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
 runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are
