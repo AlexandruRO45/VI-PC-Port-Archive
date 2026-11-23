@@ -23,6 +23,13 @@ class SourceVersionTest(unittest.TestCase):
             "# synthetic source\n", encoding="utf-8", newline="\n")
         (self.work / "build").mkdir()
         (self.work / "build" / "sentinel").write_bytes(b"keep existing build")
+        # The fixture's commit message is a fixture, not this project's: a contributor's `core.hooksPath`
+        # (a Conventional Commits commit-msg hook) must not reject it. Same isolation as
+        # tests/test_make_game_assets_decoder.py and tests/test_make_game_submodule.py.
+        self.git_env = os.environ.copy()
+        self.git_env.pop("GIT_CONFIG_COUNT", None)
+        self.git_env.pop("GIT_CONFIG_PARAMETERS", None)
+        self.git_env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
         self.git("init", "-q")
         self.git("add", ".")
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -41,7 +48,7 @@ class SourceVersionTest(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.run(["git", "-C", str(self.src), *args], check=True,
-                              capture_output=True, text=True, timeout=15).stdout.strip()
+                              capture_output=True, text=True, timeout=15, env=self.git_env).stdout.strip()
 
     def select(self, version, accepted):
         before = {str(p.relative_to(self.work)): p.read_bytes()

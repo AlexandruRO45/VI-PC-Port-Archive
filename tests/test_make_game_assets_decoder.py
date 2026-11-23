@@ -100,9 +100,18 @@ class AssetsDecoderTest(unittest.TestCase):
             os.makedirs(sub)
             src = os.path.join(sub, "Decoder.cs")
 
+            # A contributor's global Git config must not reach this fixture: a `core.hooksPath` there makes the
+            # commit below run an unrelated hook (a Conventional Commits commit-msg hook rejects "x"), and this
+            # test is about the digest. tests/test_make_game_submodule.py isolates its fixtures the same way.
+            git_env = dict(os.environ)
+            git_env.pop("GIT_CONFIG_COUNT", None)
+            git_env.pop("GIT_CONFIG_PARAMETERS", None)
+            git_env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+
             def git(*args):
                 subprocess.run(["git", "-C", sub, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
-                                "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
+                                "-c", "commit.gpgsign=false", *args], check=True, capture_output=True,
+                               env=git_env)
 
             with open(src, "w", newline="\n") as f:
                 f.write("a\n")
@@ -118,6 +127,56 @@ class AssetsDecoderTest(unittest.TestCase):
                     digests.append(make_game.decoder_digest())
             make_game.decoder_digest.cache_clear()
         self.assertNotEqual(*digests)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_the_fixture_commit_ignores_a_global_git_hook(self):
+        """A contributor's global `core.hooksPath` must not decide whether the fixture can commit.
+
+        A Conventional Commits commit-msg hook rejects the fixture's "x" message, so this file failed on every
+        machine that sets one. The control commit proves the poisoned config reaches Git; the fixture run in a
+        subprocess with that same config must still commit.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            hooks = os.path.join(root, "hooks")
+            os.makedirs(hooks)
+            hook = os.path.join(hooks, "commit-msg")
+            with open(hook, "w", newline="\n") as f:
+                f.write("#!/bin/sh\nexit 1\n")
+            os.chmod(hook, 0o755)
+            # Let Git write the value: a hand-written Windows path ("C:\\Users\\...") is a bad config line because
+            # the parser reads backslashes as escapes, while `git config` escapes them itself. Reading it back
+            # proves the file parses before the control commit runs.
+            config = os.path.join(root, "gitconfig")
+            subprocess.run(["git", "config", "--file", config, "core.hooksPath", hooks],
+                           check=True, capture_output=True)
+            readback = subprocess.run(["git", "config", "--file", config, "--get", "core.hooksPath"],
+                                      check=True, capture_output=True, text=True).stdout.strip()
+            self.assertEqual(readback, hooks, "the hook path did not survive Git's own config quoting")
+            env = dict(os.environ)
+            env.pop("GIT_CONFIG_COUNT", None)
+            env.pop("GIT_CONFIG_PARAMETERS", None)
+            env.update({"GIT_CONFIG_GLOBAL": config, "GIT_CONFIG_NOSYSTEM": "1"})
+
+            # Control: a commit made with this environment really does run the hook and is rejected.
+            control = os.path.join(root, "control")
+            os.makedirs(control)
+            with open(os.path.join(control, "file"), "w", newline="\n") as f:
+                f.write("x\n")
+            for args in (("init", "-q"), ("add", "file")):
+                subprocess.run(["git", "-C", control, *args], check=True, capture_output=True, env=env)
+            rejected = subprocess.run(
+                ["git", "-C", control, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                 "commit", "-q", "-m", "x"], capture_output=True, env=env)
+            if rejected.returncode == 0:
+                # A Git build or filesystem that does not run hooks from an arbitrary core.hooksPath cannot be
+                # poisoned this way; the fixture check below still runs, it just cannot fail for this reason.
+                self.skipTest("git did not run the commit-msg hook here")
+
+            result = subprocess.run(
+                [sys.executable, "-I", os.path.abspath(__file__),
+                 "AssetsDecoderTest.test_the_digest_follows_an_uncommitted_submodule_edit"],
+                cwd=root, env=env, capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
