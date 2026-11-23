@@ -29,8 +29,11 @@ Usage:
     python -I awc_names.py <banks> [<banks> ...] (--words FILE | --conversations PATH) [...]
                            [--min-token N] [--out names.csv|.json]
 
+A JSON inventory from ``awc_manifest.py`` can also supply the bank names and stream IDs.
+
 Standard library only. The output names game files: it is a local work product and must not be committed or
 attached to an issue. The tests use synthetic banks and words.
+Usage: `python -I tools/awc_names.py --help` lists the options.
 """
 import argparse
 import collections
@@ -90,6 +93,9 @@ def bank_ids(path: str) -> list:
         flags, n, _header_size = struct.unpack_from("<III", head, 4)
         skip = (4 if flags & 0x400000 else 0) + (n * 2 if flags & 0x10000 else 0) \
             + ((n + 1) * 4 if flags & 0x200000 else 0)
+        table_end = 16 + skip + 4 * n
+        if table_end > os.fstat(fh.fileno()).st_size:
+            raise ValueError(f"{path}: stream table extends past the end of the file")
         fh.seek(16 + skip)
         table = fh.read(4 * n)
     if len(table) < 4 * n:
@@ -98,13 +104,25 @@ def bank_ids(path: str) -> list:
 
 
 def load_banks(source: str) -> dict:
-    """{bank label: [stream ids]} from an .awc file, a directory of them, or an audio_manifest.json."""
+    """{bank label: [stream ids]} from AWC banks, a Python inventory, or an rpf9dump manifest."""
     if os.path.isfile(source) and source.lower().endswith(".json"):
         with open(source, encoding="utf-8") as fh:
             doc = json.load(fh)
+        if isinstance(doc, dict) and "bank_count" in doc and "streams" in doc:
+            grouped = collections.defaultdict(list)
+            for row in doc["streams"]:
+                bank = row["bank"]
+                # Match the export folder used by awc_opus, including nested bank paths.
+                label = os.path.splitext(bank)[0] if bank.lower().endswith(".awc") else bank
+                grouped[label].append(int(row["stream"], 16) & M29)
+            return dict(grouped)
         banks = doc.get("Banks", doc) if isinstance(doc, dict) else doc
+        if not isinstance(banks, list):
+            raise ValueError("expected a list of banks")
         out = {}
         for bank in banks:
+            if not isinstance(bank, dict):
+                raise ValueError(f"expected each bank to be an object, got {type(bank).__name__}")
             out[bank["Path"]] = [int(s["Id"], 16) & M29 for s in bank.get("Streams") or []]
         return out
     if os.path.isfile(source):
@@ -142,13 +160,17 @@ def _files(path: str):
 
 
 def read_words(path: str) -> list:
-    """Words from a text file (one per line) or a hashdict.py JSON object."""
+    """Words from a text file (one per line), a hashdict.py JSON object or a JSON list of words."""
     with open(path, "rb") as fh:
         head = fh.read(1).lstrip()
     if path.lower().endswith(".json") or head == b"{":
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        return [str(v) for v in (doc.values() if isinstance(doc, dict) else doc)]
+        if isinstance(doc, dict):
+            return [str(v) for v in doc.values()]
+        if isinstance(doc, list):
+            return [str(v) for v in doc]
+        raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
     with open(path, encoding="utf-8", errors="replace") as fh:
         return [line.strip() for line in fh if line.strip()]
 
@@ -204,14 +226,15 @@ def family_ok(names) -> bool:
     return len(nums) == 2 and nums[1] - nums[0] == 1
 
 
-def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict:
-    """{(bank number, id): (name, rule, family size)}; ``salt`` != '' is the control run."""
-    found = {}
+def _attack_split(dictionary: Dictionary, bases: list, index: Index, salt: str) -> tuple:
+    """Separate dialogue and best family hits per (bank number, id) before control filtering."""
+    dialogue_hits = {}
     for w in dictionary.words:
         if DIALOGUE.match(w):
             name = salt + w
-            for b in index.by_id.get(joaat(name) & M29, ()):
-                found[(b, joaat(name) & M29)] = (name, "dialogue", 99)
+            h = joaat(name) & M29
+            for b in index.by_id.get(h, ()):
+                dialogue_hits[(b, h)] = (name, "dialogue", 99)
     suffix_bytes = [_enc(s) for s in SUFFIXES]
     families = collections.defaultdict(dict)     # (bank, base) -> {id: (name, verbatim)}
     by_id = index.by_id
@@ -224,11 +247,21 @@ def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict
                 verbatim = (base + s) in dictionary.wordset
                 for b in banks:
                     families[(b, base)][i] = (salt + base + s, verbatim)
+    family_hits = {}
     for (b, _base), members in families.items():
         if family_ok(n for n, _v in members.values()) and any(v for _n, v in members.values()):
+            size = len(members)
             for i, (name, _v) in members.items():
-                found.setdefault((b, i), (name, "family", len(members)))
-    return found
+                prev = family_hits.get((b, i))
+                if prev is None or size > prev[2]:
+                    family_hits[(b, i)] = (name, "family", size)
+    return dialogue_hits, family_hits
+
+
+def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict:
+    """{(bank number, id): (name, rule, family size)}; ``salt`` != '' is the control run."""
+    dialogue_hits, family_hits = _attack_split(dictionary, bases, index, salt)
+    return {**family_hits, **dialogue_hits}
 
 
 def _distinct(found: dict, rule: str, kmin: int = 0) -> int:
@@ -237,21 +270,28 @@ def _distinct(found: dict, rule: str, kmin: int = 0) -> int:
 
 def name_source(dictionary: Dictionary, bases: list, index: Index) -> tuple:
     """Accepted names and the per-source statistics, after the salted control picks the thresholds."""
-    real = attack(dictionary, bases, index, "")
-    control = attack(dictionary, bases, index, SALT)
-    keep_dialogue = _distinct(control, "dialogue") < CONTROL_LIMIT * max(_distinct(real, "dialogue"), 1)
+    real_dlg, real_fam = _attack_split(dictionary, bases, index, "")
+    ctrl_dlg, ctrl_fam = _attack_split(dictionary, bases, index, SALT)
+    keep_dialogue = _distinct(ctrl_dlg, "dialogue") < CONTROL_LIMIT * max(_distinct(real_dlg, "dialogue"), 1)
     kmin = None
     for k in FAMILY_SIZES:
-        r, c = _distinct(real, "family", k), _distinct(control, "family", k)
+        r, c = _distinct(real_fam, "family", k), _distinct(ctrl_fam, "family", k)
         if r and c < CONTROL_LIMIT * r:
             kmin = k
             break
 
-    def keep(v):
-        return (v[1] == "dialogue" and keep_dialogue) or (v[1] == "family" and kmin is not None and v[2] >= kmin)
+    def combine(dlg, fam):
+        accepted = {}
+        if kmin is not None:
+            for key, val in fam.items():
+                if val[2] >= kmin:
+                    accepted[key] = val
+        if keep_dialogue:
+            accepted.update(dlg)
+        return accepted
 
-    real = {k: v for k, v in real.items() if keep(v)}
-    control = {k: v for k, v in control.items() if keep(v)}
+    real = combine(real_dlg, real_fam)
+    control = combine(ctrl_dlg, ctrl_fam)
     stats = {
         "banks": len(index.labels),
         "streams": index.streams,
@@ -285,14 +325,26 @@ def source_labels(sources):
     return labels
 
 
+def positive_int(text):
+    """--min-token: a count of dictionary words a token must appear in, at least 1. 0 or a negative silently
+    turned the common-token filter off, since every token passes tokens[t] >= min_token."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("banks", nargs="+", help="an .awc file, a directory of banks, or an audio_manifest.json")
+    ap.add_argument("banks", nargs="+", help="an .awc file, a bank directory, or JSON from awc_manifest.py or rpf9dump audio")
     ap.add_argument("--words", action="append", default=[], help="word list or hashdict.py JSON (repeatable)")
     ap.add_argument("--conversations", action="append", default=[],
                     help="file or directory with conversation key/label pairs (repeatable)")
-    ap.add_argument("--min-token", type=int, default=MIN_TOKEN,
-                    help="dictionary words a family base token must appear in (default 5)")
+    ap.add_argument("--min-token", type=positive_int, default=MIN_TOKEN,
+                    help="dictionary words a family base token must appear in (default 5, at least 1)")
     ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
     a = ap.parse_args(argv)
     if not a.words and not a.conversations:
@@ -302,12 +354,23 @@ def main(argv=None) -> int:
         if not os.path.exists(path):
             print(f"awc_names: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-    if a.out and os.path.exists(a.out) and any(os.path.samefile(p, a.out) for p in inputs):
-        ap.error("--out must not overwrite an input")
+    if a.out and os.path.exists(a.out):
+        protected = inputs.copy()
+        for sources, suffix in ((a.banks, ".awc"), (a.conversations, "")):
+            for source in sources:
+                if os.path.isdir(source):
+                    protected.extend(full for full in _files(source)
+                                     if full.lower().endswith(suffix) and os.path.isfile(full))
+        if any(os.path.samefile(p, a.out) for p in protected):
+            ap.error("--out must not overwrite an input")
 
     words = []
     for path in a.words:
-        words += read_words(path)
+        try:
+            words += read_words(path)
+        except (OSError, ValueError) as error:
+            print(f"awc_names: error: cannot read {path}: {error}", file=sys.stderr)
+            return 2
     waves = conversation_waves(a.conversations)
     dictionary = Dictionary(words + waves)
     bases = dictionary.bases(a.min_token)
@@ -329,7 +392,7 @@ def main(argv=None) -> int:
         for (b, i), (name, rule, _k) in sorted(found.items()):
             rows.append({"source": label, "bank": index.labels[b], "stream_id": f"{i:08x}", "name": name,
                          "rule": rule})
-        print(f"{label}: {stats['banks']} banks, {stats['streams']} streams, {stats['named']} named "
+        print(f"{label}: {stats['banks']} banks, {stats['streams']} distinct bank/ID pairs, {stats['named']} named "
               f"({stats['dialogue']} dialogue, {stats['family']} family, family size >= {stats['family_min_size']}); "
               f"control {stats['control_dialogue']} dialogue, {stats['control_family']} family", flush=True)
     if a.out:

@@ -8,12 +8,15 @@
 // writes into `spirv/index.json`, next to `<name>.spv`. This header needs no Windows, Vulkan or third-party code:
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
+#include "spirv_words.h"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -292,20 +295,35 @@ inline std::string sha256_hex(std::span<const std::uint8_t> data) {
 // ---------------------------------------------------------------------------------------------------------------
 // JSON (the subset the translator's index uses, which is all of JSON except number precision beyond double)
 
+struct JsonObjectEntry;
+
 struct Json {
     enum class Kind { null, boolean, number, string, array, object } kind = Kind::null;
     bool boolean = false;
     double number = 0;
     std::string string;
     std::vector<Json> array;
-    std::vector<std::pair<std::string, Json>> object;
+    // Declared through the incomplete JsonObjectEntry and destroyed out of line: a vector element type that holds a
+    // Json by value cannot be instantiated while Json is still being defined. GCC tolerates it, Clang with libstdc++
+    // does not (the pair<string, Json> form used to fail to build there). Structured bindings still work.
+    std::vector<JsonObjectEntry> object;
 
-    const Json* find(std::string_view key) const {
-        for (const auto& [k, v] : object)
-            if (k == key) return &v;
-        return nullptr;
-    }
+    ~Json();
+    const Json* find(std::string_view key) const;
 };
+
+struct JsonObjectEntry {
+    std::string key;
+    Json value;
+};
+
+inline Json::~Json() = default;
+
+inline const Json* Json::find(std::string_view key) const {
+    for (const auto& [k, v] : object)
+        if (k == key) return &v;
+    return nullptr;
+}
 
 class JsonReader {
 public:
@@ -551,6 +569,59 @@ inline std::span<const std::uint8_t> fspx_program(std::span<const std::uint8_t> 
     return fspx_parts(payload).code;
 }
 
+// One pointer and size pair of the description device slot 67 receives (docs/fspx.md, "How the DLL reads it").
+struct FspxPart {
+    std::uint32_t kind;
+    const void* data;
+    std::uint64_t size;
+};
+
+// The largest entry fspx_payload_from_parts takes: far above the 1.0.2.1 DLL's largest (a 41,536-byte program), and
+// small enough that the payload's u32 offsets cannot overflow.
+inline constexpr std::uint64_t kFspxPartLimit = 16u << 20;
+
+// An FSPX payload built from the pairs of a slot-67 description, in the layout fspx_parts() reads: the header, one
+// directory entry per present pair and the entries' bytes after it, each at a 16-byte boundary. A pair is present
+// when its pointer is non-null and its size non-zero; a pointer without a size or a size without a pointer, a size
+// over kFspxPartLimit, a kind other than 0, 1, 6 and 7, the same kind twice, or a missing kind 0 or kind 6 gives an
+// empty result, and nothing is read. Every pointer is read only for its own size.
+inline std::vector<std::uint8_t> fspx_payload_from_parts(std::span<const FspxPart> parts) {
+    bool seen[8] = {};
+    std::vector<const FspxPart*> present;
+    for (const FspxPart& part : parts) {
+        if (part.kind > 7 || (part.kind != 0 && part.kind != 1 && part.kind != 6 && part.kind != 7)) return {};
+        if (seen[part.kind]) return {};
+        seen[part.kind] = true;
+        if (!part.data && !part.size) continue;
+        if (!part.data || !part.size || part.size > kFspxPartLimit) return {};
+        present.push_back(&part);
+    }
+    const auto has = [&](std::uint32_t kind) {
+        return std::any_of(present.begin(), present.end(), [&](const FspxPart* p) { return p->kind == kind; });
+    };
+    if (!has(0) || !has(6)) return {};
+    const auto align = [](std::uint64_t v) { return (v + 15) & ~std::uint64_t(15); };
+    std::uint64_t at = align(16 + 16 * std::uint64_t(present.size()));
+    std::vector<std::uint64_t> offsets;
+    for (const FspxPart* p : present) {
+        offsets.push_back(at);
+        at = align(at + p->size);
+    }
+    std::vector<std::uint8_t> out(std::size_t(at), 0);
+    const auto put = [&](std::size_t where, std::uint32_t v) { std::memcpy(out.data() + where, &v, 4); };
+    std::memcpy(out.data(), "FSPX", 4);
+    put(4, 1);
+    put(8, std::uint32_t(present.size()));
+    put(12, std::uint32_t(at));
+    for (std::size_t i = 0; i < present.size(); ++i) {
+        put(16 + 16 * i, present[i]->kind);
+        put(16 + 16 * i + 4, std::uint32_t(offsets[i]));
+        put(16 + 16 * i + 8, std::uint32_t(present[i]->size));
+        std::memcpy(out.data() + offsets[i], present[i]->data, std::size_t(present[i]->size));
+    }
+    return out;
+}
+
 // Whether `code` looks like a bare kind-6 program: the 36-byte prologue of three VOP3 words with opcode 0x180
 // (bits 31..16 = 0xD580) at words 0, 3 and 6, which all 29 programs of the 1.0.2.1 DLL have (docs/fspx.md).
 inline bool fspx_bare_program(std::span<const std::uint8_t> code) {
@@ -636,7 +707,17 @@ struct ShaderEntry {
     std::string wave64_exchange;
     bool emulated() const { return !wave64_exchange.empty(); }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
-    std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
+    std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
+    std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
+    // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
+    std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
+    // The S#s the shader builds from immediates (the index's literal_samplers): no heap slot names them, so a
+    // pipeline that uses the shader registers them in the bindless set itself (docs/design.md, Literal samplers).
+    std::vector<std::array<std::uint32_t, 4>> literal_samplers;
+    // Mesh shaders: the output array sizes the SPIR-V declares (OutputVertices / OutputPrimitivesEXT), checked
+    // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
+    std::uint32_t max_vertices = 0;
+    std::uint32_t max_primitives = 0;
 };
 
 class ShaderLibrary {
@@ -645,7 +726,7 @@ public:
     // DLL's FSPX programs into that folder; their entries are named "fspx/<name>"). Entries with neither
     // fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The fspx folder is optional: a
     // missing or unreadable index there leaves the main one loaded.
-    bool load(const std::string& dir, std::string* error = nullptr) {
+    bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
             return false;
@@ -658,7 +739,7 @@ public:
         }
         try {
             const auto ignore = [](const std::string&) { return false; };
-            if (std::ifstream(dir + "/fspx/index.json", std::ios::binary)) load_index(dir + "/fspx", "fspx/", ignore);
+            if (std::ifstream(dir / "fspx/index.json", std::ios::binary)) load_index(dir / "fspx", "fspx/", ignore);
         } catch (...) {
         }
         return true;
@@ -666,6 +747,9 @@ public:
 
     bool loaded() const { return !dir_.empty(); }
     std::size_t size() const { return count_; }
+    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
+    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    std::size_t fspx_size() const { return fspx_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -717,13 +801,10 @@ public:
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
-        std::ifstream file(dir_ + "/" + entry.name + ".spv", std::ios::binary);
-        if (!file) return {};
-        const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        if (bytes.size() < 20 || bytes.size() % 4) return {};
-        std::vector<std::uint32_t> words(bytes.size() / 4);
-        std::memcpy(words.data(), bytes.data(), bytes.size());
-        return words[0] == 0x07230203 ? words : std::vector<std::uint32_t>{};
+        auto path = dir_;
+        path += "/" + entry.name + ".spv";
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        return read_spirv_words(file, file.tellg());
     }
 
 private:
@@ -734,11 +815,16 @@ private:
         return n >= 0 && n <= 4294967295.0 ? std::uint32_t(n) : 0;
     }
 
-    using Entries = std::map<std::pair<std::string, std::string>, std::vector<ShaderEntry>>;
+    using LookupKey = std::pair<std::string_view, std::string_view>;
+    struct KeyLess {
+        using is_transparent = void;
+        bool operator()(LookupKey a, LookupKey b) const { return a < b; }
+    };
+    using Entries = std::map<std::pair<std::string, std::string>, std::vector<ShaderEntry>, KeyLess>;
 
     static std::vector<const ShaderEntry*> lookup(const Entries& entries, std::string_view stage, std::string_view key) {
         std::vector<const ShaderEntry*> out;
-        const auto it = entries.find({std::string(stage), std::string(key)});
+        const auto it = entries.find(LookupKey{stage, key});
         if (it != entries.end())
             for (const ShaderEntry& e : it->second) out.push_back(&e);
         return out;
@@ -747,17 +833,25 @@ private:
     // Reads <dir>/index.json. With an empty prefix it replaces what was loaded (the main index); with a prefix it
     // adds its entries under "<prefix><name>", the path of their modules relative to the main folder.
     template<typename Fail>
-    bool load_index(const std::string& dir, const std::string& prefix, Fail&& fail) {
-        std::ifstream file(dir + "/index.json", std::ios::binary);
-        if (!file) return fail("cannot open " + dir + "/index.json");
+    bool load_index(const std::filesystem::path& dir, const std::string& prefix, Fail&& fail) {
+        const auto index = dir / "index.json";
+        std::ifstream file(index, std::ios::binary);
+        if (!file) {
+            const auto path = index.u8string();
+            return fail("cannot open " + std::string(path.begin(), path.end()));
+        }
         const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        constexpr std::string_view utf8_bom = "\xef\xbb\xbf";
+        std::string_view json(text);
+        if (json.starts_with(utf8_bom)) json.remove_prefix(utf8_bom.size());
         Json root;
-        if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
+        if (!JsonReader(json).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
         if (prefix.empty()) {
             dir_ = dir;
             entries_.clear();
             fspx_entries_.clear();
             count_ = 0;
+            fspx_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -796,17 +890,40 @@ private:
                     e.input_signature.push_back(std::move(element));
                 }
             }
+            if (const Json* in = meta.find("inputs"); in && in->kind == Json::Kind::array)
+                for (const Json& item : in->array) e.inputs.push_back(u32(&item));
             if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
                 for (const Json& item : o->array) e.outputs.push_back(u32(&item));
+            if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
+                for (const auto& [key, val] : fh->object) {
+                    if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
+                    char* end = nullptr;
+                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
+                    if (!end || *end != '\0') continue;
+                    e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
+                }
+            }
+            if (const Json* l = meta.find("literal_samplers"); l && l->kind == Json::Kind::array) {
+                for (const Json& item : l->array) {
+                    if (item.kind != Json::Kind::array || item.array.size() != 4) continue;
+                    std::array<std::uint32_t, 4> words{};
+                    for (std::size_t i = 0; i < 4; ++i) words[i] = u32(&item.array[i]);
+                    e.literal_samplers.push_back(words);
+                }
+            }
+            e.max_vertices = u32(meta.find("max_vertices"));
+            e.max_primitives = u32(meta.find("max_primitives"));
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+            if (by_fspx && prefix == "fspx/") ++fspx_count_;
             ++count_;
         }
         return true;
     }
 
-    std::string dir_;
+    std::filesystem::path dir_;
     std::size_t count_ = 0;
+    std::size_t fspx_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;

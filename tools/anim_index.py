@@ -5,8 +5,9 @@ zlib stream that inflates cleanly to its end, then classify the inflated bytes. 
 game data, and does not decode animation.
 
 Signatures are only the byte patterns measured in docs/animation.md. Anything else is reported as `raw:<hex>`
-instead of being guessed. A `0DRP` page is reported with its version and page count; `MoVE` with its version and
-size hint; `RBF0` with its first schema name; name tables with their first path and number of paths.
+instead of being guessed. A `0DRP` page is reported with its version and page count; the tagged auxiliary table that starts a
+`0DRP` second system page (historical label `clip-stream`) with its entry count, tags and payload end, and only
+when its directory and payloads fit in the stream; `MoVE` with its version and size hint; `RBF0` with its first schema name; name tables with their first path and number of paths.
 
 Usage:
     python -I anim_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES] [--quiet]
@@ -15,6 +16,7 @@ Usage:
 
 `--rigs` additionally joins the RBF0 stream with its 64 KiB continuation blocks and writes the rig-set/rig entries
 and plain `SKEL_` bone names to its own JSON. It stops at the next known container signature or a gap.
+Usage: `python -I tools/anim_index.py --help` lists the options.
 """
 import argparse
 import bisect
@@ -26,8 +28,13 @@ import os
 import re
 import struct
 import sys
-import unicodedata
 import zlib
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from report_paths import same_report_path  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -65,8 +72,34 @@ def _printable(data):
     if not data:
         return False
     sample = data[:512]
-    good = sum(1 for b in sample if 9 <= b < 127 or b in (10, 13))
+    good = sum(1 for b in sample if 32 <= b < 127 or b in (9, 10, 13))
     return len(sample) >= 64 and good / len(sample) > 0.9
+
+
+AUX_FIRST_TAG = 0x101
+AUX_COUNTS = (2, 3)
+
+
+def aux_table(data):
+    """The tagged auxiliary table at the start of a `0DRP` resource's second system page (docs/animation.md):
+    a u32 count (2 or 3), then `count` pairs {u32 tag, u32 payloadBytes}, then the payloads in order; the first
+    tag is 0x101. Bytes after the payloads are legitimate (schema tables follow them). Returns
+    ([(tag, size), ...], payload_end) when the directory and every payload fit in `data`, else None, so a
+    matching prefix on truncated or unrelated bytes keeps its generic classification. Needs the whole
+    inflated stream, not a head slice."""
+    count = _u32(data, 0)
+    if count not in AUX_COUNTS:
+        return None
+    directory_end = 4 + 8 * count
+    if len(data) < directory_end:
+        return None
+    entries = [struct.unpack_from("<II", data, 4 + 8 * i) for i in range(count)]
+    if entries[0][0] != AUX_FIRST_TAG:
+        return None
+    payload_end = directory_end + sum(size for _, size in entries)
+    if payload_end > len(data):
+        return None
+    return entries, payload_end
 
 
 def classify(data, offset, stored):
@@ -99,8 +132,13 @@ def classify(data, offset, stored):
           and 0 < (_u32(data, 8) or 0) <= 4096):
         record.update(signature="typehash", version=8, count=_u32(data, 8),
                       detail=f"type=0x{_u32(data, 0):08x}")
-    elif len(data) >= 8 and _u32(data, 0) in (2, 3) and data[4:8] == b"\x01\x01\x00\x00":
-        record.update(signature="clip-stream", version=_u32(data, 0), detail="24-byte header")
+    elif (table := aux_table(data)) is not None:
+        # Historical label kept so existing consumers group these pages as before; the count is the measured
+        # entry count, not a version.
+        entries, payload_end = table
+        record.update(signature="clip-stream", count=len(entries),
+                      detail=f"aux-table tags={','.join(f'0x{tag:x}' for tag, _ in entries)} "
+                             f"payload_end={payload_end}")
     elif data[:3] == b"KB2" and len(data) >= 0x20:
         record.update(signature="bink2", version=chr(data[3]), count=_u32(data, 8))
         record["detail"] = f"{_u32(data, 0x14)}x{_u32(data, 0x18)}"
@@ -292,14 +330,23 @@ def collect_skeletons_dir(path):
     out = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")) or os.path.getsize(full) > 16384:
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
+        size = os.path.getsize(full)
         with open(full, "rb") as f:
-            data = f.read()
+            head = f.read(5)
+            if size > 16384 and head != b"SKEL_":
+                continue
+            data = head + f.read()
+        m = re.match(r"([0-9a-fA-F]{6,})", name)
+        offset = int(m.group(1), 16) if m else 0
+        sig = classify(data, offset, len(data))["signature"]
+        if not (sig == "skeleton-names" or (size <= 16384 and sig.startswith("raw:"))):
+            continue
         if b"SKEL_" in data or b"PH_" in data:
-            m = re.match(r"([0-9a-fA-F]{6,})", name)
-            record = parse_skel_names(data, int(m.group(1), 16) if m else 0)
-            record["kind"] = "motion-matcher" if b"motionmatcher" in data else "bone-table"
+            record = parse_skel_names(data, offset)
+            record["kind"] = ("plain-bone-table" if sig == "skeleton-names"
+                              else ("motion-matcher" if b"motionmatcher" in data else "bone-table"))
             if record["distinct"] or record["hashes_present"]:
                 out.append(record)
     return out
@@ -335,9 +382,6 @@ def collect_rbf0_dir(path):
     return bytes(blob)
 
 
-def _gap(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
-
 
 def scan_rpf(path, start=None, limit=None, progress=None):
     """Walk an RPF9 data area. Returns (records, summary). No tables of contents are read or decrypted."""
@@ -364,7 +408,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                z, u = _gap(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 head = m[s:s + min(blen, 0x20)]
@@ -390,14 +434,14 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            z, u = _gap(m[last:s])
+            z, u = gap_split(m, last, s)
             zero += z
             unread += u
             rows.append(classify(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        z, u = _gap(m[last:end])
+        z, u = gap_split(m, last, end)
         zero += z
         unread += u
     summary = summarise(rows, end - span_start, zero, unread)
@@ -408,7 +452,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
 
 def scan_dir(path, progress=None):
     """Index already-carved files. An offset is taken from a leading hexadecimal file name when possible."""
-    entries = []
+    rows, span = [], 0
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
@@ -417,10 +461,10 @@ def scan_dir(path, progress=None):
         with open(full, "rb") as f:
             data = f.read()
         m = re.match(r"([0-9a-fA-F]{6,})", name)
-        offset = int(m.group(1), 16) if m else len(entries)
-        entries.append((offset, name, data))
-    rows = [classify(data, offset, len(data)) for offset, _, data in entries]
-    summary = summarise(rows, sum(len(data) for _, _, data in entries), 0, 0)
+        offset = int(m.group(1), 16) if m else len(rows)
+        span += len(data)
+        rows.append(classify(data, offset, len(data)))
+    summary = summarise(rows, span, 0, 0)
     summary["mode"] = "directory"
     summary["directory"] = path
     if progress:
@@ -487,42 +531,6 @@ def byte_count(text):
     return value
 
 
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
-def same_report_path(first, second):
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
@@ -548,7 +556,8 @@ def main():
         for flag, path in (("output", a.out), ("--rigs", a.rigs)):
             if not path:
                 continue
-            if os.path.isfile(manifest) and same_report_path(manifest, path):
+            # Reserved even before the carve writes it: other tools read <source>/index.json as the carve manifest.
+            if same_report_path(manifest, path):
                 ap.error(f"{flag} would overwrite the carve manifest: {path}")
             if os.path.isfile(path):
                 for name in os.listdir(a.source):

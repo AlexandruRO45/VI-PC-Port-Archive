@@ -574,6 +574,20 @@ MEASURED = [
 ]
 
 
+# Measured all-NaN rows from the gfx1036 sweep with a signalling src0: with all three operands NaN, hardware returns
+# src0's bits unchanged (0x7C01 stays signalling under IEEE 0), preserving the unwritten high half.
+ALL_NAN_SRC0_SIGNALLING = [
+    ('v_min3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7E00, 0xABCD7E00, 0xDEAD7C01),
+    ('v_min3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7E00, 0xABCD7C01, 0xDEAD7C01),
+    ('v_min3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7C01, 0xABCD7E00, 0xDEAD7C01),
+    ('v_min3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7C01, 0xABCD7C01, 0xDEAD7C01),
+    ('v_max3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7E00, 0xABCD7E00, 0xDEAD7C01),
+    ('v_max3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7E00, 0xABCD7C01, 0xDEAD7C01),
+    ('v_max3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7C01, 0xABCD7E00, 0xDEAD7C01),
+    ('v_max3_f16 v4, v1, v2, v3', 0xABCD7C01, 0xABCD7C01, 0xABCD7C01, 0xDEAD7C01),
+]
+
+
 def run_rows(rows):
     """Translate one pixel shader that runs every row and stores v4 at BASE + 4k; return the stored words."""
     body = [f"s_mov_b32 s0, {BASE:#x}", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x1000", "s_mov_b32 s3, 0x31016fac"]
@@ -606,6 +620,11 @@ class MeasuredWords(unittest.TestCase):
             for row, word in zip(rows, got):
                 with self.subTest(insn=row[0], v1=hex(row[1]), v2=hex(row[2]), v3=hex(row[3])):
                     self.assertEqual(word, row[4])
+
+    def test_all_nan_keeps_src0(self):
+        """When all three operands are NaN, v_min3_f16/v_max3_f16 return src0's exact 16-bit pattern."""
+        rows = ALL_NAN_SRC0_SIGNALLING
+        self.assertEqual(run_rows(rows), [row[4] for row in rows])
 
 
 if __name__ == "__main__":

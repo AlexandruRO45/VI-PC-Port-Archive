@@ -155,6 +155,72 @@ class TestCli(unittest.TestCase):
                     with open(destination, "rb") as f:
                         self.assertEqual(f.read(), original)
 
+    def test_rejects_refs_directory_and_files_inside_src_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "carved")
+            os.mkdir(src)
+            bin_file = os.path.join(src, "0001.bin")
+            original = sample()
+            with open(bin_file, "wb") as f:
+                f.write(original)
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "w", encoding="utf-8") as f:
+                f.write("prop_crate_01\n")
+            other_dir = os.path.join(tmp, "out_dir")
+            os.mkdir(other_dir)
+
+            for bad_refs, expected_msg in (
+                (other_dir, "--refs must be a file path, not a directory"),
+                (src, "--refs must be a file path, not a directory"),
+                (bin_file, "--refs must not overwrite an input"),
+                (os.path.join(src, "..", "carved", "0001.bin"), "--refs must not overwrite an input"),
+                (os.path.join(src, "new_refs.tsv"), "--refs must not overwrite an input"),
+            ):
+                with self.subTest(bad_refs=bad_refs):
+                    r = self.run_tool(src, "--names", names, "--refs", bad_refs)
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertIn(expected_msg, r.stderr)
+                    with open(bin_file, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
+    def test_rejects_external_hard_link_to_a_carved_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "carved")
+            os.mkdir(src)
+            payload = os.path.join(src, "0001.bin")
+            names = os.path.join(tmp, "names.txt")
+            original = sample()
+            with open(payload, "wb") as f:
+                f.write(original)
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("prop_crate_01\n")
+            refs = os.path.join(tmp, "refs.tsv")
+            try:
+                os.link(payload, refs)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"hard links unavailable: {e}")
+
+            result = self.run_tool(src, "--names", names, "--refs", refs)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--refs must not overwrite an input", result.stderr)
+            with open(payload, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_refs_unwritable_parent_dir_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "one.bin")
+            names = os.path.join(tmp, "names.txt")
+            with open(src, "wb") as f:
+                f.write(sample())
+            with open(names, "w", encoding="utf-8") as f:
+                f.write("prop_crate_01\n")
+            missing_parent = os.path.join(tmp, "no_such_dir", "refs.tsv")
+            r = self.run_tool(src, "--names", names, "--refs", missing_parent)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
+
     def test_missing_names_file_is_one_line(self):
         with tempfile.TemporaryDirectory() as d:
             r = self.run_tool(d, "--names", os.path.join(d, "none.txt"))

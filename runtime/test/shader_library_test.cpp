@@ -2,11 +2,13 @@
 // Huffman blocks, compressed from synthetic data with Python's zlib), the JSON reader, FSSM extraction from a
 // synthetic DXBC container, and index lookup by content hash. No game data.
 #include "../src/shader_library.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -251,6 +253,26 @@ int fspx_checks() {
 int main() {
     using namespace leonida;
 
+    // Test the shared file reader without passing malformed bytes to a driver.
+    const std::vector<std::uint32_t> header = {0x07230203, 0x00010300, 0, 1, 0};
+    const std::string header_bytes(reinterpret_cast<const char*>(header.data()), header.size() * sizeof(header.front()));
+    {
+        std::istringstream input(header_bytes);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()) == header);
+    }
+    for (const auto& bad : {std::string{}, header_bytes.substr(0, 16), header_bytes + 'x',
+                            std::string("bad!") + header_bytes.substr(4)}) {
+        std::istringstream input(bad);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()).empty());
+    }
+    {
+        std::istringstream input(header_bytes);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, static_cast<std::streamoff>(header_bytes.size() + 4)).empty());
+    }
+
     CHECK(sha256_hex({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     CHECK(sha256_hex(bytes("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     CHECK(sha256_hex(bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")) ==
@@ -322,13 +344,14 @@ int main() {
     CHECK(fssm_program(container({{dynamic, 600}, {fixed, 25}})) == bytes("hello hello hello leonida"));
 
     // An index with one findable shader, one without a hash, and the module next to it.
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_test";
+    const testfiles::ScratchDir scratch("leonida_shader_library_test");
+    const auto& dir = scratch.path();
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
     const std::string hash2 = sha256_hex(bytes("another program"));
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
-        index << "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
+        index << "\xef\xbb\xbf" "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
               << "\", \"bindings\": [2], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": true, \"wave64\": false},\n"
                  " \"vs_test\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
@@ -339,7 +362,8 @@ int main() {
                  " \"vs_same_program\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
-                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
+                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
+                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
@@ -360,10 +384,17 @@ int main() {
     // out-of-range number (register -1) reads as 0 instead of wrapping.
     const auto vs_all = library.candidates("vs", hash);
     CHECK(vs_all.size() == 2 && vs_all[0] == vs && vs_all[1]->name == "vs_same_program");
+    const std::string tagged_hash = hash + "-suffix";
+    CHECK(library.candidates(std::string_view("vs-extra", 2),
+                             std::string_view(tagged_hash).substr(0, hash.size())) == vs_all);
+    CHECK(library.candidates("vs", tagged_hash).empty());
     CHECK(vs_all[1]->input_signature.size() == 1 && vs_all[1]->input_signature[0].semantic_index == 3 &&
           vs_all[1]->input_signature[0].register_index == 0);
     const ShaderEntry* ps = library.find("ps", hash);
     CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
+    CHECK(ps->inputs.size() == 4 && ps->inputs[0] == 0 && ps->inputs[3] == 29);
+    CHECK(ps->f16_halves.size() == 2 && ps->f16_halves.at(0)[0] == 28 && ps->f16_halves.at(0)[1] == 29 &&
+          ps->f16_halves.at(7)[0] == 20 && ps->f16_halves.at(7)[1] == 21);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
@@ -407,7 +438,7 @@ int main() {
             spv.write(reinterpret_cast<const char*>(words), sizeof(words));
         }
         ShaderLibrary fspx;
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3);
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3 && fspx.fspx_size() == 1);
         const auto found = fspx.fspx_candidates("cs", code_hash);
         CHECK(found.size() == 1 && found[0]->name == "fspx/upscaler_00" && found[0]->local_size[0] == 8 &&
               found[0]->wave64 && found[0]->fssm_sha256.empty());
@@ -427,9 +458,10 @@ int main() {
             std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
             sub << "{broken";
         }
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_candidates("cs", code_hash).empty());
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 &&
+              fspx.fspx_candidates("cs", code_hash).empty());
         std::filesystem::remove(dir / "fspx" / "index.json");
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.find("cs", hash));
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 && fspx.find("cs", hash));
         std::filesystem::remove_all(dir);
     }
 
@@ -479,6 +511,21 @@ int main() {
         CHECK(by64.size() == 1 && by64[0]->name == "fspx/pair_64" && !ambiguous);
         CHECK(pair.program_candidates("cs", compute_program(wrapped(state16)), &ambiguous).empty() && !ambiguous);
         CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).empty() && ambiguous);
+        // Slot 67 with all four pairs (RT-99): the payload the proxy builds carries kind 0, so each program finds
+        // its own translation, where the bare kind-6 program above is ambiguous.
+        {
+            const std::vector<std::uint8_t> kind1(20, 0x22), kind7(24, 0x77);
+            for (const auto* state : {&state32, &state64}) {
+                const FspxPart parts[] = {{0, state->data(), state->size()}, {1, kind1.data(), kind1.size()},
+                                          {6, code.data(), code.size()}, {7, kind7.data(), kind7.size()}};
+                const auto built = fspx_payload_from_parts(parts);
+                const ComputeProgram program = compute_program(built);
+                CHECK(program.kind == ComputeProgram::Kind::fspx && program.bytes == code && program.state == *state);
+                const auto found = pair.program_candidates("cs", program, &ambiguous);
+                CHECK(found.size() == 1 && !ambiguous &&
+                      found[0]->name == (state == &state32 ? "fspx/pair_32" : "fspx/pair_64"));
+            }
+        }
         // The same two keys with one module (a duplicate container) is not ambiguous for the bare program.
         write("pair_64", module(1));
         CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).size() == 2 && !ambiguous);
@@ -488,6 +535,35 @@ int main() {
         const auto bare = pair.program_candidates("cs", compute_program(code), &ambiguous);
         CHECK(bare.size() == 1 && bare[0]->name == "fspx/pair_32" && !ambiguous);
         std::filesystem::remove_all(dir);
+    }
+
+    // fspx_payload_from_parts: the slot-67 pairs as one payload, and every inconsistent pair refused before a read.
+    {
+        const auto code = fspx_code(0x5000);
+        const std::vector<std::uint8_t> state(28, 0x11), kind1(20, 0x22), kind7(24, 0x77);
+        const auto build = [&](std::initializer_list<FspxPart> parts) {
+            return fspx_payload_from_parts(std::span<const FspxPart>(parts.begin(), parts.size()));
+        };
+        const auto full = build({{0, state.data(), 28}, {1, kind1.data(), 20}, {6, code.data(), code.size()},
+                                 {7, kind7.data(), 24}});
+        CHECK(!full.empty() && full.size() % 16 == 0);
+        const FspxParts parsed = fspx_parts(full);
+        CHECK(std::vector<std::uint8_t>(parsed.code.begin(), parsed.code.end()) == code);
+        CHECK(std::vector<std::uint8_t>(parsed.state.begin(), parsed.state.end()) == state);
+        // Kinds 1 and 7 are optional (null pointer and zero size), as in the DLL's reader.
+        CHECK(compute_program(build({{0, state.data(), 28}, {1, nullptr, 0}, {6, code.data(), code.size()},
+                                     {7, nullptr, 0}})).state == state);
+        // A wild pointer with a size that is refused is never read; neither is anything after a refused pair.
+        const void* wild = reinterpret_cast<const void*>(std::uintptr_t(0x10));
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {7, wild, kFspxPartLimit + 1}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, nullptr, code.size()}}).empty());          // size without pointer
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), 0}}).empty());                // pointer without size
+        CHECK(build({{0, state.data(), 28}, {1, wild, 0}, {6, code.data(), code.size()}}).empty());
+        CHECK(build({{0, nullptr, 0}, {6, code.data(), code.size()}}).empty());           // no kind 0
+        CHECK(build({{0, state.data(), 28}, {7, kind7.data(), 24}}).empty());              // no kind 6
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {6, code.data(), code.size()}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {5, kind7.data(), 24}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {99, kind7.data(), 24}}).empty());
     }
 
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");

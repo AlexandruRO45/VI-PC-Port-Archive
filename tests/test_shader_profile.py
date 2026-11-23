@@ -8,12 +8,15 @@ Run:
     python -I tests/test_shader_profile.py
     python -m unittest discover -s tests -v
 """
+from contextlib import nullcontext, redirect_stdout
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -348,6 +351,16 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         with open(out_json, encoding="utf-8") as f:
             return res.stdout, json.load(f, parse_constant=self.fail)
 
+    def test_cli_default_report_is_next_to_disasm_directory(self):
+        shader_dir = os.path.join(self.tmp.name, "work", "shaders", "dxbc")
+        disasm_dir = os.path.join(shader_dir, "disasm")
+        os.makedirs(disasm_dir)
+        tool = os.path.join(ROOT, "tools", "shader_profile.py")
+        result = subprocess.run([sys.executable, "-I", tool, disasm_dir], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(os.path.join(shader_dir, "profile.json"), encoding="utf-8") as report:
+            self.assertEqual(json.load(report)["shaders"], 0)
+
     def test_cli_bad_source_or_out_is_one_line(self):
         tool = os.path.join(ROOT, "tools", "shader_profile.py")
         a_file = os.path.join(self.disasm_dir, "ps_001.s")
@@ -375,9 +388,28 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertEqual(data["categories"]["memory"], 0)
         self.assertIsNone(data["ratios"]["alu_to_memory"])
 
+    def test_cli_counts_category_occurrences_by_stage(self):
+        self.write("ps_first", "\tv_mov_b32 v0, 1\n" * 2)
+        self.write("ps_second", "\tv_mov_b32 v1, 2\n\ts_endpgm\n")
+        self.write("vs_first", "\ts_load_dword s0, s[2:3], 0\n")
+        self.write("unclassified", "")
+        self.write("zz_foo", "\tv_mov_b32 v2, 1\n")
+        self.write("LIB_helper", "\ts_endpgm\n")
+        _, data = self.run_profile()
+        stages = data["categories_by_stage"]
+        self.assertEqual(list(stages), ["?", "lib", "ps", "vs"])
+        self.assertEqual(stages["ps"], {"alu": 3, "memory": 0, "branch": 0,
+                                        "export": 0, "other": 1, "total": 4})
+        self.assertEqual(stages["vs"]["memory"], 1)
+        self.assertEqual(stages["?"]["alu"], 1)
+        self.assertEqual(stages["lib"]["total"], 1)
+        for key, count in data["categories"].items():
+            self.assertEqual(sum(stage[key] for stage in stages.values()), count)
+
     def test_cli_empty_corpus(self):
         stdout, data = self.run_profile()
         self.assertEqual(data["shaders"], 0)
+        self.assertEqual(data["categories_by_stage"], {})
         self.assertEqual(data["ratios"]["alu_to_memory"], 0.0)
         self.assertEqual(data["undecoded"], {"warnings": 0, "unresolved": 0, "by_word": []})
         self.assertIn("  undecoded: 0 LLVM warnings, 0 distinct words, 0 unresolved", stdout)
@@ -475,6 +507,51 @@ class TestCommandLineEndToEnd(unittest.TestCase):
 
         self.assertEqual(data["shaders"], 1)
         self.assertEqual([shader["name"] for shader in data["per_shader"]], ["cs_main"])
+
+    def test_profile_rankings_do_not_depend_on_directory_order(self) -> None:
+        self.write("ps_vector", "\n".join((
+            "\tv_add_f32 v0, v0, v1",
+            "\tv_add_f32 v0, v0, v1",
+            "\tv_and_b32 v0, v0, v1",
+            "\tv_max_f32 v0, v0, v1",
+            "\tv_min_f32 v0, v0, v1",
+            "\tv_mov_b32 v0, v1",
+            "\tv_or_b32 v0, v0, v1",
+            "\tv_xor_b32 v0, v0, v1",
+            "\ts_endpgm",
+        )))
+        self.write("ps_scalar", "\n".join((
+            "\ts_add_u32 s0, s0, s1",
+            "\ts_and_b32 s0, s0, s1",
+            "\ts_mov_b32 s0, s1",
+            "\ts_nop 0",
+            "\ts_or_b32 s0, s0, s1",
+            "\ts_xor_b32 s0, s0, s1",
+            "\ts_endpgm",
+        )))
+        with os.scandir(self.disasm_dir) as scan:
+            entries = sorted(scan, key=lambda entry: entry.name)
+        report = os.path.join(self.tmp.name, "profile.json")
+        args = ["shader_profile.py", self.disasm_dir, "--out", report]
+
+        def profile(order: list[os.DirEntry[str]]) -> tuple[str, bytes]:
+            stdout = io.StringIO()
+            with (patch.object(P.os, "scandir", return_value=nullcontext(order)),
+                  patch.object(sys, "argv", args), redirect_stdout(stdout)):
+                self.assertIsNone(P.main())
+            with open(report, "rb") as output:
+                return stdout.getvalue(), output.read()
+
+        forward, data = profile(entries)
+        reverse, reversed_data = profile(list(reversed(entries)))
+        self.assertEqual(data, reversed_data)
+        self.assertEqual(forward, reverse)
+        rankings = json.loads(data)["by_mnemonic"]
+        self.assertEqual(rankings[0], {"m": "s_endpgm", "shaders": 2, "count": 2})
+        self.assertEqual([row["m"] for row in rankings[1:]], sorted(row["m"] for row in rankings[1:]))
+        most_widespread = next(line for line in forward.splitlines() if "most widespread:" in line)
+        self.assertEqual(most_widespread.removeprefix("  most widespread: "),
+                         ", ".join(f"{row['m']} ({row['shaders']})" for row in rankings[:12]))
 
     def test_cli_warning_words_from_llvm_messages(self):
         a = echo("070080bf feffffff ffffffd7 050080bf feffffff 000081bf")
@@ -587,6 +664,32 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertIn("ERROR: output would overwrite input shader", res.stderr)
         with open(shader_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), original_content)
+
+    def test_unreadable_listing_reports_its_path_and_preserves_report(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        self.write("cs_main", "\ts_endpgm\n")
+        listing = os.path.join(self.disasm_dir, "cs_main.s")
+        report = os.path.join(self.tmp.name, "profile.json")
+        original = b'{"previous": true}\n'
+        with open(report, "wb") as f:
+            f.write(original)
+
+        def open_listing(path, *args, **kwargs):
+            if path == listing:
+                raise PermissionError(13, "Cannot read listing", listing)
+            return open(path, *args, **kwargs)
+
+        stderr = StringIO()
+        with (patch.object(P, "open", open_listing, create=True),
+              patch.object(sys, "argv", ["shader_profile.py", self.disasm_dir, "--out", report]),
+              patch.object(sys, "stderr", stderr)):
+            self.assertEqual(P.main(), 2)
+
+        self.assertEqual(stderr.getvalue().splitlines(), [f"ERROR: cannot read {listing}: Cannot read listing"])
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), original)
 
 
 if __name__ == "__main__":

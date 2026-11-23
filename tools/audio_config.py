@@ -15,10 +15,10 @@ record:
     record + 20  22 bytes            fixed flags/parameters
 
 `hash B` is Jenkins one-at-a-time over the lowercase name with spaces and punctuation mapped to `_`.
-The AWC stream id is `hash B & 0x1FFFFFFF`; the duration is the real song/ad length, while the AWC
-manifest reports twice that value because of a stereo-sample counting artifact. That mapping was
-checked against a package's AWC manifest: all 1,589 records resolve to a stream id and 1,584 of 1,589
-durations equal `manifest duration / 2` within 0.01 s.
+The AWC stream id is `hash B & 0x1FFFFFFF`. The config and the current AWC manifest report
+per-channel duration, which is the actual song/ad length. In the original comparison, all
+1,589 records resolved to a stream id and 1,584 durations matched within 0.01 s after
+halving the legacy manifest values to account for interleaved stereo samples.
 
 The config stores no per-track start offsets. It gives the station grouping as contiguous config-id
 ranges and station-local content-id lists, but the mix order is not stored; a continuous radio mix
@@ -60,9 +60,15 @@ JOIN_BLOCK_BYTES = 1 << 20   # --join read size; a typical carved part is one re
 
 
 def joaat(text):
-    """Jenkins one-at-a-time over the lowercased UTF-8 bytes, as used for the name hash."""
+    """Jenkins one-at-a-time over the lowercased latin-1 bytes, as the name hash is defined.
+
+    The same rule as ``tools/hashdict.py`` (the pinned name dictionary) and ``tools/awc_names.py``, which
+    recovers stream names: a name has to hash alike in every tool or the id never matches. Lowercased
+    UTF-8 gave a different hash for any non-ASCII character (``é`` is one byte 0xE9, not 0xC3 0xA9), so a
+    title with an accent produced a stream id no bank stores.
+    """
     h = 0
-    for c in text.lower().encode("utf-8", "ignore"):
+    for c in text.lower().encode("latin-1", "replace"):
         h = (h + c) & 0xFFFFFFFF
         h = (h + (h << 10)) & 0xFFFFFFFF
         h ^= h >> 6
@@ -257,7 +263,8 @@ def main():
         ap.error("require 1 <= min-ms <= max-ms")
 
     if not os.path.exists(a.src):
-        sys.exit(f"{a.src}: does not exist")
+        print(f"ERROR: {a.src}: does not exist", file=sys.stderr)
+        return 2
     if a.join and not os.path.isdir(a.src):
         ap.error("--join applies to a directory, not a single file")
     try:

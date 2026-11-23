@@ -31,7 +31,8 @@ Usage:
     python -I tools/cf_diff.py --seed S --program K --show [--minimize]     # print (and shrink) one program
 
 Exit code 0 when every program matches, 1 on a mismatch (case, seed, lane, the expected and actual words and the
-listing; with --minimize also a reduced listing), 2 on harness errors. Skips are counted with reasons.
+listing; with --minimize also a reduced listing), 2 on harness errors or when every program was skipped (nothing was
+compared). Skips are counted with reasons.
 """
 import argparse
 import gc
@@ -124,8 +125,11 @@ class Gen:
 
     def compound(self, depth):
         r = self.r
-        kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "vloop", "irr",
-                         "sccmask", "csel"))
+        kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
+                         "vloop", "irr", "sccmask", "csel"))
+        if kind == "saveexec":
+            return ("saveexec", self.cmp(), r.choice(("andn2", "orn2", "xor", "nand", "nor", "xnor")),
+                    r.choice((None, "s_cbranch_execz", "s_cbranch_scc0")), [self.probe()] + self.block(depth))
         if kind == "sccmask":
             return ("sccmask", self.cmp(), r.choice(("and", "andn2", "or", "xor")),
                     r.choice(("s_cbranch_scc0", "s_cbranch_scc1")), [self.probe()] + self.block(depth))
@@ -282,6 +286,18 @@ class Emitter:
             self.ins(f"v_cmpx_{cc}_{ty}_e32 {k}, v{v}")
             if skip:
                 self.br("s_cbranch_execz", end)
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.place(end)
+            self.ins(f"s_mov_{w} {ex}, {save}")
+        elif kind == "saveexec":
+            _, c, op_name, skip_br, body = n
+            save, end = self.sreg(20), self.label()
+            self.vcmp(c)
+            self.ins(f"s_{op_name}_saveexec_{w} {save}, {self.vcc()}")
+            if skip_br is not None:
+                self.br(skip_br, end)
             self.depth += 1
             self.nodes(body)
             self.depth -= 1
@@ -598,7 +614,13 @@ def main(argv=None):
     ap.add_argument("--spirv-val", action="store_true",
                     help="also run spirv-as and spirv-val on every translation (a failure counts as a mismatch)")
     ap.add_argument("--self-test", action="store_true")
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
+    if a.programs < 1:
+        ap.error("--programs must be at least 1")
     if a.spirv_val:
         missing = [t for t in ("spirv-as", "spirv-val") if not shutil.which(t)]
         if missing:
@@ -612,10 +634,12 @@ def main(argv=None):
     structured = not a.dispatch_loop
     if a.program is not None:
         rc = 0
+        matched = 0
         for wave in waves:
             body = program_for(a.seed, a.program, wave, a.depth)
             status, detail = run_case(f"ps_cf_{a.program:04d}_w{wave}", body, wave, structured)
             print(f"program {a.program} wave{wave}: {status} {detail}")
+            matched += status == "match"
             if status == "mismatch":
                 rc = 1
                 if a.minimize:
@@ -623,6 +647,9 @@ def main(argv=None):
                     print("reduced:", run_case("ps_cf_min", body, wave, structured)[1])
             if a.show or a.minimize:
                 print(listing_text(build(body, wave), f"ps_cf_{a.program:04d}_w{wave}"))
+        if not rc and not matched:   # same order as the suite: a mismatch (1) outranks "nothing was compared" (2)
+            print("no program ran: every one was skipped")
+            return 2
         return rc
     counts, failures = run_suite(a.programs, a.seed, waves, structured, a.depth)
     skips = sum(counts["skip"].values())
@@ -638,7 +665,12 @@ def main(argv=None):
         print(f"  ... {len(failures) - 10} more")
     if counts["harness-error"]:
         return 2
-    return 1 if counts["mismatch"] else 0
+    if counts["mismatch"]:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

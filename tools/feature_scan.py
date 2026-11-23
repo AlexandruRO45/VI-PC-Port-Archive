@@ -17,6 +17,11 @@ Reads what the shaders stage of make_game.py leaves in <work>/shaders, and print
   (§5.2) if two of its stages use one; this gives the per-stage counts. Which stages are paired in one PSO is in
   the executable, not in shaders.rpf.
 
+InnerCoverage metadata is cross-tabulated by stage: SFI0 set/clear/unknown versus ISG1
+present/absent/unknown. Unknown includes missing or truncated parts; unreadable containers
+remain in the existing unreadable count. DXIL permits InnerCoverage outside the signature,
+so ISG1 absence is not evidence of non-use. These counts do not identify an Xbox input VGPR.
+
 Standard library only. Nothing from the game is printed or written: names, code and data stay in the work folder.
 """
 import argparse
@@ -143,9 +148,32 @@ def stage_name(row: dict) -> str:
     return stage if isinstance(stage, str) and stage else "?"
 
 
+def inner_coverage_metadata(p: dict) -> tuple[str, str]:
+    """Independent SFI0/ISG1 observations, not an Xbox VGPR mapping.
+
+    DXC DxilConstants.h defines ShaderFeatureInfo_InnerCoverage as 0x400;
+    DxilContainer.h defines the signature system value as 70. DXIL.rst marks
+    InnerCoverage NotInSig: an absent signature entry does not disprove use.
+    Missing/truncated metadata must not become evidence of absence.
+    """
+    sfi = p.get("SFI0", b"")
+    feature = "unknown"
+    if len(sfi) >= 8:
+        feature = "set" if struct.unpack_from("<Q", sfi)[0] & 0x400 else "clear"
+    sig = p.get("ISG1", b"")
+    signature = "unknown"
+    if len(sig) >= 8:
+        count, first = struct.unpack_from("<II", sig)
+        if 8 <= first <= len(sig) and count <= (len(sig) - first) // 32:
+            signature = "present" if any(struct.unpack_from("<I", sig, first + i * 32 + 12)[0] == 70
+                                         for i in range(count)) else "absent"
+    return feature, signature
+
+
 def scan_dxbc(dxbc_dir: str, index: list) -> dict:
     stages = Counter()
     flags = defaultdict(Counter)  # flag -> stage -> shaders
+    inner = defaultdict(Counter)  # stage -> independent metadata observations, counts only
     gs_streams = Counter()
     non_zero_stream = Counter()  # stage -> shaders with an output element on a stream other than 0
     records, shaders_with = Counter(), Counter()   # PSV0: (type, kind) -> records; watched class -> shaders
@@ -168,6 +196,8 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
         except (OSError, ValueError):
             missing += 1
             continue
+        feature, signature = inner_coverage_metadata(p)
+        inner[stage][f"sfi0_{feature}__isg1_{signature}"] += 1
         if len(p.get("SFI0", b"")) >= 8:
             mask = struct.unpack_from("<Q", p["SFI0"], 0)[0]
             for bit, name in SFI0_FLAGS.items():
@@ -193,6 +223,7 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
         by_type[t] += n
     return {"stages": {s: stages.get(s, 0) for s in ALL_STAGES} | {k: v for k, v in stages.items() if k not in ALL_STAGES},
             "sfi0": {n: dict(flags[n]) for n in sorted(flags)},
+            "inner_coverage_metadata": {s: dict(sorted(v.items())) for s, v in sorted(inner.items())},
             "gs_output_stream_count": dict(gs_streams), "output_on_stream_other_than_0": dict(non_zero_stream),
             "psv0": {"records": sum(records.values()),
                      "by_type": dict(by_type),
@@ -230,6 +261,10 @@ def _written_regs(tok: str) -> list:
     return []
 
 
+def _has_secondary_sgpr_destination(op: str) -> bool:
+    return op.startswith("v_") and ("_co_" in op or op.startswith("v_div_scale"))
+
+
 def _update_const_regs(const_reg: dict, op: str, operands: list) -> None:
     """Track single-register immediate loads and invalidate any destination register written."""
     if not operands:
@@ -241,8 +276,12 @@ def _update_const_regs(const_reg: dict, op: str, operands: list) -> None:
         if imm is not None:
             const_reg[dst] = imm
             return
-    for r in _written_regs(dst):
-        const_reg.pop(r, None)
+    destination_count = 2 if _has_secondary_sgpr_destination(op) else 1
+    for operand in operands[:destination_count]:
+        tokens = operand.split()
+        if tokens:
+            for register in _written_regs(tokens[0]):
+                const_reg.pop(register, None)
 
 
 def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
@@ -253,7 +292,7 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
     vperm_sext_shaders = vperm_sext_insns = 0
     vperm_classes = {"0_7": 0, "8_11": 0, "12": 0, "13_plus": 0}
     files = 0
-    for fn in os.listdir(disasm_dir):
+    for fn in sorted(os.listdir(disasm_dir)):
         if not fn.endswith(".s"):
             continue
         files += 1
@@ -361,7 +400,7 @@ def sgpr_writes(ins: dict) -> range:
     elif op.startswith(("v_readlane", "v_readfirstlane")) or (op.startswith("v_cmp") and not op.startswith("v_cmpx")
                                                                and op.endswith("_e64")):
         dst = args[0] if args else None
-    elif op.startswith("v_") and len(args) > 1 and ("_co_" in op or op.startswith("v_div_scale")):
+    elif len(args) > 1 and _has_secondary_sgpr_destination(op):
         dst = args[1]
     if dst and dst.get("k") == "sgpr":
         return range(dst["r"], dst["r"] + dst.get("n", 1))
@@ -464,7 +503,7 @@ def scan_typed_buffers(disasm_dir: str, stage_of: dict) -> dict:
 
 
 def scan_spirv(spirv_index: str) -> dict:
-    with open(spirv_index, encoding="utf-8") as f:
+    with open(spirv_index, encoding="utf-8-sig") as f:
         idx = json.load(f)
     # An object maps shader names to rows; a list is the other accepted shape. A scalar is a
     # broken index, not something to iterate -- report no translated shaders for it.
@@ -497,10 +536,13 @@ def same_path(first: str, second: str) -> bool:
 
 
 def inside_dir(path: str, folder: str) -> bool:
-    """True when path is folder itself or anything under it."""
-    root = os.path.normcase(os.path.abspath(folder))
-    target = os.path.normcase(os.path.abspath(path))
-    return target == root or target.startswith(root + os.sep)
+    """True when the path itself or its symlink target is in the folder."""
+    for resolve in (os.path.abspath, os.path.realpath):
+        root = os.path.normcase(resolve(folder))
+        target = os.path.normcase(resolve(path))
+        if target == root or target.startswith(os.path.join(root, "")):
+            return True
+    return False
 
 
 def main() -> int:
@@ -521,15 +563,16 @@ def main() -> int:
             print(f"ERROR: --out {a.out} is inside the scanned corpus {dxbc_dir}. Writing the report there would "
                   "replace index.json or a .dxbc the scan reads. Give a report path outside it.", file=sys.stderr)
             return 2
-        if same_path(a.out, spirv_index):
-            print(f"ERROR: --out {a.out} is {spirv_index}, which the scan reads. Give another report path.",
-                  file=sys.stderr)
-            return 2
+        for input_index in (index_path, spirv_index):
+            if same_path(a.out, input_index):
+                print(f"ERROR: --out {a.out} is {input_index}, which the scan reads. Give another report path.",
+                      file=sys.stderr)
+                return 2
     if not os.path.isfile(index_path):
         print(f"ERROR: {index_path} is missing. Run the shaders stage of make_game.py first.", file=sys.stderr)
         return 2
     try:
-        with open(index_path, encoding="utf-8") as f:
+        with open(index_path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
         print(f"ERROR: cannot read {index_path}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
@@ -563,6 +606,8 @@ def main() -> int:
     for name in WATCHED:
         print(f"SFI0 {name}: {sum(d['sfi0'].get(name, {}).values())} {d['sfi0'].get(name, {})}")
     print("SFI0, every flag set anywhere:", {n: sum(v.values()) for n, v in d["sfi0"].items()})
+    print("InnerCoverage metadata (ISG1 absence does not disprove use; no Xbox VGPR mapping):",
+          d["inner_coverage_metadata"])
     print("GS output-signature stream counts:", d["gs_output_stream_count"],
           "| shaders with an output on a stream other than 0:", d["output_on_stream_other_than_0"] or 0)
     pv = d["psv0"]
@@ -596,10 +641,14 @@ def main() -> int:
         print(f"{d['unreadable']} .dxbc files could not be read")
     if a.out:
         folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(result, f, indent=1)
+        try:
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(result, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 

@@ -11,13 +11,14 @@ interpreter and is never modified here.
 
 Usage:
     python -I tools/shader_diff.py [--programs N] [--seed S] [--max-ops N]
+    python -I tools/shader_diff.py --program-index I --seed S --max-ops N
     python -I tools/shader_diff.py --self-test     # harness canaries (must fail loudly if broken)
     python -I tools/shader_diff.py --list-ops
 
 Exit code is 0 when every program matches, 1 on the first mismatch (with the
 case name, seed, lane, register, expected/actual bits and the RDNA2
-instruction that last wrote the value), 2 on harness errors. Skips are
-counted with reasons and never silent.
+instruction that last wrote the value), 2 on harness errors or when every
+program was skipped (nothing was compared). Skips are counted with reasons and never silent.
 """
 import argparse
 import gc
@@ -116,7 +117,7 @@ def _op_templates():
 # adds to OpIAddCarry, which tests/semantic/spirv_mini_interp.py does not
 # model yet, so every such program would skip with a reason instead of
 # proving anything. Scalar reads are still covered: seeds are moved through
-# s_regs and observed via the v_mov_b32/sgpr copy into v15. Extending the
+# s_regs and observed via the v_mov_b32/sgpr copy into an exported VGPR. Extending the
 # mini-interp (not this runner) re-enables scalar ALU coverage.
 _VEC_OPS = ("v_mov_b32", "v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32",
             "v_and_b32", "v_or_b32", "v_xor_b32", "v_lshlrev_b32",
@@ -162,7 +163,14 @@ def generate_program(rng, n_ops):
         name, emit = rng.choice(vec_ops)
         dst = rng.choice(SCRATCH)
         clean = [v for v in SCRATCH if v not in tainted]
-        pool = SCRATCH if name in _FLOAT_OPS or not clean else clean
+        if name not in _FLOAT_OPS and not clean:
+            # All float results may carry oracle-specific NaN payloads. Restore one
+            # known bit pattern before choosing integer operands, even when dst is read.
+            lines.append(f"v_mov_b32 v{dst}, 0")
+            writers[dst] = ("v_mov_b32/seed", len(lines))
+            tainted.discard(dst)
+            clean = [dst]
+        pool = SCRATCH if name in _FLOAT_OPS else clean
         srcs = [rng.choice(pool) for _ in range(4)]
         lines.append(emit(rng, dst, srcs))
         writers[dst] = (name, len(lines))
@@ -170,9 +178,10 @@ def generate_program(rng, n_ops):
             tainted.add(dst)
         else:
             tainted.discard(dst)
-    # Observe one scalar through a VGPR so scalar ops are covered too.
-    lines.append(f"v_mov_b32 v15, s{rng.choice(s_regs)}")
-    writers[15] = ("v_mov_b32/sgpr-copy", len(lines))
+    # Reuse the oldest export: an untouched seed if possible, else an ALU result.
+    dst = min(EXPORT_REGS, key=lambda reg: writers[reg][1])
+    lines.append(f"v_mov_b32 v{dst}, s{rng.choice(s_regs)}")
+    writers[dst] = ("v_mov_b32/sgpr-copy", len(lines))
     return lines, writers
 
 
@@ -209,7 +218,7 @@ def compare_pair(cpu_words, spv_words, *, writers=None):
             if c_nan or s_nan:
                 mismatch = f"lane word {i}: only one side is NaN (cpu=0x{c:08x} spv=0x{s:08x})"
         if writer:
-            mismatch += f" (last writer {writer[0]} at body line {writer[1]})"
+            mismatch += f" (last writer {writer[0]} at body line {writer[1]} for v{EXPORT_REGS[i]})"
         return mismatch
     return None
 
@@ -239,8 +248,6 @@ def run_one(name, lines, writers):
                 gc.collect()
         except rdna2spirv.Unsupported as e:
             return ("skip", f"translator unsupported: {e}")
-        except (IndexError, KeyError, ValueError) as e:
-            return ("skip", f"translator error {type(e).__name__}: {e}")
         try:
             out = run_fragment(spvasm)
         except UnsupportedConstruct as e:
@@ -256,28 +263,32 @@ def run_one(name, lines, writers):
         return ("mismatch", mismatch)
 
 
-def run_suite(programs, seed, max_ops, limit=None):
-    """Run N seeded programs. Returns (counts, first_failure)."""
+def run_suite(programs, seed, max_ops, limit=None, *, start=0):
+    """Generate the seeded sequence, executing cases from index start. Return (counts, first_failure)."""
     counts = {"pass": 0, "mismatch": 0, "skip": {}, "harness-error": 0}
     first_failure = None
     rng = random.Random(seed)
     total = programs if limit is None else min(programs, limit)
     for i in range(total):
-        name = f"ps_diff_{i:04d}"
         lines, writers = generate_program(rng, rng.randrange(1, max_ops + 1))
+        if i < start:  # advance the original RNG stream, but skip both oracles
+            continue
+        name = f"ps_diff_{i:04d}"
         try:
             status, detail = run_one(name, lines, writers)
         except Exception as e:  # noqa: BLE001 - harness bugs must be loud
             counts["harness-error"] += 1
             if first_failure is None:
-                first_failure = f"{name}: harness error {type(e).__name__}: {e}"
+                first_failure = (f"{name}: harness error {type(e).__name__}: {e}\n"
+                                 f"Replay: --seed {seed} --max-ops {max_ops} --program-index {i}")
             continue
         if status == "match":
             counts["pass"] += 1
         elif status == "mismatch":
             counts["mismatch"] += 1
             if first_failure is None:
-                first_failure = (f"{name} (seed {seed} program {i}): {detail}\n" +
+                first_failure = (f"{name} (seed {seed} program {i}): {detail}\n"
+                                 f"Replay: --seed {seed} --max-ops {max_ops} --program-index {i}\n" +
                                  "\n".join("\t" + line for line in lines))
         else:
             counts["skip"][detail] = counts["skip"].get(detail, 0) + 1
@@ -326,7 +337,10 @@ def _at_least_one(value):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Differential oracle: cpu_ref vs translated SPIR-V.")
-    ap.add_argument("--programs", type=_at_least_one, default=200, help="number of programs to run (default: 200)")
+    selection = ap.add_mutually_exclusive_group()
+    selection.add_argument("--programs", type=_at_least_one, help="number of programs to run (default: 200)")
+    selection.add_argument("--program-index", type=int, metavar="I",
+                           help="replay only zero-based program I using the original --seed and --max-ops")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-ops", type=_at_least_one, default=8,
                     help="maximum ops per generated program (default: 8)")
@@ -341,7 +355,15 @@ def main(argv=None):
         return 0
     if a.self_test:
         return 0 if self_test() else 1
-    counts, first_failure = run_suite(a.programs, a.seed, a.max_ops, a.limit)
+    if a.program_index is None:
+        counts, first_failure = run_suite(a.programs or 200, a.seed, a.max_ops, a.limit)
+    else:
+        if a.program_index < 0:
+            ap.error("--program-index must be nonnegative")
+        if a.limit is not None:
+            ap.error("--program-index cannot be combined with --limit")
+        print(f"replaying program {a.program_index} (seed {a.seed}, max ops {a.max_ops})")
+        counts, first_failure = run_suite(a.program_index + 1, a.seed, a.max_ops, start=a.program_index)
     total_skips = sum(counts["skip"].values())
     total_run = counts["pass"] + counts["mismatch"] + total_skips + counts["harness-error"]
     print(f"{total_run} programs (seed {a.seed}): "
@@ -353,7 +375,12 @@ def main(argv=None):
         print("FIRST FAILURE:\n" + first_failure)
     if counts["harness-error"]:
         return 2
-    return 1 if counts["mismatch"] else 0
+    if counts["mismatch"]:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

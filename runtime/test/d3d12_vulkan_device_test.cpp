@@ -3,13 +3,15 @@
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue, a fence and query heaps. Results are read back through D3D12 itself
 // (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo,
-// GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths and the HRESULTs of invalid
-// arguments to resource, heap, queue and fence creation and Map are compared with the host PC runtime's
+// GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths, fence semantics and the
+// HRESULTs of invalid arguments to resource, heap, queue and fence creation and Map are compared with the host PC
+// runtime's
 // (LEONIDA_D3D49_VERBOSE=1 prints every argument case). WriteToSubresource/ReadFromSubresource run on
 // devices of their own, once per copy path. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run
 // under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_feature_compat.h"
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
@@ -252,15 +254,15 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
         EXPECT(bc1->WriteToSubresource(0, &cut, blocks, 16, 0) == E_INVALIDARG);
     }
 
-    // Calls D3D12 rejects.
+    // Calls D3D12 rejects, and two it doesn't: an empty box copies nothing, and pitches aren't checked (the host's
+    // answers, d3d12_subresource_copy_test).
     const D3D12_BOX outside{0, 0, 0, 9, 1, 1}, empty{2, 2, 0, 2, 3, 1};
     EXPECT(tex->WriteToSubresource(0, &outside, src.data(), 100, 0) == E_INVALIDARG);
-    EXPECT(tex->WriteToSubresource(0, &empty, src.data(), 100, 0) == E_INVALIDARG);
+    EXPECT(tex->WriteToSubresource(0, &empty, src.data(), 100, 0) == S_OK);
     EXPECT(tex->WriteToSubresource(2, nullptr, src.data(), 100, 0) == E_INVALIDARG);  // 2 mips, 1 layer
     EXPECT(tex->WriteToSubresource(0, nullptr, nullptr, 32, 0) == E_INVALIDARG);
     EXPECT(tex->ReadFromSubresource(nullptr, 32, 0, 0, nullptr) == E_INVALIDARG);
-    EXPECT(tex->WriteToSubresource(0, nullptr, src.data(), 16, 0) == E_INVALIDARG);  // 32-byte rows 16 apart
-    EXPECT(vol->WriteToSubresource(0, nullptr, src.data(), 16, 32) == E_INVALIDARG);  // 64-byte slices 32 apart
+    EXPECT(vol->WriteToSubresource(0, nullptr, src.data(), 16, 32) == S_OK);  // 64-byte slices 32 apart
     EXPECT(buffer->WriteToSubresource(0, nullptr, src.data(), 16, 0) == E_INVALIDARG);
 
     // A default-heap texture: D3D12 wants a CPU-visible heap, but the copy still works (and is logged).
@@ -531,6 +533,10 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        // Mip counts past 32 (and past 64 for the width): D3D12 accepts any count, every mip past the chain is 1x1.
+        {texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 40), 40},
+        {line_desc(16, 70, 1, DXGI_FORMAT_R8G8B8A8_UNORM), 70},
+        {volume_desc(40), 40},
     };
     for (const auto& c : footprint_validity_cases()) cases.push_back({c.first, 1});
     int mismatches = 0;
@@ -621,6 +627,56 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"buffer width 0", buffer_desc(0), 0},
         {"buffer height 2", bad_buffer, 0},
         {"buffer with a format", typed_buffer, 0},
+        // Resource flag handling (D3D-467).
+        {"buffer render target", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+             return d;
+         }(), 0},
+        {"buffer render target UAV", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return d;
+         }(), 0},
+        {"buffer cross adapter", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+             return d;
+         }(), 0},
+        {"buffer depth stencil (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+             return d;
+         }(), 0},
+        {"buffer simultaneous access (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+             return d;
+         }(), 0},
+        {"buffer video decode reference only (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY;
+             return d;
+         }(), 0},
+        {"buffer flag 0x1000 (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAGS(0x1000);
+             return d;
+         }(), 0},
+        {"tex2d deny shader resource alone (invalid)", [&] {
+             auto d = texture_desc(16, 16, rgba8, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+             return d;
+         }(), 0},
+        {"tex2d single sample quality 1", [&] {
+             auto d = texture_desc(16, 16, rgba8, none);
+             d.SampleDesc.Quality = 1;
+             return d;
+         }(), 16 * 16 * 4},
+        {"tex2d single sample quality center pattern", [&] {
+             auto d = texture_desc(16, 16, rgba8, none);
+             d.SampleDesc.Quality = 0xffffffff;
+             return d;
+         }(), 16 * 16 * 4},
         {"256x256 full chain", texture_desc(256, 256, rgba8, none, 0), 256 * 256 * 4},
         {"16x16 small", with(texture_desc(16, 16, rgba8, none), k4), 16 * 16 * 4},
         {"16x16 small render target", with(texture_desc(16, 16, rgba8, rt), k4), 16 * 16 * 4},
@@ -865,6 +921,56 @@ int compare_allocation_info(ID3D12Device* ours) {
     const D3D12_RESOURCE_ALLOCATION_INFO empty_b = host->GetResourceAllocationInfo(0, 0, nullptr);
     if (empty_a.SizeInBytes != empty_b.SizeInBytes || empty_a.Alignment != empty_b.Alignment)
         mismatch("no resources", empty_a, empty_b);
+
+    // A visible mask above 1 names a node a single-node adapter does not have: the host answers the invalid
+    // allocation (size UINT64_MAX, 64 KiB alignment), for one resource and for none, through GetResourceAllocationInfo
+    // and its 1 and 2 variants, and leaves the per-resource array as it was.
+    {
+        Ref<ID3D12Device4> ours4, host4;
+        Ref<ID3D12Device8> ours8_mask, host8_mask;
+        ours->QueryInterface(IID_PPV_ARGS(&ours4.p));
+        host->QueryInterface(IID_PPV_ARGS(&host4.p));
+        ours->QueryInterface(IID_PPV_ARGS(&ours8_mask.p));
+        host->QueryInterface(IID_PPV_ARGS(&host8_mask.p));
+        const D3D12_RESOURCE_DESC buffer = buffer_desc(256);
+        D3D12_RESOURCE_DESC1 buffer1{};
+        buffer1.Dimension = buffer.Dimension;
+        buffer1.Width = buffer.Width;
+        buffer1.Height = buffer1.DepthOrArraySize = buffer1.MipLevels = 1;
+        buffer1.SampleDesc.Count = 1;
+        buffer1.Layout = buffer.Layout;
+        const auto same_info = [](const D3D12_RESOURCE_ALLOCATION_INFO& x, const D3D12_RESOURCE_ALLOCATION_INFO& y) {
+            return x.SizeInBytes == y.SizeInBytes && x.Alignment == y.Alignment;
+        };
+        for (const UINT mask : {0u, 1u, 2u, 3u, 0x80000000u}) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "visible mask 0x%x", mask);
+            for (const UINT count : {0u, 1u}) {
+                const D3D12_RESOURCE_DESC* descs = count ? &buffer : nullptr;
+                const auto ia = ours->GetResourceAllocationInfo(mask, count, descs);
+                const auto ib = host->GetResourceAllocationInfo(mask, count, descs);
+                if (!same_info(ia, ib)) mismatch(name, ia, ib);
+            }
+            if (ours4.p && host4.p) {
+                const D3D12_RESOURCE_ALLOCATION_INFO1 sentinel{0xdead, 0xbeef, 0xcafe};
+                D3D12_RESOURCE_ALLOCATION_INFO1 each_a = sentinel, each_b = sentinel;
+                const auto ia = ours4->GetResourceAllocationInfo1(mask, 1, &buffer, &each_a);
+                const auto ib = host4->GetResourceAllocationInfo1(mask, 1, &buffer, &each_b);
+                if (!same_info(ia, ib) || each_a.Offset != each_b.Offset || each_a.SizeInBytes != each_b.SizeInBytes ||
+                    each_a.Alignment != each_b.Alignment)
+                    mismatch("visible mask, GetResourceAllocationInfo1", ia, ib);
+            }
+            if (ours8_mask.p && host8_mask.p) {
+                const D3D12_RESOURCE_ALLOCATION_INFO1 sentinel{0xdead, 0xbeef, 0xcafe};
+                D3D12_RESOURCE_ALLOCATION_INFO1 each_a = sentinel, each_b = sentinel;
+                const auto ia = ours8_mask->GetResourceAllocationInfo2(mask, 1, &buffer1, &each_a);
+                const auto ib = host8_mask->GetResourceAllocationInfo2(mask, 1, &buffer1, &each_b);
+                if (!same_info(ia, ib) || each_a.Offset != each_b.Offset || each_a.SizeInBytes != each_b.SizeInBytes ||
+                    each_a.Alignment != each_b.Alignment)
+                    mismatch("visible mask, GetResourceAllocationInfo2", ia, ib);
+            }
+        }
+    }
 
     Ref<ID3D12Device8> ours8;
     // MULTISAMPLE_QUALITY_LEVELS with TILED_RESOURCE: the same answers as the host, except 128-bit formats at 4x,
@@ -1376,6 +1482,8 @@ int compare_depth_multisample_quality_levels(ID3D12Device* ours, VkSampleCountFl
         DXGI_FORMAT_D16_UNORM,
         DXGI_FORMAT_D24_UNORM_S8_UINT,
         DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        DXGI_FORMAT_R24G8_TYPELESS,
+        DXGI_FORMAT_R32G8X24_TYPELESS,
     };
     constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
     unsigned compared = 0, skipped = 0;
@@ -1701,6 +1809,13 @@ bool within_06_ulp(std::uint8_t a, std::uint8_t b, double ideal) {
     return std::abs(double(a) - ideal) <= 0.6 && std::abs(double(b) - ideal) <= 0.6;
 }
 
+// The code nearest to `ideal`, a tie going to the even one: what the layer writes for a normalised clear (#521's
+// quantize_unorm), whichever way the GPU's own driver rounds the tie.
+double nearest_even_code(double ideal) {
+    const double r = std::floor(ideal + 0.5);
+    return r - ideal == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
+
 bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physical,
                                      PFN_vkGetInstanceProcAddr instance_proc, Ref<ID3D12Device>& host,
                                      std::string& adapter_name) {
@@ -1848,6 +1963,11 @@ int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo
             continue;
         }
         ++compared;
+        if ((f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM ||
+             f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+             f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB) &&
+            ((o1 ^ h1) & D3D12_FORMAT_SUPPORT1_BUFFER))
+            fail(f, "buffer support differs from host", o1, o2, h1, h2);
         if (o1 & format_rules & ~h1) fail(f, "1D, 3D, depth-stencil or MIP the host doesn't have", o1, o2, h1, h2);
         if (o2 & any_atomic & ~h2) fail(f, "UAV atomics the host doesn't have", o1, o2, h1, h2);
         if (integer_format(DXGI_FORMAT(f)) && (o1 & filtered))
@@ -1864,9 +1984,7 @@ int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo
         if ((h1 & D3D12_FORMAT_SUPPORT1_MIP) && (o1 & (dims | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL)) &&
             !(o1 & D3D12_FORMAT_SUPPORT1_MIP))
             fail(f, "no MIP where the host has mips", o1, o2, h1, h2);
-        // A8_UNORM reads through a swizzled R8 view, and gathers through that swizzle aren't verified: no gather.
-        if (f != DXGI_FORMAT_A8_UNORM &&
-            bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER))
+        if (bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER))
             fail(f, "gather and sample disagree", o1, o2, h1, h2);
         if (bool(o2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != bool(o2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD))
             fail(f, "typed UAV load and store disagree", o1, o2, h1, h2);
@@ -1962,6 +2080,7 @@ int new_format_round_trips(ID3D12Device* device, const rt::d3d12::VulkanDeviceIn
     };
     constexpr UINT size = 4, pitch = 256, slot = 1024;
     int failures = 0;
+    unsigned host_compared = 0, host_lacking = 0;
     const auto fail = [&](DXGI_FORMAT format, const char* what) {
         if (failures++ < 16) std::fprintf(stderr, "new format %d: %s\n", int(format), what);
     };
@@ -2034,11 +2153,28 @@ int new_format_round_trips(ID3D12Device* device, const rt::d3d12::VulkanDeviceIn
             continue;
         }
         if (host.p) {
-            Ref<ID3D12Resource> native;
-            if (FAILED(host->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                     IID_PPV_ARGS(&native.p))))
-                fail(format, "the host refuses a texture the layer creates");
+            // A host runtime older than the format has nothing to match: A4B4G4R4_UNORM is not in Windows 10's D3D12,
+            // which answers the query with an error (E_FAIL on Windows 10 build 19045, E_INVALIDARG on another 19041
+            // host) or reports no 2D texture, and refuses the texture. Compare only where the host itself says it has
+            // the format, so a host that reports it and still refuses the texture fails as before. The answer is
+            // printed, so an unexpected code stays visible.
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT host_support{format};
+            const HRESULT query = host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &host_support,
+                                                            sizeof(host_support));
+            const bool host_has_format = SUCCEEDED(query) && (host_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+            if (!host_has_format) {
+                ++host_lacking;
+                std::printf("new format %d: the host runtime has no such 2D texture (FORMAT_SUPPORT answered %08lx, "
+                            "e.g. Windows 10), host comparison skipped\n",
+                            int(format), static_cast<unsigned long>(query));
+            } else {
+                ++host_compared;
+                Ref<ID3D12Resource> native;
+                if (FAILED(host->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&native.p))))
+                    fail(format, "the host refuses a texture the layer creates");
+            }
         }
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
         UINT rows = 0;
@@ -2153,9 +2289,12 @@ int new_format_round_trips(ID3D12Device* device, const rt::d3d12::VulkanDeviceIn
     }
     upload->Unmap(0, nullptr);
     readback->Unmap(0, nullptr);
+    char compared[64] = "";
+    if (host.p) std::snprintf(compared, sizeof(compared), " (host compared on %u, host lacks %u)", host_compared,
+                              host_lacking);
     std::printf("new formats: %u of %zu created and copied both ways bit for bit%s, %u render-target clears "
                 "matched the host, A4B4G4R4 render target %s, %d failures\n",
-                round_trips, std::size(formats), host.p ? " (host compared)" : "", clears_matched,
+                round_trips, std::size(formats), compared, clears_matched,
                 a4_target ? (a4_cleared == 4 ? "cleared to R, G, B and A" : "cleared wrong") : "not reported, skipped",
                 failures);
     return failures;
@@ -2217,8 +2356,8 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS18 o18{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19{};
-    D3D12_FEATURE_DATA_D3D12_OPTIONS20 o20{};
-    D3D12_FEATURE_DATA_D3D12_OPTIONS21 o21{};
+    rt::d3d12::compat::FeatureDataOptions20 o20{};
+    rt::d3d12::compat::FeatureDataOptions21 o21{};
 
     query_ours(std::pair{"OPTIONS2", D3D12_FEATURE_D3D12_OPTIONS2}, o2);
     query_ours(std::pair{"OPTIONS3", D3D12_FEATURE_D3D12_OPTIONS3}, o3);
@@ -2233,16 +2372,16 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     query_ours(std::pair{"OPTIONS16", D3D12_FEATURE_D3D12_OPTIONS16}, o16);
     query_ours(std::pair{"OPTIONS18", D3D12_FEATURE_D3D12_OPTIONS18}, o18);
     query_ours(std::pair{"OPTIONS19", D3D12_FEATURE_D3D12_OPTIONS19}, o19);
-    query_ours(std::pair{"OPTIONS20", D3D12_FEATURE_D3D12_OPTIONS20}, o20);
-    query_ours(std::pair{"OPTIONS21", D3D12_FEATURE_D3D12_OPTIONS21}, o21);
+    query_ours(std::pair{"OPTIONS20", rt::d3d12::compat::kFeatureOptions20}, o20);
+    query_ours(std::pair{"OPTIONS21", rt::d3d12::compat::kFeatureOptions21}, o21);
 
     D3D12_FEATURE_DATA_SHADER_CACHE shader_cache{};
     D3D12_FEATURE_DATA_EXISTING_HEAPS existing_heaps{};
     D3D12_FEATURE_DATA_CROSS_NODE cross_node{};
     D3D12_FEATURE_DATA_DISPLAYABLE displayable{};
-    D3D12_FEATURE_DATA_PREDICATION predication{};
-    D3D12_FEATURE_DATA_APPLICATION_SPECIFIC_DRIVER_STATE driver_state{};
-    D3D12_FEATURE_DATA_BYTECODE_BYPASS_HASH_SUPPORTED bypass_hash{};
+    rt::d3d12::compat::FeatureSupportFlag predication{};
+    rt::d3d12::compat::FeatureSupportFlag driver_state{};
+    rt::d3d12::compat::FeatureSupportFlag bypass_hash{};
     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT prot_support{};
     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT prot_count{};
     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES prot_types{};
@@ -2253,10 +2392,13 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     query_ours(std::pair{"EXISTING_HEAPS", D3D12_FEATURE_EXISTING_HEAPS}, existing_heaps);
     query_ours(std::pair{"CROSS_NODE", D3D12_FEATURE_CROSS_NODE}, cross_node);
     query_ours(std::pair{"DISPLAYABLE", D3D12_FEATURE_DISPLAYABLE}, displayable);
-    query_ours(std::pair{"PREDICATION", D3D12_FEATURE_PREDICATION}, predication);
-    query_ours(std::pair{"APPLICATION_SPECIFIC_DRIVER_STATE", D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE},
+    query_ours(std::pair{"PREDICATION", rt::d3d12::compat::kFeaturePredication}, predication);
+    query_ours(std::pair{"APPLICATION_SPECIFIC_DRIVER_STATE",
+                         rt::d3d12::compat::kFeatureApplicationSpecificDriverState},
                driver_state);
-    query_ours(std::pair{"BYTECODE_BYPASS_HASH_SUPPORTED", D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED}, bypass_hash);
+    query_ours(std::pair{"BYTECODE_BYPASS_HASH_SUPPORTED",
+                         rt::d3d12::compat::kFeatureBytecodeBypassHashSupported},
+               bypass_hash);
     query_ours_input(std::pair{"PROTECTED_RESOURCE_SESSION_SUPPORT", D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT},
                      D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT{0, {}}, prot_support);
     query_ours_input(
@@ -2319,11 +2461,11 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o19.MaxViewDescriptorHeapSize != D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2 ||
         o19.ComputeOnlyCustomHeapSupported)
         fail("OPTIONS19 mismatch");
-    if (o20.ComputeOnlyWriteWatchSupported || o20.RecreateAtTier != D3D12_RECREATE_AT_TIER_NOT_SUPPORTED)
+    if (o20.ComputeOnlyWriteWatchSupported || o20.RecreateAtTier != rt::d3d12::compat::kRecreateAtTierNotSupported)
         fail("OPTIONS20 unexpected support");
-    if (o21.WorkGraphsTier != D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED ||
-        o21.ExecuteIndirectTier != D3D12_EXECUTE_INDIRECT_TIER_1_0 || o21.SampleCmpGradientAndBiasSupported ||
-        o21.ExtendedCommandInfoSupported)
+    if (o21.WorkGraphsTier != rt::d3d12::compat::kWorkGraphsTierNotSupported ||
+        o21.ExecuteIndirectTier != rt::d3d12::compat::kExecuteIndirectTier1_0 ||
+        o21.SampleCmpGradientAndBiasSupported || o21.ExtendedCommandInfoSupported)
         fail("OPTIONS21 unexpected support");
 
     // Verify OPTIONS19.AnisoFilterWithPointMipSupported follows VulkanDeviceInfo::sampler_anisotropy.
@@ -2426,8 +2568,9 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         if (FAILED(rt::d3d12::create_vulkan_device(no_pred_info, IID_PPV_ARGS(&no_pred.p)))) {
             fail("failed to create conditional_rendering=false device");
         } else {
-            D3D12_FEATURE_DATA_PREDICATION pred_off{TRUE};
-            if (FAILED(no_pred->CheckFeatureSupport(D3D12_FEATURE_PREDICATION, &pred_off, sizeof(pred_off))) ||
+            rt::d3d12::compat::FeatureSupportFlag pred_off{TRUE};
+            if (FAILED(no_pred->CheckFeatureSupport(rt::d3d12::compat::kFeaturePredication, &pred_off,
+                                                    sizeof(pred_off))) ||
                 pred_off.Supported != FALSE)
                 fail("PREDICATION did not become FALSE when conditional_rendering is off");
         }
@@ -2607,13 +2750,13 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                      check_bool(n, "ComputeOnlyCustomHeapSupported", a.ComputeOnlyCustomHeapSupported,
                                 b.ComputeOnlyCustomHeapSupported);
                  });
-    compare_host("OPTIONS20", D3D12_FEATURE_D3D12_OPTIONS20, o20,
+    compare_host("OPTIONS20", rt::d3d12::compat::kFeatureOptions20, o20,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "ComputeOnlyWriteWatchSupported", a.ComputeOnlyWriteWatchSupported,
                                 b.ComputeOnlyWriteWatchSupported);
                      check_tier(n, "RecreateAtTier", int(a.RecreateAtTier), int(b.RecreateAtTier));
                  });
-    compare_host("OPTIONS21", D3D12_FEATURE_D3D12_OPTIONS21, o21,
+    compare_host("OPTIONS21", rt::d3d12::compat::kFeatureOptions21, o21,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_tier(n, "WorkGraphsTier", int(a.WorkGraphsTier), int(b.WorkGraphsTier));
                      check_tier(n, "ExecuteIndirectTier", int(a.ExecuteIndirectTier), int(b.ExecuteIndirectTier));
@@ -2644,15 +2787,17 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                      check_tier(n, "SharedResourceCompatibilityTier", int(a.SharedResourceCompatibilityTier),
                                 int(b.SharedResourceCompatibilityTier));
                  });
-    compare_host("PREDICATION", D3D12_FEATURE_PREDICATION, predication,
+    compare_host("PREDICATION", rt::d3d12::compat::kFeaturePredication, predication,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "Supported", a.Supported, b.Supported);
                  });
-    compare_host("APPLICATION_SPECIFIC_DRIVER_STATE", D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE, driver_state,
+    compare_host("APPLICATION_SPECIFIC_DRIVER_STATE", rt::d3d12::compat::kFeatureApplicationSpecificDriverState,
+                 driver_state,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "Supported", a.Supported, b.Supported);
                  });
-    compare_host("BYTECODE_BYPASS_HASH_SUPPORTED", D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED, bypass_hash,
+    compare_host("BYTECODE_BYPASS_HASH_SUPPORTED", rt::d3d12::compat::kFeatureBytecodeBypassHashSupported,
+                 bypass_hash,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "Supported", a.Supported, b.Supported);
                  });
@@ -2781,6 +2926,56 @@ HRESULT command_queue(ID3D12Device* device, D3D12_COMMAND_QUEUE_DESC desc) {
     return released(device->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), &out), &out);
 }
 
+HRESULT query_heap(ID3D12Device* device, D3D12_QUERY_HEAP_TYPE type, UINT count, UINT node_mask = 0,
+                   bool output = true) {
+    const D3D12_QUERY_HEAP_DESC desc{type, count, node_mask};
+    void* out = nullptr;
+    return released(device->CreateQueryHeap(&desc, __uuidof(ID3D12QueryHeap), output ? &out : nullptr), &out);
+}
+
+// A root signature blob from the host's own serializer (version 1.0): empty, or one root CBV at b0, or one table of
+// unbounded SRVs from t0. Empty when d3d12.dll has no serializer, and both devices then get the same refusal.
+std::vector<std::uint8_t> root_signature_blob(int parameters) {
+    using Serialize = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**,
+                                       ID3DBlob**);
+    static const auto serialize = reinterpret_cast<Serialize>(reinterpret_cast<void*>(GetProcAddress(
+        LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32), "D3D12SerializeRootSignature")));
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 0,
+                                       D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+    if (parameters == 1) {
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    } else if (parameters == 2) {
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameter.DescriptorTable = {1, &range};
+    }
+    const D3D12_ROOT_SIGNATURE_DESC desc{parameters ? 1u : 0u, parameters ? &parameter : nullptr, 0, nullptr,
+                                         D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* error = nullptr;
+    std::vector<std::uint8_t> bytes;
+    if (serialize && SUCCEEDED(serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) && blob) {
+        const auto* first = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+        bytes.assign(first, first + blob->GetBufferSize());
+    }
+    if (blob) blob->Release();
+    if (error) error->Release();
+    return bytes;
+}
+
+// CreateRootSignature with `blob`, passed as `size` bytes (the blob's own size when 0; the vector is padded with
+// zeros when `size` is larger).
+HRESULT root_signature(ID3D12Device* device, std::vector<std::uint8_t> blob, SIZE_T size = 0, UINT node_mask = 0,
+                       bool output = true, REFIID riid = __uuidof(ID3D12RootSignature)) {
+    if (!size) size = blob.size();
+    if (blob.size() < size) blob.resize(size);
+    void* out = nullptr;
+    return released(device->CreateRootSignature(node_mask, blob.empty() ? nullptr : blob.data(), size, riid,
+                                                output ? &out : nullptr),
+                    &out);
+}
+
 // CreateCommandSignature without a root signature. Each argument is only its type; a CONSTANT one sets one value.
 HRESULT command_signature(ID3D12Device* device, UINT stride, std::initializer_list<D3D12_INDIRECT_ARGUMENT_TYPE> types,
                           UINT node_mask = 0) {
@@ -2796,9 +2991,46 @@ HRESULT command_signature(ID3D12Device* device, UINT stride, std::initializer_li
     return released(device->CreateCommandSignature(&desc, nullptr, __uuidof(ID3D12CommandSignature), &out), &out);
 }
 
+// CheckFeatureSupport(FORMAT_SUPPORT) for `value`: the HRESULT, or Support1 when it succeeds (Support2 holds what the
+// GPU can do, such as TILED, which the layer doesn't offer, so it isn't compared).
+HRESULT format_support1(ID3D12Device* device, UINT value) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{static_cast<DXGI_FORMAT>(value)};
+    const HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support));
+    return SUCCEEDED(hr) ? static_cast<HRESULT>(support.Support1) : hr;
+}
+
 HRESULT fence(ID3D12Device* device, D3D12_FENCE_FLAGS flags, REFIID riid = __uuidof(ID3D12Fence)) {
     void* out = nullptr;
     return released(device->CreateFence(0, flags, riid, &out), &out);
+}
+
+HRESULT command_allocator(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, bool output = true,
+                          REFIID riid = __uuidof(ID3D12CommandAllocator)) {
+    void* out = nullptr;
+    return released(device->CreateCommandAllocator(type, riid, output ? &out : nullptr), &out);
+}
+
+// CreateCommandList with a fresh allocator of `allocator_type` (or none when it is -2).
+HRESULT command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                     int allocator_type, bool output = true) {
+    void* allocator = nullptr;
+    if (allocator_type != -2)
+        device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(allocator_type), __uuidof(ID3D12CommandAllocator),
+                                       &allocator);
+    void* out = nullptr;
+    const HRESULT hr = device->CreateCommandList(node_mask, type, static_cast<ID3D12CommandAllocator*>(allocator),
+                                                 nullptr, __uuidof(ID3D12GraphicsCommandList), output ? &out : nullptr);
+    released(S_OK, &allocator);
+    return released(hr, &out);
+}
+
+HRESULT command_list1(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, bool output = true) {
+    Ref<ID3D12Device4> device4;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) return E_NOINTERFACE;
+    void* out = nullptr;
+    return released(device4->CreateCommandList1(node_mask, type, D3D12_COMMAND_LIST_FLAG_NONE,
+                                                __uuidof(ID3D12GraphicsCommandList), output ? &out : nullptr),
+                    &out);
 }
 
 // A 64 KiB heap description for the CreateHeap cases (D3D-238).
@@ -2815,6 +3047,49 @@ D3D12_HEAP_DESC heap_desc_of(UINT64 alignment, D3D12_HEAP_PROPERTIES properties 
 HRESULT heap_create(ID3D12Device* device, D3D12_HEAP_DESC desc) {
     void* out = nullptr;
     return released(device->CreateHeap(&desc, __uuidof(ID3D12Heap), &out), &out);
+}
+
+// CreatePlacedResource in a fresh heap of `heap` made on the same device. A heap the device refuses makes the case
+// itself wrong, so it answers E_UNEXPECTED on either side.
+struct PlacedArgs {
+    D3D12_HEAP_DESC heap = heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 1024 * 1024);
+    UINT64 offset = 0;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    const D3D12_CLEAR_VALUE* clear = nullptr;
+    bool output = true;
+    const IID* riid = &__uuidof(ID3D12Resource);
+};
+
+HRESULT placed(ID3D12Device* device, const D3D12_RESOURCE_DESC* desc, const PlacedArgs& args = {}) {
+    ID3D12Heap* heap = nullptr;
+    if (FAILED(device->CreateHeap(&args.heap, IID_PPV_ARGS(&heap)))) return E_UNEXPECTED;
+    void* out = nullptr;
+    const HRESULT hr = device->CreatePlacedResource(heap, args.offset, desc, args.state, args.clear, *args.riid,
+                                                    args.output ? &out : nullptr);
+    released(hr, &out);
+    heap->Release();
+    return hr;
+}
+
+HRESULT placed(ID3D12Device* device, D3D12_RESOURCE_DESC desc, const PlacedArgs& args = {}) {
+    return placed(device, &desc, args);
+}
+
+HRESULT reserved(ID3D12Device* device, const D3D12_RESOURCE_DESC* desc,
+                 D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON, const D3D12_CLEAR_VALUE* clear = nullptr,
+                 bool output = true, REFIID riid = __uuidof(ID3D12Resource)) {
+    void* out = nullptr;
+    return released(device->CreateReservedResource(desc, state, clear, riid, output ? &out : nullptr), &out);
+}
+
+HRESULT reserved(ID3D12Device* device, D3D12_RESOURCE_DESC desc,
+                 D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON, const D3D12_CLEAR_VALUE* clear = nullptr) {
+    return reserved(device, &desc, state, clear);
+}
+
+D3D12_RESOURCE_DESC tiled(D3D12_RESOURCE_DESC desc) {
+    desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    return desc;
 }
 
 // Map on a fresh committed resource; `range` is the read range, or null.
@@ -2843,6 +3118,30 @@ HRESULT call_guarded(InvalidCase call, ID3D12Device* device) {
     }
 }
 
+// The host accepts a UAV buffer in RAYTRACING_ACCELERATION_STRUCTURE state only where OPTIONS5 reports ray tracing
+// (an RTX does, an integrated Radeon without DXR refuses it: @aguedou-34 on #2462). The layer accepts it where it
+// has acceleration structures: the standalone device (XDXR or KHR), not the device main builds without them.
+bool host_ray_tracing(ID3D12Device* host) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
+    return SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))) &&
+           o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+}
+
+// Windows 10's runtime (no ID3D12Device10) still checks a buffer's initial state and refuses a HARDWARE_PROTECTED
+// heap, where newer runtimes and the layer accept them (measured on Windows 10 22H2 build 19045.5737). Windows 11
+// 23H2's runtime (D3D12Core 10.0.22621.5415: ID3D12Device10 but no ID3D12Device11) still refuses the
+// HARDWARE_PROTECTED heap. For a case marked windows10_refuses only that pair is excused: the layer's S_OK against
+// the host's E_INVALIDARG, on a host without ID3D12Device11. Any other difference, and any difference on a newer
+// host, is still a mismatch.
+bool windows10_refusal(const char* name, ID3D12Device* host, HRESULT ours, HRESULT theirs) {
+    if (ours != S_OK || theirs != E_INVALIDARG) return false;
+    Ref<ID3D12Device11> newer;
+    if (SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&newer.p)))) return false;
+    std::printf("invalid arguments %s: an older host runtime (Windows 10, Windows 11 23H2) refuses it (ours 0x%08lx, "
+                "host 0x%08lx)\n", name, ours, theirs);
+    return true;
+}
+
 int compare_invalid_arguments(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
@@ -2851,9 +3150,18 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         const char* name;
         InvalidCase call;
         bool (*comparable)(ID3D12Device*) = nullptr;
+        bool windows10_refuses = false;
     };
     const auto device10 = [](ID3D12Device* d) {
         Ref<ID3D12Device10> newer;
+        return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
+    };
+    // Windows 11 23H2's in-box runtime (D3D12Core 10.0.22621.5415) has ID3D12Device10 but not ID3D12Device11, and
+    // still answers five of the device10 cases as Windows 10 does (HARDWARE_PROTECTED and flag 0x400 refused, 2049
+    // shader-visible samplers refused, a type -1 list created). Those five are compared only on a host with
+    // ID3D12Device11, which newer runtimes have (d3d12_sampler2_test compares against one).
+    const auto device11 = [](ID3D12Device* d) {
+        Ref<ID3D12Device11> newer;
         return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
     };
     static const Case cases[] = {
@@ -2880,6 +3188,105 @@ int compare_invalid_arguments(ID3D12Device* ours) {
                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                         __uuidof(ID3D12Fence), &out), &out);
          }},
+        // CreateCommittedResource: the initial state. A buffer takes any bits but the acceleration-structure state
+        // without UAV access; a texture takes GENERIC_READ, one write state alone (RENDER_TARGET, UNORDERED_ACCESS,
+        // DEPTH_WRITE with their flag), or a mix of read states (DEPTH_READ with ALLOW_DEPTH_STENCIL, the shader
+        // resource states without DENY_SHADER_RESOURCE), and never a buffer-only or undefined bit.
+        {"committed: plain texture in RENDER_TARGET state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+         }},
+        {"committed: render target in RENDER_TARGET state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                              D3D12_RESOURCE_STATE_RENDER_TARGET);
+         }},
+        {"committed: plain texture in UNORDERED_ACCESS state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         }},
+        {"committed: UAV texture in UNORDERED_ACCESS state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         }},
+        {"committed: plain texture in DEPTH_WRITE state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
+         }},
+        {"committed: plain texture in DEPTH_READ state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_DEPTH_READ);
+         }},
+        {"committed: depth texture in DEPTH_READ | PIXEL_SHADER_RESOURCE state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT},
+                              texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+                              D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+         }},
+        {"committed: depth texture in DEPTH_WRITE | DEPTH_READ state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT},
+                              texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+                              D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_DEPTH_READ);
+         }},
+        {"committed: depth texture without shader resource in PIXEL_SHADER_RESOURCE state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT},
+                              texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT,
+                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                               D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE),
+                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+         }},
+        {"committed: depth texture without shader resource in GENERIC_READ state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT},
+                              texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT,
+                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                               D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE),
+                              D3D12_RESOURCE_STATE_GENERIC_READ);
+         }},
+        {"committed: texture in GENERIC_READ state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_GENERIC_READ);
+         }},
+        {"committed: texture in GENERIC_READ | COPY_DEST state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(),
+                              D3D12_RESOURCE_STATE_GENERIC_READ | D3D12_RESOURCE_STATE_COPY_DEST);
+         }},
+        {"committed: texture in COPY_DEST | PIXEL_SHADER_RESOURCE state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(),
+                              D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+         }},
+        {"committed: texture in the three shader-read and copy-source states", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(),
+                              D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE);
+         }},
+        {"committed: render target in RENDER_TARGET | PIXEL_SHADER_RESOURCE state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                              D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+         }},
+        {"committed: texture in VERTEX_AND_CONSTANT_BUFFER state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+         }},
+        {"committed: texture in INDEX_BUFFER | PIXEL_SHADER_RESOURCE state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(),
+                              D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+         }},
+        {"committed: texture in state 0x80000000", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATES(0x80000000u));
+         }},
+        {"committed: texture in RESOLVE_DEST state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_RESOLVE_DEST);
+         }},
+        // A buffer's initial state: Windows 10's runtime refuses these two, newer ones accept them, as the layer does.
+        {"committed: buffer in state 0x80000000", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, buffer_desc(256), D3D12_RESOURCE_STATES(0x80000000u));
+         }, nullptr, true},
+        {"committed: buffer in RENDER_TARGET | UNORDERED_ACCESS state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, buffer_desc(256),
+                              D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         }, nullptr, true},
+        {"committed: buffer in RAYTRACING_ACCELERATION_STRUCTURE state", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, buffer_desc(256),
+                              D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+         }},
+        // This device has no acceleration structures and refuses it, as a host without ray tracing does.
+        {"committed: UAV buffer in RAYTRACING_ACCELERATION_STRUCTURE state", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc,
+                              D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+         }, [](ID3D12Device* host) { return !host_ray_tracing(host); }},
         // CreateCommittedResource: buffer descriptions.
         {"committed: buffer width 0", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, buffer_desc(0));
@@ -3290,12 +3697,38 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: heap flag HARDWARE_PROTECTED on a texture", [](ID3D12Device* d) {
              return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_HARDWARE_PROTECTED);
-         }, +device10},
+         }, +device11},
         {"committed: heap flag ALLOW_WRITE_WATCH on a buffer", [](ID3D12Device* d) {
              return with_heap_flags(d, buffer_desc(256), D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH);
          }},
         {"committed: heap flag ALLOW_SHADER_ATOMICS on a buffer", [](ID3D12Device* d) {
              return with_heap_flags(d, buffer_desc(256), D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a UAV buffer", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return with_heap_flags(d, desc, D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a UAV texture", [](ID3D12Device* d) {
+             return with_heap_flags(d, texture_desc(16, 16, DXGI_FORMAT_R32_FLOAT,
+                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a render-target UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a texture without UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a render target without UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on an upload buffer", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_GENERIC_READ,
+                              D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
          }},
         {"committed: heap flag CREATE_NOT_RESIDENT on a texture", [](ID3D12Device* d) {
              return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT);
@@ -3378,10 +3811,10 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(0x400);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }, +device10},
+         }, +device11},
         {"committed: resource flag 0x400 on a texture", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAGS(0x400)));
-         }, +device10},
+         }, +device11},
         // A null output is a capability check; with invalid arguments too, the host's answer says which comes first.
         {"committed: heap type 99, null output", [](ID3D12Device* d) {
              const H heap{D3D12_HEAP_TYPE(99)};
@@ -3464,7 +3897,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"descriptor heap: shader-visible 2049 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2049,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
-         }, +device10},
+         }, +device11},
         {"descriptor heap: shader-visible 2048 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
@@ -3512,8 +3945,189 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command queue: compute", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COMPUTE}); }},
         {"command queue: copy", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COPY}); }},
+        // CreateQueryHeap: the description is checked first (types past PIPELINE_STATISTICS1 are refused), then a
+        // null output is E_UNEXPECTED. Known types this layer has no path for (stream output, video decode, mesh
+        // statistics) are E_NOTIMPL here and not compared.
+        {"query heap: occlusion", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4); }},
+        {"query heap: timestamps", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 4); }},
+        {"query heap: no queries", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0); }},
+        {"query heap: type 8", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE(8), 1); }},
+        {"query heap: type 99", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE(99), 1); }},
+        {"query heap: type -1", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE(-1), 1); }},
+        {"query heap: node mask 1", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 1);
+         }},
+        {"query heap: node mask 2", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 2);
+         }},
+        {"query heap: null output", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0, false);
+         }},
+        {"query heap: null output, no queries", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0, false);
+         }},
+        {"query heap: null output, type 99", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE(99), 1, 0, false);
+         }},
+        {"query heap: null output, node mask 2", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 2, false);
+         }},
+        {"query heap: wrong interface", [](ID3D12Device* d) {
+             const D3D12_QUERY_HEAP_DESC desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+             void* out = nullptr;
+             return released(d->CreateQueryHeap(&desc, __uuidof(ID3D12Fence), &out), &out);
+         }},
+        // CreateRootSignature: a null output is S_FALSE whatever the blob; otherwise node 0 only, and the blob's
+        // DXBC size must be the size passed.
+        {"root signature: empty", [](ID3D12Device* d) { return root_signature(d, root_signature_blob(0)); }},
+        {"root signature: root CBV", [](ID3D12Device* d) { return root_signature(d, root_signature_blob(1)); }},
+        {"root signature: unbounded SRV table", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(2));
+         }},
+        {"root signature: size 0", [](ID3D12Device* d) {
+             void* out = nullptr;
+             const auto blob = root_signature_blob(0);
+             return released(d->CreateRootSignature(0, blob.data(), 0, __uuidof(ID3D12RootSignature), &out), &out);
+         }},
+        {"root signature: one byte short", [](ID3D12Device* d) {
+             const auto blob = root_signature_blob(0);
+             return root_signature(d, blob, blob.size() - 1);
+         }},
+        {"root signature: 4 bytes over", [](ID3D12Device* d) {
+             const auto blob = root_signature_blob(1);
+             return root_signature(d, blob, blob.size() + 4);
+         }},
+        {"root signature: 16 bytes over", [](ID3D12Device* d) {
+             const auto blob = root_signature_blob(0);
+             return root_signature(d, blob, blob.size() + 16);
+         }},
+        {"root signature: 64 zero bytes", [](ID3D12Device* d) {
+             return root_signature(d, std::vector<std::uint8_t>(64, 0));
+         }},
+        {"root signature: null blob", [](ID3D12Device* d) {
+             void* out = nullptr;
+             return released(d->CreateRootSignature(0, nullptr, 64, __uuidof(ID3D12RootSignature), &out), &out);
+         }},
+        {"root signature: node mask 1", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 1);
+         }},
+        {"root signature: node mask 2", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 2);
+         }},
+        {"root signature: node mask 0x80000000", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 0x80000000u);
+         }},
+        {"root signature: wrong interface", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 0, true, __uuidof(ID3D12Fence));
+         }},
+        {"root signature: null output", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(1), 0, 0, false);
+         }},
+        {"root signature: null output, 64 zero bytes", [](ID3D12Device* d) {
+             return root_signature(d, std::vector<std::uint8_t>(64, 0), 0, 0, false);
+         }},
+        {"root signature: null output, node mask 2", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 2, false);
+         }},
+        {"root signature: null output, 16 bytes over", [](ID3D12Device* d) {
+             const auto blob = root_signature_blob(0);
+             return root_signature(d, blob, blob.size() + 16, 0, false);
+         }},
         {"command queue: high priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_HIGH});
+         }},
+        // Command allocators and lists (video list types are only created here, not compared: the host hands out
+        // a video list, which is not an ID3D12GraphicsCommandList). Types past VIDEO_ENCODE and nodes other than 0
+        // are refused first; a null output is then E_UNEXPECTED.
+        {"command allocator: type direct", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(0));
+         }},
+        {"command allocator: type bundle", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(1));
+         }},
+        {"command allocator: type compute", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(2));
+         }},
+        {"command allocator: type copy", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(3));
+         }},
+        {"command allocator: type video encode", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(6));
+         }},
+        {"command allocator: type 7", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(7)); }},
+        {"command allocator: type 99", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(99));
+         }},
+        {"command allocator: type -1", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(-1));
+         }},
+        {"command allocator: null output", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE_DIRECT, false);
+         }},
+        {"command allocator: null output, type 99", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(99), false);
+         }},
+        {"command allocator: null output, wrong interface", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE_DIRECT, false, __uuidof(ID3D12Fence));
+         }},
+        {"command allocator: wrong interface", [](ID3D12Device* d) {
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE_DIRECT, true, __uuidof(ID3D12Fence));
+         }},
+        {"command list: direct", [](ID3D12Device* d) { return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0); }},
+        {"command list: bundle", [](ID3D12Device* d) { return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, 1); }},
+        {"command list: node mask 1", [](ID3D12Device* d) {
+             return command_list(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT, 0);
+         }},
+        {"command list: node mask 2", [](ID3D12Device* d) {
+             return command_list(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT, 0);
+         }},
+        {"command list: node mask 3", [](ID3D12Device* d) {
+             return command_list(d, 3, D3D12_COMMAND_LIST_TYPE_DIRECT, 0);
+         }},
+        {"command list: compute allocator", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 2);
+         }},
+        {"command list: no allocator", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, -2);
+         }},
+        {"command list: type 99", [](ID3D12Device* d) { return command_list(d, 0, D3D12_COMMAND_LIST_TYPE(99), 0); }},
+        {"command list: null output", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, false);
+         }},
+        {"command list: null output, node mask 2", [](ID3D12Device* d) {
+             return command_list(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, false);
+         }},
+        {"command list: null output, no allocator", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, -2, false);
+         }},
+        {"command list1: type direct", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(0)); }},
+        {"command list1: type bundle", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(1)); }},
+        {"command list1: type compute", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(2));
+         }},
+        {"command list1: type copy", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(3)); }},
+        {"command list1: type 7", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(7)); }},
+        {"command list1: type 99", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99)); }},
+        // NONE (-1): Windows 10's runtime (19045, no ID3D12Device10) creates the list and newer Windows 11 runtimes
+        // refuse it (measured on #2297); Windows 11 23H2 (22621.5415, ID3D12Device10 but no ID3D12Device11) still
+        // creates it, so it is compared only on a host with ID3D12Device11.
+        {"command list1: type -1", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(-1));
+         }, +device11},
+        {"command list1: node mask 1", [](ID3D12Device* d) {
+             return command_list1(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT);
+         }},
+        {"command list1: node mask 2", [](ID3D12Device* d) {
+             return command_list1(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT);
+         }},
+        {"command list1: null output", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, false);
+         }},
+        {"command list1: null output, node mask 2", [](ID3D12Device* d) {
+             return command_list1(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT, false);
+         }},
+        {"command list1: null output, type 99", [](ID3D12Device* d) {
+             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99), false);
          }},
         // CreateCommandSignature (no root signature). A null description faults in the host runtime, so it is not
         // compared.
@@ -3594,6 +4208,19 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 1});
          }},
         // CreateFence.
+        // FORMAT_SUPPORT for values the runtime's format table has no entry for (E_FAIL), and for UNKNOWN (a buffer
+        // format: Support1 is compared, not Support2).
+        {"format support: UNKNOWN", [](ID3D12Device* d) { return format_support1(d, DXGI_FORMAT_UNKNOWN); }},
+        {"format support: 116, the first unused value", [](ID3D12Device* d) { return format_support1(d, 0x74u); }},
+        {"format support: 129", [](ID3D12Device* d) { return format_support1(d, 0x81u); }},
+        {"format support: 130, P208", [](ID3D12Device* d) { return format_support1(d, 0x82u); }},
+        {"format support: 131, V208", [](ID3D12Device* d) { return format_support1(d, 0x83u); }},
+        {"format support: 132, V408", [](ID3D12Device* d) { return format_support1(d, 0x84u); }},
+        {"format support: 133", [](ID3D12Device* d) { return format_support1(d, 0x85u); }},
+        {"format support: 188", [](ID3D12Device* d) { return format_support1(d, 0xbcu); }},
+        {"format support: 192, past A4B4G4R4", [](ID3D12Device* d) { return format_support1(d, 0xc0u); }},
+        {"format support: 1000", [](ID3D12Device* d) { return format_support1(d, 0x3e8u); }},
+        {"format support: -1", [](ID3D12Device* d) { return format_support1(d, 0xffffffffu); }},
         {"fence: null output", [](ID3D12Device* d) {
              return d->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), nullptr);
          }},
@@ -3671,6 +4298,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
         if (a == b) continue;
+        if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
         if (c.comparable && !c.comparable(host.p)) {
             std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
                         a, b);
@@ -3741,6 +4369,7 @@ int compare_heap_neighbours(ID3D12Device* ours) {
     struct Case {
         const char* name;
         InvalidCase call;
+        bool windows10_refuses = false;
     };
     static const Case cases[] = {
         {"heap: alignment 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0)); }},
@@ -3767,15 +4396,520 @@ int compare_heap_neighbours(ID3D12Device* ours) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
          }},
         // The D3D12_HEAP_FLAGS documentation calls it unsupported, but the host accepts it (RTX 4070 SUPER and
-        // UHD 770, @CowBoYdu76).
+        // UHD 770, @CowBoYdu76). Windows 10's and Windows 11 23H2's runtimes refuse it, as they refuse the committed
+        // case above.
         {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
-         }},
+         }, true},
     };
     int mismatches = 0;
     for (const Case& c : cases) {
         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
         if (a == b) continue;
+        if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
+        ++mismatches;
+        std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
+    }
+    return mismatches;
+}
+
+// ID3D12Heap::GetDesc reads back as the host's for heaps of each type with each node-mask pair, on a device with the
+// GPU address arena: a node mask of 0 reads back as the one node (1), as the layer's resources, descriptor heaps and
+// queues already answer (d3d12_node_mask_test). Returns the number of mismatches, or -1 without a host.
+int compare_heap_descs(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    struct HeapCase {
+        D3D12_HEAP_PROPERTIES properties;
+        UINT64 alignment;  // 0: the default
+    };
+    const HeapCase heaps[] = {
+        {{D3D12_HEAP_TYPE_DEFAULT}, 0},
+        {{D3D12_HEAP_TYPE_DEFAULT}, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT},
+        {{D3D12_HEAP_TYPE_UPLOAD}, 0},
+        {{D3D12_HEAP_TYPE_READBACK}, 0},
+        {{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0}, 0},
+    };
+    const UINT masks[][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+    int mismatches = 0;
+    for (const HeapCase& heap : heaps) {
+        for (const auto& mask : masks) {
+            D3D12_HEAP_PROPERTIES props = heap.properties;
+            props.CreationNodeMask = mask[0];
+            props.VisibleNodeMask = mask[1];
+            const D3D12_HEAP_DESC desc = heap_desc_of(heap.alignment, props, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                                                      heap.alignment ? heap.alignment : 64 * 1024);
+            Ref<ID3D12Heap> a, e;
+            const HRESULT ha = ours->CreateHeap(&desc, IID_PPV_ARGS(&a.p));
+            const HRESULT he = host->CreateHeap(&desc, IID_PPV_ARGS(&e.p));
+            if (FAILED(he) || !e.p) continue;  // nothing to compare
+            if (FAILED(ha) || !a.p) {
+                ++mismatches;
+                std::fprintf(stderr, "heap GetDesc type %d align %llu masks %u/%u: the layer refused it (0x%08lx)\n",
+                             int(props.Type), heap.alignment, mask[0], mask[1], ha);
+                continue;
+            }
+            const D3D12_HEAP_DESC x = a->GetDesc(), y = e->GetDesc();
+            if (x.SizeInBytes == y.SizeInBytes && x.Alignment == y.Alignment && x.Flags == y.Flags &&
+                x.Properties.Type == y.Properties.Type &&
+                x.Properties.CPUPageProperty == y.Properties.CPUPageProperty &&
+                x.Properties.MemoryPoolPreference == y.Properties.MemoryPoolPreference &&
+                x.Properties.CreationNodeMask == y.Properties.CreationNodeMask &&
+                x.Properties.VisibleNodeMask == y.Properties.VisibleNodeMask)
+                continue;
+            ++mismatches;
+            std::fprintf(stderr,
+                         "heap GetDesc type %d align %llu masks %u/%u: ours size %llu align %llu flags 0x%x cpu %d "
+                         "pool %d masks %u/%u, host size %llu align %llu flags 0x%x cpu %d pool %d masks %u/%u\n",
+                         int(props.Type), heap.alignment, mask[0], mask[1], x.SizeInBytes, x.Alignment,
+                         unsigned(x.Flags), int(x.Properties.CPUPageProperty),
+                         int(x.Properties.MemoryPoolPreference), x.Properties.CreationNodeMask,
+                         x.Properties.VisibleNodeMask, y.SizeInBytes, y.Alignment, unsigned(y.Flags),
+                         int(y.Properties.CPUPageProperty), int(y.Properties.MemoryPoolPreference),
+                         y.Properties.CreationNodeMask, y.Properties.VisibleNodeMask);
+        }
+    }
+    std::printf("ID3D12Heap::GetDesc against the host: %zu heaps, %d differ\n", std::size(heaps) * std::size(masks),
+                mismatches);
+    return mismatches;
+}
+
+// CreatePlacedResource and CreateReservedResource answer their arguments as the host runtime does: the placement
+// (offset, alignment, room in the heap), the heap's type and DENY flags against the resource, the description and
+// initial state rules CreateCommittedResource shares, and the output and interface. Run on a device with the GPU
+// address arena (without it every heap is E_NOTIMPL). Returns the number of mismatches, or -1 without a host.
+int compare_placed_reserved(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    struct Case {
+        const char* name;
+        InvalidCase call;
+        bool (*comparable)(ID3D12Device*) = nullptr;
+        bool windows10_refuses = false;
+    };
+    static const Case cases[] = {
+        // The standalone device has acceleration structures (XDXR, or KHR with LEONIDA_RT_AS=khr) and accepts a UAV
+        // buffer in their state, as a host with ray tracing does.
+        {"committed (standalone): UAV buffer in RAYTRACING_ACCELERATION_STRUCTURE state", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc,
+                              D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+         }, host_ray_tracing},
+        {"placed: UAV buffer in RAYTRACING_ACCELERATION_STRUCTURE state", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+             auto desc = buffer_desc(64 * 1024);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return placed(d, desc, a);
+         }, host_ray_tracing},
+        // CreatePlacedResource: arguments.
+        {"placed: buffer at 0", [](ID3D12Device* d) { return placed(d, buffer_desc(64 * 1024)); }},
+        {"placed: null description", [](ID3D12Device* d) { return placed(d, nullptr); }},
+        {"placed: null heap", [](ID3D12Device* d) {
+             const D3D12_RESOURCE_DESC desc = buffer_desc(64 * 1024);
+             void* out = nullptr;
+             return released(d->CreatePlacedResource(nullptr, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                     __uuidof(ID3D12Resource), &out), &out);
+         }},
+        {"placed: null output (capability check)", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.output = false;
+             return placed(d, buffer_desc(64 * 1024), a);
+         }},
+        {"placed: null output, offset 4096", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.output = false;
+             a.offset = 4096;
+             return placed(d, buffer_desc(64 * 1024), a);
+         }},
+        {"placed: null output, buffer height 2", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Height = 2;
+             PlacedArgs a;
+             a.output = false;
+             return placed(d, desc, a);
+         }},
+        {"placed: null output, texture past the heap's end", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.output = false;
+             a.offset = 1024 * 1024 - 64 * 1024;
+             return placed(d, texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: wrong interface", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.riid = &__uuidof(ID3D12Fence);
+             return placed(d, buffer_desc(64 * 1024), a);
+         }},
+        // CreatePlacedResource: where the resource goes.
+        {"placed: buffer at 64 KiB", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.offset = 64 * 1024;
+             return placed(d, buffer_desc(64 * 1024), a);
+         }},
+        {"placed: buffer at 4096", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.offset = 4096;
+             return placed(d, buffer_desc(256), a);
+         }},
+        {"placed: buffer filling the heap", [](ID3D12Device* d) { return placed(d, buffer_desc(1024 * 1024)); }},
+        {"placed: buffer one byte larger than the heap", [](ID3D12Device* d) {
+             return placed(d, buffer_desc(1024 * 1024 + 1));
+         }},
+        {"placed: buffer past the heap's end", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.offset = 1024 * 1024 - 64 * 1024;
+             return placed(d, buffer_desc(128 * 1024), a);
+         }},
+        {"placed: buffer at the heap's end", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.offset = 1024 * 1024;
+             return placed(d, buffer_desc(256), a);
+         }},
+        {"placed: small texture at 4096 (4 KiB alignment)", [](ID3D12Device* d) {
+             auto desc = texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+             desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+             PlacedArgs a;
+             a.offset = 4096;
+             return placed(d, desc, a);
+         }},
+        {"placed: texture at 4096 (default alignment)", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.offset = 4096;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: texture at 64 KiB", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.offset = 64 * 1024;
+             return placed(d, texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: texture larger than the heap", [](ID3D12Device* d) {
+             return placed(d, texture_desc(1024, 1024, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+         }},
+        {"placed: texture past the heap's end", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.offset = 1024 * 1024 - 64 * 1024;
+             return placed(d, texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: MSAA texture at 64 KiB (4 MiB alignment)", [](ID3D12Device* d) {
+             auto desc = texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+             desc.SampleDesc.Count = 4;
+             PlacedArgs a;
+             a.heap = heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT, {D3D12_HEAP_TYPE_DEFAULT},
+                                   D3D12_HEAP_FLAG_NONE, 8 * 1024 * 1024);
+             a.offset = 64 * 1024;
+             return placed(d, desc, a);
+         }},
+        {"placed: MSAA texture in a 64 KiB-aligned heap", [](ID3D12Device* d) {
+             auto desc = texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+             desc.SampleDesc.Count = 4;
+             return placed(d, desc);
+         }},
+        // CreatePlacedResource: the heap's type and DENY flags against the resource.
+        {"placed: buffer in an ALLOW_ONLY_NON_RT_DS_TEXTURES heap", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+             return placed(d, buffer_desc(256), a);
+         }},
+        {"placed: texture in an ALLOW_ONLY_BUFFERS heap", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: render target in an ALLOW_ONLY_NON_RT_DS_TEXTURES heap", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), a);
+         }},
+        {"placed: plain texture in an ALLOW_ONLY_RT_DS_TEXTURES heap", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: render target in an ALLOW_ONLY_RT_DS_TEXTURES heap", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), a);
+         }},
+        {"placed: texture in an upload heap", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+             a.state = D3D12_RESOURCE_STATE_GENERIC_READ;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        // CreatePlacedResource: the description rules CreateCommittedResource has.
+        {"placed: buffer width 0", [](ID3D12Device* d) { return placed(d, buffer_desc(0)); }},
+        {"placed: buffer height 2", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Height = 2;
+             return placed(d, desc);
+         }},
+        {"placed: buffer with 2 mips", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.MipLevels = 2;
+             return placed(d, desc);
+         }},
+        {"placed: buffer with a format", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+             return placed(d, desc);
+         }},
+        {"placed: buffer with layout UNKNOWN", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+             return placed(d, desc);
+         }},
+        {"placed: buffer with 4 KiB alignment", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+             return placed(d, desc);
+         }},
+        {"placed: buffer with ALLOW_DEPTH_STENCIL", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+             return placed(d, desc);
+         }},
+        {"placed: texture width 0", [](ID3D12Device* d) {
+             return placed(d, texture_desc(0, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+         }},
+        {"placed: texture with format UNKNOWN", [](ID3D12Device* d) {
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE));
+         }},
+        {"placed: texture with layout ROW_MAJOR", [](ID3D12Device* d) {
+             auto desc = texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+             desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+             return placed(d, desc);
+         }},
+        {"placed: depth texture with ALLOW_UNORDERED_ACCESS", [](ID3D12Device* d) {
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT,
+                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+         }},
+        // CreatePlacedResource: the initial state and the clear value.
+        {"placed: upload buffer in GENERIC_READ", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+             a.state = D3D12_RESOURCE_STATE_GENERIC_READ;
+             return placed(d, buffer_desc(256), a);
+         }},
+        {"placed: upload buffer in COPY_DEST", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+             a.state = D3D12_RESOURCE_STATE_COPY_DEST;
+             return placed(d, buffer_desc(256), a);
+         }, nullptr, true},
+        {"placed: upload buffer with ALLOW_UNORDERED_ACCESS", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             PlacedArgs a;
+             a.heap.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+             a.state = D3D12_RESOURCE_STATE_GENERIC_READ;
+             return placed(d, desc, a);
+         }},
+        {"placed: readback buffer in COPY_DEST", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Properties.Type = D3D12_HEAP_TYPE_READBACK;
+             a.state = D3D12_RESOURCE_STATE_COPY_DEST;
+             return placed(d, buffer_desc(256), a);
+         }},
+        {"placed: readback buffer in GENERIC_READ", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.heap.Properties.Type = D3D12_HEAP_TYPE_READBACK;
+             a.state = D3D12_RESOURCE_STATE_GENERIC_READ;
+             return placed(d, buffer_desc(256), a);
+         }, nullptr, true},
+        {"placed: default buffer in state 0x80000000", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.state = D3D12_RESOURCE_STATES(0x80000000u);
+             return placed(d, buffer_desc(256), a);
+         }, nullptr, true},
+        {"placed: depth texture in DEPTH_WRITE", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+                           a);
+         }},
+        {"placed: plain texture in UNORDERED_ACCESS", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: render target in RENDER_TARGET", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), a);
+         }},
+        {"placed: plain texture in RENDER_TARGET", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: render target with a clear value", [](ID3D12Device* d) {
+             static const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0.f, 0.f, 0.f, 1.f}};
+             PlacedArgs a;
+             a.clear = &clear;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), a);
+         }},
+        {"placed: plain texture with a clear value", [](ID3D12Device* d) {
+             static const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0.f, 0.f, 0.f, 1.f}};
+             PlacedArgs a;
+             a.clear = &clear;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
+        {"placed: buffer with a clear value", [](ID3D12Device* d) {
+             static const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0.f, 0.f, 0.f, 1.f}};
+             PlacedArgs a;
+             a.clear = &clear;
+             return placed(d, buffer_desc(256), a);
+         }},
+        {"placed: render target, clear value of another format", [](ID3D12Device* d) {
+             static const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R16G16B16A16_FLOAT, {0.f, 0.f, 0.f, 1.f}};
+             PlacedArgs a;
+             a.clear = &clear;
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), a);
+         }},
+        // CreateReservedResource.
+        {"reserved: buffer", [](ID3D12Device* d) { return reserved(d, buffer_desc(64 * 1024)); }},
+        {"reserved: null description", [](ID3D12Device* d) { return reserved(d, nullptr); }},
+        {"reserved: null output (capability check)", [](ID3D12Device* d) {
+             const auto desc = buffer_desc(64 * 1024);
+             return reserved(d, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, false);
+         }},
+        {"reserved: null output, buffer height 2", [](ID3D12Device* d) {
+             auto desc = buffer_desc(64 * 1024);
+             desc.Height = 2;
+             return reserved(d, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, false);
+         }},
+        {"reserved: null output, plain texture in RENDER_TARGET", [](ID3D12Device* d) {
+             const auto desc =
+                 tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+             return reserved(d, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, false);
+         }},
+        {"reserved: wrong interface", [](ID3D12Device* d) {
+             const auto desc = buffer_desc(64 * 1024);
+             return reserved(d, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, true, __uuidof(ID3D12Fence));
+         }},
+        {"reserved: buffer with layout UNKNOWN", [](ID3D12Device* d) {
+             auto desc = buffer_desc(64 * 1024);
+             desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+             return reserved(d, desc);
+         }},
+        {"reserved: buffer width 0", [](ID3D12Device* d) { return reserved(d, buffer_desc(0)); }},
+        {"reserved: buffer height 2", [](ID3D12Device* d) {
+             auto desc = buffer_desc(64 * 1024);
+             desc.Height = 2;
+             return reserved(d, desc);
+         }},
+        {"reserved: buffer with a format", [](ID3D12Device* d) {
+             auto desc = buffer_desc(64 * 1024);
+             desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+             return reserved(d, desc);
+         }},
+        {"reserved: buffer with 4 KiB alignment", [](ID3D12Device* d) {
+             auto desc = buffer_desc(64 * 1024);
+             desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+             return reserved(d, desc);
+         }},
+        {"reserved: buffer in COPY_DEST", [](ID3D12Device* d) {
+             return reserved(d, buffer_desc(64 * 1024), D3D12_RESOURCE_STATE_COPY_DEST);
+         }},
+        {"reserved: buffer in state 0x80000000", [](ID3D12Device* d) {
+             return reserved(d, buffer_desc(64 * 1024), D3D12_RESOURCE_STATES(0x80000000u));
+         }, nullptr, true},
+        {"reserved: texture", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)));
+         }},
+        {"reserved: texture with layout UNKNOWN", [](ID3D12Device* d) {
+             return reserved(d, texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+         }},
+        {"reserved: texture with layout ROW_MAJOR", [](ID3D12Device* d) {
+             auto desc = texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+             desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+             return reserved(d, desc);
+         }},
+        {"reserved: texture with 64KB_STANDARD_SWIZZLE", [](ID3D12Device* d) {
+             auto desc = texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+             desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;
+             return reserved(d, desc);
+         }},
+        {"reserved: texture width 0", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(0, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)));
+         }},
+        {"reserved: full mip chain", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+                                                   0)));
+         }},
+        {"reserved: BC1 texture", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE)));
+         }},
+        {"reserved: 1D texture", [](ID3D12Device* d) {
+             auto desc = tiled(texture_desc(256, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+             return reserved(d, desc);
+         }},
+        {"reserved: D24S8 depth texture", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_D24_UNORM_S8_UINT,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)));
+         }},
+        {"reserved: D32 depth texture", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_D32_FLOAT,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)));
+         }},
+        {"reserved: R32G32B32 texture", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R32G32B32_FLOAT, D3D12_RESOURCE_FLAG_NONE)));
+         }},
+        {"reserved: texture with ALLOW_SIMULTANEOUS_ACCESS", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)));
+         }},
+        {"reserved: render target with a clear value", [](ID3D12Device* d) {
+             static const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0.f, 0.f, 0.f, 1.f}};
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)),
+                             D3D12_RESOURCE_STATE_COMMON, &clear);
+         }},
+        {"reserved: plain texture with a clear value", [](ID3D12Device* d) {
+             static const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0.f, 0.f, 0.f, 1.f}};
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)),
+                             D3D12_RESOURCE_STATE_COMMON, &clear);
+         }},
+        {"reserved: plain texture in RENDER_TARGET", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)),
+                             D3D12_RESOURCE_STATE_RENDER_TARGET);
+         }},
+        {"reserved: 3D texture", [](ID3D12Device* d) {
+             auto desc = tiled(texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 16));
+             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+             return reserved(d, desc);
+         }},
+        {"reserved: 4x MSAA render target", [](ID3D12Device* d) {
+             auto desc = tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+             desc.SampleDesc.Count = 4;
+             return reserved(d, desc);
+         }},
+    };
+    const bool verbose = GetEnvironmentVariableA("LEONIDA_D3D49_VERBOSE", nullptr, 0) > 0;
+    int mismatches = 0;
+    for (const Case& c : cases) {
+        if (verbose) {
+            std::printf("invalid arguments %s:", c.name);
+            std::fflush(stdout);
+        }
+        const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
+        if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
+        if (a == b) continue;
+        if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
+        if (c.comparable && !c.comparable(host.p)) {
+            std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
+                        a, b);
+            continue;
+        }
         ++mismatches;
         std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
     }
@@ -3831,6 +4965,54 @@ int compare_check_feature_support(ID3D12Device* ours) {
         std::uint8_t buf[256] = {};
         check("undefined feature", f, buf, sizeof(buf));
     }
+    return mismatches;
+}
+
+// Fences and queues must follow the host runtime's semantics: Signal raises the completed value and a null event set
+// for a reached value blocks until then. Runs the same sequence on ours and the host and compares the completed value
+// and the HRESULT at each step. A signal of an already-passed (lower) value is a documented deviation: the shim drops
+// it and stays monotonic because a Vulkan timeline cannot go back, so that case is checked against the documented
+// behaviour rather than the host. Returns the number of mismatches, or -1 when the host has no D3D12 device.
+int compare_fences(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Ref<ID3D12CommandQueue> oq, hq;
+    Ref<ID3D12Fence> of, hf;
+    if (FAILED(ours->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&oq.p))) ||
+        FAILED(host->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&hq.p))) ||
+        FAILED(ours->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&of.p))) ||
+        FAILED(host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hf.p))))
+        return -1;
+    int mismatches = 0;
+    const auto check = [&](const char* what, UINT64 a, UINT64 b) {
+        if (a != b && mismatches++ < 24)
+            std::fprintf(stderr, "fence %s: ours %llu host %llu\n", what, static_cast<unsigned long long>(a),
+                         static_cast<unsigned long long>(b));
+    };
+    const auto check_hr = [&](const char* what, HRESULT a, HRESULT b) {
+        if (a != b && mismatches++ < 24)
+            std::fprintf(stderr, "fence %s: ours 0x%08x host 0x%08x\n", what, static_cast<unsigned>(a),
+                         static_cast<unsigned>(b));
+    };
+    // A signal raises the completed value; a null event blocks until it is reached.
+    check_hr("signal 5", oq->Signal(of.p, 5), hq->Signal(hf.p, 5));
+    check_hr("block to 5", of->SetEventOnCompletion(5, nullptr), hf->SetEventOnCompletion(5, nullptr));
+    check("completed at 5", of->GetCompletedValue(), hf->GetCompletedValue());
+    // A higher signal raises it again.
+    check_hr("signal 9", oq->Signal(of.p, 9), hq->Signal(hf.p, 9));
+    check_hr("block to 9", of->SetEventOnCompletion(9, nullptr), hf->SetEventOnCompletion(9, nullptr));
+    check("completed at 9", of->GetCompletedValue(), hf->GetCompletedValue());
+    // An event for an already-reached value returns at once.
+    check_hr("event at reached 9", of->SetEventOnCompletion(9, nullptr), hf->SetEventOnCompletion(9, nullptr));
+    // A signal of an already-passed (lower) value: the host is free to lower the fence on some drivers, but a Vulkan
+    // timeline only increases. The shim deliberately drops it and keeps the higher value (see Fence::claim in
+    // d3d12_com.cpp), so this is checked against the documented behaviour, not the host.
+    check_hr("signal 3 (lower)", oq->Signal(of.p, 3), S_OK);
+    if (of->GetCompletedValue() != 9 && mismatches++ < 24)
+        std::fprintf(stderr, "fence lower signal: ours %llu, want 9\n",
+                     static_cast<unsigned long long>(of->GetCompletedValue()));
     return mismatches;
 }
 
@@ -3990,15 +5172,62 @@ int main() {
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
 
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_sample_count{};
-        invalid_sample_count.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        invalid_sample_count.SampleCount = D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT * 2;
-        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
-                                           sizeof(invalid_sample_count)) == E_INVALIDARG);
-        EXPECT(invalid_sample_count.NumQualityLevels == 0);
-        invalid_sample_count.SampleCount = 0;
-        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
-                                           sizeof(invalid_sample_count)) == E_INVALIDARG);
+        // RTX 5070 / 621.14 host answers, without requiring a host device for this regression.
+        for (const UINT samples : {0u, 33u, 64u, UINT_MAX}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{DXGI_FORMAT_R8G8B8A8_UNORM, samples,
+                                                                D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                                               sizeof(quality)) == E_FAIL);
+            EXPECT(quality.NumQualityLevels == 0);
+        }
+        for (UINT format = 0; format <= 192; ++format) {
+            const bool known = format != UINT(DXGI_FORMAT_R1_UNORM) &&
+                               (format <= 115 || (format >= 189 && format <= 191));
+            for (const UINT samples : {1u, 3u, 31u}) {
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{DXGI_FORMAT(format), samples,
+                                                                    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+                EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                                                   sizeof(quality)) == (known ? S_OK : E_FAIL));
+                EXPECT(quality.NumQualityLevels == (known ? UINT(samples == 1) : 99u));
+            }
+        }
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_format_levels{DXGI_FORMAT_FORCE_UINT, 1,
+                                                                          D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_format_levels,
+                                           sizeof(invalid_format_levels)) == E_FAIL);
+        EXPECT(invalid_format_levels.NumQualityLevels == 99);
+        // Native (RTX 5070 / 621.24): an unknown format keeps the output even with an invalid count.
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS unknown_zero{DXGI_FORMAT(192), 0,
+                                                                   D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &unknown_zero,
+                                           sizeof(unknown_zero)) == E_FAIL);
+        EXPECT(unknown_zero.NumQualityLevels == 99);
+        for (const auto format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_R32G32B32_FLOAT}) {
+            for (const UINT samples : {1u, 3u, 4u, 32u}) {
+                for (const UINT flags : {0u, 1u}) {
+                    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS plain{format, samples,
+                        D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS(flags)};
+                    EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &plain,
+                                                       sizeof(plain)) == S_OK);
+                    if (flags && format == DXGI_FORMAT_R32G32B32_FLOAT) EXPECT(plain.NumQualityLevels == 0);
+                    for (const UINT extra : {2u, 0xfeu}) {
+                        auto undefined_flags = plain;
+                        undefined_flags.Flags = D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS(flags | extra);
+                        undefined_flags.NumQualityLevels = 99;
+                        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &undefined_flags,
+                                                           sizeof(undefined_flags)) == S_OK);
+                        EXPECT(undefined_flags.NumQualityLevels == plain.NumQualityLevels);
+                    }
+                }
+            }
+        }
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS wrong_size[2]{{DXGI_FORMAT_R8G8B8A8_UNORM, 1,
+            D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99}};
+        for (const UINT bytes : {UINT(sizeof(wrong_size[0]) - 1), UINT(sizeof(wrong_size))}) {
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, wrong_size,
+                                               bytes) == E_INVALIDARG);
+            EXPECT(wrong_size[0].NumQualityLevels == 99);
+        }
 
         D3D12_RESOURCE_DESC unsupported_quality =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
@@ -4006,8 +5235,20 @@ int main() {
         unsupported_quality.SampleDesc.Quality = 1;
         EXPECT(device->GetResourceAllocationInfo(0, 1, &unsupported_quality).SizeInBytes == UINT64_MAX);
 
-        D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
-        EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
+        // UNKNOWN is a buffer format to the host runtime (S_OK, Support1 BUFFER; "format support: UNKNOWN" compares
+        // it), and a value past its format table is E_FAIL.
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT unknown_format{DXGI_FORMAT_UNKNOWN};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &unknown_format, sizeof(unknown_format)) ==
+                   S_OK &&
+               unknown_format.Support1 == D3D12_FORMAT_SUPPORT1_BUFFER);
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{static_cast<DXGI_FORMAT>(116)};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format)) ==
+               E_FAIL);
+        // The table's last entries before and after the gap are formats, whatever this GPU supports of them.
+        for (const UINT edge : {115u, 189u, 191u}) {  // B4G4R4A4_UNORM, SAMPLER_FEEDBACK_MIN_MIP_OPAQUE, A4B4G4R4_UNORM
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT known{static_cast<DXGI_FORMAT>(edge)};
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &known, sizeof(known)) != E_FAIL);
+        }
 
         // D3D-61: XR_BIAS is a display-only format with the R10G10B10A2 bit layout. The layer can create and
         // copy it, and its views can cast to the ordinary 10:10:10:2 format, but it does not claim display or
@@ -4123,6 +5364,15 @@ int main() {
 
         const int options_mismatches = compare_feature_options(device.p, info);
         EXPECT(options_mismatches == 0);
+        // Uncompressed 8-bit sRGB formats support texture reads but cannot type a D3D12 buffer view.
+        for (DXGI_FORMAT format : {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                                   DXGI_FORMAT_B8G8R8X8_UNORM_SRGB}) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
+            EXPECT(!(support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER));
+            EXPECT(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD);
+            EXPECT(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+        }
         const int format_support_mismatches = compare_format_support(device.p, info);
         EXPECT(format_support_mismatches == 0);
         {
@@ -4220,6 +5470,11 @@ int main() {
             EXPECT(above.HighestShaderModel == D3D_SHADER_MODEL_6_0);  // clamped to what the layer accepts
             D3D12_FEATURE_DATA_SHADER_MODEL below{static_cast<D3D_SHADER_MODEL>(0)};
             EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &below, sizeof(below))));
+            // Between 5.1 and 6.0 no runtime names a model: refused (the host's E_INVALIDARG), not echoed back.
+            for (const UINT undefined : {0x52u, 0x5au, 0x5fu}) {
+                D3D12_FEATURE_DATA_SHADER_MODEL gap{static_cast<D3D_SHADER_MODEL>(undefined)};
+                EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &gap, sizeof(gap)) == E_INVALIDARG);
+            }
 
             D3D12_FEATURE_DATA_ROOT_SIGNATURE signature{D3D_ROOT_SIGNATURE_VERSION_1_1};
             EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &signature, sizeof(signature))));
@@ -4229,6 +5484,15 @@ int main() {
             EXPECT(newer.HighestVersion == D3D_ROOT_SIGNATURE_VERSION_1_1);
             D3D12_FEATURE_DATA_ROOT_SIGNATURE undefined{static_cast<D3D_ROOT_SIGNATURE_VERSION>(0)};
             EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &undefined, sizeof(undefined))));
+            // Anything above 1.2 is undefined: E_INVALIDARG with the value left alone, measured on an RTX 4070 Laptop
+            // (621.24) and WARP. Checked here rather than against the host, which has crashed on undefined values of
+            // the shader model query next to this one.
+            for (const UINT undefined_version : {0x4u, 0x5u, 0x10u, 0xffu, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+                D3D12_FEATURE_DATA_ROOT_SIGNATURE refused{static_cast<D3D_ROOT_SIGNATURE_VERSION>(undefined_version)};
+                EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &refused, sizeof(refused)) ==
+                       E_INVALIDARG);
+                EXPECT(static_cast<UINT>(refused.HighestVersion) == undefined_version);
+            }
             // A wrong DataSize and a null buffer are refused for both queries.
             D3D12_FEATURE_DATA_SHADER_MODEL short_model{D3D_SHADER_MODEL_6_0};
             D3D12_FEATURE_DATA_ROOT_SIGNATURE short_signature{D3D_ROOT_SIGNATURE_VERSION_1_1};
@@ -4271,6 +5535,10 @@ int main() {
         if (feature_error_mismatches < 0)
             std::printf("CheckFeatureSupport error paths: no host D3D12 device to compare with, skipped\n");
         EXPECT(feature_error_mismatches <= 0);
+        const int fence_mismatches = compare_fences(device.p);
+        if (fence_mismatches < 0)
+            std::printf("Fences: no host D3D12 device to compare with, skipped\n");
+        EXPECT(fence_mismatches <= 0);
 
         // D3D-236: CreateCommandQueue with D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME requires
         // SeIncreaseBasePriorityPrivilege enabled in the token, matching the Windows D3D12 runtime.
@@ -4422,7 +5690,9 @@ int main() {
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
             const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_MAXIMUM,
                                                            D3D12_RESIDENCY_PRIORITY(D3D12_RESIDENCY_PRIORITY_LOW + 5)};
-            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == S_OK);
+            // Only committed resources and heaps take a priority, as on the host runtime (d3d12_residency_test): a
+            // fence and an allocator don't.
+            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == E_INVALIDARG);
             EXPECT(device1->SetResidencyPriority(0, nullptr, nullptr) == S_OK);
             EXPECT(device1->SetResidencyPriority(1, pageables, nullptr) == E_INVALIDARG);
             EXPECT(device1->SetResidencyPriority(1, nullptr, priorities) == E_INVALIDARG);
@@ -4434,8 +5704,9 @@ int main() {
             EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p, 9) ==
                    S_OK);
             EXPECT(residency->GetCompletedValue() == 9);
-            // Refused calls leave the fence alone.
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == E_INVALIDARG);
+            // A null fence is accepted (the host runtime's answer) and signals nothing; refused calls leave the fence
+            // alone.
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == S_OK);
             EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) ==
                    E_INVALIDARG);
             EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) ==
@@ -4530,7 +5801,7 @@ int main() {
                E_INVALIDARG && !refused_buffer.p);
 
         Ref<ID3D12Resource> rt_resource, packed565, ds, untouched, upload, readback, volume, line, line_array,
-            line_refused;
+            line_refused, line_target;
         D3D12_RESOURCE_DESC xbox_rt =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         xbox_rt.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
@@ -4563,10 +5834,11 @@ int main() {
         refused_line.Height = 2;
         EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
                !line_refused.p);
-        refused_line = line_shape;
-        refused_line.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
-               !line_refused.p);
+        // A 1D render target is created, as the PC runtime does (d3d12_texture1d_target_test compares them).
+        auto line_target_shape = line_shape;
+        line_target_shape.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        EXPECT(SUCCEEDED(create(default_heap, line_target_shape, D3D12_RESOURCE_STATE_RENDER_TARGET, line_target)) &&
+               rt::d3d12::vulkan_image(line_target.p));
         EXPECT(rt_resource->GetDesc().Width == size && rt_resource->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         EXPECT(rt::d3d12::vulkan_image(rt_resource.p) && !rt::d3d12::vulkan_image(upload.p));
 
@@ -4581,6 +5853,21 @@ int main() {
         D3D12_HEAP_PROPERTIES heap_properties{};
         EXPECT(SUCCEEDED(upload->GetHeapProperties(&heap_properties, nullptr)) &&
                heap_properties.Type == D3D12_HEAP_TYPE_UPLOAD);
+        {
+            // D3D-469: the flag stays on the heap, next to the DENY flags a committed buffer gets (0x4c0 on the host).
+            const D3D12_HEAP_PROPERTIES atomics_heap{D3D12_HEAP_TYPE_DEFAULT};
+            auto atomics_desc = buffer_desc(256);
+            atomics_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            Ref<ID3D12Resource> atomics;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&atomics_heap, D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS,
+                                                             &atomics_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&atomics.p))));
+            D3D12_HEAP_PROPERTIES atomics_got{};
+            D3D12_HEAP_FLAGS atomics_flags = D3D12_HEAP_FLAG_NONE;
+            EXPECT(SUCCEEDED(atomics->GetHeapProperties(&atomics_got, &atomics_flags)));
+            EXPECT(UINT(atomics_flags) == (UINT(D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) |
+                                           UINT(D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)));
+        }
 
         // D3D-96: upload buffers are in VRAM exactly when the GPU has Resizable BAR (and LEONIDA_UPLOAD_SYSMEM is not
         // set), host-visible either way. The copies below read this buffer on the GPU, so both placements are checked.
@@ -5238,8 +6525,9 @@ int main() {
             EXPECT(tiled->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
             D3D12_HEAP_PROPERTIES reserved_heap{};
             EXPECT(tiled->GetHeapProperties(&reserved_heap, nullptr) == E_INVALIDARG);  // no heap of its own
+            // A null output is E_UNEXPECTED, as on the host runtime (compare_placed_reserved, "reserved:").
             EXPECT(device->CreateReservedResource(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                  __uuidof(ID3D12Resource), nullptr) == S_FALSE);
+                                                  __uuidof(ID3D12Resource), nullptr) == E_UNEXPECTED);
             const auto refuses = [&](D3D12_RESOURCE_DESC desc) {
                 const HRESULT hr = device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   IID_PPV_ARGS(&refused.p));
@@ -5408,10 +6696,11 @@ int main() {
             UINT64 frequency = 0;
             EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency >= 1'000'000);
             EXPECT(queue->GetTimestampFrequency(nullptr) == E_INVALIDARG);
-            Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, refused;
+            Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, so, refused;
             D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));
-            EXPECT(device->CreateQueryHeap(&query_desc, __uuidof(ID3D12QueryHeap), nullptr) == S_FALSE);
+            // A null output is E_UNEXPECTED, as on the host runtime (compare_invalid_arguments, "query heap:").
+            EXPECT(device->CreateQueryHeap(&query_desc, __uuidof(ID3D12QueryHeap), nullptr) == E_UNEXPECTED);
             {
                 Ref<ID3D12Device> parent;
                 EXPECT(SUCCEEDED(occlusion->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
@@ -5420,16 +6709,20 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0};
             EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
-            query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 1, 0};  // no stream output path yet
-            EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+            // The layer has no stream output, so stream-output statistics heaps are made without a Vulkan pool and
+            // every query reads zero (D3D-302).
+            query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 3, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&so.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 2, 0};
             if (d.pipeline_statistics_query)
                 EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&statistics.p))));
             else
                 std::printf("pipeline statistics: no pipelineStatisticsQuery, skipped\n");
 
-            // Readback layout: timestamps at 0, occlusion at 64, statistics at 256, the second run's at 1024.
-            constexpr UINT64 ts_at = 0, occlusion_at = 64, statistics_at = 256, again_at = 1024;
+            // Readback layout: timestamps at 0, occlusion at 64, statistics at 256, stream output at 512, the second
+            // run's at 1024.
+            constexpr UINT64 ts_at = 0, occlusion_at = 64, statistics_at = 256, so_at = 512, again_at = 1024;
+            static_assert(sizeof(D3D12_QUERY_DATA_SO_STATISTICS) == 16);
             const auto u64 = [&](UINT64 offset) {
                 UINT64 value;
                 std::memcpy(&value, down + offset, sizeof(value));
@@ -5439,15 +6732,21 @@ int main() {
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0);
             if (statistics.p) list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            // Two streams at once, inside the statistics query and crossing the occlusion one: none of them is a
+            // Vulkan query, so none overlaps.
+            list->BeginQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+            list->BeginQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3, 1);
             // A rectangle clear runs in a render pass inside a query; clears count no samples.
             device->CreateRenderTargetView(rt_resource.p, &rtv_desc, rtv1);  // the resolve test reused it
             list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
             barrier = transition(rt_resource.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             list->ResourceBarrier(1, &barrier);
             list->ClearRenderTargetView(rtv1, red, 1, &square);
+            list->EndQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
             list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
             list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
             list->CopyBufferRegion(readback.p, 8192, upload.p, 0, 32768);
+            list->EndQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3, 1);
             list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
             if (statistics.p) list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
             list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 1);
@@ -5458,6 +6757,8 @@ int main() {
             if (statistics.p)
                 list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 2, readback.p,
                                        statistics_at);
+            list->ResolveQueryData(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 1, readback.p, so_at);
+            list->ResolveQueryData(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3, 1, 2, readback.p, so_at + 16);  // 2: never
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
@@ -5470,6 +6771,8 @@ int main() {
             for (UINT i = 0; i < 4; ++i) EXPECT(u64(occlusion_at + 8 * i) == 0);
             for (UINT i = 0; statistics.p && i < 22; ++i) EXPECT(u64(statistics_at + 8 * i) == 0);
             EXPECT(u64(statistics.p ? statistics_at + 176 : statistics_at) == 0xcdcdcdcdcdcdcdcdull);  // not past it
+            for (UINT i = 0; i < 6; ++i) EXPECT(u64(so_at + 8 * i) == 0);  // written and needed, three queries
+            EXPECT(u64(so_at + 48) == 0xcdcdcdcdcdcdcdcdull);              // not past them
 
             // A second execution reuses timestamp 0 (reset before it is written again) and resolves timestamp 1,
             // which keeps the result of the first execution.
@@ -5481,6 +6784,33 @@ int main() {
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             EXPECT(submit_and_wait());
             EXPECT(u64(again_at) >= t1 && u64(again_at + 8) == t1);
+
+            // A timestamp written by one execution and resolved by the next, with nothing waited for in between, as
+            // a game resolves last frame's timestamps. The resolve reads the new value (on MoltenVK only because the
+            // queue orders the two; docs/d3d12_vulkan.md section 4.6).
+            {
+                constexpr UINT64 later_at = 2048;
+                Ref<ID3D12CommandAllocator> writer_allocator;
+                Ref<ID3D12GraphicsCommandList> writer;
+                EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                IID_PPV_ARGS(&writer_allocator.p))));
+                EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, writer_allocator.p,
+                                                           nullptr, IID_PPV_ARGS(&writer.p))));
+                writer->CopyBufferRegion(readback.p, 8192, upload.p, 0, 32768);
+                writer->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                EXPECT(writer->Close() == S_OK);
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, readback.p, later_at);
+                EXPECT(list->Close() == S_OK);
+                ID3D12CommandList* const writers[] = {writer.p};
+                queue->ExecuteCommandLists(1, writers);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                EXPECT(submit_and_wait());
+                EXPECT(u64(later_at) == u64(again_at) && u64(later_at + 8) == t1);
+                EXPECT(u64(later_at + 16) >= u64(again_at) && u64(later_at + 16) != 0xcdcdcdcdcdcdcdcdull);
+            }
 
             // Lists that break the rules. Close reports what it can see; the rest is refused at execution, and
             // nothing is submitted.
@@ -5502,15 +6832,23 @@ int main() {
                           [&] { list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 3, 2, readback.p, 0); }));
             EXPECT(refuse(S_OK, R::invalid_query,  // a type the heap does not hold
                           [&] { list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
+            EXPECT(refuse(S_OK, R::invalid_query, [&] {  // a stream-output query in an occlusion heap
+                list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 0);
+                list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 0);
+            }));
+            EXPECT(refuse(E_INVALIDARG, R::invalid_query,  // a stream-output query begun and never ended
+                          [&] { list->BeginQuery(so.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2, 0); }));
             EXPECT(refuse(S_OK, R::invalid_query,  // into a texture
                           [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, rt_resource.p, 0); }));
             EXPECT(refuse(S_OK, R::invalid_query,  // past the end of the buffer
                           [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback.p, 65528); }));
-            EXPECT(refuse(S_OK, R::unsupported, [&] {  // valid D3D12, but Vulkan runs one occlusion query at a time
+            EXPECT(refuse(S_OK, R::success, [&] {  // overlapping occlusion kinds share physical segments (D3D-252)
                 list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
                 list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
                 list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
                 list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+                list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.p, 0);
+                list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1, readback.p, 8);
             }));
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
             EXPECT(SUCCEEDED(list->Close()));
@@ -5605,11 +6943,50 @@ int main() {
             }
         }
 
+        // D3D-71: a default-heap buffer outside the arena (this device has none) starts zeroed, as D3D12 committed
+        // resources do. Its memory is first dirtied through an earlier buffer, which is then released so the next
+        // allocation is likely to reuse it. CREATE_NOT_ZEROED skips the fill; a copy into the same list still lands.
+        {
+            constexpr UINT64 bytes = 4096;
+            const D3D12_HEAP_PROPERTIES default_buffer_heap{D3D12_HEAP_TYPE_DEFAULT};
+            std::memset(up, 0xab, std::size_t(bytes));
+            {
+                Ref<ID3D12Resource> dirty;
+                EXPECT(SUCCEEDED(create(default_buffer_heap, buffer_desc(bytes), D3D12_RESOURCE_STATE_COMMON, dirty)));
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                list->CopyBufferRegion(dirty.p, 0, upload.p, 0, bytes);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(submit_and_wait());
+            }
+            Ref<ID3D12Resource> fresh, not_zeroed;
+            EXPECT(SUCCEEDED(create(default_buffer_heap, buffer_desc(bytes), D3D12_RESOURCE_STATE_COMMON, fresh)));
+            const D3D12_RESOURCE_DESC zero_desc = buffer_desc(bytes);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_buffer_heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+                                                             &zero_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&not_zeroed.p))));
+            std::memset(down, 0xcd, std::size_t(2 * bytes));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->CopyBufferRegion(readback.p, 0, fresh.p, 0, bytes);
+            list->CopyBufferRegion(not_zeroed.p, 0, upload.p, 0, bytes);  // written before it is read
+            auto readable = transition(not_zeroed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &readable);
+            list->CopyBufferRegion(readback.p, bytes, not_zeroed.p, 0, bytes);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(submit_and_wait());
+            const std::uint8_t zero[4] = {}, written[4] = {0xab, 0xab, 0xab, 0xab};
+            for (UINT64 i = 0; i < bytes; i += 4) report("zero-filled buffer byte", UINT(i), down + i, zero, 4);
+            for (UINT64 i = 0; i < bytes; i += 4)
+                report("NOT_ZEROED buffer byte after a copy", UINT(i), down + bytes + i, written, 4);
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
         for (auto* r : {&rt_resource, &packed565, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc,
-                        &line, &line_array}) r->reset();
+                        &line, &line_array, &line_target}) r->reset();
         list7.reset();
         list.reset();
         allocator.reset();
@@ -5714,7 +7091,14 @@ int main() {
                 ext_query.pNext = &m8;
             }
 #endif
+            VkPhysicalDeviceShaderClockFeaturesKHR clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+            if (has(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+                clock.pNext = ext_query.pNext;
+                ext_query.pNext = &clock;
+            }
             if (features2) features2(made->physical, &ext_query);
+            EXPECT(made->shader_subgroup_clock == (clock.shaderSubgroupClock == VK_TRUE));
+            EXPECT(made->shader_device_clock == (clock.shaderDeviceClock == VK_TRUE));
             EXPECT(made->fragment_shader_barycentric == (bary.fragmentShaderBarycentric == VK_TRUE));
             EXPECT(made->fragment_shader_interlock == (lock.fragmentShaderPixelInterlock == VK_TRUE));
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
@@ -5894,6 +7278,15 @@ int main() {
             if (heap_mismatches < 0)
                 std::printf("CreateHeap valid neighbours: no host D3D12 device to compare with, skipped\n");
             EXPECT(heap_mismatches <= 0);
+            const int heap_desc_mismatches = compare_heap_descs(standalone.p);
+            if (heap_desc_mismatches < 0)
+                std::printf("ID3D12Heap::GetDesc: no host D3D12 device to compare with, skipped\n");
+            EXPECT(heap_desc_mismatches <= 0);
+            const int placed_mismatches = compare_placed_reserved(standalone.p);
+            if (placed_mismatches < 0)
+                std::printf("CreatePlacedResource/CreateReservedResource arguments: no host D3D12 device to compare "
+                            "with, skipped\n");
+            EXPECT(placed_mismatches <= 0);
         }
 
         auto tiled_2d = [&](UINT w, UINT h, DXGI_FORMAT fmt, UINT16 mips, D3D12_RESOURCE_FLAGS flags,
@@ -6585,6 +7978,9 @@ int main() {
             // WARP and NVIDIA's Vulkan driver give 188, Intel's Vulkan driver 187 (UHD 770 101.7092), both within
             // 0.6 ULP. On the layer's own adapter (same LUID) the comparison stays exact; against another adapter
             // or WARP a byte may differ when both sides are within 0.6 ULP of the ideal value.
+            // The plain clear's normalised values are rounded by the layer itself (nearest even, WARP's and AMD's
+            // code), so on its own NVIDIA adapter the tie byte may be the step above the driver's: accepted only
+            // when it is exactly that nearest-even code and within 0.6 ULP.
             const FLOAT clear_value[4] = {0.25f, 0.5f, 0.75f, 1.0f};  // placed_cast_scenario's clear colour
             const auto within_tolerance = [&](std::uint8_t ours_byte, std::uint8_t host_byte, double ideal) {
                 return !same_adapter && within_06_ulp(ours_byte, host_byte, ideal);
@@ -6597,7 +7993,9 @@ int main() {
                     const double plain_ideal = c * 255.0;
                     const double srgb_ideal = (i % 4 == 3 ? c : ideal_srgb(c)) * 255.0;  // alpha stays linear
                     if (ours[b] != host[b]) {
-                        if (within_tolerance(ours[b], host[b], plain_ideal))
+                        const bool layer_tie = double(ours[b]) == nearest_even_code(plain_ideal) &&
+                                               within_06_ulp(ours[b], host[b], plain_ideal);
+                        if (within_tolerance(ours[b], host[b], plain_ideal) || layer_tie)
                             ++plain_within;
                         else if (differences++ < 8)
                             std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,
@@ -6684,6 +8082,6 @@ int main() {
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
                 "BC copies, a resolve, reserved resources, queries, GetCopyableFootprints, GetResourceTiling and "
-                "CheckFeatureSupport error paths all matched\n");
+                "CheckFeatureSupport error paths and fence semantics all matched\n");
     return 0;
 }
