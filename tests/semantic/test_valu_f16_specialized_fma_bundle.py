@@ -401,5 +401,37 @@ class TestVFmamkF16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & 0xFFFF, 0x4100)
 
+def ref_v_fma_mixhi_f16(s0: int, s1: int, s2: int, old_dst: int = 0) -> int:
+    if is_nan_f32(s0) or is_nan_f32(s1) or is_nan_f32(s2):
+        res_f16 = 0x7E00
+    else:
+        fa = bits_to_f32(s0)
+        fb = bits_to_f32(s1)
+        fc = bits_to_f32(s2)
+        r = fa * fb + fc
+        if math.isnan(r):
+            res_f16 = 0x7E00
+        elif math.isinf(r):
+            res_f16 = 0x7C00 if r > 0 else 0xFC00
+        else:
+            res_f16 = f16_to_bits(r)
+    return (((res_f16 & 0xFFFF) << 16) | (old_dst & 0xFFFF)) & MASK32
+
+GLOBAL_ORACLE_MAP[Opcode.V_FMA_MIXHI_F16] = ref_v_fma_mixhi_f16
+
+
+class TestVFmaMixhiF16Oracle(unittest.TestCase):
+    def test_basic_arithmetic(self) -> None:
+        # 1.0f * 2.0f + 0.5f = 2.5f (f16 0x4100 written to high halfword)
+        res = ref_v_fma_mixhi_f16(0x3F800000, 0x40000000, 0x3F000000, old_dst=0x000055AA)
+        self.assertEqual(res >> 16, 0x4100)
+        self.assertEqual(res & 0xFFFF, 0x55AA)
+
+    def test_zero_and_identity(self) -> None:
+        # 0.0f * 2.0f + 1.0f = 1.0f (0x3C00 in high halfword)
+        res = ref_v_fma_mixhi_f16(0x00000000, 0x40000000, 0x3F800000, old_dst=0x00001234)
+        self.assertEqual(res >> 16, 0x3C00)
+        self.assertEqual(res & 0xFFFF, 0x1234)
+
 if __name__ == "__main__":
     unittest.main()
