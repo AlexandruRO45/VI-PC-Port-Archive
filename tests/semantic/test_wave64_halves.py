@@ -171,6 +171,30 @@ class Classification(unittest.TestCase):
                                     "v_add_nc_u32_e32 v6, s21, v0"]), "B", [], ["lane-spill"])
 
     # -- tier C: each near miss of the idioms above
+    # -- tier C: a write under a narrowed EXEC keeps the old value in the lanes that are off (SHADER-819)
+    def test_c_masked_write_keeps_lane_id(self):
+        self.tier("ps_c_mask_id", ps([
+            "v_mbcnt_lo_u32_b32 v6, -1, 0", "v_mbcnt_hi_u32_b32 v6, -1, v6", "v_cmp_eq_u32_e32 vcc, 1, v0",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v6, 0", "s_or_b64 exec, exec, s[12:13]"]),
+            "C", ["lane-id"])
+
+    def test_c_masked_write_keeps_readlane(self):
+        self.tier("ps_c_mask_rl", ps([
+            "v_readlane_b32 s6, v0, 5", "v_mov_b32_e32 v6, s6", "v_cmp_eq_u32_e32 vcc, 1, v0",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v6, 0", "s_or_b64 exec, exec, s[12:13]"]), "C")
+
+    def test_c_masked_write_keeps_lane_count(self):
+        self.tier("ps_c_mask_cnt", ps([
+            "s_bcnt1_i32_b64 s6, exec", "v_mov_b32_e32 v6, s6", "v_cmp_eq_u32_e32 vcc, 1, v0",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v6, 0", "s_or_b64 exec, exec, s[12:13]"]),
+            "C", ["lane-count"])
+
+    def test_a_masked_write_of_clean_value_stays_exact(self):
+        # the lanes that are off keep a clean value, the lanes that are on get one: still tier A
+        self.tier("ps_a_mask_clean", ps([
+            "v_mul_u32_u24_e32 v6, 7, v0", "v_cmp_eq_u32_e32 vcc, 1, v0", "s_and_saveexec_b64 s[12:13], vcc",
+            "v_mov_b32_e32 v6, 3", "s_or_b64 exec, exec, s[12:13]"]), "A", [], [])
+
     def test_c_lane_count_exported(self):
         self.tier("ps_c_cnt", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc", "v_mov_b32_e32 v6, s6"]),
                   "C", ["lane-count"])
@@ -336,6 +360,16 @@ class Execution(unittest.TestCase):
         self.assertEqual(tier, "A")
         self.assertEqual(whole, halves)
         self.assertEqual([w[:2] for w in whole], [(k ^ 3, k ^ 16) for k in range(64)])
+
+    def test_c_masked_write_keeps_lane_id_differs(self):
+        # the lane id written before the narrowing survives in the lanes the write skips: lane 32 keeps 32 in the
+        # wave and 0 in its half (SHADER-819)
+        tier, whole, halves = self.run_both("vs_c_mask_id", vs([
+            "v_mbcnt_lo_u32_b32 v6, -1, 0", "v_mbcnt_hi_u32_b32 v6, -1, v6", "v_cmp_eq_u32_e32 vcc, 1, v0",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v6, 0", "s_or_b64 exec, exec, s[12:13]"]))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual([w[0] for w in whole], [w[0] for w in halves])
+        self.assertEqual((whole[32][0], halves[32][0]), (32, 0))
 
     def test_c_bpermute_shift_by_one_differs(self):
         # the negative control of the rule: lane bit 5 reaches an address bit the permute uses
