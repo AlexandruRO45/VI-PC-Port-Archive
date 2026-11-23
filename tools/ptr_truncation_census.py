@@ -299,13 +299,15 @@ def main(argv=None):
     ap.add_argument("--json", help="write the summary here")
     ap.add_argument("--index-out", help="write {number: {stage, user_sgpr_reads}} for tools/user_sgpr_census.py")
     a = ap.parse_args(argv)
+    if a.jobs < 1:
+        ap.error("--jobs must be at least 1")
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
         return 2
     if a.json and a.index_out and same_report_path(a.json, a.index_out):
         ap.error(f"--json and --index-out name one file: {a.json}; the second report would replace the first")
     files = listings(a.src)[: a.limit] if a.limit is not None else listings(a.src)
-    jobs = pool_workers.process_workers(max(1, a.jobs))
+    jobs = pool_workers.process_workers(a.jobs)
     if jobs == 1 or len(files) < 64:
         records = scan_many(files)
     else:
