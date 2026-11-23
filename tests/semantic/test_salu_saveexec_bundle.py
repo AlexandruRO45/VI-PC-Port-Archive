@@ -654,6 +654,22 @@ class TestSaveExecTranslator_nor(unittest.TestCase):
     def test_translator_hardware_runner(self):
         saveexec_run.check(self, "nor")
 
+class TestSaveExecOracle_xnor(unittest.TestCase):
+    def test_oracle_mathematical_properties(self):
+        old_exec = 0xF0F0_F0F0_0F0F_0F0F
+        s0 = 0x5555_5555_AAAA_AAAA
+        new_exec, d_val, scc = model_saveexec("xnor", s0, old_exec)
+        self.assertEqual(d_val, old_exec)
+        self.assertEqual(scc, 1 if new_exec != 0 else 0)
+        self.assertEqual(new_exec, ISA_OPS["xnor"](s0, old_exec) & MASK64)
+
+    def test_oracle_edge_patterns(self):
+        for old_exec in (0, MASK64, 0x8000_0000_0000_0000, 1):
+            for s0 in (0, MASK64, 0x8000_0000_0000_0000, 1):
+                new_exec, d_val, scc = model_saveexec("xnor", s0, old_exec)
+                self.assertEqual(d_val, old_exec)
+                self.assertEqual(scc, int(new_exec != 0))
+
 
 if __name__ == "__main__":
     unittest.main()
