@@ -20,6 +20,11 @@ field) the rule cannot be applied to that model and every geometry is a candidat
 --no-bucket-rule turns it off. --skip-shaders (or BVH_SKIP_SHADERS) still leaves out geometries by shader name hash
 on top of it; the hashes are game data, for local use only.
 
+A consistent candidate is not proof of every geometry it names (ASSET-566). The checks see the bounds, the stored
+box overrides and the paired edges, not where each leaf is, so a small geometry inside the bounds can often be
+swapped for another of the same triangle count without any check noticing. For the best candidate the tool tries
+those swaps (at most --pin-checks of them) and names every geometry index that is not pinned that way.
+
 The instance transform is the 3x4 at +0x50 of the BLAS's 208-byte instance descriptor (docs/bvh.md §3.2). Without
 it, every leaf of a rotated structure falls outside the header bounds and a correct geometry is rejected.
 
@@ -34,7 +39,7 @@ Usage:
     python -I tools/bvh_match.py <dehydrated.bin> <manifest.json> --descriptor <instance208.bin>
                                 [--models DIR] [--header-offset N] [--descriptor-offset N]
                                 [--transform 12 floats] [--skip-shaders HEX,HEX] [--no-bucket-rule] [--unordered]
-                                [--embeddings N] [--top N] [--names] [--write DIR] [--json FILE]
+                                [--embeddings N] [--top N] [--pin-checks N] [--names] [--write DIR] [--json FILE]
 
 --write DIR writes the matched geometries as float3/uint32 buffers plus an export.json, the shape
 tools/bvh_rehydrate.py takes: the transform is recorded in it rather than applied to the vertices.
@@ -240,6 +245,51 @@ def score(src, candidate, groups, transform, header_offset=0):
     return C.check(src, geometries, header_offset)
 
 
+def pinning(src, candidate, groups, transform, header_offset=0, cap=128):
+    """Which geometry indices of a consistent candidate the checks actually pin down (ASSET-566).
+
+    For each index, the candidate's geometry is replaced by every other geometry of the same model with the same
+    triangle count - including geometries the rules leave out and ones the candidate uses at another index - and
+    the checks are run again. An index is pinned when no replacement passes. The checks only see what the
+    dehydrated stream stores (bounds, box overrides, paired edges), so a small geometry deep inside the bounds is
+    often not pinned: the stream does not say where it is, only that it is there.
+
+    Returns {"unpinned", "alternatives", "tried", "not_tried", "no_obj_group"}: unpinned lists every index a
+    replacement also passes as {"index", "geometry", "also_passes"}; alternatives counts every replacement there is,
+    tried those run. A replacement is not tried when the cap is reached or its OBJ group is missing; then an index
+    without a passing replacement is not known to be pinned (not_tried > 0).
+    """
+    used = [candidate["kept"][k] for k in candidate["used"]]
+    model = [mesh for mesh in model_geometries(candidate["item"]) if mesh[1] == candidate["model"]]
+    built = {}
+
+    def geometry(mesh):
+        if mesh[0] not in built:
+            built[mesh[0]] = build_geometry(groups[mesh[0]], transform)
+        return built[mesh[0]]
+
+    plan = [[other for other in model if other[3] == mesh[3] and other[0] != mesh[0]] for mesh in used]
+    alternatives = sum(len(others) for others in plan)
+    rows, tried, missing = [], 0, 0
+    for index, (mesh, others) in enumerate(zip(used, plan)):
+        passes = []
+        for other in others:
+            if other[0] >= len(groups):
+                missing += 1
+                continue
+            if tried >= cap:
+                break
+            tried += 1
+            trial = [geometry(m) for m in used]
+            trial[index] = geometry(other)
+            if C.check(src, trial, header_offset)["consistent"]:
+                passes.append(other[2])
+        if passes:
+            rows.append({"index": index, "geometry": mesh[2], "also_passes": passes})
+    return {"unpinned": rows, "alternatives": alternatives, "tried": tried,
+            "not_tried": alternatives - tried, "no_obj_group": missing}
+
+
 def export_buffer_names(count):
     """The (vertex, index) buffer names write_export gives each of `count` matched geometries."""
     return [("g%d_f3.bin" % i, "g%d_tri.bin" % i) for i in range(count)]
@@ -301,8 +351,14 @@ def main(argv=None):
     ap.add_argument("--names", action="store_true", help="print drawable names (game data: local use only)")
     ap.add_argument("--write", metavar="DIR", help="write the matched geometries here as float3/uint32 buffers "
                                                   "and an export.json for tools/bvh_rehydrate.py")
+    ap.add_argument("--pin-checks", type=int, default=128, metavar="N",
+                    help="re-run the checks at most N times to find geometry indices of the match that another "
+                         "geometry of the same triangle count also passes (0: skip)")
     ap.add_argument("--json", help="write the report here")
     a = ap.parse_args(argv)
+    if a.pin_checks < 0:
+        print("error: --pin-checks must be 0 or more", file=sys.stderr)
+        return 2
     if a.json:
         # The report is written last, after the inputs have been read, so an aliased input would silently
         # be replaced by it. Refuse the alias before any input is opened, as the other report tools do.
@@ -374,6 +430,35 @@ def main(argv=None):
     if len(consistent) > 1:
         print("more than one candidate is consistent: the signature and the checks do not decide between them; "
               "the internal box area (the smallest one) is the tie-break")
+    if not consistent and not a.no_bucket_rule and any(
+            isinstance(material, dict) and "RenderBucket" in material
+            for item in items if isinstance(item, dict) for material in (item.get("Materials") or [])):
+        # A few BLAS do not follow the bucket rule (docs/bvh.md §4a); without it the checks decide alone.
+        print("no candidate under the bucket rule; --no-bucket-rule checks every geometry")
+    pin = None
+    if consistent and a.pin_checks:
+        match = consistent[0][3]
+        try:
+            pin = pinning(src, match, groups[os.path.join(models_dir, match["item"]["File"])],
+                          transform, a.header_offset, a.pin_checks)
+        except (OSError, ValueError, KeyError, IndexError, TypeError, struct.error) as e:
+            print("pinning not checked: %s" % e)
+    if pin is not None:
+        for row in pin["unpinned"]:
+            print("   geometry index %d (drawable geometry %d) is not pinned: the checks also pass with geometry %s "
+                  "in its place" % (row["index"], row["geometry"], ", ".join(str(g) for g in row["also_passes"])))
+        rest = len(match["used"]) - len(pin["unpinned"])
+        if not pin["not_tried"]:
+            print("%d of %d geometry indices of the match are pinned by the checks (all %d replacements tried)"
+                  % (rest, len(match["used"]), pin["alternatives"]))
+        else:
+            # Without every replacement run, an index with no passing replacement is only not shown to be unpinned.
+            print("%d of %d geometry indices of the match have no passing replacement among those tried, but %d of %d "
+                  "replacements were not tried (%s): those indices are not known to be pinned" % (
+                      rest, len(match["used"]), pin["not_tried"], pin["alternatives"],
+                      "; ".join(x for x in ("--pin-checks reached" if pin["tried"] >= a.pin_checks else "",
+                                            "%d without an OBJ group" % pin["no_obj_group"] if pin["no_obj_group"]
+                                            else "") if x)))
     if a.write:
         if not consistent:
             print("nothing written: no candidate is consistent")
@@ -399,6 +484,10 @@ def main(argv=None):
                                "offset": match["item"]["Offset"], "model": match["model"],
                                "geometry": [match["kept"][k][2] for k in match["used"]],
                                "triangles": [match["kept"][k][3] for k in match["used"]],
+                               "pinning": None if pin is None else {
+                                   "complete": not pin["not_tried"], "unpinned": pin["unpinned"],
+                                   "alternatives": pin["alternatives"], "tried": pin["tried"],
+                                   "not_tried": pin["not_tried"], "no_obj_group": pin["no_obj_group"]},
                                "name": match["item"]["Name"] if a.names else None}},
                           f, indent=1)
         except OSError as e:

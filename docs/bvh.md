@@ -587,6 +587,34 @@ that is a hypothesis for this one).
   cannot express the rule, and it is probably the one hash below that the interior's 130 BLAS both keep and leave out.
   The note below says those 3 left-out geometries have the same bucket as the kept ones; that was not re-measured
   here, and if it holds they belong with the exceptions above.
+* *Which exceptions are established (ASSET-566):* a consistent candidate does not show that every geometry it names is
+  in the BLAS. The checks see the bounds, the stored box overrides and the paired edges, not where a leaf is, so a
+  small geometry inside the bounds can be replaced by another of the same triangle count without any check noticing;
+  `bvh_match.py` now reports every geometry index of a match that such a replacement also passes (§7, "not pinned").
+  - Ground truth with no rule (`--no-bucket-rule`, exactly one consistent match) over the BLAS among the first 2,908
+    streams with at least two geometry indices, against the `levels.rpf` windows at 3 and 4 GiB, with every
+    replacement run (no cap; no replacement lacked its OBJ group). "Pinned" means every index is pinned; "not pinned"
+    means at least one replacement passes, so the match is ambiguous on that index:
+
+    | window | BLAS | replacements run | pinned, rule exact | not pinned, rule exact | not pinned, rule differs | not fully run |
+    |---|---:|---:|---:|---:|---:|---:|
+    | 3 GiB | 622 | 846 | 546 | 75 | 1 | 0 |
+    | 4 GiB | 940 | 368 | 898 | 42 | 0 | 0 |
+    | both | 1,562 | 1,214 | 1,444 | 117 | 1 | 0 |
+
+    So the rule gives exactly the kept set in every BLAS whose match the checks pin, and the one BLAS where it does
+    not differs only on indices that are not pinned. A BLAS has up to 66 replacements here; the default
+    `--pin-checks 128` runs them all, while a cap of 32 would have left 4 of the 1,562 incomplete.
+  - That one BLAS has 11 geometry indices where the rule keeps 10 of its drawable's geometries; the 11th seemed to be
+    a 2-triangle bucket-2 geometry. But the checks pass equally with the 2-triangle bucket-3 geometry in either of the
+    last two places, or in both, so what the stream shows is one index more than the rule keeps, not which geometry
+    fills it. No other first-LOD model of `levels.rpf`, `data.rpf` or `packs.rpf` has its signature at all.
+  - The exceptions above have the same shape: 314 streams have no exact hit, but one when a single left-out geometry
+    is kept (400 of the flipped geometries bucket 2, 89 bucket 1). Over 8 windows holding 228 of them (all
+    replacements run), 213 have no consistent candidate at all (their counts match a drawable that is not the one the
+    BLAS was built from), and 15 have one that keeps the flipped geometry; in all 15 that geometry's index is not
+    pinned: another geometry of the same model with the same triangle count passes in its place. None of the 16 shows that the BVH
+    keeps a bucket-1 or bucket-2 geometry; each shows only one index more than the rule keeps.
 
 `tools/bvh_match.py` applies the rule by default whenever every geometry of a model has a bucket in the manifest
 (`--no-bucket-rule` turns it off; `--skip-shaders` still adds hashes on top).
@@ -722,7 +750,9 @@ converse fails: 1,008 (BLAS header, transform) pairs occur under more than one k
 can share both the BLAS and its transform: the key identifies something finer than that pair. What it hashes is open;
 #4199 (open) finds no more matches between these keys and the values of the table descriptors than chance gives.
 
-**Open:** why the BVH keeps the bucket-1 and bucket-2 geometries of at least 22 BLAS (ASSET-349 above); what decides the LOD a BLAS is built from; what the rest of the band of streams 231,012
+**Open:** what fills the one extra geometry index of the BLAS that have one more than the render-bucket rule keeps
+(ASSET-349, ASSET-566 above: no such case has a pinned bucket-1 or bucket-2 geometry; a second-LOD build is one
+possibility, not tested); what decides the LOD a BLAS is built from; what the rest of the band of streams 231,012
 to 261,585 holds, and how the pack is ordered; why 4 exported archetypes with a kept shader have no BLAS; what
 the descriptor key at `+0x40` hashes; how the game picks the entity of a BLAS when the BLAS does not name it (the
 drawable match does it here); whether the game composes TLAS instances as `I * E * M^-1`; whether the runtime
@@ -871,7 +901,19 @@ counts contain that signature as an ordered subsequence, and checks the survivor
 `tools/bvh_geometry_check.py` from the model's exported OBJ and the 3x4 at `+0x50` of the instance descriptor. The
 geometries the BVH leaves out are filtered by render bucket (§4a, ASSET-349: kept when the low 7 bits are 0 or 3);
 `--no-bucket-rule` turns that off and `--skip-shaders` adds shader name hashes on top (game data, local use only). A
-model with a geometry whose bucket the manifest cannot resolve keeps every geometry and the checks decide. Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
+model with a geometry whose bucket the manifest cannot resolve keeps every geometry and the checks decide. When no
+candidate fits while the bucket rule is in use, the tool says that `--no-bucket-rule` checks every geometry.
+
+For the best consistent candidate, the tool then tests which geometry indices the checks pin down (ASSET-566): it
+replaces each index's geometry by every other geometry of the same model with the same triangle count (including
+geometries the rules leave out and ones used at another index) and runs the checks again. An index is reported as
+not pinned when a replacement passes too; the stream stores the bounds, box overrides and paired edges, not where a
+leaf is, so a small geometry inside the bounds often is not. An index is called pinned only when every replacement
+was run and none passed. `--pin-checks N` caps the extra checks (default 128, 0 skips them); a replacement past the
+cap, or one whose OBJ group is missing, is not run, and the tool then says the indices without a passing
+replacement are not known to be pinned. The `--json` report gives the unpinned indices and the counts
+(`alternatives`, `tried`, `not_tried`, `complete`). A match whose decisive geometry is not pinned does not show which
+geometry the BLAS holds (§4a, exceptions). Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
 `levels.rpf` cut at 3 GB (exported as a whole slice): 1,228 models, 1 to 374 candidates from the signature per BLAS,
 and exactly one consistent candidate each. A window holds one region's drawables, so a BLAS whose drawable is
 elsewhere in the archive finds no candidate in it at all, and the tool says so instead of reporting a rejection. The
@@ -886,7 +928,7 @@ from its own compression blocks; a sub-range is never written to the index cache
 ```powershell
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
 dotnet tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll models <levels.rpf> <out> --start 3221225472 --length 1073741824
-python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--no-bucket-rule] [--skip-shaders H,H,...]
+python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--no-bucket-rule] [--skip-shaders H,H,...] [--pin-checks N]
 python -I tests/test_bvh_match.py
 ```
 

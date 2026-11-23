@@ -1,5 +1,6 @@
 """Synthetic checks for tools/bvh_match.py: the manifest entry the BLAS was built from is found and verified, a
 wrong geometry, a wrong shader rule and a missing transform are not, and geometries are matched inside one model.
+The pinning report (ASSET-566) names the geometry indices of a match that another geometry also passes.
 No game data is read.
 
     python -I tests/test_bvh_match.py
@@ -421,6 +422,108 @@ class TestMatching(unittest.TestCase):
             self.assertNotIn("Traceback", err)
         finally:
             os.chmod(ro, 0o644)
+
+
+def square(lo, hi):
+    """A two-triangle quad over x,y lo..hi at z 0, as one OBJ group."""
+    return [(lo, lo, 0.0), (hi, lo, 0.0), (lo, hi, 0.0), (hi, hi, 0.0)], QUAD_FACES
+
+
+class TestPinning(unittest.TestCase):
+    """ASSET-566: which geometry indices of a consistent match the checks actually decide.
+
+    The dehydrated stream stores the bounds, box overrides and paired edges, not where each leaf is. A small geometry
+    inside the bounds can therefore be swapped for another of the same triangle count without any check noticing.
+    """
+
+    setUp = TestMatching.setUp
+    guide = TestMatching.guide
+    THREE = [(0, 0x81, 0, 1, 0x09), (1, 0x81, 0, 1, 0x09), (2, 0x81, 0, 1, 0x09)]
+    # The big quad spans the bounds; quads A and B lie inside it, apart from each other.
+    OBJ = {"a.obj": [square(0.0, 1.0), square(0.1, 0.2), square(0.6, 0.7)]}
+
+    def test_small_geometries_inside_the_bounds_are_not_pinned(self):
+        src, _, _ = build(self.THREE, bounds=BOUNDS)
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [2, 2, 2])], self.OBJ)
+        self.assertEqual(status, 0, out)
+        self.assertIn("1 of 1 scored candidates are consistent", out)
+        # The big quad cannot be replaced: the leaves would no longer reach the bounds. A and B can.
+        self.assertNotIn("geometry index 0 ", out)
+        self.assertIn("geometry index 1 (drawable geometry 1) is not pinned: the checks also pass with geometry 0, 2",
+                      out)
+        self.assertIn("geometry index 2 (drawable geometry 2) is not pinned: the checks also pass with geometry 0, 1",
+                      out)
+        self.assertIn("1 of 3 geometry indices of the match are pinned by the checks (all 6 replacements tried)", out)
+
+    def test_a_geometry_the_rule_leaves_out_still_counts_as_a_replacement(self):
+        # The §4a exception had this shape: the decal the rule leaves out passes in place of a kept geometry.
+        src, _, _ = build(self.THREE[:2], bounds=BOUNDS)
+        row = item(0x1000, "a.obj", [2, 2, 2], [1, 2, 3], [0, 0, 2])
+        status, out, _ = self.guide(src, [row], self.OBJ)
+        self.assertEqual(status, 0, out)
+        self.assertIn("model 0 geometry [0, 1]", out)
+        self.assertIn("geometry index 1 (drawable geometry 1) is not pinned: the checks also pass with geometry 0, 2",
+                      out)
+
+    def test_a_geometry_with_no_same_count_neighbour_is_pinned(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [5, 2, 3])],
+                                    {"a.obj": [group(5), group(2), group(3)]})
+        self.assertEqual(status, 0, out)
+        self.assertIn("1 of 1 geometry indices of the match are pinned by the checks (all 0 replacements tried)", out)
+        self.assertNotIn("is not pinned", out)
+
+    def test_the_report_lists_the_unpinned_indices(self):
+        src, _, _ = build(self.THREE, bounds=BOUNDS)
+        report = os.path.join(self.dir, "r.json")
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [2, 2, 2])], self.OBJ, ["--json", report])
+        self.assertEqual(status, 0, out)
+        with open(report, encoding="utf-8") as f:
+            matched = json.load(f)["matched"]
+        pin = matched["pinning"]
+        self.assertEqual(pin["unpinned"], [{"index": 1, "geometry": 1, "also_passes": [0, 2]},
+                                           {"index": 2, "geometry": 2, "also_passes": [0, 1]}])
+        self.assertEqual((pin["complete"], pin["alternatives"], pin["tried"], pin["not_tried"]), (True, 6, 6, 0))
+
+    def test_pin_checks_caps_the_work_and_says_so(self):
+        src, _, _ = build(self.THREE, bounds=BOUNDS)
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [2, 2, 2])], self.OBJ, ["--pin-checks", "1"])
+        self.assertEqual(status, 0, out)
+        # One replacement run finds nothing for index 0; the other 5 are not run, so nothing is called pinned.
+        self.assertIn("3 of 3 geometry indices of the match have no passing replacement among those tried, but 5 of 6 "
+                      "replacements were not tried (--pin-checks reached)", out)
+        self.assertNotIn("pinned by the checks", out)
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [2, 2, 2])], self.OBJ, ["--pin-checks", "0"])
+        self.assertEqual(status, 0, out)
+        self.assertNotIn("pinned", out)
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2, 2, 2])], self.OBJ, ["--pin-checks", "-1"])
+        self.assertEqual(status, 2)
+        self.assertIn("--pin-checks", err)
+
+    def test_a_replacement_without_an_obj_group_is_not_counted_as_tried(self):
+        # The manifest lists a fourth geometry of two triangles that the OBJ does not hold: it cannot be run.
+        src, _, _ = build(self.THREE, bounds=BOUNDS)
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [2, 2, 2, 2])], self.OBJ)
+        self.assertEqual(status, 0, out)
+        self.assertIn("3 without an OBJ group", out)
+        self.assertNotIn("pinned by the checks", out)
+        self.assertIn("are not known to be pinned", out)
+
+    def test_no_candidate_under_the_bucket_rule_says_how_to_turn_it_off(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        row = item(0x1000, "a.obj", [2], [1], [2])          # a decal: left out by the rule
+        status, out, _ = self.guide(src, [row], {"a.obj": [group(2)]})
+        self.assertEqual(status, 1, out)
+        self.assertIn("--no-bucket-rule checks every geometry", out)
+        status, out, _ = self.guide(src, [row], {"a.obj": [group(2)]}, ["--no-bucket-rule"])
+        self.assertEqual(status, 0, out)
+        self.assertNotIn("--no-bucket-rule checks", out)
+
+    def test_the_hint_needs_buckets_in_the_manifest(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [5])], {"a.obj": [group(5)]})
+        self.assertEqual(status, 1, out)
+        self.assertNotIn("--no-bucket-rule", out)
 
 
 class TestPieces(unittest.TestCase):
