@@ -201,6 +201,8 @@ def validate_json_path(path):
         return "--json path contains a NUL byte"
     if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
         return f"--json path is a directory: {path}"
+    if os.path.isfile(path) and not os.access(path, os.W_OK):
+        return f"--json path is not writable: {path}"
     cur = os.path.dirname(os.path.abspath(path))
     while cur:
         if os.path.isdir(cur):
