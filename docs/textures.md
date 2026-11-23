@@ -1065,6 +1065,8 @@ python -I tools/ttpf_mips.py scan <game root> --json scan.json [--tuples]
 python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
 python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional] [--history <path>]
 python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--allow-provisional] [--history <path>]
+python -I tools/bcpack_tool.py inspect <chunk.bin> --codec {1,3,4,5,6,7} --size <bytes> [--json]
+python -I tools/bcpack_tool.py decode <chunk.bin> <out.bin> --codec {1,3,4,5,6,7} --size <bytes> [--provisional] [--history <path>]
 python -I tests/test_bcpack.py
 python -I tests/test_bcpack_history_calib.py
 python -I tests/test_tex_headers.py
