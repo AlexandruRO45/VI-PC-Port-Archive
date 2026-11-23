@@ -894,8 +894,11 @@ state-machine and motion-tree hierarchy (**1,616** containers across the 324 res
   embedded bone tables (30-name union; 19 bone hashes present).
 - **Outer compression:** the only compression this work inverts is the RPF9 zlib framing. Inflating the 130,470
   streams accounts for the 11.59 GB above.
-- **No nested zlib:** in eight sampled zero-prefixed pages, none of the `78 01/5E/9C/DA` byte pairs started a
-  valid nested zlib stream. The outer zlib stream is the only compression layer observed.
+- **No nested zlib:** in all 78,688 zero-prefixed pages of `anim.rpf` (6,918,674,880 inflated bytes; the
+  earlier check covered eight), none of the 599,632 `78 01/5E/9C/DA` byte pairs starts a nested zlib stream:
+  599,627 fail at once as invalid deflate data, the other 5 decode a few bytes and stop without a stream end
+  inside the page, and none ends with 64 or more bytes of output (the scanners' test for a stream). The outer
+  zlib stream is the only compression layer observed.
 - **No known codec at the sampled headers:** no zstd or LZ4 frame magic was found in the first 4 KiB of the
   130,449 indexed streams. gzip, bzip2 and lzma byte patterns occur, but none started a valid stream at the
   sampled positions.
