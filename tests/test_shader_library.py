@@ -249,7 +249,7 @@ class Main(unittest.TestCase):
     def test_unknown_stage_is_a_usage_error(self):
         # A typo used to write zero programs and exit 0; now it is a usage error (exit 2) before the input is read
         # or the output folder is made.
-        for stages in ("px", "cs,", "cs,,ps", "unused", "slot7"):
+        for stages in ("px", "cs,", "cs,,ps", "unused", "slot7", "all,cs"):
             with self.subTest(stages=stages), tempfile.TemporaryDirectory() as tmp:
                 out = os.path.join(tmp, "out")
                 err = io.StringIO()
@@ -264,6 +264,9 @@ class Main(unittest.TestCase):
                 f.write(sample())
             rc, text = self.run_main(src, "--out", os.path.join(tmp, "out"),
                                      "--stages", "cs,ps,vs,ms,slot3,slot4,slot5,slot6")
+            self.assertEqual(rc, 0)
+            self.assertIn("4 written", text)
+            rc, text = self.run_main(src, "--out", os.path.join(tmp, "all"), "--stages", " all ")
             self.assertEqual(rc, 0)
             self.assertIn("4 written", text)
 

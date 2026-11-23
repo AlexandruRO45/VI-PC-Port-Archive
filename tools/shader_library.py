@@ -265,12 +265,12 @@ def main(argv=None) -> int:
     if not a.out and not a.save:
         ap.error("give --out, --save or both")
     want = None
-    if a.stages != "all":
+    if a.stages.strip() != "all":
         want = {s.strip() for s in a.stages.split(",")}
         known = {"cs"} | {SLOTS.get(slot, f"slot{slot}") for slot in range(7)}
         if not want <= known:
             ap.error(f"--stages: unknown stage {', '.join(repr(s) for s in sorted(want - known))} "
-                     f"(give 'all' or some of {','.join(sorted(known))})")
+                     f"(give 'all' alone, or some of {','.join(sorted(known))})")
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)
