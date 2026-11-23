@@ -1,9 +1,10 @@
 """Inspect a PE image (exe or dll) for porting work.
 
 Usage:
-    python -I pe_inspect.py <image> [--game-dir DIR] [--out DIR]
+    python -I pe_inspect.py <image> [--game-dir DIR] --out DIR
 
-Writes <out>/<file>.json and <out>/<file>.md, where <file> is the image's full file name (game.exe.json,
+`--out` has no default: a report goes only to the directory the caller names, so a run never writes into the
+checkout. Writes <out>/<file>.json and <out>/<file>.md, where <file> is the image's full file name (game.exe.json,
 game.dll.md), so an exe and a dll with the same stem get separate reports. Images with the same file name from
 different directories get a numbered suffix (x.exe-2.json), and the name used is printed to stderr. The same file
 given twice with the same import search folder is inspected once. Reads the file only; never runs it.
@@ -488,12 +489,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="+")
     ap.add_argument("--game-dir")
-    ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
+    ap.add_argument("--out", help="directory for <file>.json and <file>.md (required)")
     a = ap.parse_args(argv)
     missing = [img for img in a.image if not os.path.exists(img)]
     if missing:
         for img in missing:
             print(f"ERROR: {img}: does not exist", file=sys.stderr)
+        return 2
+    if a.out is None:
+        print("ERROR: --out is required: a report goes only to the directory you name", file=sys.stderr)
         return 2
     if os.path.isfile(a.out):
         print(f"cannot create output directory {a.out}: path is a file, not a directory", file=sys.stderr)
