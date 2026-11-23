@@ -183,10 +183,14 @@ def main(argv=None):
             return 2
     try:
         with open(a.blob, "rb") as f:
-            data = f.read()[a.offset:]
+            data = f.read()
     except OSError as e:
         print(f"ERROR: {a.blob}: {e.strerror or e}", file=sys.stderr)
         return 2
+    # a negative offset used to slice from the file's tail, and a past-the-end one probed nothing
+    if not 0 <= a.offset < len(data):
+        ap.error(f"--offset must be inside the blob: {a.offset} is not (0..{len(data) - 1})")
+    data = data[a.offset:]
     nibbles, tables = load()
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
