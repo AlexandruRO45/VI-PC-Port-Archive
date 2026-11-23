@@ -684,6 +684,17 @@ class ShortStreamEndsTheResource(unittest.TestCase):
         self.assertEqual([s["offset"] for s in skels], [0x20000])
         self.assertEqual(skels[0]["names"], ["SKEL_Neck", "SKEL_Spine"])
 
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}'
+        path = os.path.join(self.root, "out.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(anim_index, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                anim_index.write_json_report(path, {"summary": {}, "files": []})
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ Usage:
 
 `--rigs` additionally joins the RBF0 stream with its 64 KiB continuation blocks and writes the rig-set/rig entries
 and plain `SKEL_` bone names to its own JSON. It stops at the next known container signature or a gap.
+A JSON `out` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 Usage: `python -I tools/anim_index.py --help` lists the options.
 """
 import argparse
@@ -26,13 +27,17 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import zlib
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
@@ -494,12 +499,44 @@ def summarise(rows, span, zero, unread):
     }
 
 
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".anim_index-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def write_output(path, rows, summary):
     """Write CSV or JSON from the file extension. CSV writes one summary line to stderr."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".json":
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "files": rows}, f, indent=1)
+        write_json_report(path, {"summary": summary, "files": rows})
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, lineterminator="\n")
