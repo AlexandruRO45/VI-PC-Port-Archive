@@ -16,146 +16,131 @@ RDNA2 SALU Architecture:
       s_max_i32: SCC = 1 if S0 > S1 (signed), 0 on <= (ties set SCC to 0)
       s_max_u32: SCC = 1 if S0 > S1 (unsigned), 0 on <= (ties set SCC to 0)
       s_pack_*: SCC is preserved (untouched)
-  - End-to-end SPIR-V assembly translation through tools/rdna2spirv.py.
+  - 100% of tests are wired to end-to-end SPIR-V assembly translation through tools/rdna2spirv.py.
 
 Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-import enum
 import os
-import struct
 import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TESTS_DIR = os.path.dirname(HERE)
-for p in (HERE, TESTS_DIR):
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.path.join(ROOT, "tools")
+for p in (HERE, TOOLS_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from support import translate_lines, mrt0_words  # noqa: E402
+from support import mrt0_words, translate_lines  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 
 
-def s32(u: int) -> int:
-    u &= MASK32
-    return u if u < 0x80000000 else u - 0x100000000
+def run_salu(
+    op: str,
+    s0: int,
+    s1: int,
+    *,
+    has_scc: bool = True,
+    name: str = "",
+    dst: str = "s2",
+    src0: str = "s0",
+    src1: str = "s1",
+) -> tuple[int, int]:
+    """Execute SALU instruction `op <dst>, <src0>, <src1>` via translate_lines and mrt0_words.
+
+    Returns (dst_word, scc_word).
+    """
+    if not name:
+        name = f"ps_{op}_{s0 & MASK32:#x}_{s1 & MASK32:#x}"
+    lines = [
+        f"s_mov_b32 s0, {s0 & MASK32:#010x}",
+        f"s_mov_b32 s1, {s1 & MASK32:#010x}",
+        f"{op} {dst}, {src0}, {src1}",
+    ]
+    if has_scc:
+        lines += [
+            "s_cselect_b32 s3, 1, 0",
+            f"v_mov_b32 v0, {dst}",
+            "v_mov_b32 v1, s3",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+        ]
+    else:
+        lines += [
+            f"v_mov_b32 v0, {dst}",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+    lines.append("s_endpgm")
+    spv = translate_lines(name, lines)
+    words = mrt0_words(spv)
+    return words[0], (words[1] if has_scc else 0)
 
 
-def u32(s: int) -> int:
-    return s & MASK32
+def run_pack_with_prior_scc(op: str, s0: int, s1: int, prior_scc: int, name: str = "") -> tuple[int, int]:
+    """Execute s_pack_* instruction while verifying preservation of prior SCC state."""
+    if not name:
+        name = f"ps_{op}_scc_{prior_scc}_{s0 & MASK32:#x}_{s1 & MASK32:#x}"
+    # Set prior SCC to 1 via s_cmp_eq_u32 1, 1 or 0 via s_cmp_eq_u32 1, 0
+    lines = [
+        f"s_cmp_eq_u32 1, {1 if prior_scc else 0}",
+        f"s_mov_b32 s0, {s0 & MASK32:#010x}",
+        f"s_mov_b32 s1, {s1 & MASK32:#010x}",
+        f"{op} s2, s0, s1",
+        "s_cselect_b32 s3, 1, 0",
+        "v_mov_b32 v0, s2",
+        "v_mov_b32 v1, s3",
+        "exp mrt0 v0, v1, v0, v1 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines(name, lines)
+    words = mrt0_words(spv)
+    return words[0], words[1]
 
-# -----------------------------------------------------------------------------
+
+# =============================================================================
 # Opcode 1: s_min_i32
-# -----------------------------------------------------------------------------
-def oracle_min_i32(s0: int, s1: int) -> tuple[int, int]:
-    """Reference mathematical oracle for s_min_i32: returns (result_u32, scc)."""
-    xi = s32(s0)
-    yi = s32(s1)
-    val = xi if xi < yi else yi
-    scc = 1 if xi < yi else 0
-    return u32(val), scc
+# =============================================================================
+class TestSMinI32(unittest.TestCase):
+    """Translator-backed semantic tests for s_min_i32 (Signed 32-bit Minimum)."""
 
-
-class SMinI32OracleTests(unittest.TestCase):
-    def test_min_i32_basic(self):
-        # min(10, 20) = 10, SCC = 1 (10 < 20)
-        res, scc = oracle_min_i32(10, 20)
-        self.assertEqual(res, 10)
+    def test_min_i32_basic_positive(self):
+        val, scc = run_salu("s_min_i32", 10, 20, name="ps_min_i32_pos")
+        self.assertEqual(val, 10)
         self.assertEqual(scc, 1)
 
     def test_min_i32_negative_numbers(self):
-        # min(-10, 5) = -10, SCC = 1 (-10 < 5)
-        res, scc = oracle_min_i32(u32(-10), 5)
-        self.assertEqual(res, u32(-10))
+        # min(-20, 10) = -20, SCC = 1 (-20 < 10)
+        val, scc = run_salu("s_min_i32", -20 & MASK32, 10, name="ps_min_i32_neg1")
+        self.assertEqual(val, -20 & MASK32)
         self.assertEqual(scc, 1)
 
-        # min(5, -10) = -10, SCC = 0 (5 < -10 is False)
-        res, scc = oracle_min_i32(5, u32(-10))
-        self.assertEqual(res, u32(-10))
-        self.assertEqual(scc, 0)
+        # min(-5, -15) = -15, SCC = 0 (-5 < -15 is False)
+        val2, scc2 = run_salu("s_min_i32", -5 & MASK32, -15 & MASK32, name="ps_min_i32_neg2")
+        self.assertEqual(val2, -15 & MASK32)
+        self.assertEqual(scc2, 0)
 
     def test_min_i32_ties(self):
-        # Equal values: SCC = 0 (ties clear SCC)
-        res, scc = oracle_min_i32(42, 42)
-        self.assertEqual(res, 42)
+        # On tie: SCC must be 0
+        val, scc = run_salu("s_min_i32", 100, 100, name="ps_min_i32_tie")
+        self.assertEqual(val, 100)
         self.assertEqual(scc, 0)
 
-class RegKind(enum.Enum):
-    SGPR = "sgpr"
-    IMM = "imm"
-
-
-@dataclass(frozen=True)
-class Operand:
-    kind: RegKind
-    index: int = 0
-    raw_val: int = 0
-
-
-@dataclass(frozen=True)
-class SaluInstructionAST:
-    mnemonic: str
-    dst: Operand
-    src0: Operand
-    src1: Operand
-
-
-class ScalarRegisterState:
-    def __init__(self):
-        self.sgprs: dict[int, int] = {}
-        self.scc: int = 0
-
-    def set_sgpr(self, idx: int, val: int):
-        self.sgprs[idx] = val & MASK32
-
-    def get_sgpr(self, idx: int) -> int:
-        return self.sgprs.get(idx, 0) & MASK32
-
-    def get_operand_val(self, op: Operand) -> int:
-        if op.kind == RegKind.SGPR:
-            return self.get_sgpr(op.index)
-        return op.raw_val & MASK32
-
-class SMinI32AstInterpreterTests(unittest.TestCase):
-    def test_min_i32_ast_construction(self):
-        ast = SaluInstructionAST("s_min_i32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
-        self.assertEqual(ast.mnemonic, "s_min_i32")
-        self.assertEqual(ast.dst.index, 2)
-
-    def test_min_i32_scalar_execution(self):
-        state = ScalarRegisterState()
-        state.set_sgpr(0, u32(-50))
-        state.set_sgpr(1, 100)
-        res, scc = oracle_min_i32(state.get_sgpr(0), state.get_sgpr(1))
-        state.set_sgpr(2, res)
-        state.scc = scc
-        self.assertEqual(state.get_sgpr(2), u32(-50))
-        self.assertEqual(state.scc, 1)
-
-class SMinI32SimdDivergenceTests(unittest.TestCase):
-    def test_min_i32_uniform_scalar_execution(self):
-        # Scalar instructions execute uniformly for the whole wave
-        state = ScalarRegisterState()
-        state.set_sgpr(0, 5)
-        state.set_sgpr(1, 10)
-        res, scc = oracle_min_i32(state.get_sgpr(0), state.get_sgpr(1))
-        state.set_sgpr(2, res)
-        state.scc = scc
-        self.assertEqual(state.get_sgpr(2), 5)
-        self.assertEqual(state.scc, 1)
-
     def test_min_i32_scc_extrema(self):
-        # Extreme signed limits: -2147483648 (0x80000000) vs 2147483647 (0x7FFFFFFF)
-        res, scc = oracle_min_i32(0x80000000, 0x7FFFFFFF)
-        self.assertEqual(res, 0x80000000)
+        # 0x80000000 (-2147483648) vs 0x7FFFFFFF (2147483647)
+        val, scc = run_salu("s_min_i32", 0x80000000, 0x7FFFFFFF, name="ps_min_i32_extrema")
+        self.assertEqual(val, 0x80000000)
         self.assertEqual(scc, 1)
 
-class SMinI32TranslatorTests(unittest.TestCase):
-    def test_min_i32_translation_and_execution(self):
+    def test_min_i32_in_place_aliasing(self):
+        # s_min_i32 s0, s0, s1 (destination aliases source 0)
+        val, scc = run_salu("s_min_i32", 50, 25, dst="s0", src0="s0", src1="s1", name="ps_min_i32_alias")
+        self.assertEqual(val, 25)
+        self.assertEqual(scc, 0)
+
+    def test_min_i32_spirv_lowering_and_execution(self):
         lines = [
             "s_mov_b32 s0, -5",
             "s_mov_b32 s1, 10",
@@ -168,73 +153,52 @@ class SMinI32TranslatorTests(unittest.TestCase):
         ]
         spv = translate_lines("ps_min_i32_exec", lines)
         words = mrt0_words(spv)
-        self.assertEqual(words[0], 0xFFFFFFFB)  # -5 in uint32
-        self.assertEqual(words[1], 1)           # SCC = 1
+        self.assertEqual(words[0], 0xFFFFFFFB)
+        self.assertEqual(words[1], 1)
 
     def test_min_i32_syntax_rejection(self):
-        with self.assertRaises(Exception):
-            translate_lines("ps_bad_min_i32", ["s_min_i32 s0, s1"])
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_min_i32", ["s_min_i32 s0, s1", "s_endpgm"])
 
-# -----------------------------------------------------------------------------
+
+# =============================================================================
 # Opcode 2: s_min_u32
-# -----------------------------------------------------------------------------
-def oracle_min_u32(s0: int, s1: int) -> tuple[int, int]:
-    """Reference mathematical oracle for s_min_u32: returns (result_u32, scc)."""
-    xu = s0 & MASK32
-    yu = s1 & MASK32
-    val = xu if xu < yu else yu
-    scc = 1 if xu < yu else 0
-    return val, scc
+# =============================================================================
+class TestSMinU32(unittest.TestCase):
+    """Translator-backed semantic tests for s_min_u32 (Unsigned 32-bit Minimum)."""
 
-
-class SMinU32OracleTests(unittest.TestCase):
     def test_min_u32_basic(self):
-        # min(10, 20) = 10, SCC = 1
-        res, scc = oracle_min_u32(10, 20)
-        self.assertEqual(res, 10)
+        val, scc = run_salu("s_min_u32", 10, 20, name="ps_min_u32_basic")
+        self.assertEqual(val, 10)
         self.assertEqual(scc, 1)
 
     def test_min_u32_unsigned_comparison(self):
-        # 0xFFFFFFFF (4294967295) vs 10: unsigned min is 10
-        res, scc = oracle_min_u32(0xFFFFFFFF, 10)
-        self.assertEqual(res, 10)
-        self.assertEqual(scc, 0)  # 0xFFFFFFFF < 10 is False unsigned
-
-        res, scc = oracle_min_u32(10, 0xFFFFFFFF)
-        self.assertEqual(res, 10)
-        self.assertEqual(scc, 1)  # 10 < 0xFFFFFFFF is True unsigned
-
-    def test_min_u32_ties(self):
-        res, scc = oracle_min_u32(100, 100)
-        self.assertEqual(res, 100)
+        # 0xFFFFFFFF (4294967295) vs 10: unsigned min is 10, SCC = 0
+        val, scc = run_salu("s_min_u32", 0xFFFFFFFF, 10, name="ps_min_u32_ucomp1")
+        self.assertEqual(val, 10)
         self.assertEqual(scc, 0)
 
-class SMinU32AstInterpreterTests(unittest.TestCase):
-    def test_min_u32_ast_construction(self):
-        ast = SaluInstructionAST("s_min_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
-        self.assertEqual(ast.mnemonic, "s_min_u32")
+        # 10 vs 0xFFFFFFFF: unsigned min is 10, SCC = 1
+        val2, scc2 = run_salu("s_min_u32", 10, 0xFFFFFFFF, name="ps_min_u32_ucomp2")
+        self.assertEqual(val2, 10)
+        self.assertEqual(scc2, 1)
 
-    def test_min_u32_scalar_execution(self):
-        state = ScalarRegisterState()
-        state.set_sgpr(0, 0x80000000)
-        state.set_sgpr(1, 0x40000000)
-        res, scc = oracle_min_u32(state.get_sgpr(0), state.get_sgpr(1))
-        state.set_sgpr(2, res)
-        state.scc = scc
-        self.assertEqual(state.get_sgpr(2), 0x40000000)
-        self.assertEqual(state.scc, 0)
+    def test_min_u32_ties(self):
+        val, scc = run_salu("s_min_u32", 100, 100, name="ps_min_u32_ties")
+        self.assertEqual(val, 100)
+        self.assertEqual(scc, 0)
 
-class SMinU32SimdDivergenceTests(unittest.TestCase):
-    def test_min_u32_scc_transitions(self):
-        # Non-zero SCC
-        res1, scc1 = oracle_min_u32(0x10, 0x20)
-        self.assertEqual(scc1, 1)
-        # Zero SCC
-        res2, scc2 = oracle_min_u32(0x20, 0x10)
-        self.assertEqual(scc2, 0)
+    def test_min_u32_extrema(self):
+        val, scc = run_salu("s_min_u32", 0, 0xFFFFFFFF, name="ps_min_u32_extrema")
+        self.assertEqual(val, 0)
+        self.assertEqual(scc, 1)
 
-class SMinU32TranslatorTests(unittest.TestCase):
-    def test_min_u32_translation_and_execution(self):
+    def test_min_u32_in_place_aliasing(self):
+        val, scc = run_salu("s_min_u32", 0x80000000, 0x40000000, dst="s1", src0="s0", src1="s1", name="ps_min_u32_alias")
+        self.assertEqual(val, 0x40000000)
+        self.assertEqual(scc, 0)
+
+    def test_min_u32_spirv_lowering_and_execution(self):
         lines = [
             "s_mov_b32 s0, 10",
             "s_mov_b32 s1, 0xFFFFFFFF",
@@ -248,70 +212,54 @@ class SMinU32TranslatorTests(unittest.TestCase):
         spv = translate_lines("ps_min_u32_exec", lines)
         words = mrt0_words(spv)
         self.assertEqual(words[0], 10)
-        self.assertEqual(words[1], 1)  # 10 < 0xFFFFFFFF -> SCC = 1
+        self.assertEqual(words[1], 1)
 
-# -----------------------------------------------------------------------------
+    def test_min_u32_syntax_rejection(self):
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_min_u32", ["s_min_u32 s0, s1", "s_endpgm"])
+
+
+# =============================================================================
 # Opcode 3: s_max_i32
-# -----------------------------------------------------------------------------
-def oracle_max_i32(s0: int, s1: int) -> tuple[int, int]:
-    """Reference mathematical oracle for s_max_i32: returns (result_u32, scc)."""
-    xi = s32(s0)
-    yi = s32(s1)
-    val = xi if xi > yi else yi
-    scc = 1 if xi > yi else 0
-    return u32(val), scc
+# =============================================================================
+class TestSMaxI32(unittest.TestCase):
+    """Translator-backed semantic tests for s_max_i32 (Signed 32-bit Maximum)."""
 
-
-class SMaxI32OracleTests(unittest.TestCase):
     def test_max_i32_basic(self):
-        # max(10, 20) = 20, SCC = 0 (10 > 20 is False)
-        res, scc = oracle_max_i32(10, 20)
-        self.assertEqual(res, 20)
-        self.assertEqual(scc, 0)
+        val, scc = run_salu("s_max_i32", 10, 20, name="ps_max_i32_basic")
+        self.assertEqual(val, 20)
+        self.assertEqual(scc, 0)  # 10 > 20 is False
 
-        # max(20, 10) = 20, SCC = 1 (20 > 10 is True)
-        res, scc = oracle_max_i32(20, 10)
-        self.assertEqual(res, 20)
-        self.assertEqual(scc, 1)
+    def test_max_i32_s0_greater(self):
+        val, scc = run_salu("s_max_i32", 30, 20, name="ps_max_i32_s0_gt")
+        self.assertEqual(val, 30)
+        self.assertEqual(scc, 1)  # 30 > 20 is True
 
     def test_max_i32_negatives(self):
-        # max(-5, -20) = -5, SCC = 1 (-5 > -20)
-        res, scc = oracle_max_i32(u32(-5), u32(-20))
-        self.assertEqual(res, u32(-5))
+        # max(-5, -15) = -5, SCC = 1 (-5 > -15)
+        val, scc = run_salu("s_max_i32", -5 & MASK32, -15 & MASK32, name="ps_max_i32_neg")
+        self.assertEqual(val, -5 & MASK32)
         self.assertEqual(scc, 1)
 
     def test_max_i32_ties(self):
-        res, scc = oracle_max_i32(u32(-7), u32(-7))
-        self.assertEqual(res, u32(-7))
+        val, scc = run_salu("s_max_i32", 100, 100, name="ps_max_i32_ties")
+        self.assertEqual(val, 100)
         self.assertEqual(scc, 0)
 
-class SMaxI32AstInterpreterTests(unittest.TestCase):
-    def test_max_i32_ast_construction(self):
-        ast = SaluInstructionAST("s_max_i32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
-        self.assertEqual(ast.mnemonic, "s_max_i32")
-
-    def test_max_i32_scalar_execution(self):
-        state = ScalarRegisterState()
-        state.set_sgpr(0, 15)
-        state.set_sgpr(1, u32(-15))
-        res, scc = oracle_max_i32(state.get_sgpr(0), state.get_sgpr(1))
-        state.set_sgpr(2, res)
-        state.scc = scc
-        self.assertEqual(state.get_sgpr(2), 15)
-        self.assertEqual(state.scc, 1)
-
-class SMaxI32SimdDivergenceTests(unittest.TestCase):
-    def test_max_i32_scc_extrema(self):
-        # 0x7FFFFFFF > 0x80000000 -> max is 0x7FFFFFFF, SCC = 1
-        res, scc = oracle_max_i32(0x7FFFFFFF, 0x80000000)
-        self.assertEqual(res, 0x7FFFFFFF)
+    def test_max_i32_extrema(self):
+        val, scc = run_salu("s_max_i32", 0x7FFFFFFF, 0x80000000, name="ps_max_i32_extrema")
+        self.assertEqual(val, 0x7FFFFFFF)
         self.assertEqual(scc, 1)
 
-class SMaxI32TranslatorTests(unittest.TestCase):
-    def test_max_i32_translation_and_execution(self):
+    def test_max_i32_in_place_aliasing(self):
+        val, scc = run_salu("s_max_i32", 10, 40, dst="s0", src0="s0", src1="s1", name="ps_max_i32_alias")
+        self.assertEqual(val, 40)
+        self.assertEqual(scc, 0)
+
+    def test_max_i32_spirv_lowering_and_execution(self):
         lines = [
-            "s_mov_b32 s0, 50",
-            "s_mov_b32 s1, -50",
+            "s_mov_b32 s0, -5",
+            "s_mov_b32 s1, 10",
             "s_max_i32 s2, s0, s1",
             "s_cselect_b32 s3, 1, 0",
             "v_mov_b32 v0, s2",
@@ -321,57 +269,46 @@ class SMaxI32TranslatorTests(unittest.TestCase):
         ]
         spv = translate_lines("ps_max_i32_exec", lines)
         words = mrt0_words(spv)
-        self.assertEqual(words[0], 50)
-        self.assertEqual(words[1], 1)
+        self.assertEqual(words[0], 10)
+        self.assertEqual(words[1], 0)
 
-# -----------------------------------------------------------------------------
+    def test_max_i32_syntax_rejection(self):
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_max_i32", ["s_max_i32 s0", "s_endpgm"])
+
+
+# =============================================================================
 # Opcode 4: s_max_u32
-# -----------------------------------------------------------------------------
-def oracle_max_u32(s0: int, s1: int) -> tuple[int, int]:
-    """Reference mathematical oracle for s_max_u32: returns (result_u32, scc)."""
-    xu = s0 & MASK32
-    yu = s1 & MASK32
-    val = xu if xu > yu else yu
-    scc = 1 if xu > yu else 0
-    return val, scc
+# =============================================================================
+class TestSMaxU32(unittest.TestCase):
+    """Translator-backed semantic tests for s_max_u32 (Unsigned 32-bit Maximum)."""
 
-
-class SMaxU32OracleTests(unittest.TestCase):
     def test_max_u32_basic(self):
-        # max(0xFFFFFFFF, 10) = 0xFFFFFFFF, SCC = 1 (0xFFFFFFFF > 10 unsigned)
-        res, scc = oracle_max_u32(0xFFFFFFFF, 10)
-        self.assertEqual(res, 0xFFFFFFFF)
-        self.assertEqual(scc, 1)
-
-    def test_max_u32_zero(self):
-        res, scc = oracle_max_u32(0, 100)
-        self.assertEqual(res, 100)
+        val, scc = run_salu("s_max_u32", 10, 20, name="ps_max_u32_basic")
+        self.assertEqual(val, 20)
         self.assertEqual(scc, 0)
 
-class SMaxU32AstInterpreterTests(unittest.TestCase):
-    def test_max_u32_ast_construction(self):
-        ast = SaluInstructionAST("s_max_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
-        self.assertEqual(ast.mnemonic, "s_max_u32")
-
-    def test_max_u32_scalar_execution(self):
-        state = ScalarRegisterState()
-        state.set_sgpr(0, 0x1000)
-        state.set_sgpr(1, 0x2000)
-        res, scc = oracle_max_u32(state.get_sgpr(0), state.get_sgpr(1))
-        state.set_sgpr(2, res)
-        state.scc = scc
-        self.assertEqual(state.get_sgpr(2), 0x2000)
-        self.assertEqual(state.scc, 0)
-
-class SMaxU32SimdDivergenceTests(unittest.TestCase):
-    def test_max_u32_scc_extrema(self):
-        # 0xFFFFFFFF vs 0: SCC = 1
-        res, scc = oracle_max_u32(0xFFFFFFFF, 0)
-        self.assertEqual(res, 0xFFFFFFFF)
+    def test_max_u32_s0_greater(self):
+        val, scc = run_salu("s_max_u32", 0xFFFFFFFF, 10, name="ps_max_u32_s0_gt")
+        self.assertEqual(val, 0xFFFFFFFF)
         self.assertEqual(scc, 1)
 
-class SMaxU32TranslatorTests(unittest.TestCase):
-    def test_max_u32_translation_and_execution(self):
+    def test_max_u32_ties(self):
+        val, scc = run_salu("s_max_u32", 100, 100, name="ps_max_u32_ties")
+        self.assertEqual(val, 100)
+        self.assertEqual(scc, 0)
+
+    def test_max_u32_extrema(self):
+        val, scc = run_salu("s_max_u32", 0, 0xFFFFFFFF, name="ps_max_u32_extrema")
+        self.assertEqual(val, 0xFFFFFFFF)
+        self.assertEqual(scc, 0)
+
+    def test_max_u32_in_place_aliasing(self):
+        val, scc = run_salu("s_max_u32", 0xFFFFFFFF, 0x1000, dst="s1", src0="s0", src1="s1", name="ps_max_u32_alias")
+        self.assertEqual(val, 0xFFFFFFFF)
+        self.assertEqual(scc, 1)
+
+    def test_max_u32_spirv_lowering_and_execution(self):
         lines = [
             "s_mov_b32 s0, 0xFFFFFFFF",
             "s_mov_b32 s1, 10",
@@ -387,51 +324,47 @@ class SMaxU32TranslatorTests(unittest.TestCase):
         self.assertEqual(words[0], 0xFFFFFFFF)
         self.assertEqual(words[1], 1)
 
-# -----------------------------------------------------------------------------
+    def test_max_u32_syntax_rejection(self):
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_max_u32", ["s_max_u32 s0, s1", "s_endpgm"])
+
+
+# =============================================================================
 # Opcode 5: s_pack_ll_b32_b16
-# -----------------------------------------------------------------------------
-def oracle_pack_ll_b32_b16(s0: int, s1: int) -> int:
-    """Reference mathematical oracle for s_pack_ll_b32_b16: D = {S1[15:0], S0[15:0]}."""
-    lo = s0 & 0xFFFF
-    hi = (s1 & 0xFFFF) << 16
-    return (hi | lo) & MASK32
+# =============================================================================
+class TestSPackLlB32B16(unittest.TestCase):
+    """Translator-backed semantic tests for s_pack_ll_b32_b16 (Pack Low Halves)."""
 
-
-class SPackLlB32B16OracleTests(unittest.TestCase):
     def test_pack_ll_basic(self):
         # s0 = 0x12345678, s1 = 0xABCDEF01 -> {0xef01, 0x5678} = 0xEF015678
-        res = oracle_pack_ll_b32_b16(0x12345678, 0xABCDEF01)
-        self.assertEqual(res, 0xEF015678)
+        val, _ = run_salu("s_pack_ll_b32_b16", 0x12345678, 0xABCDEF01, has_scc=False, name="ps_pack_ll_basic")
+        self.assertEqual(val, 0xEF015678)
 
     def test_pack_ll_zeros_and_ones(self):
-        self.assertEqual(oracle_pack_ll_b32_b16(0, 0), 0)
-        self.assertEqual(oracle_pack_ll_b32_b16(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFF)
+        val0, _ = run_salu("s_pack_ll_b32_b16", 0, 0, has_scc=False, name="ps_pack_ll_zeros")
+        self.assertEqual(val0, 0)
+        val1, _ = run_salu("s_pack_ll_b32_b16", 0xFFFFFFFF, 0xFFFFFFFF, has_scc=False, name="ps_pack_ll_ones")
+        self.assertEqual(val1, 0xFFFFFFFF)
 
-class SPackLlB32B16AstInterpreterTests(unittest.TestCase):
-    def test_pack_ll_ast_construction(self):
-        ast = SaluInstructionAST("s_pack_ll_b32_b16", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
-        self.assertEqual(ast.mnemonic, "s_pack_ll_b32_b16")
+    def test_pack_ll_alternating_halves(self):
+        val, _ = run_salu("s_pack_ll_b32_b16", 0xAAAA1111, 0xBBBB2222, has_scc=False, name="ps_pack_ll_alt")
+        self.assertEqual(val, 0x22221111)
 
-    def test_pack_ll_scalar_execution(self):
-        state = ScalarRegisterState()
-        state.set_sgpr(0, 0xAAAA1111)
-        state.set_sgpr(1, 0xBBBB2222)
-        res = oracle_pack_ll_b32_b16(state.get_sgpr(0), state.get_sgpr(1))
-        state.set_sgpr(2, res)
-        self.assertEqual(state.get_sgpr(2), 0x22221111)
+    def test_pack_ll_scc_preserved_when_set(self):
+        val, scc = run_pack_with_prior_scc("s_pack_ll_b32_b16", 0x12345678, 0xABCDEF01, prior_scc=1, name="ps_pack_ll_scc1")
+        self.assertEqual(val, 0xEF015678)
+        self.assertEqual(scc, 1)
 
-class SPackLlB32B16SimdDivergenceTests(unittest.TestCase):
-    def test_pack_ll_scc_preserved(self):
-        # Hardware rule: s_pack_* does NOT modify SCC
-        state = ScalarRegisterState()
-        state.scc = 1
-        res = oracle_pack_ll_b32_b16(0x0001, 0x0002)
-        # scc remains 1
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(res, 0x00020001)
+    def test_pack_ll_scc_preserved_when_clear(self):
+        val, scc = run_pack_with_prior_scc("s_pack_ll_b32_b16", 0x12345678, 0xABCDEF01, prior_scc=0, name="ps_pack_ll_scc0")
+        self.assertEqual(val, 0xEF015678)
+        self.assertEqual(scc, 0)
 
-class SPackLlB32B16TranslatorTests(unittest.TestCase):
-    def test_pack_ll_translation_and_execution(self):
+    def test_pack_ll_in_place_aliasing(self):
+        val, _ = run_salu("s_pack_ll_b32_b16", 0x12345678, 0xABCDEF01, has_scc=False, dst="s0", src0="s0", src1="s1", name="ps_pack_ll_alias")
+        self.assertEqual(val, 0xEF015678)
+
+    def test_pack_ll_spirv_lowering_and_execution(self):
         lines = [
             "s_mov_b32 s0, 0x12345678",
             "s_mov_b32 s1, 0xABCDEF01",
@@ -444,49 +377,45 @@ class SPackLlB32B16TranslatorTests(unittest.TestCase):
         val = mrt0_words(spv)[0]
         self.assertEqual(val, 0xEF015678)
 
-# -----------------------------------------------------------------------------
+    def test_pack_ll_syntax_rejection(self):
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_pack_ll", ["s_pack_ll_b32_b16 s0, s1", "s_endpgm"])
+
+
+# =============================================================================
 # Opcode 6: s_pack_hh_b32_b16
-# -----------------------------------------------------------------------------
-def oracle_pack_hh_b32_b16(s0: int, s1: int) -> int:
-    """Reference mathematical oracle for s_pack_hh_b32_b16: D = {S1[31:16], S0[31:16]}."""
-    lo = (s0 >> 16) & 0xFFFF
-    hi = s1 & 0xFFFF0000
-    return (hi | lo) & MASK32
+# =============================================================================
+class TestSPackHhB32B16(unittest.TestCase):
+    """Translator-backed semantic tests for s_pack_hh_b32_b16 (Pack High Halves)."""
 
-
-class SPackHhB32B16OracleTests(unittest.TestCase):
     def test_pack_hh_basic(self):
         # s0 = 0x12345678, s1 = 0xABCDEF01 -> {0xabcd, 0x1234} = 0xABCD1234
-        res = oracle_pack_hh_b32_b16(0x12345678, 0xABCDEF01)
-        self.assertEqual(res, 0xABCD1234)
+        val, _ = run_salu("s_pack_hh_b32_b16", 0x12345678, 0xABCDEF01, has_scc=False, name="ps_pack_hh_basic")
+        self.assertEqual(val, 0xABCD1234)
 
     def test_pack_hh_zero_high_halves(self):
-        res = oracle_pack_hh_b32_b16(0x0000FFFF, 0x0000FFFF)
-        self.assertEqual(res, 0)
+        val, _ = run_salu("s_pack_hh_b32_b16", 0x0000FFFF, 0x0000FFFF, has_scc=False, name="ps_pack_hh_zero_hi")
+        self.assertEqual(val, 0)
 
-class SPackHhB32B16AstInterpreterTests(unittest.TestCase):
-    def test_pack_hh_ast_construction(self):
-        ast = SaluInstructionAST("s_pack_hh_b32_b16", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
-        self.assertEqual(ast.mnemonic, "s_pack_hh_b32_b16")
+    def test_pack_hh_alternating_halves(self):
+        val, _ = run_salu("s_pack_hh_b32_b16", 0x43210000, 0x87650000, has_scc=False, name="ps_pack_hh_alt")
+        self.assertEqual(val, 0x87654321)
 
-    def test_pack_hh_scalar_execution(self):
-        state = ScalarRegisterState()
-        state.set_sgpr(0, 0x43210000)
-        state.set_sgpr(1, 0x87650000)
-        res = oracle_pack_hh_b32_b16(state.get_sgpr(0), state.get_sgpr(1))
-        state.set_sgpr(2, res)
-        self.assertEqual(state.get_sgpr(2), 0x87654321)
+    def test_pack_hh_scc_preserved_when_set(self):
+        val, scc = run_pack_with_prior_scc("s_pack_hh_b32_b16", 0x12345678, 0xABCDEF01, prior_scc=1, name="ps_pack_hh_scc1")
+        self.assertEqual(val, 0xABCD1234)
+        self.assertEqual(scc, 1)
 
-class SPackHhB32B16SimdDivergenceTests(unittest.TestCase):
-    def test_pack_hh_scc_preserved(self):
-        state = ScalarRegisterState()
-        state.scc = 0
-        res = oracle_pack_hh_b32_b16(0x11110000, 0x22220000)
-        self.assertEqual(state.scc, 0)
-        self.assertEqual(res, 0x22221111)
+    def test_pack_hh_scc_preserved_when_clear(self):
+        val, scc = run_pack_with_prior_scc("s_pack_hh_b32_b16", 0x12345678, 0xABCDEF01, prior_scc=0, name="ps_pack_hh_scc0")
+        self.assertEqual(val, 0xABCD1234)
+        self.assertEqual(scc, 0)
 
-class SPackHhB32B16TranslatorTests(unittest.TestCase):
-    def test_pack_hh_translation_and_execution(self):
+    def test_pack_hh_in_place_aliasing(self):
+        val, _ = run_salu("s_pack_hh_b32_b16", 0x12345678, 0xABCDEF01, has_scc=False, dst="s0", src0="s0", src1="s1", name="ps_pack_hh_alias")
+        self.assertEqual(val, 0xABCD1234)
+
+    def test_pack_hh_spirv_lowering_and_execution(self):
         lines = [
             "s_mov_b32 s0, 0x12345678",
             "s_mov_b32 s1, 0xABCDEF01",
@@ -498,6 +427,10 @@ class SPackHhB32B16TranslatorTests(unittest.TestCase):
         spv = translate_lines("ps_pack_hh_exec", lines)
         val = mrt0_words(spv)[0]
         self.assertEqual(val, 0xABCD1234)
+
+    def test_pack_hh_syntax_rejection(self):
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_pack_hh", ["s_pack_hh_b32_b16 s0", "s_endpgm"])
 
 
 if __name__ == "__main__":
