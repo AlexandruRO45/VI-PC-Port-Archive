@@ -2529,6 +2529,26 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_pso_validation COMMAND d3d12_pso_validation_test)
       set_tests_properties(d3d12_pso_validation PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+      # D3D-479: a graphics PSO whose root signature is mapped from a synthetic PS\0\x09 PSO-cache user-data
+      # record (src/pso_user_signature.h): mapped, converted to a D3D12 description, created, drawn with the
+      # record's constants parameter and read back.
+      set(LEONIDA_TEST_PS_USERSIG ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_pso_usersig.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_PS_USERSIG}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_PS_USERSIG}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_pso_usersig.frag
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_pso_usersig.frag
+        COMMENT "Compiling the PSO user-signature draw test shader"
+        VERBATIM)
+      add_executable(d3d12_pso_usersig_draw_test test/d3d12_pso_usersig_draw_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS_USERSIG})
+      target_link_libraries(d3d12_pso_usersig_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_pso_usersig_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}"
+                                 LEONIDA_TEST_PS_USERSIG_SPV="${LEONIDA_TEST_PS_USERSIG}")
+      target_compile_options(d3d12_pso_usersig_draw_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_pso_usersig_draw COMMAND d3d12_pso_usersig_draw_test)
+      set_tests_properties(d3d12_pso_usersig_draw PROPERTIES SKIP_RETURN_CODE 77)
       # Conservative raster Tier 1, with geometric coverage bounds and host D3D12 references.
       set(LEONIDA_CONSERVATIVE_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_conservative.spv)
       set(LEONIDA_CONSERVATIVE_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative.spv)
