@@ -39,7 +39,7 @@ LISTINGS = {
 }
 
 
-def build(root):
+def build(root, index_encoding="utf-8"):
     dx = os.path.join(root, "dxbc")
     os.makedirs(os.path.join(dx, "disasm"))
     index = []
@@ -47,7 +47,7 @@ def build(root):
         with open(os.path.join(dx, "disasm", name + ".s"), "w", encoding="utf-8") as f:
             f.write(f"; {name}\n" + text)
         index.append({"name": name, "file": name + ".dxbc", "stage": name.split("_")[1]})
-    with open(os.path.join(dx, "index.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(dx, "index.json"), "w", encoding=index_encoding, newline="\n") as f:
         json.dump(index, f)
     return dx
 
@@ -77,12 +77,17 @@ def test_vs_input_survey():
               "a primitive export flips the verdict away from legacy")
         check("a_vs" not in out.stdout and "c_vs" not in out.stdout, "the summary prints counts, not shader names")
 
-    # bad inputs and outputs: one error line, exit 2, no traceback, and index.json is never overwritten
     tool = os.path.join(ROOT, "scripts", "vs_input_survey.py")
 
     def cli(*args):
         return subprocess.run([sys.executable, "-I", tool, *args], capture_output=True, text=True)
 
+    with tempfile.TemporaryDirectory() as tmp:
+        r = cli(build(tmp, index_encoding="utf-8-sig"))
+        check(r.returncode == 0 and "4 vertex shaders (0 without a listing)" in r.stdout,
+              "an index with a UTF-8 BOM keeps the vertex shader counts")
+
+    # bad inputs and outputs: one error line, exit 2, no traceback, and index.json is never overwritten
     with tempfile.TemporaryDirectory() as tmp:
         d = os.path.join(tmp, "dxbc")
         os.mkdir(d)

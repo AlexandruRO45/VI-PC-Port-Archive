@@ -110,7 +110,7 @@ def read_before_write(insns):
 
 
 def survey(dxbc_dir):
-    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8-sig") as f:
         index = json.load(f)
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
         raise ValueError("index.json is not a list of shader entries")
