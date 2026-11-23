@@ -3,7 +3,7 @@
 `rpf9dump models` writes one OBJ per drawable and a `manifest.json` next to them. For levels.rpf that manifest is
 several GB, so this tool streams it one item at a time (a few KB of memory) and never loads it whole.
 
-The rule (docs/first_light.md section 7): a static drawable (not a fragment, no bone bindings), exactly one mesh,
+The rule (docs/first_light.md section 8): a static drawable (not a fragment, no bone bindings), exactly one mesh,
 300 to 3,000 triangles, a bounding box that is not degenerate (every extent at least 5% of the longest, so a flat
 card or a thin rod is out), and an OBJ that carries UVs. Of the candidates, the one whose triangle count is
 closest to 1,000 wins, ties broken by file name, so the choice is repeatable. The tool prints the OBJ path, its
@@ -21,6 +21,7 @@ import sys
 
 MIN_TRIS, MAX_TRIS, TARGET_TRIS = 300, 3000, 1000
 MIN_EXTENT_RATIO = 0.05
+LAYOUT = "expected rpf9dump's indented JSON: items opened by `    {` (4 spaces), their fields at 6, array elements at 8"
 SCALARS = ("File", "Meshes", "Verts", "Tris", "IsFragment", "HasBoneBindings")
 
 
@@ -29,13 +30,22 @@ def stream_items(lines):
 
     The manifest is indented JSON (items at 4 spaces, their fields at 6, array elements at 8); only those fields
     are read, so nested material lists are skipped without being parsed.
+
+    Any other layout (re-indented, compact) is a format error, not an empty result: a line that looks like an item
+    opener at another indentation, or a manifest with content but no items, exits with a message naming the layout.
     """
     item, array = None, None
+    seen_content, seen_items = False, False
     for line in lines:
         line = line.rstrip("\r\n")
+        if line.strip():
+            seen_content = True
         if item is None:
             if line == "    {":
                 item = {}
+                seen_items = True
+            elif line.strip() == "{" and line != "{":
+                raise SystemExit(f"manifest.json: an item opens at an indent other than 4 spaces ({line!r}); {LAYOUT}")
             continue
         if line in ("    }", "    },"):
             yield item
@@ -56,6 +66,8 @@ def stream_items(lines):
                 item[key] = value.strip('"') if key == "File" else {"true": True, "false": False}.get(value, value)
                 if key in ("Meshes", "Verts", "Tris"):
                     item[key] = int(value)
+    if seen_content and not seen_items:
+        raise SystemExit(f"manifest.json: no item found; {LAYOUT}")
 
 
 def qualifies(item: dict) -> bool:
