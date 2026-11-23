@@ -291,6 +291,20 @@ class TestSPackLhB32B16Oracle(unittest.TestCase):
         # High half of S0 and low half of S1 are ignored
         self.assertEqual(ref_s_pack_lh_b32_b16(0xDEAD1111, 0x2222BEEF), 0x22221111)
 
+class SPackLhB32B16Expr(ASTNode):
+    def __init__(self, src0: int, src1: int) -> None:
+        self.src0 = src0
+        self.src1 = src1
+
+    def eval(self) -> int:
+        return ref_s_pack_lh_b32_b16(self.src0, self.src1)
+
+
+class TestSPackLhB32B16AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SPackLhB32B16Expr(0xAAAA5555, 0x3333CCCC)
+        self.assertEqual(expr.eval(), 0x33335555)
+
 
 if __name__ == "__main__":
     unittest.main()
