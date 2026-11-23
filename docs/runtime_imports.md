@@ -648,8 +648,11 @@ asynchronous paths with `.invalid` names; it opens no connection.
   | `vcruntime140_1.dll` | 79 | covered |
 - It does **not** prove any imported function behaves correctly when called. That needs the executable, or a
   harness that calls a known entry point.
-- The executable's own imports are unknown. `MicrosoftGame.Config` names `game_scarlett_master.exe`; the package
-  here does not contain it, so its import table cannot be measured yet.
+- The executable's own import table is not what `pe_loader_test` measures: the package does not contain it, so the
+  test maps the package's images. It is measured on the executable itself in
+  [The retail executable (RT-5)](#the-retail-executable-rt-5), whose dry run classifies every import the loader binds
+  and names the shim and unimplemented ones (that table records the `1cc6e3c1` split `53 / 432 / 72 / 30`; at
+  `d9aa42a16`, after `#6792`, `#6919` and `#6891`, the same dry run reports `63 / 432 / 72 / 20`).
 - The CRT images are present in the package, but `pe_loader.cpp` prefers the host copies for the `vcruntime`/
   `msvcp`/`concrt`/`vccorlib`/`vcomp` families. The table above maps the packaged images only to test the
   parser; a real run binds the host copies.
