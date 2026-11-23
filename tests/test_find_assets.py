@@ -21,6 +21,9 @@ class TestFindAssets(unittest.TestCase):
         (assets / "char" / "cs_alpha.obj").write_bytes(b"x" * (2 * 1024))
         (assets / "char" / "cs_big.obj").write_bytes(b"x" * (2 * 1024 * 1024))
         (assets / "char" / "hair_01.OBJ").write_bytes(b"x" * (20 * 1024))
+        (assets / "char" / "deckchair.obj").write_bytes(b"x" * (30 * 1024))
+        (assets / "char" / "propeller_toy.obj").write_bytes(b"x" * (25 * 1024))
+        (assets / "char" / "prop_crate_01.obj").write_bytes(b"x" * (15 * 1024))
         (assets / "map" / "s01_w02.obj").write_bytes(b"x" * (4 * 1024))
         (assets / "random.obj").write_bytes(b"x" * 1024)
 
@@ -33,8 +36,27 @@ class TestFindAssets(unittest.TestCase):
                 code = find_assets.main(["--work", str(root)])
             output = out.getvalue()
             self.assertEqual(code, 0)
-            self.assertIn("Found 2 matching .obj models", output)
-            self.assertLess(output.index("cs_big.obj"), output.index("hair_01.OBJ"))
+            self.assertIn("Found 5 matching .obj models", output)
+            self.assertLess(output.index("cs_big.obj"), output.index("deckchair.obj"))
+
+    def test_token_boundary_filters_avoid_false_positives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._create_tree(root)
+
+            out_hair = io.StringIO()
+            with redirect_stdout(out_hair):
+                code_hair = find_assets.main(["--work", str(root), "--category", "hair"])
+            self.assertEqual(code_hair, 0)
+            self.assertIn("hair_01.OBJ", out_hair.getvalue())
+            self.assertNotIn("deckchair.obj", out_hair.getvalue())
+
+            out_props = io.StringIO()
+            with redirect_stdout(out_props):
+                code_props = find_assets.main(["--work", str(root), "--category", "props"])
+            self.assertEqual(code_props, 0)
+            self.assertIn("prop_crate_01.obj", out_props.getvalue())
+            self.assertNotIn("propeller_toy.obj", out_props.getvalue())
 
     def test_category_filter_and_top_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,6 +85,7 @@ class TestFindAssets(unittest.TestCase):
 
     def test_invalid_cli_arguments_rejected(self) -> None:
         for bad_args in (
+            ["--work", ""],
             ["--work", ".", "--top", "-1"],
             ["--work", ".", "--min-size", "nan"],
             ["--work", ".", "--min-size", "inf"],
