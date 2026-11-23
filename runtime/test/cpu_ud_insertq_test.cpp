@@ -247,7 +247,6 @@ void test_against_the_cpu() {
     for (ULONGLONG dst : dsts) {
         for (unsigned length = 0; length < 64; ++length) {
             for (unsigned index = 0; index < 64; ++index) {
-                if (index + (length ? length : 64) > 64) continue;  // compare native low bits only for APM-defined fields
                 alignas(16) M128A cpu_dst, cpu_src;
                 cpu_dst.Low = static_cast<LONGLONG>(dst);
                 cpu_dst.High = static_cast<LONGLONG>(kDstHigh);
@@ -260,7 +259,7 @@ void test_against_the_cpu() {
                 f.xmm(0).High = static_cast<LONGLONG>(kDstHigh);
                 f.xmm(1) = cpu_src;
                 const bool ok = ud::emulate(&f.pointers) == EXCEPTION_CONTINUE_EXECUTION && f.xmm(0).Low == cpu_dst.Low &&
-                                f.xmm(0).High == 0;
+                                f.xmm(0).High == 0 && f.xmm(0).High == cpu_dst.High;
                 ++compared;
                 if (ok) ++equal;
                 if (cpu_dst.High == 0) ++cpu_zeroed_high;
@@ -268,10 +267,9 @@ void test_against_the_cpu() {
         }
     }
     char text[96];
-    std::snprintf(text, sizeof text, "emulated low quadword equals the CPU's for every defined length and index (%d of %d)", equal, compared);
+    std::snprintf(text, sizeof text, "emulated quadwords match the CPU for every length and index (%d of %d)", equal, compared);
     check(compared > 0 && equal == compared, text);
-    // Native high quadwords are informational because the APM leaves them undefined.
-    std::printf("      (the CPU zeroed the high quadword in %d of %d runs; not compared)\n", cpu_zeroed_high, compared);
+    std::printf("      (the CPU zeroed the high quadword in %d of %d runs)\n", cpu_zeroed_high, compared);
     VirtualFree(mem, 0, MEM_RELEASE);
 }
 
