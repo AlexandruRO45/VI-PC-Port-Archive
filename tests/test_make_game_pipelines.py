@@ -302,7 +302,7 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIsNotNone(failed)
 
     def test_a_suspect_that_hangs_when_probed_alone_is_skipped_as_timed_out(self):
-        # A batch dies while c_mod is in flight; checking c_mod alone must carry the timeout too, and its exit 3
+        # A batch dies while c_mod is in flight; checking c_mod alone must carry the timeout too, and its timeout exit
         # makes it a timed-out module, not a crash.
         def script(args, n):
             if self.is_probe(args):
@@ -340,6 +340,27 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIsNotNone(failed)
         self.assertNotIn("still crashed after", err.getvalue())
         self.assertIn("%d module(s)" % len(all_names), err.getvalue())
+
+    def test_a_windows_abort_exit_3_is_a_crash_not_a_timeout(self):
+        # On Windows abort(), std::terminate and an unhandled SIGABRT exit 3. That must take the crash path (probe the
+        # suspect alone, a plain skip line), not skip the in-flight modules as timed out.
+        self.assertNotEqual(make_game.PIPELINE_TIMEOUT_EXIT, 3)
+        def script(args, n):
+            if self.is_probe(args):
+                self.inflight_is("c_mod")
+                return 3
+            if n == 1:
+                self.inflight_is("c_mod")
+                return 3
+            with open(self.skip, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "c_mod\n")
+            return 1
+        with mock.patch("sys.stderr", io.StringIO()):
+            failed, logs = self.stage(script)
+        self.assertIsNotNone(failed)
+        self.assertEqual(len([c for c in self.calls if self.is_probe(c)]), 1)
+        self.assertTrue(any("c_mod took vk_pipeline_check down" in m for m in logs), logs)
+        self.assertFalse(any("was still compiling" in m for m in logs), logs)
 
     def test_a_timeout_that_names_no_module_stops_the_stage(self):
         err = io.StringIO()

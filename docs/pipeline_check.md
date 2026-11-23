@@ -42,7 +42,7 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
 | `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
 | `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. A line may add a TAB and the reason to print (default: "killed the driver in an earlier run"). |
-| `--module-timeout SEC` | Give up on a module that has been in the driver (shader module or pipeline creation) for more than SEC seconds; default 0, wait forever. A hung compile can't be cancelled, so a thread that never enters the driver leaves only the timed-out modules in `--inflight-file`, prints `MODULE TIMEOUT`, saves the cache if the driver lets go of it within min(SEC, 60) s (otherwise the last checkpoint stays) and exits with status 3. Not with `--isolate`. |
+| `--module-timeout SEC` | Give up on a module that has been in the driver (shader module or pipeline creation) for more than SEC seconds; default 0, wait forever. A hung compile can't be cancelled, so a thread that never enters the driver leaves only the timed-out modules in `--inflight-file`, prints `MODULE TIMEOUT`, saves the cache if the driver lets go of it within min(SEC, 60) s (otherwise the last checkpoint stays) and exits with status 75 (not 3, which `abort()` gives on Windows). Not with `--isolate`. |
 
 `--isolate-child` is internal to the parent/child protocol and is not meant to be passed directly. A module with a missing partner stub is skipped; without `--isolate`, a driver crash ends the run.
 
@@ -318,7 +318,7 @@ saved cache or compiling one large shader can still exceed a process's available
 cannot complete even alone fails with a diagnostic rather than being counted as checked.
 
 A compile that never returns (Apple's Metal compiler on some compute modules, BUILD-1646) would hold a
-batch forever. `make_game.py` passes `--module-timeout 1800` to a checker that has it; exit 3 names the modules it
+batch forever. `make_game.py` passes `--module-timeout 1800` to a checker that has it; exit 75 names the modules it
 gave up on, and those go straight into the skip file with the reason "did not finish within 1800 s in an earlier run"
 and count as failed. They are not compiled alone again first, as a crash's suspects are, because a hang would just
 repeat. The single-module probes after a crash get the same limit, and a probe that times out marks its module as

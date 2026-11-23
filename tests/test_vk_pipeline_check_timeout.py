@@ -1,4 +1,4 @@
-"""vk_pipeline_check --module-timeout: a compile that never returns ends the run with exit status 3, the in-flight file
+"""vk_pipeline_check --module-timeout: a compile that never returns ends the run with exit status 75, the in-flight file
 naming only that module, so make_game.py's pipelines stage can skip it (a hung Metal compile on Apple GPUs).
 
 No game data: five tiny compute shaders are assembled here with spirv-as. The hang is simulated with the tool's test
@@ -84,7 +84,7 @@ class ModuleTimeoutTest(unittest.TestCase):
     def test_a_hung_compile_ends_the_run_and_names_only_that_module(self):
         inflight = self.path("inflight.txt")
         r = self.run_tool(["--module-timeout", "3", "--inflight-file", str(inflight)], hang=HANGER)
-        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 75, r.stdout + r.stderr)
         self.assertIn("MODULE TIMEOUT %s (pipeline still in the driver after" % HANGER, r.stdout)
         self.assertEqual(r.stdout.count("MODULE TIMEOUT"), 1, r.stdout)
         self.assertEqual(inflight.read_text(), HANGER + "\tpipeline\n")
@@ -100,7 +100,7 @@ class ModuleTimeoutTest(unittest.TestCase):
                    VK_PIPELINE_CHECK_SIMULATE_SAVE_HANG="1")
         r = subprocess.run([str(self.exe), str(self.dir), str(cache), "--jobs", "2"] + env_args, env=env,
                            capture_output=True, text=True, timeout=60)
-        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 75, r.stdout + r.stderr)
         self.assertIn("MODULE TIMEOUT %s" % HANGER, r.stdout)
         self.assertIn("the last saved checkpoint is kept", r.stderr)
         self.assertEqual(cache.read_bytes(), b"previous checkpoint")

@@ -2016,7 +2016,9 @@ PIPELINE_CRASH_RETRIES = 5
 # --module-timeout for vk_pipeline_check: seconds one module may spend in the driver. The slowest compiles seen that do
 # finish are minutes (Apple M2 Max, MoltenVK: 457 s for a --f64-soft compute shader); a hung one never returns.
 PIPELINE_MODULE_TIMEOUT = 1800
-PIPELINE_TIMEOUT_EXIT = 3   # vk_pipeline_check's exit status after --module-timeout gave up on a module
+# vk_pipeline_check's exit status after --module-timeout gave up on a module. Not 3: on Windows abort(), std::terminate
+# and an unhandled SIGABRT exit 3, and such a crash must reach the crash path (probes, smaller batches).
+PIPELINE_TIMEOUT_EXIT = 75
 PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
 
 

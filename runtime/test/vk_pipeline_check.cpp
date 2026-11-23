@@ -47,8 +47,8 @@
 //                 more than SEC seconds (default 0: wait forever). A compile that never returns can't be cancelled, so
 //                 a thread that never enters the driver leaves only the timed-out modules in --inflight-file, prints
 //                 MODULE TIMEOUT, saves the cache if the driver lets go of it within min(SEC, 60) s (else the last
-//                 checkpoint stays) and ends the process with exit status 3; make_game.py then skips them. Not with
-//                 --isolate.
+//                 checkpoint stays) and ends the process with exit status 75 (not 3: the Windows C runtime's abort() exits 3);
+//                 make_game.py then skips them. Not with --isolate.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] simulates a process crash
 //                 (SIGNAL, default SIGFPE) just before the pipeline of a matching module is created; SIGNAL HANG
 //                 sleeps there instead, as a compiler that never returns. For testing --isolate, --module-timeout
@@ -1984,7 +1984,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "the pipeline cache checkpoint did not finish within %.0fs (the driver still "
                                      "holds the cache); the last saved checkpoint is kept\n", wait.count());
             std::fflush(nullptr);
-            std::_Exit(3);
+            std::_Exit(75);   // the header: not 3, which abort() gives on Windows
         }
     });
     for (auto& t : pool) t.join();
@@ -2033,7 +2033,7 @@ int main(int argc, char** argv) {
                 std::printf("  %s cache feedback: %u hits, %u no hit reported, %u unavailable\n",
                             st.c_str(), s.feedback[0], s.feedback[1], s.feedback[2]);
             if (s.crash_skipped)
-                std::printf("  %s not retried after killing the driver (--skip-file): %u (counted as failed)\n",
+                std::printf("  %s not compiled (--skip-file: crashed or timed out in an earlier run): %u (counted as failed)\n",
                             st.c_str(), s.crash_skipped);
             if (!s.skip_reasons.empty()) {
                 for (const auto& [reason, cnt] : s.skip_reasons)
