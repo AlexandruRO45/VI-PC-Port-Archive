@@ -134,7 +134,8 @@ def iter_resources(path, start=None, limit=None):
     listed = set(directory_files or ())
     successors = {}
     for r in rows:
-        p = os.path.join(path, r["file"]) if os.path.isdir(path) else path
+        # Report names use '/', but continuation membership uses the directory walk's native paths.
+        p = os.path.join(path, *r["file"].split("/")) if os.path.isdir(path) else path
         if directory_files is None:
             data = WI._read_carved(p, WI.CAP)
         else:

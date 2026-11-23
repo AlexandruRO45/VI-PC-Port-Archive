@@ -74,6 +74,22 @@ class CarvedContinuationsTest(unittest.TestCase):
                 self.assertEqual(len({row["name"] for row in before["archetypes"]}), 500)
                 self.assertEqual(self.report(carved), before)
 
+    def test_nested_carved_folder_keeps_continuations_from_ancestor_paths(self):
+        archive, carved, _ = self.carve([self.definitions[:65536], self.definitions[65536:]])
+        ancestor = self.root / "parent"
+        nested = ancestor / "a" / "b"
+        nested.parent.mkdir(parents=True)
+        carved.rename(nested)
+        expected = self.report(archive)
+        self.assertEqual(expected["summary"]["names"], 500)
+        self.assertEqual(self.report(nested), expected)
+        # Report names always use '/', while Windows directory walks use native separators below
+        # the supplied root. Test both root spellings and one/two levels of recursive discovery.
+        roots = (str(ancestor), ancestor.as_posix(), str(nested.parent), nested.parent.as_posix())
+        for path in dict.fromkeys(roots):
+            with self.subTest(path=path):
+                self.assertEqual(self.report(path), expected)
+
     def test_check_extents_uses_the_entities_and_map_root_after_page_one(self):
         entities = [F.entity(F.ROCK, (0, 0, 0)) for _ in range(499)]
         entities.append(F.entity(F.ROCK, (10, 20, 30), (0, 0, F.S, F.S), sxy=2, sz=2))
