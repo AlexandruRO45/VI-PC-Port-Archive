@@ -20,7 +20,10 @@
 // ASSUMPTION (no executable yet): the quota is a fixed 1 GiB (the GDK says the per-user quota "is not a fixed size");
 // a blob name is at most 256 bytes (GS_MAX_BLOB_NAME_SIZE is not on the public pages); GetContainerInfo of a
 // container that does not exist returns S_OK without calling the callback; ReadBlobData with blobNames = nullptr
-// reads every blob of the container. syncOnDemand is accepted and ignored: nothing syncs offline.
+// reads every blob of the container; ReadBlobData and ReadBlobDataResult of a read that packs to 0 bytes accept a null
+// blobData (the public pages do not say; it follows the 0 XAsyncGetResultSize answers and the vendored
+// XAsyncGetResult, which takes any buffer for a 0-byte result). syncOnDemand is accepted and ignored: nothing syncs
+// offline.
 #include <windows.h>
 
 #include <algorithm>
@@ -748,9 +751,19 @@ HRESULT STDMETHODCALLTYPE save_enum_blobs_by_name(void*, XGameSaveContainerHandl
 
 // 20: HRESULT XGameSaveReadBlobData(XGameSaveContainerHandle, const char** blobNames, uint32_t* countOfBlobs,
 //                                   size_t blobsSize, XGameSaveBlob* blobData)
-HRESULT STDMETHODCALLTYPE save_read(void*, XGameSaveContainerHandle c, const char** names, uint32_t* count,
+HRESULT STDMETHODCALLTYPE save_read(void* self, XGameSaveContainerHandle c, const char** names, uint32_t* count,
                                     size_t size, XGameSaveBlob* out) {
-    if (!count || !out) return E_POINTER;
+    if (!count) return E_POINTER;
+    if (!out) {
+        // A read with nothing to write (a container with no blobs yet, or no names) packs to 0 bytes and needs no
+        // buffer: the same read into a 0-byte buffer succeeds. Any other read keeps E_POINTER for a null buffer,
+        // whatever it would have answered with one (expired handle, missing blob, buffer too small).
+        XGameSaveBlob none{};
+        uint32_t read = *count;
+        if (save_read(self, c, names, &read, 0, &none) != S_OK) return E_POINTER;
+        *count = read;
+        return S_OK;
+    }
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
     std::vector<BlobRead> blobs;
@@ -783,7 +796,18 @@ HRESULT STDMETHODCALLTYPE save_read_async(void*, XGameSaveContainerHandle c, con
 // 22: HRESULT XGameSaveReadBlobDataResult(XAsyncBlock* async, size_t blobsSize, XGameSaveBlob* blobData,
 //                                         uint32_t* countOfBlobs). blobsSize: XAsyncGetResultSize's answer.
 HRESULT STDMETHODCALLTYPE save_read_result(void*, XAsyncBlock* async, size_t size, XGameSaveBlob* out, uint32_t* count) {
-    if (!out || !count) return E_POINTER;
+    if (!count) return E_POINTER;
+    if (!out) {
+        // A read that completed with a 0-byte result (XAsyncGetResultSize answered 0) has nothing to write, and the
+        // vendored XAsyncGetResult collects it whatever the buffer. Any other result keeps E_POINTER for a null
+        // buffer and stays in place: it is not collected here (XAsyncGetResult would release it).
+        size_t needed = 1;
+        if (!async || XAsyncGetResultSize(async, &needed) != S_OK || needed != 0 ||
+            XAsyncGetResult(async, &kReadIdentity, 0, nullptr, nullptr) != S_OK)
+            return E_POINTER;
+        *count = 0;
+        return S_OK;
+    }
     *count = 0;
     t_read_count = 0;
     HRESULT hr = XAsyncGetResult(async, &kReadIdentity, size, out, nullptr);
