@@ -2,6 +2,7 @@
 // (PROBE_WARP=1: WARP). Every HRESULT and a hash of every block row read back must match. The host takes a
 // block-compressed box in whole blocks up to the block-padded mip edge ((0,0)-(8,8) on a 6x6 mip) and refuses one that
 // stops at an unpadded edge inside a block ((0,0)-(6,6)); NVIDIA 610-series and WARP answer alike.
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 
@@ -99,6 +100,10 @@ std::vector<std::string> run(ID3D12Device* device, const Tex& t, const std::vect
 }  // namespace
 
 int main() {
+    if (hostwine::host_is_wine()) {
+        std::printf("SKIP: the host comparison is skipped under Wine\n");
+        return 77;
+    }
     Ref<ID3D12Device> ours, host;
     if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&ours.p))) || !ours.p) return 77;
     Ref<IDXGIAdapter> adapter;
