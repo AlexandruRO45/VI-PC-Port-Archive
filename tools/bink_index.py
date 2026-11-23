@@ -31,6 +31,14 @@ import subprocess
 import sys
 import tempfile
 
+# The shared report-path rules (realpath, normcase, hard links, a folding volume) own this check, as in the
+# other report tools; same_output_path below only forwards to them.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from tools.report_paths import same_report_path
+except ImportError:  # direct script execution
+    from report_paths import same_report_path
+
 SIG = re.compile(rb"KB2[a-z]")
 HDR = 0x2C
 MAX_FRAMES = 1_000_000
@@ -306,13 +314,8 @@ def write_json(path, target, rows, summary, probe):
 
 
 def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link) - report_paths' rules."""
+    return same_report_path(first, second)
 
 
 def main(argv=None):
