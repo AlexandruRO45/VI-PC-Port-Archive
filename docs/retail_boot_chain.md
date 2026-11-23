@@ -135,11 +135,29 @@ is a driver compile of a translated module on the title's thread.
 
 ### 5.2 What clears it
 
-The layer marks the driver's compile of a compute pipeline as a host-only stall (`runtime/src/host_stall.h`), and
-the runtime serves `Sleep` (`runtime/shims/host_stall.cpp`): a guest `Sleep` that a stall overlaps does not return
-while the stall is open, and then lasts as much longer as stalls overlapped it. The check's round then comes back
-late, and the title's own late-round rule starts the count again. No pipeline is skipped and the check stays armed:
-a boot that hangs with no stall open still ends after 30 rounds.
+The layer marks the driver's compile of a compute pipeline as a host-only stall (`runtime/src/host_stall.h`): the
+`vkCreateComputePipelines` call alone, with the pipeline cache fetched before it. The runtime serves `Sleep`
+(`runtime/shims/host_stall.cpp`): a guest `Sleep(n)` of a second or more returns once `n` milliseconds have passed
+outside stalls since it was called. The check's round then comes back late, and the title's own late-round rule
+starts the count again. No pipeline is skipped and the check stays armed.
+
+| Rule | Why |
+|---|---|
+| Only a `Sleep` of 1,000 ms or more is held | A shorter one is a poll: its caller waits for another thread, possibly the one that holds the stall. It stays the host's `Sleep`. |
+| A `Sleep` no stall overlaps is the host's | Whenever the host wakes it, early or late. |
+| One stall counts for at most 60 s | Work that has not come back by then is not treated as a compile: held `Sleep`s return, the time counts as the title's again, and the runtime prints one line. |
+
+How long the check can be late for a boot that really hangs, from those rules (`host_stall_test` runs each case on
+a virtual clock):
+
+| The main thread hangs | The check fires |
+|---|---|
+| with no stall open and none after | after 30 rounds, as on the console |
+| inside a marked host call that never returns | within 60 s + 31 s of that call |
+| while other threads go on compiling | within 31 s of the last such compile; each compile is one pipeline of the title, so there are finitely many |
+
+A stall shorter than the title's 2 s rule starts no count again: with 100 ms of stall in every second the check
+fires after 30 rounds of 1.1 to 1.2 s.
 
 | Run | Driver cache | `Sleep` | First slot 62 call | Outcome | D3D12 calls |
 |---|---|---|---|---|---:|
@@ -158,5 +176,7 @@ programs, which #7323, #7201, #7180 and #7529 are about.
   from there to the first `XDisplayTryEnableHdrMode`. Hypothesis: a cold file cache. Nothing marks that time.
 - Graphics pipelines are built on first use, from whichever thread replays the list, and are not marked.
 - Only `Sleep` is held. A check built on `SleepEx`, a wait with a timeout or a clock would not see the stall.
-- Every guest `Sleep` that overlaps a stall is held, not only the check's: in the "after" run the first one held
-  was a `Sleep(10)` of another title thread.
+- Every guest `Sleep` of a second or more that overlaps a stall is held, not only the check's. Shorter ones are
+  not: in the first "after" run, which held them all, the first one held was a `Sleep(10)` of another title thread.
+- While stalls recur with less than the check's limit between them, rounds they make longer than 2 s keep starting
+  the count again. That is the title's rule for a late round, and it ends with the compiles.

@@ -184,10 +184,11 @@ Current limits, by design:
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
   missing.
 - `Sleep` (`kernel32.dll`, `kernelbase.dll`, `api-ms-win-core-synch-l1-2-0.dll` and `-l1-2-1.dll`;
-  `shims/host_stall.cpp`) — the host's `Sleep`, except that it does not return while the layer does host-only work
-  on a title thread, and then lasts as much longer as that work overlapped it. Host-only work is what the console
-  never does: today the driver's compile of a translated compute pipeline (`src/host_stall.h`). A `Sleep` no such
-  work overlaps is unchanged; `SleepEx`, the waits with a timeout and every clock stay the host's. It is there for
+  `shims/host_stall.cpp`) — the host's `Sleep`, except that a `Sleep(n)` of a second or more lasts `n` milliseconds
+  of the time in which the layer did no host-only work on a title thread. Host-only work is what the console
+  never does: today the driver's compile of a translated compute pipeline (`src/host_stall.h`), counted for at
+  most 60 s per pipeline. A shorter `Sleep` and one no such work overlaps are unchanged; `SleepEx`, the waits
+  with a timeout and every clock stay the host's. It is there for
   the retail title's startup hang check, see
   [docs/retail_boot_chain.md](../docs/retail_boot_chain.md#5-the-startup-hang-check). `host_stall_test` covers it.
 
