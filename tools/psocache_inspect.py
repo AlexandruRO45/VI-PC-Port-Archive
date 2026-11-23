@@ -65,14 +65,15 @@ def u32(m, off):
 
 
 def count_marker(m, pattern, lo, hi):
-    """Occurrences of a 4-byte pattern in [lo, hi), read-only through the map."""
+    """Count matching words aligned to the start of [lo, hi), without decoding instructions."""
     n = 0
     p = lo
     while True:
         j = m.find(pattern, p, hi)
         if j < 0:
             return n
-        n += 1
+        if (j - lo) % 4 == 0:
+            n += 1
         p = j + len(pattern)
 
 

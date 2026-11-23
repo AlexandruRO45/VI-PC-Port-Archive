@@ -217,6 +217,24 @@ class PsocacheInspectTest(unittest.TestCase):
         self.assertEqual(mk["entries_with_one"], 2)
         self.assertEqual(mk["entries_with_none"], 0)
 
+    def test_markers_ignore_unaligned_byte_sequences(self):
+        code_offset = FILE_SIZE - CODE_SIZE
+        with open(self.path, "r+b") as f:
+            f.seek(code_offset + 1)
+            f.write(END_PGM)
+            f.seek(code_offset + 9)
+            f.write(CODE_END)
+
+        markers = psocache_inspect.inspect(self.path)["markers"]
+        self.assertEqual(markers["s_endpgm"], 2)
+        self.assertEqual(markers["s_code_end"], 2 * ((0x100 - 0x24) // 4))
+        self.assertEqual(markers["entries_with_one"], 2)
+        self.assertEqual(markers["entries_with_two"], 0)
+
+    def test_marker_alignment_is_relative_to_the_range_start(self):
+        data = b"\xff" + END_PGM + b"\xff" + END_PGM + b"\xff" * 3 + END_PGM
+        self.assertEqual(psocache_inspect.count_marker(data, END_PGM, 1, len(data)), 2)
+
     def test_cli_reports_and_exits_zero(self):
         p = run(self.path)
         self.assertEqual(p.returncode, 0, p.stderr)
