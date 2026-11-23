@@ -326,6 +326,47 @@ class TestCommandLine(unittest.TestCase):
             self.assertIn(records, err.getvalue())
             self.assertNotIn(path + ":", err.getvalue())
 
+    def test_parallel_records_close_error_names_the_records_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive(fragment(drawables=3), fragment()) + bytes(8192))
+            records = os.path.join(tmp, "records.jsonl")
+            real_open = open
+
+            class BadClose:
+                name = records
+
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    self.handle.close()
+                    raise OSError(errno.ENOSPC, "No space left on device")
+
+                def write(self, data):
+                    return self.handle.write(data)
+
+                def flush(self):
+                    return self.handle.flush()
+
+            def fake_open(name, mode="r", *args, **kwargs):
+                if (isinstance(name, (str, bytes, os.PathLike))
+                        and os.path.abspath(name) == os.path.abspath(records) and "w" in mode):
+                    return BadClose(real_open(name, mode, *args, **kwargs))
+                return real_open(name, mode, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch("builtins.open", side_effect=fake_open), contextlib.redirect_stderr(err):
+                rc = fc.main([path, "--jobs", "2", "--records", records])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot write", err.getvalue())
+            self.assertIn(records, err.getvalue())
+            self.assertNotIn(path + ":", err.getvalue())
+
     def test_archive_read_error_names_the_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "a.rpf")

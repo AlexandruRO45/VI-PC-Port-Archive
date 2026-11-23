@@ -346,14 +346,14 @@ def scan_archive(path, start=0, end=None, jobs=1, records=None, log=None):
             with multiprocessing.Pool(len(work)) as pool:
                 for part in pool.imap_unordered(worker, work):
                     merge(total, part)
-            with open(records, "w", encoding="utf-8", newline="\n") as out:
-                for i in range(len(work)):
-                    with open(os.path.join(workdir, f"{i}.jsonl"), encoding="utf-8") as fh:
-                        try:
+            try:
+                with open(records, "w", encoding="utf-8", newline="\n") as out:
+                    for i in range(len(work)):
+                        with open(os.path.join(workdir, f"{i}.jsonl"), encoding="utf-8") as fh:
                             out.write(fh.read())
-                        except OSError as exc:
-                            _label_write_error(exc, records)
-                            raise
+            except OSError as exc:
+                _label_write_error(exc, records)
+                raise
         return total
     work = [(path, lo, hi, None) for lo, hi in ranges]
     with multiprocessing.Pool(len(work)) as pool:
