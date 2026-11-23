@@ -475,6 +475,8 @@ int main() {
         std::uint64_t before = presenter->presented();
         EXPECT(frame(0, [] { driver::next_present = VK_ERROR_OUT_OF_DATE_KHR; }));
         EXPECT(presenter->presented() == before);
+        std::vector<std::uint8_t> rejected_pixels;
+        EXPECT(!presenter->read_back(rejected_pixels, nullptr, nullptr));
         EXPECT(frame(0));  // recreates the swapchain the out-of-date present asked for
         before = presenter->presented();
         EXPECT(frame(0, [] { driver::next_present = VK_SUBOPTIMAL_KHR; }));

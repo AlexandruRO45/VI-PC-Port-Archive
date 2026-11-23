@@ -582,7 +582,8 @@ private:
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
-        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+        const bool accepted = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
+        if (accepted) {
             ++presented_;
             if (planes) ++composed_;
             if (tearing) {
@@ -590,8 +591,9 @@ private:
                 ++tear_presents_;
             }
         }
-        if (capture_ && capture_ptr_) {
-            captured_ = true;
+        // A completed transfer can also contain an image the presentation engine rejected.
+        captured_ = accepted && capture_ && capture_ptr_;
+        if (captured_) {
             captured_extent_ = extent_;
             captured_format_ = format_;
         }
