@@ -50,6 +50,13 @@ class BadGamedataMapsIndexTest(unittest.TestCase):
             source.write_text("junk", encoding="utf-8")
             self.assert_missing_source(self.run_tool(source), source)
 
+    def test_folder_without_index(self):
+        # A folder of carved .bin files whose index.json is missing, as main also fails on.
+        with tempfile.TemporaryDirectory() as td:
+            carve = pathlib.Path(td)
+            (carve / "000000000001.bin").write_bytes(b"MHIU" + bytes(40))
+            self.assert_missing_source(self.run_tool(carve), carve)
+
     def test_missing_files_key(self):
         with tempfile.TemporaryDirectory() as td:
             self.assert_one_error(self.run_tool(self.make_carve(td, {})))
