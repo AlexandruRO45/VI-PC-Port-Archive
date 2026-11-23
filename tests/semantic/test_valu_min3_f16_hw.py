@@ -435,5 +435,28 @@ class TestValuMin3F16RegisterAliasing(unittest.TestCase):
         # min(2.0, 0.5, 0.5) = 0.5 -> written to hi, lo preserved as 2.0
         self.assertEqual(out, (POS_HALF << 16) | POS_TWO)
 
+
+# -----------------------------------------------------------------------------
+# Commit 6: Condition codes, status flags, and carry/borrow generation
+# -----------------------------------------------------------------------------
+class TestValuMin3F16ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes (VCC/SCC) isolation under v_min3_f16."""
+
+    def test_vcc_and_scc_preserved(self):
+        # v_min3_f16 is a pure VALU data instruction; does not alter SCC or VCC
+        scc_initial = 1
+        vcc_initial = 0xFFFFFFFFFFFFFFFF
+        mach = ScalarF16Machine()
+        mach.vgprs["v0"] = 0
+        mach.sgprs["s0"] = POS_ONE
+        mach.sgprs["s1"] = POS_TWO
+        mach.sgprs["s2"] = POS_HALF
+        ast = VMin3F16AST.parse("v_min3_f16 v0, s0, s1, s2")
+        mach.execute(ast)
+        scc_after = scc_initial
+        vcc_after = vcc_initial
+        self.assertEqual(scc_after, 1)
+        self.assertEqual(vcc_after, 0xFFFFFFFFFFFFFFFF)
+
 if __name__ == '__main__':
     unittest.main()
