@@ -265,5 +265,29 @@ class TestSAndB64MaskDivergenceAndBoundaries(unittest.TestCase):
         res, scc = oracle_s_and_b64(hi_only, lo_only)
         self.assertEqual(scc, 1 if res != 0 else 0)
 
+class TestSAndB64TranslatorIntegration(unittest.TestCase):
+    """Translator integration and SCC status verification for s_and_b64."""
+
+    def test_translated_execution_matches_oracle(self) -> None:
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        exp_res, exp_scc = oracle_s_and_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_and_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
+    def test_translated_scc_zero_result(self) -> None:
+        a = 0x5555555555555555
+        b = 0xaaaaaaaaaaaaaaaa
+        exp_res, exp_scc = oracle_s_and_b64(a, b)
+        got_res, got_scc = run_translated_salu64("s_and_b64", a, b)
+        self.assertEqual(got_res, exp_res)
+        self.assertEqual(got_scc, exp_scc)
+
+    def test_syntax_rejection_missing_operands(self) -> None:
+        prog = ["s_and_b64 s[0:1], s[2:3]", "s_endpgm"]
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            support.translate_lines("ps_s_and_b64_syntax_err", prog)
+
 if __name__ == "__main__":
     unittest.main()
