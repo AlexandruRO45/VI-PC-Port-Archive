@@ -356,5 +356,39 @@ class LdexpF64Tests(unittest.TestCase):
             translate_lines(["v_ldexp_f64 v[0:1], v2, v4"])
 
 
+
+def run_cs_wave(lines, lanes=32):
+    fssm = bytearray(0x148)
+    struct.pack_into("<4I", fssm, 0x138, 0x8088, lanes, 1, 1)
+    from support import translate_lines
+    spv = translate_lines("cs_ldexp_f64_wave", lines + ["s_endpgm"], fssm=bytes(fssm))
+    return si.run_workgroup(spv, lanes, 32,
+                            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                            push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 28, memory={})
+
+
+class LdexpF64WaveTests(unittest.TestCase):
+    def test_vcc_and_inactive_lanes_are_untouched(self):
+        lines = ["v_mov_b32_e32 v4, 0", "v_mov_b32_e32 v5, 0x3ff00000",
+                 "v_mov_b32_e32 v6, 0x13572468", "v_mov_b32_e32 v7, 0x24681357",
+                 "v_cmp_gt_u32_e32 vcc_lo, 3, v0",
+                 "v_cmpx_gt_u32_e32 16, v0",
+                 "v_ldexp_f64 v[6:7], v[4:5], v0",
+                 "s_mov_b32 exec_lo, -1",
+                 "v_cndmask_b32_e64 v8, 0, 1, vcc_lo",
+                 "v_lshlrev_b32_e32 v9, 4, v0",
+                 "buffer_store_dword v6, v9, s[0:3], 0 offen",
+                 "buffer_store_dword v7, v9, s[0:3], 0 offen offset:4",
+                 "buffer_store_dword v8, v9, s[0:3], 0 offen offset:8"]
+        mem = run_cs_wave(lines)
+        for lane in range(32):
+            lo, hi, vcc_bit = mem[16 * lane], mem[16 * lane + 4], mem[16 * lane + 8]
+            if lane < 16:
+                want = d2u(2.0 ** lane)
+                self.assertEqual((lo, hi), (want & 0xFFFFFFFF, want >> 32), f"lane {lane}")
+            else:
+                self.assertEqual((lo, hi), (0x13572468, 0x24681357), f"inactive lane {lane}")
+            self.assertEqual(vcc_bit, int(lane < 3), f"vcc lane {lane}")
+
 if __name__ == "__main__":
     unittest.main()
