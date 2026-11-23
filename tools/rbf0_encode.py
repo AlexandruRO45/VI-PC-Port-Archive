@@ -9,18 +9,20 @@ its content in tree order; text and strings with the bytes and terminating NUL t
 The encoder fails closed. When the tree cannot hold the original bytes it raises EncodeError with a short reason
 instead of writing something else:
     status       the parse was not complete (bad, truncated, or bytes after the root closed)
-    utf8         a descriptor name, string or text had invalid UTF-8, which the decoder replaced with U+FFFD
+    utf8         a descriptor name, string or text had invalid UTF-8, or an edit contains an unpaired surrogate
     nan          a float or vec3 component was NaN, whose bits the tree renders as text (infinities are exact)
-    order        a value counted as an attribute came after the element's content started
+    order        a value counted as an attribute came after the element's content started, or an element short of
+                 its attribute count has a value in its content, which would decode as an attribute
     descriptor   a descriptor index outside the table, or a first use out of order
     length       a string or text no longer has its recorded byte length
-    value        a value the record cannot hold (an integer out of range, an unknown type)
+    value        a value the record cannot hold (an integer out of range, a float that overflows the layout, an
+                 unknown type, more attribute records than the element's attribute count)
 
 Usage:
     python -I rbf0_encode.py --check <carve-dir | resource> [--limit N]
         Decode every RBF0 resource (joining 64 KiB continuations as rbf0_tree.py does), encode it, and compare the
         result with the original bytes. Prints counts only: exact, different, and refused by reason. Exit 1 when a
-        resource encodes to different bytes.
+        resource encodes to different bytes or was refused: only a run where every resource is exact exits 0.
     python -I rbf0_encode.py <rbf0_tree.json> <new_out_dir>
         Write each resource of an rbf0_tree.py JSON report (possibly edited) as <offset>.rbf. The directory must be
         new or empty.
@@ -61,22 +63,28 @@ class _Writer:
 
     def record(self, node, kind):
         index = node.get("descriptor")
-        if not isinstance(index, int) or not 0 <= index < 0xFD:
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 0xFD:
             raise EncodeError("descriptor", f"descriptor index {index!r} cannot be written")
         if index > self.emitted:
             raise EncodeError("descriptor", f"descriptor {index} is used before descriptor {self.emitted}")
         self.out += bytes((index, kind))
+        name = node.get("name", "")
         if index == self.emitted:
-            name = node.get("name", "")
             if index in self.bad_names:
                 raise EncodeError("utf8", f"descriptor {index} name had invalid UTF-8")
             if index < len(self.names) and self.names[index] not in (None, name):
                 raise EncodeError("descriptor", f"descriptor {index} is named both {self.names[index]!r} and {name!r}")
+            if index == len(self.names):
+                self.names.append(name)
+            else:
+                self.names[index] = name
             raw = name.encode("utf-8")
             if len(raw) > 0xFFFF:
                 raise EncodeError("length", f"descriptor {index} name is {len(raw)} bytes")
             self.out += struct.pack("<H", len(raw)) + raw
             self.emitted += 1
+        elif index < len(self.names) and self.names[index] not in (None, name):
+            raise EncodeError("descriptor", f"descriptor {index} is named both {self.names[index]!r} and {name!r}")
 
     def float_bits(self, value, special):
         if special is not None:
@@ -87,7 +95,13 @@ class _Writer:
                 raise EncodeError("value", f"float spelling {special!r}")
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise EncodeError("value", f"float value {value!r}")
-        return struct.pack("<d" if self.wide else "<f", float(value))
+        fval = float(value)
+        if math.isnan(fval):
+            raise EncodeError("nan", "a NaN float's bits are not in the tree")
+        try:
+            return struct.pack("<d" if self.wide else "<f", fval)
+        except OverflowError:
+            raise EncodeError("value", f"float value {value!r} overflows {'double' if self.wide else 'float32'}") from None
 
     def value(self, node):
         kind = node.get("type")
@@ -129,17 +143,28 @@ class _Writer:
     def text(self, node):
         if node.get("utf8_valid") is False:
             raise EncodeError("utf8", "a text record had invalid UTF-8")
-        raw = node.get("text", "").encode("utf-8") + (b"\x00" if node.get("nul_terminated") else b"")
-        if "length" in node and len(raw) != node["length"]:
-            raise EncodeError("length", f"text of {len(raw)} bytes, recorded {node['length']}")
+        text = node.get("text", "")
+        if not isinstance(text, str):
+            raise EncodeError("value", f"text value {text!r}")
+        raw = text.encode("utf-8") + (b"\x00" if node.get("nul_terminated") else b"")
+        if len(raw) > 0xFFFFFFFF or ("length" in node and len(raw) != node["length"]):
+            raise EncodeError("length", f"text of {len(raw)} bytes, recorded {node.get('length')}")
         self.out += b"\xfd\xff" + struct.pack("<I", len(raw)) + raw
 
     def element(self, node):
         if node.get("attribute_order_violation"):
             raise EncodeError("order", f"element {node.get('name')!r} has a value attribute after its content")
         attrs = node.get("attrs_declared", len(node.get("attributes", [])))
-        if not isinstance(attrs, int) or not 0 <= attrs <= 0xFFFF:
+        if not isinstance(attrs, int) or isinstance(attrs, bool) or not 0 <= attrs <= 0xFFFF:
             raise EncodeError("value", f"attribute count {attrs!r}")
+        # The header word says how many of the following value records are attributes. One record more would decode
+        # as the element's first content value; with fewer, the next content value would decode as an attribute.
+        listed = len(node.get("attributes", []))
+        if listed > attrs:
+            raise EncodeError("value", f"element {node.get('name')!r} has {listed} attribute records, count {attrs}")
+        if listed < attrs and any(c.get("kind") == "value" for c in node.get("content", [])):
+            raise EncodeError("order", f"element {node.get('name')!r} is short of its {attrs} attributes and has a "
+                                       "value in its content")
         self.record(node, 0x00)
         self.out += struct.pack("<HHH", 0, 0, attrs)
         for child in node.get("attributes", []):
@@ -159,27 +184,39 @@ class _Writer:
 
 def encode(doc):
     """The RBF0 bytes of one rbf0_tree document. Raises EncodeError when they would not be the original's."""
+    if not isinstance(doc, dict):
+        raise EncodeError("value", f"resource document {doc!r}")
     if doc.get("status") != "ok":
         raise EncodeError("status", f"the parse status is {doc.get('status')!r}")
     if doc.get("layout") not in ("wide-64", "narrow-32"):
         raise EncodeError("value", f"layout {doc.get('layout')!r}")
     tree = doc.get("tree")
-    if not tree or tree.get("kind") != "element":
+    if not isinstance(tree, dict) or tree.get("kind") != "element":
         raise EncodeError("status", "no root element")
     w = _Writer(doc)
-    w.element(tree)
+    try:
+        w.element(tree)
+    except UnicodeEncodeError:
+        # JSON accepts escaped lone surrogates, but RBF0 strings must be UTF-8.
+        # Refuse the resource through the same path as invalid decoded UTF-8.
+        raise EncodeError("utf8", "a descriptor name, string or text contains an unpaired Unicode surrogate") from None
     return bytes(w.out)
 
 
 def resources(source, limit=None):
-    """Yield (doc, original bytes) for every RBF0 resource in a carve directory or a single file."""
+    """Yield (doc, original bytes) for every RBF0 resource in a carve directory or a single file. The bytes are
+    the resource's chunks joined as rbf0_tree.decode_source joined them; check() compares their length with the
+    size the document records."""
     docs, _summary = rbf0_tree.decode_source(source, limit=limit)
     rows, read = rbf0_tree._rows(source)
-    by_name = {row["name"]: i for i, row in enumerate(rows)}
+    by_name = {}
+    for i, row in enumerate(rows):
+        if row["name"] in by_name:      # a document names its first chunk; two rows of one name cannot be told apart
+            raise rbf0_tree.SelectionError(f"two carved streams are named {row['name']!r}")
+        by_name[row["name"]] = i
     for doc in docs:
         i = by_name[doc["source"]]
-        blob = b"".join(read(rows[j]) for j in range(i, i + doc["chunks"]))
-        yield doc, blob[:doc["size"]]
+        yield doc, b"".join(read(rows[j]) for j in range(i, i + doc["chunks"]))
 
 
 def check(source, limit=None):
@@ -197,7 +234,7 @@ def check(source, limit=None):
             counts["refused"] += 1
             reasons[e.reason] += 1
             continue
-        if encoded == blob:
+        if encoded == blob and doc.get("size") == len(blob):
             counts["exact"] += 1
             layout["exact"] += 1
         else:
@@ -207,25 +244,40 @@ def check(source, limit=None):
 
 def write_all(report, out_dir):
     """Encode every resource of an rbf0_tree JSON report into out_dir. Returns (written, refused)."""
-    with open(report, encoding="utf-8") as f:
-        data = json.load(f)
-    if data.get("tool") != "rbf0_tree":
+    try:
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:  # ValueError: bad JSON or non-UTF-8 bytes
+        raise SystemExit(f"{report}: cannot read report: {e}") from None
+    if not isinstance(data, dict) or data.get("tool") != "rbf0_tree":
         raise SystemExit(f"{report}: not an rbf0_tree.py JSON report")
-    if os.path.exists(out_dir) and (not os.path.isdir(out_dir) or os.listdir(out_dir)):
-        raise SystemExit(f"refusing to write into an existing non-empty path: {out_dir}")
-    os.makedirs(out_dir, exist_ok=True)
+    items = data.get("resources", [])
+    if not isinstance(items, list):
+        raise SystemExit(f"{report}: 'resources' must be a list")
+    try:
+        if os.path.exists(out_dir) and (not os.path.isdir(out_dir) or os.listdir(out_dir)):
+            raise SystemExit(f"refusing to write into an existing non-empty path: {out_dir}")
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f"{out_dir}: cannot prepare output directory: {e.strerror or e}") from None
     written, refused = 0, []
-    for i, doc in enumerate(data.get("resources", [])):
+    for i, doc in enumerate(items):
+        raw_offset = doc.get("offset", i) if isinstance(doc, dict) else i
         try:
             blob = encode(doc)
         except EncodeError as e:
-            refused.append((doc.get("offset", i), str(e)))
+            refused.append((raw_offset, str(e)))
             continue
-        name = f"{doc.get('offset', i):08x}.rbf"
+        file_offset = raw_offset if isinstance(raw_offset, int) and not isinstance(raw_offset, bool) and raw_offset >= 0 else i
+        name = f"{file_offset:08x}.rbf"
         if os.path.exists(os.path.join(out_dir, name)):
-            name = f"{doc.get('offset', i):08x}-{i:04d}.rbf"
-        with open(os.path.join(out_dir, name), "xb") as f:
-            f.write(blob)
+            name = f"{file_offset:08x}-{i:04d}.rbf"
+        target = os.path.join(out_dir, name)
+        try:
+            with open(target, "xb") as f:
+                f.write(blob)
+        except OSError as e:
+            raise SystemExit(f"{target}: cannot write: {e.strerror or e}") from None
         written += 1
     return written, refused
 
@@ -253,7 +305,7 @@ def main(argv=None):
             print(f"  refused ({reason}): {n}")
         for layout, c in sorted(r["by_layout"].items()):
             print(f"  {layout}: {c['exact']} of {c['resources']} exact")
-        return 1 if r["different"] else 0
+        return 1 if r["different"] or r["refused"] else 0
     if not a.report or not a.out:
         ap.error("give --check SOURCE, or a report and an output directory")
     if a.limit is not None:

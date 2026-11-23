@@ -2,11 +2,13 @@
 // Huffman blocks, compressed from synthetic data with Python's zlib), the JSON reader, FSSM extraction from a
 // synthetic DXBC container, and index lookup by content hash. No game data.
 #include "../src/shader_library.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -251,6 +253,26 @@ int fspx_checks() {
 int main() {
     using namespace leonida;
 
+    // Test the shared file reader without passing malformed bytes to a driver.
+    const std::vector<std::uint32_t> header = {0x07230203, 0x00010300, 0, 1, 0};
+    const std::string header_bytes(reinterpret_cast<const char*>(header.data()), header.size() * sizeof(header.front()));
+    {
+        std::istringstream input(header_bytes);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()) == header);
+    }
+    for (const auto& bad : {std::string{}, header_bytes.substr(0, 16), header_bytes + 'x',
+                            std::string("bad!") + header_bytes.substr(4)}) {
+        std::istringstream input(bad);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()).empty());
+    }
+    {
+        std::istringstream input(header_bytes);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, static_cast<std::streamoff>(header_bytes.size() + 4)).empty());
+    }
+
     CHECK(sha256_hex({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     CHECK(sha256_hex(bytes("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     CHECK(sha256_hex(bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")) ==
@@ -322,7 +344,8 @@ int main() {
     CHECK(fssm_program(container({{dynamic, 600}, {fixed, 25}})) == bytes("hello hello hello leonida"));
 
     // An index with one findable shader, one without a hash, and the module next to it.
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_test";
+    const testfiles::ScratchDir scratch("leonida_shader_library_test");
+    const auto& dir = scratch.path();
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
     const std::string hash2 = sha256_hex(bytes("another program"));
@@ -339,7 +362,8 @@ int main() {
                  " \"vs_same_program\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
-                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
+                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
+                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
@@ -364,6 +388,9 @@ int main() {
           vs_all[1]->input_signature[0].register_index == 0);
     const ShaderEntry* ps = library.find("ps", hash);
     CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
+    CHECK(ps->inputs.size() == 4 && ps->inputs[0] == 0 && ps->inputs[3] == 29);
+    CHECK(ps->f16_halves.size() == 2 && ps->f16_halves.at(0)[0] == 28 && ps->f16_halves.at(0)[1] == 29 &&
+          ps->f16_halves.at(7)[0] == 20 && ps->f16_halves.at(7)[1] == 21);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
@@ -407,7 +434,7 @@ int main() {
             spv.write(reinterpret_cast<const char*>(words), sizeof(words));
         }
         ShaderLibrary fspx;
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3);
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3 && fspx.fspx_size() == 1);
         const auto found = fspx.fspx_candidates("cs", code_hash);
         CHECK(found.size() == 1 && found[0]->name == "fspx/upscaler_00" && found[0]->local_size[0] == 8 &&
               found[0]->wave64 && found[0]->fssm_sha256.empty());
@@ -427,9 +454,10 @@ int main() {
             std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
             sub << "{broken";
         }
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_candidates("cs", code_hash).empty());
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 &&
+              fspx.fspx_candidates("cs", code_hash).empty());
         std::filesystem::remove(dir / "fspx" / "index.json");
-        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.find("cs", hash));
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 && fspx.find("cs", hash));
         std::filesystem::remove_all(dir);
     }
 

@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -60,6 +61,40 @@ class PackedFormatFixture(unittest.TestCase):
             check_fmt.assert_called_once()
             self.assertIn(problem, output.getvalue())
             self.assertIn("0/1 passed", output.getvalue())
+
+
+class FrameReadbackTest(unittest.TestCase):
+    def test_only_a_frame_written_by_this_run_can_pass(self):
+        name = "ps_ops"
+        pixels = struct.pack("<4I", 0x48804300, 5, 7, 0xBFFFFFFC) * 4096
+        for existing, writes_frame, expected in ((True, False, 1), (False, False, 1), (True, True, 0)):
+            with self.subTest(existing=existing, writes_frame=writes_frame), tempfile.TemporaryDirectory() as tmp:
+                raw = Path(tmp, "raw", f"{name}.raw")
+                if existing:
+                    raw.parent.mkdir()
+                    raw.write_bytes(pixels)
+                args = SimpleNamespace(filter="ps_ops.asm", build=tmp, llvm_mc="unused")
+
+                def launch(cmd, **kwargs):
+                    if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                        (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    elif writes_frame:
+                        raw.write_bytes(pixels)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"),
+                      patch.object(rgt, "bary_fallback", return_value=False),
+                      patch.object(rgt, "f16_interp_fallback", return_value=False),
+                      patch.object(rgt.subprocess, "run", side_effect=launch),
+                      contextlib.redirect_stdout(output)):
+                    self.assertEqual(rgt.run_suite(args, tmp), expected, output.getvalue())
+                if expected:
+                    self.assertIn("missing readback", output.getvalue())
+                    self.assertFalse(raw.exists())
+                else:
+                    self.assertEqual(raw.read_bytes(), pixels)
 
 
 class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
@@ -300,6 +335,14 @@ class Wave32LaneDumps(unittest.TestCase):
         self.assertEqual(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32 not available\n"),
                          "SKIP (the device can't run this shader at 32 lanes on request)")
         self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32\n"))
+        observed = "compute subgroup size: 32 (observed: all 20 invocations of a 20x1x1 group)\n"
+        self.assertIsNone(rgt.wave32_lane_skip("device: Apple M3 Max (subgroup 4..32)\n" + observed))
+        wrong = "compute subgroup size: 32 observed wrong in 4 of 64 invocations; invocation 60 has SubgroupSize 32\n"
+        self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 4..32)\n" + wrong))
+        ok, detail = rgt.judge_cs_dump(1, "device: X (subgroup 4..32)\n" + wrong, [1], wave64=False, partial=False,
+                                       emulated=False)
+        self.assertIs(ok, False)
+        self.assertIn("observed wrong", detail)
 
     def test_rule(self):
         self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),
@@ -308,6 +351,36 @@ class Wave32LaneDumps(unittest.TestCase):
                     "no device line\n"):
             with self.subTest(out=out):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
+
+
+class SubgroupPinSkip(unittest.TestCase):
+    """A device that cannot pin the wave size a shader was translated for skips, not fails. GCN3/GCN4 report
+    64..64, so cs_barrier_loop's wave32 fixture runs at 64 lanes and its words say nothing; check.py skips it
+    already (unpinned_subgroup_skip), the runner used to judge it and report a failure."""
+    MSG = "device: X (subgroup 64..64)\ncompute subgroup size: 32 not available\n" + dump(WANT)
+
+    def test_unpinned_size_is_a_skip(self):
+        self.assertEqual(rgt.subgroup_pin_skip(self.MSG, {"VKC_SUBGROUP_SIZE": "32"}),
+                         "SKIP (the device can't run this shader at 32 lanes on request)")
+
+    def test_no_pin_requested_is_judged(self):
+        for env in (None, {}, {"VKC_SGPRS": "0x1"}, {"VKH_SUBGROUP_SIZE": "64"}):
+            with self.subTest(env=env):
+                self.assertIsNone(rgt.subgroup_pin_skip(self.MSG, env))
+
+    def test_a_honoured_pin_is_judged(self):
+        out = "device: X (subgroup 32..64)\ncompute subgroup size: 32\n" + dump(WANT)
+        self.assertIsNone(rgt.subgroup_pin_skip(out, {"VKC_SUBGROUP_SIZE": "32"}))
+        self.assertIsNone(rgt.subgroup_pin_skip("device: X (subgroup 32..64)\n" + dump(WANT),
+                                                {"VKC_SUBGROUP_SIZE": "32"}))
+
+    def test_only_wave_width_fixtures_carry_the_rule(self):
+        self.assertIn("cs_barrier_loop", rgt.WAVE32_PIN_DUMPS)
+        # everything else is judged at the device's own width, as before, so a 64-only device keeps testing it
+        for name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_int_ext", "cs_barrier_divergent",
+                     "cs_barrier_early_end", "cs_w32_lds_u8_d16"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, rgt.WAVE32_PIN_DUMPS)
 
 
 class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
@@ -420,6 +493,52 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
                     with self.subTest(bary=bary, f16=f16), \
                             patch.object(check, "BARY_FALLBACK", bary), patch.object(check, "F16_HALVES", f16):
                         self.assertEqual(check.pixel_test("unused", tmp, name), want)
+
+
+class FmaFusedSuite(unittest.TestCase):
+    """run_gpu_tests.py runs cs_fma_fused under --filter, honoring LEONIDA_FMA=khr vs default glsl."""
+    RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
+
+    def run_fma(self, rc, msg, fma_env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="cs_fma_fused", build=tmp, llvm_mc="unused")
+
+            def fake_run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_compute_test":
+                    self.assertEqual((env or {}).get("VKC_SGPRS"), rgt.FMA_FUSED_ENV["VKC_SGPRS"])
+                    return rc, msg
+                (Path(tmp) / "spirv" / "cs_fma_fused.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            env_patch = {"LEONIDA_FMA": fma_env} if fma_env is not None else {}
+            with (patch.dict(rgt.os.environ, env_patch, clear=False),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=fake_run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                if fma_env is None:
+                    rgt.os.environ.pop("LEONIDA_FMA", None)
+                code = rgt.run_suite(args, tmp)
+            return code, output.getvalue()
+
+    def test_glsl_accepts_radv_split_and_khr_rejects_it(self):
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_env=None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_fma_fused", out)
+        self.assertIn("5/7 split", out)
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_env="khr")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL  cs_fma_fused", out)
+
+    def test_khr_fused_passes_and_exit_77_skips(self):
+        import check
+        rc, out = self.run_fma(0, dump(check.FMA_FUSED), fma_env="khr")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("8/8 fused exact (OpFmaKHR)", out)
+        rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
 if __name__ == "__main__":
