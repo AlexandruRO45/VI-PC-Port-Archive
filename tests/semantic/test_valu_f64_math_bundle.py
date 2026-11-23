@@ -476,5 +476,22 @@ class VMaxF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 4, oracle_max_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
         self.assertEqual(wave.get_f64(0, 4), f64_to_u64(100.0))
 
+class VMaxF64SimdIeeeTests(unittest.TestCase):
+    def test_max_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0xF0F0F0F0
+        for i in range(32):
+            wave.set_f64(i, 4, 0x7777777788888888)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_f64(i, 4, oracle_max_f64(f64_to_u64(i), f64_to_u64(15.0)))
+        for i in range(32):
+            if (0xF0F0F0F0 >> i) & 1:
+                self.assertEqual(wave.get_f64(i, 4), f64_to_u64(max(float(i), 15.0)))
+            else:
+                self.assertEqual(wave.get_f64(i, 4), 0x7777777788888888)
+
+    def test_max_infinities(self):
+        self.assertEqual(oracle_max_f64(F64_POS_INF, f64_to_u64(1000.0)), F64_POS_INF)
+
 if __name__ == "__main__":
     unittest.main()
