@@ -245,9 +245,18 @@ async function freecamFixture(requestPointerLock = async () => { throw new Error
         move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
         key: (code, modifiers) => windowEvents.get('keydown')({ code, ...modifiers }),
         blur: () => windowEvents.get('blur')(),
-        wheel: (deltaX, deltaY) => windowEvents.get('wheel')({ deltaX, deltaY }),
+        wheel: (deltaX, deltaY, ctrlKey = false) => windowEvents.get('wheel')({ deltaX, deltaY, ctrlKey }),
     };
 }
+
+test('browser zoom leaves freecam speed unchanged in both directions', async () => {
+    const cam = await freecamFixture();
+    const initial = cam.speed();
+    for (const deltaY of [-1, 1]) {
+        cam.wheel(0, deltaY, true);
+        assert.equal(cam.speed(), initial);
+    }
+});
 
 test('only vertical wheel movement adjusts freecam speed', async () => {
     const cam = await freecamFixture();
