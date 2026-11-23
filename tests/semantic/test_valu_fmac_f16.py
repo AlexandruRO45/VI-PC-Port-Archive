@@ -632,3 +632,34 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
 
         got_neg = oracle_fmac_f16(F16_POS_ZERO, 0xC000, F16_TWO, clamp=True)
         self.assertEqual(got_neg, F16_POS_ZERO)
+
+
+# ==============================================================================
+# SECTION 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754EdgeCases(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeros(self) -> None:
+        """Verify IEEE signed zeros in FMA."""
+        self.assertEqual(fma_f16(F16_POS_ZERO, F16_POS_ZERO, F16_POS_ZERO), F16_POS_ZERO)
+        self.assertEqual(fma_f16(F16_NEG_ZERO, F16_POS_ZERO, F16_NEG_ZERO), F16_NEG_ZERO)
+
+    def test_subnormal_accumulation(self) -> None:
+        """Verify subnormal preservation."""
+        sub = F16_MIN_SUBNORMAL
+        res = fma_f16(sub, F16_ONE, sub)
+        self.assertEqual(res, 0x0002)
+
+    def test_infinities_and_cancellation(self) -> None:
+        """Verify Inf * 2.0 + 1.0 = Inf, and (+Inf) + (-Inf) = NaN."""
+        self.assertEqual(fma_f16(F16_POS_INF, F16_TWO, F16_ONE), F16_POS_INF)
+        self.assertEqual(fma_f16(F16_NEG_INF, F16_TWO, F16_ONE), F16_NEG_INF)
+        self.assertEqual(fma_f16(F16_POS_INF, F16_ONE, F16_NEG_INF), F16_QNAN)
+
+    def test_nan_propagation(self) -> None:
+        """Verify NaN operand propagates quiet NaN."""
+        self.assertEqual(fma_f16(F16_QNAN, F16_ONE, F16_TWO), F16_QNAN)
+        self.assertEqual(fma_f16(F16_ONE, F16_QNAN, F16_TWO), F16_QNAN)
+        self.assertEqual(fma_f16(F16_ONE, F16_TWO, F16_QNAN), F16_QNAN)
