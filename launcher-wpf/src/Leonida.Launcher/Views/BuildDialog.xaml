@@ -10,6 +10,7 @@
     <!-- "What to build" choices: big radio cards. -->
     <Style x:Key="Choice" TargetType="RadioButton">
       <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Foreground" Value="{DynamicResource Heading}"/>
       <Setter Property="Margin" Value="0,0,10,10"/>
       <Setter Property="Template">
         <Setter.Value>
