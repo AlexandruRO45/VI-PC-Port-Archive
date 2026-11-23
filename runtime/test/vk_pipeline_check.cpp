@@ -1293,10 +1293,13 @@ int main(int argc, char** argv) {
         const char* phase;   // "module" or "pipeline"
     };
     std::map<std::thread::id, InFlight> inflight;
+    // Set (with mu held) once --module-timeout has written its report of the timed-out modules: from then until the
+    // exit no other snapshot may replace it, or make_game.py would skip a module that was still making progress.
+    bool report_final = false;
     // Publish a complete snapshot at the moments named in the header. This keeps the last full report if the
     // process dies while staging the next one. Called with mu held.
     auto write_inflight = [&] {
-        if (inflight_path.empty()) return;
+        if (inflight_path.empty() || report_final) return;
         std::string snapshot;
         for (const auto& [tid, job] : inflight) {
             snapshot += job.name;
@@ -1765,7 +1768,9 @@ int main(int argc, char** argv) {
                 timed_out += job.name + '\t' + job.phase + '\n';
             }
             if (timed_out.empty()) continue;
-            // Only the timed-out modules: the others were still making progress.
+            // Only the timed-out modules: the others were still making progress. Workers and the watchdog keep
+            // running until the exit below, so stop their snapshots first.
+            report_final = true;
             if (!inflight_path.empty())
                 if (const auto error = write_pipeline_cache_file(inflight_path, timed_out.data(), timed_out.size()))
                     std::fprintf(stderr, "in-flight snapshot save to %s failed: %s\n", inflight_path.c_str(),
