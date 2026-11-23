@@ -279,5 +279,23 @@ class TestSMulI32TranslatorIntegration(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 200)
 
+class TestSMulI32Validation(unittest.TestCase):
+    def test_commutativity(self) -> None:
+        rng = random.Random(12345)
+        for _ in range(50):
+            a = rng.randint(0, MASK32)
+            b = rng.randint(0, MASK32)
+            self.assertEqual(ref_s_mul_i32(a, b), ref_s_mul_i32(b, a))
+
+    def test_distributivity_modulo_2_32(self) -> None:
+        rng = random.Random(67890)
+        for _ in range(50):
+            a = rng.randint(0, 0xFFFF)
+            b = rng.randint(0, 0xFFFF)
+            c = rng.randint(0, 0xFFFF)
+            left = ref_s_mul_i32(a, (b + c) & MASK32)
+            right = (ref_s_mul_i32(a, b) + ref_s_mul_i32(a, c)) & MASK32
+            self.assertEqual(left, right)
+
 if __name__ == "__main__":
     unittest.main()
