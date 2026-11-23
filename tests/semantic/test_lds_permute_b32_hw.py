@@ -608,5 +608,74 @@ class TestDsPermuteBoundaryOffsetsAndWrapping(unittest.TestCase):
         self.assertEqual(target1, 0)
         self.assertEqual(target2, 0)
 
+
+def make_fssm(threads: int) -> bytes:
+    h = bytearray(0x148)
+    struct.pack_into("<4I", h, 0x138, 0x8088, threads, 1, 1)
+    return bytes(h)
+
+
+class TestDsPermuteNegativeControlsAndTranslator(unittest.TestCase):
+    """Part 8: Negative controls, syntax rejection, and live translator execution."""
+
+    def test_syntax_rejection_missing_operands(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_ds_permute_line("ds_permute_b32 v0, v1")
+
+    def test_syntax_rejection_invalid_opcode(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_ds_permute_line("v_permute_b32 v0, v1, v2")
+
+    def test_syntax_rejection_invalid_reg(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_ds_permute_line("ds_permute_b32 v0, r1, v2")
+
+    def test_live_translator_identity_wave32(self) -> None:
+        lines = [
+            "v_mov_b32_e32 v10, 99",
+            "v_lshlrev_b32_e32 v1, 2, v0",  # addr = 4 * lane -> lane maps to itself
+            "v_add_nc_u32_e32 v2, 100, v0", # data = 100 + lane
+            "ds_permute_b32 v10, v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_lshlrev_b32_e32 v21, 2, v0",
+            "buffer_store_dword v10, v21, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_perm_ident", lines, fssm=make_fssm(32))
+        vsharp = [0, 0, 0x1000, 0x31016FAC]
+        mem = si.run_workgroup(
+            spv, 32, 32,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=vsharp + [0] * 28,
+            memory={},
+        )
+        for i in range(32):
+            self.assertEqual(mem.get(4 * i), 100 + i)
+
+    def test_live_translator_rotate_by_one_with_offset(self) -> None:
+        lines = [
+            "v_mov_b32_e32 v10, 99",
+            "v_lshlrev_b32_e32 v1, 2, v0",  # addr = 4 * lane
+            "v_add_nc_u32_e32 v2, 200, v0", # data = 200 + lane
+            "ds_permute_b32 v10, v1, v2 offset:4", # offset:4 shifts target by +1
+            "s_waitcnt lgkmcnt(0)",
+            "v_lshlrev_b32_e32 v21, 2, v0",
+            "buffer_store_dword v10, v21, s[0:3], 0偏" if False else "buffer_store_dword v10, v21, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_perm_rot", lines, fssm=make_fssm(32))
+        vsharp = [0, 0, 0x1000, 0x31016FAC]
+        mem = si.run_workgroup(
+            spv, 32, 32,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=vsharp + [0] * 28,
+            memory={},
+        )
+        # Lane 0 receives lane 31 (data 231)
+        self.assertEqual(mem.get(0), 231)
+        for i in range(1, 32):
+            self.assertEqual(mem.get(4 * i), 200 + i - 1)
+
+
 if __name__ == "__main__":
     unittest.main()
