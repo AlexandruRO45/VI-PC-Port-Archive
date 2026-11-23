@@ -153,6 +153,18 @@ int IsIconic(void* hwnd) {
 void* GetForegroundWindow() { return nullptr; }
 void* GetProcessWindowStation() { return nullptr; }  // callers treat "unknown" as interactive
 void* MonitorFromWindow(void*, uint32_t) { return reinterpret_cast<void*>(1); }
+// One monitor, the main screen, its rect in pixels.
+int EnumDisplayMonitors(void*, const int32_t*, int(MSABI* proc)(void*, void*, int32_t*, int64_t), int64_t data) {
+    __block CGSize px;
+    on_main(^{
+        NSScreen* screen = [NSScreen mainScreen];
+        px = CGSizeMake(screen.frame.size.width * screen.backingScaleFactor,
+                        screen.frame.size.height * screen.backingScaleFactor);
+    });
+    int32_t rect[4] = {0, 0, static_cast<int32_t>(px.width), static_cast<int32_t>(px.height)};
+    call_guest(proc, reinterpret_cast<void*>(1), static_cast<void*>(nullptr), rect, data);
+    return 1;
+}
 int GetMonitorInfoW(void*, void*) { return 0; }  // no monitor details: the SDR white level falls back to its default
 
 }  // namespace
@@ -172,7 +184,7 @@ Exports user32_exports() {
             U(RegisterClassW), U(UnregisterClassW), U(AdjustWindowRect), U(AdjustWindowRectEx), U(GetWindowLongW),
             U(SetWindowPos), U(UpdateWindow), U(IsIconic), U(GetForegroundWindow), U(GetProcessWindowStation),
             U(MonitorFromWindow), U(GetMonitorInfoW), U(RegisterClassExA), U(CreateWindowExA), U(PeekMessageA),
-            U(DispatchMessageA), U(DefWindowProcA)};
+            U(DispatchMessageA), U(DefWindowProcA), U(EnumDisplayMonitors)};
 }
 
 }  // namespace host

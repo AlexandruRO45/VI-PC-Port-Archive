@@ -44,4 +44,4 @@ $CL /c guest/cpuid_probe.c /Fo"$OUT/cpuid_probe.obj"
 $CL /c guest/pool_probe.c /Fo"$OUT/pool_probe.obj"  # run it: exit code 0
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/pool_probe.obj" /out:"$OUT/pool_probe.exe"
 $CL /c guest/crt_probe.c /Fo"$OUT/crt_probe.obj"  # run it: exit code 0
-"$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/crt_probe.obj" /out:"$OUT/crt_probe.exe"
+"$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/crt_probe.obj" user32.lib /out:"$OUT/crt_probe.exe"

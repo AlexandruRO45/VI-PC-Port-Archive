@@ -10,6 +10,11 @@
 
 static int __cdecl by_value(const void* a, const void* b) { return *(const int*)a - *(const int*)b; }
 
+static BOOL CALLBACK count_monitor(HMONITOR m, HDC dc, LPRECT r, LPARAM out) {
+    *(LONG*)out = m && !dc ? r->right - r->left : -1;
+    return TRUE;
+}
+
 int main(void) {
     volatile float x = 0.5f;
     if (fabsf(sinf(x) - 0.4794255f) > 1e-6f || fabsf(powf(x, 2.0f) - 0.25f) > 1e-7f) return 1;
@@ -76,5 +81,7 @@ int main(void) {
     if (GetUserDefaultLocaleName(loc, LOCALE_NAME_MAX_LENGTH) != 6 || wcscmp(loc, L"en-US") ||
         LocaleNameToLCID(loc, 0) != 0x409 || GetUserDefaultLocaleName(loc, 3) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
         return 18;
+    LONG width = 0;
+    if (!EnumDisplayMonitors(NULL, NULL, count_monitor, (LPARAM)&width) || width <= 0) return 19;
     return 0;
 }
