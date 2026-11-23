@@ -10,8 +10,10 @@ disassembled, so this is a byte pattern: a stray `E8` or `E9` inside another ins
 thunk would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the
 slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
 
-With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. Output is counts
-and RVAs only, no instruction bytes (docs/runtime_imports.md, "The retail executable (RT-5)").
+With no `--import` and no `--dll`, ordinary and delay-loaded imports are listed. An import named `#N` is an ordinal
+import. Slots with the same `DLL!NAME` spelling contribute to one row. If both tables claim the same slot RVA, the
+ordinary import takes precedence. Output is counts and RVAs only, no instruction bytes (docs/runtime_imports.md,
+"The retail executable (RT-5)").
 """
 import argparse
 import json
@@ -31,11 +33,9 @@ REL_BRANCH = re.compile(b"[\xe8\xe9]")
 
 def import_slots(img):
     """{IAT slot RVA: 'dll!name'} for every import of a PE32+ image."""
-    rva, size = img.directory(1)
+    rva, size = img.directory(pe_inspect.DIR_IMPORT)
     slots = {}
-    if not rva or not size:
-        return slots
-    for i in range(size // 20):
+    for i in range(size // 20 if rva else 0):
         at = img.offset(rva + i * 20, 20)
         if at is None:
             break
@@ -48,6 +48,22 @@ def import_slots(img):
             continue
         for j, name in enumerate(img.thunk_names(lookup)):
             slots[iat_rva + j * 8] = f"{dll}!{name}"
+
+    for dll_rva, iat_rva, lookup, va_entries in img.import_descriptors(pe_inspect.DIR_DELAY_IMPORT, delay=True):
+        # Delay IAT slots hold resolver addresses before binding, so require a positive mapped INT
+        # and reject a legacy DLL-name VA that normalizes to RVA 0 (the DOS header).
+        if dll_rva <= 0 or iat_rva <= 0 or lookup <= 0:
+            continue
+        if img.offset(iat_rva, 8) is None or img.offset(lookup, 8) is None:
+            continue
+        dll = img.string_at(dll_rva)
+        if dll is None:
+            continue
+        for j, name in enumerate(img.thunk_names(lookup, va_entries=va_entries)):
+            slot = iat_rva + j * 8
+            if img.offset(slot, 8) is None:
+                break
+            slots.setdefault(slot, f"{dll}!{name}")
     return slots
 
 
