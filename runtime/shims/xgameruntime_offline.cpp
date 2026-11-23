@@ -1,5 +1,5 @@
-// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and
-// XLauncherImpl, offline: small classes a title calls early.
+// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl,
+// XLauncherImpl, XGameInviteImpl, XGameProtocolImpl and XGameActivationImpl, offline: small classes a title calls early.
 //
 // Each XGameEvent*, XGameUi* and XGameStreaming* function in xgameruntime.lib asks QueryApiImpl for its class and
 // calls one slot with its own arguments after `this`. The class and interface ids and the method order are
@@ -22,6 +22,11 @@
 //                       speech calls refuse the handle they were never given (E_INVALIDARG), speech-to-text display
 //                       calls fail (E_FAIL).
 //   XLauncherImpl       XLaunchUri and the display timeout deferral calls fail (E_FAIL); nothing is launched.
+//   XGameInviteImpl     event and pending-event registrations hand out tokens that never fire, unregistering is never
+//                       pending (true), and XGameInviteAcceptPendingInvite fails offline (E_FAIL).
+//   XGameProtocolImpl   protocol activation registration hands out a token that never fires; unregistering returns true.
+//   XGameActivationImpl activation event registration hands out a token that never fires, unregistering returns true,
+//                       and XGameActivationAcceptPendingInvite fails offline (E_FAIL).
 //
 // Slots whose signature the public pages don't give answer with a value that is safe whichever way the caller reads
 // it: see `client_not_connected` (XGameStreaming) and `offline_failure`.
@@ -456,17 +461,24 @@ HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* dev
 // 4: HRESULT XUserRegisterForDeviceAssociationChanged(XTaskQueueHandle queue, void* context,
 //        XUserDeviceAssociationChangedCallback* callback, XTaskQueueRegistrationToken* token)
 // 7: HRESULT XUserRegisterForDefaultAudioEndpointUtf16Changed(XTaskQueueHandle, void*, callback, token*)
-// Associations and endpoints never change offline: a token, no callback.
-HRESULT STDMETHODCALLTYPE device_register(void*, XTaskQueueHandle, void*, void* callback,
-                                          XTaskQueueRegistrationToken* token) {
+// Associations, endpoints, invites, protocols and activations never fire offline: a token, no callback.
+HRESULT STDMETHODCALLTYPE offline_register(void*, XTaskQueueHandle, void*, void* callback,
+                                           XTaskQueueRegistrationToken* token) {
     if (!callback || !token) return E_INVALIDARG;
     std::lock_guard<std::mutex> lock(g_streaming_mutex);
     token->token = g_next_token++;
     return S_OK;
 }
 
-// 5, 8: bool ...Unregister...(XTaskQueueRegistrationToken token, bool wait): never pending.
-bool STDMETHODCALLTYPE device_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
+// 5, 8 (and invite/protocol/activation Unregister): bool ...Unregister...(XTaskQueueRegistrationToken token, bool wait):
+// never pending.
+bool STDMETHODCALLTYPE offline_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
+
+template <const char* Class, int Slot>
+HRESULT STDMETHODCALLTYPE accept_pending_invite(void* self, const char* invite_uri) {
+    if (!invite_uri) return E_INVALIDARG;
+    return offline_failure<Class, Slot>(self);
+}
 
 // 6: HRESULT XUserGetDefaultAudioEndpointUtf16(XUserLocalId user, XUserDefaultAudioEndpointKind kind,
 //        size_t endpointIdUtf16Count, wchar_t* endpointIdUtf16, size_t* endpointIdUtf16Used)
@@ -512,11 +524,11 @@ HRESULT STDMETHODCALLTYPE device_query_interface(void*, REFIID iid, void** out);
 const void* const kUserDeviceVtable[] = {
     FN(device_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
     FN(device_find_user),                   // 3  XUserFindForDevice
-    FN(device_register),                    // 4  XUserRegisterForDeviceAssociationChanged
-    FN(device_unregister),                  // 5  XUserUnregisterForDeviceAssociationChanged
+    FN(offline_register),                   // 4  XUserRegisterForDeviceAssociationChanged
+    FN(offline_unregister),                 // 5  XUserUnregisterForDeviceAssociationChanged
     FN(device_audio_endpoint),              // 6  XUserGetDefaultAudioEndpointUtf16
-    FN(device_register),                    // 7  XUserRegisterForDefaultAudioEndpointUtf16Changed
-    FN(device_unregister),                  // 8  XUserUnregisterForDefaultAudioEndpointUtf16Changed
+    FN(offline_register),                   // 7  XUserRegisterForDefaultAudioEndpointUtf16Changed
+    FN(offline_unregister),                 // 8  XUserUnregisterForDefaultAudioEndpointUtf16Changed
     FN(device_find_controller_async),       // 9  XUserFindControllerForUserWithUiAsync
     FN(device_find_controller_result),      // 10 XUserFindControllerForUserWithUiResult
 };
@@ -643,6 +655,74 @@ HRESULT STDMETHODCALLTYPE launcher_query_interface(void*, REFIID iid, void** out
     return answer(&g_launcher_object, &kLauncherClass, &kLauncherClass + 1, iid, out);
 }
 
+// ======================= XGameInviteImpl =======================
+
+constexpr char kGameInviteName[] = "XGameInviteImpl";
+constexpr GUID kGameInviteClass = {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
+const GUID kGameInviteInterfaces[] = {
+    kGameInviteClass,   // IXGameInviteImpl: the class id
+    {0x014d1cc3, 0xbcfe, 0x41ff, {0xb2, 0xf0, 0xe1, 0xef, 0x07, 0x15, 0x58, 0x28}},   // IXGameInviteImpl2
+};
+
+HRESULT STDMETHODCALLTYPE game_invite_query_interface(void*, REFIID iid, void** out);
+const void* const kGameInviteVtable[] = {
+    FN(game_invite_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(offline_register),                                  // 3 XGameInviteRegisterForEvent
+    FN(offline_unregister),                                // 4 XGameInviteUnregisterForEvent
+    FN(offline_register),                                  // 5 XGameInviteRegisterForPendingEvent (2)
+    FN(offline_unregister),                                // 6 XGameInviteUnregisterForPendingEvent (2)
+    FN((accept_pending_invite<kGameInviteName, 7>)),       // 7 XGameInviteAcceptPendingInvite (2)
+};
+static_assert(std::size(kGameInviteVtable) == 8, "IUnknown + IXGameInviteImpl2's 5 methods");
+ClassObject g_game_invite_object{kGameInviteVtable};
+HRESULT STDMETHODCALLTYPE game_invite_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_game_invite_object, std::begin(kGameInviteInterfaces), std::end(kGameInviteInterfaces), iid, out);
+}
+
+// ======================= XGameProtocolImpl =======================
+
+constexpr GUID kGameProtocolClass = {0x95fd18d2, 0x74dd, 0x4d7c, {0xaa, 0x1b, 0x0b, 0x51, 0x82, 0x76, 0x65, 0xd6}};
+const GUID kGameProtocolInterfaces[] = {
+    kGameProtocolClass,
+    {0x026b010c, 0x06c3, 0x4cdd, {0xbb, 0xcb, 0x43, 0xf2, 0x29, 0xdb, 0x1c, 0xff}},   // IXGameProtocolImpl
+};
+
+HRESULT STDMETHODCALLTYPE game_protocol_query_interface(void*, REFIID iid, void** out);
+const void* const kGameProtocolVtable[] = {
+    FN(game_protocol_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(offline_register),     // 3 XGameProtocolRegisterForActivation
+    FN(offline_unregister),   // 4 XGameProtocolUnregisterForActivation
+};
+static_assert(std::size(kGameProtocolVtable) == 5, "IUnknown + IXGameProtocolImpl's 2 methods");
+ClassObject g_game_protocol_object{kGameProtocolVtable};
+HRESULT STDMETHODCALLTYPE game_protocol_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_game_protocol_object, std::begin(kGameProtocolInterfaces), std::end(kGameProtocolInterfaces),
+                  iid, out);
+}
+
+// ======================= XGameActivationImpl =======================
+
+constexpr char kGameActivationName[] = "XGameActivationImpl";
+constexpr GUID kGameActivationClass = {0x7f0fe8b8, 0xe075, 0x49ab, {0x9a, 0xa7, 0xa1, 0xe0, 0x65, 0x48, 0x9a, 0x9e}};
+const GUID kGameActivationInterfaces[] = {
+    kGameActivationClass,
+    {0x2e4f76fe, 0x0fc7, 0x461e, {0xab, 0x4d, 0xa4, 0x49, 0x94, 0x34, 0xc3, 0xcf}},   // IXGameActivationImpl
+};
+
+HRESULT STDMETHODCALLTYPE game_activation_query_interface(void*, REFIID iid, void** out);
+const void* const kGameActivationVtable[] = {
+    FN(game_activation_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(offline_register),                                      // 3 XGameActivationRegisterForEvent
+    FN(offline_unregister),                                    // 4 XGameActivationUnregisterForEvent
+    FN((accept_pending_invite<kGameActivationName, 5>)),       // 5 XGameActivationAcceptPendingInvite
+};
+static_assert(std::size(kGameActivationVtable) == 6, "IUnknown + IXGameActivationImpl's 3 methods");
+ClassObject g_game_activation_object{kGameActivationVtable};
+HRESULT STDMETHODCALLTYPE game_activation_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_game_activation_object, std::begin(kGameActivationInterfaces),
+                  std::end(kGameActivationInterfaces), iid, out);
+}
+
 #undef FN
 
 }  // namespace
@@ -677,6 +757,18 @@ bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void*
     }
     if (class_id == kLauncherClass) {
         *hr = launcher_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kGameInviteClass) {
+        *hr = game_invite_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kGameProtocolClass) {
+        *hr = game_protocol_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kGameActivationClass) {
+        *hr = game_activation_query_interface(nullptr, interface_id, out);
         return true;
     }
     return false;

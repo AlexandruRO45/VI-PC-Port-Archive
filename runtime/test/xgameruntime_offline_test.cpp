@@ -1,7 +1,7 @@
-// XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and XLauncherImpl
-// through QueryApiImpl, called the way xgameruntime.lib's thunks
-// call them: QueryApiImpl with the class id (or an interface id), one vtable slot with `this` first. Slots follow
-// xgameruntime-docs' layout; arguments follow the public GDK reference. No game data; nothing online.
+// XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl, XLauncherImpl,
+// XGameInviteImpl, XGameProtocolImpl and XGameActivationImpl through QueryApiImpl, called the way xgameruntime.lib's
+// thunks call them: QueryApiImpl with the class id (or an interface id), one vtable slot with `this` first. Slots
+// follow xgameruntime-docs' layout; arguments follow the public GDK reference. No game data; nothing online.
 #include <windows.h>
 
 #include <cstdint>
@@ -72,6 +72,12 @@ constexpr GUID kUserClass = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb
 constexpr GUID kAccessibilityClass = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
 constexpr GUID kAccessibility2 = {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
 constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+constexpr GUID kGameInviteClass = {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
+constexpr GUID kGameInvite2 = {0x014d1cc3, 0xbcfe, 0x41ff, {0xb2, 0xf0, 0xe1, 0xef, 0x07, 0x15, 0x58, 0x28}};
+constexpr GUID kGameProtocolClass = {0x95fd18d2, 0x74dd, 0x4d7c, {0xaa, 0x1b, 0x0b, 0x51, 0x82, 0x76, 0x65, 0xd6}};
+constexpr GUID kGameProtocol = {0x026b010c, 0x06c3, 0x4cdd, {0xbb, 0xcb, 0x43, 0xf2, 0x29, 0xdb, 0x1c, 0xff}};
+constexpr GUID kGameActivationClass = {0x7f0fe8b8, 0xe075, 0x49ab, {0x9a, 0xa7, 0xa1, 0xe0, 0x65, 0x48, 0x9a, 0x9e}};
+constexpr GUID kGameActivation = {0x2e4f76fe, 0x0fc7, 0x461e, {0xab, 0x4d, 0xa4, 0x49, 0x94, 0x34, 0xc3, 0xcf}};
 
 using EnumVoices = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
 using SpeechCreate = HRESULT(STDMETHODCALLTYPE*)(void*, void**);
@@ -83,6 +89,7 @@ using HighContrast = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
 using SetEnabled = HRESULT(STDMETHODCALLTYPE*)(void*, bool);
 using LaunchUri = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const char*);
 using AcquireDeferral = HRESULT(STDMETHODCALLTYPE*)(void*, void**);
+using AcceptInvite = HRESULT(STDMETHODCALLTYPE*)(void*, const char*);
 
 void* user_object(HRESULT(WINAPI* query)(const GUID*, REFIID, void**)) {
     void* user = nullptr;
@@ -96,7 +103,8 @@ void CALLBACK on_state(void*, uint64_t, uint32_t) {}
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("xgameruntime_offline_test: XGameEvent, XGameUi, XGameStreaming, XDisplay, XUserDevice\n");
+    std::printf("xgameruntime_offline_test: XGameEvent, XGameUi, XGameStreaming, XDisplay, XUserDevice, "
+                "XAccessibility, XLauncher, XGameInvite, XGameProtocol, XGameActivation\n");
     auto query = reinterpret_cast<Query>(rt::shims::find("xgameruntime.dll", "QueryApiImpl"));
     check(query != nullptr, "QueryApiImpl is registered");
     if (!query) return 1;
@@ -246,6 +254,83 @@ int main() {
     void* none = reinterpret_cast<void*>(1);
     check(query(&kLauncherClass, other, &none) == E_NOINTERFACE && none == nullptr,
           "XLauncherImpl refuses an interface id it doesn't implement");
+
+    // ---- XGameInvite ----
+    void* invite = nullptr;
+    void* invite2 = nullptr;
+    check(query(&kGameInviteClass, kGameInviteClass, &invite) == S_OK && invite &&
+              query(&kGameInviteClass, kGameInvite2, &invite2) == S_OK && invite2 == invite,
+          "XGameInviteImpl for its class id and IXGameInviteImpl2");
+    if (!invite) return 1;
+    none = reinterpret_cast<void*>(1);
+    check(query(&kGameInviteClass, other, &none) == E_NOINTERFACE && none == nullptr,
+          "XGameInviteImpl refuses an interface id it doesn't implement");
+    XTaskQueueRegistrationToken invite_token{};
+    XTaskQueueRegistrationToken pending_token{};
+    check(at<Register>(invite, 3)(invite, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &invite_token) ==
+                  S_OK &&
+              invite_token.token != 0 && at<Unregister>(invite, 4)(invite, invite_token, false),
+          "XGameInvite event registration hands out a token and unregisters immediately");
+    check(at<Register>(invite, 3)(invite, nullptr, nullptr, nullptr, &invite_token) == E_INVALIDARG &&
+              at<Register>(invite, 3)(invite, nullptr, nullptr, reinterpret_cast<void*>(&on_state), nullptr) ==
+                  E_INVALIDARG,
+          "XGameInviteRegisterForEvent rejects null callback or token");
+    check(at<Register>(invite, 5)(invite, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &pending_token) ==
+                  S_OK &&
+              pending_token.token != 0 && pending_token.token != invite_token.token &&
+              at<Unregister>(invite, 6)(invite, pending_token, true),
+          "XGameInvite pending-event registration hands out a distinct token and unregisters");
+    check(at<Register>(invite, 5)(invite, nullptr, nullptr, nullptr, &pending_token) == E_INVALIDARG &&
+              at<Register>(invite, 5)(invite, nullptr, nullptr, reinterpret_cast<void*>(&on_state), nullptr) ==
+                  E_INVALIDARG,
+          "XGameInviteRegisterForPendingEvent rejects null callback or token");
+    check(at<AcceptInvite>(invite, 7)(invite, nullptr) == E_INVALIDARG &&
+              at<AcceptInvite>(invite, 7)(invite, "ms-xbl-invite://example") == E_FAIL,
+          "XGameInviteAcceptPendingInvite rejects null uri and fails offline");
+
+    // ---- XGameProtocol ----
+    void* protocol = nullptr;
+    void* protocol_iface = nullptr;
+    check(query(&kGameProtocolClass, kGameProtocolClass, &protocol) == S_OK && protocol &&
+              query(&kGameProtocolClass, kGameProtocol, &protocol_iface) == S_OK && protocol_iface == protocol,
+          "XGameProtocolImpl for its class id and IXGameProtocolImpl");
+    if (!protocol) return 1;
+    none = reinterpret_cast<void*>(1);
+    check(query(&kGameProtocolClass, other, &none) == E_NOINTERFACE && none == nullptr,
+          "XGameProtocolImpl refuses an interface id it doesn't implement");
+    XTaskQueueRegistrationToken protocol_token{};
+    check(at<Register>(protocol, 3)(protocol, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &protocol_token) ==
+                  S_OK &&
+              protocol_token.token != 0 && at<Unregister>(protocol, 4)(protocol, protocol_token, false),
+          "XGameProtocol activation registration hands out a token and unregisters immediately");
+    check(at<Register>(protocol, 3)(protocol, nullptr, nullptr, nullptr, &protocol_token) == E_INVALIDARG &&
+              at<Register>(protocol, 3)(protocol, nullptr, nullptr, reinterpret_cast<void*>(&on_state), nullptr) ==
+                  E_INVALIDARG,
+          "XGameProtocolRegisterForActivation rejects null callback or token");
+
+    // ---- XGameActivation ----
+    void* activation = nullptr;
+    void* activation_iface = nullptr;
+    check(query(&kGameActivationClass, kGameActivationClass, &activation) == S_OK && activation &&
+              query(&kGameActivationClass, kGameActivation, &activation_iface) == S_OK &&
+              activation_iface == activation,
+          "XGameActivationImpl for its class id and IXGameActivationImpl");
+    if (!activation) return 1;
+    none = reinterpret_cast<void*>(1);
+    check(query(&kGameActivationClass, other, &none) == E_NOINTERFACE && none == nullptr,
+          "XGameActivationImpl refuses an interface id it doesn't implement");
+    XTaskQueueRegistrationToken activation_token{};
+    check(at<Register>(activation, 3)(activation, nullptr, nullptr, reinterpret_cast<void*>(&on_state),
+                                      &activation_token) == S_OK &&
+              activation_token.token != 0 && at<Unregister>(activation, 4)(activation, activation_token, true),
+          "XGameActivation event registration hands out a token and unregisters immediately");
+    check(at<Register>(activation, 3)(activation, nullptr, nullptr, nullptr, &activation_token) == E_INVALIDARG &&
+              at<Register>(activation, 3)(activation, nullptr, nullptr, reinterpret_cast<void*>(&on_state), nullptr) ==
+                  E_INVALIDARG,
+          "XGameActivationRegisterForEvent rejects null callback or token");
+    check(at<AcceptInvite>(activation, 5)(activation, nullptr) == E_INVALIDARG &&
+              at<AcceptInvite>(activation, 5)(activation, "ms-xbl-invite://example") == E_FAIL,
+          "XGameActivationAcceptPendingInvite rejects null uri and fails offline");
 
     std::printf("xgameruntime_offline_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

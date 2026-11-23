@@ -185,11 +185,11 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
     if (f) {
         using Available = bool(STDMETHODCALLTYPE*)(void*, uint32_t);  // bool, per Microsoft's reference page
         auto available = method<Available>(f, 3);
-        // XGameRuntimeFeature values: XAccessibility 0, XLauncher 9, XSpeechSynthesizer 13, XAsync 2, XAsyncProvider 3, XDisplay 4, XGame 5, XGameSave 7, XGameUI 8,
+        // XGameRuntimeFeature values: XAccessibility 0, XLauncher 9, XSpeechSynthesizer 13, XAsync 2, XAsyncProvider 3, XDisplay 4, XGame 5, XGameInvite 6, XGameSave 7, XGameUI 8,
         // XNetworking 10, XPackage 11, XPersistentLocalStorage 12, XStore 14, XSystem 15, XTaskQueue 16, XThread 17,
         // XUser 18, XError 19, XGameEvent 20, XGameStreaming 21.
         bool served = true;
-        for (uint32_t v : {0u, 2u, 3u, 5u, 7u, 9u, 13u, 8u, 10u, 11u, 12u, 14u, 15u, 16u, 17u, 18u, 19u, 20u, 21u})
+        for (uint32_t v : {0u, 2u, 3u, 5u, 6u, 7u, 9u, 13u, 8u, 10u, 11u, 12u, 14u, 15u, 16u, 17u, 18u, 19u, 20u, 21u})
             served = served && available(f, v);
         check(served, "slot 3 (XGameRuntimeIsFeatureAvailable): true for the features whose classes are served, "
                       "XPersistentLocalStorage among them");
