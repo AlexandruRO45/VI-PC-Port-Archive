@@ -278,7 +278,9 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(line, "exp mrt2 v0, v0, v1, v1 compr")
 
     def test_happy_run_contract(self):
-        self.assertIn(export_diff.main(["--programs", "5", "--seed", "1"]), (0, 1))
+        # The generator is deterministic, so seed 1 programs 0-4 must fully match the model: exit 1 is a
+        # mismatch, and accepting it here would let one through this very suite.
+        self.assertEqual(export_diff.main(["--programs", "5", "--seed", "1"]), 0)
 
     def test_zero_programs_is_a_usage_error(self):
         import contextlib
