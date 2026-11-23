@@ -16,6 +16,8 @@ struct Pending {
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
+    /// included in `QUEUED` (flipped back to false once in `complete`)
+    counted: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -28,6 +30,20 @@ struct Pending {
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
+fn finish_pending(p: &Pending, real: usize, queued: &AtomicUsize) -> bool {
+    let mut done = p.done.lock().unwrap();
+    let orphan = p.orphan.load(Ordering::Acquire);
+    if !orphan {
+        p.real.store(real, Ordering::Release);
+    }
+    *done = true;
+    if p.counted.swap(false, Ordering::AcqRel) {
+        queued.fetch_sub(1, Ordering::Relaxed);
+    }
+    p.cv.notify_all();
+    orphan
+}
+
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
     if real == 0 {
@@ -35,23 +51,16 @@ fn complete(p: &Pending, real: usize) {
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
     }
-    let orphan = {
-        let mut done = p.done.lock().unwrap();
-        let orphan = p.orphan.load(Ordering::Acquire);
-        if !orphan {
-            p.real.store(real, Ordering::Release);
-        }
-        *done = true;
-        p.cv.notify_all();
-        orphan
-    };
-    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    let orphan = finish_pending(p, real, &QUEUED);
+    // outside `done`: the Release override takes PENDING
     if orphan {
         release(real);
     }
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+/// Pipelines currently queued for or building on the background workers (excludes dormant lazy stand-ins).
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
 
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
@@ -113,7 +122,8 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
-        sent: std::sync::atomic::AtomicBool::new(send),
+        sent: std::sync::atomic::AtomicBool::new(false),
+        counted: std::sync::atomic::AtomicBool::new(false),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
@@ -126,6 +136,27 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
+        enqueue(p);
+    }
+}
+
+/// Mark `p` sent and increment `queued` once; returns `true` iff `p` should be sent to workers
+/// (returns `false` if already sent or already completed inline by `resolve_wait`).
+fn mark_enqueued(p: &Pending, queued: &AtomicUsize) -> bool {
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        let done = p.done.lock().unwrap();
+        if !*done {
+            p.counted.store(true, Ordering::Release);
+            queued.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    }
+    false
+}
+
+/// Send a pipeline to the workers once (skipped if already completed inline by `resolve_wait`).
+fn enqueue(p: Arc<Pending>) {
+    if mark_enqueued(&p, &QUEUED) {
         let _ = queue().lock().unwrap().send(p);
     }
 }
@@ -140,9 +171,7 @@ pub fn resolve(pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
-            }
+            enqueue(p);
             pso
         }
         r => r,
@@ -196,8 +225,49 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
-/// (built in the background, failed, still building)
+/// (built in the background, failed, queued or building on workers)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
-    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), QUEUED.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_pending(compute: bool) -> Pending {
+        Pending {
+            job: Mutex::new(Some(Box::new(|| 0))),
+            sent: std::sync::atomic::AtomicBool::new(false),
+            counted: std::sync::atomic::AtomicBool::new(false),
+            real: AtomicUsize::new(0),
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+            compute,
+            orphan: Default::default(),
+        }
+    }
+
+    #[test]
+    fn dormant_lazy_pipelines_are_not_counted_as_queued() {
+        // Isolated local counter: immune to parallel tests touching the global `QUEUED`.
+        let queued = AtomicUsize::new(0);
+
+        let dormant = new_pending(false);
+        assert_eq!(queued.load(Ordering::Relaxed), 0, "unrequested lazy pipeline must not inflate queued count");
+
+        // Enqueuing once increments queued; a duplicate enqueue is a no-op; completion drains it.
+        assert!(mark_enqueued(&dormant, &queued));
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        assert!(!mark_enqueued(&dormant, &queued));
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        assert!(!finish_pending(&dormant, 0, &queued));
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+
+        // Inline completion (resolve_wait) followed by resolve/enqueue must never increment or leak queued.
+        let inline = new_pending(true);
+        assert!(!finish_pending(&inline, 0, &queued));
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+        assert!(!mark_enqueued(&inline, &queued));
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+    }
 }

@@ -344,10 +344,10 @@ fn window_name() -> String {
 /// the XCL window's timer for `show_compiling`
 const COMPILE_TIMER: usize = 0x5C0;
 
-/// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
+/// While XCL compiles shaders (DXC or the GPU driver's pipeline compiler – the title draws
 /// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
 /// thousands recompile), the window's title says so:
-/// "XCL – <game> | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
+/// "XCL – <game> | compiling shaders: N dxc, M done[, D driver (C done)][, Q pipelines queued][, F failed]".
 /// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
 /// then the plain title comes back.
 unsafe fn show_compiling(hwnd: HWND) {
@@ -355,7 +355,8 @@ unsafe fn show_compiling(hwnd: HWND) {
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
     let (_, failed, queued) = super::pso_async::counts();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
-    let active = running > 0 || queued > 0;
+    let (driver_running, driver_done) = super::real::driver_compile_counts();
+    let active = running > 0 || driver_running > 0 || queued > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();
         if active {
@@ -365,9 +366,14 @@ unsafe fn show_compiling(hwnd: HWND) {
     };
     let title = window_name();
     let text = if recent {
+        let driver = if driver_running > 0 || driver_done > 0 {
+            format!(", {driver_running} driver ({driver_done} done)")
+        } else {
+            String::new()
+        };
         let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("XCL – {title} | compiling shaders: {running} running, {done} done{queued}{failed}")
+        format!("XCL – {title} | compiling shaders: {running} dxc, {done} done{driver}{queued}{failed}")
     } else {
         format!("XCL – {title}")
     };

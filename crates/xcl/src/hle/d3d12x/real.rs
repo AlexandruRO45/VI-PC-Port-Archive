@@ -3285,10 +3285,40 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// A compute pipeline with a console CS: `None` = not a console shader, `Some(Err)` = console
 /// shader the recompiler could not take, `Some(Ok(hr))` = translated pipeline created (or the
 /// driver's verdict on it).
-/// DXIL size from which a compute pipeline's driver compile goes to the background
-const BIG_DRIVER_COMPILE: usize = 256 << 10;
+/// DXIL size from which a pipeline's driver compile is serialized (`BIG_COMPILES`) and
+/// deferred to the background (`XCL_BIG_PSO_KB`, default 256 KiB).
+fn big_driver_compile_bytes() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("XCL_BIG_PSO_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256)
+            .saturating_mul(1024)
+    })
+}
 
-/// A counting semaphore: background driver compiles of big programs at once.
+/// Maximum concurrent translated driver `Create*PipelineState` calls
+/// (`XCL_DRIVER_COMPILE_THREADS`, default 2 on 32-lane-only GPUs such as NVIDIA to avoid
+/// `nvgpucomp64.dll` process-heap lock convoys and commit exhaustion, 4 on 64-lane GPUs).
+fn driver_compile_threads(wave32_only: bool) -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let default = if wave32_only { 2 } else { 4 };
+        let n = std::env::var("XCL_DRIVER_COMPILE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+            .clamp(1, 64);
+        crate::xlog_info!(
+            "D3D12.X: driver PSO compile concurrency = {n} (big >= {} KiB serialized to 1)",
+            big_driver_compile_bytes() >> 10
+        );
+        n
+    })
+}
+
+/// A counting semaphore bounding concurrent driver pipeline compiles.
 struct Slots {
     n: Mutex<usize>,
     cv: std::sync::Condvar,
@@ -3315,19 +3345,131 @@ impl Drop for SlotGuard {
     }
 }
 
+/// At most one big (`>= big_driver_compile_bytes()`) translated pipeline in the driver compiler
+/// at a time. Always acquired BEFORE `driver_compiles()` so waiting big shaders do not occupy
+/// slots needed by small shaders.
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
 
-/// Before a big driver compile in the background: until 3 GB of commit are free (each takes
-/// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
+fn driver_compiles(wave32_only: bool) -> &'static Slots {
+    static S: OnceLock<Slots> = OnceLock::new();
+    S.get_or_init(|| Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: driver_compile_threads(wave32_only) })
+}
+
+/// Translated driver `Create*PipelineState` compiles: [running now, finished].
+static DRIVER_COMPILING: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+
+/// (driver PSO compiles running now, finished so far) – surfaced in the XCL window title.
+pub fn driver_compile_counts() -> (usize, usize) {
+    (DRIVER_COMPILING[0].load(Ordering::Relaxed), DRIVER_COMPILING[1].load(Ordering::Relaxed))
+}
+
+fn trace_pso_time() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TRACE_PSO_TIME").is_ok_and(|v| v != "0"))
+}
+
+/// Before a big driver compile in the background: wait up to 30 s for 3 GB of free commit
+/// (each big compile can take ~1.5 GB in the driver). Bounded so a 32 GB machine running
+/// with 1-2 GB free does not livelock while holding `BIG_COMPILES`.
 fn wait_for_commit() {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let start = std::time::Instant::now();
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 3 << 30 {
             return;
         }
+        if start.elapsed().as_secs() >= 30 {
+            static WARNED: AtomicU64 = AtomicU64::new(0);
+            if WARNED.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!(
+                    "D3D12.X: low commit ({} MB free) before big driver PSO compile – waited 30s, proceeding",
+                    m.ullAvailPageFile >> 20
+                );
+            }
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Whether the current thread is a background `xcl-pso-N` worker (not a title thread and not
+/// an urgent compile thread such as `xcl-pso-urgent`).
+fn is_background_pso_worker_name(name: Option<&str>) -> bool {
+    name.is_some_and(|n| n.starts_with("xcl-pso-") && n != "xcl-pso-urgent")
+}
+
+/// Bounds background (`xcl-pso-N`) driver PSO compilation concurrency, leaves title / urgent
+/// threads exempt so blocking binds never queue behind background work, tracks in-flight count
+/// for the window title, and logs slow compiles or admission waits (>= 2 s, or all when
+/// `XCL_TRACE_PSO_TIME=1`).
+struct DriverCompileGuard {
+    // drop order: release `driver` slot before `big` slot
+    _driver: Option<SlotGuard>,
+    _big: Option<SlotGuard>,
+    waited: std::time::Duration,
+    started: std::time::Instant,
+    dxil_bytes: usize,
+    kind: &'static str,
+    background: bool,
+    hr: Option<HRESULT>,
+}
+
+impl DriverCompileGuard {
+    fn enter(device: *mut c_void, dxil_bytes: usize, kind: &'static str) -> Self {
+        let current = std::thread::current();
+        let background = is_background_pso_worker_name(current.name());
+        let w32 = wave32_only(device);
+        let big = dxil_bytes >= big_driver_compile_bytes();
+        let wait_started = std::time::Instant::now();
+        // Only background `xcl-pso-N` workers contend on the background semaphores and
+        // `wait_for_commit()`. Title threads and `xcl-pso-urgent` bypass both so a blocking
+        // bind never queues behind unrelated background compiles or a 30 s commit wait.
+        // Lock order for background workers: BIG_COMPILES -> wait_for_commit -> driver_compiles.
+        // Small background shaders never acquire BIG_COMPILES, so they keep a free lane while
+        // a big shader compiles whenever driver_compile_threads >= 2.
+        let (_big, _driver) = if background {
+            let big_slot = big.then(|| {
+                let slot = BIG_COMPILES.acquire();
+                wait_for_commit();
+                slot
+            });
+            let driver_slot = driver_compiles(w32).acquire();
+            (big_slot, Some(driver_slot))
+        } else {
+            (None, None)
+        };
+        let waited = wait_started.elapsed();
+        DRIVER_COMPILING[0].fetch_add(1, Ordering::Relaxed);
+        Self { _driver, _big, waited, started: std::time::Instant::now(), dxil_bytes, kind, background, hr: None }
+    }
+
+    fn finish(mut self, hr: HRESULT) {
+        self.hr = Some(hr);
+    }
+}
+
+impl Drop for DriverCompileGuard {
+    fn drop(&mut self) {
+        let in_flight = DRIVER_COMPILING[0].fetch_sub(1, Ordering::Relaxed);
+        DRIVER_COMPILING[1].fetch_add(1, Ordering::Relaxed);
+        let elapsed = self.started.elapsed();
+        let slow = elapsed >= std::time::Duration::from_secs(2) || self.waited >= std::time::Duration::from_secs(2);
+        if slow || trace_pso_time() {
+            static SLOW_LOGS: AtomicU64 = AtomicU64::new(0);
+            if trace_pso_time() || SLOW_LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
+                let hr = self.hr.unwrap_or(0);
+                let lane = if self.background { "bg" } else { "urgent" };
+                crate::xlog_info!(
+                    "D3D12.X: driver PSO compile ({}, {} KB DXIL, {lane}): {:.2}s (wait {:.2}s, hr={hr:#x}, concurrent={in_flight})",
+                    self.kind,
+                    self.dxil_bytes >> 10,
+                    elapsed.as_secs_f64(),
+                    self.waited.as_secs_f64()
+                );
+            }
+        }
     }
 }
 
@@ -3356,7 +3498,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
     // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
-    let big = dxil.len() >= BIG_DRIVER_COMPILE;
+    let big = dxil.len() >= big_driver_compile_bytes();
     if big && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
@@ -3366,13 +3508,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
-        wait_for_commit();
-        slot
-    });
+    let guard = DriverCompileGuard::enter(this, dxil.len(), "CS");
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    guard.finish(hr);
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
@@ -3460,7 +3598,10 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
+    let dxil_bytes = vs_dxil.len() + ps_dxil.as_deref().map_or(0, <[u8]>::len) + rect_gs.as_deref().map_or(0, <[u8]>::len);
+    let guard = DriverCompileGuard::enter(this, dxil_bytes, "VS+PS");
     let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv));
+    guard.finish(hr);
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -3929,11 +4070,24 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(
+    this: *mut c_void,
+    stream: &StreamOut,
+    tp: crate::gpu::recomp::pso::TwoPass,
+    ps_dxil_bytes: usize,
+    mesh_rs: *mut c_void,
+    kind: &'static str,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    let mesh_dxil = tp.ms.len() + ps_dxil_bytes;
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
+    let mesh_kind = if kind == "MS" { "MS-mesh" } else { "GS-mesh" };
+    let guard = DriverCompileGuard::enter(this, mesh_dxil, mesh_kind);
     let hr = finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv);
+    guard.finish(hr);
     if hr < 0 {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
@@ -3944,7 +4098,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     cdesc.CS = bytecode(&tp.cs);
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
+    let cs_kind = if kind == "MS" { "MS-cs" } else { "GS-cs" };
+    let guard = DriverCompileGuard::enter(this, tp.cs.len(), cs_kind);
     let hc = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
+    guard.finish(hc);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
@@ -4010,6 +4167,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             return Some(E_INVALIDARG);
         }
     };
+    let ps_bytes = ps.as_deref().map_or(0, <[u8]>::len);
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
     let mut out = StreamOut::default();
@@ -4035,7 +4193,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    Some(finish_two_pass(this, &out, tp, ps_bytes, rs, "MS", riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -4086,6 +4244,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
             return E_INVALIDARG;
         }
     };
+    let ps_bytes = ps.as_deref().map_or(0, <[u8]>::len);
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
@@ -4099,14 +4258,18 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &d.DepthStencilState);
     let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, ..Default::default() };
     rt.RTFormats = d.RTVFormats;
+    for f in &mut rt.RTFormats {
+        *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
+    }
+    let dsv = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(d.DSVFormat.0 as u32) as i32);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &dsv);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    finish_two_pass(this, &out, tp, ps_bytes, rs, "GS", riid, ppv)
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
@@ -4141,6 +4304,25 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             25 => put(&mut buf, &dm?.0),
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
+            // console-only topology (e.g. rect list = 19) and target / depth formats must be
+            // translated for stand-ins and fallback streams too, else D3D12 rejects with E_INVALIDARG
+            14 if psize >= 4 && at + 4 <= buf.len() => {
+                let topo = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+                if !(1..=4).contains(&topo) {
+                    let tri = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32;
+                    buf[at..at + 4].copy_from_slice(&tri.to_le_bytes());
+                }
+            }
+            15 if psize >= 32 && at + 32 <= buf.len() => {
+                for k in 0..8 {
+                    let f = super::device_x::pc_target_format(u32::from_le_bytes(buf[at + 4 * k..at + 4 * k + 4].try_into().unwrap()));
+                    buf[at + 4 * k..at + 4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                }
+            }
+            16 if psize >= 4 && at + 4 <= buf.len() => {
+                let f = super::device_x::pc_target_format(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()));
+                buf[at..at + 4].copy_from_slice(&f.to_le_bytes());
+            }
             _ => {}
         }
         off += (poff + psize + 7) & !7;
@@ -5251,6 +5433,70 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn big_compile_serialization_leaves_fast_lane_for_small_compiles() {
+        static BIG: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        static TOTAL: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2 };
+
+        // First big compile acquires BIG -> TOTAL.
+        let b1 = BIG.acquire();
+        let t1 = TOTAL.acquire();
+
+        // A second big compile blocks on BIG without taking TOTAL, so a small compile can still
+        // acquire TOTAL and finish while b1 is running.
+        let b2_entered = std::sync::Arc::new(AtomicBool::new(false));
+        let b2_flag = b2_entered.clone();
+        let h = std::thread::spawn(move || {
+            let _b2 = BIG.acquire();
+            b2_flag.store(true, Ordering::Release);
+            let _t2 = TOTAL.acquire();
+        });
+
+        let small = TOTAL.acquire();
+        assert!(!b2_entered.load(Ordering::Acquire), "second big compile must wait on BIG");
+        drop(small);
+        drop(t1);
+        drop(b1);
+        h.join().unwrap();
+        assert!(b2_entered.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn urgent_and_title_threads_are_exempt_from_background_slots() {
+        assert!(is_background_pso_worker_name(Some("xcl-pso-0")));
+        assert!(is_background_pso_worker_name(Some("xcl-pso-14")));
+        assert!(!is_background_pso_worker_name(Some("xcl-pso-urgent")));
+        assert!(!is_background_pso_worker_name(Some("main")));
+        assert!(!is_background_pso_worker_name(None));
+
+        // Saturate both background slots and verify an exempt (title / urgent) compile enters
+        // immediately without blocking on either semaphore.
+        let b = BIG_COMPILES.acquire();
+        let w32 = wave32_only(std::ptr::null_mut());
+        let cap = driver_compile_threads(w32);
+        let held: Vec<SlotGuard> = (0..cap).map(|_| driver_compiles(w32).acquire()).collect();
+
+        let guard = DriverCompileGuard::enter(std::ptr::null_mut(), big_driver_compile_bytes(), "CS");
+        assert!(!guard.background, "title/test thread is not an xcl-pso-N worker");
+        assert!(guard._big.is_none() && guard._driver.is_none(), "title compile must bypass background slots");
+        guard.finish(S_OK);
+
+        // Also verify a thread explicitly named `xcl-pso-urgent` bypasses saturated background slots.
+        std::thread::Builder::new()
+            .name("xcl-pso-urgent".into())
+            .spawn(|| {
+                let g = DriverCompileGuard::enter(std::ptr::null_mut(), big_driver_compile_bytes(), "CS");
+                assert!(!g.background && g._big.is_none() && g._driver.is_none());
+                g.finish(S_OK);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        drop(held);
+        drop(b);
     }
 }
 
