@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import csv
+import functools
 import json
 import mmap
 import os
@@ -51,11 +52,15 @@ MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1": "SPS1", b"RBF0": "RBF0", b"P
 PAGE_MARKER, PAGE_MARKER_AT = b"0DRP", 16
 
 
+# Every byte that is not TAB, LF, CR or 0x20..0x7E: deleting them in one C-level pass leaves the printable ones.
+_NOT_PRINTABLE = bytes(c for c in range(256) if not (c in (9, 10, 13) or 32 <= c < 127))
+
+
 def printable(data: bytes) -> float:
     sample = data[:4096]
     if not sample:
         return 0.0
-    good = sum(1 for c in sample if c in (9, 10, 13) or 32 <= c < 127)
+    good = len(sample.translate(None, _NOT_PRINTABLE))
     return good / len(sample)
 
 
@@ -114,6 +119,16 @@ def tail_root(data: bytes) -> str:
     return m.group(1).decode("ascii", "replace") if m else ""
 
 
+@functools.lru_cache(maxsize=1024)
+def _open_tags(name: bytes):
+    return re.compile(rb"<" + name + rb"(?=[\s/>])(?:\"[^\"]*\"|'[^']*'|[^'\">])*(?:(?<=/)(>)|>)")
+
+
+@functools.lru_cache(maxsize=1024)
+def _close_tags(name: bytes):
+    return re.compile(rb"</" + name + rb"\s*(>)")
+
+
 def xml_complete(root: str, data: bytes) -> bool:
     """True when every <root> in data is closed, not merely when a </root> occurs somewhere in the tail.
 
@@ -126,9 +141,11 @@ def xml_complete(root: str, data: bytes) -> bool:
     name = re.escape(root.encode("ascii", "replace"))
     # A quoted attribute value may contain '>'; consume quoted strings as one unit or a self-closing
     # tag with such a value is mistaken for an unclosed element.
-    opens = re.findall(rb"<" + name + rb"(?=[\s/>])(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", text)
-    closes = re.findall(rb"</" + name + rb"\s*>", text)
-    self_closed = sum(1 for tag in opens if tag.rstrip().endswith(b"/>"))
+    # The one group captures only the '>' of a tag written "/>": findall then returns one shared small object
+    # per tag (b"" or b">") instead of a copy of every tag, and the self-closing ones are the b">" entries.
+    opens = _open_tags(name).findall(text)
+    closes = _close_tags(name).findall(text)
+    self_closed = len(opens) - opens.count(b"")
     if len(opens) - self_closed > len(closes):
         return False
     return bool(closes or self_closed)
