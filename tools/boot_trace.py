@@ -52,8 +52,10 @@ HOST_FRAME = re.compile(r"^host:(?P<module>[^+]+)\+(?P<rva>0x[0-9a-fA-F]+)$")
 # llvm-symbolizer's location line: `file:line:column`. A PDB without line information prints `file:line:0`.
 SYMBOL_LOCATION = re.compile(r"^(?P<file>.+):(?P<line>\d+):(?P<column>\d+)$")
 
-# One frame per address keeps the pairing in parse_symbolizer_output to two states.
-SYMBOLIZER_ARGUMENTS = ("--functions=short", "--no-inlines")
+# One frame per address keeps the pairing in parse_symbolizer_output to two states. `--output-style=LLVM` is
+# explicit because llvm-addr2line (the same binary under another name) defaults to `file:line` without a column,
+# which the parser would misread as a function name.
+SYMBOLIZER_ARGUMENTS = ("--functions=short", "--no-inlines", "--output-style=LLVM")
 SYMBOLIZER_TIMEOUT = 120
 
 
@@ -255,6 +257,8 @@ def image_base(path: str) -> int:
     except OSError as e:
         raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
     magic = int.from_bytes(optional[0:2], "little")
+    if len(optional) < 32:
+        raise TraceError(f"{path} has a truncated optional header")
     if magic == 0x20B:  # PE32+
         return int.from_bytes(optional[24:32], "little")
     if magic == 0x10B:  # PE32
@@ -289,6 +293,7 @@ class SymbolPlan:
 
     runs: list[SymbolizerRun]
     skipped: dict[str, int]
+    errors: dict[str, str]  # a module that has a PDB but whose image header could not be read
     frames: int
 
 
@@ -313,10 +318,16 @@ def host_frames(startup: dict) -> list[FrameKey]:
 
 
 def find_symbolizer(explicit: str | None = None) -> str | None:
-    """The llvm-symbolizer to run: the option, then LLVM_SYMBOLIZER, then PATH."""
-    for candidate in (explicit, os.environ.get("LLVM_SYMBOLIZER")):
-        if candidate:
-            return candidate if os.path.isfile(candidate) else None
+    """The llvm-symbolizer to run: the option, then LLVM_SYMBOLIZER, then PATH.
+
+    An unusable `LLVM_SYMBOLIZER` falls through to PATH (a stale variable must not hide a working copy); an explicit
+    `--symbolizer` that is not a file is a usage error and is rejected before this runs.
+    """
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    from_env = os.environ.get("LLVM_SYMBOLIZER")
+    if from_env and os.path.isfile(from_env):
+        return from_env
     return shutil.which("llvm-symbolizer")
 
 
@@ -402,14 +413,17 @@ def plan_symbolizer_runs(startup: dict, build_dir: str) -> SymbolPlan:
         rvas_by_module.setdefault(module, []).append(rva)
 
     runs = []
+    errors: dict[str, str] = {}
     for module, image in image_by_module.items():
         try:
             base = image_base(image)
-        except TraceError:
+        except TraceError as e:
+            # A PDB without a readable image is a build problem worth naming, not a silent skip.
+            errors[module] = str(e)
             skipped[module] = skipped.get(module, 0) + len(rvas_by_module[module])
             continue
         runs.append(SymbolizerRun(module, image, base, rvas_by_module[module]))
-    return SymbolPlan(runs=runs, skipped=skipped, frames=len(all_frames))
+    return SymbolPlan(runs=runs, skipped=skipped, errors=errors, frames=len(all_frames))
 
 
 def resolve_symbols(
@@ -453,19 +467,25 @@ def symbols_block(
     plan: SymbolPlan,
     resolved: dict[FrameKey, dict],
     errors: dict[str, str],
+    tool_error: str | None = None,
 ) -> dict:
-    """The `symbols` block the report prints; `symbolizer` is None when no tool could be run."""
+    """The `symbols` block the report prints; `symbolizer` is None when no tool could be run.
+
+    `errors` is keyed by module; `error` is the one tool-level failure (no symbolizer found), so a JSON consumer
+    never has to string-match a reserved module name.
+    """
     skipped_frames = sum(plan.skipped.values())
     return {
         "dir": os.path.abspath(build_dir),
         "symbolizer": symbolizer,
-        "frames": plan.frames,
+        "host_frames": plan.frames,
         "resolved": len(resolved),
         "unresolved": plan.frames - skipped_frames - len(resolved),
         "skipped_frames": skipped_frames,
         "modules": sorted(item.module for item in plan.runs),
         "skipped": sorted(plan.skipped),
-        "errors": errors,
+        "errors": {**plan.errors, **errors},
+        "error": tool_error,
     }
 
 
@@ -480,7 +500,7 @@ def symbolize(startup: dict, build_dir: str, symbolizer: str, run=None) -> dict:
 def symbolizer_error_block(startup: dict, build_dir: str, message: str) -> dict:
     """The `symbols` block when no symbolizer could be run: the plan is still reported, nothing is resolved."""
     plan = plan_symbolizer_runs(startup, build_dir)
-    return symbols_block(build_dir, None, plan, {}, {"symbolizer": message})
+    return symbols_block(build_dir, None, plan, {}, {}, tool_error=message)
 
 
 def summarize(startup: dict | None, d3d12: dict | None) -> dict:
@@ -563,9 +583,10 @@ def format_text(summary: dict, limit: int) -> str:
                         out.append(f"        {frame} -> {symbol['function']}{location}")
         symbols = startup.get("symbols")
         if symbols:
+            total = symbols["host_frames"]
             if symbols["symbolizer"]:
                 line = (
-                    f"  symbols: {symbols['resolved']} of {symbols['frames']} frame(s) "
+                    f"  symbols: {symbols['resolved']} of {total} host frame(s) "
                     f"resolved from {symbols['dir']}"
                 )
                 if symbols["skipped_frames"]:
@@ -573,10 +594,12 @@ def format_text(summary: dict, limit: int) -> str:
                 out.append(line)
             else:
                 out.append(
-                    f"  symbols: none of {symbols['frames']} frame(s) resolved from {symbols['dir']}"
+                    f"  symbols: none of {total} host frame(s) resolved from {symbols['dir']}"
                 )
+            if symbols["error"]:
+                out.append(f"    {symbols['error']}")
             if symbols["skipped"]:
-                out.append(f"    no PE with a PDB there: {_tail(symbols['skipped'], limit)}")
+                out.append(f"    not resolvable from that folder: {_tail(symbols['skipped'], limit)}")
             for module, message in symbols["errors"].items():
                 out.append(f"    {module}: {message}")
         if startup["error"]:
@@ -639,8 +662,8 @@ def main(argv=None) -> int:
     if a.symbolizer and not a.symbols:
         print("error: --symbolizer needs --symbols", file=sys.stderr)
         return 2
-    if a.symbolizer and not os.path.isfile(a.symbolizer):
-        print(f"error: --symbolizer is not a file: {a.symbolizer}", file=sys.stderr)
+    if a.symbolizer and not (os.path.isfile(a.symbolizer) and os.access(a.symbolizer, os.X_OK)):
+        print(f"error: --symbolizer is not an executable file: {a.symbolizer}", file=sys.stderr)
         return 2
     if a.symbols and not os.path.isdir(a.symbols):
         print(f"error: --symbols is not a directory: {a.symbols}", file=sys.stderr)
@@ -655,20 +678,23 @@ def main(argv=None) -> int:
                 print(f"error: {e}", file=sys.stderr)
                 exit_code = 2
     if a.symbols:
-        if not summary.get("startup"):
-            print("error: --symbols needs the startup trace", file=sys.stderr)
-            return 2
-        symbolizer = find_symbolizer(a.symbolizer)
-        if symbolizer:
-            summary["startup"]["symbols"] = symbolize(summary["startup"], a.symbols, symbolizer)
+        if summary.get("startup"):
+            symbolizer = find_symbolizer(a.symbolizer)
+            if symbolizer:
+                summary["startup"]["symbols"] = symbolize(summary["startup"], a.symbols, symbolizer)
+            else:
+                # The report is still worth printing: the stack and the exception address are the caller's first
+                # triage facts, and the symbols block says why they are not annotated. The exit code still signals
+                # the failure.
+                message = "--symbols needs llvm-symbolizer (--symbolizer PATH, LLVM_SYMBOLIZER, or PATH)"
+                print(f"error: {message}", file=sys.stderr)
+                summary["startup"]["symbols"] = symbolizer_error_block(
+                    summary["startup"], a.symbols, message
+                )
+                exit_code = 2
         else:
-            # The report is still worth printing: the stack and the exception address are the caller's first triage
-            # facts, and the symbols block says why they are not annotated. The exit code still signals the failure.
-            message = "--symbols needs llvm-symbolizer (--symbolizer PATH, LLVM_SYMBOLIZER, or PATH)"
-            print(f"error: {message}", file=sys.stderr)
-            summary["startup"]["symbols"] = symbolizer_error_block(
-                summary["startup"], a.symbols, message
-            )
+            # The startup trace failed to parse; keep the other half of the report, as without --symbols.
+            print("error: --symbols needs the startup trace", file=sys.stderr)
             exit_code = 2
     if not any(summary.values()):
         return 2

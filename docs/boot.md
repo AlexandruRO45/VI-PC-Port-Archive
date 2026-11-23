@@ -35,7 +35,9 @@ On Windows, `--symbols <build dir>` resolves the stack frames of the modules tha
 function and file:line under each frame. The title's own frames and the host's modules keep the `module+RVA`
 text. The symbolizer comes from `--symbolizer`, then `LLVM_SYMBOLIZER`, then PATH; the MSVC install ships one at
 `VC\Tools\MSVC\<version>\bin\Hostx64\x64\llvm-symbolizer.exe`. If no symbolizer can be run, the report is still
-printed with the frames unchanged, the `symbols` block says why, and the exit code is 2.
+printed with the frames unchanged, the `symbols` block says why, and the exit code is 2. The CMake build writes
+the PDBs beside the images; the `cl.exe` fallback in `scripts/build_runtime.ps1` builds `gta6rt_tls_host.dll`
+without `/Zi`, so those frames stay unresolved on that path.
 
 ## 2. Commands
 

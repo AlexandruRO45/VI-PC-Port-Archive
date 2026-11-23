@@ -547,7 +547,7 @@ class SymbolTests(unittest.TestCase):
             ) + "\n"
 
         symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=fake)
-        self.assertEqual(symbols["frames"], 3)
+        self.assertEqual(symbols["host_frames"], 3)
         self.assertEqual(symbols["resolved"], 2)
         self.assertEqual(symbols["unresolved"], 0)
         self.assertEqual(symbols["skipped_frames"], 1)
@@ -558,6 +558,7 @@ class SymbolTests(unittest.TestCase):
             [[0x140000020], [0x180000040]],
         )
         self.assertIn("--no-inlines", calls[0][0])
+        self.assertIn("--output-style=LLVM", calls[0][0])
         self.assertIn("--obj=" + os.path.join(self.dir, "gta6rt.exe"), calls[0][0])
         stack_symbols = trace["exceptions"][0]["stack_symbols"]
         self.assertEqual(
@@ -576,7 +577,7 @@ class SymbolTests(unittest.TestCase):
             raise AssertionError("no symbolizer run expected")
 
         symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=fake)
-        self.assertEqual(symbols["frames"], 1)
+        self.assertEqual(symbols["host_frames"], 1)
         self.assertEqual(symbols["resolved"], 0)
         self.assertEqual(symbols["skipped"], ["gta6rt.exe"])
         self.assertNotIn("stack_symbols", trace["exceptions"][0])
@@ -643,7 +644,7 @@ class SymbolTests(unittest.TestCase):
         )
         text = bt.format_text(bt.summarize(trace, None), 10)
         self.assertIn("host:gta6rt.exe+0x20 -> rt::shims::rt_unimplemented (C:\\src\\registry.cpp:184)", text)
-        self.assertIn("symbols: 1 of 1 frame(s) resolved from " + os.path.abspath(self.dir), text)
+        self.assertIn("symbols: 1 of 1 host frame(s) resolved from " + os.path.abspath(self.dir), text)
         self.assertNotIn("game.exe+0x10 ->", text)
 
     def test_json_carries_the_stack_symbols(self):
@@ -684,19 +685,146 @@ class SymbolTests(unittest.TestCase):
             {
                 "dir": os.path.abspath(self.dir),
                 "symbolizer": None,
-                "frames": 1,
+                "host_frames": 1,
                 "resolved": 0,
                 "unresolved": 1,
                 "skipped_frames": 0,
                 "modules": ["gta6rt.exe"],
                 "skipped": [],
-                "errors": {
-                    "symbolizer": "--symbols needs llvm-symbolizer "
-                    "(--symbolizer PATH, LLVM_SYMBOLIZER, or PATH)"
-                },
+                "errors": {},
+                "error": "--symbols needs llvm-symbolizer "
+                "(--symbolizer PATH, LLVM_SYMBOLIZER, or PATH)",
             },
         )
         self.assertIn("--symbols needs llvm-symbolizer", error.getvalue())
+
+    def test_symbolize_keeps_each_frame_with_its_own_address(self):
+        self.module("gta6rt.exe", 0x140000000)
+        self.write_trace(
+            ["host:gta6rt.exe+0x20", "host:gta6rt.exe+0x30", "host:gta6rt.exe+0x40"]
+        )
+        trace = bt.parse_startup(self.startup)
+        calls = []
+
+        def fake(command, addresses):
+            calls.append((command, addresses))
+            return "".join(f"fn_{address:x}\nC:\\src\\f{address:x}.cpp:1:0\n" for address in addresses)
+
+        symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=fake)
+        stack = trace["exceptions"][0]["stack"]
+        self.assertEqual(
+            [trace["exceptions"][0]["stack_symbols"][frame]["function"] for frame in stack],
+            ["fn_140000020", "fn_140000030", "fn_140000040"],
+        )
+        self.assertEqual(symbols["host_frames"], 3)
+        self.assertEqual(symbols["resolved"], 3)
+        self.assertEqual(len(calls), 1)  # one batch per module, not one call per frame
+        self.assertEqual(calls[0][1], [0x140000020, 0x140000030, 0x140000040])
+
+    def test_a_module_with_two_frames_and_no_pdb_counts_both_as_skipped(self):
+        self.write_trace(["host:gta6rt.exe+0x20", "host:gta6rt.exe+0x30"])
+        trace = bt.parse_startup(self.startup)
+
+        def fake(command, addresses):
+            raise AssertionError("no symbolizer run expected")
+
+        symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=fake)
+        self.assertEqual(symbols["host_frames"], 2)
+        self.assertEqual(symbols["skipped_frames"], 2)
+        self.assertEqual(symbols["skipped"], ["gta6rt.exe"])
+        self.assertEqual(symbols["unresolved"], 0)
+
+    def test_an_unreadable_image_is_reported_not_silently_skipped(self):
+        path = os.path.join(self.dir, "gta6rt.exe")
+        with open(path, "wb") as f:
+            f.write(b"MZ" + b"\0" * 0x3E)  # a DOS header whose PE offset points at nothing
+        with open(os.path.join(self.dir, "gta6rt.pdb"), "wb") as f:
+            f.write(b"synthetic")
+        self.write_trace(["host:gta6rt.exe+0x20"])
+        trace = bt.parse_startup(self.startup)
+        symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=lambda c, a: "")
+        self.assertEqual(symbols["skipped"], ["gta6rt.exe"])
+        self.assertIn("gta6rt.exe", symbols["errors"])
+        self.assertIn("PE header", symbols["errors"]["gta6rt.exe"])
+
+    def test_parse_output_handles_unresolved_addresses_in_the_middle(self):
+        # `??` is followed by its own location line; consuming it keeps the next address aligned.
+        text = "??\n??:0:0\nframe_b\nC:\\src\\b.cpp:1:0\n"
+        self.assertEqual(
+            bt.parse_symbolizer_output(text, [1, 2]),
+            {2: {"function": "frame_b", "file": "C:\\src\\b.cpp", "line": 1}},
+        )
+
+    def test_parse_output_keeps_a_public_symbol_without_line_info(self):
+        text = "pub_only\n??:0:0\nframe_b\nC:\\src\\b.cpp:1:0\n"
+        self.assertEqual(
+            bt.parse_symbolizer_output(text, [1, 2]),
+            {
+                1: {"function": "pub_only", "file": None, "line": None},
+                2: {"function": "frame_b", "file": "C:\\src\\b.cpp", "line": 1},
+            },
+        )
+
+    def test_report_prints_a_function_without_a_location_alone(self):
+        self.module("gta6rt.exe", 0x140000000)
+        self.write_trace(["host:gta6rt.exe+0x20"])
+        trace = bt.parse_startup(self.startup)
+        trace["symbols"] = bt.symbolize(
+            trace, self.dir, "fake-symbolizer", run=lambda command, addresses: "pub_only\n??:0:0\n"
+        )
+        text = bt.format_text(bt.summarize(trace, None), 10)
+        self.assertIn("host:gta6rt.exe+0x20 -> pub_only", text)
+        self.assertNotIn("(??:0)", text)
+
+    def test_run_symbolizer_sends_the_addresses_and_reads_the_output(self):
+        script = "import sys\nfor line in sys.stdin:\n    print('f'); print('a.cpp:1:0')\n"
+        output = bt._run_symbolizer([sys.executable, "-c", script], [0x140001000])
+        self.assertIn("f", output)
+        self.assertIn("a.cpp:1:0", output)
+
+    def test_run_symbolizer_reports_a_nonzero_exit(self):
+        with self.assertRaises(bt.TraceError) as caught:
+            bt._run_symbolizer([sys.executable, "--obj=x", "--no-inlines"], [0x140001000])
+        self.assertIn("exited", str(caught.exception))
+
+    def test_an_unusable_env_symbolizer_falls_through_to_path(self):
+        with mock.patch.dict(os.environ, {"LLVM_SYMBOLIZER": os.path.join(self.dir, "missing")}):
+            with mock.patch.object(bt.shutil, "which", lambda name: "/path/llvm-symbolizer"):
+                self.assertEqual(bt.find_symbolizer(), "/path/llvm-symbolizer")
+
+    def test_a_valid_env_symbolizer_is_used(self):
+        path = os.path.join(self.dir, "symbolizer")
+        with open(path, "wb"):
+            pass
+        with mock.patch.dict(os.environ, {"LLVM_SYMBOLIZER": path}):
+            self.assertEqual(bt.find_symbolizer(), path)
+
+    def test_symbols_with_a_missing_startup_keeps_the_d3d12_report(self):
+        d3d12 = os.path.join(self.dir, "d3d12.log")
+        with open(d3d12, "w", encoding="utf-8") as f:
+            f.write("[d3d12-trace] #1 D3D12XboxCreateDevice ok\n")
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            code = bt.main(
+                [os.path.join(self.dir, "missing.jsonl"), "--d3d12", d3d12, "--symbols", self.dir, "--json"]
+            )
+        self.assertEqual(code, 2)
+        summary = json.loads(output.getvalue())
+        self.assertIsNone(summary["startup"])
+        self.assertEqual(summary["d3d12"]["calls"], 1)
+        self.assertIn("--symbols needs the startup trace", error.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "os.access(X_OK) is always true on Windows")
+    def test_symbolizer_must_be_executable(self):
+        self.write_trace(["host:gta6rt.exe+0x20"])
+        path = os.path.join(self.dir, "not-executable")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(path, 0o644)
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(bt.main([self.startup, "--symbols", self.dir, "--symbolizer", path]), 2)
+        self.assertIn("not an executable file", error.getvalue())
 
     def test_option_errors(self):
         self.write_trace(["host:gta6rt.exe+0x20"])
@@ -705,7 +833,7 @@ class SymbolTests(unittest.TestCase):
             (["--symbols", os.path.join(self.dir, "missing")], "--symbols is not a directory"),
             (
                 ["--symbols", self.dir, "--symbolizer", os.path.join(self.dir, "no-such-symbolizer")],
-                "--symbolizer is not a file",
+                "--symbolizer is not an executable file",
             ),
         ]
         for extra, message in cases:
@@ -724,7 +852,7 @@ class SymbolTests(unittest.TestCase):
         startup = json.loads(output.getvalue())["startup"]
         self.assertEqual(startup["exceptions"][0]["stack"], ["host:gta6rt.exe+0x20"])
         self.assertIsNone(startup["symbols"]["symbolizer"])
-        self.assertIn("symbolizer", startup["symbols"]["errors"])
+        self.assertIn("--symbols needs llvm-symbolizer", startup["symbols"]["error"])
 
         error = io.StringIO()
         with mock.patch.object(bt, "find_symbolizer", lambda explicit=None: "llvm-symbolizer"):
