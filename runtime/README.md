@@ -297,8 +297,11 @@ blocks the import-driven work:
   `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`) but
   nothing reaches them yet: their queue and device slots are unmeasured.
 - Most of the `xgameruntime` surface: an offline shim covers `XGameRuntimeInitialize`, device/console queries,
-  `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` and
-  `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
+  `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`,
+  `XPersistentLocalStorageImpl`, `XSystemImpl`, `XPackageImpl` and `XGameImpl`, then hands `XUserImpl`,
+  `XGameSaveImpl`, `XStoreImpl` and the offline `XDisplayImpl`, `XGameEventImpl`,
+  `XGameStreamingImpl`, `XGameUiImpl`, `XUserDeviceImpl` to their own files (see the `xgameruntime_*` tests); any
+  other class is refused with a log.
 
 The D3D12-to-Vulkan design and the measured console ABI are in
 [docs/d3d12_vulkan.md](../docs/d3d12_vulkan.md); the shader translator and its GPU checks are described
