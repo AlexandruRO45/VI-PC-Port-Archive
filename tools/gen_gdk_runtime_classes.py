@@ -125,10 +125,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   "gdk_runtime_classes.json"))
     a = ap.parse_args(argv)
+    if not os.path.isdir(a.docs):
+        print(f"ERROR: {a.docs}: does not exist", file=sys.stderr)
+        return 2
     try:
         table = build(a.docs)
     except OSError as e:
-        print(f"cannot read the docs: {e}", file=sys.stderr)
+        print(f"ERROR: cannot read the docs: {e}", file=sys.stderr)
         return 1
     problems = check(table["classes"], table["interfaces"])
     for p in problems:

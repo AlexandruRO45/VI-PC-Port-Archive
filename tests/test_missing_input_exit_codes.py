@@ -22,6 +22,7 @@ MISSING_INPUT_TOOLS = (
     "gamedata_blobs",
     "gamedata_maps",
     "gamedata_sps1",
+    "gen_gdk_runtime_classes",
     "glb_skinning",
     "mesh_compute_vs",
     "navmesh_index",
