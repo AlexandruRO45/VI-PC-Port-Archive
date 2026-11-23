@@ -7,6 +7,8 @@ one component in bits 31:16 instead of 15:0 (AMD's machine-readable RDNA1 and RD
 and 0x027; the multi-component D16 formats are 0x080-0x087 with no high-half counterpart). LLVM's gfx10 through
 gfx12 MUBUF tables define the same two, and the console's gfx1013 disassembles through the gfx10 table, so no
 listing can carry a multi-component `_d16_hi_` form (the 25,735-shader corpus has none, reported in #4084).
+`llvm-mc` from AMD LLVM 23.0.0git rejects all six spellings as invalid instructions for gfx1013, gfx1036 and
+gfx1201 at either operand width, while the `_x` forms assemble (checked in #4232).
 
 The translator refuses an unknown opcode by name, so these must keep raising Unsupported rather than inventing a
 placement for component 1; #1885 (SHADER-320) adds the `_x` forms, which do exist. CPU only, hand-written listings,
