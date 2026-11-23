@@ -689,6 +689,22 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual([(r["file"], r["size"]) for r in maps], [("000000001000.bin", len(blob))])
         self.assertEqual(len(rows), 2)
 
+    def test_carve_folder_reads_an_index_saved_with_a_bom(self):
+        """A carve index.json saved with a UTF-8 BOM still names the contiguous streams, so a split 0DRPz resource
+        is joined exactly as without the BOM. Read as plain UTF-8, the BOM made json.load fail and the joiner fell
+        back to {}, which silently served the truncated first stream."""
+        blob = make_resource()
+        folder = self.carve([blob[:0x150], blob[0x150:], make_resource(map_file=False)])
+        index = os.path.join(folder, "index.json")
+        with open(index, encoding="utf-8") as f:
+            doc = f.read()
+        with open(index, "w", encoding="utf-8-sig") as f:
+            f.write(doc)
+        rows, _ = WI.scan_path(folder)
+        maps = [r for r in rows if r["kind"] == "map"]
+        self.assertEqual([(r["file"], r["size"]) for r in maps], [("000000001000.bin", len(blob))])
+        self.assertEqual(len(rows), 2)
+
     def test_carve_folder_does_not_join_streams_that_were_not_contiguous(self):
         blob = make_resource()
         rows, _ = WI.scan_path(self.carve([blob[:0x150], blob[0x150:]], gap=0x10))
