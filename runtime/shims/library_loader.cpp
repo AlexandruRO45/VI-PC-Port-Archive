@@ -18,6 +18,7 @@
 #include <ntstatus.h>
 #include <delayloadhandler.h>
 
+#include <bit>
 #include <cstdio>
 #include <deque>
 #include <map>
@@ -256,7 +257,7 @@ void* WINAPI resolve_delay_loaded_api(void* parent, PCIMAGE_DELAYLOAD_DESCRIPTOR
                                      PIMAGE_THUNK_DATA thunk, ULONG flags) {
     if (!owns_bundled_module_handle(parent)) {
         using Resolve = decltype(&resolve_delay_loaded_api);
-        const auto host = reinterpret_cast<Resolve>(
+        const auto host = std::bit_cast<Resolve>(
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ResolveDelayLoadedAPI"));
         return host ? host(parent, descriptor, dll_hook, system_hook, thunk, flags) : nullptr;
     }
@@ -267,18 +268,38 @@ void* WINAPI resolve_delay_loaded_api(void* parent, PCIMAGE_DELAYLOAD_DESCRIPTOR
         return nullptr;
     }
     auto* base = static_cast<unsigned char*>(parent);
-    const auto table = reinterpret_cast<uintptr_t>(base + descriptor->ImportAddressTableRVA);
+    const auto image = reinterpret_cast<uintptr_t>(base);
+    const auto in_image = [image](uintptr_t address, size_t size) {
+        uint64_t mapped = 0;
+        return address >= image && address <= UINTPTR_MAX - (size - 1) &&
+            mapped_image_base(address, mapped) && mapped == image &&
+            mapped_image_base(address + size - 1, mapped) && mapped == image;
+    };
+    constexpr auto thunk_size = sizeof(IMAGE_THUNK_DATA);
+    const auto table = image + descriptor->ImportAddressTableRVA;
     const auto entry = reinterpret_cast<uintptr_t>(thunk);
-    if (entry < table || (entry - table) % sizeof(IMAGE_THUNK_DATA)) {
+    if (entry < table || (entry - table) % thunk_size || entry % alignof(IMAGE_THUNK_DATA) ||
+        !in_image(entry, thunk_size)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA*>(base + descriptor->ImportNameTableRVA);
-    const auto& name = names[(entry - table) / sizeof(IMAGE_THUNK_DATA)];
-    const bool by_ordinal = IMAGE_SNAP_BY_ORDINAL(name.u1.Ordinal);
-    const auto ordinal = static_cast<WORD>(IMAGE_ORDINAL(name.u1.Ordinal));
+    const auto names = image + descriptor->ImportNameTableRVA;
+    const auto name_entry = names + (entry - table);
+    if (names % alignof(IMAGE_THUNK_DATA) || !in_image(names, thunk_size) || !in_image(name_entry, thunk_size)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    // The INT terminator also bounds the IAT. IAT slots may already contain resolved addresses.
+    const auto* name = reinterpret_cast<const IMAGE_THUNK_DATA*>(names);
+    for (; reinterpret_cast<uintptr_t>(name) < name_entry && name->u1.AddressOfData; ++name) {}
+    if (reinterpret_cast<uintptr_t>(name) != name_entry || !name->u1.AddressOfData) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    const bool by_ordinal = IMAGE_SNAP_BY_ORDINAL(name->u1.Ordinal);
+    const auto ordinal = static_cast<WORD>(IMAGE_ORDINAL(name->u1.Ordinal));
     const auto* symbol = by_ordinal ? MAKEINTRESOURCEA(ordinal) :
-        reinterpret_cast<const char*>(reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + name.u1.AddressOfData)->Name);
+        reinterpret_cast<const char*>(reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + name->u1.AddressOfData)->Name);
     const auto* dll = reinterpret_cast<const char*>(base + descriptor->DllNameRVA);
     auto* handle = reinterpret_cast<void* volatile*>(base + descriptor->ModuleHandleRVA);
     auto module = static_cast<HMODULE>(InterlockedCompareExchangePointer(handle, nullptr, nullptr));
@@ -295,7 +316,19 @@ void* WINAPI resolve_delay_loaded_api(void* parent, PCIMAGE_DELAYLOAD_DESCRIPTOR
 
     auto* result = module ? reinterpret_cast<void*>(get_proc_address(module, symbol)) : nullptr;
     if (result) {
+        // Serialize the protection change and restore for concurrent delay resolutions on one page.
+        static std::mutex protection_mutex;
+        std::lock_guard lock(protection_mutex);
+        MEMORY_BASIC_INFORMATION page{};
+        if (!VirtualQuery(thunk, &page, sizeof(page))) return nullptr;
+        const DWORD writable = (page.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+        DWORD old_protection;
+        if (!VirtualProtect(thunk, thunk_size, writable, &old_protection)) return nullptr;
         InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&thunk->u1.Function), result);
+        DWORD ignored;
+        if (!VirtualProtect(thunk, thunk_size, old_protection, &ignored)) return nullptr;
         return result;
     }
     if (dll_hook) {

@@ -511,13 +511,22 @@ void test_import_name_rvas() {
 
 void test_resolve_delay_loaded_api() {
     auto img = make_import_image("kernel32.dll", "ResolveDelayLoadedAPI");
-    IMAGE_FIRST_SECTION(nt_of(img))->Characteristics |= IMAGE_SCN_MEM_WRITE;
+    auto* nt = nt_of(img);
+    auto* sections = IMAGE_FIRST_SECTION(nt);
+    sections[0].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    nt->OptionalHeader.AddressOfEntryPoint = 0;
+    nt->OptionalHeader.SizeOfImage = 0x3000;
+    nt->FileHeader.NumberOfSections = 2;
+    std::memcpy(sections[1].Name, ".data", 6);
+    sections[1].VirtualAddress = 0x2000;
+    sections[1].Misc.VirtualSize = 0x200;
+    sections[1].Characteristics = IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
     // Model a caller invoking the helper explicitly. Omitting the delay directory keeps the loader's eager
     // binding pass from resolving this descriptor before the call.
     auto* descriptor = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x280);
     descriptor->Attributes.RvaBased = 1;
     descriptor->DllNameRVA = 0x10A0;
-    descriptor->ModuleHandleRVA = 0x10B0;
+    descriptor->ModuleHandleRVA = 0x2000;
     descriptor->ImportAddressTableRVA = 0x10C0;
     descriptor->ImportNameTableRVA = 0x10D0;
     std::memcpy(img.data() + 0x2A0, "testshim.dll", sizeof("testshim.dll"));
@@ -539,15 +548,39 @@ void test_resolve_delay_loaded_api() {
     const auto resolve = reinterpret_cast<Resolve>(reinterpret_cast<IMAGE_THUNK_DATA*>(module.base + 0x1180)->u1.Function);
     descriptor = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(module.base + 0x1080);
     auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(module.base + 0x10C0);
+    const auto reject = [&](const char* check, PCIMAGE_DELAYLOAD_DESCRIPTOR desc, PIMAGE_THUNK_DATA slot) {
+        SetLastError(ERROR_SUCCESS);
+        if (!resolve(module.base, desc, nullptr, nullptr, slot, 0) && GetLastError() == ERROR_INVALID_PARAMETER)
+            pass(check);
+        else
+            failed(check, "expected ERROR_INVALID_PARAMETER");
+    };
+    reject("ResolveDelayLoadedAPI rejects an aligned thunk past the image", descriptor,
+           reinterpret_cast<PIMAGE_THUNK_DATA>(reinterpret_cast<uintptr_t>(module.base) + module.size + 8));
+    auto bad_names = *descriptor;
+    bad_names.ImportNameTableRVA = module.size - sizeof(IMAGE_THUNK_DATA);
+    reject("ResolveDelayLoadedAPI rejects a derived INT entry outside the image", &bad_names, thunk + 1);
+    reject("ResolveDelayLoadedAPI rejects a thunk at the delay table terminator", descriptor, thunk + 1);
+
+    MEMORY_BASIC_INFORMATION page{};
+    const char* protection = "ResolveDelayLoadedAPI restores read-only IAT protection";
+    if (!VirtualQuery(thunk, &page, sizeof(page)) || page.Protect != PAGE_READONLY) {
+        failed(protection, "the fixture's IAT is not read-only");
+        return;
+    }
     auto* result = resolve(module.base, descriptor, nullptr, nullptr, thunk, 0);
     const char* resolution = "ResolveDelayLoadedAPI returns and stores the shim address";
     if (result == reinterpret_cast<void*>(&test_shim_function) &&
         thunk->u1.Function == reinterpret_cast<ULONG_PTR>(result) &&
-        *reinterpret_cast<HMODULE*>(module.base + 0x10B0)) {
+        *reinterpret_cast<HMODULE*>(module.base + 0x2000)) {
         pass(resolution);
     } else {
         failed(resolution, "wrong target, IAT entry, or cached module handle");
     }
+    if (VirtualQuery(thunk, &page, sizeof(page)) && page.Protect == PAGE_READONLY)
+        pass(protection);
+    else
+        failed(protection, "the IAT page protection changed");
 }
 
 void test_delay_imports() {
