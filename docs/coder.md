@@ -92,7 +92,7 @@ compression on repeated data. The eight 7-bit code values read out are `2, 7, 16
 
 The coder stores **no table**: the longest run of identical bytes anywhere in 331 KB is the 32-byte zero
 tail, and a canonical-Kraft scan over 8,192 offsets finds nothing. With variable-length codes of 7 and 8
-bits and no stored table, the symbol→length mapping is a **static array in the executable**.
+bits and no stored table, a static symbol→length mapping in the executable is one hypothesis.
 
 That array is narrow enough to search for. A Kraft-exact length vector for 7- and 8-bit codes satisfies
 `2·n7 + n8 = 256`; with the largest observed code value 115 requiring `n7 ≥ 116`, the candidate families
@@ -100,6 +100,15 @@ are `n7 = 116..127`, i.e. a **129–140 byte vector of 7s and 8s**, most likely 
 (140 symbols). Search the executable for a 129–140 byte run of values in `{7,8}` satisfying that equation.
 It is not in the package: the 16 bundled DLLs and the whole 348 MB `gameos.xvd` contain no such run
 (byte-exact search), and no `oo2core`/`Oodle`/codec string exists in either.
+
+The full retail executable (SHA-256
+`e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`) contains
+**zero qualifying windows** when scanned with
+`python -I tools/coder_length_vectors.py image.exe`. The scanner tests all byte
+alignments, including windows inside longer runs. Synthetic controls cover
+each length from 129 to 140. This excludes that contiguous byte representation
+for this image. Packed lengths, other code assignments and runtime construction
+remain open. No symbol mapping was recovered for a payload decode.
 
 ## Recovered plaintext, for calibration
 
