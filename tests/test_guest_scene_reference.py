@@ -108,6 +108,37 @@ class GuestSceneReferenceTest(unittest.TestCase):
                 contents = (out / "logs" / f"full.{stream}.log").read_bytes()
                 self.assertEqual(record[f"{stream}_sha256"], runner.sha256(contents))
 
+    def test_launch_failure_records_the_resolved_launcher(self):
+        """The run record keeps the path that ran, not the spelling the caller typed.
+
+        A symlinked root pins the contract without depending on the host's temporary volume (macOS gets
+        /var -> /private/var for free; Windows needs a junction, which an ordinary account cannot create).
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            real = Path(temp) / "real"
+            real.mkdir()
+            link_root = Path(temp) / "link"
+            try:
+                link_root.symlink_to(real, target_is_directory=True)
+            except (OSError, NotImplementedError) as err:
+                self.skipTest(f"symbolic links unavailable: {err}")
+            (link_root / "spirv").mkdir()
+            real_loader = real / "invalid.exe"
+            real_loader.write_bytes(b"synthetic input that is not an executable")
+            real_loader.chmod(0o700)
+            link_loader = link_root / "invalid.exe"
+            self.assertNotEqual(str(link_loader), str(real_loader))
+            out = link_root / "output"
+            cmd = [sys.executable, "-I", str(path), "--loader", str(link_loader), "--guest", str(link_loader),
+                   "--shaders", str(link_root), "--out", str(out)]
+            if sys.platform != "win32":
+                cmd += ["--wine", str(link_loader)]
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            record = json.loads((out / "logs" / "full.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["outcome"], "launch_failed")
+            self.assertEqual(record["cmd"][0], str(real_loader.resolve()))
+
     def test_timeout_has_its_own_run_outcome(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
