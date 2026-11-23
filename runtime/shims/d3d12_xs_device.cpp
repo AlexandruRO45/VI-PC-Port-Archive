@@ -711,7 +711,6 @@ struct ChildProxy {
     void** real_vtable;
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
-    D3D12_COMMAND_QUEUE_DESC queue_desc{};
 };
 
 template <ChildKind K>
@@ -1097,14 +1096,6 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         const void* caller = _ReturnAddress();
         const console::QueueSlot info = console_queue_slot(Slot, a1, caller);
         using M = console::QueueMethod;
-        if constexpr (Slot == 26 || Slot == 28) {
-            if (info.kind == M::undecided && a1) {
-                // GetDesc uses a hidden return buffer and returns its address.
-                *reinterpret_cast<D3D12_COMMAND_QUEUE_DESC*>(a1) = self->queue_desc;
-                d3d12_trace::record(child_trace_name<K>(Slot));
-                return a1;
-            }
-        }
         if (info.kind == M::pc || info.kind == M::signal_x || info.kind == M::get_desc) {
             d3d12_trace::record(child_trace_name<K>(Slot));
             if (info.pc_slot == kQueueSignal || info.pc_slot == kQueueWait) a1 = unwrap_object(a1);
@@ -1203,8 +1194,7 @@ void** get_child_vtable() {
 // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
 // proxy through `out`.
 template <ChildKind K>
-HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void** out,
-                   const D3D12_COMMAND_QUEUE_DESC* queue_desc = nullptr) {
+HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
     if (!created) return E_FAIL;
     ChildProxy* proxy = new (std::nothrow) ChildProxy;
     if (!proxy) {
@@ -1217,7 +1207,6 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
     proxy->real_vtable = *reinterpret_cast<void***>(created);
     if constexpr (K == ChildKind::queue) {
         proxy->slot_count = kQueuePublicSlots;
-        if (queue_desc) proxy->queue_desc = *queue_desc;
     } else if constexpr (K == ChildKind::fence) {
         proxy->slot_count = supports_iid(created, __uuidof(ID3D12Fence1)) ? kFence1PublicSlots : kFencePublicSlots;
     } else {
@@ -1276,7 +1265,7 @@ HRESULT create_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, co
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
-    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out, desc);
+    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are

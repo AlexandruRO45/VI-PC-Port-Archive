@@ -408,14 +408,11 @@ struct QueueRig {
     std::uint64_t real_fence = 0;
 };
 
-constexpr D3D12_COMMAND_QUEUE_DESC kQueueDesc{
-    D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
-    D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT, 1};
-
 int make_rig(QueueRig& rig) {
     rig.device = make_device(rig.device_mock);
     EXPECT(rig.device);
-    EXPECT(hr_of(raw(rig.device, 8, word(&kQueueDesc), word(&kQueueIid), word(&rig.queue))) == S_OK);
+    static const D3D12_COMMAND_QUEUE_DESC desc{};
+    EXPECT(hr_of(raw(rig.device, 8, word(&desc), word(&kQueueIid), word(&rig.queue))) == S_OK);
     EXPECT(hr_of(raw(rig.device, 36, 0, 0, word(&kFenceIid), word(&rig.fence))) == S_OK);
     rig.queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(rig.queue));
     rig.real_fence = word(xs::fence_proxy_real_fence(rig.fence));
@@ -429,21 +426,12 @@ int queue_calls(const QueueRig& rig) {
     return calls;
 }
 
-int check_early_queue_desc(const QueueRig& rig, unsigned slot) {
-    D3D12_COMMAND_QUEUE_DESC desc{};
-    const auto result = raw(rig.queue, slot, word(&desc));
-    EXPECT(desc.Type == kQueueDesc.Type && desc.Priority == kQueueDesc.Priority &&
-           desc.Flags == kQueueDesc.Flags && desc.NodeMask == kQueueDesc.NodeMask);
-    EXPECT(result == word(&desc));
-    EXPECT(queue_calls(rig) == 0);
-    return 0;
-}
-
 int check_queue_kit2020() {
     QueueRig rig;
     if (make_rig(rig)) return 1;
     D3D12_COMMAND_QUEUE_DESC desc{};
-    if (check_early_queue_desc(rig, 26)) return 1;
+    // Before the layout is known, a slot that differs between the layouts does nothing.
+    EXPECT(hr_of(raw(rig.queue, 26, word(&desc))) == S_OK && queue_calls(rig) == 0);
     // Signal at 14 with a fence decides it, and reaches the PC Signal with the real fence.
     EXPECT(hr_of(raw(rig.queue, 14, word(rig.fence), 5)) == S_OK);
     EXPECT(rig.queue_mock->calls[14] == 1 && rig.queue_mock->args[14][0] == rig.real_fence &&
@@ -471,7 +459,6 @@ int check_queue_kit2020() {
 int check_queue_later(bool by_present) {
     QueueRig rig;
     if (make_rig(rig)) return 1;
-    if (check_early_queue_desc(rig, 28)) return 1;
     // Slot 14 with something other than a fence: one of the later kit's two new methods, or a marker.
     EXPECT(hr_of(raw(rig.queue, 14, 0x40, 1)) == S_OK && queue_calls(rig) == 0);
     if (by_present) EXPECT(hr_of(raw(rig.queue, 32, 0, 0, 0)) == S_OK && queue_calls(rig) == 0);
