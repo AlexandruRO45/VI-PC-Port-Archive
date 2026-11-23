@@ -141,5 +141,117 @@ class SaluAndB64OracleTests(unittest.TestCase):
                 self.assertEqual(out[2], ref_scc_b64(expected))
 
 
+class OperandKind(Enum):
+    SGPR_PAIR = auto()
+    SPECIAL = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class AstOperand:
+    kind: OperandKind
+    name: str
+    value: int = 0
+
+    def resolve(self, env: dict[str, int]) -> int:
+        if self.kind == OperandKind.LITERAL:
+            return self.value & MASK64
+        if self.name in env:
+            return env[self.name] & MASK64
+        raise KeyError(f"Operand not found in env: {self.name}")
+
+
+@dataclass(frozen=True)
+class AstSAndB64:
+    dst: AstOperand
+    src0: AstOperand
+    src1: AstOperand
+
+    def eval(self, env: dict[str, int]) -> tuple[int, int]:
+        v0 = self.src0.resolve(env)
+        v1 = self.src1.resolve(env)
+        res = ref_s_and_b64(v0, v1)
+        scc = ref_scc_b64(res)
+        return res, scc
+
+    def to_asm(self) -> str:
+        return f"s_and_b64 {self.dst.name}, {self.src0.name}, {self.src1.name}"
+
+
+class SaluAndB64AstTests(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions for s_and_b64."""
+
+    def test_ast_node_evaluation(self):
+        env = {
+            "s[0:1]": 0x11112222_33334444,
+            "s[2:3]": 0x55556666_77778888,
+        }
+        node = AstSAndB64(
+            dst=AstOperand(OperandKind.SGPR_PAIR, "s[4:5]"),
+            src0=AstOperand(OperandKind.SGPR_PAIR, "s[0:1]"),
+            src1=AstOperand(OperandKind.SGPR_PAIR, "s[2:3]"),
+        )
+        res, scc = node.eval(env)
+        expected = ref_s_and_b64(env["s[0:1]"], env["s[2:3]"])
+        self.assertEqual(res, expected)
+        self.assertEqual(scc, ref_scc_b64(expected))
+        self.assertEqual(node.to_asm(), "s_and_b64 s[4:5], s[0:1], s[2:3]")
+
+    def test_ast_compositional_expression_tree(self):
+        """Compose nested AST expressions: (A & B) & C."""
+        env = {
+            "s[0:1]": 0xFF00FF00_AA55AA55,
+            "s[2:3]": 0xFFFF0000_FFFF0000,
+            "s[4:5]": 0x0F0F0F0F_0F0F0F0F,
+        }
+        step1 = AstSAndB64(
+            dst=AstOperand(OperandKind.SGPR_PAIR, "s[6:7]"),
+            src0=AstOperand(OperandKind.SGPR_PAIR, "s[0:1]"),
+            src1=AstOperand(OperandKind.SGPR_PAIR, "s[2:3]"),
+        )
+        r1, _ = step1.eval(env)
+        env["s[6:7]"] = r1
+
+        step2 = AstSAndB64(
+            dst=AstOperand(OperandKind.SGPR_PAIR, "s[8:9]"),
+            src0=AstOperand(OperandKind.SGPR_PAIR, "s[6:7]"),
+            src1=AstOperand(OperandKind.SGPR_PAIR, "s[4:5]"),
+        )
+        r2, scc2 = step2.eval(env)
+        expected = env["s[0:1]"] & env["s[2:3]"] & env["s[4:5]"]
+        self.assertEqual(r2, expected)
+        self.assertEqual(scc2, ref_scc_b64(expected))
+
+    def test_ast_hardware_translation(self):
+        """Emit assembly from AST and verify execution via translator."""
+        node = AstSAndB64(
+            dst=AstOperand(OperandKind.SGPR_PAIR, "s[4:5]"),
+            src0=AstOperand(OperandKind.SGPR_PAIR, "s[0:1]"),
+            src1=AstOperand(OperandKind.SGPR_PAIR, "s[2:3]"),
+        )
+        v0 = 0xCAFEBABE_DEADBEEF
+        v1 = 0x0000FFFF_FFFF0000
+        lines = [
+            f"s_mov_b32 s0, {lo32(v0):#x}",
+            f"s_mov_b32 s1, {hi32(v0):#x}",
+            f"s_mov_b32 s2, {lo32(v1):#x}",
+            f"s_mov_b32 s3, {hi32(v1):#x}",
+            node.to_asm(),
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_salu_and_b64_ast", lines)
+        out = mrt0_words(spv)
+        res64 = join64(out[0], out[1])
+        expected = ref_s_and_b64(v0, v1)
+        self.assertEqual(res64, expected)
+        self.assertEqual(out[2], ref_scc_b64(expected))
+
+
 if __name__ == "__main__":
     unittest.main()
