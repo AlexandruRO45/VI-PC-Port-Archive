@@ -468,5 +468,61 @@ class TestSNorSaveExecAliasing(unittest.TestCase):
         # s6 untouched
         self.assertEqual(state.get_sgpr(6), 0x3333_3333)
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+
+class TestSNorSaveExecConditionCodes(unittest.TestCase):
+    """Unit tests for SCC flag generation under NOR logic."""
+
+    def test_scc_cleared_when_nor_all_zeros(self):
+        """SCC must be 0 when NOR produces 0."""
+        for full_mask in (MASK32, 0xFFFF_FFFF):
+            with self.subTest(mask=hex(full_mask)):
+                new_exec, _, scc = s_nor_saveexec_b32_oracle(full_mask, 0)
+                self.assertEqual(new_exec, 0)
+                self.assertEqual(scc, 0)
+
+    def test_scc_set_when_single_bit_active(self):
+        """SCC must be 1 if at least one bit in new EXEC_LO is set."""
+        for bit in (0, 1, 15, 16, 30, 31):
+            with self.subTest(bit=bit):
+                # An input mask that has 1s everywhere EXCEPT `bit` will leave `bit` as 1 after NOR(mask, 0)
+                mask = MASK32 & ~(1 << bit)
+                new_exec, _, scc = s_nor_saveexec_b32_oracle(mask, 0)
+                self.assertEqual(new_exec, 1 << bit)
+                self.assertEqual(scc, 1)
+
+    def test_scc_transitions_state_machine(self):
+        """Test all 4 state transitions for SCC: 0->0, 0->1, 1->0, 1->1."""
+        state = ScalarHardwareState32()
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=32),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=32)
+        )
+
+        # 1. 0 -> 0 transition (NOR(MASK32, 0) = 0)
+        state.scc = 0
+        state.set_sgpr(4, MASK32)
+        state.exec_lo = 0
+        ScalarInterpreter32.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
+        # 2. 0 -> 1 transition (NOR(0, 0) = MASK32)
+        state.set_sgpr(4, 0)
+        ScalarInterpreter32.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+        # 3. 1 -> 1 transition (NOR(0, 1) = MASK32 - 1)
+        state.set_sgpr(4, 0)
+        state.exec_lo = 1
+        ScalarInterpreter32.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+        # 4. 1 -> 0 transition (NOR(MASK32, 0) = 0)
+        state.set_sgpr(4, MASK32)
+        ScalarInterpreter32.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
