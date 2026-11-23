@@ -718,5 +718,35 @@ class TestLdsSubU32ConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, 0xCAFEBABE)
 
 
+
+class TestLdsSubU32EdgeCases(unittest.TestCase):
+    """Unit tests for boundary extremes, integer wrapping, and IEEE 754 bit-pattern invariance."""
+
+    def test_integer_wrap_boundaries(self) -> None:
+        self.assertEqual(oracle_ds_sub_u32(orig_val=0, sub_val=1), 0xFFFFFFFF)
+        self.assertEqual(oracle_ds_sub_u32(orig_val=0, sub_val=0xFFFFFFFF), 1)
+        self.assertEqual(oracle_ds_sub_u32(orig_val=0x80000000, sub_val=1), 0x7FFFFFFF)
+        self.assertEqual(oracle_ds_sub_u32(orig_val=0x7FFFFFFF, sub_val=0xFFFFFFFF), 0x80000000)
+
+    def test_max_offset_addressing(self) -> None:
+        lds = LDSModel(capacity_dwords=16384)
+        lds.write_dword(65532, 100)
+        # vaddr = 0, offset = 65532 (byte 65532 = dword 16383)
+        res = lds.atomic_sub_u32(vaddr=0, sub_val=30, offset=65532)
+        self.assertEqual(res, 70)
+        self.assertEqual(lds.read_dword(65532), 70)
+
+    def test_ieee754_float_bitpatterns_treated_as_integers(self) -> None:
+        qnan = struct.unpack(">I", struct.pack(">f", float("nan")))[0]
+        pos_inf = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
+        neg_inf = struct.unpack(">I", struct.pack(">f", float("-inf")))[0]
+        neg_zero = struct.unpack(">I", struct.pack(">f", -0.0))[0]
+
+        self.assertEqual(oracle_ds_sub_u32(pos_inf, pos_inf), 0)
+        self.assertEqual(oracle_ds_sub_u32(pos_inf, neg_zero), (pos_inf - neg_zero) & MASK32)
+        self.assertEqual(oracle_ds_sub_u32(qnan, qnan), 0)
+        self.assertEqual(oracle_ds_sub_u32(qnan, 1), (qnan - 1) & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
