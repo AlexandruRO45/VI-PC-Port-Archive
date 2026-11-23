@@ -16,6 +16,7 @@ UV prediction on the CPU.
 
 import contextlib
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 import io
 import json
 import os
@@ -73,6 +74,7 @@ class HarnessEnvManifestTests(unittest.TestCase):
         cases = (
             ("ptr_sgpr", 1e400), ("ptr_sgpr", -1e400), ("ptr_sgpr", [1]),
             ("ptr_sgpr", None), ("ptr_sgpr", True), ("ptr_sgpr", 1.5),
+            ("ptr_sgpr", -1), ("ptr_sgpr", 1e100), ("ptr_sgpr", 106),
             ("tsharp_va", 1e400), ("tsharp_va", [1]), ("tsharp_va", None),
         )
         for field, bad in cases:
@@ -98,11 +100,46 @@ class HarnessEnvManifestTests(unittest.TestCase):
         self.assertIn("ptr_sgpr", str(ctx.exception))
 
     def test_bad_subgroup_size_is_one_systemexit_line(self):
+        for bad in (1e400, False, [], 0, True, 1.5):
+            with self.subTest(bad=bad):
+                man = self._manifest()
+                man["ps"] = {"subgroup_size": bad}
+                with self.assertRaises(SystemExit) as ctx:
+                    fl.harness_env(man, "/tmp/out", base_env={})
+                self.assertIn("subgroup_size", str(ctx.exception))
+
+    def test_bad_ssharp_shape_is_one_systemexit_line(self):
         man = self._manifest()
-        man["ps"] = {"subgroup_size": 1e400}
+        del man["texture"]["ssharp"]
         with self.assertRaises(SystemExit) as ctx:
             fl.harness_env(man, "/tmp/out", base_env={})
-        self.assertIn("subgroup_size", str(ctx.exception))
+        self.assertIn("ssharp", str(ctx.exception))
+        for bad in (None, 5, "0,0,0,0", {"a": 0}):
+            with self.subTest(bad=bad):
+                man = self._manifest()
+                man["texture"]["ssharp"] = bad
+                with self.assertRaises(SystemExit) as ctx:
+                    fl.harness_env(man, "/tmp/out", base_env={})
+                self.assertIn("ssharp", str(ctx.exception))
+
+    def test_a_bad_manifest_keeps_an_existing_image(self):
+        # run_draw must validate before it unlinks image.raw, so a rejected manifest leaves a prior draw intact.
+        with tempfile.TemporaryDirectory() as out:
+            raw = os.path.join(out, "image.raw")
+            harness = os.path.join(out, "vk_harness")
+            with open(harness, "w") as f:
+                f.write("")  # dummy; never run because validation fails first
+            args = SimpleNamespace(harness=harness)
+            for field, bad in (("ptr_sgpr", -1), ("ssharp", None), ("ptr_sgpr", 1e100)):
+                with self.subTest(field=field, bad=bad):
+                    with open(raw, "wb") as f:
+                        f.write(b"sentinel")
+                    man = self._manifest()
+                    man["texture"][field] = bad
+                    with self.assertRaises(SystemExit):
+                        fl.run_draw(args, man, out)
+                    with open(raw, "rb") as f:
+                        self.assertEqual(f.read(), b"sentinel")
 
 
 class MeshOutputTests(unittest.TestCase):

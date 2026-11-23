@@ -514,8 +514,12 @@ def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> d
     if tex:
         tex_file = manifest["files"]["texture"]
         ptr_sgpr = _manifest_int(tex.get("ptr_sgpr"), "texture.ptr_sgpr")
+        if not 0 <= ptr_sgpr <= 105:
+            raise SystemExit("first-light manifest: texture.ptr_sgpr must be an SGPR index in 0..105")
         tsharp_va = _manifest_int(tex.get("tsharp_va"), "texture.tsharp_va")
-        ssharp = tex["ssharp"]
+        ssharp = tex.get("ssharp")
+        if not isinstance(ssharp, list):
+            raise SystemExit("first-light manifest: texture.ssharp must be a list of sampler words")
         sgprs = ["0"] * (ptr_sgpr + 1)
         sgprs[ptr_sgpr] = hex(tsharp_va)
         env["VKH_TEX_RGBA"] = os.path.join(out_dir, tex_file)
@@ -523,8 +527,11 @@ def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> d
         env["VKH_SSHARP"] = ",".join(hex(_manifest_int(w, "texture.ssharp")) for w in ssharp)
         env["VKH_SGPRS"] = ",".join(sgprs)
         ps_sg = manifest.get("ps", {}).get("subgroup_size")
-        if ps_sg:
-            env["VKH_SUBGROUP_SIZE"] = str(_manifest_int(ps_sg, "ps.subgroup_size"))
+        if ps_sg is not None:
+            subgroup = _manifest_int(ps_sg, "ps.subgroup_size")
+            if subgroup <= 0:
+                raise SystemExit("first-light manifest: ps.subgroup_size must be a positive integer")
+            env["VKH_SUBGROUP_SIZE"] = str(subgroup)
     return env
 
 
@@ -826,10 +833,10 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
     if manifest.get("vertex_count") == 0 or manifest.get("index_count") == 0:
         raise SystemExit("first-light draw requires an OBJ with faces. Prepare this output with --obj before drawing.")
     harness = find_harness(args.harness)
+    env = harness_env(manifest, out_dir)  # validate the manifest before touching any output
     raw = os.path.join(out_dir, "image.raw")
     ppm = os.path.join(out_dir, "image.ppm")
     manifest_path = os.path.join(out_dir, "manifest.json")
-    env = harness_env(manifest, out_dir)
     cmd = [
         harness,
         os.path.join(out_dir, "vs.spv"),
