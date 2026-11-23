@@ -62,8 +62,9 @@ Both tables are arrays of `(u32 offset, u32 size)` pairs, 8 bytes per entry, rel
   `offset + size` is 0xE5BC1E8, 24 bytes before the declared code size 0xE5BC200.
 
 A shader-index entry is not one program. Counting `s_endpgm` inside each entry's range gives 16,992 entries with one,
-4,508 with two, 21 with three or more, and one with none. The code blob holds 26,092 `s_endpgm` (0xBF810000) and
-1,070,769 `s_code_end` (0xBF9F0000), and 21,463 of the 21,522 entries end on an `s_code_end` dword (58 end on a zero
+4,508 with two, 21 with three or more, and one with none. At word-aligned offsets, the code blob holds 26,091
+`s_endpgm` (0xBF810000) and 1,070,769 `s_code_end` (0xBF9F0000) markers. A byte search finds 26,092 end
+markers because one match starts between words. Of the 21,522 entries, 21,463 end on an `s_code_end` dword (58 end on a zero
 dword and one on another word). The run after the last `s_endpgm` is filler, so `s_code_end` is not a program
 terminator and the `s_endpgm` count does not equal the shader count. A whole-file marker scan also finds two
 `s_endpgm` words outside the code blob (one in the meta blob) and no `s_code_end`, so the marker count has to be
