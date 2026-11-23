@@ -60,6 +60,13 @@ REMAP_IDENTITY = 1 | (2 << 2)
 # vertex slots per triangle node type (Read3Verts); slot 4 overlaps the leaf metadata, so TRI2/TRI3 are not emitted
 TRI_VERTS = {TRI0: (0, 1, 2), TRI1: (1, 3, 2), TRI2: (2, 3, 4), TRI3: (2, 4, 0)}
 
+# one record of each kind in one unpack: BOX32 = four child pointers + four (lo, hi) float boxes, BOX16 = the same with
+# half-float boxes (struct decodes a half exactly as ``decode_box16`` does, bar the clamp), a leaf = five vertex slots
+# + the remap dword
+_BOX32_REC = struct.Struct("<4I24f")
+_BOX16_REC = struct.Struct("<4I24e")
+_LEAF_REC = struct.Struct("<15fI")
+
 FLT_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
 HALF_MAX = 65504.0
 HALF_MIN_NORMAL = 2.0 ** -14
@@ -451,6 +458,18 @@ class Memory:
                 return data[va - base:va - base + n]
         raise IndexError(f"read of {n} bytes at {va:#x} outside every buffer")
 
+    def _span(self, va, n):
+        """(data, offset) of the first region that holds the n bytes at ``va``, for a caller that wants several
+        fields of one record in one unpack; None when an earlier region overlaps those bytes without holding them all
+        (``read`` could then answer the fields from different regions), so the caller reads field by field."""
+        end = va + n
+        for base, data in self.regions:
+            if base <= va and end <= base + len(data):
+                return data, va - base
+            if base < end and va < base + len(data):
+                return None
+        return None
+
     def u32(self, va, n=1):
         return struct.unpack(f"<{n}I", self.read(va, 4 * n))
 
@@ -529,8 +548,99 @@ def triangle_test(v, org, d, remap=REMAP_IDENTITY):
 def intersect_node(mem, bvh_va, node_ptr, org, d, inv, extent, sort=True):
     """One traversal step on the node ``node_ptr`` of the BVH at ``bvh_va``: four child pointers for a box node
     (misses INVALID, sorted by entry distance when ``sort``), the triangle result for TRI0..TRI3, None otherwise."""
-    va = bvh_va + ptr_offset(node_ptr)
-    kind = ptr_type(node_ptr)
+    va = bvh_va + (node_ptr >> 3) * UNIT
+    kind = node_ptr & 7
+    span = getattr(mem, "_span", None)
+    if span is None:
+        return _intersect_node_reads(mem, va, kind, org, d, inv, extent, sort)
+    if kind <= TRI3:
+        at = span(va, LEAF_SIZE)
+        if at is None:
+            return _intersect_node_reads(mem, va, kind, org, d, inv, extent, sort)
+        vals = _LEAF_REC.unpack_from(*at)
+        s0, s1, s2 = TRI_VERTS[kind]
+        return triangle_test((vals[3 * s0:3 * s0 + 3], vals[3 * s1:3 * s1 + 3], vals[3 * s2:3 * s2 + 3]), org, d,
+                             (vals[15] >> (8 * kind)) & 0xFF)
+    if kind == BOX32:
+        at = span(va, NODE32_SIZE - 16)
+        if at is None:
+            return _intersect_node_reads(mem, va, kind, org, d, inv, extent, sort)
+        vals = _BOX32_REC.unpack_from(*at)
+    elif kind == BOX16:
+        at = span(va, NODE16_SIZE)
+        if at is None:
+            return _intersect_node_reads(mem, va, kind, org, d, inv, extent, sort)
+        vals = _BOX16_REC.unpack_from(*at)
+    else:
+        return None
+    ox, oy, oz = org[0], org[1], org[2]
+    dx, dy, dz = d[0], d[1], d[2]
+    ix, iy, iz = inv[0], inv[1], inv[2]
+    dist = [INF, INF, INF, INF]
+    for i in range(4):
+        b = 4 + 6 * i
+        box = vals[b:b + 6]
+        if kind == BOX16 and (INF in box or -INF in box):        # decode_box16 clamps an infinite half to +-FLT_MAX
+            box = [min(max(x, -FLT_MAX), FLT_MAX) for x in box]
+        lx, ly, lz, hx, hy, hz = box
+        # _box_test, unrolled: entry distance of the ray into the box, INF on a miss
+        if lx > hx or ly > hy or lz > hz:
+            continue
+        tnear, tfar = 0.0, extent
+        if dx == 0.0:
+            if ox < lx or ox > hx:
+                continue
+        else:
+            t1 = (lx - ox) * ix
+            t2 = (hx - ox) * ix
+            lo_t, hi_t = (t2, t1) if t2 < t1 else (t1, t2 if t2 > t1 else t1)
+            if lo_t > tnear:
+                tnear = lo_t
+            if hi_t < tfar:
+                tfar = hi_t
+            if tfar < tnear:
+                continue
+        if dy == 0.0:
+            if oy < ly or oy > hy:
+                continue
+        else:
+            t1 = (ly - oy) * iy
+            t2 = (hy - oy) * iy
+            lo_t, hi_t = (t2, t1) if t2 < t1 else (t1, t2 if t2 > t1 else t1)
+            if lo_t > tnear:
+                tnear = lo_t
+            if hi_t < tfar:
+                tfar = hi_t
+            if tfar < tnear:
+                continue
+        if dz == 0.0:
+            if oz < lz or oz > hz:
+                continue
+        else:
+            t1 = (lz - oz) * iz
+            t2 = (hz - oz) * iz
+            lo_t, hi_t = (t2, t1) if t2 < t1 else (t1, t2 if t2 > t1 else t1)
+            if lo_t > tnear:
+                tnear = lo_t
+            if hi_t < tfar:
+                tfar = hi_t
+            if tfar < tnear:
+                continue
+        dist[i] = tnear
+    # a miss is +inf; it must stay a miss for an unbounded ray too (the public path compares with <= the extent,
+    # which a finite TMax keeps apart from the miss value)
+    kids = [k if t != INF and t <= extent else INVALID for k, t in zip(vals, dist)]
+    if sort:
+        for a, b in ((0, 2), (1, 3), (0, 1), (2, 3), (1, 2)):
+            if dist[a] > dist[b]:
+                dist[a], dist[b] = dist[b], dist[a]
+                kids[a], kids[b] = kids[b], kids[a]
+    return kids
+
+
+def _intersect_node_reads(mem, va, kind, org, d, inv, extent, sort):
+    """``intersect_node`` field by field through ``mem.read``: what a memory without ``_span`` answers, and a node
+    whose bytes lie across regions."""
     if kind <= TRI3:
         slots = TRI_VERTS[kind]
         verts = [mem.f32(va + 12 * s, 3) for s in slots]
@@ -547,8 +657,6 @@ def intersect_node(mem, bvh_va, node_ptr, org, d, inv, extent, sort=True):
             b = mem.f32(va + 16 + 24 * i, 6)
             lo, hi = list(b[:3]), list(b[3:])
         dist.append(_box_test(extent, org, d, inv, lo, hi))
-    # a miss is +inf; it must stay a miss for an unbounded ray too (the public path compares with <= the extent,
-    # which a finite TMax keeps apart from the miss value)
     kids = [k if dist[i] != INF and dist[i] <= extent else INVALID for i, k in enumerate(kids)]
     if sort:
         for a, b in ((0, 2), (1, 3), (0, 1), (2, 3), (1, 2)):
@@ -565,28 +673,32 @@ def _inverse_dir(d):
 def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst, stats=None):
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
+    pop = stack.pop
     while stack:
-        p = stack.pop()
+        p = pop()
         if p == INVALID:
             continue
         if stats is not None:
             stats["steps"] += 1
-        r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
+        extent = hit["t"] if hit else tmax
+        r = intersect_node(mem, bvh_va, p, org, d, inv, extent)
         if r is None:
             continue
-        if ptr_type(p) <= TRI3:
+        kind = p & 7
+        if kind <= TRI3:
             t_num, t_den, i_num, j_num = r
             if t_num == INF:
                 continue
             t = t_num / t_den
-            if t <= (hit["t"] if hit else tmax):
-                leaf = bvh_va + ptr_offset(p)
+            if t <= extent:
+                leaf = bvh_va + (p >> 3) * UNIT
                 gif, base, prim2 = mem.u32(leaf + 48, 3)
-                prim = prim2 if ptr_type(p) == TRI1 else base
+                prim = prim2 if kind == TRI1 else base
                 hit = {"t": t, "instance": inst, "geometry": gif >> 8, "primitive": prim, "leaf": p,
                        "bary": (i_num / t_den, j_num / t_den), "front": t_den > 0}
         else:
-            stack.extend(reversed([k for k in r if k != INVALID]))
+            r.reverse()
+            stack.extend([k for k in r if k != INVALID])
     return hit
 
 
