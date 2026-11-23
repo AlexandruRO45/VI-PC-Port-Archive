@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unicodedata
 import unittest
 from unittest.mock import Mock, patch
@@ -42,6 +43,39 @@ class ManifestSha256Test(unittest.TestCase):
 
         expected = hashlib.sha256(b"").hexdigest()
         self.assertEqual(manifest.sha256(path), expected)
+
+    def test_sha256_spans_several_chunks(self):
+        payload = bytes(range(256)) * 4096  # 1 MiB
+        path = os.path.join(self.tmp.name, "chunks.bin")
+        with open(path, "wb") as f:
+            f.write(payload)
+
+        old = manifest.CHUNK
+        manifest.CHUNK = 64 * 1024
+        try:
+            self.assertEqual(manifest.sha256(path), hashlib.sha256(payload).hexdigest())
+        finally:
+            manifest.CHUNK = old
+
+    def test_hash_loop_holds_one_input_chunk_at_a_time(self):
+        chunk = 256 * 1024
+        payload = bytes(range(256)) * (chunk * 2 // 256 + 7)
+        path = os.path.join(self.tmp.name, "peak.bin")
+        with open(path, "wb") as f:
+            f.write(payload)
+
+        old = manifest.CHUNK
+        manifest.CHUNK = chunk
+        tracemalloc.start()
+        try:
+            digest = manifest.sha256(path)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            manifest.CHUNK = old
+        self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+        # The readinto loop keeps one buffer; the old f.read() loop held two chunks (~2x).
+        self.assertLess(peak, chunk * 18 // 10)
 
 
 class ManifestWalkTest(unittest.TestCase):
@@ -532,18 +566,18 @@ class ManifestAtomicCreateTest(unittest.TestCase):
         def open_with_edit(path, mode, **kwargs):
             stream = open(path, mode, **kwargs)
             if path == source and mode == "rb":
-                original_read = stream.read
+                original_readinto = stream.readinto
 
-                def read_then_edit(size):
-                    chunk = original_read(size)
-                    stream.read = original_read
+                def readinto_then_edit(buffer):
+                    count = original_readinto(buffer)
+                    stream.readinto = original_readinto
                     stamp = os.stat(source)
                     with open(source, "r+b") as f:
                         f.write(b"X")
                     os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
-                    return chunk
+                    return count
 
-                stream.read = read_then_edit
+                stream.readinto = readinto_then_edit
             return stream
 
         with patch.object(manifest, "open", side_effect=open_with_edit, create=True):
