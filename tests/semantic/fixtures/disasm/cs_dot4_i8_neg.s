@@ -5,13 +5,15 @@
 	v_xor_b32_e32 v2, 0xe6e9e8eb, v4
 	v_xor_b32_e32 v3, 0xeeeeee8a, v4
 	v_xor_b32_e32 v5, 0x80000000, v3
+	v_xor_b32_e32 v6, 0x91919191, v4
+	v_xor_b32_e32 v7, 0x91111111, v4
 	v_dot4_i32_i8 v8, v1, v2, v3 neg_lo:[1,0,0]
 	v_dot4_i32_i8 v9, v1, v2, v3 neg_hi:[1,0,0]
 	v_dot4_i32_i8 v10, v1, v2, v3 neg_lo:[0,1,0]
 	v_dot4_i32_i8 v11, v1, v2, v3 neg_hi:[0,1,0]
 	v_dot4_i32_i8 v12, v1, v2, v3 neg_lo:[0,0,1]
 	v_dot4_i32_i8 v13, v1, v2, v5 neg_hi:[0,0,1]
-	v_dot4_i32_i8 v14, v1, v2, v3 neg_hi:[0,0,1]
+	v_dot4_i32_i8 v14, v6, v6, v7 neg_hi:[0,0,1] clamp
 	v_dot4_i32_i8 v15, v1, v2, v5 neg_lo:[1,1,1] neg_hi:[1,1,1]
 	buffer_store_dwordx4 v[8:11], v0, s[0:3], 0 offen
 	buffer_store_dwordx4 v[12:15], v0, s[0:3], 0 offen offset:16
