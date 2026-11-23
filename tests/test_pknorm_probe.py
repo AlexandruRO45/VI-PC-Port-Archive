@@ -72,6 +72,37 @@ class Translator(unittest.TestCase):
         for w in got[len(BY_HAND):]:
             self.assertEqual(w, 0)
 
+    def test_truncated_or_empty_oracle_results_and_bad_oracle_flag_exit_2(self):
+        import contextlib
+        import io
+        from unittest import mock
+        from hw_oracle import runner as hw_runner
+
+        for bad in ("", "   ", "translator,", ",hw", "gpu"):
+            with self.subTest(oracle=bad), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(["--oracle", bad])
+                self.assertEqual(cm.exception.code, 2)
+
+        n = len(probe.cases())
+        for responses, match in (
+            ([[]], f"the oracle returned 0 results for {n} kernels"),
+            ([[[0]] * (n - 1)], f"the oracle returned {n - 1} results for {n} kernels"),
+            ([[None] * n], "kernel 0: the oracle returned no result word (None)"),
+            ([[[]] * n], "kernel 0: the oracle returned no result word ([])"),
+        ):
+            with self.subTest(match=match):
+                ora = mock.MagicMock(device="fake", arch="gfx1030")
+                ora.run.side_effect = responses
+                out = io.StringIO()
+                with mock.patch.object(hw_runner, "open_oracle", return_value=ora), \
+                     contextlib.redirect_stdout(out):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, out.getvalue())
+                self.assertIn("harness error:", out.getvalue())
+                self.assertIn(match, out.getvalue())
+                ora.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

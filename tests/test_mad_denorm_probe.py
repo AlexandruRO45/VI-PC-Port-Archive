@@ -55,6 +55,32 @@ class TranslatorTests(unittest.TestCase):
                 rc = probe.main(["--oracle", "hw"])
         self.assertEqual(rc, 2)
 
+    def test_truncated_or_empty_oracle_results_and_bad_oracle_flag_exit_2(self):
+        for bad in ("", "   ", "translator,", ",hw", "gpu"):
+            with self.subTest(oracle=bad), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(["--oracle", bad])
+                self.assertEqual(cm.exception.code, 2)
+
+        sanity_ok = [[probe.POS_ZERO], [probe.SUBNORM_HALF]]
+        for responses, match in (
+            ([[]], "MODE denorm32 sanity error"),
+            ([[None, None]], "MODE denorm32 sanity error"),
+            ([sanity_ok, []], f"the oracle returned 0 results for {len(probe.CASES)} kernels"),
+            ([sanity_ok, [None] * len(probe.CASES)], "kernel 0: the oracle returned no result word (None)"),
+            ([sanity_ok, [[]] * len(probe.CASES)], "kernel 0: the oracle returned no result word ([])"),
+        ):
+            with self.subTest(match=match):
+                ora = mock.MagicMock(device="fake", arch="gfx1010")
+                ora.run.side_effect = responses
+                out = io.StringIO()
+                with mock.patch.object(hw_runner, "open_oracle", return_value=ora), \
+                     contextlib.redirect_stdout(out):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, out.getvalue())
+                self.assertIn(match, out.getvalue())
+                ora.close.assert_called_once()
+
 
 class HardwareSkipTests(unittest.TestCase):
     """--oracle hw on a GPU without the GFX10.1 mad opcodes is a skip (77), not a traceback."""

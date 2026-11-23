@@ -225,10 +225,24 @@ def hw_lines(case):
     ]
 
 
+def _unpack_oracle_words(got, expected_count):
+    if len(got) != expected_count:
+        return [f"the oracle returned {len(got)} results for {expected_count} kernels"]
+    out = []
+    for i, w in enumerate(got):
+        if isinstance(w, str):
+            out.append(w)
+        elif w is None or len(w) < 1:
+            out.append(f"kernel {i}: the oracle returned no result word ({w!r})")
+        else:
+            out.append(w[0])
+    return out
+
+
 def run_hw(oracle, case_list, wave, mode):
     from hw_oracle import asm
     got = oracle.run([asm.Kernel(hw_lines(c), wave, 1, 1, raw=True, mode=mode) for c in case_list], words=1)
-    return [w if isinstance(w, str) else w[0] for w in got]
+    return _unpack_oracle_words(got, len(case_list))
 
 
 def check_mode_denorm_effect(oracle):
@@ -247,7 +261,7 @@ def check_mode_denorm_effect(oracle):
         asm.Kernel(prog, 32, 1, 1, raw=True, mode=dict(GAME_MODE, denorm32=3)),
     ]
     got = oracle.run(kernels, words=1)
-    return [w if isinstance(w, str) else w[0] for w in got]
+    return _unpack_oracle_words(got, len(kernels))
 
 
 def _has_scale_omod(mods):
@@ -259,7 +273,10 @@ def main(argv=None):
     ap.add_argument("--oracle", default="translator", help="translator (default) or translator,hw / hw")
     ap.add_argument("--hw-arch", help="override the hardware architecture (LEONIDA_HW_ARCH)")
     a = ap.parse_args(argv)
-    sides = {s.strip() for s in a.oracle.split(",") if s.strip()} - {"translator"}
+    tokens = [s.strip() for s in a.oracle.split(",")]
+    if not any(tokens) or "" in tokens:
+        ap.error("--oracle must name at least one side (translator, hw)")
+    sides = set(tokens) - {"translator"}
     if sides - {"hw"}:
         ap.error(f"unknown --oracle side(s): {', '.join(sorted(sides - {'hw'}))}")
     try:

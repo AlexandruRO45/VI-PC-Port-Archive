@@ -162,7 +162,17 @@ def hw_lines(op, s0, s1):
 def run_hw(oracle, case_list, wave, mode):
     from hw_oracle import asm
     got = oracle.run([asm.Kernel(hw_lines(*c), wave, 1, 1, raw=True, mode=mode) for c in case_list], words=1)
-    return [w if isinstance(w, str) else w[0] for w in got]
+    if len(got) != len(case_list):
+        return [f"the oracle returned {len(got)} results for {len(case_list)} kernels"]
+    out = []
+    for i, w in enumerate(got):
+        if isinstance(w, str):
+            out.append(w)
+        elif w is None or len(w) < 1:
+            out.append(f"kernel {i}: the oracle returned no result word ({w!r})")
+        else:
+            out.append(w[0])
+    return out
 
 
 def main(argv=None):
@@ -170,7 +180,10 @@ def main(argv=None):
     ap.add_argument("--oracle", default="translator", help="translator (default) or translator,hw / hw")
     ap.add_argument("--hw-arch", help="override the hardware architecture (LEONIDA_HW_ARCH)")
     a = ap.parse_args(argv)
-    sides = {s.strip() for s in a.oracle.split(",") if s.strip()} - {"translator"}
+    tokens = [s.strip() for s in a.oracle.split(",")]
+    if not any(tokens) or "" in tokens:
+        ap.error("--oracle must name at least one side (translator, hw)")
+    sides = set(tokens) - {"translator"}
     if sides - {"hw"}:
         ap.error(f"unknown --oracle side(s): {', '.join(sorted(sides - {'hw'}))}")
     case_list = cases()
