@@ -607,9 +607,9 @@ class TestCommandLineEndToEnd(unittest.TestCase):
 
     def test_same_output_path_identity(self):
         a = os.path.join(self.disasm_dir, "a.json")
-        self.assertTrue(P.same_output_path(a, a))
+        self.assertTrue(P.same_report_path(a, a))
         b = os.path.join(self.disasm_dir, "b.json")
-        self.assertFalse(P.same_output_path(a, b))
+        self.assertFalse(P.same_report_path(a, b))
 
     def assert_carve_index_output_refused(self, output):
         tool = os.path.join(ROOT, "tools", "shader_profile.py")
