@@ -149,8 +149,19 @@ class DeviceLineArch(unittest.TestCase):
         self.assertIsNone(runner.device_arch("# device=x"))
         self.assertEqual(runner.device_arch("# device=x arch= engine=10.0"), "gfx1030")
 
+    def test_unnamed_gfx11_and_gfx12_chips_run_as_their_family_default(self):
+        for label, arch in (("gfx11xx", "gfx1100"), ("gfx12xx", "gfx1201")):
+            with self.subTest(label=label):
+                head = f"# device=AMD GPU (0x1234) rev=0x99 arch={label} engine=11.0"
+                self.assertEqual(runner.device_arch(head), arch)
+                self.assertEqual(self.probe(arch, head), head.lstrip("# "))
+                with self.assertRaisesRegex(runner.Unavailable, "assembling for gfx1030"):
+                    self.probe("gfx1030", head)
+
     def test_drm_picks_the_architecture_the_probe_then_accepts(self):
         for head, want in (("# device=x rev=0x90 arch=gfx10xx engine=10.0", "gfx1030"),
+                           ("# device=x arch=gfx11xx engine=11.0", "gfx1100"),
+                           ("# device=x arch=gfx12xx engine=12.0", "gfx1201"),
                            ("# device=x rev=0x84 arch=gfx1013 engine=10.0", "gfx1013"),
                            ("# device=x engine=10.0", "gfx1030")):
             with self.subTest(head=head):

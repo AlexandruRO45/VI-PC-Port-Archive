@@ -32,16 +32,21 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 SENTINEL = 0xDEAD0000
 
 
+# A family label the Linux launcher prints for a chip it cannot name, and the architecture assembled for then: the
+# chips of one family take the same encodings. An empty field is a GFX10 chip, as before the GFX11/GFX12 labels.
+UNNAMED_ARCH = {"": "gfx1030", "gfx10xx": "gfx1030", "gfx11xx": "gfx1100", "gfx12xx": "gfx1201"}
+
+
 def device_arch(head):
     """The architecture a launcher's device line ("# device=... arch=<gfxNNNN> ...") names, or None when the line has
-    no arch= field. Target features (gfx90a:xnack-) are dropped. hw_oracle_drm.c prints gfx10xx for a GFX10 chip it
-    cannot name (an unknown family, a revision outside its ranges); every GFX10 chip takes the same encodings, so
-    that and an empty field are gfx1030, the architecture drm.py assembles for when LEONIDA_HW_ARCH is unset."""
+    no arch= field. Target features (gfx90a:xnack-) are dropped. hw_oracle_drm.c prints a family label (gfx10xx) for
+    a chip it cannot name (an unknown family, a revision outside its ranges); UNNAMED_ARCH turns that into the
+    architecture drm.py assembles for when LEONIDA_HW_ARCH is unset, so the probe compares like with like."""
     arch = next((field[5:] for field in head.split() if field.startswith("arch=")), None)
     if arch is None:
         return None
     arch = arch.split(":", 1)[0]
-    return "gfx1030" if arch in ("", "gfx10xx") else arch
+    return UNNAMED_ARCH.get(arch, arch)
 
 
 class Unavailable(Exception):
