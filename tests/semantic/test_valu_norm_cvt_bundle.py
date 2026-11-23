@@ -380,5 +380,24 @@ class TestVCvtNormU16F16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & 0xFFFF, 0xFFFF)
 
+def ref_v_cvt_pknorm_i16_f16(s0: int, s1: int) -> int:
+    lo = 0 if is_nan_f16(s0) else norm_i16(bits_to_f16(s0 & 0xFFFF))
+    hi = 0 if is_nan_f16(s1) else norm_i16(bits_to_f16(s1 & 0xFFFF))
+    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) & MASK32
+
+GLOBAL_ORACLE_MAP[Opcode.V_CVT_PKNORM_I16_F16] = ref_v_cvt_pknorm_i16_f16
+
+
+class TestVCvtPknormI16F16Oracle(unittest.TestCase):
+    def test_basic_packing(self) -> None:
+        # lo: 1.0 -> 0x7FFF; hi: -1.0 -> 0x8001
+        res = ref_v_cvt_pknorm_i16_f16(0x3C00, 0xBC00)
+        self.assertEqual(res, 0x80017FFF)
+
+    def test_zero_and_clamp(self) -> None:
+        # lo: 0.0 -> 0x0000; hi: 2.0 -> clamped to 1.0 (0x7FFF)
+        res = ref_v_cvt_pknorm_i16_f16(0x0000, 0x4000)
+        self.assertEqual(res, 0x7FFF0000)
+
 if __name__ == "__main__":
     unittest.main()
