@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
                 if (thread && wait != WAIT_OBJECT_0) {
                     check(false, label);
                     std::fflush(nullptr);
-                    ExitProcess(1);  // Do not destroy the loader while its worker may still run.
+                    TerminateProcess(GetCurrentProcess(), 1);  // Avoid loader-lock cleanup while the worker may still run.
                 }
                 bool ok = thread && GetExitCodeThread(thread, &code) && code == 73;
                 check(ok, label);
