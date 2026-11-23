@@ -43,11 +43,15 @@ stops after that many listings and must be at least 1; a smaller value is a usag
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import pool_workers  # noqa: E402
 import rdna2spirv  # noqa: E402
 import shader_meta  # noqa: E402
@@ -303,6 +307,39 @@ def positive_int(text: str) -> int:
     return value
 
 
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1, sort_keys=True)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".ptr_truncation_census-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1, sort_keys=True)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("src", help="folder of .s listings (<work>/shaders/disasm)")
@@ -331,13 +368,11 @@ def main(argv=None):
     print_summary(summary)
     try:
         if a.json:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(summary, f, indent=1, sort_keys=True)
+            write_json_report(a.json, summary)
         if a.index_out:
             index = {str(n): {"stage": r["stage"], "user_sgpr_reads": r.get("user_sgpr_reads", [])}
                      for n, r in enumerate(records) if not r.get("error")}
-            with open(a.index_out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(index, f, indent=1, sort_keys=True)
+            write_json_report(a.index_out, index)
     except OSError as e:
         print(f"ERROR: cannot write: {e.strerror or e}", file=sys.stderr)
         return 2

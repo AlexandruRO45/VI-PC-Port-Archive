@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -221,7 +222,20 @@ class SummaryTests(unittest.TestCase):
                     message = sys.stderr.getvalue()
                     sys.stderr = stderr
                 self.assertEqual(cm.exception.code, 2)
-                self.assertIn("--limit must be at least 1", message)
+                self.assertIn("--limit", message)
+                self.assertIn("must be at least 1", message)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(P, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    P.write_json_report(path, {"flag_mismatches": 0})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":
