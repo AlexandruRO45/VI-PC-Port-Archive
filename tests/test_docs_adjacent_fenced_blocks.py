@@ -124,11 +124,15 @@ class AdjacentFencedBlocks(unittest.TestCase):
     def test_no_page_repeats_a_block_back_to_back(self):
         if not os.path.isdir(DOCS):
             self.skipTest("no docs directory")
-        pages = sorted(name for name in os.listdir(DOCS) if name.endswith(".md"))
+        # Every page under docs/, the i18n README and quickstart syncs included: a merge leftover is as likely there.
+        pages = sorted(
+            os.path.relpath(os.path.join(folder, name), DOCS).replace(os.sep, "/")
+            for folder, _, names in os.walk(DOCS) for name in names if name.endswith(".md")
+        )
         self.assertGreater(len(pages), 40, "the scan found almost no pages; is the layout different?")
         bad = []
         for name in pages:
-            with open(os.path.join(DOCS, name), encoding="utf-8", errors="replace") as handle:
+            with open(os.path.join(DOCS, *name.split("/")), encoding="utf-8", errors="replace") as handle:
                 for first, second in adjacent_repeats(handle.read()):
                     bad.append(f"docs/{name}: the block at line {first} is repeated at line {second}")
         self.assertEqual(bad, [])
