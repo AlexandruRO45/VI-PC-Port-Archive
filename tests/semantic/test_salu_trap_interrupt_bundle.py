@@ -554,5 +554,27 @@ class TestSTrapMutation(unittest.TestCase):
             support.translate_lines("ps_trap_strict_refuse", bad_lines)
 
 
+class TestSSendMsgHaltRefusal(unittest.TestCase):
+    def test_sendmsghalt_refused_in_ps(self):
+        bad_lines = [
+            "s_sendmsghalt 0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_sendmsghalt_refuse", bad_lines)
+        self.assertIn("s_sendmsghalt", str(cm.exception))
+
+    def test_sendmsghalt_exception_contains_opcode(self):
+        bad_lines = [
+            "s_sendmsghalt 1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_sendmsghalt_one", bad_lines)
+        self.assertEqual(str(cm.exception), "s_sendmsghalt")
+
+
 if __name__ == "__main__":
     unittest.main()
