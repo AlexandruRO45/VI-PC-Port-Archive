@@ -42,10 +42,12 @@
 #include <bit>
 #include <cctype>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <cstring>
 #include <memory>
@@ -2890,7 +2892,6 @@ struct PipelineStream {
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
     bool has_cs = false;
-    bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
 
 HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
@@ -2918,9 +2919,18 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
 
     const auto* base = static_cast<const std::uint8_t*>(desc.pPipelineStateSubobjectStream);
     const std::size_t size = desc.SizeInBytes;
-    const auto round_up = [](std::size_t v, std::size_t a) { return (v + a - 1) / a * a; };
+    const auto checked_round_up = [](std::size_t v, std::size_t a, std::size_t& out_v) -> bool {
+        if (v > (std::numeric_limits<std::size_t>::max)() - (a - 1)) return false;
+        out_v = (v + a - 1) / a * a;
+        return true;
+    };
     std::uint64_t seen = 0;
     std::size_t at = 0;
+    bool has_depth_bounds = false;
+    int depth_bounds_type = 0;
+    bool has_separate_stencil_masks = false;
+    int separate_stencil_type = 0;
+    UINT view_instance_count = 0;
     while (at < size) {
         D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
         if (size - at < sizeof(type)) return E_INVALIDARG;
@@ -2939,34 +2949,37 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         bool ok = true;
         const auto take = [&](auto& value) {
             using T = std::remove_reference_t<decltype(value)>;
-            const std::size_t payload = round_up(at + sizeof(type), alignof(T));
-            if (payload > size || size - payload < sizeof(T)) {
+            if (at > (std::numeric_limits<std::size_t>::max)() - sizeof(type)) {
+                ok = false;
+                return;
+            }
+            std::size_t payload = 0;
+            if (!checked_round_up(at + sizeof(type), alignof(T), payload) || payload > size ||
+                size - payload < sizeof(T)) {
                 ok = false;
                 return;
             }
             std::memcpy(&value, base + payload, sizeof(T));
-            at = round_up(payload + sizeof(T), sizeof(void*));
-        };
-        const auto stage = [&](D3D12_SHADER_BYTECODE& code) {
-            take(code);
-            out.has_graphics_stage = true;
+            std::size_t next = 0;
+            if (!checked_round_up(payload + sizeof(T), sizeof(void*), next)) {
+                ok = false;
+                return;
+            }
+            at = next;
         };
         switch (type) {
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
             take(g.pRootSignature);
             out.compute.pRootSignature = g.pRootSignature;
             break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: stage(g.VS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: stage(g.PS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: stage(g.DS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: stage(g.HS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: stage(g.GS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: stage(out.as); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: stage(out.ms); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
-            take(out.compute.CS);
-            out.has_cs = true;
-            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: take(g.VS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: take(g.PS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: take(g.DS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: take(g.HS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: take(g.GS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: take(out.as); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: take(out.ms); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: take(out.compute.CS); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: take(g.StreamOutput); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: take(g.BlendState); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: take(g.SampleMask); break;
@@ -2978,6 +2991,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
             D3D12_RT_FORMAT_ARRAY formats{};
             take(formats);
+            if (!ok) break;
             if (formats.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
             g.NumRenderTargets = formats.NumRenderTargets;
             std::copy(std::begin(formats.RTFormats), std::end(formats.RTFormats), std::begin(g.RTVFormats));
@@ -3000,9 +3014,10 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
             D3D12_DEPTH_STENCIL_DESC1 d{};
             take(d);
-            if (ok && d.DepthBoundsTestEnable) {
-                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
+            if (!ok) break;
+            if (d.DepthBoundsTestEnable) {
+                has_depth_bounds = true;
+                depth_bounds_type = int(type);
             }
             g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable, d.StencilReadMask,
                                    d.StencilWriteMask, d.FrontFace, d.BackFace};
@@ -3013,14 +3028,14 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             take(d);
             if (!ok) break;
             if (d.DepthBoundsTestEnable) {
-                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
+                has_depth_bounds = true;
+                depth_bounds_type = int(type);
             }
             // Separate front and back stencil masks are not modelled (one read and one write mask per PSO).
             if (d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
                                     d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask)) {
-                log_once("separate front and back stencil masks are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
+                has_separate_stencil_masks = true;
+                separate_stencil_type = int(type);
             }
             const auto face = [](const D3D12_DEPTH_STENCILOP_DESC1& f) {
                 return D3D12_DEPTH_STENCILOP_DESC{f.StencilFailOp, f.StencilDepthFailOp, f.StencilPassOp, f.StencilFunc};
@@ -3038,6 +3053,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1) {
                 D3D12_RASTERIZER_DESC1 d{};
                 take(d);
+                if (!ok) break;
                 r = {d.FillMode, d.CullMode, d.FrontCounterClockwise, 0, d.DepthBiasClamp, d.SlopeScaledDepthBias,
                      d.DepthClipEnable, d.MultisampleEnable, d.AntialiasedLineEnable, d.ForcedSampleCount,
                      d.ConservativeRaster};
@@ -3045,21 +3061,35 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             } else {
                 D3D12_RASTERIZER_DESC2 d{};
                 take(d);
+                if (!ok) break;
                 r = {d.FillMode, d.CullMode, d.FrontCounterClockwise, 0, d.DepthBiasClamp, d.SlopeScaledDepthBias,
                      d.DepthClipEnable, FALSE, FALSE, d.ForcedSampleCount, d.ConservativeRaster};
                 bias = d.DepthBias;
             }
-            r.DepthBias = INT(bias);
-            if (ok && FLOAT(r.DepthBias) != bias) log_once("a fractional depth bias is truncated; bias x1000", int(bias * 1000));
+            if (!std::isfinite(bias)) {
+                r.DepthBias = 0;
+                log_once("non-finite depth bias clamped to 0; bits",
+                         static_cast<int>(std::bit_cast<std::uint32_t>(bias)));
+            } else {
+                constexpr double kMin = static_cast<double>(INT_MIN);
+                constexpr double kMax = static_cast<double>(INT_MAX);
+                const double d = static_cast<double>(bias);
+                if (d <= kMin) r.DepthBias = INT_MIN;
+                else if (d >= kMax) r.DepthBias = INT_MAX;
+                else r.DepthBias = static_cast<INT>(d);
+                if (static_cast<double>(r.DepthBias) != d) {
+                    const double scaled = std::clamp(d * 1000.0, kMin, kMax);
+                    log_once("a fractional or out-of-range depth bias is truncated; bias x1000",
+                             static_cast<int>(scaled));
+                }
+            }
             break;
         }
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
             D3D12_VIEW_INSTANCING_DESC d{};
             take(d);
-            if (ok && d.ViewInstanceCount) {
-                log_once("view instancing is not supported yet; views", int(d.ViewInstanceCount));
-                return E_NOTIMPL;
-            }
+            if (!ok) break;
+            if (d.ViewInstanceCount) view_instance_count = d.ViewInstanceCount;
             break;
         }
         default:
@@ -3068,8 +3098,46 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         }
         if (!ok) return E_INVALIDARG;
     }
-    if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
-    if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
+
+    const auto has_bytecode = [](const D3D12_SHADER_BYTECODE& bc) {
+        return bc.pShaderBytecode && bc.BytecodeLength;
+    };
+    const bool has_cs = has_bytecode(out.compute.CS);
+    const bool has_vs = has_bytecode(g.VS);
+    const bool has_ms = has_bytecode(out.ms);
+    const bool has_as = has_bytecode(out.as);
+    const bool has_legacy_geom =
+        has_vs || has_bytecode(g.HS) || has_bytecode(g.DS) || has_bytecode(g.GS);
+
+    if (has_cs) {
+        // Live Windows 11 D3D12 (WARP + HW) rejects compute streams that also provide non-empty VS/MS/AS,
+        // while ignoring graphics-only state subobjects (and empty shader bytecodes) in compute streams.
+        if (has_vs || has_ms || has_as) return E_INVALIDARG;
+        out.has_cs = true;
+        return S_OK;
+    }
+
+    if (has_ms || has_as) {
+        // Mesh/amplification pipelines cannot mix with VS/HS/DS/GS or stream output, and require non-empty MS.
+        if (has_legacy_geom || g.StreamOutput.NumEntries) return E_INVALIDARG;
+        if (!has_ms) return E_INVALIDARG;
+    } else if (!has_vs) {
+        return E_INVALIDARG;
+    }
+
+    if (has_depth_bounds) {
+        log_once("depth-bounds tests are not supported yet; stream subobject", depth_bounds_type);
+        return E_NOTIMPL;
+    }
+    if (has_separate_stencil_masks) {
+        log_once("separate front and back stencil masks are not supported yet; stream subobject",
+                 separate_stencil_type);
+        return E_NOTIMPL;
+    }
+    if (view_instance_count) {
+        log_once("view instancing is not supported yet; views", int(view_instance_count));
+        return E_NOTIMPL;
+    }
     return S_OK;
 }
 
@@ -5936,8 +6004,7 @@ public:
     HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid,
                                                   void** out) override {
         constexpr const char* method = "ID3D12Device2::CreatePipelineState";
-        if (!out) return d3d12_trace::result(method, E_POINTER);
-        *out = nullptr;
+        if (out) *out = nullptr;
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         PipelineStream stream;
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
@@ -5948,6 +6015,10 @@ public:
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);
+        }
+        if (!out) {
+            pipeline->Release();
+            return d3d12_trace::result(method, S_FALSE);
         }
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
