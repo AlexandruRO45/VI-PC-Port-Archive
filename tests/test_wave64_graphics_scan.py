@@ -193,6 +193,18 @@ class CliTests(unittest.TestCase):
                     scan.main([src, "--out", missing_dir])
             self.assertNotEqual(cm.exception.code, 0)
 
+    def test_unwritable_out_is_one_line_and_exit_2(self):
+        with tempfile.TemporaryDirectory() as src:
+            name, text = PS_W64_SENSITIVE
+            with open(os.path.join(src, name), "w", encoding="utf-8") as f:
+                f.write(text)
+            target = os.path.join(src, "x" * 300 + ".json")       # a name no file system accepts
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                code = scan.main([src, "--out", target])
+        self.assertEqual(code, 2)
+        self.assertIn("shaders", out.getvalue())
+        self.assertIn("ERROR: cannot write", err.getvalue())
+
     def test_out_same_as_source_rejected(self):
         with tempfile.TemporaryDirectory() as src:
             with self.assertRaises(SystemExit) as cm:

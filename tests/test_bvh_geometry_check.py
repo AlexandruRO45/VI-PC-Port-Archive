@@ -84,6 +84,20 @@ class TestChecks(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(C.main([paths[0]]), 2)
 
+    def test_an_unwritable_json_is_one_line_and_exit_2(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        with tempfile.TemporaryDirectory() as d:
+            paths = [os.path.join(d, n) for n in ("in.bin", "vb.bin", "ib.bin")]
+            for p, data in zip(paths, (src, VB, IB)):
+                with open(p, "wb") as f:
+                    f.write(data)
+            target = os.path.join(d, "x" * 300 + ".json")          # a name no file system accepts
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = C.main([paths[0], "--geom", paths[1] + "," + paths[2], "--json", target])
+        self.assertEqual(rc, 2)
+        self.assertIn("consistent", out.getvalue())
+        self.assertIn("error: cannot write", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

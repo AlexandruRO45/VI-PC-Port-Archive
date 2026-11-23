@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -67,6 +68,19 @@ class CommandLine(unittest.TestCase):
             with redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(sm.main([missing, missing]), 2)
         self.assertIn("anim_skel_match:", err.getvalue())
+
+    def test_an_unwritable_json_is_one_line_and_exit_2(self):
+        names = {"s": BODY}
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "x" * 300 + ".json")      # a name no file system accepts
+            with mock.patch.object(sm, "stream_names", return_value=names), \
+                    mock.patch.object(sm, "read_skeletons", return_value=[skeleton(BODY)]), \
+                    redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                code = sm.main(["anim.rpf", "packs.rpf", "--json", target])
+        self.assertEqual(code, 2)
+        self.assertIn("7 of 7 names are joints", out.getvalue())
+        self.assertIn("anim_skel_match: cannot write", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
     def test_offsets_parse_as_hex_or_decimal(self):
         self.assertEqual(sm.parse_offset("0x101a32160"), 0x101A32160)
