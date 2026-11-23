@@ -1871,7 +1871,11 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    if sys.platform == "win32" and not sys.stdout.isatty():
-        # Keep the pipe encoding and escape characters it cannot represent.
-        sys.stdout.reconfigure(errors="backslashreplace")
+    if sys.platform == "win32":
+        stdout = sys.stdout
+        reconfigure = getattr(stdout, "reconfigure", None)
+        isatty = getattr(stdout, "isatty", None)
+        if callable(reconfigure) and callable(isatty) and not isatty():
+            # Keep the pipe encoding and escape characters it cannot represent.
+            reconfigure(errors="backslashreplace")
     sys.exit(main())
