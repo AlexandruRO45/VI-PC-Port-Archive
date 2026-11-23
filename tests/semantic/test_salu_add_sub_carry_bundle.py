@@ -264,6 +264,11 @@ class TestSSubU32AST(unittest.TestCase):
         expr = SSubU32Expr(1, 2)
         self.assertEqual(expr.eval(), (0xFFFFFFFF, 1))
 
+class TestSSubU32BorrowAndSCC(unittest.TestCase):
+    def test_borrow_boundary(self) -> None:
+        self.assertEqual(ref_s_sub_u32(0xFFFFFFFF, 0xFFFFFFFF), (0, 0))
+        self.assertEqual(ref_s_sub_u32(0xFFFFFFFE, 0xFFFFFFFF), (0xFFFFFFFF, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
