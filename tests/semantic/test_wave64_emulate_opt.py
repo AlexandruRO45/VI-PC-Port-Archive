@@ -139,6 +139,8 @@ def _parse_module(text):
             consts[res] = False
         elif op == "OpConstantNull":
             consts[res] = zero_of(a[0])
+        elif op == "OpConstantComposite":
+            consts[res] = [consts[x] for x in a[1:]]
         elif op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
             assert a[1] == cls, f"storage class mismatch: {line}"
@@ -147,36 +149,19 @@ def _parse_module(text):
             raise NotImplementedError(f"header op {op}: {line}")
 
     assert "%main" in funcs
-    # Expand single-block helper OpFunctionCalls inline into %main's instruction stream for lockstep interpretation.
     body = []
-    call_seq = 0
-    for res, op, a, line in funcs["%main"][1]:
-        if op != "OpFunctionCall":
-            body.append((res, op, a, line))
-            continue
-        call_seq += 1
-        ret_t, fn_name = a[0], a[1]
-        call_args = a[2:]
-        fn_params, fn_insns = funcs[fn_name]
-        assert len(call_args) == len(fn_params)
-        id_map = dict(zip(fn_params, call_args))
-        for fres, fop, fa, fline in fn_insns:
-            if fop == "OpLabel":
-                continue
-            mapped_a = [id_map.get(x, x) for x in fa]
-            if fop == "OpReturnValue":
-                body.append((res, "OpCopyObject", [ret_t, mapped_a[0]], f"{res} = OpCopyObject {ret_t} {mapped_a[0]}"))
-                break
-            new_res = f"%fc{call_seq}_{fres[1:]}" if fres else None
-            if fres:
-                id_map[fres] = new_res
-            body.append((new_res, fop, mapped_a, fline))
+    fn_start = {}
+    fn_params = {}
+    for fn_name, (fparams, fn_insns) in funcs.items():
+        fn_start[fn_name] = len(body)
+        fn_params[fn_name] = list(fparams)
+        body.extend(fn_insns)
 
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
     return {
         "types": types, "ptr_types": ptr_types, "consts": consts, "id_type": id_type,
-        "globals": globals_, "body": body, "labels": labels, "main_pc": 0,
-        "zero_of": zero_of,
+        "globals": globals_, "body": body, "labels": labels, "main_pc": fn_start["%main"],
+        "fn_start": fn_start, "fn_params": fn_params, "zero_of": zero_of,
     }
 
 
@@ -311,11 +296,15 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 else:
                     box = [zero_of(pointee)]
                 ptrs[res] = (box, 0)
+            elif cls == "Private":
+                init = consts[init_id] if init_id is not None else zero_of(pointee)
+                box = [list(init) if isinstance(init, (list, tuple)) else init]
+                ptrs[res] = (box, 0)
             else:
                 raise NotImplementedError(f"global storage class {cls}")
         return {
             "pc": mod["main_pc"], "vals": vals, "id_t": id_t, "ptrs": ptrs, "pc_t": pc_t,
-            "cur_lbl": None, "prev_lbl": None, "done": False, "barrier": None,
+            "cur_lbl": None, "prev_lbl": None, "done": False, "barrier": None, "calls": [],
         }
 
     def step_until_barrier(inv, step_budget):
@@ -332,6 +321,28 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 id_t[res] = a[0]
             if op == "OpLabel":
                 inv["prev_lbl"], inv["cur_lbl"] = inv["cur_lbl"], res
+                continue
+            if op == "OpFunctionCall":
+                fn_name, call_args = a[1], a[2:]
+                fparams = mod["fn_params"][fn_name]
+                assert len(call_args) == len(fparams)
+                arg_vals = [(vals[arg], id_t.get(arg)) for arg in call_args]
+                saved_params = {p: (vals[p], id_t.get(p)) for p in fparams if p in vals}
+                for p, (v, t) in zip(fparams, arg_vals):
+                    vals[p] = v
+                    if t is not None:
+                        id_t[p] = t
+                inv["calls"].append((pc, res, inv["cur_lbl"], inv["prev_lbl"], saved_params))
+                pc = mod["fn_start"][fn_name]
+                continue
+            if op == "OpReturnValue":
+                ret_v = vals[a[0]]
+                pc, res_id, inv["cur_lbl"], inv["prev_lbl"], saved_params = inv["calls"].pop()
+                for p, (v, t) in saved_params.items():
+                    vals[p] = v
+                    if t is not None:
+                        id_t[p] = t
+                vals[res_id] = ret_v
                 continue
             if op in _SPV_IGNORED:
                 continue
@@ -516,12 +527,30 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
             elif op == "OpBitFieldUExtract":
                 base, off, cnt = vals[a[1]], vals[a[2]], vals[a[3]]
                 vals[res] = (base >> off) & ((1 << cnt) - 1) if cnt else 0
+            elif op == "OpBitFieldSExtract":
+                base, off, cnt = vals[a[1]], vals[a[2]], vals[a[3]]
+                if cnt == 0:
+                    vals[res] = 0
+                else:
+                    v = (base >> off) & ((1 << cnt) - 1)
+                    if v & (1 << (cnt - 1)):
+                        v -= 1 << cnt
+                    vals[res] = v & MASK32
             elif op == "OpExtInst":
                 ext_op = a[2]
                 if ext_op == "UMin":
                     vals[res] = min(vals[a[3]], vals[a[4]])
                 elif ext_op == "UMax":
                     vals[res] = max(vals[a[3]], vals[a[4]])
+                elif ext_op == "SAbs":
+                    vals[res] = abs(_s32(vals[a[3]])) & MASK32
+                elif ext_op == "SClamp":
+                    x, lo, hi = _s32(vals[a[3]]), _s32(vals[a[4]]), _s32(vals[a[5]])
+                    vals[res] = max(lo, min(hi, x)) & MASK32
+                elif ext_op == "UnpackHalf2x16":
+                    u = vals[a[3]] & MASK32
+                    lo_f, hi_f = struct.unpack("<ee", struct.pack("<I", u))
+                    vals[res] = (float(lo_f), float(hi_f))
                 elif ext_op == "FindILsb":
                     v = vals[a[3]] & MASK32
                     vals[res] = (v & -v).bit_length() - 1 if v else MASK32
@@ -1710,6 +1739,96 @@ class StructuredEmulationTests(unittest.TestCase):
         # s_barrier cleared ("lds", "w"), and folded block 1 added ("mem", "r") after it.
         self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
         self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
+
+    def test_dynamic_buffer_load_format_outlining(self):
+        # Verify that dynamic MUBUF buffer_load_format_* and buffer_load_format_d16_* callsites outline
+        # both runtime-V# buffer_address and the guarded 5-dword PSB load/Phi/unpack/DST_SEL/d16 body
+        # into module-level helper OpFunctions (%buf_load_fmt_f32_fn, %buf_load_fmt_d16_fn,
+        # %buf_load_fmt_rsrc_*_fn), leaving zero OpPhis in %main, zero cross-function SSA leaks,
+        # and preserving bit-exact results.
+        import spirv_asm
+        vsharp_f32 = [0, 0, 64, (3 << 28) | (77 << 12) | 0x3AC]
+        vsharp_u8 = [256, 0, 128, (3 << 28) | (60 << 12) | 0xFAC]
+        insns = [
+            ("s_mov_b64 exec, -1", 4),
+            ("v_lshlrev_b32_e32 v1, 4, v0", 4),
+            ("v_lshlrev_b32_e32 v2, 2, v0", 4),
+            ("v_mov_b32_e32 v8, 0xCAFE0000", 8),
+            ("v_mov_b32_e32 v11, 0xBEEF0000", 8),
+        ]
+        for _ in range(2):
+            insns.extend([
+                ("buffer_load_format_xyzw v[4:7], v1, s[0:3], 0 offen", 8),
+                ("buffer_load_format_d16_x v8, v2, s[4:7], 0 offen", 8),
+                ("buffer_load_format_d16_xyz v[10:11], v2, s[4:7], 0 offen", 8),
+                ("buffer_load_format_d16_xyzw v[12:13], v1, s[0:3], 0 offen", 8),
+            ])
+        insns.extend([
+            ("v_lshlrev_b32_e32 v14, 5, v0", 4),
+            ("buffer_store_dwordx4 v[4:7], v14, s[8:11], 0 offen", 8),
+            ("buffer_store_dword v8, v14, s[8:11], 0 offen offset:16", 8),
+            ("buffer_store_dwordx2 v[10:11], v14, s[8:11], 0 offen offset:20", 8),
+            ("buffer_store_dword v12, v14, s[8:11], 0 offen offset:28", 8),
+            ("s_endpgm", 4),
+        ])
+        spv, gen = _translate_encoded("cs_dyn_buf_load_fmt_outlined", insns, (64, 1, 1), emulate=True, rsrc2=0x8098)
+        self.assertTrue(gen.dynamic_format)
+        self.assertIn("%buf_load_fmt_f32_fn = OpFunction", spv)
+        self.assertIn("%buf_load_fmt_d16_fn = OpFunction", spv)
+        self.assertIn("%buf_load_fmt_rsrc_f32_0_1_fn = OpFunction", spv)
+        self.assertIn("%buf_load_fmt_rsrc_d16_0_1_fn = OpFunction", spv)
+        self.assertEqual(spv.count("OpFunctionCall %v4uint_fmt %buf_load_fmt_rsrc_f32_0_1_fn"), 2)
+        self.assertEqual(spv.count("OpFunctionCall %v4uint_fmt %buf_load_fmt_rsrc_d16_0_1_fn"), 6)
+        # %main itself has zero OpPhis from the 8 dynamic buffer_load_format callsites, and helper functions
+        # must never reference %main-scoped SSA IDs like %heap_base or %ud_base_lo_p.
+        helpers_text, main_body = spv.split("%main = OpFunction", 1)
+        self.assertEqual(main_body.count(" = OpPhi "), 0)
+        self.assertNotIn("%heap_base", helpers_text)
+        self.assertNotIn("%ud_base_lo_p", helpers_text)
+        binary = spirv_asm.assemble(spv, target_env="vulkan1.2")
+        self.assertEqual(binary[:4], struct.pack("<I", 0x07230203))
+        self.assertLess(len(binary), 120_000)
+
+        # Also verify --pc-tail-ubo mode assembles cleanly with outlined helper functions.
+        prev_ubo = rdna2spirv.PC_TAIL_UBO
+        rdna2spirv.PC_TAIL_UBO = True
+        try:
+            spv_ubo, gen_ubo = _translate_encoded("cs_dyn_buf_load_fmt_ubo", insns, (64, 1, 1), emulate=True, rsrc2=0x8098)
+            self.assertTrue(gen_ubo.uses_pc_tail)
+            self.assertIn("%pc_tail", spv_ubo.split("%main = OpFunction", 1)[0])
+            bin_ubo = spirv_asm.assemble(spv_ubo, target_env="vulkan1.2")
+            self.assertEqual(bin_ubo[:4], struct.pack("<I", 0x07230203))
+        finally:
+            rdna2spirv.PC_TAIL_UBO = prev_ubo
+
+        vsharp_out = [1024, 0, 4096, (3 << 28) | 0xFAC]
+        pc = vsharp_f32 + vsharp_u8 + vsharp_out + [0] * 20
+        init_mem = {}
+        f_words = [0x3F800000, 0x40000000, 0xBF000000, 0x40800000]
+        for l in range(4):
+            for c in range(4):
+                init_mem[l * 16 + c * 4] = f_words[c]
+        for l in range(32):
+            init_mem[256 + l * 4] = (l + 1) | ((l + 2) << 8) | ((l + 3) << 16) | ((l + 4) << 24)
+        mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=pc, memory=dict(init_mem), max_steps=5_000_000)
+        for l in range(64):
+            base = 1024 + l * 32
+            if l < 4:
+                self.assertEqual([mem[base + 4 * c] for c in range(4)],
+                                 [0x3F800000, 0x40000000, 0xBF000000, 0x3F800000], f"lane {l} f32")
+                self.assertEqual(mem[base + 28], 0x40003C00, f"lane {l} d16_xyzw")
+            else:
+                self.assertEqual([mem[base + 4 * c] for c in range(4)],
+                                 [0, 0, 0, 0x3F800000], f"lane {l} f32 OOB")
+                self.assertEqual(mem[base + 28], 0, f"lane {l} d16_xyzw lo pair OOB")
+            if l < 32:
+                self.assertEqual(mem[base + 16], 0xCAFE0000 | (l + 1), f"lane {l} d16_x")
+                self.assertEqual(mem[base + 20], (l + 1) | ((l + 2) << 16), f"lane {l} d16_xyz v10")
+                self.assertEqual(mem[base + 24], 0xBEEF0000 | (l + 3), f"lane {l} d16_xyz v11")
+            else:
+                self.assertEqual(mem[base + 16], 0xCAFE0000, f"lane {l} d16_x OOB")
+                self.assertEqual(mem[base + 20], 0, f"lane {l} d16_xyz v10 OOB")
+                self.assertEqual(mem[base + 24], 0xBEEF0000, f"lane {l} d16_xyz v11 OOB")
 
 
 if __name__ == "__main__":
