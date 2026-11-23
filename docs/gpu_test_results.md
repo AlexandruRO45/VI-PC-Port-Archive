@@ -7,7 +7,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | GPU | Driver, OS | Commit | build.py | check.py | run_gpu_tests.py | Failed | Entry |
 |---|---|---|---|---|---|---|---|
 | AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](gpu-test-results/RX9070GRE.txt) |
-| AMD Radeon RX 9060 XT (RDNA4, Navi 44), subgroup 32..64 | AMD 25.6.1 (LLPC), Vulkan 1.4.308, Windows 10 | `867d922` | 270/270 translated and valid | 205/211, 4 skipped, 2 failed | 223/241 passed, 17 skipped (native and emulated) | `ms_wave_info_s3`; `check.py`: `cs_fmt_all`, `cs_tbuffer_store` (see below) | [below](#amd-radeon-rx-9060-xt--2026-11-23) |
+| AMD Radeon RX 9060 XT (RDNA4, Navi 44), subgroup 32..64 | AMD 25.6.1 (LLPC), Vulkan 1.4.308, Windows 10 | `867d922` | 270/270 translated and valid | 205/211, 4 skipped, 2 failed | 223/241 reported rows passed, 17 skipped (native and emulated) | `ms_wave_info_s3`; `check.py`: `cs_fmt_all`, `cs_tbuffer_store` (see below) | [below](#amd-radeon-rx-9060-xt--2026-11-23) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -45,10 +45,13 @@ build.py:   270 shaders: 270 translated, 270 pass spirv-val (6 mesh fixtures not
 check.py:   205 of 211 pass, 4 skipped, 2 failed
               cs_fmt_all        word 284: expected 0x7fd00401, got 0x7fee0c01
               cs_tbuffer_store  word 20:  expected 0xd00003ff, got 0xce1003ff
-run_gpu_tests.py: 223/241 passed, 17 skipped, 1 failed (native and LEONIDA_W64_EMULATE=1 alike)
+run_gpu_tests.py: 223/241 reported rows passed, 17 skipped, 1 failed (native and LEONIDA_W64_EMULATE=1 alike)
 Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0), the same signature as on the RX 9070 GRE above.
 Skipped:    16 "run by d3d12_*_test / w64_graphics.py" cases, and ps_w64x_readlane (no required 64-wide fragment subgroup).
 ```
 
-The two `check.py` failures are not in `run_gpu_tests.py`'s list, so they show only there. Their expected words
-come from gfx1035, gfx1036 and gfx1150. This driver is from June 2025, so a newer one may differ.
+The 241 are reported rows, not distinct fixtures. The two `check.py` failures are missing from that summary for
+different reasons. At this commit, `run_gpu_tests.py` runs `cs_tbuffer_store` but never appends its result, and
+appends `cs_fmt_d16_xyz` twice instead (#4784 and #5265 fix this), so its failure is hidden there. `cs_fmt_all` has no
+branch in that runner at all. Their expected words come from gfx1035, gfx1036 and gfx1150. This driver is from June
+2025, so a newer one may differ.
