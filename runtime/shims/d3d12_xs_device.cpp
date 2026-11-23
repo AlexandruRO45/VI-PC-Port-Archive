@@ -84,6 +84,7 @@ struct HeapProxy {
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
 std::atomic<bool> g_beyond_warned[kMaxSlots];
+std::atomic<bool> g_bad_forward_warned[kMaxSlots];  // separate: a refused `this` must not hide the beyond line
 std::atomic<std::uint64_t> g_heap_hits[kHeapSlots];
 std::atomic<bool> g_heap_first[kHeapSlots];
 // The hit counters are for tests. They count from the first call of a *_slot_hits reader or of
@@ -1129,6 +1130,38 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
     return E_NOTIMPL;
 }
 
+void** get_vtable();  // built below, next to the table it fills
+
+// Why a forward through `self` cannot be made, or null when it can. A thunk trusts the pointer it was handed, and
+// the title does hand out other objects: a foreign COM pointer whose slot number reaches this table gives a `self`
+// whose words are not a proxy at all. Reading the PC table out of that and jumping through it faults inside the
+// shim, where no name is attached to the stop, so the words a forward needs are looked at first and a bad `this`
+// comes back as E_NOINTERFACE with the slot named (once per slot, like the refusal above).
+const char* device_forward_blocker(DeviceProxy* self, unsigned slot) {
+    if (!self) return "null device pointer";
+    if (IsBadReadPtr(self, sizeof(DeviceProxy))) return "unreadable device pointer";
+    if (self->vtable != get_vtable()) return "not a device proxy";
+    if (!self->real || !self->real_vtable) return "proxy without a PC device";
+    if (slot >= kMaxSlots) return "slot past the proxy table";
+    if (IsBadReadPtr(self->real_vtable, (slot + 1) * sizeof(void*))) return "unreadable PC vtable";
+    if (!self->real_vtable[slot]) return "null PC method";
+    return nullptr;
+}
+
+// The refusal for a `this` or a slot that cannot be forwarded: E_NOINTERFACE, since the object being called is not
+// the device the caller thinks it is. Logged once per slot with the words found, which is how a mismatch between
+// the Xbox slot numbering and the PC one shows up in a boot log.
+HRESULT refuse_bad_forward(DeviceProxy* self, unsigned slot, const char* why) {
+    bool expected = false;
+    if (slot < kMaxSlots &&
+        g_bad_forward_warned[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) refused: %s (self %p, PC device %p, %u slots)\n",
+                     slot, slot_name(slot), why, static_cast<void*>(self),
+                     self && !IsBadReadPtr(self, sizeof(DeviceProxy)) ? static_cast<void*>(self->real) : nullptr,
+                     self && !IsBadReadPtr(self, sizeof(DeviceProxy)) ? self->slot_count : 0u);
+    return E_NOINTERFACE;
+}
+
 // Device slot 8: CreateCommandQueue(desc, riid, out). Without an output it is the device's own capability answer
 // (S_FALSE for a valid description on the PC), as #558 does for slot 14.
 HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
@@ -1530,6 +1563,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
     } else {
+        // Before `self` is read at all: a pointer that is not a proxy has no meaningful slot count or PC table, and
+        // the forward below would jump through whatever its words happen to be.
+        if (const char* why = device_forward_blocker(self, Slot))
+            return hr_to_u64(refuse_bad_forward(self, Slot, why));
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
@@ -1839,6 +1876,7 @@ void reset_device_proxy_stats() {
         g_hits[slot].store(0, std::memory_order_relaxed);
         g_first[slot].store(false, std::memory_order_relaxed);
         g_beyond_warned[slot].store(false, std::memory_order_relaxed);
+        g_bad_forward_warned[slot].store(false, std::memory_order_relaxed);
     }
     for (unsigned slot = 0; slot < kHeapSlots; ++slot) {
         g_heap_hits[slot].store(0, std::memory_order_relaxed);

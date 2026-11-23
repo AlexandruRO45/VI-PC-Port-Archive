@@ -843,6 +843,58 @@ int check_tail(bool want_guarded) {
     return 0;
 }
 
+// ---- 10. A `this` that is not a device proxy ----
+//
+// The proxy table is only safe while the pointer it was handed is the proxy: a title that keeps an object of its
+// own, or one of our other proxies, and calls a device slot through it reaches the generic thunk with a pointer
+// whose words are not a device at all. Before the check in d3d12_xs_device.cpp the thunk read a PC vtable out of
+// those words and jumped through it, which stops the process inside the shim with nothing naming the slot.
+int check_bad_self() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 1, false);
+    EXPECT(device);
+    void* const* const table = *reinterpret_cast<void* const* const*>(device);  // the proxy's own table
+    xs::reset_device_proxy_stats();
+
+    // The honest call first: slot 26 forwards, so the mock sees it.
+    EXPECT(hr_of(raw(device, 26, 1, 2, 3, 4, 5)) == S_OK && mock->calls[26] == 1);
+
+    const auto forwarded = reinterpret_cast<SlotFn>(table[26]);
+    // The shape that actually stopped the boot run: an object whose words read as a proxy with plenty of slots and
+    // a table full of values that are not addresses. Without the check the thunk tail-jumps into one of them, so
+    // this process dies here instead of reporting; with it, slot 26 is refused before anything is dereferenced.
+    void** bogus = new void*[64];
+    for (unsigned i = 0; i < 64; ++i) bogus[i] = reinterpret_cast<void*>(uintptr_t(0x1000) + i * 8);
+    struct {
+        void** vtable;
+        void* real;
+        void** real_vtable;
+        unsigned slot_count;
+    } not_a_proxy = {mock_vtable(), reinterpret_cast<void*>(0x14247A660), bogus, 64};
+    EXPECT(hr_of(forwarded(&not_a_proxy, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0)) == E_NOINTERFACE);
+    delete[] bogus;
+    // A mock of another kind: proxy-shaped words, but its own table, so its slot 26 must not run either.
+    Mock* foreign = new_mock(Kind::resource);
+    EXPECT(hr_of(forwarded(foreign, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0)) == E_NOINTERFACE);
+    EXPECT(foreign->calls[26] == 0 && mock->calls[26] == 1);
+    // Null, and one of our other proxies (a queue: its first word is the queue table, not the device one).
+    EXPECT(hr_of(forwarded(nullptr, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0)) == E_NOINTERFACE);
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    EXPECT(hr_of(forwarded(queue, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0)) == E_NOINTERFACE);
+    // A pointer into the middle of a proxy is not a proxy either: its first word is the DXGI view's table.
+    EXPECT(hr_of(forwarded(reinterpret_cast<char*>(device) + 8, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0)) ==
+           E_NOINTERFACE);
+    // The refusals are counted as calls of slot 26 and nothing reached the device.
+    EXPECT(mock->calls[26] == 1 && xs::device_slot_hits(26) == 1);
+    // IUnknown on the proxy is untouched, and the proxy still forwards after all of that.
+    EXPECT(hr_of(raw(device, 26, 9, 9, 9, 9, 9)) == S_OK && mock->calls[26] == 2);
+    EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
+    std::printf("%s: a device slot called on a pointer that is not the proxy returns E_NOINTERFACE instead of "
+                "reading a PC vtable out of it\n", g_label);
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -948,7 +1000,7 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_bad_self())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
