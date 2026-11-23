@@ -443,5 +443,27 @@ class TestSSendMsgRejection(unittest.TestCase):
         self.assertIn("s_sendmsg", str(cm.exception))
 
 
+class TestSTrapRefusal(unittest.TestCase):
+    def test_trap_zero_refused_in_ps(self):
+        bad_lines = [
+            "s_trap 0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_trap_zero", bad_lines)
+        self.assertIn("s_trap", str(cm.exception))
+
+    def test_trap_exception_contains_opcode(self):
+        bad_lines = [
+            "s_trap 1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_trap_one", bad_lines)
+        self.assertEqual(str(cm.exception), "s_trap")
+
+
 if __name__ == "__main__":
     unittest.main()
