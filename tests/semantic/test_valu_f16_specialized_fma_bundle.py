@@ -581,5 +581,46 @@ class TestVFmaMixloF16ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(res >> 16, 0x8899)
         self.assertEqual(state.vgprs[3], res)
 
+class TestVFmaMixloF16SIMDAndIEEE(unittest.TestCase):
+    def test_condition_code_neutrality(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+        state.write_vgpr(0, 0x3F800000)
+        state.write_vgpr(1, 0x40000000)
+        state.write_vgpr(2, 0x3F000000)
+        state.write_vgpr(3, 0x44440000)
+        inst = ASTInstruction(
+            Opcode.V_FMA_MIXLO_F16,
+            ASTOperand.vgpr(3),
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+        )
+        ScalarInterpreter().step(inst, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+
+    def test_register_aliasing(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x3F800000)
+        state.write_vgpr(1, 0x40000000)
+        state.write_vgpr(2, 0x3F000000)
+        inst = ASTInstruction(
+            Opcode.V_FMA_MIXLO_F16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res & 0xFFFF, 0x4100)
+
+    def test_ieee754_nan_and_inf(self) -> None:
+        res_nan = ref_v_fma_mixlo_f16(0x7FC00000, 0x40000000, 0x3F000000)
+        self.assertEqual(res_nan & 0xFFFF, 0x7E00)
+        res_inf = ref_v_fma_mixlo_f16(0x7F800000, 0x40000000, 0x3F000000)
+        self.assertEqual(res_inf & 0xFFFF, 0x7C00)
+
 if __name__ == "__main__":
     unittest.main()
