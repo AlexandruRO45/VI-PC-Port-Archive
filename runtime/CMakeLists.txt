@@ -439,6 +439,9 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
+  # The xg_xs computer's layout model (src/gfx10_layout.h, src/xg_surface.h) against tools/tex_headers.py.
+  add_executable(xg_surface_test test/xg_surface_test.cpp)
+  add_test(NAME xg_surface COMMAND xg_surface_test)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
