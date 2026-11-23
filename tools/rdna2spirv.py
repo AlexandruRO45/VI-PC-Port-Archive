@@ -7665,7 +7665,21 @@ class Gen:
             if fi:
                 # FI=1 fetches the value of a source lane that is off in EXEC.
                 r = self.tmp()
-                self.g_shuffle(r, v, src)
+                if self.emulate:
+                    self.g_shuffle(r, v, src)
+                else:
+                    # As FI=0 below: a source lane absent from a workgroup smaller than the wave is redirected to
+                    # the calling lane, and the value is stored (Gen.eager). Read only in dst()'s select, the shuffle
+                    # would be inlined into its `active ? ... : old` (SHADER-529), which the lanes off in EXEC, the
+                    # ones FI=1 reads from, never run.
+                    ballot, present, safe_src = (self.tmp() for _ in range(3))
+                    self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                    self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} "
+                              f"{self.wave_source_lane(src)}")
+                    self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
+                    self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {self.wave_source_lane(safe_src)}")
+                    self.uses_ballot = True
+                    r = self.eager("%uint", r)
                 self.dst(a[0], r)
             elif self.emulate:
                 r = self.tmp()
@@ -7699,6 +7713,9 @@ class Gen:
                 self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
                 self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {self.wave_source_lane(safe_src)}")
                 self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {self.wave_source_lane(safe_src)}")
+                # Only on the right of the && below, the activity shuffle would run in just the lanes whose source is
+                # present (SHADER-529); a lane whose own source is absent can still be another lane's source.
+                act = self.eager("%uint", act)
                 self.emit(f"{got} = OpINotEqual %bool {act} {self.cu(0)}")
                 self.emit(f"{ok} = OpLogicalAnd %bool {present} {got}")
                 self.uses_subgroup = self.uses_ballot = True

@@ -11,6 +11,7 @@ import unittest
 
 import support
 import spirv_mini_interp as si
+from test_dpp_eager_subgroup import conditional_subgroup_ops
 
 # 4 user SGPRs (the output V#), 32x1x1 threads: build.py's default header with a 32-wide group.
 FSSM = bytearray(0x148)
@@ -39,6 +40,16 @@ class PermlaneSourceOff(unittest.TestCase):
         for i, name in enumerate(NAMES):
             with self.subTest(case=name):
                 self.assertEqual(got[i], EXPECTED[i])
+
+    def test_no_permlane_shuffle_is_conditional(self):
+        # SPIRV-Cross (MoltenVK) inlines a value used once into the expression that reads it: in an arm of a select
+        # or on the right of an &&, a shuffle runs only in some lanes, and a lane that skips it gives undefined
+        # data to the lanes reading from it (SHADER-529). FI=1 reads exactly from lanes off in EXEC.
+        spv = support.translate_fixture("cs_w32_permlane_fi", fssm=FSSM)
+        # At least the 8 value shuffles and the activity bit of the 6 permlanes with FI=0 (FI=1 takes the value
+        # either way); a later write gate may add its own.
+        self.assertGreaterEqual(spv.count("OpGroupNonUniformShuffle "), 14)
+        self.assertEqual(conditional_subgroup_ops(spv), [])
 
 
 if __name__ == "__main__":
