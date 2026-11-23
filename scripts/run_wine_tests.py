@@ -336,6 +336,16 @@ def main() -> int:
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()
 
+    if args.summary:
+        try:
+            summary_is_inventory = os.path.samefile(args.summary, args.tests)
+        except OSError:
+            # The summary may not exist yet. The append below reports write errors.
+            summary_is_inventory = False
+        if summary_is_inventory:
+            print(f"ERROR: --summary and --tests refer to the same file: {args.tests}", file=sys.stderr)
+            return 2
+
     tests = read_tests(args.tests)
     if tests is None:
         return 2

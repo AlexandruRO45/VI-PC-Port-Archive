@@ -538,6 +538,20 @@ class MainTest(unittest.TestCase):
         self.assertIn("invalid CTest SKIP_RETURN_CODE", out)
         self.assertIn("[PASS] ok", out)
 
+    def test_summary_cannot_append_to_the_inventory(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        inventory = Path(self.list_tests(entries))
+        original = inventory.read_bytes()
+
+        with mock.patch.object(rwt, "run_test_process") as launch:
+            code, out, err = self.run_main(entries, "--summary", str(inventory))
+
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("--summary and --tests refer to the same file", err)
+        self.assertEqual(inventory.read_bytes(), original)
+        launch.assert_not_called()
+
     def test_the_summary_table_is_appended(self):
         summary = self.root / "summary.md"
         code, _, _ = self.run_main([ctest_entry("ok", self.command("ok.py")), ctest_entry("bad", self.command("bad.py"))],
