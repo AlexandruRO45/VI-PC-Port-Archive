@@ -11124,12 +11124,12 @@ class Gen:
             for i, comp in enumerate(comps):
                 self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
 
-    # image atomic -> (SPIR-V op, value that leaves memory unchanged, used for inactive lanes)
-    IMG_ATOMICS = {"image_atomic_umin": ("OpAtomicUMin", 0xFFFFFFFF), "image_atomic_umax": ("OpAtomicUMax", 0),
-                   "image_atomic_smin": ("OpAtomicSMin", 0x7FFFFFFF), "image_atomic_smax": ("OpAtomicSMax", 0x80000000),
-                   "image_atomic_or": ("OpAtomicOr", 0), "image_atomic_xor": ("OpAtomicXor", 0),
-                   "image_atomic_and": ("OpAtomicAnd", 0xFFFFFFFF), "image_atomic_add": ("OpAtomicIAdd", 0),
-                   "image_atomic_sub": ("OpAtomicISub", 0)}
+    # image atomic -> SPIR-V op (inactive and out-of-range lanes skip it: emit_image_atomic)
+    IMG_ATOMICS = {"image_atomic_umin": "OpAtomicUMin", "image_atomic_umax": "OpAtomicUMax",
+                   "image_atomic_smin": "OpAtomicSMin", "image_atomic_smax": "OpAtomicSMax",
+                   "image_atomic_or": "OpAtomicOr", "image_atomic_xor": "OpAtomicXor",
+                   "image_atomic_and": "OpAtomicAnd", "image_atomic_add": "OpAtomicIAdd",
+                   "image_atomic_sub": "OpAtomicISub"}
     IMG_ATOMICS_EXTRA = ("image_atomic_swap", "image_atomic_inc", "image_atomic_dec",
                          "image_atomic_fmin", "image_atomic_fmax", "image_atomic_fcmpswap")
 
@@ -11451,16 +11451,62 @@ class Gen:
                 vals[i] = kept
         return vals + [lv]
 
-    def emit_image_atomic_extra(self, op, ip, iv, vdata, mods):
+    def image_atomic_guard(self, ip, iv, is3d):
+        """Active lanes whose texel coordinate is inside the r32ui storage image at `ip`, unsigned per axis against
+        OpImageQuerySize. An out-of-range texel pointer is undefined in Vulkan; on RDNA2 (gfx1036, measured with
+        tools/hw_oracle on a linear 4x4 R32_UINT T#) an image atomic past an edge, at -1 or at the row pitch leaves
+        memory untouched and returns 0 with glc."""
+        self.uses_query = True
+        n = 3 if is3d else 2
+        img, sz = self.tmp(), self.tmp()
+        self.emit(f"{img} = OpLoad {'%simg3d_u' if is3d else '%simg2d_u'} {ip}")
+        self.emit(f"{sz} = OpImageQuerySize {'%v3int' if is3d else '%v2int'} {img}")
+        cond = self.active_b()
+        for i in range(n):
+            c, s, lt, both = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{c} = OpCompositeExtract %int {iv} {i}")
+            self.emit(f"{s} = OpCompositeExtract %int {sz} {i}")
+            self.emit(f"{lt} = OpULessThan %bool {c} {s}")
+            self.emit(f"{both} = OpLogicalAnd %bool {cond} {lt}")
+            cond = both
+        return cond
+
+    def emit_image_atomic(self, op, ip, iv, vdata, mods, is3d):
+        """image_atomic_{add,sub,and,or,xor,smin,smax,umin,umax,cmpswap} on an r32ui storage image (2D or 3D). Only
+        active lanes inside the image touch memory (image_atomic_guard); with glc the others that are active get 0.
+        cmpswap: vdata = (src, cmp), memory = (memory == cmp) ? src : memory."""
+        val = self.load_reg("vgpr", vdata["r"])
+        cmpv = self.load_reg("vgpr", vdata["r"] + 1) if op == "image_atomic_cmpswap" else None
+        cond = self.image_atomic_guard(ip, iv, is3d)
+        pre = self.current_label_placeholder()
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        tp, old, res = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
+        if cmpv is not None:
+            self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
+        else:
+            self.emit(f"{old} = {self.IMG_ATOMICS[op]} %uint {tp} {self.cu(1)} {self.cu(0)} {val}")
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        self.emit(f"{res} = OpPhi %uint {old} {lbl_do} {self.cu(0)} {pre}")
+        if "glc" in mods:
+            self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, res)
+
+    def emit_image_atomic_extra(self, op, ip, iv, vdata, mods, is3d):
         """Lower 32-bit image_atomic_{swap,inc,dec,fmin,fmax,fcmpswap} on an r32ui storage image (2D or 3D).
-        Inactive lanes skip the op and preserve vdata. CAS loops use OpAtomicLoad (valid on Image pointers) +
-        OpAtomicCompareExchange, requiring no shader float atomic extension."""
+        Inactive lanes skip the op and preserve vdata; active lanes outside the image skip it and get 0 with glc
+        (image_atomic_guard). CAS loops use OpAtomicLoad (valid on Image pointers) + OpAtomicCompareExchange,
+        requiring no shader float atomic extension."""
         need_n = 2 if op == "image_atomic_fcmpswap" else 1
         if vdata["k"] != "vgpr" or vdata.get("n", 1) != need_n:
             raise Unsupported(op + " operands")
         val = self.load_reg("vgpr", vdata["r"])
         cmpv = self.load_reg("vgpr", vdata["r"] + 1) if op == "image_atomic_fcmpswap" else None
-        act = self.active_b()
+        act = self.image_atomic_guard(ip, iv, is3d)
+        pre = self.current_label_placeholder()
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
@@ -11471,8 +11517,6 @@ class Gen:
         if op == "image_atomic_swap":
             old = self.tmp()
             self.emit(f"{old} = OpAtomicExchange %uint {tp} {sc} {sem} {val}")
-            if "glc" in mods:
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
         elif op == "image_atomic_fcmpswap":
             # IEEE-754 binary32 ordered equality on raw 32-bit words (denormal-safe on drivers with
             # shaderDenormPreserveFloat32 = false): equal iff neither is NaN and (cur == cmpv or both are +-0.0).
@@ -11509,8 +11553,7 @@ class Gen:
             self.emit(f"{lbl_cont} = OpLabel")
             self.emit(f"OpBranch {lbl_hdr}")
             self.emit(f"{lbl_exit} = OpLabel")
-            if "glc" in mods:
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, cur)
+            old = cur
         else:
             val_f = None
             if op in ("image_atomic_fmin", "image_atomic_fmax"):
@@ -11549,10 +11592,14 @@ class Gen:
             self.emit(f"{lbl_cont} = OpLabel")
             self.emit(f"OpBranch {lbl_hdr}")
             self.emit(f"{lbl_exit} = OpLabel")
-            if "glc" in mods:
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, cur)
+            old = cur
+        last = self.current_label_placeholder()      # the CAS loop's exit block, or lbl_do for swap
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
+        res = self.tmp()
+        self.emit(f"{res} = OpPhi %uint {old} {last} {self.cu(0)} {pre}")
+        if "glc" in mods:
+            self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, res)
 
     def image_misc(self, op, a, mods):
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
@@ -11617,30 +11664,9 @@ class Gen:
             self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg3 %simages3d {idx}")
             if op in self.IMG_ATOMICS_EXTRA:
-                self.emit_image_atomic_extra(op, ip, iv, vdata, mods)
-                return
-            tp, old, safe = self.tmp(), self.tmp(), self.tmp()
-            val = self.load_reg("vgpr", vdata["r"])
-            if op == "image_atomic_cmpswap":
-                cmpv = self.load_reg("vgpr", vdata["r"] + 1)
-                act = self.active_b()
-                do, end = self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"OpSelectionMerge {end} None")
-                self.emit(f"OpBranchConditional {act} {do} {end}")
-                self.emit(f"{do} = OpLabel")
-                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
-                if "glc" in mods:
-                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-                self.emit(f"OpBranch {end}")
-                self.emit(f"{end} = OpLabel")
-                return
-            spv, neutral = self.IMG_ATOMICS[op]
-            self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-            self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
-            self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {safe}")
-            if "glc" in mods:
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+                self.emit_image_atomic_extra(op, ip, iv, vdata, mods, True)
+            else:
+                self.emit_image_atomic(op, ip, iv, vdata, mods, True)
             return
         if op == "image_store":
             self.image_store(a, mods, dim)
@@ -11654,47 +11680,9 @@ class Gen:
             ip = self.tmp()
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg %simages {idx}")
             if op in self.IMG_ATOMICS_EXTRA:
-                self.emit_image_atomic_extra(op, ip, iv, vdata, mods)
-                return
-            val = self.load_reg("vgpr", vdata["r"])
-            if op == "image_store":
-                # Writes dmask component 0 as r32ui; only active lanes store.
-                img, lbl_do, lbl_end = self.tmp(), self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"{img} = OpLoad %simg2d_u {ip}")
-                v4 = self.tmp()
-                self.emit(f"{v4} = OpCompositeConstruct %v4uint {val} {self.cu(0)} {self.cu(0)} {self.cu(0)}")
-                act = self.active_b()      # must be computed before OpSelectionMerge (merge directly precedes branch)
-                self.emit(f"OpSelectionMerge {lbl_end} None")
-                self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
-                self.emit(f"{lbl_do} = OpLabel")
-                self.emit(f"OpImageWrite {img} {iv} {v4}")
-                self.emit(f"OpBranch {lbl_end}")
-                self.emit(f"{lbl_end} = OpLabel")
-                self.uses_v4uint = True
-                return
-            if op == "image_atomic_cmpswap":
-                # vdata = (src, cmp): memory = (memory == cmp) ? src : memory; glc returns the old value.
-                cmpv = self.load_reg("vgpr", vdata["r"] + 1)
-                act = self.active_b()
-                do, end = self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"OpSelectionMerge {end} None")
-                self.emit(f"OpBranchConditional {act} {do} {end}")
-                self.emit(f"{do} = OpLabel")               # inactive lanes don't touch memory
-                tp, old = self.tmp(), self.tmp()
-                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
-                if "glc" in mods:
-                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-                self.emit(f"OpBranch {end}")
-                self.emit(f"{end} = OpLabel")
-                return
-            spv, neutral = self.IMG_ATOMICS[op]
-            tp, old, safe = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-            self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
-            self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {safe}")
-            if "glc" in mods:
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+                self.emit_image_atomic_extra(op, ip, iv, vdata, mods, False)
+            else:
+                self.emit_image_atomic(op, ip, iv, vdata, mods, False)
             return
         ip, img = self.tmp(), self.tmp()
         if array_query:
