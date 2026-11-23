@@ -20,7 +20,14 @@ inline std::vector<std::uint32_t> read_spirv_words(std::istream& input, std::str
     std::vector<std::uint32_t> words(static_cast<std::size_t>(byte_count / word_bytes));
     words.front() = magic;
     if (!input.read(reinterpret_cast<char*>(words.data() + 1), byte_count - word_bytes)) return {};
+    if (words[3] == 0 || words[4] != 0) return {};
+    for (std::size_t at = 5; at < words.size();) {
+        const std::size_t inst_words = words[at] >> 16;
+        if (inst_words == 0 || inst_words > words.size() - at) return {};
+        at += inst_words;
+    }
     return words;
 }
+
 
 }  // namespace leonida

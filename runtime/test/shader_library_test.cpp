@@ -271,6 +271,21 @@ int main() {
         input.seekg(0, std::ios::end);
         CHECK(read_spirv_words(input, static_cast<std::streamoff>(header_bytes.size() + 4)).empty());
     }
+    {
+        const auto to_stream = [](const std::vector<std::uint32_t>& words) {
+            std::istringstream in(std::string(reinterpret_cast<const char*>(words.data()),
+                                              words.size() * sizeof(std::uint32_t)));
+            in.seekg(0, std::ios::end);
+            return read_spirv_words(in, in.tellg());
+        };
+        const std::vector<std::uint32_t> with_inst = {0x07230203, 0x00010300, 0, 1, 0, (2u << 16) | 17u, 1u};
+        CHECK(to_stream(with_inst) == with_inst);
+        CHECK(to_stream({0x07230203, 0x00010300, 0, 0, 0}).empty());                    // Bound == 0
+        CHECK(to_stream({0x07230203, 0x00010300, 0, 1, 1}).empty());                    // schema != 0
+        CHECK(to_stream({0x07230203, 0x00010300, 0, 1, 0, 0u}).empty());                // instruction WordCount == 0
+        CHECK(to_stream({0x07230203, 0x00010300, 0, 1, 0, (3u << 16) | 17u, 1u}).empty());  // truncated instruction
+    }
+
 
     CHECK(sha256_hex({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     CHECK(sha256_hex(bytes("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
