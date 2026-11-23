@@ -1158,8 +1158,8 @@ int main(int argc, char** argv) {
         return std::make_tuple(required_push_bytes(meta.push_constant_bytes, meta.pc_tail_bytes),
                                meta.pc_tail_bytes != 0, descriptors.layout_mask(meta.set0_bindings));
     };
-    std::map<std::tuple<uint32_t, bool, uint32_t>, VkPipelineLayout> layouts;
-    std::map<uint32_t, VkDescriptorSetLayout> set_layouts;
+    std::map<std::tuple<uint32_t, bool, std::optional<uint32_t>>, VkPipelineLayout> layouts;
+    std::map<std::optional<uint32_t>, VkDescriptorSetLayout> set_layouts;
     LOADD(vkDestroyDescriptorSetLayout); LOADD(vkDestroyPipelineLayout);
     for (const auto& [_, meta] : work) {
         const auto key = layout_key(*meta);

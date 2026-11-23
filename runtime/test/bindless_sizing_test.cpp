@@ -122,8 +122,21 @@ int main() {
         // If reduced ordinary arrays fit, keep the shared layout and its real descriptor counts.
         const Device reduced = uniform(4000, 65536);
         const leonida::vk_test::PipelineCheckDescriptors sized(enabled, reduced.limits, reduced.v11, reduced.v12);
-        EXPECT(!sized.compact && sized.layout_mask(image_and_table) == ~0u);
+        EXPECT(!sized.compact && !sized.layout_mask(image_and_table));
         EXPECT(sized.features.counts[0] > 1 && sized.features.counts[0] < defaults[0]);
+
+        // An MS declaration always reaches set 0, including on a device whose base layout is shared.
+        // The adjacent binding of the same component class is present only if the shader declares it too.
+        for (const auto* checker : {&indexed, &plain, &sized}) {
+            for (uint32_t b = bindless::first_ms_binding; b < bindless::binding_count; ++b) {
+                const uint32_t declared = (1u << bindless::table_binding) | (1u << b);
+                const bindless::SetLayout ms(checker->features, checker->layout_mask(declared));
+                EXPECT(checker->fits(declared) && ms.info.bindingCount == 2);
+                EXPECT(ms.entries[0].binding == bindless::table_binding && ms.entries[1].binding == b);
+                EXPECT(ms.entries[1].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && ms.entries[1].descriptorCount == 1);
+            }
+        }
+        EXPECT(indexed.fits(~0u) && !plain.fits(~0u));
     }
 
     // An RTX 5070 (driver 621.24): 1048576 of each descriptor type, update-after-bind or not, 4000 samplers.

@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -172,13 +173,16 @@ struct SetLayout {
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
     VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
 
-    // The runtime uses every enabled binding. The pipeline checker can request only those its shader declares.
-    explicit SetLayout(const BindlessFeatures& features, std::uint32_t binding_mask = ~0u) {
+    // The runtime sizes and filters bindings for real resources, including fallback MS images.
+    // A per-shader checker layout only compiles pipelines. One descriptor per declared binding suffices.
+    explicit SetLayout(const BindlessFeatures& features, std::optional<std::uint32_t> shader_bindings = std::nullopt) {
         static_assert(binding_count <= 32);
         std::uint32_t count = 0;
         for (std::uint32_t b = 0; b < binding_count; ++b) {
-            if (!binding_enabled(b, features) || !(binding_mask & (1u << b))) continue;
-            entries[count] = {b, bindings[b].type, features.counts[b], VK_SHADER_STAGE_ALL, nullptr};
+            const bool enabled = shader_bindings ? (*shader_bindings & (1u << b)) != 0 : binding_enabled(b, features);
+            if (!enabled) continue;
+            const auto descriptors = shader_bindings ? 1u : features.counts[b];
+            entries[count] = {b, bindings[b].type, descriptors, VK_SHADER_STAGE_ALL, nullptr};
             flags[count] = (features.update_after_bind ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0) |
                            (features.partially_bound ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0);
             ++count;

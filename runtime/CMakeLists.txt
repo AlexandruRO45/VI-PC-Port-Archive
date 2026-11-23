@@ -1007,6 +1007,15 @@ if(TARGET Vulkan::Headers)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   endif()
   if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    if(BUILD_TESTING)
+      add_test(NAME vk_pipeline_check_ms_binding COMMAND "${CMAKE_COMMAND}"
+               "-DTOOL=$<TARGET_FILE:vk_pipeline_check>" "-DGLSLANG=${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}"
+               "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/pipeline_ms_binding/$<CONFIG>"
+               "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+               -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_pipeline_ms_binding.cmake")
+      set_tests_properties(vk_pipeline_check_ms_binding PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP: set LEONIDA_VK_VALIDATION"
+                           ENVIRONMENT_MODIFICATION "VK_INSTANCE_LAYERS=path_list_prepend:VK_LAYER_KHRONOS_validation")
+    endif()
     add_executable(vk_overlapping_occlusion_test test/vk_overlapping_occlusion_test.cpp)
     target_link_libraries(vk_overlapping_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
