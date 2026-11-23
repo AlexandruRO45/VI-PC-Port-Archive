@@ -66,6 +66,16 @@ class HarnessError(unittest.TestCase):
 
 
 class ArgumentValidation(unittest.TestCase):
+    def test_reps_must_fit_the_native_counter(self):
+        with patch.object(sys, "argv", ["bench_wave64.py", "--reps", str(2**31)]), \
+                patch.object(bench_wave64, "build", side_effect=AssertionError("must reject before build")) as build, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as e:
+                bench_wave64.main()
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn("2147483647", err.getvalue())
+        build.assert_not_called()
+
     def test_positive_only(self):
         for option in ("--groups", "--reps", "--procs"):
             for value in ("0", "-1"):

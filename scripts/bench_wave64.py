@@ -82,6 +82,8 @@ def main():
     ap.add_argument("--procs", type=positive_int, default=5)
     ap.add_argument("--shader", default="cs_bench_mix")
     a = ap.parse_args()
+    if a.reps > 2**31 - 1:
+        ap.error("--reps must be at most 2147483647 (vk_compute_test repetition limit)")
     with tempfile.TemporaryDirectory(prefix="bench-w64-") as work:
         spv = {False: build(work, a.shader, False, a.llvm_mc), True: build(work, a.shader, True, a.llvm_mc)}
         seg = segments(spv[True])

@@ -3,8 +3,8 @@
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
 //            "workgroup_yz": pass 2x3x4 for groups; check the Y/Z histogram (cs_workgroup_yz.asm)
 //            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
-//   VKC_BENCH=N (env): dispatch N more times after the checked one and print the median / min / max wall time of one
-//   dispatch (submit to queue idle) as "bench ms: median=.. min=.. max=.. n=..". The buffer is not cleared in between.
+//   VKC_BENCH=N (env): dispatch N more times (0..2147483647) after the checked one. Print the median / min / max
+//   wall time (submit to queue idle) as "bench ms: median=.. min=.. max=.. n=..". The buffer is not cleared in between.
 //   VKC_OUT_WORDS=N (env): make the output buffer at least N words (default groups * 64), so a single group can
 //   write more than one word per thread. VKC_DUMP=<file> (env): write the whole buffer to <file> after the dispatch.
 //   VKC_HEAP_INIT=<file> (env): copy the file's bytes to the start of the buffer (Xbox VA 0) after the default fill
@@ -22,7 +22,9 @@
 #include "vk_pc_tail.h"
 
 #include <cctype>
+#include <charconv>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
@@ -72,6 +74,16 @@ int main(int argc, char** argv) {
     if (argc != 4 && !require_wave64) {
         std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
         return 2;
+    }
+    const char* bench = std::getenv("VKC_BENCH");
+    std::int32_t bench_reps = 0;
+    if (bench) {
+        const char* end = bench + std::strlen(bench);
+        const auto [ptr, error] = std::from_chars(bench, end, bench_reps);
+        if (error != std::errc{} || ptr != end || bench_reps < 0) {
+            std::fprintf(stderr, "VKC_BENCH: expected a decimal repetition count in 0..2147483647, got \"%s\"\n", bench);
+            return 2;
+        }
     }
     uint32_t pc[36] = {};
     const char* sgprs_env = std::getenv("VKC_SGPRS");
@@ -347,9 +359,9 @@ int main(int argc, char** argv) {
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
-    if (const char* b = std::getenv("VKC_BENCH")) {
+    if (bench) {
         std::vector<double> ms;
-        for (int i = 0, n = std::atoi(b); i < n; i++) {
+        for (std::int32_t i = 0; i < bench_reps; i++) {
             auto t0 = std::chrono::steady_clock::now();
             CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
             CHECK(vkQueueWaitIdle(q));
