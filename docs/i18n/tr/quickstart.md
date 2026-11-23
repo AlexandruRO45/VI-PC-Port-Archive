@@ -3,7 +3,7 @@
 > [!NOTE]
 > İngilizce dokümantasyon ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) ve
 > [`docs/README.md`](../../README.md)) **yetkili kaynaktır**. Bu rehber yalnızca kararlı kurulum ve derleme
-> yönergelerini kapsar (`f85582e` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
+> yönergelerini kapsar (`561b65a` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
 > [`README.md`](../../../README.md) dosyasına bakın.
 
 ## Leonida Nedir?
