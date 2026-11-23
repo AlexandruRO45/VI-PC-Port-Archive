@@ -101,6 +101,49 @@ def test_scarab_cross_check():
     assert errors == []
 
 
+def _scarab_tree(tmp, table=b"", console=b"", catalogue=b"h\n"):
+    paths = {
+        os.path.join("components", "runtime-bridge", "src", "iid_table.cpp"): table,
+        os.path.join("components", "extension-wrapper", "src", "iid_console.inc"): console,
+        os.path.join("components", "extension-wrapper", "docs", "console-extension-catalogue.tsv"): catalogue,
+    }
+    for rel, data in paths.items():
+        full = os.path.join(tmp, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data)
+    return tmp
+
+
+def test_scarab_malformed_inputs_report_failure_not_traceback():
+    bad = b"\xff\xfe\x00not utf-8"
+    cases = {
+        "iid_table.cpp": dict(table=bad),
+        "iid_console.inc": dict(console=bad),
+        "catalogue": dict(catalogue=bad),
+    }
+    for name, kwargs in cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            errors, _notes = S.check_scarab(_scarab_tree(tmp, **kwargs))
+            assert any(e.startswith("cannot read ") for e in errors), (name, errors)
+
+
+def test_scarab_unreadable_input_reports_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _scarab_tree(tmp)
+        table = os.path.join(root, "components", "runtime-bridge", "src", "iid_table.cpp")
+        os.remove(table)
+        os.makedirs(table)
+        errors, _notes = S.check_scarab(root)
+        assert any(e.startswith("cannot read ") for e in errors), errors
+
+
+def test_scarab_missing_input_is_reported_not_raised():
+    with tempfile.TemporaryDirectory() as tmp:
+        errors, _notes = S.check_scarab(tmp)
+        assert any(e.startswith("missing ") for e in errors), errors
+
+
 if __name__ == "__main__":
     test_slots_are_116()
     test_data_classes()
@@ -109,6 +152,9 @@ if __name__ == "__main__":
     test_unrecovered_console_iids_stay_outside_the_table()
     test_sdk_include_override_accepts_a_trailing_separator()
     test_sdk_discovery_sorts_versions_numerically()
+    test_scarab_malformed_inputs_report_failure_not_traceback()
+    test_scarab_unreadable_input_reports_failure()
+    test_scarab_missing_input_is_reported_not_raised()
     # Call the two optional checks through their real definitions so this runner cannot drift from them; both
     # raise unittest.SkipTest when their inputs (SDK headers, SCARAB_REF) are absent.
     for optional in (test_standard_iids_match_sdk, test_scarab_cross_check):
