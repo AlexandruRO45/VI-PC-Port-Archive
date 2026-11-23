@@ -57,6 +57,28 @@ class Sampling(unittest.TestCase):
         self.assertTrue(all(sampled >= min(10, size) for size, sampled in per.values()))
         self.assertEqual(sum(sampled for _, sampled in per.values()), len(picked))
 
+    def test_tier_weighted_sample(self):
+        # SHADER-836: --tier-n samples each wave64_graphics tier on its own, so the rare tier C gets its own count.
+        index = synthetic_index()
+        for i, k in enumerate(sorted(k for k, v in index.items() if v["stage"] == "ps")):
+            index[k]["wave64_graphics"] = "C" if i % 10 == 0 else "A"
+            if i % 10 == 0:
+                index[k]["wave64_graphics_reasons"] = ["LANE_COUNT", "LANE_COUNT"]
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv, out = os.path.join(tmp, "spirv"), os.path.join(tmp, "out")
+            os.makedirs(spirv)
+            with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                ps_sweep.main(["sample", "--spirv", spirv, "--out", out, "--tier-n", "C=100,A=20", "--seed", "3"])
+            with open(os.path.join(out, "sample.json"), encoding="utf-8") as f:
+                sample = json.load(f)
+        tiers = [s["tier"] for s in sample]
+        self.assertEqual(tiers.count("C"), 14)            # all 14 tier C shaders: fewer than asked for
+        self.assertGreaterEqual(tiers.count("A"), 20)      # the stratum floors may add a few more
+        self.assertEqual({tuple(s["reasons"]) for s in sample if s["tier"] == "C"}, {("LANE_COUNT",)})
+        self.assertEqual(len({s["name"] for s in sample}), len(sample))
+
     def test_fixed_seed_is_stable_and_seed_matters(self):
         ps = {k: v for k, v in synthetic_index().items() if v["stage"] == "ps"}
         first = ps_sweep.pick_sample(ps, 40, 7)[0]

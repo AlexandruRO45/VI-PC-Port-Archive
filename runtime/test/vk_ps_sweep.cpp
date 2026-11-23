@@ -21,6 +21,10 @@
 //   push        s0..s31 from VKS_SGPRS (like VKH_SGPRS), then the heap base
 //   heap        VKS_HEAP_KB KiB (default 1024), zero unless VKS_HEAP_FILL=<offset>,<bytes>,<seed> fills a range with
 //               floats in [0.25, 1)
+//   VKS_SUBGROUP=32|64  draws the pixel shader with that required subgroup size (subgroupSizeControl, the fragment
+//               stage in requiredSubgroupSizeStages; else exit 77). On a device whose fragment subgroups can be 64
+//               and 32 wide (AMD RDNA), 64 is the wave64 the shader was written for and 32 is what a 32-wide GPU
+//               gives it, so the two runs of one shader on one GPU measure tier C of tools/wave64_halves.py alone
 // Output: the targets back to back, each width * height * 16 bytes, cleared to -1 so a pixel that was never
 // written stays clear. --depth also writes <out.raw>.depth, one D32_SFLOAT word per pixel, cleared to 1.
 // It enables precise occlusion counting, depth test ALWAYS, depth writes, and no stencil or depth bounds test.
@@ -238,9 +242,11 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary_have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock_have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features have13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     have.pNext = &have12;
-    have12.pNext = &lock_have;
+    have12.pNext = &have13;
+    have13.pNext = &lock_have;
     lock_have.pNext = &bary_have;
     vkGetPhysicalDeviceFeatures2(pd, &have);
     VkPhysicalDeviceSubgroupProperties sub{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
@@ -305,6 +311,18 @@ int main(int argc, char** argv) {
         need((sub.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0, "subgroup operations in fragment shaders");
         need((sub.supportedOperations & subgroup_ops) == subgroup_ops, "a subgroup operation class");
     }
+    // VKS_SUBGROUP: a required fragment subgroup size, within what the device allows for that stage.
+    uint32_t required_subgroup = 0;
+    if (const char* s = std::getenv("VKS_SUBGROUP"); s && *s) {
+        required_subgroup = uint32_t(std::strtoul(s, nullptr, 10));
+        VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+        VkPhysicalDeviceProperties2 p13w{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
+        vkGetPhysicalDeviceProperties2(pd, &p13w);
+        need(have13.subgroupSizeControl && (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+                 required_subgroup >= p13.minSubgroupSize && required_subgroup <= p13.maxSubgroupSize &&
+                 (required_subgroup & (required_subgroup - 1)) == 0,
+             "the requested fragment subgroup size (VKS_SUBGROUP)");
+    }
     leonida::vk_test::ShaderFma fma;
     fma.query(gipa, inst, pd);
     if (!fma.accepts(fs_code.data(), fs_code.size() * 4, argv[2])) return 77;
@@ -362,8 +380,11 @@ int main(int argc, char** argv) {
     en12.descriptorBindingPartiallyBound = flags.partially_bound;
     en12.runtimeDescriptorArray = VK_TRUE;
     en12.bufferDeviceAddress = VK_TRUE;
-    // pNext chain: features2 -> vulkan12 -> [barycentric] -> [interlock] -> [maintenance8] -> [fma]
+    VkPhysicalDeviceVulkan13Features en13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    en13.subgroupSizeControl = required_subgroup ? VK_TRUE : VK_FALSE;
+    // pNext chain: features2 -> vulkan12 -> [vulkan13] -> [barycentric] -> [interlock] -> [maintenance8] -> [fma]
     void** tail = &en12.pNext;
+    if (required_subgroup) { *tail = &en13; tail = &en13.pNext; }
     if (bary.fragmentShaderBarycentric) { *tail = &bary; tail = &bary.pNext; }
     if (lock.fragmentShaderPixelInterlock) { *tail = &lock; tail = &lock.pNext; }
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
@@ -651,6 +672,9 @@ int main(int argc, char** argv) {
         stages[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT; stages[stage_count].module = gs;
         stages[stage_count++].pName = "main";
     }
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+    rss.requiredSubgroupSize = required_subgroup;
+    if (required_subgroup) stages[stage_count].pNext = &rss;
     stages[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[stage_count].module = fs;
     stages[stage_count++].pName = "main";
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};

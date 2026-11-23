@@ -169,12 +169,28 @@ def make_vs(glslang, meta, cache_dir):
     return spv
 
 
+def tier(meta):
+    """The wave64_graphics tier (tools/wave64_halves.py) of a wave64 pixel shader, '-' for a wave32 or unmarked one."""
+    return meta.get("wave64_graphics") or "-"
+
+
 def cmd_sample(a):
     ps = load_ps(a.spirv)
-    picked, per = pick_sample(ps, a.n, a.seed)
+    if a.tier_n:
+        # A sample weighted by tier: each tier's shaders are sampled on their own (still stratified as above), so a
+        # rare tier gets the count asked for instead of its share of the population.
+        picked, per = [], {}
+        for t, n in sorted(a.tier_n.items()):
+            sub = {k: v for k, v in ps.items() if tier(v) == t}
+            p, q = pick_sample(sub, min(n, len(sub)), a.seed)
+            picked += p
+            per.update({(t,) + s: v for s, v in q.items()})
+    else:
+        picked, per = pick_sample(ps, a.n, a.seed)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "sample.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump([{"name": k, "stratum": list(stratum(ps[k]))} for k in picked], f)
+        json.dump([{"name": k, "stratum": list(stratum(ps[k])), "tier": tier(ps[k]),
+                    "reasons": sorted(set(ps[k].get("wave64_graphics_reasons", [])))} for k in picked], f)
     print(f"population {len(ps)} strata {len(per)} sampled {len(picked)}")
     for s in sorted(per, key=str):
         print(f"  stratum {s}: population {per[s][0]} sampled {per[s][1]}")
@@ -225,6 +241,8 @@ def cmd_run(a):
                 f.write(json.dumps({"i": i, "code": NOT_TRANSLATED, "reason": "no bary_gs companion", "targets": 0, "sec": 0}) + "\n")
             continue
         env = job_env(os.environ, a.timeout, a.variant, meta, gs)
+        if a.subgroup:
+            env["VKS_SUBGROUP"] = str(a.subgroup)
         cmd = [a.exe, make_vs(a.glslang, meta, cache), os.path.join(a.spirv, s["name"] + ".spv"), raw,
                str(W), str(H), str(targets)]
         if a.depth:
@@ -504,6 +522,20 @@ def cmd_compare(a):
     for (c, sc), n in sorted(sub.items()):
         if sc:
             print(f"    {c} / {sc}: {n}")
+    # By wave64_graphics tier, and tier C by reason code (a shader with several reasons counts under each).
+    if any("tier" in s for s in sample):
+        by_tier, by_reason = {}, {}
+        for s, row in zip(sample, rows):
+            t = s.get("tier", "-")
+            by_tier.setdefault(t, {})[row["class"]] = by_tier.setdefault(t, {}).get(row["class"], 0) + 1
+            if t == "C":
+                for r in s.get("reasons") or ["(none)"]:
+                    d = by_reason.setdefault(r, {})
+                    d[row["class"]] = d.get(row["class"], 0) + 1
+        for t in sorted(by_tier):
+            print(f"  tier {t}: " + ", ".join(f"{c} {n}" for c, n in sorted(by_tier[t].items())))
+        for r in sorted(by_reason):
+            print(f"    tier C reason {r}: " + ", ".join(f"{c} {n}" for c, n in sorted(by_reason[r].items())))
 
 
 WARNING = ("warning (run): a few sampled shaders hang NVIDIA GPUs with the zeroed heap (VK_ERROR_DEVICE_LOST, a\n"
@@ -534,6 +566,10 @@ def main(argv=None):
     ap.add_argument("--hi", type=int, default=0)
     ap.add_argument("--only", type=lambda s: [int(x) for x in s.split(",")], default=None)
     ap.add_argument("--suffix", default="", help="results folder suffix (a re-run uses _re)")
+    ap.add_argument("--tier-n", type=lambda s: {k: int(v) for k, v in (p.split("=") for p in s.split(","))},
+                    default=None, help="sample: shaders per wave64_graphics tier instead of --n, e.g. C=240,B=60,A=60")
+    ap.add_argument("--subgroup", type=int, default=0,
+                    help="run: required fragment subgroup size (VKS_SUBGROUP), e.g. 64 and 32 on one AMD GPU")
     a = ap.parse_args(argv)
     a.depth |= a.two_clear
     if a.depth and a.cmd != "run":

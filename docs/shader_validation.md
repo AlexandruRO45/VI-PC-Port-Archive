@@ -2256,6 +2256,53 @@ reads per vertex. Not shown: the 61 individually (a 12-shader subset of the 190 
 the RTX 4080 SUPER; draws of these shaders take about 20 s each). Only 9 of the 480 read raw
 barycentrics and need the geometry shader; all 9 agree on both GPUs.
 
+### What tier C costs in pixels: one AMD GPU at subgroup 64 and 32 (SHADER-836)
+
+The two-GPU sweep above cannot show tier C (`tools/wave64_halves.py`): the RTX 4080 SUPER and the UHD 770 are both
+32-wide, so a tier C shader is inexact the same way on both. An AMD RDNA GPU whose driver lists the fragment stage in
+`requiredSubgroupSizeStages` can draw one translated pixel shader twice, at subgroup 64 (the wave64 it was written for)
+and at 32 (what a 32-wide GPU gives it). Nothing else changes between the two draws, so a difference is tier C (or a
+mis-tiered shader) and not filter weights or a vendor. `vk_ps_sweep` takes the size from `VKS_SUBGROUP` (exit 77 when
+the device cannot require it), and `ps_sweep.py run --subgroup 64|32` passes it on. `ps_sweep.py sample --tier-n` samples
+each tier on its own so that the rare tiers get a count of their own.
+
+AMD Radeon RX 9060 XT (RDNA4), AMD driver 26.10.44, Windows 11. Pixel shaders translated by `make_game --stages shaders`
+from `main` `659654236`, own 1.0.2.1 copy. Population: 12,101 pixel shaders, A 3,396 / B 27 / C 7,551 (wave64_halves
+census; the same counts as SHADER-836b's). Sample `--tier-n C=240,B=27,A=60 --seed 836`: 360 shaders, A 93 (the stratum
+floors add 33), all 27 of tier B, C 240. Every one of the 360 draws at both sizes in both variants (no unsupported
+feature, no timeout, no device loss).
+
+| class | variant z (fallback images) | variant t (gradient textures) |
+|---|---|---|
+| same at 64 and 32 | 351 | 336 |
+| differs beyond tolerance | 5 (4 by > 0.1) | 19 (all by > 0.1) |
+| NaN, zero or unwritten at one size only | 4 | 5 |
+
+By tier (variant t; variant z in brackets):
+
+| tier | sampled | same | differ | NaN / zero / unwritten at one size |
+|---|---:|---:|---:|---:|
+| A | 93 | 93 (93) | 0 (0) | 0 (0) |
+| B | 27 | 24 (24) | 3 (3) | 0 (0) |
+| C | 240 | 219 (234) | 16 (2) | 5 (4) |
+
+- **Tier C, 21 of 240 (8.8 %) in variant t, 6 of 240 in variant z.** A tier C shader lists several reasons, so these
+  overlap. Among the 21 (variant t): cross-lane 20, tainted-exec 20, unsafe-vote-branch 17, tainted-branch 8,
+  mask-half 5, stale-scalar 4, lane-id 1; first-lane (0 of 9) and unsafe-execz-branch (0 of 17) never differ here.
+  Nearly all of the cost sits with cross-lane data flow. Variant z hides most of it, because with zero textures most
+  tier C shaders compute nothing that depends on the lane.
+- **Tier B is not always exact.** 3 of the 27 differ by more than 0.1 in both variants. All 3 carry the
+  `readfirstlane-uniform` idiom (26 of the 27 sampled tier B shaders carry it, one carries `lane-spill`). The
+  analysis proves that value uniform, but on 3 shaders it is not uniform across the two 32-lane halves.
+- **Tier A is exact:** 93 of 93 in both variants, which also shows that the 64-wide and the 32-wide pipelines are
+  otherwise the same.
+- **The differences are the subgroup size, not noise.** All 24 shaders that differ in variant t, drawn again at 64, are
+  bit-identical to the first draw at 64, and the same holds at 32. The 9 shaders that differ in variant z, drawn again
+  at 64, match too. The second 64 draw against the second 32 draw reproduces the same 19 + 5 classes.
+- The limit is the synthetic input of this sweep (zeroed heap, fallback or gradient images, generated varyings). It
+  gives a floor on how often tier C shows, not how much a real frame changes. Shaders whose tier C path needs real
+  descriptors or data stay equal here.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
