@@ -212,14 +212,16 @@ std::vector<Case> cases() {
          CALLS(e.list->CopyBufferRegion(e.buffer.p, 0, nullptr, 0, 16))},
         {"CopyBufferRegion into a texture", false, looser,
          CALLS(e.list->CopyBufferRegion(e.tex.p, 0, e.upload.p, 0, 16))},
-        // CopyTextureRegion
+        // CopyTextureRegion. WARP accepts an upload footprint whose offset is not 512-aligned and whose row pitch is
+        // not 256-aligned (measured with this test on Windows 11 26100: the live WARP verdict is S_OK for all three and
+        // the layer agrees), so these three are matches rather than cases where the layer is stricter.
         {"CopyTextureRegion upload, offset 0, row pitch 256", true, match,
          CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 256), nullptr))},
-        {"CopyTextureRegion upload, offset 16 (not 512-aligned)", true, stricter,
+        {"CopyTextureRegion upload, offset 16 (not 512-aligned)", true, match,
          CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 16, 256), nullptr))},
-        {"CopyTextureRegion upload, offset 4 (not 512-aligned)", true, stricter,
+        {"CopyTextureRegion upload, offset 4 (not 512-aligned)", true, match,
          CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 4, 256), nullptr))},
-        {"CopyTextureRegion upload, row pitch 260 (not 256-aligned)", true, stricter,
+        {"CopyTextureRegion upload, row pitch 260 (not 256-aligned)", true, match,
          CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 260), nullptr))},
         {"CopyTextureRegion upload, row pitch 128 (shorter than a row)", false, match,
          CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 128), nullptr))},
