@@ -255,6 +255,7 @@ class TestCommandLine(unittest.TestCase):
             result = self.run_tool(path, "--json", long_json)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+            self.assertIn("cannot write", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
             self.assertFalse(os.path.exists(long_json))
 
@@ -262,6 +263,7 @@ class TestCommandLine(unittest.TestCase):
             result = self.run_tool(path, "--records", long_records)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+            self.assertIn("cannot write", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
             self.assertFalse(os.path.exists(long_records))
 

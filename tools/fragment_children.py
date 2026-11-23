@@ -372,7 +372,8 @@ def main(argv=None):
     try:
         stats = scan_archive(a.archive, a.start, a.end, a.jobs, a.records, lambda text: print(text, flush=True))
     except OSError as exc:
-        if a.records:
+        # An archive or worker read error is not a records write error; label it by the failing path.
+        if a.records and exc.filename and ss.same_output_path(exc.filename, a.records):
             print(f"error: cannot write {a.records}: {exc}", file=sys.stderr)
         else:
             print(f"error: {a.archive}: {exc}", file=sys.stderr)
