@@ -222,6 +222,38 @@ bool write_marker(const std::filesystem::path& mark, DWORD& error) {
     return true;
 }
 
+// Prepare the package tombstone before changing the overlay. If the host operation fails, undo only a marker
+// created for this attempt; a pre-existing tombstone still belongs to an earlier successful operation.
+class PendingMarker {
+public:
+    bool prepare(const std::filesystem::path& path, DWORD& error) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(path, ec)) return true;
+        if (!write_marker(path, error)) return false;
+        path_ = path;
+        return true;
+    }
+    void commit() { path_.clear(); }
+    ~PendingMarker() {
+        if (path_.empty()) return;
+        const DWORD error = ::GetLastError();
+        ::DeleteFileW(path_.c_str());
+        ::SetLastError(error);
+    }
+    // Keep another delete/move from adopting a temporary marker that this attempt might roll back.
+    PendingMarker() : lock_(mutex()) {}
+    PendingMarker(const PendingMarker&) = delete;
+    PendingMarker& operator=(const PendingMarker&) = delete;
+
+private:
+    static std::mutex& mutex() {
+        static std::mutex value;
+        return value;
+    }
+    std::unique_lock<std::mutex> lock_;
+    std::filesystem::path path_;
+};
+
 // Flushes a file the shim wrote on the title's behalf, for MOVEFILE_WRITE_THROUGH. On failure `error` holds the reason.
 bool flush_file(const std::filesystem::path& path, DWORD& error) {
     const HANDLE h = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -774,10 +806,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
     bool removed = false;
     std::error_code ec;
     const std::filesystem::path overlay_path = join(r.overlay, parts);
-    if (std::filesystem::exists(overlay_path, ec)) {
-        if (!::DeleteFileW(overlay_path.c_str())) return FALSE;
-        removed = true;
-    }
+    PendingMarker deletion;
     if (!r.game.empty() && !deleted(r.overlay, parts)) {
         const std::filesystem::path package_path = join(r.game, parts);
         if (std::filesystem::exists(package_path, ec)) {
@@ -787,14 +816,19 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
             }
             // The package file stays where it is; the marker is what hides it.
             DWORD error = 0;
-            if (!write_marker(marker(r.overlay, parts), error)) return fail_bool(error);
+            if (!deletion.prepare(marker(r.overlay, parts), error)) return fail_bool(error);
             removed = true;
         }
+    }
+    if (std::filesystem::exists(overlay_path, ec)) {
+        if (!::DeleteFileW(overlay_path.c_str())) return FALSE;
+        removed = true;
     }
     if (!removed) {
         SetLastError(ERROR_FILE_NOT_FOUND);
         return FALSE;
     }
+    deletion.commit();
     return TRUE;
 }
 
@@ -872,17 +906,19 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" itself stays
+    PendingMarker deletion;
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
     if (!empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
 
-    if (v.in_overlay && !::RemoveDirectoryW(join(r.overlay, parts).c_str())) return FALSE;  // its error
     if (v.in_package) {
         // The package folder stays where it is; the marker hides it, and its files are already hidden one by one.
         DWORD error = 0;
-        if (!write_marker(marker(r.overlay, parts) / kRemovedDirMarker, error)) return fail_bool(error);
+        if (!deletion.prepare(marker(r.overlay, parts) / kRemovedDirMarker, error)) return fail_bool(error);
     }
+    if (v.in_overlay && !::RemoveDirectoryW(join(r.overlay, parts).c_str())) return FALSE;  // its error
+    deletion.commit();
     return TRUE;
 }
 
@@ -909,6 +945,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (src.empty() || dst.empty()) return fail_bool(ERROR_ACCESS_DENIED);
+    PendingMarker deletion;
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     const View to_view = view(r, dst);
@@ -931,6 +968,11 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     const bool write_through = (flags & MOVEFILE_WRITE_THROUGH) != 0;
     const DWORD keep = flags & (MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     DWORD error = 0;
+    if (from_view.in_package) {
+        const std::filesystem::path mark = marker(r.overlay, src);
+        if (!deletion.prepare(mark, error)) return fail_bool(error);
+        if (write_through && !flush_file(mark, error)) return fail_bool(error);
+    }
     if (from_view.in_overlay) {
         if (!::MoveFileExW(overlay_from.c_str(), overlay_to.c_str(), keep | MOVEFILE_COPY_ALLOWED)) return FALSE;
     } else {
@@ -940,11 +982,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
         if (!::CopyFileW(join(r.game, src).c_str(), overlay_to.c_str(), fail_if_exists)) return FALSE;
         if (write_through && !flush_file(overlay_to, error)) return fail_bool(error);
     }
-    if (from_view.in_package) {
-        const std::filesystem::path mark = marker(r.overlay, src);
-        if (!write_marker(mark, error)) return fail_bool(error);
-        if (write_through && !flush_file(mark, error)) return fail_bool(error);
-    }
+    deletion.commit();
     return TRUE;
 }
 

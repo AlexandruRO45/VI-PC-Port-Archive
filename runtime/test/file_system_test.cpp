@@ -39,6 +39,7 @@ using RemoveDirectoryWFn = BOOL(WINAPI*)(LPCWSTR);
 using RemoveDirectoryAFn = BOOL(WINAPI*)(LPCSTR);
 using MoveFileWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR);
 using MoveFileExWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, DWORD);
+using MoveFileExAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, DWORD);
 using MoveFileAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR);
 using CopyFileWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, BOOL);
 using CopyFileAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, BOOL);
@@ -107,6 +108,117 @@ int count(const std::vector<std::wstring>& names, const wchar_t* name) {
 }
 
 bool contains(const std::vector<std::wstring>& names, const wchar_t* name) { return count(names, name) != 0; }
+
+// A failed marker write must happen before removing the overlay's newer bytes or replacing a destination.
+void check_marker_failures(const std::filesystem::path& root) {
+    const auto del_w = resolve<DeleteFileWFn>("kernel32.dll", "DeleteFileW");
+    const auto del_a = resolve<DeleteFileAFn>("kernel32.dll", "DeleteFileA");
+    const auto move_w = resolve<MoveFileExWFn>("kernel32.dll", "MoveFileExW");
+    const auto move_a = resolve<MoveFileExAFn>("kernel32.dll", "MoveFileExA");
+    const auto remove_w = resolve<RemoveDirectoryWFn>("kernel32.dll", "RemoveDirectoryW");
+    const auto remove_a = resolve<RemoveDirectoryAFn>("kernel32.dll", "RemoveDirectoryA");
+    const auto open = resolve<CreateFileWFn>("kernel32.dll", "CreateFileW");
+    const auto attrs = resolve<GetFileAttributesWFn>("kernel32.dll", "GetFileAttributesW");
+    check(del_w && del_a && move_w && move_a && remove_w && remove_a && open && attrs,
+          "marker-failure tests resolve the production file APIs");
+    if (!del_w || !del_a || !move_w || !move_a || !remove_w || !remove_a || !open || !attrs) return;
+    unsigned scenario = 0;
+    for (const bool ansi : {false, true}) {
+        for (const bool overlay_source : {false, true}) {
+            for (int operation = 0; operation < 3; ++operation) {
+                const auto dir = root / ("marker-failure-" + std::to_string(++scenario));
+                const auto package = dir / "package", overlay = dir / "overlay";
+                const bool folder = operation == 2;
+                if (folder) {
+                    std::filesystem::create_directories(package / "source");
+                    if (overlay_source) std::filesystem::create_directories(overlay / "source");
+                } else {
+                    write_path(package / "source", "package-old");
+                    if (overlay_source) write_path(overlay / "source", "overlay-new");
+                }
+                write_path(package / "destination", "package-destination");
+                write_path(overlay / "destination", "overlay-destination");
+                // A regular file where marker parents must be created: deterministic, no ACL privileges needed.
+                write_path(overlay / ".gta6rt-deleted", "obstructed marker directory");
+                rt::fs::configure(package, overlay);
+                auto invoke = [&] {
+                    if (operation == 0) return ansi ? del_a("GAME:\\source") : del_w(L"GAME:\\source");
+                    if (operation == 1)
+                        return ansi ? move_a("GAME:\\source", "GAME:\\destination",
+                                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+                                    : move_w(L"GAME:\\source", L"GAME:\\destination", MOVEFILE_REPLACE_EXISTING);
+                    return ansi ? remove_a("GAME:\\source") : remove_w(L"GAME:\\source");
+                };
+                SetLastError(0);
+                const BOOL result = invoke();
+                const DWORD error = GetLastError();
+                check(!result && error != ERROR_SUCCESS, "an obstructed marker directory reports an OS error");
+                check(std::filesystem::exists(overlay / "source") == overlay_source,
+                      "marker failure preserves the overlay source");
+                check(read_path(overlay / "destination") == "overlay-destination" &&
+                          read_path(package / "destination") == "package-destination",
+                      "marker failure preserves both destination versions");
+                if (folder) {
+                    check(attrs(L"GAME:\\source") != INVALID_FILE_ATTRIBUTES,
+                          "a folder is still visible after failed removal");
+                } else {
+                    const HANDLE h = open(L"GAME:\\source", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    check(h != INVALID_HANDLE_VALUE && read_handle(h) ==
+                              (overlay_source ? "overlay-new" : "package-old"),
+                          "failed delete or move preserves the title-visible source bytes");
+                    if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+                    check(read_path(package / "source") == "package-old", "the package source is unchanged");
+                }
+                std::filesystem::remove(overlay / ".gta6rt-deleted");
+                check(invoke() != FALSE, "retry succeeds after the marker obstruction is removed");
+                check(attrs(L"GAME:\\source") == INVALID_FILE_ATTRIBUTES,
+                      "a successful retry hides the source instead of exposing its package version");
+                if (operation == 1)
+                    check(read_path(overlay / "destination") == (overlay_source ? "overlay-new" : "package-old"),
+                          "successful replacement uses the correct source bytes");
+            }
+        }
+    }
+
+    // A later host error must undo only the marker created for this operation, preserving GetLastError.
+    for (int operation = 0; operation < 3; ++operation) {
+        for (const bool existing_marker : {false, true}) {
+            const auto dir = root / ("marker-rollback-" + std::to_string(++scenario));
+            const auto package = dir / "package", overlay = dir / "overlay";
+            const bool folder = operation == 2;
+            if (folder) {
+                std::filesystem::create_directories(package / "source");
+                std::filesystem::create_directories(overlay / "source");
+            } else {
+                write_path(package / "source", "package-old");
+                write_path(overlay / "source", "overlay-new");
+            }
+            write_path(overlay / "destination", "destination-old");
+            const auto marker = folder ? overlay / ".gta6rt-deleted" / "source" / ".gta6rt-dir"
+                                       : overlay / ".gta6rt-deleted" / "source";
+            if (existing_marker) write_path(marker, "");
+            rt::fs::configure(package, overlay);
+            const HANDLE held = ::CreateFileW((overlay / "source").c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            check(held != INVALID_HANDLE_VALUE, "hold the source without delete sharing");
+            if (held == INVALID_HANDLE_VALUE) continue;
+            SetLastError(0);
+            const BOOL result = operation == 0 ? del_w(L"GAME:\\source")
+                                : operation == 1 ? move_w(L"GAME:\\source", L"GAME:\\destination",
+                                                          MOVEFILE_REPLACE_EXISTING)
+                                                 : remove_w(L"GAME:\\source");
+            const DWORD error = GetLastError();
+            check(!result && error == ERROR_SHARING_VIOLATION, "host failure keeps its sharing-violation error");
+            check(std::filesystem::exists(marker) == existing_marker,
+                  "host failure rolls back new markers and retains existing markers");
+            check(std::filesystem::exists(overlay / "source") &&
+                      read_path(overlay / "destination") == "destination-old",
+                  "host failure preserves the source and destination");
+            ::CloseHandle(held);
+        }
+    }
+}
 
 }  // namespace
 
@@ -744,6 +856,8 @@ int main() {
         rt::fs::configure(package, overlay);
     }
 
+    check_marker_failures(root);
+    rt::fs::configure({}, {});
     std::filesystem::remove_all(root);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

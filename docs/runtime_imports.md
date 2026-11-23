@@ -121,6 +121,11 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 - `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
   folder) first, so the package keeps its own.
 
+`DeleteFile*`, `RemoveDirectory*` and `MoveFile*` prepare required package-deletion markers before removing an
+overlay source or replacing a destination. A marker-creation failure leaves those files intact. If the subsequent
+host operation fails, newly created markers are removed while pre-existing markers are retained. This handles
+reported filesystem failures; it is not a power-loss recovery scheme.
+
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
 ## When an unimplemented import is called
