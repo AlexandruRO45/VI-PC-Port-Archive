@@ -40,7 +40,6 @@ import os
 import statistics
 import struct
 import sys
-import tempfile
 import zlib
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
@@ -50,6 +49,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 from pool_workers import process_workers  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -395,7 +395,8 @@ def graph_stats(nodes, links, junctions):
     s["node_keys_unique"] = len(by_key)
     edges = []
     firsts = [n["first_link"] for n in nodes]
-    ranges_ok = all(firsts[i] is not None and firsts[i] <= firsts[i + 1] for i in range(len(firsts) - 1))
+    ranges_ok = (all(v is not None for v in firsts)
+                 and all(firsts[i] <= firsts[i + 1] for i in range(len(firsts) - 1)))
     s["first_link_monotonic"] = int(ranges_ok)
     for i, n in enumerate(nodes):
         a = n["first_link"]
@@ -633,7 +634,13 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
     size = os.path.getsize(path)
     with open(path, "rb") as f:
         head = f.read(8)
-    data_start = struct.unpack_from("<I", head, 4)[0] if head[:4] == b"9FPR" else 0
+    if head[:4] == b"9FPR":
+        if len(head) < 8:
+            # unpack_from on the data-start word would raise struct.error; a truncated header is a usage error.
+            raise ValueError(f"the RPF9 header is {len(head)} bytes, the format needs 8")
+        data_start = struct.unpack_from("<I", head, 4)[0]
+    else:
+        data_start = 0
     lo = max(data_start, start or 0)
     hi = size if limit is None else min(size, lo + limit)
     # Each window walks its own byte range; a resource that starts inside it is read to its end even past the
@@ -751,33 +758,6 @@ def summarize(total, entities=None, lights_out=None):
     return summary
 
 
-def same_report_path(first, second):
-    first, second = os.path.realpath(first), os.path.realpath(second)
-    if os.path.normcase(first) == os.path.normcase(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return False
-
-    first_dir, first_name = os.path.split(first)
-    second_dir, second_name = os.path.split(second)
-    if first_name.casefold() != second_name.casefold():
-        return False
-    try:
-        if not os.path.samefile(first_dir, second_dir):
-            return False
-        # normcase on POSIX does not tell us whether this volume folds case.
-        # Try the two names in a scratch directory on the destination volume before scanning.
-        with tempfile.TemporaryDirectory(prefix=".world-lights-", dir=first_dir) as probe:
-            with open(os.path.join(probe, first_name), "xb"):
-                return os.path.exists(os.path.join(probe, second_name))
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("archive")
@@ -805,7 +785,20 @@ def main(argv=None):
         return 2
     if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
         ap.error("--out and --lights-out must use different paths")
-    total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
+    inputs = [("archive", a.archive)]
+    if a.entities:
+        inputs.append(("--entities", a.entities))
+    for rname, rpath in (("--out", a.out), ("--lights-out", a.lights_out)):
+        if not rpath:
+            continue
+        for iname, ipath in inputs:
+            if same_report_path(rpath, ipath):
+                ap.error("%s must use a different path than %s" % (rname, iname))
+    try:
+        total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
+    except ValueError as e:  # a truncated RPF9 header: one error line, not a struct.error traceback
+        print(f"ERROR: {a.archive}: {e}", file=sys.stderr)
+        return 2
     try:
         summary = summarize(total, a.entities, a.lights_out)
     except ValueError as e:            # a bad --entities row, or an archetype that is not a number
@@ -816,8 +809,12 @@ def main(argv=None):
         return 2
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        try:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 2
     else:
         sys.stdout.write(text + "\n")
     return 0
