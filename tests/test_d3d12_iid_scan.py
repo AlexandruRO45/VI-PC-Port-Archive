@@ -181,13 +181,10 @@ class IidScan(unittest.TestCase):
     def test_truncated_file_rva_past_eof_keeps_prior_imports(self):
         # Two d3d12_xs.dll descriptors in one section whose header declares SizeOfRawData = VirtualSize = 0x400,
         # but the file is truncated at sect_raw + 0x100. Descriptor 1's thunks live before EOF; descriptor 2's
-        # lookup RVA maps to sect_raw + 0x100 (exactly len(data), inside the declared section bounds), so offset()
-        # must return None rather than letting struct.unpack_from raise and discard descriptor 1's imports.
+        # lookup RVA maps to sect_raw + 0x100 (exactly len(data), inside the declared section bounds), so
+        # read_at() must return None cleanly rather than discarding descriptor 1's imports.
         sect_rva, sect_raw, declared_size = 0x1000, 0x200, 0x400
         body = bytearray(0x100)
-        # Descriptor table at +0x00 (2 descriptors + null terminator = 60 bytes):
-        #   name "d3d12_xs.dll\0" at +0x40, descriptor 1 thunks at +0x60 (ordinal #80 + 0),
-        #   descriptor 2 lookup RVA at sect_rva + 0x100 (exact EOF boundary, inside declared_size).
         body[0x40:0x40 + 13] = b"d3d12_xs.dll\0"
         struct.pack_into("<QQ", body, 0x60, (1 << 63) | 80, 0)
         struct.pack_into("<IIIII", body, 0, sect_rva + 0x60, 0, 0, sect_rva + 0x40, sect_rva + 0x60)
@@ -208,6 +205,114 @@ class IidScan(unittest.TestCase):
         struct.pack_into("<IIII", hdr, sec + 8, declared_size, sect_rva, declared_size, sect_raw)
 
         self.assertEqual(scan.d3d12_xs_imports(bytes(hdr) + bytes(body)), ["#80"])
+
+    def test_number_of_rva_and_sizes_below_two_ignores_import_directory(self):
+        # Compact optional header with NumberOfRvaAndSizes = 1; bytes where Import directory would sit are fake RVAs.
+        pe, opt_size = 0x80, 120  # covers up to DataDirectory[0] (Export) + Export size only
+        sect_rva, sect_raw = 0x1000, 0x200
+        # Build a valid import descriptor in .rdata just in case section-table bytes get read as RVA 0x1000.
+        body = bytearray(0x60)
+        struct.pack_into("<IIIII", body, 0, 0x1040, 0, 0, 0x1050, 0x1040)
+        struct.pack_into("<QQ", body, 0x40, (1 << 63) | 80, 0)
+        body[0x50:0x5D] = b"d3d12_xs.dll\0"
+
+        hdr = bytearray(sect_raw)
+        hdr[0:2] = b"MZ"
+        struct.pack_into("<I", hdr, 0x3C, pe)
+        hdr[pe:pe + 4] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", hdr, pe + 4, 0x8664, 1, 0, 0, 0, opt_size, 0x2022)
+        opt = pe + 24
+        struct.pack_into("<H", hdr, opt, 0x20B)
+        struct.pack_into("<I", hdr, opt + 108, 1)  # only Export directory exists
+        # First section name happens to have bytes after opt_size, unused for NumberOfRvaAndSizes == 1
+        sec = opt + opt_size
+        hdr[sec:sec + 8] = b"\x00\x10\x00\x00\x28\x00\x00\x00"  # if misread as Import RVA=0x1000
+        struct.pack_into("<IIII", hdr, sec + 8, len(body), sect_rva, len(body), sect_raw)
+        self.assertIsNone(scan.d3d12_xs_imports(bytes(hdr) + bytes(body)))
+
+    def test_thunk_table_without_terminator_stops_at_section_boundary(self):
+        # Section 1 ends with a thunk referencing section 2's ordinal #80 right across the raw section boundary.
+        sect1_rva, sect1_raw, sect1_rsize = 0x1000, 0x200, 0x40
+        sect2_rva, sect2_raw, sect2_rsize = 0x2000, 0x240, 0x20
+        sect1 = bytearray(sect1_rsize)
+        # Descriptor at 0x1000 points Lookup to 0x1038 (exact last 8 bytes of .rdata) and DLL name to 0x1028.
+        struct.pack_into("<IIIII", sect1, 0, 0x1038, 0, 0, 0x1028, 0x1038)
+        sect1[0x28:0x35] = b"d3d12_xs.dll\0"
+        struct.pack_into("<Q", sect1, 0x38, (1 << 63) | 7)  # NOT zero-terminated inside section 1!
+        sect2 = bytearray(sect2_rsize)
+        struct.pack_into("<QQ", sect2, 0, (1 << 63) | 80, 0)  # lives immediately after section 1 in file
+
+        pe, opt_size = 0x80, 240
+        hdr = bytearray(sect1_raw)
+        hdr[0:2] = b"MZ"
+        struct.pack_into("<I", hdr, 0x3C, pe)
+        hdr[pe:pe + 4] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", hdr, pe + 4, 0x8664, 2, 0, 0, 0, opt_size, 0x2022)
+        opt = pe + 24
+        struct.pack_into("<H", hdr, opt, 0x20B)
+        struct.pack_into("<I", hdr, opt + 108, 16)
+        struct.pack_into("<II", hdr, opt + 112 + 8, sect1_rva, 40)
+        sec1 = opt + opt_size
+        hdr[sec1:sec1 + 8] = b".rdata\0\0"
+        struct.pack_into("<IIII", hdr, sec1 + 8, sect1_rsize, sect1_rva, sect1_rsize, sect1_raw)
+        sec2 = sec1 + 40
+        hdr[sec2:sec2 + 8] = b".data\0\0\0"
+        struct.pack_into("<IIII", hdr, sec2 + 8, sect2_rsize, sect2_rva, sect2_rsize, sect2_raw)
+
+        self.assertEqual(scan.d3d12_xs_imports(bytes(hdr) + bytes(sect1) + bytes(sect2)), ["#7"])
+
+    def test_pe64_non_ordinal_thunk_high_bits_are_not_masked(self):
+        # Set bit 32 (with the ordinal flag clear) in a thunk pointing at a valid Hint/Name; bits 32..62 must
+        # not be masked off to hit the valid RVA.
+        sect_rva, sect_raw = 0x1000, 0x200
+        body = bytearray(0x80)
+        struct.pack_into("<IIIII", body, 0, 0x1040, 0, 0, 0x1050, 0x1040)
+        struct.pack_into("<QQ", body, 0x40, (1 << 32) | 0x1060, 0)
+        body[0x50:0x5D] = b"d3d12_xs.dll\0"
+        struct.pack_into("<H", body, 0x60, 0)
+        body[0x62:0x66] = b"Foo\0"
+        pe, opt_size = 0x80, 240
+        hdr = bytearray(sect_raw)
+        hdr[0:2] = b"MZ"
+        struct.pack_into("<I", hdr, 0x3C, pe)
+        hdr[pe:pe + 4] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", hdr, pe + 4, 0x8664, 1, 0, 0, 0, opt_size, 0x2022)
+        opt = pe + 24
+        struct.pack_into("<H", hdr, opt, 0x20B)
+        struct.pack_into("<I", hdr, opt + 108, 16)
+        struct.pack_into("<II", hdr, opt + 112 + 8, sect_rva, 40)
+        sec = opt + opt_size
+        hdr[sec:sec + 8] = b".rdata\0\0"
+        struct.pack_into("<IIII", hdr, sec + 8, len(body), sect_rva, len(body), sect_raw)
+        self.assertEqual(scan.d3d12_xs_imports(bytes(hdr) + bytes(body)), ["?"])
+
+    def test_unterminated_dll_name_in_section_is_ignored(self):
+        sect1_rva, sect1_raw, sect1_rsize = 0x1000, 0x200, 0x30
+        sect2_rva, sect2_raw, sect2_rsize = 0x2000, 0x230, 0x20
+        sect1 = bytearray(sect1_rsize)
+        # Descriptor points DLL name to last 6 bytes of section 1 ("d3d12_"), continuation "_xs.dll\0" sits in section 2!
+        struct.pack_into("<IIIII", sect1, 0, 0x1020, 0, 0, 0x102A, 0x1020)
+        struct.pack_into("<Q", sect1, 0x20, 0)
+        sect1[0x2A:0x30] = b"d3d12_"
+        sect2 = bytearray(sect2_rsize)
+        sect2[0:8] = b"xs.dll\0\x00"
+        pe, opt_size = 0x80, 240
+        hdr = bytearray(sect1_raw)
+        hdr[0:2] = b"MZ"
+        struct.pack_into("<I", hdr, 0x3C, pe)
+        hdr[pe:pe + 4] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", hdr, pe + 4, 0x8664, 2, 0, 0, 0, opt_size, 0x2022)
+        opt = pe + 24
+        struct.pack_into("<H", hdr, opt, 0x20B)
+        struct.pack_into("<I", hdr, opt + 108, 16)
+        struct.pack_into("<II", hdr, opt + 112 + 8, sect1_rva, 40)
+        sec1 = opt + opt_size
+        hdr[sec1:sec1 + 8] = b".rdata\0\0"
+        struct.pack_into("<IIII", hdr, sec1 + 8, sect1_rsize, sect1_rva, sect1_rsize, sect1_raw)
+        sec2 = sec1 + 40
+        hdr[sec2:sec2 + 8] = b".data\0\0\0"
+        struct.pack_into("<IIII", hdr, sec2 + 8, sect2_rsize, sect2_rva, sect2_rsize, sect2_raw)
+        self.assertIsNone(scan.d3d12_xs_imports(bytes(hdr) + bytes(sect1) + bytes(sect2)))
 
     def test_not_a_pe_still_scans_bytes(self):
         iids = scan.read_iids(self.header)

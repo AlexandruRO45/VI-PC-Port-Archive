@@ -62,56 +62,86 @@ def d3d12_xs_imports(data: bytes) -> list[str] | None:
     """What the PE image imports from d3d12_xs.dll: names, or "#N" for an import by ordinal (ordinals 23-115 are
     GUID data, docs/d3d12_xs_surface.md section 2). None when the image does not import d3d12_xs.dll at all."""
     try:
-        if data[:2] != b"MZ":
+        if data[:2] != b"MZ" or len(data) < 0x40:
             return None
         pe = struct.unpack_from("<I", data, 0x3C)[0]
         if data[pe:pe + 4] != b"PE\0\0":
             return None
         sections, opt_size = struct.unpack_from("<H", data, pe + 6)[0], struct.unpack_from("<H", data, pe + 20)[0]
         opt = pe + 24
-        pe32plus = struct.unpack_from("<H", data, opt)[0] == 0x20B
-        dirs = opt + (112 if pe32plus else 96)
-        imp_rva = struct.unpack_from("<I", data, dirs + 8)[0]
+        magic = struct.unpack_from("<H", data, opt)[0]
+        if magic == 0x20B:
+            pe32plus, num_dirs_off, dirs_off = True, opt + 108, opt + 112
+        elif magic == 0x10B:
+            pe32plus, num_dirs_off, dirs_off = False, opt + 92, opt + 96
+        else:
+            return None
         table = opt + opt_size
+        if opt_size < (dirs_off - opt) + 16 or table + sections * 40 > len(data):
+            return None
+        num_dirs = struct.unpack_from("<I", data, num_dirs_off)[0]
+        if num_dirs < 2:
+            return None
+        imp_rva = struct.unpack_from("<I", data, dirs_off + 8)[0]
+        if imp_rva == 0:
+            return None
 
-        def offset(rva: int) -> int | None:
+        def section_slice(rva: int) -> tuple[int, int] | None:
             for i in range(sections):
                 s = table + 40 * i
                 vsize, va, rsize, raw = struct.unpack_from("<IIII", data, s + 8)
                 span = min(vsize, rsize) if vsize else rsize
                 if va <= rva < va + span:
-                    pos_in_file = raw + rva - va
-                    return pos_in_file if pos_in_file < len(data) else None
+                    rel = rva - va
+                    pos_in_file = raw + rel
+                    if pos_in_file >= len(data):
+                        return None
+                    return pos_in_file, min(span - rel, len(data) - pos_in_file)
             return None
 
-        def cstr(at: int) -> bytes:
-            return data[at:data.index(b"\0", at)]
+        def read_at(rva: int, size: int) -> bytes | None:
+            loc = section_slice(rva)
+            if loc is None or loc[1] < size:
+                return None
+            return data[loc[0]:loc[0] + size]
+
+        def cstr(rva: int) -> bytes | None:
+            loc = section_slice(rva)
+            if loc is None:
+                return None
+            at, rem = loc
+            end = data.find(b"\0", at, at + rem)
+            return data[at:end] if end != -1 else None
 
         names: list[str] | None = None
-        pos = offset(imp_rva) if imp_rva else None
-        while pos is not None and pos + 20 <= len(data):
-            lookup_rva, _, _, name_rva, iat_rva = struct.unpack_from("<IIIII", data, pos)
+        desc_rva = imp_rva
+        width, flag = (8, 1 << 63) if pe32plus else (4, 1 << 31)
+        fmt = "<Q" if pe32plus else "<I"
+        while (desc := read_at(desc_rva, 20)) is not None:
+            lookup_rva, _, _, name_rva, iat_rva = struct.unpack_from("<IIIII", desc)
             if name_rva == 0:
                 break
-            at = offset(name_rva)
-            if at is not None and cstr(at).lower() == b"d3d12_xs.dll":
+            dll_name = cstr(name_rva)
+            if dll_name is not None and dll_name.lower() == b"d3d12_xs.dll":
                 if names is None:
                     names = []
-                thunk = offset(lookup_rva or iat_rva)
-                width, flag = (8, 1 << 63) if pe32plus else (4, 1 << 31)
-                while thunk is not None:
-                    value = struct.unpack_from("<Q" if pe32plus else "<I", data, thunk)[0]
+                thunk_rva = lookup_rva or iat_rva
+                while thunk_rva and (thunk_bytes := read_at(thunk_rva, width)) is not None:
+                    value = struct.unpack_from(fmt, thunk_bytes)[0]
                     if value == 0:
                         break
                     if value & flag:
                         names.append(f"#{value & 0xFFFF}")
+                    elif pe32plus and (value >> 32) != 0:
+                        names.append("?")
                     else:
-                        hint = offset(value & 0x7FFFFFFF)
-                        names.append(cstr(hint + 2).decode("ascii", "replace") if hint is not None else "?")
-                    thunk += width
-            pos += 20
+                        hint_rva = value & 0xFFFFFFFF
+                        name_bytes = cstr(hint_rva + 2) if read_at(hint_rva, 2) is not None else None
+                        names.append(name_bytes.decode("ascii", "replace") if name_bytes is not None else "?")
+                    thunk_rva += width
+            desc_rva += 20
         return names
-    except (struct.error, ValueError):
+    except struct.error:
         return None
 
 
