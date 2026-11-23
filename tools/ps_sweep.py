@@ -548,8 +548,10 @@ def main(argv=None):
         ap.error("--depth needs run")
     if a.occlusion and a.cmd != "run":
         ap.error("--occlusion needs run")
-    if a.exact and (a.cmd != "compare" or a.tags[0] == a.tags[1]):
-        ap.error("--exact needs compare with two different tags")
+    if a.exact and a.cmd != "compare":
+        ap.error("--exact needs compare")
+    if a.cmd == "compare" and a.tags[0] == a.tags[1]:
+        ap.error("compare needs two different tags")
     if a.cmd == "run" and not (a.tag and a.exe and a.spirv):
         ap.error("run needs --tag, --exe and --spirv")
     if a.cmd == "run" and a.only and not a.suffix:

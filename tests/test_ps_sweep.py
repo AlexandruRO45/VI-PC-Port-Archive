@@ -194,6 +194,30 @@ class Classification(unittest.TestCase):
 
 
 class CompareCommand(unittest.TestCase):
+    def test_duplicate_tags_are_rejected_in_both_comparison_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            sample = [{"name": "synthetic", "stratum": [False, "none", "structured"]}]
+            (out / "sample.json").write_text(json.dumps(sample), encoding="utf-8", newline="\n")
+            run = out / "a_z"
+            run.mkdir()
+            receipt = {"i": 0, "code": 0, "reason": "", "targets": 1}
+            (run / "results_0.jsonl").write_text(json.dumps(receipt) + "\n", encoding="utf-8", newline="\n")
+            write_raw(run / "0.raw", [0.25])
+            args = ["compare", "--out", tmp, "--tags", "a", "a"]
+
+            for exact in (False, True):
+                with self.subTest(exact=exact):
+                    stderr = io.StringIO()
+                    flags = ["--exact"] if exact else []
+                    with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as error:
+                            ps_sweep.main(args + flags)
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertIn("two different tags", stderr.getvalue())
+                    report = "exact_z.json" if exact else "classes_z.json"
+                    self.assertFalse((out / report).exists())
+
     def test_readback_shapes(self):
         one = struct.pack("<f", 0.25) * TARGET_FLOATS
         two = one * 2
