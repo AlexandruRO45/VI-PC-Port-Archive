@@ -9,6 +9,7 @@ import ast
 import os
 import pathlib
 import posixpath
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -64,6 +65,22 @@ class SamePathTests(unittest.TestCase):
         self.assertTrue(report_paths.same_report_path(self.p("new", "x.json"), self.p("new", "..", "new", "x.json")))
         self.assertFalse(report_paths.same_report_path(self.p("new", "x.json"), self.p("new", "y.json")))
 
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows directory case sensitivity")
+    def test_missing_paths_follow_a_case_sensitive_windows_directory(self):
+        try:
+            subprocess.run(["fsutil", "file", "setCaseSensitiveInfo", self.dir, "enable"],
+                           check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("cannot enable case sensitivity on the NTFS temporary directory")
+
+        touch(self.p("Existing.json"))
+        for first, second in (("Report.json", "report.json"), ("Existing.json", "existing.json"),
+                              ("new/Report.json", "new/report.json"), ("Out/report.json", "out/report.json")):
+            with self.subTest(first=first, second=second):
+                self.assertFalse(report_paths.same_report_path(self.p(first), self.p(second)))
+                self.assertFalse(report_paths.same_report_path(self.p(second), self.p(first)))
+        self.assertEqual(os.listdir(self.dir), ["Existing.json"])
+
     def test_one_missing_one_present_is_not_an_error(self):
         touch(self.p("a.json"))
         self.assertFalse(report_paths.same_report_path(self.p("a.json"), self.p("missing.json")))
@@ -91,7 +108,7 @@ class SamePathTests(unittest.TestCase):
         touch(self.p("probe.tmp"))
         insensitive = os.path.exists(self.p("PROBE.TMP"))
         got = report_paths.same_report_path(self.p("new", "B.json"), self.p("new", "b.json"))
-        self.assertEqual(got, insensitive or os.path.normcase("A") == os.path.normcase("a"))
+        self.assertEqual(got, insensitive)
 
 
 class MacVolumeTests(unittest.TestCase):
