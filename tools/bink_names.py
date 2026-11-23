@@ -105,7 +105,8 @@ def mount_documents(paths):
         elif os.path.isfile(path) and path.lower().endswith(".rpf"):
             yield from _archive_documents(path)
         elif os.path.isdir(path):
-            for root, _dirs, files in os.walk(path, onerror=scan_failed):
+            for root, dirs, files in os.walk(path, onerror=scan_failed):
+                dirs.sort()
                 for name in sorted(files):
                     full = os.path.join(root, name)
                     if os.path.getsize(full) <= MAX_LIST_BYTES:

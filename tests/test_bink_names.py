@@ -75,6 +75,29 @@ class TestListOrder(unittest.TestCase):
             self.write(tmp, "2.bin", "<other>no movies here</other>")
             self.assertEqual(names_mod.read_mount_lists([tmp]), ["q/x.bk2"])
 
+    def test_sub_folder_order_does_not_pick_the_spelling(self):
+        # two sub-folders list the same movie with different letter case; the first spelling seen is kept, so the
+        # walk must visit sub-folders in sorted order whatever order the file system hands them back in
+        real_walk = os.walk
+
+        def walk_in_order(reverse):
+            def walk(top, *args, **kwargs):
+                for root, dirs, files in real_walk(top, *args, **kwargs):
+                    dirs.sort(reverse=reverse)
+                    yield root, dirs, files
+            return walk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for folder, spelling in (("a", "Intro/Clip.bk2"), ("b", "intro/clip.bk2")):
+                os.mkdir(os.path.join(tmp, folder))
+                self.write(tmp, f"{folder}/l.xml", mount_xml([spelling]))
+            results = []
+            for reverse in (False, True):
+                with mock.patch.object(names_mod.os, "walk", walk_in_order(reverse)):
+                    results.append(names_mod.read_mount_lists([tmp]))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0], ["Intro/Clip.bk2"])
+
     def test_carve_list_split_across_streams(self):
         # rpf9_carve.py layout: index.json plus one inflated <offset>.bin per zlib stream
         doc = ('<?xml version="1.0" encoding="UTF-8"?>\n'
