@@ -3475,9 +3475,9 @@ reports one (D3D-264). `LEONIDA_DRED=2` adds how far the GPU got inside each lis
     - it records no marker at all and changes no slot's owner;
     - it stays in the history as CPU knowledge, with its GPU progress unknown: no D3D12 node, and in the report
       "every breadcrumb slot was busy";
-    - besides the lists that hold a slot, the history keeps up to 64 that don't (lists without a slot, or ones
-      whose slot passed on), dropping the oldest of those first. A list that still holds its slot
-      is never pushed out, so an unfinished list stays in the report.
+    - the history holds at most 1024 + 64 lists. When it is full, the oldest list that no longer holds a slot
+      (one without a slot, or one whose slot passed on) is dropped first, so at least the newest 64 of those
+      stay. A list that still holds its slot is never pushed out, so an unfinished list stays in the report.
     A slot is used again as soon as its owner's end word shows.
   - **Failed submissions.** A list whose submission failed never runs, so its slot is free again at once.
   - **What the Vulkan spec guarantees.** `vkCmdWriteBufferMarkerAMD` orders a marker write after earlier commands

@@ -248,7 +248,9 @@ public:
 
     static constexpr std::uint32_t kSlots = 1024;  // lists kept: the newest 1024 submitted
     static constexpr std::uint32_t kNoSlot = ~0u;  // Mark::slot of a list that got none (CPU history only)
-    static constexpr std::size_t kNoSlotKept = 64;  // such lists kept besides the slots' own: the newest 64
+    // The history holds at most kSlots + kNoSlotKept lists. Lists without a slot fill what the slot holders leave,
+    // so there are at least kNoSlotKept of them (the newest), and more while fewer than kSlots lists hold a slot.
+    static constexpr std::size_t kNoSlotKept = 64;
     static constexpr std::size_t kUnknownShown = 16;  // lists the report shows when GPU progress is unknown
 
     BreadcrumbRing() = default;
