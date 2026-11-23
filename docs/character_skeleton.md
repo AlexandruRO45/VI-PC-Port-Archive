@@ -198,6 +198,19 @@ on a deterministic sample (96 meshes per layout per archive; the census itself c
   4-influence layouts in `packs.rpf`, sums to exactly 255. The packed 4-influence meshes in
   `packs.rpf` round: of 50,648 sampled vertices, 31,884 sum to exactly 255, 11,604 to 247–254,
   and 7,160 fall below 247 (as low as 164).
+  Over **every** skin mesh of `packs.rpf` (`skin_streams.py --sample` above the mesh count: 26,304 resources,
+  48,375 meshes, 60,205,616 vertices) the 8-influence layouts hold without exception, but the 8-bit
+  4-influence layout rounds too, so the "8-bit 4-influence" part above was a sample effect:
+
+  | Layout | Meshes | Vertices | Sum 255 | 247–254 | Below 247 (lowest) |
+  |---|---:|---:|---:|---:|---:|
+  | 8 influences, 8-bit indices | 23,772 | 47,276,325 | 47,276,325 (100%) | 0 | 0 |
+  | 8 influences, packed indices | 16,049 | 9,482,620 | 9,482,620 (100%) | 0 | 0 |
+  | 4 influences, 8-bit indices | 7,352 | 2,683,066 | 2,263,766 (84.4%) | 231,927 | 187,373 (127) |
+  | 4 influences, packed indices | 1,202 | 763,605 | 580,820 (76.1%) | 110,703 | 72,082 (127) |
+
+  No non-zero weight points past the model's bone count in any of them (0 components out of range), and the
+  native descriptor matches every slot (0 mismatches).
 - **Packed `R32G32B32A32_UINT`: the bone index is bits 0–11 of each u32.** Bits 9–11 were never
   set in the sampled meshes; bit 8 appears only where the model has more than 256 bones. Bits
   12–31 hold a separate, dense, unidentified field (smooth per-vertex values in the high bits —
