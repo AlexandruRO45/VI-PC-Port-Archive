@@ -36,6 +36,7 @@ Exit 0 when the sweep ran (which rule the hardware follows is a finding, not a f
 or MUBUF and MTBUF disagree, 2 on a harness error (a control failed, a kernel without its words), 77 when the
 hardware oracle is unavailable or the GPU is not GFX10. Nothing here reads game files.
 The `--json` path is probed before the hardware sweep; an unwritable report is one `ERROR:` line with exit 2.
+Usage: `python -I tools/d16_format_probe.py --help` lists the options.
 """
 import argparse
 import json
