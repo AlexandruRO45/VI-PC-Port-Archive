@@ -12230,8 +12230,10 @@ class Gen:
                 # the 2x2 footprint at mip round(lod) (clamped to the mip range) in gather order
                 # (u0,v1) (u1,v1) (u1,v0) (u0,v0). Each texel coordinate goes through the S#'s own address mode
                 # (CLAMP_X/CLAMP_Y, see gather_addr_modes / gather_addr).
-                if bin(dmask).count("1") != 1 or ncoord != 2 or len(f) < 3:
+                if bin(dmask).count("1") != 1 or ncoord not in (2, 3) or is3d or len(f) < ncoord + 1:
                     raise Unsupported("image_gather4_l form")
+                if dim == "dim:SQ_RSRC_IMG_CUBE":
+                    f = self.cube_coords(f)
                 modes = self.gather_addr_modes(a[3])
                 self.uses_query = True
                 ch = dmask.bit_length() - 1
@@ -12239,7 +12241,7 @@ class Gen:
                 # Size and level-count queries read view properties; only the texel fetches need a typed alias.
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
-                lod = self.clamp_gather_lod(f[2], a[3]["r"] + 1)
+                lod = self.clamp_gather_lod(f[ncoord], a[3]["r"] + 1)
                 # Native gather rounds the LOD to the nearest mip with ties up, not to even (SHADER-152: on
                 # Radeon Graphics 26.10.1, LOD 0.5 with bounds [0,1] selected mip 1, where RoundEven selected 0).
                 # floor + (fraction >= 0.5), not Floor(lod + 0.5): lod - floor(lod) is exact in binary32, the sum is
@@ -12253,9 +12255,25 @@ class Gen:
                 self.emit(f"{mi} = OpIAdd %int {fl} {inc}")
                 self.emit(f"{mz} = OpExtInst %int %glsl SMax {mi} {self.as_int(self.cu(0))}")
                 self.emit(f"{mc} = OpExtInst %int %glsl SMin {mz} {lvm}")
-                self.emit(f"{sz} = OpImageQuerySizeLod %v2int {img} {mc}")
+                self.emit(f"{sz} = OpImageQuerySizeLod {'%v3int' if ncoord == 3 else '%v2int'} {img} {mc}")
+                szx, szy = self.tmp(), self.tmp()
+                self.emit(f"{szx} = OpCompositeExtract %int {sz} 0")
+                self.emit(f"{szy} = OpCompositeExtract %int {sz} 1")
+                if ncoord == 3:
+                    sz2 = self.tmp()
+                    self.emit(f"{sz2} = OpCompositeConstruct %v2int {szx} {szy}")
+                    szz, lmax, lr, li, lz, layer = (self.tmp() for _ in range(6))
+                    self.emit(f"{szz} = OpCompositeExtract %int {sz} 2")
+                    self.emit(f"{lmax} = OpISub %int {szz} {self.as_int(self.cu(1))}")
+                    self.emit(f"{lr} = OpExtInst %float %glsl RoundEven {f[2]}")
+                    self.emit(f"{li} = OpConvertFToS %int {lr}")
+                    self.emit(f"{lz} = OpExtInst %int %glsl SMax {li} {self.as_int(self.cu(0))}")
+                    self.emit(f"{layer} = OpExtInst %int %glsl SMin {lz} {lmax}")
+                else:
+                    sz2 = sz
+                    layer = None
                 self.emit(f"{uvf} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-                self.emit(f"{szf} = OpConvertSToF %v2float {sz}")
+                self.emit(f"{szf} = OpConvertSToF %v2float {sz2}")
                 self.emit(f"{st} = OpFMul %v2float {uvf} {szf}")
                 self.emit(f"{half} = OpCompositeConstruct %v2float %fhalf_g %fhalf_g")
                 sub = self.tmp()
@@ -12274,15 +12292,15 @@ class Gen:
                 self.emit(f"{y0} = OpCompositeExtract %int {i0} 1")
                 self.emit(f"{x1} = OpCompositeExtract %int {i1} 0")
                 self.emit(f"{y1} = OpCompositeExtract %int {i1} 1")
-                szx, szy = self.tmp(), self.tmp()
-                self.emit(f"{szx} = OpCompositeExtract %int {sz} 0")
-                self.emit(f"{szy} = OpCompositeExtract %int {sz} 1")
                 ax = [self.gather_addr(c, szx, modes[0]) for c in (x0, x1)]
                 ay = [self.gather_addr(c, szy, modes[1]) for c in (y0, y1)]
                 texels, outs = [], []
                 for (xx, ox), (yy, oy) in ((ax[0], ay[1]), (ax[1], ay[1]), (ax[1], ay[0]), (ax[0], ay[0])):
                     cc = self.tmp()
-                    self.emit(f"{cc} = OpCompositeConstruct %v2int {xx} {yy}")
+                    if layer is not None:
+                        self.emit(f"{cc} = OpCompositeConstruct %v3int {xx} {yy} {layer}")
+                    else:
+                        self.emit(f"{cc} = OpCompositeConstruct %v2int {xx} {yy}")
                     texels.append(cc)
                     if ox is not None and oy is not None:
                         both = self.tmp()
@@ -12317,7 +12335,8 @@ class Gen:
                     self.emit(f"{result} = OpCompositeConstruct {ty} {' '.join(taps)}")
                     return result
 
-                self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
+                view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
+                self.image_read_typed(view_dim, self.sgpr_word(a[2], 1), img, img_idx,
                                       0xf, vdata, d16, gather_mip)
                 self.uses_fhalf = True
                 return
