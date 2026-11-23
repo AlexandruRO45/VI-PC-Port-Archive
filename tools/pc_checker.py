@@ -388,12 +388,14 @@ def evaluate(profile_name: str, cpu: str, gpu: str, ram):
     return ("Looks good", p["subtitle"], rows)
 
 
-def result_as_text(profile_name, headline, sub, rows):
+def result_as_text(profile_name, headline, sub, rows, pcie_note=""):
     lines = [f"Leonida PC Checker - vs {profile_name}", headline, sub, ""]
     for label, st, ref, mine, est in rows:
         note = ", score estimated" if est else ""
         lines.append(f"{label}: {STATUS_TEXT[st]} (ref: {ref}; your PC: {mine or '?'}{note})")
     lines += ["", f"{BOOT_NOTE[0]} ({BOOT_NOTE[1].rstrip('.')})."]
+    if pcie_note:
+        lines += ["", pcie_note]
     return "\n".join(lines)
 
 
@@ -559,6 +561,61 @@ def detect_ram_gb():
     return max(4, min(128, round(gb)))
 
 
+PCIE_GEN_GBPS_PER_LANE = {
+    1: 0.250,   # 2.5 GT/s, 8b/10b
+    2: 0.500,   # 5.0 GT/s, 8b/10b
+    3: 0.985,   # 8.0 GT/s, 128b/130b (~0.9846 GB/s)
+    4: 1.969,   # 16.0 GT/s, 128b/130b (~1.9692 GB/s)
+    5: 3.938,   # 32.0 GT/s, 128b/130b (~3.9385 GB/s)
+    6: 7.877,   # 64.0 GT/s, 128b/130b PAM4
+}
+
+
+def pcie_bandwidth_gb_s(gen: int | None, width: int | None) -> float | None:
+    """Theoretical PCIe payload bandwidth in GB/s."""
+    if not gen or not width or gen not in PCIE_GEN_GBPS_PER_LANE or width <= 0:
+        return None
+    return round(PCIE_GEN_GBPS_PER_LANE[gen] * width, 1)
+
+
+def detect_pcie(target_gpu: str | None = None) -> tuple[int | None, int | None, float | None]:
+    """Detect PCIe generation, current link width, and bandwidth (GB/s). Returns (gen, width, bandwidth_gb_s)."""
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        out = _run([smi, "--query-gpu=name,pcie.link.gen.current,pcie.link.width.current",
+                    "--format=csv,noheader,nounits"])
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3 and parts[0]:
+                if target_gpu and target_gpu.lower() not in parts[0].lower() and parts[0].lower() not in target_gpu.lower():
+                    continue
+                try:
+                    gen = int(parts[1])
+                    width = int(parts[2])
+                    return gen, width, pcie_bandwidth_gb_s(gen, width)
+                except ValueError:
+                    continue
+
+    if sys.platform != "win32" and sys.platform != "darwin":
+        lspci = shutil.which("lspci")
+        if lspci:
+            out = _run([lspci, "-vv"])
+            m = re.search(r"LnkSta:\s*Speed\s*([0-9.]+)GT/s.*Width\s*x(\d+)", out, re.I)
+            if m:
+                try:
+                    speed_gt = float(m.group(1))
+                    width = int(m.group(2))
+                    gen = (1 if speed_gt <= 2.5 else
+                           2 if speed_gt <= 5.0 else
+                           3 if speed_gt <= 8.0 else
+                           4 if speed_gt <= 16.0 else
+                           5 if speed_gt <= 32.0 else 6)
+                    return gen, width, pcie_bandwidth_gb_s(gen, width)
+                except ValueError:
+                    pass
+    return None, None, None
+
+
 def detect_all() -> dict:
     best = None
     for name, vram in detect_gpus():  # with several GPUs, use the strongest
@@ -571,7 +628,9 @@ def detect_all() -> dict:
         gpu = clean_name(best[1])
         if best[2]:
             gpu += f" ({best[2]} GB VRAM)"
-    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb()}
+    gen, width, bw = detect_pcie(target_gpu=best[1] if best else None)
+    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb(),
+            "pcie_gen": gen, "pcie_width": width, "pcie_bw": bw}
 
 
 # ----------------------------------------------------------------------------
@@ -596,6 +655,7 @@ class Report:
     headline: str
     summary: str
     checks: list
+    pcie_note: str = ""
 
     @property
     def verdict(self) -> str:
@@ -611,7 +671,8 @@ class Report:
     def as_text(self) -> str:
         rows = [(c.component, c.status, c.reference, c.detected, c.estimated)
                 for c in self.checks]
-        return result_as_text(self.profile, self.headline, self.summary, rows)
+        return result_as_text(self.profile, self.headline, self.summary, rows,
+                              pcie_note=self.pcie_note)
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -632,15 +693,38 @@ class SpecChecker:
         if self.profile not in PROFILES:
             raise ValueError(f"unknown profile {self.profile!r}; use one of {list(PROFILES)}")
 
-    def check(self, cpu=None, gpu=None, ram=None) -> Report:
+    def check(self, cpu=None, gpu=None, ram=None, pcie=None) -> Report:
         """Anything left as None is detected from this PC."""
+        pcie_detected = None
         if cpu is None or gpu is None or ram is None:
             info = detect_all()
             cpu = info["cpu"] if cpu is None else cpu
             gpu = info["gpu"] if gpu is None else gpu
             ram = info["ram"] if ram is None else ram
+            pcie_detected = (info.get("pcie_gen"), info.get("pcie_width"), info.get("pcie_bw"))
         headline, summary, rows = evaluate(self.profile, cpu, gpu, ram)
-        return Report(self.profile, headline, summary, [Check(*r) for r in rows])
+
+        gen, width, bw = None, None, None
+        if pcie is None and pcie_detected:
+            gen, width, bw = pcie_detected
+        elif isinstance(pcie, tuple) and len(pcie) == 3:
+            gen, width, bw = pcie
+        elif isinstance(pcie, str):
+            m_p = re.match(r"^gen(\d+)x(\d+)$", pcie.strip().lower())
+            if m_p:
+                gen, width = int(m_p.group(1)), int(m_p.group(2))
+                bw = pcie_bandwidth_gb_s(gen, width)
+
+        pcie_note = ""
+        m_v = re.search(r"\((\d+)\s*GB\s*VRAM\)", gpu)
+        vram_gb = int(m_v.group(1)) if m_v else None
+        if vram_gb is not None and vram_gb <= 8 and bw is not None and bw <= 8.0:
+            pcie_note = (
+                f"Advisory: GPU PCIe link is Gen {gen} x{width} (~{bw:.1f} GB/s bandwidth). "
+                f"On <= 8 GB GPUs, bandwidth <= 8 GB/s causes heavy streaming stutter when VRAM spills over the bus. "
+                f"Consider setting LEONIDA_TEXTURE_MIP_DROP=1 to reduce PCIe streaming traffic and verify the GPU is in the primary CPU-attached x16 slot."
+            )
+        return Report(self.profile, headline, summary, [Check(*r) for r in rows], pcie_note=pcie_note)
 
     def warn_if_weak(self, report=None) -> bool:
         """Show a popup if the PC is weak. Returns False only if the player
@@ -931,7 +1015,7 @@ def _pick_profile(n: int) -> str:
 def run_check(args) -> int:
     """No window. Exit code: 0 good, 1 weak, 2 unknown, 3 player declined (--warn)."""
     checker = SpecChecker(_pick_profile(args.profile))
-    report = checker.check(args.cpu, args.gpu, args.ram)
+    report = checker.check(args.cpu, args.gpu, args.ram, pcie=getattr(args, "pcie", None))
     print(json.dumps(report.as_dict(), indent=2) if args.json else report.as_text())
     if args.warn and not checker.warn_if_weak(report):
         return 3
@@ -940,12 +1024,14 @@ def run_check(args) -> int:
 
 def run_cli(args):
     profile = _pick_profile(args.profile)
+    checker = SpecChecker(profile)
+    report = checker.check(args.cpu, args.gpu, args.ram, pcie=getattr(args, "pcie", None))
     info = detect_all() if not (args.cpu and args.gpu and args.ram) else {}
     cpu = args.cpu or info.get("cpu", "")
     gpu = args.gpu or info.get("gpu", "")
     ram = args.ram or info.get("ram")
     print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | RAM: {ram or '?'} GB\n")
-    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram)))
+    print(report.as_text())
 
 
 def main():
@@ -956,6 +1042,7 @@ def main():
     ap.add_argument("--cpu", help="override the detected CPU")
     ap.add_argument("--gpu", help="override the detected GPU")
     ap.add_argument("--ram", type=int, help="override the detected RAM, in GB")
+    ap.add_argument("--pcie", help="override PCIe link configuration (e.g. gen3x8, gen4x16, gen3x4)")
     ap.add_argument("--check", action="store_true",
                     help="no window; exit code 0 good, 1 weak, 2 unknown (3 with --warn if declined)")
     ap.add_argument("--json", action="store_true", help="with --check: print JSON")

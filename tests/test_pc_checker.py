@@ -153,6 +153,58 @@ class Api(unittest.TestCase):
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
 
+    def test_pcie_bandwidth_calculation(self):
+        self.assertEqual(pc.pcie_bandwidth_gb_s(3, 8), 7.9)
+        self.assertEqual(pc.pcie_bandwidth_gb_s(4, 16), 31.5)
+        self.assertEqual(pc.pcie_bandwidth_gb_s(3, 16), 15.8)
+        self.assertEqual(pc.pcie_bandwidth_gb_s(3, 4), 3.9)
+        self.assertEqual(pc.pcie_bandwidth_gb_s(2, 16), 8.0)
+        self.assertIsNone(pc.pcie_bandwidth_gb_s(None, 8))
+        self.assertIsNone(pc.pcie_bandwidth_gb_s(3, 0))
+
+    def test_pcie_advisory_for_8gb_gpu_low_bandwidth(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, pcie="gen3x8")
+        self.assertIn("Advisory: GPU PCIe link is Gen 3 x8", report.pcie_note)
+        self.assertIn("~7.9 GB/s bandwidth", report.pcie_note)
+        self.assertIn("LEONIDA_TEXTURE_MIP_DROP=1", report.pcie_note)
+        self.assertIn("Advisory: GPU PCIe link is Gen 3 x8", report.as_text())
+
+    def test_no_pcie_advisory_for_high_bandwidth_8gb_gpu(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, pcie="gen4x16")
+        self.assertEqual(report.pcie_note, "")
+        self.assertNotIn("Advisory: GPU PCIe link", report.as_text())
+
+    def test_no_pcie_advisory_for_16gb_gpu(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 4080 (16 GB VRAM)", 32, pcie="gen3x8")
+        self.assertEqual(report.pcie_note, "")
+
+    def test_detect_pcie_from_nvidia_smi(self):
+        from unittest import mock
+        smi_out = "NVIDIA GeForce RTX 5060, 3, 8\n"
+        with mock.patch("shutil.which", return_value="nvidia-smi"), \
+             mock.patch.object(pc, "_run", return_value=smi_out):
+            gen, width, bw = pc.detect_pcie(target_gpu="NVIDIA GeForce RTX 5060")
+            self.assertEqual(gen, 3)
+            self.assertEqual(width, 8)
+            self.assertEqual(bw, 7.9)
+
+    def test_detect_pcie_from_lspci(self):
+        from unittest import mock
+        lspci_out = (
+            "Capabilities: [78] Express Endpoint, MSI 00\n"
+            "        LnkSta: Speed 8GT/s, Width x8\n"
+        )
+        with mock.patch.object(pc.sys, "platform", "linux"), \
+             mock.patch("shutil.which", side_effect=lambda name: "lspci" if name == "lspci" else None), \
+             mock.patch.object(pc, "_run", return_value=lspci_out):
+            gen, width, bw = pc.detect_pcie(target_gpu="Some GPU")
+            self.assertEqual(gen, 3)
+            self.assertEqual(width, 8)
+            self.assertEqual(bw, 7.9)
+
 
 if __name__ == "__main__":
     unittest.main()
