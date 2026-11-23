@@ -4,13 +4,14 @@
 
 .DESCRIPTION
     Dynamically inspects system hardware (GPU VRAM, Resizable BAR, CPU core topology),
-    configures memory budgets, Wave64 emulation, and thread concurrency, then launches
-    the Leonida runtime (gta6rt.exe) with safety guards against watchdog timeouts.
+    configures memory budgets, Wave64 emulation, thread concurrency, timer resolution,
+    and process priority, then launches the Leonida runtime (gta6rt.exe) with safety guards
+    against watchdog timeouts.
 
 .EXAMPLE
     .\scripts\run_optimized.ps1
     .\scripts\run_optimized.ps1 -Image "game.exe" -Mode Run
-    .\scripts\run_optimized.ps1 -Image "game.exe" -Mode DryRun
+    .\scripts\run_optimized.ps1 -Image "game.exe" -Affinity PhysicalOnly
 #>
 [CmdletBinding()]
 param(
@@ -27,6 +28,12 @@ param(
 
     [int]$ArenaMb = -1,
 
+    [ValidateSet("All", "PhysicalOnly")]
+    [string]$Affinity = "All",
+
+    [ValidateSet("Normal", "AboveNormal", "High")]
+    [string]$Priority = "High",
+
     [switch]$SkipBarCheck,
 
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -35,14 +42,48 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# WinMM timeBeginPeriod / timeEndPeriod for 1 ms timer precision
+$timePeriodCode = @"
+using System;
+using System.Runtime.InteropServices;
+public static class TimePeriodRunner {
+    [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    public static extern uint TimeBeginPeriod(uint uMilliseconds);
+    [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+    public static extern uint TimeEndPeriod(uint uMilliseconds);
+}
+"@
+if (-not ([System.Management.Automation.PSTypeName]'TimePeriodRunner').Type) {
+    Add-Type -TypeDefinition $timePeriodCode -Language CSharp
+}
+
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "            LEONIDA HARDWARE OPTIMIZER & RUNNER           " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host ""
 
 # 1. CPU Configuration & Affinity Safeguards
+$cpuInfo = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+$cpuName = if ($cpuInfo) { $cpuInfo.Name.Trim() } else { "Unknown CPU" }
 $logicalCores = [Environment]::ProcessorCount
-Write-Host "[CPU] Detected $logicalCores logical processors." -ForegroundColor Green
+
+Write-Host "[CPU] Detected: $cpuName ($logicalCores logical processors)." -ForegroundColor Green
+
+$isIntel = $cpuName -match "Intel"
+$isCC150 = $cpuName -match "CC150"
+
+if ($isCC150) {
+    Write-Host "      Profile: Intel CC150 (8C/16T Coffee Lake @ 3.50 GHz locked frequency)." -ForegroundColor Cyan
+    Write-Host "      Watchdog mitigation: Active (pinned base clock requires unthrottled worker threads)." -ForegroundColor Gray
+} elseif ($isIntel) {
+    Write-Host "      Profile: Intel Architecture detected." -ForegroundColor Cyan
+}
+
+# Sizing host worker thread pools
+$env:OMP_NUM_THREADS = [string]$logicalCores
+$env:VK_LOADER_THREAD_MAX = [string]$logicalCores
+$env:MKL_NUM_THREADS = [string]$logicalCores
+$env:LEONIDA_THREAD_POOL_SIZE = [string]$logicalCores
 
 # 2. GPU Detection & Resizable BAR Check
 $is8GbOrLess = $false
@@ -117,7 +158,10 @@ if (-not $Image) {
 # 4. Locate Runtime Executable
 $rtExe = Join-Path $LeonidaDir "gta6rt.exe"
 if (-not (Test-Path $rtExe)) {
-    $localBuild = Join-Path $PSScriptRoot "..\runtime\build\gta6rt.exe"
+    $localBuild = Join-Path $PSScriptRoot "..\runtime\build\RelWithDebInfo\gta6rt.exe"
+    if (-not (Test-Path $localBuild)) {
+        $localBuild = Join-Path $PSScriptRoot "..\runtime\build\gta6rt.exe"
+    }
     if (Test-Path $localBuild) {
         $rtExe = (Resolve-Path $localBuild).Path
     } else {
@@ -137,15 +181,61 @@ $argFlag = switch ($Mode) {
 
 Write-Host "[EXEC] Mode: $argFlag" -ForegroundColor Cyan
 Write-Host "[EXEC] Image target: $Image" -ForegroundColor Cyan
-Write-Host ""
 
 $callArgs = @($argFlag, $Image)
 if ($ExtraArgs) {
     $callArgs += $ExtraArgs
 }
 
-& $rtExe @callArgs
-$exitCode = $LASTEXITCODE
+# Calculate affinity mask
+$affinityMask = [IntPtr]0xFFFF
+if ($Affinity -eq "PhysicalOnly") {
+    $affinityMask = [IntPtr]0x5555
+    Write-Host "[EXEC] CPU Affinity: Physical cores only (mask 0x5555)." -ForegroundColor Cyan
+} else {
+    Write-Host "[EXEC] CPU Affinity: All logical threads (mask 0xFFFF)." -ForegroundColor Cyan
+}
+
+Write-Host "[EXEC] Process Priority: $Priority" -ForegroundColor Cyan
+Write-Host "[TIMER] Enabling 1 ms multimedia timer period (winmm.dll)." -ForegroundColor Green
+[TimePeriodRunner]::TimeBeginPeriod(1) | Out-Null
+
+$exitCode = 0
+try {
+    $escapedArgs = ($callArgs | ForEach-Object {
+        if ($_ -match '[\s"]') {
+            '"' + ($_ -replace '(\\+)"', '$1$1\"' -replace '"', '\"') + '"'
+        } else {
+            $_
+        }
+    }) -join " "
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $rtExe
+    $psi.Arguments = $escapedArgs
+    $psi.UseShellExecute = $false
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($proc) {
+        try {
+            $proc.ProcessorAffinity = $affinityMask
+            $proc.PriorityClass = switch ($Priority) {
+                "AboveNormal" { [System.Diagnostics.ProcessPriorityClass]::AboveNormal }
+                "High"        { [System.Diagnostics.ProcessPriorityClass]::High }
+                Default       { [System.Diagnostics.ProcessPriorityClass]::Normal }
+            }
+        } catch {
+            # Non-fatal if OS restricts priority adjustment
+        }
+        $proc.WaitForExit()
+        $exitCode = $proc.ExitCode
+    } else {
+        $exitCode = 1
+    }
+} finally {
+    [TimePeriodRunner]::TimeEndPeriod(1) | Out-Null
+    Write-Host "[TIMER] Restored multimedia timer period." -ForegroundColor Gray
+}
 
 Write-Host ""
 if ($exitCode -eq 0) {
