@@ -322,5 +322,17 @@ class VCubeTcOracleTests(unittest.TestCase):
         # -Z (face 5): tc = -y
         self.assertEqual(oracle_cubetc_f32(0.0, 0.5, -2.0), -0.5)
 
+class VCubeTcAstTests(unittest.TestCase):
+    def test_cubetc_ast_construction(self):
+        ast = CubeInstructionAST(
+            "v_cubetc_f32",
+            Operand(RegKind.VGPR, index=5),
+            Operand(RegKind.VGPR, index=0),
+            Operand(RegKind.VGPR, index=1),
+            Operand(RegKind.VGPR, index=2),
+        )
+        self.assertEqual(ast.mnemonic, "v_cubetc_f32")
+        self.assertEqual(ast.dst.index, 5)
+
 if __name__ == "__main__":
     unittest.main()
