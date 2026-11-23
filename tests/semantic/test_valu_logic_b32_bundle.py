@@ -582,3 +582,30 @@ class TestXorB32SIMDAndProperties(unittest.TestCase):
             "v_xor_b32 v0, v0, v2",
         ])
         self.assertEqual(val_roundtrip, 0x13579BDF)
+
+
+# ------------------------------------------------------------------------------
+# v_xor_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestXorB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            LiteralOperand(0x1_0000_0000)
+
+    def test_boundary_extremes_hardware(self):
+        val_not, _ = run_shader("ps_xor_not", [
+            "v_mov_b32 v1, 0x55555555",
+            "v_mov_b32 v2, 0xFFFFFFFF",
+            "v_xor_b32 v0, v1, v2",
+        ])
+        self.assertEqual(val_not, 0xAAAAAAAA)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        val, spv = run_shader("ps_xor_lowering", [
+            "v_mov_b32 v1, 0xFF00",
+            "v_mov_b32 v2, 0x0FF0",
+            "v_xor_b32 v0, v1, v2",
+        ])
+        self.assertIn("OpBitwiseXor", spv)
+        self.assertEqual(val, 0xF0F0)
