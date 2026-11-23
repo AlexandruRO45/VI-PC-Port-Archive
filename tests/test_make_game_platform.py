@@ -254,6 +254,13 @@ class RuntimePackagingTest(unittest.TestCase):
         env = dict(os.environ, WINE=sys.executable)
         env.pop("LEONIDA_D3D12", None)
         env.pop("LEONIDA_SHADERS", None)
+        for wine in (os.path.join(self.root, "no-proton", "files", "bin", "wine"), "no-such-wine-command"):
+            with self.subTest(wine=wine):
+                result = subprocess.run([launcher, "--dry-run", "x.exe"], cwd=self.root, env=dict(env, WINE=wine),
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 127)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(f"No Wine at {wine}: install Wine, or set WINE", result.stderr)
         missing = subprocess.run([launcher, "--run"], cwd=self.root, env=env, capture_output=True, text=True)
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn(image, missing.stderr)
@@ -475,7 +482,8 @@ class RuntimeBuildPackagingTest(unittest.TestCase):
             with open(launcher, encoding="utf-8") as f:
                 text = f.read()
             self.assertTrue(text.startswith("#!/bin/sh\n"))
-            self.assertIn('"${WINE:-wine}" "$here/gta6rt.exe" "$@"', text)
+            self.assertIn('wine=${WINE:-wine}\n', text)
+            self.assertIn('exec "$wine" "$here/gta6rt.exe" "$@"', text)
             if os.name != "nt":
                 self.assertTrue(os.access(launcher, os.X_OK))
 

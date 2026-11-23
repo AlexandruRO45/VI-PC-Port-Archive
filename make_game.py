@@ -2213,7 +2213,16 @@ if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --
 {moved_catalog}    export LEONIDA_D3D12="${{LEONIDA_D3D12:-vulkan}}"
     set -- "$1" "./$image" --overlay "Z:$here/overlay"
 fi
-exec "${{WINE:-wine}}" "$here/gta6rt.exe" "$@"
+wine=${{WINE:-wine}}
+# A path must be an executable file; a bare name must be on PATH.
+case $wine in
+    */*) [ -f "$wine" ] && [ -x "$wine" ] ;;
+    *) command -v "$wine" >/dev/null 2>&1 ;;
+esac || {{
+    printf 'No Wine at %s: install Wine, or set WINE to one, e.g. a Proton build'"'"'s files/bin/wine (README.md).\\n' "$wine" >&2
+    exit 127
+}}
+exec "$wine" "$here/gta6rt.exe" "$@"
 """
 
 
