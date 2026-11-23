@@ -230,7 +230,8 @@ DWORD host_protect(DWORD p) {
 // AWE's MapUserPhysicalPages does.
 //
 // ASSUMPTION: a title does not commit memory inside such a window with kernel32!VirtualAlloc. A placeholder refuses a
-// plain commit; the measured windows are only ever passed to the map calls.
+// plain commit; the measured windows are only ever passed to the map calls. A commit-only XMemVirtualAlloc into a
+// window is served (commit_in_window).
 struct Window {
     SIZE_T size;
     DWORD protect;
@@ -297,6 +298,49 @@ bool isolate_placeholder(void* address, SIZE_T size) {
     }
     if (info.AllocationBase == address && info.RegionSize == size) return true;
     return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
+}
+
+// With g_phys_mutex held. A commit-only XMemVirtualAlloc of [start, end) that the host refused, because that range of
+// a window is still a placeholder. The range is widened to `granularity` (placeholders split on allocation-granularity
+// boundaries only) and has to lie in one window, as a plain commit has to lie in one reservation. Each part is
+// committed with the call's protection, as a plain commit is: a placeholder part is replaced with committed memory, a
+// part committed before is committed again (Windows accepts a repeated MEM_COMMIT). A part with a physical page mapped
+// (or nothing reserved) fails the call with ERROR_INVALID_ADDRESS before anything changes. The window record keeps the
+// committed part: it is still the title's reservation, and a map there fails as the part is no longer a placeholder.
+// A failure part-way leaves the parts before it committed.
+bool commit_in_window(uintptr_t start, uintptr_t end, SIZE_T granularity, DWORD protect) {
+    start &= ~(static_cast<uintptr_t>(granularity) - 1);
+    end = (end + granularity - 1) & ~(static_cast<uintptr_t>(granularity) - 1);
+    if (!find_window(start, end - start)) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return false;
+    }
+    for (int pass = 0; pass < 2; ++pass) {  // 0: check every part, 1: commit them
+        for (uintptr_t at = start; at < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info))) return false;
+            const uintptr_t region_end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+            const uintptr_t part_end = region_end < end ? region_end : end;
+            void* const part = reinterpret_cast<void*>(at);
+            const SIZE_T part_size = static_cast<SIZE_T>(part_end - at);
+            const bool placeholder = info.State == MEM_RESERVE;
+            if (pass == 0) {
+                if (!placeholder && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)) {
+                    SetLastError(ERROR_INVALID_ADDRESS);
+                    return false;
+                }
+            } else if (!VirtualAlloc(part, part_size, MEM_COMMIT, protect)) {
+                if (!placeholder || !isolate_placeholder(part, part_size) ||
+                    !placeholder_api().virtual_alloc2(GetCurrentProcess(), part, part_size,
+                                                      MEM_REPLACE_PLACEHOLDER | MEM_RESERVE | MEM_COMMIT, protect,
+                                                      nullptr, 0)) {
+                    return false;
+                }
+            }
+            at = part_end;
+        }
+    }
+    return true;
 }
 
 PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
@@ -421,6 +465,19 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         parameter.Pointer = &requirements;
         return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
                                                 &parameter, 1);
+    }
+    if (commit && !(host_type & MEM_RESERVE) && address != nullptr) {
+        // A commit into an existing reservation. A window is a placeholder, which refuses a plain commit.
+        const std::lock_guard lock(g_phys_mutex);
+        if (void* const result = VirtualAlloc(address, size, host_type, host_prot)) return result;
+        const DWORD error = GetLastError();
+        const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+        if (!placeholder_api().available() || !find_window(start, size)) {
+            SetLastError(error);
+            return nullptr;
+        }
+        return commit_in_window(start, start + size, system_info.dwAllocationGranularity, host_prot) ? address
+                                                                                                    : nullptr;
     }
     return VirtualAlloc(address, size, host_type, host_prot);
 }

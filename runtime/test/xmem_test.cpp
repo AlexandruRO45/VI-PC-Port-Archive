@@ -7,7 +7,8 @@
 // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
 // graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
-// contents across unmap and remap, alias when mapped twice, and scatter-map per address.
+// contents across unmap and remap, alias when mapped twice, and scatter-map per address; a commit-only call into a
+// reserve-only page-mode window commits that range.
 #include <windows.h>
 #include <psapi.h>
 
@@ -474,6 +475,146 @@ void test_placeholders(const PhysicalApi& api) {
     check(reserved_only(base), "the rest of the placeholder is still reserved");
 }
 
+bool committed_read_write(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_COMMIT && info.Type == MEM_PRIVATE &&
+           info.Protect == PAGE_READWRITE;
+}
+
+// Releases every allocation in [base, base + size): a window that pages were mapped or memory committed into is one
+// host allocation per part. True when each release succeeded and the whole range is free afterwards.
+bool release_parts(uint8_t* base, SIZE_T size) {
+    bool ok = true;
+    for (uint8_t* at = base; at < base + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(at, &info, sizeof(info))) return false;
+        if (info.State != MEM_FREE) ok &= VirtualFree(info.BaseAddress, 0, MEM_RELEASE) != FALSE;
+        at = static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize;
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    return ok && VirtualQuery(base, &info, sizeof(info)) && info.State == MEM_FREE &&
+           static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize >= base + size;
+}
+
+// A commit-only XMemVirtualAlloc into a reserve-only page-mode region (a window, so a placeholder on the host) commits
+// that range, as a plain reserve then commit does, and the rest of the window still takes physical pages.
+void test_commit_into_window(const PhysicalApi& api) {
+    constexpr SIZE_T kWindow = 16 * kPage64k;
+    auto* const base = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kWindow, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    check(base != nullptr, "commit into a window: reserve 1 MiB of 64 KiB pages");
+    if (!base) return;
+
+    auto* const committed = static_cast<uint8_t*>(
+        api.virtual_alloc(base + kPage64k, kPage64k, MEM_COMMIT | kXmem64kPages, 0x283, PAGE_READWRITE));
+    check(committed == base + kPage64k, "a commit-only 64 KiB-page call into the window returns the requested address");
+    {
+        MEMORY_BASIC_INFORMATION info{};
+        check(VirtualQuery(base + kPage64k, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+                  info.Type == MEM_PRIVATE && info.Protect == PAGE_READWRITE && info.RegionSize == kPage64k,
+              "VirtualQuery reports exactly the requested 64 KiB committed read-write");
+    }
+    check(reserved_only(base) && reserved_only(base + 2 * kPage64k),
+          "the window on either side of the committed range is still reserved");
+    if (committed) {
+        committed[0] = 0x5a;
+        committed[kPage64k - 1] = 0xa5;
+        check(committed[0] == 0x5a && committed[kPage64k - 1] == 0xa5, "bytes written there read back");
+    }
+
+    // Windows accepts a repeated MEM_COMMIT; the contents stay.
+    check(api.virtual_alloc(base + kPage64k, kPage64k, MEM_COMMIT | kXmem64kPages, 0x283, PAGE_READWRITE) ==
+                  base + kPage64k &&
+              committed && committed[0] == 0x5a,
+          "committing the same range again succeeds and keeps its contents");
+
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == 2, "allocate two pages for the rest of the window");
+    check(api.map(base, 1, &pages[0]) == base && api.map(base + 2 * kPage64k, 1, &pages[1]) == base + 2 * kPage64k,
+          "physical pages still map on either side of the committed range");
+    fill_page(base, 0x1110000u);
+    fill_page(base + 2 * kPage64k, 0x2220000u);
+    check(page_holds(base, 0x1110000u) && page_holds(base + 2 * kPage64k, 0x2220000u),
+          "the mapped pages beside the committed range hold data");
+
+    SetLastError(ERROR_SUCCESS);
+    check(api.map(base + kPage64k, 1, &pages[0]) == nullptr && committed_read_write(base + kPage64k) &&
+              committed && committed[0] == 0x5a,
+          "a physical page does not map over the committed range, which keeps its contents");
+
+    // A range with a physical page mapped in it is refused before anything changes.
+    SetLastError(ERROR_SUCCESS);
+    check(api.virtual_alloc(base + 2 * kPage64k, 2 * kPage64k, MEM_COMMIT | kXmem64kPages, 0x283, PAGE_READWRITE) ==
+                  nullptr &&
+              GetLastError() == ERROR_INVALID_ADDRESS,
+          "a commit over a mapped physical page fails with ERROR_INVALID_ADDRESS");
+    check(page_holds(base + 2 * kPage64k, 0x2220000u) && reserved_only(base + 3 * kPage64k),
+          "the refused commit left the mapped page and the placeholder after it as they were");
+
+    // A range that runs past the end of the window fails, as a plain commit past its reservation does.
+    check(api.virtual_alloc(base + kWindow - kPage64k, 2 * kPage64k, MEM_COMMIT | kXmem64kPages, 0x283,
+                            PAGE_READWRITE) == nullptr &&
+              reserved_only(base + kWindow - kPage64k),
+          "a commit that runs past the end of the window fails and changes nothing");
+
+    // A range over an earlier committed part and placeholders commits all of it.
+    check(api.map(base + 2 * kPage64k, 1, nullptr) == base + 2 * kPage64k, "unmap the page after the committed range");
+    check(api.virtual_alloc(base + kPage64k, 4 * kPage64k, MEM_COMMIT | kXmem64kPages, 0x283, PAGE_READWRITE) ==
+              base + kPage64k,
+          "a commit over a committed part and the placeholders after it succeeds");
+    bool all_committed = true;
+    for (SIZE_T i = 1; i < 5; ++i) all_committed &= committed_read_write(base + i * kPage64k);
+    check(all_committed && committed && committed[0] == 0x5a && reserved_only(base + 5 * kPage64k),
+          "the whole range is committed, the earlier contents stay and the window after it is reserved");
+
+    // Without a page mode the address keeps its 4 KiB rounding; the host commits the whole 64 KiB around it.
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    uint8_t* const small = base + 8 * kPage64k + system_info.dwPageSize;
+    auto* const small_result =
+        static_cast<uint8_t*>(api.virtual_alloc(small, system_info.dwPageSize, MEM_COMMIT, 0x183, PAGE_READWRITE));
+    check(small_result == small && committed_read_write(small), "a commit-only call without a page mode commits there too");
+    if (small_result == small) {
+        small[0] = 0x33;
+        check(small[0] == 0x33, "that page is writable");
+    }
+
+    check(api.map(base, 1, nullptr) == base, "unmap the first page");
+    check(api.free_pages(2, pages) == TRUE, "free the two pages");
+    check(release_parts(base, kWindow), "the window and its committed parts release");
+
+    // 2 MiB pages: the same reserve then commit.
+    auto* const large = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 2 * kPage2m, MEM_RESERVE | kXmemLargePages, 0x183, PAGE_READWRITE));
+    check(large != nullptr, "commit into a window: reserve 4 MiB of 2 MiB pages");
+    if (!large) return;
+    auto* const large_committed = static_cast<uint8_t*>(
+        api.virtual_alloc(large + kPage2m, kPage2m, MEM_COMMIT | kXmemLargePages, 0x183, PAGE_READWRITE));
+    check(large_committed == large + kPage2m, "a commit-only 2 MiB-page call into the window returns the requested address");
+    {
+        MEMORY_BASIC_INFORMATION info{};
+        check(VirtualQuery(large + kPage2m, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+                  info.Protect == PAGE_READWRITE && info.RegionSize == kPage2m,
+              "VirtualQuery reports the 2 MiB page committed read-write");
+    }
+    if (large_committed) {
+        large_committed[0] = 0x11;
+        large_committed[kPage2m - 1] = 0x22;
+        check(large_committed[0] == 0x11 && large_committed[kPage2m - 1] == 0x22,
+              "bytes written in the 2 MiB page read back");
+    }
+    check(reserved_only(large), "the first 2 MiB of the window is still reserved");
+    uint64_t page = 0;
+    count = 1;
+    check(api.allocate(0x280, &count, &page) == TRUE && count == 1 && api.map(large, 1, &page) == large,
+          "a physical page still maps in the rest of the 2 MiB-page window");
+    fill_page(large, 0x3330000u);
+    check(page_holds(large, 0x3330000u), "that page holds data");
+    check(api.map(large, 1, nullptr) == large && api.free_pages(1, &page) == TRUE, "unmap and free that page");
+    check(release_parts(large, 2 * kPage2m), "the 2 MiB-page window and its committed part release");
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -719,6 +860,7 @@ int main() {
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
         test_placeholders(physical);
+        test_commit_into_window(physical);
     }
 
     print_result();
