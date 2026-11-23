@@ -107,7 +107,8 @@ UNDEF = _Undef()
 # Operations whose result is undefined when an operand is (they have no side effect and no control).
 _PURE = frozenset({
     "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
-    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUConvert", "OpBitCount", "OpIEqual",
+    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUDiv", "OpUMod", "OpSDiv", "OpSRem",
+    "OpUConvert", "OpBitCount", "OpIEqual",
     "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThan", "OpUGreaterThanEqual", "OpCopyObject",
     "OpBitcast",
     "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
@@ -951,6 +952,26 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             values[res] = (val(a[1]) - val(a[2])) & wmask(a[0])
         elif op == "OpIMul":
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
+        elif op in ("OpUDiv", "OpUMod"):
+            m = wmask(a[0])
+            x, y = val(a[1]) & m, val(a[2]) & m
+            if y == 0:
+                values[res] = UNDEF             # undefined in SPIR-V; raises only if it is used
+                continue
+            values[res] = (x // y if op == "OpUDiv" else x % y) & m
+        elif op in ("OpSDiv", "OpSRem"):
+            bits = types.bits(a[0])
+            m = wmask(a[0])
+            x, y = signed(val(a[1]), bits), signed(val(a[2]), bits)
+            if y == 0 or (x == -(1 << (bits - 1)) and y == -1):
+                values[res] = UNDEF             # undefined in SPIR-V; raises only if it is used
+                continue
+            if op == "OpSDiv":
+                q = abs(x) // abs(y)
+                values[res] = (-q if (x < 0) != (y < 0) else q) & m
+            else:
+                r = abs(x) % abs(y)
+                values[res] = (-r if x < 0 else r) & m
         elif op == "OpUConvert":
             values[res] = val(a[1]) & wmask(a[0])
         elif op == "OpSConvert":

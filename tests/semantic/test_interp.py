@@ -675,7 +675,7 @@ OpStore %f32_control %control
                                   "%res = OpLoad %uint %q\n"), 0xFFFFFFF0)
 
     def test_unsupported_constructs_are_rejected(self):
-        for body in ("%res = OpUDiv %uint %c2 %c1\n",                                     # opcode not modelled
+        for body in ("%res = OpOuterProduct %uint %c2 %c1\n",                             # opcode not modelled
                      "%res = OpExtInst %uint %glsl Ldexp %c2 %c1\n",                     # ext inst not modelled
                      "%res = OpBitFieldUExtract %uint %cFF %c32 %c1\n",                  # undefined per spec
                      "%res = OpShiftLeftLogical %uint %cFF %c32\n",                     # undefined per spec
