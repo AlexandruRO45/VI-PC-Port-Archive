@@ -53,6 +53,7 @@ struct Blob {
 };
 
 constexpr HRESULT E_GS_INVALID_CONTAINER_NAME = static_cast<HRESULT>(0x80830001);
+constexpr HRESULT E_GS_OUT_OF_LOCAL_STORAGE = static_cast<HRESULT>(0x80830003);
 constexpr HRESULT E_GS_UPDATE_TOO_BIG = static_cast<HRESULT>(0x80830005);
 constexpr HRESULT E_GS_PROVIDED_BUFFER_TOO_SMALL = static_cast<HRESULT>(0x80830007);
 constexpr HRESULT E_GS_BLOB_NOT_FOUND = static_cast<HRESULT>(0x80830008);
@@ -361,6 +362,36 @@ int main() {
         std::filesystem::remove_all(root / L"local-user" / L"first", ec);
         std::filesystem::remove_all(root / L"local-user" / L"second", ec);
     }
+
+    // A locked second destination makes the first rename succeed and the next fail.
+    Handle failure_container = nullptr;
+    check(at<Create>(save, 16)(save, provider, "failure", &failure_container) == S_OK, "create failure-test container");
+    const auto failure_dir = root / L"local-user" / L"failure";
+    std::filesystem::create_directories(failure_dir, ec);
+    HANDLE locked = CreateFileW((failure_dir / L"b").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(locked != INVALID_HANDLE_VALUE, "lock second destination");
+    Handle failure_update = nullptr;
+    check(at<Create>(save, 23)(save, failure_container, nullptr, &failure_update) == S_OK, "create failure update");
+    for (const char* name : {"a", "b", "c"})
+        check(at<Write>(save, 25)(save, failure_update, name, reinterpret_cast<const uint8_t*>("x"), 1) == S_OK,
+              "stage failure-test blob");
+    check(at<Submit>(save, 27)(save, failure_update) == E_GS_OUT_OF_LOCAL_STORAGE, "locked rename reports storage error");
+    check(std::filesystem::exists(failure_dir / L"a") && !std::filesystem::exists(failure_dir / L"a~") &&
+              !std::filesystem::exists(failure_dir / L"b~") && !std::filesystem::exists(failure_dir / L"c~"),
+          "failed rename removes remaining temporary blobs after first rename");
+    if (locked != INVALID_HANDLE_VALUE) CloseHandle(locked);
+    at<Close>(save, 24)(save, failure_update);
+
+    locked = CreateFileW((failure_dir / L".display").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(locked != INVALID_HANDLE_VALUE, "lock display destination");
+    Handle display_update = nullptr;
+    check(at<Create>(save, 23)(save, failure_container, "display", &display_update) == S_OK, "create display update");
+    check(at<Submit>(save, 27)(save, display_update) == E_GS_OUT_OF_LOCAL_STORAGE, "locked display reports storage error");
+    if (locked != INVALID_HANDLE_VALUE) CloseHandle(locked);
+    at<Close>(save, 24)(save, display_update);
+    at<Close>(save, 17)(save, failure_container);
 
     at<Close>(save, 6)(save, provider);
     at<Close>(save, 6)(save, provider2);

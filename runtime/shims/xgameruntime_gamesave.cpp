@@ -402,11 +402,14 @@ HRESULT commit(XGameSaveUpdate* u) {
         renames.emplace_back(temp, final_path);
     }
     for (const auto& [temp, final_path] : renames)
-        if (!MoveFileExW(temp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        if (!MoveFileExW(temp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            for (const auto& r : renames) fs::remove(r.first, ec);
             return E_GS_OUT_OF_LOCAL_STORAGE;
+        }
     for (const auto& [name, op] : u->ops)
         if (!op.write) fs::remove(dir / widen(encode_name(name)), ec);
-    if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
+    if (u->has_display_name && !write_file(dir / L".display", u->display_name.data(), u->display_name.size()))
+        return E_GS_OUT_OF_LOCAL_STORAGE;
     return S_OK;
 }
 
