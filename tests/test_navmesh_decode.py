@@ -275,7 +275,7 @@ def build_navmesh(
         start_idx = pos + 1 if (corrupt_chain and i == 1) else pos
         struct.pack_into("<II", polys, 44 * i, sector, (start_idx << 4) | nv)
         if water_poly and i == 0:
-            struct.pack_into("<I", polys, 44 * i + 0x18, 0x80000)
+            struct.pack_into("<I", polys, 44 * i + 0x18, 0x80000 if water_poly is True else water_poly)
         pos += nv
     put_split(0x70, 6, verts, n_verts)
     put_split(0x80, 2, vidx, pool)
@@ -727,6 +727,18 @@ class NavmeshDecodeTest(unittest.TestCase):
                 proc = subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
                 self.assertNotEqual(proc.returncode, 0, f"expected failure for {args}")
                 self.assertNotIn("Traceback", proc.stderr)
+
+    def test_flag3_poly18_bijection(self):
+        for bit in (0x20000, 0x40000, 0x80000):
+            blob = build_navmesh(flags=9, water_poly=bit)[0]
+            _, chk = nd.decode_navmesh(blob, 1, nd.new_stats()["navmesh"], deep=True)
+            self.assertTrue(chk["flag3_poly18_bijection"], hex(bit))
+        clear = build_navmesh(flags=1, water_poly=0)[0]
+        _, chk_clear = nd.decode_navmesh(clear, 1, nd.new_stats()["navmesh"], deep=True)
+        self.assertTrue(chk_clear["flag3_poly18_bijection"])
+        mismatch = build_navmesh(flags=9, water_poly=0)[0]
+        _, chk_bad = nd.decode_navmesh(mismatch, 1, nd.new_stats()["navmesh"], deep=True)
+        self.assertFalse(chk_bad["flag3_poly18_bijection"])
 
 
 if __name__ == "__main__":

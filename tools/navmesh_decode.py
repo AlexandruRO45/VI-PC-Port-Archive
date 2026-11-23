@@ -593,6 +593,7 @@ def decode_navmesh(b, nstreams, stats, deep):
         if blocks[3] is not None:
             chain_ok, has_water = _poly_chain(b, blocks[3], c8, pool)
             chk["polygons_chain"] = chain_ok
+            chk["flag3_poly18_bijection"] = bool(flags & 8) == has_water
             stats["water_bit3"]["b3_%d_w_%d" % (bool(flags & 8), has_water)] += 1
         qt_ok, qn, ql, qd = _walk_quadtree(b, root, c4)
         chk["quadtree_valid"] = qt_ok
@@ -619,7 +620,7 @@ def _poly_chain(b, blocks, owner, pool):
         for mesh, packed, pf18 in struct.iter_unpack("<II16xI16x", b[o:o + 44 * n]):
             if mesh != owner or packed >> 4 != nxt:
                 return False, has_water
-            if pf18 & 0x80000:
+            if pf18 & 0xE0000:
                 has_water = True
             nxt += packed & 0xF
     return nxt == pool, has_water
