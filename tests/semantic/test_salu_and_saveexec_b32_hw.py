@@ -261,5 +261,60 @@ class TestSaluAndSaveexecB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.scc, 0)
 
 
+
+
+class Wave32SIMDState:
+    """Simulated Wave32 multi-lane divergence and active lane state tracking."""
+
+    def __init__(self, exec_mask: int = ALL_LANES_ACTIVE_32):
+        self.exec_lo = u32(exec_mask)
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < 32):
+            raise IndexError(f"Lane {lane} out of range [0, 31]")
+        return bool((self.exec_lo >> lane) & 1)
+
+    def active_lanes_mask(self) -> int:
+        return self.exec_lo
+
+    def execute(self, inst: ASTInstruction, scalar_state: ScalarRegisterState) -> None:
+        scalar_state.exec_lo = self.exec_lo
+        scalar_state.execute(inst)
+        self.exec_lo = scalar_state.exec_lo
+
+
+class TestSaluAndSaveexecB32SIMDDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence, lane deactivation, and translator verification."""
+
+    def test_lanes_deactivated_under_and(self):
+        initial_exec = 0xFFFFFFFF
+        wave = Wave32SIMDState(exec_mask=initial_exec)
+        scalar = ScalarRegisterState(exec_lo=initial_exec)
+        scalar.set_sgpr(8, 0x0000FFFF)  # only lanes 0..15 kept
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_AND_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(2, 1),
+            src0=ASTOperand.sgpr(8, 1),
+        )
+        wave.execute(inst, scalar)
+
+        for lane in range(0, 16):
+            self.assertTrue(wave.is_lane_active(lane), f"Lane {lane} should remain active")
+        for lane in range(16, 32):
+            self.assertFalse(wave.is_lane_active(lane), f"Lane {lane} should have turned inactive")
+
+    def test_translator_ps_translate_lines(self):
+        # Exercises tools/rdna2spirv.py to verify s_and_saveexec_b32 produces correct SPIR-V instructions
+        lines = [
+            "s_mov_b32 s6, 0x12345678",
+            "s_and_saveexec_b32 s4, s6",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_salu_and_saveexec_hw", lines)
+        self.assertIn("OpCapability Shader", spv)
+        self.assertIn("OpBitwiseAnd", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
