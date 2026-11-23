@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <set>
 #include <vector>
 #include <wrl/client.h>
 
@@ -26,6 +27,21 @@ namespace {
 int fail(const char* what) {
     std::fprintf(stderr, "FAIL: %s\n", what);
     return 1;
+}
+
+bool same_attached_monitors(IDXGIAdapter1* shim, IDXGIAdapter1* host) {
+    auto collect = [](IDXGIAdapter1* adapter, std::set<HMONITOR>& monitors) {
+        for (UINT index = 0; ; ++index) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> output;
+            const auto hr = adapter->EnumOutputs(index, output.GetAddressOf());
+            if (hr == DXGI_ERROR_NOT_FOUND) return !output;
+            DXGI_OUTPUT_DESC desc{};
+            if (FAILED(hr) || !output || FAILED(output->GetDesc(&desc)) ||
+                !monitors.insert(desc.Monitor).second) return false;
+        }
+    };
+    std::set<HMONITOR> expected, actual;
+    return collect(host, expected) && collect(shim, actual) && actual == expected;
 }
 
 unsigned& validation_errors() {
@@ -1154,7 +1170,8 @@ int main() {
                     const HRESULT nc = SUCCEEDED(chain_hr)
                         ? native_chain->GetContainingOutput(native_containing.GetAddressOf()) : chain_hr;
                     const HRESULT ss = sc->GetContainingOutput(shim_containing.GetAddressOf());
-                    const bool enum_matches = ne == se && bool(native_enum) == bool(shim_enum);
+                    const bool enum_matches = ne == se && bool(native_enum) == bool(shim_enum) &&
+                                              same_attached_monitors(adapter1, host_adapter);
                     const bool containing_matches = FAILED(chain_hr) ||
                         (nc == ss && bool(native_containing) == bool(shim_containing));
                     if (!enum_matches || !containing_matches) {

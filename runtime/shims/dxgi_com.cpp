@@ -16,7 +16,6 @@
 #include <string>
 #include <tuple>
 #include <vector>
-#include <wrl/client.h>
 
 namespace rt::dxgi {
 namespace {
@@ -751,28 +750,23 @@ std::vector<DisplayInfo> enumerate_displays() {
 void select_adapter_displays(LUID luid, std::vector<DisplayInfo>& displays) {
     // Keep the synthetic output when Windows exposes no desktop monitors.
     if ((!luid.LowPart && !luid.HighPart) || !displays.front().monitor) return;
-    using Microsoft::WRL::ComPtr;
-    static const auto create = [] {
-        const HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        return dxgi ? reinterpret_cast<decltype(&CreateDXGIFactory1)>(GetProcAddress(dxgi, "CreateDXGIFactory1"))
-                    : nullptr;
-    }();
-    ComPtr<IDXGIFactory4> factory;
-    ComPtr<IDXGIAdapter1> adapter;
-    if (!create || FAILED(create(IID_PPV_ARGS(factory.GetAddressOf()))) ||
-        FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(adapter.GetAddressOf()))))
-        return;
-
+    // A GDI display name identifies a VidPN source. Ask WDDM which adapter owns it.
+    // Stage the result so a driver failure leaves the original fallback intact.
+    const HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi) return;
+    const auto open = reinterpret_cast<decltype(&D3DKMTOpenAdapterFromGdiDisplayName)>(
+        GetProcAddress(gdi, "D3DKMTOpenAdapterFromGdiDisplayName"));
+    const auto close = reinterpret_cast<decltype(&D3DKMTCloseAdapter)>(GetProcAddress(gdi, "D3DKMTCloseAdapter"));
+    if (!open || !close) return;
     std::vector<DisplayInfo> attached;
-    for (UINT i = 0;; ++i) {
-        ComPtr<IDXGIOutput> output;
-        const auto hr = adapter->EnumOutputs(i, output.GetAddressOf());
-        if (hr == DXGI_ERROR_NOT_FOUND) break;
-        DXGI_OUTPUT_DESC desc{};
-        if (FAILED(hr) || !output || FAILED(output->GetDesc(&desc))) return;
-        const auto match = std::find_if(displays.begin(), displays.end(),
-                                        [&](const DisplayInfo& display) { return display.monitor == desc.Monitor; });
-        if (match != displays.end()) attached.push_back(*match);
+    for (const auto& display : displays) {
+        D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME adapter{};
+        wcscpy_s(adapter.DeviceName, display.device_name);
+        if (open(&adapter) != 0) return;
+        D3DKMT_CLOSEADAPTER closing{adapter.hAdapter};
+        close(&closing);
+        if (luid.LowPart == adapter.AdapterLuid.LowPart && luid.HighPart == adapter.AdapterLuid.HighPart)
+            attached.push_back(display);
     }
     displays.swap(attached);
 }
