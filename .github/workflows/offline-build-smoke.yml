@@ -1,0 +1,35 @@
+name: Offline build smoke test
+
+on:
+  pull_request:
+    paths:
+      - 'make_game.py'
+      - 'tools/**'
+      - 'tests/test_make_game_pipeline_batches.py'
+      - '.github/workflows/offline-build-smoke.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-build-smoke-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  offline-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Exercise pipeline batching with a synthetic checker
+        # Only the checkout is mounted. The test writes its synthetic work tree under /tmp.
+        run: |
+          docker run --rm --network none --read-only --user 65534:65534 \
+            --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=128m,mode=1777 \
+            --tmpfs /home/build:rw,nosuid,nodev,size=8m,uid=65534,gid=65534,mode=700 \
+            --env HOME=/home/build --volume "$PWD:/src:ro" --workdir /src \
+            python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 \
+            python -I tests/test_make_game_pipeline_batches.py
