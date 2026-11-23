@@ -707,7 +707,7 @@ def parse_catalogue_blocks(
             else:
                 presets_by_id[pid] = rec
 
-    # Measure parent_id inheritance graph properties across the catalogue.
+    # Measure all parent chains. Kit resolution diagnoses the chains its selected members actually follow.
     presets_with_parent = 0
     max_parent_depth = 0
     parent_cycles = 0
@@ -722,7 +722,8 @@ def parse_catalogue_blocks(
         while cur:
             if cur in seen:
                 parent_cycles += 1
-                warnings.append(f"parent_id cycle detected starting at preset 0x{rec.preset_id:08x}")
+                if not rooted_presets_only:
+                    warnings.append(f"parent_id cycle detected starting at preset 0x{rec.preset_id:08x}")
                 break
             parent = presets_by_id.get(cur)
             if parent is None:
@@ -731,7 +732,10 @@ def parse_catalogue_blocks(
             seen.add(cur)
             depth += 1
             if depth >= MAX_PARENT_DEPTH:
-                warnings.append(f"parent_id chain depth reached cap ({MAX_PARENT_DEPTH}) at preset 0x{rec.preset_id:08x}")
+                if not rooted_presets_only:
+                    warnings.append(
+                        f"parent_id chain depth reached cap ({MAX_PARENT_DEPTH}) at preset 0x{rec.preset_id:08x}"
+                    )
                 break
             cur = parent.parent_id
         if depth > max_parent_depth:
