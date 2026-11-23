@@ -1136,12 +1136,24 @@ void** get_vtable();  // built below, next to the table it fills
 // the title does hand out other objects: a foreign COM pointer whose slot number reaches this table gives a `self`
 // whose words are not a proxy at all. Reading the PC table out of that and jumping through it faults inside the
 // shim, where no name is attached to the stop, so the words a forward needs are looked at first and a bad `this`
-// comes back as E_NOINTERFACE with the slot named (once per slot, like the refusal above).
-const char* device_forward_blocker(DeviceProxy* self, unsigned slot) {
+// comes back as E_NOINTERFACE with the slot named (once per slot, like the refusal above). The pointer checks run
+// before the Xbox routes, the PC-table-entry checks only after the slot is known to be inside `slot_count`, so a
+// slot that has no PC entry keeps the answer it had before (a route, or E_NOTIMPL from beyond the table).
+// What the thunk reads out of `self` before the routes: only the pointer's own shape. A slot number is not part of
+// this, because the Xbox routes (78/79/80, 48, 73) and the beyond-table refusal below must keep answering for slots
+// the PC device has no entry for.
+const char* device_pointer_blocker(DeviceProxy* self) {
     if (!self) return "null device pointer";
     if (IsBadReadPtr(self, sizeof(DeviceProxy))) return "unreadable device pointer";
     if (self->vtable != get_vtable()) return "not a device proxy";
     if (!self->real || !self->real_vtable) return "proxy without a PC device";
+    return nullptr;
+}
+
+// What the forward itself needs, checked once the slot is known to be inside the proxy's own range: a slot the
+// proxy table has no thunk for, and a PC entry that is missing or unreadable. Past `slot_count` the answer is
+// E_NOTIMPL from refuse_beyond_device, never this.
+const char* device_slot_blocker(DeviceProxy* self, unsigned slot) {
     if (slot >= kMaxSlots) return "slot past the proxy table";
     if (IsBadReadPtr(self->real_vtable, (slot + 1) * sizeof(void*))) return "unreadable PC vtable";
     if (!self->real_vtable[slot]) return "null PC method";
@@ -1564,8 +1576,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<void**>(a7)));
     } else {
         // Before `self` is read at all: a pointer that is not a proxy has no meaningful slot count or PC table, and
-        // the forward below would jump through whatever its words happen to be.
-        if (const char* why = device_forward_blocker(self, Slot))
+        // the forward below would jump through whatever its words happen to be. Only the pointer here: the routes
+        // and the beyond-table refusal must see slots the PC device has no entry for.
+        if (const char* why = device_pointer_blocker(self))
             return hr_to_u64(refuse_bad_forward(self, Slot, why));
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
@@ -1596,6 +1609,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                          reinterpret_cast<void**>(a5)));
         }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        // Past that point the slot is inside the PC table, so an entry that is missing or unreadable means the
+        // object behind the proxy is not what `slot_count` claims. Refused rather than jumped through.
+        if (const char* why = device_slot_blocker(self, Slot))
+            return hr_to_u64(refuse_bad_forward(self, Slot, why));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.

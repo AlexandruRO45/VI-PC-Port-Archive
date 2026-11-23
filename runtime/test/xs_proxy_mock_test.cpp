@@ -885,7 +885,7 @@ int check_bad_self() {
     // A pointer into the middle of a proxy is not a proxy either: its first word is the DXGI view's table.
     EXPECT(hr_of(forwarded(reinterpret_cast<char*>(device) + 8, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0)) ==
            E_NOINTERFACE);
-    // The refusals are counted as calls of slot 26 and nothing reached the device.
+    // A refusal returns before the slot is noted, so only the honest call above counts as a slot 26 hit.
     EXPECT(mock->calls[26] == 1 && xs::device_slot_hits(26) == 1);
     // IUnknown on the proxy is untouched, and the proxy still forwards after all of that.
     EXPECT(hr_of(raw(device, 26, 9, 9, 9, 9, 9)) == S_OK && mock->calls[26] == 2);
@@ -893,6 +893,52 @@ int check_bad_self() {
     std::printf("%s: a device slot called on a pointer that is not the proxy returns E_NOINTERFACE instead of "
                 "reading a PC vtable out of it\n", g_label);
     return 0;
+}
+
+// ---- 11. A PC device whose table ends before the proxy table ----
+//
+// `slot_count` comes from the interfaces the real device answers, and a driver's table can hold entries past it
+// that are not usable, or nothing readable at all. Only slots inside `slot_count` may be forwarded, so a hole past
+// the end must not change the answer a slot had before: 80 keeps its route, 100 keeps E_NOTIMPL, and only a hole
+// inside the range (77) is the missing-method refusal.
+int check_short_table() {
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 11, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 80);
+    xs::reset_device_proxy_stats();
+
+    void** table = mock_vtable();
+    void* const saved77 = table[77];
+    void* const saved80 = table[80];
+    void* const saved100 = table[100];
+    table[77] = nullptr;   // inside the range: no PC method to forward to
+    table[80] = nullptr;   // past it, and an Xbox route
+    table[100] = nullptr;  // past it, no route
+
+    std::uint64_t token = 0;
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token != 0);
+    EXPECT(mock->calls[80] == 0);
+    EXPECT(hr_of(raw(device, 100, 1, 2, 3, 4, 5)) == E_NOTIMPL);
+    EXPECT(mock->calls[100] == 0);
+    EXPECT(hr_of(raw(device, 77, 1, 2, 3, 4, 5)) == E_NOINTERFACE);
+    EXPECT(mock->calls[77] == 0);
+
+    table[77] = saved77;
+    table[80] = saved80;
+    table[100] = saved100;
+
+    // With the entries back, both are answered the ordinary way again.
+    EXPECT(hr_of(raw(device, 77, 1, 2, 3, 4, 5)) == S_OK && mock->calls[77] == 1);
+    EXPECT(xs::device_slot_hits(77) == 2);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: a hole in the PC table is refused only inside slot_count; routes and E_NOTIMPL past it are "
+                "untouched\n", g_label);
+    return 0;
+#else
+    std::printf("%s: ID3D12Device11 is not in this SDK; short-table cases are not built\n", g_label);
+    return 0;
+#endif
 }
 
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
@@ -1000,7 +1046,7 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_bad_self())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_bad_self() || check_short_table())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
