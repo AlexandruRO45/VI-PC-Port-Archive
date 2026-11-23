@@ -24,7 +24,9 @@ How it finds them (x86-64 images only):
    register copies): rcx holds the class id, rdx the interface id (the class id when rdx holds none). A helper call
    whose rcx holds no address is listed as not followed, with the calls after which no slot call is found.
 4. After the helper call, each slot call up to Release, the next helper call or the end of the function is
-   recorded. Function bounds come from the exception directory (.pdata), or a byte window without one.
+   recorded. Function bounds come from the exception directory (.pdata), or a byte window without one; adjacent
+   .pdata entries that continue one another (MSVC 14.44 splits one function into a prologue prefix, the body and
+   the epilogue) are read as one function.
 5. Whether anything in the image reaches each thunk function: a call, tail jump, RIP-relative address load or
    8-byte pointer in data, directly or through an incremental-link `jmp` stub, from code that is itself reached
    when it is another thunk. An incremental link doesn't remove unreferenced functions, so an image can carry
@@ -476,6 +478,22 @@ class Code:
             return self.begins[k], self.ends[k]
         return None
 
+    def continued_end(self, begin: int, end: int) -> int:
+        """`end` of the last .pdata entry that continues this one: an entry starting exactly where this one ends,
+        when the code at the hand-over does not end the flow. MSVC 14.44 splits one function into several adjacent
+        entries (a prologue prefix, the body with the vtable calls, the epilogue), so one entry's end is not
+        necessarily the function's end."""
+        while True:
+            nxt = self.function(end)
+            if nxt is None or nxt[0] != end:
+                return end
+            run = self.run(begin, end)
+            # shortcut: a function whose last entry ends on a call could chain into its neighbour; a function's
+            # last instruction is a ret or a jmp, so stop there.
+            if run is None or run[-1].ends_flow():
+                return end
+            begin, end = end, nxt[1]
+
     def run(self, start: int, stop: int) -> list[Insn] | None:
         """The instructions from start up to stop, or None when decoding doesn't land on stop exactly."""
         out = []
@@ -662,7 +680,7 @@ def slot_calls(code: Code, start: int, helpers: set) -> tuple[list[tuple[int, in
     """[(slot, estimated argument count, call rva)] of the vtable calls after a helper call returns at `start`, and
     the keys of the direct calls that dispatched them (the CFG dispatch routine)."""
     func = code.function(start)
-    stop = func[1] if func else start + NO_PDATA_WINDOW
+    stop = code.continued_end(func[0], func[1]) if func else start + NO_PDATA_WINDOW
     vtables: set[int] = set()            # registers holding a vtable pointer
     methods: dict[int, int] = {}         # register -> slot of the method pointer it holds
     written: set[int] = set()            # argument registers written since the last call

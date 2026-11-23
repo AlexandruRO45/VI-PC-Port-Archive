@@ -120,6 +120,7 @@ def build_code(a: Asm) -> list[tuple[int, int]]:
     s = begin("thunk1")
     a.raw("4883EC38")
     query(a, 0x28, THREADING, None, "done1")
+    a.label("t1_body")                                           # where cl 14.44 starts thunk1's second .pdata entry
     a.raw("488B4C2428" "488B01")                                 # mov rcx,[rsp+28h]; mov rax,[rcx]
     a.raw("BA01000000" "41B802000000" "4C8D4C2430")              # mov edx,1; mov r8d,2; lea r9,[rsp+30h]
     a.raw("488B4060")                                            # mov rax,[rax+60h]
@@ -223,7 +224,7 @@ def build_code(a: Asm) -> list[tuple[int, int]]:
     return funcs
 
 
-def build_image(with_pdata: bool = True) -> bytes:
+def build_image(with_pdata: bool = True, split_thunk1: bool = False) -> bytes:
     opt_size = 240
     buf = bytearray(RDATA_RAW + RDATA_SIZE)
     buf[0:2] = b"MZ"
@@ -249,10 +250,17 @@ def build_image(with_pdata: bool = True) -> bytes:
         at = RDATA_RAW + rva - RDATA_RVA
         buf[at:at + 16] = uuid.UUID(guid).bytes_le
     if with_pdata:
+        entries = list(funcs)
+        if split_thunk1:
+            # cl 14.44 /O2 splits thunk1 into three adjacent entries, measured on an MSVC-built thunk-shaped DLL:
+            # prologue and helper call, the body with the vtable calls, and the epilogue.
+            i = next(k for k, (b, _) in enumerate(entries) if b == LABELS["thunk1"])
+            entries[i:i + 1] = [(LABELS["thunk1"], LABELS["t1_body"]), (LABELS["t1_body"], LABELS["done1"]),
+                                (LABELS["done1"], entries[i][1])]
         at = RDATA_RAW + PDATA_RVA - RDATA_RVA
-        for i, (b, e) in enumerate(funcs):
+        for i, (b, e) in enumerate(entries):
             struct.pack_into("<III", buf, at + i * 12, b, e, 0x3F00)
-        struct.pack_into("<II", buf, opt + 112 + 3 * 8, PDATA_RVA, len(funcs) * 12)
+        struct.pack_into("<II", buf, opt + 112 + 3 * 8, PDATA_RVA, len(entries) * 12)
 
     sections = opt + opt_size
     for i, (name, rva, size, raw, chars) in enumerate(((b".text", TEXT_RVA, TEXT_SIZE, TEXT_RAW, 0x60000020),
@@ -360,6 +368,17 @@ class ImageTest(unittest.TestCase):
                          {(c["class"], s["slot"]) for c in self.report["classes"] for i in c["interfaces"]
                           for s in i["slots"]})
         self.assertIsNone(r["referenced_thunks"])
+
+    def test_a_split_function_keeps_the_slots_past_its_pdata_hand_over(self):
+        # cl 14.44 /O2 puts one function in several adjacent .pdata entries: the entry holding the helper call ends
+        # before the vtable calls (measured on a thunk-shaped DLL built here). Stopping at that entry loses the
+        # thunk, so the scan must continue across the hand-over.
+        path = self.write("split.dll", build_image(split_thunk1=True))
+        r = grc.report(path, self.table, self.served)
+        self.assertEqual(r["pdata_functions"], 12)
+        self.assertEqual(r["thunks"], 6)
+        threading = slots_of(by_class(r)["XThreadingImpl"])
+        self.assertEqual(threading[("XThreadingImpl/IXThreadingImpl", 12)]["method"], "XTaskQueueCreate")
 
     def test_main_writes_text_and_json_with_lf(self):
         out = os.path.join(self.tmp, "out")
