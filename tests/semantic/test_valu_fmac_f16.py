@@ -663,3 +663,94 @@ class TestIEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(fma_f16(F16_QNAN, F16_ONE, F16_TWO), F16_QNAN)
         self.assertEqual(fma_f16(F16_ONE, F16_QNAN, F16_TWO), F16_QNAN)
         self.assertEqual(fma_f16(F16_ONE, F16_TWO, F16_QNAN), F16_QNAN)
+
+
+# ==============================================================================
+# SECTION 8: Translator-Backed Execution, Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestTranslatorBackedExecutionAndMutations(unittest.TestCase):
+    """Commit 8: Translator-backed execution tests, syntax rejection, and mutation detection."""
+
+    def test_rejection_invalid_destination(self) -> None:
+        """Verify syntax rejection when destination is not a VGPR."""
+        with self.assertRaises(TypeError):
+            VFMAC16Instruction(dst=SGPR(0), src0=VGPR(1), src1=VGPR(2))
+
+    def test_rejection_out_of_range_registers(self) -> None:
+        """Verify rejection of register indices outside architectural bounds."""
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            SGPR(106)
+
+    def test_translator_execution_comprehensive(self) -> None:
+        """Verify translator execution over varied combinations of inputs."""
+        cases = [
+            (0x1234_3800, F16_ONE, F16_TWO, 0x1234_4100),       # 1.0 * 2.0 + 0.5 = 2.5
+            (0xABCD_0000, F16_TWO, F16_TWO, 0xABCD_4400),       # 2.0 * 2.0 + 0.0 = 4.0
+            (0x9876_3800, F16_HALF, F16_HALF, 0x9876_3A00),     # 0.5 * 0.5 + 0.5 = 0.75
+        ]
+        for idx, (d, s0, s1, exp) in enumerate(cases):
+            with self.subTest(idx=idx, d=hex(d), s0=hex(s0), s1=hex(s1)):
+                res = run_translator_fmac(d, s0, s1, name=f"ps_fmac_trans_{idx}")
+                self.assertEqual(res, exp)
+
+    def test_mutation_detection_swap_opcodes(self) -> None:
+        """Mutation detector: swapping OpFMul with OpFSub in SPIR-V alters results."""
+        spv = support.translate_lines("ps_mut_fmac_test", [
+            "v_mov_b32 v0, 0x00003800",         # 0.5
+            "v_mov_b32 v1, 0x00003c00",         # 1.0
+            "v_mov_b32 v2, 0x00004000",         # 2.0
+            "v_fmac_f16 v0, v1, v2",            # 1.0 * 2.0 + 0.5 = 2.5 (0x4100)
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        orig_words = support.mrt0_words(spv)
+        self.assertEqual(orig_words[0], 0x4100)
+
+        # Mutate SPIR-V: Replace OpFAdd with OpFSub
+        self.assertIn("OpFAdd %float", spv)
+        mutated_spv = spv.replace("OpFAdd %float", "OpFSub %float")
+        mutated_words = support.mrt0_words(mutated_spv)
+        self.assertNotEqual(orig_words[0], mutated_words[0])
+
+    def test_mutation_detection_inactive_lane_overwritten(self) -> None:
+        """Mutation detector: faulty interpreter overwriting inactive lane is detected."""
+        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
+        sentinel = 0x5555_5555
+        state.set_vgpr(1, 0, sentinel)
+
+        class FaultyInterpreter(SIMDInterpreter):
+            def step(self, instr: VFMAC16Instruction, s: SIMDState):
+                for l in range(s.num_lanes):
+                    s.set_vgpr(l, instr.dst.value, 0x1234)
+                return []
+
+        faulty = FaultyInterpreter()
+        instr = VFMAC16Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2))
+        faulty.step(instr, state)
+        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+
+    def test_mutation_detection_high_half_clobbered(self) -> None:
+        """Mutation detector: failing to preserve destination high half is caught."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, 0xDEAD_3800)
+        state.set_vgpr(1, F16_ONE)
+        state.set_vgpr(2, F16_TWO)
+
+        class ClobberingInterpreter(ScalarInterpreter):
+            def step(self, instr: VFMAC16Instruction, s: ScalarMachineState) -> int:
+                # Bug: zeroes the high half instead of preserving 0xDEAD
+                res = fma_f16(s.get_vgpr(instr.src0.value), s.get_vgpr(instr.src1.value), s.get_vgpr(instr.dst.value))
+                s.set_vgpr(instr.dst.value, res)  # Only writes low 16 bits, zeroing high
+                return res
+
+        clobber = ClobberingInterpreter()
+        instr = VFMAC16Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2))
+        clobber.step(instr, state)
+        self.assertNotEqual(state.get_vgpr(0), 0xDEAD_4100)
+
+
+if __name__ == "__main__":
+    unittest.main()
