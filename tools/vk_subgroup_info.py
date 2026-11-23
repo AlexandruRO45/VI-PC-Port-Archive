@@ -110,6 +110,58 @@ PROPS_DEVICE_NAME = 20      # char[256]
 PROPS_API_VERSION = 0
 PROPS_MAX_PUSH_CONSTANTS_SIZE = 296 + 32  # limits (296) + maxPushConstantsSize (32) on 64-bit
 QUEUE_FAMILY_SIZE = 24      # sizeof(VkQueueFamilyProperties)
+VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 1
+VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 1
+VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 2
+VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 4
+BAR_WINDOW_BYTES = 256 * 1024 * 1024  # kBarWindowBytes in runtime/src/vulkan_memory.h
+
+
+class VkMemoryType(ctypes.Structure):
+    _fields_ = [("propertyFlags", ctypes.c_uint32), ("heapIndex", ctypes.c_uint32)]
+
+
+class VkMemoryHeap(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint64), ("flags", ctypes.c_uint32)]
+
+
+class VkPhysicalDeviceMemoryProperties(ctypes.Structure):
+    _fields_ = [
+        ("memoryTypeCount", ctypes.c_uint32),
+        ("memoryTypes", VkMemoryType * 32),
+        ("memoryHeapCount", ctypes.c_uint32),
+        ("memoryHeaps", VkMemoryHeap * 16),
+    ]
+
+
+def evaluate_memory(mem: VkPhysicalDeviceMemoryProperties) -> tuple[int, bool, int]:
+    """Compute (vram_mb, rebar_active, rebar_heap_mb) from memory properties.
+    Aligned with leonida::resizable_bar and kBarWindowBytes in runtime/src/vulkan_memory.h."""
+    wanted = (
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    )
+
+    vram_bytes = sum(
+        mem.memoryHeaps[i].size
+        for i in range(min(mem.memoryHeapCount, 16))
+        if mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+    )
+
+    rebar_heap_bytes = 0
+    for i in range(min(mem.memoryTypeCount, 32)):
+        mtype = mem.memoryTypes[i]
+        if (mtype.propertyFlags & wanted) == wanted and mtype.heapIndex < mem.memoryHeapCount:
+            heap = mem.memoryHeaps[mtype.heapIndex]
+            if heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT:
+                if heap.size > rebar_heap_bytes:
+                    rebar_heap_bytes = heap.size
+
+    rebar_active = rebar_heap_bytes > BAR_WINDOW_BYTES
+    vram_mb = vram_bytes // (1024 * 1024)
+    rebar_heap_mb = rebar_heap_bytes // (1024 * 1024)
+    return vram_mb, rebar_active, rebar_heap_mb
 
 
 class AppInfo(ctypes.Structure):
@@ -236,7 +288,7 @@ def device_rank(device_type: int, vendor_id: int) -> int:
     return (0 if vendor_id == MICROSOFT_VENDOR_ID else 10) + type_rank
 
 
-def query(*, stage_caps=False) -> dict:
+def query(*, stage_caps=False, memory=False) -> dict:
     """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
     if sys.maxsize <= 2**32:
         # the struct sizes below are the 64-bit ones, and 32-bit Windows Vulkan is stdcall, not CDLL's cdecl
@@ -248,6 +300,7 @@ def query(*, stage_caps=False) -> dict:
     vk.vkEnumerateDeviceExtensionProperties.argtypes = [vp, vp, vp, vp]
     vk.vkGetPhysicalDeviceProperties2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceFeatures2.argtypes = [vp, vp]
+    vk.vkGetPhysicalDeviceMemoryProperties.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceQueueFamilyProperties.argtypes = [vp, vp, vp]
     vk.vkDestroyInstance.argtypes = [vp, vp]
     app = AppInfo(VK_STRUCTURE_TYPE_APPLICATION_INFO, None, b"leonida-subgroup-info", 1, None, 0, VK_API_VERSION_1_3)
@@ -316,6 +369,9 @@ def query(*, stage_caps=False) -> dict:
             rank = device_rank(dtype, vendor_id)
             if rank > chosen_rank:
                 chosen_rank = rank
+                mem = VkPhysicalDeviceMemoryProperties()
+                vk.vkGetPhysicalDeviceMemoryProperties(d, ctypes.byref(mem))
+                vram_mb, rebar_active, rebar_heap_mb = evaluate_memory(mem)
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
@@ -323,7 +379,8 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          vram_mb, rebar_active, rebar_heap_mb)
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -332,7 +389,8 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver,
+         vram_mb, rebar_active, rebar_heap_mb) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -367,14 +425,18 @@ def query(*, stage_caps=False) -> dict:
             result.update(supported_subgroup_stages=supported_stages,
                           required_subgroup_size_stages=required_stages,
                           max_compute_workgroup_subgroups=max_workgroup_subgroups)
+        if memory:
+            result.update(vram_mb=vram_mb,
+                          rebar_active=rebar_active,
+                          rebar_heap_mb=rebar_heap_mb)
         return result
     finally:
         vk.vkDestroyInstance(inst, None)
 
 
-def main(*, stage_caps=False) -> int:
+def main(*, stage_caps=False, memory=False) -> int:
     try:
-        print(json.dumps(query(stage_caps=stage_caps)))
+        print(json.dumps(query(stage_caps=stage_caps, memory=memory)))
         return 0
     except Exception as e:      # any failure means "unknown": the caller falls back to emulation
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
@@ -388,4 +450,6 @@ if __name__ == "__main__":
         pass
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--stage-caps", action="store_true", help="include raw subgroup stage masks and limits")
-    sys.exit(main(stage_caps=parser.parse_args().stage_caps))
+    parser.add_argument("--memory", action="store_true", help="include VRAM size and Resizable BAR status")
+    args = parser.parse_args()
+    sys.exit(main(stage_caps=args.stage_caps, memory=args.memory))

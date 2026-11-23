@@ -73,6 +73,8 @@ class FakeDevice:
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
     device_id: int = 0
+    vram_bytes: int = 8 * 1024 * 1024 * 1024
+    rebar_bytes: int = 8 * 1024 * 1024 * 1024
 
 
 class FakeVulkan:
@@ -94,11 +96,13 @@ class FakeVulkan:
         self.props_calls = []
         self.features_calls = []
         self.queue_calls = []
+        self.memory_calls = []
         self.vkCreateInstance = _VkProc(self._create_instance)
         self.vkEnumeratePhysicalDevices = _VkProc(self._enumerate_physical_devices)
         self.vkEnumerateDeviceExtensionProperties = _VkProc(self._enumerate_device_extension_properties)
         self.vkGetPhysicalDeviceProperties2 = _VkProc(self._get_physical_device_properties2)
         self.vkGetPhysicalDeviceFeatures2 = _VkProc(self._get_physical_device_features2)
+        self.vkGetPhysicalDeviceMemoryProperties = _VkProc(self._get_physical_device_memory_properties)
         self.vkGetPhysicalDeviceQueueFamilyProperties = _VkProc(self._get_queue_family_properties)
         self.vkDestroyInstance = _VkProc(self._destroy_instance)
 
@@ -278,6 +282,47 @@ class FakeVulkan:
             ctypes.c_uint32.from_address(entry).value = dev.queue_flags[i]
             ctypes.c_uint32.from_address(entry + 4).value = 1
         count_ptr.value = written
+
+    def _get_physical_device_memory_properties(self, phys_dev, p_props):
+        handle = _ptr(phys_dev)
+        self.memory_calls.append(handle)
+        dev = self._devices[handle]
+        addr = _ptr(p_props)
+        if not addr:
+            raise AssertionError("missing p_props pointer")
+        mem = vk_info.VkPhysicalDeviceMemoryProperties.from_address(addr)
+        ctypes.memset(addr, 0, ctypes.sizeof(vk_info.VkPhysicalDeviceMemoryProperties))
+        mem.memoryHeapCount = 2
+        mem.memoryHeaps[0].size = dev.vram_bytes
+        mem.memoryHeaps[0].flags = vk_info.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+        mem.memoryHeaps[1].size = 16 * 1024 * 1024 * 1024
+        mem.memoryHeaps[1].flags = 0
+
+        mem.memoryTypeCount = 3
+        mem.memoryTypes[0].propertyFlags = (
+            vk_info.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk_info.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+        )
+        mem.memoryTypes[0].heapIndex = 1
+
+        mem.memoryTypes[1].propertyFlags = vk_info.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        mem.memoryTypes[1].heapIndex = 0
+
+        if dev.rebar_bytes > 0:
+            mem.memoryTypes[2].propertyFlags = (
+                vk_info.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                | vk_info.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                | vk_info.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            )
+            if dev.rebar_bytes == dev.vram_bytes:
+                mem.memoryTypes[2].heapIndex = 0
+            else:
+                mem.memoryHeapCount = 3
+                mem.memoryHeaps[0].size = max(0, dev.vram_bytes - dev.rebar_bytes)
+                mem.memoryHeaps[2].size = dev.rebar_bytes
+                mem.memoryHeaps[2].flags = vk_info.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+                mem.memoryTypes[2].heapIndex = 2
+        else:
+            mem.memoryTypeCount = 2
 
 
 class StructHelpersTest(unittest.TestCase):
@@ -546,10 +591,10 @@ class QueryTest(unittest.TestCase):
         self.addCleanup(env.stop)
         vk_info.os.environ.pop("LEONIDA_VK_DEVICE", None)
 
-    def _run_query(self, *devices):
+    def _run_query(self, *devices, stage_caps=False, memory=False):
         vk = FakeVulkan(devices=devices)
         with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
-            return vk_info.query(), vk
+            return vk_info.query(stage_caps=stage_caps, memory=memory), vk
 
     def test_32bit_python_guard_raises_before_loading_vulkan(self):
         for maxsize in (2**31 - 1, 2**32):
@@ -905,6 +950,30 @@ class QueryTest(unittest.TestCase):
             with self.subTest(vendor=vendor, device=device, driver=driver):
                 res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
                 self.assertIs(res["rdna1_amd_windows"], expected)
+
+    def test_rebar_active_when_heap_exceeds_256_mib(self):
+        """Resizable BAR enabled: DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT memory sits in a heap > 256 MiB."""
+        res, _vk = self._run_query(FakeDevice(vram_bytes=8 * 1024 * 1024 * 1024, rebar_bytes=8 * 1024 * 1024 * 1024),
+                                   memory=True)
+        self.assertEqual(res["vram_mb"], 8192)
+        self.assertIs(res["rebar_active"], True)
+        self.assertEqual(res["rebar_heap_mb"], 8192)
+
+    def test_rebar_inactive_when_bar_window_is_256_mib(self):
+        """Resizable BAR disabled: BAR window is <= 256 MiB (kBarWindowBytes in runtime/src/vulkan_memory.h)."""
+        res, _vk = self._run_query(FakeDevice(vram_bytes=8 * 1024 * 1024 * 1024, rebar_bytes=256 * 1024 * 1024),
+                                   memory=True)
+        self.assertEqual(res["vram_mb"], 8192)
+        self.assertIs(res["rebar_active"], False)
+        self.assertEqual(res["rebar_heap_mb"], 256)
+
+    def test_rebar_inactive_when_no_host_visible_vram(self):
+        """No host-visible device-local memory type exposed."""
+        res, _vk = self._run_query(FakeDevice(vram_bytes=8 * 1024 * 1024 * 1024, rebar_bytes=0),
+                                   memory=True)
+        self.assertEqual(res["vram_mb"], 8192)
+        self.assertIs(res["rebar_active"], False)
+        self.assertEqual(res["rebar_heap_mb"], 0)
 
     def test_rdna2_answer_is_for_the_runtime_gpu(self):
         """An Intel iGPU next to an RX 6700: the runtime takes the discrete card, and so does the answer."""
