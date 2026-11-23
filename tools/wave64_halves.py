@@ -1427,7 +1427,7 @@ class Analysis:
                 return
             if g and g[0] == "vote":
                 # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
-                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, None)
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, st)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0
@@ -1453,9 +1453,8 @@ class Analysis:
         the wave does, so either side may have code of its own and scalars it defines are not stale. EXEC must have
         been the launch mask at the compare: under a narrowed EXEC a half with no active lane votes no while the
         wave votes yes."""
-        # st only for s_cbranch_vccz/vccnz: an SCC vote was taken on the mask as it was then, and VCC may since hold
-        # another value (a later v_cmp writes no SCC)
-        if reg == "vcc" and st is not None and st["g"].get("vcc") == UVOTE and not st["t"].get("vcc", 0) \
+        # Only a direct VCC branch can omit the vote from scalar control dependence here.
+        if op in ("s_cbranch_vccz", "s_cbranch_vccnz") and st["g"].get("vcc") == UVOTE and not st["t"].get("vcc", 0) \
                 and (id(ins), "vcc") not in self.stale:
             return
         self.voted[n] = reg
@@ -1487,24 +1486,22 @@ class Analysis:
         # stale or other SCC.
         # A pixel's fate is its EXEC bit at the last `exp ... vm` it ran (else at the end), so no such export may run
         # before the vote: one that did would keep the pixels of the empty half alive in the wave.
-        kregs = self.kill_vote(n, op, reg)
-        if not ok and kregs and run is not None and skip is not None and self.inert_exit(skip, kregs) \
-                and self.confined(run, kregs) and not self.vm_export_before(n):
+        empty_test = op.startswith("s_cbranch_scc") and st["g"].get("scc", ())[2:] == ("empty",)
+        mask = self.vote_mask(n, op, reg)
+        if not ok and mask and not empty_test and run is not None and skip is not None and self.inert_exit(skip, mask) \
+                and self.confined(run, mask) and not self.vm_export_before(n):
             ok = True
-        # A compare that is uniform in the active lanes of a narrowed EXEC: every half that has an active lane votes
-        # as the wave does, and a half that has none has all its lanes off on the side it takes (uniform_region).
-        # st only for s_cbranch_vccz/vccnz, as above.
-        if not ok and reg == "vcc" and st is not None and run is not None and skip is not None \
-                and self.active_uvote(st, st["g"].get("vcc")) and not st["t"].get("vcc", 0) \
-                and (id(ins), "vcc") not in self.stale and self.uniform_region(n, run, skip):
-            ok = True
+        # SCC can test either polarity here: uniform_region checks both sides. Require the same
+        # untainted mask at the branch, including both words if the mask is an SGPR pair.
+        tag = st["g"].get(reg)
+        if not ok and mask and run is not None and skip is not None and self.active_uvote(st, tag) \
+                and all(st["g"].get(r) == tag and not st["t"].get(r, 0) and (id(ins), r) not in self.stale for r in mask):
+            ok = self.uniform_region(n, run, skip)
         if not ok and ev is not None:
             ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
 
-    def kill_vote(self, n, op, reg):
-        """Registers of the mask whose emptiness the branch ending block `n` tests (SCC or VCC = mask != 0), or None
-        when that is not plain: the last SCC writer must set SCC = (its 64-bit mask destination != 0), and nothing
-        after it in the block may write that mask."""
+    def vote_mask(self, n, op, reg):
+        """Whole mask tested by this branch. For SCC, check its writer and exclude intervening writes to the mask."""
         if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
             return ("vcc",) if reg == "vcc" else None
         body = self.blocks[n][:-1]
@@ -1516,7 +1513,8 @@ class Analysis:
                 continue
             if o in ZERO_SCC and len(a) >= 2 and _mask64(a[0]):
                 m = tuple(_regs(a[0]))
-            elif o == "s_cmp_lg_u64" and len(a) == 2 and _mask64(a[0]) and a[1].get("k") == "imm" and a[1]["v"] == 0:
+            elif o in ("s_cmp_lg_u64", "s_cmp_eq_u64") and len(a) == 2 \
+                    and _mask64(a[0]) and a[1].get("k") == "imm" and a[1]["v"] == 0:
                 m = tuple(_regs(a[0]))
             else:
                 return None

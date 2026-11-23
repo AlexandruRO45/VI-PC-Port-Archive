@@ -83,6 +83,38 @@ class Base(unittest.TestCase):
         self.assertTrue(any(whole[lane] != halves[lane] for _, whole, halves in runs), name)
 
 
+class SccVote(Base):
+    prefix = N32 + ["v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1"]
+    restore = ["s_mov_b64 exec, s[12:13]"]
+
+    def test_scc_mask_votes(self):
+        for name, writer, branch, first, second in (
+            ("and", "s_and_b64 vcc, exec, s[14:15]", "s_cbranch_scc0", 7, 5),
+            ("nonempty", "s_cmp_lg_u64 s[14:15], 0", "s_cbranch_scc1", 5, 7),
+            ("empty", "s_cmp_eq_u64 s[14:15], 0", "s_cbranch_scc1", 7, 5),
+        ):
+            with self.subTest(name=name):
+                body = self.prefix + [writer, branch + " 2", f"v_mov_b32_e32 v6, {first}",
+                                      "s_branch 1", f"v_mov_b32_e32 v6, {second}"] + self.restore
+                self.exact("vs_uvn_scc_" + name, body, lambda s4, k: ((7 if s4 > 5 else 5) if k < 32 else 0, 0))
+
+    def test_widening_side(self):
+        body = self.prefix + ["s_and_b64 vcc, exec, s[14:15]", "s_cbranch_scc0 @else", "v_mov_b32_e32 v6, 7",
+                              "s_branch @join", "@else:"] + self.restore + ["v_mov_b32_e32 v6, 5", "@join:"] + self.restore
+        self.refused("vs_uvn_scc_widen", body, "unsafe-vote-branch")
+
+    def test_scalar_used_after_join(self):
+        body = self.prefix + ["s_cmp_lg_u64 s[14:15], 0", "s_cbranch_scc0 2", "s_mov_b32 s20, 7",
+                              "s_branch 1", "s_mov_b32 s20, 5"] + self.restore + ["v_add_nc_u32_e32 v7, s20, v0"]
+        self.refused("vs_uvn_scc_scalar", body, "stale-scalar")
+
+    def test_replaced_mask(self):
+        body = self.prefix + ["s_cmp_lg_u64 s[14:15], 0", "v_cmp_gt_u32_e64 s[14:15], 3, v0",
+                              "s_cbranch_scc0 2", "v_mov_b32_e32 v6, 7", "s_branch 1", "v_mov_b32_e32 v6, 5"] + self.restore
+        tier, _, _ = self.run_all("vs_uvn_scc_replaced", body)
+        self.assertEqual(tier, "C")
+
+
 class Accepted(Base):
     def test_lane_work_on_the_two_sides(self):
         # the census shape "run:valu, other:valu"
