@@ -142,6 +142,35 @@ class TestDsSwizzleB32Oracle(unittest.TestCase):
         for l in range(32):
             self.assertEqual(ref_ds_swizzle_b32(l, "BITMASK_PERM", "ppiii"), (l & ~7) | (7 - (l & 7)))
 
+class SwizzleExpr(ASTNode):
+    def __init__(self, mode: str, args: tuple[int, ...] | str) -> None:
+        self.mode = mode
+        self.args = args
+
+    def eval(self, lane: int, src_values: list[int], exec_mask: int = MASK32) -> int:
+        src_lane = ref_ds_swizzle_b32(lane, self.mode, self.args)
+        if not (exec_mask & (1 << src_lane)):
+            return 0
+        return src_values[src_lane]
+
+
+class TestDsSwizzleB32AST(unittest.TestCase):
+    def test_swizzle_ast_eval(self) -> None:
+        expr = SwizzleExpr("QUAD_PERM", (3, 2, 1, 0))
+        data = [100 + i for i in range(32)]
+        for lane in range(32):
+            base = (lane & ~3)
+            expected_src = base + (3 - (lane & 3))
+            self.assertEqual(expr.eval(lane, data), data[expected_src])
+
+    def test_swizzle_ast_inactive_source(self) -> None:
+        expr = SwizzleExpr("QUAD_PERM", (1, 0, 3, 2))
+        data = [100 + i for i in range(32)]
+        # Mask off lane 1: lane 0 attempts to read from lane 1 -> gets 0
+        exec_mask = MASK32 & ~(1 << 1)
+        self.assertEqual(expr.eval(0, data, exec_mask), 0)
+        self.assertEqual(expr.eval(1, data, exec_mask), data[0])
+
 
 if __name__ == "__main__":
     unittest.main()
