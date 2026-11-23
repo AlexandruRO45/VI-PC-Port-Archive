@@ -562,6 +562,64 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         s_nan = classify_float_status(QNAN)
         self.assertTrue(s_nan.nan)
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    def test_signed_zero_ordering(self):
+        # med3(-0.0, +0.0, 1.0) -> +0.0
+        r1 = ref_med3_f32(NEG_ZERO, POS_ZERO, ONE_F32)
+        self.assertEqual(r1, POS_ZERO)
+
+        # med3(+0.0, -0.0, -1.0) -> -0.0
+        r2 = ref_med3_f32(POS_ZERO, NEG_ZERO, f32_to_u32(-1.0))
+        self.assertEqual(r2, NEG_ZERO)
+
+        words = run_ps_med3([
+            f"v_mov_b32 v0, {NEG_ZERO:#x}",
+            f"v_mov_b32 v1, {POS_ZERO:#x}",
+            f"v_mov_b32 v2, {ONE_F32:#x}",
+            "v_med3_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], POS_ZERO)
+
+    def test_infinities(self):
+        # med3(-inf, 0.0, +inf) -> 0.0
+        words = run_ps_med3([
+            f"v_mov_b32 v0, {NEG_INF:#x}",
+            f"v_mov_b32 v1, {POS_ZERO:#x}",
+            f"v_mov_b32 v2, {POS_INF:#x}",
+            "v_med3_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], POS_ZERO)
+
+    def test_nan_operand_returns_min3(self):
+        # With any NaN operand, hardware returns min3 with NaN-skipping
+        # med3(1.0, 4.0, NaN) -> min3(1.0, 4.0, NaN) -> 1.0
+        words = run_ps_med3([
+            f"v_mov_b32 v0, {ONE_F32:#x}",
+            f"v_mov_b32 v1, {f32_to_u32(4.0):#x}",
+            f"v_mov_b32 v2, {QNAN:#x}",
+            "v_med3_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], ONE_F32)
+
+    def test_all_nans_returns_nan(self):
+        words = run_ps_med3([
+            f"v_mov_b32 v0, {QNAN:#x}",
+            f"v_mov_b32 v1, {SNAN:#x}",
+            f"v_mov_b32 v2, {NEG_QNAN:#x}",
+            "v_med3_f32 v3, v0, v1, v2",
+        ])
+        self.assertTrue(is_nan_u32(words[0]))
+
+    def test_subnormals(self):
+        # med3(0.0, subnorm_min, 1.0) -> subnorm_min
+        words = run_ps_med3([
+            f"v_mov_b32 v0, {POS_ZERO:#x}",
+            f"v_mov_b32 v1, {SUBNORM_MIN:#x}",
+            f"v_mov_b32 v2, {ONE_F32:#x}",
+            "v_med3_f32 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], SUBNORM_MIN)
+
 
 if __name__ == "__main__":
     unittest.main()
