@@ -248,6 +248,33 @@ class CliTests(unittest.TestCase):
                 code = e.code
         return code, out.getvalue(), err.getvalue()
 
+    def test_non_object_entries_exit_2(self):
+        # Flyander on #4946, same pattern here: entries that are not objects are input errors, not tracebacks
+        cases = [
+            (("lv", "models", "manifest.json"), {"Items": [1]}),
+            (("lv", "models", "manifest.json"), {"Items": [{"Materials": [7]}]}),
+            (("lv", "models", "manifest.json"), {"Items": [{"Materials": [{"Textures": {"Id64": "1"}}]}]}),
+            (("lv", "textures", "manifest.json"), {"Items": [{"Textures": ["x"]}]}),
+            (("lv", "textures", "manifest.json"), []),
+            (("ttpf", "pool1", "manifest.json"), {"Textures": [None]}),
+        ]
+        for rel, doc in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                exp = build_export(tmp)
+                dump(os.path.join(exp, *rel), doc)
+                code, _, err = self.run_cli([exp])
+                self.assertEqual(code, 2, (rel, doc, err))
+                self.assertIn("invalid manifest JSON", err)
+                self.assertNotIn("Traceback", err)
+
+    def test_non_string_fields_are_tolerated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = build_export(tmp)
+            dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 1, "Items": [
+                {"Offset": 0, "Textures": [{"Name": ["n"], "Hash": ["h"], "Format": {"f": 1}, "Key": [1]}]}]})
+            code, _, err = self.run_cli([exp])
+            self.assertEqual(code, 0, err)
+
     def test_report_written_outside_the_export_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             exp = build_export(tmp)

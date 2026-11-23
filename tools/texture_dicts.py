@@ -48,6 +48,23 @@ def read_all(path):
             return items, stop.value
 
 
+def objects(value, what):
+    """A manifest array of objects (absent = empty); anything else is invalid input (ValueError, exit 2)."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(v, dict) for v in value):
+        raise ValueError(f"{what} is not an array of objects")
+    return value
+
+
+def load_object(path):
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: the top level is not an object")
+    return doc
+
+
 def key64(value):
     """A 64-bit key as lowercase hex without a 0x prefix, or None."""
     if isinstance(value, int) and not isinstance(value, bool):
@@ -138,11 +155,10 @@ def census(export):
         m = os.path.join(export, arc, "textures", "manifest.json")
         if not os.path.isfile(m):
             continue
-        with open(m, encoding="utf-8") as f:
-            doc = json.load(f)
-        items = doc.get("Items") or []
+        doc = load_object(m)
+        items = objects(doc.get("Items"), f"{arc}/textures Items")
         check_count(f"{arc}/textures", len(items), doc.get("Count"), problems, coverage, "dictionaries")
-        textures = [t for it in items for t in (it.get("Textures") or [])]
+        textures = [t for it in items for t in objects(it.get("Textures"), f"{arc}/textures Textures")]
         hashes, formats, named, joaat_ok, with_key = set(), Counter(), 0, 0, 0
         for t in textures:
             hv, _ = stored_hash(t, name_key=None)
@@ -150,13 +166,14 @@ def census(export):
                 hashes.add(hv)
                 entries_per_hash[hv] += 1
             formats[str(t.get("Format"))] += 1
-            if t.get("Name"):
+            name = t.get("Name")
+            if isinstance(name, str) and name:
                 named += 1
-                if hv is not None and hv == joaat(t["Name"]):
+                if hv is not None and hv == joaat(name):
                     joaat_ok += 1
             if t.get("Key") is not None:
                 with_key += 1
-        sizes = Counter(len(it.get("Textures") or []) for it in items)
+        sizes = Counter(len(it.get("Textures") or []) for it in items)   # validated above
         offs = [it["Offset"] for it in items if isinstance(it.get("Offset"), int)]
         page = Counter(o % 4096 for o in offs)
         dict_hashes[arc] = hashes
@@ -174,9 +191,8 @@ def census(export):
     # texture pools: exact 64-bit keys
     pool_keys = set()
     for label, m in pool_manifests(export):
-        with open(m, encoding="utf-8") as f:
-            doc = json.load(f)
-        tex = doc.get("Textures") or []
+        doc = load_object(m)
+        tex = objects(doc.get("Textures"), f"{label} Textures")
         check_count(label, len(tex), doc.get("Count"), problems, coverage, "textures")
         report["pools"]["manifests"] += 1
         report["pools"]["textures"] += len(tex)
@@ -204,6 +220,8 @@ def census(export):
             except StopIteration as stop:
                 declared = stop.value
                 break
+            if not isinstance(item, dict):
+                raise ValueError(f"{arc}/models: model entry {models + 1} is not an object")
             models += 1
             emb = item.get("Embedded")
             if isinstance(emb, dict):
@@ -218,8 +236,8 @@ def census(export):
                     if hv is not None:
                         emb_hashes.add(hv)
                         entries_per_hash[hv] += 1
-            for mat in item.get("Materials") or []:
-                for t in mat.get("Textures") or []:
+            for mat in objects(item.get("Materials"), f"{arc}/models Materials"):
+                for t in objects(mat.get("Textures"), f"{arc}/models material Textures"):
                     bindings += 1
                     k = key64(t.get("Id64"))
                     if not k:
