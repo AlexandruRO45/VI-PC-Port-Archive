@@ -111,5 +111,19 @@ class VMulU32U24AstInterpreterTests(unittest.TestCase):
         res = oracle_mul_u32_u24(30, 40)
         self.assertEqual(res, 1200)
 
+class VMulU32U24SimdDivergenceTests(unittest.TestCase):
+    def test_mul_u24_simd_exec_masking(self):
+        wave = WavefrontSimdState(lane_count=32)
+        wave.exec_mask = 0x55555555  # Even lanes active
+        for i in range(32):
+            wave.set_vgpr(i, 2, 0xDEADBEEF)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_vgpr(i, 2, oracle_mul_u32_u24(i, 10))
+        for i in range(32):
+            if (0x55555555 >> i) & 1:
+                self.assertEqual(wave.get_vgpr(i, 2), i * 10)
+            else:
+                self.assertEqual(wave.get_vgpr(i, 2), 0xDEADBEEF)
+
 if __name__ == "__main__":
     unittest.main()
