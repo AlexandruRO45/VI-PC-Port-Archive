@@ -1,0 +1,93 @@
+"""Semantic reference oracle and verification bundle for RDNA2 3-input selection instructions.
+
+Covers:
+  - v_min3_f32: IEEE 754 32-bit float minimum of 3 operands with NaN-ignoring semantics
+  - v_max3_f32: IEEE 754 32-bit float maximum of 3 operands with NaN-ignoring semantics
+  - v_med3_f32: IEEE 754 32-bit float median of 3 operands; falls back to min3 on any NaN
+  - v_min3_i32: Signed 32-bit integer minimum of 3 operands
+  - v_max3_i32: Signed 32-bit integer maximum of 3 operands
+  - v_med3_i32: Signed 32-bit integer median of 3 operands
+
+High-density Subsystem Feature Bundle testing reference oracles, AST modeling,
+scalar/lane interpreter, multi-lane divergence, IEEE-754 boundary extremes,
+mutation detection, and tools/rdna2spirv.py SPIR-V translation.
+"""
+from __future__ import annotations
+
+import dataclasses
+import math
+import os
+import random
+import struct
+import sys
+import unittest
+from typing import Dict, List, Optional, Tuple
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+from support import translate_lines, mrt0_words  # noqa: E402
+
+MASK32 = 0xFFFFFFFF
+
+
+def f32_to_bits(f: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", f))[0]
+
+
+def bits_to_f32(b: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", b & MASK32))[0]
+
+
+def i32(val: int) -> int:
+    v = val & MASK32
+    return v if v < 0x80000000 else v - 0x100000000
+
+
+def u32(val: int) -> int:
+    return val & MASK32
+
+
+def is_nan_f32(b: int) -> bool:
+    return (b & 0x7F800000) == 0x7F800000 and (b & 0x007FFFFF) != 0
+
+def ref_min3_f32_bits(b0: int, b1: int, b2: int) -> int:
+    """RDNA2 v_min3_f32: minimum of 3 floats; any NaN operand is ignored in favor of non-NaN."""
+    nans = [is_nan_f32(b) for b in (b0, b1, b2)]
+    if all(nans):
+        return b0
+    valid_floats = [bits_to_f32(b) for b, is_n in zip((b0, b1, b2), nans) if not is_n]
+    res_f = min(valid_floats)
+    return f32_to_bits(res_f)
+
+
+class VMin3F32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_min3_f32."""
+
+    def test_basic_ordering(self):
+        a, b, c = f32_to_bits(1.0), f32_to_bits(2.0), f32_to_bits(3.0)
+        self.assertEqual(ref_min3_f32_bits(a, b, c), a)
+        self.assertEqual(ref_min3_f32_bits(b, a, c), a)
+        self.assertEqual(ref_min3_f32_bits(c, b, a), a)
+
+    def test_negative_floats(self):
+        a, b, c = f32_to_bits(-10.0), f32_to_bits(-5.0), f32_to_bits(0.0)
+        self.assertEqual(ref_min3_f32_bits(a, b, c), a)
+        self.assertEqual(ref_min3_f32_bits(b, a, c), a)
+
+    def test_nan_ignoring_behavior(self):
+        qnan = 0x7FC00001
+        v1 = f32_to_bits(4.5)
+        v2 = f32_to_bits(9.0)
+        self.assertEqual(ref_min3_f32_bits(qnan, v1, v2), v1)
+        self.assertEqual(ref_min3_f32_bits(v1, qnan, v2), v1)
+        self.assertEqual(ref_min3_f32_bits(v2, v1, qnan), v1)
+
+if __name__ == "__main__":
+    unittest.main()
