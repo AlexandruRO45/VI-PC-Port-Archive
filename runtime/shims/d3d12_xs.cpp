@@ -184,6 +184,21 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<void*>(vulkan));
         return result(method, S_OK);
     }
+#else
+    // A build without Vulkan headers has no Vulkan device (CMake leaves LEONIDA_VULKAN_DEVICE off without a word), so
+    // LEONIDA_D3D12=vulkan used to fall through to the host's D3D12 device, which on Wine's vkd3d fails in the proxy's
+    // QueryInterface (E_NOINTERFACE) and looked like a Wine limit. Say once that the variable has no effect here.
+    {
+        static std::atomic<bool> ignored_logged{false};
+        char backend[16] = {};
+        size_t backend_length = 0;
+        if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0 &&
+            !ignored_logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: LEONIDA_D3D12=vulkan is ignored: this gta6rt was built without the Vulkan "
+                         "device (no Vulkan headers at configure time). Configure with VULKAN_SDK set or "
+                         "-DLEONIDA_VULKAN_HEADERS_FETCH=ON; using the host's D3D12 device.\n");
+    }
 #endif
 
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
