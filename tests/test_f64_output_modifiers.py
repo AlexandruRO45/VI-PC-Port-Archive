@@ -16,6 +16,7 @@ TEST_DIR = Path(__file__).resolve().parent
 sys.path[:0] = [str(TEST_DIR.parent / "tools"), str(TEST_DIR)]
 
 from listing import translate_listing
+from rdna2spirv import no_contraction
 
 # a = 0.75 in v[0:1], b = 0.5 in v[6:7] (low word first); the sum goes to v[4:5].
 BODY = """v_mov_b32 v0, 0
@@ -31,6 +32,27 @@ def words(x):
 
 
 class F64OutputModifiersTest(unittest.TestCase):
+    def test_no_contraction_selects_only_float_arithmetic_lines(self):
+        header = 'OpName %main "example %quoted = OpFAdd %double %a %b"'
+        instructions = (
+            "%mul = OpFMul %double %a %b\n"
+            "\t%add = OpFAdd %double %a %b\n"
+            "\n  %sub = OpFSub %double %a %b\n"
+            "%div = OpFDiv %double %a %b\n"
+            " \t%neg = OpFNegate %double %a\n"
+            "%rem = OpFRem %double %a %b\n"
+            "%mod = OpFMod %double %a %b\n"
+            "; %comment = OpFAdd %double %a %b\n"
+            "%other = OpFOrdEqual %bool %a %b\n"
+        )
+        body = "\n%void = OpTypeVoid\n" + instructions
+        decorations = "".join(
+            f"\n         OpDecorate %{name} NoContraction"
+            for name in ("mul", "add", "sub", "div", "neg", "rem", "mod")
+        )
+        self.assertEqual(no_contraction(header + body), header + decorations + body)
+        self.assertEqual(no_contraction(instructions), instructions)
+
     def test_add_f64_output_modifiers(self):
         cases = (
             ("", None, False),

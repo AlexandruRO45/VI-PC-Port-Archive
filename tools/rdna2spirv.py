@@ -14877,7 +14877,8 @@ def lbl_is_sw_default(st):
     return st == "%sw_default = OpLabel"
 
 
-_FLOAT_ARITH = re.compile(r"^\s*(%\w+) = Op(?:FMul|FAdd|FSub|FDiv|FNegate|FRem|FMod) ", re.M)
+_FLOAT_ARITH_OP = re.compile(r" = OpF(?:Mul|Add|Sub|Div|Negate|Rem|Mod) ")
+_FLOAT_ARITH_ID = re.compile(r"\s*(%\w+)")
 
 
 def no_contraction(text):
@@ -14887,9 +14888,18 @@ def no_contraction(text):
     depends on how much of the code its optimiser can see at once: with real control flow instead of the
     dispatch loop, one shader's output moved by a 16-bit-float step in 49 of 4,096 pixels on an AMD GPU (a
     multiply and an add), and two more by one step in one pixel on Mesa's software driver (divide or negate)."""
-    ids = _FLOAT_ARITH.findall(text)
     at = text.find("\n%void = OpTypeVoid")
-    if not ids or at < 0:
+    if at < 0:
+        return text
+    ids = []
+    # The literal opcode prefix lets the regex skip most of the module. Check the result ID only on candidate lines.
+    for match in _FLOAT_ARITH_OP.finditer(text):
+        end = match.start()
+        line_start = text.rfind("\n", 0, end) + 1
+        result = _FLOAT_ARITH_ID.fullmatch(text, line_start, end)
+        if result:
+            ids.append(result[1])
+    if not ids:
         return text
     return text[:at] + "".join(f"\n         OpDecorate {i} NoContraction" for i in ids) + text[at:]
 
