@@ -533,6 +533,33 @@ class TestManifestVerifier(unittest.TestCase):
                             "2 problem(s)",
                         ])
 
+    @unittest.skipIf(os.name == "nt", "Windows filenames cannot contain literal backslashes")
+    def test_cli_distinguishes_literal_backslashes_on_ascii_stdout(self) -> None:
+        names = [r"caf\xe9.bin", "café.bin"]
+        for name in names:
+            with open(os.path.join(self.game_dir, name), "wb") as f:
+                f.write(b"synthetic")
+
+        launcher = (
+            "import runpy, sys; sys.stdout.reconfigure(encoding='ascii'); "
+            "runpy.run_path(sys.argv.pop(1), run_name='__main__')"
+        )
+        args = [sys.executable, "-I", "-c", launcher, TOOL, self.game_dir,
+                "--manifest", self.manifest_path, "--quiet", "--strict"]
+        structured = subprocess.run(args + ["--json"], capture_output=True, text=True, encoding="ascii")
+        self.assertEqual(structured.returncode, 1, structured.stderr)
+        report = json.loads(structured.stdout)
+        self.assertEqual(report["untracked"], names)
+        self.assertEqual(report["problem_count"], 2)
+
+        plain = subprocess.run(args, capture_output=True, text=True, encoding="ascii")
+        self.assertEqual(plain.returncode, 1, plain.stderr)
+        self.assertEqual(plain.stdout.splitlines(), [
+            r"NEW       caf\\xe9.bin",
+            r"NEW       caf\xe9.bin",
+            "2 problem(s)",
+        ])
+
     def test_cli_tampered_returns_exit_code_1(self) -> None:
         delta_p = os.path.join(self.game_dir, "delta.bin")
         with open(delta_p, "r+b") as f:

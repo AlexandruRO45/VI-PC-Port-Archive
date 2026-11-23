@@ -372,11 +372,15 @@ def print_report(
     verbose: bool = False,
     strict: Optional[bool] = None,
 ) -> None:
+    def write_result(kind: str, rel: str) -> None:
+        # Keep literal backslashes distinct from escapes added by stdout.
+        display_path = rel.replace("\\", "\\\\")
+        out.write(f"{kind:<10}{display_path}\n")
+
     for rel in sorted(report.problems.keys()):
-        kind = report.problems[rel]
-        out.write(f"{kind:<10}{rel}\n")
+        write_result(report.problems[rel], rel)
     for rel in report.untracked:
-        out.write(f"{'NEW':<10}{rel}\n")
+        write_result("NEW", rel)
 
     bad = report.count_problems(strict=strict)
 
