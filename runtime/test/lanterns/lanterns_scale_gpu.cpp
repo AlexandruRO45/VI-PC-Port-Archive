@@ -677,9 +677,9 @@ bool ScaleGpu::record_post(unsigned p) {
                u = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                rt = D3D12_RESOURCE_STATE_RENDER_TARGET, rs = D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
                rd = D3D12_RESOURCE_STATE_RESOLVE_DEST;
-    if (stream_bytes_) barrier(list, {transition(stream_[p].p, npsr, c)}, st);
-    barrier(list, {transition(main_rt_.p, rt, cs), transition(inst_a_[p].p, npsr, cs),
-                   transition(pristine_b_.p, c, cs), transition(state_b_.p, c, cd)}, st);
+    // stream[p] and A[p] stay readable (NON_PIXEL_SHADER_RESOURCE) through the aux and top passes, whose draws read
+    // streamed records and particles too; they leave that state only after the top pass.
+    barrier(list, {transition(main_rt_.p, rt, cs), transition(pristine_b_.p, c, cs), transition(state_b_.p, c, cd)}, st);
     // Compute between the passes, on the direct queue: particle set B, which the aux pass draws.
     TIMED(kCopyBuffer, list->CopyBufferRegion(state_b_.p, 0, pristine_b_.p, 0, kParticles * sizeof(Particle)));
     ++st.copies;
@@ -699,7 +699,7 @@ bool ScaleGpu::record_post(unsigned p) {
     TIMED(kClearView, list->ClearDepthStencilView(top_pass_.dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr));
     begin_pass(list, top_pass_, st);
     record_calls(list, p, top_pass_, top_calls_.data(), top_calls_.size(), st);
-    barrier(list, {transition(top_rt_.p, rt, cs), transition(inst_b_.p, npsr, cs)}, st);
+    barrier(list, {transition(top_rt_.p, rt, cs), transition(inst_b_.p, npsr, cs), transition(inst_a_[p].p, npsr, cs)}, st);
     // Everything to the readback.
     const auto copy_image = [&](ID3D12Resource* src_res, std::uint64_t offset, DXGI_FORMAT format, unsigned w, unsigned h,
                                 std::uint64_t pitch) {
@@ -725,7 +725,7 @@ bool ScaleGpu::record_post(unsigned p) {
     TIMED(kCopyBuffer, list->CopyBufferRegion(inst_a_[p].p, 0, upload_.p, up_zero_, kParticles * sizeof(Instance)));
     ++st.copies;
     if (stream_bytes_) {
-        barrier(list, {transition(stream_[p].p, c, cd)}, st);
+        barrier(list, {transition(stream_[p].p, npsr, cd)}, st);
         TIMED(kCopyBuffer, list->CopyBufferRegion(stream_[p].p, 0, upload_.p, up_zero_, stream_bytes_));
         ++st.copies;
         barrier(list, {transition(stream_[p].p, cd, c)}, st);
