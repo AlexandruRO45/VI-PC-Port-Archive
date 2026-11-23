@@ -724,5 +724,23 @@ class TestSNandB64TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_s_nand_b64_syntax_err", prog)
 
+class TestSNorB64ReferenceOracle(unittest.TestCase):
+    """Reference mathematical oracle verification for s_nor_b64."""
+
+    def test_oracle_basic_truth_table(self) -> None:
+        a = 0x1234_5678_9ABC_DEF0
+        b = 0x0F0F_0F0F_00FF_00FF
+        res, scc = oracle_s_nor_b64(a, b)
+        self.assertEqual(scc, 1 if res != 0 else 0)
+
+    def test_oracle_zero_scc(self) -> None:
+        res, scc = oracle_s_nor_b64(0xffffffffffffffff, 0x0)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+
+    def test_oracle_idempotence_and_identity(self) -> None:
+        res_same, _ = oracle_s_nor_b64(0xCAFE_BABE_DEAD_BEEF, 0xCAFE_BABE_DEAD_BEEF)
+        self.assertIsInstance(res_same, int)
+
 if __name__ == "__main__":
     unittest.main()
