@@ -23,6 +23,9 @@ import struct
 import sys
 from collections import Counter
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 _UINT64_CODE = "Q" if array.array("Q").itemsize == 8 else None
 
 DXGI = {
@@ -833,16 +836,6 @@ def scan_archive(carve, arch):
     return out
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def input_files(carve, archs):
     """Yield (kind, path) for every file the scan reads from the selected carve archives.
 
@@ -905,7 +898,7 @@ def main():
         ap.error(f"{path} is a directory, not a .json file")
     if report_needs_input_check(a.carve, archs, path):
         for kind, source in input_files(a.carve, archs):
-            if same_output_path(source, path):
+            if same_report_path(source, path):
                 ap.error(f"output would overwrite an input {kind}: {path}")
     allt = []
     for arch in archs:
