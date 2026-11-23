@@ -106,6 +106,24 @@ class Tests(unittest.TestCase):
                  '<testcase classname="tests.a" name="t[1_2]"><skipped/></testcase></testsuite></testsuites>'
         self.assertEqual([(n, r) for n, r, _, _ in pd.parse_junit(pytest)], [("tests.a::t[1-2]", "pass"), ("tests.a::t[1_2]", "skip")])
 
+    def test_nested_junit_wrappers_and_suites_import_each_case_once(self):
+        report = """<testsuites>
+            <testsuites>
+                <testsuite name="outer">
+                    <testcase name="passes" time="0.25"/>
+                    <testsuite name="inner">
+                        <testcase name="fails"><failure message="wrong result"/></testcase>
+                    </testsuite>
+                </testsuite>
+            </testsuites>
+            <testsuite name="direct"><testcase name="skips"><skipped/></testcase></testsuite>
+        </testsuites>"""
+        self.assertEqual(pd.parse_junit(report), [
+            ("passes", "pass", 0.25, ""),
+            ("fails", "fail", None, "wrong result"),
+            ("skips", "skip", None, ""),
+        ])
+
     def test_lasttest_log(self):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])

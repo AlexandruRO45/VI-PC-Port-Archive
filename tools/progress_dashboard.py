@@ -373,28 +373,28 @@ def group_of_test(name):
 def parse_junit(xml):
     """[(name, result, seconds, detail)] from CTest (--output-junit) or pytest (--junitxml) XML."""
     root = xml if isinstance(xml, ET.Element) else ET.fromstring(xml)
-    suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+    if root.tag not in ("testsuite", "testsuites"):
+        return []
     out = []
-    for suite in suites:
-        for tc in suite.iter("testcase"):
-            status = tc.get("status")
-            st = (status or "").lower()
-            fail = tc.find("failure") if tc.find("failure") is not None else tc.find("error")
-            if fail is not None or st == "fail":
-                res = "fail"
-            elif tc.find("skipped") is not None or st in ("notrun", "disabled"):
-                res = "skip"
-            else:
-                res = "pass"
-            name, cls = tc.get("name") or "?", tc.get("classname")
-            if cls and cls != name:
-                name = f"{cls}::{name}"
-            try:
-                secs = float(tc.get("time")) if tc.get("time") else None
-            except ValueError:
-                secs = None
-            detail = scrub((fail.get("message") or "") if fail is not None else "")
-            out.append((name, res, secs, detail))
+    for tc in root.iter("testcase"):
+        status = tc.get("status")
+        st = (status or "").lower()
+        fail = tc.find("failure") if tc.find("failure") is not None else tc.find("error")
+        if fail is not None or st == "fail":
+            res = "fail"
+        elif tc.find("skipped") is not None or st in ("notrun", "disabled"):
+            res = "skip"
+        else:
+            res = "pass"
+        name, cls = tc.get("name") or "?", tc.get("classname")
+        if cls and cls != name:
+            name = f"{cls}::{name}"
+        try:
+            secs = float(tc.get("time")) if tc.get("time") else None
+        except ValueError:
+            secs = None
+        detail = scrub((fail.get("message") or "") if fail is not None else "")
+        out.append((name, res, secs, detail))
     return out
 
 
