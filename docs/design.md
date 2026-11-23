@@ -564,8 +564,14 @@ LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <w
 ```
 
 Code starts at the u32 at FSSM offset 0xC0 (the code-section offset) plus 0x28 bytes into that section, and ends at the
-last `s_endpgm`. Use `--mcpu gfx1013`. On 300 random shaders it decoded 284 cleanly (134 invalid words in total),
-against 201 clean and 6,560 invalid for gfx1030 and 283 clean for gfx1010–1012.
+last `s_endpgm`. Use `--mcpu gfx1013`. Over the whole 26,503-blob 1.0.2.1 corpus (`shader_disasm.py` at `d90444f2`,
+llvm-mc 23.1.5, data blocks excluded as below) gfx1013 decodes all 26,503 blobs with no invalid word; gfx1010, gfx1011
+and gfx1012 decode 26,439 (64 blobs with invalid words: 2,481, 2,438 and 2,438 words) and gfx1030 17,875 (8,628 blobs,
+440,225 words). An earlier sample of 300 random shaders gave 284 clean for gfx1013, 201 for gfx1030 and 283 for
+gfx1010–1012. Translating those 26,503 listings at the same commit (`rdna2spirv.py <disasm> --out <out> --shard i/16`,
+then `--merge`, default options) gives 26,503 translated and 26,503 passing `spirv-val`: 2,236 VS, 12,101 PS, 195 GS,
+2,689 CS and 9,282 mesh. The index equals the `4beffda8` run's in every field but `src_sha256`, which differs for the
+1,473 listings the data-block cut below shortened.
 
 Some blobs end with a constant-data block after the real code: `s_endpgm`, a dword count N, N dwords of data, a
 closing `s_endpgm`, then `s_code_end` padding. The data is not code, so the tool ends the range at the count
