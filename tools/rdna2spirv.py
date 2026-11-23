@@ -239,6 +239,40 @@ class Unsupported(Exception):
     pass
 
 
+class MissingOperand(Unsupported, IndexError):
+    """An instruction line has fewer operands than its handler reads (``v_add_f32 v0, v1``, or a bare mnemonic).
+
+    It is an Unsupported, so main() counts it under its own reason instead of "translator error IndexError", and an
+    IndexError, so code that already catches a short operand list keeps doing so."""
+
+
+class Operands(list):
+    """The operand list of the instruction being translated: a read past its end raises MissingOperand naming the
+    instruction and the operand, where a plain list would raise a bare IndexError from deep inside a handler.
+
+    A slice past the end stays a short list (handlers slice optional operands on purpose); it is only recorded in
+    ``short``, so a handler that then unpacks too few sources (``x, y, z = (... for t in a[1:4])``) is reported as a
+    missing operand too (Gen._insn)."""
+
+    __slots__ = ("op", "short")
+
+    def __init__(self, op, items=()):
+        super().__init__(items)
+        self.op = op
+        self.short = None
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            stop = i.stop
+            if i.step is None and stop is not None and stop > len(self) and (i.start or 0) < stop:
+                self.short = stop if self.short is None else max(self.short, stop)
+            return list.__getitem__(self, i)
+        try:
+            return list.__getitem__(self, i)
+        except IndexError:
+            raise MissingOperand(f"{self.op}: missing operand {i}") from None
+
+
 class Gen:
     def __init__(self, stage, hoist_reg_ptrs=False, cache_active=False):
         self.stage = stage
@@ -6720,6 +6754,21 @@ class Gen:
         return ptr, valid
 
     def _insn(self, ins):
+        """Translate one instruction. Its operands become an Operands list (in place, so self.cur_ins sees it too),
+        and an instruction with fewer operands than its handler reads raises MissingOperand, not a bare IndexError
+        or an unpacking ValueError."""
+        a = ins["args"]
+        if type(a) is not Operands:
+            a = ins["args"] = Operands(ins["op"], a)
+        a.short = None
+        try:
+            return self._insn_op(ins)
+        except ValueError as e:
+            if a.short is None or not str(e).startswith("not enough values to unpack"):
+                raise
+            raise MissingOperand(f"{ins['op']}: missing operand {a.short - 1}") from e
+
+    def _insn_op(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
         if op in NOOPS or op.startswith("s_waitcnt"):
             return
