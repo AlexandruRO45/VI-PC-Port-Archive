@@ -205,6 +205,42 @@ class TestLdsSubU32Chaining(unittest.TestCase):
         self.assertEqual(fin[0x10], 350)
         self.assertEqual(fin[0x20], 500)
 
+class TestLdsSubU32Divergence(unittest.TestCase):
+    def test_multilane_independent_lanes(self):
+        body = [
+            "v_lshlrev_b32_e32 v1, 2, v0",
+            "v_mov_b32_e32 v2, 200",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_add_nc_u32_e32 v3, 10, v0",
+            "ds_sub_u32 v1, v3",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v4, v1",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v4", 0)
+        mem = L.run(body, lanes=32)
+        for lane in range(32):
+            self.assertEqual(L.out(mem, lane, 0), 200 - (10 + lane))
+
+    def test_multilane_exec_mask_gating(self):
+        body = [
+            "v_lshlrev_b32_e32 v1, 2, v0",
+            "v_mov_b32_e32 v2, 100",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "s_mov_b32 exec_lo, 0x55555555",
+            "v_mov_b32_e32 v3, 25",
+            "ds_sub_u32 v1, v3",
+            "s_waitcnt lgkmcnt(0)",
+            "s_mov_b32 exec_lo, -1",
+            "ds_read_b32 v4, v1",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v4", 0)
+        mem = L.run(body, lanes=32)
+        for lane in range(32):
+            expected = 75 if (lane % 2 == 0) else 100
+            self.assertEqual(L.out(mem, lane, 0), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
