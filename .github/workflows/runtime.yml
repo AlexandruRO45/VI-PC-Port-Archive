@@ -245,6 +245,7 @@ jobs:
           --summary "$GITHUB_STEP_SUMMARY" --label "$(wine --version)"
           --require loader --require pe_loader --require loader_tls --require unimplemented_policy
           --require run_tiny_game --require run_tiny_game_exit_code
+          --jobs "$(nproc)"
       # The general Wine runner skips tests driven by the Windows runner's cmake.
       - name: Loaded async callbacks under Wine
         env:

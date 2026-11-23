@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -703,6 +704,118 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rwt.wine_command("prog 'two words'"), ["prog", "two words"])
         with self.assertRaises(argparse.ArgumentTypeError):
             rwt.wine_command("   ")
+
+
+    # --jobs N: more than one test at a time, with the same results, and no overlap CTest would not allow.
+
+    def marker(self, name, body="pass"):
+        """A program that logs its start and end (with the time) to markers.log, runs `body`, and exits 0."""
+        log = (self.root / "markers.log").as_posix()
+        (self.artifact / name).write_text(
+            "import os, sys, time\n"
+            f"def mark(what):\n    open({log!r}, 'a').write(f'{{what}} {{os.path.basename(sys.argv[0])}} {{time.monotonic():.3f}}\\n')\n"
+            f"mark('start')\n{body}\nmark('end')\n", encoding="utf-8")
+        return self.command(name)
+
+    def marks(self):
+        rows = [line.split() for line in (self.root / "markers.log").read_text().splitlines()]
+        return [(what, name, float(t)) for what, name, t in rows]
+
+    def spans(self, name):
+        rows = [r for r in self.marks() if r[1] == name]
+        return min(t for _, _, t in rows), max(t for _, _, t in rows)
+
+    def test_the_results_are_those_of_one_test_at_a_time(self):
+        (self.artifact / "skip.py").write_text("import sys\nsys.exit(77)\n", encoding="utf-8")
+        entries = [ctest_entry("ok", self.command("ok.py")), ctest_entry("bad", self.command("bad.py")),
+                   ctest_entry("skipped", self.command("skip.py"), {"SKIP_RETURN_CODE": "77"}),
+                   ctest_entry("inverted", self.command("bad.py"), {"WILL_FAIL": "1"}),
+                   ctest_entry("missing", self.command("nothing.py")), ctest_entry("no_command", None)]
+        one = self.run_main(entries, "--require", "ok")
+        many = self.run_main(entries, "--require", "ok", "--jobs", "4")
+        self.assertEqual(many[0], one[0])
+        self.assertEqual(sorted(l for l in many[1].splitlines() if l.startswith("[")),
+                         sorted(l for l in one[1].splitlines() if l.startswith("[")))
+        self.assertIn("2 passed, 3 failed, 1 skipped", many[1])
+
+    def test_a_summary_lists_the_tests_in_list_order(self):
+        names = [f"t{i}" for i in range(6)]
+        summary = self.root / "summary.md"
+        self.run_main([ctest_entry(n, self.marker(f"{n}.py", "time.sleep(0.2 * (6 - int(sys.argv[0][-4])))"))
+                       for n in names], "--jobs", "6", "--summary", str(summary))
+        rows = [l.split("|")[1].strip(" `") for l in summary.read_text().splitlines() if l.startswith("| `")]
+        self.assertEqual(rows, names)
+
+    def test_different_programs_overlap_and_the_same_program_does_not(self):
+        entries = [ctest_entry("a1", self.marker("a.py", "time.sleep(0.4)")),
+                   ctest_entry("a2", self.marker("a.py", "time.sleep(0.4)")),
+                   ctest_entry("b", self.marker("b.py", "time.sleep(0.4)")),
+                   ctest_entry("c", self.marker("c.py", "time.sleep(0.4)"))]
+        code, out, _ = self.run_main(entries, "--jobs", "4")
+        self.assertEqual(code, 0, out)
+        starts = [t for what, name, t in self.marks() if what == "start"]
+        a_runs = sorted((t, what) for what, name, t in self.marks() if name.endswith("a.py"))
+        self.assertEqual([w for _, w in a_runs], ["start", "end", "start", "end"])      # a1 ended before a2 began
+        b_start, c_start = (self.spans(n)[0] for n in ("b.py", "c.py"))
+        self.assertLess(abs(b_start - c_start), 0.35)                                     # b and c ran together
+        self.assertEqual(len(starts), 4)
+
+    def test_a_run_serial_test_runs_alone(self):
+        entries = [ctest_entry("x", self.marker("x.py", "time.sleep(0.3)")),
+                   ctest_entry("alone", self.marker("alone.py", "time.sleep(0.3)"), {"RUN_SERIAL": "1"}),
+                   ctest_entry("y", self.marker("y.py", "time.sleep(0.3)"))]
+        self.run_main(entries, "--jobs", "4")
+        alone = self.spans("alone.py")
+        for other in ("x.py", "y.py"):
+            start, end = self.spans(other)
+            self.assertTrue(end <= alone[0] or start >= alone[1], (other, alone, (start, end)))
+
+    def test_a_fixture_is_set_up_before_the_tests_that_need_it(self):
+        flag = (self.root / "fixture.flag").as_posix()
+        (self.artifact / "setup.py").write_text(f"import time\ntime.sleep(0.5)\nopen({flag!r}, 'w').write('x')\n",
+                                                encoding="utf-8")
+        (self.artifact / "needs.py").write_text(f"import os, sys\nsys.exit(0 if os.path.exists({flag!r}) else 1)\n",
+                                                encoding="utf-8")
+        entries = [ctest_entry("setup", self.command("setup.py"), {"FIXTURES_SETUP": "cases"}),
+                   ctest_entry("needs", self.command("needs.py"), {"FIXTURES_REQUIRED": "cases"}),
+                   ctest_entry("other", self.command("ok.py"))]
+        code, out, _ = self.run_main(entries, "--require", "needs", "--jobs", "4")
+        self.assertEqual(code, 0, out)
+        self.assertIn("3 passed", out)
+
+    def test_a_test_that_hangs_costs_its_own_timeout_and_no_other_test(self):
+        entries = [ctest_entry("hang", self.marker("hang.py", "time.sleep(60)"))]
+        entries += [ctest_entry(f"quick{i}", self.marker(f"quick{i}.py", "time.sleep(0.2)")) for i in range(6)]
+        code, out, _ = self.run_main(entries, "--jobs", "2", "--timeout", "1.5", "--require", "quick5")
+        self.assertEqual(code, 0, out)
+        self.assertIn("6 passed, 1 failed", out)
+        self.assertIn("timed out after 1.5 s", out)
+        hang_start = self.spans("hang.py")[0]
+        # the hang held one of the two workers for its 1.5 s; the other test programs ran and ended beside it
+        beside = [n for what, n, t in self.marks() if what == "end" and n.startswith("quick") and t < hang_start + 1.0]
+        self.assertGreaterEqual(len(beside), 3, self.marks())
+
+    def test_a_runner_error_in_one_test_fails_that_test_and_not_the_others(self):
+        real = rwt.run_test
+
+        def flaky(test, args, wine):
+            if test["name"] == "boom":
+                raise RuntimeError("synthetic")
+            return real(test, args, wine)
+
+        entries = [ctest_entry("boom", self.command("ok.py")), ctest_entry("fine", self.command("bad.py"))]
+        with mock.patch.object(rwt, "run_test", flaky):
+            code, out, _ = self.run_main(entries, "--jobs", "2")
+        self.assertIn("[FAIL] boom", out)
+        self.assertIn("the runner raised RuntimeError: synthetic", out)
+        self.assertIn("[FAIL] fine", out)
+
+    def test_jobs_must_be_a_whole_number_of_at_least_one(self):
+        for bad in ("0", "-2", "x", "1.5"):
+            with self.subTest(jobs=bad), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    self.run_main([ctest_entry("ok", self.command("ok.py"))], "--jobs", bad)
+                self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

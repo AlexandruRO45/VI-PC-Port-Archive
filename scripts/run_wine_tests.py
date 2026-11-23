@@ -2,7 +2,7 @@
 
 Usage:
     python -I scripts/run_wine_tests.py --tests ctest.json --windows-root D:/a/Leonida/Leonida
-        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--summary FILE] [--label TEXT]
+        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--jobs N] [--summary FILE] [--label TEXT]
 
 --tests is the output of `ctest --show-only=json-v1` from the Windows build, and --windows-root the checkout it was
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
@@ -15,8 +15,12 @@ runtime/build/generated). For those, the drive of --windows-root is pointed at -
 Every test is run and reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
+--jobs N runs up to N tests at once (default 1, one at a time in the order listed). Tests of one program never overlap
+(they may share a scratch folder named after it), nor do tests with a CTest DEPENDS, fixture or RESOURCE_LOCK (CI runs
+them in order); a RUN_SERIAL test runs alone. The results are the same; only the order of the report lines can differ.
 """
 import argparse
+import concurrent.futures
 import json
 import math
 import ntpath
@@ -27,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -290,6 +295,80 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     return ("pass" if passed else "fail"), detail
 
 
+def positive_int(text: str) -> int:
+    """--jobs: a whole number of at least 1."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+ORDERING_PROPERTIES = ("DEPENDS", "FIXTURES_SETUP", "FIXTURES_REQUIRED", "FIXTURES_CLEANUP", "RESOURCE_LOCK")
+
+
+def plan_lanes(tests: list[dict], args) -> tuple[list[list[dict]], list[list[dict]]]:
+    """Split the tests for --jobs > 1 into (alone, lanes): the tests CTest never runs beside another one (RUN_SERIAL)
+    come first, one at a time; the rest are lanes that run side by side, each lane in list order. A lane holds the
+    tests of one executable (they may share a scratch folder named after the program), and a single lane holds every
+    test with an ordering of its own (DEPENDS, fixtures, RESOURCE_LOCK) and every test one of them names in DEPENDS,
+    so the order CTest would keep is kept."""
+    named = set()
+    for test in tests:
+        depends = properties(test).get("DEPENDS", [])
+        named.update([depends] if isinstance(depends, str) else depends)
+    alone, ordered, by_exe = [], [], {}
+    for test in tests:
+        props = properties(test)
+        if truthy(props.get("RUN_SERIAL")):
+            alone.append([test])
+        elif test.get("name") in named or any(p in props for p in ORDERING_PROPERTIES):
+            ordered.append(test)
+        else:
+            command = test.get("command") or [""]
+            exe = map_path(command[0], args.windows_root, args.root) or command[0]
+            by_exe.setdefault(exe, []).append(test)
+    lanes = ([ordered] if ordered else []) + list(by_exe.values())
+    return alone, lanes
+
+
+def run_tests(tests: list[dict], args, wine: list[str], report) -> dict[str, str]:
+    """Runs every test and calls report(name, status, detail) as each one finishes; returns {name: status} in the
+    order of `tests`. With --jobs 1 (the default) one test runs at a time in list order. With more, up to --jobs
+    tests run at once (see plan_lanes). Each test is bounded by its own timeout, so a test that hangs holds one worker
+    for at most that long and the others go on; an error inside a worker fails that test, not the run."""
+    done: dict[str, str] = {}
+    lock = threading.Lock()
+
+    def run_one(test: dict) -> None:
+        name = test.get("name", "?")
+        try:
+            status, detail = run_test(test, args, wine)
+        except Exception as e:
+            if args.jobs <= 1:
+                raise
+            # beside other tests a bug in the runner fails this test; it must not leave the others unreported
+            status, detail = "fail", f"the runner raised {type(e).__name__}: {e}"
+        with lock:
+            done[name] = status
+            report(name, status, detail)
+
+    if args.jobs <= 1:
+        for test in tests:
+            run_one(test)
+    else:
+        alone, lanes = plan_lanes(tests, args)
+        for lane in alone:
+            for test in lane:
+                run_one(test)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            for future in [pool.submit(lambda lane=lane: [run_one(t) for t in lane]) for lane in lanes]:
+                future.result()
+    return {test.get("name", "?"): done[test.get("name", "?")] for test in tests}
+
+
 def positive_seconds(text: str) -> float:
     """--timeout: a finite value greater than 0, so subprocess.run never gets a bad timeout to raise on."""
     try:
@@ -339,6 +418,9 @@ def main() -> int:
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
     ap.add_argument("--timeout", type=positive_seconds, default=120.0,
                     help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
+    ap.add_argument("--jobs", type=positive_int, default=1,
+                    help="tests to run at once (default 1: one at a time, in order). Tests of one program, and tests "
+                         "with a CTest dependency, fixture or resource lock, never overlap; RUN_SERIAL tests run alone")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     ap.add_argument("--keep-wine-debugger", action="store_true",
@@ -349,21 +431,19 @@ def main() -> int:
     if tests is None:
         return 2
     wine = args.wine
-    results = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
     with DriveMap(args.windows_root, args.root, prefix) as drive, \
             WineDebugger(wine, prefix, args.keep_wine_debugger) as debugger:
         print(drive.note, flush=True)
         if debugger.note:
             print(debugger.note, flush=True)
-        for test in tests:
-            name = test.get("name", "?")
-            status, detail = run_test(test, args, wine)
-            results[name] = status
+        def report(name: str, status: str, detail: str) -> None:
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":
                 for line in detail.rstrip().splitlines()[-40:]:
                     print(f"    {line}")
+
+        results = run_tests(tests, args, wine, report)
 
     missing = [n for n in args.require if n not in results]
     failed_required = [n for n in args.require if results.get(n) != "pass"]

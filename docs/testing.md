@@ -182,6 +182,9 @@ tests start, the command that undoes it for that prefix: if the prefix had the d
 and if it had no value it is
 `WINEPREFIX=<prefix> wine reg delete "HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug" /v Debugger /f`. Both are POSIX shell commands (Linux, WSL, macOS), like the runner itself.
 Do not run two of them on one prefix at the same time, and give `--keep-wine-debugger` if you want `winedbg`'s backtrace.
+Each test starts its own Wine process (about a second of start-up), so `--jobs N` runs up to N tests at once, as CI does
+with `--jobs "$(nproc)"`: the results are the same, but tests of one program, tests with a CTest dependency, fixture or
+resource lock never overlap, and the report lines come in the order the tests finish.
 
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
