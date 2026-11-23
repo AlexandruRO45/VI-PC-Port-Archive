@@ -220,6 +220,13 @@ class SlotControls(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "overwrite a census input"):
                     S.census(archive, index, [manifest], save=folded_index)
             self.assertGreaterEqual(probe.call_count, 1)
+            hardlink = root / "index_link.json"
+            try:
+                os.link(index, hardlink)
+            except (OSError, NotImplementedError):
+                return
+            with self.assertRaisesRegex(ValueError, "overwrite a census input"):
+                S.census(archive, index, [manifest], save=hardlink)
 
 
 if __name__ == "__main__":
