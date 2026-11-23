@@ -29,8 +29,9 @@ class TextureAssets(unittest.TestCase):
         self.work = self.root / "work"
         audio = self.work / "assets/audio"
         audio.mkdir(parents=True)
-        for marker in ("audio_manifest.json", "ogg.done", "xma.done"):
-            (audio / marker).touch()
+        (audio / "audio_manifest.json").write_text("{}", encoding="utf-8")
+        make_game.mark(str(audio / "ogg.done"), "awc_opus.py")
+        make_game.mark(str(audio / "xma.done"), "rpf9dump xma")
         self.pool = self.game / "data/pool.ttpf"
         self.pool.parent.mkdir(parents=True)
         self.folder = self.work / "assets/ttpf/pool"

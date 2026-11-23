@@ -494,10 +494,12 @@ class WavValidationTest(unittest.TestCase):
             os.makedirs(game, exist_ok=True)
 
             manifest_dir = os.path.join(out, "audio")
-            # A step counts as done by its marker, not by its folder (a stopped run leaves the folder too).
-            for name in ("audio_manifest.json", "ogg.done", "xma.done"):
-                with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
-                    f.write("{}")
+            # A step counts as done by its marker, not by its folder (a stopped run leaves the folder too),
+            # and the marker has to hold what the stage wrote: a truncated one sends the step again.
+            with open(os.path.join(manifest_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
+                make_game.mark(os.path.join(manifest_dir, name), what)
 
             with patch("make_game.rpf9dump", return_value="fake_dump"):
                 with patch("make_game.log"):
@@ -523,9 +525,10 @@ class WavValidationTest(unittest.TestCase):
             audio = os.path.join(out, "audio")
             os.makedirs(os.path.join(audio, "xma"), exist_ok=True)
             os.makedirs(game, exist_ok=True)
-            for name in ("audio_manifest.json", "xma.done"):     # no ogg.done: the Ogg Opus step is still to run
-                with open(os.path.join(audio, name), "w", encoding="utf-8") as f:
-                    f.write("{}")
+            with open(os.path.join(audio, "audio_manifest.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            # no ogg.done: the Ogg Opus step is still to run
+            make_game.mark(os.path.join(audio, "xma.done"), "rpf9dump xma")
 
             with patch("make_game.rpf9dump", return_value="fake_dump"), patch("make_game.log"), \
                     patch("make_game.py") as mock_py:
@@ -549,9 +552,10 @@ class WavValidationTest(unittest.TestCase):
 
             manifest_dir = os.path.join(out, "audio")
             os.makedirs(manifest_dir, exist_ok=True)
-            for name in ("audio_manifest.json", "ogg.done", "xma.done"):
-                with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
-                    f.write("{}")
+            with open(os.path.join(manifest_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
+                make_game.mark(os.path.join(manifest_dir, name), what)
             os.makedirs(os.path.join(manifest_dir, "ogg"), exist_ok=True)
             os.makedirs(os.path.join(manifest_dir, "xma"), exist_ok=True)
             os.makedirs(game, exist_ok=True)

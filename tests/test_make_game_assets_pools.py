@@ -34,8 +34,8 @@ class AssetsPoolsTest(unittest.TestCase):
                 with open(os.path.join(self.out, stem, mode, make_game.DECODER_RECORD), "w") as f:
                     f.write(make_game.decoder_digest())
         self.stub(os.path.join(self.out, "audio", "audio_manifest.json"))
-        self.stub(os.path.join(self.out, "audio", "ogg.done"))
-        self.stub(os.path.join(self.out, "audio", "xma.done"))
+        make_game.mark(os.path.join(self.out, "audio", "ogg.done"), "awc_opus.py")
+        make_game.mark(os.path.join(self.out, "audio", "xma.done"), "rpf9dump xma")
 
     def stub(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)

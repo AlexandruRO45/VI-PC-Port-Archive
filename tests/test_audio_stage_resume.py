@@ -1,4 +1,5 @@
-"""Audio steps of make_game.py's assets stage: resuming a stopped build, ffmpeg failures, and awc_opus.py's writes.
+"""Audio steps of make_game.py's assets stage: resuming a stopped build, ffmpeg failures, awc_opus.py's writes,
+and marker validation (truncated or invalid completion markers are treated as absent).
 
 Standard library only; no game data: the tools are mocked or fed hand-made inputs.
 """
@@ -198,6 +199,128 @@ class AudioStageResumeTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 make_game.assets(self.game, self.work, False, 2)
         self.assertFalse(os.path.exists(os.path.join(self.audio, "ogg.done")))
+
+    def _write_marker(self, name, content):
+        p = os.path.join(self.audio, name)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_truncated_ogg_marker_reruns_ogg_step(self):
+        """An ogg.done that is empty (e.g. from a power loss) is not counted as valid."""
+        self._write_marker("ogg.done", "")
+        self.assertIn("awc_opus.py", self.run_stage())
+
+    def test_garbage_ogg_marker_reruns_ogg_step(self):
+        """An ogg.done with wrong content is not counted as valid."""
+        self._write_marker("ogg.done", "some garbage\n")
+        self.assertIn("awc_opus.py", self.run_stage())
+
+    def test_truncated_xma_marker_reruns_xma_step(self):
+        """An xma.done that is empty (e.g. from a power loss) is not counted as valid."""
+        make_game.mark(os.path.join(self.audio, "ogg.done"), "awc_opus.py")
+        os.makedirs(os.path.join(self.audio, "ogg"), exist_ok=True)
+        self._write_marker("xma.done", "")
+        self.assertIn("rpf9dump xma", self.run_stage())
+
+    def test_garbage_xma_marker_reruns_xma_step(self):
+        """An xma.done with wrong content is not counted as valid."""
+        make_game.mark(os.path.join(self.audio, "ogg.done"), "awc_opus.py")
+        os.makedirs(os.path.join(self.audio, "ogg"), exist_ok=True)
+        self._write_marker("xma.done", "rpf9dump xma finished but actually no\n")
+        self.assertIn("rpf9dump xma", self.run_stage())
+
+    def test_valid_markers_skip_both_steps(self):
+        """Proper markers written by mark() mean both audio steps are skipped."""
+        make_game.mark(os.path.join(self.audio, "ogg.done"), "awc_opus.py")
+        os.makedirs(os.path.join(self.audio, "ogg"), exist_ok=True)
+        make_game.mark(os.path.join(self.audio, "xma.done"), "rpf9dump xma")
+        ran = self.run_stage(ffmpeg=None)
+        self.assertNotIn("awc_opus.py", ran)
+        self.assertNotIn("rpf9dump xma", ran)
+
+
+class ValidMarkerTest(unittest.TestCase):
+    """Unit tests for make_game.valid_marker()."""
+
+    def test_valid_content_returns_true(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "step.done")
+            make_game.mark(p, "awc_opus.py")
+            self.assertTrue(make_game.valid_marker(p, "awc_opus.py"))
+
+    def test_missing_file_returns_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(make_game.valid_marker(os.path.join(d, "no.done"), "awc_opus.py"))
+
+    def test_empty_file_returns_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "step.done")
+            open(p, "w").close()
+            self.assertFalse(make_game.valid_marker(p, "awc_opus.py"))
+
+    def test_truncated_content_returns_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "step.done")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("awc_opus.py fini")   # cut off mid-write
+            self.assertFalse(make_game.valid_marker(p, "awc_opus.py"))
+
+    def test_wrong_tool_returns_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "step.done")
+            make_game.mark(p, "rpf9dump xma")
+            self.assertFalse(make_game.valid_marker(p, "awc_opus.py"))
+
+    def test_whitespace_variants_still_valid(self):
+        """strip() means trailing newline or spaces don't invalidate the marker."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "step.done")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("awc_opus.py finished\n")
+            self.assertTrue(make_game.valid_marker(p, "awc_opus.py"))
+
+
+class AssetsBytesOnDiskMarkerTest(unittest.TestCase):
+    """assets_bytes_on_disk() counts audio step bytes only for valid markers."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = self.tmp.name
+        self.audio = os.path.join(self.work, "assets", "audio")
+        os.makedirs(self.audio)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_file(self, *parts):
+        p = os.path.join(*parts)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(b"x")
+        return p
+
+    def test_truncated_ogg_marker_not_counted(self):
+        self._write_file(self.audio, "ogg", "file.ogg")
+        with open(os.path.join(self.audio, "ogg.done"), "w") as f:
+            f.write("")   # truncated
+        self.assertEqual(make_game.assets_bytes_on_disk(self.work), 0)
+
+    def test_valid_ogg_marker_counted(self):
+        self._write_file(self.audio, "ogg", "file.ogg")
+        make_game.mark(os.path.join(self.audio, "ogg.done"), "awc_opus.py")
+        self.assertGreater(make_game.assets_bytes_on_disk(self.work), 0)
+
+    def test_truncated_xma_marker_not_counted(self):
+        self._write_file(self.audio, "xma", "file.xma.wav")
+        with open(os.path.join(self.audio, "xma.done"), "w") as f:
+            f.write("")   # truncated
+        self.assertEqual(make_game.assets_bytes_on_disk(self.work), 0)
+
+    def test_valid_xma_marker_counted(self):
+        self._write_file(self.audio, "xma", "file.xma.wav")
+        make_game.mark(os.path.join(self.audio, "xma.done"), "rpf9dump xma")
+        self.assertGreater(make_game.assets_bytes_on_disk(self.work), 0)
 
 
 # Stands in for ffmpeg: writes what it could read from its stdin into the output file.

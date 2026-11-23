@@ -1106,6 +1106,13 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with open(path, "wb") as f:
             f.write(b"\0" * size)
 
+    def put_marker(self, work, rel, what):
+        """A step's completion marker as mark() writes it, so the step counts as finished; returns its size."""
+        path = os.path.join(work, "assets", *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        make_game.mark(path, what)
+        return os.path.getsize(path)
+
     def put_pool(self, work, rel, files, promised=None):
         for name, size in files.items():
             self.put(work, f"{rel}/{name}", size)
@@ -1133,12 +1140,13 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.put(work, "audio/awc/i.awc", 60)
             self.put(work, "audio/ogg/j.ogg", 70)                        # no ogg.done yet
             self.put(work, "audio/xma/k.xma", 80)
-            self.put(work, "audio/xma.done", 1)
+            xma_done = self.put_marker(work, "audio/xma.done", "rpf9dump xma")
             self.put(work, "audio/wav/l.wav", 90)                        # --wav output: not in the estimate
             self.put(work, "unrelated.bin", 5000)
             with open(os.path.join(work, "outside.bin"), "wb") as f:     # not under assets
                 f.write(b"\0" * 999)
-            expected = (100 + 7 + r1) + (30 + 3 + r2) + (4096 + pool) + (200 + hashed) + (9 + 60 + 1) + 80
+            expected = ((100 + 7 + r1) + (30 + 3 + r2) + (4096 + pool) + (200 + hashed)
+                        + (9 + 60 + xma_done) + 80)
             self.assertEqual(make_game.assets_bytes_on_disk(work), expected)
 
     def test_unrelated_files_under_assets_are_not_credited(self):

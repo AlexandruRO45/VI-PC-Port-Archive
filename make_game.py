@@ -710,11 +710,7 @@ def assets_exported(work: str) -> bool:
     such folder before it exports it again, so the new export goes into the space the old one held."""
     audio = os.path.join(work, "assets", "audio")
     for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
-        try:
-            with open(os.path.join(audio, name), encoding="utf-8") as f:
-                if f.read().strip() != f"{what} finished":
-                    return False
-        except (OSError, UnicodeError):
+        if not valid_marker(os.path.join(audio, name), what):
             return False
     return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
 
@@ -803,8 +799,8 @@ def assets_bytes_on_disk(work: str) -> int:
     audio = os.path.join(out, "audio")
     if os.path.isfile(os.path.join(audio, "audio_manifest.json")):
         total += _tree_bytes(audio, skip=("ogg", "xma", "wav"))
-    for step in ("ogg", "xma"):
-        if os.path.isfile(os.path.join(audio, f"{step}.done")):
+    for step, what in (("ogg", "awc_opus.py"), ("xma", "rpf9dump xma")):
+        if valid_marker(os.path.join(audio, f"{step}.done"), what):
             total += _tree_bytes(os.path.join(audio, step))
     return total
 
@@ -2052,11 +2048,11 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     need_audio = not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json"))
     ogg = os.path.join(out, "audio", "ogg")
     ogg_done = os.path.join(out, "audio", "ogg.done")
-    need_ogg = not os.path.isfile(ogg_done)
+    need_ogg = not valid_marker(ogg_done, "awc_opus.py")
     need_wav = bool(wav)
     xma_dir = os.path.join(out, "audio", "xma")
     xma_done = os.path.join(out, "audio", "xma.done")
-    need_xma = not os.path.isfile(xma_done)
+    need_xma = not valid_marker(xma_done, "rpf9dump xma")
     ff = shutil.which("ffmpeg")
     need_xma_decode = bool(ff)  # decode_xma no-ops when nothing is pending
     total = (len(archive_todo) + len(pool_todo) + len(pool_follow) + int(need_audio) + int(need_ogg)
@@ -2124,6 +2120,20 @@ def mark(path: str, what: str) -> None:
     """Write a step's completion marker; call it only after the step succeeded."""
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{what} finished\n")
+
+
+def valid_marker(path: str, what: str) -> bool:
+    """True only when the marker at path holds the line mark() writes for what ("<what> finished").
+
+    A file that exists but is empty, truncated, or holds any other content (e.g. from a power loss mid-write)
+    is treated as absent, so the step runs again. Surrounding whitespace is ignored, as assets_exported()
+    always did.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip() == f"{what} finished"
+    except (OSError, UnicodeError):
+        return False
 
 
 def pending_xma(xma_dir: str) -> list:

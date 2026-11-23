@@ -24,12 +24,14 @@ class AssetsDecoderTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.work = tmp.name
         self.models = os.path.join(self.work, "assets", "scene", "models")
-        # The later steps of the stage are marked done so only the model and texture loop runs.
+        # The later steps of the stage are marked done, the way assets() writes them, so only the model and
+        # texture loop runs.
         audio = os.path.join(self.work, "assets", "audio")
         os.makedirs(audio)
-        for name in ("audio_manifest.json", "ogg.done", "xma.done"):
-            with open(os.path.join(audio, name), "w"):
-                pass
+        with open(os.path.join(audio, "audio_manifest.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
+            make_game.mark(os.path.join(audio, name), what)
 
     def export(self, digest):
         """Run assets() with a fake exporter and the given decoder digest; returns the modes it exported."""
