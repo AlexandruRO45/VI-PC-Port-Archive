@@ -1022,6 +1022,7 @@ if(TARGET Vulkan::Headers)
   # over the 2 MB that fixes the mesh case and the 4 MB the deeper structured-control-flow trees need; a
   # reserve only takes address space, committed memory grows on use. Other platforms size thread stacks
   # themselves.
+  # scripts/build_runtime.ps1 repeats this value on its cl line: change both together.
   set(LEONIDA_VK_PIPELINE_CHECK_STACK 8388608)
   if(MSVC)
     target_link_options(vk_pipeline_check PRIVATE "/STACK:${LEONIDA_VK_PIPELINE_CHECK_STACK}")

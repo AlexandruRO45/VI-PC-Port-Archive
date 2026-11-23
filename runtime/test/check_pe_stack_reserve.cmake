@@ -1,5 +1,16 @@
 # Fails when the PE at ${TOOL} reserves less than ${MIN_STACK} bytes of stack (SizeOfStackReserve).
 # vk_pipeline_check needs it on Windows: the AMD driver's shader compiler overflows the 1 MB default (#4816).
+foreach(var TOOL MIN_STACK)
+  if("${${var}}" STREQUAL "")
+    message(FATAL_ERROR "${var} is not set: pass -D${var}=... (the check would pass without it)")
+  endif()
+endforeach()
+if(NOT MIN_STACK MATCHES "^[0-9]+$")
+  message(FATAL_ERROR "MIN_STACK must be a number of bytes, got '${MIN_STACK}'")
+endif()
+if(NOT EXISTS "${TOOL}")
+  message(FATAL_ERROR "${TOOL} does not exist")
+endif()
 file(READ "${TOOL}" hex HEX LIMIT 4096)
 function(le_value offset size out)
   math(EXPR first "2 * ${offset}")
