@@ -49,6 +49,9 @@
 
 #include <d3d12.h>
 
+#include <cstddef>
+#include <cstdint>
+
 #include <cstdint>
 
 namespace rt::d3d12_xs {
@@ -168,5 +171,9 @@ void reset_device_proxy_stats();
 // A function the Xbox queue proxy calls in ExecuteCommandLists before submitting (gta6rt sets it to
 // rt::d3d12::sync_placed_descriptor_heaps). Null by default.
 void set_before_execute_hook(void (*hook)());
+
+// The title's XMemAlloc hook (its __XMemAllocationHooks__ export), which committed resources made through the
+// proxy report their console size to (gta6rt sets it). Null by default.
+void set_title_xmem_alloc(void* (*alloc)(std::size_t, std::uint64_t));
 
 }  // namespace rt::d3d12_xs

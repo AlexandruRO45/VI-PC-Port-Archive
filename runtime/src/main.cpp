@@ -107,6 +107,9 @@ void install_title_heap_placement(const rt::Module& module) {
     g_title_xmem_alloc = reinterpret_cast<TitleXMemAlloc>(table[0]);
     rt::d3d12::set_descriptor_heap_placement(&place_descriptor_heap);
     rt::d3d12_xs::set_before_execute_hook(&rt::d3d12::sync_placed_descriptor_heaps);
+    rt::d3d12_xs::set_title_xmem_alloc([](std::size_t size, std::uint64_t attributes) -> void* {
+        return g_title_xmem_alloc(size, attributes);
+    });
     std::fprintf(stderr, "[rt] d3d12: %s exports __XMemAllocationHooks__; shader-visible descriptor heaps take their "
                  "memory from its XMemAlloc hook\n", module.name.c_str());
 #else

@@ -363,7 +363,7 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
         return n;
     };
     check(count("\"kind\":\"xmem_attributes\"") == 6, "six events: two XMemAlloc words, three XMemFree words and one XMemVirtualAlloc word");
-    check(count("\"api\":\"XMemVirtualAlloc\",\"attributes\":\"0x183\",\"size\":65536") == 1,
+    check(count("\"api\":\"XMemVirtualAlloc\",\"attributes\":\"0x183\",\"type\":\"0x3000\",\"protect\":\"0x4\",\"size\":65536") == 1,
           "XMemVirtualAlloc 0x183 is recorded once, with its size");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x5e50000\",\"size\":4096") == 1,
           "XMemAlloc 0x5e50000 is recorded once, with the size of the first call");

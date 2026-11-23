@@ -30,6 +30,7 @@
 #include <dxgi1_4.h>
 
 #include "../src/frame_pacer.h"
+#include "d3d12_xs_alloc_size.h"
 
 #include <atomic>
 #include <cerrno>
@@ -980,6 +981,9 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// The title's XMemAlloc (its __XMemAllocationHooks__ entry), set by gta6rt (set_title_xmem_alloc). Null otherwise.
+std::atomic<void* (*)(std::size_t, std::uint64_t)> g_title_xmem_alloc{nullptr};
+
 // Called by queue slot 10 before anything is submitted (set_before_execute_hook).
 std::atomic<void (*)()> g_before_execute{nullptr};
 
@@ -1843,6 +1847,74 @@ void proxy_buffer_view_at_address(DeviceProxy* self, const D3D12_RESOURCE_DESC* 
                      resource_desc ? static_cast<unsigned long long>(resource_desc->Width) : 0ull);
 }
 
+// Device slot 127: CreateCommittedResource3 with the console's argument order (measured: the retail executable's
+// RVA 0x193e1b4: RDX = D3D12_HEAP_PROPERTIES {DEFAULT, 0, 0, 1, 1}, R8 = heap flags 8, R9 = the resource description,
+// then on the stack the initial barrier layout (0 or 0x1c), a D3D12_CLEAR_VALUE, null, 0, null, IID_ID3D12Resource and
+// the out pointer: ten arguments, as ID3D12Device10::CreateCommittedResource3). The description is the console's
+// 56-byte one (as slot 76's), copied into a D3D12_RESOURCE_DESC1 with no sampler-feedback region and the layout word
+// made ROW_MAJOR for buffers and UNKNOWN otherwise; Xbox resource flag bits above the PC ones are dropped.
+HRESULT proxy_create_committed_resource3(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap,
+                                         std::uint32_t heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
+                                         std::uint32_t layout, const D3D12_CLEAR_VALUE* clear, std::uint64_t session,
+                                         std::uint32_t castable_count, const DXGI_FORMAT* castable, const IID* riid,
+                                         void** out) {
+    note_slot(127);
+    if (!out || !xbox_desc || !riid || !heap) return E_POINTER;
+    *out = nullptr;
+    D3D12_RESOURCE_DESC1 desc{};
+    std::memcpy(&desc, xbox_desc, sizeof(D3D12_RESOURCE_DESC));
+    const auto xbox_layout = static_cast<std::uint32_t>(desc.Layout);
+    desc.Layout = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                     : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    const auto xbox_flags = static_cast<std::uint32_t>(desc.Flags);
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & 0x7ffu);
+    ID3D12Device10* device10 = nullptr;
+    if (FAILED(self->real->QueryInterface(IID_PPV_ARGS(&device10))) || !device10) return E_NOTIMPL;
+    HRESULT hr = device10->CreateCommittedResource3(heap, static_cast<D3D12_HEAP_FLAGS>(heap_flags), &desc,
+                                                    static_cast<D3D12_BARRIER_LAYOUT>(layout), clear,
+                                                    reinterpret_cast<ID3D12ProtectedResourceSession*>(session),
+                                                    castable_count, castable, *riid, out);
+    if (FAILED(hr) && layout != 0) {
+        // A layout the PC refuses for this resource: start it in COMMON rather than stop the title.
+        hr = device10->CreateCommittedResource3(heap, static_cast<D3D12_HEAP_FLAGS>(heap_flags), &desc,
+                                                D3D12_BARRIER_LAYOUT_COMMON, clear,
+                                                reinterpret_cast<ID3D12ProtectedResourceSession*>(session),
+                                                castable_count, castable, *riid, out);
+    }
+    // On the console the runtime takes a committed resource's memory from XMemAlloc with allocator id 0x80 and the
+    // memory bits 0x8000 (bits 14..15), and the retail title hooks that to sub-allocate its first full-screen targets
+    // from a fixed budget, asserting when more than 2 MiB is left (hook at RVA 0x56a2a60, registered at 0x247ad64, check
+    // at 0x247af25). The layer's resource has its own memory, so the hook is called for the accounting only, with the
+    // console's size (d3d12_xs_alloc_size.h; the PC size when that rule does not apply), and the block is not used.
+    // ASSUMPTION: attribute bits other than the id and 0x8000 are unknown and passed as 0.
+    if (SUCCEEDED(hr)) {
+        if (const auto title_alloc = g_title_xmem_alloc.load(std::memory_order_acquire)) {
+            D3D12_RESOURCE_DESC pc{};
+            std::memcpy(&pc, &desc, sizeof(pc));
+            UINT64 size = console_render_target_size(pc);
+            if (!size) size = self->real->GetResourceAllocationInfo(0, 1, &pc).SizeInBytes;
+            size = (size + 0xffff) & ~UINT64{0xffff};
+            void* const block = title_alloc(static_cast<std::size_t>(size), (std::uint64_t{0x80} << 16) | 0x8000);
+            static std::atomic<unsigned> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 127 accounted %llu bytes through the title's XMemAlloc "
+                             "hook -> %p\n", static_cast<unsigned long long>(size), block);
+        }
+    }
+    device10->Release();
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8 || FAILED(hr)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 127 CreateCommittedResource3: heap %d flags 0x%x dimension %d %llux%ux%u "
+                     "format %u mips %u xbox layout 0x%x xbox flags 0x%x barrier layout 0x%x -> 0x%08lx\n",
+                     static_cast<int>(heap->Type), heap_flags, static_cast<int>(desc.Dimension),
+                     static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<unsigned>(desc.DepthOrArraySize),
+                     static_cast<unsigned>(desc.Format), static_cast<unsigned>(desc.MipLevels), xbox_layout, xbox_flags,
+                     layout, static_cast<unsigned long>(hr));
+    }
+    return hr;
+}
+
 void** get_vtable();
 
 // Device methods that return a struct larger than 8 bytes (slot 25 GetResourceAllocationInfo, 16 bytes; slot 26
@@ -2076,6 +2148,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 127) {
+        return hr_to_u64(proxy_create_committed_resource3(
+            self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1), static_cast<std::uint32_t>(a2),
+            reinterpret_cast<const D3D12_RESOURCE_DESC*>(a3), static_cast<std::uint32_t>(a4),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), a6, static_cast<std::uint32_t>(a7),
+            reinterpret_cast<const DXGI_FORMAT*>(a8), reinterpret_cast<const IID*>(a9), reinterpret_cast<void**>(a10)));
     } else if constexpr (Slot == 70) {
         proxy_buffer_view_at_address(self, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a1),
                                      reinterpret_cast<const std::uint8_t*>(a2), a3);
@@ -2433,5 +2511,9 @@ void reset_device_proxy_stats() {
 }
 
 void set_before_execute_hook(void (*hook)()) { g_before_execute.store(hook, std::memory_order_release); }
+
+void set_title_xmem_alloc(void* (*alloc)(std::size_t, std::uint64_t)) {
+    g_title_xmem_alloc.store(alloc, std::memory_order_release);
+}
 
 }  // namespace rt::d3d12_xs
