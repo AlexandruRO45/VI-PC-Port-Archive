@@ -225,13 +225,16 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
             frac = sig & ((1 << top) - 1)
             mant = frac << (mant_bits - top)
             return (sign << (exp_bits + mant_bits)) | (e_biased << mant_bits) | mant
-        try:
-            fv = float.fromhex(tok)
-            return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
-        except OverflowError:
-            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        except ValueError as exc:
-            raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
+        # SPIRV-Tools truncates excess mantissa bits toward zero; match it exactly.
+        if e_biased > 0:
+            frac = sig & ((1 << top) - 1)
+            mant = frac >> (top - mant_bits) if top > mant_bits else frac << (mant_bits - top)
+            if e_biased >= exp_max:
+                return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
+            return (sign << (exp_bits + mant_bits)) | (e_biased << mant_bits) | mant
+        s = exp + (mant_bits + bias - 1)
+        mant = sig << s if s >= 0 else sig >> -s
+        return (sign << (exp_bits + mant_bits)) | mant
     try:
         fv = float(tok)
     except ValueError as exc:

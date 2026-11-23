@@ -216,6 +216,19 @@ OpFunctionEnd
                 self.assertEqual(literals, {43: expected, 251: expected})
                 _validate(spv)
 
+    def test_hex_float_excess_mantissa_truncates_toward_zero_like_spirv_as(self):
+        # Values measured from spirv-as v2026.1: excess bits are dropped, not rounded.
+        cases = [
+            (32, "0x1.0000018p+0", 0x3F800000),
+            (16, "0x1.8p-24", 0x0001),
+            (16, "0x1.ffffp-24", 0x0001),
+            (16, "0x1.29a8p-22", 0x0004),
+            (16, "0x1.3e7ap-24", 0x0001),
+        ]
+        for width, tok, want in cases:
+            with self.subTest(tok=tok):
+                self.assertEqual(spirv_asm._parse_float_bits(tok, width, 1), want)
+
     def test_hex_float_inf_nan_and_string_escapes_match_spirv_as(self):
         # Regression tests for PR #2251 review (@FreddyxS):
         # 1) Width-aware hex-float Inf and NaN payload spellings (f16, f32, f64).
