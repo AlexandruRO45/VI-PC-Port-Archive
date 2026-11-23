@@ -465,6 +465,19 @@ class Outputs(unittest.TestCase):
             self.assertNotIn(b"Traceback", result.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_tests_without_run_tests_is_an_argument_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for tests_filter in ("test_boot_trace", "["):
+                with self.subTest(tests=tests_filter):
+                    out = os.path.join(tmp, "out")
+                    result = subprocess.run([sys.executable, "-I", TOOL, "--out", out, "--tests", tests_filter],
+                                            capture_output=True, cwd=ROOT, timeout=120)
+                    self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+                    self.assertIn(b"--tests needs --run-tests", result.stderr)
+                    self.assertNotIn(b"Traceback", result.stderr)
+                    self.assertNotIn(b"unterminated", result.stderr)  # the filter itself is not judged here
+                    self.assertFalse(os.path.exists(out))
+
     def test_out_inside_the_repository_is_refused(self):
         r = subprocess.run([sys.executable, "-I", TOOL, "--out", os.path.join(ROOT, "progress_out_test")],
                            capture_output=True, cwd=ROOT, timeout=120)
