@@ -132,6 +132,24 @@ class ContentTests(unittest.TestCase):
                     self.assertEqual((counts["setups"], counts["other_xml"], counts["failed_inputs"]),
                                      (1, 1, expected))
 
+    def test_cli_names_the_input_it_cannot_use(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broken = os.path.join(directory, "broken.xml")
+            with open(broken, "wb") as f:
+                f.write(b"<Other>")
+            not_a_carve = os.path.join(directory, "not-a-carve")
+            os.mkdir(not_a_carve)
+            cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "content_definitions.py")]
+            for path, reason in ((broken, "malformed or unsupported XML"),
+                                 (not_a_carve, "cannot read: ")):
+                with self.subTest(input=reason):
+                    result = subprocess.run(cmd + [path], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+                    self.assertIn(path, result.stderr)
+                    self.assertIn(reason, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["failed_inputs"], 1)
+
     def test_cli_reports_counts_only_and_failure_status(self):
         with tempfile.TemporaryDirectory() as directory:
             self.make_carve(directory, [CHANGE, CONTENT, SETUP])
