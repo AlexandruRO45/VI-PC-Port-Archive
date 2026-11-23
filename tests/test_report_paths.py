@@ -148,6 +148,26 @@ class FoldingVolumeTests(unittest.TestCase):
                                                                  self.p("reports", "r.json")),
                          self.volume_folds_case())
 
+    def volume_folds_accents(self):
+        touch(self.p("caf\u00e9.tmp"))
+        return os.path.exists(self.p("cafe\u0301.tmp"))
+
+    def test_accent_spellings_follow_the_volume(self):
+        # BUILD-1362: an ext4/tmpfs casefold folder takes composed and decomposed accents as one name; a
+        # case-sensitive Linux volume (ext4, btrfs, tmpfs) keeps them apart. The volume decides either way.
+        os.makedirs(self.p("reports"))
+        self.assertEqual(report_paths.same_name_on_folding_volume(self.p("reports", "caf\u00e9.json"),
+                                                                 self.p("reports", "cafe\u0301.json")),
+                         self.volume_folds_accents())
+
+    def test_accent_spellings_ask_the_volume(self):
+        # casefold() alone keeps U+00E9 and e + U+0301 apart, so before BUILD-1362 the volume was never asked.
+        os.makedirs(self.p("reports"))
+        with mock.patch.object(report_paths.tempfile, "TemporaryDirectory", side_effect=OSError("asked")) as probe:
+            self.assertFalse(report_paths.same_name_on_folding_volume(self.p("reports", "CAF\u00c9.json"),
+                                                                      self.p("reports", "cafe\u0301.json")))
+        probe.assert_called_once()
+
     def test_other_spellings_of_one_folder_are_one_report(self):
         os.makedirs(self.p("reports"))
         self.assertTrue(report_paths.same_name_on_folding_volume(self.p("reports", "R.json"),
@@ -184,6 +204,42 @@ class FoldingVolumeTests(unittest.TestCase):
         with mock.patch.object(report_paths.os.path, "realpath", wraps=os.path.realpath) as resolved:
             report_paths.same_report_path(self.p("out.json"), self.p("lights.json"))
         self.assertEqual(resolved.call_count, 2, "each path is resolved once, not once per check")
+
+
+CASEFOLD_DIR = os.environ.get("LEONIDA_CASEFOLD_DIR", "")
+
+
+@unittest.skipUnless(CASEFOLD_DIR and os.path.isdir(CASEFOLD_DIR),
+                     "set LEONIDA_CASEFOLD_DIR to an empty folder that folds case, for example in "
+                     "`unshare -r -m`: mount -t tmpfs -o casefold tmpfs D; mkdir D/cf; chattr +F D/cf")
+class LinuxCasefoldFolderTests(unittest.TestCase):
+    """BUILD-1362: a real Linux folder that folds case (ext4 or tmpfs with casefold, `chattr +F`). Two report
+    names that the folder takes as one file are one report; the volume probe, not the name rules, says so."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=CASEFOLD_DIR)
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = os.path.realpath(self.tmp.name)
+        touch(os.path.join(self.dir, "Probe.tmp"))
+        if not os.path.exists(os.path.join(self.dir, "probe.tmp")):
+            self.skipTest(f"{CASEFOLD_DIR} does not fold case")
+
+    def p(self, *parts):
+        return os.path.join(self.dir, *parts)
+
+    def test_case_only_pair_is_one_report(self):
+        self.assertTrue(report_paths.same_report_path(self.p("R.json"), self.p("r.json")))
+
+    def test_accent_spellings_are_one_report(self):
+        self.assertTrue(report_paths.same_report_path(self.p("caf\u00e9.json"), self.p("cafe\u0301.json")))
+        self.assertTrue(report_paths.same_report_path(self.p("CAF\u00c9.json"), self.p("cafe\u0301.json")))
+
+    def test_other_names_are_two_reports(self):
+        self.assertFalse(report_paths.same_report_path(self.p("out.json"), self.p("lights.json")))
+
+    def test_it_leaves_no_scratch_folder_behind(self):
+        report_paths.same_report_path(self.p("R.json"), self.p("r.json"))
+        self.assertEqual(sorted(os.listdir(self.dir)), ["Probe.tmp"])
 
 
 class NoPrivateCopiesTests(unittest.TestCase):

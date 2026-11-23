@@ -8,7 +8,9 @@ case-insensitive macOS volume also case-folded and with composed and decomposed 
 exist and `os.path.samefile` says they are one file (a hard link, another spelling the name rules missed). Neither
 path has to exist: two report paths that don't exist yet still collide when they differ only in case on a volume that
 ignores case. Where the name rules cannot tell, `same_name_on_folding_volume` asks the volume itself with one
-scratch folder: a Linux mount that folds case (vfat, exFAT, CIFS) answers neither `normcase` nor `pathconf`.
+scratch folder: a Linux mount that folds case (vfat, exFAT, CIFS, or an ext4/tmpfs folder with casefold, `chattr +F`)
+answers neither `normcase` nor `pathconf`. On a case-sensitive Linux volume (ext4, btrfs, tmpfs) the probe answers
+"two files", so `R.json` and `r.json` stay two reports there.
 Standard library only; no game data.
 """
 import os
@@ -59,7 +61,9 @@ def same_name_on_folding_volume(first, second):
     os.path.normcase folds case only on Windows and the `pathconf` probe above answers only on macOS, so a Linux
     mount that ignores case (vfat, exFAT, CIFS) would pass `R.json` and `r.json` as two reports and let the second
     one overwrite the first. Ask the volume itself: create one spelling in a scratch folder beside the reports and
-    look for the other. Names that differ by more than case are never one file, so that costs nothing.
+    look for the other. Names that differ by more than case and accent spelling are never one file, so that costs
+    nothing. Accent spelling counts: an ext4 or tmpfs casefold folder also takes a composed `é` and `e` + U+0301 as
+    one name (BUILD-1362), and a case-sensitive volume still answers "two files" for them.
     """
     return _same_resolved_name(os.path.realpath(first), os.path.realpath(second))
 
@@ -68,7 +72,7 @@ def _same_resolved_name(first, second):
     """`same_name_on_folding_volume` for paths `os.path.realpath` has already resolved."""
     first_dir, first_name = os.path.split(first)
     second_dir, second_name = os.path.split(second)
-    if first_name.casefold() != second_name.casefold():
+    if _caseless(first_name) != _caseless(second_name):
         return False
     try:
         if not os.path.samefile(first_dir, second_dir):
@@ -78,6 +82,12 @@ def _same_resolved_name(first, second):
                 return os.path.exists(os.path.join(probe, second_name))
     except OSError:
         return False
+
+
+def _caseless(name):
+    """Unicode caseless matching (NFD, casefold, NFD): the names a folding volume may take as one. Only decides
+    whether to ask the volume; the volume's answer is what counts."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
 
 
 def same_report_path(first, second):
