@@ -22,10 +22,12 @@
 #include <windows.h>
 
 #include <atomic>
+#include <climits>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>
 #include <malloc.h>
 #include <mutex>
 #include <new>
@@ -35,6 +37,7 @@
 
 #include "process_shim.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::process {
 namespace {
@@ -260,7 +263,13 @@ struct EntryCall {
     void* entry;
 };
 
+extern "C" __declspec(thread) int _Init_thread_epoch;
+
 DWORD WINAPI game_thread(void* p) {
+    // The runtime image has no CRT TLS callback list, so a thread it creates starts with a zeroed _Init_thread_epoch.
+    // The game's CRT initializer first uses the shims' thread-safe statics on this thread; without the sentinel they
+    // would take the initialised fast path and dereference a null pointer.
+    _Init_thread_epoch = INT_MIN;
     if (getenv("LEONIDA_HEAP_PROBE")) {
         std::fprintf(stderr, "[rt] heap-probe: game_thread before entry\n");
         std::fflush(stderr);
@@ -363,6 +372,15 @@ using namespace rt::process;
 #define COMMAND_LINE(dll) \
     {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
+
+// The title's fatal-error path ends with TerminateProcess(GetCurrentProcess(), code); a direct termination raises no
+// exception, so the startup trace cannot record it. Log the code and caller, then let the real call proceed.
+BOOL WINAPI game_terminate_process(HANDLE process, UINT code) {
+    std::fprintf(stderr, "[rt] process: TerminateProcess(%p, 0x%08x) caller=%s\n", process, code,
+                 rt::startup_trace::where(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
+    std::fflush(stderr);
+    return ::TerminateProcess(process, code);
+}
 }  // namespace
 
 SHIM_TABLE(process,
@@ -381,6 +399,12 @@ SHIM_TABLE(process,
     EXIT_PROCESS("kernel32.dll"),
     EXIT_PROCESS("kernelbase.dll"),
     EXIT_PROCESS("api-ms-win-core-processthreads-l1-1-0.dll"),
+    {"kernel32.dll", "TerminateProcess", reinterpret_cast<void*>(&game_terminate_process)},
+    {"kernelbase.dll", "TerminateProcess", reinterpret_cast<void*>(&game_terminate_process)},
+    {"api-ms-win-core-processthreads-l1-1-0.dll", "TerminateProcess",
+     reinterpret_cast<void*>(&game_terminate_process)},
+    {"api-ms-win-core-processthreads-l1-1-1.dll", "TerminateProcess",
+     reinterpret_cast<void*>(&game_terminate_process)},
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),

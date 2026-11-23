@@ -24,6 +24,11 @@ struct Factory {
     const void** vtable;
 };
 
+struct StorageFile {
+    const void** vtable;
+};
+extern StorageFile g_storage_file;
+
 HRESULT __stdcall factory_query_interface(Factory* self, const IID* /*iid*/, void** out) {
     if (!out) return E_POINTER;
     *out = self;
@@ -55,16 +60,42 @@ HRESULT __stdcall factory_not_implemented_slot(Factory* /*self*/) {
     return E_NOTIMPL;
 }
 
-// Slot 4 is the one the retail exe reaches right after slot 8. Its arguments are logged once so the call site can be
-// resolved; it is still refused until the interface shape is known.
-HRESULT __stdcall factory_slot4(Factory* /*self*/, void* rdx, void* r8, void* r9) {
+// Slot 4 is OpenFile: (const wchar_t* path, REFIID riid, void** file). The measured caller
+// (game+0x28c8be0) stores the returned object and then opens the path itself with Win32 CreateFileW (via the file
+// shims), so the object only has to be a valid non-null COM identity. No file data is faked here.
+HRESULT __stdcall factory_slot4(Factory* /*self*/, const wchar_t* path, const IID* /*iid*/, void** out) {
     static std::atomic<bool> logged{false};
+    if (!out) return E_POINTER;
+    *out = &g_storage_file;
     if (!logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr, "[rt] xcrdapi: factory slot 4 -> E_NOTIMPL (caller %s rdx=%p r8=%p r9=%p)\n",
-                     rt::startup_trace::where(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str(), rdx, r8, r9);
+        char utf8[512] = {};
+        if (path) WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof utf8 - 1, nullptr, nullptr);
+        std::fprintf(stderr, "[rt] xcrdapi: OpenFile(\"%s\") -> dummy file object; the caller opens it with Win32\n",
+                     path ? utf8 : "(null)");
     }
-    return E_NOTIMPL;
+    return S_OK;
 }
+
+HRESULT __stdcall file_query_interface(StorageFile* self, const IID* /*iid*/, void** out) {
+    if (!out) return E_POINTER;
+    *out = self;
+    return S_OK;
+}
+ULONG __stdcall file_add_ref(StorageFile* /*self*/) { return 1; }
+ULONG __stdcall file_release(StorageFile* /*self*/) { return 1; }
+HRESULT __stdcall file_not_implemented(StorageFile* /*self*/) { return E_NOTIMPL; }
+
+const void* g_file_vtable[] = {
+    reinterpret_cast<const void*>(&file_query_interface),
+    reinterpret_cast<const void*>(&file_add_ref),
+    reinterpret_cast<const void*>(&file_release),
+    reinterpret_cast<const void*>(&file_not_implemented),
+    reinterpret_cast<const void*>(&file_not_implemented),
+    reinterpret_cast<const void*>(&file_not_implemented),
+    reinterpret_cast<const void*>(&file_not_implemented),
+    reinterpret_cast<const void*>(&file_not_implemented),
+};
+StorageFile g_storage_file{g_file_vtable};
 
 const void* g_factory_vtable[] = {
     reinterpret_cast<const void*>(&factory_query_interface),  // 0 IUnknown::QueryInterface

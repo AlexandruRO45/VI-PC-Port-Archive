@@ -563,6 +563,11 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
     const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[rt] xmem-probe: AllocatePhysicalPages count=%llu bytes=%llu handle=%p\n",
+                     static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes), handle);
+    }
     if (!handle) {
         *page_count = 0;
         return FALSE;
@@ -580,6 +585,11 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         g_pages[page] = PhysicalPage{section, i * kPhysicalPageSize};
         page_array[i] = page;
     }
+    static std::atomic<bool> done_logged{false};
+    if (!done_logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem-probe: AllocatePhysicalPages done first=%llu last=%llu\n",
+                     static_cast<unsigned long long>(page_array[0]),
+                     static_cast<unsigned long long>(page_array[count - 1]));
     return TRUE;
 }
 
@@ -613,6 +623,10 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
 // without touching its neighbours. A failure part-way leaves the pages before it mapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem-probe: MapPhysicalPages address=%p count=%llu array=%p\n", address,
+                     static_cast<unsigned long long>(page_count), page_array);
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
         start > (std::numeric_limits<uintptr_t>::max)() - page_count * kPhysicalPageSize) {

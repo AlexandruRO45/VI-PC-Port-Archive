@@ -95,6 +95,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_library(gta6rt_tls_host SHARED src/tls_host.cpp)
   target_compile_options(gta6rt_tls_host PRIVATE /W4 /permissive- /utf-8 /GS-)
   target_compile_definitions(gta6rt_tls_host PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  # The anchor must not run the C runtime's DllMain wrapper: its per-thread CRT bookkeeping happens after the
+  # entry point returns, on the TLS block the loader has already replaced with the mapped image's block.
+  target_link_options(gta6rt_tls_host PRIVATE "/ENTRY:gta6rt_tls_host_entry")
   set_target_properties(gta6rt_tls_host PROPERTIES
     OUTPUT_NAME gta6rt_tls_host
     PREFIX ""

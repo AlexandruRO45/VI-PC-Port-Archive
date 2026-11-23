@@ -59,6 +59,23 @@ int usage() {
 
 }  // namespace
 
+namespace {
+
+LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
+    if (!info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    const EXCEPTION_RECORD& r = *info->ExceptionRecord;
+    if (r.ExceptionCode != 0xC0000005 && r.ExceptionCode != 0xC0000374 && r.ExceptionCode != 0x80000003 &&
+        r.ExceptionCode != 0xC0000409 && r.ExceptionCode != 0xC00000FD)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const void* access = r.NumberParameters >= 2 ? reinterpret_cast<void*>(r.ExceptionInformation[1]) : nullptr;
+    std::fprintf(stderr, "[rt] crash-veh: code=0x%08lx addr=%p access=%p tid=%lu\n", r.ExceptionCode,
+                 r.ExceptionAddress, access, GetCurrentThreadId());
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+}  // namespace
+
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
@@ -149,6 +166,7 @@ int wmain(int argc, wchar_t** argv) {
                                    "this executable (docs/modding.md)\n", leonida::mods::active().size());
     }
     rt::d3d12_trace::set_enabled(trace_d3d12);
+    AddVectoredExceptionHandler(1, &crash_logger);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
