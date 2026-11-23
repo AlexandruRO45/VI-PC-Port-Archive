@@ -11872,22 +11872,24 @@ class Gen:
                 modes = self.gather_addr_modes(a[3])
                 self.uses_query = True
                 ch = dmask.bit_length() - 1
-                lv, lvm, rl, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1 = (self.tmp() for _ in range(15))
+                lv, lvm, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1 = (self.tmp() for _ in range(14))
                 # Size and level-count queries read view properties; only the texel fetches need a typed alias.
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
                 lod = self.clamp_gather_lod(f[2], a[3]["r"] + 1)
-                # Native gather rounds the LOD to the nearest mip with ties up, not to even (SHADER-152: on
-                # Radeon Graphics 26.10.1, LOD 0.5 with bounds [0,1] selected mip 1, where RoundEven selected 0).
-                # floor + (fraction >= 0.5), not Floor(lod + 0.5): lod - floor(lod) is exact in binary32, the sum is
-                # not (0x3effffff + 0.5 rounds to 1.0, which picked mip 1 where native sampling reads mip 0).
-                fr, up, fl, inc = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{rl} = OpExtInst %float %glsl Floor {lod}")
-                self.emit(f"{fr} = OpFSub %float {lod} {rl}")
-                self.emit(f"{up} = OpFOrdGreaterThanEqual %bool {fr} %fhalf_g")
-                self.emit(f"{fl} = OpConvertFToS %int {rl}")
-                self.emit(f"{inc} = OpSelect %int {up} {self.as_int(self.cu(1))} {self.as_int(self.cu(0))}")
-                self.emit(f"{mi} = OpIAdd %int {fl} {inc}")
+                # The RDNA2 sampler rounds the LOD to 8 fraction bits (to nearest), then takes the nearest mip with
+                # ties up (SHADER-152: LOD 0.5 with bounds [0,1] selected mip 1, where RoundEven selected 0). Native
+                # nearest-mip image_sample_l on two RDNA2 GPUs reads mip 0 at 0x3efe0000 and 0x3efeffff but mip 1 at
+                # 0x3eff0000 (127.5/256) and 0x3effffff, which only 8 rounded fraction bits explain (#4321).
+                # mip = (RoundEven(lod * 256) + 128) >> 8: the scaling and RoundEven are exact in binary32, the rest
+                # is integer. Half-even or half-up in the first rounding can't change the mip: a tie between steps
+                # 256m + 127 and 256m + 128 goes to the even (upper) one either way.
+                sc, q, qi, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{sc} = OpFMul %float {lod} {self.fconst(256.0)}")
+                self.emit(f"{q} = OpExtInst %float %glsl RoundEven {sc}")
+                self.emit(f"{qi} = OpConvertFToS %int {q}")
+                self.emit(f"{b} = OpIAdd %int {qi} {self.as_int(self.cu(128))}")
+                self.emit(f"{mi} = OpShiftRightArithmetic %int {b} {self.cu(8)}")
                 self.emit(f"{mz} = OpExtInst %int %glsl SMax {mi} {self.as_int(self.cu(0))}")
                 self.emit(f"{mc} = OpExtInst %int %glsl SMin {mz} {lvm}")
                 self.emit(f"{sz} = OpImageQuerySizeLod %v2int {img} {mc}")

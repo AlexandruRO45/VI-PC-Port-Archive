@@ -1000,14 +1000,13 @@ def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, ma
 
 
 def _gather_rounded_lod(defs):
-    """The LOD the explicit-LOD gather rounds to a mip: the operand of the Floor whose fraction (an FSub from the same
-    LOD) is compared with %fhalf_g."""
-    cmp, = (e for e in defs.values() if e.startswith("OpFOrdGreaterThanEqual %bool ") and e.endswith(" %fhalf_g"))
-    sub = defs[cmp.split()[2]].split()
-    assert sub[:2] == ["OpFSub", "%float"], sub
-    lod, floor = sub[2], sub[3]
-    assert defs[floor].split() == ["OpExtInst", "%float", "%glsl", "Floor", lod]
-    return lod
+    """The LOD the explicit-LOD gather rounds to a mip: the one it scales by 256 (8 fraction bits) for RoundEven."""
+    rounded, = (e.split()[-1] for e in defs.values() if e.startswith("OpExtInst %float %glsl RoundEven "))
+    mul = defs[rounded].split()
+    assert mul[:2] == ["OpFMul", "%float"], mul
+    cast = defs[mul[3]].split()
+    assert cast[:2] == ["OpBitcast", "%float"] and defs[cast[2]].split()[-1] == str(0x43800000), cast   # 256.0
+    return mul[2]
 
 
 def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
@@ -1110,8 +1109,8 @@ def test_gather4_l_run_time_sampler_reads_the_border_type_from_word3(make_shader
 
 
 # SHADER-152: the explicit-LOD gather's mip is the nearest one, ties up, like the native gather on Radeon
-# (LOD 0.5 with bounds [0,1] picked mip 1); the old RoundEven picked mip 0 there. It is computed as
-# floor(LOD) + (fraction >= 0.5), exact in binary32, not Floor(LOD + 0.5), whose sum rounds 0x3effffff up to 1.0.
+# (LOD 0.5 with bounds [0,1] picked mip 1); the old RoundEven of the LOD itself picked mip 0 there. #4321: first the
+# LOD is rounded to 8 fraction bits, as native RDNA2 sampling does, so (RoundEven(LOD * 256) + 128) >> 8.
 def _gather_l_at_lod(lod, word1=0x100000):
     return program(
         "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
@@ -1123,8 +1122,8 @@ def _gather_l_at_lod(lod, word1=0x100000):
 
 
 def test_gather4_l_rounds_the_lod_tie_up(make_shader):
-    """The LOD is clamped to the S# bounds first, then floored, and its fraction compared with 0.5; the result is
-    not rounded to even (which would send a 0.5 tie to mip 0), and no +0.5 is added in binary32."""
+    """The LOD is clamped to the S# bounds first, then rounded to 8 fraction bits, and the mip is that plus half a
+    level, shifted down in integers: a 0.5 tie goes up, and no +0.5 is added in binary32."""
     shader = make_shader(_gather_l_at_lod(0.5))
     text = shader.translate()
     shader.validate(text)
@@ -1132,8 +1131,9 @@ def test_gather4_l_rounds_the_lod_tie_up(make_shader):
     clamp = re.search(r"(%\w+) = OpExtInst %float %glsl FClamp (%\w+) (%\w+) (%\w+)", text)
     assert clamp, text
     assert _gather_rounded_lod(defs) == clamp.group(1)  # the clamped LOD, not the raw one
-    assert "= OpExtInst %float %glsl RoundEven" not in text
+    assert len(re.findall(r"= OpExtInst %float %glsl RoundEven ", text)) == 1, text   # only the 8-bit rounding
     assert not re.search(r"= OpFAdd %float %\w+ %fhalf_g", text), text
+    assert re.search(r"= OpShiftRightArithmetic %int %\w+ %c8$", text, re.M), text
 
 
 def _f32(x):
@@ -1169,12 +1169,15 @@ def _translated_gather_mip(text, lod, levels):
             return levels
         if op == "OpExtInst":
             fn, a = args[1], [ev(x) for x in args[2:]]
-            out = {"Floor": lambda: float(math.floor(a[0])), "FClamp": lambda: min(max(a[0], a[1]), a[2]),
+            # Python's round() of a float is half to even, as GLSL RoundEven.
+            out = {"Floor": lambda: float(math.floor(a[0])), "RoundEven": lambda: float(round(a[0])),
+                   "FClamp": lambda: min(max(a[0], a[1]), a[2]),
                    "FMax": lambda: max(a), "FMin": lambda: min(a), "SMax": lambda: max(a), "SMin": lambda: min(a),
                    "SClamp": lambda: min(max(a[0], a[1]), a[2])}[fn]()
             return _f32(out) if isinstance(out, float) else out
         a = [ev(x) for x in args]
         return {"OpFAdd": lambda: _f32(a[0] + a[1]), "OpFSub": lambda: _f32(a[0] - a[1]),
+                "OpFMul": lambda: _f32(a[0] * a[1]), "OpShiftRightArithmetic": lambda: a[0] >> a[1],
                 "OpIAdd": lambda: a[0] + a[1], "OpISub": lambda: a[0] - a[1],
                 "OpConvertFToS": lambda: int(a[0]), "OpFOrdGreaterThanEqual": lambda: a[0] >= a[1],
                 "OpSelect": lambda: a[1] if a[0] else a[2]}[op]()
@@ -1183,36 +1186,48 @@ def _translated_gather_mip(text, lod, levels):
     return ev(level)
 
 
+# Native nearest-mip image_sample_l, S# 92 100000 14500000 0, on RDNA2: a Radeon iGPU 1002:13c0
+# (https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7088753852) and an RX 6750 XT
+# (https://github.com/ItsNotRexed/Leonida/pull/3882#issuecomment-7094685411).
+RDNA2_SAMPLE_L_MIPS = {0x3efe0000: 0, 0x3efeffff: 0, 0x3eff0000: 1, 0x3effffff: 1, 0x3f000000: 1}
+
+
 @pytest.mark.parametrize("word1, lod, mip", [
-    (0x100000, _f32_bits(0x3effffff), 0),   # just below 0.5: Floor(lod + 0.5) rounded the sum to 1.0 and gave mip 1
-    (0x100000, 0.5, 1), (0x100000, _f32_bits(0x3f000001), 1), (0x100000, 0.25, 0), (0x100000, 0.75, 1),
+    *((0x100000, _f32_bits(bits), mip) for bits, mip in RDNA2_SAMPLE_L_MIPS.items()),
+    (0x100000, _f32_bits(0x3eff8000), 1), (0x100000, _f32_bits(0x3f000001), 1),
+    (0x100000, 0.25, 0), (0x100000, 0.75, 1),
     (0x100000, -1.0, 0), (0x100000, 2.0, 1),                    # clamped to the S# bounds [0, 1] first
-    (0xfff000, _f32_bits(0x3fbfffff), 1), (0xfff000, 1.5, 2), (0xfff000, 2.5, 3),
-    (0xfff000, _f32_bits(0x401fffff), 2), (0xfff000, 9.0, 3),   # the last clamped to levels - 1
+    # The next tie, at 1.5: 383.5/256 rounds up to the tie, the value below it stays on mip 1.
+    (0xfff000, _f32_bits(0x3fbfbfff), 1), (0xfff000, _f32_bits(0x3fbfc000), 2), (0xfff000, _f32_bits(0x3fbfffff), 2),
+    (0xfff000, 1.5, 2), (0xfff000, _f32_bits(0x401fffff), 3), (0xfff000, 2.5, 3),
+    (0xfff000, 9.0, 3),                                          # the last clamped to levels - 1
 ])
-def test_gather4_l_mip_is_the_nearest_level_in_binary32(word1, lod, mip, make_shader):
+def test_gather4_l_mip_matches_rdna2_lod_rounding(word1, lod, mip, make_shader):
     shader = make_shader(_gather_l_at_lod(0, word1=word1))
     text = shader.translate()
     shader.validate(text)
     assert _translated_gather_mip(text, lod, 4) == mip
 
 
-def test_gather4_l_binary32_sum_rounds_just_below_half_up():
-    # Negative control: the old Floor(lod + 0.5) in binary32 gives mip 1 for 0x3effffff (the sum is halfway between
-    # 1 - 2^-24 and 1.0 and rounds to even); computed exactly it is mip 0.
-    lod = _f32_bits(0x3effffff)
-    assert math.floor(_f32(lod + 0.5)) == 1
+def test_gather4_l_exact_rounding_misses_rdna2_at_127_5_over_256():
+    # Negative control for the rule above: at 0x3eff0000 (127.5/256) RDNA2 reads mip 1. The exact
+    # floor(lod) + (fraction >= 0.5) of the previous rule and the older Floor(lod + 0.5) both give mip 0; rounding to
+    # 8 fraction bits first gives mip 1.
+    lod = _f32_bits(0x3eff0000)
+    assert math.floor(_f32(lod + 0.5)) == 0
     assert math.floor(lod) + (lod - math.floor(lod) >= 0.5) == 0
+    assert (round(lod * 256) + 128) >> 8 == RDNA2_SAMPLE_L_MIPS[0x3eff0000] == 1
 
 
 def _gather_mip(lod, levels):
-    """Reference for the translated sequence: clamp to [0, levels-1] after floor(lod + 0.5)."""
-    return min(max(math.floor(lod + 0.5), 0), levels - 1)
+    """Reference for the translated sequence: the LOD rounded to 8 fraction bits, then up from half a level, clamped
+    to [0, levels-1]."""
+    return min(max((round(lod * 256) + 128) >> 8, 0), levels - 1)
 
 
 @pytest.mark.parametrize("lod, levels, mip", [
     (-2.0, 4, 0), (-1.5, 4, 0), (-0.5, 4, 0), (-0.1, 4, 0),
-    (0.0, 4, 0), (0.25, 4, 0), (0.499, 4, 0),
+    (0.0, 4, 0), (0.25, 4, 0), (0.497, 4, 0), (0.499, 4, 1),   # 0.499 rounds to 128/256 at 8 fraction bits
     (0.5, 4, 1), (0.501, 4, 1), (0.75, 4, 1),
     (1.5, 4, 2), (2.5, 4, 3), (3.5, 4, 3), (3.6, 4, 3),     # the last two are clamped to levels-1
     (0.5, 2, 1), (1.5, 2, 1), (10.0, 1, 0),
