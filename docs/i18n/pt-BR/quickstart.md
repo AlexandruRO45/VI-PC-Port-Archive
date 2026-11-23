@@ -3,7 +3,7 @@
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
 > [`docs/README.md`](../../README.md)) é a **referência oficial**. Este guia reúne apenas instruções estáveis de
-> configuração e compilação (sincronizado com o commit `dde82f27`). Para o status diário do projeto, consulte o
+> configuração e compilação (sincronizado com o commit `3ca3c472`). Para o status diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
 ## O que é o Leonida
@@ -25,6 +25,7 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 
 - **Sua própria cópia** do pacote Xbox Series, versão `1.0.2.1` (pasta com `MicrosoftGame.Config` e os arquivos `.rpf` legíveis em disco).
 - **Windows 10/11 x64** com cerca de **30 GB livres** para preparar só o runtime ou **400 GB** para o build completo.
+  Os tamanhos são os que o Explorador do Windows mostra (GiB): 400 GiB equivalem a cerca de 430 GB decimais.
 - [Python 3.12+](https://www.python.org/downloads/) (marque *"Add python.exe to PATH"*).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` e `vulkaninfo`).
@@ -56,18 +57,10 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 
 **Este PC aguenta?** `python -I tools/pc_checker.py --cli` detecta CPU, GPU e RAM e compara com os perfis de
 referência antes de um build longo: `--profile 1`, o padrão, equivale a um PC no nível do Xbox Series X, e
-`--profile 2` é uma estimativa da comunidade para 1080p no Low. `python -I tools/pc_checker.py --check --json`
+`--profile 2` é uma estimativa da comunidade para 1080p com gráficos no Low. `python -I tools/pc_checker.py --check --json`
 imprime o mesmo veredito em JSON e o devolve como código de saída (0 bom, 1 fraco, 2 desconhecido).
 
-**Pouco espaço em disco:** o valor de ~400 GB refere-se ao build completo. Para *executar* o port,
-`--stages check,shaders,runtime` precisa de cerca de **30 GB**; o estágio `assets` (~370 GB) serve apenas para as
-ferramentas de extração de assets, e `--wav` adiciona várias vezes o tamanho dos arquivos Ogg Opus (a verificação
-inicial mostra essa escolha quando é o estágio `assets` que não cabe). `--work` e `--out` podem apontar para outro
-disco. O runtime mapeia o pacote no lugar, então um pacote em unidade somente leitura precisa de
-`gta6rt --overlay <pasta gravável>`; `--overlay` é uma opção do `gta6rt`, não do `make_game.py`. Mantenha os
-arquivos `.s` em `work/shaders/dxbc/disasm`: a próxima execução os confere com a lista em `disasm.done`, desmonta de
-novo os que faltarem (todos, se o `disasm.done` for anterior a essa lista) e depois traduz todos os shaders de novo.
-Uma pasta `disasm` que seja link simbólico é recusada quando o estágio precisa limpá-la.
+Pouco espaço em disco? Veja [Build com pouco espaço em disco](#build-com-pouco-espaço-em-disco).
 
 ## Como compilar
 
@@ -78,6 +71,8 @@ Uma pasta `disasm` que seja link simbólico é recusada quando o estágio precis
    ```powershell
    git clone --recursive https://github.com/ItsNotRexed/Leonida
    ```
+   O "Download ZIP" do GitHub não inclui `third_party/rpf9-explorer`. O build baixa esse submódulo sozinho se o
+   `git` estiver instalado e, se não estiver, explica o que fazer.
 3. Abra a pasta `Leonida` e dê duplo clique em **`Build.bat`**.
 
 O script procura automaticamente sua cópia (Downloads, Desktop, Documentos, Games, pasta de usuário e raiz dos
@@ -100,10 +95,16 @@ python -I make_game.py --wave64-emulate off            # auto (padrão), on ou o
 Estágios: `check` sempre roda primeiro; depois `shaders`, `assets` e `runtime` rodam juntos quando selecionados (um
 não depende do outro). `pipelines` começa quando os shaders traduzidos ficam prontos (e, se a execução inclui
 `runtime`, depois que ele recompila o `vk_pipeline_check`), então pode rodar em paralelo com o resto de `assets`.
+O `pipelines` cria cada shader traduzido no driver da sua GPU, informa os que precisou pular e salva um cache em
+`pipeline_cache.bin` dentro de `--out` (o runtime ainda não carrega esse cache, então ele não acelera o primeiro boot).
 
-- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação se alguma GPU não tiver subgrupos de 64 lanes ou se o tamanho for desconhecido, verificando também se a GPU do runtime suporta compute e mesh em 64 lanes (com `--mesh-compute`, apenas o suporte em compute é necessário). No driver Windows da AMD, `auto` usa wave64 nativo em GPUs RDNA1 e RDNA2 quando a GPU do runtime suporta (para placas RDNA1 sem suporte a mesh shaders, a decisão usa o estágio compute), mesmo que outra GPU seja de 32 lanes ou que `vulkaninfo` não esteja disponível, pois o compilador desse driver pode falhar em código LDS emulado (#857). O modo escolhido fica salvo junto aos shaders traduzidos; use `--wave64-emulate on` para forçar a emulação ou `--wave64-emulate off` para forçar wave64 nativo.
-- **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
-- **`--work`**: recomenda-se apontar para um disco com pelo menos 400 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
+Num terminal interativo, uma tela de configuração do LEONIDA permite ajustar os jobs e se os estágios rodam em
+paralelo; depois, `1`–`4` / `Tab` alternam o log de cada estágio, e os logs completos ficam em `work/logs/`. Use
+`--no-tui` (ou redirecione a saída) para o console simples.
+
+- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação se alguma GPU não tiver subgrupos de 64 lanes ou se o tamanho for desconhecido, verificando também se a GPU do runtime suporta compute e mesh em 64 lanes (com `--mesh-compute`, apenas o suporte em compute é necessário). No driver Windows da AMD, `auto` usa wave64 nativo em GPUs RDNA1 e RDNA2 quando a GPU do runtime suporta (para placas RDNA1 sem suporte a mesh shaders, a decisão usa o estágio compute), mesmo que outra GPU seja de 32 lanes ou que `vulkaninfo` não esteja disponível, pois o compilador desse driver pode falhar em código LDS emulado (#857). O modo escolhido fica salvo junto aos shaders traduzidos, e mudá-lo traduz os shaders de novo; use `--wave64-emulate on` para forçar a emulação ou `--wave64-emulate off` para forçar wave64 nativo.
+- **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`; liga sozinho no driver Vulkan da Intel para Windows, cujos mesh draws nativos travam, a menos que você passe `--native-mesh`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
+- **`--work`**: pode ficar em outro disco (veja [Build com pouco espaço em disco](#build-com-pouco-espaço-em-disco)); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
 - **`--wav`**: fica desativado por padrão porque WAV PCM de 16 bits é várias vezes maior que Ogg Opus; quando ativado, decodifica os streams Ogg Opus para `work\assets\audio\wav` e pula arquivos WAV já existentes ao retomar um build.
 
 ### Build com pouco espaço em disco
@@ -114,9 +115,16 @@ Para preparar o runtime e os shaders com cerca de **30 GB livres**, execute na r
 python -I make_game.py --stages check,shaders,runtime
 ```
 
-O estágio `assets` serve às ferramentas de extração e ocupa cerca de 370 GB. A opção `--wav` aumenta ainda mais
-o espaço usado pelos áudios. Você pode apontar `--work` e `--out` para outro disco. Se o disco do pacote for
-somente leitura, inicie o runtime com `gta6rt --overlay <pasta gravável>` (opção do `gta6rt`, não do `make_game.py`).
+O valor de ~400 GB é para o build completo. O estágio `assets` (~370 GB) serve apenas às ferramentas de extração, e
+`--wav` adiciona várias vezes o tamanho dos arquivos Ogg Opus (a verificação inicial mostra essa escolha quando é o
+estágio `assets` que não cabe). Você pode apontar `--work` e `--out` para outro disco. O runtime mapeia o pacote no
+lugar, então um pacote em unidade somente leitura precisa de `gta6rt --overlay <pasta gravável>`; `--overlay` é uma
+opção do `gta6rt`, não do `make_game.py`.
+
+Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm`: a próxima execução os confere com a lista em
+`disasm.done`, desmonta de novo os que faltarem (todos, se o `disasm.done` for anterior a essa lista) e depois
+traduz todos os shaders de novo. Uma pasta `disasm` que seja link simbólico é recusada quando o estágio precisa
+limpá-la.
 
 ### Diagnóstico do Vulkan no Linux
 
@@ -155,7 +163,7 @@ da instalação. No Windows, `--runtime-build` também permite reutilizar um bui
 
 ## Problemas comuns
 
-- **Baixou pelo botão "Download ZIP" do GitHub**: o ZIP não inclui o submódulo `third_party/rpf9-explorer`. Use `git clone --recursive` ou execute `git submodule update --init --recursive` dentro da pasta do repositório.
+- **Baixou pelo botão "Download ZIP" do GitHub**: o ZIP não inclui o submódulo `third_party/rpf9-explorer`. Com o `git` instalado, o build o baixa sozinho; sem ele, use `git clone --recursive` ou execute `git submodule update --init --recursive` dentro da pasta do repositório.
 - **`llvm-mc` recusa `gfx1013` / AMDGPU**: você provavelmente está com o instalador oficial do LLVM para Windows. Siga um dos passos de configuração do LLVM acima.
 - **Erro de `D3D12_ROOT_SIGNATURE_DESC2` ao compilar o runtime**: atualize o Windows SDK para `10.0.26100` ou mais recente pelo Visual Studio Installer ou `winget install Microsoft.WindowsSDK.10.0.26100`, apague a pasta de build e reconfigure.
 - **Falha por falta de espaço no drive `C:`**: passe `--work "D:\leonida-work"` para mover os arquivos
