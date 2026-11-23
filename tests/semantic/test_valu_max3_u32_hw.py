@@ -249,5 +249,57 @@ class TestValuMax3U32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res, 200)
         self.assertEqual(interp.vgprs[0], 200)
 
+# ---------------------------------------------------------------------------
+# Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking
+# ---------------------------------------------------------------------------
+
+class SIMDWavefront:
+    """SIMD Wavefront multi-lane model with 32-bit or 64-bit EXEC masking."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: int | None = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self.mask_limit = (1 << wave_size) - 1
+        self.exec_mask = self.mask_limit if exec_mask is None else (exec_mask & self.mask_limit)
+
+    def execute(self, s0_lanes: list[int], s1_lanes: list[int], s2_lanes: list[int]) -> list[int]:
+        res_lanes: list[int] = [0] * self.wave_size
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                res_lanes[lane] = oracle_max3_u32(s0_lanes[lane], s1_lanes[lane], s2_lanes[lane])
+            else:
+                res_lanes[lane] = 0
+        return res_lanes
+
+
+class TestValuMax3U32SIMDDivergence(unittest.TestCase):
+    """Stage 4: SIMD multi-lane divergence and EXEC masking for v_max3_u32."""
+
+    def test_wave32_all_active(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        s0 = [lane * 10 for lane in range(32)]
+        s1 = [100] * 32
+        s2 = [50] * 32
+
+        res = wave.execute(s0, s1, s2)
+        for lane in range(32):
+            expected = max(lane * 10, 100, 50)
+            self.assertEqual(res[lane], expected)
+
+    def test_wave64_divergence_masking(self) -> None:
+        mask = 0xAAAA_AAAA_AAAA_AAAA
+        wave = SIMDWavefront(wave_size=64, exec_mask=mask)
+        s0 = [5] * 64
+        s1 = [15] * 64
+        s2 = [25] * 64
+
+        res = wave.execute(s0, s1, s2)
+        for lane in range(64):
+            if (mask >> lane) & 1:
+                self.assertEqual(res[lane], 25)
+            else:
+                self.assertEqual(res[lane], 0)
+
 if __name__ == "__main__":
     unittest.main()
