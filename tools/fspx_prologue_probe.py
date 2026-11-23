@@ -252,7 +252,8 @@ def self_test():
 
 def check_results(kernels, results):
     """Raise RuntimeError unless the runner answered one result per kernel, each a rejection string or a list of at
-    least that kernel's words. A short answer would otherwise drop cases and negative controls from the zip below."""
+    least that kernel's int words. A short answer would otherwise drop cases and negative controls from the zip
+    below."""
     if not isinstance(results, list) or len(results) != len(kernels):
         n = len(results) if isinstance(results, list) else type(results).__name__
         raise RuntimeError(f"the hardware runner returned {n} results for {len(kernels)} kernels")
@@ -262,6 +263,9 @@ def check_results(kernels, results):
         if not isinstance(got, list) or len(got) < k.words:
             what = f"{len(got)} words" if isinstance(got, list) else repr(got)
             raise RuntimeError(f"kernel {i}: the hardware runner returned {what}, not {k.words} words or a rejection")
+        bad = [w for w in got if not isinstance(w, int)]
+        if bad:
+            raise RuntimeError(f"kernel {i}: the hardware runner returned the word {bad[0]!r}, not an int")
 
 
 def run_hw(waves=(32, 64), arch=None):

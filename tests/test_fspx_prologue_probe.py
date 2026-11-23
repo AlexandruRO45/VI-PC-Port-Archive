@@ -176,6 +176,17 @@ class FspxPrologueProbeTests(unittest.TestCase):
         outputs[-1] = []                     # neg_multilane: an empty list used to count as a missed control
         self.assert_harness_error(outputs, "returned 0 words")
 
+    def test_non_list_result_is_a_harness_error(self):
+        self.assert_harness_error(5, "returned int results")
+        self.assert_harness_error(iter(self._passing_outputs()), "returned list_iterator results")
+        self.assert_harness_error(tuple(self._passing_outputs()), "returned tuple results")
+
+    def test_non_int_word_is_a_harness_error(self):
+        for bad in (None, 1.0, "0"):
+            outputs = self._passing_outputs()
+            outputs[2] = [bad] + outputs[2][1:]
+            self.assert_harness_error(outputs, f"kernel 2: the hardware runner returned the word {bad!r}, not an int")
+
     def test_rejection_string_is_still_a_failure_not_a_harness_error(self):
         outputs = self._passing_outputs()
         outputs[0] = "assembler rejected the kernel"
