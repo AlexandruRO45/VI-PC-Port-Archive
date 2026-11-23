@@ -404,7 +404,7 @@ def main(argv=None):
     try:
         report = pi.inspect(a.cache)
     except (OSError, ValueError) as e:
-        print("%s: %s" % (a.cache, e), file=sys.stderr)
+        print("ERROR: %s: %s" % (a.cache, e), file=sys.stderr)
         return 2
     if report["problems"]:
         print("cache disagrees with the layout model:", file=sys.stderr)
