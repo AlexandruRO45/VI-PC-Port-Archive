@@ -31,6 +31,7 @@ import re
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+D3D12_LIMIT = "[rt] d3d12 trace file reached its limit; later records are unavailable"
 
 
 class TraceError(ValueError):
@@ -171,7 +172,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
 
 
 def parse_d3d12(path: str, limit: int = 10) -> dict:
-    """Read the `--trace-d3d12` stderr lines, ignoring the runtime's ordinary diagnostics."""
+    """Read the stderr or mapped D3D12 trace, ignoring the runtime's ordinary diagnostics."""
     trace = {
         "path": path,
         "calls": 0,
@@ -187,6 +188,11 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
     }
     with _open_text(path) as fh:
         for line in fh:
+            if "\0" in line:
+                break  # a mapped file left after a crash ends at this terminator, possibly inside an unfinished line
+            if line.rstrip("\n") == D3D12_LIMIT:
+                trace["limit_reached"] = True
+                continue
             match = D3D12_LINE.match(line.rstrip("\n"))
             if not match:
                 if line.strip():
@@ -206,7 +212,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
     if trace["calls"] == 0:
         raise TraceError(
             f"{path} has no [d3d12-trace] line among {trace['ignored_lines']} line(s); "
-            "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
+            "is it from --trace-d3d12 or --trace-d3d12-file with the Vulkan device enabled?"
         )
     return trace
 
@@ -290,6 +296,8 @@ def format_text(summary: dict, limit: int) -> str:
     d3d12 = summary.get("d3d12")
     if d3d12:
         out.append(f"d3d12 trace: {d3d12['path']}")
+        if d3d12.get("limit_reached"):
+            out.append("  file limit reached; later records are unavailable")
         outcomes = ", ".join(f"{k} {v}" for k, v in sorted(d3d12["outcomes"].items()))
         out.append(
             f"  {d3d12['calls']} call(s), {d3d12['ignored_lines']} other line(s)"

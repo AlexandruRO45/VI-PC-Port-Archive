@@ -23,7 +23,8 @@ Two traces are written independently:
 * **startup trace** (`--trace FILE`): one JSON object per line, flushed per event, so it survives a crash. Kinds
   and fields are in [`runtime/README.md`](../runtime/README.md) ("Startup trace").
 * **D3D12 trace** (`--trace-d3d12`): one `[d3d12-trace] #<seq> <method> <outcome>` line per call, on stderr. The
-  ordinary `[rt]` diagnostics stay separate.
+  alternative `--trace-d3d12-file FILE` writes the same lines into a dedicated mapped file and keeps ordinary
+  `[rt]` diagnostics on stderr. Use this mode when per-call stderr flushes slow down the boot.
 
 `tools/boot_trace.py` reads both and prints the triage units: modules, unimplemented calls and callers,
 DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12 calls by outcome and first call
@@ -49,6 +50,9 @@ python -I tools\boot_trace.py $trace --d3d12 $log
 The capture pipeline writes each message as text to avoid PowerShell 5.1 wrapping the first stderr record at a
 narrow output width. The tool also reads existing UTF-16LE logs saved with `2>` in PowerShell 5.1 and recognizes
 the `program.exe : ` prefix on the first stderr line.
+
+For the mapped trace, pass `--trace-d3d12-file $log` in place of `--trace-d3d12` and omit the pipeline to
+`Out-File`. Use a fresh path. `boot_trace.py` accepts either output.
 
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 

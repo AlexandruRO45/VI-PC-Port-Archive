@@ -344,6 +344,13 @@ Each trace line contains a sequence number, a fixed API name and an outcome. `ca
 whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
 Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
 
+Use `--trace-d3d12-file FILE` before the argument separator to write the same records without per-call stderr
+flushes. It creates a new local file and reserves 64 MiB before guest code runs. On a normal exit the file is
+trimmed to its recorded lines. After a process crash the file can still be 64 MiB, with a NUL marking the end
+of its complete lines. Use `python -I tools/boot_trace.py --d3d12 FILE` to read either form. At the file limit
+the trace writes a final diagnostic and stops recording. Crash recovery assumes the operating system and its
+filesystem cache are still running.
+
 ### Startup trace: `--trace FILE`
 
 `--trace FILE` (with `--dry-run`, `--init` or `--run`, before the `--` separator) writes one JSON object per line

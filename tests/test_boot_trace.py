@@ -386,6 +386,23 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["calls"], 1)
         self.assertEqual(trace["methods"], ["Foo"])
 
+    def test_mapped_trace_ends_at_nul_after_last_complete_line(self):
+        with open(self.d3d12, "wb") as f:
+            f.write(b"[d3d12-trace] #1 CreateCommandQueue ok\n"
+                    b"[d3d12-trace] #2 SetPipelineState called\x00residue\n"
+                    b"[d3d12-trace] #3 Ignored called\n")
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["calls"], 1)
+        self.assertEqual(trace["last_seq"], 1)
+        self.assertEqual(trace["ignored_lines"], 0)
+
+    def test_reports_mapped_trace_limit(self):
+        self.write_lines(self.d3d12, [D3D12[1], bt.D3D12_LIMIT])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertTrue(trace["limit_reached"])
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertIn("file limit reached", bt.format_text(bt.summarize(None, trace), 5))
+
     def test_text_report_has_the_triage_units(self):
         self.write(self.startup, STARTUP)
         text = bt.format_text(bt.summarize(bt.parse_startup(self.startup), None), 10)

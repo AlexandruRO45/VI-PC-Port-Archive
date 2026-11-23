@@ -845,6 +845,18 @@ if(BUILD_TESTING)
     target_link_options(startup_trace_test PRIVATE /OPT:NOREF)
     add_dependencies(startup_trace_test gta6rt_tls_host)
     add_test(NAME startup_trace COMMAND startup_trace_test)
+    add_executable(d3d12_trace_file_fixture test/d3d12_trace_file_fixture.cpp)
+    target_compile_definitions(d3d12_trace_file_fixture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_trace_file_fixture PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    if(NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME d3d12_trace_file COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace_file.py"
+                 "$<TARGET_FILE:d3d12_trace_file_fixture>" "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
+        set_tests_properties(d3d12_trace_file PROPERTIES TIMEOUT 40)
+      endif()
+    endif()
   endif()
 
   if(TARGET device_proxy_test)

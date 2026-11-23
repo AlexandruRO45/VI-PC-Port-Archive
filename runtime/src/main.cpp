@@ -9,7 +9,8 @@
 //   gta6rt --init <image> [--game-dir DIR] [--overlay DIR]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
-//   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
+//   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12 | --trace-d3d12-file FILE]
+//                     [--trace FILE] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
@@ -51,10 +52,14 @@ const char* binding_name(rt::Binding b) {
 int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12 | --trace-d3d12-file FILE] [--trace FILE]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12 | --trace-d3d12-file FILE] [--trace FILE] [-- game arguments...]\n");
     return 2;
 }
+
+struct CloseD3D12Trace {
+    ~CloseD3D12Trace() { rt::d3d12_trace::close_file(); }
+};
 
 }  // namespace
 
@@ -65,7 +70,7 @@ int wmain(int argc, wchar_t** argv) {
     uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
-    std::wstring trace_file;
+    std::wstring trace_file, d3d12_trace_file;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {
@@ -76,6 +81,11 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--init") init = true;
         else if (a == L"--run") run = true;
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
+        else if (a == L"--trace-d3d12-file") {
+            if (!d3d12_trace_file.empty() || i + 1 == argc) return usage();
+            d3d12_trace_file = argv[++i];
+            if (d3d12_trace_file.empty() || d3d12_trace_file.starts_with(L"--")) return usage();
+        }
         else if (a == L"--trace" && i + 1 < argc) trace_file = argv[++i];
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
@@ -101,6 +111,7 @@ int wmain(int argc, wchar_t** argv) {
     if (image.empty()) return usage();
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
     if (dry_run + init + run != 1) return usage();
+    if (trace_d3d12 && !d3d12_trace_file.empty()) return usage();
     // The console folders are fixed once, as absolute paths. A bare image name (`gta6rt --run game.exe` from the
     // game folder) has an empty parent path, which left GAME: with no root; and a relative --game-dir or --overlay
     // would follow the title's later SetCurrentDirectory. If absolute() fails the path stays as given.
@@ -151,6 +162,18 @@ int wmain(int argc, wchar_t** argv) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
         return 2;
+    }
+    const CloseD3D12Trace close_d3d12_trace;
+    if (!d3d12_trace_file.empty()) {
+        const DWORD error = rt::d3d12_trace::open_file(d3d12_trace_file.c_str());
+        if (error != ERROR_SUCCESS) {
+            if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) {
+                std::fprintf(stderr, "error: --trace-d3d12-file only creates a new file\n");
+            } else {
+                std::fprintf(stderr, "error: cannot create the D3D12 trace file (Win32 error %lu)\n", error);
+            }
+            return 2;
+        }
     }
 
     try {
@@ -253,6 +276,7 @@ int wmain(int argc, wchar_t** argv) {
         // handlers would run against a game that has stopped) and whose last word decides the exit status.
         // ExitProcess also skips atexit, so the TLS clone cleanup registered there is run here instead.
         rt::cleanup_tls_clones();
+        rt::d3d12_trace::close_file();
         ExitProcess(static_cast<UINT>(code));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
