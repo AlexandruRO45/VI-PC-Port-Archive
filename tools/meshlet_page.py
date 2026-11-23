@@ -509,6 +509,10 @@ def parse_group(data, at):
         tbase += tcount
     if vbase != refs or tbase != triangles:
         raise PageError(f"group at +0x{at:x}: meshlet sums do not match the header")
+    if not meshlets:
+        # An empty group ends 12 bytes in and parse_page's 16-byte alignment rounds that back to the group's own
+        # start, so the walker parses the same bytes forever (#5600). It carries no chunk either way.
+        raise PageError(f"group at +0x{at:x}: no meshlets")
     vref = struct.unpack_from(f"<{refs}H", data, ref_at) if refs else ()
     span = (max(vref) + 1) if vref else 0
     record = {"kind": "group", "offset": at, "meshlets": meshlets, "triangles": triangles,
