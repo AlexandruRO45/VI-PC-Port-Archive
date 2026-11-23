@@ -336,5 +336,23 @@ class VSubrevCoU32TranslatorIntegrationTests(unittest.TestCase):
         d_rev, _ = ref_subrev_co_u32(a, b)
         self.assertNotEqual(d_sub, d_rev)
 
+class VAddCoCiU32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_add_co_ci_u32."""
+
+    def test_addition_with_carry_in_zero(self):
+        s, c = ref_add_co_ci_u32(10, 20, 0)
+        self.assertEqual(s, 30)
+        self.assertEqual(c, 0)
+
+    def test_addition_with_carry_in_one(self):
+        s, c = ref_add_co_ci_u32(10, 20, 1)
+        self.assertEqual(s, 31)
+        self.assertEqual(c, 0)
+
+    def test_ripple_carry_overflow(self):
+        s, c = ref_add_co_ci_u32(0xFFFFFFFF, 0, 1)
+        self.assertEqual(s, 0)
+        self.assertEqual(c, 1)
+
 if __name__ == "__main__":
     unittest.main()
