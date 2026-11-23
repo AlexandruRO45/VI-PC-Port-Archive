@@ -196,7 +196,7 @@ def load_pins(path):
     if not path:
         return pins
     with open(path, encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh)
+        reader = csv.DictReader(fh, strict=True)
         header = reader.fieldnames or []
         missing = [f for f in ("offset", "path") if f not in header]
         if missing:

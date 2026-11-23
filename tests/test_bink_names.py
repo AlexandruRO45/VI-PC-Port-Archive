@@ -546,6 +546,30 @@ class TestReportErrors(unittest.TestCase):
             self.assertIn(pins_dir, err.getvalue())
             self.assertFalse(os.path.exists(out))
 
+    def test_unclosed_pin_quote_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.write(tmp, "index.json", json.dumps({"streams": [stream(0)]}))
+            xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+            pins = self.write(tmp, "pins.csv", 'offset,path\n0,"a/b.bk2"')
+            out = os.path.join(tmp, "names.json")
+            args = [source, "--mount", xml, "--pins", pins, "--out", out]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(names_mod.main(args), 0)
+            with open(out, "rb") as fh:
+                previous = fh.read()
+            self.assertEqual(json.loads(previous)["streams"][0]["confidence"], "verified")
+
+            self.write(tmp, "pins.csv", 'offset,path\n0,"a/b.bk2')
+            err, stdout = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(stdout):
+                self.assertEqual(names_mod.main(args), 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(len(err.getvalue().splitlines()), 1)
+            self.assertIn(pins, err.getvalue())
+            self.assertIn("unexpected end of data", err.getvalue())
+            with open(out, "rb") as fh:
+                self.assertEqual(fh.read(), previous)
+
     def test_empty_sources_are_accepted(self):
         cases = [
             ("index.csv", "source,offset,size,width,height,frames\n"),
