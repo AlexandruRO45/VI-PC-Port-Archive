@@ -34,7 +34,9 @@ bool matches_upload(const copycmp::TexCase& tc, const copycmp::Outcome& out) {
 
 int main() {
     vktest::Device vk;
-    if (!vk.create()) return 77;
+    const auto status = vk.initialize();
+    if (status == vktest::DeviceStatus::unavailable) return 77;
+    if (status != vktest::DeviceStatus::ready) return 1;
     copycmp::Ptr<ID3D12Device> ours, host;
     rt::d3d12::VulkanDeviceInfo info{};
     info.get_instance_proc = vk.instance_proc;

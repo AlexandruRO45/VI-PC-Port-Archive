@@ -188,7 +188,9 @@ void drain(ID3D12Device* host) {
 
 int main() {
     vktest::Device vk;
-    if (!vk.create()) return 77;
+    const auto status = vk.initialize();
+    if (status == vktest::DeviceStatus::unavailable) return 77;
+    if (status != vktest::DeviceStatus::ready) return 1;
     Ref<ID3D12Debug> debug;
     const bool debug_on = SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug.p)));
     if (debug_on) debug->EnableDebugLayer();
