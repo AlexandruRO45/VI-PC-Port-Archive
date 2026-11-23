@@ -510,6 +510,37 @@ def test_a_failed_check_fails_only_its_own_test():
     assert failures == 0, f"{failures} script-runner check(s) failed"
 
 
+def test_dual_destination_ops_invalidate_const_regs_and_sgpr_writes():
+    # v_mad_u64_u32 / v_mad_i64_i32 write a carry-out SGPR to operands[1], and v_swap_b32 writes both operands.
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "a_ps.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(
+                "\ts_mov_b32 s4, 0x05040302\n"
+                "\tv_mad_u64_u32 v[0:1], s4, v2, v3, v[4:5]\n"
+                "\tv_perm_b32 v6, v7, v8, s4\n"
+                "\ts_mov_b32 s5, 0x05040302\n"
+                "\tv_mad_i64_i32 v[0:1], s5, v2, v3, v[4:5]\n"
+                "\tv_perm_b32 v6, v7, v8, s5\n"
+                "\tv_mov_b32_e32 v9, 0x05040302\n"
+                "\tv_swap_b32 v8, v9\n"
+                "\tv_perm_b32 v6, v7, v8, v9\n"
+            )
+        r = F.scan_disasm(tmp, {"a_ps": "ps"})
+        vp = r["v_perm_b32"]
+        check(vp["const_reg"] == 0, f"dual-dest ops must invalidate const_reg, got {vp}")
+        check(vp["unresolved"] == 3, f"all three v_perm_b32 selectors must be unresolved, got {vp}")
+
+        insns = [
+            {"op": "s_mov_b32", "args": [{"k": "sgpr", "r": 7, "n": 1}, {"k": "imm", "v": 0x00037000}], "mods": [], "pc": 0, "enc": b""},
+            {"op": "v_mad_u64_u32", "args": [{"k": "vgpr", "r": 0, "n": 2}, {"k": "sgpr", "r": 7, "n": 1}], "mods": [], "pc": 4, "enc": b""},
+            {"op": "buffer_load_format_x", "args": [{"k": "vgpr", "r": 0, "n": 1}, {"k": "vgpr", "r": 1, "n": 1}, {"k": "sgpr", "r": 4, "n": 4}, {"k": "imm", "v": 0}], "mods": ["idxen"], "pc": 8, "enc": b""},
+        ]
+        table, names = F.translator_formats()
+        counts = F.typed_buffer_ops(insns, table, names)
+        check(counts == {("mubuf", "load", "computed"): 1}, f"v_mad_u64_u32 carry-out must clear earlier literal, got {counts}")
+    assert failures == 0, f"{failures} dual-dest check(s) failed"
+
+
 def run_tests(tests, report=print):
     """Run each test on its own, for the plain-script run (CI's standard-library job): one that raises
     AssertionError is reported and the rest still run. Each test starts from a zero check count, so its closing

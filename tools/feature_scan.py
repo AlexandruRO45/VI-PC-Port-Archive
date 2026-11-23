@@ -268,7 +268,7 @@ def _written_regs(tok: str) -> list:
 
 
 def _has_secondary_sgpr_destination(op: str) -> bool:
-    return op.startswith("v_") and ("_co_" in op or op.startswith("v_div_scale"))
+    return op.startswith("v_") and ("_co_" in op or op.startswith(("v_div_scale", "v_mad_u64_u32", "v_mad_i64_i32")))
 
 
 def _update_const_regs(const_reg: dict, op: str, operands: list) -> None:
@@ -282,7 +282,7 @@ def _update_const_regs(const_reg: dict, op: str, operands: list) -> None:
         if imm is not None:
             const_reg[dst] = imm
             return
-    destination_count = 2 if _has_secondary_sgpr_destination(op) else 1
+    destination_count = 2 if (_has_secondary_sgpr_destination(op) or op.startswith("v_swap_b32")) else 1
     for operand in operands[:destination_count]:
         tokens = operand.split()
         if tokens:
