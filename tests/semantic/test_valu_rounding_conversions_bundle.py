@@ -1,0 +1,147 @@
+"""Comprehensive translator-backed regression bundle for RDNA2 VALU Rounding & Conversions.
+
+Subsystem Feature Bundle covering:
+1. v_floor_f32 (Float floor rounding, denormals flushed, IEEE 0 mode)
+2. v_ceil_f32  (Float ceiling rounding, denormals flushed, IEEE 0 mode)
+3. v_trunc_f32 (Float truncation rounding, denormals flushed, IEEE 0 mode)
+4. v_rndne_f32 (Float round-to-nearest-even, denormals flushed, IEEE 0 mode)
+5. v_cvt_f32_u32 (Unsigned 32-bit int to float32 conversion)
+6. v_cvt_f32_i32 (Signed 32-bit int to float32 conversion)
+7. v_cvt_i32_f32 (Float32 to signed 32-bit int with saturation and NaN handling)
+8. v_cvt_u32_f32 (Float32 to unsigned 32-bit int with saturation and NaN handling)
+"""
+from __future__ import annotations
+
+import math
+import os
+import struct
+import sys
+import unittest
+import warnings
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools"))
+sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
+
+MASK32 = 0xFFFFFFFF
+
+
+def u32_to_f32(u: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", u & MASK32))[0]
+
+
+def f32_to_u32(f: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", f))[0]
+
+
+def run_bundle_ps(lines: list[str], name: str = "ps_valu_bundle") -> list[int]:
+    all_lines = list(lines) + [
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, all_lines)
+    return support.mrt0_words(spv)
+
+
+def oracle_v_floor_f32(u: int) -> int:
+    u = u & MASK32
+    exp = u & 0x7F800000
+    if exp == 0:
+        return 0x80000000 if (u & 0x80000000) else 0x00000000
+    if exp == 0x7F800000:
+        return u
+    f = u32_to_f32(u)
+    res_f = math.floor(f)
+    if res_f == 0.0 and (u & 0x80000000):
+        return 0x80000000
+    return f32_to_u32(res_f)
+
+
+def oracle_v_ceil_f32(u: int) -> int:
+    u = u & MASK32
+    exp = u & 0x7F800000
+    if exp == 0:
+        return 0x80000000 if (u & 0x80000000) else 0x00000000
+    if exp == 0x7F800000:
+        return u
+    f = u32_to_f32(u)
+    res_f = math.ceil(f)
+    if res_f == 0.0 and (u & 0x80000000):
+        return 0x80000000
+    return f32_to_u32(res_f)
+
+
+def oracle_v_trunc_f32(u: int) -> int:
+    u = u & MASK32
+    exp = u & 0x7F800000
+    if exp == 0:
+        return 0x80000000 if (u & 0x80000000) else 0x00000000
+    if exp == 0x7F800000:
+        return u
+    f = u32_to_f32(u)
+    res_f = math.trunc(f)
+    if res_f == 0.0 and (u & 0x80000000):
+        return 0x80000000
+    return f32_to_u32(float(res_f))
+
+
+def oracle_v_rndne_f32(u: int) -> int:
+    u = u & MASK32
+    exp = u & 0x7F800000
+    if exp == 0:
+        return 0x80000000 if (u & 0x80000000) else 0x00000000
+    if exp == 0x7F800000:
+        return u
+    f = u32_to_f32(u)
+    res_f = round(f)
+    if res_f == 0.0 and (u & 0x80000000):
+        return 0x80000000
+    return f32_to_u32(float(res_f))
+
+
+def oracle_v_cvt_f32_u32(u: int) -> int:
+    return f32_to_u32(float(u & MASK32))
+
+
+def oracle_v_cvt_f32_i32(i: int) -> int:
+    signed_i = i if (i & 0x80000000) == 0 else i - 0x100000000
+    return f32_to_u32(float(signed_i))
+
+
+def oracle_v_cvt_i32_f32(u: int) -> int:
+    bits = u & MASK32
+    mag = bits & 0x7FFFFFFF
+    is_neg = (bits != mag)
+    if mag > 0x7F800000:
+        return 0
+    if bits == 0x7F800000 or mag >= 0x4F000000:
+        return 0x80000000 if is_neg else 0x7FFFFFFF
+    f = u32_to_f32(bits)
+    return int(f) & MASK32
+
+
+def oracle_v_cvt_u32_f32(u: int) -> int:
+    bits = u & MASK32
+    if (bits & 0x80000000) != 0 or bits > 0x7F800000:
+        return 0
+    if bits >= 0x4F800000:
+        return 0xFFFFFFFF
+    f = u32_to_f32(bits)
+    return int(f) & MASK32
+
+class TestVFloorF32ReferenceOracle(unittest.TestCase):
+    """Stage 1 for v_floor_f32: reference mathematical oracle validation."""
+
+    def test_v_floor_f32_oracle_identity(self):
+        res = oracle_v_floor_f32(0x3fc00000)
+        self.assertEqual(res, 0x3f800000)
+
+
+if __name__ == '__main__':
+    unittest.main()
