@@ -899,7 +899,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
              "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
-    if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
+    if "pipelines" in stages and os.name != "nt" and not runtime_build:
         build_pipeline_check(jobs)
         if not pipeline_check_exe():
             fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "

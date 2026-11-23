@@ -592,8 +592,21 @@ def find_harness(explicit: str | None) -> str:
     for candidate in (
         explicit,
         os.environ.get("LEONIDA_VK_HARNESS"),
-        *(os.path.join(folder, executable) for folder in build_dirs),
     ):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    if os.name != "nt" and not explicit and not os.environ.get("LEONIDA_VK_HARNESS") and shutil.which("cmake"):
+        linux_build = os.path.join(build, "linux")
+        try:
+            fresh = [] if os.path.isfile(os.path.join(linux_build, "CMakeCache.txt")) else [
+                *(["-G", "Ninja"] if shutil.which("ninja") else []), "-DCMAKE_BUILD_TYPE=RelWithDebInfo"]
+            subprocess.run(["cmake", "-S", os.path.join(ROOT, "runtime"), "-B", linux_build, *fresh],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(["cmake", "--build", linux_build, "--parallel", "--target", "vk_harness"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except Exception:
+            pass
+    for candidate in (os.path.join(folder, executable) for folder in build_dirs):
         if candidate and os.path.isfile(candidate):
             return candidate
     for folder in build_dirs:
