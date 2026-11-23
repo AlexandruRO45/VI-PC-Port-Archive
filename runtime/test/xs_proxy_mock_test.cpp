@@ -947,9 +947,19 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots())
-        return 1;
+    // One check per line: a pull request that adds a check adds a line, and two of them don't edit the same one.
+    int (*const checks[])() = {
+        [] { return check_tail(true); },
+        check_levels,
+        check_fence1,
+        check_create_failures,
+        check_open_shared,
+        check_alloc_failures,
+        check_allocators,
+        check_xbox_slots,
+    };
+    for (const auto check : checks)
+        if (check()) return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
 }

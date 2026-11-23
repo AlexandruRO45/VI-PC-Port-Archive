@@ -4,11 +4,11 @@
 // receives the proxy in RCX, replaces it with the PC device pointer from offset 8, and tail-calls the PC method at
 // the same index through a 15-argument integer prototype. Every PC D3D12 device method takes integer/pointer
 // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
-// hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
-// are IUnknown (0-2), slot 14 (which wraps the heap), 62 and 76, plus the heap proxy's 9/10 conversion from the
-// PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap
-// what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50 hand the real objects
-// behind heap, queue and fence proxies to the real device (see the command queue and fence section).
+// hidden return pointer in RDX, which is passed through as the first argument unchanged. The exceptions are the
+// slots in kOverriddenDeviceSlots (one per line, with what each does) and the configurable Xbox routes, plus the
+// heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. The queue, fence and allocator
+// slots wrap what they create in proxies built the same way, and the unwrapping slots hand the real objects behind
+// heap, queue and fence proxies to the real device (see the command queue and fence section).
 //
 // A thunk declares 14 argument words, but the title passes only as many as the method takes, so the caller's frame
 // may end right after the four register homes. The compiler owns a function's incoming stack-argument slots and may
@@ -1485,6 +1485,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                 std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                 std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    // One branch per slot (or group), in slot order. A new slot goes between its neighbours, not before the final
+    // `else`, so pull requests for different slots touch different lines.
     if constexpr (Slot == 0) {
         return hr_to_u64(proxy_query_interface(self, reinterpret_cast<const IID*>(a1),
                                                reinterpret_cast<void**>(a2)));
@@ -1498,21 +1500,18 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 9) {
         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
-    } else if constexpr (Slot == 36) {
-        return hr_to_u64(proxy_create_fence(self, a1, a2, reinterpret_cast<const IID*>(a3),
-                                            reinterpret_cast<void**>(a4)));
-    } else if constexpr (Slot == 32) {
-        return hr_to_u64(proxy_open_shared_handle(self, a1, reinterpret_cast<const IID*>(a2),
-                                                  reinterpret_cast<void**>(a3)));
-    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
-        return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
-    } else if constexpr (Slot == 75) {
-        return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
-                                                     reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 14) {
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
+        return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 32) {
+        return hr_to_u64(proxy_open_shared_handle(self, a1, reinterpret_cast<const IID*>(a2),
+                                                  reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 36) {
+        return hr_to_u64(proxy_create_fence(self, a1, a2, reinterpret_cast<const IID*>(a3),
+                                            reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
@@ -1521,6 +1520,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 75) {
+        return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
+                                                     reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -1703,11 +1705,34 @@ ID3D12Device* device_proxy_real_device(const void* device) {
     return static_cast<const DeviceProxy*>(device)->real;
 }
 
+// The device slots proxy_slot handles itself rather than forwarding verbatim, one per line in slot order: a pull
+// request that takes a slot adds its own line here (and its branch in proxy_slot), and two such pull requests no
+// longer edit the same line. The configurable Xbox routes (48/73 and 78/79/80 by default) are checked separately
+// below because their indices come from the environment.
+constexpr unsigned kOverriddenDeviceSlots[] = {
+    0,   // QueryInterface
+    1,   // AddRef
+    2,   // Release
+    8,   // CreateCommandQueue -> queue proxy
+    9,   // CreateCommandAllocator -> allocator proxy
+    14,  // CreateDescriptorHeap -> heap proxy
+    31,  // CreateSharedHandle (proxies unwrapped)
+    32,  // OpenSharedHandle (a fence comes back wrapped)
+    34,  // MakeResident (proxies unwrapped)
+    35,  // Evict (proxies unwrapped)
+    36,  // CreateFence -> fence proxy
+    45,  // SetEventOnMultipleFenceCompletion (fence proxies unwrapped)
+    46,  // SetResidencyPriority (proxies unwrapped)
+    50,  // EnqueueMakeResident (proxies unwrapped)
+    62,  // Xbox CreateComputePipelineState
+    67,  // Xbox compute pipeline from native code
+    75,  // CreateCommandQueue1 -> queue proxy
+    76,  // Xbox resource creation
+};
+
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76)
-        return true;
+    for (const unsigned overridden : kOverriddenDeviceSlots)
+        if (slot == overridden) return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
            slot == routes.queue_x || slot == routes.list_x;
