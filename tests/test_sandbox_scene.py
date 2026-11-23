@@ -117,6 +117,19 @@ class TestCliErrors(unittest.TestCase):
                                      "--center", "0", "0", "--out", out])
         return rc, err.getvalue()
 
+    def test_out_that_names_the_entities_file_is_refused(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                sandbox_scene.main(["--entities", self.entities, "--models", self.models,
+                                    "--center", "0", "0", "--out", self.entities])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+        self.assertTrue(err.getvalue().startswith("ERROR:"), err.getvalue())
+        self.assertIn("names the --entities input", err.getvalue())
+        with open(self.entities, encoding="utf-8") as f:
+            self.assertIn("archetype", f.read())
+
     def test_out_directory_is_one_error_line(self):
         out = os.path.join(self.tmp.name, "iamdir")
         os.makedirs(out)
