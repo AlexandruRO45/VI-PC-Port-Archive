@@ -237,6 +237,17 @@ class TestVCvtF16U16SIMD(unittest.TestCase):
         # Max u16 is 65535 -> in f16 rounds to 65536 (0x7C00 = inf in half float without clamp)
         self.assertEqual(ref_v_cvt_f16_u16(65535), 0x7C00)
 
+class TestVCvtF16U16Translator(unittest.TestCase):
+    def test_translator_cvt_f16_u16_execution(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 42",
+            "v_cvt_f16_u16_e32 v2, v1",
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_cvt_f16_u16")
+        for l in range(32):
+            self.assertEqual(results[l] & 0xFFFF, 0x5140)
+
 
 if __name__ == "__main__":
     unittest.main()
