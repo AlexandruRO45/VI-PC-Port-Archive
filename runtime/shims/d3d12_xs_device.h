@@ -1,6 +1,11 @@
 // Xbox-ABI proxy around a PC ID3D12Device.
 //
 // Measured Xbox device deviations used here (vtable indices, x64):
+//   slot 57   DeserializeGraphicsPipelineStateX(desc, iid, out): converts the Xbox 0x68-byte native graphics PSO
+//             description (+0x00 root signature, +0x08/+0x10 state blob, +0x18/+0x20 pipeline input-layout blob,
+//             +0x28/+0x30 and +0x48/+0x50 bare RDNA2 programs, +0x38/+0x40 and +0x58/+0x60 kind-2 stage blobs) to
+//             D3D12_GRAPHICS_PIPELINE_STATE_DESC and forwards to PC CreateGraphicsPipelineState (slot 10). When the
+//             second argument's IID is not IID_ID3D12PipelineState, forwards to PC CreateProtectedResourceSession.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
@@ -49,7 +54,10 @@
 
 #include <d3d12.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace rt::d3d12_xs {
 
@@ -156,5 +164,24 @@ bool device_slot_first_call_seen(unsigned slot);
 std::uint64_t heap_slot_hits(unsigned slot);
 bool heap_slot_first_call_seen(unsigned slot);
 void reset_device_proxy_stats();
+
+// Decoded input element from an Xbox slot-57 pipeline blob (188 B in the first 3 boot graphics PSOs).
+struct XboxPipelineInputElement {
+    std::string semantic_name;
+    UINT semantic_index = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    UINT input_slot = 0;
+    UINT aligned_byte_offset = 0;
+};
+
+// Defensively parses the input-layout elements from an Xbox slot-57 pipeline blob (+0x4c element count, +0x54 array
+// of NUL-terminated ASCII semantic name + 7 u32s). Stops cleanly before reading out of bounds when the last 1..4 B
+// of the trailing 28-byte block are truncated at `blob_size`. Returns true when the header is valid.
+bool parse_xbox_pipeline_blob_input_layout(const void* blob, std::size_t blob_size,
+                                           std::vector<XboxPipelineInputElement>& out_elements);
+
+// Looks up the stage ("vs", "ps", "ms", "gs") of a bare RDNA2 program by its SHA-256 (`fspx_code_sha256`) in the
+// configured shader library (`LEONIDA_SHADERS`, including `fspx_gfx/index.json`). Returns an empty string on miss.
+std::string lookup_xbox_fspx_program_stage(const void* program_bytes, std::size_t program_size);
 
 }  // namespace rt::d3d12_xs
