@@ -651,5 +651,24 @@ class TestVRcpIflagF32Reference(unittest.TestCase):
         self.assertEqual(ref_rcp_iflag_f32(4.0), 0.25)
 
 
+def step_scalar_rcp_iflag_f32(state: ValuDivState, instr: Instruction) -> None:
+    if instr.opcode != "v_rcp_iflag_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    val = state.read_f32(instr.src0)
+    res = ref_rcp_iflag_f32(val)
+    state.write_f32(int(instr.dst.index_or_val), res)
+
+
+class TestVRcpIflagF32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_rcp_iflag_f32."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ValuDivState()
+        state.write_f32(1, 2.0)
+        instr = Instruction("v_rcp_iflag_f32", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(1))
+        step_scalar_rcp_iflag_f32(state, instr)
+        self.assertEqual(bits_to_f32(state.vgprs[0]), 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()
