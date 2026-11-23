@@ -105,5 +105,39 @@ class TestReferenceOracle(unittest.TestCase):
         self.assertEqual(ref_cubetc_f32(4.0, 3.0, 1.0, clamp=True), 0.0)    # tc = -3.0 -> clamped to 0.0
         self.assertEqual(ref_cubetc_f32(4.0, -0.5, 1.0, clamp=True), 0.5)   # tc = 0.5 -> preserved
 
+class TestOpcodeTranslation(unittest.TestCase):
+    """Opcode translation to SPIR-V assembly validation."""
+
+    def test_translate_basic_instruction(self):
+        prog = [
+            "v_cubetc_f32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_op", prog)
+        self.assertIn("OpCapability Shader", spv)
+        self.assertIn("FAbs", spv)
+        self.assertIn("OpFOrdGreaterThanEqual", spv)
+        self.assertIn("OpSelect", spv)
+
+    def test_translate_clamp_modifier(self):
+        prog = [
+            "v_cubetc_f32 clamp v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_clamp", prog)
+        self.assertTrue("FClamp" in spv or "NMin" in spv or "OpSelect" in spv)
+
+    def test_translate_input_modifiers(self):
+        prog = [
+            "v_cubetc_f32 v0, |v1|, -v2, -|v3|",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_mods", prog)
+        self.assertIn("FAbs", spv)
+        self.assertIn("OpFNegate", spv)
+
 if __name__ == "__main__":
     unittest.main()
