@@ -198,6 +198,20 @@ class TestSAddU32Oracle(unittest.TestCase):
         self.assertEqual(ref_s_add_u32(0xFFFFFFFF, 1), (0, 1))
         self.assertEqual(ref_s_add_u32(0xFFFFFFFF, 0xFFFFFFFF), (0xFFFFFFFE, 1))
 
+class SAddU32Expr(ASTNode):
+    def __init__(self, src0: int, src1: int) -> None:
+        self.src0 = src0
+        self.src1 = src1
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_add_u32(self.src0, self.src1)
+
+
+class TestSAddU32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SAddU32Expr(0xFFFFFFFF, 2)
+        self.assertEqual(expr.eval(), (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
