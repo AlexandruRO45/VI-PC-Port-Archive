@@ -53,6 +53,7 @@ import re
 import struct
 import sys
 import tempfile
+import unicodedata
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -164,7 +165,7 @@ def language(strings) -> str:
     ``zh-Hant``/``zh-Hans`` (the plain code when no marker occurs).
     """
     strings = list(strings)[:400]
-    sample = " ".join(strings)
+    sample = unicodedata.normalize("NFC", " ".join(strings))
     for lang, script in SCRIPTS:
         if script.search(sample):
             if lang == "zh":

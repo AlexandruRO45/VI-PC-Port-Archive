@@ -11,6 +11,7 @@ import json
 import os
 import struct
 import tempfile
+import unicodedata
 import unittest
 from unittest.mock import patch
 
@@ -161,6 +162,12 @@ class TestTables(unittest.TestCase):
         self.assertEqual(T.language(["Привет"]), "ru")
         self.assertEqual(T.language(["안녕하세요"]), "ko")
         self.assertEqual(T.language(["你好世界"]), "zh")
+
+    def test_language_with_composed_and_decomposed_accents(self):
+        for text, lang in [("D'où ça vient ?", "fr"), ("Pójdź tam.", "pl")]:
+            for form in ("NFC", "NFD"):
+                with self.subTest(lang=lang, form=form):
+                    self.assertEqual(T.language([unicodedata.normalize(form, text)]), lang)
 
     def test_group(self):
         self.assertEqual(T.table_group(["BIL1_A_1", "BIL1_B_2", "BIL1_C_3", "OTHER"]), "BIL1")
