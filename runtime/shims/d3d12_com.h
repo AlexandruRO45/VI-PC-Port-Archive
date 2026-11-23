@@ -85,6 +85,9 @@ struct VulkanDeviceInfo {
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
     bool separate_depth_stencil_layouts = true;
+    // Core Vulkan supports independent face masks and references. A caller-owned portability-subset device
+    // without separateStencilMaskRef must set this to false.
+    bool separate_stencil_mask_ref = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from

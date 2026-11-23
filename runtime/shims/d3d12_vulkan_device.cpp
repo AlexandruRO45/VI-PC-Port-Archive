@@ -50,6 +50,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -2784,7 +2785,13 @@ leonida::cached_pso::Key pipeline_key(const D3D12_COMPUTE_PIPELINE_STATE_DESC& d
     return leonida::sha256_hex(key.data());
 }
 
-leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+struct StencilMasks {
+    UINT8 read, write;
+};
+
+leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                                     std::optional<StencilMasks> back_stencil_masks = std::nullopt,
+                                     const D3D12_SHADER_BYTECODE* ms = nullptr) {
     leonida::cached_pso::KeyBuilder key;
     key.tag("graphics");
     key_root_signature(key, desc.pRootSignature);
@@ -2793,6 +2800,7 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
     key_shader(key, "ds", desc.DS);
     key_shader(key, "hs", desc.HS);
     key_shader(key, "gs", desc.GS);
+    if (ms && ms->BytecodeLength) key_shader(key, "ms", *ms);
     const D3D12_STREAM_OUTPUT_DESC& so = desc.StreamOutput;
     key.u32(so.pSODeclaration ? so.NumEntries : 0);
     for (UINT i = 0; so.pSODeclaration && i < so.NumEntries; ++i) {
@@ -2831,6 +2839,9 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
     key.u32(desc.IBStripCutValue).u32(desc.PrimitiveTopologyType).u32(desc.NumRenderTargets);
     for (const DXGI_FORMAT format : desc.RTVFormats) key.u32(format);
     key.u32(desc.DSVFormat).u32(desc.SampleDesc.Count).u32(desc.SampleDesc.Quality).u32(desc.NodeMask);
+    if (back_stencil_masks && (back_stencil_masks->read != d.StencilReadMask ||
+                               back_stencil_masks->write != d.StencilWriteMask))
+        key.tag("back-stencil-masks").u32(back_stencil_masks->read).u32(back_stencil_masks->write);
     return leonida::sha256_hex(key.data());
 }
 
@@ -2874,6 +2885,7 @@ struct PipelineStream {
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
+    std::optional<StencilMasks> back_stencil_masks;
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
@@ -3001,12 +3013,8 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
                 log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
                 return E_NOTIMPL;
             }
-            // Separate front and back stencil masks are not modelled (one read and one write mask per PSO).
-            if (d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
-                                    d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask)) {
-                log_once("separate front and back stencil masks are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
-            }
+            if (d.StencilEnable)
+                out.back_stencil_masks = StencilMasks{d.BackFace.StencilReadMask, d.BackFace.StencilWriteMask};
             const auto face = [](const D3D12_DEPTH_STENCILOP_DESC1& f) {
                 return D3D12_DEPTH_STENCILOP_DESC{f.StencilFailOp, f.StencilDepthFailOp, f.StencilPassOp, f.StencilFunc};
             };
@@ -3154,7 +3162,15 @@ public:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr,
+                            std::optional<StencilMasks> back_stencil_masks = std::nullopt) {
+        const D3D12_DEPTH_STENCIL_DESC& ds = desc.DepthStencilState;
+        const StencilMasks back = back_stencil_masks.value_or(StencilMasks{ds.StencilReadMask, ds.StencilWriteMask});
+        if (!device_.info.separate_stencil_mask_ref &&
+            (back.read != ds.StencilReadMask || back.write != ds.StencilWriteMask)) {
+            log_once("separate front and back stencil masks need Vulkan separateStencilMaskRef; state", 1);
+            return E_NOTIMPL;
+        }
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -3512,14 +3528,13 @@ public:
         multisample.pSampleMask = &sample_mask;
         multisample.alphaToCoverageEnable = desc.BlendState.AlphaToCoverageEnable;
 
-        const D3D12_DEPTH_STENCIL_DESC& ds = desc.DepthStencilState;
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depth.depthTestEnable = ds.DepthEnable;
         depth.depthWriteEnable = ds.DepthEnable && ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
         depth.depthCompareOp = compare_op(ds.DepthFunc);
         depth.stencilTestEnable = ds.StencilEnable;
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
-        depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
+        depth.back = stencil_face(ds.BackFace, back.read, back.write);
 
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
@@ -5887,14 +5902,22 @@ public:
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         PipelineStream stream;
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        leonida::cached_pso::Key key;
+        if (!stream.has_cs && stream.back_stencil_masks) {
+            key = pipeline_key(stream.graphics, stream.back_stencil_masks, &stream.ms);
+            if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, stream.graphics.CachedPSO); FAILED(hr))
+                return d3d12_trace::result(method, hr);
+        }
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
-                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
+                                                                     stream.back_stencil_masks);
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);
         }
+        pipeline->set_cache_key(std::move(key));
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
@@ -7220,7 +7243,7 @@ public:
             *opts = {};
             opts->AdvancedTextureOpsSupported = FALSE;
             opts->WriteableMSAATexturesSupported = FALSE;
-            opts->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
+            opts->IndependentFrontAndBackStencilRefMaskSupported = state_.info.separate_stencil_mask_ref;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS15: {

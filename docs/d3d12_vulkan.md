@@ -2068,8 +2068,11 @@ The trace will enumerate them.
     a VS stream builds the same PSO as the classic call.
   - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
     tessellation or GS, CS with a graphics stage, or no stage at all.
-  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
-    masks, view instancing.
+  - `DEPTH_STENCIL2` preserves front and back read and write masks in the Vulkan pipeline, including variants
+    for unbound attachments. `CachedPSO` matches both masks. Legacy depth-stencil descriptions share masks
+    across both faces. The `d3d12_independent_stencil_masks` test reads back color and stencil for independent
+    masks and references, and checks cache matches when only a back-face mask changes.
+  - `E_NOTIMPL` with a log for an AS, a depth-bounds test or view instancing.
   - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
 - **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
   assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology
@@ -2157,11 +2160,13 @@ The trace will enumerate them.
   `18`–`21` (D3D-86; leaving `OPTIONS1` to #745, `OPTIONS6`/`10` to #469, `OPTIONS8` to #715, and `OPTIONS12` to
   #693):
   - `OPTIONS4` reports `MSAA64KBAlignedTextureSupported = TRUE` (implemented in `GetResourceAllocationInfo`);
+  - `OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported` is reported for core Vulkan devices. A
+    caller-owned portability-subset device can opt out when `separateStencilMaskRef` is disabled;
   - `OPTIONS19` maps `SupportedSampleCountsWithNoOutputs` from `framebufferNoAttachmentsSampleCounts`, ties
     `AnisoFilterWithPointMipSupported` to `VulkanDeviceInfo::sampler_anisotropy`, and reports the baseline heap
     limits (`2048` samplers, `1000000` views);
   - `OPTIONS21` reports baseline `D3D12_EXECUTE_INDIRECT_TIER_1_0`, and unimplemented features/tiers (`DepthBounds`,
-    `CastingFullyTypedFormat`, MSAA UAVs, independent stencil masks, render passes, RT, mesh shaders, sampler
+    `CastingFullyTypedFormat`, MSAA UAVs, render passes, RT, mesh shaders, sampler
     feedback, wave MMA, work graphs, GPU upload heaps) stay `FALSE`/`NOT_SUPPORTED`/`TIER_0`. Checked live against
     the host D3D12 runtime on the same adapter (`NVIDIA GeForce RTX 5080`, driver `616.56`, Windows 11): 15/15 feature
     queries compared with `0` mismatches (`MSAA64KBAlignedTextureSupported = TRUE`,

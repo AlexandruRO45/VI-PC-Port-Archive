@@ -1964,7 +1964,8 @@ if(TARGET Vulkan::Headers)
         target_compile_definitions(d3d12_state_sweep_test PRIVATE ${definition}="${binary}")
       endforeach()
       add_test(NAME d3d12_state_sweep COMMAND d3d12_state_sweep_test)
-      set_tests_properties(d3d12_state_sweep PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_independent_stencil_masks COMMAND d3d12_state_sweep_test --independent-stencil)
+      set_tests_properties(d3d12_state_sweep d3d12_independent_stencil_masks PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # 96-bit R32G32B32 textures (D3D-62): footprints and every copy path against Windows WARP.

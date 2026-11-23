@@ -20,6 +20,8 @@
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -92,7 +94,61 @@ struct Result {
     std::vector<unsigned char> color, stencil;
 };
 
-Result run(ID3D12Device* device, const Case& c, const Programs& p) {
+struct StencilCase {
+    const char* name;
+    bool back_facing;
+    UINT8 back_read_mask, back_write_mask;
+    bool bind_color;
+    UINT8 expected_stencil;
+    bool writes_color;
+};
+
+constexpr UINT kFrontRef = 0x35, kBackRef = 0xa9;
+
+template<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename T>
+struct alignas(void*) Subobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    T value{};
+};
+
+HRESULT create_stencil_pipeline(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd,
+                                const StencilCase& c, ID3D12PipelineState** out,
+                                D3D12_CACHED_PIPELINE_STATE cached = {}) {
+    struct Stream {
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2> depth;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> colors;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, D3D12_CACHED_PIPELINE_STATE> cache;
+    } stream;
+    stream.root.value = pd.pRootSignature;
+    stream.vs.value = pd.VS;
+    // The depth-only draw still declares an RTV format so it selects the unbound-attachment variant.
+    stream.ps.value = c.bind_color ? pd.PS : D3D12_SHADER_BYTECODE{};
+    stream.raster.value = pd.RasterizerState;
+    stream.raster.value.FrontCounterClockwise = c.back_facing;
+    constexpr D3D12_DEPTH_STENCILOP_DESC1 front{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                               D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_EQUAL, 0x0f, 0xf0};
+    auto back = front;
+    back.StencilReadMask = c.back_read_mask;
+    back.StencilWriteMask = c.back_write_mask;
+    stream.depth.value = {FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS, TRUE, front, back, FALSE};
+    stream.topology.value = pd.PrimitiveTopologyType;
+    stream.colors.value.RTFormats[0] = pd.RTVFormats[0];
+    stream.colors.value.NumRenderTargets = 1;
+    stream.dsv.value = pd.DSVFormat;
+    stream.cache.value = cached;
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{cached.pCachedBlob ? sizeof(stream) : offsetof(Stream, cache), &stream};
+    Ref<ID3D12Device2> device2;
+    if (const HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&device2.p)); FAILED(hr)) return hr;
+    return device2->CreatePipelineState(&desc, IID_PPV_ARGS(out));
+}
+
+Result run(ID3D12Device* device, const Case& c, const Programs& p, const StencilCase* stencil = nullptr) {
     Result r;
     const D3D12_HEAP_PROPERTIES def_heap{D3D12_HEAP_TYPE_DEFAULT}, rb_heap{D3D12_HEAP_TYPE_READBACK};
     Ref<ID3D12RootSignature> root;
@@ -100,7 +156,8 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
     base_state(pd, c, root.p, p);
     Ref<ID3D12PipelineState> pso;
-    r.pso = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p));
+    r.pso = stencil ? create_stencil_pipeline(device, pd, *stencil, &pso.p)
+                    : device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p));
     if (FAILED(r.pso)) return r;
 
     D3D12_RESOURCE_DESC cd{};
@@ -171,8 +228,17 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     const D3D12_RECT scissor{0, 0, 4, 4};
     list->SetGraphicsRootSignature(root.p);
     list->SetPipelineState(pso.p);
-    list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-    list->OMSetStencilRef(c.stencil_ref);
+    if (stencil) {
+        Ref<ID3D12GraphicsCommandList8> list8;
+        if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list8.p)))) return r;
+        list8->OMSetFrontAndBackStencilRef(kFrontRef, kBackRef);
+    } else {
+        list->OMSetStencilRef(c.stencil_ref);
+    }
+    if (stencil && !stencil->bind_color)
+        list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    else
+        list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
     list->OMSetBlendFactor(c.blend_factor);
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
@@ -432,9 +498,90 @@ std::vector<Case> build_cases() {
     return cases;
 }
 
+bool independent_stencil_cases(ID3D12Device* ours, ID3D12Device* host, const Programs& our_programs,
+                               const Programs& host_programs) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS14 options{};
+    const bool compare_host =
+        SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &options, sizeof(options))) &&
+        options.IndependentFrontAndBackStencilRefMaskSupported;
+    if (!compare_host) std::printf("host OPTIONS14 lacks independent stencil masks; checking Vulkan against the oracle\n");
+
+    // Clear 0xa5. On the front, ref 0x35 compares the low nibble and replaces the high nibble.
+    // On the back, ref 0xa9 compares the high nibble and replaces selected low bits.
+    constexpr StencilCase cases[] = {
+        {"front masks and reference", false, 0xf0, 0x0f, true, 0x35, true},
+        {"back masks and reference", true, 0xf0, 0x0f, true, 0xa9, true},
+        {"different back write mask", true, 0xf0, 0x08, true, 0xad, true},
+        {"different back read mask", true, 0x0f, 0x0f, true, 0xa5, false},
+        {"back masks with the color target unbound", true, 0xf0, 0x0f, false, 0xa9, false},
+    };
+    Case common;
+    common.clear_stencil = 0xa5;
+    std::fill_n(common.clear_color, 4, 0.0f);
+    for (const auto& c : cases) {
+        const auto matches = [&](const Result& r) {
+            if (!r.ok || r.stencil.size() != 16 || r.color.size() != 16 * 4) return false;
+            if (!std::all_of(r.stencil.begin(), r.stencil.end(), [&](UINT8 v) { return v == c.expected_stencil; }))
+                return false;
+            const UINT8 expected_red = c.writes_color ? 191 : 0;
+            for (std::size_t offset = 0; offset < r.color.size(); offset += 4)
+                if (r.color[offset] != expected_red) return false;
+            return true;
+        };
+        const Result mine = run(ours, common, our_programs, &c);
+        if (!matches(mine)) {
+            std::fprintf(stderr, "%s: Vulkan PSO 0x%08x, color %s, stencil %s, expected stencil %02x\n",
+                         c.name, unsigned(mine.pso), hex(mine.color, 4).c_str(), hex(mine.stencil, 4).c_str(),
+                         unsigned(c.expected_stencil));
+            return false;
+        }
+        if (compare_host) {
+            const Result reference = run(host, common, host_programs, &c);
+            if (!matches(reference) || reference.stencil != mine.stencil || reference.color != mine.color) {
+                std::fprintf(stderr, "%s: host PSO 0x%08x, color %s, stencil %s differ from Vulkan\n",
+                             c.name, unsigned(reference.pso), hex(reference.color, 4).c_str(),
+                             hex(reference.stencil, 4).c_str());
+                return false;
+            }
+        }
+        std::printf("%s: stencil %02x and color match%s\n", c.name, unsigned(c.expected_stencil),
+                    compare_host ? " the oracle and host" : " the oracle");
+    }
+
+    if (FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &options, sizeof(options))) ||
+        !options.IndependentFrontAndBackStencilRefMaskSupported) {
+        std::fprintf(stderr, "the Vulkan device did not advertise independent stencil masks\n");
+        return false;
+    }
+
+    // The two back-facing cases differ only in one back-face mask. CachedPSO must preserve that distinction.
+    Ref<ID3D12RootSignature> root;
+    if (FAILED(ours->CreateRootSignature(0, our_programs.root.data(), our_programs.root.size(),
+                                        IID_PPV_ARGS(&root.p))))
+        return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    base_state(pd, common, root.p, our_programs);
+    Ref<ID3D12PipelineState> pso, same, different_write, different_read;
+    Ref<ID3DBlob> blob;
+    if (FAILED(create_stencil_pipeline(ours, pd, cases[1], &pso.p)) ||
+        FAILED(pso->GetCachedBlob(&blob.p)) || !blob.p)
+        return false;
+    const D3D12_CACHED_PIPELINE_STATE cached{blob->GetBufferPointer(), blob->GetBufferSize()};
+    if (FAILED(create_stencil_pipeline(ours, pd, cases[1], &same.p, cached)) ||
+        create_stencil_pipeline(ours, pd, cases[2], &different_write.p, cached) != E_INVALIDARG ||
+        create_stencil_pipeline(ours, pd, cases[3], &different_read.p, cached) != E_INVALIDARG) {
+        std::fprintf(stderr, "CachedPSO did not match the back-face read and write masks\n");
+        return false;
+    }
+    std::printf("CachedPSO accepts the same masks and refuses a changed back read or write mask\n");
+    return true;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool independent_stencil = argc == 2 && std::strcmp(argv[1], "--independent-stencil") == 0;
+    if (argc != 1 && !independent_stencil) return 2;
     vktest::Device vk;
     vk.request_buffer_device_address = true;
     const auto status = vk.initialize();
@@ -444,7 +591,8 @@ int main() {
 
     const auto vs_program = d3d12test::fssm_program({0x56530501, 0xbf810000});
     const auto ps_program = d3d12test::fssm_program({0x50530501, 0xbf810000});
-    const auto library = std::filesystem::temp_directory_path() / "leonida_state_sweep_test";
+    const auto library = std::filesystem::temp_directory_path() /
+                         (independent_stencil ? "leonida_independent_stencil_masks" : "leonida_state_sweep_test");
     std::filesystem::create_directories(library);
     const auto overwrite = std::filesystem::copy_options::overwrite_existing;
     std::filesystem::copy_file(LEONIDA_SWEEP_VS_SPV, library / "vs.spv", overwrite);
@@ -492,6 +640,13 @@ int main() {
     }
     our_programs.vs = d3d12test::shader_container(vs_program);
     our_programs.ps = d3d12test::shader_container(ps_program);
+
+    if (independent_stencil) {
+        const bool ok = independent_stencil_cases(ours.p, host.p, our_programs, host_programs);
+        if (vk.validation_errors())
+            std::fprintf(stderr, "%u Vulkan validation errors\n", vk.validation_errors());
+        return ok && !vk.validation_errors() ? 0 : 1;
+    }
 
     const std::vector<Case> cases = build_cases();
     unsigned compared = 0, differ = 0, skipped = 0;

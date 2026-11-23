@@ -2447,8 +2447,8 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o13.TextureCopyBetweenDimensionsSupported || o13.AlphaBlendFactorSupported)
         fail("OPTIONS13 unexpected support");
     if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported ||
-        o14.IndependentFrontAndBackStencilRefMaskSupported)
-        fail("OPTIONS14 unexpected support");
+        o14.IndependentFrontAndBackStencilRefMaskSupported != (info.separate_stencil_mask_ref ? TRUE : FALSE))
+        fail("OPTIONS14 mismatch");
     if (o15.TriangleFanSupported || o15.DynamicIndexBufferStripCutSupported) fail("OPTIONS15 unexpected support");
     if (o16.DynamicDepthBiasSupported || o16.GPUUploadHeapSupported) fail("OPTIONS16 unexpected support");
     if (o18.RenderPassesValid) fail("OPTIONS18 unexpected support");
@@ -2468,14 +2468,19 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o21.SampleCmpGradientAndBiasSupported || o21.ExtendedCommandInfoSupported)
         fail("OPTIONS21 unexpected support");
 
-    // Verify OPTIONS19.AnisoFilterWithPointMipSupported follows VulkanDeviceInfo::sampler_anisotropy.
+    // Check feature reporting against capabilities on the caller-owned device.
     {
         rt::d3d12::VulkanDeviceInfo toggled_info = info;
         toggled_info.sampler_anisotropy = !info.sampler_anisotropy;
+        toggled_info.separate_stencil_mask_ref = false;
         Ref<ID3D12Device> toggled;
         if (FAILED(rt::d3d12::create_vulkan_device(toggled_info, IID_PPV_ARGS(&toggled.p)))) {
-            fail("failed to create toggled sampler_anisotropy device");
+            fail("failed to create device with toggled capabilities");
         } else {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS14 toggled14{};
+            if (FAILED(toggled->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &toggled14, sizeof(toggled14))) ||
+                toggled14.IndependentFrontAndBackStencilRefMaskSupported)
+                fail("OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported did not follow separate_stencil_mask_ref");
             D3D12_FEATURE_DATA_D3D12_OPTIONS19 toggled19{};
             if (FAILED(toggled->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &toggled19, sizeof(toggled19))) ||
                 toggled19.AnisoFilterWithPointMipSupported != (toggled_info.sampler_anisotropy ? TRUE : FALSE))
@@ -2695,9 +2700,6 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                                 b.AdvancedTextureOpsSupported);
                      check_bool(n, "WriteableMSAATexturesSupported", a.WriteableMSAATexturesSupported,
                                 b.WriteableMSAATexturesSupported);
-                     check_bool(n, "IndependentFrontAndBackStencilRefMaskSupported",
-                                a.IndependentFrontAndBackStencilRefMaskSupported,
-                                b.IndependentFrontAndBackStencilRefMaskSupported);
                  });
     compare_host("OPTIONS15", D3D12_FEATURE_D3D12_OPTIONS15, o15,
                  [&](const char* n, const auto& a, const auto& b) {
