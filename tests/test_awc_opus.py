@@ -465,6 +465,7 @@ class ExportBankTest(unittest.TestCase):
         path = os.path.join(self.tmp.name, "many.awc")
         with open(path, "wb") as f:
             f.write(build_bank([(sid, fmt, struct.pack("<h", sid)) for sid in range(1, 6)]))
+        os.makedirs(os.path.join(self.out, "many"))     # an existing bank folder: files are replaced one by one
         real_open = os.open
         probes = []
 
@@ -1074,6 +1075,86 @@ class OggCrcTest(unittest.TestCase):
         stored = struct.unpack_from("<I", page, 22)[0]
         zeroed = page[:22] + bytes(4) + page[26:]
         self.assertEqual(stored, bitwise_ogg_crc(zeroed))
+
+
+class FreshBankPublishTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "out")
+        fmt = format_block(1, 48000, 0, 1)
+        self.path = os.path.join(self.tmp.name, "bank.awc")
+        with open(self.path, "wb") as f:
+            f.write(build_bank([(sid, fmt, struct.pack("<h", sid)) for sid in range(1, 6)]))
+        self.bank = os.path.join(self.out, "bank")
+
+    def test_interrupted_fresh_export_leaves_no_bank_and_the_rerun_completes_it(self):
+        real = awc.write_wav
+        calls = []
+
+        def die_on_third(*args, **kwargs):
+            calls.append(args[0])
+            if len(calls) == 3:
+                raise OSError("disk full")
+            return real(*args, **kwargs)
+        with mock.patch.object(awc, "write_wav", die_on_third):
+            with self.assertRaises(OSError):
+                awc.export_bank(self.path, self.out)
+        self.assertEqual(os.listdir(self.out), [])          # no bank under its name, no staging folder left
+        counts = awc.export_bank(self.path, self.out)
+        self.assertEqual(counts["pcm"], 5)
+        self.assertEqual(sorted(os.listdir(self.bank)), [f"{i:08X}.wav" for i in range(1, 6)])
+
+    def test_bank_folder_does_not_exist_until_it_is_complete(self):
+        seen = []
+        real = awc.write_wav
+
+        def watch(*args, **kwargs):
+            seen.append(os.path.exists(self.bank))
+            return real(*args, **kwargs)
+        with mock.patch.object(awc, "write_wav", watch):
+            awc.export_bank(self.path, self.out)
+        self.assertEqual(seen, [False] * 5)
+        self.assertTrue(os.path.isdir(self.bank))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_published_files_and_folder_get_the_modes_a_new_file_gets(self):
+        awc.export_bank(self.path, self.out)
+        reference = os.path.join(self.tmp.name, "reference")
+        with open(reference, "wb"):
+            pass
+        os.mkdir(os.path.join(self.tmp.name, "refdir"))
+        want_file = os.stat(reference).st_mode & 0o777
+        want_dir = os.stat(os.path.join(self.tmp.name, "refdir")).st_mode & 0o777
+        self.assertEqual(os.stat(self.bank).st_mode & 0o777, want_dir)
+        for name in os.listdir(self.bank):
+            self.assertEqual(os.stat(os.path.join(self.bank, name)).st_mode & 0o777, want_file)
+
+    def test_partial_bank_is_repaired_file_by_file_and_other_files_stay(self):
+        os.makedirs(self.bank)
+        with open(os.path.join(self.bank, "00000002.wav"), "wb") as f:
+            f.write(b"short")
+        with open(os.path.join(self.bank, "keep.txt"), "wb") as f:
+            f.write(b"mine")
+        awc.export_bank(self.path, self.out)
+        self.assertEqual(sorted(os.listdir(self.bank)), [f"{i:08X}.wav" for i in range(1, 6)] + ["keep.txt"])
+        self.assertGreater(os.path.getsize(os.path.join(self.bank, "00000002.wav")), 5)
+
+    def test_duplicate_ids_still_get_tilde_names(self):
+        fmt = format_block(1, 48000, 0, 1)
+        with open(self.path, "wb") as f:
+            f.write(build_bank([(9, fmt, b"\x01\x00"), (9, fmt, b"\x02\x00")]))
+        awc.export_bank(self.path, self.out)
+        self.assertEqual(sorted(os.listdir(self.bank)), ["00000009.wav", "00000009~2.wav"])
+
+    def test_old_staging_folder_from_a_killed_run_is_removed(self):
+        os.makedirs(self.out)
+        stale = os.path.join(self.out, awc.STAGE_PREFIX + "dead")
+        os.mkdir(stale)
+        old = os.stat(stale).st_mtime - 2 * 24 * 3600
+        os.utime(stale, (old, old))
+        awc.export_bank(self.path, self.out)
+        self.assertEqual(os.listdir(self.out), ["bank"])
 
 
 class WriteFileReadOnlyTest(unittest.TestCase):

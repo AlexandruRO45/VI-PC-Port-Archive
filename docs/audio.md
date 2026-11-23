@@ -156,6 +156,10 @@ When exporting a directory, `awc_opus.py` keeps the path to each bank below the 
 `a/music.awc` writes under `<out>/a/music/`. Passing that file on its own writes under `<out>/music/`.
 To regenerate a flat export from an earlier version, run `awc_opus.py` with the original bank directory and a fresh output directory.
 
+A bank whose folder does not exist yet is written into a hidden `.awc-bank-*` folder next to it and renamed into place when
+all its files are written, so a stopped run leaves no half bank (a stale hidden folder over a day old is removed by the next
+run). A bank whose folder already exists is rewritten file by file, and files it does not produce are left alone.
+
 `audio_manifest.json` is the bank index: each bank's `Path`, `Offset`, `Size`, and its `Streams` with `Index`,
 `Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`. For streamed music,
 `Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's

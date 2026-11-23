@@ -32,7 +32,10 @@ import functools
 import os
 import struct
 import sys
+import secrets
+import shutil
 import tempfile
+import time
 import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -113,7 +116,7 @@ OPUS_PRE_SKIP = 312
 
 
 def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length: int = 0,
-                   pre_skip: int = OPUS_PRE_SKIP) -> int:
+                   pre_skip: int = OPUS_PRE_SKIP, writer=None) -> int:
     """length: the stream's declared per-channel sample count at 48 kHz; the EOS page's granule position is
     trimmed to pre_skip + length (Ogg Opus granules count the pre-skip too), so decoders drop the encoder priming
     at the start and stop at the exact end instead of the padded last frame.
@@ -137,7 +140,7 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
     written = 0
     if not packets:
         out.append(ogg_page(serial, 2, pre_skip, [], 0x04))
-        write_file(path, b"".join(out))
+        (writer or write_file)(path, b"".join(out))
         return pre_skip
     for i, p in enumerate(packets):
         pending.append(p)
@@ -153,8 +156,37 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
             pending, size = [], 0
             if reach or last:
                 break
-    write_file(path, b"".join(out))
+    (writer or write_file)(path, b"".join(out))
     return written
+
+
+def write_new_file(path: str, data: bytes) -> None:
+    """Write a file inside a bank's private staging folder: no staging name, no mode probe, no rename. The folder
+    is not visible under the bank's name yet, so nothing can read a short file, and open() gives the file the same
+    mode a new file gets everywhere else."""
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+STAGE_PREFIX = ".awc-bank-"
+STALE_STAGE_SECONDS = 24 * 3600
+
+
+def _remove_stale_stages(parent: str) -> None:
+    """Delete staging folders an interrupted run left in `parent` (older than a day, so a live run keeps its own)."""
+    now = time.time()
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return
+    for name in names:
+        full = os.path.join(parent, name)
+        if name.startswith(STAGE_PREFIX) and os.path.isdir(full):
+            try:
+                if now - os.stat(full).st_mtime > STALE_STAGE_SECONDS:
+                    shutil.rmtree(full, ignore_errors=True)
+            except OSError:
+                pass
 
 
 @functools.cache
@@ -190,7 +222,7 @@ def write_file(path: str, data: bytes) -> None:
         raise
 
 
-def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = False) -> None:
+def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = False, writer=None) -> None:
     bits = 32 if float32 else 16
     block_align = channels * (bits // 8)
     fmt = struct.pack("<HHIIHH", 3 if float32 else 1, channels, rate, rate * block_align, block_align, bits)
@@ -199,7 +231,7 @@ def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = F
         fmt += struct.pack("<H", 0)  # WAVEFORMATEX.cbSize
         fact = struct.pack("<4sII", b"fact", 4, len(pcm) // block_align)
     header = b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + fact + b"data" + struct.pack("<I", len(pcm))
-    write_file(path, b"RIFF" + struct.pack("<I", len(header) + len(pcm)) + header + pcm)
+    (writer or write_file)(path, b"RIFF" + struct.pack("<I", len(header) + len(pcm)) + header + pcm)
 
 
 # ---- AWC ----
@@ -362,6 +394,40 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
         d = f.read()
     streams, music = parse_awc(d)
     od = bank_output_dir(path, out_dir)
+    if os.path.lexists(od):
+        # Repair of an existing or partial bank: replace file by file, as before.
+        return _export_streams(d, streams, music, od, pre_skip, None)
+    # A fresh bank is built under a private sibling name and published with one rename, so an interrupted run
+    # leaves no bank at all (the rerun starts over) instead of a part-written one.
+    os.makedirs(out_dir, exist_ok=True)
+    _remove_stale_stages(out_dir)
+    stage = os.path.join(out_dir, f"{STAGE_PREFIX}{secrets.token_hex(8)}")
+    os.mkdir(stage)
+    try:
+        counts = _export_streams(d, streams, music, stage, pre_skip, write_new_file)
+        try:
+            os.rename(stage, od)
+        except OSError:
+            if not os.path.isdir(od):
+                raise
+            # Another run published the same bank first: merge into it file by file.
+            os.makedirs(od, exist_ok=True)
+            for name in os.listdir(stage):
+                write_file(os.path.join(od, name), _read_bytes(os.path.join(stage, name)))
+            shutil.rmtree(stage)
+        stage = None
+        return counts
+    finally:
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _export_streams(d, streams, music, od, pre_skip, writer):
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     for mus, data in music:
@@ -369,7 +435,7 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
             if pk:
                 n48 = samples * 48000 // rate if rate else 0
                 write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
-                               pre_skip=pre_skip)
+                               pre_skip=pre_skip, writer=writer)
                 counts["music"] += 1
     for s, stem in zip(streams, export_stems([s["id"] for s in streams])):
         at, size = s["data"]
@@ -384,16 +450,16 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
                 if not frames or frames * s["channels"] != s["samples"]:
                     frames = s["samples"] // max(1, s["channels"])
                 write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, s["channels"], s["id"], frames,
-                               pre_skip=pre_skip)
+                               pre_skip=pre_skip, writer=writer)
                 counts["opus"] += 1
                 continue
         if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:
             # codec 2: 32-bit float PCM (4 bytes per sample; values can exceed +-1, e.g. impulse responses)
-            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], True)
+            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], True, writer=writer)
             counts["pcm"] += 1
             continue
         if s["codec"] == 0 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 2:
-            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"])
+            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], writer=writer)
             counts["pcm"] += 1
             continue
         counts["other"] += 1
