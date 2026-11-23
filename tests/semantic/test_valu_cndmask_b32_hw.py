@@ -102,5 +102,105 @@ class TestValuCndmaskB32Oracle(unittest.TestCase):
             with self.subTest(s0=hex(s0), s1=hex(s1), cond=cond):
                 self.assertEqual(run_valu_cndmask_ps(s0, s1, cond), exp)
 
+# --- Section 2: Symbolic AST Opcode Definitions and Typed Expressions ---
+
+class OpcodeEncoding(enum.Enum):
+    VOP2 = enum.auto()
+    VOP3 = enum.auto()
+
+
+class OperandKind(enum.Enum):
+    VGPR = enum.auto()
+    SGPR = enum.auto()
+    IMM_INT = enum.auto()
+    LITERAL32 = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class OperandAST:
+    kind: OperandKind
+    raw: str
+    value: int
+    reg_idx: Optional[int] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: OperandAST
+    src0: OperandAST
+    src1: OperandAST
+    mask: Optional[OperandAST] = None
+    encoding: OpcodeEncoding = OpcodeEncoding.VOP2
+
+
+def parse_operand(op_str: str) -> OperandAST:
+    raw = op_str.strip()
+    if raw.startswith("v") and raw[1:].isdigit():
+        return OperandAST(kind=OperandKind.VGPR, raw=raw, value=0, reg_idx=int(raw[1:]))
+    if raw.startswith("s") and raw[1:].isdigit():
+        return OperandAST(kind=OperandKind.SGPR, raw=raw, value=0, reg_idx=int(raw[1:]))
+    if raw.startswith("s[") and ":" in raw:
+        return OperandAST(kind=OperandKind.SGPR, raw=raw, value=0, reg_idx=int(raw[2:].split(":")[0]))
+    try:
+        val = int(raw, 0)
+    except ValueError as e:
+        raise ValueError(f"Invalid operand: {raw}") from e
+    if -16 <= val <= 64:
+        return OperandAST(kind=OperandKind.IMM_INT, raw=raw, value=val & MASK32)
+    return OperandAST(kind=OperandKind.LITERAL32, raw=raw, value=val & MASK32)
+
+
+def parse_instruction(line: str) -> InstructionAST:
+    clean = line.split(";")[0].strip()
+    if not clean:
+        raise ValueError("Empty line")
+    parts = clean.split(None, 1)
+    mnemonic = parts[0]
+    if not (mnemonic.startswith("v_cndmask_b32")):
+        raise ValueError(f"Unexpected opcode: {mnemonic}")
+    operands = [op.strip() for op in parts[1].split(",")]
+    if len(operands) == 3:
+        return InstructionAST(
+            mnemonic=mnemonic,
+            dst=parse_operand(operands[0]),
+            src0=parse_operand(operands[1]),
+            src1=parse_operand(operands[2]),
+            encoding=OpcodeEncoding.VOP2,
+        )
+    elif len(operands) == 4:
+        return InstructionAST(
+            mnemonic=mnemonic,
+            dst=parse_operand(operands[0]),
+            src0=parse_operand(operands[1]),
+            src1=parse_operand(operands[2]),
+            mask=parse_operand(operands[3]),
+            encoding=OpcodeEncoding.VOP3,
+        )
+    raise ValueError(f"Invalid operand count for {mnemonic}: {len(operands)}")
+
+
+class TestValuCndmaskB32AST(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions tests."""
+
+    def test_ast_parse_vop2(self) -> None:
+        inst = parse_instruction("v_cndmask_b32 v0, v1, v2")
+        self.assertEqual(inst.encoding, OpcodeEncoding.VOP2)
+        self.assertEqual(inst.dst.reg_idx, 0)
+        self.assertEqual(inst.src0.reg_idx, 1)
+        self.assertEqual(inst.src1.reg_idx, 2)
+
+    def test_ast_parse_vop3(self) -> None:
+        inst = parse_instruction("v_cndmask_b32_e64 v0, s0, s1, s[2:3]")
+        self.assertEqual(inst.encoding, OpcodeEncoding.VOP3)
+        self.assertEqual(inst.src0.kind, OperandKind.SGPR)
+        self.assertEqual(inst.mask.kind, OperandKind.SGPR)
+
+    def test_ast_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_instruction("v_cndmask_b32 v0, v1")
+        with self.assertRaises(ValueError):
+            parse_instruction("v_cndmask_b32 v0, v1, v2, v3, v4")
+
 if __name__ == "__main__":
     unittest.main()
