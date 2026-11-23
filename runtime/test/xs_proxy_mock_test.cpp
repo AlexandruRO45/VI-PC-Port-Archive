@@ -914,7 +914,9 @@ int check_get_desc_c_abi() {
         EXPECT(xs::heap_slot_hits(8) == 3);
     }
 
-    // Queue slot 18: console C-ABI (out in RCX, proxy in RDX) + null out + PC C++ ABI (proxy in RCX, out in RDX).
+    // Queue slot 18: console C-ABI (out in RCX, proxy in RDX) translates to GetDesc; PC-order (proxy in RCX) falls
+    // through to the generic queue slot path rather than being intercepted by a GetDesc-only branch (so queue layout
+    // detection can answer GetTimestampFrequency on undetected queues and full arguments are preserved).
     {
         void* const* queue_vtbl = *reinterpret_cast<void* const* const*>(queue);
         using ConsoleQueueGetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(D3D12_COMMAND_QUEUE_DESC*, void*);
@@ -943,6 +945,21 @@ int check_get_desc_c_abi() {
         EXPECT(std::memcmp(&pc_out, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
         EXPECT(queue_mock->calls[18] == 2 && queue_mock->args[18][0] == word(&pc_out));
         EXPECT(xs::queue_slot_hits(18) == 3);
+
+        // Regression: PC-order slot 18 must fall through to the generic queue forwarder (preserving all forwarded
+        // argument words rather than short-circuiting through a 2-argument GetDesc-only branch).
+        D3D12_COMMAND_QUEUE_DESC pc_passthrough_out{};
+        constexpr std::uint64_t kTag2 = 0x1122334455667788ull;
+        constexpr std::uint64_t kTag3 = 0x2233445566778899ull;
+        constexpr std::uint64_t kTag4 = 0x33445566778899aaull;
+        constexpr std::uint64_t kTag5 = 0x445566778899aabbull;
+        EXPECT(raw(queue, 18, word(&pc_passthrough_out), kTag2, kTag3, kTag4, kTag5) == word(&pc_passthrough_out));
+        EXPECT(std::memcmp(&pc_passthrough_out, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
+        EXPECT(queue_mock->calls[18] == 3);
+        EXPECT(queue_mock->args[18][0] == word(&pc_passthrough_out) && queue_mock->args[18][1] == kTag2 &&
+               queue_mock->args[18][2] == kTag3 && queue_mock->args[18][3] == kTag4 &&
+               queue_mock->args[18][4] == kTag5);
+        EXPECT(xs::queue_slot_hits(18) == 4);
     }
 
     EXPECT(release(heap) == 0 && heap_mock->refs == 0);

@@ -994,7 +994,8 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 
 // Queue slot 18 (ID3D12CommandQueue::GetDesc): D3D12_COMMAND_QUEUE_DESC is 16 bytes, so console x64 C-ABI callers pass
 // the hidden return buffer in RCX and the queue proxy in RDX instead of PC C++ (this, out). When RDX holds a queue
-// proxy and RCX does not, translate to PC call order and return the buffer address in RAX.
+// proxy and RCX does not, translate to PC call order and return the buffer address in RAX. PC-order calls (queue proxy
+// in RCX) are left to the standard queue slot forwarding / layout-detection path.
 D3D12_COMMAND_QUEUE_DESC* queue_get_desc_console(D3D12_COMMAND_QUEUE_DESC* out, ChildProxy* self) {
     note_child_slot<ChildKind::queue>(18);
     d3d12_trace::record(child_trace_name<ChildKind::queue>(18));
@@ -1021,18 +1022,14 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(child_get_device<K>(self, reinterpret_cast<const IID*>(a1),
                                              reinterpret_cast<void**>(a2)));
-    } else if constexpr (K == ChildKind::queue && Slot == 18) {
-        if (!is_child_proxy<ChildKind::queue>(self) &&
-            is_child_proxy<ChildKind::queue>(reinterpret_cast<const void*>(a1))) {
-            return reinterpret_cast<std::uint64_t>(queue_get_desc_console(
-                reinterpret_cast<D3D12_COMMAND_QUEUE_DESC*>(self), reinterpret_cast<ChildProxy*>(a1)));
-        }
-        note_child_slot<ChildKind::queue>(18);
-        d3d12_trace::record(child_trace_name<ChildKind::queue>(18));
-        using Fn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(IUnknown*, D3D12_COMMAND_QUEUE_DESC*);
-        return reinterpret_cast<std::uint64_t>(
-            reinterpret_cast<Fn>(self->real_vtable[18])(self->real, reinterpret_cast<D3D12_COMMAND_QUEUE_DESC*>(a1)));
     } else {
+        if constexpr (K == ChildKind::queue && Slot == 18) {
+            if (!is_child_proxy<ChildKind::queue>(self) &&
+                is_child_proxy<ChildKind::queue>(reinterpret_cast<const void*>(a1))) {
+                return reinterpret_cast<std::uint64_t>(queue_get_desc_console(
+                    reinterpret_cast<D3D12_COMMAND_QUEUE_DESC*>(self), reinterpret_cast<ChildProxy*>(a1)));
+            }
+        }
         note_child_slot<K>(Slot);
         if (Slot >= self->slot_count) {
             bool expected = false;
