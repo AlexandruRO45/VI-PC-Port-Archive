@@ -216,6 +216,19 @@ class Unsupported(Exception):
     pass
 
 
+class BlockCache(dict):
+    """Ids that are only good inside the basic block that made them. clear() runs at every block boundary, so
+    reg_ptrs (Gen.reg_ptr) goes with the descriptor lookups kept in the dict itself."""
+
+    def __init__(self):
+        super().__init__()
+        self.reg_ptrs = {}
+
+    def clear(self):
+        super().clear()
+        self.reg_ptrs = {}
+
+
 class Gen:
     def __init__(self, stage):
         self.stage = stage
@@ -339,7 +352,7 @@ class Gen:
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
-        self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
+        self.desc_cache = BlockCache()  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
         self.build_meta = {}          # runtime build metadata from tools/shader_meta.py
@@ -356,6 +369,8 @@ class Gen:
 
     def emit(self, s):
         self.body.append("         " + s)
+        if s.endswith("= OpLabel"):
+            self.desc_cache.reg_ptrs = {}
         if self.emulate:
             if s.startswith(("OpStore %vcc ", "OpStore %active ")):
                 reg, val = s.split()[1:3]
@@ -365,21 +380,31 @@ class Gen:
 
     # ---- register access ----
     def load_reg(self, kind, r):
-        arr = "%vgpr" if kind == "vgpr" else "%sgpr"
-        p, t = self.tmp(), self.tmp()
-        self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
+        p, t = self.reg_ptr(kind, r), self.tmp()
         self.emit(f"{t} = OpLoad %uint {p}")
         return t
+
+    def reg_ptr(self, kind, r):
+        """Pointer to a VGPR or SGPR slot, made once per basic block: the id dominates the rest of the block it was
+        emitted in, and the cache goes with the others in desc_cache at every block boundary and at every OpLabel."""
+        ptrs = self.desc_cache.reg_ptrs
+        if ptrs.get("body") is not self.body:      # a helper function being built into its own line list
+            ptrs = self.desc_cache.reg_ptrs = {"body": self.body}
+        p = ptrs.get((kind, r))
+        if p is None:
+            p = ptrs[(kind, r)] = self.tmp()
+            arr = "%vgpr" if kind == "vgpr" else "%sgpr"
+            self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
+        return p
 
     def store_reg(self, kind, r, val):
         if kind == "sgpr":
             self.sgpr_imm.pop(r, None)
             self.x_tok[("sgpr", r)] = val
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
-                self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
-        arr = "%vgpr" if kind == "vgpr" else "%sgpr"
-        p = self.tmp()
-        self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
+                for k in [k for k in self.desc_cache if k[0] <= r < k[0] + k[1]]:
+                    del self.desc_cache[k]
+        p = self.reg_ptr(kind, r)
         self.emit(f"OpStore {p} {val}")
 
     def imm_val(self, a):
@@ -1290,8 +1315,8 @@ class Gen:
             if self.write_all_lanes:
                 self.store_reg("vgpr", a["r"], val)
                 return
-            p, old, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a['r'])}")
+            old, r = self.tmp(), self.tmp()
+            p = self.reg_ptr("vgpr", a["r"])
             self.emit(f"{old} = OpLoad %uint {p}")
             if eager:
                 mask = self.exec_value()
@@ -6839,8 +6864,7 @@ class Gen:
                 self.emit(f"{me} = OpLoad %uint %sg_lane")
             self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
             self.emit(f"{eq} = OpIEqual %bool {me} {m}")
-            p = self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a[0]['r'])}")
+            p = self.reg_ptr("vgpr", a[0]["r"])
             self.emit(f"{old} = OpLoad %uint {p}")
             self.emit(f"{r} = OpSelect %uint {eq} {val} {old}")
             self.emit(f"OpStore {p} {r}")
