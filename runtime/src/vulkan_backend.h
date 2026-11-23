@@ -1943,23 +1943,26 @@ public:
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
-            std::lock_guard state(state_mutex_);
-            context_.holds().begin_hold();
-            if (!must_hold()) {
-                result = execute_now(lists);
-            } else if (context_.is_device_lost()) {
-                result = ReplayResult::unsupported;
-            } else {
-                Deferred op;
-                op.kind = Deferred::Kind::batch;
-                op.lists.reserve(lists.size());
-                for (const CommandList* list : lists) op.lists.push_back(*list);
-                if (pin) op.pins.push_back(pin());
-                hold(std::move(op));
-                held = true;
+            // Constructed before state_mutex_: begin_hold() may wait out a fence removal. It is destroyed after the
+            // state lock is released, so remove_fence() can take that lock while draining this bracket.
+            auto reservation = context_.holds().reserve();
+            {
+                std::lock_guard state(state_mutex_);
+                if (!must_hold()) {
+                    result = execute_now(lists);
+                } else if (context_.is_device_lost()) {
+                    result = ReplayResult::unsupported;
+                } else {
+                    Deferred op;
+                    op.kind = Deferred::Kind::batch;
+                    op.lists.reserve(lists.size());
+                    for (const CommandList* list : lists) op.lists.push_back(*list);
+                    if (pin) op.pins.push_back(pin());
+                    hold(std::move(op));
+                    held = true;
+                }
+                drain_pins(retired);
             }
-            drain_pins(retired);
-            context_.holds().end_hold();
         }
         retired.clear();
         if (held) context_.holds().pump_ready();  // a Signal may have been submitted since the check
@@ -1973,20 +1976,21 @@ public:
         bool ok = true;
         std::vector<std::shared_ptr<void>> retired;
         {
-            std::lock_guard state(state_mutex_);
-            context_.holds().begin_hold();
-            if (must_hold()) {
-                Deferred op;
-                op.kind = Deferred::Kind::signal;
-                op.fence = fence;
-                op.value = value;
-                if (pin) op.pins.push_back(pin());
-                hold(std::move(op));
-            } else {
-                ok = submit(VK_NULL_HANDLE, fence, value);
+            auto reservation = context_.holds().reserve();  // before state_mutex_: may wait out a fence removal
+            {
+                std::lock_guard state(state_mutex_);
+                if (must_hold()) {
+                    Deferred op;
+                    op.kind = Deferred::Kind::signal;
+                    op.fence = fence;
+                    op.value = value;
+                    if (pin) op.pins.push_back(pin());
+                    hold(std::move(op));
+                } else {
+                    ok = submit(VK_NULL_HANDLE, fence, value);
+                }
+                drain_pins(retired);
             }
-            drain_pins(retired);
-            context_.holds().end_hold();
         }
         retired.clear();
         context_.holds().pump_ready();  // this Signal, or the hold above, may have made a held batch ready

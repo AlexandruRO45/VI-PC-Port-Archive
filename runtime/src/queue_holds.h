@@ -33,7 +33,8 @@ namespace leonida {
 // still holds the mutex of the queue whose call that thread is in, so that queue's other calls wait meanwhile.
 // One thread releases at a time; a thread that finds another one releasing leaves a note and that one takes
 // another pass. detach() and cancel_after() (and remove_fence() from outside a release) wait for a running
-// release.
+// release. The one exception is fence destruction: remove_fence() waits for open hold brackets and stops new ones
+// until the fence is erased, so a batch never gets a semaphore that is being destroyed.
 template<class Semaphore>
 class QueueHolds {
 public:
@@ -60,10 +61,12 @@ public:
     // from inside a release: the releasing thread already holds the lock, and what it is releasing cannot
     // reference a fence whose last reference it is dropping, since that reference is the one it holds.
     void remove_fence(Semaphore semaphore) {
-        // A queue can have called pending() and still be about to count its hold. Wait for those windows to close:
-        // otherwise the hold would appear after the drop below and later be submitted with a destroyed semaphore.
+        // Publish the removal before draining existing brackets, so a new begin_hold() cannot open one after the
+        // wait below. begin_hold() is called before the queue's own lock, so waiting here cannot deadlock with
+        // discard_waiting_on(), which takes that lock.
         {
             std::unique_lock reservation(reservation_mutex_);
+            ++removals_;
             reservation_cv_.wait(reservation, [this] { return hold_reservations_ == 0; });
         }
         // Drop while the fence is still registered. Until it is erased, pending() still says these waits are
@@ -80,6 +83,11 @@ public:
             std::lock_guard lock(mutex_);
             fences_.erase(semaphore);
         }
+        {
+            std::lock_guard reservation(reservation_mutex_);
+            --removals_;
+        }
+        reservation_cv_.notify_all();
         pump_ready();
     }
 
@@ -161,11 +169,25 @@ public:
         pump_ready();
     }
 
-    // Bracket a pending() decision and the hold it may create. Both calls are made with the queue's own lock held;
-    // remove_fence() waits for every open bracket before it drops holds, so a decision made before the removal
-    // cannot turn into a hold after it.
+    // RAII form of the bracket below: an exception while copying a held batch must not leave a reservation open and
+    // hang every later remove_fence().
+    class Reservation {
+        QueueHolds& holds_;
+
+    public:
+        explicit Reservation(QueueHolds& holds) : holds_(holds) { holds_.begin_hold(); }
+        ~Reservation() { holds_.end_hold(); }
+        Reservation(const Reservation&) = delete;
+        Reservation& operator=(const Reservation&) = delete;
+    };
+    Reservation reserve() { return Reservation(*this); }
+
+    // Bracket a pending() decision and the hold it may create. Called before the queue's own lock is taken: it can
+    // wait for a fence removal to finish, and remove_fence() needs that lock to drop the existing holds. Once a
+    // removal is published, no new bracket opens until the fence has been erased.
     void begin_hold() {
-        std::lock_guard lock(reservation_mutex_);
+        std::unique_lock reservation(reservation_mutex_);
+        reservation_cv_.wait(reservation, [this] { return removals_ == 0; });
         ++hold_reservations_;
     }
     void end_hold() {
@@ -251,6 +273,7 @@ private:
     std::mutex reservation_mutex_;  // leaf: guards hold_reservations_
     std::condition_variable reservation_cv_;
     unsigned hold_reservations_ = 0;
+    unsigned removals_ = 0;  // published removals; begin_hold() waits for all of them to finish
     std::unordered_map<Semaphore, std::uint64_t> fences_;
     std::vector<Holder*> holders_;
     std::deque<Barrier> barriers_;
