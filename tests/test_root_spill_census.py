@@ -266,6 +266,30 @@ class CliTest(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
             self.assertIn("containers: 1, with an RTS0 part: 1", result.stdout)
 
+    def test_an_unreadable_or_malformed_index_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "no_such.json")],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("ERROR: cannot read", result.stderr)
+            self.assertIn("no such file", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            bad = os.path.join(tmp, "bad.json")
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write("{bad")
+            result = subprocess.run([sys.executable, "-I", TOOL, bad], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("ERROR: cannot read", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            # the carve index gets the same treatment, checked before the census runs
+            good = os.path.join(tmp, "good.json")
+            with open(good, "w", encoding="utf-8") as f:
+                f.write("{}")
+            result = subprocess.run([sys.executable, "-I", TOOL, bad, "--carve", os.path.join(tmp, "nope.json")],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("ERROR: cannot read", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
 if __name__ == "__main__":
     unittest.main()
