@@ -470,6 +470,10 @@ if(BUILD_TESTING)
   add_executable(vulkan_device_filter_test test/vulkan_device_filter_test.cpp)
   target_include_directories(vulkan_device_filter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
+  # VR mode's settings and arithmetic (runtime/src/vr_config.h): pure stdlib, no OpenXR, headset or GPU.
+  add_executable(vr_config_test test/vr_config_test.cpp)
+  target_include_directories(vr_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME vr_config COMMAND vr_config_test)
   add_executable(vk_presenter_capture_colour_test test/vk_presenter_capture_colour_test.cpp)
   add_test(NAME vk_presenter_capture_colour COMMAND vk_presenter_capture_colour_test)
   if(TARGET gta6rt)
@@ -1227,6 +1231,44 @@ if(NOT TARGET Vulkan::Headers)
     FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
+
+# VR mode over OpenXR (docs/vr.md): with LEONIDA_VR=openxr the D3D12 layer shows every presented frame on a screen in a
+# headset. Off by default; with it off nothing here is built and the runtime is unchanged. With -DLEONIDA_OPENXR=ON the
+# Khronos OpenXR loader (OpenXR-SDK, Apache-2.0) is linked statically into the layer, and nothing is downloaded unless
+# asked:
+#   - an installed OpenXR SDK that find_package(OpenXR) finds (OpenXR_DIR / CMAKE_PREFIX_PATH), or
+#   - -DLEONIDA_OPENXR_FETCH=ON: download the pinned OpenXR-SDK release below once at configure time (hash-checked)
+#     and build its loader, or -DFETCHCONTENT_SOURCE_DIR_OPENXR=<extracted OpenXR-SDK> to build that copy offline.
+option(LEONIDA_OPENXR "Build VR mode (LEONIDA_VR=openxr) with the OpenXR loader into the D3D12 layer" OFF)
+option(LEONIDA_OPENXR_FETCH "Download the pinned OpenXR-SDK release if no installed OpenXR SDK is found" OFF)
+if(LEONIDA_OPENXR)
+  find_package(OpenXR CONFIG QUIET NO_SYSTEM_ENVIRONMENT_PATH)
+  if(NOT TARGET OpenXR::openxr_loader AND (LEONIDA_OPENXR_FETCH OR FETCHCONTENT_SOURCE_DIR_OPENXR))
+    include(FetchContent)
+    FetchContent_Declare(OpenXR
+      # release-1.1.65
+      URL https://github.com/KhronosGroup/OpenXR-SDK/archive/24a1f2b92d212501a2b1b8d30ffd53abf55fcfa8.tar.gz
+      URL_HASH SHA256=492967376e28a01337874ffdef11c06e5e6aaa9d50d00efad4767f46939a48fd
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    # Only the loader, static (its Windows default), with its bundled jsoncpp; the generated sources ship in the
+    # release, so no Python is needed.
+    set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+    set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
+    set(BUILD_FORCE_GENERATION OFF CACHE BOOL "" FORCE)
+    foreach(_xr_off BUILD_API_LAYERS BUILD_TESTS BUILD_CONFORMANCE_TESTS BUILD_SDK_TESTS BUILD_ALL_EXTENSIONS)
+      set(${_xr_off} OFF CACHE BOOL "" FORCE)
+    endforeach()
+    FetchContent_MakeAvailable(OpenXR)
+  endif()
+  if(NOT TARGET OpenXR::openxr_loader)
+    message(FATAL_ERROR "LEONIDA_OPENXR=ON needs the OpenXR loader: set OpenXR_DIR to an installed OpenXR SDK, or pass "
+                        "-DLEONIDA_OPENXR_FETCH=ON to download the pinned release (see docs/vr.md)")
+  endif()
+  if(NOT WIN32)
+    message(STATUS "LEONIDA_OPENXR: only the Windows runtime has VR mode; nothing else uses the loader")
+  endif()
+endif()
+
 if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
@@ -1495,6 +1537,28 @@ if(TARGET Vulkan::Headers)
     # /bigobj: a Debug build of d3d12_vulkan_device.cpp has more sections than a COFF object holds by default
     # (fatal error C1128), because without optimisation every inline function keeps its own COMDAT.
     target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8 /bigobj)
+    if(LEONIDA_OPENXR)
+      # VR mode (shims/openxr_session.h, docs/vr.md): the session, its frame loop and the virtual cinema.
+      target_sources(gta6rt_d3d12_com PRIVATE shims/openxr_session.cpp)
+      target_compile_definitions(gta6rt_d3d12_com PRIVATE LEONIDA_OPENXR=1)
+      target_link_libraries(gta6rt_d3d12_com PRIVATE OpenXR::openxr_loader)
+
+      # With no runtime (XR_RUNTIME_JSON names a file that is not there): VR is reported unavailable once, and a
+      # device and window presenter made with LEONIDA_VR=openxr work as without it. No headset or GPU needed for the
+      # first half; without a Vulkan device the second half is left out.
+      add_executable(openxr_fallback_test test/openxr_fallback_test.cpp)
+      target_link_libraries(openxr_fallback_test PRIVATE gta6rt_d3d12_com user32)
+      target_compile_definitions(openxr_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(openxr_fallback_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME openxr_fallback COMMAND openxr_fallback_test)
+      set_tests_properties(openxr_fallback PROPERTIES TIMEOUT 120 ENVIRONMENT
+                           "LEONIDA_VR=openxr;XR_RUNTIME_JSON=${CMAKE_CURRENT_BINARY_DIR}/no_openxr_runtime.json")
+      # openxr_cinema_probe: a test card in a window and in the headset, run by hand (not a CTest; docs/vr.md).
+      add_executable(openxr_cinema_probe test/openxr_cinema_probe.cpp)
+      target_link_libraries(openxr_cinema_probe PRIVATE gta6rt_d3d12_com user32)
+      target_compile_definitions(openxr_cinema_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(openxr_cinema_probe PRIVATE /W4 /permissive- /utf-8)
+    endif()
 
     add_executable(d3d12_com_test test/d3d12_com_test.cpp)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)

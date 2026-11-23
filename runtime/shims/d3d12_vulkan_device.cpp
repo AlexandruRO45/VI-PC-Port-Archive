@@ -31,6 +31,10 @@
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
+#include "../src/vr_config.h"
+#ifdef LEONIDA_OPENXR
+#include "openxr_session.h"
+#endif
 
 #include <vulkan/vulkan_win32.h>
 #ifdef _MSC_VER
@@ -5263,6 +5267,9 @@ public:
         }
         if (state_.pipeline_cache_handle)
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
+#ifdef LEONIDA_OPENXR
+        vr_.reset();  // its frame loop takes the context's submit mutex; before the device and instance, as OpenXR asks
+#endif
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
@@ -5281,6 +5288,11 @@ public:
     IUnknown* holder() { return identity(); }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
+#ifdef LEONIDA_OPENXR
+    // The OpenXR session that made this device's instance and device (LEONIDA_VR=openxr), or null.
+    void set_vr(std::unique_ptr<rt::vr::OpenXrSession> vr) { vr_ = std::move(vr); }
+    rt::vr::OpenXrSession* vr() const { return vr_.get(); }
+#endif
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
@@ -8322,6 +8334,9 @@ private:
     DeviceState state_;
     std::atomic<bool> removed_{false};
     OwnedRuntime owned_;
+#ifdef LEONIDA_OPENXR
+    std::unique_ptr<rt::vr::OpenXrSession> vr_;
+#endif
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
 
@@ -8749,6 +8764,11 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
     }
+#ifdef LEONIDA_OPENXR
+    // LEONIDA_VR=openxr: every frame this window shows is also shown in the headset (the virtual cinema, docs/vr.md).
+    if (rt::vr::OpenXrSession* vr = d->vr())
+        if (auto cinema = vr->make_cinema()) presenter->set_mirror(std::move(cinema));
+#endif
     auto window_presenter = std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
     window_presenter->set_window(window);
     return window_presenter;
@@ -8791,6 +8811,20 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         std::fprintf(stderr, "[rt] d3d12: vulkan-1.dll not found\n");
         return E_FAIL;
     }
+#ifdef LEONIDA_OPENXR
+    // LEONIDA_VR=openxr (docs/vr.md): the OpenXR runtime makes the instance and the device (XR_KHR_vulkan_enable2)
+    // and names the GPU its headset is on. Null when VR is off, and when it is unavailable (said once): then the
+    // instance and device below are made as without VR.
+    std::unique_ptr<rt::vr::OpenXrSession> vr = rt::vr::OpenXrSession::create();
+#else
+    if (leonida::vr::mode_from(leonida::vr::process_env) != leonida::vr::Mode::off) {
+        static std::once_flag said;
+        std::call_once(said, [] {
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_VR is set, but this build has no OpenXR (configure with "
+                                 "-DLEONIDA_OPENXR=ON, docs/vr.md); showing the window only\n");
+        });
+    }
+#endif
     const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
     const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
         get(nullptr, "vkEnumerateInstanceExtensionProperties"));
@@ -8889,7 +8923,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
     instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     OwnedRuntime owned{};
-    if (create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
+    bool instance_made = false;
+#ifdef LEONIDA_OPENXR
+    if (vr) {
+        instance_made = vr->create_vulkan_instance(get, instance_info, &owned.instance) == VK_SUCCESS;
+        if (!instance_made) vr.reset();
+    }
+#endif
+    if (!instance_made && create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
         std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
         return E_FAIL;
     }
@@ -8928,6 +8969,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // The first usable device of the highest vulkan_device_rank: a native driver over Microsoft's Dozen (which says
     // it is a discrete GPU, #915), then discrete over integrated; the test harnesses (vk_device_pick.h) pick the same.
     int chosen_rank = -1;
+#ifdef LEONIDA_OPENXR
+    // In VR the headset's GPU comes first, when it is usable and LEONIDA_VK_DEVICE does not exclude it.
+    const VkPhysicalDevice vr_physical = vr ? vr->physical_device(owned.instance) : VK_NULL_HANDLE;
+    if (!vr_physical) vr.reset();
+#endif
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -8947,8 +8993,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, families.data());
         for (std::uint32_t i = 0; i < family_count; ++i) {
             if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            if (const int rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
-                rank > chosen_rank) {
+            int rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
+#ifdef LEONIDA_OPENXR
+            if (vr && candidate == vr_physical) rank = INT_MAX;
+#endif
+            if (rank > chosen_rank) {
                 chosen_rank = rank;
                 info.physical = candidate;
                 info.queue_family = i;
@@ -8969,6 +9018,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                         : "no GPU named by LEONIDA_VK_DEVICE has Vulkan 1.3 (or 1.2 with VK_KHR_dynamic_rendering and "
                           "VK_KHR_synchronization2) with dynamicRendering, synchronization2, timelineSemaphore and "
                           "separateDepthStencilLayouts");
+#ifdef LEONIDA_OPENXR
+    if (vr && info.physical != vr_physical) {
+        std::fprintf(stderr, "[rt] vr: VR off: the headset's GPU cannot run the layer or LEONIDA_VK_DEVICE excludes it; "
+                             "using %s for the window only\n",
+                     chosen.deviceName);
+        vr.reset();
+    }
+#endif
     if (!v13.core)
         std::fprintf(stderr, "[rt] d3d12: Vulkan 1.2 device: dynamicRendering and synchronization2 through their KHR "
                              "extensions; %s\n",
@@ -9435,7 +9492,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
-    if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
+    bool device_made = false;
+#ifdef LEONIDA_OPENXR
+    if (vr) {
+        device_made = vr->create_vulkan_device(get, info.physical, device_info, &owned.device) == VK_SUCCESS;
+        if (!device_made) vr.reset();
+    }
+#endif
+    if (!device_made && vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
@@ -9483,6 +9547,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         device->Release();
         return E_FAIL;
     }
+#ifdef LEONIDA_OPENXR
+    // The session uses the first graphics queue (info.queue, index 0 of its family) under the layer's submit mutex.
+    if (vr && vr->start(get, info.instance, info.physical, info.device, info.queue_family, 0,
+                        device->context().submit_mutex()))
+        device->set_vr(std::move(vr));
+#endif
     return hand_out(device, riid, out);
 }
 

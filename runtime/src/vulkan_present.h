@@ -104,6 +104,21 @@ inline bool blit_unsupported_format(VkFormat format) {
 }
 }  // namespace detail
 
+// A second destination for every frame the presenter shows: the OpenXR virtual cinema (shims/openxr_session.h,
+// docs/vr.md) copies it into a headset swapchain. It sees the swapchain image after the frame is written to it, so a
+// blit, a composed plane frame and a blank frame all reach it alike.
+class PresentMirror {
+public:
+    virtual ~PresentMirror() = default;
+    // Records commands that read `image` (the swapchain image, in TRANSFER_SRC_OPTIMAL, its writes already visible
+    // to transfer reads) into `commands`; the image must be left in TRANSFER_SRC_OPTIMAL. Called with the presenter's
+    // lock held and the queue's submit mutex not held.
+    virtual void record(VkCommandBuffer commands, VkImage image, VkExtent2D extent, VkFormat format) = 0;
+    // What record() recorded was submitted, or never will be (a failed present). Called with the queue's submit
+    // mutex held, also when record() was not called for the frame.
+    virtual void submitted() = 0;
+};
+
 class VulkanPresenter {
 public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
@@ -294,6 +309,14 @@ public:
     void set_abort(std::function<bool()> abort) {
         std::lock_guard lock(abort_mutex_);
         abort_ = std::move(abort);
+    }
+
+    // From the next present on, every presented frame is also handed to `mirror` (null: none). The swapchain gets
+    // TRANSFER_SRC usage for it when the surface allows; otherwise the mirror gets nothing.
+    void set_mirror(std::shared_ptr<PresentMirror> mirror) {
+        std::lock_guard lock(present_mutex_);
+        mirror_ = std::move(mirror);
+        stale_ = true;
     }
 
     // Presents a black frame: the swapchain image cleared, nothing read. PresentX with no planes.
@@ -538,6 +561,10 @@ private:
         if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
         if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
             rollback();
+            if (mirror_) {
+                std::lock_guard lock(context_.submit_mutex());
+                mirror_->submitted();  // never submitted: the mirror gives its image back
+            }
             return stop(reset);
         }
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -572,6 +599,7 @@ private:
         {
             std::lock_guard lock(context_.submit_mutex());
             submitted = vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
+            if (mirror_) mirror_->submitted();
             if (submitted != VK_SUCCESS) rollback();
             // Commit/rollback happened before releasing tracker_mutex_ inside submit_mutex(), preserving submission
             // order without holding tracker_mutex_ across vkQueuePresentKHR.
@@ -639,6 +667,7 @@ private:
         {
             std::lock_guard lock(context_.submit_mutex());
             submitted = context_.vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
+            if (mirror_) mirror_->submitted();  // its recorded copy, if any, will not run
         }
         if (submitted != VK_SUCCESS) return stop(failure);
         stale_ = true;
@@ -945,6 +974,15 @@ private:
             layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             access = VK_ACCESS_TRANSFER_READ_BIT;
         }
+        if (mirror_ && mirror_source_) {
+            if (layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                detail::image_barrier(fn, commands, target_of(image), range, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      access, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                      VK_PIPELINE_STAGE_TRANSFER_BIT);
+            layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            access = VK_ACCESS_TRANSFER_READ_BIT;
+            mirror_->record(commands, images_[image], extent_, format_);
+        }
         detail::image_barrier(fn, commands, target_of(image), range, layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, access,
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     }
@@ -1041,6 +1079,9 @@ private:
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if ((caps.supportedUsageFlags & usage) != usage) return false;
+        // A mirror reads the swapchain image too; without the usage it gets nothing and the window is unaffected.
+        mirror_source_ = mirror_ && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        if (mirror_source_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         // Not used by the presenter itself (it blits or copies into the images), but overlays that hook the swapchain
         // draw their own frame into its images through a framebuffer, which needs COLOR_ATTACHMENT: without it
         // Bandicam's VK_LAYER_bandicam_helper builds framebuffers and image views on images that don't allow it
@@ -1307,6 +1348,8 @@ private:
     bool captured_ = false;
     VkExtent2D captured_extent_{};
     VkFormat captured_format_ = VK_FORMAT_UNDEFINED;
+    std::shared_ptr<PresentMirror> mirror_;  // set_mirror()
+    bool mirror_source_ = false;  // the current swapchain was created with TRANSFER_SRC for mirror_
 
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR_ = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ = nullptr;

@@ -280,6 +280,9 @@ pull requests.
 - [libHttpClient](https://github.com/microsoft/libHttpClient) (MIT) by Microsoft: the XTaskQueue/XAsync implementation
   in `third_party/xtaskqueue`, used by the offline `xgameruntime` shim.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
+- [OpenXR-SDK](https://github.com/KhronosGroup/OpenXR-SDK) (Apache-2.0) by Khronos: the OpenXR loader, linked into
+  the runtime only when built with `-DLEONIDA_OPENXR=ON` for VR mode ([docs/vr.md](docs/vr.md)); downloaded at
+  configure time only with `-DLEONIDA_OPENXR_FETCH=ON`.
 - Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
 
