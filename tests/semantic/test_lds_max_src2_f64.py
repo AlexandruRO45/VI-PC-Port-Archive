@@ -496,5 +496,87 @@ class TestDSMaxSrc2F64AST(unittest.TestCase):
             DSMaxSrc2F64Instruction(vaddr=v0, offset1=256)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState64:
+    """Architectural state for a single execution thread with scalar register file and 64-bit LDS."""
+
+    def __init__(
+        self,
+        lds: Optional[LDSMemory64] = None,
+        num_vgprs: int = DEFAULT_NUM_VGPRS,
+        num_sgprs: int = DEFAULT_NUM_SGPRS,
+    ) -> None:
+        self.lds: LDSMemory64 = lds if lds is not None else LDSMemory64()
+        self.vgprs: List[int] = [0] * num_vgprs
+        self.sgprs: List[int] = [0] * num_sgprs
+
+    def get_vgpr32(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def set_vgpr32(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+
+
+class ScalarDSInterpreter64:
+    """Deterministic scalar interpreter executing dual-source 64-bit DS instructions."""
+
+    def execute(self, state: ScalarThreadState64, inst: DSMaxSrc2F64Instruction) -> int:
+        base_addr = state.get_vgpr32(inst.vaddr.index)
+        new_val_a = state.lds.atomic_max_src2_f64(
+            vaddr=base_addr,
+            offset0=inst.offset0,
+            offset1=inst.offset1,
+        )
+        return new_val_a
+
+
+class TestScalarInterpreter64(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(DEFAULT_LDS_SIZE_BYTES)
+        self.state = ScalarThreadState64(lds=self.lds)
+        self.interp = ScalarDSInterpreter64()
+
+    def test_scalar_execution_basic(self) -> None:
+        # vaddr = 0x40. offset0 = 1 (0x48), offset1 = 2 (0x50)
+        self.lds.write_qword(0x48, ONE_F64)
+        self.lds.write_qword(0x50, TEN_F64)
+        self.state.set_vgpr32(2, 0x40)
+
+        inst = DSMaxSrc2F64Instruction(
+            vaddr=RegisterOperand(2, count=1),
+            offset0=1,
+            offset1=2,
+        )
+
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, TEN_F64)
+        self.assertEqual(self.lds.read_qword(0x48), TEN_F64)
+        self.assertEqual(self.lds.read_qword(0x50), TEN_F64)
+        # Verify vaddr VGPR is untouched (non-returning)
+        self.assertEqual(self.state.get_vgpr32(2), 0x40)
+
+    def test_scalar_execution_zero_offsets(self) -> None:
+        self.lds.write_qword(0x100, TWO_F64)
+        self.lds.write_qword(0x108, THREE_F64)
+        self.state.set_vgpr32(0, 0x100)
+
+        inst = DSMaxSrc2F64Instruction(
+            vaddr=RegisterOperand(0, count=1),
+            offset0=0,
+            offset1=1,
+        )
+
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, THREE_F64)
+        self.assertEqual(self.lds.read_qword(0x100), THREE_F64)
+        self.assertEqual(self.lds.read_qword(0x108), THREE_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
