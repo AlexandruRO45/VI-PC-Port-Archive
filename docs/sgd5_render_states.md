@@ -20,6 +20,19 @@ Use the `shaders.rpf` listed in the [Xbox 1.0.2.1 manifest](../game/xbox-1.0.2.1
 
 ## Interpretation of the rows
 
+To export the stored state variants of one shader chain locally, first run
+`python -I tools/sgd5_effects.py shaders.rpf --effect NAME --technique TECHNIQUE`.
+Choose one pass and copy every program's `record_offset` in the order printed.
+Run `python -I tools/sgd5_effects.py shaders.rpf --chain-records OFFSET ...`
+and redirect stdout to a private JSON file. Decimal and 0x-prefixed offsets are accepted.
+Record offsets identify programs even when the carve index has no mapping for them.
+
+Each database lists variants in first stored occurrence order. A variant contains
+the full rasterizer, depth/stencil and blend rows as hexadecimal strings. A null
+marks an empty table whose runtime default is unknown. Equal triples share one entry.
+Every occurrence retains its absolute effect and pass offsets, zero-based technique
+and pass indices, and the original three effect-local selectors.
+
 The state names are supported by comparison with the public SGD2 reader and measurements of the Xbox rows. The 16-byte rows have fill mode 3, cull mode in `1..3` and a one-byte front-face flag. In all 124 depth/stencil rows the enable flags and write mask are in `0..1`, and the comparison function is in `1..8`. All 398 blend rows have a four-byte prefix and eight eight-byte render-target entries. Their enable flag is in `0..1` and their write mask is in `0..15`. Individual enum values do not establish the rest of the Xbox state layout. [SGD2 format comparison](https://github.com/Kalmarv/rage-engine-formats/blob/91e5abb68476709fac80f256bc64f928c6fc2d19/src/sgd2_effect.rs)
 
 The measurements identify the indices stored in the package. Runtime selection of a technique, application of overrides, and the resulting image still require execution evidence.

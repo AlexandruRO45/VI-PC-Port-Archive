@@ -42,14 +42,22 @@ def post_pass(words=(), blocks=(b"", b""), packed=0, entries=b""):
     return data + b"".join(u32(len(block)) + block for block in blocks) + u32(packed) + entries
 
 
-def effect(name, ordinals=None, techniques=(), pool_tail=b"", suffix=None):
+def default_state_rows(width):
+    # One row per table that the render-state decoders accept: solid fill and cull none, compare never.
+    return [{16: b"\x03\x01", 24: b"\x00\x00\x01"}.get(width, b"").ljust(width, b"\0")]
+
+
+def effect(name, ordinals=None, techniques=(), pool_tail=b"", suffix=None, states=None):
+    """``states`` maps a table row width (16, 24, 68, 36) to the list of its rows; an empty list is an empty table."""
     data = bytearray(label(name) + u32(0xDEADBEEF))
     for group in range(6):
         entries = (ordinals or {}).get(group, ())
         data += u32(len(entries)) + b"".join(u32(i) for i in entries)
     data += bytes(80)
     for width in (16, 24, 68, 36):
-        data += u32(1) + bytes(width)
+        table = (states or {}).get(width)
+        table = default_state_rows(width) if table is None else table
+        data += u32(len(table)) + b"".join(table)
 
     pool = bytearray(b"\0")
     headers = bytearray()
@@ -60,7 +68,7 @@ def effect(name, ordinals=None, techniques=(), pool_tail=b"", suffix=None):
         rows.extend(passes)
     data += u32(len(techniques)) + headers + u32(len(rows))
     for row in rows:
-        data += bytes(row) + bytes(18)
+        data += bytes(row) + bytes(24 - len(row))  # a row longer than six bytes also sets the state selectors
     pool += pool_tail
     return data + (post_pass() if suffix is None else suffix) + u32(len(pool)) + pool
 
@@ -81,6 +89,36 @@ def database(groups, effects, base=0):
 
 
 class EffectsTest(unittest.TestCase):
+    def test_chain_variants_use_whole_local_rows_and_keep_every_pass(self):
+        row = (1, 1, 0, 0, 0, 0)
+        same = bytes(16)
+        different = same[:-1] + b"\xff"
+        def fixture(name, raster, passes):
+            return effect(name, {0: (0,), 1: (0,)}, [("T", passes)],
+                          states={16: raster, 24: [], 68: []})
+
+        data, layout = database({0: ("V",), 1: ("P",)}, [
+            fixture("A", [same, same], [row, row + (1,)]),
+            fixture("B", [different], [row]), fixture("C", [], [row]),
+        ])
+        chain = tuple(data.index(label(name)) for name in ("V", "P"))
+        with tempfile.TemporaryDirectory() as folder, patch.object(sgd5_effects, "DATABASES", [layout]):
+            archive = Path(folder) / "mock.rpf"
+            archive.write_bytes(data)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                sgd5_effects.main([str(archive), "--chain-records", *map(hex, chain)])
+            variants = json.loads(output.getvalue())[0]["variants"]
+            self.assertEqual([v["raster"] for v in variants], [same.hex(), different.hex(), None])
+            self.assertTrue(all(v["depth"] is None and v["blend"] is None for v in variants))
+            a, b = variants[0]["passes"]
+            self.assertEqual([a["selectors"], b["selectors"]], [[0, 0, 0], [1, 0, 0]])
+            self.assertEqual((a["pass_index"], b["pass_index"], b["pass_offset"] - a["pass_offset"]), (0, 1, 24))
+            self.assertNotEqual(a["effect_offset"], variants[1]["passes"][0]["effect_offset"])
+            for wrong in (chain[:1], chain[::-1]):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    sgd5_effects.main([str(archive), "--chain-records", *map(str, wrong)])
+
     def test_discover_and_resolve_via_cli(self):
         row = (1, 0, 0, 0, 0, 0)
         data, layout = database({0: ("Light",)}, [

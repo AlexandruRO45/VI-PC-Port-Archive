@@ -140,6 +140,7 @@ class Effect(NamedTuple):
     pass_end: int
     pool: int
     end: int
+    tables: tuple = ()  # (count, first row, row width) of the rasterizer, depth/stencil, blend and fourth tables
 
 
 def effect_records(data, groups, count):
@@ -156,7 +157,9 @@ def effect_records(data, groups, count):
             raise ValueError("invalid effect program lists")
         lists, pos = arrays
         pos = advance(data, pos, 80)
+        tables = []
         for width in (16, 24, 68, 36):
+            tables.append((u32(data, pos), pos + 4, width))  # row count, first row, bytes per row
             pos = advance(data, pos + 4, width * u32(data, pos))
         rows = pos + 4
         pass_count_at = advance(data, rows, 4 * u32(data, pos))
@@ -167,7 +170,7 @@ def effect_records(data, groups, count):
         if (end == pool + 4 or data[pool + 4] != 0 or data[end - 1] != 0
                 or not POOL.fullmatch(data, pool + 4, end)):
             raise ValueError("invalid counted string pool")
-        yield Effect(start, name, lists, rows, first, pass_end, pool, end)
+        yield Effect(start, name, lists, rows, first, pass_end, pool, end, tuple(tables))
         start = end
     if not 4 <= len(data) - start <= 4096 or u32(data, start) != 1 or any(data[start + 4:]):
         raise ValueError("declared effects do not reach the database terminator and zero padding")
@@ -198,7 +201,26 @@ def techniques(data, effect):
         raise ValueError("technique pass counts do not sum to the table count")
 
 
-def read_database(stream, layout, effect=None, technique=None, *, list_effects=False, shader_hash=None):
+def selected_variants(data, record, base, groups, chain, variants, passes, technique_index, first):
+    for index, programs in enumerate(passes):
+        if tuple(groups[g][ordinal] for g, ordinal in programs) != chain:
+            continue
+        offset = first + 24 * index
+        selectors = data[offset + 6:offset + 9]
+        rows = []
+        for selector, (count, start, width) in zip(selectors, record.tables):
+            if selector >= max(1, count):
+                raise ValueError("state selector outside the effect table")
+            pos = start + selector * width
+            rows.append(data[pos:pos + width].hex() if count else None)
+        variants.setdefault(tuple(rows), []).append({
+            "effect_offset": base + record.start, "technique_index": technique_index,
+            "pass_index": index, "pass_offset": base + offset, "selectors": list(selectors),
+        })
+
+
+def read_database(stream, layout, effect=None, technique=None, *, list_effects=False, shader_hash=None,
+                  chain=None):
     database, first_group, end = layout
     stream.seek(database)
     if stream.read(4) != b"SGD5":
@@ -214,6 +236,7 @@ def read_database(stream, layout, effect=None, technique=None, *, list_effects=F
         raise ValueError("truncated effect region")
     result = {"database": database, "groups": list(map(len, groups)), "effects": count,
               "named_effects": 0, "techniques": 0, "passes": 0, "matches": []}
+    variants = {}
     for record in effect_records(data, groups, count):
         name = record.name
         key = joaat(name)
@@ -221,10 +244,14 @@ def read_database(stream, layout, effect=None, technique=None, *, list_effects=F
         if list_effects:
             result["matches"].append({"effect": name, "shader_hash": f"{key:08X}", "effect_offset": base + record.start})
         listing = []
+        first = record.first_pass
         for index, (stored_name, passes) in enumerate(techniques(data, record)):
             result["named_effects"] += index == 0
             result["techniques"] += 1
             result["passes"] += len(passes)
+            if chain is not None:
+                selected_variants(data, record, base, groups, chain, variants, passes, index, first)
+                first += 24 * len(passes)
             if not selected:
                 continue
             if technique is None:
@@ -236,6 +263,10 @@ def read_database(stream, layout, effect=None, technique=None, *, list_effects=F
                                           "technique_index": index, "passes": resolved})
         if selected and technique is None:
             result["matches"].append({"effect": name, "effect_offset": base + record.start, "techniques": listing})
+    if chain is not None:
+        result["chain_records"] = chain
+        result["variants"] = [{"raster": raster, "depth": depth, "blend": blend, "passes": occurrences}
+                              for (raster, depth, blend), occurrences in variants.items()]
     return result
 
 
@@ -245,6 +276,8 @@ def main(argv=None):
     query = parser.add_mutually_exclusive_group()
     query.add_argument("--list-effects", action="store_true", help="list effect names and archive offsets locally")
     query.add_argument("--effect", help="exact effect name, or list its techniques when --technique is omitted")
+    query.add_argument("--chain-records", nargs="+", metavar="OFFSET", type=lambda value: int(value, 0),
+                       help="export private state variants for exact record_offsets in stored group order")
     query.add_argument("--shader-hash", metavar="HEX", help="hexadecimal Materials[].Shader value from rpf9dump")
     parser.add_argument("--technique", help="exact technique name from that effect")
     args = parser.parse_args(argv)
@@ -258,8 +291,11 @@ def main(argv=None):
     try:
         with args.archive.open("rb") as stream:
             results = [read_database(stream, layout, args.effect, args.technique,
-                                     list_effects=args.list_effects, shader_hash=shader_hash)
+                                     list_effects=args.list_effects, shader_hash=shader_hash,
+                                     chain=tuple(args.chain_records) if args.chain_records else None)
                        for layout in DATABASES]
+        if args.chain_records is not None and not any(row["variants"] for row in results):
+            parser.error("no pass has this exact sequence of program record offsets in stored group order")
         if (args.effect is not None or shader_hash is not None) and not any(row["matches"] for row in results):
             parser.error("no matching effect or technique; use --list-effects, then --effect NAME")
     except (ValueError, OSError) as exc:
