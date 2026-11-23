@@ -213,6 +213,21 @@ class Translated(unittest.TestCase):
                     with self.subTest(nan=hex(nan), nan_left=nan_left, op=op):
                         self.assertIsNone(d.check(lines))
 
+    def test_nan_compare_uses_selected_half_and_preserves_signaling(self):
+        prefix = ([f"v_mov_b32 v{r}, 0" for r in d.VREGS]
+                  + [f"s_mov_b32 s{r}, 0" for r in d.SREGS] + ["s_mov_b32 vcc_lo, 0"])
+        for nan in (0x7E00, 0x7C01, 0xFE00, 0xFC01):
+            for sel, shift in (("WORD_0", 0), ("WORD_1", 16)):
+                for nan_left in (True, False):
+                    nan_word = nan << shift
+                    one_word = 0x3C00 << shift
+                    values = (nan_word, one_word) if nan_left else (one_word, nan_word)
+                    line = (f"v_cmp_u_f16_sdwa vcc_lo, v2, v3 src0_sel:{sel} src1_sel:{sel}")
+                    lines = (prefix + [f"v_mov_b32 v2, {values[0]:#x}", f"v_mov_b32 v3, {values[1]:#x}", line]
+                             + d.observe([1, 2, 3]))
+                    with self.subTest(nan=hex(nan), sel=sel, nan_left=nan_left):
+                        self.assertIsNone(d.check(lines))
+
     def test_a_wrong_translation_is_caught(self):
         lines = (["v_mov_b32 v2, 0x8000", "s_mov_b32 vcc_lo, 0",
                   "v_mov_b32_sdwa v1, sext(v2) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
