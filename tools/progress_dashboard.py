@@ -13,7 +13,7 @@ Sources, each optional and reported as missing rather than counted as zero when 
     unit tests      --run-tests runs tests/test_*.py the way CI selects them (standard-library files with a
                     __main__ block), one process each; the outcome and the commit it ran on are kept
     ctest           runtime/build/Testing/Temporary/LastTest.log, and any --junit file (CTest or pytest flavour)
-    gpu tests       --gpu-log: saved output of runtime/test/shaders/check.py, one panel group per GPU
+    gpu tests       --gpu-log: saved output of check.py or scripts/run_gpu_tests.py, one panel group per GPU
     contract        the translator contract table in docs/design.md, by how each row says it was confirmed
     imports         the measured import tables in docs/runtime_imports.md
     corpus          --work: counts per stage from <work>/shaders/dxbc/index.json and <work>/shaders/spirv/index.json
@@ -492,11 +492,37 @@ GPU_LINE = re.compile(r"^(\S+)\s+(ok|SKIP \(.*\)|.+)$")
 GPU_SUMMARY = re.compile(r"^(\d+) of (\d+) pass, (\d+) skipped")
 
 
+RUN_GPU_HEADER = "=== GPU TEST RESULTS ==="
+RUN_GPU_LINE = re.compile(r"^\s+(PASS|FAIL|SKIP)\s+([A-Za-z0-9_.-]+)(?:\s+(.*))?$")
+RUN_GPU_SUMMARY = re.compile(r"(\d+)/(\d+) passed(?:, (\d+) skipped)?")
+
+
+def parse_run_gpu_log(lines):
+    rows = []
+    for line in lines:
+        if m := RUN_GPU_SUMMARY.fullmatch(line.strip()):
+            summary = int(m[1]), int(m[2]), int(m[3] or 0)
+            counts = (sum(res == "pass" for _, res, _ in rows),
+                      len(rows), sum(res == "skip" for _, res, _ in rows))
+            return (rows if counts == summary else []), summary
+        if m := RUN_GPU_LINE.fullmatch(line):
+            tag, name, detail = m.groups()
+            rows.append((name, tag.lower(), scrub(detail)))
+    return [], None
+
+
 def parse_gpu_log(text):
-    """[(shader test, result, detail)] from the output of runtime/test/shaders/check.py (one line per test,
-    "<name> ok", "<name> SKIP (why)" or "<name> <what came back>", then "N of M pass, K skipped")."""
+    """Return (rows, summary) from check.py or run_gpu_tests.py output."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == RUN_GPU_HEADER:
+            return parse_run_gpu_log(lines[i + 1:])
+    if any(line.strip() == "=== rdna2spirv.py ===" or RUN_GPU_SUMMARY.fullmatch(line.strip())
+           for line in lines):
+        return [], None
+
     rows, summary = [], None
-    for line in text.splitlines():
+    for line in lines:
         m = GPU_SUMMARY.match(line.strip())
         if m:
             summary = tuple(int(x) for x in m.groups())
@@ -519,7 +545,7 @@ def parse_gpu_log(text):
 def collect_gpu(col, logs):
     col.panel("gpu", "GPU tests (hand-written RDNA2 programs)", "test programs")
     if not logs:
-        col.source("gpu_logs", None, "missing", note="pass --gpu-log <saved check.py output>[=<GPU, driver, OS>]")
+        col.source("gpu_logs", None, "missing", note="pass --gpu-log <saved check.py or run_gpu_tests.py output>[=<GPU, driver, OS>]")
         return
     changed = max(t for t in (last_commit_time("runtime/test/shaders"), last_commit_time("tools/rdna2spirv.py"), 0) if t is not None)
     for spec in logs:
@@ -1000,7 +1026,8 @@ def main(argv=None):
     ap.add_argument("--test-timeout", type=int, default=300, help="seconds per test file")
     ap.add_argument("--junit", nargs="*", metavar="FILE", help="CTest --output-junit or pytest --junitxml files")
     ap.add_argument("--gpu-log", nargs="*", metavar="FILE[=LABEL]",
-                    help="saved output of runtime/test/shaders/check.py; LABEL names the GPU, driver and OS")
+                    help="saved output of runtime/test/shaders/check.py or scripts/run_gpu_tests.py; "
+                         "LABEL names the GPU, driver and OS")
     ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs, #313 and the coordination issue through gh")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
