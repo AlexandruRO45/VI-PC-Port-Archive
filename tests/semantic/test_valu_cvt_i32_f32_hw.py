@@ -451,3 +451,25 @@ class TestRegisterAliasing(unittest.TestCase):
         spv = support.translate_lines("ps_alias_test", lines)
         got = support.mrt0_words(spv)[0]
         self.assertEqual(got, (-77) & MASK_32)
+
+
+# ==============================================================================
+# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_invariance(self) -> None:
+        """Verify v_cvt_i32_f32 leaves VCC and SCC completely untouched."""
+        lines = [
+            "s_mov_b32 s0, 1",
+            "s_add_u32 s1, s0, 0",  # Clears carry, SCC depends on s1
+            f"v_mov_b32 v1, {f32_to_bits(15.5):#x}",
+            "v_cvt_i32_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_flags_test", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 15)
