@@ -182,5 +182,21 @@ class SCbranchExecnzTranslatorTests(unittest.TestCase):
         val = run_cs_branch(spv)
         self.assertEqual(val, 7)
 
+# -----------------------------------------------------------------------------
+# Opcode 2: s_cbranch_execz
+# -----------------------------------------------------------------------------
+
+def ref_oracle_execz(exec_mask: int) -> bool:
+    return (exec_mask & MASK64) == 0
+
+
+class SCbranchExeczOracleTests(unittest.TestCase):
+    def test_all_lanes_inactive(self):
+        self.assertTrue(ref_oracle_execz(0))
+
+    def test_active_lanes(self):
+        self.assertFalse(ref_oracle_execz(1))
+        self.assertFalse(ref_oracle_execz(0xFFFFFFFFFFFFFFFF))
+
 if __name__ == '__main__':
     unittest.main()
