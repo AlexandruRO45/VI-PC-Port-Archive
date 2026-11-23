@@ -24,7 +24,9 @@ import re
 import sys
 from collections import Counter, defaultdict
 
-FAMILIES = [("s_buffer_", "smem"), ("s_load", "smem"), ("s_", "scalar"), ("v_", "vector"), ("ds_", "lds"),
+FAMILIES = [("s_buffer_", "smem"), ("s_load", "smem"), ("s_gl1_inv", "smem"), ("s_dcache_", "smem"),
+            ("s_memtime", "smem"), ("s_memrealtime", "smem"), ("s_atc_probe", "smem"),
+            ("s_", "scalar"), ("v_", "vector"), ("ds_", "lds"),
             ("buffer_", "buffer"), ("tbuffer_", "buffer"), ("image_", "image"), ("global_", "global"),
             ("flat_", "flat"), ("scratch_", "scratch"), ("exp", "export")]
 

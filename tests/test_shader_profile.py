@@ -44,6 +44,12 @@ class TestFamilyClassification(unittest.TestCase):
         cases = [
             ("s_buffer_load_dword", "smem"),
             ("s_load_dwordx4", "smem"),
+            ("s_gl1_inv", "smem"),
+            ("s_dcache_inv", "smem"),
+            ("s_memtime", "smem"),
+            ("s_memrealtime", "smem"),
+            ("s_atc_probe", "smem"),
+            ("s_atc_probe_buffer", "smem"),
             ("s_mov_b32", "scalar"),
             ("s_add_u32", "scalar"),
             ("v_mov_b32", "vector"),
