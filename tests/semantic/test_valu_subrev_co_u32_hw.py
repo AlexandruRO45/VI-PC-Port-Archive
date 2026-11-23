@@ -186,3 +186,90 @@ class TestSubrevCoU32AST(unittest.TestCase):
                 src0=TypedOperand.vgpr(1),
                 src1=TypedOperand.vgpr(2),
             )
+
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+@dataclass
+class ScalarCpuState:
+    vgprs: dict[int, int]
+    sgprs: dict[int, int]
+    vcc: int = 0
+
+    @classmethod
+    def create(cls) -> ScalarCpuState:
+        return cls(vgprs={}, sgprs={}, vcc=0)
+
+    def read_operand(self, op: TypedOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.vgprs.get(op.index, 0) & M32
+        elif op.kind == OperandKind.SGPR:
+            return self.sgprs.get(op.index, 0) & M32
+        elif op.kind == OperandKind.IMM:
+            return op.value & M32
+        elif op.kind == OperandKind.VCC:
+            return self.vcc & M32
+        return 0
+
+    def write_operand(self, op: TypedOperand, val: int) -> None:
+        val = val & M32
+        if op.kind == OperandKind.VGPR:
+            self.vgprs[op.index] = val
+        elif op.kind == OperandKind.SGPR:
+            self.sgprs[op.index] = val
+        elif op.kind == OperandKind.VCC:
+            self.vcc = val
+
+
+def step_scalar_subrev_co(ast: VSubrevCoU32AST, state: ScalarCpuState) -> None:
+    s0 = state.read_operand(ast.src0)
+    s1 = state.read_operand(ast.src1)
+    dst, borrow = ref_subrev_co_u32(s0, s1, clamp=ast.clamp)
+    state.write_operand(ast.vdst, dst)
+    if ast.sdst.kind != OperandKind.SPECIAL:
+        state.write_operand(ast.sdst, borrow)
+
+
+class TestSubrevCoU32ScalarInterpreter(unittest.TestCase):
+    def test_scalar_execution_normal(self) -> None:
+        state = ScalarCpuState.create()
+        state.vgprs[1] = 100
+        state.vgprs[2] = 250
+        ast = VSubrevCoU32AST(
+            vdst=TypedOperand.vgpr(0),
+            sdst=TypedOperand.vcc_lo(),
+            src0=TypedOperand.vgpr(1),
+            src1=TypedOperand.vgpr(2),
+        )
+        step_scalar_subrev_co(ast, state)
+        self.assertEqual(state.vgprs[0], 150)
+        self.assertEqual(state.vcc, 0)
+
+    def test_scalar_execution_borrow(self) -> None:
+        state = ScalarCpuState.create()
+        state.vgprs[1] = 300
+        state.vgprs[2] = 100
+        ast = VSubrevCoU32AST(
+            vdst=TypedOperand.vgpr(0),
+            sdst=TypedOperand.sgpr(4),
+            src0=TypedOperand.vgpr(1),
+            src1=TypedOperand.vgpr(2),
+        )
+        step_scalar_subrev_co(ast, state)
+        self.assertEqual(state.vgprs[0], (100 - 300) & M32)
+        self.assertEqual(state.sgprs[4], 1)
+
+    def test_scalar_execution_clamped(self) -> None:
+        state = ScalarCpuState.create()
+        state.vgprs[1] = 500
+        state.vgprs[2] = 200
+        ast = VSubrevCoU32AST(
+            vdst=TypedOperand.vgpr(0),
+            sdst=TypedOperand.vcc_lo(),
+            src0=TypedOperand.vgpr(1),
+            src1=TypedOperand.vgpr(2),
+            clamp=True,
+        )
+        step_scalar_subrev_co(ast, state)
+        self.assertEqual(state.vgprs[0], 0)  # Saturated to 0
+        self.assertEqual(state.vcc, 1)       # Real borrow preserved
