@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -446,6 +447,38 @@ class ImageTest(unittest.TestCase):
             self.assertEqual(grc.main([self.write("text.txt", b"not a PE image")]), 1)
         self.assertIn("incomplete", stderr.getvalue())
         self.assertIn("not a readable PE image", stderr.getvalue())
+
+    def test_a_missing_image_is_refused_before_any_report(self):
+        missing = os.path.join(self.tmp, "missing-image.dll")
+        out = os.path.join(self.tmp, "missing-image-out")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = grc.main([self.path, missing, "--out", out])
+        self.assertEqual(rc, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue().splitlines(), [f"{missing}: does not exist"])
+        # The readable image's report waited for the whole command line; nothing was written.
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_directory_as_the_image_is_refused(self):
+        folder = os.path.join(self.tmp, "an-image-folder")
+        os.makedirs(folder, exist_ok=True)
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            rc = grc.main([folder])
+        self.assertEqual(rc, 2)
+        self.assertEqual(stderr.getvalue().splitlines(), [f"{folder}: is a directory"])
+
+    def test_an_unreadable_image_names_the_path_once(self):
+        with mock.patch.object(grc, "report", side_effect=PermissionError(13, "Permission denied", self.path)):
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                rc = grc.main([self.path])
+        self.assertEqual(rc, 1)
+        message = stderr.getvalue()
+        self.assertEqual(len(message.splitlines()), 1)
+        self.assertEqual(message.count(self.path), 1)
+        self.assertIn("not a readable PE image (Permission denied)", message)
 
 
 class DecoderTest(unittest.TestCase):
