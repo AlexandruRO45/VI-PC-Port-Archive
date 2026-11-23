@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Leonida Launcher: Leonida.exe, the graphical builder and launcher. Builds into the repository root next to
+       Build.bat with launcher-wpf\build.ps1. It needs the .NET 8 Desktop Runtime, which the .NET 8
+       SDK the build already requires includes; the Can I Run page uses the WebView2 runtime Windows ships with. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Leonida</AssemblyName>
+    <RootNamespace>Leonida.Launcher</RootNamespace>
+    <ApplicationIcon>Assets\leonida.ico</ApplicationIcon>
+    <Product>Leonida Launcher</Product>
+    <Description>Builds the Leonida PC port from your own copy of the game, and starts it.</Description>
+    <Version>1.0.0</Version>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- WebView2's WinForms half is not used; keeping its assembly out of the single-file bundle. -->
+    <WebView2UseWinRT>false</WebView2UseWinRT>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Leonida.Core\Leonida.Core.csproj" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\leonida.ico" />
+    <!-- The logo the README shows, taken from the repository at build time (one copy of it). -->
+    <Resource Include="..\..\..\assets\logo.png" Link="Assets\logo.png" />
+  </ItemGroup>
+
+</Project>

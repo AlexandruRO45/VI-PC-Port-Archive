@@ -1,0 +1,220 @@
+<Window x:Class="Leonida.Launcher.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:v="clr-namespace:Leonida.Launcher.Views"
+        Title="Leonida Launcher" Width="1465" Height="795" MinWidth="1100" MinHeight="680"
+        WindowStartupLocation="CenterScreen" Background="{StaticResource Paper}"
+        FontFamily="{StaticResource Body}" Foreground="{StaticResource Text}"
+        Icon="Assets/leonida.ico" UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+  <WindowChrome.WindowChrome>
+    <WindowChrome CaptionHeight="36" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
+  </WindowChrome.WindowChrome>
+  <Window.Resources>
+    <!-- A library entry in the sidebar: a thumbnail, the title and a status line. -->
+    <Style x:Key="LibraryItem" TargetType="RadioButton">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Border x:Name="b" Background="Transparent" Padding="20,9">
+              <Grid>
+                <Rectangle x:Name="bar" Width="3" HorizontalAlignment="Left" Margin="-20,-9,0,-9" Fill="{StaticResource Sunset}" Visibility="Hidden"/>
+                <ContentPresenter/>
+              </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#1C1C1C"/></Trigger>
+              <Trigger Property="IsChecked" Value="True"><Setter TargetName="bar" Property="Visibility" Value="Visible"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Grid x:Name="Root">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition x:Name="SideColumn" Width="270"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+
+    <!-- ===== Sidebar ===== -->
+    <Border Grid.Column="0" Background="{StaticResource Ink}">
+      <DockPanel>
+        <Grid DockPanel.Dock="Top" Height="112">
+          <StackPanel Orientation="Horizontal" Margin="20,8,0,0" VerticalAlignment="Center">
+            <Image Source="Assets/logo.png" Width="50" Height="50" RenderOptions.BitmapScalingMode="HighQuality"/>
+            <StackPanel x:Name="BrandText" Margin="12,0,0,0" VerticalAlignment="Center">
+              <TextBlock Text="LEONIDA" FontFamily="{StaticResource DisplayBold}" FontSize="26" Foreground="#FFFFFF"/>
+              <TextBlock Text="LAUNCHER" FontFamily="{StaticResource Display}" FontSize="12.5" Foreground="{StaticResource SideMuted}" Margin="1,-4,0,0"/>
+            </StackPanel>
+          </StackPanel>
+        </Grid>
+
+        <Grid DockPanel.Dock="Bottom" Height="66">
+          <Rectangle Height="1" Fill="#262626" VerticalAlignment="Top" Margin="16,0"/>
+          <Button x:Name="CollapseButton" Click="OnToggleSidebar" HorizontalAlignment="Left" Margin="20,0,0,0"
+                  Width="34" Height="34" Cursor="Hand" ToolTip="Collapse or expand the sidebar">
+            <Button.Template>
+              <ControlTemplate TargetType="Button">
+                <Border x:Name="b" Background="Transparent" BorderBrush="#7A7A7A" BorderThickness="1.5" CornerRadius="2">
+                  <TextBlock x:Name="g" Text="&#xE8A0;" FontFamily="{StaticResource Icons}" FontSize="14" Foreground="#BDBDBD"
+                             HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Border>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="#FFFFFF"/></Trigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate>
+            </Button.Template>
+          </Button>
+          <TextBlock x:Name="VersionText" Foreground="#5E5E5E" FontSize="11" VerticalAlignment="Center" Margin="68,0,0,0"/>
+        </Grid>
+
+        <StackPanel>
+          <RadioButton x:Name="LibHome" AutomationProperties.Name="Home" Style="{StaticResource LibraryItem}" GroupName="lib" Click="OnLibHome" Checked="OnLibHome" Margin="0,8,0,0">
+            <StackPanel Orientation="Horizontal">
+              <Border Width="38" Height="38" CornerRadius="3" Background="#1E1E1E">
+                <TextBlock Text="&#xE80F;" FontFamily="{StaticResource Icons}" FontSize="18" Foreground="#FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Border>
+              <StackPanel x:Name="HomeText" Margin="12,0,0,0" VerticalAlignment="Center">
+                <TextBlock Text="Home" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
+                <TextBlock Text="About Leonida" Foreground="{StaticResource SideMuted}" FontSize="11.5"/>
+              </StackPanel>
+            </StackPanel>
+          </RadioButton>
+          <TextBlock x:Name="LibraryHeader" Text="Library" Foreground="#FFFFFF" FontWeight="Bold" FontSize="15" Margin="20,16,0,10"/>
+          <RadioButton x:Name="LibLeonida" AutomationProperties.Name="Library Leonida" Style="{StaticResource LibraryItem}" GroupName="lib" Click="OnLibLeonida" Checked="OnLibLeonida">
+            <StackPanel Orientation="Horizontal">
+              <Border Width="38" Height="38" CornerRadius="3" ClipToBounds="True">
+                <Border.Background>
+                  <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                    <GradientStop Color="#2A1452" Offset="0"/><GradientStop Color="#B42A78" Offset="0.62"/><GradientStop Color="#FF8A3D" Offset="1"/>
+                  </LinearGradientBrush>
+                </Border.Background>
+                <Image Source="Assets/logo.png" Margin="3" RenderOptions.BitmapScalingMode="HighQuality"/>
+              </Border>
+              <StackPanel x:Name="LibText" Margin="12,0,0,0" VerticalAlignment="Center">
+                <TextBlock Text="Leonida" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
+                <TextBlock x:Name="LibStatus" Foreground="{StaticResource SideMuted}" FontSize="11.5" TextTrimming="CharacterEllipsis" MaxWidth="170"/>
+              </StackPanel>
+            </StackPanel>
+          </RadioButton>
+          <ProgressBar x:Name="LibProgress" Style="{StaticResource Meter}" Height="3" Margin="70,2,20,0" Visibility="Collapsed"/>
+          <RadioButton x:Name="LibCanIRun" AutomationProperties.Name="Can I Run Leonida" Style="{StaticResource LibraryItem}" GroupName="lib" Click="OnLibCanIRun" Checked="OnLibCanIRun" Margin="0,4,0,0">
+            <StackPanel Orientation="Horizontal">
+              <Border Width="38" Height="38" CornerRadius="3" Background="#1E1E1E">
+                <TextBlock Text="&#xE9D9;" FontFamily="{StaticResource Icons}" FontSize="18" Foreground="{StaticResource Pink}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Border>
+              <StackPanel x:Name="CanText" Margin="12,0,0,0" VerticalAlignment="Center">
+                <TextBlock Text="Can I Run Leonida" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
+                <TextBlock Text="Your PC against the consoles" Foreground="{StaticResource SideMuted}" FontSize="11.5"/>
+              </StackPanel>
+            </StackPanel>
+          </RadioButton>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <!-- ===== Page ===== -->
+    <Grid Grid.Column="1" ClipToBounds="True">
+      <!-- Faded grayscale art behind every page: the sun, a skyline and palms. -->
+      <Viewbox Stretch="UniformToFill" HorizontalAlignment="Right" VerticalAlignment="Bottom" IsHitTestVisible="False" Opacity="0.7">
+        <Canvas Width="1600" Height="900">
+          <Ellipse Canvas.Left="900" Canvas.Top="90" Width="560" Height="560" Fill="#E3E3E3"/>
+          <Rectangle Canvas.Left="880" Canvas.Top="420" Width="600" Height="14" Fill="#F2F2F2"/>
+          <Rectangle Canvas.Left="880" Canvas.Top="470" Width="600" Height="18" Fill="#F2F2F2"/>
+          <Rectangle Canvas.Left="880" Canvas.Top="524" Width="600" Height="22" Fill="#F2F2F2"/>
+          <Rectangle Canvas.Left="880" Canvas.Top="582" Width="600" Height="26" Fill="#F2F2F2"/>
+          <Path Fill="#DCDCDC" Data="M0,900 L0,720 L60,720 L60,650 L120,650 L120,700 L170,700 L170,600 L230,600 L230,690 L300,690
+                L300,560 L330,540 L360,560 L360,700 L420,700 L420,630 L470,630 L470,710 L560,710 L560,610 L620,610 L620,680
+                L700,680 L700,520 L720,500 L740,520 L740,690 L820,690 L820,640 L880,640 L880,700 L960,700 L960,590 L1010,590
+                L1010,670 L1080,670 L1080,620 L1140,620 L1140,690 L1220,690 L1220,560 L1260,530 L1300,560 L1300,680 L1380,680
+                L1380,630 L1440,630 L1440,700 L1520,700 L1520,650 L1600,650 L1600,900 Z"/>
+          <Path Fill="#CFCFCF" Data="M1180,900 C1190,780 1215,640 1262,520 L1276,524 C1236,640 1214,780 1210,900 Z"/>
+          <Path Fill="#CFCFCF" Data="M1268,522 C1210,470 1130,470 1080,520 C1150,492 1210,500 1262,532 Z
+                M1268,522 C1240,450 1180,410 1110,410 C1180,440 1226,480 1258,530 Z
+                M1268,522 C1300,450 1360,420 1430,430 C1360,448 1310,490 1276,532 Z
+                M1268,522 C1330,490 1410,500 1460,560 C1390,520 1330,516 1276,534 Z
+                M1268,522 C1270,460 1290,420 1330,390 C1300,440 1288,480 1278,528 Z"/>
+          <Path Fill="#D6D6D6" Data="M1440,900 C1446,800 1460,710 1490,640 L1500,643 C1474,712 1466,800 1462,900 Z"/>
+          <Path Fill="#D6D6D6" Data="M1494,640 C1450,606 1396,608 1360,640 C1410,622 1452,628 1490,650 Z
+                M1494,640 C1520,592 1566,574 1610,584 C1566,594 1526,618 1500,650 Z
+                M1494,640 C1534,622 1586,632 1612,672 C1572,646 1532,644 1500,652 Z
+                M1494,640 C1474,596 1440,572 1400,566 C1446,584 1474,610 1490,648 Z"/>
+        </Canvas>
+      </Viewbox>
+
+      <DockPanel>
+        <Grid DockPanel.Dock="Top" Height="84">
+          <!-- Home's own tabs: one page per README section, shown only while Home is selected. -->
+          <StackPanel x:Name="HomeTabs" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,44,90,0"
+                      WindowChrome.IsHitTestVisibleInChrome="True" Visibility="Collapsed"/>
+          <!-- Leonida's own tabs: shown only while Library › Leonida is selected (Home and Can I Run are in the sidebar). -->
+          <StackPanel x:Name="TopTabs" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,42,90,0"
+                      WindowChrome.IsHitTestVisibleInChrome="True">
+            <RadioButton x:Name="TabLeonida" Style="{StaticResource TopNav}" Content="LEONIDA" GroupName="top" Checked="OnTab" Margin="14,0"/>
+            <RadioButton x:Name="TabBuild" Style="{StaticResource TopNav}" Content="BUILD" GroupName="top" Checked="OnTab" Margin="14,0"/>
+            <RadioButton x:Name="TabHistory" Style="{StaticResource TopNav}" Content="HISTORY" GroupName="top" Checked="OnTab" Margin="14,0"/>
+          </StackPanel>
+          <!-- The avatar: a menu with Settings -->
+          <Button x:Name="AvatarButton" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,40,30,0" Width="44" Height="44"
+                  Cursor="Hand" Click="OnAvatar" WindowChrome.IsHitTestVisibleInChrome="True" ToolTip="Your profile"
+                  AutomationProperties.Name="Your profile">
+            <Button.Template>
+              <ControlTemplate TargetType="Button">
+                <Grid>
+                  <Ellipse x:Name="ring" Stroke="Transparent" StrokeThickness="2.5"/>
+                  <ContentPresenter Margin="4"/>
+                </Grid>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ring" Property="Stroke" Value="{StaticResource Sunset}"/></Trigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate>
+            </Button.Template>
+            <Button.ContextMenu>
+              <ContextMenu x:Name="AvatarMenu" Placement="Custom">
+                <MenuItem IsHitTestVisible="False" Focusable="False" Cursor="Arrow">
+                  <MenuItem.Header>
+                    <StackPanel Orientation="Horizontal" Margin="-22,0,0,2">
+                      <ContentControl x:Name="MenuAvatar" Width="38" Height="38"/>
+                      <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
+                        <TextBlock Text="Leonida Launcher" FontWeight="SemiBold" FontSize="14"/>
+                        <TextBlock x:Name="MenuVersion" FontSize="11.5" Foreground="#888888"/>
+                      </StackPanel>
+                    </StackPanel>
+                  </MenuItem.Header>
+                </MenuItem>
+                <Separator/>
+                <MenuItem Header="Settings" Tag="&#xE713;" Click="OnOpenSettings"/>
+              </ContextMenu>
+            </Button.ContextMenu>
+          </Button>
+        </Grid>
+
+        <Grid>
+          <v:HomeView x:Name="HomePage" Visibility="Collapsed"/>
+          <v:LeonidaView x:Name="LeonidaPage" Visibility="Collapsed"/>
+          <v:BuildView x:Name="BuildPage" Visibility="Collapsed"/>
+          <v:HistoryView x:Name="HistoryPage" Visibility="Collapsed"/>
+          <v:CanIRunView x:Name="CanIRunPage" Visibility="Collapsed"/>
+        </Grid>
+      </DockPanel>
+    </Grid>
+
+    <!-- Settings: a page of its own over the whole window, closed with Back -->
+    <v:SettingsView x:Name="SettingsPage" Grid.ColumnSpan="2" Visibility="Collapsed"/>
+
+    <!-- The build popup, over everything -->
+    <v:BuildDialog x:Name="Dialog" Grid.ColumnSpan="2" Visibility="Collapsed"/>
+
+    <!-- Window buttons, above every page and popup -->
+    <Border Grid.ColumnSpan="2" HorizontalAlignment="Right" VerticalAlignment="Top" Panel.ZIndex="20" Background="{StaticResource Ink}"
+            CornerRadius="0,0,0,12" ClipToBounds="True" WindowChrome.IsHitTestVisibleInChrome="True">
+      <StackPanel Orientation="Horizontal" Margin="6,0,2,2">
+        <Button Style="{StaticResource WinButton}" Content="&#xE921;" Click="OnMinimize" ToolTip="Minimise" AutomationProperties.Name="Minimise"/>
+        <Button x:Name="MaxButton" Style="{StaticResource WinButton}" Content="&#xE922;" Click="OnMaximize" ToolTip="Maximise" AutomationProperties.Name="Maximise"/>
+        <Button Style="{StaticResource WinClose}" Content="&#xE8BB;" Click="OnClose" ToolTip="Close" AutomationProperties.Name="Close"/>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>

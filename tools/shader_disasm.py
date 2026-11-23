@@ -24,6 +24,7 @@ from mc_command import mc_command  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 import rdna2_decode  # noqa: E402
+from progress_report import Progress  # noqa: E402
 
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
@@ -246,8 +247,13 @@ def main():
     if files:
         if a.backend == "llvm-mc":
             probe(a.mcpu)
+        progress = Progress("disasm")   # only with LEONIDA_PROGRESS_DIR set (Leonida.exe); see progress_report.py
         with ThreadPoolExecutor(a.jobs) as ex:
-            res.update(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files))
+            for result in ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files):
+                res[result] += 1
+                progress.update(total=total, done=sum(res.values()), reused=res["reused"], failed=len(FAILED))
+        progress.update(force=True, total=total, done=sum(res.values()), reused=res["reused"], failed=len(FAILED),
+                        finished=True)
     print(f"{total} shaders -> {os.path.abspath(out)}: {dict(res)}")
     if FAILED:
         path, reason = FAILED[0]

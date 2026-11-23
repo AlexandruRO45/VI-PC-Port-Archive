@@ -36,6 +36,7 @@ import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
 import wave64_emulate_opt  # noqa: E402
 import wave64_halves  # noqa: E402
+from progress_report import Progress  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
 # Deeper structured trees are emitted in the flat dispatch-loop form instead (--max-structured-depth, 0 = never).
@@ -17670,8 +17671,12 @@ def main():
         Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
         invalid.add(name)
 
-    for p in files:
+    # Live counts for Leonida.exe, only with LEONIDA_PROGRESS_DIR set (progress_report.py); one report per shard.
+    progress = Progress(f"translate.shard{shard}" if shard is not None else "translate")
+    for done, p in enumerate(files):
         name = os.path.splitext(os.path.basename(p))[0]
+        progress.update(total=len(files), done=done, translated=ok, valid=valid, failed=sum(why.values()),
+                        current=name)
         try:
             asm = translate(p)
         except FileNotFoundError as e:
@@ -17721,6 +17726,8 @@ def main():
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
         if a.no_asm and os.path.exists(sa):
             os.remove(sa)
+    progress.update(force=True, total=len(files), done=len(files), translated=ok, valid=valid,
+                    failed=sum(why.values()), finished=True)
     import json as _js
     old = {}
     if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:

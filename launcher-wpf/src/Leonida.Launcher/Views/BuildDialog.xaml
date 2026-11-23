@@ -1,0 +1,212 @@
+<UserControl x:Class="Leonida.Launcher.Views.BuildDialog"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <UserControl.Resources>
+    <Style x:Key="Small" TargetType="Button" BasedOn="{StaticResource Outline}">
+      <Setter Property="Padding" Value="12,5"/>
+      <Setter Property="Margin" Value="8,0,0,0"/>
+      <Setter Property="FontSize" Value="13.5"/>
+    </Style>
+    <!-- "What to build" choices: big radio cards. -->
+    <Style x:Key="Choice" TargetType="RadioButton">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Margin" Value="0,0,10,10"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Border x:Name="b" BorderBrush="#CFCFCF" BorderThickness="1.5" Background="#FFFFFF" Padding="14,11" CornerRadius="3">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="#7A7A7A"/></Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="b" Property="BorderBrush" Value="#000000"/>
+                <Setter TargetName="b" Property="BorderThickness" Value="2.5"/>
+                <Setter TargetName="b" Property="Background" Value="#FAFAFA"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </UserControl.Resources>
+
+  <!-- Dimmed backdrop over the whole window; a click outside the panel closes it. -->
+  <Grid x:Name="Backdrop" Background="#B3000000" MouseLeftButtonDown="OnBackdrop" SizeChanged="OnBackdropSize">
+    <Border x:Name="Panel" Background="#FFFFFF" Width="780"
+            VerticalAlignment="Center" HorizontalAlignment="Center" BorderBrush="#000000" BorderThickness="1"
+            Effect="{StaticResource SoftShadow}" MouseLeftButtonDown="OnPanelClick">
+      <DockPanel>
+        <!-- Header -->
+        <Border DockPanel.Dock="Top" Background="#000000" Padding="26,16">
+          <DockPanel>
+            <Button DockPanel.Dock="Right" Style="{StaticResource WinClose}" Foreground="#FFFFFF" Content="&#xE8BB;" Click="OnClose" ToolTip="Close"/>
+            <StackPanel>
+              <TextBlock Text="BUILD LEONIDA" Foreground="#FFFFFF" FontFamily="{StaticResource DisplayBold}" FontSize="30"/>
+              <TextBlock Text="From your own copy of the game, on this PC. A stopped build continues where it left off."
+                         Foreground="#A8A8A8" FontSize="12.5"/>
+            </StackPanel>
+          </DockPanel>
+        </Border>
+        <Rectangle DockPanel.Dock="Top" Height="4" Fill="{StaticResource Sunset}"/>
+
+        <!-- Footer -->
+        <Border DockPanel.Dock="Bottom" BorderBrush="#E2E2E2" BorderThickness="0,1,0,0" Padding="26,14" Background="#F7F7F7">
+          <DockPanel>
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+              <Button Style="{StaticResource Outline}" Content="Cancel" Click="OnClose" Margin="0,0,14,0" Padding="18,9" VerticalAlignment="Center"/>
+              <Button x:Name="StartButton" Style="{StaticResource Bevel}" Content="START BUILD" Click="OnStart" Height="50" MinWidth="200"/>
+            </StackPanel>
+            <ItemsControl x:Name="Problems" VerticalAlignment="Center" Margin="0,0,16,0">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <TextBlock Text="{Binding}" Foreground="{StaticResource Bad}" FontSize="12" TextWrapping="Wrap" Margin="0,1"/>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </DockPanel>
+        </Border>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="26,18,26,6">
+          <StackPanel>
+            <!-- Game folder -->
+            <TextBlock Text="YOUR GAME COPY" Style="{StaticResource Label}"/>
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <TextBox x:Name="GameBox" AutomationProperties.Name="Game folder" TextChanged="OnChanged" FontSize="13.5"
+                       ToolTip="Your own Xbox Series package, version 1.0.2.1: the folder that holds MicrosoftGame.Config, with its files readable on disk."/>
+              <Button Grid.Column="1" Style="{StaticResource Small}" Content="Browse" Click="OnBrowseGame"/>
+              <Button Grid.Column="2" Style="{StaticResource Small}" x:Name="FindButton" Content="Find on this PC" Click="OnFind"
+                      ToolTip="Search where Build.bat searches: Downloads, Desktop, Documents, Games, your home folder and the top of each drive."/>
+            </Grid>
+            <TextBlock x:Name="GameNote" Style="{StaticResource Hint}"/>
+            <ComboBox x:Name="CopiesBox" Margin="0,6,0,0" Visibility="Collapsed" SelectionChanged="OnCopyChosen"/>
+
+            <!-- Output folder -->
+            <TextBlock Text="WHERE THE PORT GOES" Style="{StaticResource Label}" Margin="0,18,0,4"/>
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <ComboBox x:Name="OutBox" AutomationProperties.Name="Output folder" IsEditable="True" IsTextSearchEnabled="False" TextBoxBase.TextChanged="OnChanged" FontSize="13.5"
+                        ToolTip="Left empty: Documents\Leonida. Recently used folders are in the list."/>
+              <Button Grid.Column="1" Style="{StaticResource Small}" Content="Browse" Click="OnBrowseOut"/>
+            </Grid>
+            <TextBlock x:Name="OutNote" Style="{StaticResource Hint}"/>
+
+            <!-- What to build -->
+            <TextBlock Text="WHAT TO BUILD" Style="{StaticResource Label}" Margin="0,18,0,6"/>
+            <UniformGrid Columns="2" Margin="0,0,-10,0">
+              <RadioButton x:Name="ChoiceRun" AutomationProperties.Name="Ready to run" Style="{StaticResource Choice}" GroupName="what" Checked="OnChoice">
+                <StackPanel>
+                  <TextBlock FontFamily="{StaticResource DisplayBold}" FontSize="18"><Run Text="READY TO RUN"/><Run Text="  recommended" FontFamily="{StaticResource Body}" FontSize="11" Foreground="{StaticResource Pink}" FontWeight="SemiBold"/></TextBlock>
+                  <TextBlock Text="Check, shaders and the runtime: what running the port needs. About 30 GB." FontSize="12" Foreground="#555555" TextWrapping="Wrap"/>
+                </StackPanel>
+              </RadioButton>
+              <RadioButton x:Name="ChoiceAll" AutomationProperties.Name="Everything" Style="{StaticResource Choice}" GroupName="what" Checked="OnChoice">
+                <StackPanel>
+                  <TextBlock Text="EVERYTHING" FontFamily="{StaticResource DisplayBold}" FontSize="18"/>
+                  <TextBlock Text="Adds the asset export (models, textures, audio) and the pipeline check. About 330 GB." FontSize="12" Foreground="#555555" TextWrapping="Wrap"/>
+                </StackPanel>
+              </RadioButton>
+              <RadioButton x:Name="ChoiceCheck" AutomationProperties.Name="Check my game files" Style="{StaticResource Choice}" GroupName="what" Checked="OnChoice">
+                <StackPanel>
+                  <TextBlock Text="CHECK MY GAME FILES" FontFamily="{StaticResource DisplayBold}" FontSize="18"/>
+                  <TextBlock Text="Only check the copy against the file list; build nothing (--check)." FontSize="12" Foreground="#555555" TextWrapping="Wrap"/>
+                </StackPanel>
+              </RadioButton>
+              <RadioButton x:Name="ChoiceCustom" AutomationProperties.Name="Choose stages" Style="{StaticResource Choice}" GroupName="what" Checked="OnChoice">
+                <StackPanel>
+                  <TextBlock Text="CHOOSE STAGES" FontFamily="{StaticResource DisplayBold}" FontSize="18"/>
+                  <TextBlock Text="Pick the stages yourself." FontSize="12" Foreground="#555555" TextWrapping="Wrap"/>
+                </StackPanel>
+              </RadioButton>
+            </UniformGrid>
+            <WrapPanel x:Name="StagePanel" Margin="2,0,0,4" Visibility="Collapsed">
+              <CheckBox x:Name="StageCheck" Content="check" Checked="OnChanged" Unchecked="OnChanged"
+                        ToolTip="File names and sizes against game\xbox-1.0.2.1.json. The copy is always checked first."/>
+              <CheckBox x:Name="StageShaders" Content="shaders" Checked="OnChanged" Unchecked="OnChanged"
+                        ToolTip="Carve, unpack, disassemble with llvm-mc and translate to SPIR-V. The longest step (about 30 GB)."/>
+              <CheckBox x:Name="StageAssets" Content="assets" Checked="OnChanged" Unchecked="OnChanged"
+                        ToolTip="Models (OBJ), texture dictionaries and pools (DDS), audio banks. About 300 GB; running the port does not need it."/>
+              <CheckBox x:Name="StageRuntime" Content="runtime" Checked="OnChanged" Unchecked="OnChanged"
+                        ToolTip="Build the loader (gta6rt.exe) with Visual Studio and copy it to the output folder."/>
+              <CheckBox x:Name="StagePipelines" Content="pipelines" Checked="OnChanged" Unchecked="OnChanged"
+                        ToolTip="Create every translated shader as a pipeline on your GPU's driver and save a pipeline cache (not loaded by the runtime yet)."/>
+            </WrapPanel>
+
+            <!-- Everything else -->
+            <Expander x:Name="Advanced" Margin="0,8,0,14" FontFamily="{StaticResource Display}" FontSize="17">
+              <Expander.Header>
+                <TextBlock Text="Advanced options" FontFamily="{StaticResource Display}" FontSize="17"/>
+              </Expander.Header>
+              <StackPanel Margin="4,12,0,0" TextElement.FontFamily="{StaticResource Body}" TextElement.FontSize="13">
+                <TextBlock Text="WORK FOLDER  (--work)" Style="{StaticResource Label}"/>
+                <Grid>
+                  <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <TextBox x:Name="WorkBox" TextChanged="OnChanged" ToolTip="Intermediate files: hundreds of GB for a full build. Empty: 'work' inside the output folder."/>
+                  <Button Grid.Column="1" Style="{StaticResource Small}" Content="Browse" Click="OnBrowseWork"/>
+                </Grid>
+                <TextBlock x:Name="WorkNote" Style="{StaticResource Hint}"/>
+
+                <CheckBox x:Name="FullCheck" Content="Also compare SHA-256 of every file  (--full-check, slow)" Margin="0,12,0,0" Checked="OnChanged" Unchecked="OnChanged"/>
+                <CheckBox x:Name="Wav" Content="Also decode the audio to WAV  (--wav; much larger, needs ffmpeg)" Checked="OnChanged" Unchecked="OnChanged"/>
+
+                <Grid Margin="0,12,0,0">
+                  <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="20"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel>
+                    <TextBlock Text="WAVE64 EMULATION" Style="{StaticResource Label}"/>
+                    <ComboBox x:Name="Wave64Box" SelectionChanged="OnChanged"
+                              ToolTip="auto checks your GPU: 32-wide GPUs (NVIDIA, Intel) need emulation; AMD runs wave64 natively. Changing it translates the shaders again.">
+                      <ComboBoxItem Content="auto (recommended)" Tag="auto"/><ComboBoxItem Content="on" Tag="on"/><ComboBoxItem Content="off" Tag="off"/>
+                    </ComboBox>
+                  </StackPanel>
+                  <StackPanel Grid.Column="2">
+                    <TextBlock Style="{StaticResource Label}"><Run Text="PARALLEL JOBS  "/><Run x:Name="JobsValue" Foreground="#000000"/></TextBlock>
+                    <DockPanel>
+                      <CheckBox x:Name="JobsDefault" Content="Default" DockPanel.Dock="Left" Checked="OnChanged" Unchecked="OnChanged" ToolTip="Half your CPU threads, as make_game.py chooses."/>
+                      <Slider x:Name="JobsSlider" Minimum="1" Maximum="32" IsSnapToTickEnabled="True" TickFrequency="1" VerticalAlignment="Center" ValueChanged="OnJobs"/>
+                    </DockPanel>
+                  </StackPanel>
+                </Grid>
+
+                <TextBlock Text="FALLBACKS FOR GPUS WITHOUT A FEATURE (leave off unless yours lacks it)" Style="{StaticResource Label}" Margin="0,14,0,4"/>
+                <UniformGrid Columns="2">
+                  <CheckBox x:Name="NoFloatControls" Content="--no-float-controls" Checked="OnChanged" Unchecked="OnChanged"
+                            ToolTip="Without SignedZeroInfNanPreserve and DenormPreserve, for devices lacking shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16."/>
+                  <CheckBox x:Name="BaryFallback" Content="--bary-fallback" Checked="OnChanged" Unchecked="OnChanged"
+                            ToolTip="Raw barycentrics from an interpolated input, for devices without VK_KHR_fragment_shader_barycentric."/>
+                  <CheckBox x:Name="TexelOffsetFallback" Content="--texel-offset-fallback" Checked="OnChanged" Unchecked="OnChanged"
+                            ToolTip="Fold image_sample*_o offsets into the coordinate, for devices without VK_KHR_maintenance8."/>
+                  <CheckBox x:Name="F16InterpFallback" Content="--f16-interp-fallback" Checked="OnChanged" Unchecked="OnChanged"
+                            ToolTip="16-bit interpolation without PerVertexKHR; on by itself where the GPU needs it (MoltenVK)."/>
+                  <CheckBox x:Name="MeshCompute" Content="--mesh-compute" Checked="OnChanged" Unchecked="OnChanged"
+                            ToolTip="Mesh shaders as compute shaders, for devices without VK_EXT_mesh_shader."/>
+                  <CheckBox x:Name="PcTailUbo" Content="--pc-tail-ubo" Checked="OnChanged" Unchecked="OnChanged"
+                            ToolTip="128 push-constant bytes plus a uniform block; on by itself when the GPU's maxPushConstantsSize is too small."/>
+                </UniformGrid>
+
+                <TextBlock Text="EXISTING RUNTIME BUILD  (--runtime-build)" Style="{StaticResource Label}" Margin="0,14,0,4"/>
+                <Grid>
+                  <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <TextBox x:Name="RuntimeBuildBox" TextChanged="OnChanged" ToolTip="A folder with gta6rt.exe and gta6rt_tls_host.dll, used instead of building them."/>
+                  <Button Grid.Column="1" Style="{StaticResource Small}" Content="Browse" Click="OnBrowseRuntime"/>
+                </Grid>
+
+                <TextBlock Text="EXTRA ARGUMENTS" Style="{StaticResource Label}" Margin="0,14,0,4"/>
+                <TextBox x:Name="ExtraBox" TextChanged="OnChanged" FontFamily="{StaticResource Mono}" ToolTip="Passed to make_game.py unchanged, for options this launcher does not know yet."/>
+
+                <TextBlock Text="THE COMMAND (THE SAME AS BUILD.BAT WITH THESE OPTIONS)" Style="{StaticResource Label}" Margin="0,14,0,4"/>
+                <TextBox x:Name="CommandPreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="{StaticResource Mono}" FontSize="11.5" Background="#F5F5F5"/>
+                <WrapPanel Margin="0,8,0,0">
+                  <Button Style="{StaticResource Small}" Margin="0,0,8,6" Content="Copy command" Click="OnCopyCommand"/>
+                  <ComboBox x:Name="PresetBox" Width="170" Margin="0,0,8,6" SelectionChanged="OnPreset" ToolTip="Load saved options"/>
+                  <Button Style="{StaticResource Small}" Margin="0,0,8,6" Content="Save as preset…" Click="OnSavePreset"/>
+                  <Button Style="{StaticResource Small}" Margin="0,0,8,6" Content="Delete preset" Click="OnDeletePreset"/>
+                </WrapPanel>
+              </StackPanel>
+            </Expander>
+          </StackPanel>
+        </ScrollViewer>
+      </DockPanel>
+    </Border>
+  </Grid>
+</UserControl>

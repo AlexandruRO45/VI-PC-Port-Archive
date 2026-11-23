@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Plain console tests for Leonida.Core (no test framework, like runtime/test): exit code 0 when all pass.
+       dotnet run -c Release  (or launcher-wpf\build.ps1 -Test) -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Leonida.Core\Leonida.Core.csproj" />
+  </ItemGroup>
+
+</Project>
