@@ -785,12 +785,53 @@ class GameDiscoveryTest(unittest.TestCase):
 
     def test_volume_roots_without_a_user_name(self):
         # No USER/LOGNAME and no passwd entry (a bare container): getuser() raises; the shared roots still work.
-        for failure in (KeyError("getpwuid(): uid not found"), OSError("No username set in the environment")):
-            with self.subTest(failure=type(failure).__name__), mock.patch("getpass.getuser", side_effect=failure):
-                self.assertEqual(make_game.volume_roots(), list(make_game.VOLUME_ROOTS))
-        for name in ("", ".", "..", os.path.join("a", "b")):
-            with self.subTest(name=name), mock.patch("getpass.getuser", return_value=name):
-                self.assertEqual(make_game.volume_roots(), list(make_game.VOLUME_ROOTS))
+        nowhere = os.path.join(self.home, "no-volumes")
+        with mock.patch.object(make_game, "MACOS_VOLUME_ROOT", nowhere):
+            for failure in (KeyError("getpwuid(): uid not found"), OSError("No username set in the environment")):
+                with self.subTest(failure=type(failure).__name__), mock.patch("getpass.getuser", side_effect=failure):
+                    self.assertEqual(make_game.volume_roots(), list(make_game.VOLUME_ROOTS))
+            for name in ("", ".", "..", os.path.join("a", "b")):
+                with self.subTest(name=name), mock.patch("getpass.getuser", return_value=name):
+                    self.assertEqual(make_game.volume_roots(), list(make_game.VOLUME_ROOTS))
+
+    def test_volume_roots_add_each_macos_volume(self):
+        # macOS mounts each drive under /Volumes: the volume is the top of the drive, so each real volume directory
+        # is a root of its own. The boot volume is a symlink to / (or an entry that is not a directory), so it is
+        # left out and the scan doesn't reach the system drive through it.
+        volumes = os.path.join(self.home, "Volumes")
+        os.makedirs(os.path.join(volumes, "disk"))
+        boot = os.path.join(volumes, "Macintosh HD")
+        try:
+            os.symlink(self.home, boot)
+        except (OSError, NotImplementedError):
+            with open(boot, "wb"):
+                pass
+        with mock.patch.object(make_game, "MACOS_VOLUME_ROOT", volumes), \
+             mock.patch("getpass.getuser", return_value="alice"):
+            roots = make_game.volume_roots()
+        self.assertIn(os.path.join(volumes, "disk"), roots)
+        self.assertNotIn(boot, roots)
+
+    def test_find_reaches_a_folder_on_a_macos_volume(self):
+        # /Volumes/disk/leonida/GTA VI: two levels below the volume (the drive), as D:\leonida\GTA VI on Windows,
+        # but three levels below /Volumes, so the mount point by itself never reaches it.
+        volumes = os.path.join(self.home, "Volumes")
+        package = os.path.join(volumes, "disk", "leonida", "GTA VI")
+        self.write_probes(package)
+        elsewhere = os.path.join(self.home, "nohome")
+
+        def find(volume_root):
+            with mock.patch.object(make_game.os, "name", "posix"), \
+                 mock.patch.object(make_game, "VOLUME_ROOTS", (volumes,)), \
+                 mock.patch.object(make_game, "MACOS_VOLUME_ROOT", volume_root), \
+                 mock.patch.object(make_game, "USER_MOUNT_ROOTS", ()), \
+                 mock.patch.object(make_game, "known_folders", return_value=[]), \
+                 mock.patch("os.path.expanduser", return_value=elsewhere), \
+                 mock.patch.object(make_game, "versions", return_value=[self.version]):
+                return make_game.find_dumps()
+
+        self.assertEqual(find(os.path.join(self.home, "no-volumes")), [])   # the mount point alone
+        self.assertEqual(find(volumes), [(package, self.version)])
 
     def test_find_reaches_a_folder_on_a_udisks_drive(self):
         # <media>/alice/USB DRIVE/GTA VI: three levels below <media>, two below the user's mount folder.

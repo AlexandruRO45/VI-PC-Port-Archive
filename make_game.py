@@ -11,8 +11,9 @@ r"""Build the PC port from your own copy of the game.
 The game folder is your own Xbox Series package, version 1.0.2.1, with its files already readable on disk
 (see game/xbox-1.0.2.1.json for the file list). It is found automatically in Downloads, Desktop, Documents
 (also where Windows keeps them, such as in OneDrive), Games, your home folder, the top of each drive on Windows
-and the usual mount points elsewhere (/mnt, /media, /run/media, /Volumes, and the per-user /media/<user> and
-/run/media/<user> where Linux desktops mount drives), two folder levels down. A share path
+and the usual mount points elsewhere (/mnt, /media, /run/media, /Volumes, each volume under /Volumes on macOS, and
+the per-user /media/<user> and /run/media/<user> where Linux desktops mount drives), two folder levels down.
+A share path
 (\\server\share\...) can't be listed, so give it to --game. This script never decrypts or works around anything:
 it reads plain files and writes
 everything it makes under --out. The only thing it downloads is the third_party/rpf9-explorer submodule, when
@@ -375,12 +376,28 @@ VOLUME_ROOTS = ("/mnt", "/media", "/run/media", "/Volumes")   # POSIX: where dri
 # udisks2, which mounts removable and internal drives on Linux desktops, puts a drive at <root>/<user>/<label>: one
 # level more than a drive letter, so these roots are also searched from the user's own folder.
 USER_MOUNT_ROOTS = ("/media", "/run/media")
+# macOS mounts every volume under /Volumes, and there the volume is the top of the drive: one folder level deeper
+# than a Windows drive letter. Each real volume is a root of its own, so a copy two folders down on the drive
+# (/Volumes/<volume>/<folder>/GTA VI, as D:\<folder>\GTA VI on Windows) is in reach. The boot volume is a symlink
+# to /, so it is not a volume directory and is left out.
+MACOS_VOLUME_ROOT = "/Volumes"
+
+
+def mounted_volumes(root: str) -> list:
+    """The real directories directly under a mount point, sorted; symbolic links (the boot volume on macOS) are left
+    out, and an unreadable or missing root gives nothing."""
+    try:
+        with os.scandir(root) as it:
+            return sorted(e.path for e in it if e.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
 
 
 def volume_roots() -> list:
     """POSIX mount points find_dumps() starts from: VOLUME_ROOTS, then /media/<user> and /run/media/<user>, so a copy
     in a folder on a udisks2-mounted drive (/media/<user>/<label>/GTA VI) is two levels down, as D:\\Games\\GTA VI
-    is on Windows."""
+    is on Windows. On macOS each volume under /Volumes is a root of its own for the same reason: the volume is the
+    drive, so /Volumes/<volume>/<games>/GTA VI is two levels down on it."""
     roots = list(VOLUME_ROOTS)
     try:
         import getpass
@@ -389,6 +406,7 @@ def volume_roots() -> list:
         user = ""
     if user and os.sep not in user and user not in (".", ".."):
         roots += [os.path.join(root, user) for root in USER_MOUNT_ROOTS]
+    roots += mounted_volumes(MACOS_VOLUME_ROOT)
     return roots
 
 
