@@ -102,6 +102,7 @@ public:
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
     bool sampler_filter_minmax = false;
+    bool sampler_mirror_clamp_to_edge = false;  // samplerMirrorClampToEdge enabled: D3D12's MIRROR_ONCE address mode
     bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
@@ -396,6 +397,8 @@ public:
         enable12.descriptorBindingPartiallyBound = partially_bound;
         sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
         enable12.samplerFilterMinmax = sampler_filter_minmax;
+        sampler_mirror_clamp_to_edge = features12.samplerMirrorClampToEdge == VK_TRUE;
+        enable12.samplerMirrorClampToEdge = sampler_mirror_clamp_to_edge;
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
