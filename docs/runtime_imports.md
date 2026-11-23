@@ -123,17 +123,6 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
   console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
 - `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
   on an out-of-memory path, after an allocation has already failed.
-
-The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
-`XApuEnqueueCommand`, `XApuGetResultCount`) and `chad.dll` (`XDspActivate`, `XDspConnectWithMaximumStreamLimit`,
-`XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
-read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
-a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
-Commands are accepted and dropped, the result count is always 0 and dequeuing fails, so the audio stays silent. The
-buffer size (128 stream slots) and the empty result queue are hypotheses, explained in the file. `xapu_chad_test`
-calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
-`audio_queue` event.
-
 ## The retail executable (RT-5)
 
 `game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
@@ -191,6 +180,17 @@ The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
 again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
 unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
+
+The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
+`XApuEnqueueCommand`, `XApuGetResultCount`) and `chad.dll` (`XDspActivate`, `XDspConnectWithMaximumStreamLimit`,
+`XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
+read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
+a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
+Commands are accepted and dropped, the result count is always 0 and dequeuing fails, so the audio stays silent. The
+buffer size (128 stream slots) and the empty result queue are hypotheses, explained in the file. `xapu_chad_test`
+calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
+`audio_queue` event.
+The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
 
 What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
