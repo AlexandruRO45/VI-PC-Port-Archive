@@ -42,6 +42,14 @@ This page collects the setup steps and the problems testers have run into so far
   If it reports `not a valid operand`, point `LLVM_MC` at a build that accepts this instruction. The Windows
   conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
+- **`glslangValidator`** for the runtime tests that draw or dispatch with their own GLSL shaders: part of the
+  Vulkan SDK; without the SDK, conda-forge's `glslang` package (its Windows build has `glslangValidator.exe`) or a
+  distribution package (`glslang-tools` on Debian and Ubuntu). CMake looks for it in `%VULKAN_SDK%\Bin` and on
+  `PATH`, or takes `-DVulkan_GLSLANG_VALIDATOR_EXECUTABLE=<path>`. Without it the configure still succeeds, but 27
+  tests are not registered, among them `d3d12_draw`, `d3d12_compute`, `d3d12_geometry`, `d3d12_mesh`,
+  `d3d12_subgroup` and the occlusion and conservative-raster tests, and a few others run a reduced form. The
+  configure log names only some of them ("glslangValidator not found: ..."), so a `ctest` run looks complete with
+  fewer tests: a Windows MSVC build registered 273 tests with it. Once it is on `PATH`, the next configure finds it.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
   - Windows: the full runtime needs Visual Studio 2022 with "Desktop development with C++" and Windows SDK
     10.0.26100 or newer. Install the Vulkan SDK for the backend headers. The standalone tools also compile with llvm-mingw and the Vulkan headers alone.
