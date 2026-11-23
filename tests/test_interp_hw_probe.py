@@ -263,6 +263,31 @@ class CliTest(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("no AMD GPU on this box", err.getvalue())
 
+    def test_short_or_none_oracle_results_exit_2_and_close_oracle(self):
+        rand_k, _ = ihp.random_kernel(Random(1), {"denorm32": 3})
+        tie_k, _ = ihp.tie_kernel({"denorm32": 3})
+        valid_rand = [[0] * rand_k.words]
+
+        for responses, match in (
+            ([[]], "the oracle returned 0 results for 1 kernels"),
+            ([[None]], f"expected {rand_k.words} words, got None"),
+            ([[[0] * (rand_k.words - 1)]], f"expected {rand_k.words} words"),
+            ([valid_rand, []], "the oracle returned 0 results for 1 tie kernel"),
+            ([valid_rand, [None]], f"expected {tie_k.words} words, got None"),
+            ([valid_rand, [[0] * (tie_k.words - 1)]], f"expected {tie_k.words} words"),
+        ):
+            with self.subTest(match=match):
+                ora = mock.MagicMock()
+                ora.run.side_effect = responses
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(ihp.runner, "open_oracle", return_value=ora), \
+                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = ihp.main(["--seeds", "1", "--kernels", "1"])
+                self.assertEqual(rc, 2)
+                self.assertIn("kernel failed:", err.getvalue())
+                self.assertIn(match, err.getvalue())
+                ora.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

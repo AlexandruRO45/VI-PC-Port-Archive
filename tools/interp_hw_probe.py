@@ -263,15 +263,25 @@ def main(argv=None):
         for seed in seeds:
             rng = random.Random(seed)
             ks = [random_kernel(rng, mode) for _ in range(args.kernels)]
-            for r, (_, info) in zip(o.run([k for k, _ in ks]), ks):
-                if isinstance(r, str):
-                    print(f"kernel failed: {r}", file=sys.stderr)
+            res = o.run([k for k, _ in ks])
+            if len(res) != len(ks):
+                print(f"kernel failed: the oracle returned {len(res)} results for {len(ks)} kernels", file=sys.stderr)
+                return 2
+            for r, (k, info) in zip(res, ks):
+                if r is None or isinstance(r, str) or len(r) < k.words:
+                    why = r if isinstance(r, str) else f"expected {k.words} words, got {r!r}"
+                    print(f"kernel failed: {why}", file=sys.stderr)
                     return 2
                 check_random(r, info, args.denorm32 == 0, tally, bad)
         kern, info = tie_kernel(mode)
-        r = o.run([kern])[0]
-        if isinstance(r, str):
-            print(f"kernel failed: {r}", file=sys.stderr)
+        tie_res = o.run([kern])
+        if len(tie_res) != 1:
+            print(f"kernel failed: the oracle returned {len(tie_res)} results for 1 tie kernel", file=sys.stderr)
+            return 2
+        r = tie_res[0]
+        if r is None or isinstance(r, str) or len(r) < kern.words:
+            why = r if isinstance(r, str) else f"expected {kern.words} words, got {r!r}"
+            print(f"kernel failed: {why}", file=sys.stderr)
             return 2
         check_ties(r, info, tally, bad)
     finally:
