@@ -135,5 +135,14 @@ class SCbranchExecnzOracleTests(unittest.TestCase):
     def test_all_lanes_inactive(self):
         self.assertFalse(ref_oracle_execnz(0))
 
+class SCbranchExecnzAstTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = BranchInstructionAST(
+            mnemonic="s_cbranch_execnz",
+            target_offset=4,
+        )
+        self.assertEqual(ast.mnemonic, "s_cbranch_execnz")
+        self.assertEqual(ast.target_offset, 4)
+
 if __name__ == '__main__':
     unittest.main()
