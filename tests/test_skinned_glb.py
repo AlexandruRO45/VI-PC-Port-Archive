@@ -790,6 +790,17 @@ class SkinnedGlbTest(unittest.TestCase):
                     handle.write(data)
                 self._assert_one_line_error(self._run_cli(skeleton, component), path)
 
+    def test_cli_non_object_drawable_bone_is_one_error_line(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root, own_skeleton=[["not", "an", "object"]])
+        result = self._run_cli(skeleton, component)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("error: "), result.stderr)
+        self.assertIn("drawable bone has no fields", lines[0])
+
     def test_output_must_not_overwrite_a_source(self):
         skeleton = _skeleton_dir(self.root)
         component = _component(self.root)
