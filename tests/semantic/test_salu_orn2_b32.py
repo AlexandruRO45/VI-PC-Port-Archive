@@ -436,5 +436,70 @@ class TestSaluOrn2B32SIMDDivergence(unittest.TestCase):
         for lane in range(32):
             self.assertEqual(wave.salu.sgprs[5], res)
 
+class TestSaluOrn2B32RegisterAliasing(unittest.TestCase):
+    """Unit tests for in-place register aliasing and operand reuse."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+
+    def test_alias_dst_equals_src0(self) -> None:
+        self.interp.write_sgpr(0, 0x00FF0000)
+        self.interp.write_sgpr(1, 0xFF00FF00)
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 0),
+            ssrc1=RegOperand(RegKind.SGPR, 1),
+        )
+        res, scc = self.interp.execute(inst)
+        expected = 0x00FF0000 | (~0xFF00FF00 & MASK32)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.interp.sgprs[0], expected)
+        self.assertEqual(self.interp.sgprs[1], 0xFF00FF00)
+
+    def test_alias_dst_equals_src1(self) -> None:
+        self.interp.write_sgpr(0, 0x12340000)
+        self.interp.write_sgpr(1, 0x00005678)
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 1),
+            ssrc0=RegOperand(RegKind.SGPR, 0),
+            ssrc1=RegOperand(RegKind.SGPR, 1),
+        )
+        res, scc = self.interp.execute(inst)
+        expected = 0x12340000 | (~0x00005678 & MASK32)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.interp.sgprs[1], expected)
+        self.assertEqual(self.interp.sgprs[0], 0x12340000)
+
+    def test_alias_all_operands_same(self) -> None:
+        for initial in (0x00000000, 0x12345678, 0xFFFFFFFF, 0x5555AAAA):
+            self.interp.write_sgpr(0, initial)
+            inst = SALUInstruction(
+                Opcode.S_ORN2_B32,
+                sdst=RegOperand(RegKind.SGPR, 0),
+                ssrc0=RegOperand(RegKind.SGPR, 0),
+                ssrc1=RegOperand(RegKind.SGPR, 0),
+            )
+            res, scc = self.interp.execute(inst)
+            self.assertEqual(res, 0xFFFFFFFF, f"Self-aliased OR-NOT failed for initial {initial:#x}")
+            self.assertEqual(self.interp.sgprs[0], 0xFFFFFFFF)
+            self.assertEqual(scc, 1)
+
+    def test_alias_src0_equals_src1_distinct_dst(self) -> None:
+        self.interp.write_sgpr(0, 0xCAFEBABE)
+        self.interp.write_sgpr(2, 0)
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 2),
+            ssrc0=RegOperand(RegKind.SGPR, 0),
+            ssrc1=RegOperand(RegKind.SGPR, 0),
+        )
+        res, scc = self.interp.execute(inst)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(self.interp.sgprs[2], 0xFFFFFFFF)
+        self.assertEqual(self.interp.sgprs[0], 0xCAFEBABE)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
