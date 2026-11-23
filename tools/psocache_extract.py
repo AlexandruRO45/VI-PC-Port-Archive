@@ -59,14 +59,17 @@ class NotFound(Exception):
     """The cache was not found inside the search budget."""
 
 
-def inflate(m, start, end, keep_all=False):
+def inflate(m, start, end, keep_all=False, max_bytes=None):
     """Inflate one zlib stream at ``start``.
 
     Returns ``(used, head)`` where ``used`` is the first byte after the stream (the decompressor may have read
     past its end) and ``head`` is the first 4 inflated bytes, or ``(None, None)`` when it does not decode.
     With ``keep_all`` the inflated bytes are returned in place of the 4-byte head; memory then grows with the
-    stream, which is why the search path does not use it.
+    stream, which is why the search path does not use it. When ``max_bytes`` is given with ``keep_all``,
+    inflation stops as soon as more than ``max_bytes`` bytes are produced.
     """
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
     d = zlib.decompressobj()
     head = bytearray()
     out = bytearray() if keep_all else None
@@ -74,10 +77,15 @@ def inflate(m, start, end, keep_all=False):
     try:
         while p < end and not d.eof:
             piece = m[p : min(p + (1 << 20), end)]
-            chunk = d.decompress(piece)
+            if keep_all and max_bytes is not None:
+                chunk = d.decompress(piece, max_bytes + 1 - len(out))
+            else:
+                chunk = d.decompress(piece)
             p += len(piece)
             if keep_all:
                 out += chunk
+                if max_bytes is not None and len(out) > max_bytes:
+                    return p - len(d.unused_data) - len(d.unconsumed_tail), bytes(out)
             elif len(head) < len(MAGIC):
                 head += chunk[: len(MAGIC) - len(head)]
     except zlib.error:
@@ -131,7 +139,7 @@ def find_match(m, size, start, budget, max_streams):
 
 def assemble(m, size, first, total):
     """Append following contiguous streams until ``total`` inflated bytes exist, and return them."""
-    used, first_bytes = inflate(m, first, size, keep_all=True)
+    used, first_bytes = inflate(m, first, size, keep_all=True, max_bytes=total)
     if used is None or len(first_bytes) < HEADER_SIZE:
         raise NotFound("the candidate stream does not inflate to a full header")
     data = bytearray(first_bytes)
@@ -150,7 +158,7 @@ def assemble(m, size, first, total):
                 "only %d of %d declared bytes are in contiguous streams"
                 % (len(data), total)
             )
-        used, chunk = inflate(m, pos, size, keep_all=True)
+        used, chunk = inflate(m, pos, size, keep_all=True, max_bytes=total - len(data))
         if used is None:
             raise ValueError("stream after %d bytes does not inflate" % len(data))
         if len(data) + len(chunk) > total:
