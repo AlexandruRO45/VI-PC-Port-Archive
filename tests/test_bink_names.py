@@ -489,6 +489,32 @@ class TestReportErrors(unittest.TestCase):
             code = names_mod.main([source, "--mount", xml, "--out", out])
         return code, err.getvalue(), out
 
+    def test_write_failure_preserves_previous_report(self):
+        def fail_json(_value, output, **_kwargs):
+            output.write('{"summary":')
+            raise OSError("synthetic write failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.write(tmp, "index.json", '{"streams": []}')
+            mount = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+            for suffix, failure in (
+                ("json", mock.patch.object(json, "dump", side_effect=fail_json)),
+                ("csv", mock.patch.object(csv.DictWriter, "writerows", side_effect=OSError("synthetic write failure"))),
+            ):
+                previous = b"previous report"
+                report = os.path.join(tmp, f"names.{suffix}")
+                with open(report, "wb") as f:
+                    f.write(previous)
+                entries = set(os.listdir(tmp))
+
+                with (self.subTest(suffix=suffix), failure, contextlib.redirect_stdout(io.StringIO()),
+                      contextlib.redirect_stderr(io.StringIO()) as err):
+                    self.assertEqual(names_mod.main([source, "--mount", mount, "--out", report]), 2)
+                    self.assertIn("synthetic write failure", err.getvalue())
+                    self.assertEqual(set(os.listdir(tmp)), entries)
+                    with open(report, "rb") as f:
+                        self.assertEqual(f.read(), previous)
+
     def test_bad_sources_are_rejected(self):
         # (extension, contents, expected error fragment or None to only require the path)
         cases = [

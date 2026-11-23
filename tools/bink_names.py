@@ -42,11 +42,13 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import bink_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 import gamedata_index  # noqa: E402
 import gamedata_xml  # noqa: E402
 
@@ -341,14 +343,19 @@ def name_streams(names, streams, pins=None, max_skip=MAX_SKIP):
 
 
 def write(out, rows, unmatched, summary):
-    if out.lower().endswith(".json"):
-        with open(out, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"summary": summary, "streams": rows, "unmatched_list_entries": unmatched}, fh, indent=1)
-    else:
-        with open(out, "w", encoding="utf-8", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=FIELDS, lineterminator="\n")
-            w.writeheader()
-            w.writerows(rows)
+    is_json = out.lower().endswith(".json")
+    destination = os.path.realpath(out)
+    with tempfile.TemporaryDirectory(prefix=".bink-names-", dir=os.path.dirname(destination)) as staging:
+        staged = os.path.join(staging, "report")
+        with open(staged, "w", encoding="utf-8", newline="\n" if is_json else "") as fh:
+            if is_json:
+                json.dump({"summary": summary, "streams": rows, "unmatched_list_entries": unmatched}, fh, indent=1)
+            else:
+                w = csv.DictWriter(fh, fieldnames=FIELDS, lineterminator="\n")
+                w.writeheader()
+                w.writerows(rows)
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
 
 
 def main(argv=None):
