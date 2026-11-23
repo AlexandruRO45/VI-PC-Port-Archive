@@ -104,6 +104,21 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(shorts.export_bank(path, self.out, 9, 11)[0]["channels"], 1)
         self.assertEqual(shorts.export_bank(path, self.out, 4, 6), [])
 
+    def test_opus_head_records_the_declared_rate(self):
+        # OpusHead's input_sample_rate is informational, but it must record the declared
+        # 32000, not the 48000 default, for a 32 kHz channel.
+        path = os.path.join(self.tmp.name, "rate32k.awc")
+        with open(path, "wb") as f:
+            f.write(build_music_bank(0x08, 1920, rate=32000))
+        rows = shorts.export_bank(path, self.out, 0, 1)
+        self.assertEqual(len(rows), 1)
+        with open(os.path.join(self.out, rows[0]["file"]), "rb") as f:
+            data = f.read()
+        self.assertEqual(data[:4], b"OggS")
+        body = 27 + data[26]
+        self.assertEqual(data[body:body + 8], b"OpusHead")
+        self.assertEqual(struct.unpack_from("<I", data, body + 12)[0], 32000)
+
     def test_duplicate_selected_channels_keep_both_packet_streams(self) -> None:
         path = os.path.join(self.tmp.name, "duplicate.awc")
         with open(path, "wb") as bank:
