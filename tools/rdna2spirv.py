@@ -5250,12 +5250,14 @@ class Gen:
         if const is not None:
             r31 = self.tmp()
             self.emit(f"{r31} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
-            # Shift and mask, not OpBitFieldUExtract: Intel's Windows driver (UHD 770 / Xe-LP, 32.0.101.6129;
-            # also seen on Xe-LPG) extracts from a constant that fits in 16 bits with the offset taken mod 16, so
-            # exec_lo = 0xffff turned on all 32 lanes. GPU-checked with cs_exec_const.asm.
-            shr = self.tmp()
-            self.emit(f"{shr} = OpShiftRightLogical %uint {self.cu(const & 0xFFFFFFFF)} {r31}")
-            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+            # (1 << lane) & const, not OpBitFieldUExtract and not const >> lane: Intel's Windows driver (UHD 770 /
+            # Xe-LP, 32.0.101.6129; also seen on Xe-LPG) extracts from a constant that fits in 16 bits with the
+            # offset taken mod 16, and Qualcomm's Adreno driver (0.800.77, Adreno 830) does the same for
+            # `const >> lane`, so exec_lo = 0xffff turned on all 32 lanes. Shifting a variable one is right on both.
+            # GPU-checked with cs_exec_const.asm (wave32) and cs_w64x_permute.asm (wave64).
+            shl = self.tmp()
+            self.emit(f"{shl} = OpShiftLeftLogical %uint {self.cu(1)} {r31}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {shl} {self.cu(const & 0xFFFFFFFF)}")
             self.emit(f"{on} = OpINotEqual %bool {bit} {self.cu(0)}")
         else:
             self.emit(f"{on} = OpINotEqual %bool {val} {self.cu(0)}")
