@@ -348,5 +348,20 @@ class SMaxU32OracleTests(unittest.TestCase):
         self.assertEqual(res, 100)
         self.assertEqual(scc, 0)
 
+class SMaxU32AstInterpreterTests(unittest.TestCase):
+    def test_max_u32_ast_construction(self):
+        ast = SaluInstructionAST("s_max_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        self.assertEqual(ast.mnemonic, "s_max_u32")
+
+    def test_max_u32_scalar_execution(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x1000)
+        state.set_sgpr(1, 0x2000)
+        res, scc = oracle_max_u32(state.get_sgpr(0), state.get_sgpr(1))
+        state.set_sgpr(2, res)
+        state.scc = scc
+        self.assertEqual(state.get_sgpr(2), 0x2000)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
