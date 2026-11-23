@@ -244,7 +244,8 @@ bool ScaleGpu::create_resources() {
     up_inst_ = align(up_ib_ + ib_bytes, 256);
     up_stream_ = align(up_inst_ + inst_bytes_, 256);
     up_zero_ = align(up_stream_ + stream_bytes_, 256);
-    up_cam_ = align(up_zero_ + stream_bytes_, 256);   // main, aux, top cameras, 256 bytes apart
+    // Zeros: the copy queue's poison for stream[p], and the direct queue's for stream[p] and particle set A[p] after use.
+    up_cam_ = align(up_zero_ + std::max<std::uint64_t>(stream_bytes_, kParticles * sizeof(Instance)), 256);   // main, aux, top cameras, 256 bytes apart
     up_extra_ = up_cam_ + 3 * 256;                     // the second root CBV of root signature 3
     up_particles_ = up_extra_ + 256;
     const std::uint64_t upload_bytes = up_particles_ + kParticles * sizeof(Particle);
@@ -718,7 +719,18 @@ bool ScaleGpu::record_post(unsigned p) {
     TIMED(kCopyBuffer, list->CopyBufferRegion(readback_[p].p, kOffPartA, inst_a_[p].p, 0, kParticles * sizeof(Instance)));
     TIMED(kCopyBuffer, list->CopyBufferRegion(readback_[p].p, kOffPartB, inst_b_.p, 0, kParticles * sizeof(Instance)));
     st.copies += 2;
-    barrier(list, {transition(inst_a_[p].p, cs, c), transition(inst_b_.p, cs, c)}, st);
+    // Poison what this frame took from the copy and compute queues, now that it is used: frame f + 2 must wait for
+    // their next writes, or it draws the poison (zero records draw nothing) and differs from frame 1.
+    barrier(list, {transition(inst_a_[p].p, cs, cd), transition(inst_b_.p, cs, c)}, st);
+    TIMED(kCopyBuffer, list->CopyBufferRegion(inst_a_[p].p, 0, upload_.p, up_zero_, kParticles * sizeof(Instance)));
+    ++st.copies;
+    if (stream_bytes_) {
+        barrier(list, {transition(stream_[p].p, c, cd)}, st);
+        TIMED(kCopyBuffer, list->CopyBufferRegion(stream_[p].p, 0, upload_.p, up_zero_, stream_bytes_));
+        ++st.copies;
+        barrier(list, {transition(stream_[p].p, cd, c)}, st);
+    }
+    barrier(list, {transition(inst_a_[p].p, cd, c)}, st);
     TIMED(kCloseList, hr = list->Close());
     CHECK(hr == S_OK);
     ++st.lists;
@@ -836,28 +848,44 @@ ScaleGpu::Outcome ScaleGpu::submit(std::uint64_t f, unsigned timeout_ms) {
         TIMED(kExecuteSmall, queue->ExecuteCommandLists(UINT(lists.size()), lists.begin()));
         main_stats_.executes += 1;
     };
-    jitter();
-    if (f > 2) TIMED(kQueueWait, hr = copy_->Wait(direct_fence_.p, f - 2));
-    run(copy_.p, {copy_list_[p].p});
-    TIMED(kSignal, hr = copy_->Signal(copy_fence_.p, f));
-    log_event(f, "copy queue: Wait(direct, f-2), Execute, Signal(copy)", f);
-    jitter();
-    if (f > 2) TIMED(kQueueWait, hr = compute_->Wait(direct_fence_.p, f - 2));
-    run(compute_.p, {compute_list_[p].p});
-    TIMED(kSignal, hr = compute_->Signal(compute_fence_.p, f));
-    log_event(f, "compute queue: Wait(direct, f-2), Execute, Signal(compute)", f);
+    // Every Wait and Signal must be accepted: a refused one would leave a queue unordered against the others.
+    const auto check = [&](const char* what) {
+        if (SUCCEEDED(hr)) return true;
+        std::fprintf(stderr, "lanterns: frame %llu: %s returned 0x%08lx\n", (unsigned long long)f, what, (unsigned long)hr);
+        return false;
+    };
+    // The direct queue's frame goes first, its Waits on copy and compute values not signalled yet (D3D12 allows a
+    // Wait before its Signal; a title's queues do this). The producers follow. A missing Wait then shows: the direct
+    // queue's post pass poisons what it read (lanterns_scale_gpu.h), so a frame that does not wait reads the poison.
     jitter();
     run(direct_.p, {main_list_[p][0].p});
     jitter();
     TIMED(kQueueWait, hr = direct_->Wait(copy_fence_.p, f));
+    if (!check("direct queue Wait(copy, f)")) return Outcome::error;
     TIMED(kQueueWait, hr = direct_->Wait(compute_fence_.p, f));
+    if (!check("direct queue Wait(compute, f)")) return Outcome::error;
     std::vector<ID3D12CommandList*> lists = {main_list_[p][1].p};
     for (unsigned t = 0; t < threads_; ++t) lists.push_back(chunk_list_[p][t].p);
     lists.push_back(main_list_[p][2].p);
     TIMED(kExecuteCommandLists, direct_->ExecuteCommandLists(UINT(lists.size()), lists.data()));
     main_stats_.executes += 1;
     TIMED(kSignal, hr = direct_->Signal(direct_fence_.p, f));
+    if (!check("direct queue Signal(direct, f)")) return Outcome::error;
     log_event(f, "direct queue: Execute(pre), Wait(copy f), Wait(compute f), Execute(bind, chunks, post), Signal(direct)", f);
+    jitter();
+    if (f > 2) TIMED(kQueueWait, hr = copy_->Wait(direct_fence_.p, f - 2));
+    if (!check("copy queue Wait(direct, f - 2)")) return Outcome::error;
+    run(copy_.p, {copy_list_[p].p});
+    TIMED(kSignal, hr = copy_->Signal(copy_fence_.p, f));
+    if (!check("copy queue Signal(copy, f)")) return Outcome::error;
+    log_event(f, "copy queue: Wait(direct, f-2), Execute, Signal(copy)", f);
+    jitter();
+    if (f > 2) TIMED(kQueueWait, hr = compute_->Wait(direct_fence_.p, f - 2));
+    if (!check("compute queue Wait(direct, f - 2)")) return Outcome::error;
+    run(compute_.p, {compute_list_[p].p});
+    TIMED(kSignal, hr = compute_->Signal(compute_fence_.p, f));
+    if (!check("compute queue Signal(compute, f)")) return Outcome::error;
+    log_event(f, "compute queue: Wait(direct, f-2), Execute, Signal(compute)", f);
     FrameStats sum = main_stats_;
     for (const FrameStats& w : worker_stats_) {
         sum.draws += w.draws, sum.dispatches += w.dispatches, sum.lists += w.lists, sum.barriers += w.barriers;

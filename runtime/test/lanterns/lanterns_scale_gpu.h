@@ -7,8 +7,13 @@
 //                  barriers; Signal(compute, f)
 //   DIRECT queue:  [pre: clears]; Wait(copy, f); Wait(compute, f);
 //                  [bind, main pass in one list per recording thread, post: particle set B by kStepsB dispatches on the
-//                  direct queue, the 4x MSAA aux pass and its resolve, the RGBA8 top pass, copies to readback[p]];
-//                  Signal(direct, f)
+//                  direct queue, the 4x MSAA aux pass and its resolve, the RGBA8 top pass, copies to readback[p], then
+//                  zeros over stream[p] and A[p]]; Signal(direct, f)
+// The direct queue's part is submitted first, so its Waits come before the Signals they wait for; the copy and compute
+// parts follow. The CPU waits for the direct queue's frame f - 2 before it records frame f (allocators, descriptor
+// ring, readback[p]); the copy and compute queues' frame f - 2 is done by then, since that frame waited for them.
+// Because the direct queue zeroes stream[p] and A[p] after use, a frame that does not wait for the copy or compute
+// queue draws zeros (nothing) there and differs from frame 1.
 // Every draw writes its instance V# into a CPU-only staging heap once (per parity) and copies it each frame, with
 // CopyDescriptorsSimple, into a ring in the shader-visible heap; its descriptor table points there. The main pass is
 // recorded by worker threads in parallel. The frame's content does not change from frame to frame: every readback
