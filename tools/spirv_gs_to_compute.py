@@ -188,7 +188,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     emit_split = set()
     block_tail = {}
     main_start = None
-    state = "header"        # header -> main_entry -> main_vars -> main -> other
+    state = "header"        # Functions enter either main_entry -> main_vars -> main, or helper.
     for ln in text.splitlines():
         s = ln.strip()
         if s in ("OpCapability Geometry", "OpCapability Shader"):
@@ -229,6 +229,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             if m.group(1) == main:
                 state = "main_entry"
                 main_start = len(out)
+            else:
+                state = "helper"
             out.append(ln)
             continue
         if s == "OpFunctionEnd":
@@ -268,11 +270,29 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             start, end = output_access.span(1)
             out.append(s[:start] + out_vars[output_access.group(1)] + s[end:])
             continue
+        copy = re.match(r"OpCopyMemory (%\w+) (%\w+)(.*)$", s)
+        if copy:
+            target, source, suffix = copy.groups()
+            if target in out_vars or source in out_vars:
+                target, source = out_vars.get(target, target), out_vars.get(source, source)
+                for operand in (target, source):
+                    if operand in gone:
+                        raise Unsupported(f"unhandled use of {operand}: {s}")
+                out.append(f"OpCopyMemory {target} {source}{suffix}")
+                continue
         chain = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
         if chain and chain.group(3) in out_vars:
             ptr = "%gsc_ptr_pv_f" if chain.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
             out.append(f"{chain.group(1)} = OpAccessChain {ptr} {out_vars[chain.group(3)]} {chain.group(4)}")
             continue
+        if state == "helper":
+            operands = s.partition(";")[0].split()
+            if operands and operands[0] in ("OpEmitVertex", "OpEndPrimitive", "OpEmitStreamVertex",
+                                           "OpEndStreamPrimitive"):
+                raise Unsupported(f"{operands[0]} in geometry helper")
+            for operand in operands:
+                if operand in gone:
+                    raise Unsupported(f"unhandled use of {operand} in geometry helper: {s}")
         if state not in ("main", "main_vars"):
             out.append(ln)
             continue

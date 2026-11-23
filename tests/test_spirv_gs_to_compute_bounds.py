@@ -227,7 +227,7 @@ def maybe_validate_spirv(spvasm):
     with tempfile.TemporaryDirectory() as d:
         sa = os.path.join(d, "cs.spvasm")
         sv = os.path.join(d, "cs.spv")
-        with open(sa, "w", encoding="utf-8") as f:
+        with open(sa, "w", encoding="utf-8", newline="\n") as f:
             f.write(spvasm)
         subprocess.run([sas, "--target-env", "vulkan1.2", sa, "-o", sv], check=True)
         subprocess.run([sval, "--target-env", "vulkan1.2", sv], check=True)
@@ -246,6 +246,9 @@ class TestSpirvGsToComputeEmitBounds(unittest.TestCase):
         helper = """\
 %helper = OpFunction %void None %fn
 %helper_entry = OpLabel
+%snapshot_ptr = OpVariable %ptr_fn_v4 Function
+OpCopyMemory %snapshot_ptr %out_pos Aligned 4
+OpCopyMemory %out_pos %snapshot_ptr
 %prev = OpLoad %v4float %out_pos Aligned 4
 %updated = OpCompositeInsert %v4float %f3 %prev 1
 OpStore %out_pos %updated Aligned 4
@@ -254,17 +257,39 @@ OpStore %x_ptr %f2
 OpReturn
 OpFunctionEnd
 """
-        gs = gs.replace("%main = OpFunction", "%ptr_out_f = OpTypePointer Output %float\n%main = OpFunction")
+        gs = gs.replace("%main = OpFunction", "%ptr_fn_v4 = OpTypePointer Function %v4float\n"
+                        "%ptr_out_f = OpTypePointer Output %float\n%main = OpFunction")
         gs = gs.replace("OpExecutionMode %main Triangles", "OpExecutionMode %main InputPoints")
         for module in (gs + helper, gs.replace("%main = OpFunction", helper + "%main = OpFunction")):
             with self.subTest(helper_first=module.index("%helper =") < module.index("%main =")):
                 maybe_validate_spirv(module)
                 out, _ = gsc.rewrite(module)
                 self.assertNotIn("%out_pos", out)
+                self.assertIn("OpCopyMemory %snapshot_ptr %gsc_out0 Aligned 4", out.splitlines())
+                self.assertIn("OpCopyMemory %gsc_out0 %snapshot_ptr", out.splitlines())
                 self.assertIn("%prev = OpLoad %v4float %gsc_out0 Aligned 4", out.splitlines())
                 self.assertIn("OpStore %gsc_out0 %updated Aligned 4", out.splitlines())
                 self.assertIn("%x_ptr = OpAccessChain %gsc_ptr_pv_f %gsc_out0 %u0", out.splitlines())
                 maybe_validate_spirv(out)
+
+    def test_geometry_only_helper_instructions_are_rejected(self):
+        gs = _make_gs(["%entry = OpLabel", "%call = OpFunctionCall %void %helper", "OpReturn"])
+        for instruction, message in (
+            ("OpEmitVertex ; emit in helper", "OpEmitVertex in geometry helper"),
+            ("OpEndPrimitive", "OpEndPrimitive in geometry helper"),
+            ("%input = OpAccessChain %ptr_in_v4 %in_pos %u0", "unhandled use of %in_pos in geometry helper"),
+        ):
+            with self.subTest(instruction=instruction):
+                module = gs + f"""\
+%helper = OpFunction %void None %fn
+%helper_entry = OpLabel
+{instruction}
+OpReturn
+OpFunctionEnd
+"""
+                maybe_validate_spirv(module)
+                with self.assertRaisesRegex(gsc.Unsupported, message):
+                    gsc.rewrite(module)
 
     def test_read_output_before_emit_with_implicit_shader_capability(self):
         gs = _make_gs([
