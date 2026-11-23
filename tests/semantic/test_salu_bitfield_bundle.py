@@ -525,5 +525,26 @@ class TestSBfmB32Bounds(unittest.TestCase):
         self.assertEqual(ref_bfm_b32(8, 32), 0xFF)
 
 
+def run_hw_bfm_b32(width: int, offset: int) -> int:
+    lines = [
+        f"s_mov_b32 s0, {width & MASK32:#x}",
+        f"s_mov_b32 s1, {offset & MASK32:#x}",
+        "s_bfm_b32 s2, s0, s1",
+        "v_mov_b32 v0, s2",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_bfm_b32_hw", lines)
+    return support.mrt0_words(spv)[0]
+
+
+class TestSBfmB32HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for s_bfm_b32."""
+
+    def test_translator_mask_cases(self):
+        self.assertEqual(run_hw_bfm_b32(8, 4), 0xFF0)
+        self.assertEqual(run_hw_bfm_b32(16, 0), 0xFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
