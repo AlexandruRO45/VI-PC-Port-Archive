@@ -1051,7 +1051,11 @@ rounds in an implementation-defined way (AMD's driver rounds toward zero). Beyon
 bound smaller than the smallest normal half (2^-14) in magnitude becomes 0 or +-2^-14, whichever is on its outward
 side, never a half denormal: a decoder that flushes those to zero would make the box smaller. `tools/xdxr_bvh.py`
 `half_round` does the same, and `check-build` compares every BOX16 word bit for bit with `encode_box16` of the exact
-box of the triangles under that child. Top-level builds keep BOX32 whatever the flags, because they are in world
+box of the triangles under that child. `half_directed` takes the sign as `(u & 0x80000000u) >> 16`: written as
+`(u >> 16) & 0x8000u`, AMD's Windows driver 24.10.24 (Vulkan driver 2.0.302, an RDNA2 iGPU) packed every word with
+bit 15 cleared and the low half's sign in bit 31, so negative bounds turned positive, `check-build` reported children
+outside their parents, and rays missed (SHADER-1129; RTX 5070 Ti on 621.24, RDNA3 and RDNA4 on 2.0.416, and the same
+iGPU on 24.30.18 were already right, and the NVIDIA build is byte-identical with either form). Top-level builds keep BOX32 whatever the flags, because they are in world
 space, where a half's step reaches 2 m at 2,048 m and 4 m at 4,096 m. An update must pass the same flags as its
 build (D3D12 requires it), so a refit keeps the node type. **ASSUMPTION:** that `MINIMIZE_MEMORY` is the console's
 switch for BOX16. The offline BLASes in the `*_bvh4.rpf` packs have BOX16 roots (§3.1), but `XboxBvhBuilder.dll`'s

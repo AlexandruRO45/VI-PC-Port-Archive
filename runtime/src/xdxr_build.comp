@@ -205,7 +205,9 @@ bool ptr_is_node(uint p) { return (p & 7u) == BOX16 || (p & 7u) == BOX32; }
 // flushes half denormals to zero would otherwise shrink the box. tools/xdxr_bvh.py half_round is the same function.
 uint half_directed(float x, bool up) {
     uint u = floatBitsToUint(x);
-    uint sign = (u >> 16) & 0x8000u;
+    // Not (u >> 16) & 0x8000u: AMD's Windows driver 24.10.24 (Vulkan 2.0.302) miscompiles that form in store_box16's
+    // packing, clearing bit 15 and giving bit 31 the low half's sign (SHADER-1129; docs/bvh.md "BOX16 nodes").
+    uint sign = (u & 0x80000000u) >> 16;
     uint a = u & 0x7fffffffu;
     bool away = up != (sign != 0u);          // round the magnitude up (away from zero) or down (toward zero)
     if (a > 0x7f800000u) return sign | 0x7e00u;                     // NaN: not produced by the box code
