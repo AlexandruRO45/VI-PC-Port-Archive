@@ -586,5 +586,35 @@ class TestValuAndOrB32ConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, 0)
         self.assertEqual(self.interp.scc, 0)
 
+class TestValuAndOrB32IEEE754EdgeCases(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern preservation and boundary extremes."""
+
+    def test_ieee754_float_bit_patterns_preserved(self) -> None:
+        # NaN, Infinity, -0.0, +0.0 bit patterns operated on purely as raw bits
+        nan_bits = 0x7FC00000      # Quiet NaN
+        pos_inf = 0x7F800000       # +Infinity
+        neg_zero = 0x80000000      # -0.0
+        pos_zero = 0x00000000      # +0.0
+        subnormal = 0x00000001     # Smallest positive subnormal
+
+        # (NaN & +Inf) | -0.0
+        # 0x7FC00000 & 0x7F800000 = 0x7F800000
+        # 0x7F800000 | 0x80000000 = 0xFF800000 (-Infinity)
+        res = ref_and_or_b32(nan_bits, pos_inf, neg_zero)
+        self.assertEqual(res, 0xFF800000)
+
+        # (subnormal & +Inf) | +0.0 == 0
+        self.assertEqual(ref_and_or_b32(subnormal, pos_inf, pos_zero), 0)
+
+        # Exact subnormal preserved
+        self.assertEqual(ref_and_or_b32(0xFFFFFFFF, subnormal, 0), subnormal)
+
+    def test_boundary_extrema_and_masks(self) -> None:
+        extremes = [0x00000000, 0xFFFFFFFF, 0x7FFFFFFF, 0x80000000, 0x55555555, 0xAAAAAAAA]
+        for a in extremes:
+            for b in extremes:
+                for c in extremes:
+                    self.assertEqual(ref_and_or_b32(a, b, c), ((a & b) | c) & MASK32)
+
 if __name__ == "__main__":
     unittest.main()
