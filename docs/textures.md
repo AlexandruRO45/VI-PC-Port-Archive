@@ -617,10 +617,12 @@ BC5 normal maps are outside the map.
 | `0x6994EF3F` (name not found) | 62 | 58 | 3 | 99: 52, 95: 2, 4 more | 0 |
 | `0x2C8D7182` (name not found) | 111,572 | 8 | 111,564 | 91: 3, 72: 2, 29: 1, 71: 1 | 0 |
 
-"Exact" is a metadata match. It includes keys whose sources give more than one format (16 over all map parameters,
-at most 2 per parameter, all from two pools disagreeing), which are left out of the format tally; the 20 map keys
-found both in a pool and as an embedded texture agree on the format. It also includes 1,223 pool matches whose row
-has no exported file (`File` null), so not every exact texture is available to the viewer. Textures whose name hash
+"Exact" is a metadata match, and the counts are texture/parameter pairs. It includes 16 map pairs whose key has
+more than one format (at most 2 per parameter), which are left out of the format tally: they come from 2 distinct
+keys, one listed with two formats in two pools and one whose embedded copy has another format than its pool row
+(of the 133 distinct referenced keys that are both a pool and an embedded texture, the only one that disagrees). It
+also includes 1,223 map pairs whose pool row has no exported file (`File` null), so not every exact texture is
+available to the viewer. Textures whose name hash
 is on more than one entry (at most 1 per parameter here) are neither exact nor unresolved. No manifest has fewer
 rows than its `Count`. `0x2C8D7182` is bound on 1,010,957 map bindings, but almost none of its 111,572 keys is a pool
 or embedded texture; hypothesis: it names a texture made or streamed at run time, not one in the exported pools.
