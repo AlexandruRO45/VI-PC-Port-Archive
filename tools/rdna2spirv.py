@@ -246,6 +246,11 @@ class Gen:
         # tof/tou results -> the id they were bitcast from. A bitcast of a bitcast gives the original id back: wherever
         # the key is valid its source is too (the key's own definition uses it), so no dominance is lost.
         self.bitcast_from = {}
+
+        # Float constants declared once at module scope (fconst), by bit pattern; frozen when the module's constants
+        # are written, after which fconst falls back to a bitcast in the body.
+        self.fconsts = {}
+        self.fconsts_frozen = False
         self.n = 0
         self.outputs = {}
         self.partial_color_outputs: set[str] = set()
@@ -5935,9 +5940,25 @@ class Gen:
         return out
 
     def fconst(self, x):
+        """The f32 constant x. A finite normal value or +0 is one module-scope OpConstant, shared by every use (it was
+        an OpBitcast of the uint constant at each use: 3.5% of the body lines on a corpus sample, most of them the
+        FLT_MIN of flush_f32). Written in decimal as repr() of its exact value, which both spirv-as (decimal straight
+        to binary32) and tools/spirv_asm.py (decimal via binary64, #3911) turn into these exact bits, since the value
+        is exactly representable in both. -0, subnormals, inf and NaN keep the bitcast, and so does any fconst after
+        the module's constants are written."""
         bits = struct.unpack("<I", struct.pack("<f", x))[0]
+        exp = bits & 0x7F800000
+        if not self.fconsts_frozen and (bits == 0 or (exp and exp != 0x7F800000)):
+            name = self.fconsts.get(bits)
+            if name is None:
+                name = self.fconsts[bits] = f"%cf_{bits:08x}"
+            return name
         return self.tof(self.cu(bits))
 
+    @staticmethod
+    def fconst_value(bits):
+        """The decimal OpConstant literal for an f32 bit pattern fconst hoists (finite normal or +0)."""
+        return repr(struct.unpack("<f", struct.pack("<I", bits))[0])
     def dconst(self, x):
         """A %double value (needs uses_f64): the two words of x, bitcast."""
         bits = struct.unpack("<Q", struct.pack("<d", x))[0]
@@ -14201,6 +14222,10 @@ def assemble(gen):
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
     written = dict(gen.consts)     # what the module defines; insert_late_constants adds what assemble asks for later
+
+    gen.fconsts_frozen = True
+    for v, name in sorted(gen.fconsts.items()):
+        types.append(f"{name} = OpConstant %float {Gen.fconst_value(v)}")
     if gen.desc_fn:
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
     if gen.tbuffer_norm_fns or gen.fmt_enc_fn:
