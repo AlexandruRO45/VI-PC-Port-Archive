@@ -206,11 +206,26 @@ class MalformedIndexTest(unittest.TestCase):
             tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
             return subprocess.run([sys.executable, "-I", tool, tmp], capture_output=True, text=True)
 
+    def run_tool_with_bom(self, contents):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8-sig") as f:
+                f.write(contents)
+            tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
+            return subprocess.run([sys.executable, "-I", tool, tmp], capture_output=True, text=True)
+
     def test_bad_index_json_is_one_error_not_a_traceback(self):
         p = self.run_tool("not json")
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("cannot read", p.stderr)
         self.assertIn("index.json", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_an_index_saved_with_a_utf8_bom_is_read(self):
+        # the same editor-BOM class #6017 fixed in world_index.py and #6388 in the sibling readers:
+        # a strict utf-8 read made the whole index unreadable before json.load saw any content.
+        p = self.run_tool_with_bom('{"ps_x": {"stage": "ps", "inputs": []}}')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("wrote 1 stubs", p.stdout)
         self.assertNotIn("Traceback", p.stderr)
 
     def test_help_prints_usage_and_exits_zero(self):
