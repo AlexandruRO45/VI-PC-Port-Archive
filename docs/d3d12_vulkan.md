@@ -2320,7 +2320,8 @@ That import must be shimmed. The shim provides:
 - `IDXGIFactory::CreateSwapChain`/`CreateSwapChainForHwnd` → `VkSurfaceKHR` for the HWND + `VkSwapchainKHR`.
   `GetBuffer(i)` wraps each swapchain image as an `ID3D12Resource` so the game can create RTVs.
 - `Present` → `vkQueuePresentKHR`; `ResizeBuffers`/`ResizeTarget` recreate the swapchain; `SetFullscreenState`
-  toggles borderless/fullscreen; `GetFrameStatistics` is a stub.
+  toggles borderless/fullscreen; `GetFrameStatistics` reports the present count and the last present's QPC time, and returns
+  `DXGI_ERROR_FRAME_STATISTICS_DISJOINT` once after creation or a resize (`dxgi_swapchain_test`).
 - `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
 
 **What exists.** The DXGI shim's `Present` (`runtime/shims/dxgi_com.cpp`) has its own surface, swapchain and
