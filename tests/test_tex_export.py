@@ -520,6 +520,21 @@ def test_half_float_png_export(eq, tmp_path, monkeypatch, capsys, fmt, name, cod
     assert next(out.rglob("*.dds")).read_bytes()[148:] == texels
     assert read_png(next(out.rglob("*.png"))) == (2, 1, bytes(rgba))
 
+
+def test_rgba16_unorm_png_export(eq, tmp_path, monkeypatch, capsys):
+    eq(T.FMT[11][0])
+    # (65535, 32768, 0, 65535) and (257, 128, 129, 0): alpha 0 stays 0, 128 rounds down and 129 up
+    codes = [65535, 32768, 0, 65535, 257, 128, 129, 0]
+    texels = struct.pack("<8H", *codes)
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, texels.ljust(4096, b"\0"))
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [texture(11, "R16G16B16A16_UNORM", 2, 1, 1)],
+                               carve, "--png")
+    assert code is None
+    assert text.splitlines()[1] == "png: {'written': 1}"
+    assert next(out.rglob("*.dds")).read_bytes()[148:] == texels
+    assert read_png(next(out.rglob("*.png"))) == (2, 1, bytes((255, 128, 0, 255, 1, 0, 1, 0)))
+
 def test_png_module_is_not_imported_without_the_flag(eq, tmp_path, monkeypatch, capsys):
     monkeypatch.delitem(sys.modules, "dds_png", raising=False)
     carve, _ = build_case(eq, tmp_path, 28, top_first=True)

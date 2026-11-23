@@ -75,9 +75,39 @@ class SingleChannelTests(unittest.TestCase):
         self.assertEqual(set(rgba[0::4]) | set(rgba[1::4]) | set(rgba[2::4]), {0})
 
     def test_truncated_rejected(self):
-        for dxgi, n in ((56, 7), (65, 3), (41, 15)):
+        for dxgi, n in ((56, 7), (65, 3), (41, 15), (11, 31)):
             with self.assertRaises(dds.DdsError):
                 dds.decode_dds(_dx10(2, 2, dxgi, bytes(n)))
+
+
+class Rgba16UnormTests(unittest.TestCase):
+    def test_channels_and_alpha_with_padding(self):
+        # 2x2 with a 20-byte pitch: 16 bytes of texels and 4 bytes of padding per row
+        payload = (struct.pack("<8H", 0, 65535, 32768, 65535, 257, 128, 129, 0) + b"skip"
+                   + struct.pack("<8H", 65535, 0, 0, 32767, 1, 2, 3, 65534) + b"skip")
+        data = _dx10(2, 2, 11, payload, pitch=20)
+        self.assertEqual(dds.parse_dds_header(data)["format"], "RGBA16_UNORM")
+        width, height, rgba = dds.decode_dds(data)
+        self.assertEqual((width, height), (2, 2))
+        # 128 * 255 / 65535 is just under one half and 129 just over; alpha is kept, not forced opaque
+        self.assertEqual(rgba, bytes((0, 255, 128, 255, 1, 0, 1, 0, 255, 0, 0, 127, 0, 0, 0, 255)))
+
+    def test_every_code_rounds_like_r16_unorm(self):
+        codes = list(range(65536))
+        red = dds.decode_dds(_dx10(256, 256, 56, struct.pack("<65536H", *codes)))[2][0::4]
+        rgba16 = dds.decode_dds(_dx10(256, 64, 11, struct.pack("<65536H", *codes)))[2]
+        self.assertEqual(rgba16, red)
+
+    def test_png_keeps_alpha(self):
+        png = dds.dds_to_png_bytes(_dx10(1, 1, 11, struct.pack("<4H", 65535, 0, 0, 32768)))
+        pos = 8 + 12 + 13
+        size, kind = struct.unpack_from(">I4s", png, pos)
+        self.assertEqual(kind, b"IDAT")
+        self.assertEqual(zlib.decompress(png[pos + 8:pos + 8 + size]), bytes((0, 255, 0, 0, 128)))
+
+    def test_short_pitch_rejected(self):
+        with self.assertRaises(dds.DdsError):
+            dds.decode_dds(_dx10(2, 1, 11, bytes(16), pitch=12))
 
 
 if __name__ == "__main__":

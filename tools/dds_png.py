@@ -17,6 +17,8 @@ written like the UNORM formats, with no tone mapping or sRGB transfer: clamp to
 and NaN map to 0. The single-channel formats fill red, with green and blue 0 and alpha 255;
 R16G16B16A16_FLOAT keeps its own alpha.
 R11G11B10_FLOAT previews clamp RGB to [0, 1], map NaN to zero and use opaque alpha.
+DX10 R16G16B16A16_UNORM (11) keeps its four channels and its own alpha; each 16-bit value
+becomes round(v * 255 / 65535) half up, the same rounding as R16_UNORM.
 
 Usage:
     python -I tools/dds_png.py <in.dds> --info
@@ -87,6 +89,7 @@ _DXGI_MAP: dict[int, str] = {
     93: "BGRX8",
     26: "R11G11B10_FLOAT",
     41: "R32_FLOAT",
+    11: "RGBA16_UNORM",
     56: "R16_UNORM",
     65: "A8_UNORM",
     70: "BC1",
@@ -368,7 +371,7 @@ class _Plane(NamedTuple):
 _TEXEL_BYTES = {
     "RGBA8": 4, "BGRA8": 4, "BGRX8": 4, "RGBX8": 4, "R11G11B10_FLOAT": 4,
     "BGR8": 3, "RGB8": 3, "R16_UNORM": 2, "A8_UNORM": 1,
-    "R32_FLOAT": 4,
+    "R32_FLOAT": 4, "RGBA16_UNORM": 8,
     **{fmt: layout[0] for fmt, layout in _HALF_FLOAT_LAYOUT.items()},
 }
 
@@ -1089,6 +1092,31 @@ def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: 
     return bytes(rgba)
 
 
+@cache
+def _unorm16_to_u8_lut() -> bytes:
+    """Byte for every 16-bit UNORM code: round(v * 255 / 65535) half up, as R16_UNORM does."""
+    return bytes((v * 255 + 32767) // 65535 for v in range(65536))
+
+
+def _decode_rgba16_unorm(payload: memoryview, width: int, height: int, pitch: int) -> bytes:
+    """R16G16B16A16_UNORM to RGBA8, keeping the stored alpha."""
+    row_bytes = width * 8
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid RGBA16_UNORM row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated RGBA16_UNORM payload: {len(payload)} bytes (need {expected})")
+
+    lut = _unorm16_to_u8_lut()
+    unpack_row = struct.Struct(f"<{width * 4}H").unpack_from
+    rgba = bytearray(width * height * 4)
+    for y in range(height):
+        start = y * width * 4
+        rgba[start:start + width * 4] = bytes(map(lut.__getitem__, unpack_row(payload, y * pitch)))
+    return bytes(rgba)
+
+
 def _bc7_read_indices(bits: int, index_bits: int, is_anchor: tuple[int, ...]) -> tuple[list[int], int]:
     """Read 16 LSB-first pixel indices; anchor pixels omit their implicit zero MSB."""
     indices = []
@@ -1271,6 +1299,8 @@ def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _Dd
         rgba = _decode_r11g11b10(payload, width, height, pitch)
     elif fmt in ("R16_UNORM", "R32_FLOAT", "A8_UNORM"):
         rgba = _decode_single_channel(payload, width, height, pitch, fmt)
+    elif fmt == "RGBA16_UNORM":
+        rgba = _decode_rgba16_unorm(payload, width, height, pitch)
     elif fmt == "BC7":
         rgba = _decode_bc7(payload, 0, width, height)
     else:
