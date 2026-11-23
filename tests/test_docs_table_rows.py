@@ -30,12 +30,17 @@ class DocsTableRowsTest(unittest.TestCase):
 
         for path in DOCS:
             lines = path.read_text(encoding="utf-8").splitlines()
-            for i in range(1, len(lines) - 1):
-                if lines[i].strip() or not lines[i - 1].startswith("|") or not lines[i + 1].startswith("|"):
+            for i, line in enumerate(lines):
+                if line.strip() or (i and not lines[i - 1].strip()):
+                    continue  # not blank, or not the first blank of a run
+                prev = next((lines[j] for j in range(i - 1, -1, -1) if lines[j].strip()), "")
+                nxt = next((j for j in range(i + 1, len(lines)) if lines[j].strip()), None)
+                if not prev.startswith("|") or nxt is None or not lines[nxt].startswith("|"):
                     continue
-                if is_separator(lines[i + 1]) or (i + 2 < len(lines) and is_separator(lines[i + 2])):
+                after = next((lines[j] for j in range(nxt + 1, len(lines)) if lines[j].strip()), "")
+                if is_separator(lines[nxt]) or is_separator(after):
                     continue  # a new table: header then separator
-                self.fail(f"{path.relative_to(ROOT)}:{i + 1}: blank line ends the table before this row")
+                self.fail(f"{path.relative_to(ROOT)}:{nxt + 1}: blank line ends the table before this row")
 
     def test_no_duplicate_rows_in_one_table(self):
         for path in DOCS:
