@@ -6,11 +6,10 @@
 The extension check in .github/workflows/no-game-data.yml misses a renamed file: a DDS saved as .bin, an executable
 as .txt. This reads the first bytes of each file and matches the magic numbers of the package's formats and the
 files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resources, XBCH/FSSM/DXBC shader
-containers, SPIR-V, DDS, AWC audio, PSIN/PAMH/MHIU/SPS1/SGD5/RDS5 containers, YSC/SCRP compiled scripts, the
-animation MoVE container and SKEL_ bone table, Ogg, RIFF WAVE, Bink, glTF binaries, PE executables and XVD
-images. The magics are
-the ones docs/ measures (docs/gamedata.md and the shader and audio notes). Text formats (disassembly, .obj, .spvasm)
-have no magic and stay with the extension check.
+containers, SPIR-V, DDS, AWC audio, the PSO/shader cache, PSIN/PAMH/MHIU/SPS1/SGD5/RDS5 containers, YSC/SCRP
+compiled scripts, the animation MoVE container and SKEL_ bone table, Ogg, RIFF WAVE, Bink, glTF binaries, PE
+executables and XVD images. The magics are the ones docs/ measures (docs/gamedata.md and the shader and audio
+notes). Text formats (disassembly, .obj, .spvasm) have no magic and stay with the extension check.
 
 A compressed file hides those magics from both checks, so the script looks inside what the standard library opens:
 each member of a zip (found by its central directory too, so with bytes in front of it) or a tar, and the stream of
@@ -54,6 +53,7 @@ MAGICS = (
     ("AWC audio bank", 0, b"ADAT"),
     ("AWC audio bank", 0, b"TADA"),
     ("AWC audio bank", 0, b"AWC\x00"),
+    ("PSO/shader cache container", 0, b"PS\x00\x09"),
     ("PSIN metadata container", 0, b"PSIN"),
     ("PAMH heightmap", 0, b"PAMH"),
     ("MHIU heightmap", 0, b"MHIU"),
