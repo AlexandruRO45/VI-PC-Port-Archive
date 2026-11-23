@@ -353,6 +353,17 @@ class TestValuSubF32ScalarExecution(unittest.TestCase):
         words = support.mrt0_words(support.translate_lines(next_test_id("ps_sub_inline"), lines))
         self.assertAlmostEqual(bits_to_f32(words[0]), 0.5, places=6)
 
+class TestValuSubF32SIMDDivergence(unittest.TestCase):
+    """Stage 10: SIMD multi-lane divergence tests for v_sub_f32 clamp and omod."""
+
+    def test_sub_operand_asymmetry(self):
+        # S0 - S1 != S1 - S0 under clamp
+        res_ab = run_binary_f32("v_sub_f32", 0.8, 0.3, clamp=True)  # 0.5
+        res_ba = run_binary_f32("v_sub_f32", 0.3, 0.8, clamp=True)  # 0.0
+        self.assertAlmostEqual(res_ab, 0.5, places=6)
+        self.assertAlmostEqual(res_ba, 0.0, places=6)
+        self.assertNotEqual(res_ab, res_ba)
+
 
 if __name__ == "__main__":
     unittest.main()
