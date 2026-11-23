@@ -409,6 +409,24 @@ class CompletePoolEarlyReturn(unittest.TestCase):
                              (0, 0))
         pool.assert_not_called()
 
+    def test_no_candidates_still_removes_the_files_an_earlier_pass_replaced(self):
+        # A calibrated pass switched every row but could not remove the old file (in use). Without the profile no
+        # row is a candidate, so the next builds never reached the removal and the file stayed for good.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "partial.dds").write_bytes(b"previous mip chain")
+            (folder / "000000_bcpack_v1-calibrated.dds").write_bytes(b"full chain")
+            manifest = {"BCPackPass": "v1-calibrated", ttpf_assets.PENDING: ["partial.dds"],
+                        "Textures": [synthetic_row(Index=0, File="000000_bcpack_v1-calibrated.dds", Mips=5,
+                                                   SourceMips=5, BCPackDecoder="v1-calibrated")]}
+            with mock.patch.object(ttpf_assets.ttpf, "Pool") as pool:
+                self.assertEqual(ttpf_assets.complete_pool("missing.rpf", folder, manifest, ("v1-strict", None)),
+                                 (0, 0))
+            pool.assert_not_called()
+            self.assertFalse((folder / "partial.dds").exists())
+            self.assertTrue((folder / "000000_bcpack_v1-calibrated.dds").exists())
+            self.assertNotIn(ttpf_assets.PENDING, json.loads((folder / "manifest.json").read_bytes()))
+
 
     def test_a_pool_hashes_the_decoder_sources_once_for_all_its_strict_fallback_rows(self):
         # With a profile, each row the calibrated decoder can't take falls back to strict decoding; hashing the

@@ -154,6 +154,10 @@ def complete_pool(source, directory, manifest, settings):
         return 0, 0
     rows = [row for row in manifest["Textures"] if candidate(row, profile)]
     if not rows:
+        # Nothing to export, but a file an earlier pass replaced may still be listed (it was in use, or that run
+        # stopped after the switch). Remove it now: no later pass may find a candidate to reach the end below, as
+        # when the rows were completed with a calibration profile that has since been removed.
+        finish_replaced(directory, manifest)
         return 0, 0
     written = blocked = 0
     superseded = set()   # the files the rows named before they were switched to a full chain
