@@ -13,19 +13,23 @@ minutes on evidence.
 
 **What is verified.** 26,503/26,503 shaders translate and pass `spirv-val`; the staged `<work>/shaders/spirv` +
 `<work>/shaders/dxbc` layout resolves all 26,503 containers in `shader_library_corpus_test` with 0 failures
-(`docs/design.md`, `runtime/README.md`). The delivered `gta6rt.exe` passes `check_tiny_frame.py` on a Vulkan device.
-**What is not:** the retail executable has not been run, the PresentX queue slot is unmeasured, and the opt-in
-`LEONIDA_PRESENTX_SLOT` / `LEONIDA_CAPTURE` route is in PR #6230 and the final exe-day assembly, not on main at
-`561b65a83`. The delivered intermediate does not contain those strings.
+(`docs/design.md`, `runtime/README.md`). The delivered `gta6rt-final.exe` passes `check_tiny_frame.py` on a Vulkan
+device. **What is not:** the retail executable has not been run, the PresentX queue slot is unmeasured, and the opt-in
+`LEONIDA_PRESENTX_SLOT` / `LEONIDA_CAPTURE` route is in PR #6230 at `255efe094` and the final exe-day assembly, not on
+main at `561b65a83`. The older `gta6rt.exe` intermediate does not contain those strings.
 
 ## 0. The build you are timing
 
-Main at `561b65a83` does not contain all of the validated boot fixes. The delivered kit is the `exe-day-3777`
-assembly: base `561b65a83`, final commit `366c2463b`, with the PRs in its `MANIFEST.txt` (#5731, #5312, #4026,
-#5662, #1712, #5689, #5855, #5797, #5805, #5814 and #3777). Run that binary. The earlier `exe-day-integration` (16
-commits over `561b65a83`) is the integration without #3777; it is history, not the exe-day loader. If you build main
-instead, expect the fixed failures back, and check the build with the pre-flight tests rather than discovering the
-gap at 17:05.
+Main at `561b65a83` does not contain all of the validated boot fixes. The kit's default is `gta6rt-final.exe`: base
+`ba4b0bd4d` + #3777 + #5867/#5808/#5851 + #6230 at `255efe094` (the PresentX identity guard) + #6107/#6149 + the
+runtime layer `7bce00bca` + upstream #6351 `XMemTransferMemory`. `gta6rt-final-pre-xmem.exe` is the same build minus
+#6351. The older `gta6rt.exe` is the trace/draw intermediate. The kit's `MANIFEST.txt` describes the older
+`exe-day-3777` build; read it for its test history, but use the three loaders and hashes in §1.1.
+
+The final is the default because #6351 serves `XMemTransferMemory`, a Series startup call used by public
+NetRumble/NativeAOT-Xbox bootstraps; without it the title can stop before the device. If you build main instead,
+expect the fixed failures back, and check the build with the pre-flight tests rather than discovering the gap at
+17:05.
 
 The failures those fixes remove, so you recognise them if they return: an early `XErrorReport` stops the title; a
 console-sized `CheckFeatureSupport(D3D12_OPTIONS)` returns `E_INVALIDARG`; a bundled module and a host DLL with the
@@ -36,53 +40,72 @@ None of them is a diagnosis to make during the five hours.
 
 ### 1.1 Use the delivered SDL3 binary
 
-The exe-day kit at `C:\Users\kam\leonida-work\gta6rt-exeday` is the loader to run. Its `gta6rt.exe` has SDL3 3.4.20
-statically linked, so the GameInput shim is inside the binary, and it carries the integration fixes in §0 (#5731,
-#5312, #4026, #1712, #5689 and the #3777 indirect path). Do not rebuild it just to run; a code fix in §3 is the
-exception. A source rebuild without `-DLEONIDA_SDL3_FETCH=ON` omits the GameInput shim, and
-`gameinput.dll!GameInputCreate` becomes a boot blocker.
+The kit at `C:\Users\kam\leonida-work\gta6rt-exeday` has three loaders. Prefer the newest:
 
-Use `gta6rt.exe`, not the kit's `gta6rt-mesh-only.exe` or `gta6rt-nosdl3.exe`; those are history. Stage the five
-files the loader needs in a private folder. `gta6rt.exe` links the MSVC runtime dynamically, and `gta6rt_tls_host.dll`
-is the loader's TLS anchor; all must sit beside the executable.
+| Loader | Bytes | SHA-256 | Capture route | Series startup |
+|---|---|---|---|---|
+| `gta6rt-final.exe` | 6,679,552 | `A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B` | yes | #6351 `XMemTransferMemory` |
+| `gta6rt-final-pre-xmem.exe` | 6,672,896 | `A5F6124D6C8C43D5260B69C0A9AA4A5FDAC8EB8C6FF4520FDD3FB3FBD6D2BAD7` | yes | no #6351 |
+| `gta6rt.exe` | 6,456,320 | `4F2C5156D0BAB04369E547C83D8809634DBAB233B8CDC052C697E68D1EF1ED16` | no | no #6351 |
+
+`gta6rt-final.exe` is the default: SDL3 3.4.20 is static, the PresentX capture route is #6230 at `255efe094` (the
+identity guard), and #6351 serves `XMemTransferMemory`. That last call is a Series startup call used by public
+NetRumble/NativeAOT-Xbox bootstraps; without it the title can stop before the device.
+`gta6rt-final-pre-xmem.exe` is the same build minus #6351, for a machine that must avoid it. The older `gta6rt.exe`
+can trace and draw but has no present capture. Do not use the kit's `gta6rt-mesh-only.exe` or `gta6rt-nosdl3.exe`;
+those are history.
+
+Do not rebuild the loader just to run; a code fix in §3 is the exception. A source rebuild without
+`-DLEONIDA_SDL3_FETCH=ON` omits the GameInput shim, and `gameinput.dll!GameInputCreate` becomes a boot blocker.
 
 ```powershell
-$repo  = "C:\path\to\exe-day-3777"   # the kit's source tree at 366c2463b, not fresh main
+$repo  = "C:\path\to\the-final-assembly-tree"   # not fresh main
 $build = Join-Path $repo "runtime\build"
 $work  = "E:\leonida-work"
 $kit   = "C:\Users\kam\leonida-work\gta6rt-exeday"
-$bin  = Join-Path $work "exeday\bin"
+$bin   = Join-Path $work "exeday\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
 
-$files = "gta6rt.exe", "gta6rt_tls_host.dll",
+$candidates = @(
+    [pscustomobject]@{ Name = "gta6rt-final.exe"; Bytes = 6679552; Sha = "A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B" },
+    [pscustomobject]@{ Name = "gta6rt-final-pre-xmem.exe"; Bytes = 6672896; Sha = "A5F6124D6C8C43D5260B69C0A9AA4A5FDAC8EB8C6FF4520FDD3FB3FBD6D2BAD7" },
+    [pscustomobject]@{ Name = "gta6rt.exe"; Bytes = 6456320; Sha = "4F2C5156D0BAB04369E547C83D8809634DBAB233B8CDC052C697E68D1EF1ED16" }
+)
+$selected = $candidates | Where-Object { Test-Path (Join-Path $kit $_.Name) } | Select-Object -First 1
+if (-not $selected) { throw "no exe-day loader in $kit" }
+$source = Join-Path $kit $selected.Name
+$actual = (Get-FileHash $source -Algorithm SHA256).Hash
+if ($actual -ne $selected.Sha) { throw "$($selected.Name): hash $actual, expected $($selected.Sha)" }
+"selected $($selected.Name) ($($selected.Bytes) bytes, $actual)"
+
+$files = $selected.Name, "gta6rt_tls_host.dll",
          "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"
 $files | ForEach-Object { Copy-Item (Join-Path $kit $_) $bin -Force }
+$loader = Join-Path $bin $selected.Name
 Get-ChildItem $bin | Select-Object Name, Length
-Get-FileHash (Join-Path $bin "gta6rt.exe") -Algorithm SHA256
-$loader = Join-Path $bin "gta6rt.exe"
 ```
 
-Compare the hash with the one in the kit's `MANIFEST.txt`; a mismatch means the kit changed, so re-read the manifest
-before trusting its recorded test results.
-
-The frame attempt is gated on three strings in this exact binary:
+The exact check runs on `$loader`, the binary that will actually launch:
 
 ```powershell
-$tokens = "LEONIDA_PRESENTX_SLOT", "LEONIDA_CAPTURE", "present-"
+$tokens = "LEONIDA_PRESENTX_SLOT", "LEONIDA_CAPTURE", "present-", "XMemTransferMemory", "SDL-release-3.4.20"
 $ascii  = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($loader))
 $tokens | ForEach-Object { "$_ = $($ascii.Contains($_))" }
-$captureRoute = ($tokens | Where-Object { -not $ascii.Contains($_) }).Count -eq 0
-"capture route in this binary: $captureRoute"
-"SDL3 3.4.20 in binary: $($ascii.Contains('SDL-release-3.4.20'))"
+$captureRoute = (@("LEONIDA_PRESENTX_SLOT", "LEONIDA_CAPTURE", "present-") |
+                 Where-Object { -not $ascii.Contains($_) }).Count -eq 0
+$xmemServed = $ascii.Contains("XMemTransferMemory")
+$sdl3 = $ascii.Contains("SDL-release-3.4.20")
+"capture route: $captureRoute; XMemTransferMemory: $xmemServed; SDL3: $sdl3"
 ```
 
-The SDL3 marker must be `True`; if it is `False`, this is the no-SDL3 build and the GameInput shim is absent. The
-deployed intermediate (13:35 UTC, 2026-11-23) has none of the three capture strings; the final exe-day assembly will.
-They are in PR #6230 and that assembly, not on `main` at `561b65a83`. If `$captureRoute` is false, the binary can
-trace and draw but cannot write a frame artifact: plan the offscreen fallback in §5.4 and say "trace/draw only" in
-the handoff. The strings are a necessary condition, not proof that capture works; §5 still has to produce the file.
+`gta6rt-final.exe` has all five. `gta6rt-final-pre-xmem.exe` has the three capture strings and SDL3 but not
+`XMemTransferMemory`; the older `gta6rt.exe` has only SDL3. The three capture strings are the gate for §5: with any
+false, the binary can trace and draw but cannot write a frame artifact; plan the offscreen fallback in §5.4 and say
+"trace/draw only" in the handoff. They are in PR #6230 at `255efe094` and the final assembly, not on `main` at
+`561b65a83`. `XMemTransferMemory` is a separate boot check: if it is false, the title can stop before the device, so
+use the final binary unless you have a reason not to.
 
-If the delivered binary is lost, rebuild it from the tree that produced it, with SDL3:
+If the delivered binary is lost, rebuild the tree that produced the selected one, with SDL3:
 
 ```powershell
 cmake -S (Join-Path $repo "runtime") -B $build -G Ninja `
@@ -154,16 +177,17 @@ folder, not at `shaders`; the corpus test reads `<spirv>/../dxbc` for the contai
 
 ### 1.3 Verify the delivered binary, the corpus and the movie
 
-`$tests` is the build tree that produced the kit; the kit's `MANIFEST.txt` names it. If it is gone, the delivered
-binary can still be run, but these checks need a source build.
+`$tests` is the build tree that produced the selected binary; the kit's `MANIFEST.txt` describes the older
+`exe-day-3777` build, so use the tree tied to `gta6rt-final.exe`. If it is gone, the delivered binary can still be
+run, but these checks need a source build.
 
 ```powershell
-$tests = "C:\path\to\the\kit-build"   # MANIFEST.txt names the real path
+$tests = "C:\path\to\the-final-build"   # the build that produced the selected exe
 $env:LEONIDA_D3D12    = "vulkan"
 $env:LEONIDA_SHADERS  = Join-Path $work "shaders\spirv"
 $env:LEONIDA_GAME_DIR = $game
 
-# 1. The exact delivered gta6rt.exe, through the synthetic tiny_frame guest.
+# 1. The exact delivered gta6rt-final.exe, through the synthetic tiny_frame guest.
 python -I runtime\test\check_tiny_frame.py $loader `
     (Join-Path $tests "fixtures\game\Release\tiny_frame.exe") `
     --probe (Join-Path $tests "d3d12_com_test.exe")
@@ -182,7 +206,7 @@ is not in `$tests`, build it with `cmake --build $tests --target shader_library_
 
 | Check | Pass looks like | If it does not |
 |---|---|---|
-| `check_tiny_frame.py` | `OK`; the trace has device, queue, allocator, list, fence and the clear/copy; 32/32 pixels | no usable Vulkan device, a missing CRT DLL or a broken loader. Fix before 17:00. |
+| `check_tiny_frame.py` | `gta6rt-final.exe`: `OK`; the trace has device, queue, allocator, list, fence and the clear/copy; 32/32 pixels | no usable Vulkan device, a missing CRT DLL or a broken loader. Fix before 17:00. |
 | `shader_library_corpus_test` | 26,503 containers resolve, 0 failures | `LEONIDA_SHADERS` is wrong or the staged layout is incomplete. |
 | `d3d12_present`, `xbox_present` | `Passed`; the swapchain/present core and its capture work | no presentation-capable Vulkan device. The present hour is at risk. |
 | `d3d12_boot_movie`, `bink_decode` | `Passed`; a real boot-movie frame is decoded and presented on pixels | `LEONIDA_GAME_DIR`/`LEONIDA_MOVIE` unset means SKIP; the movie path is unverified, not passed. |
@@ -239,13 +263,14 @@ foreach ($d in @($overlay, $saves)) {
 
 | Before 17:00 | Done when |
 |---|---|
-| Loader | `$bin` has `gta6rt.exe`, `gta6rt_tls_host.dll`, `msvcp140.dll`, `vcruntime140.dll` and `vcruntime140_1.dll`; the hash matches `MANIFEST.txt` |
-| SDL3/GameInput | the delivered binary is used; if rebuilt, `-DLEONIDA_SDL3_FETCH=ON` was set and the GameInput shim is in it |
-| Capture route | `$captureRoute` is recorded; if false, the deliverable is trace/draw only, not a frame artifact |
+| Loader | the selected loader's byte count and SHA-256 match §1.1; `$bin` has it plus `gta6rt_tls_host.dll` and the three CRT DLLs |
+| SDL3/GameInput | `$sdl3` is true; if rebuilt, `-DLEONIDA_SDL3_FETCH=ON` was set and the GameInput shim is in it |
+| Series startup | `$xmemServed` is true and `gta6rt-final.exe` is selected; `gta6rt-final-pre-xmem.exe` is only a deliberate fallback |
+| Capture route | `$captureRoute` is true for a frame artifact; false means trace/draw only, not a frame artifact |
 | Package | all 16 modules are present; `$exe` exists |
 | Movie | `LEONIDA_MOVIE` is a file; `d3d12_boot_movie` passed (or the gap is recorded) |
 | Shaders | `index.json` exists; four `VS_Bink_*` modules; corpus passed 26,503/26,503 |
-| Device and present | `check_tiny_frame.py` passed on the delivered binary; the present tests passed |
+| Device and present | `check_tiny_frame.py` passed on `gta6rt-final.exe`; the present tests passed |
 | Overlay and saves | `$overlay` and `$saves` exist and the write probe succeeded |
 | Traces | `$run` is empty; no path is reused between passes |
 | Rollback | `runtime\build-prev` holds all five loader files |
@@ -570,9 +595,9 @@ this title, not a measurement. The queue proxy accepts the 19 public slots and l
 the D3D12 trace as `XboxID3D12CommandQueue::SlotN unsupported`. That N is the only evidence for the slot. Do not guess
 30 or 32: a wrong slot can fault past the proxy's 128-entry table.
 
-The gate is the exact binary, not the source tree: `$captureRoute` from §1.1. The flags are in PR #6230 and the final
-exe-day assembly, not on `main` at `561b65a83`; a `git grep` on main is expected to be empty even when the delivered
-binary has them.
+The gate is the exact binary, not the source tree: `$captureRoute` from §1.1. The flags are in PR #6230 at
+`255efe094` and the final exe-day assembly, not on `main` at `561b65a83`; a `git grep` on main is expected to be empty
+even when the selected binary has them.
 
 ```powershell
 if (-not $captureRoute) {
@@ -589,6 +614,12 @@ if (-not $captureRoute) {
 If `$captureRoute` is false, do not run the capture block; the binary cannot write the artifact. If it is true, the
 branch's README is the authority for the slot value and the capture format. `$captureRoute` is necessary, not
 sufficient: §5.2 still has to find and check the file.
+
+After a run that names an unknown queue slot, `C:\Users\kam\leonida-work\discover-presentx-slot.ps1 -Log <console.log>
+-Exe <exe> -GameDir <package>` counts the `XboxID3D12CommandQueue::SlotN` lines, ranks the candidates and prints the
+relaunch with `-PresentXSlot N`. The printed command calls `launch-exeday.ps1`, whose `$bin` currently names the kit's
+`gta6rt.exe` (the intermediate); point that at `gta6rt-final.exe` before using it, or run the final binary directly
+with the same environment variables.
 
 If the capture route writes raw RGBA instead of PPM or PNG, convert it in the route's source, not in this repository.
 The capture is game data and stays local.
@@ -779,10 +810,11 @@ These restate `AGENTS.md` for the pressure of the day.
 
 Run on 2026-11-23 on Windows 11, NVIDIA GeForce RTX 5070 Ti (driver 621.24):
 
-- The delivered `gta6rt.exe` from the kit passed `check_tiny_frame.py` against the synthetic `tiny_frame` guest:
+- `gta6rt-final.exe` (6,679,552 bytes, SHA-256 `A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B`)
+  passed `check_tiny_frame.py` against the synthetic `tiny_frame` guest:
   `tiny_frame under gta6rt --run on the Vulkan D3D12 device: OK`.
-- The delivered binary's string scan is `False` for `LEONIDA_PRESENTX_SLOT`, `LEONIDA_CAPTURE` and `present-`. It can
-  trace and draw; the frame artifact waits for the final exe-day assembly with #6230.
+- The exact string scan is true for all five tokens on `gta6rt-final.exe`. `gta6rt-final-pre-xmem.exe` has the three
+  capture strings and SDL3 but not `XMemTransferMemory`; the older `gta6rt.exe` has only SDL3.
 - The staged 1.0.2.1 corpus: 26,503 containers, 26,503 reached, 0 not translated, 0 failures.
 - A Release build of `561b65a83` produced `gta6rt.exe` and `gta6rt_tls_host.dll`; `run_tiny_frame`, `d3d12_present`
   and `xbox_present` passed on the source build (19 D3D12 calls, 0 failed/unsupported/refused, 32/32 pixels).
