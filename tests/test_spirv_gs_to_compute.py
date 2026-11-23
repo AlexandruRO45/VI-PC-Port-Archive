@@ -58,6 +58,55 @@ def test_compute_module(gs_tri):
 
 
 @requires_tools
+def test_bda_module_uses_physical_buffer_addresses(gs_tri):
+    shader, spvasm = gs_tri
+    ssbo, ssbo_lay = gsc.rewrite(spvasm)
+    out, lay = gsc.rewrite(spvasm, buffers="bda")
+    assert lay == ssbo_lay
+    for name in ("%gsc_in", "%gsc_rec", "%gsc_meta"):
+        assert not re.search(rf"OpDecorate {re.escape(name)} (?:DescriptorSet|Binding) ", out)
+        assert not re.search(rf"{re.escape(name)} = OpVariable ", out)
+    assert "DescriptorSet" not in out and "Binding" not in out
+    assert "OpMemoryModel PhysicalStorageBuffer64 GLSL450" in out
+    assert "OpCapability PhysicalStorageBufferAddresses" in out
+    assert 'OpExtension "SPV_KHR_physical_storage_buffer"' in out
+    assert ("%UserData = OpTypeStruct %arr_ud %uint %uint %uint %uint %uint %uint %uint %uint %uint %uint"
+            in out)
+    for member, offset in zip(range(5, 11), range(144, 165, 4)):
+        assert f"OpMemberDecorate %UserData {member} Offset {offset}" in out
+    # every storage-buffer access site in the ssbo module becomes one OpConvertUToPtr (the site sets match)
+    sites = len(re.findall(r"OpAccessChain %\w+ %gsc_(?:in|rec|meta) ", ssbo))
+    assert sites
+    assert len(re.findall(r"OpConvertUToPtr %gsc_ptr_psb_\w+ ", out)) == sites
+    for address in ("%gsc_in64", "%gsc_rec64", "%gsc_meta64"):
+        assert re.search(rf"{re.escape(address)} = OpIAdd %gsc_ulong ", out)
+    shader.validate(out)
+
+
+@requires_tools
+def test_ssbo_buffers_are_the_default(gs_tri):
+    _, spvasm = gs_tri
+    default, lay = gsc.rewrite(spvasm)
+    explicit, explicit_lay = gsc.rewrite(spvasm, buffers="ssbo")
+    assert default == explicit and lay == explicit_lay
+    assert "OpMemoryModel Logical GLSL450" in default
+    assert "%gsc_in = OpVariable %gsc_ptr_in_t StorageBuffer" in default
+
+
+@requires_tools
+def test_cli_writes_bda_module(gs_tri, tmp_path):
+    _, spvasm = gs_tri
+    sa, sv = tmp_path / "gs.spvasm", tmp_path / "gs.spv"
+    sa.write_text(spvasm)
+    subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"], check=True)
+    out = tmp_path / "cs_bda.spv"
+    r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"), str(sv),
+                        str(out), "--buffers", "bda"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(out)], check=True)
+
+
+@requires_tools
 def test_rejects_non_geometry(make_shader):
     shader = make_shader("v_mov_b32 v1, 1.0\ns_endpgm", name="cs_not_gs")
     with pytest.raises(gsc.Unsupported):

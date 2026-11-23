@@ -259,8 +259,9 @@ def main():
             for suffix in (".spv", ".spvasm"):
                 artifact = built / (n + suffix)
                 artifact.replace(spirv / artifact.name)
-            # The --gs-compute capture sidecar (SHADER-1092), published only when it was built.
-            for suffix in (".gs_compute.spv", ".gs_compute.spvasm"):
+            # The --gs-compute capture sidecars (SHADER-1092), published only when they were built.
+            for suffix in (".gs_compute.spv", ".gs_compute.spvasm",
+                           ".gs_compute_bda.spv", ".gs_compute_bda.spvasm"):
                 artifact = built / (n + suffix)
                 if artifact.is_file():
                     artifact.replace(spirv / artifact.name)

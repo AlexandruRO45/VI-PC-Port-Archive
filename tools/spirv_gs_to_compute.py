@@ -19,7 +19,13 @@ p, `InvocationId` reads 0 (only `Invocations 1` is supported). The workgroup is 
 `primitive_count` return at once. Push constants and set 0 are untouched. The draw afterwards turns each strip into
 triangles (or lines, points) in emission order.
 
-Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]
+With `--buffers bda` the three buffers are addressed through 64-bit physical device addresses instead of
+storage-buffer descriptors: the input, record and meta console VAs come from push-constant members 5..10 (added to the
+module's `%UserData` block at offsets 144..164) and are added to the heap base from members 1/2. This is for the D3D12
+layer's geometry-shader fallback, where no descriptor set can be bound. The default, `--buffers ssbo`, keeps the
+descriptors at set 1, bindings 0/1/2.
+
+Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json] [--buffers ssbo|bda]
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
 """
 import json
@@ -114,8 +120,12 @@ def layout_of(text):
             "input_vars": inputs, "output_vars": outputs, "builtins": builtins}
 
 
-def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[str, int | str | list[str]]]:
-    """Return (compute module text, layout dict for --layout)."""
+def rewrite(text: str, *, version: tuple[int, int] = (1, 5),
+            buffers: str = "ssbo") -> tuple[str, dict[str, int | str | list[str]]]:
+    """Return (compute module text, layout dict for --layout). buffers: "ssbo" (descriptors) or "bda" (addresses)."""
+    if buffers not in ("ssbo", "bda"):
+        raise ValueError(f"buffers must be 'ssbo' or 'bda', not {buffers!r}")
+    bda = buffers == "bda"
     lay = layout_of(text)
     defs, _ = parse(text)
     main, ins, outs, builtins = lay["main"], lay["input_vars"], lay["output_vars"], lay["builtins"]
@@ -128,44 +138,81 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     boolt = find_type(defs, "OpTypeBool", []) or "%gsc_bool"
     float_ptrs = {r for r, (op, ops) in defs.items() if op == "OpTypePointer" and ops[1] == f32}
     nin, nout, mv, vin = len(ins), len(outs), lay["max_verts"], lay["verts_in"]
+    ulong = find_type(defs, "OpTypeInt", ["64", "0"])
+    int64 = ulong is None
+    ud = ud_var = pc_uint = None
+    if bda:
+        if not re.search(r"^\s*OpMemoryModel Logical GLSL450\s*$", text, re.M):
+            raise Unsupported("no OpMemoryModel Logical GLSL450 line to make PhysicalStorageBuffer64")
+        ud_var = next((r for r, (op, ops) in defs.items()
+                       if op == "OpVariable" and ops[1:2] == ["PushConstant"]), None)
+        ud_ptr = defs.get(ud_var, (None, [None]))[1][0]
+        ud = defs.get(ud_ptr, (None, [None, None]))[1][1]
+        pc_uint = find_type(defs, "OpTypePointer", ["PushConstant", uint])
+        if not (ud and defs.get(ud, (None,))[0] == "OpTypeStruct" and len(defs[ud][1]) >= 5 and pc_uint):
+            raise Unsupported("no push-constant block to take the buffer addresses from")
 
     def k(v):
         return f"%gsc_k{v}"
 
     # Before SPIR-V 1.3, storage buffers use Uniform with BufferBlock in core SPIR-V.
     buffer_storage, buffer_block = ("StorageBuffer", "Block") if version >= (1, 3) else ("Uniform", "BufferBlock")
-    decos = ["OpDecorate %gsc_gid BuiltIn GlobalInvocationId",
-             "OpDecorate %gsc_rt_v4 ArrayStride 16", "OpDecorate %gsc_rt_u ArrayStride 4",
-             "OpDecorate %gsc_pad ArrayStride 4",
-             f"OpDecorate %gsc_in_t {buffer_block}", "OpMemberDecorate %gsc_in_t 0 Offset 0",
-             "OpMemberDecorate %gsc_in_t 1 Offset 4", "OpMemberDecorate %gsc_in_t 2 Offset 16",
-             f"OpDecorate %gsc_rec_t {buffer_block}", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
-             f"OpDecorate %gsc_meta_t {buffer_block}", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
-             "OpDecorate %gsc_in DescriptorSet 1", "OpDecorate %gsc_in Binding 0", "OpDecorate %gsc_in NonWritable",
-             "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
-             "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
+    if bda:
+        # The three buffers are physical addresses, so they need no descriptors and no Block structs.
+        decos = ["OpDecorate %gsc_gid BuiltIn GlobalInvocationId"]
+    else:
+        decos = ["OpDecorate %gsc_gid BuiltIn GlobalInvocationId",
+                 "OpDecorate %gsc_rt_v4 ArrayStride 16", "OpDecorate %gsc_rt_u ArrayStride 4",
+                 "OpDecorate %gsc_pad ArrayStride 4",
+                 f"OpDecorate %gsc_in_t {buffer_block}", "OpMemberDecorate %gsc_in_t 0 Offset 0",
+                 "OpMemberDecorate %gsc_in_t 1 Offset 4", "OpMemberDecorate %gsc_in_t 2 Offset 16",
+                 f"OpDecorate %gsc_rec_t {buffer_block}", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
+                 f"OpDecorate %gsc_meta_t {buffer_block}", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
+                 "OpDecorate %gsc_in DescriptorSet 1", "OpDecorate %gsc_in Binding 0",
+                 "OpDecorate %gsc_in NonWritable",
+                 "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
+                 "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
     types = ([f"{v3u} = OpTypeVector {uint} 3"] if v3u == "%gsc_v3u" else []) + \
             ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else [])
-    types += [f"{k(v)} = OpConstant {uint} {v}" for v in sorted({0, 1, 2, 3, vin, nin, nout, mv, mv + 1}
-                                                              | set(range(max(nin, nout))))]
-    types += [f"%gsc_ptr_in_v3u = OpTypePointer Input {v3u}",
-              f"%gsc_rt_v4 = OpTypeRuntimeArray {v4}", f"%gsc_rt_u = OpTypeRuntimeArray {uint}",
-              f"%gsc_pad = OpTypeArray {uint} {k(3)}",
-              f"%gsc_in_t = OpTypeStruct {uint} %gsc_pad %gsc_rt_v4",
-              "%gsc_rec_t = OpTypeStruct %gsc_rt_v4", "%gsc_meta_t = OpTypeStruct %gsc_rt_u",
-              f"%gsc_ptr_in_t = OpTypePointer {buffer_storage} %gsc_in_t",
-              f"%gsc_ptr_rec_t = OpTypePointer {buffer_storage} %gsc_rec_t",
-              f"%gsc_ptr_meta_t = OpTypePointer {buffer_storage} %gsc_meta_t",
-              f"%gsc_ptr_sb_v4 = OpTypePointer {buffer_storage} {v4}",
-              f"%gsc_ptr_sb_u = OpTypePointer {buffer_storage} {uint}",
-              f"%gsc_ptr_sb_f = OpTypePointer {buffer_storage} {f32}",
-              f"%gsc_ptr_pv_v4 = OpTypePointer Private {v4}", f"%gsc_ptr_pv_f = OpTypePointer Private {f32}",
-              f"%gsc_ptr_pv_u = OpTypePointer Private {uint}",
-              "%gsc_gid = OpVariable %gsc_ptr_in_v3u Input",
-              f"%gsc_in = OpVariable %gsc_ptr_in_t {buffer_storage}",
-              f"%gsc_rec = OpVariable %gsc_ptr_rec_t {buffer_storage}",
-              f"%gsc_meta = OpVariable %gsc_ptr_meta_t {buffer_storage}",
-              f"%gsc_n = OpVariable %gsc_ptr_pv_u Private {k(0)}"]
+    const_values = {0, 1, 2, 3, vin, nin, nout, mv, mv + 1}
+    if bda:
+        # 4 and 16 scale element indices to byte offsets; 5..10 are the input/record/meta VAs' push-constant members.
+        const_values |= {4, 5, 6, 7, 8, 9, 10, 16}
+    types += [f"{k(v)} = OpConstant {uint} {v}" for v in sorted(const_values | set(range(max(nin, nout))))]
+    if bda:
+        if ulong is None:
+            ulong = "%gsc_ulong"
+            types.append(f"{ulong} = OpTypeInt 64 0")
+        types += [f"%gsc_ptr_in_v3u = OpTypePointer Input {v3u}",
+                  f"%gsc_ptr_psb_v4 = OpTypePointer PhysicalStorageBuffer {v4}",
+                  f"%gsc_ptr_psb_f = OpTypePointer PhysicalStorageBuffer {f32}",
+                  f"%gsc_ptr_psb_u = OpTypePointer PhysicalStorageBuffer {uint}",
+                  f"%gsc_cl32 = OpConstant {ulong} 32",
+                  f"%gsc_ptr_pv_v4 = OpTypePointer Private {v4}",
+                  f"%gsc_ptr_pv_f = OpTypePointer Private {f32}",
+                  f"%gsc_ptr_pv_u = OpTypePointer Private {uint}",
+                  "%gsc_gid = OpVariable %gsc_ptr_in_v3u Input",
+                  f"%gsc_n = OpVariable %gsc_ptr_pv_u Private {k(0)}"]
+    else:
+        types += [f"%gsc_ptr_in_v3u = OpTypePointer Input {v3u}",
+                  f"%gsc_rt_v4 = OpTypeRuntimeArray {v4}", f"%gsc_rt_u = OpTypeRuntimeArray {uint}",
+                  f"%gsc_pad = OpTypeArray {uint} {k(3)}",
+                  f"%gsc_in_t = OpTypeStruct {uint} %gsc_pad %gsc_rt_v4",
+                  "%gsc_rec_t = OpTypeStruct %gsc_rt_v4", "%gsc_meta_t = OpTypeStruct %gsc_rt_u",
+                  f"%gsc_ptr_in_t = OpTypePointer {buffer_storage} %gsc_in_t",
+                  f"%gsc_ptr_rec_t = OpTypePointer {buffer_storage} %gsc_rec_t",
+                  f"%gsc_ptr_meta_t = OpTypePointer {buffer_storage} %gsc_meta_t",
+                  f"%gsc_ptr_sb_v4 = OpTypePointer {buffer_storage} {v4}",
+                  f"%gsc_ptr_sb_u = OpTypePointer {buffer_storage} {uint}",
+                  f"%gsc_ptr_sb_f = OpTypePointer {buffer_storage} {f32}",
+                  f"%gsc_ptr_pv_v4 = OpTypePointer Private {v4}",
+                  f"%gsc_ptr_pv_f = OpTypePointer Private {f32}",
+                  f"%gsc_ptr_pv_u = OpTypePointer Private {uint}",
+                  "%gsc_gid = OpVariable %gsc_ptr_in_v3u Input",
+                  f"%gsc_in = OpVariable %gsc_ptr_in_t {buffer_storage}",
+                  f"%gsc_rec = OpVariable %gsc_ptr_rec_t {buffer_storage}",
+                  f"%gsc_meta = OpVariable %gsc_ptr_meta_t {buffer_storage}",
+                  f"%gsc_n = OpVariable %gsc_ptr_pv_u Private {k(0)}"]
     out_vars = {v: f"%gsc_out{i}" for i, v in enumerate(outs)}
     types += [f"{nv} = OpVariable %gsc_ptr_pv_v4 Private" for nv in out_vars.values()]
     in_slot = {v: i for i, v in enumerate(ins)}
@@ -173,7 +220,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     capture_interface = ["%gsc_gid"]
     # Before SPIR-V 1.4, the interface only lists Input and Output variables.
     if version >= (1, 4):
-        capture_interface += ["%gsc_in", "%gsc_rec", "%gsc_meta", "%gsc_n"] + list(out_vars.values())
+        storage = [] if bda else ["%gsc_in", "%gsc_rec", "%gsc_meta"]
+        capture_interface += storage + ["%gsc_n"] + list(out_vars.values())
 
     count = 0
 
@@ -182,16 +230,51 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         count += 1
         return f"%gsc_t{count}"
 
+    def load_pc(member):
+        """A push-constant member's uint value, through the module's own %_ptr_PC_uint."""
+        p, v = tmp(), tmp()
+        out.extend([f"{p} = OpAccessChain {pc_uint} {ud_var} {k(member)}", f"{v} = OpLoad {uint} {p}"])
+        return v
+
+    def bda_u64(lo, hi):
+        """(hi << 32) | lo in the module's 64-bit uint type."""
+        lo64, hi64, sh, r = tmp(), tmp(), tmp(), tmp()
+        out.extend([f"{lo64} = OpUConvert {ulong} {lo}", f"{hi64} = OpUConvert {ulong} {hi}",
+                    f"{sh} = OpShiftLeftLogical {ulong} {hi64} %gsc_cl32",
+                    f"{r} = OpBitwiseOr {ulong} {sh} {lo64}"])
+        return r
+
+    def bda_addr(base, byte):
+        """base + byte, the 64-bit address an OpConvertUToPtr site converts."""
+        b64, a = tmp(), tmp()
+        out.extend([f"{b64} = OpUConvert {ulong} {byte}", f"{a} = OpIAdd {ulong} {base} {b64}"])
+        return a
+
     out = []
+    psb_align = {}          # PhysicalStorageBuffer pointers we made, and the alignment their loads need
     entry_label = None
     cur_block = None
     emit_split = set()
     block_tail = {}
     main_start = None
+    bda_head = False
     state = "header"        # header -> main_entry -> main_vars -> main -> other
     for ln in text.splitlines():
         s = ln.strip()
+        if bda and not bda_head and s and not s.startswith(";"):
+            if not (s.startswith("OpCapability ") or s.startswith("OpExtension ")):
+                out.append("OpCapability PhysicalStorageBufferAddresses")
+                if int64:   # the module gets its own 64-bit uint type below
+                    out.append("OpCapability Int64")
+                out.append('OpExtension "SPV_KHR_physical_storage_buffer"')
+                bda_head = True
         if s == "OpCapability Geometry":
+            continue
+        if bda and s == "OpMemoryModel Logical GLSL450":
+            out.append("OpMemoryModel PhysicalStorageBuffer64 GLSL450")
+            continue
+        if bda and re.fullmatch(rf"OpMemberDecorate {re.escape(ud)} 4 Offset 140", s):
+            out += [ln] + [f"OpMemberDecorate {ud} {i} Offset {144 + 4 * (i - 5)}" for i in range(5, 11)]
             continue
         m = re.match(r"OpEntryPoint Geometry (%\w+) (\"[^\"]*\")(.*)$", s)
         if m:
@@ -220,6 +303,10 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         if decos and m and m.group(2).startswith("OpType"):
             out += decos            # decorations end where the first type begins
             decos = []
+        if bda and s.startswith(f"{ud} = OpTypeStruct "):
+            # members 5..10 are the input, record and meta console VAs, added for the physical addresses
+            out.append(s + f" {uint}" * 6)
+            continue
         if m and m.group(2) == "OpVariable" and m.group(1) in gone:
             continue
         if m and m.group(2) == "OpFunction":
@@ -253,8 +340,25 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         if state == "main_vars" and not re.match(r"(?:%\w+ = OpVariable |OpLine |OpNoLine$)", s):
             # after the entry block's variables: p = GlobalInvocationId.x; return when p >= primitive_count
             state = "main"
-            out += [f"%gsc_gidv = OpLoad {v3u} %gsc_gid", f"%gsc_prim = OpCompositeExtract {uint} %gsc_gidv 0",
-                    f"%gsc_cntp = OpAccessChain %gsc_ptr_sb_u %gsc_in {k(0)}", f"%gsc_cnt = OpLoad {uint} %gsc_cntp",
+            out += [f"%gsc_gidv = OpLoad {v3u} %gsc_gid", f"%gsc_prim = OpCompositeExtract {uint} %gsc_gidv 0"]
+            if bda:
+                # console VAs in push-constant members 5..10, relative to the heap base in members 1/2
+                hlo, hhi = load_pc(1), load_pc(2)
+                inlo, inhi = load_pc(5), load_pc(6)
+                reclo, rechi = load_pc(7), load_pc(8)
+                metalo, metahi = load_pc(9), load_pc(10)
+                heap = bda_u64(hlo, hhi)
+                inva, recva, metava = bda_u64(inlo, inhi), bda_u64(reclo, rechi), bda_u64(metalo, metahi)
+                out += [f"%gsc_in64 = OpIAdd {ulong} {heap} {inva}",
+                        f"%gsc_rec64 = OpIAdd {ulong} {heap} {recva}",
+                        f"%gsc_meta64 = OpIAdd {ulong} {heap} {metava}"]
+                zero, cnta = tmp(), tmp()
+                out += [f"{zero} = OpUConvert {ulong} {k(0)}", f"{cnta} = OpIAdd {ulong} %gsc_in64 {zero}",
+                        f"%gsc_cntp = OpConvertUToPtr %gsc_ptr_psb_u {cnta}"]
+            else:
+                out.append(f"%gsc_cntp = OpAccessChain %gsc_ptr_sb_u %gsc_in {k(0)}")
+            cnt_aligned = " Aligned 4" if bda else ""
+            out += [f"%gsc_cnt = OpLoad {uint} %gsc_cntp{cnt_aligned}",
                     f"%gsc_past = OpUGreaterThanEqual {boolt} %gsc_prim %gsc_cnt",
                     "OpSelectionMerge %gsc_body None", "OpBranchConditional %gsc_past %gsc_ret %gsc_body",
                     "%gsc_ret = OpLabel", "OpReturn", "%gsc_body = OpLabel",
@@ -279,10 +383,22 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                 vtx = tmp()
                 out.append(f"{vtx} = OpBitcast {uint} {idx[0]}")
             a, b, c = tmp(), tmp(), tmp()
-            ptr = "%gsc_ptr_sb_f" if m.group(2) in float_ptrs else "%gsc_ptr_sb_v4"
             out += [f"{a} = OpIAdd {uint} %gsc_inbase {vtx}", f"{b} = OpIMul {uint} {a} {k(nin)}",
-                    f"{c} = OpIAdd {uint} {b} {k(in_slot[m.group(3)])}",
-                    " ".join([f"{m.group(1)} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:])]
+                    f"{c} = OpIAdd {uint} {b} {k(in_slot[m.group(3)])}"]
+            if bda:
+                # 16-byte count+pad header, then a vec4 per element; a scalar read adds 4 per component
+                ptr = "%gsc_ptr_psb_f" if m.group(2) in float_ptrs else "%gsc_ptr_psb_v4"
+                m16, byte = tmp(), tmp()
+                out += [f"{m16} = OpIMul {uint} {c} {k(16)}", f"{byte} = OpIAdd {uint} {m16} {k(16)}"]
+                if len(idx) > 1:
+                    w4, off = tmp(), tmp()
+                    out += [f"{w4} = OpIMul {uint} {idx[1]} {k(4)}", f"{off} = OpIAdd {uint} {byte} {w4}"]
+                    byte = off
+                out.append(f"{m.group(1)} = OpConvertUToPtr {ptr} {bda_addr('%gsc_in64', byte)}")
+                psb_align[m.group(1)] = 16 if ptr == "%gsc_ptr_psb_v4" else 4
+            else:
+                ptr = "%gsc_ptr_sb_f" if m.group(2) in float_ptrs else "%gsc_ptr_sb_v4"
+                out.append(" ".join([f"{m.group(1)} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:]))
             continue
         if m and m.group(3) in out_vars:
             ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
@@ -317,11 +433,24 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                 for i, nv in enumerate(out_vars.values()):
                     b, c, val, p = tmp(), tmp(), tmp(), tmp()
                     out += [f"{b} = OpIMul {uint} {a} {k(nout)}", f"{c} = OpIAdd {uint} {b} {k(i)}",
-                            f"{val} = OpLoad {v4} {nv}", f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_rec {k(0)} {c}",
-                            f"OpStore {p} {val}"]
+                            f"{val} = OpLoad {v4} {nv}"]
+                    if bda:
+                        byte = tmp()
+                        out.append(f"{byte} = OpIMul {uint} {c} {k(16)}")
+                        out.append(f"{p} = OpConvertUToPtr %gsc_ptr_psb_v4 {bda_addr('%gsc_rec64', byte)}")
+                        out.append(f"OpStore {p} {val} Aligned 16")
+                    else:
+                        out.append(f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_rec {k(0)} {c}")
+                        out.append(f"OpStore {p} {val}")
             d, e, q, n1 = tmp(), tmp(), tmp(), tmp()
-            out += [f"{d} = OpIAdd {uint} %gsc_metabase {n}", f"{e} = OpIAdd {uint} {d} {k(1)}",
-                    f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {e}", f"OpStore {q} {k(0)}",
+            out += [f"{d} = OpIAdd {uint} %gsc_metabase {n}", f"{e} = OpIAdd {uint} {d} {k(1)}"]
+            if bda:
+                byte = tmp()
+                out.append(f"{byte} = OpIMul {uint} {e} {k(4)}")
+                out.append(f"{q} = OpConvertUToPtr %gsc_ptr_psb_u {bda_addr('%gsc_meta64', byte)}")
+            else:
+                out.append(f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {e}")
+            out += [f"OpStore {q} {k(0)}" + (" Aligned 4" if bda else ""),
                     f"{n1} = OpIAdd {uint} {n} {k(1)}", f"OpStore %gsc_n {n1}",
                     f"OpBranch {lbl_end}",
                     f"{lbl_end} = OpLabel"]
@@ -333,19 +462,36 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             # flag the last emitted vertex: meta[base + 1 + (n - 1)]; with none emitted this writes the count slot,
             # which the final store overwrites
             n, d, q = tmp(), tmp(), tmp()
-            out += [f"{n} = OpLoad {uint} %gsc_n", f"{d} = OpIAdd {uint} %gsc_metabase {n}",
-                    f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {d}", f"OpStore {q} {k(1)}"]
+            out += [f"{n} = OpLoad {uint} %gsc_n", f"{d} = OpIAdd {uint} %gsc_metabase {n}"]
+            if bda:
+                byte = tmp()
+                out.append(f"{byte} = OpIMul {uint} {d} {k(4)}")
+                out.append(f"{q} = OpConvertUToPtr %gsc_ptr_psb_u {bda_addr('%gsc_meta64', byte)}")
+            else:
+                out.append(f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {d}")
+            out.append(f"OpStore {q} {k(1)}" + (" Aligned 4" if bda else ""))
             continue
         if s == "OpReturn":
             n, q = tmp(), tmp()
-            out += [f"{n} = OpLoad {uint} %gsc_n",
-                    f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} %gsc_metabase", f"OpStore {q} {n}"]
+            out.append(f"{n} = OpLoad {uint} %gsc_n")
+            if bda:
+                byte = tmp()
+                out.append(f"{byte} = OpIMul {uint} %gsc_metabase {k(4)}")
+                out.append(f"{q} = OpConvertUToPtr %gsc_ptr_psb_u {bda_addr('%gsc_meta64', byte)}")
+            else:
+                out.append(f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} %gsc_metabase")
+            out.append(f"OpStore {q} {n}" + (" Aligned 4" if bda else ""))
         if s.startswith("OpLoopMerge ") and cur_block in emit_split:
             # Splitting a loop header with OpSelectionMerge moves OpLoopMerge into the merge block while
             # back-edges still target the original header label, violating SPIR-V structured CFG rules.
             raise Unsupported("OpEmitVertex in a loop header before OpLoopMerge")
         if s in ("OpKill", "OpTerminateInvocation", "OpReturnValue"):
             raise Unsupported(s)
+        if bda and " Aligned " not in s:
+            # a load of an input read goes through a converted PhysicalStorageBuffer pointer
+            m = re.match(r"(?:%\w+ = )?OpLoad %\w+ (%\w+)", s)
+            if m and m.group(1) in psb_align:
+                s += f" Aligned {psb_align[m.group(1)]}"
         out.append(s)
     public = {key: lay[key] for key in ("verts_in", "max_verts", "topology", "inputs", "outputs")}
     public["local_size"] = LOCAL_SIZE
@@ -365,6 +511,14 @@ def main(argv):
         i = args.index("--layout")
         lay_path = args[i + 1]
         del args[i:i + 2]
+    buffers = "ssbo"
+    if "--buffers" in args:
+        i = args.index("--buffers")
+        buffers = args[i + 1]
+        del args[i:i + 2]
+        if buffers not in ("ssbo", "bda"):
+            print(USAGE, file=sys.stderr)
+            return 2
     if len(args) != 2:
         print(USAGE, file=sys.stderr)
         return 2
@@ -386,7 +540,7 @@ def main(argv):
     ver = re.search(r"; Version: (\d+)\.(\d+)", text)
     version = (int(ver[1]), int(ver[2])) if ver else (1, 5)
     try:
-        new, lay = rewrite(text, version=version)
+        new, lay = rewrite(text, version=version, buffers=buffers)
     except Unsupported as e:
         print(f"{args[0]}: not supported: {e}", file=sys.stderr)
         return 1

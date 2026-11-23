@@ -18132,9 +18132,11 @@ def main():
         # module, and the index merge below drops its entry, exactly like a spirv-as/val rejection. The
         # .spvasm text stays for diagnosis, as it does on a rejection.
         Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
-        # The --gs-compute sidecar is published with the module, so it goes the same way.
+        # The --gs-compute sidecars are published with the module, so they go the same way.
         Path(os.path.join(a.out, name + ".gs_compute.spv")).unlink(missing_ok=True)
         Path(os.path.join(a.out, name + ".gs_compute.spvasm")).unlink(missing_ok=True)
+        Path(os.path.join(a.out, name + ".gs_compute_bda.spv")).unlink(missing_ok=True)
+        Path(os.path.join(a.out, name + ".gs_compute_bda.spvasm")).unlink(missing_ok=True)
         invalid.add(name)
 
     for i, p in enumerate(files, 1):
@@ -18197,6 +18199,22 @@ def main():
                         lay["record_stride"] = 16 * len(cap_lay["outputs"])
                         lay["meta_words"] = cap_lay["max_verts"] + 1
                         meta[name]["gs_compute"] = lay
+                        # The same capture pass addressed through push-constant device addresses, for the D3D12
+                        # layer's GS fallback where no descriptor set can be bound.
+                        try:
+                            bda_asm, _ = _gsc.rewrite(asm, buffers="bda")
+                            bda_sa = os.path.join(a.out, name + ".gs_compute_bda.spvasm")
+                            bda_sv = os.path.join(a.out, name + ".gs_compute_bda.spv")
+                            with open(bda_sa, "w", encoding="utf-8", newline="\n") as f:
+                                f.write(bda_asm)
+                            br = assemble_spirv(bda_sa, bda_sv, asm_text=bda_asm, assembler=a.assembler)
+                            if br.returncode != 0:
+                                why["INVALID gs_compute_bda: "
+                                    + (br.stderr.strip().splitlines() or ["?"])[0][:80]] += 1
+                        except (_gsc.Unsupported, ValueError, KeyError, IndexError) as e:
+                            why[f"gs_compute_bda unsupported: {str(e)[:70]}"] += 1
+                            Path(os.path.join(a.out, name + ".gs_compute_bda.spv")).unlink(missing_ok=True)
+                            Path(os.path.join(a.out, name + ".gs_compute_bda.spvasm")).unlink(missing_ok=True)
                     else:
                         why["INVALID gs_compute: " + (cr.stderr.strip().splitlines() or ["?"])[0][:80]] += 1
                 except (_gsc.Unsupported, ValueError, KeyError, IndexError) as e:
