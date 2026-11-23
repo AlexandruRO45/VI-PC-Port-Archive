@@ -1770,9 +1770,12 @@ public:
 
     // A reserved resource is a committed one underneath (docs/d3d12_vulkan.md section 4.2); it reports the layout it
     // was created with and has no heap of its own.
-    void make_reserved(D3D12_TEXTURE_LAYOUT layout) {
+    // `flags` are the application's, which GetDesc reports: create_reserved checks and backs the resource without
+    // ALLOW_CROSS_ADAPTER.
+    void make_reserved(D3D12_TEXTURE_LAYOUT layout, D3D12_RESOURCE_FLAGS flags) {
         reserved_ = true;
         desc_.Layout = layout;
+        desc_.Flags = flags;
     }
     bool reserved() const { return reserved_; }
 
@@ -7017,6 +7020,12 @@ private:
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
         D3D12_RESOURCE_DESC backing = *desc;
+        // ALLOW_CROSS_ADAPTER: a committed resource needs a SHARED | SHARED_CROSS_ADAPTER heap for it, but the host
+        // creates a reserved buffer or texture with it wherever it creates the same description without it, and
+        // GetDesc reports the flag (D3D-468; d3d12_vulkan_device_test's "reserved: ... ALLOW_CROSS_ADAPTER" cases,
+        // the same on an RX 9060 XT / AMD 26.10.44 and on WARP). A reserved resource has no heap to share and this
+        // layer has one adapter, so the flag changes nothing here: the description is checked and backed without it.
+        backing.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
@@ -7065,7 +7074,7 @@ private:
                                          nullptr, IID_PPV_ARGS(&resource));
         }
         if (FAILED(hr)) return hr;
-        Resource::from<Resource>(resource)->make_reserved(desc->Layout);
+        Resource::from<Resource>(resource)->make_reserved(desc->Layout, desc->Flags);
         hr = resource->QueryInterface(riid, out);
         resource->Release();
         return hr;

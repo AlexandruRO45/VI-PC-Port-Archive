@@ -82,6 +82,12 @@ D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes) {
     return desc;
 }
 
+D3D12_RESOURCE_DESC flagged_buffer(UINT64 bytes, UINT flags) {
+    D3D12_RESOURCE_DESC desc = buffer_desc(bytes);
+    desc.Flags = D3D12_RESOURCE_FLAGS(flags);
+    return desc;
+}
+
 D3D12_RESOURCE_DESC volume_desc(UINT16 mips) {
     auto desc = texture_desc(8, 6, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, mips, 16);
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -2942,6 +2948,18 @@ D3D12_RESOURCE_DESC tiled(D3D12_RESOURCE_DESC desc) {
     return desc;
 }
 
+// The flags GetDesc reports for a reserved resource, as 0x10000 | flags so that two devices compare them like an
+// HRESULT; the creation's own HRESULT when it fails.
+HRESULT reserved_flags(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc) {
+    ID3D12Resource* resource = nullptr;
+    const HRESULT hr = device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                      IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) return hr;
+    const UINT flags = UINT(resource->GetDesc().Flags);
+    resource->Release();
+    return HRESULT(0x10000 | flags);
+}
+
 // Map on a fresh committed resource; `range` is the read range, or null.
 HRESULT map(ID3D12Device* device, D3D12_HEAP_PROPERTIES heap, D3D12_RESOURCE_DESC desc, D3D12_RESOURCE_STATES state,
             UINT subresource, const D3D12_RANGE* range, bool want_pointer = true) {
@@ -4532,6 +4550,88 @@ int compare_placed_reserved(ID3D12Device* ours) {
                                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
              desc.SampleDesc.Count = 4;
              return reserved(d, desc);
+         }},
+        // ALLOW_CROSS_ADAPTER on a reserved resource (D3D-468). The host takes it wherever it takes the description
+        // without it, buffers and textures alike, and GetDesc reports it; a description it refuses anyway stays
+        // refused. Measured the same on an RX 9060 XT (AMD 26.10.44) and on WARP. Two more combinations are left out
+        // because a host driver loses its device on them (DXGI_ERROR_DEVICE_REMOVED, and every later case with it):
+        // a buffer with ALLOW_RENDER_TARGET too on WARP (S_OK on the AMD driver), and a D32 depth texture on the AMD
+        // driver (S_OK on WARP).
+        {"reserved: buffer with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER));
+         }},
+        {"reserved: 1-byte buffer with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(1, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER));
+         }},
+        {"reserved: 1 MiB buffer with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(1024 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER));
+         }},
+        {"reserved: buffer with ALLOW_CROSS_ADAPTER in COPY_DEST", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER),
+                             D3D12_RESOURCE_STATE_COPY_DEST);
+         }},
+        {"reserved: buffer with ALLOW_CROSS_ADAPTER | ALLOW_UNORDERED_ACCESS", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+         }},
+        {"reserved: buffer with ALLOW_CROSS_ADAPTER | DENY_SHADER_RESOURCE", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                                              D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE));
+         }},
+        {"reserved: buffer with ALLOW_CROSS_ADAPTER | ALLOW_SIMULTANEOUS_ACCESS", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                                              D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS));
+         }},
+        {"reserved: buffer with ALLOW_CROSS_ADAPTER | ALLOW_DEPTH_STENCIL", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+         }},
+        {"reserved: buffer with ALLOW_CROSS_ADAPTER | 0x200", [](ID3D12Device* d) {
+             return reserved(d, flagged_buffer(64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | 0x200));
+         }},
+        {"reserved: GetDesc of a buffer with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved_flags(d, flagged_buffer(64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER));
+         }},
+        {"reserved: texture with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)));
+         }},
+        {"reserved: texture with ALLOW_CROSS_ADAPTER | ALLOW_UNORDERED_ACCESS", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)));
+         }},
+        {"reserved: texture with ALLOW_CROSS_ADAPTER | ALLOW_SIMULTANEOUS_ACCESS", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                                       D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)));
+         }},
+        {"reserved: BC1 texture with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_BC1_UNORM,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)));
+         }},
+        {"reserved: full mip chain with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, 0)));
+         }},
+        {"reserved: texture array with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, 1, 4)));
+         }},
+        {"reserved: 3D texture with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             auto desc = tiled(texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                            D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, 1, 16));
+             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+             return reserved(d, desc);
+         }},
+        {"reserved: texture with ALLOW_CROSS_ADAPTER and layout ROW_MAJOR", [](ID3D12Device* d) {
+             auto desc = texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+             desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+             return reserved(d, desc);
+         }},
+        {"reserved: GetDesc of a texture with ALLOW_CROSS_ADAPTER", [](ID3D12Device* d) {
+             return reserved_flags(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                         D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)));
          }},
     };
     const bool verbose = GetEnvironmentVariableA("LEONIDA_D3D49_VERBOSE", nullptr, 0) > 0;

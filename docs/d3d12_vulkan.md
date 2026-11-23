@@ -1866,6 +1866,10 @@ The trace will enumerate them.
     runtime: buffers are `ROW_MAJOR`, textures `64KB_UNDEFINED_SWIZZLE` (anything else, or a format without a tile
     shape, is `E_INVALIDARG`; `64KB_STANDARD_SWIZZLE` too, since `CheckFeatureSupport` reports
     `StandardSwizzle64KBSupported` as FALSE), and `GetHeapProperties` on a reserved resource is `E_INVALIDARG`.
+    `ALLOW_CROSS_ADAPTER`, which a committed resource only takes on a shared cross-adapter heap, is taken on a
+    reserved buffer or texture wherever the description is taken without it, and `GetDesc` reports it (D3D-468,
+    the same on an RX 9060 XT with AMD 26.10.44 and on WARP); the layer has one adapter, so it backs the resource
+    without the flag.
     The description, initial-state and clear-value rules are a committed resource's on a default heap, and a null
     output is `E_UNEXPECTED` after them (`compare_placed_reserved`, RTX 3060 / 610.88).
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
