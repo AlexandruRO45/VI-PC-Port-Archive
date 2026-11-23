@@ -16,6 +16,7 @@ from unittest.mock import patch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import make_game
+import report_paths  # make_game puts tools/ on sys.path
 
 
 class BuildDestinationTest(unittest.TestCase):
@@ -87,6 +88,18 @@ class BuildDestinationTest(unittest.TestCase):
         self.link(target, alias)
         self.run_build(self.game, os.path.join(alias, "new"),
                        os.path.join(self.root, "work"), rejected=False)
+
+    def test_case_only_spelling_of_game_folder_is_rejected(self):
+        # On Windows and on macOS's default volume, GAME and game are one folder.
+        if os.name != "nt" and not report_paths.case_insensitive_volume(self.root):
+            self.skipTest("the volume holding the temporary folder tells letter case apart")
+        other_case = os.path.join(self.root, "GAME")
+        for option in ("out", "work"):
+            with self.subTest(option=option):
+                destinations = {name: os.path.join(self.root, name) for name in ("out", "work")}
+                destinations[option] = os.path.join(other_case, "new")
+                self.run_build(self.game, **destinations, rejected=True)
+                self.assertFalse(os.path.exists(os.path.join(self.game, "new")))
 
     def test_drive_root_game_folder_rules(self):
         if os.name != "nt":

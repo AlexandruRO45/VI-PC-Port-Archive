@@ -56,6 +56,7 @@ TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
+from report_paths import path_key  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -2178,20 +2179,21 @@ def main() -> int:
     if a.check:
         return 0
     # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.
-    real_game = os.path.normcase(os.path.realpath(game))
+    # path_key: realpath and normcase, and case folding on a volume that ignores case (Windows, macOS's default), so
+    # C:\Games\X and c:\games\x\out, or ~/Game and ~/GAME/out, are inside.
+    real_game = path_key(game)
     is_game_drive_root = os.path.splitdrive(real_game)[1] in ("\\", "/")
     game_entries = []
     if is_game_drive_root:
         try:
             game_entries = [
-                os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
-                for e in os.listdir(real_game)
+                path_key(os.path.join(game, e))
+                for e in os.listdir(game)
             ]
         except OSError:
             game_entries = []
     for p in (out, work):
-        # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
-        real_destination = os.path.normcase(os.path.realpath(p))
+        real_destination = path_key(p)
         if is_game_drive_root:
             # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
             # inside the dump's existing top-level entries, but allow separate top-level folders.
