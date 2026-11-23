@@ -654,6 +654,31 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
             index = json.load(f)
         self.assertEqual([(r["name"], r["offset"]) for r in index], [("real_shader", len(bogus))])
 
+    def test_oserror_on_archive_read_dxbc_write_and_index_replace(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+
+        err = io.StringIO()
+        with mock.patch("shader_carve.mmap.mmap", side_effect=OSError("mmap failed")):
+            with contextlib.redirect_stderr(err):
+                rc = shader_carve.main([self.archive, self.out])
+        self.assertEqual(rc, 1)
+        self.assertIn("ERROR: cannot read", err.getvalue())
+
+        os.makedirs(os.path.join(self.out, "valid.dxbc"), exist_ok=True)
+        res_dxbc = self.run_carve(self.archive, self.out)
+        self.assertEqual(res_dxbc.returncode, 1)
+        self.assertIn("ERROR: cannot write", res_dxbc.stderr)
+        self.assertNotIn("Traceback", res_dxbc.stderr)
+        os.rmdir(os.path.join(self.out, "valid.dxbc"))
+
+        os.makedirs(os.path.join(self.out, "index.json"), exist_ok=True)
+        res_idx = self.run_carve(self.archive, self.out)
+        self.assertEqual(res_idx.returncode, 1)
+        self.assertIn("ERROR: cannot write", res_idx.stderr)
+        self.assertNotIn("Traceback", res_idx.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
