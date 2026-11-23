@@ -5,7 +5,7 @@
 ``.github/workflows/ci.yml`` splits ``tests/test_*.py`` between two jobs with a single predicate
 (``PYTEST_FILE_MARKERS``, or no ``__main__``): the standard-library loop in ``check`` runs the rest with
 ``python -I``, and ``translator-tests`` hands the matched files to pytest.  ``tests/semantic/`` goes to
-``unittest discover`` and ``tests/*.cjs`` to ``node --test``.  This is the test-file counterpart of
+``unittest discover`` and ``tests/**/test_*.cjs`` to ``node --test``.  This is the test-file counterpart of
 ``tests/test_ctest_registration.py``: it reads the patterns from the workflow (not from a copy, so it cannot
 drift) and fails on the three ways a test goes missing without CI turning red --
 
@@ -18,9 +18,7 @@ drift) and fails on the three ways a test goes missing without CI turning red --
   ``grep -q '__main__'``, which a comment satisfies), or whose guard is inverted
   (``if __name__ != "__main__":``) and runs nothing;
 * a semantic file with only module-level ``test*`` functions: ``unittest discover`` collects nothing
-  there, even though pytest would; and
-* a nested ``tests/*/test_*.cjs`` file that ``fnmatch`` matches across ``/`` but the non-recursive
-  ``node --test tests/test_*.cjs`` command never runs.
+  there, even though pytest would.
 
 It also runs the ``check`` loop itself, taken from the workflow, under bash on a synthetic tree: the loop has
 to run every file and then fail, since stopping at the first failure hides the files sorted after it.
@@ -30,6 +28,7 @@ needs bash (Git for Windows' on Windows) and skips without it, except on a GitHu
 """
 import ast
 import fnmatch
+import glob
 import os
 import re
 import shutil
@@ -37,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,7 +53,7 @@ def read(root, rel):
 
 
 def ci_rules(root):
-    """(markers, pruned, loop_glob, semantic_dir, viewer_glob), exactly as the workflow spells them."""
+    """Read the discovery rules and resolve the viewer files selected by the workflow."""
     text = read(root, WORKFLOW)
 
     def find(pattern, what):
@@ -69,7 +69,10 @@ def ci_rules(root):
     pruned, loop_glob = find(r"-path\s+'([^']+)'\s+-prune\s+-o\s+-type\s+f\s+-name\s+'([^']+)'",
                              "the tests/test_*.py scan")
     (semantic,) = find(r"python\s+-m\s+unittest\s+discover\s+-s\s+(\S+)", "unittest discover -s")
-    (viewer,) = find(r"node\s+--test\s+(\S+)", "node --test")
+    (viewer_glob,) = find(r'node\s+--test\s+"([^"]+)"', "the quoted node --test glob")
+    # Node skips node_modules when expanding its test glob.
+    viewer_paths = map(Path, glob.iglob(viewer_glob, root_dir=root, recursive=True))
+    viewer = {path.as_posix() for path in viewer_paths if "node_modules" not in path.parts}
     if re.search(r"unittest\s+discover[^\n]*-p\s", text):
         raise AssertionError("unittest discover now passes -p; this test assumes its default 'test*.py' pattern")
     return markers, pruned.rstrip("/"), loop_glob, semantic.rstrip("/"), viewer
@@ -146,20 +149,11 @@ def claimed_test_files(root):
     return sorted(found)
 
 
-def matches_nonrecursive_glob(rel, pattern):
-    """Match the way the shell and ``node --test`` do: ``*`` does not cross ``/``.
-
-    ``fnmatch`` lets ``tests/test_*.cjs`` match ``tests/sub/test_x.cjs``, but the workflow command
-    only expands the top level, so those files would be selected by this test and never run.
-    """
-    directory, _, name = rel.rpartition("/")
-    pattern_dir, _, pattern_name = pattern.rpartition("/")
-    return directory == pattern_dir and fnmatch.fnmatchcase(name, pattern_name)
-
-
-def job_of(root: str, rel: str, rules: tuple[str, str, str, str, str]) -> str | None:
+def job_of(root: str, rel: str, rules: tuple[str, str, str, str, set[str]]) -> str | None:
     """Which job runs ``rel``: 'stdlib', 'pytest', 'semantic', 'viewer', or None for no job at all."""
     markers, pruned, loop_glob, semantic, viewer = rules
+    if rel in viewer:
+        return "viewer"
     if rel.startswith(semantic + "/"):
         directory, _, name = rel.rpartition("/")
         # unittest discovery only descends into packages beneath its start directory.
@@ -168,8 +162,6 @@ def job_of(root: str, rel: str, rules: tuple[str, str, str, str, str]) -> str | 
                 return None
             directory = directory.rpartition("/")[0]
         return "semantic" if fnmatch.fnmatchcase(name, "test*.py") else None
-    if matches_nonrecursive_glob(rel, viewer):
-        return "viewer"
     if rel.startswith(pruned + "/"):
         return None                                # the Python scans prune this whole tree
     if fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], loop_glob):
@@ -296,7 +288,7 @@ class RepositoryRegistrationTest(unittest.TestCase):
         unselected = [f for f in self.files if job_of(ROOT, f, self.rules) is None]
         self.assertEqual(unselected, [],
                          "no CI job runs these test files: " + ", ".join(unselected) + "\n"
-                         "Rename them to tests/test_*.py (or tests/test_*.cjs), put them under tests/semantic/ "
+                         "Rename them to tests/test_*.py (or tests/**/test_*.cjs), put them under tests/semantic/ "
                          "as test*.py with an __init__.py in each nested directory, or add the pattern to ci.yml.")
 
     def test_every_selected_file_exposes_a_test_to_its_runner(self):
@@ -380,8 +372,9 @@ class RepositoryRegistrationTest(unittest.TestCase):
             write("tests/test_inequality_guard.py", "import unittest\n"
                   "class T(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
                   "if __name__ != \"__main__\":\n    unittest.main()\n")
-            # fnmatch would match this against tests/test_*.cjs, but node --test does not recurse.
             write("tests/test_nested_dir/test_nested.cjs", "const test = require('node:test');\n")
+            write("tests/test_root.cjs", "const test = require('node:test');\n")
+            write("tests/test_nested_dir/testhelper.cjs", "module.exports = {};\n")
 
             rules = ci_rules(tmp)
             found = claimed_test_files(tmp)
@@ -398,7 +391,9 @@ class RepositoryRegistrationTest(unittest.TestCase):
             self.assertFalse(defines_a_test(read(tmp, "tests/semantic/test_function_only.py"),
                                             require_test_case=True))
             self.assertFalse(has_main_guard(read(tmp, "tests/test_inequality_guard.py")))
-            self.assertEqual(selected["tests/test_nested_dir/test_nested.cjs"], None)
+            self.assertEqual(selected["tests/test_nested_dir/test_nested.cjs"], "viewer")
+            self.assertEqual(selected["tests/test_root.cjs"], "viewer")
+            self.assertIsNone(selected["tests/test_nested_dir/testhelper.cjs"])
 
     def test_semantic_selection_matches_discovery_through_packages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

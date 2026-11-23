@@ -196,4 +196,4 @@ jobs:
         with:
           node-version: "24"
       - name: Viewer chunk streaming (synthetic, no browser or game data)
-        run: node --test tests/test_*.cjs
+        run: node --test "tests/**/test_*.cjs"
