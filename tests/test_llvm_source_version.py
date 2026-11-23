@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_llvm_mc.ps1"
@@ -13,6 +14,13 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_llvm_mc.ps1"
 @unittest.skipUnless(os.name == "nt" and shutil.which("git"), "Windows and Git required")
 class SourceVersionTest(unittest.TestCase):
     def setUp(self):
+        # Git runs here and in the script under test without the contributor's global and system
+        # settings: with tag.gpgsign set, the fixture's plain `git tag` stops with "no tag message?".
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
