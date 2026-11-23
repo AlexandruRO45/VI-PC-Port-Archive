@@ -877,31 +877,6 @@ records as JSON from a carve (the CLI prints summary counts; the JSON is game da
 python -I tools/gamedata_reader.py <work>/carve/common --root time_data --out <scratch>
 ```
 
-Not measured here (hypothesis): how the two regions are chosen at runtime, what the two plain-modifier numbers
-are (GTA V reads them as a value pair blended by strength), and how `controlValue` maps onto game state.
-
-**The two plain-modifier numbers.** Measured over the 29,727 two-number variables of the plain modifiers
-(1,051 variable names, 3,257 modifiers with at least one such variable):
-
-- The second number is `0` in 26,186 pairs (88 %) and `1` in 3,104; only 437 take another value. In 2,300 of
-  the 3,257 modifiers it is `0` on every variable, in 21 it repeats the first number on every variable, and
-  936 mix. Per variable name, 624 names never have a non-zero second number (8,410 pairs), 83 always do
-  (1,289 pairs) and the other 344 vary from one modifier to the next.
-- The pair is not an ordered range: the first number is larger in 20,833 pairs, smaller in 4,604 and equal in
-  4,290.
-- Where the second number is non-zero (3,541 pairs) it does not follow the first: Pearson correlation 0.009,
-  and the first is `0` in 570 of them.
-- Against the keyframe documents (25,732 pairs with a second number of `0` whose name is also a keyframe
-  variable): `0` lies outside every value that variable takes in the 27 keyframe documents in 17,041 pairs,
-  but the first number is outside that range too in 15,183 of the same pairs. Plain-modifier values are not
-  bounded by the keyframe ranges, so this comparison does not tell what either number means.
-
-So `0` is the most frequent stored value of the second number. What it means, and how the runtime blends the
-two numbers by strength, is not settled by these counts.
-
-Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
-regions are chosen at runtime, what the two plain-modifier numbers mean and how the runtime blends them (see
-above), and how `controlValue` maps onto game state.
 **Plain-modifier number pairs `(a, b)`** (`tools/timecycle_pairs.py`, measured over all **29,727** two-number
 elements in the 4,291 plain modifiers across all 49 `timecycle_modifier_data` documents):
 
@@ -932,9 +907,9 @@ Three patterns establish what the pair stores (matching RAGE's two-float `tcModD
    `b < 0`, `a` in `-1,000..5,000`, `b` in `-3..5,000`, `a == b` in 94, `a < b` in 89, `a > b` in 7), and
    `fog_isotropic_phase` (`a == b` in all `10/10`, `1.0..6.0`).
 
-Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
-regions are chosen at runtime, the exact runtime rule distinguishing `b == 0` from `b == 1` on the 343 variables
-where both occur, and how `controlValue` maps onto game state.
+Not measured here (hypothesis): how the two regions are chosen at runtime, the exact runtime rule distinguishing
+`b == 0` from `b == 1` on the 343 variables where both occur, and how `controlValue` maps onto game state.
+
 ## Vehicle and tyre XML documents
 
 Four roots account for 37 of the 45 documents (4,547,932 inflated bytes) in the vehicles/tyres category:
