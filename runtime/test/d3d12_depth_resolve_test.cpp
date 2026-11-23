@@ -502,10 +502,11 @@ int main() {
         for (const Case& c : refused) {
             Planes p;
             if (!resolve_and_read(ours.p, c, p, true)) return 1;
-            if (p.close != E_INVALIDARG || !same_planes(p, expected_planes(c, false), false, c.plane)) {
-                std::fprintf(stderr, "refused %s %s rect %d: Close 0x%08lx, destination %s\n", c.name,
-                             mode_name(c.mode), int(c.rect), p.close,
-                             same_planes(p, expected_planes(c, false), false, c.plane) ? "kept" : "changed");
+            const bool clear_matches = same_planes(p, expected_planes(c, false), false, c.plane);
+            if (p.close != E_INVALIDARG || !clear_matches) {
+                std::fprintf(stderr, "refused %s %s rect %d: Close 0x%08lx, readback %s the destination clear\n",
+                             c.name, mode_name(c.mode), int(c.rect), p.close,
+                             clear_matches ? "matches" : "differs from");
                 ++failures;
             }
             ++refusals;
