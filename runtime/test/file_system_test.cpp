@@ -58,6 +58,7 @@ using SetFileAttributesWFn = BOOL(WINAPI*)(LPCWSTR, DWORD);
 using SetFileAttributesAFn = BOOL(WINAPI*)(LPCSTR, DWORD);
 // The CRT's own file entry points: __cdecl, int return, errno for the reason.
 using RemoveFn = int(__cdecl*)(const char*);
+using WRemoveFn = int(__cdecl*)(const wchar_t*);
 using WStat64Fn = int(__cdecl*)(const wchar_t*, struct _stat64*);
 
 int g_checks = 0;
@@ -510,13 +511,28 @@ void run_checks(const std::filesystem::path& root) {
     }
 
     // The CRT's own file entry points take the same console paths. The retail executable imports remove and
-    // _wstat64 from api-ms-win-crt-filesystem-l1-1-0.dll; bound to the host UCRT that drive does not exist, so
-    // they are answered over the same overlay/package view as CreateFileW and DeleteFileW. A host path stays the
-    // CRT's own.
+    // _wstat64 from api-ms-win-crt-filesystem-l1-1-0.dll, and one package DLL imports _wremove from the same set;
+    // bound to the host UCRT that drive does not exist, so they are answered over the same overlay/package view as
+    // CreateFileW and DeleteFileW. A host path stays the CRT's own.
     {
         const auto remove_fn = resolve<RemoveFn>("api-ms-win-crt-filesystem-l1-1-0.dll", "remove");
+        const auto wremove = resolve<WRemoveFn>("api-ms-win-crt-filesystem-l1-1-0.dll", "_wremove");
         const auto wstat64 = resolve<WStat64Fn>("api-ms-win-crt-filesystem-l1-1-0.dll", "_wstat64");
-        check(remove_fn && wstat64, "remove() and _wstat64() resolve under the CRT filesystem set the title imports");
+        check(remove_fn && wremove && wstat64,
+              "remove(), _wremove() and _wstat64() resolve under the CRT filesystem set the title imports");
+        if (wremove) {
+            write_path(package / "crt" / "wide.txt", "package");
+            check(wremove(L"GAME:\\crt\\wide.txt") == 0, "_wremove() deletes a console path");
+            check(std::filesystem::exists(package / "crt" / "wide.txt"),
+                  "_wremove() leaves the package file in place");
+            check(attributes_w(L"GAME:\\crt\\wide.txt") == INVALID_FILE_ATTRIBUTES,
+                  "the name _wremove() hid is gone from the title's view");
+            check(wremove(L"GAME:\\crt\\wide.txt") != 0, "_wremove() reports the hidden name as missing");
+            write_path(root / "crt-host-wide.txt", "host");
+            const std::wstring host_wide = (root / "crt-host-wide.txt").wstring();
+            check(wremove(host_wide.c_str()) == 0 && !std::filesystem::exists(root / "crt-host-wide.txt"),
+                  "_wremove() deletes a host path as before");
+        }
         if (remove_fn && wstat64) {
             write_path(package / "crt" / "sized.txt", "package");
             struct _stat64 info{};

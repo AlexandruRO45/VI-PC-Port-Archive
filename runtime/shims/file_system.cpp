@@ -3,8 +3,8 @@
 // A GDK title names its files on the console's drives, "GAME:\\data\\x.sps" being one in the installed game folder, so
 // the imports it makes of CreateFile*, FindFirstFile*/FindNextFile*/FindClose, GetFileAttributes*/GetFileAttributesEx*,
 // DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes*, and of the
-// CRT's remove and _wstat64, are answered here (docs/runtime_imports.md, "Console paths and the write overlay"; the
-// prefixes come from ivall/xcl, GPL-2.0-only, as facts). The rules:
+// CRT's remove, _wremove and _wstat64, are answered here (docs/runtime_imports.md, "Console paths and the write
+// overlay"; the prefixes come from ivall/xcl, GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
 //     the overlay (RT-218); any other path is a host path and goes to the host;
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
@@ -979,9 +979,10 @@ BOOL WINAPI delete_file_a(LPCSTR name) {
 
 // ---- The CRT's own file entry points
 //
-// The retail executable imports remove and _wstat64 from api-ms-win-crt-filesystem-l1-1-0.dll and hands them the
-// same GAME: paths it opens through CreateFileW. Bound to the host UCRT that drive does not exist, so both are
-// answered over the same overlay/package view here; a host path goes to the CRT unchanged.
+// The retail executable imports remove and _wstat64 from api-ms-win-crt-filesystem-l1-1-0.dll, and one package DLL
+// imports _wremove from the same set, all with the same GAME: paths it opens through CreateFileW. Bound to the host
+// UCRT that drive does not exist, so the three are answered over the same overlay/package view here; a host path goes
+// to the CRT unchanged.
 int __cdecl crt_remove_w(LPCWSTR name) {
     if (!name) return fail_errno(ERROR_INVALID_PARAMETER);
     std::vector<std::wstring> parts;
@@ -1429,9 +1430,11 @@ using namespace rt::fs;
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
         {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
 
-// The CRT file entry points, reached through the UCRT's own names rather than kernel32's.
-#define CRT_FILE_API(dll)                                                                \
-    {dll, "remove", reinterpret_cast<void*>(&crt_remove_a)},                             \
+// The CRT file entry points, reached through the UCRT's own names rather than kernel32's. One package DLL calls
+// _wremove directly through its IAT, so the wide delete is served next to the narrow one.
+#define CRT_FILE_API(dll)                                                                       \
+    {dll, "remove", reinterpret_cast<void*>(&crt_remove_a)},                                    \
+        {dll, "_wremove", reinterpret_cast<void*>(&crt_remove_w)},                              \
         {dll, "_wstat64", reinterpret_cast<void*>(&crt_wstat64)}
 }  // namespace
 
