@@ -311,6 +311,19 @@ def test_split_irreducible_dominating_back_edges():
     assert len(ns5) == 9 and orig5 == [0, 1, 2, 3, 4, 5, 6, 7, 2], f"unexpected outer-inner split: len={len(ns5)} orig={orig5}"
     check_semantics(g_outer_inner, ns5, orig5)
 
+    # 5. Multi-entry SCC with an internal bottleneck header (6) and a sub-loop on 4 (7->8->4):
+    # peeling all external entries {2, 3, 5} to header 6 clones {2, 3, 4, 5} once (10 -> 14 blocks),
+    # well within default max_factor=2 (18 on parent d0835dd9; refused at factor 2 on 7ecee910).
+    g_bottleneck = [[1, 5], [2, 3], [3, 4], [4], [5, 6], [6], [7, 2], [8], [9, 4], []]
+    assert S.structure(g_bottleneck) is None
+    res6 = S.split_irreducible(g_bottleneck)
+    assert res6 is not None, "expected g_bottleneck to split within default budget"
+    ns6, orig6 = res6
+    assert len(ns6) == 14 and orig6 == list(range(10)) + [2, 3, 4, 5], (
+        f"unexpected bottleneck split: len={len(ns6)} orig={orig6}")
+    assert all([orig6[w] for w in row] == g_bottleneck[orig6[i]] for i, row in enumerate(ns6))
+    check_semantics(g_bottleneck, ns6, orig6)
+
 
 if __name__ == "__main__":
     test_depth()

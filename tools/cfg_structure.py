@@ -235,8 +235,9 @@ def _sccs(nodes, adj):
 
 
 def split_irreducible(succ, max_factor=2, max_splits=64):
-    """Make an irreducible CFG reducible by controlled node splitting (cloning the closed region R reachable from a secondary entry e without passing through primary entry h
-    in an irreducible SCC, and redirecting e's external predecessors to clone[e]).
+    """Make an irreducible CFG reducible by controlled node splitting (choosing a header h in an
+    irreducible SCC, cloning the closed region R reachable from all non-h external entries without passing
+    through h, and redirecting each peeled entry's external non-dominating predecessors to clone[e]).
 
     Returns `(new_succ, orig_of)` where `orig_of[b]` is the original block index that block `b` executes
     and `new_succ[b]` preserves the exact positional successor order of `succ[orig_of[b]]`.
@@ -289,32 +290,34 @@ def split_irreducible(succ, max_factor=2, max_splits=64):
                         body.add(x)
                         work.extend(preds[x])
         entries = [x for x in scc if x == 0 or any(p not in scc and not dominates(x, p) for p in preds[x])]
-        # Choose a pair (h, e) of SCC entries (e != h, e != 0) minimizing |R|, where R is the closed region of
-        # SCC nodes (plus any private dominated sub-loops) reachable from e without passing through h. Cloning all
-        # of R at once keeps internal cycles inside the clone instead of re-entering the original SCC and unrolling.
+        entry_set = set(entries)
+        # Choose a target header h in `scc` minimizing |R|, where R is the closed region of SCC nodes (plus any
+        # private dominated sub-loops) reachable from all external entries other than h without passing through h.
+        # Peeling every non-h entry at once collapses the SCC to the single header h, shares cloned nodes across
+        # peeled entries, and allows an internal bottleneck header when it yields a strictly smaller split.
         best = None
-        for h in entries:
-            for e in entries:
-                if e == h or e == 0:
-                    continue
-                region = {e}
-                work = [e]
-                while work:
-                    u = work.pop()
-                    for w in g[u]:
-                        if w in scc and w != h and w not in region:
-                            region.add(w)
-                            work.append(w)
-                    for w in subloop_of.get(u, ()):
-                        if w not in region:
-                            region.add(w)
-                            work.append(w)
-                key = (len(region), pos[h], -pos[e])
-                if best is None or key < best[0]:
-                    best = (key, h, e, region)
+        for h in scc:
+            peel = [e for e in entries if e != h]
+            if 0 in peel or not peel:
+                continue
+            region = set(peel)
+            work = list(peel)
+            while work:
+                u = work.pop()
+                for w in g[u]:
+                    if w in scc and w != h and w not in region:
+                        region.add(w)
+                        work.append(w)
+                for w in subloop_of.get(u, ()):
+                    if w not in region:
+                        region.add(w)
+                        work.append(w)
+            key = (len(region), 0 if h in entry_set else 1, pos[h], -max(pos[e] for e in peel))
+            if best is None or key < best[0]:
+                best = (key, h, peel, region)
         if best is None:
             return None
-        _, h, e, region = best
+        _, h, peel, region = best
         if len(g) + len(region) > max_blocks:
             return None
         # Order cloned nodes deterministically by RPO position.
@@ -326,10 +329,11 @@ def split_irreducible(succ, max_factor=2, max_splits=64):
             g.append([])
         for u in reg_ordered:
             g[clone_of[u]] = [clone_of[w] if w in clone_of else w for w in g[u]]
-        ext_preds = {p for p in preds[e] if p not in scc and not dominates(e, p)}
-        ce = clone_of[e]
-        for p in ext_preds:
-            g[p] = [ce if w == e else w for w in g[p]]
+        for e in peel:
+            ext_preds = {p for p in preds[e] if p not in scc and not dominates(e, p)}
+            ce = clone_of[e]
+            for p in ext_preds:
+                g[p] = [ce if w == e else w for w in g[p]]
 
 def run(tree, choose, limit):
     """Interpret a tree: the blocks it executes, in order, stopping after `limit`. `choose(b)` gives the block
