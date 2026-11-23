@@ -538,6 +538,22 @@ class GlbInspectTests(unittest.TestCase):
             self.assertTrue(any("output accessor is missing" in issue for issue in issues))
             self.assertEqual(report["animations"][0]["target_node_count"], 1)
 
+    def test_channel_on_a_non_object_sampler_is_reported_not_a_traceback(self):
+        gltf = animated_gltf()
+        gltf["animations"][0]["samplers"] = ["not an object"]
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "bad_sampler.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                issues = json.load(handle)["animations"][0]["issues"]
+            self.assertTrue(any("sampler[0] is not an object" in issue for issue in issues), issues)
+
     def test_animation_type_mismatches_are_reported(self):
         gltf = animated_gltf()
         gltf["accessors"][2]["type"] = "VEC3"

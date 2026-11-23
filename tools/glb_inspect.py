@@ -229,8 +229,8 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
         if not isinstance(sampler, dict):
             issues.append(f"sampler[{sampler_index}] is not an object")
             samplers.append({"index": sampler_index, "input_accessor": None, "input_count": None,
-                             "output_accessor": None, "output_count": None,
-                             "interpolation": None, "duration": None})
+                             "input_type": None, "output_accessor": None, "output_count": None,
+                             "output_type": None, "interpolation": None, "duration": None})
             continue
         input_index = _index(sampler.get("input"))
         output_index = _index(sampler.get("output"))
