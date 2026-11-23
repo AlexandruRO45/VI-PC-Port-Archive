@@ -262,5 +262,23 @@ class SXnorB64ConditionCodesTests(unittest.TestCase):
         execute_scalar_xnor_b64(state, ast2)
         self.assertEqual(state.scc, 0)
 
+class SXnorB64ExtremeBoundariesTests(unittest.TestCase):
+    def test_single_bit_differences(self):
+        # Only bit 0 differs -> all bits 1 except bit 0
+        res, scc = oracle_xnor_b64(0, 1)
+        self.assertEqual(res, MASK64 ^ 1)
+        self.assertEqual(scc, 1)
+
+        # Only bit 63 differs -> all bits 1 except bit 63
+        res, scc = oracle_xnor_b64(0, 1 << 63)
+        self.assertEqual(res, MASK64 ^ (1 << 63))
+        self.assertEqual(scc, 1)
+
+    def test_alternating_nibbles(self):
+        a = 0x0F0F0F0F0F0F0F0F
+        b = 0x0F0F0F0F0F0F0F0F
+        res, scc = oracle_xnor_b64(a, b)
+        self.assertEqual(res, MASK64)
+
 if __name__ == "__main__":
     unittest.main()
