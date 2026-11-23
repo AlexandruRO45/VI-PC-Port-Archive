@@ -125,5 +125,22 @@ class VMulU32U24SimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_vgpr(i, 2), 0xDEADBEEF)
 
+class VMulU32U24TranslatorTests(unittest.TestCase):
+    def test_mul_u24_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 100",
+            "v_mov_b32 v1, 200",
+            "v_mul_u32_u24 v2, v0, v1",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mul_u24_exec", lines)
+        val = mrt0_words(spv)[0]
+        self.assertEqual(val, 20000)
+
+    def test_mul_u24_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_mul_u24", ["v_mul_u32_u24"])
+
 if __name__ == "__main__":
     unittest.main()
