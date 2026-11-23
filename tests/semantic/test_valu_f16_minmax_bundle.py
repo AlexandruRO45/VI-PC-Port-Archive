@@ -266,5 +266,38 @@ class TestMinF16HardwareTranslator(unittest.TestCase):
             self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on min_f16({s0:#x}, {s1:#x})")
 
 
+# ------------------------------------------------------------------------------
+# v_max_f16 Reference Oracle
+# ------------------------------------------------------------------------------
+
+def ref_max_f16(s0: int, s1: int) -> int:
+    u0 = s0 & MASK16
+    u1 = s1 & MASK16
+    nan0 = is_nan_f16(u0)
+    nan1 = is_nan_f16(u1)
+    if nan0 and nan1:
+        return u0
+    if nan0:
+        return u1
+    if nan1:
+        return u0
+    if (u0 | u1) == 0x8000:
+        return POS_ZERO16
+    f0 = bits_to_f16(u0)
+    f1 = bits_to_f16(u1)
+    return u0 if f0 > f1 else u1
+
+
+class TestMaxF16Oracle(unittest.TestCase):
+    def test_basic_max(self):
+        self.assertEqual(ref_max_f16(f16_to_bits(1.0), f16_to_bits(2.0)), f16_to_bits(2.0))
+        self.assertEqual(ref_max_f16(f16_to_bits(-3.0), f16_to_bits(1.0)), f16_to_bits(1.0))
+
+    def test_signed_zeros(self):
+        # +0.0 > -0.0
+        self.assertEqual(ref_max_f16(POS_ZERO16, NEG_ZERO16), POS_ZERO16)
+        self.assertEqual(ref_max_f16(NEG_ZERO16, POS_ZERO16), POS_ZERO16)
+
+
 if __name__ == '__main__':
     unittest.main()
