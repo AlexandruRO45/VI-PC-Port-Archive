@@ -589,6 +589,10 @@ def parse_page(data):
         else:
             raise PageError(f"unknown chunk at +0x{pos:x}")
         chunks.append(record)
+        # Chunks are 16-byte aligned but a chunk can end inside a word (an empty meshlet group is
+        # 12 bytes). Advance to the next boundary so the walk always moves forward; the padding
+        # bytes are not required to be zero.
+        pos = (pos + 15) & ~15
     return chunks
 
 

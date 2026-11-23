@@ -235,6 +235,30 @@ class ParseTests(unittest.TestCase):
         self.assertEqual((c["vertices"], c["positions_finite"], c["normals_unit"]), (7, 7, 0))
         self.assertEqual((c["uv_vertices"], c["uv_finite"]), (14, 14))
 
+    def test_empty_group_does_not_spin(self):
+        # A 0x80000000 group with zero meshlets/triangles/refs followed by one nonzero
+        # word: the 12-byte group ends inside a word, so the walk must advance to the
+        # next 16-byte boundary and finish instead of parsing the same group forever.
+        data = bytes.fromhex("00000080000000000000000001000000")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hang.bin")
+            with open(path, "wb") as out:
+                out.write(data)
+            run = subprocess.run([sys.executable, "-I", TOOL, path],
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("groups=1", run.stdout)
+
+    def test_valid_group_after_empty_group_with_any_padding(self):
+        # The four bytes after the 12-byte empty group are alignment padding; they are
+        # not required to be zero, so both forms must reach the valid group at +0x10.
+        empty = struct.pack("<III", 0x80000000, 0, 0)
+        for padding in (b"\x00" * 4, b"\x01\x00\x00\x00"):
+            with self.subTest(padding=padding.hex()):
+                chunks = mp.parse_page(empty + padding + group([(7, 5)]))
+                self.assertEqual([c["kind"] for c in chunks], ["group", "group"])
+                self.assertEqual((chunks[1]["meshlets"], chunks[1]["triangles"]), (1, 5))
+
     def test_group_led_page(self):
         data = page(group([(10, 8)]), block(10))
         self.assertTrue(mp.is_mesh_page(data))
