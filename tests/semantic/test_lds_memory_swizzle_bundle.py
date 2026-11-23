@@ -171,6 +171,27 @@ class TestDsSwizzleB32AST(unittest.TestCase):
         self.assertEqual(expr.eval(0, data, exec_mask), 0)
         self.assertEqual(expr.eval(1, data, exec_mask), data[0])
 
+class TestDsSwizzleB32SIMD(unittest.TestCase):
+    def test_simd_lane_divergence(self) -> None:
+        data = [i * 10 for i in range(32)]
+        expr_swap = SwizzleExpr("BITMASK_PERM", "ppppi")  # swap adjacent
+        # EXEC mask with lower 16 lanes active
+        exec_mask = 0x0000FFFF
+        results = [expr_swap.eval(l, data, exec_mask) for l in range(32)]
+        for l in range(16):
+            src = l ^ 1
+            self.assertEqual(results[l], data[src])
+        # Lane 16 reads from 17, but lane 17 is inactive in exec_mask -> 0
+        self.assertEqual(results[16], 0)
+
+    def test_simd_alternating_exec_mask(self) -> None:
+        data = [i + 1 for i in range(32)]
+        expr = SwizzleExpr("QUAD_PERM", (1, 0, 3, 2))
+        exec_mask = 0x55555555  # even lanes active
+        for l in (0, 2, 4, 6):
+            # Target is l+1, which is odd (inactive) -> returns 0
+            self.assertEqual(expr.eval(l, data, exec_mask), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
