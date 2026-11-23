@@ -30,7 +30,8 @@ resumes from the DDS files already written.
 
 **Bottom line:** the compact mip chain is decoded and validated below, and a clean-room
 stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`,
-`tools/bcpack_tables_bptc.py`) now decodes the rANS entropy layer and rebuilds BC blocks
+`tools/bcpack_tables_bptc.py`, with `tools/bcpack_tool.py` as the command line over them)
+now decodes the rANS entropy layer and rebuilds BC blocks
 for all six active modes (BC1, BC3, BC4, BC5, BC6H and BC7 — 100% of BCPack codecs in the
 corpus). To inspect or decode one raw BCPack stream from the command line, `tools/bcpack_tool.py`
 wraps the same decoder: `inspect <in.bin> --codec <1..7> --size <uncompressed_bytes> [--json]` prints
