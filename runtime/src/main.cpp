@@ -111,6 +111,15 @@ int wmain(int argc, wchar_t** argv) {
     };
     game_dir = game_dir.empty() ? absolute_or_same(image).parent_path() : absolute_or_same(game_dir);
     if (!overlay_dir.empty()) overlay_dir = absolute_or_same(overlay_dir);
+    // A --game-dir that is not a folder (a file, or a path that does not exist) cannot serve GAME:. Left alone, the
+    // loader maps only the image, the package's imports stay unimplemented, and --dry-run still exits 0, so a mistyped
+    // path reads as a clean dry run.
+    if (std::error_code error; !std::filesystem::is_directory(game_dir, error)) {
+        const auto folder = game_dir.u8string();
+        std::fprintf(stderr, "error: --game-dir is not a folder: %s\n",
+                     reinterpret_cast<const char*>(folder.c_str()));
+        return 2;
+    }
     // An image without relocations whose range this process already uses (arm64 Wine on macOS) runs in a new
     // process that has the range reserved from the start (base_reservation.h); that process does not do this again.
     if (!rt::base_reservation::inherited())

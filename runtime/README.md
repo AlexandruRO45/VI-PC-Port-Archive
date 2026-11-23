@@ -50,7 +50,9 @@ available until these notifications finish, so DLLs can release resources such a
 argument is null (explicit unload). A map-only load receives no detach notifications.
 
 `--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
-print the usage and exit 2 before anything is mapped.
+print the usage and exit 2 before anything is mapped. `--game-dir` must be a folder that exists: a file or a
+mistyped path is `error: --game-dir is not a folder` and exit 2 before the image is opened, instead of a dry
+run that maps only the image and reports the package's imports as unimplemented.
 
 The report line is:
 
