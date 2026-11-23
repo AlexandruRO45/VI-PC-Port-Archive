@@ -5,7 +5,7 @@
 
 The extension check in .github/workflows/no-game-data.yml misses a renamed file: a DDS saved as .bin, an executable
 as .txt. This reads the first bytes of each file and matches the magic numbers of the package's formats and the
-files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resources, XBCH/FSSM/DXBC shader
+files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resources, XBCH/FSSM/FSPX/DXBC shader
 containers, SPIR-V, DDS, AWC audio, PSIN/PAMH/MHIU/SPS1/SGD5/RDS5 containers, YSC/SCRP compiled scripts, the
 animation MoVE container and SKEL_ bone table, Ogg, RIFF WAVE, Bink, glTF binaries, PE executables and XVD
 images. The magics are
@@ -47,6 +47,8 @@ MAGICS = (
     ("RBF0 tree", 0, b"RBF0"),
     ("XBCH shader container", 0, b"XBCH"),
     ("FSSM shader", 0, b"FSSM"),
+    # The ACCC part of a FidelityFX container, and a bare payload the DLL takes on its own (docs/fspx.md).
+    ("FSPX compute payload", 0, b"FSPX"),
     ("DXBC container", 0, b"DXBC"),
     ("SPIR-V module", 0, b"\x03\x02\x23\x07"),
     ("SPIR-V module", 0, b"\x07\x23\x02\x03"),
