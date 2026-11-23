@@ -501,3 +501,43 @@ class TestSIMDDivergence(unittest.TestCase):
             else:
                 self.assertIsNone(results[lane])
                 self.assertEqual(state.get_vgpr64(lane, 0), sentinel)
+
+
+# ==============================================================================
+# SECTION 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0_in_place(self) -> None:
+        """Verify v[0:1] = div_fixup(v[0:1], v[2:3], v[4:5]) evaluates correctly."""
+        state = ScalarMachineState64()
+        state.set_vgpr64(0, F64_ONE)
+        state.set_vgpr64(2, F64_TWO)
+        state.set_vgpr64(4, F64_TWO)
+
+        interp = ScalarInterpreter64()
+        instr = VDivFixup64Instruction(dst=VGPRPair(0), src0=VGPRPair(0), src1=VGPRPair(2), src2=VGPRPair(4))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(state.get_vgpr64(0), F64_ONE)
+
+        # Cross check with translated SPIR-V
+        spv_res = run_translator_div_fixup(F64_ONE, F64_TWO, F64_TWO, name="ps_alias_dst_src0")
+        self.assertEqual(res, spv_res)
+
+    def test_alias_dst_equals_src1(self) -> None:
+        """Verify v[0:1] = div_fixup(v[2:3], v[0:1], v[4:5])."""
+        state = ScalarMachineState64()
+        state.set_vgpr64(0, F64_TWO)
+        state.set_vgpr64(2, F64_ONE)
+        state.set_vgpr64(4, F64_TWO)
+
+        interp = ScalarInterpreter64()
+        instr = VDivFixup64Instruction(dst=VGPRPair(0), src0=VGPRPair(2), src1=VGPRPair(0), src2=VGPRPair(4))
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(state.get_vgpr64(0), F64_ONE)
