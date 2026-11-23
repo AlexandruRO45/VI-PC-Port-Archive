@@ -620,5 +620,27 @@ class TestSSendMsgHaltStages(unittest.TestCase):
         self.assertEqual(str(cm.exception), "s_sendmsghalt")
 
 
+class TestSSendMsgHaltNegative(unittest.TestCase):
+    def test_sendmsghalt_missing_operand_rejection(self):
+        bad_lines = [
+            "s_sendmsghalt",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_sendmsghalt_syntax", bad_lines)
+        self.assertEqual(str(cm.exception), "s_sendmsghalt")
+
+    def test_sendmsghalt_malformed_syntax_rejection(self):
+        bad_lines = [
+            "s_sendmsghalt_bad",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_bad_sendmsghalt_invalid", bad_lines)
+        self.assertEqual(str(cm.exception), "s_sendmsghalt_bad")
+
+
 if __name__ == "__main__":
     unittest.main()
