@@ -148,6 +148,14 @@ class ShaderStemsTests(unittest.TestCase):
             shader_stems(path, "file", ".dxbc")
         self.assertIn(path, str(ctx.exception))
 
+    def test_index_saved_with_utf8_bom_reads(self):
+        # PowerShell 5.1's `Out-File -Encoding utf8` writes a BOM; the JSON under it is still valid UTF-8.
+        path = self.write_bytes(
+            "bom_index.json",
+            b"\xef\xbb\xbf" + json.dumps([{"file": "ps_water.dxbc"}]).encode("utf-8"),
+        )
+        self.assertEqual(shader_stems(path, "file", ".dxbc"), {"ps_water"})
+
 
 class CallerIntegrationTests(unittest.TestCase):
     def setUp(self):
