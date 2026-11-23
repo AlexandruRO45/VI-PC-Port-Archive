@@ -146,7 +146,11 @@ rpf9dump xma    <audio.rpf>  <out>
 ```
 
 `audio` writes the AWC banks plus `audio_manifest.json` (stream ids, codec, channels, rate, duration); `xma`
-writes RIFF XMA2 WAVs that ffmpeg decodes. `models`/`textures` write OBJ/DDS plus a manifest. The tool's
+writes RIFF XMA2 WAVs that ffmpeg decodes. `models`/`textures` write OBJ/DDS plus a manifest. Except for
+`models`/`textures`, the source has to be a container the reader knows (RPF9 for `audio`, an RPF, ZIP or RDS5 pool
+for `xma`, an RDS5 pool for `ttpf`): anything else is one error line and exit code 2 before `<out>/<name>` is
+created. `models` and `textures` also take a headerless slice of an archive, which is how a multi-GiB archive is
+exported a piece at a time with `--start`/`--length`. The tool's
 `ArchiveReader` recovery names are offset-based, and its structured path validates XML/PSIN, models and
 textures; the original RPF paths still require the missing executable/key.
 
