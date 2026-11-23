@@ -105,7 +105,8 @@ class RunSemanticTests(unittest.TestCase):
         d = self.folder(test_stuck=GRANDCHILD.format(pidfile=pidfile))
         t0 = time.monotonic()
         r = run(d, "--timeout", "3")
-        pid = int(open(pidfile).read())
+        with open(pidfile) as f:
+            pid = int(f.read())
         self.addCleanup(lambda: alive(pid) and os.kill(pid, 9))
         self.assertLess(time.monotonic() - t0, 25)
         self.assertEqual(r.returncode, 1)
