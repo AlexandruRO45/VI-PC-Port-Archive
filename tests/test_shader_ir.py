@@ -67,6 +67,23 @@ class OperandTests(unittest.TestCase):
         self.assertEqual(shader_ir.operand("08"), {"k": "imm", "v": 8})
         self.assertEqual(shader_ir.operand("-010"), {"k": "imm", "v": -10})
 
+    def test_extended_float_spellings(self):
+        # The parser feeds the translator's src_u(fimm) path, which writes raw f32 bits.
+        for spelling, value in (
+            ("1e0", 1.0), ("1.", 1.0), (".5", 0.5),
+            ("1.E+0", 1.0), ("2.5E-1", 0.25),
+            ("-2E1", -20.0), ("-.5", -0.5),
+        ):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(shader_ir.operand(spelling),
+                                 {"k": "fimm", "v": value, "abs": False})
+        self.assertEqual(shader_ir.operand("|1E0|"),
+                         {"k": "fimm", "v": 1.0, "abs": True})
+        self.assertEqual(shader_ir.operand("-|.5|"),
+                         {"k": "fimm", "v": 0.5, "abs": True, "neg": True})
+        # An integer token is still an integer, not an FP immediate.
+        self.assertEqual(shader_ir.operand("42"), {"k": "imm", "v": 42})
+
     def test_hardware_fp_modifiers_on_constants(self):
         # LLVM AMDGPUInstPrinter::printOperandAndFPInputMods emits neg(<imm>), |<imm>|, -|<imm>| and the
         # assembler also accepts abs(<imm>) / neg(abs(<imm>)). Keep abs/neg as VOP3 FP modifier flags rather

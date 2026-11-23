@@ -33,7 +33,8 @@ _SLIST = re.compile(r"\[((?:s\d+|vcc_lo|vcc_hi)(?:\s*,\s*(?:s\d+|vcc_lo|vcc_hi))
 _ATTR = re.compile(r"attr(\d+)\.([xyzw])")
 _TARGET = re.compile(r"(pos|param|mrt|mrtz|null|prim)(\d*)")
 _INT = re.compile(r"-?(0x[0-9a-fA-F]+|\d+)")
-_FLOAT = re.compile(r"-?\d+\.\d+(e[+-]?\d+)?")
+# Keep integer literals distinct; accept normal decimal/scientific FP spellings from text assembly.
+_FLOAT = re.compile(r"-?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)")
 
 
 def operand(tok):
