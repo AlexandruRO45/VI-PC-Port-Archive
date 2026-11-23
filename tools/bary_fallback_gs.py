@@ -14,6 +14,7 @@ BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
 
 The paired helper forwards a VS ClipDistance or CullDistance array. The suffix identifies the kind and length.
 Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
+Usage: `python -I tools/bary_fallback_gs.py --help` lists the options.
 """
 import argparse
 from collections.abc import Iterator
@@ -125,6 +126,9 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
         vertex, pixel = pair
         producer = index.get(vertex, {})
         consumer = index.get(pixel, {})
+        for name, entry in ((vertex, producer), (pixel, consumer)):
+            if not isinstance(entry, dict):
+                raise ValueError(f"{index_path}: index entry {name!r} must be a JSON object")
         if producer.get("stage") != "vs" or consumer.get("stage") != "ps" or not consumer.get("bary_fallback_input"):
             raise ValueError("--pair requires a translated VS and a barycentric-fallback PS from the index")
         caps = set(producer.get("capabilities", []))
@@ -189,6 +193,8 @@ def main(argv):
     parser.add_argument("spirv_dir")
     parser.add_argument("--pair", nargs=2, metavar=("VS", "PS"), help="build for these index entries")
     args = parser.parse_args(argv[1:])
+    if not os.path.exists(args.spirv_dir):
+        parser.exit(2, f"ERROR: {args.spirv_dir}: does not exist\n")
     if not os.path.isdir(args.spirv_dir):
         parser.exit(1, f"{args.spirv_dir}: not a directory\n")
     try:
