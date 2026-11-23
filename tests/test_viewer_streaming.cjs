@@ -325,6 +325,11 @@ test('browser shortcuts leave viewer actions alone and Ctrl movement remains ava
     }
     assert.deepEqual(cam.actions, []);
 
+    for (const modifier of ['metaKey', 'altKey']) {
+        cam.key('KeyW', { [modifier]: true });
+        assert.equal(cam.keys.has('KeyW'), false, modifier);
+    }
+
     cam.key('ControlLeft', { ctrlKey: true });
     cam.key('KeyW', { ctrlKey: true });
     assert.equal(cam.keys.has('ControlLeft'), true);

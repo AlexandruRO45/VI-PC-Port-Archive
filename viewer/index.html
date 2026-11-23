@@ -224,9 +224,10 @@ addEventListener("wheel", e => { speed = THREE.MathUtils.clamp(speed * (e.deltaY
 addEventListener("blur", () => { keys.clear(); dragging = false; });
 const world = await loadWorld();
 addEventListener("keydown", e => {
+  if (e.metaKey || e.altKey) return;
   keys.add(e.code);
-  // Track Ctrl for slow movement, but leave modified shortcuts to the browser.
-  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  // Track Ctrl for slow movement, but leave Ctrl shortcuts to the browser.
+  if (e.ctrlKey) return;
   if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
   if (e.code === "KeyG" && !e.repeat) toggleBounds();
