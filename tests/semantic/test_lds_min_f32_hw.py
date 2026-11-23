@@ -621,6 +621,35 @@ class TestDSMinF32RegisterAliasing(unittest.TestCase):
         # min(1.0, subnormal) = subnormal (0x40)
         self.assertEqual(self.lds.read_dword(0x40), 0x40)
 
+class TestDSMinF32ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Part 6: Condition codes, status flags, and lgkmcnt tracking."""
+
+    def test_status_flags_invariance(self) -> None:
+        lds = LDSMemory(size_bytes=4096)
+        state = ScalarThreadState(lds)
+        state.sgprs[0] = 0xABCD1234
+        lds.write_dword(0x10, TWO_F32)
+        state.set_vgpr(VGPR(1), 0x10)
+        state.set_vgpr(VGPR(2), ONE_F32)
+
+        interp = ScalarDSInterpreter(lds)
+        inst = DSMinF32Instruction.parse("ds_min_rtn_f32 v5, v1, v2")
+        interp.execute(state, inst)
+
+        self.assertEqual(state.sgprs[0], 0xABCD1234)
+        self.assertEqual(state.lgkm_cnt, 1)
+
+    def test_lgkmcnt_counter_tracking(self) -> None:
+        lds = LDSMemory(size_bytes=4096)
+        state = ScalarThreadState(lds)
+        interp = ScalarDSInterpreter(lds)
+
+        for i in range(4):
+            inst = DSMinF32Instruction.parse(f"ds_min_f32 v1, v2 offset:{i*4}")
+            interp.execute(state, inst)
+
+        self.assertEqual(state.lgkm_cnt, 4)
+
 
 if __name__ == '__main__':
     unittest.main()
