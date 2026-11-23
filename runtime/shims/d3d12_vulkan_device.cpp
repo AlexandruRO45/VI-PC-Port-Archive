@@ -5208,6 +5208,41 @@ public:
                                                         identity()));
     }
 
+    // Shared handles. Nothing this device creates can be shared with another device or process, so the calls the
+    // host refuses on their arguments are answered as the host does (d3d12_shared_handle_test) and a call that
+    // would succeed on the host stays E_NOTIMPL. Docs:
+    // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createsharedhandle
+    HRESULT STDMETHODCALLTYPE CreateSharedHandle(ID3D12DeviceChild* object, const SECURITY_ATTRIBUTES*, DWORD,
+                                                 LPCWSTR, HANDLE* handle) override {
+        constexpr auto method = "ID3D12Device::CreateSharedHandle";
+        if (handle) *handle = nullptr;
+        // The page names DXGI_ERROR_INVALID_CALL for an invalid parameter; the host runtime answers E_INVALIDARG
+        // for a null object, a null output and an object not created shared, on WARP, NVIDIA and Intel.
+        if (!object || !handle) return d3d12_trace::result(method, E_INVALIDARG);
+        log_once("CreateSharedHandle (shared objects are not supported)", 0);
+        return d3d12_trace::result(method, E_NOTIMPL);
+    }
+
+    HRESULT STDMETHODCALLTYPE OpenSharedHandle(HANDLE handle, REFIID, void** out) override {
+        constexpr auto method = "ID3D12Device::OpenSharedHandle";
+        if (out) *out = nullptr;
+        // No handle this layer made names a D3D12 object: INVALID_HANDLE_VALUE is E_INVALIDARG, every other
+        // handle that is not a shared D3D12 object (null, closed, an event) is E_HANDLE, as on the host.
+        if (handle == INVALID_HANDLE_VALUE) return d3d12_trace::result(method, E_INVALIDARG);
+        return d3d12_trace::result(method, E_HANDLE);
+    }
+
+    HRESULT STDMETHODCALLTYPE OpenSharedHandleByName(LPCWSTR, DWORD access, HANDLE* handle) override {
+        constexpr auto method = "ID3D12Device::OpenSharedHandleByName";
+        if (!handle) return d3d12_trace::result(method, E_INVALIDARG);
+        *handle = nullptr;
+        // CreateSharedHandle currently names nothing, so no name is found (E_HANDLE, also for a null name); the
+        // page says CreateSharedHandle accepts only GENERIC_ALL, and the host refuses another access with
+        // E_INVALIDARG before looking the name up.
+        if (access != GENERIC_ALL) return d3d12_trace::result(method, E_INVALIDARG);
+        return d3d12_trace::result(method, E_HANDLE);
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                                      ID3D12RootSignature* root_signature, REFIID riid,
                                                      void** out) override {
