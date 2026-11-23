@@ -12,7 +12,6 @@ line, and exits 1 if a file fails or none is found. Standard library only.
 """
 import argparse
 import concurrent.futures
-import fnmatch
 import os
 import re
 import subprocess
@@ -27,7 +26,8 @@ def test_modules(directory):
         dirs[:] = sorted(d for d in dirs if os.path.isfile(os.path.join(base, d, "__init__.py")))
         prefix = os.path.relpath(base, directory).replace(os.sep, ".")
         for name in sorted(files):
-            if fnmatch.fnmatchcase(name, "test*.py"):
+            # Match the test*.py pattern and unittest discover's module filename rule.
+            if re.fullmatch(r"test\w*\.py", name):
                 names.append(name[:-3] if prefix == "." else f"{prefix}.{name[:-3]}")
     return names
 

@@ -52,6 +52,15 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             self.assertIn("2 files, 4 tests, 0 files failed", out)
 
+    def test_parallel_discovery_ignores_invalid_module_filenames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS,
+                        "test_notes.v2.py": BROKEN, "test-notes.py": BROKEN})
+            self.assertEqual(run(tmp, "-j", "1")[0], 0)
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("1 files, 2 tests, 0 files failed", out)
+
     def test_a_failure_or_import_error_is_reported_and_fails_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "test_f.py": FAIL, "test_b.py": BROKEN})
