@@ -689,5 +689,32 @@ class TestVRcpF32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_rcp_f32(0.5), 2.0)
 
 
+def ref_rsq_f32(src: float) -> float:
+    """Bit-accurate reference oracle for RDNA2 v_rsq_f32 (1.0 / sqrt(x))."""
+    if math.isnan(src) or src < 0.0:
+        return float("nan")
+    if src == 0.0:
+        return float("inf")
+    if math.isinf(src):
+        return 0.0
+    return 1.0 / math.sqrt(src)
+
+
+class TestVRsqF32Reference(unittest.TestCase):
+    """Reference mathematical oracle verification for v_rsq_f32."""
+
+    def test_reference_squares(self):
+        self.assertEqual(ref_rsq_f32(1.0), 1.0)
+        self.assertEqual(ref_rsq_f32(4.0), 0.5)
+        self.assertEqual(ref_rsq_f32(16.0), 0.25)
+        self.assertEqual(ref_rsq_f32(0.25), 2.0)
+
+    def test_reference_edge_cases(self):
+        self.assertEqual(ref_rsq_f32(0.0), float("inf"))
+        self.assertEqual(ref_rsq_f32(float("inf")), 0.0)
+        self.assertTrue(math.isnan(ref_rsq_f32(-4.0)))
+        self.assertTrue(math.isnan(ref_rsq_f32(float("nan"))))
+
+
 if __name__ == "__main__":
     unittest.main()
