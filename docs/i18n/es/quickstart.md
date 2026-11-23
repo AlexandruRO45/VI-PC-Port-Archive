@@ -3,7 +3,7 @@
 > [!NOTE]
 > La documentación en inglés ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) y
 > [`docs/README.md`](../../README.md)) es **la referencia oficial**. Esta guía solo recoge las instrucciones
-> estables de instalación y compilación (sincronizada con el commit `003e7812`). Para el estado del proyecto, que
+> estables de instalación y compilación (sincronizada con el commit `3faac557`). Para el estado del proyecto, que
 > cambia a diario, consulte el [`README.md`](../../../README.md).
 
 ## Qué es Leonida
@@ -36,6 +36,10 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
   - Para compilar un `llvm-mc.exe` nativo con ese destino, ejecute `.\scripts\build_llvm_mc.ps1` en PowerShell
     desde la raíz del repositorio. El script necesita `git` y las herramientas de C++ de Visual Studio. Define
     `LLVM_MC` para su usuario: abra después un terminal nuevo para que la variable se aplique.
+  - Más rápido, si usa [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools` (su compilación
+    para Windows incluye el destino AMDGPU; [`docs/testing.md`](../../testing.md) usó la versión 23.1.6). Luego
+    apunte `LLVM_MC` a la ruta completa del `llvm-mc.exe` que instala (`where llvm-mc` la muestra con el entorno
+    activado).
   - Con WSL, instale `llvm-21` en Ubuntu y pase el comando completo a `LLVM_MC`, en la sesión de PowerShell
     donde vaya a ejecutar `make_game.py`:
 
@@ -51,6 +55,11 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 - [ffmpeg](https://ffmpeg.org/download.html) en el `PATH` *(opcional: decodifica los flujos XMA2 y es obligatorio
   con `--wav`)*.
 
+**Poco espacio en disco:** la cifra de ~350 GB es para la compilación completa. Para *ejecutar* el port,
+`--stages check,shaders,runtime` necesita unos 30 GB; la etapa `assets` (~300 GB) solo hace falta para las
+herramientas de recursos, y `--wav` añade varias veces el tamaño del Ogg Opus (la comprobación previa le ofrece
+esta opción cuando la etapa `assets` es la que no cabe). `--work` y `--out` pueden ir en otra unidad.
+
 ## Compilar
 
 ### La forma sencilla (Windows)
@@ -62,17 +71,19 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
    ```
 3. Haga doble clic en **`Build.bat`**.
 
-El script encuentra su copia por sí solo: busca en Descargas, Escritorio, Documentos, Games, su carpeta de usuario
-y en la raíz de cada disco, dos niveles de carpetas en profundidad. Si encuentra varias copias, le pregunta cuál
-usar; si no encuentra ninguna, le pide que pegue la ruta de la carpeta. Antes de empezar comprueba los requisitos
-y el espacio libre, y enumera de una vez todo lo que falta. El resultado va a `Documents\Leonida`. Una
-compilación interrumpida se reanuda donde quedó.
+El script encuentra su copia por sí solo: busca en Descargas, Escritorio, Documentos (también donde Windows los
+guarda, como en OneDrive), Games, su carpeta de usuario y en la raíz de cada disco, dos niveles de carpetas en
+profundidad. Si encuentra varias copias, le pregunta cuál usar; si no encuentra ninguna, le pide que pegue la ruta
+de la carpeta. Antes de empezar comprueba los requisitos y el espacio libre, y enumera de una vez todo lo que
+falta. El resultado va a `Documents\Leonida`. Una compilación interrumpida se reanuda donde quedó.
 
 ### Desde un terminal (`make_game.py`)
 
 ```powershell
 python -I make_game.py --find                          # enumera las copias encontradas en este PC
+python -I make_game.py --pick                          # elige la carpeta del juego en un diálogo
 python -I make_game.py --check                         # verifica su copia, sin compilar nada
+python -I make_game.py --check --full-check            # además compara el SHA-256 de cada archivo (lento)
 python -I make_game.py --game "D:\ruta\al\paquete" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # solo algunas etapas
 python -I make_game.py --game "D:\ruta\al\paquete" --wav  # además decodifica el Opus a WAV PCM (ocupa mucho)
@@ -84,8 +95,9 @@ Las etapas se ejecutan en este orden: `check` → `shaders` → `assets` → `ru
 - **`--wave64-emulate`**: traduce los shaders compute y mesh wave64 de forma exacta cualquiera que sea el tamaño de
   subgrupo de la GPU. Las GPU NVIDIA e Intel usan subgrupos de 32 y lo necesitan. El valor predeterminado, `auto`,
   consulta `vulkaninfo` y activa la emulación salvo que todas las GPU anuncien subgrupos de 64.
-- **`--work`**: elija un disco con al menos 350 GB libres. La traducción de shaders es la etapa más larga; por
-  defecto usa la mitad de los hilos del procesador (ajustable con `--jobs`).
+- **`--work`**: elija un disco con unos 350 GB libres para la compilación completa (véase la nota sobre poco
+  espacio en disco). La traducción de shaders es la etapa más larga; por defecto usa la mitad de los hilos del
+  procesador (ajustable con `--jobs`).
 - **`--wav`**: desactivado por defecto, porque el WAV PCM de 16 bits ocupa varias veces más que el Ogg Opus.
 - **Linux y Wine/Proton**: `make_game.py` también funciona en Linux. El cargador es un programa de Windows y se
   ejecuta bajo Wine o Proton. Para la etapa `runtime` puede pasar `--runtime-build <carpeta>` con una compilación
