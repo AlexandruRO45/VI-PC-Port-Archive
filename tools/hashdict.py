@@ -20,6 +20,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from report_paths import same_report_path  # noqa: E402  (same folder; -I drops the script's folder)
+
 # A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
 STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
 # For --min below 3 the run matcher must also accept one- and two-character identifiers, so the same
@@ -119,19 +122,15 @@ def main():
     else:
         archives = [(d, os.path.join(a.carve, d)) for d in sorted(os.listdir(a.carve))]
     # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
-    # samefile also catches a case-only difference on Windows and macOS's default volume.
-    if os.path.exists(a.out):
-        inputs = [x for x in a.extra if os.path.isfile(x)]
-        inputs += [os.path.join(d, "index.json") for _, d in archives]
-        for x in inputs:
-            try:
-                same = os.path.isfile(x) and os.path.samefile(a.out, x)
-            except OSError:
-                same = False
-            if same:
-                print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
-                      file=sys.stderr)
-                return 2
+    # same_report_path also catches a hard link, another spelling and a folding volume's other name for
+    # one file, and it answers for an --out that does not exist yet.
+    inputs = [x for x in a.extra if os.path.isfile(x)]
+    inputs += [os.path.join(d, "index.json") for _, d in archives]
+    for x in inputs:
+        if same_report_path(x, a.out):
+            print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
+                  file=sys.stderr)
+            return 2
     # A report can also alias a harvested <offset>.bin, including through a hard link.
     # Snapshot its file identity once; compare against the input's already-open handle
     # rather than statting every carve path (there may be millions of entries).
