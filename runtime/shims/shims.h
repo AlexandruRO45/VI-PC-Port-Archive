@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace rt::shims {
 
@@ -12,12 +13,18 @@ struct Entry {
     void* fn;
 };
 
-// Registers a static table at startup.
+// Registers a static table at startup. A name another table already serves with a different function is replaced by
+// the later table, and which table is later is static-initialization order across files, so the replacement is
+// logged and listed by conflicting_registrations().
 struct Table {
     Table(const Entry* entries, size_t count);
 };
 
 void* find(const std::string& dll_lower, const std::string& name);
+
+// The "dll!name" keys that a second table registered with a different function, in registration order. Empty for
+// gta6rt's own shim set (the shim_tables_unique test).
+std::vector<std::string> conflicting_registrations();
 
 // Whether the shims own a whole module: the registry serves names from it and it is not a host system DLL (kernel32,
 // kernelbase, the CRTs, api-ms-* sets, vulkan-1) of which only a few functions are replaced. A title's

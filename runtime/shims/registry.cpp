@@ -10,6 +10,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "shims.h"
@@ -475,8 +476,28 @@ bool owns_bundled_module_handle(void* module) {
     return false;
 }
 
+namespace {
+// Keys a later table replaced with a different function. Constant-initialized and immortal: Table constructors run
+// during static initialization, in an order across files that nothing here controls.
+std::vector<std::string>* g_conflicts = nullptr;
+}  // namespace
+
 Table::Table(const Entry* entries, size_t count) {
-    for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
+    for (size_t i = 0; i < count; ++i) {
+        std::string key = lower_ascii(entries[i].dll) + "!" + entries[i].name;
+        void*& slot = table()[key];
+        if (slot && slot != entries[i].fn) {
+            std::fprintf(stderr, "[rt] shims: %s is registered by two shim tables with different functions; the later "
+                                 "one is served\n", key.c_str());
+            if (!g_conflicts) g_conflicts = new std::vector<std::string>;
+            g_conflicts->push_back(std::move(key));
+        }
+        slot = entries[i].fn;
+    }
+}
+
+std::vector<std::string> conflicting_registrations() {
+    return g_conflicts ? *g_conflicts : std::vector<std::string>{};
 }
 
 void* find(const std::string& dll_lower, const std::string& name) {

@@ -246,6 +246,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
 
+  # Two shim tables serving one name: the registry lists the replaced entry (shim_tables_unique checks gta6rt's set).
+  add_executable(shim_table_conflict_test
+    test/shim_table_conflict_test.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(shim_table_conflict_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(shim_table_conflict_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(shim_table_conflict_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(shim_table_conflict_test PRIVATE /OPT:NOREF)
+
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
@@ -1007,6 +1017,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)
   endif()
+  if(WIN32 AND TARGET shim_table_conflict_test)
+    add_test(NAME shim_table_conflict COMMAND shim_table_conflict_test)
+  endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
   endif()
@@ -1133,6 +1146,12 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "usage: gta6rt"
         FAIL_REGULAR_EXPRESSION "running |module\\(s\\) mapped")
     endforeach()
+    # Every shim table is constructed before main, so gta6rt with no arguments has logged any name two tables serve
+    # with different functions (registry.cpp); which of the two is served would depend on link order.
+    add_test(NAME shim_tables_unique COMMAND gta6rt)
+    set_tests_properties(shim_tables_unique PROPERTIES
+      PASS_REGULAR_EXPRESSION "usage: gta6rt"
+      FAIL_REGULAR_EXPRESSION "registered by two shim tables")
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
