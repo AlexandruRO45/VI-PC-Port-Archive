@@ -512,5 +512,24 @@ class TestVLogF32Reference(unittest.TestCase):
         self.assertTrue(math.isnan(ref_log_f32(float("nan"))))
 
 
+def step_scalar_log_f32(state: ScalarState, instr: Instruction) -> None:
+    if instr.opcode != "v_log_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    val = state.read_operand_f32(instr.src0)
+    res = ref_log_f32(val)
+    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+
+
+class TestVLogF32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_log_f32."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ScalarState()
+        state.write_vgpr_f32(1, 4.0)
+        instr = Instruction("v_log_f32", Operand.vgpr(0), Operand.vgpr(1))
+        step_scalar_log_f32(state, instr)
+        self.assertEqual(bits_to_f32(state.vgprs[0]), 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
