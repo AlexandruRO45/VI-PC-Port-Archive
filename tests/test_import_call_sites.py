@@ -126,6 +126,34 @@ class ImportCallSitesTest(unittest.TestCase):
         self.assertEqual(out["xmem.dll!XMemFoo"]["call"], [])
         self.assertEqual(out["xmem.dll!XMemBar"]["call"], [TEXT_RVA + 0x100])
 
+    def test_calls_and_jumps_in_raw_padding_are_not_counted(self):
+        for opcode, field in ((0xE8, "call"), (0xE9, "jmp")):
+            for virtual_size in (0x100, 0x103, 0x105):
+                with self.subTest(opcode=opcode, virtual_size=virtual_size):
+                    data = bytearray(build_image([(TEXT_RVA + 0x100, opcode, THUNK_FOO)]))
+                    struct.pack_into("<I", data, 0x58 + 0xF0 + 8, virtual_size)
+                    foo = import_call_sites.call_sites(bytes(data))["imports"]["xmem.dll!XMemFoo"]
+                    self.assertEqual(foo["thunks"], [THUNK_FOO])
+                    self.assertEqual(foo[field], [TEXT_RVA + 0x100] if virtual_size == 0x105 else [])
+
+    def test_thunks_in_raw_padding_are_not_counted(self):
+        for virtual_size in (0x10, 0x14, 0x16):
+            with self.subTest(virtual_size=virtual_size):
+                data = bytearray(build_image([(TEXT_RVA + 8, 0xE8, THUNK_BAR)]))
+                struct.pack_into("<I", data, 0x58 + 0xF0 + 8, virtual_size)
+                bar = import_call_sites.call_sites(bytes(data))["imports"]["xmem.dll!XMemBar"]
+                self.assertEqual(bar["thunks"], [THUNK_BAR] if virtual_size == 0x16 else [])
+                self.assertEqual(bar["call"], [TEXT_RVA + 8] if virtual_size == 0x16 else [])
+
+    def test_zero_or_larger_virtual_size_keeps_file_backed_code(self):
+        expected = import_call_sites.call_sites(self.data)
+        for virtual_size, raw_size in ((0, 0x1000), (0xC00, 0x800)):
+            with self.subTest(virtual_size=virtual_size):
+                data = bytearray(self.data)
+                struct.pack_into("<I", data, 0x58 + 0xF0 + 8, virtual_size)
+                struct.pack_into("<I", data, 0x58 + 0xF0 + 16, raw_size)
+                self.assertEqual(import_call_sites.call_sites(bytes(data)), expected)
+
     def test_a_32_bit_image_is_refused(self):
         data = bytearray(self.data)
         struct.pack_into("<H", data, 0x58, 0x10B)

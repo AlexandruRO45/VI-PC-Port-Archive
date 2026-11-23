@@ -71,7 +71,8 @@ def call_sites(data, wanted=None, dlls=None):
                (lower_dlls is not None and dll.lower() in lower_dlls)
 
     slots = {rva: key for rva, key in import_slots(img).items() if selected(key)}
-    code = [(s["rva"], img.section_data(s)) for s in img.sections if s["exec"]]
+    # Raw alignment padding is not mapped by the loader; scan only the section's file-backed virtual span.
+    code = [(s["rva"], img.section_data(s)[:s["vsize"] or s["rawsize"]]) for s in img.sections if s["exec"]]
 
     thunks = {}
     for rva, blob in code:
