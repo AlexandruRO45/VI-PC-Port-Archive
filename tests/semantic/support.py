@@ -30,17 +30,23 @@ def shaders_importable():
 
     Those modules put more folders on sys.path when they load, and "build" is a name any other test could meet,
     so a plain sys.path.insert in a test would leak into every test that runs after it in the same pytest process.
-    On exit sys.path is what it was and the modules first imported from that folder are forgotten."""
-    saved_path, known = list(sys.path), set(sys.modules)
+    On exit sys.path is what it was, the modules imported from that folder are forgotten, and a module of the same
+    name that another test had loaded from elsewhere (set aside on entry, so the block gets the folder's own) is put
+    back."""
+    folder = os.path.abspath(SHADERS_DIR)
+    names = {entry[:-3] for entry in os.listdir(folder) if entry.endswith(".py")}
+    saved_path = list(sys.path)
+    set_aside = {name: sys.modules.pop(name) for name in names if name in sys.modules}
     sys.path.insert(0, SHADERS_DIR)
     try:
         yield
     finally:
         sys.path[:] = saved_path
-        for name in set(sys.modules) - known:
+        for name in list(sys.modules):
             origin = getattr(sys.modules[name], "__file__", None)
-            if origin and os.path.dirname(os.path.abspath(origin)) == os.path.abspath(SHADERS_DIR):
+            if origin and os.path.dirname(os.path.abspath(origin)) == folder:
                 del sys.modules[name]
+        sys.modules.update(set_aside)
 
 
 def translate_fixture(name, dxbc=STUB_DXBC, fssm=None):
