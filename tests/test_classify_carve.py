@@ -312,10 +312,6 @@ class MainTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.root)), files)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PublishTests(unittest.TestCase):
     def test_failed_replace_of_a_read_only_report_removes_the_temp(self):
         # os.replace onto a read-only destination fails on Windows, and the staging file has the destination's
@@ -329,3 +325,7 @@ class PublishTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     carve.publish_report(root, report, {"overall": {"x": 1}})
             self.assertEqual(sorted(os.listdir(root)), ["types.json"])
+
+
+if __name__ == "__main__":
+    unittest.main()
