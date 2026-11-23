@@ -860,5 +860,31 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(_read(new_buf)).hexdigest(), before_hash)
 
 
+class GltfComponentTypeConstantsTest(unittest.TestCase):
+    """The COMPONENT_* values are the glTF 2.0 accessor componentType codes."""
+
+    GLTF_COMPONENT_TYPES = {
+        "COMPONENT_BYTE": 5120,
+        "COMPONENT_UNSIGNED_BYTE": 5121,
+        "COMPONENT_SHORT": 5122,
+        "COMPONENT_UNSIGNED_SHORT": 5123,
+        "COMPONENT_UNSIGNED_INT": 5125,
+        "COMPONENT_FLOAT": 5126,
+    }
+
+    def test_component_constants_match_gltf_codes(self):
+        names = [name for name in dir(skinned_glb)
+                 if name.startswith("COMPONENT_") and name != "COMPONENT_SIZES"]
+        self.assertTrue(names)
+        for name in names:
+            self.assertIn(name, self.GLTF_COMPONENT_TYPES)
+            self.assertEqual(getattr(skinned_glb, name), self.GLTF_COMPONENT_TYPES[name], name)
+
+    def test_component_sizes_match_gltf_byte_lengths(self):
+        self.assertEqual(skinned_glb.COMPONENT_SIZES, {
+            5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4,
+        })
+
+
 if __name__ == "__main__":
     unittest.main()
