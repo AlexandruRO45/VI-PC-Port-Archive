@@ -235,12 +235,14 @@ def run_one_test(rel, timeout):
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, rel)], cwd=ROOT, capture_output=True, timeout=timeout)
         out = (r.stdout + r.stderr).decode("utf-8", "replace")
-        skipped = re.search(r"^OK \(skipped=(\d+)\)", out, re.M) and not re.search(r"Ran [1-9]\d* tests?", out.replace("skipped", ""))
         res = "pass" if r.returncode == 0 else "fail"
         tail = "" if res == "pass" else scrub(out)
-        ran = re.search(r"Ran (\d+) tests?", out)
+        ran = re.search(r"^Ran (\d+) tests?\b", out, re.M)
+        cases = int(ran.group(1)) if ran else None
+        skipped = re.search(r"^OK \(skipped=(\d+)\)", out, re.M)
+        all_skipped = res == "pass" and bool(cases and skipped and cases == int(skipped.group(1)))
         return {"test": rel, "result": res, "seconds": round(time.monotonic() - t0, 2), "detail": tail,
-                "cases": int(ran.group(1)) if ran else None, "all_skipped": bool(skipped)}
+                "cases": cases, "all_skipped": all_skipped}
     except subprocess.TimeoutExpired:
         return {"test": rel, "result": "fail", "seconds": timeout, "detail": f"timed out after {timeout} s"}
 
@@ -272,11 +274,15 @@ def code_digest():
 
 def run_unit_tests(match, jobs, timeout):
     files = [f for f in ci_test_files() if not match or re.search(match, f)]
+    def run_with_digest(rel):
+        digest = file_digest(rel)
+        result = run_one_test(rel, timeout)
+        result["digest"] = digest if digest == file_digest(rel) else None
+        return result
+
     before = code_digest()
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        results = list(pool.map(lambda f: run_one_test(f, timeout), files))
-    for r in results:
-        r["digest"] = file_digest(r["test"])
+        results = list(pool.map(run_with_digest, files))
     g = git_info()
     after = code_digest()
     return {"ran_at": iso(now_utc()), "commit": g.get("head"), "modified_files": g.get("modified_files"),
@@ -302,19 +308,15 @@ def collect_unit(col, out_dir, args):
     passed = current = 0
     for r in data["results"]:
         test = r["test"]
-        if r["result"] != "pass":
-            fresh = "failed"
-        elif not r.get("digest") or data.get("code_digest") is None:
-            fresh = "unknown"
+        if r["result"] == "fail":
+            fresh, status = "failed", "failed"
+        elif (r["result"] != "pass" or r.get("all_skipped") or
+              not r.get("digest") or data.get("code_digest") is None):
+            fresh, status = "unknown", "unknown"
         elif code_same and file_digest(test) == r["digest"]:
-            fresh = "current"
+            fresh, status = "current", "verified"
         else:
-            fresh = "revalidation_required"
-        status = {"pass": "verified", "fail": "failed"}.get(r["result"], "unknown")
-        if r["result"] == "pass" and r.get("all_skipped"):
-            status = "unknown"
-        if status == "verified" and fresh == "revalidation_required":
-            status = "partial"
+            fresh, status = "revalidation_required", "partial"
         passed += r["result"] == "pass"
         current += status == "verified"
         name = test.split("/", 1)[-1]

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -83,6 +84,51 @@ class Tests(unittest.TestCase):
             self.assertIsNone(pd.PYTEST_MARKERS.search(text))
 
 
+class UnitRuns(unittest.TestCase):
+    def test_fully_skipped_and_mixed_unittest_runs(self):
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(pd, "ROOT", folder):
+            script = os.path.join(folder, "test_sample.py")
+            suite = (
+                "import unittest\n"
+                "class Sample(unittest.TestCase):\n"
+                "    @unittest.skip('synthetic skip')\n"
+                "    def test_skipped(self):\n"
+                "        self.fail('must not run')\n"
+            )
+            for mixed in (False, True):
+                with self.subTest(mixed=mixed):
+                    with open(script, "w", encoding="utf-8", newline="\n") as handle:
+                        handle.write(suite)
+                        if mixed:
+                            handle.write("    def test_executed(self):\n        pass\n")
+                        handle.write("unittest.main()\n")
+                    result = pd.run_one_test("test_sample.py", 10)
+                    self.assertEqual(result["result"], "pass")
+                    self.assertEqual(result["cases"], 2 if mixed else 1)
+                    self.assertEqual(result["all_skipped"], not mixed)
+
+    def test_edited_test_file_has_no_verified_digest(self):
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(pd, "ROOT", folder):
+            rel = "tests/test_rewrite.py"
+            script = os.path.join(folder, rel)
+            os.makedirs(os.path.dirname(script))
+            with open(script, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(
+                    "import unittest\n"
+                    "from pathlib import Path\n"
+                    "class Rewrite(unittest.TestCase):\n"
+                    "    def test_edit(self):\n"
+                    "        Path(__file__).write_text('# edited', encoding='utf-8', newline='\\n')\n"
+                    "if __name__ == '__main__':\n"
+                    "    unittest.main()\n"
+                )
+            before = pd.file_digest(rel)
+            [result] = pd.run_unit_tests(None, 1, 10)["results"]
+            self.assertEqual(result["result"], "pass")
+            self.assertNotEqual(before, pd.file_digest(rel))
+            self.assertIsNone(result["digest"])
+
+
 class Freshness(unittest.TestCase):
     def collect(self, results):
         with tempfile.TemporaryDirectory() as out:
@@ -100,6 +146,12 @@ class Freshness(unittest.TestCase):
         got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), pd.code_digest()))
         self.assertEqual(got["test_progress_dashboard.py"], ("verified", "current"))
 
+    def test_fully_skipped_suite_is_unknown_on_unchanged_code(self):
+        data = self.base(pd.file_digest("tests/test_progress_dashboard.py"), pd.code_digest())
+        data["results"][0]["all_skipped"] = True
+        got = self.collect(data)
+        self.assertEqual(got["test_progress_dashboard.py"], ("unknown", "unknown"))
+
     def test_changed_test_file_needs_revalidation(self):
         got = self.collect(self.base("0" * 16, pd.code_digest()))
         self.assertEqual(got["test_progress_dashboard.py"], ("partial", "revalidation_required"))
@@ -110,7 +162,7 @@ class Freshness(unittest.TestCase):
 
     def test_code_edited_during_the_run_is_never_current(self):
         got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), None))
-        self.assertEqual(got["test_progress_dashboard.py"], ("verified", "unknown"))
+        self.assertEqual(got["test_progress_dashboard.py"], ("unknown", "unknown"))
 
 
 class GpuLog(unittest.TestCase):
