@@ -14,7 +14,8 @@
 //
 // The executable links thunks for IXUserImpl slots 3-5, 7-14, 19-25 and 33-34 and IXUserGamertagImpl slot 3
 // (tools/gdk_runtime_calls.py, from the file alone; docs/runtime_imports.md). None of them is a private or PC-only
-// slot; those still log once when called.
+// slot; those still log once when called. The title's own callers (docs/runtime_imports.md) add the user with
+// AddDefaultUserSilently and read the Classic gamertag into a 21-byte buffer.
 #include <windows.h>
 
 #include <atomic>

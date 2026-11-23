@@ -353,7 +353,16 @@ none after, and the three `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table). The executable links thunks for
 `IXUserImpl` slots 3-5, 7-14, 19-25 and 33-34 and `IXUserGamertagImpl` slot 3 (`tools/gdk_runtime_calls.py`, from the
 file alone): none of the slots logged on first use below, and of the offline failures only the token-and-signature
-trio (23-25). What the slots must answer is still **not measured**; that is the executable's first boot.
+trio (23-25). How the title's own code calls them is **measured** from its callers (static read, nothing run); what a
+run sees from each slot is still the executable's first boot:
+- `XUserAddAsync` has one caller, which passes `AddDefaultUserSilently` (1) and tests only the `HRESULT`.
+- `XUserGetGamertag` is called by the title with `Classic` (0), a 21-byte buffer and no `gamertagUsed`, so a classic
+  gamertag of up to 15 characters fits. Its other caller is library code that passes the component and the buffer
+  size through and does read `gamertagUsed` (#7418).
+- `XUserGetState`: the title's one caller asks for four users in turn, starts each answer at `SignedOut` (2), and
+  treats a failing `HRESULT` or `SignedOut` as signed out.
+- `XUserCheckPrivilege`: one caller, with options `None` (0), the privilege from its argument, and the bool and the
+  deny reason both cleared first; a failing `HRESULT` takes its own branch before either is read.
 - **Interfaces:** the class id doubles as `IXUserImpl`'s; `IXUserImpl2`-`6` answer with the same 50-slot vtable;
   `IXUserGamertagImpl` (`XUserGetGamertag`) is a second interface.
 - **The user:** one offline local user, always signed in. `XUserAddAsync` adds it with or without
