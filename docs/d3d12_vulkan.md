@@ -2037,6 +2037,10 @@ The trace will enumerate them.
     at 4096x4096 (`d3d12_rgb96_test` with `LEONIDA_RGB96_LARGE` set; single runs that vary by a few ms, each the
     first submission of a new queue). The converter is created on every device for this, whether or not the
     GPU has a native D24.
+  - On a D3D12 COPY queue, batches that repack an RGB96 footprint run on the primary Vulkan queue when the
+    dedicated transfer family lacks compute. The COPY queue's timeline orders the handoff in both directions,
+    and batches of ordinary copies still run on the transfer family. `d3d12_rgb96_copy_queue` exercises mixed
+    batches, cross-queue waits and signals, and byte-exact upload and readback.
   - Texture-to-texture copies and `CopyResource` are plain image copies, and only between two 96-bit textures.
   - `WriteToSubresource`/`ReadFromSubresource` always take the staged copy, as a D24 texture stored as D32 does:
     a host image copy would not repack.

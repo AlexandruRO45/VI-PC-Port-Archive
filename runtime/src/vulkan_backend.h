@@ -1181,11 +1181,17 @@ public:
         return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
     }
 
-    // `prepare` is called at the start of the command buffer of every ExecuteCommandLists, before the lists are
-    // written: the device brings the bindless set 0 of the translated shaders up to date there (vulkan_bindless.h)
-    // and records what the set needs first. When it fails, nothing of that call is executed.
-    void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
+    // Logical COPY queues without compute can send an RGB96 conversion batch to the primary queue if it has compute.
+    void configure_copy_conversion(std::uint32_t transfer_only_family, std::uint32_t primary_without_compute,
+                                   VkQueue queue, std::uint32_t family) {
+        transfer_only_family_ = transfer_only_family;
+        primary_without_compute_ = primary_without_compute;
+        copy_conversion_queue_ = queue;
+        copy_conversion_family_ = family;
+    }
 
+    // `prepare` brings bindless set 0 up to date before the lists are written (vulkan_bindless.h).
+    // When it fails, none of those lists are executed.
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::unique_lock lock(resource_mutex_);
         bindless_prepare_ = std::move(prepare);
@@ -1194,9 +1200,9 @@ public:
     // D24_UNORM_S8_UINT stored as D32: copies of its depth plane run a compute pass (vulkan_depth24.h). `allocate`
     // gives the scratch buffers device-local memory. Without this such a copy is refused as unsupported.
     void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate,
-                       std::uint64_t max_storage_range = 1u << 27) {
+                       std::uint64_t max_storage_range = 1u << 27, std::span<const std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
-        depth24_ = std::make_unique<Depth24Converter>(get, device_, std::move(allocate), max_storage_range);
+        depth24_ = std::make_unique<Depth24Converter>(get, device_, std::move(allocate), max_storage_range, families);
         if (!depth24_->loaded()) {
             depth24_.reset();
             return;
@@ -1209,9 +1215,10 @@ public:
 
     // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
     // `allocate`. Without this such a copy is refused as unsupported.
-    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
+    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate,
+                             std::span<const std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
-        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
+        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), families);
         if (!scratch_->loaded()) scratch_.reset();
     }
 
@@ -1395,6 +1402,9 @@ private:
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
+    std::uint32_t primary_without_compute_ = UINT32_MAX;
+    VkQueue copy_conversion_queue_ = VK_NULL_HANDLE;
+    std::uint32_t copy_conversion_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
 #ifdef _MSC_VER
@@ -1486,10 +1496,8 @@ public:
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind = QueueKind::direct)
         : context_(context), queue_(queue), kind_(kind), family_(family) {
         auto& vk = context.vk;
-        VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        pool.queueFamilyIndex = family;
-        ok_ = vk.vkCreateCommandPool(context.device(), &pool, nullptr, &pool_) == VK_SUCCESS;
+        pool_ = make_command_pool(family);
+        ok_ = pool_ != VK_NULL_HANDLE;
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
@@ -1504,8 +1512,7 @@ public:
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
-            const VkResult idle_result = vk.vkQueueWaitIdle(queue_);
-            if (idle_result == VK_SUCCESS) {
+            if (wait_idle_locked()) {
                 if (progress_) context_.retire_queue_idle_locked(progress_);
             } else {
                 context_.mark_device_lost();
@@ -1523,6 +1530,7 @@ public:
             if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
+        if (copy_conversion_pool_) vk.vkDestroyCommandPool(context_.device(), copy_conversion_pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
         for (auto& slot : buffers_) free_events_.insert(free_events_.end(), slot.events.begin(), slot.events.end());
         for (VkEvent event : free_events_) vk.vkDestroyEvent(context_.device(), event, nullptr);
@@ -1668,11 +1676,42 @@ public:
     }
 
     bool idle() {
+        std::lock_guard state(state_mutex_);
         std::lock_guard lock(context_.submit_mutex());
-        return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+        return wait_idle_locked();
     }
 
 private:
+    bool wait_idle_locked() {
+        const auto& vk = context_.vk;
+        const bool primary_idle = vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+        const bool conversion_idle = !copy_conversion_pool_ ||
+                                     vk.vkQueueWaitIdle(context_.copy_conversion_queue_) == VK_SUCCESS;
+        return primary_idle && conversion_idle;
+    }
+
+    VkCommandPool make_command_pool(std::uint32_t family) {
+        VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        info.queueFamilyIndex = family;
+        VkCommandPool pool = VK_NULL_HANDLE;
+        return context_.vk.vkCreateCommandPool(context_.device(), &info, nullptr, &pool) == VK_SUCCESS
+            ? pool : VK_NULL_HANDLE;
+    }
+
+    // Called under resource_mutex_, before prepare allocates the conversion scratch or records any commands.
+    bool uses_rgb96_footprint(std::span<const CommandList* const> lists) const {
+        for (const auto* list : lists) {
+            for (const auto& command : list->commands()) {
+                const auto* copy = std::get_if<CopyTexture>(&command);
+                if (!copy || copy->src.footprint == copy->dst.footprint) continue;
+                const auto* image = context_.resolve(copy->src.footprint ? copy->dst.resource : copy->src.resource);
+                if (image && image->image && image->rgb96) return true;
+            }
+        }
+        return false;
+    }
+
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
@@ -1707,16 +1746,23 @@ private:
                 if (active && scratch) scratch->retire(progress, 0);
             }
         } scratch_guard{context_.scratch_.get(), progress_, false};
+        const bool rgb96_conversion = kind_ == QueueKind::copy && uses_rgb96_footprint(lists);
+        const bool use_conversion_queue = rgb96_conversion &&
+            (family_ == context_.transfer_only_family_ || family_ == context_.primary_without_compute_);
+        const VkQueue physical_queue = use_conversion_queue ? context_.copy_conversion_queue_ : queue_;
+        if (!physical_queue) return ReplayResult::unsupported;
         const bool transfer_only = family_ == context_.transfer_only_family_;
+        // Keep COPY command-list rules, but include the actual compute accesses of the RGB96 repack.
+        const QueueKind execution_kind = rgb96_conversion ? QueueKind::compute : kind_;
         if (!transfer_only) bindless_commit = context_.bindless_commit_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
         auto& prepared = prepared_;
         prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
-        replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
-                              : kind_ == QueueKind::compute ? detail::queue_stages_compute
-                                                            : 0;
+        replay.queue_stages = execution_kind == QueueKind::copy      ? detail::queue_stages_copy
+                              : execution_kind == QueueKind::compute ? detail::queue_stages_compute
+                                                                     : 0;
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -1774,7 +1820,12 @@ private:
                 context_.counted_dispatch_->emit(cb, job);
             };
         }
-        if (context_.depth24_ && !transfer_only) {
+        if (!use_conversion_queue &&
+            (transfer_only || (kind_ == QueueKind::copy && family_ == context_.primary_without_compute_))) {
+            // A depth24-as-float copy also needs compute. Leave native depth and stencil copies on their normal path.
+            replay.depth24_prepare = {};
+            replay.depth24_run = {};
+        } else if (context_.depth24_) {
             replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
                                                                            std::vector<Depth24Job>& parts) {
                 if (!tracker_lock.owns_lock()) tracker_lock.lock();
@@ -1861,7 +1912,11 @@ private:
                 return ReplayResult::unsupported;
         }
 
-        CommandSlot* slot = acquire();
+        if (use_conversion_queue && !copy_conversion_pool_) {
+            copy_conversion_pool_ = make_command_pool(context_.copy_conversion_family_);
+            if (!copy_conversion_pool_) return ReplayResult::unsupported;
+        }
+        CommandSlot* slot = acquire(use_conversion_queue ? copy_conversion_pool_ : pool_);
         if (!slot) return ReplayResult::unsupported;
         command_buffer = slot->buffer;
         // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
@@ -1895,8 +1950,8 @@ private:
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
-            const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
-            if (!submitted) discard();
+            const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, physical_queue);
+            if (!submitted && !(ended && context_.is_device_lost())) discard();
             if (depth24_guard.active) {
                 context_.depth24_->retire(progress_, 0);
                 depth24_guard.active = false;
@@ -1959,7 +2014,7 @@ private:
         close_labels(command_buffer, replay, open_labels);
         // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
         if (wrote_readback) {
-            const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
+            const VkPipelineStageFlags2 allowed = queue_supported_stages(execution_kind);
             VkPipelineStageFlags2 src_stages = readback_stages & allowed;
             if (!src_stages) src_stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             const bool copy_only =
@@ -1989,12 +2044,9 @@ private:
         }
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
-        const bool wait_previous = ordered_timestamps && submitted_;
-        if (wait_previous) {
-            waits_.push_back(progress_);
-            wait_values_.push_back(submitted_);
-        }
-        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, physical_queue, ordered_timestamps);
+        // A submit that reports device loss can still leave its command buffer and conversion scratch pending.
+        const bool conversion_pending = rgb96_conversion && ended && !submitted && context_.is_device_lost();
         if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
             // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
@@ -2008,10 +2060,6 @@ private:
             ++context_.storage_init_version_;
             storage_init_seen_ = context_.storage_init_version_;
         }
-        if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
-            waits_.pop_back();
-            wait_values_.pop_back();
-        }
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
@@ -2019,15 +2067,16 @@ private:
             slot->counted_dispatch = std::move(counted_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
-        } else {
+        } else if (!conversion_pending) {
             discard();
         }
+        const std::uint64_t scratch_ticket = submitted ? submitted_ : conversion_pending ? UINT64_MAX : 0;
         if (depth24_guard.active) {
-            context_.depth24_->retire(progress_, submitted ? submitted_ : 0);
+            context_.depth24_->retire(progress_, scratch_ticket);
             depth24_guard.active = false;
         }
         if (scratch_guard.active) {
-            context_.scratch_->retire(progress_, submitted ? submitted_ : 0);
+            context_.scratch_->retire(progress_, scratch_ticket);
             scratch_guard.active = false;
         }
         tracker_lock.unlock();
@@ -2168,6 +2217,7 @@ private:
     struct CommandSlot {
         VkCommandBuffer buffer;
         std::uint64_t ticket;
+        VkCommandPool pool;
         std::vector<std::shared_ptr<const OcclusionSegmentPool>> segments;
         std::vector<VkEvent> events;  // order_timestamp_copy's, reset and reused once the slot completes
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
@@ -2248,6 +2298,7 @@ private:
             context_.record_submit_locked(progress_, ticket);
         }
         submitted_ = last_sparse_ = ticket;
+        last_submit_queue_ = queue_;
         waits_.clear();
         wait_values_.clear();
         for (auto it = changes.begin(); it != changes.end();) {
@@ -2261,8 +2312,7 @@ private:
 
     std::uint64_t completed() const {
         std::uint64_t done = 0;
-        context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
-        return done;
+        return context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done) == VK_SUCCESS ? done : 0;
     }
 
     void collect_bindings(std::uint64_t done) {
@@ -2271,7 +2321,7 @@ private:
         if (last_sparse_ <= done) last_sparse_ = 0;
     }
 
-    CommandSlot* acquire() {
+    CommandSlot* acquire(VkCommandPool pool) {
         if (context_.is_device_lost()) return nullptr;
         context_.drain_deleted_resources(context_.completed_retire_ticket());
         const auto done = completed();
@@ -2284,7 +2334,7 @@ private:
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);
             slot.events.clear();
-            if (!reuse) reuse = &slot;
+            if (!reuse && slot.pool == pool) reuse = &slot;
         }
         if (reuse) {
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
@@ -2295,13 +2345,13 @@ private:
             return reuse;
         }
         VkCommandBufferAllocateInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        info.commandPool = pool_;
+        info.commandPool = pool;
         info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         info.commandBufferCount = 1;
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         if (context_.vk.vkAllocateCommandBuffers(context_.device(), &info, &command_buffer) != VK_SUCCESS)
             return nullptr;
-        buffers_.push_back({command_buffer, UINT64_MAX});
+        buffers_.push_back({command_buffer, UINT64_MAX, pool});
         return &buffers_.back();
     }
 
@@ -2319,21 +2369,27 @@ private:
         return event;
     }
 
-    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
+    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
+                VkQueue physical_queue = VK_NULL_HANDLE, bool wait_previous = false) {
         if (context_.is_device_lost()) return false;
+        if (!physical_queue) physical_queue = queue_;
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) collect_bindings(completed());
+        // The logical queue's progress orders a switch between physical queues, even for fence-only submits.
+        // A single wait is enough when a sparse bind or the timestamp workaround also needs it.
+        const bool switch_queue = submitted_ && physical_queue != last_submit_queue_;
+        const auto progress_wait = (switch_queue || wait_previous) ? submitted_ : last_sparse_;
         std::span<const VkSemaphore> semaphores = waits_;
         std::span<const std::uint64_t> values = wait_values_;
-        std::vector<VkSemaphore> sparse_waits;
-        std::vector<std::uint64_t> sparse_values;
-        if (last_sparse_) {
-            sparse_waits = waits_;
-            sparse_values = wait_values_;
-            sparse_waits.push_back(progress_);
-            sparse_values.push_back(last_sparse_);
-            semaphores = sparse_waits;
-            values = sparse_values;
+        std::vector<VkSemaphore> ordered_waits;
+        std::vector<std::uint64_t> ordered_values;
+        if (progress_wait) {
+            ordered_waits = waits_;
+            ordered_values = wait_values_;
+            ordered_waits.push_back(progress_);
+            ordered_values.push_back(progress_wait);
+            semaphores = ordered_waits;
+            values = ordered_values;
         }
         const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
@@ -2360,7 +2416,7 @@ private:
             submit.pCommandBuffers = &command_buffer;
             submit.signalSemaphoreCount = signal_count;
             submit.pSignalSemaphores = signals;
-            res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+            res = context_.vk.vkQueueSubmit(physical_queue, 1, &submit, VK_NULL_HANDLE);
             if (res == VK_SUCCESS) context_.record_submit_locked(progress_, ticket);
         }
         if (res == VK_ERROR_DEVICE_LOST) {
@@ -2373,6 +2429,7 @@ private:
         if (ok) {
             if (fence) context_.holds().signaled(fence, value);  // held batches waiting for it: the caller pumps
             submitted_ = ticket;
+            last_submit_queue_ = physical_queue;
             waits_.clear();
             wait_values_.clear();
             for (auto& slot : buffers_)
@@ -2386,6 +2443,8 @@ private:
     QueueKind kind_ = QueueKind::direct;
     std::uint32_t family_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
+    VkCommandPool copy_conversion_pool_ = VK_NULL_HANDLE;
+    VkQueue last_submit_queue_ = VK_NULL_HANDLE;
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;

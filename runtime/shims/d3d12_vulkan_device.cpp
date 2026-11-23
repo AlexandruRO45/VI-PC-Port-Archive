@@ -4305,22 +4305,28 @@ public:
         }
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
-        if (info.conditional_rendering) {
-            const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
-            const auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
-                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
-            if (properties && families) {
-                VkPhysicalDeviceProperties limits{};
-                properties(info.physical, &limits);
-                std::uint32_t count = 0;
-                families(info.physical, &count, nullptr);
-                std::vector<VkQueueFamilyProperties> queues(count);
-                families(info.physical, &count, queues.data());
-                if (info.copy_family < count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
-                    state_.context->set_transfer_only_family(info.copy_family);
-                if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
-                    state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
+        if (const auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"))) {
+            std::uint32_t count = 0;
+            families(info.physical, &count, nullptr);
+            std::vector<VkQueueFamilyProperties> queues(count);
+            families(info.physical, &count, queues.data());
+            const auto supports_compute = [&](std::uint32_t family) {
+                return family < count && (queues[family].queueFlags & VK_QUEUE_COMPUTE_BIT);
+            };
+            const auto transfer_only = info.copy_family < count && !supports_compute(info.copy_family)
+                ? info.copy_family : UINT32_MAX;
+            const bool primary_compute = supports_compute(info.queue_family);
+            const auto primary_without_compute = primary_compute ? UINT32_MAX : info.queue_family;
+            state_.context->configure_copy_conversion(transfer_only, primary_without_compute,
+                                                       primary_compute ? info.queue : VK_NULL_HANDLE, info.queue_family);
+            if (info.conditional_rendering && supports_compute(info.queue_family)) {
+                if (const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+                    VkPhysicalDeviceProperties limits{};
+                    properties(info.physical, &limits);
+                    state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange,
+                                                          info.queue_family);
                     if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);
                 }
             }
@@ -4329,7 +4335,7 @@ public:
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        });
+        }, state_.families);
         if (info.buffer_device_address && info.physical && info.get_instance_proc) {
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
@@ -4354,7 +4360,7 @@ public:
             }
             state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            }, max_storage_range);
+            }, max_storage_range, state_.families);
         }
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");

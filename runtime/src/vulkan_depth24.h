@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -29,8 +30,10 @@ public:
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
     // `max_range`: the device's maxStorageBufferRange; a copy is split into dispatches that stay inside it.
-    Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, std::uint64_t max_range = 1u << 27)
-        : device_(device), allocate_(std::move(allocate)), max_range_(max_range) {
+    Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate,
+                     std::uint64_t max_range = 1u << 27, std::span<const std::uint32_t> families = {})
+        : device_(device), allocate_(std::move(allocate)), families_(families.begin(), families.end()),
+          max_range_(max_range) {
         loaded_ = vk_.load(get, device);
     }
 
@@ -328,6 +331,12 @@ private:
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        // Completed chunks can be reused by submissions on different queue families.
+        if (families_.size() > 1) {
+            info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            info.queueFamilyIndexCount = std::uint32_t(families_.size());
+            info.pQueueFamilyIndices = families_.data();
+        }
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
@@ -355,6 +364,7 @@ private:
 
     VkDevice device_;
     Allocate allocate_;
+    std::vector<std::uint32_t> families_;
     std::uint64_t max_range_;
     Functions vk_;
     bool loaded_ = false;

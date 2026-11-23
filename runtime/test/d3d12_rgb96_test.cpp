@@ -12,7 +12,8 @@
 //   - what creation, GetResourceAllocationInfo and CheckFeatureSupport say, next to WARP's answers, and that
 //     the three agree with each other;
 //   - copies between a 96-bit texture and an RGBA32 one refused;
-//   - an upload and a readback on a COPY queue;
+//   - an upload and a readback on a COPY queue, plus a separate DIRECT -> COPY -> DIRECT roundtrip that mixes
+//     buffer copies and RGB96 repacks across submissions on a standalone device;
 //   - how long an upload and a readback take at 64x64 and 256x256, and up to 4096x4096 with LEONIDA_RGB96_LARGE
 //     set (single runs, each on a new queue).
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
@@ -86,20 +87,30 @@ struct Gpu {
     Ref<ID3D12Fence> fence;
     UINT64 signalled = 0;
 
-    bool create(ID3D12Device* d, D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT) {
+    bool create(ID3D12Device* d, D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ID3D12CommandQueue* shared_queue = nullptr) {
         device = d;
-        D3D12_COMMAND_QUEUE_DESC desc{};
-        desc.Type = type;
-        CHECK(SUCCEEDED(d->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue.p))));
+        if (shared_queue) {
+            shared_queue->AddRef();
+            queue.p = shared_queue;
+        } else {
+            D3D12_COMMAND_QUEUE_DESC desc{};
+            desc.Type = type;
+            CHECK(SUCCEEDED(d->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue.p))));
+        }
         CHECK(SUCCEEDED(d->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator.p))));
         CHECK(SUCCEEDED(d->CreateCommandList(0, type, allocator.p, nullptr, IID_PPV_ARGS(&list.p))));
         CHECK(SUCCEEDED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
         return true;
     }
-    bool run() {
+    bool submit() {
         CHECK(SUCCEEDED(list->Close()));
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
+        return true;
+    }
+    bool run() {
+        CHECK(submit());
         CHECK(SUCCEEDED(queue->Signal(fence.p, ++signalled)));
         const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         CHECK(event);
@@ -501,6 +512,112 @@ bool copy_queue(ID3D12Device* device) {
     return true;
 }
 
+// Three submissions on one logical COPY queue: DMA produces the RGB96 footprint, the mixed batch repacks
+// in both directions, and DMA consumes the result. DIRECT brackets the COPY work with GPU fence waits.
+bool copy_queue_roundtrip(ID3D12Device* device) {
+    constexpr UINT width = 7, height = 5;
+    constexpr DXGI_FORMAT format = DXGI_FORMAT_R32G32B32_UINT;
+    const auto texture_info = texture_desc(format, false, width, height, 1, 1);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    constexpr UINT64 base = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    UINT rows = 0;
+    UINT64 row_bytes = 0;
+    device->GetCopyableFootprints(&texture_info, 0, 1, base, &footprint, &rows, &row_bytes, nullptr);
+    CHECK(footprint.Offset == base && footprint.Footprint.Format == format && rows == height &&
+          row_bytes == width * kTexel && footprint.Footprint.RowPitch == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    const UINT64 size = footprint.Offset + UINT64(footprint.Footprint.RowPitch) * height + 64;
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD},
+        readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto make_buffer = [&](Ref<ID3D12Resource>& resource, const D3D12_HEAP_PROPERTIES& heap,
+                                 D3D12_RESOURCE_STATES state, UINT64 bytes) {
+        const auto desc = buffer_desc(bytes);
+        return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                                          IID_PPV_ARGS(&resource.p)));
+    };
+    Ref<ID3D12Resource> image, upload, patch, packed, staged, readback;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_info,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&image.p))));
+    CHECK(make_buffer(upload, upload_heap, D3D12_RESOURCE_STATE_GENERIC_READ, 3 * size));
+    CHECK(make_buffer(patch, default_heap, D3D12_RESOURCE_STATE_COMMON, size));
+    CHECK(make_buffer(packed, default_heap, D3D12_RESOURCE_STATE_COMMON, size));
+    CHECK(make_buffer(staged, default_heap, D3D12_RESOURCE_STATE_COMMON, size));
+    CHECK(make_buffer(readback, readback_heap, D3D12_RESOURCE_STATE_COPY_DEST, size));
+
+    const auto offset = [&](UINT x, UINT y, UINT c) {
+        return footprint.Offset + UINT64(y) * footprint.Footprint.RowPitch + x * kTexel + c * 4;
+    };
+    std::uint8_t* mapped = nullptr;
+    const D3D12_RANGE none{};
+    CHECK(SUCCEEDED(upload->Map(0, &none, reinterpret_cast<void**>(&mapped))) && mapped);
+    std::memset(mapped, kUntouched, 3 * size);
+    for (UINT i = 0; i < 2; ++i)
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x)
+                for (UINT c = 0; c < 3; ++c) {
+                    const auto word = value(11, x, y, 0, c, i);
+                    std::memcpy(mapped + i * size + offset(x, y, c), &word, sizeof(word));
+                }
+    upload->Unmap(0, nullptr);
+
+    Gpu direct, dma_in, mixed, dma_out, finish;
+    constexpr auto copy = D3D12_COMMAND_LIST_TYPE_COPY, graphics = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    CHECK(direct.create(device));
+    CHECK(dma_in.create(device, copy));
+    CHECK(mixed.create(device, copy, dma_in.queue.p));
+    CHECK(dma_out.create(device, copy, dma_in.queue.p));
+    CHECK(finish.create(device, graphics, direct.queue.p));
+    const auto tex = subresource(image.p, 0), from_cpu = placed(upload.p, footprint);
+    direct.list->CopyTextureRegion(&tex, 0, 0, 0, &from_cpu, nullptr);
+    direct.transition(image.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    CHECK(direct.submit());
+    CHECK(SUCCEEDED(direct.queue->Signal(direct.fence.p, 1)));
+    CHECK(SUCCEEDED(dma_in.queue->Wait(direct.fence.p, 1)));
+
+    dma_in.list->CopyBufferRegion(patch.p, 0, upload.p, size, size);
+    CHECK(dma_in.submit());
+
+    // Initialize every byte, including the footprint's prefix, row padding and tail. The readback conversion
+    // must only modify texels. The patch must only modify its 3x3 rectangle, shifted to touch the bottom edge.
+    mixed.list->CopyBufferRegion(packed.p, 0, upload.p, 2 * size, size);
+    mixed.transition(image.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    const auto from_dma = placed(patch.p, footprint), to_dma = placed(packed.p, footprint);
+    const D3D12_BOX box{1, 0, 0, 4, 3, 1};
+    mixed.list->CopyTextureRegion(&tex, 3, 2, 0, &from_dma, &box);
+    mixed.transition(image.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    mixed.list->CopyTextureRegion(&to_dma, 0, 0, 0, &tex, nullptr);
+    mixed.transition(image.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    CHECK(mixed.submit());
+
+    dma_out.list->CopyBufferRegion(staged.p, 0, packed.p, 0, size);
+    CHECK(dma_out.submit());
+    CHECK(SUCCEEDED(dma_out.queue->Signal(dma_out.fence.p, 1)));
+    CHECK(SUCCEEDED(finish.queue->Wait(dma_out.fence.p, 1)));
+    finish.list->CopyBufferRegion(readback.p, 0, staged.p, 0, size);
+    CHECK(finish.run());
+    CHECK(SUCCEEDED(device->GetDeviceRemovedReason()));
+
+    std::vector<std::uint8_t> expected(size, kUntouched);
+    for (UINT y = 0; y < height; ++y)
+        for (UINT x = 0; x < width; ++x)
+            for (UINT c = 0; c < 3; ++c) {
+                const bool patched = x >= 3 && x < 6 && y >= 2;
+                const auto word = patched ? value(11, x - 2, y - 2, 0, c, 1) : value(11, x, y, 0, c);
+                std::memcpy(expected.data() + offset(x, y, c), &word, sizeof(word));
+            }
+    const D3D12_RANGE all{0, SIZE_T(size)};
+    CHECK(SUCCEEDED(readback->Map(0, &all, reinterpret_cast<void**>(&mapped))) && mapped);
+    bool matched = true;
+    for (UINT64 i = 0; i < size; ++i) {
+        if (mapped[i] == expected[i]) continue;
+        std::fprintf(stderr, "RGB96 COPY roundtrip byte %llu: got %02x, want %02x\n", i, unsigned(mapped[i]),
+                     unsigned(expected[i]));
+        matched = false;
+        break;
+    }
+    readback->Unmap(0, &none);
+    return matched;
+}
+
 HRESULT creates(ID3D12Device* device, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     const D3D12_RESOURCE_DESC desc = texture_desc(format, false, 4, 4, 1, 1, flags);
@@ -551,7 +668,43 @@ bool refusals(ID3D12Device* device) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--copy-queue-roundtrip") == 0) {
+        vktest::Device vk;
+        vk.all_queue_types = true;
+        const auto status = vk.initialize();
+        if (status == vktest::DeviceStatus::unavailable) return 77;
+        if (status != vktest::DeviceStatus::ready) return 1;
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = vk.instance_proc;
+        info.instance = vk.instance;
+        info.physical = vk.physical;
+        info.device = vk.device;
+        info.queue = vk.queue;
+        info.queue_family = vk.family;
+        if (vk.copy_family != vk.family) {
+            info.command_queues = vk.queues;
+            info.copy_family = vk.copy_family;
+            info.copy_queues = {vk.copy_queue};
+            Ref<ID3D12Device> device;
+            if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))) ||
+                !copy_queue_roundtrip(device.p)) return 1;
+            std::printf("RGB96 dedicated COPY family %u (flags 0x%x), primary family %u\n",
+                        vk.copy_family, vk.families[vk.copy_family].queueFlags, vk.family);
+        }
+        info.command_queues.clear();
+        info.copy_family = UINT32_MAX;
+        info.copy_queues.clear();
+        {
+            Ref<ID3D12Device> device;
+            if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))) ||
+                !copy_queue_roundtrip(device.p)) return 1;
+        }
+        if (vk.validation_errors() != 0) return 1;
+        std::printf("RGB96 COPY on the primary family %u (validation %s)\n", vk.family, vk.validation ? "on" : "off");
+        std::puts("RGB96 DIRECT -> COPY -> DIRECT: 7x5 texels, shifted 3x3 patch and footprint sentinels match");
+        return 0;
+    }
     vktest::Device vk;
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
