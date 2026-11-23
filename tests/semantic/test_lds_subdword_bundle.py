@@ -334,5 +334,21 @@ class TestDsReadU16ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[2], 0x1234)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_u16 SIMD Divergence & Halfword Addressing
+# ------------------------------------------------------------------------------
+
+class TestDsReadU16SIMD(unittest.TestCase):
+    def test_simd_halfword_reads(self):
+        wave = SIMDWaveDS(wave_size=32)
+        for i in range(32):
+            wave.lds.write_u16(i * 2, i * 1000)
+            wave.vgprs[1][i] = i * 2
+
+        for i in range(32):
+            wave.vgprs[2][i] = wave.lds.read_u16(wave.vgprs[1][i])
+            self.assertEqual(wave.vgprs[2][i], (i * 1000) & 0xFFFF)
+
+
 if __name__ == '__main__':
     unittest.main()
