@@ -199,6 +199,19 @@ class TestSwapPCOracle(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("cs_swappc_oracle", prog, fssm=saveexec_run.fssm())
 
+class TestSwapPCAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        pc = 0x2000
+        target = 0x5000
+        new_pc, link = model_swappc(pc, target)
+        self.assertEqual(new_pc, target)
+        self.assertEqual(link, pc + 4)
+
+    def test_translator_swappc_rejection_in_compute(self):
+        prog = ["s_swappc_b64 s[4:5], s[6:7]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("cs_swappc_ast", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
