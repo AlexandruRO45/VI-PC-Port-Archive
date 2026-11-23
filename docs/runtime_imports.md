@@ -273,9 +273,11 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Not available offline:** purchases, consumables, license tokens, collections and purchase ids, downloads and
   every store UI fail before starting (`E_FAIL`, logged once). The docs' three unnamed slots and
   `XStoreIsAvailabilityPurchasable` (no documented signature) answer `E_NOTIMPL`.
-- **UNVERIFIED:** `STORE_SKU_ID_SIZE` = 18, `SKU_ID_SIZE` = 5 and `TRIAL_UNIQUE_ID_MAX_SIZE` = 64, which fix
-  `XStoreGameLicense` (104 bytes) and `XStoreCanAcquireLicenseResult` (12 bytes). The public pages give no values;
-  confirm them from the buffer the executable passes to `XStoreQueryGameLicenseResult` before a boot relies on it.
+- `STORE_SKU_ID_SIZE` = 18 and `TRIAL_UNIQUE_ID_MAX_SIZE` = 64, and the 104-byte `XStoreGameLicense` field order,
+  have an independent public corroboration: the MIT-licensed `minecraft-linux/xgameruntime-rs`, `src/xstore.rs` at
+  c523673a9e. **UNVERIFIED:** the remaining `SKU_ID_SIZE` = 5, which fixes `XStoreCanAcquireLicenseResult` (12 bytes);
+  that reference leaves the type opaque and the public GDK pages give no values. The executable's stack buffer passed
+  to `XStoreQueryGameLicenseResult` is still the real check before a boot relies on any of them.
 
 `xgameruntime_store_test` drives the license check, add-ons, updates, package licenses and product queries.
 

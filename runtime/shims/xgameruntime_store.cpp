@@ -12,10 +12,15 @@
 // service or a store UI (purchases, consumables, tokens, collections ids, downloads) fails before starting, so no
 // XAsyncBlock waits, and logs once. License-changed and license-lost callbacks are never called: nothing changes.
 //
-// ASSUMPTION (UNVERIFIED): STORE_SKU_ID_SIZE = 18, SKU_ID_SIZE = 5 and TRIAL_UNIQUE_ID_MAX_SIZE = 64, which fix the
-// layouts of XStoreGameLicense (104 bytes) and XStoreCanAcquireLicenseResult (12 bytes). The public pages name the
-// constants without values; they are from memory of the GDK header and must be confirmed against the executable
-// (the stack buffer it passes to XStoreQueryGameLicenseResult) before a first boot relies on them.
+// Two of the three sizes have an independent public corroboration: the MIT-licensed
+// minecraft-linux/xgameruntime-rs, src/xstore.rs at c523673a9e, defines STORE_SKU_ID_SIZE = 18 and
+// TRIAL_UNIQUE_ID_MAX_SIZE = 64 and declares XStoreGameLicense in the same field order, giving 104 bytes.
+//
+// ASSUMPTION (UNVERIFIED): the remaining size SKU_ID_SIZE = 5 fixes XStoreCanAcquireLicenseResult (12 bytes);
+// that reference leaves the type opaque and the public GDK pages name the constants without values.
+// STORE_SKU_ID_SIZE and TRIAL_UNIQUE_ID_MAX_SIZE are corroborated, not measured here; the executable's stack
+// buffer (the one it passes to XStoreQueryGameLicenseResult) is still the real check before a first boot relies
+// on any of them.
 #include <windows.h>
 
 #include <atomic>
@@ -49,9 +54,9 @@ using XStoreContextHandle = XStoreContext*;
 using XStoreLicenseHandle = XStoreLicense*;
 using XStoreProductQueryHandle = XStoreProductQuery*;
 
-constexpr size_t STORE_SKU_ID_SIZE = 18;          // UNVERIFIED, see the header
-constexpr size_t SKU_ID_SIZE = 5;                 // UNVERIFIED
-constexpr size_t TRIAL_UNIQUE_ID_MAX_SIZE = 64;   // UNVERIFIED
+constexpr size_t STORE_SKU_ID_SIZE = 18;          // corroborated externally, see the header
+constexpr size_t SKU_ID_SIZE = 5;                 // UNVERIFIED, see the header
+constexpr size_t TRIAL_UNIQUE_ID_MAX_SIZE = 64;   // corroborated externally, see the header
 
 struct XStoreGameLicense {
     char skuStoreId[STORE_SKU_ID_SIZE];
@@ -63,7 +68,7 @@ struct XStoreGameLicense {
     char trialUniqueId[TRIAL_UNIQUE_ID_MAX_SIZE];
     time_t expirationDate;
 };
-static_assert(sizeof(XStoreGameLicense) == 104, "the layout the UNVERIFIED constants give");
+static_assert(sizeof(XStoreGameLicense) == 104, "layout matches the public xgameruntime-rs struct");
 
 enum class XStoreCanLicenseStatus : uint32_t { NotLicensableToUser = 0, Licensable = 1, LicenseActionNotApplicableToProduct = 2 };
 struct XStoreCanAcquireLicenseResult {
