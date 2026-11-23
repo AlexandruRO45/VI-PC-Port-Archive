@@ -825,12 +825,13 @@ if(BUILD_TESTING)
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
     set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
-    # With --trace-d3d12 the 24 D3D12XboxCreateDevice parameter words still print (docs/boot.md, question 1),
-    # and the line with run-specific pointers does not.
+    # With --trace-d3d12 the 20 D3D12XboxCreateDevice parameter words still print (docs/boot.md, question 1),
+    # ending at the block's last word (0x50 bytes) and reading nothing past it; the line with run-specific pointers
+    # does not print.
     add_test(NAME device_proxy_trace COMMAND device_proxy_test --trace-d3d12)
     set_tests_properties(device_proxy_trace PROPERTIES SKIP_RETURN_CODE 77
-        PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice params\\[24\\] =1234abcd"
-        FAIL_REGULAR_EXPRESSION "FAIL;D3D12XboxCreateDevice adapter=")
+        PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice params\\[20\\] =1234abcd( 00000000)+ 5e1f0013[\r\n]"
+        FAIL_REGULAR_EXPRESSION "FAIL;D3D12XboxCreateDevice adapter=;0bad0bad")
   endif()
   if(TARGET xs_proxy_mock_test)
     add_test(NAME xs_proxy_mock COMMAND xs_proxy_mock_test)

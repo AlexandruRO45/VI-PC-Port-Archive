@@ -565,17 +565,17 @@ void test_xmem_working_set_statistics_abi_layout() {
 void test_d3d12_xbox_create_device_params_abi() {
     std::printf("\n--- Testing D3D12XboxCreateDevice Parameter Layout ABI ---\n");
 
-    // Measured parameter block in d3d12_xs is 24 32-bit words (96 bytes)
-    constexpr size_t kWordCount = 24;
+    // The retail executable passes a 0x50-byte block: 20 32-bit words
+    constexpr size_t kWordCount = 20;
     constexpr size_t kParamsSize = kWordCount * sizeof(uint32_t);
-    check(kParamsSize == 96, "D3D12XboxCreateDevice params block is 24 words (96 bytes)");
+    check(kParamsSize == 0x50, "D3D12XboxCreateDevice params block is 20 words (0x50 bytes)");
 
     std::array<uint32_t, kWordCount> params{};
     for (size_t i = 0; i < kWordCount; ++i) {
         params[i] = static_cast<uint32_t>(0x1000 + i);
     }
 
-    check(params[0] == 0x1000 && params[23] == 0x1017,
+    check(params[0] == 0x1000 && params[19] == 0x1013,
           "Parameter block words are indexed contiguously as 32-bit integers");
 }
 

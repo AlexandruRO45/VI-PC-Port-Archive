@@ -135,7 +135,11 @@ int main(int argc, char** argv) {
     check(create_device != nullptr, "shim registry exposes d3d12_xs!D3D12XboxCreateDevice");
     if (!create_device) return 1;
 
-    std::uint32_t params[24] = {0x1234abcd};  // logged only, not decoded; word 0 is device_proxy_trace's marker
+    // The title's block is 20 words (0x50 bytes); it is logged only, not decoded. Words 0 and 19 are device_proxy_trace's
+    // markers for the first and last word, and the 4 words past the block hold a value that must never be printed.
+    std::uint32_t params[24] = {0x1234abcd};
+    params[19] = 0x5e1f0013;
+    for (int i = 20; i < 24; ++i) params[i] = 0x0bad0bad;
     const IID iid_device = __uuidof(ID3D12Device);
     void* created = nullptr;
     hr = create_device(warp.Get(), params, &iid_device, &created);

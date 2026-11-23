@@ -158,7 +158,7 @@ int main() {
         // The import the game uses is the guest's only way to a device. With LEONIDA_D3D12=vulkan the shim returns the
         // Vulkan device behind the Xbox-ABI proxy; the host's D3D12 device cannot build the PSO from FSSM containers,
         // and the link-time stub returns no device, so either of those fails below.
-        const std::uint32_t device_params[24] = {};  // the 24-word block the shim logs; it does not create from it
+        const std::uint32_t device_params[20] = {};  // the 20-word block the shim logs; it does not create from it
         const IID device_iid = __uuidof(ID3D12Device);
         Ref<ID3D12Device> device;
         const HRESULT created = D3D12XboxCreateDevice(nullptr, device_params, &device_iid, reinterpret_cast<void**>(&device.p));

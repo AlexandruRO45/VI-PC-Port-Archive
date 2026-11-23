@@ -45,7 +45,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     // The entry point's second argument is a block the shim logs and does not interpret; a title passes its own.
-    std::uint32_t params[24] = {};
+    std::uint32_t params[20] = {};
     const IID device_iid = __uuidof(ID3D12Device);
     ID3D12Device* device = nullptr;
     HRESULT hr = D3D12XboxCreateDevice(nullptr, params, &device_iid, reinterpret_cast<void**>(&device));

@@ -579,7 +579,7 @@ evidence.
 
 | Leonida unknown | Status after SCARAB | What is actually new |
 |---|---|---|
-| #1 device entry point and 24-word params | **described** | The separate console device export exists at ordinal 13 and is named `D3D12ConsCreateDevice` internally / `D3D12XboxCreateDevice` publicly; the params struct is named `D3D12CONS_CREATE_DEVICE_PARAMETERS`. Layout and field meanings are still unknown. |
+| #1 device entry point and 20-word params | **described** | The separate console device export exists at ordinal 13 and is named `D3D12ConsCreateDevice` internally / `D3D12XboxCreateDevice` publicly; the params struct is named `D3D12CONS_CREATE_DEVICE_PARAMETERS`. The retail executable's one call passes a 0x50-byte (20-word) block; field meanings are still unknown. |
 | #2 device/heap/queue/command-list slots | **still unknown** | SCARAB has no console slot map. Its appended-after-GCL6 model conflicts with the SDK's GCL8/GCL9 methods (§5.1). Do not use it as a slot source. |
 | #3 root signature → `s0..s31` | **still unknown** | Only flag names (`D3D12CONS_ROOT_SIGNATURE_FLAG_FORCE_MEMORY_BASED_ABI`, `_RAYTRACING`); no mapping. Leonida's own register-based/spill facts already go further. |
 | #4 descriptor bytes and increments | **still unknown** | No measured increment. `D3D12CONS_DESCRIPTOR_HEAP_TYPE_SAMPLER_UNBOUNDED` is a new name, not a size. |

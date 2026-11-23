@@ -117,9 +117,9 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
-// Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
-// logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
-// (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
+// Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 20-word block that is only
+// logged and not used to create the device. The retail executable's one call passes adapter = null and a 0x50-byte
+// (20 x 32-bit word) block in its own stack frame, so the log reads exactly those 20 words and nothing past them. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
 // least restrictive floor; higher feature levels are still exposed by the created device.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
     constexpr auto method = "D3D12XboxCreateDevice";
@@ -132,20 +132,21 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     if (!tracing)
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice adapter=%p params=%p riid=%08lx-%04x-%04x\n",
                      adapter, params, static_cast<unsigned long>(riid->Data1), riid->Data2, riid->Data3);
-    // The 24 words are the title's device parameters (docs/boot.md, question 1). Unlike the pointers above they are the
+    // The 20 words are the title's device parameters (docs/boot.md, question 1). Unlike the pointers above they are the
     // same on every run, so they are printed with --trace-d3d12 as well, and one traced run shows them.
     if (params) {
+        constexpr int kParamWords = 20;  // 0x50 bytes, the size of the block the retail executable passes
         const uint32_t* words = static_cast<const uint32_t*>(params);
-        char line[24 * 11 + 1];
+        char line[kParamWords * 9 + 1];
         line[0] = '\0';
         size_t used = 0;
-        for (int i = 0; i < 24 && used < sizeof(line); ++i) {
+        for (int i = 0; i < kParamWords && used < sizeof(line); ++i) {
             int n = std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? " " : "",
                                   static_cast<unsigned>(words[i]));
             if (n < 0) break;
             used += static_cast<size_t>(n);
         }
-        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params[24] =%s\n", line);
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params[%d] =%s\n", kParamWords, line);
     } else {
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }

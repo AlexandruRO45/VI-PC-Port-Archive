@@ -825,7 +825,7 @@ means the code is absent, not that the API is undocumented.
 | Draws and dispatch | `DrawInstanced`, `DrawIndexedInstanced`, `Dispatch`, root-argument setters (interfaces index) | Present and GPU-tested ([first_light.md](first_light.md)) | Nothing to change from the documentation side |
 | Shader cache | Session desc with its three documented defaults, `StoreValue`/`FindValue` two-call pattern, `ShaderCacheControl` in developer mode, library gate (§4) | Implemented with `ID3D12Device9::CreateShaderCacheSession`, the session object and `ShaderCacheControl` (D3D-34, `runtime/test/d3d12_shader_cache_test.cpp`) | The defaults (1 KB / 128 entries / 128 MB) are the numbers the layer must reproduce for a host-parity answer |
 | Present | No page (§5.5) | `runtime/shims/xbox_present.cpp` plus a DXGI swapchain fallback | The layer's presenter is built on measurement; there is no document to check it against |
-| Device creation | No `D3D12CreateDevice` page; `D3D12GetInterface` only (§5.1) | `D3D12XboxCreateDevice` with an unmeasured 24-word params block | Params and flags stay open; nothing in the public reference narrows them |
+| Device creation | No `D3D12CreateDevice` page; `D3D12GetInterface` only (§5.1) | `D3D12XboxCreateDevice` with a 20-word (0x50-byte) params block, size measured at the retail call | Params and flags stay open; nothing in the public reference narrows them |
 
 Two consequences follow for how this documentation is used. First, the parts a replay layer needs most precisely
 (the enum values) are the parts this reference publishes worst: three enums in this page print colliding or all-zero
