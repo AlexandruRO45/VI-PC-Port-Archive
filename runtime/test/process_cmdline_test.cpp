@@ -22,12 +22,26 @@ using QuickRegister = int(__cdecl*)(void(__cdecl*)());
 using QuickExit = void(__cdecl*)(int);
 QuickRegister quick_register;
 QuickExit quick_terminate;
+using ProcessExit = void(WINAPI*)(UINT);
+using Abort = void(__cdecl*)();
+ProcessExit process_terminate;
+Abort abort_terminate;
 int quick_order = 0;
 void __cdecl quick_first() { quick_order = quick_order * 10 + 1; }
 void __cdecl quick_second() { quick_order = quick_order * 10 + 2; }
 DWORD WINAPI quick_entry(void*) {
     if (quick_register(quick_first) || quick_register(quick_second)) return 99;
     quick_terminate(23);
+    return 99;
+}
+DWORD WINAPI quick_process_entry(void*) {
+    if (quick_register(quick_first) || quick_register(quick_second)) return 99;
+    process_terminate(23);
+    return 99;
+}
+DWORD WINAPI quick_abort_entry(void*) {
+    if (quick_register(quick_first) || quick_register(quick_second)) return 99;
+    abort_terminate();
     return 99;
 }
 void check_quick_exit() {
@@ -52,6 +66,24 @@ void check_quick_exit() {
                 if (code != 23 || quick_order != expected) {
                     std::fprintf(stderr, "FAIL %s!%s via %s: code %d order %d, expected 23 and %d\n",
                                  dll, name, exit_name, code, quick_order, expected);
+                    ++failures;
+                }
+            }
+            process_terminate = reinterpret_cast<ProcessExit>(rt::shims::find("kernel32.dll", "ExitProcess"));
+            abort_terminate = reinterpret_cast<Abort>(rt::shims::find(dll, "abort"));
+            for (const char* exit_name : {"ExitProcess", "abort"}) {
+                const bool is_abort = std::strcmp(exit_name, "abort") == 0;
+                if (is_abort ? !abort_terminate : !process_terminate) {
+                    std::fprintf(stderr, "FAIL missing %s via %s!%s\n", exit_name, dll, name);
+                    ++failures;
+                    continue;
+                }
+                quick_order = 0;
+                int code = rt::process::run_entry(reinterpret_cast<void*>(is_abort ? quick_abort_entry : quick_process_entry), 0);
+                int expected_code = is_abort ? 3 : 23;
+                if (code != expected_code || quick_order != 0) {
+                    std::fprintf(stderr, "FAIL %s!%s via %s: code %d order %d, expected %d and 0\n",
+                                 dll, name, exit_name, code, quick_order, expected_code);
                     ++failures;
                 }
             }
