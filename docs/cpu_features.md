@@ -1,8 +1,9 @@
 # CPU instructions the executable needs
 
 The Xbox Series CPU is an AMD Zen 2, and the runtime runs the game's code natively
-([design.md](design.md), "Why a loader before a recompiler"). Code built for one known CPU can use every instruction
-that CPU has without asking CPUID first. An instruction the host lacks raises `#UD`
+([design.md](design.md), "Why a loader before a recompiler"). Code built for one known CPU may use every instruction
+that CPU has without asking CPUID first; whether a given site is guarded by a check is not something this scan shows.
+An instruction the host lacks raises `#UD`
 (`STATUS_ILLEGAL_INSTRUCTION`) where it is reached, and a privileged one faults in user mode. This page records
 which such instructions `game_scarlett_master.exe` contains, measured with `tools/cpu_feature_scan.py`. Counts only;
 nothing from the executable is quoted.
@@ -36,9 +37,10 @@ function that does not touch the stack has no `.pdata` entry either, so those si
 
 Each flagged site was read by hand in a private copy (not quoted here):
 
-- All 41 SSE4a, CLZERO, MONITORX and CLWB sites are real code: each sits among instructions of the same kind of
-  code (vector arithmetic around the `insertq` sites, cache-line loops around CLZERO and CLWB, a wait on a memory
-  address around the two `monitorx`/`mwaitx` pairs). The 10 CLZERO sites are one leaf routine, a cache-line zeroing
+- All 41 SSE4a, CLZERO, MONITORX and CLWB sites read as real code, not data decoded as instructions: each sits
+  among instructions of the same kind of code (vector arithmetic around the `insertq` sites, cache-line loops around
+  CLZERO and CLWB, a wait on a memory address around the two `monitorx`/`mwaitx` pairs). This is a static reading:
+  it does not show which sites run, or whether a CPUID check in front keeps any of them from an Intel host. The 10 CLZERO sites are one leaf routine, a cache-line zeroing
   loop with no `.pdata` entry, which is why none of them is inside a `.pdata` range.
 - The 8 privileged and 1 `int n` hits are data: tables of 32-bit offsets placed in `.text` (some inside a `.pdata`
   range) that the linear sweep decodes as instructions. They are listed for completeness, not as code to replace.
