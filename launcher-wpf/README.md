@@ -39,8 +39,8 @@ tabs at the top right. The avatar next to the tabs opens **Settings**.
 | **Can I Run Leonida** | Your CPU, GPU and memory, read from Windows, compared with every console on the [community checker](https://assttro.github.io/can-i-run-leonida/)'s list. It runs automatically, and **Detect again** reads the hardware again. |
 | **Settings** (avatar menu) | One page per group, one setting per row. **Launcher settings**: *General* (language, theme, start page, sidebar, avatar), *Builds* (how builds stop, end-of-build notice, console text size, log clean-up), *Online*, *About and files* (version, settings file, logs, restore defaults). **Leonida settings**: *Your setup* (`make_game.py`'s own preflight), *Play* (Play's options), *Folders and Python* (the Leonida folder, Python, environment variables). |
 
-The launcher is in **English** and **Polish**; choose the language in Launcher settings. The README pages and the
-build's own output stay in English.
+The launcher is in **English**, **Polish** and **Russian**; choose the language in Launcher settings. The README pages
+and the build's own output stay in English.
 
 There is a **light** and a **dark** theme, or **Same as Windows** (the default), which follows Windows' app mode
 (Settings › Personalisation › Colours). The black sidebar, the console and the white BUILD/PLAY button look the same in both.
