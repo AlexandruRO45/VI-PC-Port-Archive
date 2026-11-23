@@ -533,5 +533,49 @@ class TestMed3I32ConditionCodes(unittest.TestCase):
         self.assertEqual(words[0], 0x2222)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and Integer Extremes (Commit 7)
+# ==============================================================================
+
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+NEG_QNAN_F32: int = 0xFFC00000
+
+
+class TestMed3I32BoundaryExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_vs_unsigned_median_divergence(self):
+        s0, s1, s2 = 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF
+        signed_med = ref_med3_i32(s0, s1, s2)
+        self.assertEqual(signed_med, 0xFFFFFFFF)
+
+        res_shader = run_shader_med3_i32(s0, s1, s2)
+        self.assertEqual(res_shader, 0xFFFFFFFF)
+
+    def test_ieee754_bitpatterns_as_signed_integers(self):
+        self.assertEqual(ref_med3_i32(NEG_ZERO_F32, POS_ZERO_F32, 100), POS_ZERO_F32)
+        self.assertEqual(run_shader_med3_i32(NEG_ZERO_F32, POS_ZERO_F32, 100), POS_ZERO_F32)
+
+        self.assertEqual(ref_med3_i32(POS_INF_F32, NEG_INF_F32, 0), 0)
+        self.assertEqual(run_shader_med3_i32(POS_INF_F32, NEG_INF_F32, 0), 0)
+
+        self.assertEqual(ref_med3_i32(QNAN_F32, NEG_QNAN_F32, 1), 1)
+        self.assertEqual(run_shader_med3_i32(QNAN_F32, NEG_QNAN_F32, 1), 1)
+
+    def test_integer_boundary_extremes_sweep(self):
+        values = (0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF)
+        for perm in itertools.product(values, repeat=3):
+            with self.subTest(perm=[hex(x) for x in perm]):
+                expected = ref_med3_i32(*perm)
+                self.assertEqual(hw_clamp_med3_i32(*perm), expected)
+                if perm[0] != perm[1] and perm[1] != perm[2]:
+                    res = run_shader_med3_i32(*perm)
+                    self.assertEqual(res, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
