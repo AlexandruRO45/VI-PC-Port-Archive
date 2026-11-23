@@ -12790,10 +12790,14 @@ def assemble(gen):
 # construct (inner OpSwitch on pc, merge %swm<k>), and that chunk's blocks branch to %swm<k>, which goes on to
 # %sw_merge. Every block keeps its label and code, so only the routing changes.
 SWITCH_CHUNK = 16000      # spirv-val also caps a switch at 16,383 (literal, label) pairs
-_BIG_SWITCH = re.compile(r"^(\s*)OpSwitch %pcv %sw_default ((?:\d+ %\w+ ?)+)$", re.M)
+_DISPATCH_SWITCH = "OpSwitch %pcv %sw_default "
+_BIG_SWITCH = re.compile(rf"^(\s*){_DISPATCH_SWITCH}((?:\d+ %\w+ ?)+)$", re.M)
 
 
 def split_big_switch(text):
+    # Structured modules usually have no dispatch switch at all.
+    if _DISPATCH_SWITCH not in text:
+        return text
     m = _BIG_SWITCH.search(text)
     if not m:
         return text
