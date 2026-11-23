@@ -191,9 +191,9 @@ float component(std::mt19937_64& rng, DXGI_FORMAT view) {
 }
 
 // What the default programs leave out (--all puts it back), each a known difference with its own entry:
-// - `documented`: ClearUnorderedAccessViewUint bit patterns that runtime/src/uav_clear.h documents as inexact through
-//   vkCmdClearColorImage: an SNORM channel's 0x80.. (written as -1.0, 0x81..) and float NaN patterns (payloads a driver
-//   canonicalises). Such a channel gets its top value bit cleared instead.
+// - `documented`: ClearUnorderedAccessViewUint bit patterns that runtime/src/uav_clear.h documents as inexact on a
+//   texture that isn't typeless (R11G11B10_FLOAT here): float NaN patterns, whose payload a driver canonicalises. Such
+//   a channel gets its top value bit cleared instead.
 // - `nvidia_stencil`: a stencil clear with rects on a mip past 0. NVIDIA's Vulkan driver (621.14) writes the stencil of
 //   a depth-stencil attachment view of mip > 0 into mip 0 (vkCmdClearAttachments and loadOp CLEAR alike); such a
 //   clear goes to mip 0 instead.
@@ -284,7 +284,9 @@ Program generate(std::uint64_t seed, const std::vector<Usable>& use, const Avoid
             const LONG y1 = y0 + 1 + LONG(pick(h - UINT(y0)));
             c.rects.push_back({x0, y0, x1, y1});
         }
-        if (c.op == Clear::uav_uint && avoid.documented)
+        // A typeless texture's UINT clears are exact (the replay clears through the family's UINT format); only the
+        // others go through a float.
+        if (c.op == Clear::uav_uint && avoid.documented && !std::strstr(p.use->family->name, "TYPELESS"))
             for (UINT k = 0; k < 4; ++k) c.values[k] = avoid_documented(c.view, k, c.values[k]);
         if (avoid.nvidia_stencil && c.op == Clear::dsv && (c.flags & D3D12_CLEAR_FLAG_STENCIL) && !c.rects.empty()) {
             c.mip = 0;

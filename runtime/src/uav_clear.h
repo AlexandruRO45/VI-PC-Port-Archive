@@ -22,7 +22,8 @@
 //
 // An image is cleared with the value that decodes those bytes in the image's own format, which is exact for every
 // format here except the SNORM pattern 0x80..00 (Vulkan writes -1.0 as 0x81..), and NaN payloads, which a driver
-// may canonicalise.
+// may canonicalise. A typeless image avoids both for a Uint clear: the replay clears it through uint_twin's format,
+// whose decode is the bits themselves.
 
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -336,6 +337,25 @@ inline bool decode(VkFormat format, const Element& element, VkClearColorValue& o
 }
 
 // A raw or structured buffer view: every 32-bit word gets value 0 (its bits, for Float).
+// The UINT format with `format`'s bit layout, in the same DXGI typeless family, or VK_FORMAT_UNDEFINED. Clearing a
+// mutable image through it writes an element's bits unchanged, where `format` would turn them into a float first.
+inline constexpr VkFormat uint_twin(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return VK_FORMAT_R32G32B32A32_UINT;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM:
+        return VK_FORMAT_R16G16B16A16_UINT;
+    case VK_FORMAT_R32G32_SFLOAT: return VK_FORMAT_R32G32_UINT;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SNORM: return VK_FORMAT_R8G8B8A8_UINT;
+    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM: return VK_FORMAT_R16G16_UINT;
+    case VK_FORMAT_R32_SFLOAT: return VK_FORMAT_R32_UINT;
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: return VK_FORMAT_R16_UINT;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: return VK_FORMAT_R8G8_UINT;
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: return VK_FORMAT_R8_UINT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 inline Element raw_element(const std::array<std::uint32_t, 4>& values) {
     Element e{};
     e.size = 4;

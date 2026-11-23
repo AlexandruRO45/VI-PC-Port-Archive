@@ -2640,14 +2640,24 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!image_layout || image_layout->bytes != p.element.size)
                 return ReplayResult::unsupported;
             const bool attachment = p.binding.color_attachment && !p.binding.volume;
-            const bool view_attachable = vk.color_attachment_format
-                                             ? vk.color_attachment_format(view_format)
-                                             : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
-            const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
-            const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
+            const auto attachable = [&](VkFormat format) {
+                return vk.color_attachment_format ? vk.color_attachment_format(format)
+                                                  : format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+            };
+            // A Uint clear writes raw bits. Through a float, UNORM or SNORM format they become a float that the driver
+            // encodes again: a NaN loses its payload and SNORM 0x80 becomes 0x81 (uav_clear.h). A typeless image
+            // (mutable, no format list) is cleared through its family's UINT format of the same layout instead, which
+            // writes the bits as they are.
+            VkFormat write_format = view_format;
+            if (!uav->is_float && p.binding.typeless) {
+                const VkFormat twin = uav_clear::uint_twin(view_format);
+                if (twin != VK_FORMAT_UNDEFINED && attachable(twin)) write_format = twin;
+            }
+            const bool reinterpret = write_format != p.binding.format && attachment && attachable(write_format);
+            const VkFormat clear_format = reinterpret ? write_format : p.binding.format;
             if (!uav_clear::decode(clear_format, p.element, p.clear_color))
                 return ReplayResult::unsupported;
-            if (reinterpret) p.clear_format = view_format;
+            if (reinterpret) p.clear_format = write_format;
             if (!uav->rects.empty() && !attachment)
                 return ReplayResult::unsupported;
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
