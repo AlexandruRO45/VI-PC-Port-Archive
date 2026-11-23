@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
     }
     // VKH_MESH_COMPUTE=<vs.spv>: the first shader is a mesh shader translated with rdna2spirv.py --mesh-compute.
     // It is dispatched as compute over the mesh grid (1x1x1, or --mesh-group-readback's), writing its slots to an
-    // output buffer (VKH_MESH_SLOT bytes per workgroup, address in push-constant dwords 36..37). Then
+    // output buffer (VKH_MESH_SLOT bytes per workgroup, address in push-constant dwords 36..37 or tail 4..5). Then
     // vs.spv (tools/mesh_compute_vs.py) draws groups * VKH_MESH_PRIMS * 3 vertices with the fragment shader. No
     // VK_EXT_mesh_shader is needed.
     const char* mesh_vs_path = std::getenv("VKH_MESH_COMPUTE");
@@ -367,13 +367,25 @@ int main(int argc, char** argv) {
     // cannot take that range: declaring it anyway is invalid, and there a shader reading past the limit crashed or
     // hung the device. 77, as vk_texture_test and vk_bindless_test: a device limit, not a wrong result (D3D-14).
     // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only, 128 bytes, which every device has; the
-    // tail is a uniform block at set 1 (vk_pc_tail.h). tools/mesh_compute_vs.py's vertex shader still reads the
-    // --mesh-compute output address from push constants, so that combination isn't run.
+    // tail is a uniform block at set 1 (vk_pc_tail.h). Both sides of mesh-compute must read the output
+    // address there: dispatch writes through it, and the generated vertex shader reads through it.
     const bool pc_tail = leonida::vk_test::pc_tail_requested();
-    if (pc_tail && mesh_compute) {
-        std::fprintf(stderr, "unsupported: --mesh-compute's vertex shader reads the output address from push "
-                             "constants, not from the --pc-tail-ubo block\n");
-        return 77;
+    if (mesh_compute) {
+        const char* const mesh_stages[] = {mesh_vs_path, argv[1]};
+        for (const char* path : mesh_stages) {
+            const auto code = read_spv(path);
+            if (code.empty()) {
+                std::fprintf(stderr, "cannot read mesh-compute shader: %s\n", path);
+                return 2;
+            }
+            const bool shader_tail = leonida::vk_test::spirv_declares_set(
+                code.data(), code.size() * sizeof(uint32_t), leonida::vk_test::pc_tail_set);
+            if (shader_tail != pc_tail) {
+                std::fprintf(stderr, "unsupported: mesh-compute shader mode does not match LEONIDA_PC_TAIL_UBO (%s)\n",
+                             path);
+                return 77;
+            }
+        }
     }
     const uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : 144u;
     if (props.limits.maxPushConstantsSize < pc_bytes) {
@@ -724,13 +736,13 @@ int main(int argc, char** argv) {
         pli.pSetLayouts = &dsl;
     }
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
-    // --pc-tail-ubo: the tail block at set 1 (set 0 stays empty here), one slot for the one draw.
+    // The dispatch and draw share a single immutable tail slot at set 1.
     leonida::vk_test::PcTail tail;
     if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.limits.minUniformBufferOffsetAlignment, pcs, 1)) {
         std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
         return 1;
     }
-    const VkDescriptorSetLayout tail_layouts[] = {tail.empty_layout, tail.set_layout};
+    const VkDescriptorSetLayout tail_layouts[] = {dsl ? dsl : tail.empty_layout, tail.set_layout};
     if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = tail_layouts; }
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -1082,11 +1094,20 @@ int main(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                              0, nullptr, 0, nullptr, 2, to_ro);
     }
+    if (tail_block)
+        tail.write(0, pc, mesh_compute ? 6u : 4u);  // heap/code bases, then the mesh output address
+    auto bind_tail = [&](VkPipelineBindPoint point) {
+        if (!tail_block) return;
+        LOADD(vkCmdBindDescriptorSets);
+        const uint32_t offset = tail.offset(0);
+        vkCmdBindDescriptorSets(cmd, point, pl, leonida::vk_test::pc_tail_set, 1, &tail.set, 1, &offset);
+    };
     if (mesh_compute) {
         // The mesh shader as compute, then make its stores visible to the vertex shader's reads.
         LOADD(vkCmdDispatch);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cpipe);
         push(cmd, pl, pcs, 0, pc_bytes, pc);
+        bind_tail(VK_PIPELINE_BIND_POINT_COMPUTE);
         vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1112,13 +1133,7 @@ int main(int argc, char** argv) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
     }
     push(cmd, pl, pcs, 0, pc_bytes, pc);
-    if (tail_block) {
-        LOADD(vkCmdBindDescriptorSets);
-        tail.write(0, pc, 4);           // heap base (VKH_HEAP) and code base, as pc[32..35] are without the flag
-        const uint32_t offset = tail.offset(0);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, leonida::vk_test::pc_tail_set, 1, &tail.set,
-                                1, &offset);
-    }
+    bind_tail(VK_PIPELINE_BIND_POINT_GRAPHICS);
     // VKH_VERTICES=<n>: draw n vertices instead of one triangle, so a vertex shader fills whole waves (TEST-251).
     const char* vertices_env = std::getenv("VKH_VERTICES");
     if (count_gs) {

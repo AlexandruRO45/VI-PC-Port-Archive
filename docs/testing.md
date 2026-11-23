@@ -340,9 +340,9 @@ To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check
 and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
 block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
 `vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
-only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
-(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
-constants, so those tests skip.
+only for `check.py`, the shaders read the tail from push constants the programs no longer declare. For
+`--mesh-compute` (`LEONIDA_MESH_COMPUTE=1`), both the compute shader and the generated vertex shader must use
+the same tail mode. The generated vertex shader needs the `pc_tail_address_dwords` support from #2528.
 
 ## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
 
@@ -358,9 +358,9 @@ To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check
 and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
 block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
 `vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
-only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
-(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
-constants, so those tests skip.
+only for `check.py`, the shaders read the tail from push constants the programs no longer declare. For
+`--mesh-compute` (`LEONIDA_MESH_COMPUTE=1`), both the compute shader and the generated vertex shader must use
+the same tail mode. The generated vertex shader needs the `pc_tail_address_dwords` support from #2528.
 
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 
