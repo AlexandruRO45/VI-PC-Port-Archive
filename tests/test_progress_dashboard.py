@@ -541,6 +541,66 @@ class Outputs(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("is not a directory", err.getvalue())
 
+    def test_unwritable_out_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "not_a_dir")
+            with open(blocker, "wb") as f:
+                f.write(b"keep me")
+            for target in (blocker, os.path.join(blocker, "sub")):
+                with self.subTest(target=target):
+                    r = subprocess.run([sys.executable, "-I", TOOL, "--out", target],
+                                       capture_output=True, text=True, cwd=ROOT, timeout=120)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
+
+    def test_corrupt_history_json_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            hist = os.path.join(out, "history.json")
+            with open(hist, "wb") as f:
+                f.write(b"{bad json")
+            r = subprocess.run([sys.executable, "-I", TOOL, "--out", out],
+                               capture_output=True, text=True, cwd=ROOT, timeout=300)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+            with open(hist, "rb") as f:
+                self.assertEqual(f.read(), b"{bad json")
+
+    def test_malformed_unit_and_corpus_json_record_invalid_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            with open(os.path.join(out, "unit_results.json"), "wb") as f:
+                f.write(b"{bad json")
+            col = pd.Collector()
+            args = type("Args", (), {"run_tests": False})()
+            pd.collect_unit(col, out, args)
+            self.assertEqual(col.sources[-1]["status"], "invalid")
+
+            work = os.path.join(tmp, "work")
+            os.makedirs(os.path.join(work, "shaders", "dxbc"))
+            os.makedirs(os.path.join(work, "shaders", "spirv"))
+            with open(os.path.join(work, "shaders", "dxbc", "index.json"), "wb") as f:
+                f.write(b"{bad json")
+            col2 = pd.Collector()
+            pd.collect_corpus(col2, work)
+            self.assertEqual(col2.sources[-1]["status"], "invalid")
+
+            with open(os.path.join(work, "shaders", "dxbc", "index.json"), "wb") as f:
+                f.write(b'[{"stage": "ps"}]')
+            with open(os.path.join(work, "shaders", "spirv", "index.json"), "wb") as f:
+                f.write(b"[1, 2]")
+            col3 = pd.Collector()
+            pd.collect_corpus(col3, work)
+            statuses = {s["id"]: s["status"] for s in col3.sources}
+            self.assertEqual(statuses["corpus_carved"], "ok")
+            self.assertEqual(statuses["corpus_spirv"], "invalid")
+
 
 if __name__ == "__main__":
     unittest.main()

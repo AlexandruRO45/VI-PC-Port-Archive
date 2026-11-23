@@ -323,7 +323,13 @@ def collect_unit(col, out_dir, args):
         data = run_unit_tests(args.test_files, args.jobs, args.test_timeout)
         save_text(path, dump_json(data))
     elif os.path.isfile(path):
-        data = json.loads(read_utf8(path))
+        try:
+            data = json.loads(read_utf8(path))
+            if not (isinstance(data, dict) and isinstance(data.get("results"), list) and "ran_at" in data):
+                raise ValueError("expected a JSON object with 'results' list and 'ran_at'")
+        except (OSError, ValueError) as e:
+            col.source("unit_results", path, "invalid", note=str(e))
+            return
     else:
         col.source("unit_results", None, "missing", note="no unit-test outcome yet: run with --run-tests")
         return
@@ -697,7 +703,13 @@ def collect_corpus(col, work):
     if not os.path.isfile(carved_p):
         col.source("corpus", None, "missing", note="no <work>/shaders/dxbc/index.json (run make_game.py's shaders stage)")
         return
-    carved = json.loads(read_utf8(carved_p))
+    try:
+        carved = json.loads(read_utf8(carved_p))
+        if not isinstance(carved, (list, dict)):
+            raise ValueError("expected a JSON list or object")
+    except (OSError, ValueError) as e:
+        col.source("corpus_carved", "<work>/shaders/dxbc/index.json", "invalid", note=str(e))
+        return
     entries = carved if isinstance(carved, list) else list(carved.values())
     per_stage = {}
     for e in entries:
@@ -705,13 +717,19 @@ def collect_corpus(col, work):
         per_stage.setdefault(st, [0, 0])[0] += 1
     validated_total = 0
     if os.path.isfile(spirv_p):
-        spirv = json.loads(read_utf8(spirv_p))
-        for meta in spirv.values():
-            if isinstance(meta, dict) and "error" not in meta:
-                st = meta.get("stage") or "unknown"
-                per_stage.setdefault(st, [0, 0])[1] += 1
-                validated_total += 1
-        col.source("corpus_spirv", "<work>/shaders/spirv/index.json", "ok", len(spirv))
+        try:
+            spirv = json.loads(read_utf8(spirv_p))
+            if not isinstance(spirv, dict):
+                raise ValueError("expected a JSON object")
+        except (OSError, ValueError) as e:
+            col.source("corpus_spirv", "<work>/shaders/spirv/index.json", "invalid", note=str(e))
+        else:
+            for meta in spirv.values():
+                if isinstance(meta, dict) and "error" not in meta:
+                    st = meta.get("stage") or "unknown"
+                    per_stage.setdefault(st, [0, 0])[1] += 1
+                    validated_total += 1
+            col.source("corpus_spirv", "<work>/shaders/spirv/index.json", "ok", len(spirv))
     else:
         col.source("corpus_spirv", "<work>/shaders/spirv/index.json", "missing", note="translation not finished")
     col.source("corpus_carved", "<work>/shaders/dxbc/index.json", "ok", len(entries))
@@ -980,7 +998,12 @@ def render_page(snap, history):
 def write_outputs(snap, out_dir):
     os.makedirs(os.path.join(out_dir, "snapshots"), exist_ok=True)
     hist_path = os.path.join(out_dir, "history.json")
-    history = json.loads(read_utf8(hist_path)) if os.path.isfile(hist_path) else []
+    if os.path.isfile(hist_path):
+        history = json.loads(read_utf8(hist_path))
+        if not (isinstance(history, list) and all(isinstance(h, dict) and "content_hash" in h for h in history)):
+            raise ValueError(f"invalid history JSON in {hist_path}")
+    else:
+        history = []
     new = not history or history[-1]["content_hash"] != snap["content_hash"][:16]
     if new:
         stamp = snap["generated_at"].replace("-", "").replace(":", "")
@@ -1036,10 +1059,10 @@ def main(argv=None):
         return 2
     try:
         snap = build(args, out_dir)
-    except OSError as exc:
-        print(f"error: {exc.filename or ''}: {exc.strerror or exc}", file=sys.stderr)
+        new = write_outputs(snap, out_dir)
+    except (OSError, ValueError) as exc:
+        print(f"error: {getattr(exc, 'filename', None) or args.out}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
         return 2
-    new = write_outputs(snap, out_dir)
     n = len(snap["components"])
     print(f"{n} units, {len(snap['metrics'])} metrics -> {os.path.join(out_dir, 'progress.html')}"
           + ("" if new else " (no change since the last snapshot)"))
