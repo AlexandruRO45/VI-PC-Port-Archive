@@ -168,6 +168,16 @@ class OpReachTests(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
 
+    def test_non_codepage_op_pattern_does_not_crash_stdout(self):
+        r = subprocess.run(
+            [sys.executable, "-I", "-X", "utf8=0", TOOL, self.disasm, "op_\ue9c3*"],
+            capture_output=True,
+            timeout=60,
+        )
+        err = r.stderr.decode("utf-8", "replace")
+        self.assertEqual(r.returncode, 0, err)
+        self.assertNotIn("UnicodeEncodeError", err)
+
 
 if __name__ == "__main__":
     unittest.main()
