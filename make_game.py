@@ -1495,7 +1495,7 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
         return
     settings = bvh_settings(dll, mc_signature, emulate, fallbacks)
     programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
-    if programs:
+    if programs and len(programs[1]) < len(programs[0]):
         bvh_report(programs)
         return
     log(f"shaders: extracting and translating the compute programs of {BVH_DLL}")

@@ -319,6 +319,25 @@ class BvhStage(unittest.TestCase):
         self.assertEqual(self.run_step(), TOOLS)
         self.assertEqual(self.run_step(), [])
 
+    def test_empty_cached_index_is_rebuilt(self):
+        """A cached index with no usable entries ({}, all error entries, or an empty extraction index) must not be
+        reused as finished: the fresh-build check treats 0 translated programs as a failure."""
+        self.assertEqual(self.run_step(), TOOLS)
+        for bad_index in ("{}", '{"SortKeys": {"error": "ValueError: synthetic"}}'):
+            with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(bad_index)
+            self.assertEqual(self.run_step(), TOOLS)
+            self.assertIn(f"shaders: 3 of 3 {make_game.BVH_DLL} programs translated", self.logs)
+            self.assertEqual(self.run_step(), [])
+            self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.BVH_DLL} programs translated"])
+        with open(os.path.join(self.unpacked, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("[]")
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}")
+        self.assertEqual(self.run_step(), TOOLS)
+        self.assertIn(f"shaders: 3 of 3 {make_game.BVH_DLL} programs translated", self.logs)
+        self.assertEqual(self.run_step(), [])
+
     def test_a_stopped_translation_leaves_no_marker_and_no_old_modules(self):
         self.run_step()
         open(os.path.join(self.spirv, "notes.txt"), "w").close()
