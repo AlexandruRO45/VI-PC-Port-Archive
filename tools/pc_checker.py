@@ -261,6 +261,13 @@ def cpu_lookup(name: str):
         base = ULTRA_BASE[int(m[1])]
         return (base if "k" in m[3] else base * 0.95), False
 
+    m = re.search(r"\bcore\s*([3579])\s*(\d{3})([a-z]*)\b", s)
+    if m:
+        tier, num, suf = int(m[1]), m[2], m[3]
+        base = _pick(INTEL_BASE, 14)[tier]
+        is_k = "k" in suf
+        return base * (1.06 if is_k else 1.0) * _mobile_mult(suf), False
+
     m = re.search(r"\bi([3579])[- ]?(\d{4,5})([a-z]{0,2})\d?\b", s)
     if m:
         tier, num, suf = int(m[1]), m[2], m[3]
@@ -301,6 +308,7 @@ CPU_CHOICES = [
     "Intel Core i7-13700K", "Intel Core i9-13900K", "Intel Core i5-14400F",
     "Intel Core i5-14600K", "Intel Core i7-14700K", "Intel Core i9-14900K",
     "Intel Core Ultra 5 245K", "Intel Core Ultra 7 265K", "Intel Core Ultra 9 285K",
+    "Intel Core 5 120U", "Intel Core 7 150H",
     "AMD Ryzen 5 2600", "AMD Ryzen 5 3600", "AMD Ryzen 7 3700X", "AMD Ryzen 5 5500",
     "AMD Ryzen 5 5600", "AMD Ryzen 5 5600X", "AMD Ryzen 7 5700X", "AMD Ryzen 7 5800X",
     "AMD Ryzen 7 5800X3D", "AMD Ryzen 9 5900X", "AMD Ryzen 5 7600", "AMD Ryzen 7 7700X",

@@ -60,6 +60,11 @@ class CpuScore(unittest.TestCase):
     def test_ultra(self):
         self.assertEqual(pc.cpu_score("Intel Core Ultra 7 265K"), 178)
 
+    def test_core_series(self):
+        self.assertAlmostEqual(pc.cpu_score("Intel Core 7 150H"), 175 * 0.85)
+        self.assertAlmostEqual(pc.cpu_score("Intel Core 5 120U"), 130 * 0.55)
+        self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) 3 100U"), 100 * 0.55)
+
     def test_unknown(self):
         self.assertIsNone(pc.cpu_score("Mystery CPU"))
         self.assertIsNone(pc.cpu_score(""))
