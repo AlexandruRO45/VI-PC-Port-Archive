@@ -422,6 +422,20 @@ class TestValuMulF32AST(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertAlmostEqual(bits_to_f32(words[0]), 0.5, places=6)
 
+class TestValuMulF32ScalarExecution(unittest.TestCase):
+    """Stage 15: Scalar execution tests for v_mul_f32 clamp and omod."""
+
+    def test_mul_aliasing_square(self):
+        # v0 = v0 * v0 clamped
+        lines = [
+            "v_mov_b32 v0, 0x3f000000",  # 0.5
+            "v_mul_f32_e64 v0, v0, v0 clamp",  # 0.25
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        words = support.mrt0_words(support.translate_lines(next_test_id("ps_mul_sq"), lines))
+        self.assertAlmostEqual(bits_to_f32(words[0]), 0.25, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
