@@ -64,6 +64,11 @@ EPI_VS = ["v_mov_b32_e32 v5, 0", "exp pos0 v5, v5, v5, v5 done", "exp param0 v6,
 EPI_PS = ["exp mrt0 v6, v7, v5, v5 done vm", "s_endpgm"]
 
 
+BPERM = ["v_mbcnt_lo_u32_b32 v10, -1, 0", "v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_saveexec_b64 s[12:13], vcc",
+         "v_mbcnt_hi_u32_b32 v10, -1, v10", "s_or_b64 exec, exec, s[12:13]", "v_lshlrev_b32_e32 v11, 2, v10",
+         "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]   # the finding's fourth listing (Kev-Ball's rebuild)
+
+
 def vs(body, prologue=PRO):
     return prologue + ["v_mov_b32_e32 v6, 0", "v_mov_b32_e32 v7, 0"] + body + EPI_VS
 
@@ -188,6 +193,11 @@ class Classification(unittest.TestCase):
             "s_bcnt1_i32_b64 s6, exec", "v_mov_b32_e32 v6, s6", "v_cmp_eq_u32_e32 vcc, 1, v0",
             "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v6, 0", "s_or_b64 exec, exec, s[12:13]"]),
             "C", ["lane-count"])
+
+    def test_c_masked_lane_count_feeding_bpermute(self):
+        # the low-half count is written at the launch mask, the high-half count only for lanes 0..31: lanes 32..63
+        # keep 32 as the bpermute address in the wave, their own id in the halves (SHADER-819, fourth listing)
+        self.tier("ps_c_mask_bperm", ps(BPERM), "C")
 
     def test_a_masked_write_of_clean_value_stays_exact(self):
         # the lanes that are off keep a clean value, the lanes that are on get one: still tier A
@@ -370,6 +380,14 @@ class Execution(unittest.TestCase):
         self.assertEqual(tier, "C")
         self.assertNotEqual([w[0] for w in whole], [w[0] for w in halves])
         self.assertEqual((whole[32][0], halves[32][0]), (32, 0))
+
+    def test_c_masked_lane_count_feeding_bpermute_differs(self):
+        # lanes 33..63 read lane 32's v0 in the wave and their own in the halves (SHADER-819, fourth listing)
+        tier, whole, halves = self.run_both("vs_c_mask_bperm", vs(BPERM))
+        self.assertEqual(tier, "C")
+        self.assertEqual([w[0] for w in whole[:33]], [h[0] for h in halves[:33]])
+        self.assertEqual((whole[33][0], halves[33][0]), (32, 33))
+        self.assertTrue(all(whole[i][0] != halves[i][0] for i in range(33, 64)))
 
     def test_c_bpermute_shift_by_one_differs(self):
         # the negative control of the rule: lane bit 5 reaches an address bit the permute uses
