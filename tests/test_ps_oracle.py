@@ -1,11 +1,15 @@
 """tools/ps_oracle.py: the msgpack subset, the PAL ELF rewrite that puts new pixel-shader code in a pipeline binary,
 the binary file format, and (with LEONIDA_PS_ORACLE_BUILD set to a runtime build and an AMD GPU selected) a real
 draw with patched code. Standard library only."""
+import io
+import json
 import os
 import struct
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout, redirect_stderr
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -256,6 +260,57 @@ class RadvOracleWithoutGpu(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
+    def test_report_cannot_replace_shader_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            asm = os.path.join(directory, "source.s")
+            for flag in ("--asm", "--vs", "--ps"):
+                protected = asm if flag == "--asm" else os.path.join(directory, flag[2:] + ".spv")
+                for linked in (False, True):
+                    with self.subTest(flag=flag, linked=linked):
+                        with open(asm, "wb") as output:
+                            output.write(b"s_endpgm")
+                        with open(protected, "wb") as output:
+                            output.write(b"s_endpgm")
+                        report = protected
+                        if linked:
+                            report = os.path.join(directory, "alias.json")
+                            os.link(protected, report)
+                        oracle = mock.Mock(device="synthetic", wave64=False)
+                        oracle.run.return_value = [[0, 0, 0, 0]]
+                        args = ["--build", ".", "--asm", asm, "--size", "1", "1", "--json", report]
+                        if flag != "--asm":
+                            args += [flag, protected]
+                        try:
+                            with mock.patch.object(P, "Oracle", return_value=oracle) as factory:
+                                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                                    try:
+                                        code = P.main(args)
+                                    except SystemExit as error:
+                                        code = error.code
+                                with open(protected, "rb") as source:
+                                    self.assertEqual(source.read(), b"s_endpgm")
+                                self.assertEqual(code, 2)
+                                factory.assert_not_called()
+                        finally:
+                            if linked:
+                                os.unlink(report)
+
+    def test_distinct_report_still_writes_and_closes_the_oracle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            asm = os.path.join(directory, "source.s")
+            report = os.path.join(directory, "report.json")
+            with open(asm, "wb") as output:
+                output.write(b"s_endpgm")
+            oracle = mock.Mock(device="synthetic", wave64=False)
+            oracle.run.return_value = [[1, 2, 3, 4]]
+            with mock.patch.object(P, "Oracle", return_value=oracle), redirect_stdout(io.StringIO()):
+                self.assertEqual(P.main(["--build", ".", "--asm", asm, "--size", "1", "1",
+                                         "--json", report]), 0)
+            with open(report, encoding="utf-8") as source:
+                self.assertEqual(json.load(source)["pixels"], [[1, 2, 3, 4]])
+            oracle.close.assert_called_once()
+
+
     def test_nothing_to_do_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as cm:
             P.main(["--build", "."])

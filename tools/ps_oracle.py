@@ -53,6 +53,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from report_paths import same_report_path  # noqa: E402
 
 PS_SYMBOL = "_amdgpu_ps_main"
 S_CODE_END = struct.pack("<I", 0xBF9F0000)
@@ -751,6 +752,10 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not (a.asm or a.show_template):
         ap.error("nothing to do: give --asm and/or --show-template")
+    if a.json:
+        for source in (a.asm, a.vs, a.ps):
+            if source and same_report_path(a.json, source):
+                ap.error("--json must not overwrite an input shader")
     if not all(0 < n <= 4096 for n in a.size):
         ap.error("--size must be 1..4096")
     try:
