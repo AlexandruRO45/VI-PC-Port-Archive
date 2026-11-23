@@ -106,6 +106,11 @@ class DecisionTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 Device.read(bad)
 
+    def test_assess_rejects_non_dict_and_invalid_or_missing_stage(self):
+        for bad in ("not-a-dict", None, {}, {"wave64": True}, {"stage": "bad"}, {"stage": "bad", "wave64": True}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                assess(bad, CAPS32)
+
 
 class CommandLineTest(unittest.TestCase):
     def setUp(self):
@@ -189,6 +194,57 @@ class CommandLineTest(unittest.TestCase):
         proc = self.run_audit("--strict")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("no graphics shaders", proc.stderr)
+
+    def test_rejects_deeply_nested_json_inputs(self):
+        deep = self.dir / "deep.json"
+        deep.write_text("[" * 2000 + "]" * 2000, encoding="utf-8", newline="\n")
+        cases = (
+            ("index", [str(deep), "--device-info", str(self.caps)]),
+            ("device-info", [str(self.index), "--device-info", str(deep)]),
+            ("manifest", [str(self.index), "--device-info", str(self.caps), "--manifest", str(deep)]),
+        )
+        for label, cli_args in cases:
+            with self.subTest(label=label):
+                proc = subprocess.run(
+                    [sys.executable, "-I", str(ROOT / "tools" / "wave64_pipeline_audit.py"), *cli_args],
+                    capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("wave64_pipeline_audit:", proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+
+    def test_rejects_non_standard_json_constants(self):
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            bad_index = self.dir / f"bad_{constant}.json"
+            bad_index.write_text(f'{{"s": {{"stage": "ps", "wave64": {constant}}}}}', encoding="utf-8", newline="\n")
+            with self.subTest(target="index", constant=constant):
+                proc = subprocess.run(
+                    [sys.executable, "-I", str(ROOT / "tools" / "wave64_pipeline_audit.py"),
+                     str(bad_index), "--device-info", str(self.caps)],
+                    capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("invalid JSON constant", proc.stderr)
+
+            bad_caps = self.dir / f"caps_{constant}.json"
+            bad_caps.write_text(f'{{"subgroup_size": {constant}}}', encoding="utf-8", newline="\n")
+            with self.subTest(target="device-info", constant=constant):
+                proc = subprocess.run(
+                    [sys.executable, "-I", str(ROOT / "tools" / "wave64_pipeline_audit.py"),
+                     str(self.index), "--device-info", str(bad_caps)],
+                    capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("invalid JSON constant", proc.stderr)
+
+    def test_invalid_or_missing_stage_in_index_cli_reports_error(self):
+        for bad in ({"s": {}}, {"s": {"stage": "bad", "wave64": True}}):
+            self.dump(self.index, bad)
+            with self.subTest(bad=bad):
+                proc = self.run_audit()
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("wave64_pipeline_audit:", proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
 
 
 if __name__ == "__main__":

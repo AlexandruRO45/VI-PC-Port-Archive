@@ -63,6 +63,8 @@ class Assessment:
 
 
 def assess(entry, caps, *, in_chain=False):
+    if not isinstance(entry, dict) or entry.get("stage") not in STAGE_BITS:
+        raise ValueError("entry must be a shader metadata object with a valid stage")
     stage = entry["stage"]
     if stage == "ms" and entry.get("mesh_compute"):
         if in_chain:
@@ -149,11 +151,15 @@ def build_report(index, caps, chains=None):
             "reasons": dict(sorted(reasons.items())), "pipelines": chain_counts}
 
 
+def _reject_constant(constant):
+    raise ValueError(f"invalid JSON constant {constant}")
+
+
 def load_json(path):
     try:
         with path.open(encoding="utf-8") as source:
-            return json.load(source)
-    except (OSError, ValueError) as exc:
+            return json.load(source, parse_constant=_reject_constant)
+    except (OSError, ValueError, RecursionError) as exc:
         raise ValueError(f"cannot read JSON input {path}: {exc}") from exc
 
 
@@ -183,7 +189,7 @@ def main(argv=None):
                           if is_shader_stem(name))
             ensure_report_is_separate(args.report, inputs)
             write_report(args.report, report)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, RecursionError) as exc:
         print(f"wave64_pipeline_audit: {exc}", file=sys.stderr)
         return 2
 
