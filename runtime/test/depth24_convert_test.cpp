@@ -15,6 +15,7 @@
 #include "../src/vulkan_backend.h"
 #include "../src/vulkan_depth24.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -712,13 +713,20 @@ int main() {
             std::uint64_t sem_value = UINT64_MAX;
             unsigned sem_queries = 0;
             unsigned destroyed_buffers = 0;
+            VkSharingMode sharing = VK_SHARING_MODE_EXCLUSIVE;
+            std::vector<std::uint32_t> families;
 
             static MockVk*& state() {
                 static MockVk* s = nullptr;
                 return s;
             }
-            static VKAPI_ATTR VkResult VKAPI_CALL create_buf(VkDevice, const VkBufferCreateInfo*,
+            static VKAPI_ATTR VkResult VKAPI_CALL create_buf(VkDevice, const VkBufferCreateInfo* info,
                                                              const VkAllocationCallbacks*, VkBuffer* out) {
+                state()->sharing = info->sharingMode;
+                state()->families.clear();
+                if (info->queueFamilyIndexCount)
+                    state()->families.assign(info->pQueueFamilyIndices,
+                                             info->pQueueFamilyIndices + info->queueFamilyIndexCount);
                 *out = reinterpret_cast<VkBuffer>(state()->next_handle++);
                 return VK_SUCCESS;
             }
@@ -759,11 +767,12 @@ int main() {
         MockVk mock{};
         MockVk::state() = &mock;
         const VkSemaphore fake_sem = reinterpret_cast<VkSemaphore>(std::uintptr_t(0x1234));
+        const auto fake_device = reinterpret_cast<VkDevice>(std::uintptr_t(1));
+        const auto allocate = [&](const VkMemoryRequirements&) {
+            return reinterpret_cast<VkDeviceMemory>(mock.next_handle++);
+        };
         {
-            ScratchBuffers scratch(&MockVk::gdpa, reinterpret_cast<VkDevice>(std::uintptr_t(1)),
-                                   [&](const VkMemoryRequirements&) {
-                                       return reinterpret_cast<VkDeviceMemory>(mock.next_handle++);
-                                   });
+            ScratchBuffers scratch(&MockVk::gdpa, fake_device, allocate);
             EXPECT(scratch.loaded());
             VkBuffer b1 = VK_NULL_HANDLE, b2 = VK_NULL_HANDLE;
             VkDeviceSize off = 0;
@@ -789,6 +798,23 @@ int main() {
             scratch.retire(fake_sem, 0);
         }
         EXPECT(mock.destroyed_buffers == 2);
+        constexpr std::uint32_t single_family[]{0};
+        constexpr std::uint32_t active_families[]{0, 2, 1};
+        {
+            ScratchBuffers scratch(&MockVk::gdpa, fake_device, allocate, single_family);
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            EXPECT(scratch.get(1024, buffer, offset));
+            EXPECT(mock.sharing == VK_SHARING_MODE_EXCLUSIVE && mock.families.empty());
+        }
+        {
+            ScratchBuffers scratch(&MockVk::gdpa, fake_device, allocate, active_families);
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            EXPECT(scratch.get(1024, buffer, offset));
+            EXPECT(mock.sharing == VK_SHARING_MODE_CONCURRENT &&
+                   std::ranges::equal(mock.families, active_families));
+        }
         MockVk::state() = nullptr;
         std::printf("depth24: ScratchBuffers::collect() checks vkGetSemaphoreCounterValue VkResult and ticket 0 ok\n");
     }

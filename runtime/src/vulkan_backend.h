@@ -1187,9 +1187,10 @@ public:
     }
 
     // Copies the replay stages through a buffer take device-local scratch from `allocate`.
-    bool enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
+    bool enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate,
+                             std::span<const std::uint32_t> queue_families = {}) {
         std::unique_lock lock(resource_mutex_);
-        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
+        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), queue_families);
         if (!scratch_->loaded()) scratch_.reset();
         return scratch_ != nullptr;
     }

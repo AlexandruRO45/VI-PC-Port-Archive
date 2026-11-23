@@ -1998,7 +1998,8 @@ The trace will enumerate them.
   [D3D12's unrestricted copy rules](https://microsoft.github.io/DirectX-Specs/d3d/VulkanOn12.html#unrestricted-buffer-texture-copy-row-pitch-and-offset).
   `GetCopyableFootprints` still returns the standard padded layout. Replay uses a direct Vulkan copy where
   possible and otherwise packs or unpacks only the copied rows through aligned transfer scratch, preserving
-  bytes outside the copy. The existing compute conversion for RGB96 and emulated D24 still needs a queue
+  bytes outside the copy. Transfer scratch uses concurrent sharing across the device's active queue families
+  when more than one family is in use. The existing compute conversion for RGB96 and emulated D24 needs a queue
   that can dispatch. `d3d12_unrestricted_footprint_test` compares synthetic uploads and readbacks with native
   D3D12, and `replay_copy_offset_test` checks the transfer scratch regions without a GPU.
 - `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is

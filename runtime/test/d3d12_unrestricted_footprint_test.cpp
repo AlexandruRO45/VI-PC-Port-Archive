@@ -52,6 +52,8 @@ constexpr D3D12_RESOURCE_DIMENSION tex3d = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
 constexpr DXGI_FORMAT rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr Extent rectangle{7, 5, 1};
 constexpr Region whole{};  // A null source box copies the whole subresource or footprint.
+constexpr Case depth_case{"D16 2D depth plane", DXGI_FORMAT_D16_UNORM, tex2d, rectangle, rectangle, 2, 1,
+                           {2, 18}, {6, 22}, whole, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, true};
 constexpr Case cases[] = {
     {"RGBA8 legacy", rgba, tex2d, rectangle, rectangle, 4, 1, {512, 256}, {1024, 256}, whole},
     {"RGBA8 offset only", rgba, tex2d, rectangle, rectangle, 4, 1, {4, 256}, {20, 256}, whole},
@@ -71,8 +73,7 @@ constexpr Case cases[] = {
     // The RGB96 conversion needs compute and depth copies need graphics on a dedicated transfer family.
     {"RGB96 2D repack", DXGI_FORMAT_R32G32B32_UINT, tex2d, rectangle, rectangle, 12, 1,
      {12, 96}, {36, 108}, whole, D3D12_RESOURCE_FLAG_NONE, true},
-    {"D16 2D depth plane", DXGI_FORMAT_D16_UNORM, tex2d, rectangle, rectangle, 2, 1,
-     {2, 18}, {6, 22}, whole, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, true},
+    depth_case,
 };
 
 D3D12_RESOURCE_DESC buffer_desc() {
@@ -281,11 +282,16 @@ bool format_supported(ID3D12Device* device, const Case& test) {
 
 bool run_all(ID3D12Device* device, bool layer) {
     const char* backend = layer ? "Vulkan layer" : "Native D3D12";
-    for (const auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COPY}) {
+    constexpr std::array types{D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COPY};
+    std::array<ComPtr<ID3D12CommandQueue>, types.size()> queues;
+    // Keep DIRECT alive while COPY runs so its completed scratch stays available for reuse.
+    for (std::size_t i = 0; i < types.size(); ++i) {
+        const D3D12_COMMAND_QUEUE_DESC desc{types[i]};
+        CHECK(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queues[i]))));
+    }
+    for (std::size_t i = 0; i < types.size(); ++i) {
+        const auto type = types[i];
         const char* queue_name = type == D3D12_COMMAND_LIST_TYPE_COPY ? "COPY" : "DIRECT";
-        const D3D12_COMMAND_QUEUE_DESC desc{type};
-        ComPtr<ID3D12CommandQueue> queue;
-        CHECK(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))));
         unsigned passed = 0;
         for (const Case& test : cases) {
             if (test.direct_only && type != D3D12_COMMAND_LIST_TYPE_DIRECT) continue;
@@ -293,13 +299,18 @@ bool run_all(ID3D12Device* device, bool layer) {
                 std::printf("%s %s skipped: %s (format unavailable)\n", backend, queue_name, test.name);
                 continue;
             }
-            if (!run(device, queue.Get(), test, layer)) {
+            if (!run(device, queues[i].Get(), test, layer)) {
                 std::fprintf(stderr, "%s %s failed: %s\n", backend, queue_name, test.name);
                 return false;
             }
             ++passed;
         }
         std::printf("%s %s: %u byte-exact round trips with intact guards\n", backend, queue_name, passed);
+    }
+    // Repeat the two-byte-aligned depth copy after COPY has used the shared scratch.
+    if (format_supported(device, depth_case)) {
+        CHECK(run(device, queues.front().Get(), depth_case, layer));
+        std::printf("%s DIRECT after COPY: byte-exact depth round trip with intact guards\n", backend);
     }
     return true;
 }
