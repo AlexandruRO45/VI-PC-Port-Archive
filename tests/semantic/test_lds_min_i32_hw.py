@@ -388,3 +388,147 @@ class TestLdsMinI32AST(unittest.TestCase):
         ))
         expected = "ds_min_i32 v1, v2 offset:8\nds_min_rtn_i32 v5, v3, v4"
         self.assertEqual(prog.to_assembly(), expected)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class LdsMinI32ConditionCodes:
+    """Condition codes resulting from atomic signed minimum."""
+    zero: bool
+    negative: bool
+    positive: bool
+    operand_clamped: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class LdsMinI32StatusFlags:
+    """Execution status and address resolution metadata."""
+    effective_byte_address: int
+    dword_index: int
+    old_value: int
+    operand_value: int
+    new_value: int
+
+
+class ScalarLDSInterpreter:
+    """Deterministic scalar interpreter for ds_min_i32 and ds_min_rtn_i32."""
+
+    def __init__(self, capacity_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.lds: LDSModel = LDSModel(capacity_dwords)
+        self.last_condition_codes: LdsMinI32ConditionCodes | None = None
+        self.last_status_flags: LdsMinI32StatusFlags | None = None
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= len(self.vgprs)) or (kind == RegKind.SGPR and idx >= len(self.sgprs)):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        return (self.vgprs[idx] if kind == RegKind.VGPR else self.sgprs[idx]) & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= len(self.vgprs)) or (kind == RegKind.SGPR and idx >= len(self.sgprs)):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def step(self, inst: Instruction) -> tuple[int, int]:
+        """Executes a single ds_min_i32 or ds_min_rtn_i32 instruction: returns (old_val, new_val)."""
+        vaddr = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
+        vdata = self.read_reg_u32(RegKind.VGPR, inst.vdata.index)
+        eff_byte, idx = calc_lds_address(vaddr, inst.offset.offset, self.lds.capacity_dwords)
+        old_val, new_val = self.lds.atomic_min_i32(
+            vaddr=vaddr,
+            data=vdata,
+            offset=inst.offset.offset,
+        )
+        if inst.opcode == Opcode.DS_MIN_RTN_I32:
+            assert inst.vdst is not None
+            self.write_reg_u32(RegKind.VGPR, inst.vdst.index, old_val)
+
+        is_neg = bool(new_val & SIGN_BIT32)
+        self.last_condition_codes = LdsMinI32ConditionCodes(
+            zero=(new_val == 0),
+            negative=is_neg,
+            positive=(new_val > 0 and not is_neg),
+            operand_clamped=(new_val != old_val),
+        )
+        self.last_status_flags = LdsMinI32StatusFlags(
+            effective_byte_address=eff_byte,
+            dword_index=idx,
+            old_value=old_val,
+            operand_value=vdata,
+            new_value=new_val,
+        )
+        self.trace.append(f"{inst.to_assembly()} => old={old_val:#010x}, new={new_val:#010x}")
+        return old_val, new_val
+
+    def run_program(self, prog: Program) -> list[tuple[int, int]]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
+class TestLdsMinI32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(capacity_dwords=1024)
+
+    def test_scalar_execution_non_returning(self) -> None:
+        self.interp.lds.write_dword(0x10, 80)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 25)
+
+        inst = Instruction(
+            opcode=Opcode.DS_MIN_I32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        old_val, new_val = self.interp.step(inst)
+        self.assertEqual(old_val, 80)
+        self.assertEqual(new_val, 25)
+        self.assertEqual(self.interp.lds.read_dword(0x10), 25)
+        # Verify operands are preserved (non-returning)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 0x10)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 2), 25)
+
+    def test_scalar_execution_returning(self) -> None:
+        self.interp.lds.write_dword(0x20, 50)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x20)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, -10)
+        self.interp.write_reg_u32(RegKind.VGPR, 5, 0xDEADBEEF)
+
+        inst = Instruction(
+            opcode=Opcode.DS_MIN_RTN_I32,
+            vdst=Register(RegKind.VGPR, 5),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        old_val, new_val = self.interp.step(inst)
+        self.assertEqual(old_val, 50)
+        self.assertEqual(new_val, u32(-10))
+        # vdst receives old_val
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 5), 50)
+        self.assertEqual(self.interp.lds.read_dword(0x20), u32(-10))
+
+    def test_scalar_chained_reduction(self) -> None:
+        self.interp.lds.write_dword(0x30, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x30)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 70)
+        self.interp.write_reg_u32(RegKind.VGPR, 3, 20)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, -5)
+
+        prog = Program()
+        prog.append(Instruction(opcode=Opcode.DS_MIN_I32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 2)))
+        prog.append(Instruction(opcode=Opcode.DS_MIN_I32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 3)))
+        prog.append(Instruction(opcode=Opcode.DS_MIN_I32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 4)))
+
+        results = self.interp.run_program(prog)
+        self.assertEqual(results, [(100, 70), (70, 20), (20, u32(-5))])
+        self.assertEqual(self.interp.lds.read_dword(0x30), u32(-5))
