@@ -194,8 +194,12 @@ def main(argv=None) -> int:
     o = report["other_stages"]
     print("other stages: %d shaders, %d wave64 (not counted)" % (o["shaders"], o["wave64"]))
     if args.out:
-        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        try:
+            with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+        except OSError as e:
+            print("ERROR: cannot write %s: %s" % (args.out, e.strerror or e), file=sys.stderr)
+            return 2
         print("wrote %s" % args.out)
     return 0
 

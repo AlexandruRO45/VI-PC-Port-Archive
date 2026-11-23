@@ -181,8 +181,12 @@ def main(argv=None):
     print("internal box area: %.6g" % report["internal_area"])
     print("consistent" if report["consistent"] else "NOT consistent")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+        except OSError as e:
+            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     return 0 if report["consistent"] else 1
 
 
