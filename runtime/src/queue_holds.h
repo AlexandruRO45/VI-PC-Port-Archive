@@ -58,16 +58,23 @@ public:
     // The fence is released: a Wait on it counts as reached from now on, as on the host runtime, so held batches
     // waiting on it go on (D3D-496) once their other waits are met. Every queue is asked, held work or not: a Wait
     // not yet attached to a submission names the fence too. pump_ready() below releases what became ready.
+    //
+    // It can be released from inside a release: a queue drops the pin of a Signal it has just submitted after its
+    // own lock (VulkanQueue::release_ready), and since a Wait does not pin its fence, that can be the last reference
+    // while another queue still holds work waiting on it (D3D-496 case 1: the fence's postponed CPU Signal is
+    // cancelled with it, so that wait is never met on the GPU). The releasing thread already holds pump_mutex_ and
+    // no queue lock: the queues forget the fence right there, before the running pass releases anything else, and
+    // the pass goes round again for what became ready.
     void remove_fence(Semaphore semaphore) {
-        {
-            std::lock_guard lock(mutex_);
-            fences_.erase(semaphore);
+        if (in_pump()) {
+            forget(semaphore);
+            dirty_.store(true, std::memory_order_release);
+            return;
         }
-        if (in_pump()) return;  // released from inside a release: the releasing thread holds pump_mutex_
         {
             std::lock_guard pump(pump_mutex_);
             in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
-            for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
+            forget(semaphore);
             in_pump() = false;
         }
         pump_ready();
@@ -190,6 +197,15 @@ private:
     static bool& in_pump() {
         static thread_local bool pumping = false;
         return pumping;
+    }
+
+    // Every queue takes `semaphore` off its Waits and held Signals, and only then is it erased: until it is,
+    // pending() still counts a Wait on it as unmet, so no queue releases a held batch, or submits a Wait not yet
+    // attached, that still waits on a semaphore being retired. Called with pump_mutex_ held and no queue lock.
+    void forget(Semaphore semaphore) {
+        for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
+        std::lock_guard lock(mutex_);
+        fences_.erase(semaphore);
     }
 
     std::vector<Holder*> snapshot() const {

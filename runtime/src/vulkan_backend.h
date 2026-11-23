@@ -1700,9 +1700,10 @@ public:
     }
     // The fence is released, but submissions made so far may still signal or wait for its semaphore (D3D12 lets an
     // application release a fence it has just asked a queue to Signal or Wait for). remove_fence leaves no queue
-    // about to use it (held batches waiting on it are dropped, held Signals of it and Waits not yet attached to a
-    // submission forgotten, VulkanQueue::discard_waiting_on), so the semaphore goes through the deletion queue once
-    // every submission made before has completed (D3D-486), not at once (VUID-vkDestroySemaphore-semaphore-05149).
+    // about to use it (its wait is taken off held batches and off Waits not yet attached to a submission, held
+    // Signals of it are forgotten, VulkanQueue::discard_waiting_on), so the semaphore goes through the deletion
+    // queue once every submission made before has completed (D3D-486), not at once
+    // (VUID-vkDestroySemaphore-semaphore-05149).
     ~VulkanFence() {
         if (!semaphore_) return;
         context_.holds().remove_fence(semaphore_);
@@ -2693,7 +2694,15 @@ private:
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
                 context_.holds().held_changed(-1);
-                if (!context_.is_device_lost()) run(op);
+                if (!context_.is_device_lost()) {
+                    run(op);
+                } else {
+                    // Not run on a lost device: its pins (a fence it signals) still go after the lock, as a run
+                    // operation's do. A fence's last reference released under it would deadlock in remove_fence,
+                    // which asks this queue to forget the fence.
+                    retire_pins(op.pins, 0);
+                    retire_pins(op.wait_pins, 0);
+                }
                 released = true;
             }
             drain_pins(retired);
