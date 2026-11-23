@@ -458,6 +458,24 @@ class GlbInspectTests(unittest.TestCase):
             self.assertTrue(report["position_bbox_complete"])
             self.assertEqual(report["meshes"][0]["primitives"][0]["bbox"], report["position_bbox"])
 
+    def test_inverted_position_bounds_do_not_contribute_to_the_model_box(self):
+        gltf = bbox_gltf(with_bounds=True)
+        valid = gltf["accessors"][0]
+        gltf["accessors"].append({**valid, "min": [-100, 7, -100]})
+        gltf["meshes"][0]["primitives"].append({"attributes": {"POSITION": 1}})
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "inverted.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, bytes(36)))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+        self.assertIsNone(report["meshes"][0]["primitives"][1]["bbox"])
+        self.assertEqual(report["position_bbox"], {"min": valid["min"], "max": valid["max"]})
+        self.assertFalse(report["position_bbox_complete"])
+
     def test_missing_bounds_and_material_fields_are_reported_not_guessed(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "missing.glb")

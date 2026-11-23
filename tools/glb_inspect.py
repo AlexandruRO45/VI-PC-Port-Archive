@@ -368,6 +368,8 @@ def _bbox(accessor: dict | None) -> dict | None:
         return None
     if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in lower[:3] + upper[:3]):
         return None
+    if any(lower[axis] > upper[axis] for axis in range(3)):
+        return None
     return {"min": lower[:3], "max": upper[:3]}
 
 
