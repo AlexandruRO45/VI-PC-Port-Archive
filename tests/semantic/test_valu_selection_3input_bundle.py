@@ -368,5 +368,22 @@ class VMin3I32AstInterpreterTests(unittest.TestCase):
         regs["v0"] = res
         self.assertEqual(i32(regs["v0"]), -50)
 
+class VMin3I32SimdBoundaryTests(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_min3_i32."""
+
+    def test_simd_divergent_lanes(self):
+        lanes = 64
+        src0 = [u32(i - 32) for i in range(lanes)]
+        src1 = [0 for _ in range(lanes)]
+        src2 = [u32(32 - i) for i in range(lanes)]
+        out = [ref_min3_i32(s0, s1, s2) for s0, s1, s2 in zip(src0, src1, src2)]
+        for i in range(lanes):
+            expected = min(i - 32, 0, 32 - i)
+            self.assertEqual(i32(out[i]), expected)
+
+    def test_extremes_min3(self):
+        int_min = 0x80000000
+        self.assertEqual(ref_min3_i32(int_min, int_min, int_min), int_min)
+
 if __name__ == "__main__":
     unittest.main()
