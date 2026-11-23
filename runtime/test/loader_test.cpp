@@ -725,15 +725,22 @@ void test_failed_existing_thread_tls_record_rolls_back() {
             else {
                 uint32_t index = rt::kNoTlsIndex;
                 void* saved = nullptr;
-                if (!rt::failed_existing_thread_tls_record_for_test(index, saved)) {
-                    why = "the injected failure did not capture the worker's original helper slot";
+                void* loading_saved = nullptr;
+                bool owner_retired = false;
+                if (!rt::failed_existing_thread_tls_record_for_test(index, saved, loading_saved, owner_retired)) {
+                    why = "the injected failure did not capture the original helper slots";
+                } else if (!owner_retired) {
+                    why = "the failed image still owned the global TLS slot";
                 } else {
+                    auto** loading_slots = reinterpret_cast<void**>(__readgsqword(0x58));
+                    if (!loading_slots || index >= 64 || loading_slots[index] != loading_saved)
+                        why = "the loading thread's TLS slot still held the failed image block";
                     probe_index.store(index, std::memory_order_relaxed);
                     probe.store(true, std::memory_order_release);
                     while (!probed.load(std::memory_order_acquire)) Sleep(0);
-                    if (observed_slot.load(std::memory_order_relaxed) != saved) {
+                    if (why.empty() && observed_slot.load(std::memory_order_relaxed) != saved) {
                         why = "the worker's TLS slot still held the failed image block before retry";
-                    } else {
+                    } else if (why.empty()) {
                         rt::Module& retried = loader.load(path);
                         ok = retried.tls_index != rt::kNoTlsIndex;
                         if (!ok) why = "the corrected retry did not install TLS";

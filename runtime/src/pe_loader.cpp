@@ -362,7 +362,9 @@ ExistingThreads& existing_threads() {
 #ifdef LEONIDA_LOADER_TEST_HOOKS
 std::atomic<uint32_t> g_fail_existing_thread_tls_record{0};
 std::atomic<uint32_t> g_failed_existing_thread_tls_index{kNoTlsIndex};
+std::atomic<uint32_t> g_failed_existing_thread_tls_slot{kNoTlsIndex};
 std::atomic<void*> g_failed_existing_thread_tls_saved{nullptr};
+std::atomic<void*> g_failed_existing_thread_tls_loading_saved{nullptr};
 #endif
 struct ExistingThreadsLock {
     ExistingThreadsLock() { AcquireSRWLockExclusive(&existing_threads().lock); }
@@ -646,7 +648,9 @@ void install_on_existing_threads(Module& m) {
                 if (g_fail_existing_thread_tls_record.load() == c.id &&
                     g_fail_existing_thread_tls_record.exchange(0) == c.id) {
                     g_failed_existing_thread_tls_index.store(m.tls_index);
+                    g_failed_existing_thread_tls_slot.store(m.tls_slot);
                     g_failed_existing_thread_tls_saved.store(saved);
+                    g_failed_existing_thread_tls_loading_saved.store(g_thread_tls_slots[m.tls_slot].saved);
                     throw std::bad_alloc();
                 }
 #endif
@@ -874,14 +878,20 @@ void cleanup_tls_clones() { cleanup_tls_clones_internal(); }
 #ifdef LEONIDA_LOADER_TEST_HOOKS
 void fail_existing_thread_tls_record_for_test(uint32_t thread) {
     g_failed_existing_thread_tls_index.store(kNoTlsIndex);
+    g_failed_existing_thread_tls_slot.store(kNoTlsIndex);
     g_failed_existing_thread_tls_saved.store(nullptr);
+    g_failed_existing_thread_tls_loading_saved.store(nullptr);
     g_fail_existing_thread_tls_record.store(thread);
 }
 
-bool failed_existing_thread_tls_record_for_test(uint32_t& index, void*& saved) {
+bool failed_existing_thread_tls_record_for_test(uint32_t& index, void*& saved, void*& loading_saved,
+                                                bool& owner_retired) {
     index = g_failed_existing_thread_tls_index.load();
     saved = g_failed_existing_thread_tls_saved.load();
-    return index != kNoTlsIndex && saved != nullptr;
+    loading_saved = g_failed_existing_thread_tls_loading_saved.load();
+    const uint32_t slot = g_failed_existing_thread_tls_slot.load();
+    owner_retired = slot < kMaxMappedTlsModules && g_tls_slot_owners[slot].load() == nullptr;
+    return index != kNoTlsIndex && saved != nullptr && loading_saved != nullptr;
 }
 #endif
 
