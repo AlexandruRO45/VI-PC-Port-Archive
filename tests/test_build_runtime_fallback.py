@@ -58,6 +58,33 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertTrue(wanted)
         self.assertEqual(wanted - listed, set(), "in CMake's gta6rt sources but not in the cl.exe fallback")
 
+    def test_the_launcher_builds_the_vulkan_device_cmake_gives_it(self):
+        """EGEN-FALLBACK-VULKAN-DEVICE: with VULKAN_SDK set, the CMake branch refuses to configure without the Vulkan
+        headers (LEONIDA_REQUIRE_VULKAN) and links gta6rt_d3d12_com + /DLEONIDA_VULKAN_DEVICE into gta6rt. The
+        fallback left all of that out, so `LEONIDA_D3D12=vulkan` — the backend docs/boot.md measures the title on —
+        silently kept the host's PC D3D12 device in a fallback build."""
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        library = re.search(r"add_library\(gta6rt_d3d12_com STATIC (.*?)\)", cmake, re.S).group(1)
+        wanted = {item.replace("/", "\\") for item in library.split() if item.endswith(".cpp")}
+        self.assertTrue(wanted)
+        branch = re.search(r"if \(\$env:VULKAN_SDK\) \{\n(.*?)\n    \}", self.body, re.S)
+        self.assertIsNotNone(branch, "the fallback has no VULKAN_SDK branch for gta6rt")
+        branch = branch.group(1)
+        # d3d12_xs_device.cpp already sits in $files; both variables feed the same cl.exe line.
+        listed = set(re.findall(r'"([^"]+\.cpp)"', branch)) - {"shims\\d3d12_xs_device.cpp"}
+        self.assertEqual(wanted - {"shims\\d3d12_xs_device.cpp"} - listed, set(),
+                         "in CMake's gta6rt_d3d12_com but not in the fallback's VULKAN_SDK branch")
+        self.assertIn("/DLEONIDA_VULKAN_DEVICE", branch)
+        line = [item for item in self.body.splitlines() if "/Fe:gta6rt.exe" in item]
+        self.assertEqual(len(line), 1)
+        self.assertIn("$vulkan", line[0])
+        # The presenter and the DXGI proxies call user32; CMake's MSVC default libraries bring it, an explicit
+        # cl.exe line needs it named.
+        self.assertIn("$vulkanLibs", line[0])
+        # The stub header comes from CMake's own generator call, so the interface lists cannot drift apart.
+        stubs = re.search(r"gen_d3d12_stubs\.py --out \S+(.*?)DEPENDS", cmake, re.S).group(1)
+        self.assertEqual(re.findall(r"\bID3D12\w+", stubs), re.findall(r'"(ID3D12\w+)"', branch))
+
     def test_every_test_source_it_compiles_exists(self):
         sources = re.findall(r'"\$src\\test\\([A-Za-z0-9_]+\.cpp)"', self.body)
         self.assertTrue(sources)

@@ -83,11 +83,35 @@ $build || exit /b 1
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
     $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\xgameruntime_gamesave.cpp", "shims\xgameruntime_store.cpp", "shims\xgameruntime_offline.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }
     $includes = "/I `"$src\src`" /I `"$src\shims`" /I `"$src\shims\xtaskqueue`" /I `"$xtaskqueueDir\Include`" /I `"$xtaskqueueDir\Source\Task`" /I `"$xtaskqueueDir\Source\Common`""
+    # LEONIDA_D3D12=vulkan is the backend the measured boot chain runs on (docs/boot.md). CMake puts it behind
+    # gta6rt_d3d12_com and /DLEONIDA_VULKAN_DEVICE when the Vulkan headers are found; leaving it out here made the
+    # fallback silently keep the host's PC D3D12 device. Same sources, same generator as runtime\CMakeLists.txt.
+    $vulkan = ""
+    $vulkanLibs = ""
+    $vulkanStubs = ""
+    if ($env:VULKAN_SDK) {
+        # The stub header comes from the same generator call as CMake's (runtime\CMakeLists.txt); it runs inside the
+        # batch because the tool finds d3d12.h through INCLUDE, which vcvars sets.
+        $interfaces = "ID3D12GraphicsCommandList8", "ID3D12CommandQueue", "ID3D12CommandAllocator", "ID3D12Fence1",
+                      "ID3D12Device11", "ID3D12DescriptorHeap", "ID3D12Heap", "ID3D12Resource", "ID3D12QueryHeap",
+                      "ID3D12RootSignature", "ID3D12PipelineState", "ID3D12CommandSignature", "ID3D12PipelineLibrary1",
+                      "ID3D12ShaderCacheSession"
+        New-Item -ItemType Directory -Force (Join-Path $out "generated") | Out-Null
+        $vulkanStubs = "echo generating d3d12_stubs.h && python -I `"$(Join-Path $root 'tools\gen_d3d12_stubs.py')`" --out `"$out\generated\d3d12_stubs.h`" $($interfaces -join ' ') || exit /b 1"
+        $vulkanSources = ("shims\d3d12_com.cpp", "shims\d3d12_vulkan_device.cpp", "shims\xbox_present.cpp",
+                          "shims\dxgi_com.cpp", "src\root_signature.cpp") | ForEach-Object { "`"$src\$_`"" }
+        $vulkan = "/DLEONIDA_VULKAN_DEVICE /bigobj /I `"$out\generated`" /I `"$env:VULKAN_SDK\Include`" " +
+                  ($vulkanSources -join ' ') + " "
+        # The window and monitor calls of the presenter and the DXGI proxies: CMake's MSVC default libraries bring
+        # user32 along, an explicit cl.exe line does not.
+        $vulkanLibs = " user32.lib"
+    }
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
     $body = @"
 cd /d "$out" || exit /b 1
+$vulkanStubs
 rem BUILD-1457: a game thread with the default stack size gets this program's reserve, and drivers compile on it. The same number as in CMakeLists.txt.
-cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /Zi $opt /MP$jobs /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE $includes $($files -join ' ') $($xtaskqueueFiles -join ' ') /Fe:gta6rt.exe /link /OPT:NOREF /STACK:8388608 psapi.lib ole32.lib || exit /b 1
+cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /Zi $opt /MP$jobs /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE $includes $vulkan$($files -join ' ') $($xtaskqueueFiles -join ' ') /Fe:gta6rt.exe /link /OPT:NOREF /STACK:8388608 psapi.lib ole32.lib$vulkanLibs || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX "$src\src\tls_host.cpp" /LD /Fe:gta6rt_tls_host.dll || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" "$src\shims\d3d12_xs_rootsig.cpp" "$src\shims\registry.cpp" "$src\shims\d3d12_xs.cpp" "$src\shims\d3d12_xs_device.cpp" "$src\test\root_sig_test.cpp" /Fe:root_sig_test.exe /link d3d12.lib || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" "$src\shims\d3d12_xs_rootsig.cpp" "$src\shims\registry.cpp" "$src\shims\d3d12_xs.cpp" "$src\shims\d3d12_xs_device.cpp" "$src\test\device_proxy_test.cpp" /Fe:device_proxy_test.exe /link d3d12.lib dxgi.lib || exit /b 1
