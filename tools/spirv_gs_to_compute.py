@@ -86,7 +86,12 @@ def layout_of(text):
     f32 = find_type(defs, "OpTypeFloat", ["32"])
     v4 = find_type(defs, "OpTypeVector", [f32, "4"])
 
+    # glslang's gl_PerVertex: Position at member 0, on the struct rather than the variable
+    struct_position = set(re.findall(r"^\s*OpMemberDecorate (%\w+) 0 BuiltIn Position\s*$", text, re.M))
+
     def slot(v):
+        if v in struct_io:
+            return (-1, "position")  # the per-vertex block's member 0
         ds = deco.get(v, [])
         if "BuiltIn Position" in ds:
             return (-1, "position")
@@ -96,6 +101,7 @@ def layout_of(text):
         return (loc, f"location {loc}")
 
     inputs, outputs, builtins = [], [], {}
+    struct_io = set()
     for v, (op, ops) in defs.items():
         if op != "OpVariable" or ops[1:2] not in (["Input"], ["Output"]):
             continue
@@ -106,10 +112,15 @@ def layout_of(text):
         pointee = defs[ops[0]][1][1]
         if ops[1] == "Input":
             t = defs.get(pointee, (None, []))
-            if t[0] != "OpTypeArray" or t[1][0] != v4:
+            if t[0] != "OpTypeArray" or t[1][0] not in (v4, *struct_position):
                 raise Unsupported(f"{v}: input isn't an array of vec4")
+            if t[1][0] != v4:
+                struct_io.add(v)  # glslang's gl_in: the per-vertex block with Position at member 0
             inputs.append(v)
         elif pointee == v4:
+            outputs.append(v)
+        elif pointee in struct_position:
+            struct_io.add(v)  # glslang's gl_PerVertex output block
             outputs.append(v)
         else:
             raise Unsupported(f"{v}: output isn't a vec4")
@@ -117,7 +128,7 @@ def layout_of(text):
     outputs.sort(key=slot)
     return {"main": main, "verts_in": verts_in, "max_verts": max_verts, "topology": topology,
             "inputs": [slot(v)[1] for v in inputs], "outputs": [slot(v)[1] for v in outputs],
-            "input_vars": inputs, "output_vars": outputs, "builtins": builtins}
+            "input_vars": inputs, "output_vars": outputs, "builtins": builtins, "struct_io": struct_io}
 
 
 def rewrite(text: str, *, version: tuple[int, int] = (1, 5),
@@ -129,6 +140,12 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5),
     lay = layout_of(text)
     defs, _ = parse(text)
     main, ins, outs, builtins = lay["main"], lay["input_vars"], lay["output_vars"], lay["builtins"]
+    struct_io = lay.get("struct_io", set())
+
+    def const_zero(operand):
+        """True when the operand names the constant 0 (the per-vertex block's Position member)."""
+        d = defs.get(operand)
+        return bool(d) and d[0] == "OpConstant" and d[1][-1] == "0"
     uint = find_type(defs, "OpTypeInt", ["32", "0"])
     f32 = find_type(defs, "OpTypeFloat", ["32"])
     v4 = find_type(defs, "OpTypeVector", [f32, "4"])
@@ -148,8 +165,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5),
                        if op == "OpVariable" and ops[1:2] == ["PushConstant"]), None)
         ud_ptr = defs.get(ud_var, (None, [None]))[1][0]
         ud = defs.get(ud_ptr, (None, [None, None]))[1][1]
-        pc_uint = find_type(defs, "OpTypePointer", ["PushConstant", uint])
-        if not (ud and defs.get(ud, (None,))[0] == "OpTypeStruct" and len(defs[ud][1]) >= 5 and pc_uint):
+        pc_uint = find_type(defs, "OpTypePointer", ["PushConstant", uint]) or "%gsc_pcu"
+        if not (ud and defs.get(ud, (None,))[0] == "OpTypeStruct" and len(defs[ud][1]) >= 5):
             raise Unsupported("no push-constant block to take the buffer addresses from")
 
     def k(v):
@@ -173,7 +190,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5),
                  "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
                  "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
     types = ([f"{v3u} = OpTypeVector {uint} 3"] if v3u == "%gsc_v3u" else []) + \
-            ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else [])
+            ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else []) + \
+            ([f"{pc_uint} = OpTypePointer PushConstant {uint}"] if pc_uint == "%gsc_pcu" else [])
     const_values = {0, 1, 2, 3, vin, nin, nout, mv, mv + 1}
     if bda:
         # 4 and 16 scale element indices to byte offsets; 5..10 are the input/record/meta VAs' push-constant members.
@@ -378,6 +396,11 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5),
         m = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
         if m and m.group(3) in in_slot:
             idx = m.group(4).split()
+            if m.group(3) in struct_io:
+                # glslang's gl_in: the last index names the block's member, not a component of the vec4
+                if not const_zero(idx[-1]):
+                    raise Unsupported(f"{m.group(3)}: member {idx[-1]} is not the position")
+                idx = idx[:1]
             vtx = idx[0]
             if defs.get(vtx, (None, [None]))[1][:1] != [uint]:
                 vtx = tmp()
@@ -401,6 +424,13 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5),
                 out.append(" ".join([f"{m.group(1)} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:]))
             continue
         if m and m.group(3) in out_vars:
+            if m.group(3) in struct_io:
+                # glslang's gl_PerVertex: the store's chain names member 0 of the block; the private
+                # position is the whole vec4, so the pointer is a copy of it, and the store passes through
+                if not const_zero(m.group(4).split()[-1]):
+                    raise Unsupported(f"{m.group(3)}: member {m.group(4).split()[-1]} is not the position")
+                out.append(f"{m.group(1)} = OpCopyObject %gsc_ptr_pv_v4 {out_vars[m.group(3)]}")
+                continue
             ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
             out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
             continue
