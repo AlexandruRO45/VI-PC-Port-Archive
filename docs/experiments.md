@@ -3773,6 +3773,19 @@ python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --tools-path "$ru
 
 Add `--calibration path/to/profile.json` to retry strict decode failures using a local version-1 Leonida profile. This option requires NumPy and the calibration library. Use it by itself or with `--require-rust`. The separate legacy history mode uses `--allow-provisional --history`. Output produced by the local profile has `"mode": "fitted"` in the manifest.
 
+To delegate an entire batch to Rust, build the standalone Leonida exporter at the pinned revision and pass its path with `--rust-exporter`. The executable parses the index, schedules workers, rebuilds and detiles blocks, and writes the DDS files and manifest. It defaults to strict export. Add `--calibration` for fitted retry with a local profile. The CLI covers supported BC layouts and supplied histories. Use the reference path above for legacy `--allow-provisional --history` and reference-only layouts or histories.
+
+```powershell
+$batchCheckout = "$out/Leonida-rust-batch"
+$batchCommit = '39be7f419af3baa261aca8a480af45935c919ccd'
+git init "$batchCheckout"
+git -C "$batchCheckout" fetch --depth=1 https://github.com/wish131400/Leonida.git $batchCommit
+git -C "$batchCheckout" checkout --detach $batchCommit
+$batchTarget = "$out/bcpack-dds"
+cargo build --release --locked --manifest-path "$batchCheckout/tools/bcpack_dds/Cargo.toml" --target-dir "$batchTarget"
+python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --rust-exporter "$batchTarget/release/bcpack_dds.exe" --threads 8
+```
+
 ### Drawing BC7 textures with a recompiled pixel shader
 
 `linearize_4k_s_tail(tile, width, height, tail_level)` reads a single BC7 level from a shared GFX10 4 KiB mip-tail tile. Supply the decoded tile, the requested pixel dimensions and its zero-based position within the tail. Whole-tile storage and per-slot bounds are checked before reading. [AMD mip-tail address calculation](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp)

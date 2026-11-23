@@ -15,7 +15,9 @@ import importlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import time
 
 FORMAT_NAMES = {
@@ -237,8 +239,30 @@ def batch_export(pool_path: Path, out_dir: Path,
                  manifest_path: Path | None = None,
                  tools_path: Path | None = None,
                  require_rust: bool = False,
-                 calibration_path: Path | None = None) -> dict:
+                 calibration_path: Path | None = None,
+                 rust_exporter: Path | None = None) -> dict:
     """Run batch export over a range of texture pool indices and write manifest.json."""
+    if rust_exporter is not None:
+        if allow_provisional or history_path is not None:
+            raise ValueError("--rust-exporter accepts --calibration for fitted export")
+        if require_rust:
+            raise ValueError("--require-rust checks the Python backend's library. Choose --rust-exporter separately.")
+        with tempfile.TemporaryDirectory(prefix="ttpf-selection-") as tmp:
+            selection = Path(tmp, "selection.json")
+            selection.write_text(json.dumps({"indices": indices, "start": max(0, start),
+                                             "count": None if count is None else max(0, count)}),
+                                 encoding="utf-8")
+            command = [str(rust_exporter.resolve()), str(pool_path), str(out_dir), "--jobs",
+                       str(max(1, min(threads, 256))), "--selection", str(selection)]
+            if manifest_path is not None:
+                command += ["--manifest", str(manifest_path)]
+            if calibration_path is not None:
+                command += ["--calibration", str(calibration_path)]
+            result = subprocess.run(command, capture_output=True, encoding="utf-8")
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or f"Rust exporter exited {result.returncode}")
+            return json.loads(result.stdout)
+
     ttpf = load_tools(tools_path)
     if ttpf is None:
         raise RuntimeError("Could not find ttpf_mips module. Provide --tools-path or set TTPF_TOOLS_DIR.")
@@ -358,6 +382,8 @@ def main():
                         help="Path to directory containing ttpf_mips.py and bcpack.py")
     parser.add_argument("--require-rust", action="store_true",
                         help="Require the optional Rust BCPack library to load before exporting")
+    parser.add_argument("--rust-exporter", type=Path,
+                        help="Delegate the complete batch to the Leonida bcpack_dds executable")
     parser.add_argument("--calibration", type=Path,
                         help="Retry strict failures with a local version-1 Leonida calibration profile")
     args = parser.parse_args()
@@ -381,6 +407,7 @@ def main():
             tools_path=args.tools_path,
             require_rust=args.require_rust,
             calibration_path=args.calibration,
+            rust_exporter=args.rust_exporter,
         )
     except (RuntimeError, OSError, ValueError) as exc:
         parser.error(str(exc))

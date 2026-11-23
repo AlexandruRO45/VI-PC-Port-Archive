@@ -398,6 +398,34 @@ class BatchExportTests(unittest.TestCase):
             finally:
                 batch.load_tools = orig_load
 
+    @unittest.skipUnless(os.environ.get("TTPF_RUST_EXPORTER"), "set TTPF_RUST_EXPORTER to the built CLI")
+    def test_rust_exporter_selection_and_failure_preserve_dds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "synthetic.ttpf"
+            archive = make_synthetic_ttpf_archive()
+            source.write_bytes(archive)
+            out = root / "dds"
+            manifest = root / "custom-manifest.json"
+            exporter = Path(os.environ["TTPF_RUST_EXPORTER"])
+            with patch.object(batch, "load_tools", side_effect=AssertionError("loaded Python decoder")):
+                summary = batch.batch_export(source, out, start=0, count=1, threads=2,
+                                             manifest_path=manifest, rust_exporter=exporter)
+                (row,) = json.loads(manifest.read_bytes())
+                self.assertEqual(summary["stats"]["strict"], 1)
+                self.assertEqual(row["index"], 0)
+                prev = (out / row["file"]).read_bytes()
+                self.assertEqual(row["sha256"], hashlib.sha256(prev).hexdigest())
+                self.assertEqual(decode_bc1_block(prev[148:]), bytes([255, 0, 0, 255] * 16))
+                self.assertFalse((out / "manifest.json").exists())
+                self.assertFalse((out / "tex_00001.dds").exists())
+
+                source.write_bytes(archive[:24])
+                with self.assertRaises(RuntimeError):
+                    batch.batch_export(source, out, indices=[0], rust_exporter=exporter)
+                self.assertEqual((out / row["file"]).read_bytes(), prev)
+                self.assertFalse((out / "manifest.json").exists())
+
     def test_real_exporter_dds_and_pixel_verification(self):
         """Verify real pinned exporter with generated synthetic TTPF input and independent pixel decoding."""
         tools_path = None
