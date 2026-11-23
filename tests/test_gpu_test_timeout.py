@@ -63,12 +63,23 @@ class HungProgram(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("timed out after 0.5 s", msg)
         self.assertIn(os.path.basename(sys.executable), msg)
+        return msg
 
     def test_run_gpu_tests_run_cmd(self):
         self.assert_killed(lambda: run_gpu_tests.run_cmd(HANG))
 
     def test_check_run(self):
-        self.assert_killed(lambda: check.run(*HANG))
+        command = [
+            sys.executable, "-c",
+            "import sys, time; "
+            "print('stdout before timeout', flush=True); "
+            "print('stderr before timeout', file=sys.stderr, flush=True); "
+            "time.sleep(60)",
+        ]
+        message = self.assert_killed(lambda: check.run(*command))
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                self.assertIn(f"{stream} before timeout", message)
 
     def test_texture_cases_use_the_timeout_from_the_shader_directory(self) -> None:
         for name in ("ps_texture_sample", "ps_gather_wrap"):

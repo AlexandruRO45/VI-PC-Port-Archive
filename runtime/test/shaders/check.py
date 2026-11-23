@@ -19,6 +19,7 @@ ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device w
 """
 import collections
 import json
+import locale
 import math
 import os
 import re
@@ -525,8 +526,13 @@ def run(*cmd, env=None):
     limit = gpu_test_timeout()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
-    except subprocess.TimeoutExpired:
-        return 1, timed_out(cmd[0], limit)
+    except subprocess.TimeoutExpired as timeout:
+        # TimeoutExpired keeps captured output as bytes even with text=True.
+        encoding = locale.getpreferredencoding(False)
+        stdout = (timeout.stdout or b"").decode(encoding, errors="replace").rstrip("\r\n")
+        stderr = (timeout.stderr or b"").decode(encoding, errors="replace").rstrip("\r\n")
+        reason = timed_out(cmd[0], limit)
+        return 1, "\n".join(part for part in (reason, stdout, stderr) if part)
     except OSError as e:
         if isinstance(e, FileNotFoundError):
             tools = os.path.abspath(os.path.dirname(cmd[0]))
