@@ -599,5 +599,26 @@ class TestSSendMsgHaltVariants(unittest.TestCase):
         self.assertEqual(str(cm.exception), "s_sendmsghalt")
 
 
+class TestSSendMsgHaltStages(unittest.TestCase):
+    def test_sendmsghalt_refused_in_compute(self):
+        bad_lines = [
+            "s_sendmsghalt 0",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("cs_sendmsghalt_test", bad_lines, fssm=FSSM)
+        self.assertEqual(str(cm.exception), "s_sendmsghalt")
+
+    def test_sendmsghalt_refused_in_vertex(self):
+        bad_lines = [
+            "s_sendmsghalt 0",
+            "exp pos0 v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("vs_sendmsghalt_test", bad_lines)
+        self.assertEqual(str(cm.exception), "s_sendmsghalt")
+
+
 if __name__ == "__main__":
     unittest.main()
