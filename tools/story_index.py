@@ -244,8 +244,8 @@ def _carve_index(path):
     """Read rpf9_carve.py's index.json in `path`.
 
     Returns (by_name, by_offset, summary, has_manifest):
-      - by_name: {lowercase filename: (offset, stored_bytes)} for `<off:012x>.bin` and `<off:012x>.bk2`
-      - by_offset: {offset: stored_bytes} for hex-prefixed names of another width
+      - by_name: {lowercase filename: (offset, stored_bytes, expected_size)} for `<off:012x>.bin` / `.bk2`
+      - by_offset: {offset: (stored_bytes, expected_size)} for hex-prefixed names of another width
       - summary: the manifest's summary dict (or {})
       - has_manifest: True when index.json is a valid carve manifest
     """
@@ -266,11 +266,17 @@ def _carve_index(path):
             return {}, {}, {}, False
         off = _nonneg_int(entry.get("off"))
         stored = _nonneg_int(entry.get("stored"))
+        if "size" in entry:
+            size = _nonneg_int(entry["size"])
+            if size is None:
+                return {}, {}, {}, False
+        else:
+            size = None
         if off is None or stored is None or off in by_offset:
             return {}, {}, {}, False
         ext = ".bk2" if entry.get("type") == "bink2" else ".bin"
-        by_name[f"{off:012x}{ext}"] = (off, stored)
-        by_offset[off] = stored
+        by_name[f"{off:012x}{ext}"] = (off, stored, size)
+        by_offset[off] = (stored, size)
     raw_summary = index.get("summary")
     summary = raw_summary if isinstance(raw_summary, dict) else {}
     return by_name, by_offset, summary, True
@@ -280,8 +286,9 @@ def scan_dir(path, progress=None, output=None):
     """Index carved files, excluding the output report. Use leading hex digits for offsets when possible.
 
     With rpf9_carve.py's index.json in the folder, each file's stored (compressed) size and (when every carved
-    stream matches the manifest) the carve's span, zero padding and unread bytes come from it so compressed_bytes
-    and readable_fraction match archive mode; without a valid carve manifest, the length on disk is used.
+    stream matches the manifest, including its inflated size when recorded) the carve's span, zero padding and
+    unread bytes come from it so compressed_bytes and readable_fraction match archive mode; otherwise the
+    file falls back to its length on disk and the summary uses the partial-folder fallback.
     """
     entries = []
     t0 = time.time()
@@ -309,13 +316,16 @@ def scan_dir(path, progress=None, output=None):
         offset = int(m.group(1), 16) if m else len(entries)
         hit = by_name.get(name.lower())
         if hit is not None:
-            entry_off, stored = hit
+            entry_off, entry_stored, entry_size = hit
+        elif m is not None and offset in by_offset:
+            entry_off = offset
+            entry_stored, entry_size = by_offset[offset]
+        else:
+            entry_off = entry_stored = entry_size = None
+        if entry_stored is not None and (entry_size is None or len(data) == entry_size):
+            stored = entry_stored
             matched += 1
             matched_offsets.add(entry_off)
-        elif m is not None and offset in by_offset:
-            stored = by_offset[offset]
-            matched += 1
-            matched_offsets.add(offset)
         else:
             stored = len(data)
         entries.append((offset, data, stored))

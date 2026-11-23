@@ -665,6 +665,8 @@ class FolderModeCarveManifestTest(unittest.TestCase):
             ("list_manifest", '[{"off": 4096, "stored": 16}]', 1000, 1000),
             ("negative_stored", json.dumps({"summary": {"span": 2000}, "files": [{"off": 0x1000, "stored": -5}]}), 1000, 1000),
             ("bool_stored", json.dumps({"summary": {"span": 2000}, "files": [{"off": 0x1000, "stored": True}]}), 1000, 1000),
+            ("negative_size", json.dumps({"summary": {"span": 2000}, "files": [{"off": 0x1000, "stored": 300, "size": -1}]}), 1000, 1000),
+            ("bool_size", json.dumps({"summary": {"span": 2000}, "files": [{"off": 0x1000, "stored": 300, "size": True}]}), 1000, 1000),
             ("negative_span", json.dumps({"summary": {"span": -1}, "files": [{"off": 0x1000, "stored": 300}]}), 300, 300),
             ("span_smaller_than_stored", json.dumps({"summary": {"span": 10}, "files": [{"off": 0x1000, "stored": 300}]}), 300, 300),
         )
@@ -681,6 +683,66 @@ class FolderModeCarveManifestTest(unittest.TestCase):
                 self.assertEqual(summary["compressed_bytes"], want_stored)
                 self.assertEqual(summary["span"], want_span)
                 self.assertEqual((summary["zero_padding"], summary["unread_bytes"]), (0, 0))
+
+    def test_truncated_or_replaced_payload_falls_back_to_partial_summary(self):
+        rpf = os.path.join(self.root, "partial_story.rpf")
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        body = bytearray()
+        body += zlib.compress(psin())
+        body += bytes(128)
+        body += zlib.compress(page())
+        body += bytes(0xA5 + (i % 17) for i in range(64))
+        body += bink()
+        body += bytes(32)
+        with open(rpf, "wb") as f:
+            f.write(header + body)
+
+        arc_rows, _ = story_index.scan_rpf(rpf)
+        psin_row, page_row, bink_row = arc_rows
+
+        def carve_copy(name):
+            carved = os.path.join(self.root, name)
+            p = subprocess.run([sys.executable, "-I", CARVE_TOOL, rpf, carved],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            return carved
+
+        with self.subTest("emptied_payload"):
+            carved = carve_copy("emptied")
+            with open(os.path.join(carved, f"{page_row['offset']:012x}.bin"), "wb") as f:
+                pass
+            rows, summary = story_index.scan_dir(carved)
+            by_off = {r["offset"]: r for r in rows}
+            self.assertEqual((by_off[page_row["offset"]]["size"], by_off[page_row["offset"]]["stored"]), (0, 0))
+            self.assertEqual(by_off[psin_row["offset"]]["stored"], psin_row["stored"])
+            self.assertEqual(by_off[bink_row["offset"]]["stored"], bink_row["stored"])
+            want_total = psin_row["stored"] + bink_row["stored"]
+            self.assertEqual(
+                (summary["compressed_bytes"], summary["span"],
+                 summary["zero_padding"], summary["unread_bytes"]),
+                (want_total, want_total, 0, 0),
+            )
+
+        with self.subTest("truncated_nonempty_payload"):
+            carved = carve_copy("truncated")
+            psin_path = os.path.join(carved, f"{psin_row['offset']:012x}.bin")
+            with open(psin_path, "rb") as f:
+                original = f.read()
+            with open(psin_path, "wb") as f:
+                f.write(original[:100])
+            rows, summary = story_index.scan_dir(carved)
+            by_off = {r["offset"]: r for r in rows}
+            self.assertEqual((by_off[psin_row["offset"]]["size"], by_off[psin_row["offset"]]["stored"]), (100, 100))
+            self.assertEqual(by_off[page_row["offset"]]["stored"], page_row["stored"])
+            self.assertEqual(by_off[bink_row["offset"]]["stored"], bink_row["stored"])
+            want_total = 100 + page_row["stored"] + bink_row["stored"]
+            self.assertEqual(
+                (summary["compressed_bytes"], summary["span"],
+                 summary["zero_padding"], summary["unread_bytes"]),
+                (want_total, want_total, 0, 0),
+            )
 
 
 if __name__ == "__main__":
