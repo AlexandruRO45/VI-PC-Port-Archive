@@ -492,6 +492,49 @@ class TestSIMDDivergence(unittest.TestCase):
         for lane in range(32, 64):
             self.assertEqual(wave.vgprs[lane][3], sentinel)
 
+class TestRegisterAliasing(unittest.TestCase):
+    def test_alias_dst_equals_src0(self):
+        # v0 = min(v0, v1, v2)
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {THREE_F32:#x}",
+            f"v_mov_b32 v1, {TWO_F32:#x}",
+            f"v_mov_b32 v2, {ONE_F32:#x}",
+            "v_min3_f32 v0, v0, v1, v2",
+            "v_mov_b32 v3, v0",
+        ])
+        self.assertEqual(words[0], ONE_F32)
+
+    def test_alias_dst_equals_src1(self):
+        # v1 = min(v0, v1, v2)
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {THREE_F32:#x}",
+            f"v_mov_b32 v1, {TWO_F32:#x}",
+            f"v_mov_b32 v2, {ONE_F32:#x}",
+            "v_min3_f32 v1, v0, v1, v2",
+            "v_mov_b32 v3, v1",
+        ])
+        self.assertEqual(words[0], ONE_F32)
+
+    def test_alias_dst_equals_src2(self):
+        # v2 = min(v0, v1, v2)
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {THREE_F32:#x}",
+            f"v_mov_b32 v1, {TWO_F32:#x}",
+            f"v_mov_b32 v2, {ONE_F32:#x}",
+            "v_min3_f32 v2, v0, v1, v2",
+            "v_mov_b32 v3, v2",
+        ])
+        self.assertEqual(words[0], ONE_F32)
+
+    def test_alias_quadruple_collision(self):
+        # v0 = min(v0, v0, v0)
+        words = run_ps_min3([
+            f"v_mov_b32 v0, {TWO_F32:#x}",
+            "v_min3_f32 v0, v0, v0, v0",
+            "v_mov_b32 v3, v0",
+        ])
+        self.assertEqual(words[0], TWO_F32)
+
 
 if __name__ == "__main__":
     unittest.main()
