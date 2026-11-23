@@ -32,6 +32,10 @@ python -I tools/xcl_compare.py --xcl C:\src\xcl
 python -I tools/xcl_compare.py --xcl C:\src\xcl --gui      # the checks live in a window
 ```
 
+The runtime it runs is the first `gta6rt.exe` under `runtime/build/` (the `RelWithDebInfo`, `Release` then `Debug`
+build, then the folder root); `--gta6rt <path>` points at a build somewhere else, such as a CMake build directory of
+its own.
+
 The work folder defaults to `%TEMP%\leonida_xcl_compare`. It must not be on `D:`: XCL maps the console drive `D:`
 to the game folder, so a real `D:\` path is not reachable inside XCL and the title fails to load. The report is
 `report.json` in the work folder (`--out` to change it). Everything each title printed is in `xcl_output.txt` and
