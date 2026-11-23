@@ -2048,8 +2048,12 @@ public:
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             create.format_list.viewFormatCount = std::uint32_t(view_formats_.size());
             create.format_list.pViewFormats = view_formats_.data();
-            create.format_list.pNext = info.pNext;
-            info.pNext = &create.format_list;
+            // The R9G9B9E5 emulation already chained format_list (TextureCreateInfo): relinking it would point it
+            // at itself, and a looped pNext chain hangs whatever walks it.
+            if (info.pNext != &create.format_list) {
+                create.format_list.pNext = info.pNext;
+                info.pNext = &create.format_list;
+            }
         }
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.

@@ -1779,7 +1779,8 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_shader_cache_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_shader_cache COMMAND d3d12_shader_cache_test)
     set_tests_properties(d3d12_shader_cache PROPERTIES SKIP_RETURN_CODE 77)
-    set_tests_properties(d3d12_method_variants PROPERTIES SKIP_RETURN_CODE 77)
+    # TIMEOUT: a looped Vulkan pNext chain (the R9G9B9E5 castable case) hung here rather than failing.
+    set_tests_properties(d3d12_method_variants PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # ID3D12Object private data (GetPrivateData, SetPrivateData, SetPrivateDataInterface, SetName) compared with
     # the host runtime's answers on the device and four child objects.
     add_executable(d3d12_private_data_test test/d3d12_private_data_test.cpp)
