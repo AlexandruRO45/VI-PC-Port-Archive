@@ -301,5 +301,23 @@ class TestLshlAddU32ASTInterpreter(unittest.TestCase):
         self.assertEqual(res, 66)
         self.assertEqual(interp.vgprs[4], 66)
 
+# ---------------------------------------------------------------------------
+# Opcode 2: v_lshl_add_u32 - SIMD and Boundary Tests
+# ---------------------------------------------------------------------------
+
+class TestLshlAddU32SIMDBoundaries(unittest.TestCase):
+    def test_simd_wave_shift_sweep(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        s0 = [1] * 32
+        s1 = [lane for lane in range(32)]
+        s2 = [0] * 32
+        res = wave.execute(oracle_lshl_add_u32, s0, s1, s2)
+        for lane in range(32):
+            self.assertEqual(res[lane], (1 << lane) & MASK32)
+
+    def test_boundary_shift_values(self) -> None:
+        self.assertEqual(oracle_lshl_add_u32(1, 31, 0), 0x8000_0000)
+        self.assertEqual(oracle_lshl_add_u32(1, 31, 1), 0x8000_0001)
+
 if __name__ == "__main__":
     unittest.main()
