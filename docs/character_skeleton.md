@@ -340,7 +340,7 @@ are not in it does not bind (see the table).
 
 `tools/skinned_glb.py` writes one skinned glTF 2.0 binary from a decoded ped skeleton
 `model.json` and one or more decoded drawable directories. It reads the drawable's palette
-(`grmModel + 0x20`), maps each palette hash through the drawable's own skeleton/string table
+(`grmModel + 0x28`), maps each palette hash through the drawable's own skeleton/string table
 and then the ped table, and reads the 8-influence streams from the graphics buffer. The
 section offsets are also in `drawable.buffers[vertex_buffer].mesh_blob.sections` as
 `[semantic, offset, format]`; the 23-word mesh-block header encodes

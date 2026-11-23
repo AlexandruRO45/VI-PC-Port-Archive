@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -217,6 +218,39 @@ class InterleavedAccessorTest(unittest.TestCase):
         self.assertEqual(normals, struct.pack("<6f", 0, 1, 0, 0, 0, 1))
         with self.assertRaisesRegex(skinned_glb.SkinError, "outside the BIN chunk"):
             skinned_glb.accessor_bytes(gltf, vertices[:-1], 0)
+
+
+class PaletteOffsetTextTest(unittest.TestCase):
+    """The module docstring and the "Skinned GLB export" section name the grmModel offsets that the
+    measured table in docs/character_skeleton.md gives (they said +0x20 and +0x0C after the table moved
+    to +0x28 and +0x14)."""
+
+    def setUp(self):
+        with open(os.path.join(ROOT, "docs", "character_skeleton.md"), encoding="utf-8") as f:
+            self.page = f.read()
+
+    def section(self, heading):
+        start = self.page.index(heading + "\n")
+        end = self.page.find("\n## ", start + len(heading))
+        return self.page[start:] if end < 0 else self.page[start:end]
+
+    def table_offset(self, meaning):
+        rows = re.findall(r"^\| `\+(0x[0-9A-F]+)` \| (.+?) \|$",
+                          self.section("## Model-side bone mapping"), re.M)
+        found = [offset for offset, text in rows if meaning in text]
+        self.assertEqual(len(found), 1, f"one table row for {meaning!r}: {rows}")
+        return found[0]
+
+    def test_docstring_names_the_table_offsets(self):
+        doc = " ".join(skinned_glb.__doc__.split())
+        pointer = self.table_offset("bone-hash array pointer")
+        count = self.table_offset("local bone count")
+        self.assertIn(f"array at ``grmModel + {pointer}`` with its length at ``grmModel + {count}``", doc)
+
+    def test_export_section_names_the_palette_pointer(self):
+        named = re.findall(r"grmModel \+ (0x[0-9A-F]+)", self.section("## Skinned GLB export"))
+        self.assertTrue(named)
+        self.assertEqual(set(named), {self.table_offset("bone-hash array pointer")})
 
 
 class SkinnedGlbTest(unittest.TestCase):
