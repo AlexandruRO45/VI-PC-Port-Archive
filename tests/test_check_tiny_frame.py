@@ -1,6 +1,12 @@
 """The verdict logic of runtime/test/check_tiny_frame.py on synthetic output: no loader, GPU or game files."""
+import contextlib
 import importlib.util
+import io
+import os
+import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,6 +81,40 @@ class SubsequenceTest(unittest.TestCase):
 
     def test_order_matters(self):
         self.assertEqual(check.ordered_subsequence(["a", "b"], ["b", "a"]), "b")
+
+
+@unittest.skipIf(os.name == "nt", "the stand-in loader and runner are shell scripts")
+class RelativePathsTest(unittest.TestCase):
+    """The run starts in the guest's folder; loader and runner paths given relative to the caller still work."""
+
+    def run_main(self, *args):
+        with tempfile.TemporaryDirectory() as tmp:
+            for folder in ("build", "game", "tools"):
+                os.mkdir(os.path.join(tmp, folder))
+            expected = os.path.join(tmp, "output.txt")
+            with open(expected, "w", encoding="utf-8") as f:
+                f.write(good_output())
+            loader = os.path.join(tmp, "build", "gta6rt.exe")
+            runner = os.path.join(tmp, "tools", "wine")
+            for script, body in ((loader, f"cat '{expected}'"), (runner, 'exec "$@"')):
+                with open(script, "w", encoding="utf-8") as f:
+                    f.write(f"#!/bin/sh\n{body}\n")
+                os.chmod(script, 0o755)
+            open(os.path.join(tmp, "game", "tiny_frame.exe"), "w").close()
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                argv = ["check_tiny_frame.py", "build/gta6rt.exe", "game/tiny_frame.exe", *args]
+                with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()) as out:
+                    return check.main(), out.getvalue()
+            finally:
+                os.chdir(previous)
+
+    def test_a_relative_loader_is_found_from_the_guest_folder(self):
+        self.assertEqual(self.run_main(), (0, "tiny_frame under gta6rt --run on the Vulkan D3D12 device: OK\n"))
+
+    def test_a_relative_runner_is_found_from_the_guest_folder(self):
+        self.assertEqual(self.run_main("--runner", "./tools/wine")[0], 0)
 
 
 if __name__ == "__main__":

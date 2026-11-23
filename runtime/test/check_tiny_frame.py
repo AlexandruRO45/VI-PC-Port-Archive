@@ -124,10 +124,17 @@ def main():
             print("SKIP: no usable Vulkan device (the probe test skipped)")
             return SKIP
 
+    # The run starts in the guest's folder, so a relative loader or runner path would no longer resolve there. A bare
+    # command name such as `wine` is left for PATH.
+    loader = os.path.abspath(options.loader)
+    runner = list(options.runner)
+    if runner and os.path.dirname(runner[0]):
+        runner[0] = os.path.abspath(runner[0])
+
     environment = dict(os.environ, LEONIDA_D3D12="vulkan")
     if options.queue_test_settings:
         environment.update(QUEUE_TEST_SETTINGS)
-    run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
+    run = subprocess.run([*runner, loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
                          cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
                          text=True, encoding="utf-8", errors="replace", timeout=timeout)
     output = run.stdout + run.stderr
