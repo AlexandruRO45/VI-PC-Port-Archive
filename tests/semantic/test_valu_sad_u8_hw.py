@@ -342,5 +342,39 @@ class TestSIMDDivergence(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][3], 0xCAFEBABE)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    def test_alias_dst_equals_src0(self):
+        # v0 = v_sad_u8 v0, v1, v2
+        words = run_ps_sad_u8([
+            "v_mov_b32 v0, 0x04030201",
+            "v_mov_b32 v1, 0x00000000",
+            "v_mov_b32 v2, 0",
+            "v_sad_u8 v0, v0, v1, v2",
+            "v_mov_b32 v3, v0",
+        ])
+        self.assertEqual(words[0], 10)
+
+    def test_alias_dst_equals_src2_accumulator(self):
+        # v2 = v_sad_u8 v0, v1, v2 (accumulator aliased with dst)
+        words = run_ps_sad_u8([
+            "v_mov_b32 v0, 0x04030201",
+            "v_mov_b32 v1, 0x00000000",
+            "v_mov_b32 v2, 50",
+            "v_sad_u8 v2, v0, v1, v2",
+            "v_mov_b32 v3, v2",
+        ])
+        self.assertEqual(words[0], 60)
+
+    def test_alias_all_operands_same(self):
+        # v0 = v_sad_u8 v0, v0, v0 -> all bytes diff = 0, acc = v0 value
+        # So result = v0 + 0 = v0
+        words = run_ps_sad_u8([
+            "v_mov_b32 v0, 42",
+            "v_sad_u8 v0, v0, v0, v0",
+            "v_mov_b32 v3, v0",
+        ])
+        self.assertEqual(words[0], 42)
+
+
 if __name__ == "__main__":
     unittest.main()
