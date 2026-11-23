@@ -176,12 +176,22 @@ def main():
     if missing:
         print(f"WARNING: {len(missing)} carved blobs listed in an index.json could not be read and were skipped "
               f"(first: {missing[0]}). Re-run the carve to get their strings.", file=sys.stderr)
-    output_name = os.path.basename(a.out).casefold()
+    # A directory walk returns long filenames, even if --out used a Windows 8.3 or trailing-dot
+    # spelling. Keep the supplied name too: it may be a symlink to a differently named output.
+    output_names = set()
+    if output_stat is not None:
+        output_names = {os.path.basename(p).casefold() for p in (a.out, os.path.realpath(a.out))}
     for x in a.extra:
         if os.path.isdir(x):
             try:
-                for _, _, files in os.walk(x, onerror=_raise_scan_error):
+                for root, _, files in os.walk(x, onerror=_raise_scan_error):
                     for fn in files:
+                        if output_names and fn.casefold() in output_names:
+                            try:
+                                if os.path.samestat(os.stat(os.path.join(root, fn)), output_stat):
+                                    continue
+                            except FileNotFoundError:
+                                pass  # a dangling link still contributes its filename
                         strings.add(os.path.splitext(fn)[0])
             except OSError as e:
                 print(f"ERROR: cannot scan --extra directory {e.filename or x}: {e.strerror or e}", file=sys.stderr)

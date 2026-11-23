@@ -325,23 +325,54 @@ class CarveAndExtraCLITest(unittest.TestCase):
 
         self.out_json = os.path.join(self.dir, "out_hashes.json")
 
+    def generate_with_extra_dir(self, out):
+        result = self.run_tool(self.carve_dir, "--extra", self.extra_dir, "--out", out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(out, "rb") as fh:
+            return fh.read()
+
     def test_output_inside_extra_directory_is_not_harvested_on_rerun(self):
         out = os.path.join(self.extra_dir, "reports", "dictionary.json")
-        args = (self.carve_dir, "--extra", self.extra_dir, "--out", out)
-
-        def generate():
-            result = self.run_tool(*args)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            with open(out, "rb") as fh:
-                return fh.read()
-
-        first = generate()
+        first = self.generate_with_extra_dir(out)
         self.assertIn("model_prop", json.loads(first).values())
-        self.assertEqual(generate(), first)
+        self.assertEqual(self.generate_with_extra_dir(out), first)
         # A legitimate input of the same name in another folder still contributes its stem.
         with open(os.path.join(self.extra_dir, "dictionary.json"), "wb") as f:
             f.write(b"")
-        self.assertIn("dictionary", json.loads(generate()).values())
+        self.assertIn("dictionary", json.loads(self.generate_with_extra_dir(out)).values())
+
+    def test_output_symlink_with_different_name_skips_its_target(self):
+        target = os.path.join(self.extra_dir, "generated_dictionary.json")
+        first = self.generate_with_extra_dir(target)
+        alias = os.path.join(self.dir, "other.json")
+        try:
+            os.symlink(target, alias)
+        except OSError as exc:
+            self.skipTest(f"cannot create symlink: {exc}")
+        self.assertEqual(self.generate_with_extra_dir(alias), first)
+
+    @unittest.skipUnless(os.name == "nt", "Win32 trailing-dot filename alias")
+    def test_output_trailing_dot_alias_is_not_harvested(self):
+        out = os.path.join(self.extra_dir, "report.json")
+        first = self.generate_with_extra_dir(out)
+        alias = out + "."
+        self.assertTrue(os.path.samefile(alias, out))
+        self.assertEqual(self.generate_with_extra_dir(alias), first)
+
+    @unittest.skipUnless(os.name == "nt", "Win32 short filename alias")
+    def test_output_short_name_alias_is_not_harvested(self):
+        import ctypes
+
+        out = os.path.join(self.extra_dir, "generated_dictionary.json")
+        first = self.generate_with_extra_dir(out)
+        buf = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetShortPathNameW(out, buf, len(buf))
+        self.assertTrue(0 < length < len(buf), "GetShortPathNameW failed")
+        alias = buf.value
+        if os.path.basename(alias).casefold() == os.path.basename(out).casefold():
+            self.skipTest("volume did not assign a short filename")
+        self.assertTrue(os.path.samefile(alias, out))
+        self.assertEqual(self.generate_with_extra_dir(alias), first)
 
     def tearDown(self):
         self.tmp.cleanup()
