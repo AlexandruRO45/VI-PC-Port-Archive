@@ -561,28 +561,22 @@ def detect_ram_gb():
     return max(4, min(128, round(gb)))
 
 
+def _rebar_device_name(name: str) -> str:
+    name = re.sub(r"\s+\(\d+\s+GB\s+VRAM\)$", "", clean_name(name), flags=re.I)
+    return " ".join(name.casefold().split())
+
+
 def detect_rebar(target_gpu: str | None = None) -> tuple[bool | None, int | None]:
     """Detect whether Resizable BAR is active and the aperture size in MiB.
     Returns (rebar_active, bar1_mb)."""
+    target_name = _rebar_device_name(target_gpu) if target_gpu else ""
     try:
         tools_dir = os.path.dirname(os.path.abspath(__file__))
         if tools_dir not in sys.path:
             sys.path.insert(0, tools_dir)
         import vk_subgroup_info as vk_info
         info = vk_info.query(memory=True)
-        device = info.get("device", "")
-        if target_gpu and device:
-            tg = target_gpu.lower()
-            dev = device.lower()
-            is_tg_nv = "nvidia" in tg or "geforce" in tg or "rtx" in tg or "gtx" in tg
-            is_dev_nv = "nvidia" in dev or "geforce" in dev or "rtx" in dev or "gtx" in dev
-            is_tg_amd = "amd" in tg or "radeon" in tg
-            is_dev_amd = "amd" in dev or "radeon" in dev
-            is_tg_intel = "intel" in tg or "arc" in tg
-            is_dev_intel = "intel" in dev or "arc" in dev
-            if (is_tg_nv and not is_dev_nv) or (is_tg_amd and not is_dev_amd) or (is_tg_intel and not is_dev_intel):
-                info = None
-        if info:
+        if "rebar_active" in info and (not target_name or target_name == _rebar_device_name(info.get("device", ""))):
             return info.get("rebar_active"), info.get("rebar_heap_mb")
     except Exception:
         pass
@@ -594,17 +588,14 @@ def detect_rebar(target_gpu: str | None = None) -> tuple[bool | None, int | None
         if out:
             # The first part is the NVSMI LOG preamble, not a GPU.
             sections = re.split(r"(?m)^(?=GPU [0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+\.[0-7][ \t\r]*$)", out)[1:]
-            tg_clean = clean_name(target_gpu).lower() if target_gpu else ""
-
-            if tg_clean:
-                if ("amd" in tg_clean or "radeon" in tg_clean or "intel" in tg_clean) and "nvidia" not in tg_clean:
+            if target_name:
+                if ("amd" in target_name or "radeon" in target_name or "intel" in target_name) and "nvidia" not in target_name:
                     return None, None
                 matching = []
                 for sec in sections:
                     prod_m = re.search(r"Product Name[ \t]*:[ \t]*(.+)", sec)
                     if prod_m:
-                        prod = clean_name(prod_m.group(1)).lower()
-                        if prod and (prod in tg_clean or tg_clean in prod):
+                        if target_name == _rebar_device_name(prod_m.group(1)):
                             matching.append(sec)
                     elif len(sections) == 1:
                         matching.append(sec)

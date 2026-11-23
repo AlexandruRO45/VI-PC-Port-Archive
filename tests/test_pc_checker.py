@@ -206,6 +206,19 @@ class Api(unittest.TestCase):
             self.assertIsNone(active)
             self.assertIsNone(size)
 
+    def test_detect_rebar_vulkan_same_vendor_device_mismatch(self):
+        from unittest import mock
+        mock_vk = mock.MagicMock()
+        mock_vk.query.return_value = {
+            "device": "NVIDIA GeForce RTX 4060",
+            "rebar_active": False,
+            "rebar_heap_mb": 256,
+        }
+        with mock.patch.dict(sys.modules, {"vk_subgroup_info": mock_vk}), \
+             mock.patch("shutil.which", return_value=None):
+            self.assertEqual(pc.detect_rebar("NVIDIA GeForce RTX 5060 (8 GB VRAM)"), (None, None))
+            self.assertEqual(pc.detect_rebar("NVIDIA GeForce RTX 4060 (8 GB VRAM)"), (False, 256))
+
     def test_detect_rebar_from_nvidia_smi(self):
         from unittest import mock
         smi_out_on = (
