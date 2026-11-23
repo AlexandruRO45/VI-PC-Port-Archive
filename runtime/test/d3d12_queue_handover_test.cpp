@@ -9,7 +9,8 @@
 // assignment of queue types to a, b and c (27, repeats on separate queues) and every one of the 6 orders the three
 // submissions can reach the queues in. Then: a consumer waiting for a texture from one queue and a buffer from another
 // (two waits), a chain released by a CPU Signal (the producer waits for a fence the CPU sets after everything is
-// submitted), a CPU Signal before the Wait, and two layer-only cases that must not hang: a fence nobody signals (the
+// submitted), a CPU Signal before the Wait, a COPY signal that rewinds a fence before a DIRECT Wait, and two
+// layer-only cases that must not hang: a fence nobody signals (the
 // other queues keep working, the held batch never runs, the queue is destroyed and the layer reports it), and a fence
 // released while a batch waits for it.
 //
@@ -383,6 +384,51 @@ bool cpu_gate(Rig& rig, Type producer, Type consumer, bool signal_first, int see
     return c.wait_fence(2, 1) && c.verify();
 }
 
+// A host signal of the same fence must preserve the completed COPY work's memory dependency.
+bool cpu_rewinds_completed_queue(Rig& rig, int seed) {
+    arm("COPY Signal(1) makes data available; CPU Signal(0); DIRECT Wait(0)");
+    Case c(rig, seed);
+    if (!c.make_resources()) return false;
+    if (!c.submit({copy_q, 0, nullptr, &c.stage[0], 3, {}, 0}) || !c.wait_fence(0, 1)) return false;
+    if (FAILED(c.fence(0)->Signal(0)) || c.fence(0)->GetCompletedValue() != 0)
+        return c.fail("CPU did not rewind the completed COPY fence", __LINE__);
+    if (!c.submit({direct_q, 0, &c.stage[0], nullptr, 3, {{0, 0}}, 2})) return false;
+    ++cases_run;
+    return c.wait_fence(2, 1) && c.verify();
+}
+
+// A new wait must use the rewound value. The producer writes the data only before the signal that releases it.
+bool queue_rewind(Rig& rig, int seed) {
+    arm("COPY Signal(4) rewinds 10; DIRECT Wait(8) needs COPY Signal(12)");
+    Case c(rig, seed);
+    if (!c.make_resources()) return false;
+    ID3D12CommandQueue* copy = rig.queues[copy_q][0].Get();
+    ID3D12Fence* progress = c.fence(0);
+    ID3D12Fence* copy_done = c.fence(1);
+    ID3D12Fence* direct_done = c.fence(2);
+    if (!progress || !copy_done || !direct_done || FAILED(progress->Signal(10)) ||
+        FAILED(copy->Signal(progress, 4)) || FAILED(copy->Signal(copy_done, 1)) || !c.wait_fence(1, 1))
+        return c.fail("could not rewind the fence on COPY", __LINE__);
+    const UINT64 rewound = progress->GetCompletedValue();
+    const bool consumer_submitted = c.submit({direct_q, 0, &c.stage[0], nullptr, 3, {{0, 8}}, 2});
+    Sleep(50);
+    const bool consumer_early = direct_done->GetCompletedValue() != 0;
+    if (!c.submit({copy_q, 0, nullptr, &c.stage[0], 3, {}, -1}) || FAILED(copy->Signal(progress, 12)) ||
+        FAILED(copy->Signal(copy_done, 2)) || !consumer_submitted) {
+        c.fail("could not submit or release the held copy", __LINE__);
+        std::fflush(stderr);
+        std::_Exit(1);  // a queue can still be holding the case's resources
+    }
+    if (!c.wait_fence(1, 2) || !c.wait_fence(2, 1)) return false;
+    const bool exact = c.verify();
+    if (rewound != 4 || consumer_early)
+        return c.fail("DIRECT did not wait for a new COPY signal after the rewind", __LINE__);
+    if (!exact) return false;
+    std::puts("COPY rewound 10 -> 4; DIRECT waited for 12 and read the exact texture and buffer");
+    ++cases_run;
+    return true;
+}
+
 // Runs `body` with stderr redirected to a file and returns what it wrote.
 std::string capture_stderr(const std::function<void()>& body) {
     char dir[MAX_PATH], path[MAX_PATH];
@@ -511,6 +557,8 @@ bool run_all(ID3D12Device* device, bool layer) {
     for (int p = 0; p < 3; ++p)
         for (int q = 0; q < 3; ++q)
             for (bool first : {true, false}) ok &= cpu_gate(rig, Type(p), Type(q), first, ++seed);
+    ok &= cpu_rewinds_completed_queue(rig, ++seed);
+    ok &= queue_rewind(rig, ++seed);
     if (layer) {
         // The layer hands out a limited number of VkQueues: give the spare ones back for the two cases below.
         for (auto& type_queues : rig.queues)

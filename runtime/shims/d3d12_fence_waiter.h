@@ -14,11 +14,12 @@ namespace rt::d3d12 {
 // from 1 to 0 sets the event, and later hits (ANY) leave it at 0 instead of wrapping.
 struct FenceWaiter {
     FenceWaiter(HANDLE e, UINT n) : event(e), remaining(n) {}
-    void hit() {
+    bool hit() {
         UINT left = remaining.load();
         while (left && !remaining.compare_exchange_weak(left, left - 1)) {
         }
         if (left == 1) SetEvent(event);
+        return left == 1;
     }
     bool done() const { return remaining.load() == 0; }
     HANDLE event;

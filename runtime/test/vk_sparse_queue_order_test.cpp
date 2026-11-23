@@ -1,5 +1,5 @@
 // A held sparse mapping that submits no work must pass its GPU wait to the next submission.
-// The fake Vulkan entry points keep the producer's counter at zero after its Signal is submitted.
+// Raw waits test the submitted-signal path. Logical waits test GPU completion and queue destruction.
 #include "../src/vulkan_backend.h"
 
 #include <array>
@@ -23,6 +23,9 @@ struct Trace {
     unsigned wait_count = 0;
     VkSemaphore wait_semaphore = VK_NULL_HANDLE;
     std::uint64_t wait_value = 0;
+    VkSemaphore producer = VK_NULL_HANDLE;
+    std::uint64_t producer_completed = 0;
+    unsigned host_waits = 0;
 };
 
 Trace trace;
@@ -41,8 +44,14 @@ VulkanDeviceFunctions fake_driver() {
         return VK_SUCCESS;
     };
     vk.vkDestroySemaphore = +[](VkDevice, VkSemaphore, const VkAllocationCallbacks*) {};
-    vk.vkGetSemaphoreCounterValue = +[](VkDevice, VkSemaphore, std::uint64_t* value) {
-        *value = 0;
+    vk.vkGetSemaphoreCounterValue = +[](VkDevice, VkSemaphore semaphore, std::uint64_t* value) {
+        *value = semaphore == trace.producer ? trace.producer_completed : 0;
+        return VK_SUCCESS;
+    };
+    vk.vkWaitSemaphores = +[](VkDevice, const VkSemaphoreWaitInfo* info, std::uint64_t) {
+        if (info->semaphoreCount != 1 || info->pSemaphores[0] != trace.producer) return VK_ERROR_UNKNOWN;
+        trace.producer_completed = info->pValues[0];
+        ++trace.host_waits;
         return VK_SUCCESS;
     };
     vk.vkDestroyBuffer = +[](VkDevice, VkBuffer, const VkAllocationCallbacks*) {};
@@ -81,6 +90,8 @@ struct Case {
     bool reject_bind;
     bool queued_signal;
     bool higher_following_wait;
+    bool logical_gate = false;
+    bool release_queue = false;
 };
 
 bool run(const Case& test) {
@@ -90,10 +101,11 @@ bool run(const Case& test) {
     };
     trace = {};
     constexpr std::uint64_t first_wait = 3;
+    constexpr std::uint64_t producer_ticket = 11;
     VulkanContext context(device_proc, handle<VkDevice>(1), true);
     VulkanFence gate(context, 0), done(context, 0);
-    VulkanQueue queue(context, handle<VkQueue>(1), 0);
-    if (!expect(queue.ok() && gate.semaphore() && done.semaphore(), "fake queue and fences initialized"))
+    auto queue = std::make_unique<VulkanQueue>(context, handle<VkQueue>(1), 0);
+    if (!expect(queue->ok() && gate.semaphore() && done.semaphore(), "fake queue and fences initialized"))
         return false;
 
     constexpr ResourceId resource = 1;
@@ -113,29 +125,51 @@ bool run(const Case& test) {
     const std::array regions{BufferTileRegion{0, 1}};
     const std::array ranges{BufferTileRange{test.reject_bind ? TileRangeMode::sequential : TileRangeMode::skip, 0, 1}};
 
-    queue.wait(gate.semaphore(), first_wait);
-    if (!expect(queue.update_tiles(resource, regions, ranges, [&] { return heap; }),
+    auto logical = std::make_shared<LogicalFence>(context, 0);
+    if (test.logical_gate) {
+        auto progress = std::make_shared<QueueProgress>(context.device(), handle<VkQueue>(2),
+                                                        context.vk.vkDestroySemaphore);
+        trace.producer = progress->semaphore = handle<VkSemaphore>(99);
+        if (!expect(logical->submit_signal({progress, producer_ticket}, first_wait, [] { return VK_SUCCESS; }) ==
+                        VK_SUCCESS, "accepted producer signal"))
+            return false;
+        queue->wait_fence(logical, first_wait);
+    } else {
+        queue->wait(gate.semaphore(), first_wait);
+    }
+    if (!expect(queue->update_tiles(resource, regions, ranges, [&] { return heap; }),
                 "accepted the mapping while the producer was unsignaled"))
         return false;
-    queue.marker(DebugMarker::Kind::set, "marker after mapping");
+    queue->marker(DebugMarker::Kind::set, "marker after mapping");
     const auto expected_wait = first_wait + test.higher_following_wait;
-    if (test.higher_following_wait) queue.wait(gate.semaphore(), expected_wait);
+    if (test.higher_following_wait) queue->wait(gate.semaphore(), expected_wait);
     if (test.queued_signal &&
-        !expect(queue.signal(done.semaphore(), 1), "accepted the following signal while the gate was unsignaled"))
+        !expect(queue->signal(done.semaphore(), 1), "accepted the following signal while the gate was unsignaled"))
         return false;
     if (!expect(trace.submits == 0 && trace.binds == 0, "nothing submitted before the producer signal"))
         return false;
 
-    context.holds().signaled(gate.semaphore(), expected_wait);
-    context.holds().pump_ready();
-    if (!test.queued_signal && !expect(queue.signal(done.semaphore(), 1), "accepted the later signal"))
+    if (test.release_queue) {
+        queue.reset();
+    } else if (test.logical_gate) {
+        trace.producer_completed = producer_ticket;
+        if (!expect(logical->completed() == first_wait, "producer completion updates the logical fence"))
+            return false;
+    } else {
+        context.holds().signaled(gate.semaphore(), expected_wait);
+        context.holds().pump_ready();
+    }
+    if (!test.queued_signal && !expect(queue->signal(done.semaphore(), 1), "accepted the later signal"))
         return false;
-    return expect(gate.completed() < first_wait, "producer has not completed on the GPU") &&
+    const VkSemaphore expected_semaphore = test.logical_gate ? trace.producer : gate.semaphore();
+    const auto expected_ticket = test.logical_gate ? producer_ticket : expected_wait;
+    return expect(trace.host_waits == (test.release_queue ? 1u : 0u),
+                  "queue destruction waits for an already submitted logical signal") &&
            expect(trace.binds == (test.reject_bind ? 1u : 0u) && buffer->mapped.empty(),
                   "the mapping was skipped or its bind failed without changing the map") &&
-           expect(trace.submits == 1 && trace.wait_count == 1 && trace.wait_semaphore == gate.semaphore() &&
-                      trace.wait_value == expected_wait,
-                  "the following submission still waits for the incomplete producer exactly once");
+           expect(trace.submits == 1 && trace.wait_count == 1 && trace.wait_semaphore == expected_semaphore &&
+                      trace.wait_value == expected_ticket,
+                  "the following submission still carries the producer ticket exactly once");
 }
 
 } // namespace
@@ -146,6 +180,8 @@ int main() {
         {"no-op mapping and later signal", false, false, false},
         {"rejected sparse bind and queued signal", true, true, false},
         {"no-op mapping followed by a higher wait on the same fence", false, true, true},
+        {"no-op mapping with a logical fence", false, true, false, true},
+        {"rejected logical mapping when the consumer queue is released", true, true, false, true, true},
     };
     bool ok = true;
     for (const auto& test : cases) ok = run(test) && ok;

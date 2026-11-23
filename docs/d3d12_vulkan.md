@@ -809,24 +809,14 @@ the game's present entry point (DXGI factory/swapchain or `PresentX`; the presen
 calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do
 not wait on view creation), typeless volume RTVs, depth-stencil resolves to a destination offset other than
 the source rectangle's;
-default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
-increase; such a signal is reported and dropped); a CPU `Signal` above a queue `Signal` the GPU has not reached
-yet is held until it has (`vkSignalSemaphore` must stay below every pending signal,
-`VUID-VkSemaphoreSignalInfo-value-03259`), so `GetCompletedValue` shows it only then, and a fence released
-while it holds one drops it; instance step rates above 1 (they need vertex attribute
+default-heap buffers are not zero-filled yet; instance step rates above 1 (they need vertex attribute
 divisors); read-only DSVs (the depth image always moves to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, which matters once
 depth SRVs are sampled next to a read-only DSV, M2); the index buffer is bound without its view's size
 (`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one).
 
 Known gaps found in review, not fixed here:
-- **Queues:** every D3D12 queue submits to one `VkQueue`, which runs batches in order. So a queue that waits on a
-  fence another queue signals later (`B->Wait(f, n)` recorded before `A->Signal(f, n)`) holds back that signal,
-  and the GPU never progresses (woreksami's probe). Queues on separate Vulkan queues (#306 for copy and compute)
-  or holding back a batch until its wait value is submitted would fix it.
 - **Lookups:** `buffer_at` searches every resource for each vertex and index view; an ordered map by VA would do
   when it shows.
-- **Fences:** a CPU `ID3D12Fence::Signal` checks only the semaphore's current value, so it can signal below a GPU
-  signal that is still pending (`VUID-VkSemaphoreSignalInfo-value-03258`).
 
 Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <build> --output-on-failure` for the
 CPU tests:
@@ -1658,7 +1648,7 @@ The trace will enumerate them.
 | `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. Increments are layer-chosen (32/32) pending the console value. |
 | `ID3D12Resource` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed, placed and reserved. Reserved buffers use sparse memory where supported (section 4.2). Xbox textures may arrive through device slot 76. `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
 | `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get their own `VkDeviceMemory`. Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
-| `ID3D12Fence` / `ID3D12Fence1` | `Fence` over a timeline `VkSemaphore` | `GetCompletedValue` = counter value; `SetEventOnCompletion` = wait thread + Win32 event; CPU `Signal` = host signal. |
+| `ID3D12Fence` / `ID3D12Fence1` | Application fence value and Vulkan queue progress tickets | CPU signals set the value immediately. GPU signals set it when their queue reaches their progress ticket. See §4.4. |
 | Resource barriers (legacy) | `vkCmdPipelineBarrier` | Per-subresource state tracking; `BEGIN_ONLY`/`END_ONLY` become conservative full barriers at the begin point. |
 | Enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`) | `vkCmdPipelineBarrier2` | Direct mapping of sync/access/layout; prefer it when the game uses it. |
 | `IDXGISwapChain` / `IDXGIFactory` | Factory/adapter/output: fake objects. `Swapchain` over `VkSwapchainKHR` + Win32 surface: only for the PC-style path | Shim DXGI; do not bind host DXGI. A GDKX title likely creates no swapchain (§4.5); it needs `IDXGIDevice1`→`GetAdapter`→`EnumOutputs` and a `PresentX` + frame-event presenter instead. |
@@ -2156,46 +2146,30 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 
 ### 4.4 Fences, queues and frames in flight
 
-- One timeline semaphore per `ID3D12Fence`. Queue `Signal` = `vkQueueSubmit` signal; queue `Wait` = submit wait.
+- **Fence values.** The logical D3D12 fence value can go down. CPU `Signal` sets it immediately. Queue
+  `Signal` records a value against a ticket on that queue's Vulkan progress semaphore, whose tickets always
+  increase. `GetCompletedValue` also collects completed GPU signals before returning the current logical value.
+  A CPU signal on the same fence carries forward the memory dependency from its last completed GPU signal.
+  A wait that has reached its target stays satisfied. Each later wait compares its target with the current
+  value. The D3D12 rules are described in [multi-engine synchronization][fence-sync].
 - **Wait before Signal across queues, with resources handed over** (`src/queue_holds.h`, `VulkanQueue`; test
   `d3d12_queue_handover_test`). Vulkan accepts a timeline wait whose signal comes later, but the layer replays every
   `ExecuteCommandLists` against one `LayoutTracker` in the order the calls arrive, so a queue that waits for work
   submitted afterwards would be recorded against the layouts from before that work (a copy list that reads a texture
   a compute list has not yet written was replayed against `UNDEFINED`: zero-filled, and a validation error). The layer
-  therefore tracks, per fence, the highest value a Signal has been *submitted* for (or the CPU has set; the creation
-  value counts), which is not the completed value. A queue that is asked to run a batch (or a `Signal`) while a
-  `Wait` it carries names a value above that, or while an earlier batch of the queue is held, copies the lists
-  (`CommandList` is a value; the application may `Reset` its list at once) and holds the operation. Everything the
+  therefore holds a batch (or a `Signal`) while a `Wait` it carries is unsatisfied or an earlier operation is
+  held. It copies the lists so the application can reset them immediately. Everything the
   queue is asked to do after it (batches, Signals, reserved-buffer tile mappings and queue markers) goes behind
   it, so per-queue order is kept. A mapping can also be the first operation held by a Wait. It owns its input
   ranges and retains the involved sparse buffers and the heap backing until release. If a mapping submits no
-  bind, its waits carry over to the next submission. `vk_sparse_queue_order_test` checks this with a producer
-  signal that has been submitted but has not reached the requested value.
-  The held operations are recorded and submitted, in order, on their own `VkQueue` as soon as the Signals they wait for
-  have been submitted: by the thread that submits that Signal, after it has released its own queue's lock (or by the
-  thread of a CPU `Signal`). There is no worker thread and no caller ever waits for the GPU or for a Signal: the cost
-  moves to that thread and is what the held `ExecuteCommandLists` would have cost anyway. One thread releases at a time
-  (the others leave a note and the running one makes another pass), a release that submits a Signal lets the next
-  queue's front run in the same pass, so chains (C waits B, B waits A, in any submission order) and operations with
-  several waits resolve in dependency order, and the layout tracker follows that order. A wait whose value has been
-  reached by a submitted Signal never blocks again. The normal case (the Signal submitted first) is unchanged: no copy,
-  no hold, the same `vkQueueSubmit`. Holding on the CPU also avoids a Wait and its Signal landing in the wrong order on
-  one `VkQueue`, which would not make forward progress on the GPU (Vulkan-Docs issue 1262). Edge cases: a queue
-  destroyed with held operations reports them once (stderr: `queue destroyed with N held operation(s) never
-  submitted: waits for a fence value (V) that no Signal reached`) and goes on without waiting; a fence nobody signals
-  holds back only the queues that wait for it (and those that wait for what they would have signaled), never the
-  others; a fence released while operations wait for it drops them and says so; a Signal value that is not above
-  the fence's (Vulkan timelines only increase) is still dropped with a note, as before. Failures of a held
-  `ExecuteCommandLists` (what the call would have returned) are printed when it is released, not returned from the
-  call. The application must keep resources named in a held command list alive until its fence signals. The
-  deferred-destruction tickets track submitted work (D3D-203). Facts from vkd3d-proton (LGPL, approach only,
-  nothing copied): it keeps
-  a CPU-side virtual value and pending signals per fence and blocks the queue's submission thread until a signal that
-  satisfies a wait has been submitted, so Vulkan never sees a wait without a submitted signal; a satisfied wait stays
-  satisfied. It also maps virtual fence values to physical timeline values so a D3D12 `Signal` of a lower value works;
-  the layer does not yet (the value is dropped with a note). Resources are `VK_SHARING_MODE_EXCLUSIVE` and every
-  D3D12 queue is in the graphics family, so no ownership transfer is needed; with dedicated compute/transfer families
-  they would need `CONCURRENT` (vkd3d-proton does that, because D3D12 gives no information for transfers).
+  bind, its waits carry over to the next submission. `vk_sparse_queue_order_test` checks this behavior.
+  A CPU signal or the device's fence dispatcher releases ready operations in queue order. GPU signals satisfy
+  waits when the producer's ticket completes. The dependent submission carries that ticket as a Vulkan wait
+  to order memory accesses. Holding the operation until then also avoids submitting a wait before its signal
+  on a shared `VkQueue`, where it can block progress (Vulkan-Docs issue 1262).
+  If a held `ExecuteCommandLists` fails, the layer reports it when the operation is released. The application
+  must keep resources named in a held command list alive until its fence signals. The deferred-destruction
+  tickets track submitted work (D3D-203).
   Measured: `d3d12_queue_handover_test` runs 358 cases on the layer (371 on the RTX 5070 Laptop, which gives three
   queues per type) and 369 on the host runtime: three-stage chains (produce, relay, consume) over all 27 queue type
   assignments and all 6 submission orders (consumer first among them), two producers (texture from one queue, buffer
@@ -2203,18 +2177,17 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   a never-signaled fence and a fence released while a batch waits; results compared byte for byte, sync validation
   clean. With holding disabled the same test fails 236 cases on the layer and validation reports
   `VUID-vkCmdDraw-None-09600`.
-- `SetEventOnCompletion(value, hEvent)`: a small wait thread calls `vkWaitSemaphores` and `SetEvent`. Reuse one
-  thread with a condition variable; do not create a thread per fence.
-- `GetCompletedValue` is `vkGetSemaphoreCounterValue`; CPU `Signal` is `vkSignalSemaphore`.
-- `SetEventOnMultipleFenceCompletion` (implemented). With a null event it is one blocking `vkWaitSemaphores` over
-  every fence's semaphore, with `VK_SEMAPHORE_WAIT_ANY_BIT` for `D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY` and no flag for
-  `ALL`. With an event, the device's fence wait thread counts down one shared waiter (1 for `ANY`, the fence
-  count for `ALL`, kept as the API's unsigned `UINT`) and the hit that reaches zero sets the event, so no thread is
-  added; later hits stay at zero (`d3d12_fence_waiter_test` checks counts past `INT_MAX`). Values already reached are
+- `SetEventOnCompletion` and `SetEventOnMultipleFenceCompletion` track the logical fence value. A null event
+  blocks the caller. The device's fence dispatcher handles GPU signals for all fences. A multiple-fence wait
+  counts down a shared waiter (1 for `ANY`, the fence count for `ALL`), and the hit that reaches zero completes it.
+  Later hits stay at zero (`d3d12_fence_waiter_test` checks counts past `INT_MAX`). Values already reached are
   counted before the call returns. Zero fences, other flags, a null array or a fence from elsewhere are
   `E_INVALIDARG`, as on the PC runtime. A fence released while an event waits on it counts as reached for that
   wait, as on the PC runtime (RTX 5070 and WARP): `SetEventOnCompletion` and `ANY` set the event, `ALL` counts it
   as one fence (`d3d12_fence_events_test`).
+
+[fence-sync]: https://learn.microsoft.com/en-us/windows/win32/direct3d12/user-mode-heap-synchronization#fences
+
 - The swapchain owns acquire/present semaphores and N frames in flight. A present waits for the frame's
   render-finished semaphore; the next acquire waits for the image's present-complete semaphore.
 - Queue types: a direct queue maps to a graphics+compute queue, a compute queue to a compute-only family if one

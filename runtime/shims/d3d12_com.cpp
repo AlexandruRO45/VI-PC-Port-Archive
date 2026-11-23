@@ -9,9 +9,7 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <bit>
-#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -20,7 +18,6 @@
 #include <mutex>
 #include <set>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1097,96 +1094,56 @@ public:
     static constexpr GUID kTag{0xb4c39e02, 0x6f71, 0x4d8a, {0xb2, 0x5e, 0x3e, 0x9d, 0x0f, 0x6c, 0x1a, 0x88}};
 
     Fence(leonida::VulkanContext& context, UINT64 initial, D3D12_FENCE_FLAGS flags)
-        : context_(context), fence_(context, initial), flags_(flags), highest_(initial) {}
+        : context_(context), fence_(std::make_shared<leonida::LogicalFence>(context, initial)), flags_(flags) {}
 
-    // As in D3D12, releasing the fence completes the waits still pending on it (ALL counts it as one fence).
-    ~Fence() override { context_.cancel_fence_waits(fence_.semaphore()); }
+    // Releasing the fence completes pending CPU events, as on D3D12, but cancels unsatisfied queue work.
+    ~Fence() override { fence_->close(); }
 
-    bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
-    VkSemaphore semaphore() const { return fence_.semaphore(); }
+    bool belongs_to(const leonida::VulkanContext& context) const { return &context_ == &context; }
+    const std::shared_ptr<leonida::LogicalFence>& logical() const { return fence_; }
 
-    // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
-    // A queue's claim also records the value as one the GPU will signal, which a later CPU signal must not overtake.
-    bool claim(UINT64 value, bool queue = false) {
-        std::lock_guard lock(claim_mutex_);
-        return claim_locked(value, queue);
-    }
-
-    UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
-        return context_.is_device_lost() ? UINT64_MAX : fence_.completed();
-    }
+    UINT64 STDMETHODCALLTYPE GetCompletedValue() override { return fence_->completed(); }
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 
-    // vkSignalSemaphore must stay below every signal still pending on the GPU
-    // (VUID-VkSemaphoreSignalInfo-value-03259). A CPU signal above a queue signal the GPU has not reached yet, or
-    // made while an earlier one is held, is held: the fence dispatcher applies it once the GPU passes that queue
-    // value, in the order the signals were made. Until then GetCompletedValue reads the GPU's progress, where D3D12
-    // would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
-        std::lock_guard lock(claim_mutex_);
-        if (!claim_locked(value, false)) return S_OK;
-        const UINT64 queued = queued_;
-        if (held_->load() == 0 && fence_.completed() >= queued) return fence_.signal(value) ? S_OK : E_FAIL;
-        held_->fetch_add(1);
-        // The callback must not touch the fence, which may be released first. Released (cancel) or device lost,
-        // the queue value may not be reached, and signalling then would break the same rule: the signal is dropped.
-        leonida::VulkanContext* context = &context_;
-        const VkSemaphore semaphore = fence_.semaphore();
-        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
-            std::uint64_t now = 0;
-            context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now);
-            if (now >= queued && now < value) {
-                VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
-                info.semaphore = semaphore;
-                info.value = value;
-                context->vk.vkSignalSemaphore(context->device(), &info);
-            }
-            held->fetch_sub(1);
-        });
-        return S_OK;
+        return fence_->signal(value) ? S_OK : E_FAIL;
     }
 
-    // A null event blocks until the value is reached, as D3D12 does.
+    // A null event blocks on the same latch an asynchronous event uses. No worker waits on the caller's behalf.
     HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
-        if (context_.is_device_lost() || fence_.completed() >= value) {
-            if (event) SetEvent(event);
+        if (event) {
+            notify(value, std::make_shared<FenceWaiter>(event, 1u));
             return S_OK;
         }
-        if (!event) return fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
-        context_.enqueue_fence_wait(fence_.semaphore(), value, event);
-        return S_OK;
+        const HANDLE completion = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!completion) return HRESULT_FROM_WIN32(GetLastError());
+        notify(value, std::make_shared<FenceWaiter>(completion, 1u));
+        const DWORD waited = WaitForSingleObject(completion, INFINITE);
+        CloseHandle(completion);
+        return waited == WAIT_OBJECT_0 ? S_OK : E_FAIL;
     }
 
-    // Counts `waiter` down once this fence reaches `value`: now if it has, else via the centralized dispatcher.
-    void notify(UINT64 value, std::shared_ptr<FenceWaiter> waiter) {
-        if (context_.is_device_lost() || fence_.completed() >= value) {
-            waiter->hit();
+    using AnyFences = std::vector<std::weak_ptr<leonida::LogicalFence>>;
+    void notify(UINT64 value, const std::shared_ptr<FenceWaiter>& waiter,
+                const std::shared_ptr<AnyFences>& any_fences = {}) {
+        if (!any_fences) {
+            fence_->notify(value, [waiter] { waiter->hit(); });
             return;
         }
-        context_.enqueue_fence_callback(fence_.semaphore(), value, [w = std::move(waiter)] { w->hit(); });
+        fence_->notify(value, [waiter, any_fences] {
+            if (!waiter->hit()) return;
+            for (const auto& weak : *any_fences) {
+                if (const auto fence = weak.lock()) fence->cancel_events(waiter.get());
+            }
+        }, waiter.get(), [&waiter] { return waiter->done(); });
     }
 
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
 private:
-    bool claim_locked(UINT64 value, bool queue) {
-        if (value <= highest_) {
-            std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
-                         static_cast<unsigned long long>(value), static_cast<unsigned long long>(highest_));
-            return false;
-        }
-        highest_ = value;
-        if (queue) queued_ = value;
-        return true;
-    }
-
     leonida::VulkanContext& context_;
-    leonida::VulkanFence fence_;
+    std::shared_ptr<leonida::LogicalFence> fence_;
     D3D12_FENCE_FLAGS flags_;
-    std::mutex claim_mutex_;
-    UINT64 highest_;     // the highest value claimed, from either side
-    UINT64 queued_ = 0;  // the highest value a queue will signal
-    std::shared_ptr<std::atomic<int>> held_ = std::make_shared<std::atomic<int>>(0);  // CPU signals not applied yet
 };
 
 class CommandQueue final
@@ -1299,18 +1256,17 @@ public:
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {
         constexpr auto method = "ID3D12CommandQueue::Signal";
         Fence* f = Fence::from(fence);
-        if (!f) return d3d12_trace::result(method, E_INVALIDARG);
+        if (!f || !f->belongs_to(context_)) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
-        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value) ? S_OK : E_FAIL);
+        return d3d12_trace::result(method, queue_.signal_fence(f->logical(), value) ? S_OK : E_FAIL);
     }
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
         constexpr auto method = "ID3D12CommandQueue::Wait";
         Fence* f = Fence::from(fence);
-        if (!f) return d3d12_trace::result(method, E_INVALIDARG);
+        if (!f || !f->belongs_to(context_)) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        queue_.wait(f->semaphore(), value);
+        queue_.wait_fence(f->logical(), value);
         return d3d12_trace::result(method, S_OK);
     }
 
@@ -1575,12 +1531,7 @@ HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D1
                      void** out, IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    context.set_signal_event_fn([](void* h) { SetEvent(static_cast<HANDLE>(h)); });
     auto* object = new Fence(context, initial_value, flags);
-    if (!object->ok()) {
-        object->Release();
-        return E_FAIL;
-    }
     object->attach_device(device);
     return hand_out(object, riid, out);
 }
@@ -1592,24 +1543,28 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
         return E_INVALIDARG;
     if (!count || !fences || !values) return E_INVALIDARG;  // no fences is refused, as on the host runtime
     std::vector<Fence*> objects(count);
-    for (UINT i = 0; i < count; ++i)
-        if (!(objects[i] = Fence::from(fences[i]))) return E_INVALIDARG;
-    const bool any = flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
-    if (!event) {
-        // One vkWaitSemaphores call: VK_SEMAPHORE_WAIT_ANY_BIT is the ANY flag, no flag is ALL.
-        std::vector<VkSemaphore> semaphores(count);
-        for (UINT i = 0; i < count; ++i) semaphores[i] = objects[i]->semaphore();
-        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        wait.flags = any ? VK_SEMAPHORE_WAIT_ANY_BIT : 0;
-        wait.semaphoreCount = count;
-        wait.pSemaphores = semaphores.data();
-        wait.pValues = values;
-        return context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX) == VK_SUCCESS ? S_OK : E_FAIL;
+    for (UINT i = 0; i < count; ++i) {
+        objects[i] = Fence::from(fences[i]);
+        if (!objects[i] || !objects[i]->belongs_to(context)) return E_INVALIDARG;
     }
-    // Each fence's own waiter thread counts the shared waiter down; no thread of its own.
+    const bool blocking = !event;
+    if (blocking) {
+        event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!event) return HRESULT_FROM_WIN32(GetLastError());
+    }
+    const bool any = flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
     const auto waiter = std::make_shared<FenceWaiter>(event, any ? 1u : count);
-    for (UINT i = 0; i < count && !waiter->done(); ++i) objects[i]->notify(values[i], waiter);
-    return S_OK;
+    std::shared_ptr<Fence::AnyFences> any_fences;
+    if (any && count > 1) {
+        any_fences = std::make_shared<Fence::AnyFences>();
+        any_fences->reserve(count);
+        for (const auto* object : objects) any_fences->emplace_back(object->logical());
+    }
+    for (UINT i = 0; i < count && !waiter->done(); ++i) objects[i]->notify(values[i], waiter, any_fences);
+    if (!blocking) return S_OK;
+    const DWORD waited = WaitForSingleObject(event, INFINITE);
+    CloseHandle(event);
+    return waited == WAIT_OBJECT_0 ? S_OK : E_FAIL;
 }
 
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {

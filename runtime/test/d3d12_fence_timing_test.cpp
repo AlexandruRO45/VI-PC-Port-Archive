@@ -1,11 +1,13 @@
 // D3D-30 on the Vulkan device, through the Xbox-ABI proxy: SetEventOnMultipleFenceCompletion (ALL and ANY, with an
-// event and blocking), a CPU fence signal held behind a pending queue signal, queue GetClockCalibration on both
+// event and blocking), fence rewinds with CPU and queue signals, queue GetClockCalibration on both
 // paths (calibrated timestamps on the standalone device when it exposes both clock domains, the submitted timestamp
 // query otherwise), GetAdapterLuid (must name a DXGI adapter) and GetCustomHeapProperties (compared with the host PC
 // runtime's answer when the host adapter is NUMA, as the layer reports itself). No shaders or game data.
 // LEONIDA_VK_VALIDATION=1 runs the test-made device under VK_LAYER_KHRONOS_validation; any validation error fails
 // the test.
 #include "vk_test_device.h"
+#include "host_adapter.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -15,7 +17,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -38,8 +42,9 @@ struct Ref {
 };
 
 struct Event {
-    HANDLE h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    ~Event() { CloseHandle(h); }
+    explicit Event(bool manual_reset = false) : h(CreateEventW(nullptr, manual_reset, FALSE, nullptr)) {}
+    HANDLE h;
+    ~Event() { if (h) CloseHandle(h); }
     bool set_within(DWORD ms) const { return WaitForSingleObject(h, ms) == WAIT_OBJECT_0; }
 };
 
@@ -166,34 +171,114 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
     return 0;
 }
 
-// A CPU Signal above a queue Signal the GPU has not reached yet: vkSignalSemaphore would break
-// VUID-VkSemaphoreSignalInfo-value-03259, so the layer holds the CPU signal until the GPU passes the queue's value.
-// The queue's signal is kept pending by a Wait on a gate fence the CPU opens later.
-int check_held_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* queue) {
-    Ref<ID3D12Fence> gate, f;
-    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))));
-    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f.p))));
-    EXPECT(SUCCEEDED(queue->Wait(gate.p, 1)));
-    EXPECT(SUCCEEDED(queue->Signal(f.p, 10)));
-    EXPECT(SUCCEEDED(f->Signal(20)));
-    Event reached;
-    EXPECT(SUCCEEDED(f->SetEventOnCompletion(20, reached.h)));
-    EXPECT(!reached.set_within(50));
-    EXPECT(f->GetCompletedValue() < 10);  // held: the GPU has not reached 10, so 20 is not applied either
-    EXPECT(SUCCEEDED(gate->Signal(1)));
-    EXPECT(reached.set_within(5000));
-    EXPECT(f->GetCompletedValue() == 20);
-
-    // Two CPU signals held behind one queue signal are applied in order: the fence ends on the later one.
-    EXPECT(SUCCEEDED(queue->Wait(gate.p, 2)));
-    EXPECT(SUCCEEDED(queue->Signal(f.p, 30)));
-    EXPECT(SUCCEEDED(f->Signal(40)));
-    EXPECT(SUCCEEDED(f->Signal(50)));
-    EXPECT(f->GetCompletedValue() == 20);
-    EXPECT(SUCCEEDED(gate->Signal(2)));
-    EXPECT(SUCCEEDED(f->SetEventOnCompletion(50, nullptr)));
-    EXPECT(f->GetCompletedValue() == 50);
+int check_cpu_rewind(ID3D12Device* device, const char* who) {
+    Event old_eight(true), old_twelve, new_eight;
+    EXPECT(old_eight.h && old_twelve.h && new_eight.h);
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateFence(10, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(8, old_eight.h)));
+    EXPECT(old_eight.set_within(0));
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(12, old_twelve.h)));
+    EXPECT(SUCCEEDED(fence->Signal(4)));
+    const UINT64 rewound = fence->GetCompletedValue();
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(8, new_eight.h)));
+    const bool old_retained = old_eight.set_within(0);
+    const bool old_twelve_early = old_twelve.set_within(0);
+    const bool new_eight_early = new_eight.set_within(50);
+    EXPECT(SUCCEEDED(fence->Signal(12)));
+    const bool old_twelve_reached = old_twelve_early || old_twelve.set_within(5000);
+    const bool new_eight_reached = new_eight_early || new_eight.set_within(5000);
+    std::printf("%s: CPU fence 10 -> %llu -> %llu, old event retained %d, new event set early %d\n", who,
+                static_cast<unsigned long long>(rewound),
+                static_cast<unsigned long long>(fence->GetCompletedValue()), old_retained, new_eight_early);
+    EXPECT(rewound == 4 && fence->GetCompletedValue() == 12);
+    EXPECT(old_retained && !old_twelve_early && !new_eight_early && old_twelve_reached && new_eight_reached);
     return 0;
+}
+
+// Once a queue has a Wait pending, a failure must leave the process without closing live events or destroying
+// the blocked queue. The queue's gate is opened before checking the observed results in the normal path.
+void require_progress(bool ok, const char* who, const char* what) {
+    if (ok) return;
+    std::fprintf(stderr, "%s: %s\n", who, what);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
+// The host applies CPU signals immediately, even while an earlier queue Signal is held at a gate. When the
+// queue reaches its lower value it rewinds the fence, but the event set by the CPU signal stays set.
+int check_pending_gpu_rewind(ID3D12Device* device, ID3D12CommandQueue* queue, const char* who) {
+    Event old_twenty(true), new_twenty, queue_done;
+    EXPECT(old_twenty.h && new_twenty.h && queue_done.h);
+    Ref<ID3D12Fence> gate, fence, done;
+    for (Ref<ID3D12Fence>* f : {&gate, &fence, &done})
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f->p))));
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(20, old_twenty.h)));
+    EXPECT(SUCCEEDED(done->SetEventOnCompletion(1, queue_done.h)));
+
+    require_progress(SUCCEEDED(queue->Wait(gate.p, 1)), who, "queue Wait failed");
+    require_progress(SUCCEEDED(queue->Signal(fence.p, 10)), who, "queue Signal(10) failed");
+    require_progress(SUCCEEDED(queue->Signal(done.p, 1)), who, "queue completion Signal failed");
+    require_progress(SUCCEEDED(fence->Signal(15)), who, "CPU Signal(15) failed");
+    const UINT64 cpu_first = fence->GetCompletedValue();
+    require_progress(SUCCEEDED(fence->Signal(20)), who, "CPU Signal(20) failed");
+    const UINT64 cpu_last = fence->GetCompletedValue();
+    const bool set_during_gate = old_twenty.set_within(50);
+
+    require_progress(SUCCEEDED(gate->Signal(1)), who, "opening the queue gate failed");
+    require_progress(queue_done.set_within(5000), who, "queue did not complete after opening the gate");
+    const UINT64 gpu = fence->GetCompletedValue();
+    const bool old_retained = old_twenty.set_within(0);
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(20, new_twenty.h)));
+    const bool new_early = new_twenty.set_within(50);
+    EXPECT(SUCCEEDED(fence->Signal(25)));
+    const bool new_reached = new_early || new_twenty.set_within(5000);
+    if (!old_retained) EXPECT(old_twenty.set_within(5000));
+    std::printf("%s: CPU signals %llu -> %llu, queued signal then %llu, old event retained %d, new event set early %d\n",
+                who, static_cast<unsigned long long>(cpu_first), static_cast<unsigned long long>(cpu_last),
+                static_cast<unsigned long long>(gpu), old_retained, new_early);
+    EXPECT(cpu_first == 15 && cpu_last == 20 && gpu == 10 && fence->GetCompletedValue() == 25);
+    EXPECT(set_during_gate && old_retained && !new_early && new_reached);
+    return 0;
+}
+
+int check_queue_rewind(ID3D12Device* device, ID3D12CommandQueue* copy, ID3D12CommandQueue* direct, const char* who) {
+    Event copy_done, direct_done;
+    EXPECT(copy_done.h && direct_done.h);
+    Ref<ID3D12Fence> fence, copy_complete, direct_complete;
+    EXPECT(SUCCEEDED(device->CreateFence(10, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy_complete.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&direct_complete.p))));
+    EXPECT(SUCCEEDED(copy_complete->SetEventOnCompletion(1, copy_done.h)));
+    EXPECT(SUCCEEDED(direct_complete->SetEventOnCompletion(1, direct_done.h)));
+    require_progress(SUCCEEDED(copy->Signal(fence.p, 4)), who, "COPY Signal(4) failed");
+    require_progress(SUCCEEDED(copy->Signal(copy_complete.p, 1)), who, "COPY completion Signal failed");
+    require_progress(copy_done.set_within(5000), who, "COPY did not complete");
+    const UINT64 rewound = fence->GetCompletedValue();
+
+    require_progress(SUCCEEDED(direct->Wait(fence.p, 8)), who, "DIRECT Wait(8) failed");
+    require_progress(SUCCEEDED(direct->Signal(direct_complete.p, 1)), who, "DIRECT completion Signal failed");
+    const bool direct_early = direct_done.set_within(50);
+    require_progress(SUCCEEDED(fence->Signal(12)), who, "CPU Signal(12) failed");
+    require_progress(direct_early || direct_done.set_within(5000), who, "DIRECT did not complete after Signal(12)");
+    std::printf("%s: COPY fence value %llu, DIRECT after Wait(8) completed early %d\n", who,
+                static_cast<unsigned long long>(rewound), direct_early);
+    EXPECT(rewound == 4 && !direct_early);
+    return 0;
+}
+
+int check_standalone_rewinds(ID3D12Device* device, ID3D12CommandQueue* direct, const char* who) {
+    Ref<ID3D12CommandQueue> copy;
+    const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COPY};
+    const bool has_copy = SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&copy.p)));
+    int failures = check_cpu_rewind(device, who);
+    failures += check_pending_gpu_rewind(device, has_copy ? copy.p : direct, who);
+    if (has_copy) {
+        failures += check_queue_rewind(device, copy.p, direct, who);
+    } else {
+        std::printf("%s: COPY queue unavailable for the cross-queue rewind case\n", who);
+    }
+    return failures;
 }
 
 int check_luid(ID3D12Device* device) {
@@ -294,6 +379,7 @@ int main() {
     d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
     const double gpu_frequency = 1e9 / double(properties.limits.timestampPeriod);  // GetTimestampFrequency's answer
 
+    int rewind_failures = 0;
     // A device without calibrated timestamps (the test device enables no extensions): the submitted fallback.
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -313,7 +399,8 @@ int main() {
         EXPECT(!rt::d3d12::queue_uses_calibrated_timestamps(queue.p));
         EXPECT(check_calibration(queue.p, gpu_frequency, "fallback (submitted timestamp query)") == 0);
         EXPECT(check_multiple_fences(device.p, queue.p) == 0);
-        EXPECT(check_held_cpu_signal(device.p, queue.p) == 0);
+        rewind_failures += check_cpu_rewind(device.p, "Xbox-ABI proxy");
+        rewind_failures += check_pending_gpu_rewind(device.p, queue.p, "Xbox-ABI proxy");
         EXPECT(check_luid(device.p) == 0);
         EXPECT(check_custom_heap_properties(device.p) == 0);
     }
@@ -360,15 +447,37 @@ int main() {
         const char* clock_path = calibrated ? "calibration-capable queue" : "standalone fallback";
         EXPECT(check_calibration(queue.p, gpu_frequency, clock_path) == 0);
         EXPECT(check_multiple_fences(standalone.p, queue.p) == 0);
-        EXPECT(check_held_cpu_signal(standalone.p, queue.p) == 0);
+        rewind_failures += check_standalone_rewinds(standalone.p, queue.p, "standalone Vulkan");
         EXPECT(check_luid(standalone.p) == 0);
     }
 
+    Ref<IDXGIFactory4> factory;
+    if (hostwine::host_is_wine()) {
+        std::puts("host fence comparisons skipped under Wine");
+    } else if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
+        std::puts("host fence comparisons skipped because no DXGI factory is available");
+    } else {
+        for (const bool warp : {false, true}) {
+            Ref<IDXGIAdapter> adapter;
+            Ref<ID3D12Device> host;
+            std::string name;
+            if (!hostadapter::reference(factory.p, d, warp, &adapter.p, name) ||
+                FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+                std::printf("%s D3D12 fence comparison unavailable\n", warp ? "WARP" : "native");
+                continue;
+            }
+            Ref<ID3D12CommandQueue> direct;
+            const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+            EXPECT(SUCCEEDED(host->CreateCommandQueue(&desc, IID_PPV_ARGS(&direct.p))));
+            rewind_failures += check_standalone_rewinds(host.p, direct.p, name.c_str());
+        }
+    }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("fences and timing: multiple-fence waits, held CPU signals, clock calibration, adapter LUID and "
+    if (rewind_failures) return 1;
+    std::printf("fences and timing: multiple-fence waits, CPU and queue rewinds, clock calibration, adapter LUID and "
                 "custom heap properties all checked\n");
     return 0;
 }

@@ -6,6 +6,7 @@
 //   3. mark_device_lost() wakes a blocked vkWaitSemaphores() so pending waits complete and cancel()/stop() never hang.
 //   4. vkGetSemaphoreCounterValue() returning VK_ERROR_DEVICE_LOST drains pending waits and marks device_lost_ instead
 //      of spinning forever.
+//   5. Logical fence rewinds keep already-satisfied waits latched even when a queue advances during a counter scan.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -16,9 +17,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); std::_Exit(1); } \
@@ -30,10 +33,26 @@ namespace driver {
 PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkWaitSemaphores real_wait_semaphores = nullptr;
 PFN_vkGetSemaphoreCounterValue real_get_counter = nullptr;
+PFN_vkSignalSemaphore real_signal = nullptr;
 
 std::atomic<bool> in_wait_semaphores{false};
 std::atomic<bool> fail_counter_device_lost{false};
 std::atomic<std::uint32_t> counter_calls{0};
+
+struct AdvanceOnSample {
+    VkSemaphore sampled = VK_NULL_HANDLE;
+    VkSemaphore advance = VK_NULL_HANDLE;
+    std::uint64_t value = 0;
+    std::uint64_t sampled_value = 0;
+};
+thread_local AdvanceOnSample advance_on_sample;
+
+VkResult signal(VkDevice device, VkSemaphore semaphore, std::uint64_t value) {
+    VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+    info.semaphore = semaphore;
+    info.value = value;
+    return real_signal(device, &info);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo* info, std::uint64_t timeout) {
     in_wait_semaphores.store(true, std::memory_order_release);
@@ -45,6 +64,15 @@ VKAPI_ATTR VkResult VKAPI_CALL wait_semaphores(VkDevice device, const VkSemaphor
 VKAPI_ATTR VkResult VKAPI_CALL get_semaphore_counter_value(VkDevice device, VkSemaphore sem, std::uint64_t* value) {
     counter_calls.fetch_add(1, std::memory_order_relaxed);
     if (fail_counter_device_lost.load(std::memory_order_acquire)) return VK_ERROR_DEVICE_LOST;
+    if (sem == advance_on_sample.sampled) {
+        const auto advance = std::exchange(advance_on_sample, AdvanceOnSample{});
+        const VkResult result = signal(device, advance.advance, advance.value);
+        if (result != VK_SUCCESS) return result;
+        if (advance.sampled_value) {
+            const VkResult sampled = signal(device, sem, advance.sampled_value);
+            if (sampled != VK_SUCCESS) return sampled;
+        }
+    }
     return real_get_counter(device, sem, value);
 }
 
@@ -60,6 +88,7 @@ void install(PFN_vkGetDeviceProcAddr device_proc, VkDevice device) {
     real_wait_semaphores = reinterpret_cast<PFN_vkWaitSemaphores>(device_proc(device, "vkWaitSemaphores"));
     real_get_counter =
         reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(device_proc(device, "vkGetSemaphoreCounterValue"));
+    real_signal = reinterpret_cast<PFN_vkSignalSemaphore>(device_proc(device, "vkSignalSemaphore"));
 }
 }  // namespace driver
 
@@ -75,6 +104,108 @@ bool wait_until_in_vk_wait(int timeout_ms = 2000) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return true;
+}
+
+std::shared_ptr<leonida::QueueProgress> progress_timeline(leonida::VulkanContext& context, VkQueue physical_queue) {
+    auto progress =
+        std::make_shared<leonida::QueueProgress>(context.device(), physical_queue, context.vk.vkDestroySemaphore);
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    EXPECT(context.vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress->semaphore) == VK_SUCCESS);
+    return progress;
+}
+
+void check_logical_fence_rewind(VkDevice device) {
+    using namespace leonida;
+    using Status = LogicalFenceWait::Status;
+
+    VulkanContext context(driver::get_device, device, true);
+    EXPECT(context.loaded());
+    // These mock queue handles carry identity only. The real timeline semaphores are advanced by the test.
+    const auto queue_a = reinterpret_cast<VkQueue>(std::uintptr_t{1});
+    const auto queue_b = reinterpret_cast<VkQueue>(std::uintptr_t{2});
+    const auto a = progress_timeline(context, queue_a), b = progress_timeline(context, queue_b);
+    const auto fence = std::make_shared<LogicalFence>(context, 0);
+    const auto old_wait = fence->wait(8);
+    const auto submitted = [] { return VK_SUCCESS; };
+    EXPECT(fence->submit_signal({a, 1}, 10, submitted) == VK_SUCCESS);
+    EXPECT(fence->submit_signal({b, 1}, 6, submitted) == VK_SUCCESS);
+    EXPECT(fence->submit_signal({a, 2}, 4, submitted) == VK_SUCCESS);
+
+    // A is at 0 when sampled and reaches ticket 2 while the same scan samples B. The scan must not see A2
+    // without A1. The next scan sees both in order and leaves a wait from before the rewind satisfied.
+    EXPECT(driver::signal(device, b->semaphore, 1) == VK_SUCCESS);
+    driver::advance_on_sample = {b->semaphore, a->semaphore, 2};
+    EXPECT(fence->completed() == 6);
+    EXPECT(driver::advance_on_sample.sampled == VK_NULL_HANDLE);
+    EXPECT(old_wait->status.load() == Status::pending);
+    EXPECT(fence->completed() == 4);
+    EXPECT(old_wait->status.load() == Status::ready && old_wait->point.queue == a && old_wait->point.ticket == 1);
+    EXPECT(fence->wait(8)->status.load() == Status::pending);
+
+    // The queue reaches 12, but no dispatcher callback runs between that completion and CPU Signal(3).
+    // The host signal must first collect 12, satisfy the old waiter, and then leave the visible value at 3.
+    const auto prior = fence->wait(12);
+    EXPECT(fence->submit_signal({a, 3}, 12, submitted) == VK_SUCCESS);
+    EXPECT(driver::signal(device, a->semaphore, 3) == VK_SUCCESS);
+    EXPECT(fence->signal(3));
+    EXPECT(fence->completed() == 3);
+    EXPECT(prior->status.load() == Status::ready && prior->point.queue == a && prior->point.ticket == 3);
+    const auto relayed = fence->wait(3);
+    EXPECT(relayed && relayed->status.load() == Status::ready &&
+           relayed->point.queue == a && relayed->point.ticket == 3);
+
+    // Two D3D12 queues can share the same Vulkan queue but have distinct progress semaphores.
+    // A was sampled at ticket 3. By the time C is sampled both signals have run, with A first.
+    const auto c = progress_timeline(context, queue_a);
+    const auto shared_queue_fence = std::make_shared<LogicalFence>(context, 0);
+    const auto shared_wait = shared_queue_fence->wait(8);
+    EXPECT(shared_queue_fence->submit_signal({a, 4}, 10, submitted) == VK_SUCCESS);
+    EXPECT(shared_queue_fence->submit_signal({c, 1}, 4, submitted) == VK_SUCCESS);
+    driver::advance_on_sample = {c->semaphore, a->semaphore, 4, 1};
+    EXPECT(shared_queue_fence->completed() == 4);
+    EXPECT(driver::advance_on_sample.sampled == VK_NULL_HANDLE);
+    EXPECT(shared_wait->status.load() == Status::ready);
+    EXPECT(shared_wait->point.queue == a && shared_wait->point.ticket == 4);
+    EXPECT(shared_queue_fence->completed() == 4);
+
+    // A winning ANY notification removes the registrations on the other fences. A late registration
+    // for the same completed wait is ignored too.
+    int any_owner = 0;
+    bool any_done = false;
+    const auto done = [&] { return any_done; };
+    auto callback_data = std::make_shared<int>(0);
+    const std::weak_ptr<int> callback_lifetime = callback_data;
+    fence->notify(99, [data = std::move(callback_data)] { ++*data; }, &any_owner, done);
+    EXPECT(!callback_lifetime.expired());
+    shared_queue_fence->notify(4, [&] {
+        any_done = true;
+        fence->cancel_events(&any_owner);
+    }, &any_owner, done);
+    EXPECT(any_done && callback_lifetime.expired());
+    auto late_data = std::make_shared<int>(0);
+    const std::weak_ptr<int> late_lifetime = late_data;
+    fence->notify(99, [data = std::move(late_data)] { ++*data; }, &any_owner, done);
+    EXPECT(late_lifetime.expired());
+
+    const auto pending = fence->wait(12);
+    EXPECT(pending->status.load() == Status::pending);
+    std::mutex mu;
+    std::condition_variable cv;
+    bool notified = false;
+    fence->notify(12, [&] {
+        std::lock_guard lock(mu);
+        notified = true;
+        cv.notify_all();
+    });
+    context.mark_device_lost();
+    EXPECT(wait_flag(mu, cv, notified));
+    fence->close();
+    EXPECT(fence->completed() == UINT64_MAX);
+    EXPECT(pending->status.load() == Status::cancelled);
+    EXPECT(prior->status.load() == Status::ready);
+    std::puts("logical fence: stable queue scan, latched waits, CPU rewind and device loss ok");
 }
 
 }  // namespace
@@ -256,6 +387,7 @@ int main() {
                     observed_calls);
     }
 
+    check_logical_fence_rewind(d.device);
     EXPECT(d.validation_errors() == 0);
     std::printf("vk_fence_dispatcher_sync_test: ok\n");
     return 0;

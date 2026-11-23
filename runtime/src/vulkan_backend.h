@@ -530,6 +530,8 @@ public:
     FenceWaitDispatcher(const FenceWaitDispatcher&) = delete;
     FenceWaitDispatcher& operator=(const FenceWaitDispatcher&) = delete;
 
+    bool ready() const noexcept { return wakeup_sem_ != VK_NULL_HANDLE; }
+
     void set_signal_event_fn(SignalEventFn fn) {
         std::lock_guard lock(mutex_);
         signal_event_ = fn;
@@ -573,6 +575,25 @@ public:
             return;
         }
         cv_.notify_one();
+    }
+
+    // Logical fence waits are not waiting on a Vulkan semaphore until a GPU signal is submitted.
+    // Keep watching the device while such a CPU wait is pending, so device loss still completes it.
+    bool watch_device_loss(const void* owner, std::function<void()> callback) {
+        {
+            std::lock_guard lock(mutex_);
+            if (stop_ || device_lost_.load(std::memory_order_acquire)) return false;
+            loss_waiters_.emplace(owner, std::move(callback));
+            if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
+            signal_wakeup_locked();
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+    void unwatch_device_loss(const void* owner) {
+        std::lock_guard lock(mutex_);
+        if (loss_waiters_.erase(owner)) signal_wakeup_locked();
     }
 
     // Wakes run() when another path marks the device lost so pending waits complete and stop()/cancel() never hang.
@@ -631,6 +652,19 @@ private:
         }
     }
 
+    void dispatch_device_loss(std::unique_lock<std::mutex>& lock, std::vector<Entry> ready = {}) {
+        device_lost_.store(true, std::memory_order_release);
+        auto pending = std::move(pending_);
+        auto loss_waiters = std::move(loss_waiters_);
+        pending_.clear();
+        loss_waiters_.clear();
+        const SignalEventFn fn = signal_event_;
+        lock.unlock();
+        dispatch_entries(ready, fn);
+        dispatch_entries(pending, fn);
+        for (auto& [owner, callback] : loss_waiters) callback();
+    }
+
     // Only signals wakeup_sem_ when run() is actively waiting (waiting_ == true) on wakeup_val_ + 1,
     // eliminating any lost-wakeup race between snapshot construction and vkWaitSemaphores. Keep signaling even if
     // device_lost_ is already set so a blocked vkWaitSemaphores wakes cleanly for cancel()/stop().
@@ -646,13 +680,12 @@ private:
     void run() {
         std::unique_lock lock(mutex_);
         while (true) {
-            cv_.wait(lock, [this] { return stop_ || !pending_.empty() || device_lost_.load(std::memory_order_acquire); });
+            cv_.wait(lock, [this] {
+                return stop_ || !pending_.empty() || !loss_waiters_.empty() ||
+                       device_lost_.load(std::memory_order_acquire);
+            });
             if (device_lost_.load(std::memory_order_acquire)) {
-                std::vector<Entry> drained = std::move(pending_);
-                pending_.clear();
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(drained, fn);
+                dispatch_device_loss(lock);
                 return;
             }
             if (stop_) return;
@@ -687,12 +720,7 @@ private:
             epoch_cv_.notify_all();
 
             if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
-                device_lost_.store(true, std::memory_order_release);
-                std::vector<Entry> drained = std::move(pending_);
-                pending_.clear();
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(drained, fn);
+                dispatch_device_loss(lock);
                 return;
             }
             if (stop_) return;
@@ -717,12 +745,7 @@ private:
             }
             if (lost) {
                 pending_.resize(write);
-                for (Entry& e : pending_) ready.push_back(std::move(e));
-                pending_.clear();
-                device_lost_.store(true, std::memory_order_release);
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(ready, fn);
+                dispatch_device_loss(lock, std::move(ready));
                 return;
             }
             pending_.resize(write);
@@ -747,6 +770,7 @@ private:
     std::condition_variable cv_;
     std::condition_variable epoch_cv_;
     std::vector<Entry> pending_;
+    std::unordered_map<const void*, std::function<void()>> loss_waiters_;
     std::vector<VkSemaphore> semaphores_;
     std::vector<std::uint64_t> values_;
     std::uint64_t epoch_ = 0;
@@ -929,10 +953,15 @@ public:
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
         if (loaded_) {
             fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
+            loaded_ = fence_dispatcher_->ready();
+            if (!loaded_)
+                std::fprintf(stderr, "[rt] d3d12: could not create the fence dispatcher's wake semaphore\n");
         }
     }
 
     ~VulkanContext() {
+        // A completing GPU callback can still call into the dispatcher through this context.
+        if (fence_dispatcher_) fence_dispatcher_->stop();
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
@@ -1272,6 +1301,12 @@ public:
     void cancel_fence_waits(VkSemaphore sem) {
         if (fence_dispatcher_) fence_dispatcher_->cancel(sem);
     }
+    bool watch_fence_device_loss(const void* owner, std::function<void()> callback) {
+        return fence_dispatcher_ && fence_dispatcher_->watch_device_loss(owner, std::move(callback));
+    }
+    void unwatch_fence_device_loss(const void* owner) {
+        if (fence_dispatcher_) fence_dispatcher_->unwatch_device_loss(owner);
+    }
 
     // Cross-queue Wait-before-Signal: per fence, the highest value a Signal was submitted for, and the queues that
     // hold batches until one is (queue_holds.h).
@@ -1429,6 +1464,304 @@ private:
     VkSemaphore semaphore_ = VK_NULL_HANDLE;
 };
 
+// A producer queue can be destroyed before another queue has consumed its last fence signal. Retain the
+// progress semaphore, not the producer queue, wherever it is used by a fence, a wait, or the dispatcher.
+struct QueueProgress {
+    QueueProgress(VkDevice device, VkQueue physical_queue, PFN_vkDestroySemaphore destroy)
+        : device(device), physical_queue(physical_queue), destroy(destroy) {}
+    ~QueueProgress() { if (semaphore) destroy(device, semaphore, nullptr); }
+
+    VkDevice device;
+    VkQueue physical_queue;
+    PFN_vkDestroySemaphore destroy;
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+};
+
+struct FencePoint {
+    std::shared_ptr<const QueueProgress> queue;
+    std::uint64_t ticket = 0;
+};
+
+class LogicalFence;
+
+// The point is written once before publishing the status. A later signal or fence release cannot change
+// the dependency of a queue Wait that has already been satisfied.
+struct LogicalFenceWait {
+    enum class Status { pending, ready, cancelled };
+    explicit LogicalFenceWait(std::uint64_t value, std::weak_ptr<LogicalFence> producer = {})
+        : value(value), producer(std::move(producer)) {}
+
+    void satisfy(const FencePoint& signal) {
+        point = signal;
+        status.store(Status::ready, std::memory_order_release);
+    }
+
+    const std::uint64_t value;
+    const std::weak_ptr<LogicalFence> producer;
+    FencePoint point;
+    std::atomic<Status> status{Status::pending};
+};
+
+// D3D12 fence values belong to the application and can move backwards. Completion tickets belong to
+// individual Vulkan queues and only increase. Collect already-completed GPU signals under the same lock
+// as a host Signal or a new wait, so a delayed dispatcher callback cannot overwrite a newer host value.
+class LogicalFence : public std::enable_shared_from_this<LogicalFence> {
+public:
+    LogicalFence(VulkanContext& context, std::uint64_t initial) : context_(context), completed_(initial) {}
+
+    std::uint64_t completed() {
+        Notifications ready;
+        std::uint64_t value;
+        {
+            std::lock_guard lock(mutex_);
+            collect_locked(ready);
+            value = context_.is_device_lost() ? UINT64_MAX : completed_;
+        }
+        dispatch(ready);
+        context_.holds().pump_ready();
+        return value;
+    }
+
+    bool signal(std::uint64_t value) {
+        Notifications ready;
+        bool ok;
+        {
+            std::lock_guard lock(mutex_);
+            collect_locked(ready);
+            ok = !context_.is_device_lost();
+            // CPU signals can relay completed GPU work to another queue through the same fence.
+            if (ok) publish_locked(value, point_, ready);
+        }
+        dispatch(ready);
+        context_.holds().pump_ready();
+        return ok;
+    }
+
+    void notify(std::uint64_t value, std::function<void()> callback, const void* owner = nullptr,
+                const std::function<bool()>& already_done = {}) {
+        Notifications ready;
+        {
+            std::lock_guard lock(mutex_);
+            collect_locked(ready);
+            // The winning ANY callback cancels the other registrations. Check under the same lock as
+            // cancel_events so a registration racing that cancellation cannot leave an abandoned callback.
+            if (!already_done || !already_done()) {
+                if (closed_ || context_.is_device_lost() || completed_ >= value ||
+                    (events_.empty() && !watch_device_loss())) {
+                    ready.push_back(std::move(callback));
+                } else {
+                    events_.push_back({value, owner, std::move(callback)});
+                }
+            }
+        }
+        dispatch(ready);
+        context_.holds().pump_ready();
+    }
+
+    void cancel_events(const void* owner) {
+        std::lock_guard lock(mutex_);
+        if (std::erase_if(events_, [owner](const auto& event) { return event.owner == owner; }) && events_.empty())
+            context_.unwatch_fence_device_loss(this);
+    }
+
+    std::shared_ptr<LogicalFenceWait> wait(std::uint64_t value) {
+        Notifications ready;
+        std::shared_ptr<LogicalFenceWait> wait;
+        {
+            std::lock_guard lock(mutex_);
+            collect_locked(ready);
+            if (closed_ || context_.is_device_lost()) {
+                wait = std::make_shared<LogicalFenceWait>(value);
+                wait->status.store(LogicalFenceWait::Status::cancelled, std::memory_order_release);
+            } else if (completed_ < value) {
+                wait = std::make_shared<LogicalFenceWait>(value, weak_from_this());
+                std::erase_if(waits_, [](const auto& pending) { return pending.expired(); });
+                waits_.push_back(wait);
+            } else if (point_.queue) {
+                wait = std::make_shared<LogicalFenceWait>(value);
+                wait->satisfy(point_);
+            }
+            // A wait already satisfied without a GPU dependency needs no Vulkan semaphore.
+        }
+        dispatch(ready);
+        context_.holds().pump_ready();
+        return wait;
+    }
+
+    FencePoint submitted_point(std::uint64_t value) {
+        std::lock_guard lock(mutex_);
+        const auto it = std::find_if(pending_.begin(), pending_.end(),
+                                     [value](const auto& signal) { return signal.value >= value; });
+        return it == pending_.end() ? FencePoint{} : it->point;
+    }
+
+    // Called under the submit mutex. Publish the pending point transactionally with vkQueueSubmit:
+    // otherwise a CPU signal could miss a GPU signal that already completed before the host call.
+    template<class Submit>
+    VkResult submit_signal(FencePoint point, std::uint64_t value, Submit&& submit) {
+        std::lock_guard lock(mutex_);
+        if (closed_) return submit();
+        pending_.push_back({std::move(point), value});
+        const VkResult result = submit();
+        if (result != VK_SUCCESS) pending_.pop_back();
+        return result;
+    }
+
+    void close() {
+        Notifications ready;
+        {
+            std::lock_guard lock(mutex_);
+            if (closed_) return;
+            collect_locked(ready);
+            closed_ = true;
+            finish_events_locked(ready);
+            if (context_.is_device_lost()) pending_.clear();
+            // A GPU signal already submitted can still satisfy its waits after the COM fence is gone.
+            // A wait with no such signal would hold a queue indefinitely, so cancel just that work.
+            std::erase_if(waits_, [&](const auto& weak) {
+                const auto wait = weak.lock();
+                if (!wait) return true;
+                if (std::any_of(pending_.begin(), pending_.end(),
+                                [&](const auto& signal) { return signal.value >= wait->value; }))
+                    return false;
+                wait->status.store(LogicalFenceWait::Status::cancelled, std::memory_order_release);
+                return true;
+            });
+        }
+        dispatch(ready);
+        context_.holds().pump_ready();
+    }
+
+    // Can be reached by a Vulkan callback while its submitting queue is still locked. Do not pump there.
+    void device_lost() {
+        Notifications ready;
+        {
+            std::lock_guard lock(mutex_);
+            closed_ = true;
+            finish_events_locked(ready);
+            for (auto& pending : waits_)
+                if (auto wait = pending.lock())
+                    wait->status.store(LogicalFenceWait::Status::cancelled, std::memory_order_release);
+            waits_.clear();
+            pending_.clear();
+            point_ = {};
+        }
+        dispatch(ready);
+    }
+
+private:
+    using Notifications = std::vector<std::function<void()>>;
+
+    static void dispatch(Notifications& ready) {
+        for (auto& callback : ready) callback();
+    }
+
+    bool watch_device_loss() {
+        const auto weak = weak_from_this();
+        return context_.watch_fence_device_loss(this, [weak] {
+            if (const auto fence = weak.lock()) fence->device_lost();
+        });
+    }
+
+    void finish_events_locked(Notifications& ready) {
+        if (events_.empty()) return;
+        for (auto& event : events_) ready.push_back(std::move(event.callback));
+        events_.clear();
+        context_.unwatch_fence_device_loss(this);
+    }
+
+    void collect_locked(Notifications& ready) {
+        if (pending_.empty() || context_.is_device_lost()) return;
+        counters_.clear();
+        completed_prefixes_.clear();
+        for (std::size_t i = 0; i < pending_.size(); ++i) {
+            const auto& signal = pending_[i];
+            const auto* progress = signal.point.queue.get();
+            auto it = std::find_if(counters_.begin(), counters_.end(),
+                                   [progress](const auto& entry) { return entry.first == progress; });
+            if (it == counters_.end()) {
+                std::uint64_t counter = 0;
+                const VkResult result = context_.vk.vkGetSemaphoreCounterValue(
+                    context_.device(), progress->semaphore, &counter);
+                if (result != VK_SUCCESS) counter = 0;
+                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+                counters_.emplace_back(progress, counter);
+                it = counters_.end() - 1;
+            }
+            if (signal.point.ticket > it->second) continue;
+            const auto physical = progress->physical_queue;
+            const auto prefix = std::find_if(completed_prefixes_.begin(), completed_prefixes_.end(),
+                                             [physical](const auto& entry) { return entry.first == physical; });
+            if (prefix == completed_prefixes_.end()) completed_prefixes_.emplace_back(physical, i);
+            else prefix->second = i;
+        }
+
+        // Vulkan orders signal operations submitted to the same VkQueue. D3D12 queues can share that VkQueue
+        // but have different progress semaphores. A later completed signal proves the earlier ones have also
+        // completed, even when we sampled their counters before the GPU reached them.
+        std::size_t remaining = 0;
+        for (std::size_t i = 0; i < pending_.size(); ++i) {
+            auto& signal = pending_[i];
+            const auto physical = signal.point.queue->physical_queue;
+            const auto prefix = std::find_if(completed_prefixes_.begin(), completed_prefixes_.end(),
+                                             [physical](const auto& entry) { return entry.first == physical; });
+            if (prefix != completed_prefixes_.end() && i <= prefix->second) {
+                publish_locked(signal.value, signal.point, ready);
+            } else {
+                if (remaining != i) pending_[remaining] = std::move(signal);
+                ++remaining;
+            }
+        }
+        pending_.resize(remaining);
+    }
+
+    void publish_locked(std::uint64_t value, const FencePoint& point, Notifications& ready) {
+        completed_ = value;
+        point_ = point;
+        std::erase_if(waits_, [&](const auto& weak) {
+            const auto wait = weak.lock();
+            if (!wait) return true;
+            if (wait->value > value) return false;
+            wait->satisfy(point);
+            return true;
+        });
+        if (events_.empty()) return;
+        std::size_t remaining = 0;
+        for (std::size_t i = 0; i < events_.size(); ++i) {
+            auto& event = events_[i];
+            if (event.value <= value) {
+                ready.push_back(std::move(event.callback));
+            } else {
+                if (remaining != i) events_[remaining] = std::move(event);
+                ++remaining;
+            }
+        }
+        events_.resize(remaining);
+        if (events_.empty()) context_.unwatch_fence_device_loss(this);
+    }
+
+    struct PendingSignal {
+        FencePoint point;
+        std::uint64_t value;
+    };
+    struct EventWait {
+        std::uint64_t value;
+        const void* owner;
+        std::function<void()> callback;
+    };
+
+    VulkanContext& context_;
+    std::mutex mutex_;
+    std::uint64_t completed_;
+    FencePoint point_;
+    std::vector<PendingSignal> pending_;
+    std::vector<std::pair<const QueueProgress*, std::uint64_t>> counters_;
+    std::vector<std::pair<VkQueue, std::size_t>> completed_prefixes_;
+    std::vector<EventWait> events_;
+    std::vector<std::weak_ptr<LogicalFenceWait>> waits_;
+    bool closed_ = false;
+};
+
 // One D3D12 command queue on one VkQueue. D3D12 lets one thread use a queue at a time per call and the COM wrapper
 // serialises its calls; state_mutex_ additionally serialises them against the thread that releases a held batch
 // (Wait-before-Signal, queue_holds.h), the only other thread that touches a queue.
@@ -1466,12 +1799,15 @@ public:
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
-        ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
+        progress_owner_ = std::make_shared<QueueProgress>(context.device(), queue_, vk.vkDestroySemaphore);
+        ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_owner_->semaphore) == VK_SUCCESS;
+        progress_ = progress_owner_->semaphore;
         context_.holds().attach(this);
     }
 
     ~VulkanQueue() {
         auto& vk = context_.vk;
+        drain_submitted_waits();
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
         if (queue_) {
@@ -1490,7 +1826,6 @@ public:
             if (context_.scratch_) context_.scratch_->forget(progress_);
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
-        if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
         for (auto& slot : buffers_) free_events_.insert(free_events_.end(), slot.events.begin(), slot.events.end());
         for (VkEvent event : free_events_) vk.vkDestroyEvent(context_.device(), event, nullptr);
     }
@@ -1612,7 +1947,35 @@ public:
         return ok;
     }
 
-    // ID3D12CommandQueue::Wait: later submissions wait for the fence. A wait in a Vulkan batch only holds back that
+    // D3D12 fence signals publish logical values on completion of this queue's real Vulkan submission.
+    bool signal_fence(const std::shared_ptr<LogicalFence>& fence, std::uint64_t value) {
+        bool ok = true;
+        {
+            std::lock_guard state(state_mutex_);
+            if (must_hold()) {
+                Deferred op;
+                op.kind = Deferred::Kind::signal;
+                op.logical_fence = fence;
+                op.value = value;
+                hold(std::move(op));
+            } else {
+                ok = submit(VK_NULL_HANDLE, VK_NULL_HANDLE, value, fence);
+            }
+        }
+        context_.holds().pump_ready();
+        return ok;
+    }
+
+    void wait_fence(const std::shared_ptr<LogicalFence>& fence, std::uint64_t value) {
+        // A waiter latches either the current value or a future completed signal, even if this queue
+        // has no new submission until after the fence has returned to a lower value.
+        auto wait = fence->wait(value);
+        if (!wait) return;
+        std::lock_guard state(state_mutex_);
+        logical_waits_.push_back(std::move(wait));
+    }
+
+    // A raw timeline Wait: later submissions wait for the fence. A wait in a Vulkan batch only holds back that
     // batch, so it is kept and attached to the next submission (held on the CPU if no Signal reaches it yet).
     void wait(VkSemaphore fence, std::uint64_t value) {
         std::lock_guard state(state_mutex_);
@@ -1995,14 +2358,18 @@ private:
 
     // ---- Wait-before-Signal: operations held on the CPU (queue_holds.h) ----
 
+    using LogicalWaits = std::vector<std::shared_ptr<LogicalFenceWait>>;
+
     // One held operation, with the waits that were pending when it was asked for.
     struct Deferred {
         enum class Kind : std::uint8_t { batch, signal, marker, tile_mapping };
         Kind kind = Kind::batch;
         std::vector<VkSemaphore> waits;
         std::vector<std::uint64_t> wait_values;
+        LogicalWaits logical_waits;
         std::vector<CommandList> lists;  // batch: copies, so the application may Reset its lists after the call
-        VkSemaphore fence = VK_NULL_HANDLE;  // signal
+        VkSemaphore fence = VK_NULL_HANDLE;  // raw signal
+        std::shared_ptr<LogicalFence> logical_fence;
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
         std::string label;
@@ -2015,17 +2382,29 @@ private:
         return false;
     }
 
-    // A submission has to be held if something is held ahead of it, or a Wait it carries has no submitted Signal
-    // yet. Called with state_mutex_ held.
-    bool must_hold() const { return !held_.empty() || waits_pending(waits_, wait_values_); }
+    static bool has_wait(const LogicalWaits& waits, LogicalFenceWait::Status status) {
+        return std::any_of(waits.begin(), waits.end(), [status](const auto& wait) {
+            return wait->status.load(std::memory_order_acquire) == status;
+        });
+    }
+
+    // A CPU signal or another queue can satisfy a logical wait ahead of a submitted signal.
+    // Hold the work until a signal actually satisfies the wait. Called with state_mutex_ held.
+    bool must_hold() const {
+        return !held_.empty() || waits_pending(waits_, wait_values_) ||
+               has_wait(logical_waits_, LogicalFenceWait::Status::pending) ||
+               has_wait(logical_waits_, LogicalFenceWait::Status::cancelled);
+    }
 
     // Appends `op`, which takes the pending waits with it (a marker has none). Called with state_mutex_ held.
     void hold(Deferred&& op) {
         if (op.kind != Deferred::Kind::marker) {
             op.waits = std::move(waits_);
             op.wait_values = std::move(wait_values_);
+            op.logical_waits = std::move(logical_waits_);
             waits_.clear();
             wait_values_.clear();
+            logical_waits_.clear();
         }
         held_.push_back(std::move(op));
         context_.holds().held_changed(1);
@@ -2035,8 +2414,10 @@ private:
     void run(Deferred& op) {
         auto later_waits = std::move(waits_);
         auto later_values = std::move(wait_values_);
+        auto later_logical = std::move(logical_waits_);
         waits_ = std::move(op.waits);
         wait_values_ = std::move(op.wait_values);
+        logical_waits_ = std::move(op.logical_waits);
         switch (op.kind) {
         case Deferred::Kind::batch: {
             std::vector<const CommandList*> lists;
@@ -2048,7 +2429,7 @@ private:
             break;
         }
         case Deferred::Kind::signal:
-            if (!submit(VK_NULL_HANDLE, op.fence, op.value))
+            if (!submit(VK_NULL_HANDLE, op.fence, op.value, op.logical_fence))
                 std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
             break;
         case Deferred::Kind::marker:
@@ -2058,32 +2439,33 @@ private:
             if (!op.tile_mapping())
                 std::fprintf(stderr, "[rt] d3d12: a held tile mapping failed when it was released\n");
             // A no-op or rejected mapping did not submit its GPU waits. Forward them to the next submission.
-            if (!waits_.empty()) preserve_tile_waits(later_waits, later_values);
+            if (!waits_.empty() || !logical_waits_.empty())
+                preserve_tile_waits(later_waits, later_values, later_logical);
             break;
         }
         waits_ = std::move(later_waits);
         wait_values_ = std::move(later_values);
+        logical_waits_ = std::move(later_logical);
     }
 
-    void preserve_tile_waits(std::vector<VkSemaphore>& later_waits, std::vector<std::uint64_t>& later_values) {
+    void preserve_tile_waits(std::vector<VkSemaphore>& later_waits, std::vector<std::uint64_t>& later_values,
+                             LogicalWaits& later_logical) {
         const auto next = std::find_if(held_.begin(), held_.end(), [](const Deferred& op) {
             return op.kind != Deferred::Kind::marker;
         });
         auto& semaphores = next == held_.end() ? later_waits : next->waits;
         auto& values = next == held_.end() ? later_values : next->wait_values;
-        for (std::size_t i = 0; i < waits_.size(); ++i) {
-            const auto existing = std::find(semaphores.begin(), semaphores.end(), waits_[i]);
-            if (existing == semaphores.end()) {
-                semaphores.push_back(waits_[i]);
-                values.push_back(wait_values_[i]);
-            } else {
-                auto& value = values[static_cast<std::size_t>(existing - semaphores.begin())];
-                value = std::max(value, wait_values_[i]);
-            }
-        }
+        for (std::size_t i = 0; i < waits_.size(); ++i)
+            add_wait(semaphores, values, waits_[i], wait_values_[i]);
+        auto& logical = next == held_.end() ? later_logical : next->logical_waits;
+        for (auto& wait : logical_waits_) logical.push_back(std::move(wait));
     }
 
-    bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
+    bool ready(const Deferred& op) const {
+        return has_wait(op.logical_waits, LogicalFenceWait::Status::cancelled) ||
+               (!waits_pending(op.waits, op.wait_values) &&
+                !has_wait(op.logical_waits, LogicalFenceWait::Status::pending));
+    }
 
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
     bool release_ready() override {
@@ -2093,7 +2475,12 @@ private:
             Deferred op = std::move(held_.front());
             held_.pop_front();
             context_.holds().held_changed(-1);
-            if (!context_.is_device_lost()) run(op);
+            if (has_wait(op.logical_waits, LogicalFenceWait::Status::cancelled)) {
+                std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work waiting on it; "
+                                     "that work is dropped\n");
+            } else if (!context_.is_device_lost()) {
+                run(op);
+            }
             released = true;
         }
         return released;
@@ -2114,15 +2501,65 @@ private:
         }
     }
 
-    // A queue destroyed with held work: the fence it waits on was never signaled. Reported, not waited for; nothing
-    // was submitted for it, so the VkQueue is idle and the destructor goes on.
+    // Preserve dependent work if its producers have already submitted the signals it needs.
+    void drain_submitted_waits() {
+        auto& vk = context_.vk;
+        if (!vk.vkWaitSemaphores) return;
+        while (!context_.is_device_lost()) {
+            context_.holds().pump_ready();
+            LogicalWaits waits;
+            {
+                std::lock_guard state(state_mutex_);
+                if (held_.empty() || waits_pending(held_.front().waits, held_.front().wait_values)) return;
+                waits = held_.front().logical_waits;
+            }
+            FencePoint point;
+            std::shared_ptr<LogicalFence> producer;
+            for (const auto& wait : waits) {
+                if (wait->status.load(std::memory_order_acquire) != LogicalFenceWait::Status::pending) continue;
+                auto fence = wait->producer.lock();
+                auto candidate = fence ? fence->submitted_point(wait->value) : FencePoint{};
+                if (!candidate.queue) {
+                    if (wait->status.load(std::memory_order_acquire) == LogicalFenceWait::Status::pending) return;
+                    continue;
+                }
+                if (!point.queue) {
+                    point = std::move(candidate);
+                    producer = std::move(fence);
+                }
+            }
+            if (!point.queue) {
+                // A release pass on another thread can still have this operation in its queue.
+                std::this_thread::yield();
+                continue;
+            }
+            // Wait only for producers that really submitted. An unresolved hold may be part of a cycle.
+            VkSemaphoreWaitInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            info.semaphoreCount = 1;
+            info.pSemaphores = &point.queue->semaphore;
+            info.pValues = &point.ticket;
+            const VkResult result =
+                vk.vkWaitSemaphores(context_.device(), &info, FenceWaitDispatcher::kWaitSliceNs);
+            if (result == VK_SUCCESS) producer->completed();
+            else if (result != VK_TIMEOUT) {
+                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+                return;
+            }
+        }
+    }
+
+    // Report held work whose dependencies were still unresolved when the queue was destroyed.
     void report_held_at_teardown() {
         std::lock_guard state(state_mutex_);
         if (held_.empty()) return;
         std::uint64_t value = 0;
-        for (const Deferred& op : held_)
+        for (const Deferred& op : held_) {
             for (std::size_t i = 0; i < op.waits.size() && !value; ++i)
                 if (context_.holds().pending(op.waits[i], op.wait_values[i])) value = op.wait_values[i];
+            for (const auto& wait : op.logical_waits)
+                if (!value && wait->status.load(std::memory_order_acquire) == LogicalFenceWait::Status::pending)
+                    value = wait->value;
+        }
         std::fprintf(stderr, "[rt] d3d12: queue destroyed with %zu held operation(s) never submitted: waits for a "
                              "fence value (%llu) that no Signal reached; the fence was never signaled\n",
                      held_.size(), static_cast<unsigned long long>(value));
@@ -2145,6 +2582,41 @@ private:
         std::vector<std::shared_ptr<const TileHeapAllocation>> old_heaps;
         std::shared_ptr<SparseBuffer> buffer;
     };
+
+    struct SubmittedWaits {
+        std::uint64_t ticket;
+        LogicalWaits waits;
+    };
+
+    static void add_wait(std::vector<VkSemaphore>& semaphores, std::vector<std::uint64_t>& values,
+                         VkSemaphore semaphore, std::uint64_t value) {
+        const auto existing = std::find(semaphores.begin(), semaphores.end(), semaphore);
+        if (existing == semaphores.end()) {
+            semaphores.push_back(semaphore);
+            values.push_back(value);
+        } else {
+            const auto index = static_cast<std::size_t>(existing - semaphores.begin());
+            values[index] = std::max(values[index], value);
+        }
+    }
+
+    void add_logical_waits(std::vector<VkSemaphore>& semaphores, std::vector<std::uint64_t>& values) const {
+        for (const auto& wait : logical_waits_)
+            if (wait->point.queue) add_wait(semaphores, values, wait->point.queue->semaphore, wait->point.ticket);
+    }
+
+    void retire_waits(std::uint64_t done) {
+        while (!submitted_waits_.empty() && submitted_waits_.front().ticket <= done)
+            submitted_waits_.pop_front();
+    }
+
+    void consume_logical_waits(std::uint64_t ticket) {
+        std::erase_if(logical_waits_, [this](const auto& wait) {
+            return !wait->point.queue || wait->point.queue == progress_owner_;
+        });
+        if (!logical_waits_.empty()) submitted_waits_.push_back({ticket, std::move(logical_waits_)});
+        logical_waits_.clear();
+    }
 
     static bool valid_tiles(const SparseBuffer& buffer, BufferTileRegion region) {
         return region.count && region.first < buffer.tile_count && region.count <= buffer.tile_count - region.first;
@@ -2201,7 +2673,10 @@ private:
     bool bind_tiles(const std::shared_ptr<SparseBuffer>& buffer,
                     std::map<std::uint64_t, BufferTile>& changes) {
         auto& vk = context_.vk;
-        if (!vk.vkQueueBindSparse || context_.is_device_lost()) return false;
+        if (!vk.vkQueueBindSparse || context_.is_device_lost() ||
+            has_wait(logical_waits_, LogicalFenceWait::Status::pending) ||
+            has_wait(logical_waits_, LogicalFenceWait::Status::cancelled))
+            return false;
         const auto ticket = submitted_ + 1;
         PendingBindings pending{ticket, {}, buffer};
         std::vector<VkSparseMemoryBind> binds;
@@ -2227,14 +2702,14 @@ private:
             binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
         }
         if (binds.empty()) return true;
-        collect_bindings(completed());
+        const auto done = completed();
+        collect_bindings(done);
+        retire_waits(done);
         auto semaphores = waits_;
         auto values = wait_values_;
+        add_logical_waits(semaphores, values);
         // Sparse binds are not ordered against work on the same Vulkan queue by submission order alone.
-        if (submitted_) {
-            semaphores.push_back(progress_);
-            values.push_back(submitted_);
-        }
+        if (submitted_) add_wait(semaphores, values, progress_, submitted_);
         VkTimelineSemaphoreSubmitInfo tickets{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
         tickets.waitSemaphoreValueCount = std::uint32_t(values.size());
         tickets.pWaitSemaphoreValues = values.data();
@@ -2262,6 +2737,7 @@ private:
         submitted_ = last_sparse_ = ticket;
         waits_.clear();
         wait_values_.clear();
+        consume_logical_waits(ticket);
         for (auto it = changes.begin(); it != changes.end();) {
             buffer->mapped.erase(it->first);
             if (it->second.heap) ++it;
@@ -2288,6 +2764,7 @@ private:
         context_.drain_deleted_resources(context_.completed_retire_ticket());
         const auto done = completed();
         collect_bindings(done);
+        retire_waits(done);
         CommandSlot* reuse = nullptr;
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
@@ -2330,21 +2807,26 @@ private:
         return event;
     }
 
-    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
+    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
+                const std::shared_ptr<LogicalFence>& logical_fence = {}) {
         if (context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
-        if (last_sparse_) collect_bindings(completed());
+        if (last_sparse_ || (!logical_waits_.empty() && !submitted_waits_.empty())) {
+            const auto done = completed();
+            collect_bindings(done);
+            retire_waits(done);
+        }
         std::span<const VkSemaphore> semaphores = waits_;
         std::span<const std::uint64_t> values = wait_values_;
-        std::vector<VkSemaphore> sparse_waits;
-        std::vector<std::uint64_t> sparse_values;
-        if (last_sparse_) {
-            sparse_waits = waits_;
-            sparse_values = wait_values_;
-            sparse_waits.push_back(progress_);
-            sparse_values.push_back(last_sparse_);
-            semaphores = sparse_waits;
-            values = sparse_values;
+        std::vector<VkSemaphore> combined_waits;
+        std::vector<std::uint64_t> combined_values;
+        if (last_sparse_ || !logical_waits_.empty()) {
+            combined_waits = waits_;
+            combined_values = wait_values_;
+            add_logical_waits(combined_waits, combined_values);
+            if (last_sparse_) add_wait(combined_waits, combined_values, progress_, last_sparse_);
+            semaphores = combined_waits;
+            values = combined_values;
         }
         const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
@@ -2371,13 +2853,16 @@ private:
             submit.pCommandBuffers = &command_buffer;
             submit.signalSemaphoreCount = signal_count;
             submit.pSignalSemaphores = signals;
-            res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+            const auto submit_now = [&] { return context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE); };
+            res = logical_fence ? logical_fence->submit_signal({progress_owner_, ticket}, value, submit_now)
+                                : submit_now();
             if (res == VK_SUCCESS) context_.record_submit_locked(progress_, ticket);
         }
         if (res == VK_ERROR_DEVICE_LOST) {
             context_.mark_device_lost();
             waits_.clear();
             wait_values_.clear();
+            logical_waits_.clear();
             return false;
         }
         const bool ok = (res == VK_SUCCESS);
@@ -2386,6 +2871,16 @@ private:
             submitted_ = ticket;
             waits_.clear();
             wait_values_.clear();
+            consume_logical_waits(ticket);
+            if (logical_fence) {
+                auto* context = &context_;
+                context_.enqueue_fence_callback(progress_, ticket, [context, logical_fence, progress = progress_owner_] {
+                    // The dispatcher borrows the raw VkSemaphore until it invokes this callback.
+                    (void)progress;
+                    if (context->is_device_lost()) logical_fence->device_lost();
+                    else logical_fence->completed();
+                });
+            }
             for (auto& slot : buffers_)
                 if (slot.buffer == command_buffer) slot.ticket = ticket;
         }
@@ -2397,6 +2892,7 @@ private:
     QueueKind kind_ = QueueKind::direct;
     std::uint32_t family_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
+    std::shared_ptr<QueueProgress> progress_owner_;
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;
@@ -2407,6 +2903,8 @@ private:
     std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
+    LogicalWaits logical_waits_;
+    std::deque<SubmittedWaits> submitted_waits_;
     // execute's working storage. Per queue like buffers_: one execute at a time on a queue, as acquire() and
     // submit() already assume; other queues prepare concurrently with their own.
     std::vector<PreparedList> prepared_;
