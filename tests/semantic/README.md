@@ -79,6 +79,10 @@ instruction family per file; the list below describes some of them, not every fi
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
   `test_spirv_wave_interp.py` pins its convergence rules on hand-written modules.
+- `test_wave64_halves_sdst_pair.py` writes each hand-written wave64 listing with the mask destination of a
+  `v_cmp_*_e64` or carry-out as one SGPR (as the corpus prints it) and as the pair, and checks that
+  `tools/wave64_halves.py` gives the two spellings the same tier: tier A with equal words for one wave of 64
+  lanes and two waves of 32 when the high register held a stale value before, tier C for the near misses.
 - `test_global_mem_offset.py` runs the address arithmetic `global_load*`/`global_store*` emit (its own small
   evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
   accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.

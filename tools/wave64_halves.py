@@ -201,6 +201,15 @@ OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64", "s_and_sa
           "s_andn2_saveexec_b64", "s_andn2_wrexec_b64")
 
 
+def _mask_sdst(a):
+    """The lane-mask destination of a VALU instruction (v_cmp_*_e64, a carry-out) as the registers it writes. The
+    listings are disassembled for wave32, so they print that destination as one SGPR (`v_cmp_gt_f32_e64 s0, ...`),
+    and a wave64 program writes the pair s[0:1] (lane_masks.mask_sdst; docs/design.md, "Wave64 VALU mask destination
+    printed as one SGPR"). This module analyses wave64 programs only. Taken as one register, the high register kept
+    the taint, the tag and the reaching definitions of the value it held before."""
+    return lane_masks.mask_sdst(a, True)
+
+
 def operands(ins):
     """(dests, srcs, implicit defs, implicit uses): operand dicts, and register keys the text does not show."""
     op, a = base_op(ins["op"]), ins["args"]
@@ -219,7 +228,7 @@ def operands(ins):
             dests, srcs = [], list(a)
             defs.append("vcc")
         else:
-            dests, srcs = [a[0]], list(a[1:])
+            dests, srcs = [_mask_sdst(a[0])], list(a[1:])
     elif op.startswith("buffer_atomic") or op.startswith(("global_atomic", "flat_atomic")):
         dests = [a[0]] if "glc" in mods and a else []
         srcs = list(a)
@@ -237,7 +246,7 @@ def operands(ins):
         if op.startswith("v_") and len(a) > 2 and (
                 "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
                 and a[1].get("k") in ("sgpr", "special", "slist"):
-            dests, srcs = [a[0], a[1]], list(a[2:])
+            dests, srcs = [a[0], _mask_sdst(a[1])], list(a[2:])
     else:
         dests, srcs = [], []
     if any(op.startswith(p) for p in SAVEEXEC):
