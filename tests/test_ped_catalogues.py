@@ -483,6 +483,42 @@ class PedCataloguesTests(unittest.TestCase):
         for value in (9, 8, 404):
             self.assertTrue(any(f"0x{value:08x}" in w for w in warnings), warnings)
 
+    def test_kit_parent_warnings_follow_selected_members(self):
+        state = _pack_state(state_id=0, drawable_hash=33)
+        last = 100 + pc.MAX_PARENT_DEPTH
+        chain = [(n, n + 1, []) for n in range(100, last)] + [(last, 0, [state])]
+        blocks = build_kit_blocks(
+            kits=[(10, [(20, 0)]), (11, [(30, 0)]), (12, [(100, 0)])],
+            presets=[(20, 0, [state]), (30, 31, [state]), (31, 30, [])] + chain,
+        )
+        for build in (build_synthetic_0drp, build_synthetic_psin):
+            with self.subTest(framing=build.__name__):
+                data = build(blocks)
+                for kit_id in (10, 12):
+                    members, warnings = pc.resolve_kit(data, kit_id)
+                    self.assertEqual([m.drawable_hash for m in members], [33])
+                    self.assertEqual(warnings, [])
+
+                members, warnings = pc.resolve_kit(data, 11)
+                self.assertEqual([m.drawable_hash for m in members], [33])
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("parent cycle", warnings[0])
+                self.assertIn("0x0000001e", warnings[0])
+
+                catalogue = pc.parse_catalogue_strict(data)
+                self.assertEqual(catalogue.stats["parent_cycles"], 2)
+                self.assertTrue(any("cycle" in w for w in catalogue.warnings))
+                self.assertTrue(any("depth reached cap" in w for w in catalogue.warnings))
+
+    def test_kit_preserves_structural_warnings(self):
+        chosen = _pack_state(state_id=0, drawable_hash=33)
+        broken = _pack_state(tag_ptr=_encode_ptr(99, 0), tag_count=1)
+        blocks = build_kit_blocks(kits=[(10, [(20, 0)])], presets=[(20, 0, [chosen]), (21, 0, [broken])])
+        for build in (build_synthetic_0drp, build_synthetic_psin):
+            with self.subTest(framing=build.__name__):
+                _, warnings = pc.resolve_kit(build(blocks), 10)
+                self.assertIn("tag map points to missing block 99", warnings)
+
     def test_kit_ambiguous_ids_and_selected_states_are_errors(self):
         state = _pack_state(state_id=0, drawable_hash=33)
         for case, presets in [
