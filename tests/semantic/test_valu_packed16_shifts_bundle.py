@@ -790,5 +790,46 @@ class TestVPkMadU16ASTAndInterpreter(unittest.TestCase):
         res = ScalarInterpreter().step(inst, state)
         self.assertEqual(res, pack16(40, 50))
 
+class TestVPkMadU16SIMDAndEdgeCases(unittest.TestCase):
+    def test_simd_divergence_exec_mask(self) -> None:
+        simd = SIMDWavefront(wave_size=32, exec_mask=0x33333333)
+        s0_lanes = [pack16(i, i * 2) for i in range(32)]
+        s1_lanes = [pack16(3, 3) for _ in range(32)]
+        s2_lanes = [pack16(1, 2) for _ in range(32)]
+        orig_dst = [0x11111111] * 32
+        res = simd.execute(ref_v_pk_mad_u16, s0_lanes, s1_lanes, s2_lanes, orig_dst=orig_dst)
+        for i in range(32):
+            if (0x33333333 >> i) & 1:
+                self.assertEqual(res[i], pack16(i * 3 + 1, (i * 2) * 3 + 2))
+            else:
+                self.assertEqual(res[i], 0x11111111)
+
+    def test_multi_lane_patterns(self) -> None:
+        simd = SIMDWavefront(wave_size=32, exec_mask=0xFFFFFFFF)
+        s0_lanes = [pack16(0x0100, 0x0100) for _ in range(32)]
+        s1_lanes = [pack16(0x0100, 0x0100) for _ in range(32)]
+        s2_lanes = [pack16(i, i) for i in range(32)]
+        res = simd.execute(ref_v_pk_mad_u16, s0_lanes, s1_lanes, s2_lanes)
+        for i in range(32):
+            self.assertEqual(res[i], pack16(i, i))
+
+    def test_condition_code_neutrality(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0x5555555555555555
+        state.write_vgpr(1, pack16(2, 2))
+        state.write_vgpr(2, pack16(2, 2))
+        state.write_vgpr(3, pack16(2, 2))
+        inst = ASTInstruction(
+            Opcode.V_PK_MAD_U16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(3),
+        )
+        ScalarInterpreter().step(inst, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0x5555555555555555)
+
 if __name__ == "__main__":
     unittest.main()
