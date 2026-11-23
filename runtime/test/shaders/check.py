@@ -459,6 +459,9 @@ STORE_WORDS = {
     # 3D image atomics: the data register afterwards (sint image) and the six texels afterwards (volume)
     "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
                        {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
+    # EGEN-IMGATOMIC-OOB: image atomics outside the image leave every texel alone and return 0 with glc; one in-range
+    # control on the 2D image and one on the volume (cases in the .asm header)
+    "cs_imgatomic_oob": ({2: 103}, dict(enumerate([0, 0, 0, 0, 0, 0, 0, 7, 102, 0, 0, 201])), {1: 202}),
     # image_get_resinfo on a 16x4 image with five levels: (width, height, depth, levels) of levels 0, 1 and 3, then
     # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone, and
     # level 5, past the last (2D depth 0 and the past-the-end zeros measured on RDNA2, SHADER-388)
