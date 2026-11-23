@@ -8,16 +8,18 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
 It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each as
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
-or on a single core, it runs that discover command itself and the timeout covers the whole discovery run.
+or on a single core, it runs that discover command itself and the timeout covers the whole discovery run. A deadline stops the Windows job or the POSIX process group for that unittest run.
 Prints the output of every failing file and one summary
 line, and exits 1 if a file fails or none is found. Standard library only.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import fnmatch
 import locale
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -35,12 +37,100 @@ def test_modules(directory):
     return names
 
 
+_WINDOWS_JOB_GATE = """\
+import _winapi
+import subprocess
+import sys
+
+event = _winapi.OpenEventW(_winapi.SYNCHRONIZE, False, sys.argv[1])
+try:
+    _winapi.WaitForSingleObject(event, _winapi.INFINITE)
+finally:
+    _winapi.CloseHandle(event)
+sys.exit(subprocess.call(sys.argv[2:]))
+"""
+
+
+def _wait_with_deadline(proc, cmd, timeout, terminate):
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        terminate()
+        if os.name != "nt":
+            # POSIX already captured partial output. Close our pipes even if a child left the group.
+            raise
+        stdout, stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr) from None
+    except KeyboardInterrupt:
+        terminate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def _run_in_windows_job(cmd, timeout, **kwargs):
+    import _winapi
+    import ctypes
+    from ctypes import wintypes
+    from uuid import uuid4
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel.TerminateJobObject.restype = wintypes.BOOL
+
+    with contextlib.ExitStack() as handles:
+        job = kernel.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        handles.callback(_winapi.CloseHandle, job)
+        # The wrapper must join the job before it can launch unittest or any descendants.
+        name = f"Local\\LeonidaSemantic-{uuid4().hex}"
+        event = _winapi.CreateEventW(0, True, False, name)
+        handles.callback(_winapi.CloseHandle, event)
+        gated = [sys.executable, "-I", "-c", _WINDOWS_JOB_GATE, name, *cmd]
+        with subprocess.Popen(gated, **kwargs) as proc:
+            try:
+                access = 0x0100 | 0x0001  # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+                child = _winapi.OpenProcess(access, False, proc.pid)
+                try:
+                    if not kernel.AssignProcessToJobObject(job, child):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                finally:
+                    _winapi.CloseHandle(child)
+                _winapi.SetEvent(event)
+            except OSError:
+                proc.kill()
+                raise
+
+            def terminate():
+                if not kernel.TerminateJobObject(job, 1):
+                    raise ctypes.WinError(ctypes.get_last_error())
+
+            return _wait_with_deadline(proc, cmd, timeout, terminate)
+
+
+def _run_unittest(cmd, timeout, **kwargs):
+    if timeout is None:
+        return subprocess.run(cmd, **kwargs)
+    if os.name == "nt":
+        return _run_in_windows_job(cmd, timeout, **kwargs)
+    with subprocess.Popen(cmd, start_new_session=True, **kwargs) as proc:
+        def terminate():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+
+        return _wait_with_deadline(proc, cmd, timeout, terminate)
+
+
 def run_module(directory, module, verbose, timeout=None):
     """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
     try:
-        p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                           errors="replace", timeout=timeout)
+        p = _run_unittest(cmd, timeout, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors="replace")
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout or ""
         if isinstance(output, bytes):  # Windows can return already-decoded text after killing the child.
@@ -61,9 +151,9 @@ def main(argv=None):
         ap.error("--timeout must be at least 1 second")
     directory = os.path.abspath(a.directory)
     if a.jobs <= 1:
+        cmd = [sys.executable, "-m", "unittest", "discover", "-s", directory, *(["-v"] if a.verbose else [])]
         try:
-            return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
-                                    *(["-v"] if a.verbose else [])], timeout=a.timeout)
+            return _run_unittest(cmd, a.timeout).returncode
         except subprocess.TimeoutExpired:
             print(f"unittest discovery timed out after {a.timeout} s", file=sys.stderr)
             return 1

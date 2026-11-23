@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -115,6 +116,34 @@ class SemanticRunnerTimeout(unittest.TestCase):
         result = self.run_suite(1, 2)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("unittest discovery timed out after 2 s", result.stderr)
+
+    def test_timeout_stops_descendants_holding_inherited_output(self):
+        marker = self.suite / "descendant-survived"
+        descendant = (
+            "from pathlib import Path; import sys, time; "
+            "print('descendant ready', flush=True); time.sleep(2); Path(sys.argv[1]).touch()"
+        )
+        test = (
+            "import subprocess\nimport sys\nimport unittest\n\n"
+            "class Slow(unittest.TestCase):\n"
+            "    def test_slow(self):\n"
+            f"        child = subprocess.Popen([sys.executable, '-c', {descendant!r}, {str(marker)!r}])\n"
+        )
+        for jobs, parent_waits in ((1, True), (2, True), (2, False)):
+            with self.subTest(jobs=jobs, parent_waits=parent_waits):
+                marker.unlink(missing_ok=True)
+                source = test + ("        child.wait()\n" if parent_waits else "")
+                (self.suite / "test_slow.py").write_text(source, encoding="utf-8", newline="\n")
+                result = self.run_suite(jobs, 1)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 1, output)
+                self.assertIn("descendant ready", output)
+                self.assertIn("timed out after 1 s", output)
+                # A surviving descendant can outlive the runner even when the output pipe has closed.
+                time.sleep(2.5)
+                self.assertFalse(marker.exists(), "a descendant continued past the timeout")
+                if jobs == 2:
+                    self.assertIn("2 files, 1 tests, 1 files failed", output)
 
     def test_timeout_must_be_positive(self):
         result = self.run_suite(2, 0)
