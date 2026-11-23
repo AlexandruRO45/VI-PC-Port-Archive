@@ -1784,6 +1784,14 @@ if(TARGET Vulkan::Headers)
       message(STATUS "glslangValidator not found: d3d12_descriptor_test skips its shader")
     endif()
 
+    # GetGPUVirtualAddress of 1 KiB buffers through the proxy: non-zero and aligned for every heap and initial state.
+    add_executable(d3d12_gpuva_test test/d3d12_gpuva_test.cpp)
+    target_link_libraries(d3d12_gpuva_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_gpuva_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_gpuva_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_gpuva COMMAND d3d12_gpuva_test)
+    set_tests_properties(d3d12_gpuva PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(d3d12_predicated_copy_test test/d3d12_predicated_copy_test.cpp)
     target_link_libraries(d3d12_predicated_copy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_predicated_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
