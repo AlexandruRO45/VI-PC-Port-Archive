@@ -11,7 +11,10 @@ import argparse
 import os
 import sys
 
-import numpy as np
+try:
+    import numpy as np
+except ModuleNotFoundError:
+    np = None
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -81,6 +84,8 @@ def score(img: np.ndarray) -> float:
 
 
 def probe(data: bytes, offset=0):
+    if np is None:
+        raise SystemExit("tile_probe requires numpy")
     best = []
     for bpe in (8, 16):
         raw = np.frombuffer(data[offset:offset + (len(data) - offset) // bpe * bpe], np.uint8).reshape(-1, bpe)
