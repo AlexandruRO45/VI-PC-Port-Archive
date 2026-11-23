@@ -472,54 +472,62 @@ pub unsafe extern "C" fn bvh_rehydrate_v1(
     frame: *const [f32; 15],
     dst: *mut u8,
 ) -> i32 {
-    // Offsets on disk are u32, with a few scaled offsets that can exceed u32.
-    if usize::BITS != 64 || src.is_null() || dst.is_null() || len < 64 || len > isize::MAX as usize
-    {
-        return -1;
-    }
-    if geometries.is_null()
-        || geometry_count > isize::MAX as usize / std::mem::size_of::<Geometry>()
-    {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(src, len) };
-    let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
-    let Some(views) = unsafe { slice::from_raw_parts(geometries, geometry_count) }
-        .iter()
-        .map(|geometry| {
-            if geometry.vertices.is_null()
-                || geometry.vertices_len > isize::MAX as usize
-                || geometry.indices_len > isize::MAX as usize
-                || geometry.stride < 12
-            {
-                return None;
-            }
-            let indices = if geometry.index_width == 0 {
-                &[]
-            } else if geometry.indices.is_null() || !matches!(geometry.index_width, 2 | 4) {
-                return None;
-            } else {
-                unsafe { slice::from_raw_parts(geometry.indices, geometry.indices_len) }
-            };
-            Some(GeometryView {
-                vertices: unsafe {
-                    slice::from_raw_parts(geometry.vertices, geometry.vertices_len)
-                },
-                indices,
-                stride: geometry.stride,
-                index_width: geometry.index_width,
-                transform: unsafe { geometry.transform.as_ref() },
+    // A panic must never unwind across the C ABI; treat it as a failure so the caller falls back to Python.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> i32 {
+        // Offsets on disk are u32, with a few scaled offsets that can exceed u32.
+        if usize::BITS != 64
+            || src.is_null()
+            || dst.is_null()
+            || len < 64
+            || len > isize::MAX as usize
+        {
+            return -1;
+        }
+        if geometries.is_null()
+            || geometry_count > isize::MAX as usize / std::mem::size_of::<Geometry>()
+        {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(src, len) };
+        let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
+        let Some(views) = unsafe { slice::from_raw_parts(geometries, geometry_count) }
+            .iter()
+            .map(|geometry| {
+                if geometry.vertices.is_null()
+                    || geometry.vertices_len > isize::MAX as usize
+                    || geometry.indices_len > isize::MAX as usize
+                    || geometry.stride < 12
+                {
+                    return None;
+                }
+                let indices = if geometry.index_width == 0 {
+                    &[]
+                } else if geometry.indices.is_null() || !matches!(geometry.index_width, 2 | 4) {
+                    return None;
+                } else {
+                    unsafe { slice::from_raw_parts(geometry.indices, geometry.indices_len) }
+                };
+                Some(GeometryView {
+                    vertices: unsafe {
+                        slice::from_raw_parts(geometry.vertices, geometry.vertices_len)
+                    },
+                    indices,
+                    stride: geometry.stride,
+                    index_width: geometry.index_width,
+                    transform: unsafe { geometry.transform.as_ref() },
+                })
             })
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return -1;
-    };
-    if rehydrate(src, dst, kept, &views, unsafe { frame.as_ref() }).is_some() {
-        0
-    } else {
-        -1
-    }
+            .collect::<Option<Vec<_>>>()
+        else {
+            return -1;
+        };
+        if rehydrate(src, dst, kept, &views, unsafe { frame.as_ref() }).is_some() {
+            0
+        } else {
+            -1
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
