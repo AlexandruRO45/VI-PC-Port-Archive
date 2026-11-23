@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 
 namespace {
@@ -23,6 +24,8 @@ struct Trace {
     unsigned wait_count = 0;
     VkSemaphore wait_semaphore = VK_NULL_HANDLE;
     std::uint64_t wait_value = 0;
+    VkResult bind_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+    std::function<void()> on_idle;
 };
 
 Trace trace;
@@ -46,10 +49,13 @@ VulkanDeviceFunctions fake_driver() {
         return VK_SUCCESS;
     };
     vk.vkDestroyBuffer = +[](VkDevice, VkBuffer, const VkAllocationCallbacks*) {};
-    vk.vkQueueWaitIdle = +[](VkQueue) { return VK_SUCCESS; };
+    vk.vkQueueWaitIdle = +[](VkQueue) {
+        if (trace.on_idle) trace.on_idle();
+        return VK_SUCCESS;
+    };
     vk.vkQueueBindSparse = +[](VkQueue, std::uint32_t count, const VkBindSparseInfo*, VkFence) {
         trace.binds += count;
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
+        return trace.bind_result;
     };
     vk.vkQueueSubmit = +[](VkQueue, std::uint32_t count, const VkSubmitInfo* info, VkFence) {
         trace.submits += count;
@@ -142,6 +148,66 @@ bool run(const Case& test) {
                   "the following submission still waits for the incomplete producer exactly once");
 }
 
+bool run_lost_bind(VkResult result) {
+    trace = {};
+    trace.bind_result = result;
+    const bool lost = result == VK_ERROR_DEVICE_LOST;
+    VulkanContext context(device_proc, handle<VkDevice>(1), true);
+    VulkanFence gate(context, 0);
+    auto queue = std::make_unique<VulkanQueue>(context, handle<VkQueue>(1), 0);
+    if (!queue->ok() || !gate.semaphore()) return false;
+
+    constexpr ResourceId id = 1;
+    auto buffer = std::make_shared<SparseResource>(context.device(), context.vk);
+    buffer->buffer = handle<VkBuffer>(1);
+    buffer->tile_count = 1;
+    buffer->memory_types = 1;
+    auto old_heap = std::make_shared<const TileHeapAllocation>(
+        TileHeapAllocation{handle<VkDeviceMemory>(1), 0, tile_size_in_bytes, 0});
+    auto new_heap = std::make_shared<const TileHeapAllocation>(
+        TileHeapAllocation{handle<VkDeviceMemory>(2), 0, tile_size_in_bytes, 0});
+    buffer->mapped.emplace(0, TileMapping{old_heap, 0});
+    ResourceBinding binding{};
+    binding.buffer = buffer->buffer;
+    binding.size = tile_size_in_bytes;
+    binding.sparse_buffer = true;
+    context.add_sparse_resource(id, binding, buffer);
+
+    auto wait_pin = std::make_shared<int>(0);
+    const std::weak_ptr<int> watched_wait = wait_pin;
+    const std::weak_ptr<SparseResource> watched_buffer = buffer;
+    const std::weak_ptr<const TileHeapAllocation> watched_old = old_heap, watched_new = new_heap;
+    queue->wait(gate.semaphore(), 1, [&] { return wait_pin; });
+    const std::array regions{TileRegion{0, 1}};
+    const std::array ranges{TileRange{TileRangeMode::sequential, 0, 1}};
+    if (!queue->update_tiles(id, regions, ranges, [&](bool, std::uint32_t) { return new_heap; })) return false;
+
+    // The held operation must keep the resource and allocations even if the application releases all
+    // of them. Eject the mock's deferred-deletion reference too so only the queue owns the buffer.
+    context.remove_resource(id);
+    context.drain_deleted_resources(UINT64_MAX);
+    old_heap.reset();
+    new_heap.reset();
+    wait_pin.reset();
+    buffer.reset();
+    context.holds().signaled(gate.semaphore(), 1);
+    context.holds().pump_ready();
+    const auto alive = [&] {
+        return !watched_buffer.expired() && !watched_old.expired() && !watched_new.expired() && !watched_wait.expired();
+    };
+    const bool before_idle = !watched_wait.expired() && (lost ? alive() :
+        watched_buffer.expired() && watched_old.expired() && watched_new.expired());
+    bool at_idle = false;
+    trace.on_idle = [&] { at_idle = lost ? alive() : !watched_wait.expired(); };
+    queue.reset();
+    trace.on_idle = {};
+    const bool ok = trace.binds == 1 && trace.submits == 0 && context.is_device_lost() == lost &&
+                    before_idle && at_idle && watched_buffer.expired() && watched_old.expired() &&
+                    watched_new.expired() && watched_wait.expired();
+    if (!ok) std::fprintf(stderr, "deferred sparse bind lifetime: unexpected result for VkResult %d\n", result);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -153,6 +219,8 @@ int main() {
     };
     bool ok = true;
     for (const auto& test : cases) ok = run(test) && ok;
-    if (ok) std::puts("Sparse queue order: deferred no-op and rejected mappings preserve GPU waits");
+    for (const auto result : {VK_ERROR_DEVICE_LOST, VK_ERROR_OUT_OF_HOST_MEMORY})
+        ok = run_lost_bind(result) && ok;
+    if (ok) std::puts("Sparse queue order: forwarded GPU waits and retained device-loss bindings");
     return ok ? 0 : 1;
 }

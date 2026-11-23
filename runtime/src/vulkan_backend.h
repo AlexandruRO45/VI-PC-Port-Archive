@@ -2692,7 +2692,9 @@ private:
             if (!waits_.empty()) preserve_tile_waits(later_waits, later_values, later_pins);
             break;
         }
-        retire_pins(op.pins, submitted_);
+        const auto pin_ticket = op.kind == Deferred::Kind::tile_mapping && context_.is_device_lost()
+                                    ? UINT64_MAX : submitted_;
+        retire_pins(op.pins, pin_ticket);
         waits_.insert(waits_.end(), later_waits.begin(), later_waits.end());
         wait_values_.insert(wait_values_.end(), later_values.begin(), later_values.end());
         for (auto& pin : later_pins) wait_pins_.push_back(std::move(pin));
@@ -2727,6 +2729,7 @@ private:
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
     bool release_ready() override {
         std::vector<std::shared_ptr<void>> retired;
+        std::vector<Deferred> abandoned;  // release COM pins outside state_mutex_
         bool released = false;
         {
             std::lock_guard state(state_mutex_);
@@ -2734,7 +2737,8 @@ private:
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
                 context_.holds().held_changed(-1);
-                if (!context_.is_device_lost()) run(op);
+                if (context_.is_device_lost()) abandoned.push_back(std::move(op));
+                else run(op);
                 released = true;
             }
             drain_pins(retired);
@@ -2811,6 +2815,7 @@ private:
         // Vulkan needs the resource until the bind completes and the previous allocation until it is unmapped.
         std::vector<std::shared_ptr<const TileHeapAllocation>> old_heaps;
         std::shared_ptr<SparseResource> resource;
+        std::map<std::uint64_t, TileMapping> lost_mappings{};  // new allocations a lost bind may still reference
     };
 
     static bool valid_tiles(const SparseResource& resource, TileRegion region) {
@@ -2892,8 +2897,9 @@ private:
                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        if (vk.vkEndCommandBuffer(command_buffer) != VK_SUCCESS || !submit(command_buffer, VK_NULL_HANDLE, 0)) {
-            slot->ticket = 0;
+        if (vk.vkEndCommandBuffer(command_buffer) != VK_SUCCESS ||
+            !submit(command_buffer, VK_NULL_HANDLE, 0, /*retain_waits_on_device_loss=*/true)) {
+            if (!context_.is_device_lost()) slot->ticket = 0;
             return false;
         }
         context_.tracker_.set(id, range, VK_IMAGE_LAYOUT_GENERAL);
@@ -2941,7 +2947,14 @@ private:
             binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
         }
         if (binds.empty() && image_binds.empty()) return true;
-        if (!image_binds.empty() && !initialize_sparse_image_layout(id, resource->image)) return false;
+        if (!image_binds.empty() && !initialize_sparse_image_layout(id, resource->image)) {
+            // The layout transition may already refer to this image if its submit returned device loss.
+            if (context_.is_device_lost()) {
+                pending.ticket = UINT64_MAX;
+                pending_bindings_.push_back(std::move(pending));
+            }
+            return false;
+        }
         const auto ticket = submitted_ + 1;
         pending.ticket = ticket;
         collect_bindings(completed());
@@ -2978,8 +2991,17 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             const auto result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
             if (result != VK_SUCCESS) {
-                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
-                pending_bindings_.pop_back();
+                if (result == VK_ERROR_DEVICE_LOST) {
+                    // Vulkan may have accepted this bind. Keep both sets of allocations and its wait
+                    // semaphores alive until this queue has waited for idle in its destructor.
+                    auto& lost = pending_bindings_.back();
+                    lost.ticket = UINT64_MAX;
+                    lost.lost_mappings = std::move(changes);
+                    clear_waits(UINT64_MAX);
+                    context_.mark_device_lost();
+                } else {
+                    pending_bindings_.pop_back();
+                }
                 return false;
             }
             context_.record_submit_locked(progress_, ticket);
@@ -3105,7 +3127,8 @@ private:
         return event;
     }
 
-    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
+    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
+                bool retain_waits_on_device_loss = false) {
         if (context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) {
@@ -3162,7 +3185,7 @@ private:
         }
         if (res == VK_ERROR_DEVICE_LOST) {
             context_.mark_device_lost();
-            clear_waits();
+            clear_waits(retain_waits_on_device_loss ? UINT64_MAX : 0);
             return false;
         }
         const bool ok = (res == VK_SUCCESS);
