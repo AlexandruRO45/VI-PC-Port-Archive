@@ -224,3 +224,55 @@ class TestDsSwizzleB32AST(unittest.TestCase):
             offset16=0x801F,
         )
         self.assertEqual(ast.to_assembly(), "ds_swizzle_b32 v5, v6 offset:0x801f")
+
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+@dataclass
+class SwizzleSimdState:
+    wave_size: int
+    exec_mask: int
+    vgprs: dict[int, list[int]]
+
+    @classmethod
+    def create(cls, wave_size: int = 32, exec_mask: int = 0xFFFFFFFF) -> SwizzleSimdState:
+        return cls(wave_size=wave_size, exec_mask=exec_mask, vgprs={})
+
+    def ensure_vgpr(self, idx: int, init_val: int = 0) -> None:
+        if idx not in self.vgprs:
+            self.vgprs[idx] = [init_val] * self.wave_size
+
+
+def step_swizzle_instruction(ast: DsSwizzleB32AST, state: SwizzleSimdState) -> None:
+    state.ensure_vgpr(ast.vsrc_idx, 0)
+    state.ensure_vgpr(ast.vdst_idx, 0xBAADF00D)
+    src_vals = state.vgprs[ast.vsrc_idx]
+    dst_old = state.vgprs[ast.vdst_idx]
+    out = ref_swizzle_wave(src_vals, dst_old, ast.offset16, state.exec_mask)
+    state.vgprs[ast.vdst_idx] = out
+
+
+class TestDsSwizzleB32ScalarInterpreter(unittest.TestCase):
+    def test_interpreter_swap_execution(self) -> None:
+        state = SwizzleSimdState.create(32, 0xFFFFFFFF)
+        state.vgprs[1] = [1000 + i for i in range(32)]
+        ast = DsSwizzleB32AST(0, 1, SwizzleKind.SWAP, encode_swap(2), (2,))
+        step_swizzle_instruction(ast, state)
+
+        # Stride 2 swap: 0 <-> 2, 1 <-> 3
+        self.assertEqual(state.vgprs[0][0], 1002)
+        self.assertEqual(state.vgprs[0][1], 1003)
+        self.assertEqual(state.vgprs[0][2], 1000)
+        self.assertEqual(state.vgprs[0][3], 1001)
+
+    def test_interpreter_determinism(self) -> None:
+        state1 = SwizzleSimdState.create(32, 0xFFFFFFFF)
+        state2 = SwizzleSimdState.create(32, 0xFFFFFFFF)
+        src = [(i * 37 + 11) & M32 for i in range(32)]
+        state1.vgprs[1] = list(src)
+        state2.vgprs[1] = list(src)
+        ast = DsSwizzleB32AST(0, 1, SwizzleKind.QUAD_PERM, encode_quad_perm(2, 3, 0, 1), (2, 3, 0, 1))
+
+        step_swizzle_instruction(ast, state1)
+        step_swizzle_instruction(ast, state2)
+        self.assertEqual(state1.vgprs[0], state2.vgprs[0])
