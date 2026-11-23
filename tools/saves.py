@@ -530,6 +530,13 @@ def xgs_storage_name(name):
     return xgs_escape(xgs_encode(name))
 
 
+def xgs_find(parent, name, kind):
+    """Where the shim looks `name` up under `parent` (kind: os.path.isdir or os.path.isfile): its storage name, else
+    the unescaped encoding older imports wrote, which Windows saved without a trailing '.' and never as a device."""
+    stored, legacy = os.path.join(parent, xgs_storage_name(name)), os.path.join(parent, xgs_encode(name))
+    return legacy if not kind(stored) and kind(legacy) else stored
+
+
 def save_slot(folder):
     """Return (folder label, payload filename, slot name, title) for one save folder."""
     meta_path = os.path.join(folder, 'chives.json')
@@ -629,8 +636,9 @@ def import_saves(args):
             files.append(('chives.dat', 'chives.dat'))
         for src_name, blob_name in files:
             src = os.path.join(folder, src_name)
-            dst = os.path.join(root, xgs_storage_name(container), xgs_storage_name(blob_name))
-            plan.append((src, dst))
+            c_dir = xgs_find(root, container, os.path.isdir)
+            dst = os.path.join(c_dir, xgs_storage_name(blob_name))
+            plan.append((src, dst, xgs_find(c_dir, blob_name, os.path.isfile)))
             data = read(src)
             manifest['entries'].append({'folder': sd, 'source': src_name, 'title': title, 'container': container,
                                         'blob': blob_name, 'size': len(data),
@@ -640,17 +648,17 @@ def import_saves(args):
             if not valid_container_name(container):
                 print(f'warning: container {container!r} breaks XGameSaveCreateContainer\'s naming rule, so the game '
                       f'cannot open it by that name; give it another with --map {sd}=NAME', file=sys.stderr)
-    dsts = [d.lower() for _, d in plan]
+    dsts = [d.lower() for _, d, _ in plan]
     if len(set(dsts)) != len(dsts):
         raise SystemExit('import: two payloads map to the same container/blob (names are case-insensitive on '
                          'Windows); use --map to separate them')
     if dry:
         print('dry run: nothing written')
         return
-    for src, dst in plan:
-        if os.path.exists(dst) and not force:
-            raise SystemExit(f'{dst} exists; pass --force to overwrite')
-    for src, dst in plan:
+    for _, _, found in plan:
+        if os.path.exists(found) and not force:
+            raise SystemExit(f'{found} exists; pass --force to overwrite')
+    for src, dst, _ in plan:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         tmp = os.path.join(os.path.dirname(dst), '~' + os.path.basename(dst))   # the shim's temp-file convention
         with open(tmp, 'wb') as f:

@@ -602,6 +602,30 @@ class ImportTest(unittest.TestCase):
         write(os.path.join(prof, "Player"), make_asav(kind=3, title="Player", slot="Player"))
         return story, prof, jsav
 
+    def test_saves_written_before_the_escape_are_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, jsav = self._folders(tmp)
+            out = os.path.join(tmp, "saves")
+            old = os.path.join(out, "local-user", "old")
+            write(os.path.join(old, "story"), b"plain")
+            write(os.path.join(old, "data."), b"dotted")    # Windows saves it as "data"
+            for blob, data in (("story", b"plain"), ("data.", b"dotted")):
+                self.assertEqual(rd(saves.xgs_find(old, blob, os.path.isfile)), data, blob)
+                with self.assertRaises(SystemExit):
+                    quiet(saves.import_saves, [story, "--out", out, "--map", f"SLOT3=old/{blob}"])
+            quiet(saves.import_saves, [story, "--out", out, "--map", "SLOT3=old/data.", "--force"])
+            self.assertEqual(rd(saves.xgs_find(old, "data.", os.path.isfile)), jsav)
+
+    def test_reserved_names_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, jsav = self._folders(tmp)
+            out = os.path.join(tmp, "saves")
+            quiet(saves.import_saves, [story, "--out", out, "--map", "SLOT3=CON/NUL.sav"])
+            c_dir = saves.xgs_find(os.path.join(out, "local-user"), "CON", os.path.isdir)
+            self.assertEqual(os.path.basename(c_dir), "%43ON")
+            self.assertEqual(rd(saves.xgs_find(c_dir, "NUL.sav", os.path.isfile)), jsav)
+            self.assertFalse(os.path.exists(saves.xgs_find(c_dir, "nul", os.path.isfile)))
+
     def test_import_rejects_flag_as_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             story, _, _ = self._folders(tmp)
