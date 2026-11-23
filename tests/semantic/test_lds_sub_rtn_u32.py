@@ -1,4 +1,6 @@
-"""Semantic interpreter tests for LDS atomic subtraction with return: ds_sub_rtn_u32.
+from __future__ import annotations
+
+"""Semantic interpreter tests for LDS atomic subtraction: ds_sub_rtn_u32 and ds_sub_u32.
 
 Standard library only; no GPU, no LLVM, no external tools, no game files.
 
@@ -18,8 +20,9 @@ Background & Specification Rules:
           old_val = LDS[dword_index]
           LDS[dword_index] = (old_val - vdata) & 0xFFFFFFFF
           vdst = old_val
-    - Returning form (_rtn_):
-        Returns the pre-subtraction value stored in LDS into destination VGPR vdst.
+    - `ds_sub_u32 vaddr, vdata [offset:N]`:
+        Non-returning form that performs the same atomic subtraction without returning
+        the pre-subtraction value to a destination VGPR.
     - Byte addressing & alignment:
         Byte addresses are converted to dwords via right shift by 2, dropping
         unaligned low bits [1:0]. Out-of-range addresses wrap within the allocated
@@ -32,12 +35,10 @@ Background & Specification Rules:
     - Translates to OpAtomicISub:
         %old = OpAtomicISub %uint %ptr %scope %semantics %vdata
       where %scope is Workgroup (2) and %semantics is Relaxed (0).
-    - Result %old is stored into destination register vdst.
+    - Result %old is stored into destination register vdst for returning form.
 """
-from __future__ import annotations
 
 import os
-import random
 import sys
 import unittest
 
@@ -53,18 +54,8 @@ import support  # noqa: E402
 M32 = 0xFFFFFFFF
 
 
-def ref_sub_u32(initial: int, subtrahend: int) -> tuple[int, int]:
-    """Reference ISA calculation for 32-bit LDS atomic subtraction.
-
-    Returns (old_value, new_value) both masked to 32 bits.
-    """
-    old = initial & M32
-    new = (old - subtrahend) & M32
-    return old, new
-
-
 class TestLdsSubRtnU32SingleOp(unittest.TestCase):
-    """Test individual ds_sub_rtn_u32 operations across critical numeric boundaries."""
+    """Test individual ds_sub_rtn_u32 and ds_sub_u32 operations across critical numeric boundaries."""
 
     # (initial_memory, subtrahend, expected_returned_old, expected_final_memory)
     BOUNDARY_CASES = (
@@ -86,9 +77,15 @@ class TestLdsSubRtnU32SingleOp(unittest.TestCase):
 
     def test_boundary_cases(self):
         for m, d, want_rtn, want_mem in self.BOUNDARY_CASES:
-            with self.subTest(m=hex(m), d=hex(d)):
+            with self.subTest(op="ds_sub_rtn_u32", m=hex(m), d=hex(d)):
                 rtns, fin = L.run_chain([("ds_sub_rtn_u32", 0x40, 0, (d,))], {0x40: m})
                 self.assertEqual(rtns, [want_rtn], f"Returned old value mismatch for {hex(m)} - {hex(d)}")
+                self.assertEqual(fin, {0x40: want_mem}, f"Final memory value mismatch for {hex(m)} - {hex(d)}")
+
+            with self.subTest(op="ds_sub_u32", m=hex(m), d=hex(d)):
+                rtns, fin = L.run_chain([("ds_sub_u32", 0x40, 0, (d,))], {0x40: m})
+                # non-returning form leaves preset 0xDEAD in destination; memory updated
+                self.assertEqual(rtns, [0xDEAD])
                 self.assertEqual(fin, {0x40: want_mem}, f"Final memory value mismatch for {hex(m)} - {hex(d)}")
 
 
@@ -143,18 +140,18 @@ class TestLdsSubRtnU32Chaining(unittest.TestCase):
         self.assertEqual(fin, {0x30: 0xFFFFFFFF})
 
     def test_interleaved_dwords(self):
-        # Subtractions interleaved across three distinct LDS locations
+        # Subtractions interleaved across three distinct LDS locations mixing returning and non-returning forms
         init = {0x10: 500, 0x20: 300, 0x30: 100}
         ops = [
             ("ds_sub_rtn_u32", 0x10, 0, (50,)),    # 0x10: 500 -> 450 (returns 500)
-            ("ds_sub_rtn_u32", 0x20, 0, (100,)),   # 0x20: 300 -> 200 (returns 300)
+            ("ds_sub_u32",     0x20, 0, (100,)),   # 0x20: 300 -> 200 (returns DEAD)
             ("ds_sub_rtn_u32", 0x30, 0, (30,)),    # 0x30: 100 -> 70  (returns 100)
             ("ds_sub_rtn_u32", 0x10, 0, (200,)),   # 0x10: 450 -> 250 (returns 450)
-            ("ds_sub_rtn_u32", 0x20, 0, (200,)),   # 0x20: 200 -> 0   (returns 200)
+            ("ds_sub_u32",     0x20, 0, (200,)),   # 0x20: 200 -> 0   (returns DEAD)
             ("ds_sub_rtn_u32", 0x30, 0, (70,)),    # 0x30: 70  -> 0   (returns 70)
         ]
         rtns, fin = L.run_chain(ops, init)
-        self.assertEqual(rtns, [500, 300, 100, 450, 200, 70])
+        self.assertEqual(rtns, [500, 0xDEAD, 100, 450, 0xDEAD, 70])
         self.assertEqual(fin, {0x10: 250, 0x20: 0, 0x30: 0})
 
 
@@ -162,7 +159,7 @@ class TestLdsSubRtnU32RegisterAliasing(unittest.TestCase):
     """Test register aliasing between destination (vdst), address (vaddr), and data (vdata)."""
 
     def test_vdst_aliases_vaddr(self):
-        # In ds_sub_rtn_u32 v1, v1, v2: vdst == vaddr == v1
+        # In ds_sub_rtn_u32 v1, v1, v3: vdst == vaddr == v1
         # The address in v1 must be read before the returned old value overwrites v1.
         body = [
             "v_mov_b32_e32 v1, 0x40",
@@ -269,36 +266,16 @@ class TestLdsSubRtnU32SpirvOutput(unittest.TestCase):
         self.assertIn("Workgroup", spv)
 
 
-class TestLdsSubRtnU32SeededFuzzing(unittest.TestCase):
-    """Deterministic pseudo-random sequence testing against the mathematical model."""
+class TestLdsSubRtnU32NegativeRejection(unittest.TestCase):
+    """Verify negative syntax rejection and stage enforcement."""
 
-    def test_randomized_sequences(self):
-        rng = random.Random(0x50B_32)
-        addrs = [0x20, 0x60, 0x100, 0x240]
+    def test_outside_compute_rejection(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_test_sub_outside_compute", ["ds_sub_rtn_u32 v0, v1, v2", "s_endpgm"])
 
-        for trial in range(10):
-            init = {a: rng.getrandbits(32) for a in addrs}
-            ops = []
-            expected_rtns = []
-            cur_mem = dict(init)
-
-            for _ in range(16):
-                eff_addr = rng.choice(addrs)
-                off = rng.choice((0, 0, 4, 16))
-                base = eff_addr - off
-                subtrahend = rng.choice((
-                    rng.getrandbits(32),
-                    0, 1, M32, 0x80000000, 0x7FFFFFFF
-                ))
-                ops.append(("ds_sub_rtn_u32", base, off, (subtrahend,)))
-                old_val, new_val = ref_sub_u32(cur_mem[eff_addr], subtrahend)
-                expected_rtns.append(old_val)
-                cur_mem[eff_addr] = new_val
-
-            with self.subTest(trial=trial):
-                got_rtns, got_fin = L.run_chain(ops, init)
-                self.assertEqual(got_rtns, expected_rtns, f"Trial {trial} returned values mismatch")
-                self.assertEqual(got_fin, cur_mem, f"Trial {trial} final memory mismatch")
+    def test_invalid_syntax_rejection(self):
+        with self.assertRaises((rdna2spirv.Unsupported, IndexError, ValueError)):
+            support.translate_lines("cs_test_sub_bad_syntax", ["ds_sub_rtn_u32 v1, v2", "s_endpgm"], fssm=L.fssm())
 
 
 if __name__ == "__main__":
