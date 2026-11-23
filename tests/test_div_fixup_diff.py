@@ -13,7 +13,8 @@ import re
 import sys
 import unittest
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -371,6 +372,44 @@ class Translated(unittest.TestCase):
             self.assertIn("expected 0x00000000, actual 0x3f800000", d.check(lines))
         finally:
             d.translate_listing = real
+
+
+class ArgumentValidation(unittest.TestCase):
+    """--programs and --max-ops must be at least 1 (the same rule as the sibling *_diff fuzzers)."""
+
+    def rejected(self, flag, value):
+        err = io.StringIO()
+        argv = ["div_fixup_diff.py", "--no-sweep", flag, value]
+        with mock.patch.object(sys, "argv", argv), redirect_stderr(err), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                d.main()
+        self.assertEqual(caught.exception.code, 2)
+        lines = err.getvalue().splitlines()
+        errors = [line for line in lines if "error:" in line]
+        # argparse prints its usage line first; exactly one error line names both flags.
+        self.assertEqual(len(errors), 1, err.getvalue())
+        self.assertTrue(errors[0].endswith("error: --programs and --max-ops must be at least 1"), errors[0])
+        self.assertIn(flag, errors[0])
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_programs_below_one_is_a_usage_error(self):
+        # --programs 0 used to drop the random stage silently and exit 0.
+        for value in ("0", "-1"):
+            with self.subTest(value=value):
+                self.rejected("--programs", value)
+
+    def test_max_ops_below_one_is_a_usage_error(self):
+        # --max-ops 0 used to reach random.randint(1, 0): a ValueError traceback, exit 1.
+        for value in ("0", "-1"):
+            with self.subTest(value=value):
+                self.rejected("--max-ops", value)
+
+    def test_a_valid_small_run_still_works(self):
+        out = io.StringIO()
+        argv = ["div_fixup_diff.py", "--no-sweep", "--programs", "1", "--max-ops", "1"]
+        with mock.patch.object(sys, "argv", argv), redirect_stdout(out):
+            self.assertEqual(d.main(), 0)
+        self.assertIn("random: 1/1 programs match", out.getvalue())
 
 
 if __name__ == "__main__":
