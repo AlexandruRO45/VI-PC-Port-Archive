@@ -211,7 +211,9 @@ The game executable targets the console's AMD CPU. An instruction a desktop CPU 
 (`STATUS_ILLEGAL_INSTRUCTION`); `src/cpu_ud_emulate.*` is a vectored handler that emulates the ones in its table and
 resumes after them, and passes every other exception on. Installed at startup only when the host CPU lacks an emulated
 instruction. So far: `CLZERO` (`0F 01 FC`) zeroes the 64-byte line at `RAX & ~63`. If that line is not writable the
-emulator declines and the exception goes on to the next handler, as the real instruction's page fault would. Another
+emulator declines and the exception goes on to the next handler, as the real instruction's page fault would. `INSERTQ` (SSE4a, `F2 0F 79 /r` and `F2 0F 78 /r ib ib`, register forms) inserts the low bits of one XMM
+register's low quadword into another's; a field the APM leaves undefined (index + length > 64) is declined, and the
+high quadword of the destination is left as it was. Another
 instruction is one emulator function and one line in `kTable`; `cpu_ud_emulate_test` drives the dispatcher with a
 synthetic `CONTEXT`, so it runs on any CPU.
 

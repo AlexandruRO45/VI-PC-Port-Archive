@@ -36,8 +36,48 @@ size_t emulate_clzero(CONTEXT& ctx, const uint8_t* code, size_t available) {
     return 3;
 }
 
+// INSERTQ (SSE4a), F2 [REX] 0F 79 /r (xmm1, xmm2: length and index come from the high quadword of xmm2) and
+// F2 [REX] 0F 78 /r ib ib (xmm1, xmm2, length, index). Both take ModRM.reg as xmm1 (destination, also a source) and
+// ModRM.rm as xmm2, register forms only. The low `length` bits of the low quadword of xmm2 replace the bits of the low
+// quadword of xmm1 from bit `index` up; the high quadword of xmm1 is unchanged. Length and index are 6-bit fields
+// (bits 5:0 of the immediate, or bits 69:64 and 77:72 of xmm2; the bits around them are ignored); a length of 0
+// means 64. A field that reaches past bit 63 (index + length > 64, which includes length 64 at a non-zero index) is
+// undefined in the APM (vol. 4), so the emulator declines it rather than invent a result.
+size_t emulate_insertq(CONTEXT& ctx, const uint8_t* code, size_t available) {
+    size_t at = 0;
+    if (available < 1 || code[at++] != 0xF2) return 0;
+    uint8_t rex = 0;
+    if (at < available && (code[at] & 0xF0) == 0x40) rex = code[at++];
+    if (available < at + 3 || code[at] != 0x0F) return 0;
+    const uint8_t opcode = code[at + 1];
+    const uint8_t modrm = code[at + 2];
+    at += 3;
+    if ((opcode != 0x78 && opcode != 0x79) || (modrm >> 6) != 3) return 0;
+    const unsigned dst_index = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+    const unsigned src_index = (modrm & 7) | ((rex & 1) << 3);
+    M128A& dst = ctx.FltSave.XmmRegisters[dst_index];
+    const M128A& src = ctx.FltSave.XmmRegisters[src_index];
+
+    unsigned length, index;
+    if (opcode == 0x79) {
+        length = static_cast<unsigned>(src.High) & 0x3F;
+        index = static_cast<unsigned>(src.High >> 8) & 0x3F;
+    } else {
+        if (available < at + 2) return 0;
+        length = code[at] & 0x3F;
+        index = code[at + 1] & 0x3F;
+        at += 2;
+    }
+    if (length == 0) length = 64;
+    if (index + length > 64) return 0;
+    const ULONGLONG mask = length == 64 ? ~0ULL : (1ULL << length) - 1;
+    dst.Low = (dst.Low & ~(mask << index)) | ((src.Low & mask) << index);
+    return at;
+}
+
 const Emulator kTable[] = {
     {"clzero", &emulate_clzero},
+    {"insertq", &emulate_insertq},
 };
 
 // Copies up to kMaxInstructionLength bytes of the code at `ip`, fewer when it runs into unreadable memory, and
@@ -83,9 +123,17 @@ bool host_has_clzero() {
     return (regs[1] & 1) != 0;
 }
 
+bool host_has_sse4a() {
+    int regs[4];
+    __cpuid(regs, static_cast<int>(0x80000000));
+    if (static_cast<unsigned>(regs[0]) < 0x80000001u) return false;
+    __cpuid(regs, static_cast<int>(0x80000001));
+    return (regs[2] & (1 << 6)) != 0;
+}
+
 bool install(bool force) {
     if (g_handler) return true;
-    if (!force && host_has_clzero()) return false;
+    if (!force && host_has_clzero() && host_has_sse4a()) return false;
     g_handler = AddVectoredExceptionHandler(1, &handler);
     return g_handler != nullptr;
 }
