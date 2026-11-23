@@ -28,8 +28,10 @@ Every type carries `Name`, `ShortName`, `DataName`, `SkipDebugCycling`, and eith
 `Mod*` tags: `ModAtmosphere`, `ModPrecipitation`, `ModTemperature`, `ModHumidity`, `ModWind`, `ModFetch`,
 `ModMisc`, `ModNiceness`. The split is 151 fully tagged, 17 with nothing, and it is exactly a family split.
 The 151 tagged types live in the nine `CLOUDSCAPE_*` families (2 to 38 types each by `DataName`). The 17
-untagged ones are the 16 single-type families plus one stray variant of a `CLOUDSCAPE_*` data set. Eleven of
-the 17 have `Name == DataName` exactly; the other six differ only in case (like `MISTY` borrowing `misty`).
+untagged ones are the 16 single-type families plus one stray variant of a `CLOUDSCAPE_*` data set; in those
+17 the seven tags except `ModNiceness` remain as empty strings and `ModNiceness` is absent. Eleven of the 17
+have `Name == DataName` exactly and five more differ only in case (like `MISTY` borrowing `misty`); the stray
+variant's `Name` differs from its `DataName` by more than case.
 
 The `Mod*` axes are not restatements of the numeric data. All eight axes change *within* a family; seven of
 the eight do it in at least 6 of the nine `CLOUDSCAPE_*` families (`ModTemperature` and `ModFetch` in 8 of 9,
