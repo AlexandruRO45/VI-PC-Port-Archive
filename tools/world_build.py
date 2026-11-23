@@ -944,7 +944,8 @@ def resolve_model_textures(
             continue
         try:
             idx = int(raw_idx)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # a JSON float like 1e400 is inf, and int(inf) overflows; skip it like any bad index
             continue
         dds_path = _find_embedded_dds(tex_dir, dds_files, idx) if dds_files else None
         if not dds_path:
@@ -971,7 +972,7 @@ def resolve_model_textures(
                 continue
             try:
                 sidx = int(raw_sidx)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if sidx in result:
                 continue

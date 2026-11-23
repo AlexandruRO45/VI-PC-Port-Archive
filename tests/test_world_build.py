@@ -1534,6 +1534,36 @@ class WorldBuildTest(unittest.TestCase):
                     record[field] = malformed
                     self.assertEqual(build(manifest), expected)
 
+    def test_overflowing_texture_index_is_skipped_not_a_traceback(self):
+        # int(1e400) is an OverflowError, which the (TypeError, ValueError) guard around the
+        # Embedded Index / ShaderIndex conversion did not catch, so a non-finite index escaped
+        # build_world as a traceback. It must be skipped like any other unreadable index.
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            path = _write_synthetic_assets(assets)["models_manifest_path"]
+            with open(path, encoding="utf-8") as f:
+                original = f.read()
+
+            def build(manifest):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f)
+                result = world_build.build_world(assets, output)
+                self.assertEqual(result["stats"]["models"], 2)
+                return self._output_snapshot(output)
+
+            for field in ("Index", "ShaderIndex"):
+                with self.subTest(field=field):
+                    manifest = json.loads(original)
+                    record = manifest["Items"][0]
+                    if field == "ShaderIndex":
+                        record = record["Materials"][0]
+                    record[field] = "not-a-number"
+                    expected = build(manifest)
+                    for bad in (1e400, -1e400):
+                        with self.subTest(bad=bad):
+                            record[field] = bad
+                            self.assertEqual(build(manifest), expected)
+
     def test_limit_zero_explicitly_replaces_world_with_empty_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
