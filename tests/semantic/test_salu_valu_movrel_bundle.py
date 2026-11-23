@@ -315,3 +315,42 @@ class TestSMovrelsB64AST(unittest.TestCase):
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0x77889900)
         self.assertEqual(out[1], 0xAABBCCDD)
+
+
+class TestSMovrelsB64Indexing(unittest.TestCase):
+    def test_dynamic_pair_indexing(self):
+        lines = [
+            "s_mov_b32 s24, 0x12344321",
+            "s_mov_b32 s25, 0x56788765",
+            "s_mov_b32 m0, 4",
+            "s_movrels_b64 s[16:17], s[20:21]",
+            "v_mov_b32 v0, s16",
+            "v_mov_b32 v1, s17",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b64_idx", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x12344321)
+        self.assertEqual(out[1], 0x56788765)
+
+    def test_scc_preserved_b64(self):
+        lines = [
+            "s_cmp_eq_u32 7, 7",  # SCC = 1
+            "s_mov_b32 s20, 0x11111111",
+            "s_mov_b32 s21, 0x22222222",
+            "s_mov_b32 m0, 0",
+            "s_movrels_b64 s[10:11], s[20:21]",
+            "s_cselect_b32 s12, 0x9999, 0x8888",
+            "v_mov_b32 v0, s12",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_b64_scc", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x9999)
