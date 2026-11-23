@@ -150,5 +150,113 @@ class TestLdsMaxU32Oracle(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(0), 200)
 
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register kinds in RDNA2 architecture."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Register operand with kind, index, and grouping."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def format_asm(self) -> str:
+        if self.count == 1:
+            return f"{self.kind.value}{self.index}"
+        return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+
+@dataclasses.dataclass(frozen=True)
+class LdsModifiers:
+    """Modifiers and options for LDS instructions."""
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.offset < 0 or self.offset > 65535:
+            raise ValueError(f"LDS offset must be in range [0, 65535]: {self.offset}")
+
+
+class Opcode(enum.Enum):
+    """LDS instruction opcodes."""
+    DS_MAX_U32 = "ds_max_u32"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a ds_max_u32 instruction."""
+    opcode: Opcode
+    vaddr: Register
+    vdata: Register
+    mods: LdsModifiers = dataclasses.field(default_factory=LdsModifiers)
+
+    def __post_init__(self) -> None:
+        if not self.vaddr.is_vgpr or self.vaddr.count != 1:
+            raise ValueError(f"vaddr must be a single VGPR: {self.vaddr}")
+        if not self.vdata.is_vgpr or self.vdata.count != 1:
+            raise ValueError(f"vdata must be a single VGPR: {self.vdata}")
+
+    def to_assembly(self) -> str:
+        va_str = self.vaddr.format_asm()
+        vd_str = self.vdata.format_asm()
+        off_str = f" offset:{self.mods.offset}" if self.mods.offset != 0 else ""
+        return f"{self.opcode.value} {va_str}, {vd_str}{off_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of LDS instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestLdsMaxU32AST(unittest.TestCase):
+    """Unit tests for AST data structures and assembly emission."""
+
+    def test_ast_instruction_creation(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.DS_MAX_U32,
+            vaddr=Register(RegKind.VGPR, 0),
+            vdata=Register(RegKind.VGPR, 1),
+        )
+        self.assertEqual(inst.opcode, Opcode.DS_MAX_U32)
+        self.assertEqual(inst.vaddr.format_asm(), "v0")
+        self.assertEqual(inst.vdata.format_asm(), "v1")
+        self.assertEqual(inst.to_assembly(), "ds_max_u32 v0, v1")
+
+    def test_ast_to_assembly_with_offset(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.DS_MAX_U32,
+            vaddr=Register(RegKind.VGPR, 2),
+            vdata=Register(RegKind.VGPR, 3),
+            mods=LdsModifiers(offset=64),
+        )
+        self.assertEqual(inst.to_assembly(), "ds_max_u32 v2, v3 offset:64")
+
+    def test_ast_program_assembly(self) -> None:
+        prog = Program()
+        prog.append(Instruction(Opcode.DS_MAX_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1)))
+        prog.append(Instruction(Opcode.DS_MAX_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 2), LdsModifiers(offset=16)))
+        lines = prog.to_assembly().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], "ds_max_u32 v0, v1")
+        self.assertEqual(lines[1], "ds_max_u32 v0, v2 offset:16")
+
+
 if __name__ == "__main__":
     unittest.main()
