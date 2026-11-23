@@ -57,5 +57,43 @@ class Osg1BuilderTest(unittest.TestCase):
         self.assertEqual(len(dxbc) % 4, 0)
 
 
+class PsModelTest(unittest.TestCase):
+    E = export_diff.PsExport
+
+    def test_sparse_targets(self):
+        # SHADER-210: export mrtK writes the K-th declared SV_Target; the variable carries that target's register.
+        pred = export_diff.ps_model(export_diff.PsShape([0, 2], True),
+                                    [self.E("mrt", 0, False, False), self.E("mrt", 1, False, False)])
+        self.assertEqual(pred.locations, {"%out_mrt0": 0, "%out_mrt2": 2})
+        self.assertEqual(pred.refusals, [])
+
+    def test_no_osg1_locations(self):
+        pred = export_diff.ps_model(export_diff.PsShape([], False),
+                                    [self.E("mrt", 0, False, False), self.E("mrt", 3, False, False)])
+        self.assertEqual(pred.locations, {"%out_mrt0": 0, "%out_mrt3": 3})
+
+    def test_empty_osg1_is_identity(self):
+        # An OSG1 that declares no SV_Target: rdna2spirv.py:14340-14342 takes the export index as the target.
+        pred = export_diff.ps_model(export_diff.PsShape([], True), [self.E("mrt", 2, False, False)])
+        self.assertEqual(pred.locations, {"%out_mrt2": 2})
+
+    def test_past_declared_refused(self):
+        pred = export_diff.ps_model(export_diff.PsShape([0], True),
+                                    [self.E("mrt", 0, False, False), self.E("mrt", 1, False, False)])
+        self.assertEqual(pred.refusals, ["mrt1"])
+        self.assertEqual(pred.locations, {"%out_mrt0": 0})
+
+    def test_mrtz_compr_is_not_depth(self):
+        compr = export_diff.ps_structure(export_diff.ps_model(export_diff.PsShape([], False),
+                                                              [self.E("mrtz", 0, True, True)]))
+        self.assertEqual(compr, [])
+        plain = export_diff.ps_structure(export_diff.ps_model(export_diff.PsShape([], False),
+                                                              [self.E("mrtz", 0, True, False)]))
+        self.assertEqual(plain, ["BuiltIn %out_depth FragDepth"])
+        off = export_diff.ps_structure(export_diff.ps_model(export_diff.PsShape([], False),
+                                                            [self.E("mrtz", 0, False, False)]))
+        self.assertEqual(off, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

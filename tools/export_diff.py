@@ -43,3 +43,42 @@ def osg1_dxbc(elements):
     part += bytes((-len(part)) % 4)
     header = b"DXBC" + bytes(16) + struct.pack("<III", 1, 0, 1)
     return header + struct.pack("<I", len(header) + 8) + bytes(4) + part
+
+
+# ---- the model: pixel-shader exports ---------------------------------------------------------------------------------
+PsShape = namedtuple("PsShape", "targets has_osg1")             # declared SV_Target registers in order; an OSG1 at all
+PsExport = namedtuple("PsExport", "kind index depth_x compr")   # kind "mrt" | "mrtz"
+PsPrediction = namedtuple("PsPrediction", "locations refusals")  # %out_* -> Location | "FragDepth"; expected refusals
+
+
+def ps_model(shape, exports):
+    """Colour and depth exports of a pixel shader.
+
+    With SV_Target outputs declared, `exp mrtK` writes the K-th declared one and the output variable carries that
+    target's register (SHADER-210); an export past the declared count raises Unsupported and ends the program.
+    Without a declared target the export index is the target. `exp mrtz` exports FragDepth only when x is on in an
+    uncompressed export: the 16-bit compr form is the stencil and sample-mask format and never holds Z.
+    """
+    locations, refusals = {}, []
+    for e in exports:
+        if e.kind == "mrtz":
+            if e.depth_x and not e.compr:
+                locations["%out_depth"] = "FragDepth"
+            continue
+        if shape.targets and e.index >= len(shape.targets):
+            refusals.append(f"mrt{e.index}")
+            break
+        rt = shape.targets[e.index] if shape.targets else e.index
+        locations[f"%out_mrt{rt}"] = rt
+    return PsPrediction(locations, refusals)
+
+
+def structure_lines(locations):
+    """Output decorations as canonical strings, sorted: "Location %var n" or "BuiltIn %var Name"."""
+    return sorted(f"BuiltIn {var} {val}" if isinstance(val, str) else f"Location {var} {val}"
+                  for var, val in locations.items())
+
+
+def ps_structure(prediction):
+    """The pixel-shader module's output decorations the translated module must carry."""
+    return structure_lines(prediction.locations)
