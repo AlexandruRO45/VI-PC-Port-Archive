@@ -181,20 +181,6 @@ También puede pasar `--runtime-build <carpeta>` con una compilación de Windows
 descomprimido. Así evita compilar el runtime; la misma opción funciona en Windows. En Linux el script escribe
 `gta6rt.sh`, que lanza `gta6rt.exe` con `wine`, o con el Wine indicado por la variable `WINE` (para Proton, su
 `files/bin/wine`).
-- **`--wave64-emulate`**: traduce los shaders compute y mesh wave64 de forma exacta cualquiera que sea el tamaño de
-  subgrupo de la GPU. Las GPU NVIDIA e Intel usan subgrupos de 32 y lo necesitan. El valor predeterminado, `auto`,
-  consulta `vulkaninfo` y activa la emulación si alguna GPU no tiene subgrupos de 64 o su tamaño es desconocido;
-  también comprueba si la GPU del runtime puede ejecutar compute y mesh en 64 (con `--mesh-compute` basta el
-  soporte de compute). Con el driver de Windows de AMD, `auto` usa wave64 nativo en RDNA1 y RDNA2 cuando la GPU del
-  runtime lo permite, aunque otra GPU sea de 32 o `vulkaninfo` no esté disponible; ese driver puede fallar con el
-  código LDS emulado (#857), y en RDNA1 sin mesh nativo decide por la etapa compute.
-- **`--work`**: elija un disco con al menos 400 GB libres. La traducción de shaders es la etapa más larga; por
-  defecto usa la mitad de los hilos del procesador (ajustable con `--jobs`).
-- **`--wav`**: desactivado por defecto, porque el WAV PCM de 16 bits ocupa varias veces más que el Ogg Opus.
-- **Linux y Wine/Proton**: `make_game.py` también funciona en Linux. El cargador es un programa de Windows y se
-  ejecuta bajo Wine o Proton. Para la etapa `runtime` puede pasar `--runtime-build <carpeta>` con una compilación
-  de Windows (`gta6rt.exe` y `gta6rt_tls_host.dll`): el script escribe entonces `gta6rt.sh`, que lanza
-  `gta6rt.exe` con `wine`, o con el Wine indicado por la variable `WINE` (para Proton, su `files/bin/wine`).
 
 Con el backend Vulkan (`LEONIDA_D3D12=vulkan`), el runtime empaquetado encuentra los shaders traducidos en
 `<work>/shaders/spirv` mediante `shader_path.txt` junto a `gta6rt.exe`. `LEONIDA_SHADERS` permite indicar otro
