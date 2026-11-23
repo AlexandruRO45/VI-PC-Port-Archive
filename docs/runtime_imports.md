@@ -638,8 +638,9 @@ asynchronous paths with `.invalid` names; it opens no connection.
   | `vcruntime140_1.dll` | 79 | covered |
 - It does **not** prove any imported function behaves correctly when called. That needs the executable, or a
   harness that calls a known entry point.
-- The executable's own imports are unknown. `MicrosoftGame.Config` names `game_scarlett_master.exe`; the package
-  here does not contain it, so its import table cannot be measured yet.
+- The executable's own imports are measured, from a copy supplied separately from the package (`MicrosoftGame.Config`
+  names `game_scarlett_master.exe`), in [The retail executable](#the-retail-executable-rt-5) above; nothing has run,
+  so no import is known to be reached.
 - The CRT images are present in the package, but `pe_loader.cpp` prefers the host copies for the `vcruntime`/
   `msvcp`/`concrt`/`vccorlib`/`vcomp` families. The table above maps the packaged images only to test the
   parser; a real run binds the host copies.
