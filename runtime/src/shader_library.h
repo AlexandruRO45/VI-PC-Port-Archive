@@ -718,7 +718,62 @@ struct ShaderEntry {
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
     std::uint32_t max_primitives = 0;
+    // Vulkan features and SPIR-V capabilities the module requires (written by tools/rdna2spirv.py).
+    // Empty when absent from the index.
+    std::vector<std::string> features;
+    std::vector<std::string> capabilities;
+
+    // True when the index records OpFmaKHR / VK_KHR_shader_fma (shaderFmaFloat32 or capability FMAKHR).
+    // Note: the index's "fma": "khr" flag is not checked because a shader with no f32 FMA ops emits neither.
+    bool needs_shader_fma() const {
+        return std::find(features.begin(), features.end(), "shaderFmaFloat32") != features.end() ||
+               std::find(capabilities.begin(), capabilities.end(), "FMAKHR") != capabilities.end();
+    }
 };
+
+inline constexpr std::uint32_t kSpvCapabilityFmaKhr = 6030;  // SPV_KHR_fma / OpCapability FMAKHR
+
+// True when the binary SPIR-V module declares `capability` via OpCapability (opcode 17).
+inline bool spirv_declares_capability(std::span<const std::uint32_t> words, std::uint32_t capability) {
+    constexpr std::uint32_t magic = 0x07230203;
+    constexpr std::uint16_t op_capability = 17;
+    if (words.size() < 5 || words[0] != magic) return false;
+    for (std::size_t at = 5; at < words.size();) {
+        const std::uint32_t count = words[at] >> 16;
+        const std::uint16_t op = static_cast<std::uint16_t>(words[at] & 0xffff);
+        if (count == 0 || at + count > words.size()) return false;
+        if (op == op_capability && count == 2 && words[at + 1] == capability) return true;
+        at += count;
+    }
+    return false;
+}
+
+// Checks whether `entry`'s index metadata (`features`, `capabilities`) requires VK_KHR_shader_fma (OpFmaKHR /
+// shaderFmaFloat32) when the device does not have it enabled. Returns true when supported; otherwise sets `reason`
+// (if non-null) to an actionable diagnostic and returns false.
+inline bool check_shader_fma_support(const ShaderEntry& entry, bool shader_fma_float32,
+                                     std::string* reason = nullptr) {
+    if (entry.needs_shader_fma() && !shader_fma_float32) {
+        if (reason)
+            *reason = "needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32), which the device does not have enabled; "
+                      "retranslate with --fma glsl or --fma exact";
+        return false;
+    }
+    return true;
+}
+
+// Checks whether a SPIR-V module declares OpCapability FMAKHR (6030) when the device does not have VK_KHR_shader_fma
+// enabled (catches modules whose index.json omitted `features` / `capabilities`).
+inline bool check_shader_fma_support(std::span<const std::uint32_t> words, bool shader_fma_float32,
+                                     std::string* reason = nullptr) {
+    if (!shader_fma_float32 && spirv_declares_capability(words, kSpvCapabilityFmaKhr)) {
+        if (reason)
+            *reason = "needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32), which the device does not have enabled; "
+                      "retranslate with --fma glsl or --fma exact";
+        return false;
+    }
+    return true;
+}
 
 class ShaderLibrary {
 public:
@@ -924,6 +979,14 @@ private:
             }
             e.max_vertices = u32(meta.find("max_vertices"));
             e.max_primitives = u32(meta.find("max_primitives"));
+            const auto read_strings = [&](std::string_view key, std::vector<std::string>& out) {
+                if (const Json* arr = meta.find(key); arr && arr->kind == Json::Kind::array) {
+                    for (const Json& item : arr->array)
+                        if (item.kind == Json::Kind::string && !item.string.empty()) out.push_back(item.string);
+                }
+            };
+            read_strings("features", e.features);
+            read_strings("capabilities", e.capabilities);
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && prefix == "fspx/") ++fspx_count_;

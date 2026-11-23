@@ -633,6 +633,66 @@ int main() {
         CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {99, kind7.data(), 24}}).empty());
     }
 
+    // VK_KHR_shader_fma metadata parsing (`features`, `capabilities`) and SPIR-V OpCapability FMAKHR guard.
+    {
+        const auto caps_dir = scratch.path() / "fma_caps";
+        std::filesystem::create_directories(caps_dir);
+        const std::string h_fma_feat = sha256_hex(bytes("fma-by-feature"));
+        const std::string h_fma_cap = sha256_hex(bytes("fma-by-capability"));
+        const std::string h_fma_no_op = sha256_hex(bytes("fma-flag-without-op"));
+        {
+            std::ofstream index(caps_dir / "index.json", std::ios::binary);
+            index << "{\"cs_fma_feat\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << h_fma_feat
+                  << "\", \"fma\": \"khr\", \"features\": [\"shaderInt64\", \"shaderFmaFloat32\", 42, \"\"], "
+                     "\"capabilities\": [\"Shader\", \"Int64\"]},\n"
+                     " \"ps_fma_cap\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h_fma_cap
+                  << "\", \"capabilities\": [\"Shader\", \"FMAKHR\"]},\n"
+                     " \"cs_fma_no_op\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << h_fma_no_op
+                  << "\", \"fma\": \"khr\", \"features\": [\"shaderInt64\"], \"capabilities\": [\"Shader\"]}}";
+        }
+        ShaderLibrary caps_lib;
+        CHECK(caps_lib.load(caps_dir.string(), &error) && caps_lib.size() == 3);
+        const ShaderEntry* e_feat = caps_lib.find("cs", h_fma_feat);
+        const ShaderEntry* e_cap = caps_lib.find("ps", h_fma_cap);
+        const ShaderEntry* e_noop = caps_lib.find("cs", h_fma_no_op);
+        CHECK(e_feat && e_cap && e_noop);
+        CHECK(e_feat->features.size() == 2 && e_feat->features[1] == "shaderFmaFloat32" && e_feat->needs_shader_fma());
+        CHECK(e_cap->capabilities.size() == 2 && e_cap->capabilities[1] == "FMAKHR" && e_cap->needs_shader_fma());
+        CHECK(!e_noop->needs_shader_fma());
+
+        // Without VK_KHR_shader_fma (e.g. Pascal / GTX 1070), FMAKHR entries are rejected with an actionable message;
+        // entries with only "fma": "khr" and no shaderFmaFloat32 / FMAKHR are accepted.
+        std::string reason;
+        CHECK(!check_shader_fma_support(*e_feat, false, &reason) && reason.find("VK_KHR_shader_fma") != std::string::npos);
+        reason.clear();
+        CHECK(!check_shader_fma_support(*e_cap, false, &reason) && reason.find("--fma glsl") != std::string::npos &&
+              reason.find("--fma exact") != std::string::npos);
+        CHECK(check_shader_fma_support(*e_noop, false, &reason));
+
+        // Enabling shader_fma_float32 allows FMAKHR shaders.
+        CHECK(check_shader_fma_support(*e_feat, true, &reason));
+        CHECK(check_shader_fma_support(*e_cap, true, &reason));
+
+        // Direct SPIR-V scanning catches unindexed OpCapability FMAKHR (6030) and safely ignores malformed streams.
+        const std::vector<std::uint32_t> spv_plain = {0x07230203u, 0x00010500u, 0u, 2u, 0u, (2u << 16) | 17u, 1u};
+        const std::vector<std::uint32_t> spv_fma = {0x07230203u, 0x00010500u, 0u, 2u, 0u, (2u << 16) | 17u, 1u,
+                                                    (2u << 16) | 17u, kSpvCapabilityFmaKhr};
+        const std::vector<std::uint32_t> spv_malformed = {0x07230203u, 0x00010500u, 0u, 2u, 0u, 0u};
+        const std::vector<std::uint32_t> spv_truncated = {0x07230203u, 0x00010500u, 0u, 2u, 0u, (4u << 16) | 17u, 1u};
+        CHECK(!spirv_declares_capability(spv_plain, kSpvCapabilityFmaKhr));
+        CHECK(spirv_declares_capability(spv_fma, kSpvCapabilityFmaKhr));
+        CHECK(!spirv_declares_capability(spv_malformed, kSpvCapabilityFmaKhr));
+        CHECK(!spirv_declares_capability(spv_truncated, kSpvCapabilityFmaKhr));
+        CHECK(check_shader_fma_support(spv_plain, false, &reason));
+        reason.clear();
+        CHECK(!check_shader_fma_support(spv_fma, false, &reason) && reason.find("VK_KHR_shader_fma") != std::string::npos);
+        CHECK(check_shader_fma_support(spv_fma, true, &reason));
+        CHECK(check_shader_fma_support(spv_malformed, false, &reason));
+        CHECK(check_shader_fma_support(spv_truncated, false, &reason));
+
+        std::filesystem::remove_all(caps_dir);
+    }
+
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");
     return 0;
 }

@@ -3272,6 +3272,7 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
             }
+            if (!check_stage_fma_entry(*stage.entry, stage.name)) return E_NOTIMPL;
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
                     std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
@@ -3310,6 +3311,7 @@ public:
             }
             stage.words = library->spirv(*stage.entry);
             if (stage.words.empty()) return E_FAIL;
+            if (!check_stage_fma_spirv(*stage.entry, stage.name, stage.words)) return E_NOTIMPL;
             const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
             if (!inner.valid) return E_INVALIDARG;
             if (inner.fully_covered &&
@@ -3745,6 +3747,7 @@ public:
                              leonida::sha256_hex(program.bytes).c_str());
             return E_INVALIDARG;
         }
+        if (!check_stage_fma_entry(*entry, "cs")) return E_NOTIMPL;
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
         if (entry->binding_count && !device_.bindless) {
@@ -3777,6 +3780,7 @@ public:
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
             return E_FAIL;
         }
+        if (!check_stage_fma_spirv(*entry, "cs", words)) return E_NOTIMPL;
 
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module_info.codeSize = words.size() * 4;
@@ -3821,6 +3825,21 @@ public:
     }
 
 private:
+    bool check_stage_fma_entry(const leonida::ShaderEntry& entry, const char* stage_name) const {
+        std::string reason;
+        if (leonida::check_shader_fma_support(entry, device_.info.shader_fma, &reason)) return true;
+        std::fprintf(stderr, "[rt] d3d12: %s (%s) %s\n", entry.name.c_str(), stage_name, reason.c_str());
+        return false;
+    }
+
+    bool check_stage_fma_spirv(const leonida::ShaderEntry& entry, const char* stage_name,
+                               std::span<const std::uint32_t> words) const {
+        std::string reason;
+        if (leonida::check_shader_fma_support(words, device_.info.shader_fma, &reason)) return true;
+        std::fprintf(stderr, "[rt] d3d12: %s (%s) %s\n", entry.name.c_str(), stage_name, reason.c_str());
+        return false;
+    }
+
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
         bool mesh = false;  // no vertex input or input assembly state, and no dynamic topology or strides
