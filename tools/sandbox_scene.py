@@ -161,12 +161,20 @@ def build(args):
     return stats
 
 
+def center_coordinate(text):
+    value = float(text)
+    # The LSB1 header stores each scene coordinate as a binary32 float.
+    if not math.isfinite(value) or abs(value) > float.fromhex("0x1.fffffep+127"):
+        raise argparse.ArgumentTypeError("coordinates must be finite and fit in a 32-bit float")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--entities", required=True, help="world_index.py --entities-out file (JSON lines)")
     ap.add_argument("--models", required=True, help="folder holding rpf9dump models manifests")
     ap.add_argument("--textures", action="append", default=[], help="folder holding rpf9dump ttpf manifests (repeatable)")
-    ap.add_argument("--center", type=float, nargs=2, metavar=("X", "Y"),
+    ap.add_argument("--center", type=center_coordinate, nargs=2, metavar=("X", "Y"),
                     help="RAGE world x y (default: densest 50 m cell of resolved model placements)")
     ap.add_argument("--radius", type=float, default=150.0)
     ap.add_argument("--max-props", type=int, default=400, help="entities to place, nearest first (each can be several draws)")

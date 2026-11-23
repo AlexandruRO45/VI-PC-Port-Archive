@@ -112,7 +112,7 @@ def main(argv=None):
     ap.add_argument("--entities", required=True)
     ap.add_argument("--models", required=True)
     ap.add_argument("--textures", action="append", default=[])
-    ap.add_argument("--center", type=float, nargs=2, metavar=("X", "Y"))
+    ap.add_argument("--center", type=sandbox_scene.center_coordinate, nargs=2, metavar=("X", "Y"))
     ap.add_argument("--radius", type=float, default=150.0)
     ap.add_argument("--max-props", type=int, default=400)
     ap.add_argument("--build", default=os.path.join(HERE, "..", "runtime", "build"))

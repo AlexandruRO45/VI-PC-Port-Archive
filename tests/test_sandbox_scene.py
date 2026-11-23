@@ -10,6 +10,7 @@ import unittest
 from contextlib import redirect_stderr
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
+import sandbox
 import sandbox_scene
 
 class TestSandboxScene(unittest.TestCase):
@@ -161,16 +162,35 @@ class TestCliErrors(unittest.TestCase):
         self.assertEqual(len(err.strip().splitlines()), 1)
         self.assertTrue(err.startswith("ERROR:"))
 
+    def test_invalid_center_is_refused_before_writing_output(self):
+        out = os.path.join(self.tmp.name, "scene.bin")
+        common = ["--entities", self.entities, "--models", self.models]
+        entry_points = (
+            (sandbox_scene.main, ["--out", out]),
+            (sandbox.main, ["--work", self.tmp.name, "--check", "--scene", out]),
+        )
+        for main, options in entry_points:
+            for center in (("nan", "0"), ("0", "inf"), ("1e40", "0")):
+                with self.subTest(main=main.__module__, center=center):
+                    err = io.StringIO()
+                    with redirect_stderr(err), self.assertRaises(SystemExit) as refused:
+                        main(common + options + ["--center", *center])
+                    self.assertEqual(refused.exception.code, 2)
+                    self.assertIn("coordinates must be finite and fit in a 32-bit float", err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
     def test_writable_out_still_builds(self):
         out = os.path.join(self.tmp.name, "o.bin")
         err = io.StringIO()
         with redirect_stderr(err):
             rc = sandbox_scene.main(["--entities", self.entities, "--models", self.models,
-                                     "--center", "0", "0", "--out", out])
+                                     "--center", "-1.25", "2.5", "--out", out])
         self.assertEqual(rc, 0)
         self.assertEqual(err.getvalue(), "")
         with open(out, "rb") as f:
-            self.assertEqual(f.read(4), b"LSB1")
+            magic, _, _, _, _, x, y, z = struct.unpack("<4s4I3f", f.read(32))
+        self.assertEqual(magic, b"LSB1")
+        self.assertEqual((x, y, z), (-1.25, 2.5, 0.0))
 
 
 if __name__ == "__main__":
