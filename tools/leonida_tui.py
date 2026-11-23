@@ -659,9 +659,10 @@ def run_setup(default_jobs: int | None = None, default_overlap: bool = True) -> 
     ansi = enable_ansi()
     result: SetupConfig | None = None
 
-    def _row(label: str, value: str, selected: bool) -> str:
-        # Highlight stops at the end of the text — never padded to terminal width.
-        body = f"  {label:<12} {value}"
+    def _row(label: str, value: str, selected: bool, bar_width: int) -> str:
+        # Highlight covers label+value only (not full terminal width), but Jobs and Overlap
+        # share one bar width so a short jobs number does not leave a shorter white strip.
+        body = f"  {label:<12} {value}".ljust(bar_width)
         if selected:
             return _c(body, _BOLD, _REVERSE, on=ansi)
         return body
@@ -670,6 +671,9 @@ def run_setup(default_jobs: int | None = None, default_overlap: bool = True) -> 
         width, height = term_size()
         rule = _c("=" * width, _DIM, _CYAN, on=ansi)
         thin = _c("-" * width, _DIM, on=ansi)
+        jobs_text = f"  {'Jobs':<12} {jobs}"
+        overlap_text = f"  {'Overlap':<12} {'yes' if overlap else 'no'}"
+        bar_width = max(len(jobs_text), len(overlap_text))
         rows = [""] * height
         rows[0] = rule
         rows[1] = ""
@@ -681,11 +685,11 @@ def run_setup(default_jobs: int | None = None, default_overlap: bool = True) -> 
         rows[10] = ""
         # Hint stays outside the selection highlight so the bar does not run to the edge.
         rows[11] = (
-            _row("Jobs", str(jobs), cursor == 0)
+            _row("Jobs", str(jobs), cursor == 0, bar_width)
             + _c(f"    min {lo} · default {half} · max {hi}", _DIM, on=ansi)
         )
         rows[12] = ""
-        rows[13] = _row("Overlap", "yes" if overlap else "no", cursor == 1)
+        rows[13] = _row("Overlap", "yes" if overlap else "no", cursor == 1, bar_width)
         rows[height - 3] = thin
         rows[height - 2] = _c(
             "  Up/Down select   Left/Right change   Enter start   Esc defaults",
