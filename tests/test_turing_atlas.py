@@ -82,6 +82,40 @@ class VulkanMatrixTests(unittest.TestCase):
             with self.subTest(document=doc):
                 self.assert_unknown(self.probe(doc))
 
+    def test_multiple_profiles_pick_native_discrete_over_igpu_dozen_and_corrupt(self):
+        dozen = report()
+        dozen["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"].update({
+            "deviceName": "Microsoft Direct3D12 (Discrete)",
+            "vendorID": 0x1414,
+            "deviceType": "VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU",
+        })
+        igpu = report()
+        igpu["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"].update({
+            "deviceName": "Integrated Graphics",
+            "vendorID": 0x1002,
+            "deviceType": "VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU",
+        })
+        dgpu = report()
+        dgpu["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"].update({
+            "deviceName": "Native Discrete GPU",
+            "vendorID": 0x1002,
+            "deviceType": "VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU",
+        })
+
+        def run(cmd, cwd):
+            Path(cwd, "VP_VULKANINFO_0_corrupt.json").write_text("{not valid json", encoding="utf-8")
+            Path(cwd, "VP_VULKANINFO_1_dozen.json").write_text(json.dumps(dozen), encoding="utf-8")
+            Path(cwd, "VP_VULKANINFO_2_igpu.json").write_text(json.dumps(igpu), encoding="utf-8")
+            Path(cwd, "VP_VULKANINFO_3_dgpu.json").write_text(json.dumps(dgpu), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with patch.object(turing_atlas.shutil, "which", return_value="vulkaninfo"):
+            with patch.object(turing_atlas, "run", run):
+                matrix = turing_atlas.vulkan_matrix()
+        self.assertEqual(matrix["vulkaninfo"], "ok")
+        self.assertEqual(matrix["device"]["name"], "Native Discrete GPU")
+
+
 
 class ValidationGateTests(unittest.TestCase):
     """The malformed control must fail, or the atlas results prove nothing. Tools are mocked."""
@@ -177,6 +211,18 @@ class ValidationGateTests(unittest.TestCase):
             code, err = self.main_with(argv=["turing_atlas.py", "--out", tmp])
             self.assertEqual(code, 2)
             self.assertIn("--out is a folder", err)
+
+            trailing = os.path.join(tmp, "new_folder") + os.sep
+            code, err = self.main_with(argv=["turing_atlas.py", "--out", trailing])
+            self.assertEqual(code, 2)
+            self.assertIn("--out is a folder", err)
+
+            for empty_out in ("", "   "):
+                with self.subTest(empty_out=repr(empty_out)):
+                    code, err = self.main_with(argv=["turing_atlas.py", "--out", empty_out])
+                    self.assertEqual(code, 2)
+                    self.assertIn("turing_atlas: error:", err)
+
 
     def test_missing_tools_skip_without_treating_it_as_a_control_failure(self):
         with patch.object(turing_atlas.shutil, "which", return_value=None):
