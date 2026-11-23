@@ -187,8 +187,8 @@ It decodes nothing in that range. `python -I tests/test_imhex_patterns.py` runs 
 ## Limits
 
 - The TOC is the hard boundary. File names, original paths and the exact file boundaries come from the TOC,
-  so they are unavailable until the executable (or a documented key/schema) is part of the project. This
-  repository does not search for or distribute keys.
+  which is read from the player's own copy or a documented key/schema. This repository contains neither and
+  does not search for or distribute keys.
 - Some archives are not plain zlib (`audio.rpf`, parts of `story000.rpf`/`shared_minigame000.rpf`); the
   recovery tools handle the formats they know and report the rest as unread.
 - Bink 2 video is carved as whole `.bk2` streams. FFmpeg builds generally expose only Bink 1; the package's
