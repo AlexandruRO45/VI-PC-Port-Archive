@@ -877,33 +877,12 @@ records as JSON from a carve (the CLI prints summary counts; the JSON is game da
 python -I tools/gamedata_reader.py <work>/carve/common --root time_data --out <scratch>
 ```
 
-Not measured here (hypothesis): how the two regions are chosen at runtime, what the two plain-modifier numbers
-are (GTA V reads them as a value pair blended by strength), and how `controlValue` maps onto game state.
-
-**The two plain-modifier numbers.** Measured over the 29,727 two-number variables of the plain modifiers
-(1,051 variable names, 3,257 modifiers with at least one such variable):
-
-- The second number is `0` in 26,186 pairs (88 %) and `1` in 3,104; only 437 take another value. In 2,300 of
-  the 3,257 modifiers it is `0` on every variable, in 21 it repeats the first number on every variable, and
-  936 mix. Per variable name, 624 names never have a non-zero second number (8,410 pairs), 83 always do
-  (1,289 pairs) and the other 344 vary from one modifier to the next.
-- The pair is not an ordered range: the first number is larger in 20,833 pairs, smaller in 4,604 and equal in
-  4,290.
-- Where the second number is non-zero (3,541 pairs) it does not follow the first: Pearson correlation 0.009,
-  and the first is `0` in 570 of them.
-- Against the keyframe documents (25,732 pairs with a second number of `0` whose name is also a keyframe
-  variable): `0` lies outside every value that variable takes in the 27 keyframe documents in 17,041 pairs,
-  but the first number is outside that range too in 15,183 of the same pairs. Plain-modifier values are not
-  bounded by the keyframe ranges, so this comparison does not tell what either number means.
-
-So `0` is the most frequent stored value of the second number. What it means, and how the runtime blends the
-two numbers by strength, is not settled by these counts.
-
-Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
-regions are chosen at runtime, what the two plain-modifier numbers mean and how the runtime blends them (see
-above), and how `controlValue` maps onto game state.
-**Plain-modifier number pairs `(a, b)`** (`tools/timecycle_pairs.py`, measured over all **29,727** two-number
-elements in the 4,291 plain modifiers across all 49 `timecycle_modifier_data` documents):
+**Plain-modifier number pairs `(a, b)`.** Every non-empty variable of a plain modifier holds two numbers, `a`
+then `b`: **29,727** pairs in the 4,291 plain modifiers of the 49 `timecycle_modifier_data` documents, carried
+by 1,051 of the 1,054 plain variable names (the other 3 occur only as empty elements) and by 3,257 modifiers.
+`tools/timecycle_pairs.py` (#3901) prints the table and the per-name, per-triplet and out-of-`[0, 1]` counts
+from `common.rpf` or a carve. The per-modifier split, the ordering, the correlation and the keyframe comparison
+are from #3880, measured with `tools/gamedata_xml.py`'s loader and a script that is not in the repository.
 
 | Measure | First number (`a`) | Second number (`b`) |
 |---|---:|---:|
@@ -915,26 +894,37 @@ elements in the 4,291 plain modifiers across all 49 `timecycle_modifier_data` do
 | `== 1` | 6,973 (23.5%) | 3,104 (10.4%) |
 | `> 1` | 5,962 (20.1%) | 342 (1.15%) |
 
-Three patterns establish what the pair stores (matching RAGE's two-float `tcModData` slot):
+- **Per modifier** (#3880): `b` is `0` on every pair in 2,300 of the 3,257 modifiers and repeats `a` on every
+  pair in 21; the other 936 mix. 579 modifiers use both `0` and `1` and no other `b` value.
+- **Per variable name:** 624 names have `b == 0` on every pair (8,410 pairs) and 83 never do (1,289 pairs),
+  75 of them with `b == 1` on every pair. The other 344 vary from one modifier to the next; 343 of them take both
+  `0` and `1`, 272 of those within a single document. (The 624/83/344 split and its pair counts are #3880's; the
+  75, 343 and 272 come from `tools/timecycle_pairs.py`.)
+- **Colour triplets:** in all **1,875 / 1,875** RGB triplets (`*_r`/`*_g`/`*_b`) present in the same modifier,
+  `b` is identical across the three channels (`1,554` with `0`, `301` with `1`, `20` fractional; `0`
+  mismatches), so `b` is set per colour, not per channel.
+- **`b` outside `{0, 1}`:** only 18 variables ever take such a `b`; 15 of them stay in `[0, 1]` (88 entries
+  total). Only three take `b` outside `[0, 1]` (349 entries, all keyframe variables), and there `b` takes values
+  of the same size as `a`: `far_clip` (`172/172` with `b > 1`, `a` in `0..5,000`, `b` in `40..5,000`, `a == b`
+  in 110, `a == 0` in 54, `0 < a < b` in 7, `a > b` in 1), `fog_start` (`161` with `b > 1`, `7` with `b < 0`,
+  `a` in `-1,000..5,000`, `b` in `-3..5,000`, `a == b` in 94, `a < b` in 89, `a > b` in 7), and
+  `fog_isotropic_phase` (`a == b` in all `10/10`, `1.0..6.0`).
+- **Not an ordered range** (#3880): `a` is larger than `b` in 20,833 pairs, smaller in 4,604 and equal in
+  4,290. Where `b` is non-zero (3,541 pairs) it does not follow `a`: Pearson correlation 0.009, and `a` is `0`
+  in 570 of them.
+- **Against the keyframe documents** (#3880; the control was reproduced in its review): of the 25,732 pairs with
+  `b == 0` whose name is also a keyframe variable, `0` lies outside that variable's range over the 27 keyframe
+  documents in 17,041, and `a` lies outside it in 15,183 of the same pairs. Plain-modifier values are not
+  bounded by the keyframe ranges, so this comparison does not tell what either number means.
 
-1. **`a` carries the variable's value; `b` is zero (`0.0`) on 88.1% of entries.** Across the 1,051 distinct plain
-   variables, 624 always have `b == 0.0`, 75 always have `b == 1.0`, and 343 appear with both `b == 0.0` and
-   `b == 1.0` (272 of them mixed within a single document, and 579 modifiers mix `0` and `1` across their own
-   variables) with the same physical range in `a`. A loader that applied `lerp(base, a, strength * b)` uniformly
-   would discard 88.1% of all modifier entries.
-2. **Fractional `b` in `(0, 1)` is a shared per-colour blend weight.** Only 18 variables ever take `b` outside
-   `{0, 1}`; 15 of them stay in `[0, 1]` (88 entries total). Across all **1,875 / 1,875** RGB triplets
-   (`*_r`/`*_g`/`*_b`) present in the same modifier, `b` is identical across all three channels (`1,554` with `0`,
-   `301` with `1`, `20` fractional — `0` mismatches).
-3. **Only three variables take `b` outside `[0, 1]` (349 entries, all keyframe variables), where `(a, b)` is a
-   same-unit value/range pair:** `far_clip` (`172/172` with `b > 1`, `a` in `0..5,000`, `b` in `40..5,000`,
-   `a == b` in 110, `a == 0` in 54, `0 < a < b` in 7, `a > b` in 1), `fog_start` (`161` with `b > 1`, `7` with
-   `b < 0`, `a` in `-1,000..5,000`, `b` in `-3..5,000`, `a == b` in 94, `a < b` in 89, `a > b` in 7), and
-   `fog_isotropic_phase` (`a == b` in all `10/10`, `1.0..6.0`).
+So `0` is the most frequent stored value of `b`. These counts describe how the pair is stored; what each number
+means, and how the runtime blends the two by strength, is not settled by them.
 
-Not measured here (hypothesis): how the two regions are chosen at runtime, the exact runtime rule distinguishing
-`b == 0` from `b == 1` on the 343 plain-modifier variables where both occur (see *Plain-modifier number pairs*
-above), and how `controlValue` maps onto game state.
+Not measured here (hypothesis): how the two regions are chosen at runtime; what the two plain-modifier numbers
+mean and how the runtime blends them (GTA V reads them as a value pair blended by strength, RAGE's two-float
+`tcModData` slot; with `b == 0` on 88.1% of pairs, a uniform `lerp(base, a, strength * b)` would leave those
+pairs without effect), including the rule that distinguishes `b == 0` from `b == 1` on the 343 names where both
+occur; and how `controlValue` maps onto game state.
 
 ## Vehicle and tyre XML documents
 
