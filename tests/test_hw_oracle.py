@@ -802,6 +802,14 @@ class LinuxBackend(unittest.TestCase):
             with self.assertRaisesRegex(runner.Unavailable, "cannot create the launcher cache"):
                 self.build_launcher(root)
 
+    def test_a_launcher_that_cannot_be_installed_is_unavailable_and_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            # the compiler succeeds, then installing the build fails (a full or failing disk)
+            with mock.patch.object(drm.os, "replace", side_effect=OSError(5, "simulated EIO")):
+                with self.assertRaisesRegex(runner.Unavailable, "cannot install the launcher.*simulated EIO"):
+                    self.build_launcher(root)
+            self.assertEqual(os.listdir(os.path.join(root, "cache", "leonida")), [])   # the temp build is removed
+
     def test_no_absolute_home_and_no_xdg_cache_home_is_unavailable(self):
         # HOME unset and no passwd entry: expanduser leaves "~" as is, which would be a folder under the current one
         with mock.patch.object(drm.os.path, "expanduser", return_value="~"):

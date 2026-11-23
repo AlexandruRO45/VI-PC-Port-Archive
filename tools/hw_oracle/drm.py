@@ -231,8 +231,11 @@ class DrmOracle(runner.Oracle):
             r = subprocess.run([cc, "-O1", SOURCE, "-o", tmp, *flags], capture_output=True, text=True)
             if r.returncode:
                 raise Unavailable("hw_oracle_drm.c did not build (it needs the libdrm headers): " + r.stderr.strip()[:300])
-            os.chmod(tmp, 0o700)
-            os.replace(tmp, exe)   # replaces a file or symlink that failed the check above, never writes through it
+            try:   # a full or failing disk while installing the launcher is a missing oracle, not a traceback
+                os.chmod(tmp, 0o700)
+                os.replace(tmp, exe)   # replaces a file or symlink that failed the check above, never writes through it
+            except OSError as e:
+                raise Unavailable(f"cannot install the launcher in {cache}: {e.strerror or e}") from None
         finally:
             if os.path.lexists(tmp):
                 os.remove(tmp)
