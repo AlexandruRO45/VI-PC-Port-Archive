@@ -123,7 +123,7 @@ def main(argv=None) -> int:
         except OSError as error:
             # A failed write must not leave a half-written report where the last good one was.
             reason = error.strerror or str(error)
-            print(f"ERROR: {a.json}: {reason}", file=sys.stderr)
+            print(f"mask_channels: error: {a.json}: {reason}", file=sys.stderr)
             return 2
     return 0
 

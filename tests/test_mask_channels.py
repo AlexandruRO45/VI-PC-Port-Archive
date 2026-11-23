@@ -95,7 +95,7 @@ class MaskChannelTests(unittest.TestCase):
             self.assertEqual(os.listdir(reports), ["m.json"])                # no staging file left behind
 
     def test_json_write_error_is_one_line(self):
-        """A --json path the tool cannot write is one ERROR line and exit 2, as the other report tools do."""
+        """A --json path the tool cannot write is one error line and exit 2, as the other report tools do."""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "m.dds")
             with open(path, "wb") as fh:
@@ -105,7 +105,9 @@ class MaskChannelTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()), redirect_stderr(err):
                 self.assertEqual(mc.main([path, "--json", out]), 2)
             self.assertEqual(err.getvalue().count("\n"), 1)
-            self.assertTrue(err.getvalue().startswith(f"ERROR: {out}: "), err.getvalue())
+            self.assertTrue(err.getvalue().startswith(f"mask_channels: error: {out}: "), err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            self.assertFalse(os.path.exists(out))
 
     def test_json_cannot_replace_the_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,7 +164,6 @@ class MaskChannelTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(mc.main([path, "--json", out]), 0)
             self.assertTrue(os.path.isfile(out))
-
 
 if __name__ == "__main__":
     unittest.main()
