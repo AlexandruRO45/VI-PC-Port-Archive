@@ -365,11 +365,33 @@ A `0DRP` stream starts a **logical resource**. The fixed header is followed by p
 `q38`; the first segment normally starts at +0x60. The page does not map to a zlib block (the zlib framing is
 outside it), to another page, or to a named RBF0/PSIN/model/texture resource:
 
-- Every `q38` target's first 0x18 bytes were classed (zero-prefix: the first eight bytes are zero). In
-  `data.rpf`: 46,184 "other" and 14,696 zero-prefix; in navmesh (whole archive): 52,171 "other" and 2,727
-  zero-prefix; in anim (whole archive): 175,220 "other", 352,213 zero-prefix and 6 too short. None started with
-  `PSIN`, `RBF0`, `0DRP`, `RSC7` or `RSC8`. (The 64 MiB and 256 MiB slices gave 6,194 / 451 and 80,697 /
-  188,617 / 6.)
+- The 24-byte **window** that starts at every `q38` target was classed in the joined streams of its page
+  (zero-prefix: the first eight bytes of the window are zero; too short: the window runs past the end of the
+  joined streams). A window is not the record: it can run on into the next record, and the **declared record**
+  is only the `size` bytes of the entry. Window classes, `data.rpf`: 46,184 "other" and 14,696 zero-prefix of
+  60,880; navmesh (whole archive): 52,171 and 2,727 of 54,898; anim (whole archive): 175,220, 352,213 and 6 too
+  short of 527,439. (The 64 MiB and 256 MiB slices gave 6,194 / 451 and 80,697 / 188,617 / 6.)
+- The declared record is often shorter than its window:
+
+  | Count (whole archive) | `data.rpf` | `navmeshes.rpf` | `anim.rpf` |
+  |---|---:|---:|---:|
+  | `q38` records (= target windows) | 60,880 | 54,898 | 527,439 |
+  | windows cut short at the joined-stream end | 0 | 0 | 6 |
+  | records declaring ≥ 4 bytes | 60,857 | 54,898 | 527,435 |
+  | records declaring ≥ 8 bytes | 60,783 | 54,896 | 524,474 |
+  | records declaring ≥ 24 bytes | 44,955 | 54,746 | 488,411 |
+  | records declaring < 24 bytes | 15,925 | 152 | 39,028 |
+  | records declaring < 8 bytes | 97 | 2 | 2,965 |
+
+  No record reaches past the end of the joined streams (the tool reads a page only when every entry fits). The 6
+  too-short `anim.rpf` windows belong to records that declare 8-23 bytes and end at the stream boundary; the
+  other 39,022 short records declare fewer bytes than the window reads and are not cut by any boundary.
+- Zero-prefix **inside the declared record** (records declaring ≥ 8 bytes): 14,696 of 60,783 in `data.rpf`,
+  2,727 of 54,896 in `navmeshes.rpf`, 352,206 of 524,474 in `anim.rpf`. The `anim.rpf` window count (352,213)
+  is 7 higher because 7 zero-prefix windows belong to records declaring < 8 bytes, whose first eight bytes
+  were read past the record.
+- None started with `PSIN`, `RBF0`, `0DRP`, `RSC7` or `RSC8`: 0 of the 60,857, 54,898 and 527,435 records that
+  declare ≥ 4 bytes (and 0 of all 60,880, 54,898 and 527,439 windows).
 - Continuation streams were classed as zero-prefix or other payload in every case (`data.rpf` 87 / 71,
   navmesh 116 / 2,054, anim 8,827 / 2,933); none was a `0DRP` page. A
   resource therefore extends forward by payload, not by nesting another directory.
@@ -385,8 +407,10 @@ boundaries by itself.
 
 This is the cross-check the navmesh report asked for: the `0x50000000` base is shared by directory pages and typed
 data pages, but only the directory page carries the offset/size table. The typed prefix is not a `q38` payload
-magic; 0 of 60,880 `data.rpf` records, 0 of 54,898 navmesh records and 0 of 527,439 animation records started with
-`0x00010015` at +0x14.
+magic. The four bytes at +0x14 lie inside the declared record only when it declares ≥ 24 bytes: 0 of those 44,955
+`data.rpf`, 54,746 navmesh and 488,411 animation records had `0x00010015` there. Over the 24-byte windows, which
+can read past a short record, it was also 0 of 60,880, 54,898 and 527,439 (527,433 of them full windows in
+`anim.rpf`; the 6 cut-short ones end before +0x18).
 
 ## Distribution of the +0x20 count
 
