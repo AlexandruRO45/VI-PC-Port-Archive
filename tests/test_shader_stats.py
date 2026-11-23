@@ -229,6 +229,23 @@ class ShaderStats(unittest.TestCase):
         self.assertNotIn("missing required", r.stderr)
         self.assertIn("no shader is in both", r.stderr)
 
+    def test_invalid_disasm_dir_is_rejected_with_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "stats.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("name,stage,statistic,value\n" + COMPLETE[0] + "\n")
+            # Place a matching listing in cwd to confirm "" does not silently read cwd.
+            with open(os.path.join(tmp, "ps_flat.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(PS_FLAT)
+            missing = os.path.join(tmp, "no_such_dir")
+            for label, bad_dir in (("empty", ""), ("missing", missing), ("file", csv_path)):
+                with self.subTest(case=label):
+                    r = subprocess.run([sys.executable, "-I", SCRIPT, csv_path, bad_dir],
+                                       cwd=tmp, capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("not a directory", r.stderr)
+                    self.assertEqual(r.stdout, "")
+
 
 if __name__ == "__main__":
     unittest.main()

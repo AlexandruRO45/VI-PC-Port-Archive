@@ -161,6 +161,9 @@ def main():
     except (OSError, ValueError, csv.Error) as e:
         sys.exit(f"{path}: {e}")
     disasm = args[1]
+    if not disasm or not os.path.isdir(disasm):
+        print(f"{disasm or '<empty>'}: not a directory", file=sys.stderr)
+        return 2
     rows = []
     for (name, stage), st in sorted(stats.items()):
         src = os.path.join(disasm, name + ".s")
