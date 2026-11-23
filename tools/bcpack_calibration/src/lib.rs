@@ -3,6 +3,7 @@
 use std::slice;
 
 mod blocks;
+mod bptc;
 mod model;
 
 #[repr(C)]
@@ -300,11 +301,25 @@ pub unsafe extern "C" fn unpack_model(
     used as isize
 }
 
-// Lanes and the strict block rebuild of codec 1 (BC1), 3 (BC3), 4 (BC4) or 5
-// (BC5) in one call. `lut` is BC1_QUADRANT, the flattened BC3_ALPHA_PAIR then
-// BC3_COLOUR_QUADRANT, the flattened BC4_PAIR or the flattened BC5_PAIR,
-// `builtin` the confirmed built-in history (rows of 6, 8, 2 or 4 values, -1 where absent). Returns the bytes
-// used, or -1: then Python decodes the chunk itself.
+// A slice of `len` items at `ptr`, or None for a null pointer or a length past isize::MAX bytes.
+unsafe fn view<'a, T>(ptr: *const T, len: usize) -> Option<&'a [T]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if ptr.is_null() || len.checked_mul(std::mem::size_of::<T>())? > isize::MAX as usize {
+        return None;
+    }
+    Some(slice::from_raw_parts(ptr, len))
+}
+
+// Lanes and the strict block rebuild of codec 1 (BC1), 3 (BC3), 4 (BC4), 5
+// (BC5), 6 (BC6H) or 7 (BC7) in one call. `lut` is BC1_QUADRANT, the flattened
+// BC3_ALPHA_PAIR then BC3_COLOUR_QUADRANT, the flattened BC4_PAIR, the
+// flattened BC5_PAIR, or the BC6H and BC7 tables described in `bptc.rs`.
+// `builtin` is the confirmed built-in history (rows of 6, 8, 2 or 4 values, -1
+// where absent; for BC6H and BC7 the layout in `bptc.rs`). `target` is the
+// number of symbols per lane and `output_len` must be `8 * target`. Returns the
+// bytes used, or -1: then Python decodes the chunk itself.
 #[no_mangle]
 pub unsafe extern "C" fn decode_blocks(
     data: *const u8,
@@ -322,33 +337,43 @@ pub unsafe extern "C" fn decode_blocks(
     output: *mut u8,
     output_len: usize,
 ) -> isize {
-    if lanes != 12 {
+    let want = match codec {
+        1 | 3 | 4 | 5 => 12,
+        6 | 7 => 16,
+        _ => return -1,
+    };
+    if lanes != want || target == 0 || target.checked_mul(8) != Some(output_len) || output.is_null() {
         return -1;
     }
-    let stream = slice::from_raw_parts(data, size);
-    let bits = slice::from_raw_parts(widths, lanes);
-    let Some(t) = model::Tables::new(slice::from_raw_parts(tables, tables_len)) else {
+    let (Some(stream), Some(bits), Some(tables), Some(lut), Some(builtin)) = (
+        view(data, size),
+        view(widths, lanes),
+        view(tables, tables_len),
+        view(lut, lut_len),
+        view(builtin, builtin_len),
+    ) else {
         return -1;
     };
-    let Some((symbols, used)) = model::decode(stream, bits, target, &t) else {
-        return -1;
-    };
-    if stream[used..].iter().any(|&b| b != 0) {
-        return -1;
-    }
-    let lut = slice::from_raw_parts(lut, lut_len);
-    let builtin = slice::from_raw_parts(builtin, builtin_len);
     let out = slice::from_raw_parts_mut(output, output_len);
-    let done = match codec {
-        1 => blocks::bc1(&symbols, target, lut, builtin, out),
-        3 => blocks::bc3(&symbols, target, lut, builtin, out),
-        4 => blocks::bc4(&symbols, target, lut, builtin, out),
-        5 => blocks::bc5(&symbols, target, lut, builtin, out),
-        _ => None,
-    };
-    if done.is_some() {
-        used as isize
-    } else {
-        -1
-    }
+    // A panic must not unwind into Python: it is one more refusal.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let t = model::Tables::new(tables)?;
+        let (symbols, used) = model::decode(stream, bits, target, &t)?;
+        if stream[used..].iter().any(|&b| b != 0) {
+            return None;
+        }
+        match codec {
+            1 => blocks::bc1(&symbols, target, lut, builtin, out),
+            3 => blocks::bc3(&symbols, target, lut, builtin, out),
+            4 => blocks::bc4(&symbols, target, lut, builtin, out),
+            5 => blocks::bc5(&symbols, target, lut, builtin, out),
+            6 => bptc::bc6h(&symbols, target, lut, builtin, out),
+            7 => bptc::bc7(&symbols, target, lut, builtin, out),
+            _ => None,
+        }?;
+        Some(used as isize)
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or(-1)
 }

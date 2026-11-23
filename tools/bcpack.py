@@ -386,37 +386,154 @@ _NATIVE_BLOCKS = {
 _NATIVE_BUILTIN = {}
 
 
-def _decode_blocks_native(raw, codec, out_size, history):
-    """BC1/BC3/BC4/BC5 bytes from the Rust lanes + strict rebuild, or None to decode in Python.
+def _bc6h_native_lut():
+    """BC6H plans, mode table and anchors for `decode_blocks` (layout in `bptc.rs`)."""
+    out = bytearray(_bptc.BC7_ANCHOR2[:32])
+    for mode in range(1, 15):
+        code = _BC6H_CODE[mode]
+        trans, base, deltas, reg = _BC6H_INFO[code]
+        plan, header = _bc6h_plan(code)
+        if len(plan) > 128:
+            raise ValueError(f"BC6H mode {mode} plan has {len(plan)} items")
+        out += bytes((code, trans, base, *deltas, reg, len(plan), header, 0, 0, 0))
+        items = bytearray(128 * 4)
+        for j, (c, q, bit, pos) in enumerate(plan):
+            items[4 * j:4 * j + 4] = bytes((0, 0, bit, pos) if c < 0 else (c + 1, q, bit, pos))
+        out += items
+    return bytes(out)
 
-    Rust only takes the strict path: a stream it refuses, a non-zero lane 1 or
-    a history entry that is not confirmed returns None, and Python decodes the
-    chunk itself, so its errors and provisional entries are unchanged.
+
+def _clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def _bc6h_native_history(history):
+    """The `load_bc6h` tables as Rust reads them.
+
+    Values keep only the low bits a block reads (16, 10, 6 and 6 for the
+    endpoint fields, 4 for indices: every read shifts right and masks, so the
+    higher bits never reach the output); confirmed-bit depths are clamped to
+    -1..64, which keeps every comparison with a need of 0..16.
     """
-    native = _native_unpack()
-    spec = _NATIVE_BLOCKS.get(codec)
-    if native is None or spec is None or out_size <= 0 or out_size % BLOCK_BYTES[codec]:
-        return None
+    eh, ih, ec, ic, ep_cb, ix_cb = _bptc.load_bc6h(history, with_confirmed_bits=True)
+    flat = []
+    for row in eh:
+        for r0, r1, r2, r3 in row:
+            flat += (r0 & 0xFFFF, r1 & 0x3FF, r2 & 0x3F, r3 & 0x3F)
+    for row in ih:
+        flat += (v & 15 for v in row)
+    flat += (int(c == 3) for c in ec)
+    flat += (int(c == 3) for c in ic)
+    for row in ep_cb:
+        for ch in row:
+            flat += (_clamp(v, -1, 64) for v in ch)
+    for row in ix_cb:
+        flat += (_clamp(v, -1, 64) for v in row)
+    return flat
+
+
+def _bc7_native_lut():
+    """BC7 signature cells, partitions, anchors and mode table for `decode_blocks` (layout in `bptc.rs`)."""
+    t = _bptc.load_bc7()
+    cfg, rank_of, inferred = t["config"], t["rank_of"], t["inferred"]
+    out = bytearray()
+    for a in range(32):
+        for b in range(32):
+            rank = rank_of[a * 16 + b] if b < 16 else -1
+            if rank < 0 or cfg[rank][0] > 7 or cfg[rank][1] == 255 or rank in inferred:
+                out += bytes((255, 0, 0, 0))  # strict mode refuses this pair
+            else:
+                out += bytes(cfg[rank])
+    for name in ("partition2", "partition3"):
+        out += bytes(v for row in t[name] for v in row)
+    for name in ("anchor2", "anchor3a", "anchor3b"):
+        out += bytes(t[name])
+    for row in (_B7_NS, _B7_CB, _B7_AB, _B7_PK, _B7_IB, _B7_PB):
+        out += bytes(row)
+    out += bytes(255 if v < 0 else v for row in _B7_LANE for v in row)
+    return bytes(out)
+
+
+def _bc7_native_history(history):
+    """The `load_bc7` history as Rust reads it.
+
+    Endpoint values keep their low 8 bits and indices their low 4 (each read
+    shifts right by 8 or 4 minus its width and masks to that width). A slot's
+    depth is min(known, confirmed) clamped to 0..9: `_bc7_check` refuses when
+    either is below the 1..8 bits a block reads.
+    """
+    t = _bptc.load_bc7(history)
+    flat = []
+    for row in t["history_endpoints"]:
+        flat += (v & 0xFF for v in row)
+    for row in t["history_indices"]:
+        flat += (v & 15 for v in row)
+    for bits, conf in (("history_endpoint_bits", "history_endpoint_confirmed_bits"),
+                       ("history_index_bits", "history_index_confirmed_bits")):
+        for kb, kc in zip(t[bits], t[conf]):
+            flat += (_clamp(min(b, c), 0, 9) for b, c in zip(kb, kc))
+    return flat
+
+
+# codec: (static lookup table, history loader)
+_NATIVE_BPTC = {
+    6: (_bc6h_native_lut, _bc6h_native_history),
+    7: (_bc7_native_lut, _bc7_native_history),
+}
+_NATIVE_LUT = {}
+
+
+def _native_tables(codec, history):
+    """`(lut bytes, builtin int32 array)` for `decode_blocks`; raises when the history is rejected."""
     import ctypes
-    _, tables, blocks = native
-    lut, conf_name, prov_name, k = spec
     cached = _NATIVE_BUILTIN.get(codec) if history is None else None
-    if cached is None:
-        try:
-            confirmed, _ = _resolve_bc_history(
-                codec, getattr(_tables, conf_name), getattr(_tables, prov_name), history)
-        except (ValueError, TypeError, OSError):
-            return None  # Python reads the same history after the lanes, so its error order is unchanged
+    if cached is not None:
+        return cached
+    if codec in _NATIVE_BPTC:
+        lut_fn, hist_fn = _NATIVE_BPTC[codec]
+        lut = _NATIVE_LUT.get(codec)
+        if lut is None:
+            lut = _NATIVE_LUT[codec] = lut_fn()
+        flat = hist_fn(history)
+    else:
+        lut_fn, conf_name, prov_name, k = _NATIVE_BLOCKS[codec]
+        confirmed, _ = _resolve_bc_history(
+            codec, getattr(_tables, conf_name), getattr(_tables, prov_name), history)
         flat = [-1] * (256 * k)
         for entry, values in confirmed.items():
             if 0 <= entry < 256 and len(values) == k:
                 flat[entry * k:entry * k + k] = values
-        cached = lut(), (ctypes.c_int32 * len(flat))(*flat)
-        if history is None:
-            _NATIVE_BUILTIN[codec] = cached
-    table, builtin = cached
+        lut = lut_fn()
+    cached = lut, (ctypes.c_int32 * len(flat))(*flat)
+    if history is None:
+        _NATIVE_BUILTIN[codec] = cached
+    return cached
+
+
+def _decode_blocks_native(raw, codec, out_size, history, provisional=False):
+    """BCn bytes from the Rust lanes + strict rebuild, or None to decode in Python.
+
+    Rust only takes the strict path: a stream it refuses, a non-zero BC1-BC5
+    lane 1, a history entry that is not confirmed, or a BC6H/BC7 chunk Python
+    would refuse or label (an unknown or inferred signature, an anchor or p-bit
+    that does not agree) returns None, and Python decodes the chunk itself, so
+    its errors and provisional entries are unchanged. BC6H and BC7 also return
+    None in provisional mode, whose labels (last-resort entries) Rust does not
+    track.
+    """
+    native = _native_unpack()
+    if (native is None or out_size <= 0 or codec not in BLOCK_BYTES or out_size % BLOCK_BYTES[codec]
+            or (codec not in _NATIVE_BLOCKS and codec not in _NATIVE_BPTC)
+            or (provisional and codec in _NATIVE_BPTC)):
+        return None
+    _, tables, blocks = native
+    try:
+        table, builtin = _native_tables(codec, history)
+    except Exception:  # noqa: BLE001 - Python reads the same history after the lanes and raises it there
+        return None
     widths = LANE_WIDTHS[codec]
     data = bytes(raw)
+    import ctypes
     out = ctypes.create_string_buffer(out_size)
     used = blocks(data, len(data), codec, bytes(widths), len(widths), out_size // ELEMENT_BYTES,
                   tables, len(tables), table, len(table), builtin, len(builtin), out, out_size)
@@ -1458,7 +1575,7 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
     if rebuilder is None:
         name = CODEC_NAMES.get(codec, str(codec))
         raise BcpackUnsupportedCodec(f"BCPack block rebuilder for codec {codec} ({name}) is not implemented yet")
-    fast = _decode_blocks_native(raw, codec, out_size, history)
+    fast = _decode_blocks_native(raw, codec, out_size, history, allow_provisional)
     if fast is not None:
         return fast, set()
     lanes, _ = decode_lanes(raw, codec, out_size)
