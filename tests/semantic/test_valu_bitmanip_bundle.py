@@ -193,6 +193,23 @@ class TestVBfeU32Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x3456)
 
+def ref_v_bfe_i32(s0: int, s1: int, s2: int) -> int:
+    off = s1 & 31
+    wid = min(s2 & 31, 32 - off)
+    if wid == 0:
+        return 0
+    raw = (s0 >> off) & ((1 << wid) - 1)
+    sign_bit = 1 << (wid - 1)
+    return ((raw ^ sign_bit) - sign_bit) & MASK32
+
+GLOBAL_ORACLE_MAP[Opcode.V_BFE_I32] = ref_v_bfe_i32
+
+
+class TestVBfeI32Oracle(unittest.TestCase):
+    def test_oracle_execution(self) -> None:
+        res = ref_v_bfe_i32(0x12345678, 8, 16)
+        self.assertEqual(res, 0x3456)
+
 
 if __name__ == "__main__":
     unittest.main()
