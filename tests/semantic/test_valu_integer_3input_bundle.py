@@ -448,5 +448,36 @@ class TestLshlOrB32Oracle(unittest.TestCase):
         # Pack 16-bit halves: (hi << 16) | lo
         self.assertEqual(oracle_lshl_or_b32(0x1234, 16, 0x5678), 0x12345678)
 
+# ---------------------------------------------------------------------------
+# Opcode 4: v_lshl_or_b32 - AST and Interpreter
+# ---------------------------------------------------------------------------
+
+class TestLshlOrB32ASTInterpreter(unittest.TestCase):
+    def test_ast_construction(self) -> None:
+        inst = VOP3Instruction(
+            TriOpcode.V_LSHL_OR_B32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        self.assertEqual(inst.opcode, TriOpcode.V_LSHL_OR_B32)
+
+    def test_interpreter_step(self) -> None:
+        interp = BundleInterpreter()
+        interp.vgprs[1] = 0xAB
+        interp.vgprs[2] = 8
+        interp.vgprs[3] = 0xCD
+        inst = VOP3Instruction(
+            TriOpcode.V_LSHL_OR_B32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0xABCD)
+        self.assertEqual(interp.vgprs[0], 0xABCD)
+
 if __name__ == "__main__":
     unittest.main()
