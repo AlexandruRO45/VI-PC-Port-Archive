@@ -252,12 +252,12 @@ class BadCarveIndexTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, target],
                               cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
-    def assert_one_error(self, result, *needles):
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+    def assert_one_error(self, result, *needles, returncode=1, prefix="error:"):
+        self.assertEqual(result.returncode, returncode, result.stdout + result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         lines = result.stderr.strip().splitlines()
         self.assertEqual(len(lines), 1, result.stderr)
-        self.assertTrue(lines[0].startswith("error:"), lines[0])
+        self.assertTrue(lines[0].startswith(prefix), lines[0])
         for needle in needles:
             self.assertIn(needle, lines[0])
 
@@ -287,7 +287,13 @@ class BadCarveIndexTest(unittest.TestCase):
 
     def test_missing_file_names_what_is_wrong(self):
         folder = self.make_folder()
-        self.assert_one_error(self.run_tool(os.path.join(folder, "nope.rpf")), "nope.rpf", "no such file or folder")
+        self.assert_one_error(
+            self.run_tool(os.path.join(folder, "nope.rpf")),
+            "nope.rpf",
+            "no such file or folder",
+            returncode=2,
+            prefix="ERROR:",
+        )
 
 
 if __name__ == "__main__":
