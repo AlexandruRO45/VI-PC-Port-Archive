@@ -14,7 +14,7 @@ have no magic and stay with the extension check.
 
 A compressed file hides those magics from both checks, so the script looks inside what the standard library opens:
 each member of a zip (found by its central directory too, so with bytes in front of it) or a tar, and the stream of
-a gzip, bzip2 or xz file, nested up to three levels, is matched the same way. What's inside is read into memory
+a gzip, bzip2, xz or zlib file, nested up to three levels, is matched the same way. What's inside is read into memory
 under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb can't make the check run long.
 7-Zip, Zstandard and RAR files, which it can't open, archives that fail to open and archives over the budget are
 reported as archives that can't be checked.
@@ -106,6 +106,9 @@ def read_head(path):
 
 
 ZIP = b"PK\x03\x04"
+# A zlib stream starts with 0x78 (deflate, 32 KiB window) and a check byte that leaves only these four pairs valid.
+# The package stores most of its data this way (docs/rpf.md), so a carved chunk handed to the build is one stream.
+ZLIB = (b"\x78\x01", b"\x78\x5e", b"\x78\x9c", b"\x78\xda")
 # Single compressed streams the standard library opens: (name, magic, opener of a binary file object). GzipFile
 # gets its mode explicitly: it reads the file object's own `mode`, which for a GzipFile inside it isn't a string.
 STREAMS = (
@@ -169,8 +172,33 @@ def printable(name):
     return "".join(c if c.isprintable() else "?" for c in name)
 
 
+def inflate_zlib(f, budget):
+    """The zlib stream at the start of the seekable file `f`, inflated into memory under `budget`. Output is read in
+    CHUNK bites, so a deflate bomb is stopped by the budget instead of expanding to its full size first; a stream that
+    ends before its own end marker is zlib.error, as a damaged one is."""
+    stream = zlib.decompressobj()
+    out = io.BytesIO()
+    f.seek(0)
+    data = f.read(CHUNK)
+    while True:
+        if not data:
+            raise zlib.error("incomplete zlib stream")
+        part = stream.decompress(data, min(budget.bytes + 1, CHUNK))
+        budget.bytes -= len(part)
+        if budget.bytes < 0:
+            raise TooLarge
+        out.write(part)
+        if stream.eof:
+            break
+        data = stream.unconsumed_tail or f.read(CHUNK)
+    out.seek(0)
+    return out
+
+
 def archive_kind(f, head):
     """The kind of archive the seekable file `f` (first bytes `head`) is, or None."""
+    if any(head.startswith(magic) for magic in ZLIB):
+        return "zlib stream"
     stream = next((s for s in STREAMS if head.startswith(s[1])), None)
     if stream:
         return stream[0]
@@ -207,6 +235,10 @@ def classify_open(f, first, depth=0, budget=None):
 
     try:
         f.seek(0)
+        if kind == "zlib stream":
+            inner = inflate_zlib(f, budget)
+            found = classify_open(inner, read_head_from(inner), depth + 1, budget)
+            return f"{found} in {kind}" if found else None
         if kind == "zip archive":
             with zipfile.ZipFile(f) as archive:
                 for info in archive.infolist():
