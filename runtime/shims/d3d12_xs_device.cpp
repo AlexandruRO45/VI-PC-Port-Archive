@@ -2660,8 +2660,12 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    const auto state = (buffer || initial_state == 0xFFFFFFFFu) ? D3D12_RESOURCE_STATE_COMMON
-                                                                 : static_cast<D3D12_RESOURCE_STATES>(initial_state);
+    // The fourth word is a console D3D12_BARRIER_LAYOUT (0xFFFFFFFF is UNDEFINED), not a legacy resource state: a
+    // texture arrives with layout 6 (SHADER_RESOURCE), which the PC committed-resource path refuses. Create as
+    // COMMON and let the title's barriers move it. A larger value is a legacy state and is kept.
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    if (!buffer && initial_state != 0xFFFFFFFFu && initial_state > 0xFF)
+        state = static_cast<D3D12_RESOURCE_STATES>(initial_state);
     const bool clearable =
         !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
 
