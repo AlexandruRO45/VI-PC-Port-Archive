@@ -736,6 +736,12 @@ def check_mesh_v5(data):
 # shader tools/mesh_compute_vs.py wrote (<name>.mesh_vs.spv), so they run without VK_EXT_mesh_shader.
 MESH_COMPUTE = os.environ.get("LEONIDA_MESH_COMPUTE") == "1"
 
+# LEONIDA_GS_COMPUTE=1 (for run_gpu_tests.py, which builds the gs fixtures): the geometry shaders were translated
+# with rdna2spirv.py --gs-compute, and vk_harness runs the capture module as compute (<name>.gs_compute.spv,
+# tools/spirv_gs_to_compute.py's lowering) with the scatter and draw vertex shader tools/gs_compute_stages.py wrote
+# (<name>.gs_scatter.spv, <name>.gs_vs.spv), so they draw without the Vulkan geometry stage.
+GS_COMPUTE = os.environ.get("LEONIDA_GS_COMPUTE") == "1"
+
 
 def mesh_env(spirv, name, base=None):
     """vk_harness environment for mesh shader `name`: VKH_MESH=1, or under LEONIDA_MESH_COMPUTE=1 the
@@ -754,6 +760,27 @@ def mesh_env(spirv, name, base=None):
             return env
     env["VKH_MESH"] = "1"
     return env
+
+
+def gs_env(spirv, name, base=None):
+    """vk_harness environment for a geometry shader drawn through the --gs-compute capture path
+    (LEONIDA_GS_COMPUTE=1): the capture module as the first argument is the caller's, this adds the generated
+    scatter and draw vertex shader and the layout from index.json's gs_compute. None when they are missing."""
+    capture = Path(spirv) / f"{name}.gs_compute.spv"
+    scatter = Path(spirv) / f"{name}.gs_scatter.spv"
+    vs = Path(spirv) / f"{name}.gs_vs.spv"
+    try:
+        with open(Path(spirv) / "index.json", encoding="utf-8") as f:
+            lay = json.load(f).get(name, {}).get("gs_compute")
+    except (OSError, ValueError):
+        lay = None
+    if lay and capture.is_file() and scatter.is_file() and vs.is_file():
+        env = dict(base if base is not None else os.environ)
+        env.update(VKH_GS_VS=str(vs), VKH_GS_SCATTER=str(scatter),
+                   VKH_GS_LAYOUT=f"{lay['verts_in']},{lay['num_inputs']},{len(lay['outputs'])},"
+                                 f"{lay['max_verts']}")
+        return env
+    return None
 
 
 def mesh_v5_test(tools, spirv, raw):

@@ -250,7 +250,7 @@ def scatter_module(lay):
     ivc = x.add(x.mul(p, x.c(vin)), v)
     byte = x.mul(ivc, x.c(2))
     wv16 = x.load_word(x.add64(idx, x.and64(x.u64(byte), x.cl(4294967292))), 0)
-    v16 = x.and_(x.shr(wv16, x.shl(x.umod(byte, x.c(2)), x.c(3))), x.c(65535))
+    v16 = x.and_(x.shr(wv16, x.shl(x.umod(byte, x.c(4)), x.c(3))), x.c(65535))
     v32 = x.load_dword(idx, x.mul(ivc, x.c(4)))
     vid = x.sel_u(x.eq(flag, x.c(1)), v32, v16)
     vid = x.sel_u(x.eq(flag, x.c(2)), ivc, vid)

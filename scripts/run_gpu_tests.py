@@ -41,6 +41,7 @@ from check import gpu_test_timeout, timed_out   # per-program time limit (LEONID
 from check import failure   # "exit <status>: <last lines>", check.py's detail for a program that exited non-zero
 from check import run_readback
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
+from check import GS_COMPUTE, gs_env        # LEONIDA_GS_COMPUTE=1: the GS capture path and its generated stages
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, VINT_ENV, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
@@ -197,6 +198,16 @@ VS_TRI_SPVASM = """\
                OpReturn
                OpFunctionEnd
 """
+
+
+# vs_tri's per-vertex outputs, from the constants above: position then location 1, the geometry shader's input
+# slot order (tools/spirv_gs_to_compute.py). The --gs-compute capture path feeds these to its scatter pass
+# instead of running the vertex shader, so the record-driven draw reproduces the native result exactly.
+VS_TRI_OUTPUTS = [
+    (-1.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+    (3.0, -1.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0),
+    (-1.0, 3.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0),
+]
 
 
 def make_fs_passthru(loc: int) -> str:
@@ -815,6 +826,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
+        if GS_COMPUTE:   # geometry shaders get their capture module, drawn by tools/gs_compute_stages.py
+            cmd.append("--gs-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
@@ -833,6 +846,10 @@ def run_suite(a, work: str) -> int:
         import mesh_compute_vs
         for vs_spv in mesh_compute_vs.build_for_index(spirv_dir):
             print("mesh compute VS:", os.path.basename(vs_spv))
+    if GS_COMPUTE:
+        import gs_compute_stages
+        for stage in gs_compute_stages.build_for_index(spirv_dir):
+            print("gs compute stage:", os.path.basename(stage))
 
     # 3. Build helper SPIR-V shaders
     vs_tri = os.path.join(spirv_dir, "vs_tri.spv")
@@ -1401,15 +1418,53 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "gs_tri":
             raw = os.path.join(raw_dir, f"{name}.raw")
-            env = dict(gfx_env or os.environ, VKH_GS=spv)
-            rc, msg = run_readback(raw, run_cmd, [vk_harness, vs_tri, fs_loc1, raw], env=env)
-            if rc == UNSUPPORTED:
-                results.append((name, None, unsupported_skip(msg)))
-            elif rc != 0:
-                results.append((name, False, msg))
+            if GS_COMPUTE:
+                # The capture path (SHADER-1092): the scatter regroups vs_tri's outputs (its constants,
+                # VS_TRI_OUTPUTS) and the draw's indices into the capture pass's input buffer, the capture
+                # module runs the geometry shader over them, and the generated vertex shader draws the
+                # records. Non-indexed first, then a u16 index buffer, so the scatter's two paths both run.
+                env = gs_env(spirv_dir, name, gfx_env)
+                if env is None:
+                    results.append((name, False, "gs_compute layout or generated stages missing"))
+                    continue
+                lin = os.path.join(work, "gs_tri_linear.bin")
+                with open(lin, "wb") as f:
+                    for v in VS_TRI_OUTPUTS:
+                        f.write(struct.pack("<8f", *v))
+                env.update(VKH_GS_LINEAR=lin)
+                runs = [("non-indexed", raw, env)]
+                idx = os.path.join(work, "gs_tri_indices_u16.bin")
+                with open(idx, "wb") as f:
+                    f.write(struct.pack("<3H", 0, 1, 2))
+                raw2 = os.path.join(raw_dir, f"{name}.u16.raw")
+                runs.append(("u16 indices", raw2, dict(env, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16")))
+                capture = os.path.join(spirv_dir, f"{name}.gs_compute.spv")
+                ok, parts = True, []
+                for label, out, run_env in runs:
+                    rc, msg = run_readback(out, run_cmd, [vk_harness, capture, fs_loc1, out], env=run_env)
+                    if rc == UNSUPPORTED:
+                        results.append((name, None, unsupported_skip(msg)))
+                        ok = None
+                        break
+                    if rc != 0:
+                        results.append((name, False, f"{label}: {msg}"))
+                        ok = False
+                        break
+                    run_ok, run_detail = check_grad(out, 0.0, 0.0)
+                    parts.append(f"{label}: {run_detail}")
+                    ok = ok and run_ok
+                if ok is not None:
+                    results.append((name, ok, "; ".join(parts)))
             else:
-                ok, detail = check_grad(raw, 0.0, 0.0)
-                results.append((name, ok, detail))
+                env = dict(gfx_env or os.environ, VKH_GS=spv)
+                rc, msg = run_readback(raw, run_cmd, [vk_harness, vs_tri, fs_loc1, raw], env=env)
+                if rc == UNSUPPORTED:
+                    results.append((name, None, unsupported_skip(msg)))
+                elif rc != 0:
+                    results.append((name, False, msg))
+                else:
+                    ok, detail = check_grad(raw, 0.0, 0.0)
+                    results.append((name, ok, detail))
         elif name == "ms_v5_workgroup":
             rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
             if rc:

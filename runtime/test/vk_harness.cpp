@@ -66,6 +66,12 @@ static std::vector<uint32_t> read_spv(const char* path) {
     return w;
 }
 
+// VKH_GS_LINEAR / VKH_GS_INDICES: a raw byte file (the real vertex shader's outputs / the draw's indices).
+static std::vector<uint8_t> read_bytes(const char* path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), {});
+}
+
 static bool parse_u32(const char*& s, uint32_t& v) {
     const bool hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
     const char* digits = hex ? s + 2 : s;
@@ -165,8 +171,11 @@ int main(int argc, char** argv) {
     } else if (argc > 5) {
         W = atoi(argv[4]); H = atoi(argv[5]);
     }
-    // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37).
-    uint32_t pc[38] = {};
+    // Push constants: s0..s31, heap base (32..33), code base (34..35); the tail that follows is the
+    // --mesh-compute output address (36..37), or under --gs-compute the scatter's buffers (36..44) for the
+    // compute passes and then the draw vertex shader's record, meta and primitive count (36..40) for the draw
+    // (tools/gs_compute_stages.py: both read their tail from dword 36).
+    uint32_t pc[45] = {};
     const char* draw_mesh_path = std::getenv("VKH_DRAW_MESH");
     if (draw_mesh_path && !*draw_mesh_path) draw_mesh_path = nullptr;
     VertexAttr vertex_attrs[8];
@@ -360,6 +369,32 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // VKH_GS_VS=<vs.spv>: argv[1] is a geometry shader translated with rdna2spirv.py --gs-compute, i.e.
+    // tools/spirv_gs_to_compute.py's capture module, dispatched as compute over the input primitives (its
+    // descriptors are set 1: input, record, meta). VKH_GS_SCATTER runs first, regrouping the real vertex
+    // shader's outputs (VKH_GS_LINEAR, one vec4 per input slot, the GS's slot order) and the optional index
+    // buffer (VKH_GS_INDICES, VKH_GS_INDEX_TYPE 16 or 32; without it the draw is non-indexed) into the capture
+    // pass's input buffer. Then vs.spv (tools/gs_compute_stages.py) draws the records as a triangle list with
+    // the fragment shader. No Vulkan geometry stage is needed (Apple GPUs).
+    const char* gs_vs_path = std::getenv("VKH_GS_VS");
+    const char* gs_scatter_path = std::getenv("VKH_GS_SCATTER");
+    const char* gs_linear_path = std::getenv("VKH_GS_LINEAR");
+    const char* gs_indices_path = std::getenv("VKH_GS_INDICES");
+    const bool gs_capture = gs_vs_path != nullptr && *gs_vs_path;
+    uint32_t gs_verts_in = 0, gs_num_inputs = 0, gs_num_outputs = 0, gs_max_verts = 0;
+    if (gs_capture) {
+        const char* lay_env = std::getenv("VKH_GS_LAYOUT");
+        if (!gs_scatter_path || !lay_env || std::sscanf(lay_env, "%u,%u,%u,%u", &gs_verts_in, &gs_num_inputs,
+                                                       &gs_num_outputs, &gs_max_verts) != 4) {
+            std::fprintf(stderr, "VKH_GS_VS needs VKH_GS_SCATTER and VKH_GS_LAYOUT=verts_in,num_inputs,"
+                                 "num_outputs,max_verts (index.json gs_compute)\n");
+            return 2;
+        }
+        if (!gs_linear_path) {
+            std::fprintf(stderr, "VKH_GS_VS needs VKH_GS_LINEAR (the real vertex shader's outputs)\n");
+            return 2;
+        }
+    }
     // Translated shaders declare a 144-byte push-constant block (user SGPRs, heap base, code base; see VKH_SGPRS /
     // VKH_HEAP); --mesh-compute modules and their vertex shaders add the output address (152 bytes). A device with
     // fewer bytes (128, the Vulkan minimum, as on some Intel Arc drivers and AMD's Windows driver for RDNA2 iGPUs)
@@ -374,7 +409,17 @@ int main(int argc, char** argv) {
                              "constants, not from the --pc-tail-ubo block\n");
         return 77;
     }
-    const uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : 144u;
+    if (pc_tail && gs_capture) {
+        std::fprintf(stderr, "unsupported: --gs-compute's shaders read their buffer addresses from push "
+                             "constants, not from the --pc-tail-ubo block\n");
+        return 77;
+    }
+    if (mesh_compute && gs_capture) {
+        std::fprintf(stderr, "unsupported: --mesh-compute and --gs-compute in one run\n");
+        return 77;
+    }
+    // --gs-compute: the scatter's tail is the longest (36..44); the draw vertex shader's (36..40) fits in it.
+    const uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : gs_capture ? 180u : 144u;
     if (props.limits.maxPushConstantsSize < pc_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n", pc_bytes,
                      props.limits.maxPushConstantsSize);
@@ -507,9 +552,9 @@ int main(int argc, char** argv) {
         }
         feats.shaderFloat64 = VK_TRUE;
     }
-    if (need_heap || mesh_compute) {
+    if (need_heap || mesh_compute || gs_capture) {
         if (!f2q.features.shaderInt64) { std::fprintf(stderr, "unsupported: 64-bit addresses need shaderInt64\n"); return 77; }
-        feats.shaderInt64 = VK_TRUE;   // heap and --mesh-compute output addresses are 64-bit
+        feats.shaderInt64 = VK_TRUE;   // heap, --mesh-compute and --gs-compute buffer addresses are 64-bit
     }
     if (tex_rgba_path) {
         if (!f2q.features.shaderSampledImageArrayDynamicIndexing) {
@@ -627,8 +672,17 @@ int main(int argc, char** argv) {
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
     VkShaderModule vs, fs, csm = VK_NULL_HANDLE;
-    CHECK(module(mesh_compute ? mesh_vs_path : argv[1], &vs)); CHECK(module(argv[2], &fs));
+    // Under VKH_GS_VS the first argument is the capture module and the generated vertex shader (which reads the
+    // records through its push-constant addresses) takes its place in the pipeline.
+    if (gs_capture) CHECK(module(gs_vs_path, &vs));
+    else CHECK(module(mesh_compute ? mesh_vs_path : argv[1], &vs));
+    CHECK(module(argv[2], &fs));
     if (mesh_compute) CHECK(module(argv[1], &csm));
+    VkShaderModule gs_capture_module = VK_NULL_HANDLE, gs_scatter_module = VK_NULL_HANDLE;
+    if (gs_capture) {
+        CHECK(module(argv[1], &gs_capture_module));
+        CHECK(module(gs_scatter_path, &gs_scatter_module));
+    }
     VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -706,6 +760,18 @@ int main(int argc, char** argv) {
         dslci.bindingCount = 3;
         dslci.pBindings = dslb;
         CHECK(vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl));
+    }
+    // --gs-compute: the capture module's set 1, its three storage buffers (input, record, meta; the lowering's
+    // contract, tools/spirv_gs_to_compute.py).
+    VkDescriptorSetLayout gs_dsl = VK_NULL_HANDLE;
+    if (gs_capture) {
+        LOADD(vkCreateDescriptorSetLayout);
+        VkDescriptorSetLayoutBinding gb[3]{};
+        for (uint32_t i = 0; i < 3; ++i)
+            gb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo gci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        gci.bindingCount = 3; gci.pBindings = gb;
+        CHECK(vkCreateDescriptorSetLayout(dev, &gci, nullptr, &gs_dsl));
     }
     VkPushConstantRange pcr{pcs, 0, pc_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -826,6 +892,36 @@ int main(int argc, char** argv) {
         cpi.layout = pl;
         LOADD(vkCreateComputePipelines);
         CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &cpipe));
+    }
+    // --gs-compute: the scatter and the capture share one compute layout: set 0 empty (the capture's buffers are
+    // set 1), push constants 0..pc_bytes for both. The wave64 GS runs emulated (rdna2spirv.py --wave64-emulate)
+    // on 32-wide subgroups, so no required subgroup size is asked for here.
+    VkPipeline gs_spipe = VK_NULL_HANDLE, gs_cpipe = VK_NULL_HANDLE;
+    VkPipelineLayout gs_cl = VK_NULL_HANDLE;
+    VkDescriptorSet gs_set = VK_NULL_HANDLE;
+    if (gs_capture) {
+        LOADD(vkCreateDescriptorSetLayout);
+        VkDescriptorSetLayoutCreateInfo eci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        VkDescriptorSetLayout gs_edsl = VK_NULL_HANDLE;
+        CHECK(vkCreateDescriptorSetLayout(dev, &eci, nullptr, &gs_edsl));
+        const VkDescriptorSetLayout gs_layouts[] = {gs_edsl, gs_dsl};
+        VkPipelineLayoutCreateInfo gpl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        gpl.setLayoutCount = 2; gpl.pSetLayouts = gs_layouts;
+        VkPushConstantRange gpcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes};
+        gpl.pushConstantRangeCount = 1; gpl.pPushConstantRanges = &gpcr;
+        CHECK(vkCreatePipelineLayout(dev, &gpl, nullptr, &gs_cl));
+        VkComputePipelineCreateInfo gcp[2]{};
+        for (int i = 0; i < 2; ++i) {
+            gcp[i].sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            gcp[i].stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            gcp[i].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; gcp[i].stage.pName = "main";
+            gcp[i].stage.module = i == 0 ? gs_scatter_module : gs_capture_module;
+            gcp[i].layout = gs_cl;
+        }
+        VkPipeline gs_pipes[2]{};
+        LOADD(vkCreateComputePipelines);
+        CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 2, gcp, nullptr, gs_pipes));
+        gs_spipe = gs_pipes[0]; gs_cpipe = gs_pipes[1];
     }
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = VkDeviceSize(W) * H * texel_bytes; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1015,6 +1111,107 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mesh compute: %llu workgroups x %llu bytes, %u primitives each\n",
                      (unsigned long long)mesh_groups, (unsigned long long)mesh_slot, mesh_prims);
     }
+    // --gs-compute: the scatter's input (linear VS outputs, indices) and the capture's buffers, all through
+    // 64-bit addresses in the push-constant tail; the capture's set 1 points at input, record and meta.
+    uint32_t gs_prims = 0, gs_draw_verts = 0;
+    uint64_t gs_rec_addr = 0, gs_meta_addr = 0;   // the draw vertex shader's tail, pushed after the compute passes
+    void* gs_in_map = nullptr, *gs_rec_map = nullptr, *gs_meta_map = nullptr;
+    if (gs_capture) {
+        const std::vector<uint8_t> gs_linear = read_bytes(gs_linear_path);
+        const uint32_t gs_vertex_bytes = gs_num_inputs * 16;
+        if (gs_linear.empty() || gs_linear.size() % gs_vertex_bytes) {
+            std::fprintf(stderr, "VKH_GS_LINEAR must hold whole vertices of %u bytes\n", gs_vertex_bytes);
+            return 2;
+        }
+        std::vector<uint8_t> gs_index;
+        uint32_t gs_flag = 2, gs_count = 0;   // 2: no index buffer, the draw is non-indexed
+        if (gs_indices_path) {
+            const char* t = std::getenv("VKH_GS_INDEX_TYPE");
+            const bool wide = t && std::strcmp(t, "32") == 0;
+            if (!t || (!wide && std::strcmp(t, "16") != 0)) {
+                std::fprintf(stderr, "VKH_GS_INDICES needs VKH_GS_INDEX_TYPE 16 or 32\n");
+                return 2;
+            }
+            gs_index = read_bytes(gs_indices_path);
+            if (gs_index.empty() || gs_index.size() % (wide ? 4 : 2)) {
+                std::fprintf(stderr, "VKH_GS_INDICES must hold whole %s indices\n", wide ? "u32" : "u16");
+                return 2;
+            }
+            gs_flag = wide ? 1u : 0u;
+            gs_count = uint32_t(gs_index.size() / (wide ? 4 : 2));
+        } else {
+            gs_count = uint32_t(gs_linear.size() / gs_vertex_bytes);
+        }
+        uint32_t gs_first = 0;
+        if (const char* f = std::getenv("VKH_GS_FIRST")) gs_first = uint32_t(std::strtoul(f, nullptr, 0));
+        gs_prims = gs_count / gs_verts_in;
+        gs_draw_verts = gs_prims * 3 * (gs_max_verts >= 3 ? gs_max_verts - 2 : 1);
+        LOADD(vkGetBufferDeviceAddress);
+        // A storage buffer with a device address, host-visible so it can be zeroed and uploaded here.
+        auto bda_buffer = [&](VkDeviceSize bytes, const void* upload, VkBuffer& out, uint64_t& out_addr,
+                              void*& out_map) -> VkResult {
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.size = bytes;
+            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            if (VkResult r = vkCreateBuffer(dev, &bci, nullptr, &out)) return r;
+            VkMemoryRequirements rq; vkGetBufferMemoryRequirements(dev, out, &rq);
+            VkMemoryAllocateFlagsInfo af{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+            af.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.pNext = &af; ai.allocationSize = rq.size;
+            ai.memoryTypeIndex = memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkDeviceMemory m;
+            if (VkResult r = vkAllocateMemory(dev, &ai, nullptr, &m)) return r;
+            if (VkResult r = vkBindBufferMemory(dev, out, m, 0)) return r;
+            void* p = nullptr;
+            if (VkResult r = vkMapMemory(dev, m, 0, bytes, 0, &p)) return r;
+            if (upload) std::memcpy(p, upload, size_t(bytes));
+            else std::memset(p, 0, size_t(bytes));
+            out_map = p;
+            VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            da.buffer = out;
+            out_addr = vkGetBufferDeviceAddress(dev, &da);
+            return VK_SUCCESS;
+        };
+        VkBuffer gs_lin_b, gs_in_b, gs_rec_b, gs_meta_b, gs_idx_b = VK_NULL_HANDLE;
+        uint64_t gs_lin_a = 0, gs_in_a = 0, gs_rec_a = 0, gs_meta_a = 0, gs_idx_a = 0;
+        void* unused_map = nullptr;
+        CHECK(bda_buffer(VkDeviceSize(gs_linear.size()), gs_linear.data(), gs_lin_b, gs_lin_a, unused_map));
+        CHECK(bda_buffer(16 + VkDeviceSize(gs_prims) * gs_verts_in * gs_num_inputs * 16, nullptr,
+                         gs_in_b, gs_in_a, gs_in_map));
+        CHECK(bda_buffer(VkDeviceSize(gs_prims) * gs_max_verts * gs_num_outputs * 16, nullptr, gs_rec_b,
+                         gs_rec_a, gs_rec_map));
+        CHECK(bda_buffer(VkDeviceSize(gs_prims) * (gs_max_verts + 1) * 4, nullptr, gs_meta_b, gs_meta_a,
+                         gs_meta_map));
+        // Without an index buffer the scatter only reads members 3..4 for the u16/u32 paths, so the linear
+        // buffer's address serves (tools/gs_compute_stages.py's contract).
+        if (gs_index.empty()) gs_idx_a = gs_lin_a;
+        else CHECK(bda_buffer(VkDeviceSize(gs_index.size()), gs_index.data(), gs_idx_b, gs_idx_a, unused_map));
+        pc[36] = uint32_t(gs_lin_a); pc[37] = uint32_t(gs_lin_a >> 32);
+        pc[38] = uint32_t(gs_idx_a); pc[39] = uint32_t(gs_idx_a >> 32);
+        pc[40] = uint32_t(gs_in_a); pc[41] = uint32_t(gs_in_a >> 32);
+        pc[42] = gs_count; pc[43] = gs_flag; pc[44] = gs_first;
+        gs_rec_addr = gs_rec_a; gs_meta_addr = gs_meta_a;
+        LOADD(vkCreateDescriptorPool); LOADD(vkAllocateDescriptorSets); LOADD(vkUpdateDescriptorSets);
+        VkDescriptorPoolSize gps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+        VkDescriptorPoolCreateInfo gpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        gpci.maxSets = 1; gpci.poolSizeCount = 1; gpci.pPoolSizes = &gps;
+        VkDescriptorPool gpool; CHECK(vkCreateDescriptorPool(dev, &gpci, nullptr, &gpool));
+        VkDescriptorSetAllocateInfo gsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        gsai.descriptorPool = gpool; gsai.descriptorSetCount = 1; gsai.pSetLayouts = &gs_dsl;
+        CHECK(vkAllocateDescriptorSets(dev, &gsai, &gs_set));
+        VkDescriptorBufferInfo gbi[3] = {{gs_in_b, 0, VK_WHOLE_SIZE}, {gs_rec_b, 0, VK_WHOLE_SIZE},
+                                         {gs_meta_b, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet gw[3]{};
+        for (int i = 0; i < 3; ++i) {
+            gw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; gw[i].dstSet = gs_set;
+            gw[i].dstBinding = uint32_t(i); gw[i].descriptorCount = 1;
+            gw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; gw[i].pBufferInfo = &gbi[i];
+        }
+        vkUpdateDescriptorSets(dev, 3, gw, 0, nullptr);
+        std::fprintf(stderr, "gs compute: %u primitives (%s), %u out vertices\n", gs_prims,
+                     gs_flag == 2 ? "non-indexed" : gs_flag ? "u32 indices" : "u16 indices", gs_draw_verts);
+    }
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpi.queueFamilyIndex = qi;
     VkCommandPool pool; CHECK(vkCreateCommandPool(dev, &cpi, nullptr, &pool));
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1083,6 +1280,32 @@ int main(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0,
                              1, &mb, 0, nullptr, 0, nullptr);
     }
+    if (gs_capture) {
+        // The scatter regroups the linear vertex outputs into the capture pass's input buffer, the capture runs
+        // the geometry shader over them, and the records become visible to the draw's vertex shader.
+        LOADD(vkCmdDispatch); LOADD(vkCmdBindDescriptorSets);
+        const uint32_t gs_scatter_groups = (4 + gs_prims * gs_verts_in * gs_num_inputs * 4 + 63) / 64;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_spipe);
+        push(cmd, gs_cl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes, pc);
+        vkCmdDispatch(cmd, gs_scatter_groups, 1, 1);
+        VkMemoryBarrier sb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        sb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; sb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                             1, &sb, 0, nullptr, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_cpipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_cl, 1, 1, &gs_set, 0, nullptr);
+        push(cmd, gs_cl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes, pc);
+        vkCmdDispatch(cmd, (gs_prims + 63) / 64, 1, 1);
+        VkMemoryBarrier vb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        vb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; vb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0,
+                             1, &vb, 0, nullptr, 0, nullptr);
+        // The draw vertex shader's tail replaces the scatter's from dword 36 (the graphics push below).
+        pc[36] = uint32_t(gs_rec_addr); pc[37] = uint32_t(gs_rec_addr >> 32);
+        pc[38] = uint32_t(gs_meta_addr); pc[39] = uint32_t(gs_meta_addr >> 32);
+        pc[40] = gs_prims;
+        for (uint32_t i = 41; i < 45; ++i) pc[i] = 0;
+    }
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = rp; rbi.framebuffer = fb; rbi.renderArea = sc; rbi.clearValueCount = rpi.attachmentCount; rbi.pClearValues = clears;
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -1120,7 +1343,10 @@ int main(int argc, char** argv) {
         vkCmdBindVertexBuffers(cmd, 0, 1, &vbo, &offset);
         vkCmdBindIndexBuffer(cmd, ibo, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, uint32_t(mesh_indices.size()), 1, 0, 0, 0);
-    } else if (const unsigned vertices = vertices_env ? unsigned(std::strtoul(vertices_env, nullptr, 10)) : 0;
+    } else if (gs_capture)
+        // The record-driven draw: every primitive's strip triangles, as a triangle list.
+        vkCmdDraw(cmd, gs_draw_verts, 1, 0, 0);
+    else if (const unsigned vertices = vertices_env ? unsigned(std::strtoul(vertices_env, nullptr, 10)) : 0;
                vertices && !mesh)
         vkCmdDraw(cmd, vertices, 1, 0, 0);
     else if (mesh_compute)
@@ -1158,6 +1384,18 @@ int main(int argc, char** argv) {
                                     sizeof(primitives), VK_QUERY_RESULT_64_BIT));
         vkDestroyQueryPool(dev, gs_query, nullptr);
         std::fprintf(stderr, "gs_primitives=%llu\n", static_cast<unsigned long long>(primitives));
+    }
+    // VKH_GS_DUMP: the capture path's buffers after the run, to bisect a wrong image by hand.
+    if (gs_capture && std::getenv("VKH_GS_DUMP")) {
+        auto dump = [](const char* what, const void* map, uint32_t words) {
+            std::fprintf(stderr, "gs %s:", what);
+            for (uint32_t i = 0; i < words; ++i)
+                std::fprintf(stderr, " %08x", static_cast<const uint32_t*>(map)[i]);
+            std::fprintf(stderr, "\n");
+        };
+        dump("input", gs_in_map, 4 + gs_prims * gs_verts_in * gs_num_inputs * 4);
+        dump("record", gs_rec_map, gs_prims * gs_max_verts * gs_num_outputs * 4);
+        dump("meta", gs_meta_map, gs_prims * (gs_max_verts + 1));
     }
     void* p; CHECK(vkMapMemory(dev, bmem, 0, bi.size, 0, &p));
     std::ofstream output(argv[3], std::ios::binary);
