@@ -405,6 +405,23 @@ class TestValuMulF32ClampOracle(unittest.TestCase):
         hw = run_binary_f32("v_mul_f32", 0.5, 0.25, omod="mul:4")
         self.assertAlmostEqual(hw, 0.5, places=6)
 
+class TestValuMulF32AST(unittest.TestCase):
+    """Stage 14: Symbolic AST and typed modifier definitions for v_mul_f32."""
+
+    def test_ast_mul_compilation(self):
+        lines = [
+            "v_mov_b32 v0, 0x3f000000",
+            "v_mov_b32 v1, 0x3f000000",
+            "v_mul_f32_e64 v2, v0, v1 mul:2 clamp",
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(next_test_id("ps_ast_mul"), lines)
+        self.assertIn("OpFMul", spv)
+        self.assertIn("FClamp", spv)
+        words = support.mrt0_words(spv)
+        self.assertAlmostEqual(bits_to_f32(words[0]), 0.5, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
