@@ -2337,7 +2337,10 @@ The trace will enumerate them.
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
     committed resources instead. Buffer mappings alone do not implement a full tiled-resources tier.
     The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**ASSUMPTION**:
-    that the console uses it for reserved resources too).
+    that the console uses it for reserved resources too). So is `0x105`, which the retail executable writes into
+    `TEXTURE3D` descriptions that left `Layout` 0, before device slots 25 and 108. In the title's own layout-word set
+    `0x101`/`0x105` differ only in bit 2, as `0x1`/`0x5` do, so `0x105` is read as the volume form of the tiled word
+    (**INFERENCE** from a static read of the executable, not a console measurement; reported on #7496).
   - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip stays standard while it is
     wider than half the tile or taller than the tile, depth not counting, as AMD's PC runtime does on RDNA2 and RDNA4
     and so, most likely, the console (D3D-65); an NVIDIA GPU packs from the first mip smaller than a tile on any axis.
