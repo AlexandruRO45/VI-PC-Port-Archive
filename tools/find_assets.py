@@ -9,6 +9,7 @@ import argparse
 import math
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -71,14 +72,18 @@ def scan_assets(work_dir: Path, category: str, min_kb: float, top_n: int) -> int
         root_path = Path(root)
         for name in files:
             obj_path = root_path / name
-            if obj_path.suffix.lower() != ".obj" or not obj_path.is_file():
+            if obj_path.suffix.lower() != ".obj":
                 continue
             try:
-                size = obj_path.stat().st_size
+                info = obj_path.stat()
             except OSError as exc:
                 walk_errors.append(exc)
                 continue
 
+            if not stat.S_ISREG(info.st_mode):
+                continue
+
+            size = info.st_size
             if size < min_bytes:
                 continue
 
