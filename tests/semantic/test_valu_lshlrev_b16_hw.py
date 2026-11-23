@@ -181,3 +181,50 @@ class TestValuLshlrevB16AST(unittest.TestCase):
         )
         with self.assertRaises(TypeError):
             inst.validate()
+
+
+class RegisterState:
+    """Simulated state of GCN/RDNA registers for VALU scalar execution."""
+
+    def __init__(self):
+        self.vgpr = [0] * 256
+        self.sgpr = [0] * 106
+
+    def read_operand_u16(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.vgpr[op.index] & MASK16
+        elif op.kind == OperandKind.SGPR:
+            return self.sgpr[op.index] & MASK16
+        elif op.kind in (OperandKind.LITERAL16, OperandKind.INLINE_CONST):
+            return op.value & MASK16
+        raise ValueError(f"Unsupported operand kind for read: {op.kind}")
+
+    def write_vgpr_u16(self, index: int, val: int) -> None:
+        # VOP2 forms write low 16 bits and zero high 16 bits
+        self.vgpr[index] = u16(val)
+
+    def execute(self, inst: ASTInstruction) -> int:
+        inst.validate()
+        src0 = self.read_operand_u16(inst.src0)
+        src1 = self.read_operand_u16(inst.src1)
+        res = ref_lshlrev_b16(src0, src1)
+        self.write_vgpr_u16(inst.dst.index, res)
+        return res
+
+
+class TestValuLshlrevB16ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction execution."""
+
+    def test_scalar_interpreter_execution(self):
+        state = RegisterState()
+        state.vgpr[1] = 4
+        state.vgpr[2] = 0x000F
+        inst = ASTInstruction(
+            opcode=Opcode.V_LSHLREV_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        res = state.execute(inst)
+        self.assertEqual(res, 0x00F0)
+        self.assertEqual(state.vgpr[0], 0x00F0)
