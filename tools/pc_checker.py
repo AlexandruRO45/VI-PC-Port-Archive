@@ -473,7 +473,7 @@ def detect_gpus() -> list:
                 continue
             try:
                 gpus.append((parts[0], round(float(parts[1]) / 1024)))
-            except (IndexError, ValueError):
+            except (IndexError, OverflowError, ValueError):
                 gpus.append((parts[0], None))
 
     if sys.platform == "win32":

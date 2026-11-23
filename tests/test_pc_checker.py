@@ -2,12 +2,31 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
 import pc_checker as pc  # noqa: E402
 
 XBOX = "Xbox Series X"
+
+
+class GpuDetection(unittest.TestCase):
+    def test_nonfinite_smi_vram_does_not_interrupt_detection(self):
+        fallback = '"00:02.0" "VGA compatible controller" "Intel Corporation" "Test device"'
+        for memory in ("inf", "-inf", "1e309"):
+            with self.subTest(memory=memory):
+                smi = f"NVIDIA Test A, {memory}\nNVIDIA Test B, 8192"
+                with (
+                    patch.object(pc.shutil, "which", return_value="nvidia-smi"),
+                    patch.object(pc.sys, "platform", "linux"),
+                    patch.object(pc, "_run", side_effect=[smi, fallback]),
+                ):
+                    self.assertEqual(pc.detect_gpus(), [
+                        ("NVIDIA Test A", None),
+                        ("NVIDIA Test B", 8),
+                        ("Intel Test device", None),
+                    ])
 
 
 class GpuScore(unittest.TestCase):
