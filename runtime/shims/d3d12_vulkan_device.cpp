@@ -4263,6 +4263,7 @@ public:
                                  "sampler heap (%u of %u besides the fallback): its limits or "
                                  "vkGetDescriptorSetLayoutSupport allow no more\n",
                          features.counts[b::sampler_binding] - 1, unsigned(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE));
+        features.queue_families = state_.families;
         state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
@@ -4275,7 +4276,7 @@ public:
                 if (st->bindless) st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
             },
             &state_);
-        state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
+        state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer, bool* recorded) {
             std::lock_guard lock(state_.descriptor_mutex);
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
             if (state_.bindless->flush_needs_idle()) {
@@ -4287,7 +4288,9 @@ public:
                 }
                 state_.bindless->release_retired();
             }
-            return state_.bindless->flush(command_buffer);
+            const bool ok = state_.bindless->flush(command_buffer);
+            if (recorded) *recorded = state_.bindless->has_recorded_upload();
+            return ok;
         });
         state_.context->set_bindless_commit([this](bool submitted) {
             std::lock_guard lock(state_.descriptor_mutex);

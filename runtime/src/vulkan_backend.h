@@ -929,6 +929,11 @@ public:
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
         if (loaded_) {
             fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
+            VkSemaphoreTypeCreateInfo bindless_type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+            bindless_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            VkSemaphoreCreateInfo bindless_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &bindless_type};
+            if (vk.vkCreateSemaphore(device_, &bindless_info, nullptr, &bindless_timeline_) != VK_SUCCESS)
+                bindless_timeline_ = VK_NULL_HANDLE;
         }
     }
 
@@ -936,6 +941,7 @@ public:
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
+        if (bindless_timeline_) vk.vkDestroySemaphore(device_, bindless_timeline_, nullptr);
     }
 
     VulkanContext(const VulkanContext&) = delete;
@@ -1165,9 +1171,21 @@ public:
     // and records what the set needs first. When it fails, nothing of that call is executed.
     void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
 
-    void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
+    void set_bindless_prepare(std::function<bool(VkCommandBuffer, bool*)> prepare) {
         std::unique_lock lock(resource_mutex_);
         bindless_prepare_ = std::move(prepare);
+    }
+
+    void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
+        std::unique_lock lock(resource_mutex_);
+        if (!prepare) {
+            bindless_prepare_ = {};
+            return;
+        }
+        bindless_prepare_ = [fn = std::move(prepare)](VkCommandBuffer command_buffer, bool* recorded) {
+            if (recorded) *recorded = true;
+            return fn(command_buffer);
+        };
     }
 
     // D24_UNORM_S8_UINT stored as D32: copies of its depth plane run a compute pass (vulkan_depth24.h). `allocate`
@@ -1354,8 +1372,13 @@ private:
     VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t storage_init_value_ = 0;
     std::uint64_t storage_init_version_ = 0;
+    // Cross-queue timeline for BindlessSet fallback-image init and descriptor-table uploads; guarded by tracker_mutex_.
+    VkSemaphore bindless_timeline_ = VK_NULL_HANDLE;
+    std::uint64_t bindless_upload_value_ = 0;
+    std::uint64_t bindless_completed_value_ = 0;
+    VkSemaphore bindless_upload_owner_ = VK_NULL_HANDLE;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
-    std::function<bool(VkCommandBuffer)> bindless_prepare_;
+    std::function<bool(VkCommandBuffer, bool*)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
@@ -1845,10 +1868,22 @@ private:
             return ReplayResult::unsupported;
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
-        if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
+        bool bindless_recorded = false;
+        if (!transfer_only && context_.bindless_prepare_ &&
+            !context_.bindless_prepare_(command_buffer, &bindless_recorded)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
-            const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+            VkSemaphore bindless_wait = VK_NULL_HANDLE, bindless_signal = VK_NULL_HANDLE;
+            std::uint64_t bindless_wait_val = 0, bindless_signal_val = 0;
+            if (!transfer_only)
+                prepare_bindless_sync(bindless_recorded, bindless_wait, bindless_wait_val, bindless_signal,
+                                      bindless_signal_val);
+            const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, bindless_wait, bindless_wait_val,
+                                                   bindless_signal, bindless_signal_val);
+            if (submitted && bindless_signal) {
+                context_.bindless_upload_value_ = bindless_signal_val;
+                context_.bindless_upload_owner_ = progress_;
+            }
             if (!submitted) discard();
             if (depth24_guard.active) {
                 context_.depth24_->retire(progress_, 0);
@@ -1936,7 +1971,17 @@ private:
             waits_.push_back(progress_);
             wait_values_.push_back(submitted_);
         }
-        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+        VkSemaphore bindless_wait = VK_NULL_HANDLE, bindless_signal = VK_NULL_HANDLE;
+        std::uint64_t bindless_wait_val = 0, bindless_signal_val = 0;
+        if (!transfer_only)
+            prepare_bindless_sync(bindless_recorded, bindless_wait, bindless_wait_val, bindless_signal,
+                                  bindless_signal_val);
+        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, bindless_wait, bindless_wait_val,
+                                               bindless_signal, bindless_signal_val);
+        if (submitted && bindless_signal) {
+            context_.bindless_upload_value_ = bindless_signal_val;
+            context_.bindless_upload_owner_ = progress_;
+        }
         if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
@@ -2256,32 +2301,72 @@ private:
         return event;
     }
 
-    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
+    // Orders bindless fallback/table uploads across independent queues; must be called with context_.tracker_mutex_
+    // held.
+    void prepare_bindless_sync(bool bindless_recorded, VkSemaphore& wait_sem, std::uint64_t& wait_val,
+                               VkSemaphore& signal_sem, std::uint64_t& signal_val) {
+        wait_sem = signal_sem = VK_NULL_HANDLE;
+        wait_val = signal_val = 0;
+        if (!context_.bindless_timeline_) return;
+        const std::uint64_t pending = context_.bindless_upload_value_;
+        if (pending > 0 && (bindless_recorded || context_.bindless_upload_owner_ != progress_)) {
+            if (context_.bindless_completed_value_ < pending) {
+                std::uint64_t done = 0;
+                if (context_.vk.vkGetSemaphoreCounterValue(context_.device_, context_.bindless_timeline_, &done) ==
+                    VK_SUCCESS) {
+                    context_.bindless_completed_value_ = std::max(context_.bindless_completed_value_, done);
+                }
+            }
+            if (context_.bindless_completed_value_ < pending) {
+                wait_sem = context_.bindless_timeline_;
+                wait_val = pending;
+            }
+        }
+        if (bindless_recorded) {
+            signal_sem = context_.bindless_timeline_;
+            signal_val = pending + 1;
+        }
+    }
+
+    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
+                VkSemaphore extra_wait = VK_NULL_HANDLE, std::uint64_t extra_wait_value = 0,
+                VkSemaphore extra_signal = VK_NULL_HANDLE, std::uint64_t extra_signal_value = 0) {
         if (context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) collect_bindings(completed());
         std::span<const VkSemaphore> semaphores = waits_;
         std::span<const std::uint64_t> values = wait_values_;
-        std::vector<VkSemaphore> sparse_waits;
-        std::vector<std::uint64_t> sparse_values;
-        if (last_sparse_) {
-            sparse_waits = waits_;
-            sparse_values = wait_values_;
-            sparse_waits.push_back(progress_);
-            sparse_values.push_back(last_sparse_);
-            semaphores = sparse_waits;
-            values = sparse_values;
+        std::vector<VkSemaphore> extra_waits;
+        std::vector<std::uint64_t> extra_values;
+        if (last_sparse_ || extra_wait) {
+            extra_waits = waits_;
+            extra_values = wait_values_;
+            if (last_sparse_) {
+                extra_waits.push_back(progress_);
+                extra_values.push_back(last_sparse_);
+            }
+            if (extra_wait) {
+                extra_waits.push_back(extra_wait);
+                extra_values.push_back(extra_wait_value);
+            }
+            semaphores = extra_waits;
+            values = extra_values;
         }
         const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
-            VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
-            std::uint64_t signal_values[2]{ticket, 0};
+            VkSemaphore signals[3]{progress_, VK_NULL_HANDLE, VK_NULL_HANDLE};
+            std::uint64_t signal_values[3]{ticket, 0, 0};
             std::uint32_t signal_count = 1;
             if (fence) {
                 signals[signal_count] = fence;
                 signal_values[signal_count] = value;
+                ++signal_count;
+            }
+            if (extra_signal) {
+                signals[signal_count] = extra_signal;
+                signal_values[signal_count] = extra_signal_value;
                 ++signal_count;
             }
             VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};

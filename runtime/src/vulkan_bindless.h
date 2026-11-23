@@ -79,6 +79,9 @@ struct BindlessFeatures {
         VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT};
     // Descriptors in each binding, by binding number: bindless::bindings by default, or what size_bindings() chose.
     std::array<std::uint32_t, bindless::binding_count> counts = bindless::default_counts();
+    // Unique Vulkan queue family indices that access the bindless resources; when 2+, table buffers and fallback
+    // images are created with VK_SHARING_MODE_CONCURRENT.
+    std::vector<std::uint32_t> queue_families;
 };
 
 namespace bindless {
@@ -312,7 +315,12 @@ class BindlessSet {
 public:
     BindlessSet(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
                 BindlessFeatures features = {})
-        : device_(device), memory_(memory), features_(features) {
+        : device_(device), memory_(memory), features_(std::move(features)) {
+        std::vector<std::uint32_t> unique_families;
+        for (const std::uint32_t f : features_.queue_families)
+            if (std::find(unique_families.begin(), unique_families.end(), f) == unique_families.end())
+                unique_families.push_back(f);
+        features_.queue_families = std::move(unique_families);
         ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
     }
 
@@ -363,6 +371,7 @@ public:
     bool fallbacks_ready() const { return fallbacks_ready_; }
     void record_fallback_init(VkCommandBuffer command_buffer) {
         fallbacks_ready_ = true;
+        fallbacks_in_flight_ = true;
         std::vector<VkImageMemoryBarrier> barriers;
         for (const auto& image : fallback_images_) {
             if (!image.image) continue;  // unsupported multisample component class
@@ -467,16 +476,25 @@ public:
     // HOST_VISIBLE, which still works, just slower).
     bool table_in_device_local_memory() const { return table_device_local_; }
 
-    // True when the command buffer that carried the last table upload reached the queue; false keeps the upload
-    // obligation, and the next flush() rebuilds the whole table (the changed-slot list was consumed when the copy
-    // was recorded). A failed vkQueueSubmit is the caller's signal, not ours.
+    // True when the command buffer that carried the last table upload or fallback init reached the queue; false keeps
+    // those obligations so the next flush() records them again (the changed-slot list was consumed when the copy was
+    // recorded). A failed vkQueueSubmit is the caller's signal, not ours.
     void table_upload_result(bool submitted) {
-        if (!upload_in_flight_) return;
+        const bool table_pending = upload_in_flight_;
+        const bool fallbacks_pending = fallbacks_in_flight_;
         upload_in_flight_ = false;
+        fallbacks_in_flight_ = false;
         if (submitted) return;
-        table_dirty_ = true;
-        force_full_upload_ = true;
+        if (fallbacks_pending) fallbacks_ready_ = false;
+        if (table_pending) {
+            table_dirty_ = true;
+            force_full_upload_ = true;
+        }
     }
+
+    // True when the current flush/init pass recorded GPU work (fallback image clear or table copy/update) into the
+    // command buffer, cleared once table_upload_result() runs.
+    bool has_recorded_upload() const { return upload_in_flight_ || fallbacks_in_flight_; }
 
     // Writes the pending descriptor changes and uploads the table, in `command_buffer`, before the commands that use
     // the set are recorded after it. A table that has grown gets new buffers (binding 2 is rewritten); the old ones
@@ -629,6 +647,7 @@ private:
                 info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
                 if (t != ms_type) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
                 if (t == ms_type || c == 0) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                share(info);
                 FallbackImage& image = fallback_images_[t * classes + c];
                 if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
                 VkMemoryRequirements requirements{};
@@ -670,11 +689,20 @@ private:
         return vk_.vkCreateSampler(device_, &sampler, nullptr, &fallback_sampler_) == VK_SUCCESS;
     }
 
+    template<typename CreateInfo>
+    void share(CreateInfo& info) const {
+        if (features_.queue_families.size() < 2) return;
+        info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        info.queueFamilyIndexCount = std::uint32_t(features_.queue_families.size());
+        info.pQueueFamilyIndices = features_.queue_families.data();
+    }
+
     bool create(TableBuffer& out, std::size_t bytes, bool device_local, bool* got_device_local = nullptr) const {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      (device_local ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        share(info);
         TableBuffer made;
         made.size = bytes;
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &made.buffer) != VK_SUCCESS) return false;
@@ -823,7 +851,7 @@ private:
     void record_table_barrier(VkCommandBuffer command_buffer) const {
         VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.buffer = table_buffers_.table.buffer;
@@ -932,6 +960,7 @@ private:
     std::array<VkImageView, bindless::bindings.size()> fallback_by_binding_{};
     VkSampler fallback_sampler_ = VK_NULL_HANDLE;
     bool fallbacks_ready_ = false;
+    bool fallbacks_in_flight_ = false;
     std::array<std::vector<std::uint8_t>, dimensions> image_used_;
     std::vector<std::uint8_t> sampler_used_;
     std::vector<Pending> pending_;
