@@ -1594,6 +1594,10 @@ if(TARGET Vulkan::Headers)
     endforeach()
     add_test(NAME d3d12_trace COMMAND "${Python3_EXECUTABLE}" -I
              "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_gcl8_test>" ${_trace_runner})
+    add_test(NAME d3d12_trace_queue COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_com_test>" --queue
+             ${_trace_runner})
+    set_tests_properties(d3d12_trace_queue PROPERTIES SKIP_RETURN_CODE 77)
 
     # The Vulkan device behind the Xbox-ABI proxy, end to end.
     add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp)

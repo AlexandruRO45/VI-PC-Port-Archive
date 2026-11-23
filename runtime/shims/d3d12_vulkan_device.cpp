@@ -5501,12 +5501,13 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                                      ID3D12RootSignature* root_signature, REFIID riid,
                                                      void** out) override {
+        constexpr auto method = "ID3D12Device::CreateCommandSignature";
         if (out) *out = nullptr;
         // The host refuses these with E_INVALIDARG (compare_invalid_arguments, "command signature:"): one node, a
         // known type per argument, exactly one draw or dispatch and it comes last, a root signature for root
         // arguments, and a stride that is a multiple of 4 and holds every argument.
         if (!desc || desc->NumArgumentDescs == 0 || !desc->pArgumentDescs || (desc->NodeMask & ~1u))
-            return E_INVALIDARG;
+            return d3d12_trace::result(method, E_INVALIDARG);
         UINT64 size = 0;  // 64-bit: a large Num32BitValuesToSet must not wrap past ByteStride
         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
             const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
@@ -5523,25 +5524,27 @@ public:
             case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
             case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
             case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS); break;
-            default: return E_INVALIDARG;
+            default: return d3d12_trace::result(method, E_INVALIDARG);
             }
             const bool draw = arg.Type <= D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH ||
                               arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS ||
                               arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
             const bool root_argument = !draw && arg.Type != D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW &&
                                        arg.Type != D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
-            if (draw != (i + 1 == desc->NumArgumentDescs) || (root_argument && !root_signature)) return E_INVALIDARG;
+            if (draw != (i + 1 == desc->NumArgumentDescs) || (root_argument && !root_signature))
+                return d3d12_trace::result(method, E_INVALIDARG);
         }
-        if (desc->ByteStride % 4 || desc->ByteStride < size) return E_INVALIDARG;
-        if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
+        if (desc->ByteStride % 4 || desc->ByteStride < size) return d3d12_trace::result(method, E_INVALIDARG);
+        // E_UNEXPECTED is the host's answer for a valid description and no output.
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         leonida::IndirectKind kind;
         switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type) {
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
-        default: return E_NOTIMPL;
+        default: return d3d12_trace::result(method, E_NOTIMPL);
         }
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+        return d3d12_trace::result(method, create_command_signature(kind, desc->ByteStride, riid, out, identity()));
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
@@ -5691,6 +5694,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device::CreateQueryHeap";
         if (out) *out = nullptr;
         // The host runtime's order (compare_invalid_arguments, "query heap:"): the description first, refused with
         // E_INVALIDARG for no queries, a node other than node 0 or a type past PIPELINE_STATISTICS1 (7; 6 has no
@@ -5698,15 +5702,15 @@ public:
         // can't create stays E_NOTIMPL.
         if (!desc || !desc->Count || desc->NodeMask > 1 ||
             UINT(desc->Type) > UINT(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1))
-            return E_INVALIDARG;
-        if (!out) return E_UNEXPECTED;
+            return d3d12_trace::result(method, E_INVALIDARG);
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         auto* heap = new QueryHeap(state_);
         heap->attach_device(identity());
         if (const HRESULT hr = heap->create(*desc); FAILED(hr)) {
             heap->Release();
-            return hr;
+            return d3d12_trace::result(method, hr);
         }
-        return hand_out(heap, riid, out);
+        return d3d12_trace::result(method, hand_out(heap, riid, out));
     }
 
     HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT node_mask, const void* blob, SIZE_T size, REFIID riid,
@@ -6730,29 +6734,30 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* desc, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device::CreateHeap";
         if (out) *out = nullptr;
-        if (!desc) return E_INVALIDARG;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         if (const char* why = heap_desc_refusal(*desc)) {
             log_once((std::string("CreateHeap refused (") + why + "), heap type").c_str(), int(desc->Properties.Type));
-            return E_INVALIDARG;
+            return d3d12_trace::result(method, E_INVALIDARG);
         }
         if (!state_.arena.mapped) {
             log_once("heaps need the GPU address arena (bufferDeviceAddress); heap size in KiB:",
                      int(desc->SizeInBytes / 1024));
-            return E_NOTIMPL;
+            return d3d12_trace::result(method, E_NOTIMPL);
         }
         auto* heap = new Heap(state_, *desc);
         heap->attach_device(identity());
         if (!heap->reserved()) {
             log_once("GPU address arena full (raise LEONIDA_ARENA_MB); heap size in KiB:", int(desc->SizeInBytes / 1024));
             heap->Release();
-            return E_OUTOFMEMORY;
+            return d3d12_trace::result(method, E_OUTOFMEMORY);
         }
         if (!out) {
             heap->Release();
-            return S_FALSE;
+            return d3d12_trace::result(method, S_FALSE);
         }
-        return hand_out(heap, riid, out);
+        return d3d12_trace::result(method, hand_out(heap, riid, out));
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,

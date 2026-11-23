@@ -12,6 +12,8 @@ def run_fixture(exe, *args):
     # A first start of Wine in a fresh prefix can take tens of seconds, hence the longer limit through a runner.
     process = subprocess.run([*RUNNER, exe, *args], capture_output=True, text=True, encoding="utf-8",
                              errors="replace", timeout=120 if RUNNER else 30)
+    if process.returncode == 77:  # no usable Vulkan device: ctest skips
+        raise SystemExit(77)
     if process.returncode:
         raise SystemExit(f"{exe} exited with {process.returncode}\n{process.stdout}{process.stderr}")
     return [line for line in process.stderr.splitlines() if line.startswith("[d3d12-trace]")]
@@ -47,6 +49,13 @@ def main():
             "ID3D12CommandQueue::Wait ok",
             "ID3D12CommandQueue::ExecuteCommandLists ok",
             "ID3D12CommandQueue::Signal ok",
+            "ID3D12Device::CreateCommandSignature ok",
+            "ID3D12Device::CreateCommandSignature unsupported",
+            "ID3D12Device::CreateCommandSignature failed",
+            "ID3D12Device::CreateQueryHeap ok",
+            "ID3D12Device::CreateQueryHeap failed",
+            "ID3D12Device::CreateHeap ok",
+            "ID3D12Device::CreateHeap failed",
         ]
     else:
         expected = [

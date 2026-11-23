@@ -376,6 +376,54 @@ int main(int argc, char** argv) {
         EXPECT(list->Close() == S_OK);
     }
 
+    // Device creation calls leave an outcome in the trace whichever way they end (check_d3d12_trace.py --queue).
+    // An ID3D12Device on the test's own Vulkan device, with the GPU address arena on so that CreateHeap can succeed.
+    {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = d.instance_proc;
+        info.instance = d.instance;
+        info.physical = d.physical;
+        info.device = d.device;
+        info.queue = d.queue;
+        info.queue_family = d.family;
+        info.buffer_device_address = true;
+        Ref<ID3D12Device> device;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
+        auto signature = [&](D3D12_INDIRECT_ARGUMENT_TYPE type, UINT stride) {
+            D3D12_INDIRECT_ARGUMENT_DESC arg{};
+            arg.Type = type;
+            D3D12_COMMAND_SIGNATURE_DESC desc{};
+            desc.ByteStride = stride;
+            desc.NumArgumentDescs = 1;
+            desc.pArgumentDescs = &arg;
+            Ref<ID3D12CommandSignature> out;
+            return device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&out.p));
+        };
+        EXPECT(SUCCEEDED(signature(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, sizeof(D3D12_DISPATCH_ARGUMENTS))));
+        // A valid signature of a kind the layer does not replay.
+        EXPECT(signature(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS, sizeof(D3D12_DISPATCH_RAYS_DESC)) == E_NOTIMPL);
+        EXPECT(signature(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, 2) == E_INVALIDARG);
+        auto query_heap = [&](UINT count) {
+            D3D12_QUERY_HEAP_DESC desc{};
+            desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            desc.Count = count;
+            Ref<ID3D12QueryHeap> out;
+            return device->CreateQueryHeap(&desc, IID_PPV_ARGS(&out.p));
+        };
+        EXPECT(SUCCEEDED(query_heap(2)));
+        EXPECT(query_heap(0) == E_INVALIDARG);
+        auto heap = [&](UINT64 bytes) {
+            D3D12_HEAP_DESC desc{};
+            desc.SizeInBytes = bytes;
+            desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+            Ref<ID3D12Heap> out;
+            return device->CreateHeap(&desc, IID_PPV_ARGS(&out.p));
+        };
+        EXPECT(SUCCEEDED(heap(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)));
+        EXPECT(heap(0) == E_INVALIDARG);
+    }
+
     EXPECT(d.run([&](VkCommandBuffer cb) {
         d.read_back(cb, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, 1, buffer, 0);
         d.read_back(cb, ds, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, size, size, 1, buffer,
