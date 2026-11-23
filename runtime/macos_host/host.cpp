@@ -6,7 +6,9 @@
 //   macos_host <image.exe> [guest arguments...]
 #include "host.h"
 
+#include <dlfcn.h>
 #include <limits.h>
+#include <signal.h>
 #include <strings.h>
 
 #include <mach/mach.h>
@@ -72,6 +74,16 @@ uint32_t thread_id() {
 }
 
 std::string g_game_dir;  // absolute folder of the game image, where GAME:\ points
+std::string g_exe_path;
+
+void* find_export(const std::string& key) {
+    auto it = g_exports.find(key);
+    return it == g_exports.end() ? nullptr : it->second;
+}
+bool has_dll(const std::string& dll) {
+    auto it = g_exports.lower_bound(dll + "!");
+    return it != g_exports.end() && it->first.compare(0, dll.size() + 1, dll + "!") == 0;
+}
 
 std::string to_host_path(const char* p) {  // ponytail: no drive letters
     std::string s(p);
@@ -117,6 +129,53 @@ void free_teb(uint8_t* teb) {
     free(teb);
 }
 
+// ---- crashes -------------------------------------------------------------------------------------------------
+// A fault prints where it happened, image-relative when it is in the game image, so llvm-symbolizer or
+// llvm-objdump can name the function. Async-signal-unsafe printing is fine: the process is about to die.
+namespace {
+void on_fault(int sig, siginfo_t* info, void* uc) {
+    auto& ss = static_cast<ucontext_t*>(uc)->uc_mcontext->__ss;
+    uint64_t rip = ss.__rip, base = reinterpret_cast<uint64_t>(g_image);
+    std::fprintf(stderr, "host: signal %d at rip=0x%llx", sig, rip);
+    if (g_image && rip >= base && rip < base + 0x10000000) std::fprintf(stderr, " (image+0x%llx)", rip - base);
+    std::fprintf(stderr, " addr=%p rsp=0x%llx [rsp]=0x%llx\n", info->si_addr, ss.__rsp,
+                 *reinterpret_cast<uint64_t*>(ss.__rsp));
+    Dl_info dl;
+    for (uint64_t pc : {rip, *reinterpret_cast<uint64_t*>(ss.__rsp)})
+        if (pc && dladdr(reinterpret_cast<void*>(pc), &dl) && dl.dli_sname)
+            std::fprintf(stderr, "host:   0x%llx = %s+0x%llx\n", pc, dl.dli_sname,
+                         pc - reinterpret_cast<uint64_t>(dl.dli_saddr));
+    _exit(128 + sig);
+}
+}  // namespace
+
+// ---- unimplemented imports --------------------------------------------------------------------------------
+// Each missing import gets a stub `mov rcx, name; mov rax, trap; jmp rax`, so the image loads and only a call that
+// actually happens stops the run, naming the function. LEONIDA_STRICT_IMPORTS=1 restores the load-time check.
+namespace {
+[[noreturn]] MSABI void trap(const char* name) {
+    HostGs gs;
+    fail(std::string("unimplemented import called: ") + name);
+}
+void* import_trap(const std::string& name) {
+    static uint8_t* page = nullptr;
+    static size_t used = 0;
+    constexpr size_t kPage = 1 << 16, kStub = 24;
+    if (!page || used + kStub > kPage) {
+        page = static_cast<uint8_t*>(mmap(nullptr, kPage, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0));
+        if (page == MAP_FAILED) fail("mmap import traps");
+        used = 0;
+    }
+    uint8_t* p = page + used;
+    used += kStub;
+    uint64_t n = reinterpret_cast<uint64_t>(strdup(name.c_str())), t = reinterpret_cast<uint64_t>(&trap);
+    p[0] = 0x48, p[1] = 0xB9, std::memcpy(p + 2, &n, 8);   // mov rcx, imm64
+    p[10] = 0x48, p[11] = 0xB8, std::memcpy(p + 12, &t, 8); // mov rax, imm64
+    p[20] = 0xFF, p[21] = 0xE0;                             // jmp rax
+    return p;
+}
+}  // namespace
+
 // ---- threads -------------------------------------------------------------------------------------------------
 namespace {
 struct ThreadStart {
@@ -127,12 +186,14 @@ struct ThreadStart {
     pthread_cond_t ready = PTHREAD_COND_INITIALIZER;
     bool started = false;
 };
+thread_local Object* t_self = nullptr;  // the guest thread's own handle, for ExitThread
 void* thread_main(void* p) {
     auto* s = static_cast<ThreadStart*>(p);
     Object* obj = s->obj;
     ThreadProc proc = s->proc;
     void* arg = s->arg;
     obj->tid = thread_id();
+    t_self = obj;
     pthread_mutex_lock(&s->lock);
     s->started = true;
     pthread_cond_signal(&s->ready);
@@ -144,6 +205,21 @@ void* thread_main(void* p) {
     free_teb(teb);
     return nullptr;
 }
+}  // namespace
+
+// ExitThread from guest code: the thread's guest frames are abandoned, as on Windows.
+[[noreturn]] void exit_thread(uint32_t code) {
+    if (!t_self) {  // the main thread
+        std::fflush(nullptr);
+        _exit(static_cast<int>(code));
+    }
+    t_self->exit_code = code;
+    uint8_t* teb = t_teb;
+    attach_thread(teb, 3 /* DLL_THREAD_DETACH */);
+    free_teb(teb);
+    pthread_exit(nullptr);
+}
+namespace {
 }  // namespace
 
 Object* spawn_thread(ThreadProc proc, void* arg) {
@@ -170,7 +246,8 @@ uint32_t wait_thread(Object* o) {
 void close_object(Object* o) {
     if (o->kind == Object::File && o->fd > 2) close(o->fd);
     if (o->kind == Object::Thread && !o->joined) pthread_detach(o->thread);
-    if (o->fd > 2 || o->kind == Object::Thread) delete o;
+    if (o->signal) free_signal(o->signal);
+    if (o->fd > 2 || o->kind != Object::File) delete o;
 }
 
 // ---- PE loading ----------------------------------------------------------------------------------------------
@@ -231,11 +308,15 @@ uint8_t* load_pe(const char* path) {
             }
             std::string key = dll + "!" + reinterpret_cast<char*>(image + (*t & 0x7fffffff) + 2);
             auto it = g_exports.find(key);
-            if (it == g_exports.end()) missing.push_back(key);
-            else *iat = reinterpret_cast<uint64_t>(it->second);
+            if (it == g_exports.end()) {
+                missing.push_back(key);
+                *iat = reinterpret_cast<uint64_t>(import_trap(key));
+            } else {
+                *iat = reinterpret_cast<uint64_t>(it->second);
+            }
         }
     }
-    if (!missing.empty()) {
+    if (!missing.empty() && std::getenv("LEONIDA_STRICT_IMPORTS")) {
         for (auto& m : missing) std::fprintf(stderr, "host: unresolved import %s\n", m.c_str());
         fail(std::to_string(missing.size()) + " unresolved imports");
     }
@@ -275,12 +356,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: macos_host <image.exe> [guest arguments...]\n");
         return 64;
     }
-    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports})
+    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports})
         for (auto& [name, fn] : (*list)()) g_exports[name] = fn;
 
     char real[PATH_MAX];
     if (!realpath(argv[1], real)) fail(std::string("cannot open ") + argv[1]);
     g_game_dir.assign(real, std::strrchr(real, '/'));
+    g_exe_path = real;
     const char* slash = std::strrchr(argv[1], '/');
     g_argc = argc - 1;
     g_argv = argv + 1;
@@ -288,6 +370,10 @@ int main(int argc, char** argv) {
     g_command_line = g_argv[0];
     for (int i = 1; i < g_argc; ++i) g_command_line += std::string(" ") + g_argv[i];
 
+    struct sigaction sa = {};
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) sigaction(sig, &sa, nullptr);
     g_peb = static_cast<uint8_t*>(calloc(1, 0x1000));
     auto entry = reinterpret_cast<void(MSABI*)()>(load_pe(real));
     std::memcpy(g_peb + 0x10, &g_image, sizeof g_image);  // PEB.ImageBaseAddress

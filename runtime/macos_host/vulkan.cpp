@@ -50,6 +50,7 @@ void* metal_layer_for_window(void* hwnd);  // window.mm
 namespace {
 
 PFN_vkGetInstanceProcAddr g_gipa = nullptr;  // MoltenVK's
+PFN_vkGetDeviceProcAddr g_gdpa = nullptr;    // exported directly: vkGetInstanceProcAddr(NULL, ...) does not give it
 
 void load_moltenvk() {
     if (g_gipa) return;
@@ -58,7 +59,8 @@ void load_moltenvk() {
     void* lib = dlopen(path && *path ? path : "@rpath/libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!lib) fail(std::string("cannot load MoltenVK (set LEONIDA_MOLTENVK): ") + dlerror());
     g_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib, "vkGetInstanceProcAddr"));
-    if (!g_gipa) fail("MoltenVK has no vkGetInstanceProcAddr");
+    g_gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(lib, "vkGetDeviceProcAddr"));
+    if (!g_gipa || !g_gdpa) fail("MoltenVK lacks vkGetInstanceProcAddr or vkGetDeviceProcAddr");
 }
 
 // One 24-byte stub per host function: movabs rax, target; jmp [rip+0]; .quad host_ms_to_sysv.
@@ -161,8 +163,7 @@ VkBool32 win32_presentation_support(VkPhysicalDevice, uint32_t) { return VK_TRUE
 
 void* get_instance_proc_addr(VkInstance instance, const char* name);
 void* get_device_proc_addr(VkDevice device, const char* name) {
-    auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(g_gipa(nullptr, "vkGetDeviceProcAddr"));
-    PFN_vkVoidFunction real = gdpa(device, name);
+    PFN_vkVoidFunction real = g_gdpa(device, name);
     void* f = float_command(name, real);
     return f != reinterpret_cast<void*>(-1) ? f : stub_for(reinterpret_cast<void*>(real));
 }

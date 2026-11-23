@@ -15,7 +15,7 @@ mkdir -p "$OUT"
   "$OUT/guest.obj" "$OUT/kernel32.lib" /out:"$OUT/guest_fixed.exe"
 VKH=${VKH:-/opt/homebrew/opt/vulkan-headers/include}
 MVK=${MVK:-$HOME/.local/share/moltenvk/MoltenVK/MoltenVK/dynamic/dylib/macOS}  # universal MoltenVK release
-/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra -I"$VKH" host.cpp kernel32.cpp crt.cpp eh.cpp vulkan.cpp \
+/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra -I"$VKH" host.cpp kernel32.cpp kernel32_crt.cpp crt.cpp eh.cpp vulkan.cpp \
   window.mm -framework Cocoa -framework QuartzCore -Wl,-rpath,"$MVK" -o "$OUT/macos_host"
 
 # Leonida's own stand-in game (runtime/test/fixtures/tiny_game.cpp), built as runtime/CMakeLists.txt builds it,

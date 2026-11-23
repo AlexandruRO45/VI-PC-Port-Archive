@@ -37,6 +37,9 @@ uint32_t thread_id();         // the id GetCurrentThreadId and the CRT report
 void set_last_error(uint32_t e);
 std::string to_host_path(const char* windows_path);
 [[noreturn]] void fail(const std::string& why);
+extern std::string g_exe_path;              // host path of the game image
+void* find_export(const std::string& key);  // "dll!name" (dll lowercase) -> entry, or nullptr
+bool has_dll(const std::string& dll);       // the host exports something from this (lowercase) DLL
 
 // Run guest code with gs on the thread's TEB, from host code.
 template <typename R, typename... A, typename... B> R call_guest(R(MSABI* fn)(A...), B... args) {
@@ -71,18 +74,22 @@ template <typename R, typename... A, R (*F)(A...)> struct Thunk<R(A...), F> {
 };
 
 // Kernel handles.
+struct Signal;  // events and semaphores, kernel32_crt.cpp
 struct Object {
-    enum Kind { File, Thread } kind;
+    enum Kind { File, Thread, Event, Semaphore } kind;
     int fd = -1;
     pthread_t thread{};
     uint32_t tid = 0;
     uint32_t exit_code = 0;
     bool joined = false;
+    Signal* signal = nullptr;
 };
+void free_signal(Signal* s);
 using ThreadProc = uint32_t(MSABI*)(void*);
 Object* spawn_thread(ThreadProc proc, void* arg);  // nullptr on failure
 uint32_t wait_thread(Object* o);                   // joins; returns the exit code
 void close_object(Object* o);
+[[noreturn]] void exit_thread(uint32_t code);  // from inside a guest thread
 
 using Exports = std::vector<std::pair<std::string, void*>>;  // "dll!name" -> ms_abi entry
 Exports kernel32_exports();
@@ -90,6 +97,7 @@ Exports crt_exports();
 Exports eh_exports();
 Exports vulkan_exports();
 Exports user32_exports();
+Exports kernel32_crt_exports();
 
 }  // namespace host
 

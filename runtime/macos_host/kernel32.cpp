@@ -102,12 +102,6 @@ HANDLE CreateThread(void*, uint64_t, ThreadProc proc, void* arg, uint32_t, uint3
     else if (tid) *tid = o->tid;
     return o;
 }
-uint32_t WaitForSingleObject(HANDLE h, uint32_t) {  // ponytail: threads only, INFINITE only
-    auto* o = static_cast<Object*>(h);
-    if (o->kind != Object::Thread) return 0xFFFFFFFFu;
-    wait_thread(o);
-    return 0;
-}
 int CloseHandle(HANDLE h) {
     close_object(static_cast<Object*>(h));
     return 1;
@@ -141,10 +135,6 @@ const char* GetCommandLineA() { return g_command_line.c_str(); }
 HANDLE GetCurrentProcess() { return kInvalid; }
 uint32_t GetCurrentProcessId() { return static_cast<uint32_t>(getpid()); }
 uint32_t GetCurrentThreadId() { return thread_id(); }
-HANDLE GetModuleHandleW(const char16_t* name) {
-    if (name) unsupported("GetModuleHandleW with a module name");
-    return g_image;
-}
 uint32_t GetTempPathA(uint32_t size, char* buf) {
     const char* tmp = "/tmp/";
     uint32_t n = static_cast<uint32_t>(std::strlen(tmp));
@@ -173,9 +163,9 @@ Exports kernel32_exports() {
     return {
         K(GetStdHandle), K(WriteFile), K(ReadFile), K(ExitProcess), K(TerminateProcess), K(GetLastError),
         K(GetProcessHeap), K(HeapAlloc), K(HeapFree), K(VirtualAlloc), K(VirtualFree), K(TlsAlloc),
-        K(TlsGetValue), K(TlsSetValue), K(CreateThread), K(WaitForSingleObject), K(CloseHandle), K(Sleep),
+        K(TlsGetValue), K(TlsSetValue), K(CreateThread), K(CloseHandle), K(Sleep),
         K(QueryPerformanceCounter), K(GetSystemTimeAsFileTime), K(CreateFileW), K(GetCommandLineA),
-        K(GetCurrentProcess), K(GetCurrentProcessId), K(GetCurrentThreadId), K(GetModuleHandleW),
+        K(GetCurrentProcess), K(GetCurrentProcessId), K(GetCurrentThreadId),
         K(GetTempPathA), K(SetCurrentDirectoryA), K(InitializeSListHead), K(IsDebuggerPresent),
         K(IsProcessorFeaturePresent), K(SetUnhandledExceptionFilter), K(UnhandledExceptionFilter),
         K(RtlCaptureContext), K(RtlLookupFunctionEntry), K(RtlVirtualUnwind),
