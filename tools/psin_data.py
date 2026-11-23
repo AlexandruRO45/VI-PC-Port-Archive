@@ -435,10 +435,14 @@ class Walker:
         st[f"{kind} slots"] += slots
         st[f"{kind} entries"] += entries
         self.mark(number, absolute, slots * elem)
+        if btype in c.structs:
+            if not self.keep:
+                for i in range(slots):
+                    self.struct(btype, absolute + i * elem, depth + 1, number)
+                return None
+            return [self.struct(btype, absolute + i * elem, depth + 1, number) for i in range(slots)]
         if not self.keep:
             return None
-        if btype in c.structs:
-            return [self.struct(btype, absolute + i * elem, depth + 1, number) for i in range(slots)]
         if elem != 4:
             return [f"{elem} byte records"] * slots
         values = [struct.unpack_from("<I", blob, absolute + 4 * i)[0] for i in range(slots)]

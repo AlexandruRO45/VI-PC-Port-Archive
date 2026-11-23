@@ -4,6 +4,7 @@
 """
 import collections
 import os
+import struct
 import sys
 import unittest
 
@@ -12,7 +13,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import psin_data as D  # noqa: E402
-from test_psin_data import sample  # noqa: E402
+from test_psin_data import make_container, sample  # noqa: E402
 from test_psin_index import joaat  # noqa: E402
 
 
@@ -42,6 +43,29 @@ class TestMemberTypes(unittest.TestCase):
         self.assertEqual(self.tree[f"{joaat('grid'):08x}"], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         self.assertEqual(self.stats["grid 5a count == rows * cols"], 1)
         self.assertEqual(self.stats["grid 5a block is f32"], 1)
+
+    def test_hash_set_counts_only_follows_bucket_pointers(self):
+        r, b, i = (joaat(n) for n in ("Root", "Bucket", "Item"))
+        schema = [
+            (r, 1, 16, 3, [(1, 0, 0x77, 0, 0, 0)]),
+            (b, 2, 8, 3, [(2, 0, 0x07, 0, 0, 0)]),
+            (i, 3, 4, 2, [(3, 0, 0x15, 0, 0, 0)]),
+        ]
+        blocks = [
+            (r, struct.pack("<IIQ", 1, 1, 2)),
+            (b, struct.pack("<Q", 3)),
+            (i, struct.pack("<I", 42)),
+        ]
+        container = D.Container(make_container(blocks, schema))
+        counts_only = collections.Counter()
+        with_values = collections.Counter()
+        self.assertIsNone(D.Walker(container, counts_only, keep=False).run())
+        tree = D.Walker(container, with_values, keep=True).run()
+        self.assertEqual(tree[f"{1:08x}"], [{f"{2:08x}": {f"{3:08x}": 42}}])
+        for key in ("blocks reached", "bytes reached", "structs"):
+            self.assertEqual((key, counts_only[key]), (key, with_values[key]))
+        self.assertEqual((counts_only["blocks reached"], counts_only["bytes reached"], counts_only["structs"]),
+                         (3, 28, 3))
 
 
 if __name__ == "__main__":
