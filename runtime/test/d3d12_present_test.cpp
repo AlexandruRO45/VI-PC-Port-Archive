@@ -572,8 +572,9 @@ int main() {
                         std::printf("read %d times, 50 ms apart; the first read was %d,%d,%d\n", reads,
                                     GetRValue(first_pixel), GetGValue(first_pixel), GetBValue(first_pixel));
                     if (device_is_not_display_adapter(d, window)) {
-                        // The pixel is what the desktop shows, and the desktop does not show this GPU's swapchain.
-                        std::printf("the Vulkan device is not the adapter that drives this monitor: the desktop does "
+                        // The pixel is what the desktop shows, and the desktop may not show this GPU's swapchain
+                        // (it did on a Radeon iGPU that drives no display; it read white on Intel UHD 770).
+                        std::printf("the Vulkan device is not the adapter that drives this monitor: the desktop may "
                                     "not show its swapchain, on-screen colour check skipped, the colour was checked "
                                     "in the presented images\n");
                     } else {
