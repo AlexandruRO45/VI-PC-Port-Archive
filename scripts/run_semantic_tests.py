@@ -37,11 +37,10 @@ def run_module(directory, module, verbose):
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
     p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        errors="replace")
-    ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    summaries = re.findall(r"^Ran \d+ tests? in [^\n]*\n\s*\n(?:OK|FAILED)(?: \(([^\n]*)\))?$", p.stdout, re.M)
-    skip = re.search(r"(?:^|, )skipped=(\d+)(?:,|$)", summaries[-1]) if summaries else None
+    summaries = re.findall(r"^Ran (\d+) tests? in [^\n]*\n\s*\n(?:OK|FAILED)(?: \(([^\n]*)\))?$", p.stdout, re.M)
+    skip = re.search(r"(?:^|, )skipped=(\d+)(?:,|$)", summaries[-1][1]) if summaries else None
     skipped = int(skip.group(1)) if skip else (0 if summaries else None)
-    return p.returncode, int(ran.group(1)) if ran else 0, skipped, p.stdout
+    return p.returncode, int(summaries[-1][0]) if summaries else 0, skipped, p.stdout
 
 
 def main(argv=None):

@@ -78,6 +78,21 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(code, 0, out)
             self.assertIn("1 tests skipped", out)
 
+    def test_nested_runner_counts_outer_summary(self):
+        nested = '''import sys, unittest
+class T(unittest.TestCase):
+    def test_nested(self):
+        unittest.TextTestRunner(stream=sys.stdout).run(unittest.TestSuite([unittest.FunctionTestCase(lambda: None)]))
+    @unittest.skip("optional")
+    def test_skip(self): pass
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_nested.py": nested})
+            code, out = run(tmp, "-j", "2", "-v")
+            self.assertEqual(code, 0, out)
+            self.assertIn("1 files, 2 tests, 0 files failed", out)
+            self.assertIn("1 tests skipped", out)
+
     def test_parallel_summary_reports_unknown_skip_count_on_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"test_crash.py": "import os\nos._exit(2)\n"})
