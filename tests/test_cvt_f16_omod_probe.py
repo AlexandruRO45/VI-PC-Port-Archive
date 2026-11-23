@@ -333,5 +333,15 @@ class ProbeCliTests(unittest.TestCase):
         self.assertIn("unavailable", buf.getvalue())
 
 
+class ReportNewlineTests(unittest.TestCase):
+    def test_the_written_report_ends_with_a_newline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "report.json"
+            self.assertIsNone(pr.write_json_report(str(out), {"ok": True}))
+            raw = out.read_bytes()
+        self.assertTrue(raw.endswith(b"\n"), raw[-20:])
+        self.assertEqual(json.loads(raw), {"ok": True})
+
+
 if __name__ == "__main__":
     unittest.main()
