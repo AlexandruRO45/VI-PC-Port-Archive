@@ -394,6 +394,36 @@ def check_bary(raw_path: str) -> tuple[bool, str]:
     return not problem, problem or "4096/4096 pixels match"
 
 
+def mesh_bary_case(vk_harness: str, spirv_dir: str, raw_dir: str, gfx_env, run_cmd) -> tuple[bool | None, str]:
+    """ms_tri_bary: ms_tri drawn through ps_bary. ms_tri exports attr0 = (0,0), (2,0), (0,2) on the vs_ids triangle,
+    so ps_bary's raw barycentrics must again be its interpolated attr0.xy / 2 on every pixel (check_bary).
+
+    On a device with neither VK_EXT_mesh_shader nor fragment barycentrics (NVIDIA Pascal) this is the one draw where
+    both fallbacks meet: under LEONIDA_MESH_COMPUTE=1 the mesh shader runs as compute and the generated vertex shader
+    (tools/mesh_compute_vs.py) feeds ps_bary's pass-through geometry shader (tools/bary_fallback_gs.py). A native mesh
+    stage can't be followed by a geometry shader (VUID-VkGraphicsPipelineCreateInfo-pStages-02095), so the bary
+    fallback without --mesh-compute is a skip."""
+    fs = os.path.join(spirv_dir, "ps_bary.spv")
+    if not os.path.isfile(fs):
+        return False, "missing ps_bary.spv"
+    env = mesh_env(spirv_dir, "ms_tri", gfx_env)
+    if bary_fallback():
+        if "VKH_MESH_COMPUTE" not in env:
+            return None, ("SKIP (--bary-fallback's geometry shader can't follow a native mesh stage; "
+                          "set LEONIDA_MESH_COMPUTE=1)")
+        gs = os.path.join(spirv_dir, "ps_bary.bary_gs.spv")
+        if not os.path.isfile(gs):
+            return False, "missing ps_bary.bary_gs.spv"
+        env = dict(env, VKH_GS=gs, VKH_GS_HELPER="1")
+    raw = os.path.join(raw_dir, "ms_tri_bary.raw")
+    rc, msg = run_readback(raw, run_cmd, [vk_harness, os.path.join(spirv_dir, "ms_tri.spv"), fs, raw], env=env)
+    if rc == UNSUPPORTED:
+        return None, unsupported_skip(msg)
+    if rc != 0:
+        return False, msg
+    return check_bary(raw)
+
+
 def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
     px = read_raw_u32(raw_path)
     if skip := bitmask_perm_narrow_skip(msg, px):
@@ -611,7 +641,8 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
               SIGNED_MIP_TEST: "vs_ids.asm", UINT_MIP_TEST: "vs_ids.asm",
-              "vs_base_ids": "ps_flat.asm"}
+              "vs_base_ids": "ps_flat.asm",
+              "ms_tri": "ps_bary.asm"}   # ms_tri_bary: ms_tri drawn through ps_bary (mesh_bary_case)
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
 
@@ -1424,6 +1455,8 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_grad(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
+            if name == "ms_tri":
+                results.append(("ms_tri_bary", *mesh_bary_case(vk_harness, spirv_dir, raw_dir, gfx_env, run_cmd)))
         elif name == "ms_f16_pack":   # mesh producer of packed f16 params, drawn with ps_interp_f16_high
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)   # VKH_MESH=1, or the --mesh-compute pass and its VS

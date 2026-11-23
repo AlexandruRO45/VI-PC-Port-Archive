@@ -354,6 +354,13 @@ runs them anyway, set `LEONIDA_MESH_COMPUTE=1` for `run_gpu_tests.py`, together 
 compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
 `bufferDeviceAddress` and `shaderInt64` instead.
 
+A GPU with neither mesh shaders nor fragment barycentrics (Pascal) needs both fallbacks in one draw: `ms_tri_bary`
+draws `ms_tri` through `ps_bary`, so with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1 LEONIDA_BARY_FALLBACK=1` the
+generated vertex shader feeds `ps_bary`'s pass-through geometry shader. It runs with `--filter ms_tri` and is judged
+like `ps_bary`. A native mesh stage can't be followed by a geometry shader, so `LEONIDA_BARY_FALLBACK=1` without
+`LEONIDA_MESH_COMPUTE=1` skips it. Passes on a GTX 1050 Ti (NVIDIA 580.196.07, Linux) and on llvmpipe (Mesa 25.0.7)
+with both fallbacks.
+
 ## Without a GPU: Mesa llvmpipe
 
 Mesa's llvmpipe is a software Vulkan driver (`mesa-vulkan-drivers` on Debian and Ubuntu). CI runs the suite on it
