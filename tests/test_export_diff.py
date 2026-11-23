@@ -273,6 +273,13 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(export_diff.structure_lines({"%out_mrt7": 7, "%out_mrt0": 0}),
                          ["Location %out_mrt0 0", "Location %out_mrt7 7"])
 
+    def test_array_length_constant_is_read_as_hex(self):
+        # cu() names constants in hex (%c{v:x}), as the access-chain indices below already assume; a decimal read
+        # only worked while the 8-float clamp kept every array length a single digit.
+        spvasm = "\n".join(["%arr_clip = OpTypeArray %float %ca",
+                            "OpDecorate %out_clip BuiltIn ClipDistance"])
+        self.assertIn("Array %out_clip 10", export_diff.module_structure(spvasm))
+
     def test_compressed_colour_operand_order(self):
         line = export_diff.export_line(self.E("mrt", 2, False, True))
         self.assertEqual(line, "exp mrt2 v0, v0, v1, v1 compr")
@@ -326,6 +333,27 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("--show requires --program", err.getvalue())
 
+    def test_program_without_show_is_a_usage_error(self):
+        # --program selects nothing on its own; say so instead of the bare-invocation usage line.
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = export_diff.main(["--seed", "3", "--program", "7"])
+        self.assertEqual(code, 2)
+        self.assertIn("--program requires --show", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_show_rejects_programs(self):
+        # --show prints exactly one program; a silently ignored --programs would run neither.
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = export_diff.main(["--programs", "5", "--show", "--program", "2"])
+        self.assertEqual(code, 2)
+        self.assertIn("drop --programs", err.getvalue())
+
     def test_show_returns_one_on_a_mismatch(self):
         import contextlib
         import io
@@ -344,6 +372,24 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("usage:", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
+
+    def test_tools_dir_env_var_selects_the_translator(self):
+        # The sibling fuzzers' convention (f32_fuzz.py, sad_diff.py): LEONIDA_TOOLS_DIR points the tool at a
+        # private copy of tools/, so a mutation run of this tool would exercise the mutant, not the repo copy.
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as sabotaged:
+            with open(os.path.join(sabotaged, "rdna2spirv.py"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("class Unsupported(Exception):\n    pass\n\n\n"
+                        "def translate(path):\n    raise Unsupported('sabotaged translator')\n")
+            with open(os.path.join(sabotaged, "spirv_mini_interp.py"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("def run_fragment(*args, **kwargs):\n    raise AssertionError('not used here')\n")
+            env = dict(os.environ, LEONIDA_TOOLS_DIR=sabotaged)
+            proc = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "export_diff.py"),
+                                   "--programs", "1", "--seed", "1"],
+                                  capture_output=True, text=True, timeout=30, env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sabotaged translator", proc.stderr)
 
     def test_calibration_sparse_targets(self):
         for targets in ([0, 2], [1, 3], [0, 7]):

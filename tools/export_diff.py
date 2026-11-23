@@ -19,7 +19,8 @@ Usage:
     python -I tools/export_diff.py --list-ops
 
 Exit code 0 when every program matches, 1 on the first mismatch (case, seed, program, the listing, and the expected
-against the actual structure), 2 on a harness error, a bare invocation or when no program was compared. `--show`
+against the actual structure), 2 on a harness error, a bare invocation, a contradictory flag combination
+(`--program` without `--show`, `--show` with `--programs`) or when no program was compared. `--show`
 follows the same codes for its one program (a predicted refusal is not a mismatch); `--self-test` exits 0 when
 every canary is caught and 2 when the comparator has gone blind. Skips are counted with reasons: a refusal the
 model predicts is a skip, one it does not is a mismatch.
@@ -37,8 +38,9 @@ from collections import Counter, namedtuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or HERE
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
 SEM_DIR = os.path.join(os.path.dirname(HERE), "tests", "semantic")
 if SEM_DIR not in sys.path:
     sys.path.insert(0, SEM_DIR)
@@ -314,9 +316,9 @@ def module_structure(spvasm):
     lines = [f"Location {var} {n}" for var, n in re.findall(r"OpDecorate (%out_\S+) Location (\d+)", spvasm)]
     lines += [f"BuiltIn {var} {built_in}" for var, built_in in re.findall(r"OpDecorate (%out_\S+) BuiltIn (\S+)", spvasm)]
     for array, var in (("arr_clip", "%out_clip"), ("arr_cull", "%out_cull")):
-        found = re.search(rf"%{array} = OpTypeArray %float %c(\d+)", spvasm)
+        found = re.search(rf"%{array} = OpTypeArray %float %c([0-9a-f]+)", spvasm)
         if found:
-            lines.append(f"Array {var} {found.group(1)}")
+            lines.append(f"Array {var} {int(found.group(1), 16)}")   # cu() names constants in hex
     # Follow each output access chain through its store's OpSelect to the register read for that export.
     # The generated posN source registers are disjoint, so the register itself identifies (N, component).
     sources, pointers = {}, {}
@@ -425,11 +427,17 @@ def main(argv=None):
     parser.add_argument("--self-test", action="store_true", help="run the comparator canaries")
     parser.add_argument("--list-ops", action="store_true", help="list the export forms the generator emits")
     args = parser.parse_args(argv)
-    if args.programs is None and not (args.self_test or args.list_ops or args.show):
-        parser.print_usage(sys.stderr)      # a bare invocation is a usage error, never the start of a long run
-        return 2
     if args.programs is not None and args.programs < 1:
         print("--programs must be at least 1", file=sys.stderr)
+        return 2
+    if args.show and args.programs is not None:
+        print("export_diff: --show prints one program; drop --programs", file=sys.stderr)
+        return 2
+    if args.program is not None and not args.show:
+        print("export_diff: --program requires --show", file=sys.stderr)
+        return 2
+    if args.programs is None and not (args.self_test or args.list_ops or args.show):
+        parser.print_usage(sys.stderr)      # a bare invocation is a usage error, never the start of a long run
         return 2
     if args.self_test:
         missed = self_test()
