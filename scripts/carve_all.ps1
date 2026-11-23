@@ -4,11 +4,16 @@ param([Parameter(Mandatory)][string]$Game, [Parameter(Mandatory)][string]$Out)
 $root = Split-Path $PSScriptRoot -Parent
 $tool = Join-Path $root "tools\rpf9_carve.py"
 # -Game may be relative or end in a separator; archive names are cut from a separator-ended prefix.
-$Game = (Resolve-Path -LiteralPath $Game).ProviderPath
+$gamePath = Resolve-Path -LiteralPath $Game -ErrorAction SilentlyContinue
+if ($gamePath.Provider.Name -ne 'FileSystem' -or
+    -not (Test-Path -LiteralPath $gamePath.ProviderPath -PathType Container)) {
+    throw "Game directory '$Game' does not exist or is not a directory."
+}
+$Game = $gamePath.ProviderPath
 # Resolve-Path preserves 8.3 short components (e.g. RUNNER~1), while Get-ChildItem emits canonical
 # FullName paths. Deriving the prefix from Resolve-Path then cuts the wrong number of characters and
 # re-carves already-caved archives; use the canonical form for both sides of the Substring.
-$prefix = (Get-Item -LiteralPath $Game).FullName.TrimEnd('\') + '\'
+$prefix = (Get-Item -LiteralPath $Game -ErrorAction Stop).FullName.TrimEnd('\') + '\'
 $destinations = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
 # Validate every destination before accepting any cached index or starting a carve.
 $archives = foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -Filter *.rpf | Sort-Object Length) {

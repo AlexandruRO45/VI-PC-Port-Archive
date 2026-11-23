@@ -2,6 +2,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,32 @@ INDEX = {"summary": {"files": 1, "bink2_files": 0, "span": 10, "compressed_bytes
 
 @unittest.skipUnless(os.name == "nt", "PowerShell research script")
 class CarveAllGamePathTest(unittest.TestCase):
+    def test_invalid_game_paths_stop_before_carving(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "out"
+            out.mkdir()
+            coverage = out / "coverage.json"
+            coverage.write_bytes(b"[]\n")
+            (root / "game1").mkdir()
+            (root / "game.txt").write_bytes(b"x")
+            shells = ["powershell.exe"]
+            if shutil.which("pwsh.exe"):
+                shells.append("pwsh.exe")
+            for shell in shells:
+                for game in ("missing", "game[1]", "game.txt"):
+                    with self.subTest(shell=shell, game=game):
+                        result = subprocess.run(
+                            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                             "-Game", game, "-Out", str(out)], cwd=tmp, capture_output=True, text=True,
+                            timeout=30,
+                        )
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn(f"Game directory '{game}' does not exist or is not a directory", result.stderr)
+                        self.assertEqual(result.stdout, "")
+                        self.assertEqual(list(out.iterdir()), [coverage])
+                        self.assertEqual(coverage.read_bytes(), b"[]\n")
+
     def test_invalid_cached_summary_does_not_replace_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
             game, out = Path(tmp, "game"), Path(tmp, "out")
