@@ -7,6 +7,7 @@
 //   3. Concurrent present() + VulkanQueue::execute() + add_resource()/remove_resource() follows VulkanContext's
 //      resource_mutex_ -> tracker_mutex_ -> submit_mutex_ lock hierarchy without data races or deadlocks.
 //   4. A swapchain-destroy WSI layer which calls vkDeviceWaitIdle cannot overlap vkQueueSubmit on another thread.
+//   5. A client extent that clamps to the existing swapchain extent must not retire it on each present.
 // Skips with exit code 77 when no Vulkan 1.3 device with Win32 presentation is available. No game data.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -62,6 +63,7 @@ PFN_vkCmdPipelineBarrier real_barrier = nullptr;
 PFN_vkCmdCopyImageToBuffer real_copy_i2b = nullptr;
 PFN_vkDestroySwapchainKHR real_destroy_swapchain = nullptr;
 PFN_vkDeviceWaitIdle real_device_wait_idle = nullptr;
+PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR real_surface_capabilities = nullptr;
 
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
 std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
@@ -78,12 +80,28 @@ std::atomic<bool> unexpected_submit_error{false};
 std::mutex destroy_mutex;
 std::condition_variable destroy_cv;
 bool allow_destroy_finish = false;
+VkExtent2D constrained_extent{};
+unsigned constrained_extent_queries = 0;
+unsigned constrained_extent_destroys = 0;
+
+VKAPI_ATTR VkResult VKAPI_CALL surface_capabilities(VkPhysicalDevice physical, VkSurfaceKHR surface,
+                                                    VkSurfaceCapabilitiesKHR* caps) {
+    const VkResult result = real_surface_capabilities(physical, surface, caps);
+    if (result == VK_SUCCESS && constrained_extent.width) {
+        ++constrained_extent_queries;
+        caps->currentExtent = {UINT32_MAX, UINT32_MAX};
+        caps->minImageExtent = constrained_extent;
+        caps->maxImageExtent = constrained_extent;
+    }
+    return result;
+}
 
 // Synthetic WSI layer: a destroy hook initiates vkDeviceWaitIdle, as a capture layer may do internally.
 // Holding the hook behind a condition variable makes the concurrency window deterministic rather than dependent
 // on the installed capture software or validation logging overhead. Only the test hook waits on this condition.
 VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice device, VkSwapchainKHR swapchain,
                                               const VkAllocationCallbacks* alloc) {
+    if (constrained_extent.width) ++constrained_extent_destroys;
     if (check_swapchain_destroy.load(std::memory_order_relaxed)) {
         destroy_entered.store(true, std::memory_order_release);
         destroy_cv.notify_all();
@@ -165,13 +183,18 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
-    if (std::string_view(name) == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    const std::string_view n = name;
+    if (n == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    if (n == "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+        return reinterpret_cast<PFN_vkVoidFunction>(surface_capabilities);
     return real_get_instance(instance, name);
 }
 
 void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDevice device) {
     real_get_instance = instance_proc;
     real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
+    real_surface_capabilities = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
+        instance_proc(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
     real_destroy_swapchain = reinterpret_cast<PFN_vkDestroySwapchainKHR>(real_get_device(device, "vkDestroySwapchainKHR"));
     real_device_wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(real_get_device(device, "vkDeviceWaitIdle"));
     real_submit = reinterpret_cast<PFN_vkQueueSubmit>(real_get_device(device, "vkQueueSubmit"));
@@ -252,7 +275,9 @@ int main() {
         VkSurfaceKHR surface = VK_NULL_HANDLE;
         EXPECT(create_surface(d.instance, &surface_info, nullptr, &surface) == VK_SUCCESS);
 
-        VulkanPresenter presenter(context, driver::get_instance, d.instance, d.physical, d.queue, d.family, surface);
+        VkExtent2D reported_client{width, height};
+        VulkanPresenter presenter(context, driver::get_instance, d.instance, d.physical, d.queue, d.family, surface,
+                                  false, [&] { return reported_client; });
         EXPECT(presenter.ok());
         EXPECT(presenter.enable_capture());
 
@@ -341,6 +366,22 @@ int main() {
         const bool bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
         EXPECT(presenter_capture_matches_clear(pixels, ext.width, ext.height, bgra));
         std::printf("presenter sync: capture-buffer WAW barriers (4/4) and full-frame read_back ok\n");
+
+        // Leave the real window and images alone. Report an application-chosen extent with bounds equal to the
+        // current swapchain, and a client extent outside those bounds in both directions.
+        const VkExtent2D swapchain_extent = presenter.extent();
+        EXPECT(swapchain_extent.width && swapchain_extent.height > 1);
+        driver::constrained_extent = swapchain_extent;
+        reported_client = {swapchain_extent.width + 1, swapchain_extent.height - 1};
+        const auto presented_before = presenter.presented();
+        for (int i = 0; i < 3; ++i) EXPECT(presenter.present(1, true) == VK_SUCCESS);
+        reported_client = swapchain_extent;
+        driver::constrained_extent = {};
+        EXPECT(presenter.presented() == presented_before + 3);
+        EXPECT(driver::constrained_extent_queries >= 3);
+        std::printf("presenter resize: %u swapchains retired in 3 presents at a clamped extent\n",
+                    driver::constrained_extent_destroys);
+        EXPECT(driver::constrained_extent_destroys == 0);
 
         // 2b. A Present behind held work shows what that work draws (queue_holds.h). The render waits for a gate with
         //     no submitted Signal, so the queue holds it; the presents are queued behind it instead of blitting the

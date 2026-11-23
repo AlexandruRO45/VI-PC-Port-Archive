@@ -436,17 +436,18 @@ private:
             stale_ = true;  // the old swapchain is gone: rebuild on the new surface below
         }
         // The window was resized but the driver has not said so yet: some (NVIDIA on Win32) keep returning VK_SUCCESS
-        // for a few presents, which shows frames at the old size. The client area is cheap to read; the surface is
-        // asked only when it differs, and the swapchain is rebuilt only when the surface agrees, so a window whose
-        // client size never matches the surface (DPI virtualisation) does not rebuild on every present.
+        // for a few presents, which shows frames at the old size. Query the surface when the client area differs.
+        // Compare with the extent recreate would choose, accounting for DPI virtualisation and surface bounds.
         if (swapchain_ && !stale_ && extent_fn_) {
             const VkExtent2D client = extent_fn_();
             if (client.width && client.height && (client.width != extent_.width || client.height != extent_.height)) {
                 VkSurfaceCapabilitiesKHR caps{};
-                if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) == VK_SUCCESS &&
-                    (caps.currentExtent.width == 0xFFFFFFFF ||
-                     caps.currentExtent.width != extent_.width || caps.currentExtent.height != extent_.height))
-                    stale_ = true;
+                if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) == VK_SUCCESS) {
+                    const VkExtent2D current = caps.currentExtent;
+                    const VkExtent2D target = current.width == UINT32_MAX || current.height == UINT32_MAX
+                        ? resolve_client_extent(client, caps) : current;
+                    stale_ = target.width != extent_.width || target.height != extent_.height;
+                }
             }
         }
         // The swapchain's HDR10 format is only for composed planes that ask for it; a blit of an SDR source or a blank
@@ -1011,6 +1012,17 @@ private:
         captured_ = false;
     }
 
+    VkExtent2D resolve_client_extent(VkExtent2D extent, const VkSurfaceCapabilitiesKHR& caps) const {
+        if (extent.width == UINT32_MAX || extent.height == UINT32_MAX || (extent.width == 0 && extent.height == 0)) {
+            extent = extent_.width && extent_.height ? extent_ : caps.minImageExtent;
+        }
+        if (extent.width && extent.height) {
+            extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+            extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+        }
+        return extent;
+    }
+
     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
     // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
     // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
@@ -1028,17 +1040,8 @@ private:
         VkExtent2D extent = caps.currentExtent;
         // When the platform leaves the swapchain extent to the application (0xFFFFFFFF, as on Intel UHD / Win32 WSI),
         // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
-        if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF) {
-            if (extent_fn_) extent = extent_fn_();
-            // ponytail: if no window extent function was supplied, fall back to last extent_ or minImageExtent
-            if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF || (extent.width == 0 && extent.height == 0)) {
-                extent = extent_.width && extent_.height ? extent_ : caps.minImageExtent;
-            }
-            if (extent.width && extent.height) {
-                extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
-                extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
-            }
-        }
+        if (extent.width == UINT32_MAX || extent.height == UINT32_MAX)
+            extent = resolve_client_extent(extent_fn_ ? extent_fn_() : extent, caps);
         if (extent.width == 0 || extent.height == 0) {
             {
                 std::lock_guard lock(context_.submit_mutex());
