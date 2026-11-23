@@ -3,6 +3,7 @@ import io
 import json
 import os
 import subprocess
+import stat
 import sys
 import tempfile
 import unittest
@@ -135,6 +136,29 @@ class BufferBoundsProbeTests(unittest.TestCase):
             self.assertTrue(err.getvalue().startswith("ERROR: "), err.getvalue())
             self.assertIn("disk full", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
+
+
+class ReadOnlyReportTests(unittest.TestCase):
+    def test_an_existing_read_only_report_is_refused_before_the_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "report.json")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("previous report")
+            os.chmod(target, stat.S_IREAD)
+            err = io.StringIO()
+            try:
+                with unittest.mock.patch.object(hw_runner, "open_oracle") as open_oracle, \
+                        unittest.mock.patch.object(bbp, "probe", return_value=FAKE_REPORT) as measured, \
+                        redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    rc = bbp.main(["--json", target])
+            finally:
+                os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+            self.assertEqual(rc, 2)
+            open_oracle.assert_not_called()
+            measured.assert_not_called()
+            self.assertIn("not writable", err.getvalue())
+            with open(target, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "previous report")
 
 
 if __name__ == "__main__":
