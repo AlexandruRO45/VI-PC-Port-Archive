@@ -2178,7 +2178,16 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   destroyed with held operations reports them once (stderr: `queue destroyed with N held operation(s) never
   submitted: waits for a fence value (V) that no Signal reached`) and goes on without waiting; a fence nobody signals
   holds back only the queues that wait for it (and those that wait for what they would have signaled), never the
-  others; a fence released while operations wait for it drops them and says so; a Signal value that is not above
+  others; a fence released while operations wait for it drops them and says so. Its semaphore is not destroyed at
+  once (D3D-486): an application may release a fence right after asking a queue to Signal or Wait for it, so the
+  semaphore goes through the deferred-deletion tickets once every submission made before the release has completed,
+  and no later one uses it: a `Wait` for it not yet attached to a batch counts as reached (on the host runtime the
+  queue still waits) and a held `Signal` of it signals nothing. Case "fences released while queues use them" of
+  `d3d12_queue_handover_test`, behind a GPU gate (A: a Signal and a Wait in flight, B: a Wait not yet attached, C: a
+  held Signal; layer and host, readbacks exact, validation silent, RTX 3060 / 617.14). With the
+  semaphore destroyed at once, as before, the layer gave `VUID-vkDestroySemaphore-semaphore-05149` in A and B, B
+  submitted a batch waiting on the destroyed semaphore (`VUID-VkSubmitInfo-pWaitSemaphores-parameter`) and the
+  process ended with an access violation. A Signal value that is not above
   the fence's (Vulkan timelines only increase) is still dropped with a note, as before. Failures of a held
   `ExecuteCommandLists` (what the call would have returned) are printed when it is released, not returned from the
   call. Not covered: sparse `UpdateTileMappings` while a queue holds work still submits at once, and the resources a

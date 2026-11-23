@@ -387,6 +387,7 @@ public:
         image_view,
         image,
         buffer,
+        semaphore,  // a released fence's timeline semaphore (D3D-486)
         device_memory,
         acceleration_structure,
     };
@@ -464,6 +465,9 @@ public:
                 break;
             case Kind::buffer:
                 vk.vkDestroyBuffer(device, reinterpret_cast<VkBuffer>(item.handle), nullptr);
+                break;
+            case Kind::semaphore:
+                vk.vkDestroySemaphore(device, reinterpret_cast<VkSemaphore>(item.handle), nullptr);
                 break;
             case Kind::device_memory:
                 vk.vkFreeMemory(device, reinterpret_cast<VkDeviceMemory>(item.handle), nullptr);
@@ -1386,10 +1390,15 @@ public:
             semaphore_ = VK_NULL_HANDLE;
         if (semaphore_) context.holds().add_fence(semaphore_, initial);
     }
+    // The fence is released, but submissions made so far may still signal or wait for its semaphore (D3D12 lets an
+    // application release a fence it has just asked a queue to Signal or Wait for). remove_fence leaves no queue
+    // about to use it (held batches waiting on it are dropped, held Signals of it and Waits not yet attached to a
+    // submission forgotten, VulkanQueue::discard_waiting_on), so the semaphore goes through the deletion queue once
+    // every submission made before has completed (D3D-486), not at once (VUID-vkDestroySemaphore-semaphore-05149).
     ~VulkanFence() {
         if (!semaphore_) return;
-        context_.holds().remove_fence(semaphore_);  // batches held on it can never run: dropped and reported
-        context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
+        context_.holds().remove_fence(semaphore_);
+        context_.defer_destroy(DeferredDeletionQueue::Kind::semaphore, semaphore_);
     }
     VulkanFence(const VulkanFence&) = delete;
     VulkanFence& operator=(const VulkanFence&) = delete;
@@ -2073,9 +2082,21 @@ private:
         return released;
     }
 
-    // Holder: the fence is released, so what waits on it can never run.
+    // Holder: the fence is released, so what waits on it can never run. Its semaphore is retired once the submissions
+    // made so far have completed (VulkanFence), so none after may use it either: a Wait not yet attached to a
+    // submission counts as reached, as a released fence does for the CPU, and a held Signal of it signals nothing.
     void discard_waiting_on(VkSemaphore semaphore) override {
         std::lock_guard state(state_mutex_);
+        for (std::size_t i = 0; i < waits_.size();) {
+            if (waits_[i] != semaphore) {
+                ++i;
+                continue;
+            }
+            waits_.erase(waits_.begin() + std::ptrdiff_t(i));
+            wait_values_.erase(wait_values_.begin() + std::ptrdiff_t(i));
+        }
+        for (Deferred& op : held_)
+            if (op.kind == Deferred::Kind::signal && op.fence == semaphore) op.fence = VK_NULL_HANDLE;
         for (auto it = held_.begin(); it != held_.end();) {
             if (std::find(it->waits.begin(), it->waits.end(), semaphore) == it->waits.end()) {
                 ++it;
