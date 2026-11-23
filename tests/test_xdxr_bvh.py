@@ -468,5 +468,31 @@ class Cli(unittest.TestCase):
             self.assertEqual(X.main(["selftest", "--rays", "50"]), 0)
 
 
+class BruteForceScene(unittest.TestCase):
+    """brute_force takes a Scene to keep the per-scene work out of the per-ray loop; the answers must not change."""
+
+    def scene(self):
+        rng = random.Random(3)
+        flip = [[1, 0, 0, 2], [0, -1, 0, 0], [0, 0, 1, 0.5]]
+        return [(None, 0xFF, X.random_scene(rng, 20)), (flip, 0x02, X.random_scene(rng, 20))]
+
+    def test_a_scene_reused_for_many_rays_answers_like_a_fresh_one(self):
+        raw, hits = self.scene(), 0
+        reused = X.Scene(raw)
+        for mask in (0xFF, 0x01):
+            for o, d in rays(random.Random(9), 400):
+                want = X.brute_force(raw, o, d, mask=mask)
+                self.assertEqual(X.brute_force(reused, o, d, mask=mask), want)
+                hits += want is not None
+        self.assertGreater(hits, 20)
+
+    def test_an_instance_the_mask_excludes_is_not_inverted(self):
+        singular = [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 1, 0]]
+        scene = X.Scene([(None, 0x01, [TRI]), (singular, 0x02, [TRI])])
+        self.assertIsNotNone(X.brute_force(scene, [0.25, 0.25, -2.0], [0.0, 0.0, 1.0], mask=0x01))
+        with self.assertRaises(ValueError):
+            X.brute_force(scene, [0.25, 0.25, -2.0], [0.0, 0.0, 1.0], mask=0x02)
+
+
 if __name__ == "__main__":
     unittest.main()

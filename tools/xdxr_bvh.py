@@ -473,11 +473,10 @@ def _tie_miss(ay, by, cy, winding):
     return below != winding
 
 
-def triangle_test(v, org, d, remap=REMAP_IDENTITY):
-    """(t_num, t_denom, i_num, j_num) of a ray against a triangle, or (inf, 1, 0, 0) on a miss; t = t_num / t_denom
-    and the barycentrics are i_num / t_denom, j_num / t_denom (TestXboxBvh4Leaf)."""
-    dd = list(d)
-    mag = [abs(c) for c in dd]
+def _ray_axes(d):
+    """(perm, dd) of a ray: the axis permutation that makes its largest |component| the last one, and the ray
+    direction in that order. It does not depend on the triangle, so a caller testing many triangles computes it once."""
+    mag = [abs(c) for c in d]
     m = max(mag)
     if mag[0] == m:
         perm = (1, 2, 0)
@@ -485,34 +484,62 @@ def triangle_test(v, org, d, remap=REMAP_IDENTITY):
         perm = (2, 0, 1)
     else:
         perm = (0, 1, 2)
-    sw = lambda p: [p[perm[0]], p[perm[1]], p[perm[2]]]
-    rel = [sw([p[c] - org[c] for c in range(3)]) for p in v]
-    dd = sw(dd)
-    A, B, C = ([p[0] * dd[2] - dd[0] * p[2], p[1] * dd[2] - dd[1] * p[2], p[2]] for p in rel)
-    U = C[0] * B[1] - C[1] * B[0]
-    V = A[0] * C[1] - A[1] * C[0]
-    W = B[0] * A[1] - B[1] * A[0]
-    t_num = U * A[2] + V * B[2] + W * C[2]
-    t_den = (U + V + W) * dd[2]
-    missed = (U < 0 or V < 0 or W < 0) and (U > 0 or V > 0 or W > 0)
-    missed |= t_den == 0.0
-    missed |= t_num * math.copysign(1.0, t_den) <= 0.0
-    missed |= math.isnan(t_num)
+    return perm, (d[perm[0]], d[perm[1]], d[perm[2]])
+
+
+def _triangle_test(v, org, perm, dd, remap):
+    """triangle_test with the ray's axes already worked out (see _ray_axes). Same arithmetic in the same order, with
+    the vertex loops unrolled and a miss returned as soon as the edge functions say so."""
+    o0, o1, o2 = org
+    p0, p1, p2 = perm
+    d0, d1, d2 = dd
+    a, b, c = v
+    r = (a[0] - o0, a[1] - o1, a[2] - o2)
+    az = r[p2]
+    a0 = r[p0] * d2 - d0 * az
+    a1 = r[p1] * d2 - d1 * az
+    r = (b[0] - o0, b[1] - o1, b[2] - o2)
+    bz = r[p2]
+    b0 = r[p0] * d2 - d0 * bz
+    b1 = r[p1] * d2 - d1 * bz
+    r = (c[0] - o0, c[1] - o1, c[2] - o2)
+    cz = r[p2]
+    c0 = r[p0] * d2 - d0 * cz
+    c1 = r[p1] * d2 - d1 * cz
+    U = c0 * b1 - c1 * b0
+    V = a0 * c1 - a1 * c0
+    W = b0 * a1 - b1 * a0
+    if (U < 0 or V < 0 or W < 0) and (U > 0 or V > 0 or W > 0):
+        return _MISS
+    t_den = (U + V + W) * d2
+    if t_den == 0.0:
+        return _MISS
+    t_num = U * az + V * bz + W * cz
+    if t_num * math.copysign(1.0, t_den) <= 0.0 or math.isnan(t_num):
+        return _MISS
     winding = t_den > 0.0
-    if U == 0.0:
-        missed |= _tie_miss(A[1], B[1], C[1], winding)
-    if V == 0.0:
-        missed |= _tie_miss(B[1], C[1], A[1], winding)
-    if W == 0.0:
-        missed |= _tie_miss(C[1], A[1], B[1], winding)
-    if missed:
-        return (INF, 1.0, 0.0, 0.0)
+    if U == 0.0 and _tie_miss(a1, b1, c1, winding):
+        return _MISS
+    if V == 0.0 and _tie_miss(b1, c1, a1, winding):
+        return _MISS
+    if W == 0.0 and _tie_miss(c1, a1, b1, winding):
+        return _MISS
     e = (U, V, W)
     # t_den carries dd[2], so scale i_num/j_num by dd[2] too: i_num / t_den = e_i / (U + V + W),
     # which is both ray-scale invariant and non-negative even when i_num == 0 and dd[2] < 0.
-    i_num = (e[remap & 3] if remap & 3 < 3 else U) * dd[2]   # selector 3 falls back to U, as the public path does
-    j_num = (e[(remap >> 2) & 3] if (remap >> 2) & 3 < 3 else U) * dd[2]
+    i_num = (e[remap & 3] if remap & 3 < 3 else U) * d2   # selector 3 falls back to U, as the public path does
+    j_num = (e[(remap >> 2) & 3] if (remap >> 2) & 3 < 3 else U) * d2
     return (t_num, t_den, i_num, j_num)
+
+
+_MISS = (INF, 1.0, 0.0, 0.0)
+
+
+def triangle_test(v, org, d, remap=REMAP_IDENTITY):
+    """(t_num, t_denom, i_num, j_num) of a ray against a triangle, or (inf, 1, 0, 0) on a miss; t = t_num / t_denom
+    and the barycentrics are i_num / t_denom, j_num / t_denom (TestXboxBvh4Leaf)."""
+    perm, dd = _ray_axes(d)
+    return _triangle_test(v, org, perm, dd, remap)
 
 
 def intersect_node(mem, bvh_va, node_ptr, org, d, inv, extent, sort=True):
@@ -613,25 +640,51 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
     return hit
 
 
+class Scene:
+    """What brute_force needs from a scene, worked out once and reused for every ray: each instance's triangles with
+    their vertices rounded to float32 and its inverse transform. Both are computed the first time an instance is
+    tested, so an instance no ray reaches (masked out) is never rounded or inverted, as before."""
+
+    def __init__(self, scene):
+        self.instances = list(scene)
+        self._rounded = {}
+        self._inverse = {}
+
+    def triangles(self, idx):
+        if idx not in self._rounded:
+            self._rounded[idx] = [[[f32(c) for c in p] for p in t] for t in self.instances[idx][2]]
+        return self._rounded[idx]
+
+    def inverse(self, idx):
+        if idx not in self._inverse:
+            self._inverse[idx] = invert_affine(self.instances[idx][0])
+        return self._inverse[idx]
+
+
 def brute_force(scene, org, d, tmax=INF, mask=0xFF):
     """Closest hit over every triangle of every instance, with the same triangle test: what a BVH must reproduce.
-    ``scene`` is a list of (transform or None, mask, triangles); the result names the scene index as instance."""
+    ``scene`` is a list of (transform or None, mask, triangles); the result names the scene index as instance.
+    A caller tracing many rays through one scene passes a Scene, which keeps the per-scene work out of the ray loop."""
+    if not isinstance(scene, Scene):
+        scene = Scene(scene)
     best = None
-    for idx, (m, imask, tris) in enumerate(scene):
+    for idx, (m, imask, _) in enumerate(scene.instances):
         if m is not None and not imask & mask:
             continue
         if m is None:
             lo, ld = org, d
         else:
-            inv = invert_affine(m)
+            inv = scene.inverse(idx)
             lo, ld = _transform_point(inv, org), _transform_dir(inv, d)
-        for prim, t in enumerate(tris):
-            v = [[f32(c) for c in p] for p in t]
-            t_num, t_den, i_num, j_num = triangle_test(v, lo, ld)
+        perm, dd = _ray_axes(ld)
+        limit = best["t"] if best else tmax
+        for prim, v in enumerate(scene.triangles(idx)):
+            t_num, t_den, i_num, j_num = _triangle_test(v, lo, perm, dd, REMAP_IDENTITY)
             if t_num == INF:
                 continue
             tt = t_num / t_den
-            if tt <= (best["t"] if best else tmax):
+            if tt <= limit:
+                limit = tt
                 best = {"t": tt, "instance": None if m is None else idx, "primitive": prim,
                         "bary": (i_num / t_den, j_num / t_den)}
     return best
@@ -780,6 +833,7 @@ def check_build(directory, rays=300, seed=1):
                 src = blas[inst["blas"]]["triangles"] if inst["blas"] >= 0 else []
                 scene.append((rows, inst["mask"], [t[:3] for t in src]))
                 inst_ids.append([(t[3], t[4]) for t in src])      # list position -> (geometry, primitive)
+        scene = Scene(scene)
         bad = hits = 0
         case_rays = min(rays, desc.get("rays", rays))      # a large case may ask for fewer (brute force is slow)
         for _ in range(case_rays):
@@ -844,12 +898,13 @@ def selftest(seed=1, rays=400, verbose=False):
         mem = Memory()
         mem.place(0x10000, data)
         bad = 0
+        scene = Scene([(None, 0xFF, tris)])
         for _ in range(rays):
             o = [rng.uniform(-6, 6) for _ in range(3)]
             target = [rng.uniform(-3, 3) for _ in range(3)]
             d = [target[c] - o[c] for c in range(3)]
             a = trace(mem, 0x10000, o, d)
-            b = brute_force([(None, 0xFF, tris)], o, d)
+            b = brute_force(scene, o, d)
             if (a is None) != (b is None) or (a and (a["primitive"] != b["primitive"] or
                                                      abs(a["bary"][0] - b["bary"][0]) > 1e-9 or
                                                      abs(a["bary"][1] - b["bary"][1]) > 1e-9)):
