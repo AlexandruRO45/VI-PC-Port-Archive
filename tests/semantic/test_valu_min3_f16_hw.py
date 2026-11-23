@@ -403,5 +403,37 @@ class TestValuMin3F16SimdDivergence(unittest.TestCase):
             else:
                 self.assertEqual(res[lane], 0xDEAD0000)
 
+
+# -----------------------------------------------------------------------------
+# Commit 5: Register aliasing and in-place operand preservation
+# -----------------------------------------------------------------------------
+class TestValuMin3F16RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing (dst == src0, src1, src2) and preservation."""
+
+    def test_dst_aliases_src0(self):
+        mach = ScalarF16Machine()
+        mach.vgprs["v0"] = 0x55554000  # lo=2.0, hi=0x5555
+        mach.sgprs["s1"] = 0x3C00      # 1.0
+        mach.sgprs["s2"] = 0x4200      # 3.0
+        ast = VMin3F16AST.parse("v_min3_f16 v0, v0, s1, s2")
+        out = mach.execute(ast)
+        self.assertEqual(out, 0x55553C00)
+
+    def test_dst_aliases_src1_and_src2(self):
+        mach = ScalarF16Machine()
+        mach.vgprs["v0"] = 0xAAAA4200  # lo=3.0, hi=0xAAAA
+        mach.sgprs["s0"] = 0x4400      # 4.0
+        ast = VMin3F16AST.parse("v_min3_f16 v0, s0, v0, v0")
+        out = mach.execute(ast)
+        self.assertEqual(out, 0xAAAA4200)
+
+    def test_all_operands_same_register_high_low(self):
+        mach = ScalarF16Machine()
+        mach.vgprs["v0"] = (POS_HALF << 16) | POS_TWO  # lo=2.0, hi=0.5
+        ast = VMin3F16AST.parse("v_min3_f16 v0, v0, v0, v0 op_sel:[0, 1, 1, 1]")
+        out = mach.execute(ast)
+        # min(2.0, 0.5, 0.5) = 0.5 -> written to hi, lo preserved as 2.0
+        self.assertEqual(out, (POS_HALF << 16) | POS_TWO)
+
 if __name__ == '__main__':
     unittest.main()
