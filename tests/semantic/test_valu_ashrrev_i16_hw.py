@@ -427,6 +427,22 @@ class TestVAshrrevI16RegisterAliasing(unittest.TestCase):
         self.assertEqual(res, 0)
         self.assertEqual(self.state.get_vgpr(VGPR(0)), 0)
 
+class TestVAshrrevI16ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Part 6: Condition codes and status flags invariance."""
+
+    def test_vcc_and_scc_invariance(self) -> None:
+        # Standard v_ashrrev_i16 does not update VCC or SCC
+        interp = ScalarVALUInterpreter()
+        state = ScalarThreadState()
+        state.set_vgpr(VGPR(1), 1)
+        state.set_vgpr(VGPR(2), 0x8000)
+
+        inst = VAshrrevI16Instruction.parse("v_ashrrev_i16 v0, v1, v2")
+        res = interp.execute(state, inst)
+
+        # -32768 >> 1 = -16384 (0xC000)
+        self.assertEqual(res, 0xC000)
+
 
 if __name__ == '__main__':
     unittest.main()
