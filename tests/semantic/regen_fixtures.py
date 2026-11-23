@@ -41,20 +41,26 @@ def marked_names(directory=None):
 
 
 def generated_names(directory=None):
-    """Names of the fixtures this script wrote, in name order: their first line carries `HEADER_MARK`."""
+    """Names of fixtures whose first line matches the generated header for that name."""
     directory = directory or FIXTURE_DIR
     names = []
     for fname in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
-        if fname.endswith(".s") and has_generated_header(os.path.join(directory, fname)):
-            names.append(fname[:-2])
+        if fname.endswith(".s"):
+            name = fname[:-2]
+            if has_generated_header(os.path.join(directory, fname), name):
+                names.append(name)
     return names
 
 
-def has_generated_header(path):
+def _generated_header(name):
+    return f"; {name}  {HEADER_MARK}{name}.asm"
+
+
+def has_generated_header(path, name):
     if not os.path.isfile(path):
         return False
     with open(path, encoding="utf-8") as f:
-        return HEADER_MARK in f.readline()
+        return f.readline().removesuffix("\n") == _generated_header(name)
 
 
 SHADERS = tuple(marked_names())
@@ -64,7 +70,7 @@ def render(name):
     """Fixture text for one shader: header line, then each instruction line indented with a tab."""
     with open(os.path.join(ASM_DIR, name + ".asm"), encoding="utf-8") as f:
         insns = [ln.strip() for ln in f.read().splitlines() if ln.strip() and not ln.lstrip().startswith(";")]
-    head = f"; {name}  {HEADER_MARK}{name}.asm\n"
+    head = _generated_header(name) + "\n"
     return head + "".join("\t" + ln + "\n" for ln in insns)
 
 
@@ -97,7 +103,7 @@ def main(argv):
     for name in named or marked_names():
         path = os.path.join(FIXTURE_DIR, name + ".s")
         if not check:
-            if os.path.lexists(path) and not has_generated_header(path):
+            if os.path.lexists(path) and not has_generated_header(path, name):
                 print(f"{name}: refusing to overwrite {shown(path)} without the generated fixture header",
                       file=sys.stderr)
                 bad += 1

@@ -99,6 +99,27 @@ class RegenFixturesTest(unittest.TestCase):
         self.assertEqual(rf.generated_names(), ["cs_b"])
         self.assertIn("cs_b.s", out)
 
+    def test_generated_header_must_match_the_fixture_name(self):
+        manual = os.path.join(self.fix, "cs_a.s")
+        cases = (
+            (("cs_a",), f"; not a {rf.HEADER_MARK}cs_a.asm"),
+            ((), f"; cs_b  {rf.HEADER_MARK}cs_b.asm"),
+        )
+        for args, header in cases:
+            with self.subTest(args=args, header=header):
+                if not args:
+                    rf.mark("cs_a")
+                original = header + "\n\ts_endpgm\n"
+                self.write(manual, original)
+
+                code, _, err = self.run_main(*args)
+                self.assertEqual(code, 1)
+                self.assertIn("refusing to overwrite", err)
+                with open(manual, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), original)
+                self.assertEqual(rf.generated_names(), [])
+                self.assertEqual(rf.marked_names(), [] if args else ["cs_a"])
+
     def test_check_reports_a_stale_fixture(self):
         self.run_main("cs_a")
         self.write(os.path.join(self.asm, "cs_a.asm"), rf.ASM_MARK + "\nv_mov_b32 v0, 2\ns_endpgm\n")
