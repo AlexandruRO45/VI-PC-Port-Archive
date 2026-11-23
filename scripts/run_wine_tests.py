@@ -12,8 +12,8 @@ Some tests open files through absolute paths compiled into them (the GLSL test s
 runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
 ($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
 
-Every test is run and reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
-others show what does and doesn't work under Wine yet without failing the job.
+Every test is reported. Tests that require a CTest fixture do not run if its setup fails. The exit code is 1 if
+a test named by --require fails or is missing, else 0: the others show what works under Wine without failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
 """
 import argparse
@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from graphlib import CycleError, TopologicalSorter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -106,6 +107,27 @@ def wine_path(path: str) -> str:
 
 def properties(test: dict) -> dict:
     return {p["name"]: p["value"] for p in test.get("properties", [])}
+
+
+def test_schedule(tests: list[dict]) -> list[tuple[int, list[int]]]:
+    """Order the tests with CTest's DEPENDS edges, and identify the setup tests whose failures block each test."""
+    props = [properties(test) for test in tests]
+    indexes_by_name = {}
+    setups_by_fixture = {}
+    for index, (test, values) in enumerate(zip(tests, props)):
+        indexes_by_name.setdefault(test.get("name", "?"), []).append(index)
+        for fixture in values.get("FIXTURES_SETUP", []):
+            setups_by_fixture.setdefault(fixture, []).append(index)
+
+    sorter = TopologicalSorter({index: () for index in range(len(tests))})
+    requirements = []
+    for index, values in enumerate(props):
+        required = list(dict.fromkeys(setup for fixture in values.get("FIXTURES_REQUIRED", [])
+                                      for setup in setups_by_fixture.get(fixture, [])))
+        requirements.append(required)
+        depends = [dependency for name in values.get("DEPENDS", []) for dependency in indexes_by_name.get(name, [])]
+        sorter.add(index, *depends, *required)
+    return [(index, requirements[index]) for index in sorter.static_order()]
 
 
 def truthy(value) -> bool:
@@ -254,20 +276,32 @@ def main() -> int:
     tests = read_tests(args.tests)
     if tests is None:
         return 2
+    try:
+        schedule = test_schedule(tests)
+    except CycleError as exc:
+        names = (tests[index].get("name", "?") for index in exc.args[1])
+        print("ERROR: CTest dependency cycle: " + " -> ".join(names), file=sys.stderr)
+        return 2
     wine = args.wine
-    results = {}
+    statuses = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
     with DriveMap(args.windows_root, args.root, prefix) as drive:
         print(drive.note, flush=True)
-        for test in tests:
+        for index, required_setups in schedule:
+            test = tests[index]
             name = test.get("name", "?")
-            status, detail = run_test(test, args, wine)
-            results[name] = status
+            failed_setups = [tests[setup].get("name", "?") for setup in required_setups if statuses[setup] == "fail"]
+            if failed_setups and not truthy(properties(test).get("DISABLED")):
+                status, detail = "fail", "CTest fixture setup failed: " + ", ".join(failed_setups)
+            else:
+                status, detail = run_test(test, args, wine)
+            statuses[index] = status
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":
                 for line in detail.rstrip().splitlines()[-40:]:
                     print(f"    {line}")
 
+    results = {tests[index].get("name", "?"): status for index, status in statuses.items()}
     missing = [n for n in args.require if n not in results]
     failed_required = [n for n in args.require if results.get(n) != "pass"]
     counts = {s: sum(1 for v in results.values() if v == s) for s in ("pass", "fail", "skip")}

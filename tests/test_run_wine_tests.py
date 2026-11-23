@@ -418,6 +418,41 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("[FAIL] bad", out)
 
+    def test_fixture_setup_orders_and_gates_its_consumer(self):
+        child = self.artifact / "consumer.py"
+        marker = self.artifact / "consumer.ran"
+        child.write_text("from pathlib import Path\nPath(__file__).with_suffix('.ran').touch()\n", encoding="utf-8")
+        for status, file, extra in (("FAIL", "bad.py", {}), ("SKIP", "bad.py", {"SKIP_RETURN_CODE": 1}),
+                                    ("PASS", "ok.py", {})):
+            with self.subTest(setup_status=status):
+                marker.unlink(missing_ok=True)
+                entries = [
+                    ctest_entry("consumer", self.command(child.name),
+                                {"FIXTURES_REQUIRED": ["generated"], "DEPENDS": ["setup"]}),
+                    ctest_entry("cleanup", self.command("ok.py"),
+                                {"FIXTURES_CLEANUP": ["generated"], "DEPENDS": ["consumer", "setup"]}),
+                    ctest_entry("setup", self.command(file), {"FIXTURES_SETUP": ["generated"], **extra}),
+                ]
+                code, out, err = self.run_main(entries, "--require", "consumer")
+                blocked = status == "FAIL"
+                self.assertEqual(code, int(blocked), out)
+                self.assertEqual(err, "")
+                self.assertEqual(marker.exists(), not blocked)
+                if blocked:
+                    self.assertIn("CTest fixture setup failed: setup", out)
+                self.assertLess(out.index(f"[{status}] setup"), out.index("] consumer"))
+                self.assertLess(out.index("] consumer"), out.index("[PASS] cleanup"))
+
+    def test_dependency_cycle_is_reported_before_running_tests(self):
+        entries = [ctest_entry(name, self.command("ok.py"), {"DEPENDS": [other]})
+                   for name, other in (("first", "second"), ("second", "first"))]
+        code, out, err = self.run_main(entries)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("CTest dependency cycle", err)
+        self.assertIn("first", err)
+        self.assertIn("second", err)
+
     def test_the_summary_table_is_appended(self):
         summary = self.root / "summary.md"
         code, _, _ = self.run_main([ctest_entry("ok", self.command("ok.py")), ctest_entry("bad", self.command("bad.py"))],
