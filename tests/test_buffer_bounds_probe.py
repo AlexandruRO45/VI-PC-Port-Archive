@@ -24,7 +24,8 @@ class BufferBoundsProbeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 77, proc.stderr or proc.stdout)
 
     def test_nonnumeric_waves_are_usage_errors(self):
-        for waves in ("invalid", "32,invalid", "32.0", "32,64x"):
+        for waves in ("invalid", "32,invalid", "32.0", "32,64x", "\u0663\u0662", "3_2", " 32 ", "+32",
+                      "064", "32,+64", "", "32,", ",64", "32,,64"):
             with self.subTest(waves=waves):
                 result = subprocess.run(
                     [sys.executable, "-I", PROBE, "--waves", waves],

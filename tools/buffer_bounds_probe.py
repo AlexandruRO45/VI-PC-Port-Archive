@@ -199,13 +199,10 @@ def main():
     if args.self_test:
         self_test()
         return 0
-    try:
-        waves = [int(w) for w in args.waves.split(",") if w.strip()]
-    except ValueError:
+    waves = args.waves.split(",")
+    if any(w not in ("32", "64") for w in waves):
         ap.error("--waves must be a non-empty list of 32 and/or 64")
-    if not waves or any(w not in (32, 64) for w in waves):
-        print("--waves must be a non-empty list of 32 and/or 64", file=sys.stderr)
-        return 2
+    waves = [int(w) for w in waves]
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle()
