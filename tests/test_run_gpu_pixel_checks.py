@@ -194,5 +194,61 @@ class PixelChecks(unittest.TestCase):
         self.assertIn("no subgroup width", str(skip))
 
 
+class MeshW64xChecks(unittest.TestCase):
+    """mesh_w64x_test: the NaN guard, and which meshes need a 64-wide subgroup."""
+
+    FRAME = [(((i % 64) + .5) / 64, ((i // 64) + .5) / 64, .5, 1.0) for i in range(64 * 64)]
+
+    def run_mesh(self, frames, name, subgroup):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            tools, spirv = root / "tools", root / "spirv"
+            tools.mkdir()
+            spirv.mkdir()
+            for shader in (name, "fs_passthru"):
+                (spirv / (shader + ".spv")).write_bytes(b"\x03\x02\x23\x07")
+            harness = tools / "vk_harness"
+            harness.write_text(
+                "import sys, struct\n"
+                "nan = float('nan')\n"
+                "open(sys.argv[3], 'wb').write(b''.join(struct.pack('<4f', *p) for p in "
+                + repr(frames) + "))\n"
+                "sys.stderr.write(" + repr("subgroup " + subgroup + "\n") + ")\n", encoding="utf-8")
+            real_run = check.subprocess.run
+
+            def patched(cmd, **kwargs):
+                if cmd and "vk_harness" in str(cmd[0]):
+                    cmd = [sys.executable, str(harness)] + list(cmd[1:])
+                return real_run(cmd, **kwargs)
+
+            with patch.object(check.subprocess, "run", side_effect=patched), \
+                    patch.object(check, "mesh_env", return_value={}), \
+                    patch.object(check, "EXE", ""), \
+                    patch.object(check, "W64_EMULATED", False):
+                return check.mesh_w64x_test(str(tools), str(spirv), name)
+
+    def test_a_nan_frame_fails(self):
+        nan = float("nan")
+        problem = self.run_mesh([(nan, nan, nan, nan)] * (64 * 64), "ms_w64x_ballot", "32..64")
+        self.assertTrue(problem, "an all-NaN frame must not read as success")
+        self.assertIn("differ", problem)
+
+    def test_one_nan_channel_fails(self):
+        frames = list(self.FRAME)
+        pixel = list(frames[7])
+        pixel[2] = float("nan")
+        frames[7] = tuple(pixel)
+        self.assertTrue(self.run_mesh(frames, "ms_w64x_ballot", "32..64"))
+
+    def test_the_expected_frame_passes(self):
+        self.assertEqual(self.run_mesh(self.FRAME, "ms_w64x_ballot", "32..64"), "")
+
+    def test_the_ballot_mesh_still_needs_a_64_wide_subgroup(self):
+        self.assertIsNone(self.run_mesh(self.FRAME, "ms_w64x_ballot", "32..32"))
+
+    def test_the_wave_info_mesh_runs_on_a_32_wide_subgroup(self):
+        self.assertEqual(self.run_mesh(self.FRAME, "ms_wave_info_s3", "32..32"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
