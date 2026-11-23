@@ -281,6 +281,10 @@ def _decode_lanes_raw(raw, widths, nsym):
                             fail("fragment did not end at its home state", i)
                     elif out_rem[i] == 0 and not nxt:
                         done[i] = True
+                    elif st == L:
+                        # A non-final fragment that ran out of bytes at the home state with symbols still owed:
+                        # st == L neither decodes nor reads the next header, so the lane could never move again.
+                        fail("fragment ended at its home state with symbols still to decode", i)
                 elif st == L or (out_rem[i] == 0 and not nxt and st > L):
                     fail("fragment did not end at its home state", i)
 
