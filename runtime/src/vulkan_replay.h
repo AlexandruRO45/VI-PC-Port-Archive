@@ -1260,12 +1260,15 @@ inline void clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t l
     }
 }
 
+// The stages a barrier may name on a COPY or COMPUTE queue (restrict_to_queue). CLEAR is valid on transfer-only
+// queues: vkCmdUpdateBuffer and vkCmdFillBuffer run there. Whether the queue can clear images is a separate test
+// (initialize), since vkCmdClearColorImage needs a compute or graphics queue.
 inline constexpr VkPipelineStageFlags2 queue_stages_copy =
     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
-    VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-inline constexpr VkPipelineStageFlags2 queue_stages_compute =
-    queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+    VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT |
     VK_PIPELINE_STAGE_2_CLEAR_BIT;
+inline constexpr VkPipelineStageFlags2 queue_stages_compute =
+    queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
 
 inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& stages, VkAccessFlags2& access) {
     if (!vk.queue_stages) return;
@@ -1490,7 +1493,10 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
         const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
-        const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
+        // vkCmdClearColorImage needs a compute or graphics queue (0: no restriction); vkCmdClearDepthStencilImage
+        // a graphics one.
+        const bool can_clear =
+            !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) && color);
         const bool compressed = fmt.block > 1 || (!can_clear && color);
         if (resource.not_zeroed || (!can_clear && !color)) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
