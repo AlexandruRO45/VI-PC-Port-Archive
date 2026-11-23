@@ -240,5 +240,37 @@ class TestValuCndmaskB32ScalarInterpreter(unittest.TestCase):
             expected = 0x22222222 * (i + 1) if (i % 2 == 1) else 0x11111111 * (i + 1)
             self.assertEqual(lane.vgprs[0], expected & MASK32)
 
+# --- Section 4: SIMD Multi-Lane Divergence and EXEC Masking ---
+
+def run_valu_cndmask_simd_ps(cond_mask: int) -> List[int]:
+    """Execute v_cndmask_b32 across multiple lanes in a fragment shader."""
+    lines = [
+        "s_mov_b32 s0, 0x11111111",
+        "s_mov_b32 s1, 0x22222222",
+        f"s_mov_b64 s[2:3], {cond_mask & MASK64:#x}",
+        "v_cndmask_b32_e64 v0, s0, s1, s[2:3]",
+        "v_cndmask_b32_e64 v1, s1, s0, s[2:3]",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_cndmask_simd", lines)
+    return mrt0_words(spv)
+
+
+class TestValuCndmaskB32SimdExecution(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking tests."""
+
+    def test_divergent_mask_lane_0(self) -> None:
+        # Lane 0 has bit 0 of mask.
+        words_bit0_on = run_valu_cndmask_simd_ps(cond_mask=1)
+        self.assertEqual(words_bit0_on[0], 0x22222222)
+        self.assertEqual(words_bit0_on[1], 0x11111111)
+
+        words_bit0_off = run_valu_cndmask_simd_ps(cond_mask=0)
+        self.assertEqual(words_bit0_off[0], 0x11111111)
+        self.assertEqual(words_bit0_off[1], 0x22222222)
+
 if __name__ == "__main__":
     unittest.main()
