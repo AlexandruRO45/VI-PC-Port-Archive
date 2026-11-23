@@ -821,5 +821,37 @@ class VSubF16TranslatorIntegrationTests(unittest.TestCase):
             translate_lines("ps_neg_sub_f16", prog)
 
 
+class VSubrevF16OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_subrev_f16 with translator execution."""
+
+    def test_basic_reverse_subtraction(self):
+        # S0 = 2.0 (0x4000), S1 = 5.0 (0x4500): 5.0 - 2.0 = 3.0 (0x4200)
+        out = run_prog([
+            "v_mov_b32 v0, 0x4000",
+            "v_mov_b32 v1, 0x4500",
+            "v_subrev_f16 v2, v0, v1",
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0x4200)
+
+    def test_negative_reverse_subtraction(self):
+        # S0 = 4.0 (0x4400), S1 = 1.0 (0x3C00): 1.0 - 4.0 = -3.0 (0xC200)
+        out = run_prog([
+            "v_mov_b32 v0, 0x4400",
+            "v_mov_b32 v1, 0x3C00",
+            "v_subrev_f16 v2, v0, v1",
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0xC200)
+
+    def test_exact_cancellation(self):
+        out = run_prog([
+            "v_mov_b32 v0, 0x4200",  # 3.0
+            "v_subrev_f16 v1, v0, v0",
+            "v_mov_b32 v0, v1",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0x0000)
+
+
 if __name__ == "__main__":
     unittest.main()
