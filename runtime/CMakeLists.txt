@@ -2188,6 +2188,53 @@ if(TARGET Vulkan::Headers)
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" ${_trace_runner})
         set_tests_properties(run_tiny_frame PROPERTIES SKIP_RETURN_CODE 77)
       endif()
+
+      # First-boot runbook plumbing (docs/boot.md): a synthetic guest run through `gta6rt --run` with BOTH traces,
+      # so the startup JSONL and the shim's [d3d12-trace] lines are checked together, not as separate synthetic logs.
+      # Opt-in: it needs a Vulkan GPU and a Windows host; neither a missing GPU nor Wine is a test failure.
+      option(LEONIDA_TEST_BOOT_TRACE_GUEST
+             "Build and run the synthetic D3D12 boot-trace guest through gta6rt --run (needs a Vulkan GPU)" OFF)
+      if(LEONIDA_TEST_BOOT_TRACE_GUEST)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(NOT TARGET d3d12_boot_stub)
+          add_library(d3d12_boot_stub SHARED test/fixtures/d3d12_boot_stub.cpp test/fixtures/d3d12_boot_stub.def)
+          target_compile_definitions(d3d12_boot_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+          target_compile_options(d3d12_boot_stub PRIVATE /W4 /permissive- /utf-8)
+          set_target_properties(d3d12_boot_stub PROPERTIES
+            OUTPUT_NAME d3d12_xs
+            PREFIX ""
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/boot_stub/$<CONFIG>"
+            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/boot_stub/$<CONFIG>"
+          )
+        endif()
+        add_executable(tiny_boot_trace_guest test/fixtures/d3d12_trace_guest.cpp)
+        target_link_libraries(tiny_boot_trace_guest PRIVATE d3d12_boot_stub)
+        target_compile_definitions(tiny_boot_trace_guest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_options(tiny_boot_trace_guest PRIVATE /W4 /permissive- /utf-8)
+        set_target_properties(tiny_boot_trace_guest PROPERTIES
+          RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/boot_guest/$<CONFIG>"
+        )
+        if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING AND Python3_FOUND)
+          add_dependencies(tiny_boot_trace_guest gta6rt)
+          set(_boot_trace_out "${CMAKE_CURRENT_BINARY_DIR}/boot_trace_guest")
+          file(MAKE_DIRECTORY "${_boot_trace_out}")
+          add_test(NAME d3d12_boot_trace_guest
+            COMMAND ${CMAKE_COMMAND}
+              -DGTA6RT=$<TARGET_FILE:gta6rt>
+              -DGUEST=$<TARGET_FILE:tiny_boot_trace_guest>
+              -DPYTHON=${Python3_EXECUTABLE}
+              -DCHECK=${CMAKE_CURRENT_SOURCE_DIR}/test/check_boot_trace_guest.py
+              -DTOOL=${CMAKE_CURRENT_SOURCE_DIR}/../tools/boot_trace.py
+              -DBOOT=${_boot_trace_out}/boot.jsonl
+              -DLOG=${_boot_trace_out}/d3d12.log
+              -DSUMMARY=${_boot_trace_out}/summary.json
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_boot_trace_guest.cmake
+          )
+          set_tests_properties(d3d12_boot_trace_guest PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        else()
+          message(STATUS "tiny_boot_trace_guest will build. The CTest needs a Windows host and Python 3.")
+        endif()
+      endif()
     endif()
     # bvh_builder_test can put the package's XboxBvhBuilder on this device too (LEONIDA_BVH_DEVICE=vulkan).
     if(TARGET bvh_builder_test)

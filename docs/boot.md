@@ -141,7 +141,8 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 ## 6. Limits
 
 The retail executable is not in the package, so this page is untested against it; the tool and the trace formats
-are tested on synthetic fixtures and on `tiny_game` (which has no D3D12 calls). The present slots (Q6) and the
+are tested on synthetic fixtures, on `tiny_game` (which has no D3D12 calls), and by the opt-in
+`d3d12_boot_trace_guest`, which runs both traces end to end through `gta6rt --run`. The present slots (Q6) and the
 Xbox device parameters (Q1) remain the first things the executable itself has to name. The D3D12 trace needs the
 Vulkan backend; a build without it runs the game's calls through the PC device and records nothing. The runbook
 does not make the game boot; it makes the first real trace readable.
