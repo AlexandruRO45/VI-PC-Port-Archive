@@ -131,6 +131,27 @@ def safe_subpath(base_dir: str, rel: str) -> str | None:
     return real_target
 
 
+def _prune_walk_dirs(base_dir: str, root: str, dirs: list[str], seen: set[str]) -> None:
+    """Keep in dirs, in place and in order, only the subfolders safe_subpath would serve from: realpath inside
+    base_dir and not visited yet. os.walk follows Windows junctions even with followlinks=False, so a junction to a
+    folder outside would list files /models/ and /textures/ refuse, and a junction back up would loop. seen holds the
+    normcased realpaths already walked; start it with the root's."""
+    real_base = os.path.realpath(base_dir)
+    kept = []
+    for name in dirs:
+        real = os.path.realpath(os.path.join(root, name))
+        try:
+            common = os.path.commonpath([real_base, real])
+        except ValueError:
+            continue
+        key = os.path.normcase(real)
+        if os.path.normcase(common) != os.path.normcase(real_base) or key in seen:
+            continue
+        seen.add(key)
+        kept.append(name)
+    dirs[:] = kept
+
+
 class StudioHandler(http.server.BaseHTTPRequestHandler):
     models_dir: str = ""
     textures_dir: str = ""
@@ -336,8 +357,10 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
     def _serve_models_json(self) -> None:
         items = []
         if os.path.isdir(self.models_dir):
+            seen = {os.path.normcase(os.path.realpath(self.models_dir))}
             for root, dirs, files in os.walk(self.models_dir):
                 dirs.sort()
+                _prune_walk_dirs(self.models_dir, root, dirs, seen)
                 for fn in sorted(files):
                     if fn.lower().endswith((".glb", ".gltf")):
                         full_path = os.path.join(root, fn)
@@ -382,8 +405,10 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
     def _serve_textures_json(self) -> None:
         items = []
         if os.path.isdir(self.textures_dir):
+            seen = {os.path.normcase(os.path.realpath(self.textures_dir))}
             for root, dirs, files in os.walk(self.textures_dir):
                 dirs.sort()
+                _prune_walk_dirs(self.textures_dir, root, dirs, seen)
                 for fn in sorted(files):
                     ext = os.path.splitext(fn)[1].lower()
                     if ext in TEXTURE_FORMATS:

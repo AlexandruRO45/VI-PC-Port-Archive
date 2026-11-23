@@ -5,6 +5,7 @@ import io
 import os
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -590,6 +591,56 @@ class TestGalleryServer(unittest.TestCase):
             with self.subTest(target=target):
                 status, _, _ = _raw_get(self.port, target, host=host)
                 self.assertEqual(status, 404)
+
+
+class TestCatalogJunctions(unittest.TestCase):
+    """os.walk follows Windows junctions even with followlinks=False. The catalogs must list only what /models/ and
+    /textures/ serve: no folder whose realpath is outside the root (403 there), and no folder twice (a junction back
+    to the root used to list the same file once per level, up to the path length limit)."""
+
+    def setUp(self) -> None:
+        if os.name != "nt":
+            self.skipTest("directory junctions are a Windows feature")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for attr in ("models_dir", "textures_dir"):
+            self.addCleanup(setattr, gallery.StudioHandler, attr, getattr(gallery.StudioHandler, attr))
+        self.outside = os.path.join(self.tmp.name, "outside")
+        os.makedirs(self.outside)
+        for name in ("linked.glb", "linked.png"):
+            with open(os.path.join(self.outside, name), "wb") as f:
+                f.write(b"outside")
+
+    def _junction(self, link: str, target: str) -> None:
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True)
+        if result.returncode != 0 or not os.path.isdir(link):
+            self.skipTest(f"mklink /J failed: {result.stderr.decode('mbcs', 'replace').strip()}")
+        self.addCleanup(os.rmdir, link)          # removes the junction itself, before the folder is cleaned up
+
+    def _tree(self, name: str, local: str) -> str:
+        root = os.path.join(self.tmp.name, name)
+        os.makedirs(root)
+        with open(os.path.join(root, local), "wb") as f:
+            f.write(b"local")
+        self._junction(os.path.join(root, "more"), self.outside)
+        self._junction(os.path.join(root, "loop"), root)
+        return root
+
+    def _check(self, paths: list, local: str) -> None:
+        self.assertEqual(paths.count(local), 1, paths)
+        self.assertEqual([p for p in paths if p.startswith(("more/", "loop/"))], [])
+
+    def test_models_list_skips_junctions_out_of_the_root_and_back_into_it(self) -> None:
+        gallery.StudioHandler.models_dir = self._tree("models", "local.glb")
+        status, _, body = _memory_get("/api/models")
+        self.assertEqual(status, 200)
+        self._check([m["path"] for m in json.loads(body)["models"]], "local.glb")
+
+    def test_textures_list_skips_junctions_out_of_the_root_and_back_into_it(self) -> None:
+        gallery.StudioHandler.textures_dir = self._tree("textures", "local.png")
+        status, _, body = _memory_get("/api/textures")
+        self.assertEqual(status, 200)
+        self._check([t["path"] for t in json.loads(body)["textures"]], "local.png")
 
 
 class TestGalleryCommandLine(unittest.TestCase):
