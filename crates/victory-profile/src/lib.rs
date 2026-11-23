@@ -903,6 +903,18 @@ fn summary(period: Duration) {
     out::flush();
 }
 
+static EXTRAS: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
+
+/// Something more for the scheduled dumps (`VICTORY_PROFILE_DUMP`), such
+/// as every thread's stack. Not run by [`dump`] itself: a run failing may
+/// not survive suspending its threads.
+pub fn with_dump(f: fn()) {
+    let mut extras = lock(&EXTRAS);
+    if !extras.iter().any(|&g| std::ptr::fn_addr_eq(g, f)) {
+        extras.push(f);
+    }
+}
+
 /// Logs everything known now, since the start: the frames so far and the
 /// last few hundred, memory, every statistic, the notes. For a run about
 /// to end badly (the host GPU failing), or on `VICTORY_PROFILE_DUMP`.
@@ -966,6 +978,10 @@ fn reporter() {
                 "VICTORY_PROFILE_DUMP at {:.0} s",
                 at.as_secs_f64()
             ));
+            let extras = lock(&EXTRAS).clone();
+            for f in extras {
+                f();
+            }
         }
         let period = last.elapsed();
         if period >= s.interval {
