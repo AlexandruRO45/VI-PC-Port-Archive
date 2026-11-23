@@ -101,8 +101,10 @@ Observed constants, where the window before the call loads one:
 | `XMemGetWorkingSetStatistics` | 3 | kind `0x2000000a` (2 sites), `0x20000001` |
 | `XMemIsToolsMemAvailable` | 1 | arguments not read |
 
-`runtime/shims/xmem.cpp` says one call site "passes `0x5e50000`" as the attribute word. The two `XMemAlloc` sites here
-whose attribute is a constant pass `0xf0814000`, not that value, so it comes from another image.
+An earlier version of the `runtime/shims/xmem.cpp` comment said one call site "passes `0x5e50000`" as the attribute
+word. No site in this image does: the two `XMemAlloc` sites whose attribute is a constant pass `0xf0814000`, and
+`0x5e50000` is the synthetic value in `runtime/test/xmem_test.cpp` and the tiny bundled-DLL fixture. The comment now
+records the measured set (the eight `XMemVirtualAlloc` attribute words above) instead.
 
 ## What this does not show
 
