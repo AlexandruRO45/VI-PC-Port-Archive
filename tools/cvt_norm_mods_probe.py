@@ -38,6 +38,14 @@ NORM_F16_OPS = ("v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16")
 PKNORM_F32_OPS = ("v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32")
 OPS: tuple[str, ...] = NORM_F16_OPS + PKNORM_F32_OPS
 
+# One launch carries at most 4096 output words (hw_oracle_drm.c refuses more), so the 32,768-word f16 sweep runs as
+# SWEEP_WORDS // PER_KERNEL kernels of THREADS threads writing PER_THREAD dwords each.
+THREADS = 1024
+PER_THREAD = 4
+PER_THREAD_SHIFT = PER_THREAD.bit_length() - 1
+PER_KERNEL = THREADS * PER_THREAD
+SWEEP_WORDS = 32768
+
 VOP3_NORM_MODS: tuple[str, ...] = (
     "",
     "clamp",
@@ -226,7 +234,7 @@ def expected_sweep_words(op: str) -> list[int]:
 
 
 def sweep_kernel_lines(op: str, mod_str: str, base_word: int, label: str, mode_val: int | None = None) -> list[str]:
-    """GFX10 kernel evaluating 32,768 sequential f16 inputs as 16,384 packed dwords."""
+    """GFX10 kernel evaluating PER_KERNEL packed dwords of f16 inputs starting at base_word."""
     mod_suf = (" " + mod_str) if mod_str else ""
     lines: list[str] = []
     if mode_val is not None:
@@ -234,11 +242,11 @@ def sweep_kernel_lines(op: str, mod_str: str, base_word: int, label: str, mode_v
     lines += [
         "v_mov_b32_e32 v2, 0",
         "v_mov_b32_e32 v3, 0",
-        "v_lshlrev_b32_e32 v10, 4, v0",
+        f"v_lshlrev_b32_e32 v10, {PER_THREAD_SHIFT}, v0",
         f"v_add_nc_u32_e32 v11, {base_word}, v10",
         "v_lshlrev_b32_e32 v12, 1, v11",
         "v_lshlrev_b32_e32 v13, 2, v10",
-        "s_mov_b32 s4, 16",
+        f"s_mov_b32 s4, {PER_THREAD}",
         f"{label}:",
         f"{op}_e64 v2, v12{mod_suf}",
         "v_add_nc_u32_e32 v14, 1, v12",
@@ -351,13 +359,14 @@ def build_jobs(ops: list[str], waves: list[int]):
             for wave in waves:
                 for mod_str in VOP3_NORM_MODS:
                     mod_key = mod_str or "plain"
-                    for part, base_word in enumerate((0, 16384)):
+                    for base_word in range(0, SWEEP_WORDS, PER_KERNEL):
                         lbl = f".L_cvt_loop_{label_id}"
                         label_id += 1
                         lines = sweep_kernel_lines(op, mod_str, base_word, lbl)
-                        kernels.append(asm.Kernel(lines, wave=wave, threads=1024, words=16384, raw=True))
-                        exp_slice = exp_full[base_word : base_word + 16384]
-                        meta.append(("sweep", op, wave, f"{mod_key}_p{part}", bool(mod_str), exp_slice))
+                        kernels.append(asm.Kernel(lines, wave=wave, threads=THREADS, words=PER_KERNEL, raw=True))
+                        exp_slice = exp_full[base_word : base_word + PER_KERNEL]
+                        meta.append(("sweep", op, wave, f"{mod_key}_p{base_word // PER_KERNEL}", bool(mod_str),
+                                     exp_slice))
                 for clamp in (False, True):
                     lines = sdwa_kernel_lines(op, clamp)
                     exp = expected_sdwa_and_pres_words(op, clamp)
@@ -366,13 +375,13 @@ def build_jobs(ops: list[str], waves: list[int]):
             # MODE tests (RTZ and IEEE=1) on the first requested wave.
             mode_wave = waves[0]
             for mode_name, mode_val in NORM_MODE_VARIANTS:
-                for part, base_word in enumerate((0, 16384)):
+                for base_word in range(0, SWEEP_WORDS, PER_KERNEL):
                     lbl = f".L_cvt_loop_{label_id}"
                     label_id += 1
                     lines = sweep_kernel_lines(op, "", base_word, lbl, mode_val=mode_val)
-                    kernels.append(asm.Kernel(lines, wave=mode_wave, threads=1024, words=16384, raw=True))
-                    exp_slice = exp_full[base_word : base_word + 16384]
-                    meta.append(("mode", op, mode_wave, f"{mode_name}_p{part}", False, exp_slice))
+                    kernels.append(asm.Kernel(lines, wave=mode_wave, threads=THREADS, words=PER_KERNEL, raw=True))
+                    exp_slice = exp_full[base_word : base_word + PER_KERNEL]
+                    meta.append(("mode", op, mode_wave, f"{mode_name}_p{base_word // PER_KERNEL}", False, exp_slice))
         elif op in PKNORM_F32_OPS:
             exp_pk = expected_pknorm_words(op)
             for wave in waves:
@@ -604,7 +613,7 @@ def main(argv: list[str] | None = None) -> int:
             return 77
 
         kernels, meta = build_jobs(ops, waves)
-        raw_results = oracle.run(kernels, words=16384)
+        raw_results = oracle.run(kernels, words=PER_KERNEL)
         summary = evaluate_results(waves, meta, raw_results)
         device = oracle.device
         arch = oracle.arch
