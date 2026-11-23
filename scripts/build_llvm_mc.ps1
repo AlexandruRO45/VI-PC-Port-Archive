@@ -46,6 +46,9 @@ if (-not ((Test-Path $cmake) -and (Test-Path $ninja))) {
     $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
     if (-not ($cmake -and $ninja)) { throw "CMake and Ninja weren't found (install VS's 'C++ CMake tools' or put them on PATH)." }
 }
+# vcvars64.bat succeeds without a Windows SDK, and CMake's compiler check would only fail after the LLVM clone.
+. (Join-Path $PSScriptRoot "windows_sdk.ps1")
+Assert-WindowsSdk
 
 $src = Join-Path $Temp "src"
 $out = Join-Path $Temp "build"

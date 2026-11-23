@@ -35,6 +35,9 @@ function Find-BuildTool([string]$Preferred, [string]$CommandName, [scriptblock]$
 }
 
 $root = Split-Path $PSScriptRoot -Parent
+# vcvars64.bat succeeds without a Windows SDK; both the CMake and the cl.exe path below need one.
+. (Join-Path $PSScriptRoot "windows_sdk.ps1")
+Assert-WindowsSdk
 $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
 $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
