@@ -12,6 +12,8 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
+import importlib.util
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "run_semantic_tests.py")
@@ -158,6 +160,21 @@ class RunSemanticTests(unittest.TestCase):
         r = run(self.folder(helper=PASS))
         self.assertEqual(r.returncode, 1)
         self.assertIn("no test*.py file", r.stderr)
+
+
+def load_runner():
+    spec = importlib.util.spec_from_file_location("run_semantic_tests", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class DefaultJobs(unittest.TestCase):
+    def test_the_default_is_the_cpu_count_capped(self):
+        mod = load_runner()
+        for cpus, want in ((None, 1), (2, 2), (8, 8), (64, mod.MAX_DEFAULT_JOBS)):
+            with self.subTest(cpus=cpus), mock.patch("os.cpu_count", return_value=cpus):
+                self.assertEqual(mod.default_jobs(), want)
 
 
 if __name__ == "__main__":

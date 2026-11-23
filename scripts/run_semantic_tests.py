@@ -8,7 +8,7 @@ imports as `python -m unittest discover -s tests/semantic`, so a file that passe
 about 7 minutes on Linux (Python 3.13); with one file per process on 4 workers, about 1.5 minutes.
 
 A failing file's whole output is printed. The exit code is 1 when a file fails, errors, runs no test, or runs past
---timeout (it is stopped and reported), and when --start holds no test file; else 0. --jobs defaults to the CPU count;
+--timeout (it is stopped and reported), and when --start holds no test file; else 0. --jobs defaults to the CPU count, at most 8;
 --timeout (default 300 seconds per file) keeps one stuck file from holding the job until the CI limit.
 """
 import argparse
@@ -25,6 +25,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RAN = re.compile(r"^Ran (\d+) tests? in ", re.M)
 KILL_WAIT = 10.0   # seconds to collect a killed file's output before giving up on it
+# Past ~8 workers the run is as long as its longest file, while each worker can hold ~130 MB: cap the default there.
+MAX_DEFAULT_JOBS = 8
+
+
+def default_jobs():
+    """The CPU count, at most MAX_DEFAULT_JOBS (an explicit --jobs can go higher)."""
+    return max(1, min(os.cpu_count() or 1, MAX_DEFAULT_JOBS))
 
 
 # Loads one module by its dotted name with `start` first on sys.path (what discovery does with its top-level directory).
@@ -95,7 +102,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--start", default=str(ROOT / "tests" / "semantic"), help="directory to discover (tests/semantic)")
     ap.add_argument("--pattern", default="test*.py", help="test file pattern (unittest's default)")
-    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="files run at once (CPU count)")
+    ap.add_argument("--jobs", type=int, default=default_jobs(), help=f"files run at once (CPU count, at most {MAX_DEFAULT_JOBS})")
     ap.add_argument("--timeout", type=float, default=300.0, help="seconds per file before it is stopped (0: none)")
     ap.add_argument("--verbose", action="store_true", help="print every file's output, not only the failing ones")
     args = ap.parse_args(argv)
