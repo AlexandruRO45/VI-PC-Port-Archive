@@ -1382,9 +1382,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Source up axis: 'z' converts RAGE Z-up to glTF Y-up (default), 'y' keeps Y-up",
     )
     parser.add_argument(
-        "--flip-v",
-        action="store_true",
-        help="Flip V coordinate (1.0 - v) for bottom-left Wavefront OBJs; off by default for rpf9dump OBJs",
+        "--no-flip-v",
+        action="store_false",
+        dest="flip_v",
+        help="Preserve V coordinate as-is for top-left UVs (e.g. rpf9dump OBJs) instead of flipping 1.0 - v",
     )
     args = parser.parse_args(argv)
 

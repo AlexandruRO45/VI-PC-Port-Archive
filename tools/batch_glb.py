@@ -82,13 +82,14 @@ class TextureCache:
 
 
 def convert_single(
-    args_tuple: tuple[str, str, str, dict[str, str], int, TextureCache],
+    args_tuple: tuple,
 ) -> tuple[bool, str, str, list[tuple[str, str]]]:
-    in_path, out_path, up_axis, tex_index, max_tex_size, tex_cache = args_tuple
+    in_path, out_path, up_axis, tex_index, max_tex_size, tex_cache, *rest = args_tuple
+    flip_v = rest[0] if rest else True
     dropped: list[tuple[str, str]] = []
     dropped_seen: set[str] = set()
     try:
-        primitives = glb_writer.parse_obj(in_path, is_path=True, up_axis=up_axis, flip_v=False)
+        primitives = glb_writer.parse_obj(in_path, is_path=True, up_axis=up_axis, flip_v=flip_v)
         materials: dict[str, dict] = {}
 
         if tex_index:
@@ -142,6 +143,7 @@ def batch_convert(
     jobs: int | None = None,
     texture_dir: str | None = None,
     max_tex_size: int = 0,
+    flip_v: bool = True,
 ) -> dict[str, int]:
     if not os.path.isdir(in_dir):
         raise ValueError(f"Input directory does not exist: {in_dir}")
@@ -162,6 +164,7 @@ def batch_convert(
             tex_index,
             max_tex_size,
             tex_cache,
+            flip_v,
         )
         for f in obj_files
     ]
@@ -236,6 +239,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="Max texture dimension in pixels when decoding DDS (0 = unconstrained)",
     )
+    parser.add_argument(
+        "--no-flip-v",
+        action="store_false",
+        dest="flip_v",
+        help="Preserve V coordinate as-is for top-left UVs (e.g. rpf9dump OBJs) instead of flipping 1.0 - v",
+    )
 
     args = parser.parse_args(argv)
     t0 = time.monotonic()
@@ -247,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
             jobs=args.jobs,
             texture_dir=args.textures,
             max_tex_size=args.max_tex_size,
+            flip_v=args.flip_v,
         )
     except (ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

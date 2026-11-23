@@ -1187,10 +1187,10 @@ class TestGlbWriterMainCli(unittest.TestCase):
                 return struct.unpack_from("<2f", data, off)[1]
 
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(glb_writer.main([obj_path, glb_default]), 0)
-                self.assertEqual(glb_writer.main([obj_path, glb_flipped, "--flip-v"]), 0)
-            self.assertAlmostEqual(read_v0(glb_default), 0.1, places=5)
+                self.assertEqual(glb_writer.main([obj_path, glb_flipped]), 0)
+                self.assertEqual(glb_writer.main([obj_path, glb_default, "--no-flip-v"]), 0)
             self.assertAlmostEqual(read_v0(glb_flipped), 0.9, places=5)
+            self.assertAlmostEqual(read_v0(glb_default), 0.1, places=5)
 
 
 if __name__ == "__main__":
