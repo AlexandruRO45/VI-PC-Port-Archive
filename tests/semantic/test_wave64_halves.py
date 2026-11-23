@@ -764,6 +764,37 @@ class KillExit(unittest.TestCase):
         run = RUN_WQM + second + ["s_cbranch_scc0 5"] + RUN_WQM
         self.tier("ps_kill_shared", kill(KILL, run, EXIT_PS), "C", contains=["tainted-exec"])
 
+    def test_kill_vote_is_not_a_skip_region(self):
+        # The kill rule's vote is no skip region: its run side is the rest of the program and ends it, its exit is
+        # no join. A check that a skip region's run side rejoins the skipped path with EXEC restored and does not
+        # end the program (SHADER-747, the `accepted` votes of #4541) would call every kill exit
+        # `unconfined-vote-side`, so the kill votes stay out of it: only `kill_exits` holds them, and kill_confined()
+        # is their check. An execz vote of an if/endif on the run side is a skip region and no kill exit.
+        import wave64_halves
+        seen = []
+
+        class Recording(wave64_halves.Analysis):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                seen.append(self)
+        old = wave64_halves.Analysis
+        wave64_halves.Analysis = Recording
+        try:
+            self.tier("ps_kill_if_skip", kill(KILL, RUN_WQM + [
+                "v_cmp_eq_u32_e32 vcc, 1, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 1",
+                "v_mov_b32_e32 v6, 7", "s_or_b64 exec, exec, s[12:13]"], EXIT_PS), "A", [], [])
+        finally:
+            wave64_halves.Analysis = old
+        an = seen[-1]
+        kills = getattr(an, "kill_exits", {})
+        self.assertEqual(len(kills), 1, "one vote accepted by the kill rule")
+        (n, (regs, run, exit_)), = kills.items()
+        self.assertEqual(regs, (("s", 20), ("s", 21)))
+        self.assertFalse(an.reaches(run, exit_, n), "the run side never reaches the kill's exit")
+        self.assertIn(n, an.voted)
+        self.assertEqual(len(an.voted), 2, "the kill vote and the if/endif's execz vote")
+        self.assertNotIn(n, getattr(an, "accepted", {}), "a kill-accepted vote is no skip region (#4541)")
+
     # -- execution: vertex shaders, 64 lanes against two halves of 32 (vertices < 40 killed: all of the first half)
     def test_kill_exit_invariant(self):
         tier, whole, halves = self.run_both("vs_kill", kill(KILL, RUN_WQM + [

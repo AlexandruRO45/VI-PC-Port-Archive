@@ -148,7 +148,7 @@ def _mask64(a):
 ZERO_SCC = ("s_and_b64", "s_andn2_b64", "s_or_b64", "s_orn2_b64", "s_xor_b64", "s_nand_b64", "s_nor_b64",
             "s_xnor_b64", "s_not_b64", "s_wqm_b64")      # SCC = (64-bit result != 0)
 # Before the run side narrows EXEC: mask arithmetic, and the SAVEEXEC/WREXEC forms whose new EXEC is S0 & EXEC or
-# S0 & ~EXEC (a narrowing into S0; confine_step decides whether S0 is inside, and what the destination holds).
+# S0 & ~EXEC (a narrowing into S0; kill_confine_step decides whether S0 is inside, and what the destination holds).
 OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64", "s_and_saveexec_b64", "s_and_wrexec_b64",
           "s_andn2_saveexec_b64", "s_andn2_wrexec_b64")
 
@@ -221,6 +221,8 @@ class Analysis:
         self.tok = {("e",): (None, None, True)}      # exec token -> (parent token, exec tag after, exec is the entry exec)
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
+        self.kill_exits = {}                         # vote block -> (mask registers, run side, exit) of the votes the
+        #                                              kill rule accepts: no skip region, the run side never rejoins
         self.branch_class = {}
 
     # ---- helpers ----
@@ -986,7 +988,10 @@ class Analysis:
         # before the vote: one that did would keep the pixels of the empty half alive in the wave.
         kregs = self.kill_vote(n, op, reg)
         if not ok and kregs and run is not None and skip is not None and self.inert_exit(skip, kregs) \
-                and self.confined(run, kregs) and not self.vm_export_before(n):
+                and self.kill_confined(run, kregs) and not self.vm_export_before(n):
+            # Not a skip region: the run side is the rest of the program and ends it, the exit is not a join. A check
+            # of the votes whose run side rejoins the skipped path must leave these out (kill_confined() covers them).
+            self.kill_exits[n] = (kregs, run, skip)
             ok = True
         if not ok and ev is not None:
             ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
@@ -1062,7 +1067,7 @@ class Analysis:
             blk = self.succ[blk][0]
         return False
 
-    def confined(self, run, m):
+    def kill_confined(self, run, m):
         """Whether, on every path from block `run` (loops included), EXEC is narrowed into the whole quads of mask
         `m` before anything but mask arithmetic runs, and stays inside them: then a lane of a half whose `m` is empty
         is off for the rest of the wave. A must-dataflow over the blocks `run` reaches: (EXEC inside, set of 64-bit
@@ -1082,7 +1087,7 @@ class Analysis:
             for ins in self.blocks[b]:
                 if not inside and base_op(ins["op"]) not in OFF_OK:
                     return False
-                inside, sub = self.confine_step(ins, inside, sub)
+                inside, sub = self.kill_confine_step(ins, inside, sub)
             for s in self.succ[b]:
                 new = (inside, sub) if s not in entry else (entry[s][0] and inside, entry[s][1] & sub)
                 if new != entry.get(s):
@@ -1091,7 +1096,7 @@ class Analysis:
         return True
 
     @staticmethod
-    def confine_step(ins, inside, sub):
+    def kill_confine_step(ins, inside, sub):
         op, a = base_op(ins["op"]), ins["args"]
         dests, srcs, defs, _ = operands(ins)
 
