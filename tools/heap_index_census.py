@@ -15,6 +15,9 @@ dataflow over the reachable basic blocks, tagging every SGPR with where its valu
   * ("ld", pc, i)   dword i of an s_load / s_buffer_load at code offset pc;
   * ("off", t, d)   tag t plus an offset, d = True when the offset is not a constant.
 
+The analysis also tracks a known scalar carry/borrow bit (SCC) through unsigned arithmetic. A join keeps it
+only when every incoming path agrees. Instructions with unmodelled SCC effects discard the bit.
+
 Each descriptor-width scalar load (s_load_dwordx4/x8/x16 from an SGPR pair) is then classified by its base: a
 64-bit pointer from an input pair, a 32-bit pointer from one input SGPR with the high word a constant 0, a pointer
 that was itself loaded from memory, or something else. Its offset is static (immediate or a known constant) or
@@ -49,6 +52,11 @@ DESC_LOADS = {"s_load_dwordx4": 4, "s_load_dwordx8": 8, "s_load_dwordx16": 16}
 BRANCHES = {"s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz",
             "s_cbranch_execz", "s_cbranch_execnz"}
 ADDS = {"s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32", "s_addc_u32", "s_subb_u32"}
+UNSIGNED_SUBS = {"s_sub_u32", "s_subb_u32"}
+WITH_CARRY = {"s_addc_u32", "s_subb_u32"}
+UNSIGNED_ADD_SUB = WITH_CARRY | {"s_add_u32", "s_sub_u32"}
+SCC_PRESERVING_SALU = BRANCHES | {"s_mov_b32", "s_mov_b64", "s_movk_i32", "s_nop", "s_waitcnt"}
+U32_MAX = 0xFFFFFFFF
 
 
 class Skip(Exception):
@@ -169,10 +177,33 @@ def _pointerish(tag):
     return t is not None and t[0] in ("in", "ld")
 
 
+def unsigned_add_sub(op, x, y, carry):
+    """Return (known result, known SCC) using unsigned dword bounds for unknown operands."""
+    xlo, xhi = (0, U32_MAX) if x is None else (x, x)
+    ylo, yhi = (0, U32_MAX) if y is None else (y, y)
+    clo, chi = (0, 1) if carry is None else (carry, carry)
+    if op in UNSIGNED_SUBS:
+        lo, hi = xlo - yhi - chi, xhi - ylo - clo
+        flag_lo, flag_hi = int(lo < 0), int(hi < 0)
+    else:
+        lo, hi = xlo + ylo + clo, xhi + yhi + chi
+        flag_lo, flag_hi = int(lo > U32_MAX), int(hi > U32_MAX)
+    return lo & U32_MAX if lo == hi else None, flag_lo if flag_lo == flag_hi else None
+
+
 def step(sym, ins, on_load=None, on_use=None):
     """Advance the SGPR tags over one instruction; report descriptor loads and their consumers."""
     op = shader_meta.base_op(ins["op"])
     a = ins["args"]
+    carry = sym.get("scc") if op in WITH_CARRY else 0
+    # Scalar ALU and control instructions may write SCC implicitly. Vector and memory operations
+    # preserve it unless SCC appears explicitly, in which case discard it conservatively.
+    if "scc" in sym:
+        preserves_scc = op in SCC_PRESERVING_SALU or op.startswith(
+            ("v_", "ds_", "image_", "buffer_", "tbuffer_", "flat_", "global_", "scratch_", "s_load_", "s_buffer_load_")
+        )
+        if not preserves_scc or any(arg.get("t") == "scc" for arg in a):
+            del sym["scc"]
     if not a:
         return
     if on_use is not None:
@@ -219,17 +250,25 @@ def step(sym, ins, on_load=None, on_use=None):
             tx, ty = ty, tx            # s_lshlK_add_u32 d, idx, base: the base is the second source
         cx = tx[1] if tx is not None and tx[0] == "const" else None
         cy = ty[1] if ty is not None and ty[0] == "const" else None
-        if cx is not None and cy is not None and op not in ("s_addc_u32", "s_subb_u32"):
+        if op in UNSIGNED_ADD_SUB:
+            value, flag = unsigned_add_sub(op, cx, cy, carry)
+            if flag is not None:
+                sym["scc"] = flag
+        elif cx is not None and cy is not None:
             if op in shader_meta.LSHL_ADD_SHIFT:
-                new[a[0]["r"]] = ("const", ((cy << shader_meta.LSHL_ADD_SHIFT[op]) + cx) & 0xFFFFFFFF)
+                total = (cy << shader_meta.LSHL_ADD_SHIFT[op]) + cx
+                value = total & U32_MAX
+                sym["scc"] = int(total > U32_MAX)
             else:
-                new[a[0]["r"]] = ("const", shader_meta._fold_scalar_alu(op, cx, cy))
-        elif cx == 0 and cy == 0:
-            new[a[0]["r"]] = ("const", 0)          # high word of a pointer below 4 GB plus a carry of 0
+                value = shader_meta._fold_scalar_alu(op, cx, cy)
+        else:
+            value = None
+        if value is not None:
+            new[a[0]["r"]] = ("const", value)
         elif _pointerish(tx) and not _pointerish(ty):
-            new[a[0]["r"]] = ("off", tx, cy is None)
+            new[a[0]["r"]] = ("off", tx, cy is None or carry is None)
         elif _pointerish(ty) and not _pointerish(tx) and not op.startswith(("s_sub", "s_subb")):
-            new[a[0]["r"]] = ("off", ty, cx is None)
+            new[a[0]["r"]] = ("off", ty, cx is None or carry is None)
     elif op == "s_addk_i32" and a[0]["k"] == "sgpr":
         old = sym.get(a[0]["r"])
         if old is not None and old[0] == "const":
