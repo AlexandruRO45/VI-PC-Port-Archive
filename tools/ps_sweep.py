@@ -9,6 +9,14 @@ inputs are the same on every device. Run the same sample on each GPU, then compa
     VK_LOADER_DRIVERS_DISABLE=*nv* python -I tools/ps_sweep.py run ... --tag b      # another GPU (any loader filter)
     python -I tools/ps_sweep.py compare --out <dir> --tags a b
 
+For native and fallback translations drawn from the same sample, compare exact RGBA32F target bytes:
+
+    python -I tools/ps_sweep.py compare --exact --out <dir> --tags native fallback --variant z
+
+The report (exact_<variant>.json) gives one row per sampled draw, with target classes in attachment order for
+compatible pairs. An exact draw is observable if any component differs from the worker's -1 clear value.
+A clear-only match cannot distinguish a discarded fragment from an explicit write of the clear value.
+
 A `--spirv` folder translated with `--bary-fallback`, with `python -I tools/bary_fallback_gs.py <folder>` run on it
 (it writes `<name>.bary_gs.spv`), draws each shader that reads raw barycentrics through that pass-through geometry
 shader (`VKS_GS`), so it runs on a device without `fragmentShaderBarycentric`; the sample itself comes from the
@@ -22,6 +30,7 @@ timed out while another process was starting.
 Shaders are numbered by their place in `sample.json`; the summary lines and everything under `<dir>` except
 `sample.json` (which names the sampled shaders, so keep it out of reports) are counts and numbers only.
 """
+from collections import Counter
 import argparse
 import json
 import math
@@ -287,11 +296,70 @@ def load_results(a, tag):
     return recs
 
 
+def exact_pair(i, left, right):
+    """Compare successful draws with complete, equally shaped readbacks. Ignore stale files of failed draws."""
+    target_bytes = W * H * 16
+    clear = struct.pack("<f", -1.0) * (W * H * 4)
+    payloads = []
+    for rec in (left, right):
+        if rec is None or rec["code"] != 0:
+            return "missing", []
+    if left["targets"] != right["targets"]:
+        return "incompatible", []
+    count = left["targets"]
+    if type(count) is not int or type(right["targets"]) is not int or not 1 <= count <= 8:
+        return "incompatible", []
+    size = count * target_bytes
+    for rec in (left, right):
+        try:
+            with open(os.path.join(rec["dir"], f"{i}.raw"), "rb") as f:
+                data = f.read(size + 1)
+        except FileNotFoundError:
+            return "missing", []
+        if len(data) != size:
+            return "incompatible", []
+        payloads.append(data)
+
+    targets = []
+    for offset in range(0, size, target_bytes):
+        a, b = (data[offset:offset + target_bytes] for data in payloads)
+        if a != b:
+            targets.append("mismatch")
+        elif a == clear:
+            targets.append("clear-only exact")
+        else:
+            targets.append("non-clear exact")
+    for outcome in ("mismatch", "non-clear exact"):
+        if outcome in targets:
+            return outcome, targets
+    return "clear-only exact", targets
+
+
+def compare_exact(a, sample, ra, rb):
+    draws, attachments = Counter(), Counter()
+    rows = []
+    for i in range(len(sample)):
+        left, right = ra.get(i), rb.get(i)
+        outcome, targets = exact_pair(i, left, right)
+        draws[outcome] += 1
+        attachments.update(targets)
+        rows.append({"i": i, "class": outcome, "targets": targets,
+                     "codes": [r["code"] if r else None for r in (left, right)]})
+    with open(os.path.join(a.out, f"exact_{a.variant}.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"tags": a.tags, "draws": draws, "targets": attachments, "rows": rows}, f)
+    for label, counts in (("draws", draws), ("targets", attachments)):
+        print(label, "total", sum(counts.values()))
+        for outcome, n in sorted(counts.items()):
+            print(f"  {outcome}: {n}")
+
+
 def cmd_compare(a):
     with open(os.path.join(a.out, "sample.json"), encoding="utf-8") as f:
         sample = json.load(f)
     ta, tb = a.tags
     ra, rb = load_results(a, ta), load_results(a, tb)
+    if a.exact:
+        return compare_exact(a, sample, ra, rb)
     counts, sub, rows = {}, {}, []
     for i, s in enumerate(sample):
         if i not in ra or i not in rb:
@@ -327,6 +395,7 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=20261122)
     ap.add_argument("--tag", help="a label for the GPU this run uses")
     ap.add_argument("--tags", nargs=2, default=["a", "b"])
+    ap.add_argument("--exact", action="store_true", help="compare target bytes and count clear-only pairs separately")
     ap.add_argument("--variant", choices=["z", "t"], default="z")
     ap.add_argument("--exe", help="vk_ps_sweep")
     ap.add_argument("--glslang", default="glslangValidator")
@@ -336,6 +405,8 @@ def main(argv=None):
     ap.add_argument("--only", type=lambda s: [int(x) for x in s.split(",")], default=None)
     ap.add_argument("--suffix", default="", help="results folder suffix (a re-run uses _re)")
     a = ap.parse_args(argv)
+    if a.exact and (a.cmd != "compare" or a.tags[0] == a.tags[1]):
+        ap.error("--exact needs compare with two different tags")
     if a.cmd == "run" and not (a.tag and a.exe and a.spirv):
         ap.error("run needs --tag, --exe and --spirv")
     if a.cmd == "run" and a.only and not a.suffix:

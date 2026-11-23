@@ -214,6 +214,53 @@ class CompareCommand(unittest.TestCase):
             self.assertIn("OK on both: 2", buf.getvalue())
             self.assertNotIn("timeout", buf.getvalue())
 
+    def test_exact_readbacks_and_rerun(self):
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            clear = struct.pack("<f", -1) * (ps_sweep.W * ps_sweep.H * 4)
+            zero = bytes(len(clear))
+            neg_zero = zero[:-4] + struct.pack("<f", -0.0)
+            # Entries are (declared targets, payload). None means no result record.
+            pairs = [
+                ((2, clear + zero), (2, clear + zero)),
+                ((1, clear), (1, clear)),
+                ((1, zero), (1, neg_zero)),
+                ((1, zero), (1, None)),
+                ((1, zero[:-1]), (1, zero[:-1])),
+                ((1, zero), (2, zero)),
+                ((1, clear), None),
+                ((1, zero + b"x"), (1, zero + b"x")),
+                ((1, clear), (1, zero)),
+            ]
+            (out / "sample.json").write_text(json.dumps([{}] * len(pairs)), encoding="utf-8", newline="\n")
+            for side, tag in enumerate(("a", "b")):
+                folder = out / f"{tag}_z"
+                folder.mkdir()
+                with (folder / "results_0.jsonl").open("w", encoding="utf-8", newline="\n") as log:
+                    for i, pair in enumerate(pairs):
+                        if pair[side] is None:
+                            continue
+                        n, data = pair[side]
+                        print(json.dumps({"i": i, "code": 0, "targets": n}), file=log)
+                        if data is not None:
+                            (folder / f"{i}.raw").write_bytes(data)
+            rerun = out / "a_z_re"
+            rerun.mkdir()
+            (rerun / "8.raw").write_bytes(zero)
+            (rerun / "results_8.jsonl").write_text('{"i":8,"code":3,"targets":1}\n', encoding="utf-8", newline="\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                ps_sweep.main(["compare", "--exact", "--out", tmp])
+            report = json.loads((out / "exact_z.json").read_text(encoding="utf-8"))
+            self.assertEqual([r["class"] for r in report["rows"]], [
+                "non-clear exact", "clear-only exact", "mismatch", "missing", "incompatible",
+                "incompatible", "missing", "incompatible", "missing",
+            ])
+            self.assertEqual(report["rows"][0]["targets"], ["clear-only exact", "non-clear exact"])
+            self.assertEqual(report["targets"], {"non-clear exact": 1, "clear-only exact": 2, "mismatch": 1})
+            self.assertEqual(report["rows"][-1]["codes"], [3, 0])
+
     def test_help_warns_about_nvidia_resets(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
