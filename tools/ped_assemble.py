@@ -1099,6 +1099,8 @@ _GLB_ATTRIBUTE_TYPES = {
     "WEIGHTS_1": ("VEC4",),
 }
 
+_MORPH_ATTRIBUTES = ("POSITION", "NORMAL", "TEXCOORD_0", "COLOR_0")
+
 
 def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
     """Refuse a GLB document `read_glb_parts` cannot walk, with one message instead of a traceback.
@@ -1231,12 +1233,27 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
                 raise bad(f"{label}.sparse.indices must be strictly increasing and below {count}")
             previous = dest
 
+    def check_weights(owner, count, where):
+        if "weights" not in owner:
+            return
+        weights = owner["weights"]
+        if not isinstance(weights, list) or len(weights) != count:
+            raise bad(f"{where}.weights must contain {count} morph weights")
+        try:
+            finite = all(type(w) in (int, float) and math.isfinite(w) for w in weights)
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise bad(f"{where}.weights must contain finite numbers")
+
+    morph_counts = []
     for i, mesh in enumerate(meshes):
         if not isinstance(mesh, dict):
             raise bad(f"meshes[{i}] must be an object")
         primitives = mesh.get("primitives", [])
         if not isinstance(primitives, list):
             raise bad(f"meshes[{i}].primitives must be a list")
+        morph_count = None
         for pi, prim in enumerate(primitives):
             where = f"meshes[{i}].primitives[{pi}]"
             if not isinstance(prim, dict):
@@ -1249,6 +1266,24 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
             for name, allowed in _GLB_ATTRIBUTE_TYPES.items():
                 if name in attrs:
                     check_accessor(attrs[name], f"{where}.{name}", allowed)
+            targets = prim.get("targets", [])
+            if not isinstance(targets, list):
+                raise bad(f"{where}.targets must be a list")
+            if morph_count is not None and len(targets) != morph_count:
+                raise bad(f"{where} has a different number of morph targets from its siblings")
+            morph_count = len(targets)
+            for ti, target in enumerate(targets):
+                label = f"{where}.targets[{ti}]"
+                if not isinstance(target, dict):
+                    raise bad(f"{label} must be an object")
+                for name in _MORPH_ATTRIBUTES:
+                    if name not in target:
+                        continue
+                    if name not in attrs:
+                        raise bad(f"{label}.{name} has no base attribute")
+                    check_accessor(target[name], f"{label}.{name}", _GLB_ATTRIBUTE_TYPES[name])
+                    if accessors[target[name]]["count"] != accessors[attrs[name]]["count"]:
+                        raise bad(f"{label}.{name} count differs from the base attribute")
             if "indices" in prim:
                 check_accessor(prim["indices"], f"{where}.indices", ("SCALAR",))
             if "material" not in prim:
@@ -1272,6 +1307,8 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
             for owner, key in ((pbr, "metallicFactor"), (pbr, "roughnessFactor"), (material, "alphaCutoff")):
                 if key in owner:
                     number(owner[key], f"materials[{material_index}] {key}")
+        morph_counts.append(morph_count or 0)
+        check_weights(mesh, morph_counts[-1], f"meshes[{i}]")
 
     for i, node in enumerate(nodes):
         if not isinstance(node, dict):
@@ -1284,6 +1321,7 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
             continue
         if not is_index(node["mesh"]) or node["mesh"] >= len(meshes):
             raise bad(f"nodes[{i}] names mesh {node['mesh']!r} (GLB has {len(meshes)})")
+        check_weights(node, morph_counts[node["mesh"]], f"nodes[{i}]")
         check_name(node.get("name"), f"nodes[{i}].name")
         if not node.get("name"):
             check_name(meshes[node["mesh"]].get("name"), f"meshes[{node['mesh']}].name")
@@ -1393,8 +1431,39 @@ def _extract_glb_skin_joint_names(
     return joint_names
 
 
+def _read_posed_attribute(name, attributes, weighted_targets, read_accessor, accessors):
+    rows = read_accessor(attributes[name])
+    for i, row in enumerate(rows):
+        values = tuple(map(float, row))
+        rows[i] = (*values, 1.0) if name == "COLOR_0" and len(row) == 3 else values
+    changed = False
+    for weight, target in weighted_targets:
+        if name not in target:
+            continue
+        changed = True
+        index = target[name]
+        accessor = accessors[index]
+        signed_norm = accessor.get("normalized") and accessor["componentType"] in (COMPONENT_BYTE, COMPONENT_SHORT)
+        for i, delta in enumerate(read_accessor(index)):
+            if signed_norm:
+                delta = tuple(max(-1.0, x) for x in delta)
+            if name == "COLOR_0" and len(delta) == 3:
+                delta = (*delta, 0.0)
+            rows[i] = tuple(base + weight * d for base, d in zip(rows[i], delta))
+    if changed:
+        if any(not math.isfinite(v) for row in rows for v in row):
+            raise PedAssembleError(f"non-finite morphed {name}")
+        if name == "NORMAL":
+            rows = [glb_writer._normalize3(*row) for row in rows]
+        elif name == "COLOR_0":
+            rows = [tuple(max(0.0, min(1.0, v)) for v in row) for row in rows]
+        elif any(abs(v) > 3.4028234663852886e38 for row in rows for v in row):
+            raise PedAssembleError(f"morphed {name} exceeds float32")
+    return rows
+
+
 def read_glb_parts(path: str) -> list[MeshPart]:
-    """Read mesh parts from a binary glTF 2.0 (``.glb``) file (always Y-up)."""
+    """Read Y-up parts at their instance's default morph pose for static assembly."""
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 20 or data[:4] != GLB_MAGIC:
@@ -1451,6 +1520,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
     for node, mesh_idx in mesh_nodes:
         mesh = meshes[mesh_idx]
         node_name = node.get("name") or mesh.get("name") or stem
+        weights = node.get("weights", mesh.get("weights", ()))
         trans = tuple(float(v) for v in node.get("translation", (0.0, 0.0, 0.0)))
         has_node_skin = "skin" in node and node["skin"] is not None
         node_joint_names = (
@@ -1462,27 +1532,15 @@ def read_glb_parts(path: str) -> list[MeshPart]:
             attrs = prim.get("attributes", {})
             if "POSITION" not in attrs:
                 continue
-            positions = [tuple(float(x) for x in p) for p in read_accessor(attrs["POSITION"])]
+            weighted_targets = [(w, t) for w, t in zip(weights, prim.get("targets", ())) if w]
+            posed = {name: _read_posed_attribute(name, attrs, weighted_targets, read_accessor, doc["accessors"])
+                     for name in _MORPH_ATTRIBUTES if name in attrs}
+            positions = posed["POSITION"]
             if "indices" in prim:
                 raw_idx = [int(i) for i in read_accessor(prim["indices"])]
             else:
                 raw_idx = list(range(len(positions)))
             triangles = _normalize_triangles(raw_idx)
-            normals = (
-                [tuple(float(x) for x in n) for n in read_accessor(attrs["NORMAL"])]
-                if "NORMAL" in attrs else None
-            )
-            uvs = (
-                [tuple(float(x) for x in u) for u in read_accessor(attrs["TEXCOORD_0"])]
-                if "TEXCOORD_0" in attrs else None
-            )
-            colors = None
-            if "COLOR_0" in attrs:
-                raw_c = read_accessor(attrs["COLOR_0"])
-                colors = [
-                    (float(c[0]), float(c[1]), float(c[2]), float(c[3]) if len(c) > 3 else 1.0)
-                    for c in raw_c
-                ]
             joints_0 = (
                 [tuple(int(x) for x in j) for j in read_accessor(attrs["JOINTS_0"])]
                 if "JOINTS_0" in attrs else None
@@ -1542,9 +1600,9 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 triangles=triangles,
                 coord_space="y-up",
                 translation=trans,
-                normals=normals,
-                uvs=uvs,
-                colors=colors,
+                normals=posed.get("NORMAL"),
+                uvs=posed.get("TEXCOORD_0"),
+                colors=posed.get("COLOR_0"),
                 joints_0=joints_0,
                 weights_0=weights_0,
                 joints_1=joints_1,

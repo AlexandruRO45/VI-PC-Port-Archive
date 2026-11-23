@@ -12,6 +12,7 @@ TESTS = Path(__file__).resolve().parent
 TOOLS = TESTS.parent / "tools"
 sys.path[:0] = [str(TESTS), str(TOOLS)]
 from test_ped_assemble_malformed_glb import container, document
+from test_glb_skinning import Builder, build_glb
 import glb_skinning
 import ped_assemble
 
@@ -50,6 +51,80 @@ def triangle(index_type=5121, dense=True):
 
 
 class SparseGlbTests(unittest.TestCase):
+    def test_morphed_normals_uvs_and_rgb_deltas(self):
+        b = Builder()
+
+        def vectors(kind, row):
+            return b.add_accessor(struct.pack("<" + "f" * len(row), *row) * 3, 5126, kind, 3)
+
+        positions = b.add_accessor(struct.pack("<9f", 0, 0, 0, 1, 0, 0, 0, 1, 0), 5126, "VEC3", 3,
+                                   minimum=[0, 0, 0], maximum=[1, 1, 0])
+        attrs = {"POSITION": positions, "NORMAL": vectors("VEC3", (0, 1, 0)),
+                 "TEXCOORD_0": vectors("VEC2", (0.25, 0.5)), "COLOR_0": vectors("VEC4", (0.75, 0.25, 0, 0.5))}
+        color_delta = vectors("VEC3", (0.5, -0.5, 0.25))
+        targets = [{"NORMAL": vectors("VEC3", (1, 0, 0)), "TEXCOORD_0": vectors("VEC2", (-0.5, 0.25)),
+                    "COLOR_0": color_delta}, {"COLOR_0": color_delta}]
+        mesh = dict(primitives=[dict(attributes=attrs, targets=targets)], weights=[2, -1])
+        doc = b.document([mesh], [dict(mesh=0)], [], [0])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "posed.glb"
+            path.write_bytes(build_glb(doc, b.data))
+            part, = ped_assemble.read_glb_parts(path)
+        self.assertAlmostEqual(part.normals[0][0], 2 / 5**0.5)
+        self.assertAlmostEqual(part.normals[0][1], 1 / 5**0.5)
+        self.assertEqual(part.uvs[0], (-0.75, 1))
+        self.assertEqual(part.colors[0], (1, 0, 0.25, 0.5))
+
+    def test_invalid_morph_layout_and_implicit_row_budget(self):
+        doc, data = triangle(dense=False)
+        mesh = doc["meshes"][0]
+        prim = mesh["primitives"][0]
+        mesh["weights"] = [1]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "morph.glb"
+            for target, weights, reason in (({"POSITION": 7}, [1], "accessor"),
+                                            ({"NORMAL": 0}, [1], "no base"),
+                                            ({"POSITION": 0}, [], "weights"),
+                                            ({"POSITION": 0}, [True], "finite")):
+                prim["targets"] = [target]
+                doc["nodes"][0]["weights"] = weights
+                path.write_bytes(container(json.dumps(doc).encode(), bytes(data)))
+                with self.subTest(reason=reason), self.assertRaisesRegex(ped_assemble.PedAssembleError, reason):
+                    ped_assemble.read_glb_parts(path)
+            prim["targets"] = [{"POSITION": 0}]
+            for weight in (0, 1):
+                doc["nodes"][0]["weights"] = [weight]
+                path.write_bytes(container(json.dumps(doc).encode(), bytes(data)))
+                # Nine base/index rows consume the budget. An active sparse target consumes three more.
+                with patch.object(ped_assemble, "MAX_IMPLICIT_ACCESSOR_ROWS", 9):
+                    if weight:
+                        with self.assertRaisesRegex(ped_assemble.PedAssembleError, "per-file limit"):
+                            ped_assemble.read_glb_parts(path)
+                    else:
+                        self.assertEqual(len(ped_assemble.read_glb_parts(path)), 1)
+
+    def test_morph_pose_is_baked_per_instance_before_assembly(self):
+        doc, data = triangle(dense=False)
+        mesh = doc["meshes"][0]
+        mesh["weights"] = [0.5, -0.25]
+        # Share sparse accessor 0 between the base and both targets.
+        mesh["primitives"][0]["targets"] = [{"POSITION": 0}, {"POSITION": 0}]
+        doc["nodes"].extend([dict(mesh=0, weights=[-1, 2]), dict(mesh=0, weights=[0, 0])])
+        doc["scenes"][0]["nodes"] = [0, 1, 2]
+        with tempfile.TemporaryDirectory() as directory:
+            src, dst = Path(directory) / "morph.glb", Path(directory) / "parts.glb"
+            src.write_bytes(container(json.dumps(doc).encode(), bytes(data)))
+            run = subprocess.run([sys.executable, "-I", str(TOOLS / "ped_assemble.py"), "assemble",
+                                  str(src), "-o", str(dst), "--no-standing-offset", "--no-cull"],
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            result, binary, _ = glb_skinning.parse_glb(dst.read_bytes())
+        reader = glb_skinning._Reader(result, binary)
+        for output, scale in zip(result["meshes"], (1.25, 2, 1)):
+            attrs = output["primitives"][0]["attributes"]
+            rows, _ = reader.read(attrs["POSITION"], "baked positions")
+            self.assertEqual(rows, [(0, 0, 0), (scale, 0, 0), (0, 2 * scale, 0)])
+
     def test_assemble_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
             src, dst = Path(directory) / "in.glb", Path(directory) / "out.glb"
