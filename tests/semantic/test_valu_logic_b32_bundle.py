@@ -685,3 +685,44 @@ class TestNotB32ASTAndScalar(unittest.TestCase):
             "v_not_b32 v0, v0",
         ])
         self.assertEqual(val_inplace, 0xEDCBFFFF)
+
+
+# ------------------------------------------------------------------------------
+# v_not_b32 SIMD Divergence & Multi-Lane Properties
+# ------------------------------------------------------------------------------
+
+def step_not_simd(wave: SIMDWaveLogic, insn: VNotB32Instruction):
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.vgprs[insn.src0.index][lane]
+            wave.vgprs[insn.dst.index][lane] = ref_not_b32(s0)
+
+
+class TestNotB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveLogic(wave_size=32)
+        for i in range(32):
+            wave.vgprs[1][i] = 1 << i
+            wave.vgprs[0][i] = 0
+
+        insn = VNotB32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+        )
+        step_not_simd(wave, insn)
+
+        val_hw, _ = run_shader("ps_not_simd_lane", [
+            "v_mov_b32 v1, 0x10",
+            "v_not_b32 v0, v1",
+        ])
+        self.assertEqual(wave.vgprs[0][4], val_hw)
+        self.assertEqual(val_hw, (~0x10) & MASK32)
+
+    def test_algebraic_properties_hardware(self):
+        # Involution: ~(~a) == a
+        val_involution, _ = run_shader("ps_not_involution", [
+            "v_mov_b32 v1, 0x87654321",
+            "v_not_b32 v0, v1",
+            "v_not_b32 v0, v0",
+        ])
+        self.assertEqual(val_involution, 0x87654321)
