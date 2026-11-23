@@ -239,10 +239,10 @@ int main() {
     // The review case on #1911: program C in two containers whose kind-0 entries differ, translated to two
     // different modules (the second has another generator word in its header, still a valid module).
     const auto code_c = kind6(9100);
-    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
-                                library / "fspx" / "cs_c_state1.spv"));
+    const auto state1_spv = library / "fspx" / "cs_c_state1.spv";
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), state1_spv));
     {
-        std::ifstream in(LEONIDA_TEST_CS_SPV, std::ios::binary);
+        std::ifstream in(state1_spv, std::ios::binary);
         std::vector<char> words((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         EXPECT(words.size() > 12);
         words[8] ^= 0x5a;  // word 2: the generator
