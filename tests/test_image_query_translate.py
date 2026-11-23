@@ -186,7 +186,7 @@ class ImageGetResinfoTranslateTests(unittest.TestCase):
         self.assertIn("OpImageQueryLevels %int", spv)
 
     def test_unsupported_dims_and_mods_raise(self):
-        for dim in ("SQ_RSRC_IMG_1D", "SQ_RSRC_IMG_3D", "SQ_RSRC_IMG_CUBE", "SQ_RSRC_IMG_1D_ARRAY"):
+        for dim in ("SQ_RSRC_IMG_1D_ARRAY",):
             with self.subTest(dim=dim):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate_lines("ps_resinfo_bad_dim", [
@@ -195,7 +195,7 @@ class ImageGetResinfoTranslateTests(unittest.TestCase):
                         "exp mrt0 v4, v5, v6, v7 done vm",
                         "s_endpgm",
                     ])
-        for mod in ("a16", "d16"):
+        for mod in ("d16",):
             with self.subTest(mod=mod):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate_lines("ps_resinfo_bad_mod", [

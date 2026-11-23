@@ -270,6 +270,8 @@ class Gen:
         self.uses_query = False
         self.uses_tex_1d = False
         self.uses_tex_3d = False
+        self.uses_tex_2d_ms = False
+        self.uses_tex_2d_ms_array = False
         self.uses_v4uint = False
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
         self.uses_int_sampler = False    # 2D typed sampled-image types for sampling and gathering
@@ -12500,41 +12502,71 @@ class Gen:
         self.emit(f"OpBranch {L['end']}")
         self.emit(f"{L['end']} = OpLabel")
 
-    def resinfo_words(self, img, level, array_query, word3):
-        """[width, height, depth, levels] (int ids) of image_get_resinfo for the uint mip level `level`, as RDNA2
-        returns them (measured on gfx1036 with tools/image_query_probe.py, SHADER-388): the level count of the view;
-        past the last level (level >= levels, unsigned) width, height and depth are 0, and the size is not queried
-        there (OpImageQuerySizeLod is undefined past the view's levels); a 2D image's depth word is 0; a 2D array's
-        is its layer count minified like a 3D depth, max(1, layers >> (BASE_LEVEL + level)), BASE_LEVEL being T#
-        word 3 [15:12] (`word3`, a uint id), which is also the view's first level."""
+    def resinfo_words(self, img, level, dim, word3):
+        """[width, height, depth, levels/samples] (int ids) of image_get_resinfo for the uint mip level `level`, as
+        RDNA2 returns them (2D and 2D array measured on gfx1036 with tools/image_query_probe.py, SHADER-388): the
+        level count of the view (or sample count for MSAA, which has only level 0); past the last level
+        (level >= levels, unsigned) width, height and depth are 0, and OpImageQuerySizeLod is not called there
+        (undefined past the view's levels); unused spatial axes are 0; a 2D array's depth word is its layer count
+        minified like a 3D depth, max(1, layers >> (BASE_LEVEL + level)), BASE_LEVEL being T# word 3 [15:12]
+        (`word3`, a uint id); 3D uses OpImageQuerySizeLod %v3int directly; CUBE is bound as a 2D array of 6*N faces
+        and returns that face count; 1D uses scalar OpImageQuerySizeLod %int; MSAA uses OpImageQuerySize +
+        OpImageQuerySamples (no mipmaps)."""
+        if isinstance(dim, bool):
+            dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim else "dim:SQ_RSRC_IMG_2D"
         zero = self.as_int(self.cu(0))
+        if dim in ("dim:SQ_RSRC_IMG_2D_MSAA", "dim:SQ_RSRC_IMG_2D_MSAA_ARRAY"):
+            is_ms_array = dim == "dim:SQ_RSRC_IMG_2D_MSAA_ARRAY"
+            samples, ok, sz = (self.tmp() for _ in range(3))
+            self.emit(f"{samples} = OpImageQuerySamples %int {img}")
+            self.emit(f"{ok} = OpIEqual %bool {level} {self.cu(0)}")
+            self.emit(f"{sz} = OpImageQuerySize {'%v3int' if is_ms_array else '%v2int'} {img}")
+            n_axes = 3 if is_ms_array else 2
+            vals = []
+            for axis in range(n_axes):
+                extent = self.tmp()
+                self.emit(f"{extent} = OpCompositeExtract %int {sz} {axis}")
+                vals.append(extent)
+            if not is_ms_array:
+                vals.append(zero)
+            for i in range(n_axes):
+                kept = self.tmp()
+                self.emit(f"{kept} = OpSelect %int {ok} {vals[i]} {zero}")
+                vals[i] = kept
+            return vals + [samples]
         lv, lvu, ok, safe, sz = (self.tmp() for _ in range(5))
         self.emit(f"{lv} = OpImageQueryLevels %int {img}")
         self.emit(f"{lvu} = OpBitcast %uint {lv}")
         self.emit(f"{ok} = OpULessThan %bool {level} {lvu}")
         lod = self.as_int(level)
         self.emit(f"{safe} = OpSelect %int {ok} {lod} {zero}")
-        self.emit(f"{sz} = OpImageQuerySizeLod {'%v3int' if array_query else '%v2int'} {img} {safe}")
-        vals = []
-        for axis in range(3 if array_query else 2):
-            extent = self.tmp()
-            self.emit(f"{extent} = OpCompositeExtract %int {sz} {axis}")
-            vals.append(extent)
-        if array_query:
-            base, shift, layers, mini, at_least = (self.tmp() for _ in range(5))
-            self.emit(f"{base} = OpBitFieldUExtract %uint {word3} {self.cu(12)} {self.cu(4)}")
-            self.emit(f"{shift} = OpIAdd %uint {base} {level}")
-            self.emit(f"{layers} = OpBitcast %uint {vals[2]}")
-            self.emit(f"{mini} = OpShiftRightLogical %uint {layers} {shift}")
-            self.emit(f"{at_least} = OpExtInst %uint %glsl UMax {mini} {self.cu(1)}")
-            vals[2] = self.as_int(at_least)
+        if dim == "dim:SQ_RSRC_IMG_1D":
+            self.emit(f"{sz} = OpImageQuerySizeLod %int {img} {safe}")
+            vals = [sz, zero, zero]
+            n_axes = 1
         else:
-            vals.append(zero)
-        for i in range(3):
-            if i < 2 or array_query:
-                kept = self.tmp()
-                self.emit(f"{kept} = OpSelect %int {ok} {vals[i]} {zero}")
-                vals[i] = kept
+            has_z = dim in ("dim:SQ_RSRC_IMG_2D_ARRAY", "dim:SQ_RSRC_IMG_3D", "dim:SQ_RSRC_IMG_CUBE")
+            self.emit(f"{sz} = OpImageQuerySizeLod {'%v3int' if has_z else '%v2int'} {img} {safe}")
+            n_axes = 3 if has_z else 2
+            vals = []
+            for axis in range(n_axes):
+                extent = self.tmp()
+                self.emit(f"{extent} = OpCompositeExtract %int {sz} {axis}")
+                vals.append(extent)
+            if dim == "dim:SQ_RSRC_IMG_2D_ARRAY":
+                base, shift, layers, mini, at_least = (self.tmp() for _ in range(5))
+                self.emit(f"{base} = OpBitFieldUExtract %uint {word3} {self.cu(12)} {self.cu(4)}")
+                self.emit(f"{shift} = OpIAdd %uint {base} {level}")
+                self.emit(f"{layers} = OpBitcast %uint {vals[2]}")
+                self.emit(f"{mini} = OpShiftRightLogical %uint {layers} {shift}")
+                self.emit(f"{at_least} = OpExtInst %uint %glsl UMax {mini} {self.cu(1)}")
+                vals[2] = self.as_int(at_least)
+            elif not has_z:
+                vals.append(zero)
+        for i in range(n_axes):
+            kept = self.tmp()
+            self.emit(f"{kept} = OpSelect %int {ok} {vals[i]} {zero}")
+            vals[i] = kept
         return vals + [lv]
 
     def emit_image_atomic_extra(self, op, ip, iv, vdata, mods):
@@ -12645,7 +12677,16 @@ class Gen:
         if a and a[0]["k"] != "vgpr":      # `off`, an SGPR or a constant where the VGPR range of the data goes
             raise Unsupported(op + " data")
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
-        array_query = op == "image_get_resinfo" and dim == "dim:SQ_RSRC_IMG_2D_ARRAY"
+        RESINFO_DIMS = {
+            "dim:SQ_RSRC_IMG_1D": ("uses_tex_1d", "%_ptr_UC_img1", "%images_1d", "%img1d"),
+            "dim:SQ_RSRC_IMG_2D": (None, "%_ptr_UC_img", "%images", "%img2d"),
+            "dim:SQ_RSRC_IMG_2D_ARRAY": ("uses_tex_array", "%_ptr_UC_imga", "%images_arr", "%img2da"),
+            "dim:SQ_RSRC_IMG_3D": ("uses_tex_3d", "%_ptr_UC_img3", "%images_3d", "%img3d"),
+            "dim:SQ_RSRC_IMG_CUBE": ("uses_tex_array", "%_ptr_UC_imga", "%images_arr", "%img2da"),
+            "dim:SQ_RSRC_IMG_2D_MSAA": ("uses_tex_2d_ms", "%_ptr_UC_img2dms", "%images_2dms", "%img2dms"),
+            "dim:SQ_RSRC_IMG_2D_MSAA_ARRAY": ("uses_tex_2d_ms_array", "%_ptr_UC_img2dmsa", "%images_2dmsa", "%img2dmsa"),
+        }
+        resinfo_query = op == "image_get_resinfo" and dim in RESINFO_DIMS
         is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap" or op in self.IMG_ATOMICS_EXTRA
         is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and is_atomic
         if op == "image_store":
@@ -12673,8 +12714,8 @@ class Gen:
                                   vdata, xs[3], d16="d16" in mods)
             return
         packed_mip = op == "image_load_mip" and "tfe" not in mods and "lwe" not in mods
-        if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))
-                or ("a16" in mods and not (is_atomic or packed_mip))
+        if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or resinfo_query))
+                or ("a16" in mods and not (is_atomic or packed_mip or resinfo_query))
                 or ("d16" in mods and op != "image_load_mip")):
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
@@ -12783,19 +12824,23 @@ class Gen:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
             return
         ip, img = self.tmp(), self.tmp()
-        if array_query:
-            self.uses_tex_array = True
-            self.dynamic_sampled_access(ip, "%_ptr_UC_imga", "%images_arr", idx)
-            self.emit(f"{img} = OpLoad %img2da {ip}")
-        else:
-            self.dynamic_sampled_access(ip, "%_ptr_UC_img", "%images", idx)
-            self.emit(f"{img} = OpLoad %img2d {ip}")
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
         self.uses_query = True
         if op == "image_get_resinfo":
-            vals = self.resinfo_words(img, self.load_reg("vgpr", addr[0]), array_query,
-                                      self.load_reg("sgpr", a[2]["r"] + 3))
+            if len(addr) < 1:
+                raise Unsupported("image_get_resinfo coords")
+            flag, ptr_ty, arr_var, img_ty = RESINFO_DIMS[dim]
+            if flag:
+                setattr(self, flag, True)
+            self.dynamic_sampled_access(ip, ptr_ty, arr_var, idx)
+            self.emit(f"{img} = OpLoad {img_ty} {ip}")
+            level = self.load_reg("vgpr", addr[0])
+            if "a16" in mods:
+                lo = self.tmp()
+                self.emit(f"{lo} = OpBitwiseAnd %uint {level} {self.cu(0xFFFF)}")
+                level = lo
+            vals = self.resinfo_words(img, level, dim, self.load_reg("sgpr", a[2]["r"] + 3))
             out = 0
             for c in range(4):
                 if dmask >> c & 1:
@@ -12804,6 +12849,8 @@ class Gen:
                     self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, u)
                     out += 1
             return
+        self.dynamic_sampled_access(ip, "%_ptr_UC_img", "%images", idx)
+        self.emit(f"{img} = OpLoad %img2d {ip}")
         # image_load_mip: x, y, mip, with the same typed SRV as image_load.
         packed = "a16" in mods
         if len(addr) < (2 if packed else 3):
@@ -13901,7 +13948,9 @@ def assemble(gen):
     if tex:
         iface += ["%images", "%samplers", "%desc_map"] + (["%images_arr"] if gen.uses_tex_array else []) + \
                  (["%simages"] if gen.uses_storage else []) + (["%images_1d"] if gen.uses_tex_1d else []) + \
-                 (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
+                 (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else []) + \
+                 (["%images_2dms"] if gen.uses_tex_2d_ms else []) + \
+                 (["%images_2dmsa"] if gen.uses_tex_2d_ms_array else [])
     if sg:
         iface += ["%sg_lane"]
     if gen.writes_depth:
@@ -14160,6 +14209,18 @@ def assemble(gen):
                       "%_ptr_UC_rt_img1 = OpTypePointer UniformConstant %rt_img1",
                       "%_ptr_UC_img1 = OpTypePointer UniformConstant %img1d"]
             dec += ["OpDecorate %images_1d DescriptorSet 0", "OpDecorate %images_1d Binding 5"]
+        if gen.uses_tex_2d_ms:
+            types += ["%img2dms = OpTypeImage %float 2D 0 0 1 1 Unknown",
+                      "%rt_img2dms = OpTypeRuntimeArray %img2dms",
+                      "%_ptr_UC_rt_img2dms = OpTypePointer UniformConstant %rt_img2dms",
+                      "%_ptr_UC_img2dms = OpTypePointer UniformConstant %img2dms"]
+            dec += ["OpDecorate %images_2dms DescriptorSet 0", "OpDecorate %images_2dms Binding 20"]
+        if gen.uses_tex_2d_ms_array:
+            types += ["%img2dmsa = OpTypeImage %float 2D 0 1 1 1 Unknown",
+                      "%rt_img2dmsa = OpTypeRuntimeArray %img2dmsa",
+                      "%_ptr_UC_rt_img2dmsa = OpTypePointer UniformConstant %rt_img2dmsa",
+                      "%_ptr_UC_img2dmsa = OpTypePointer UniformConstant %img2dmsa"]
+            dec += ["OpDecorate %images_2dmsa DescriptorSet 0", "OpDecorate %images_2dmsa Binding 21"]
         if gen.uses_storage:
             types += ["%simg2d_u = OpTypeImage %uint 2D 0 0 0 2 R32ui", "%rt_simg = OpTypeRuntimeArray %simg2d_u",
                       "%_ptr_UC_rt_simg = OpTypePointer UniformConstant %rt_simg",
@@ -14437,6 +14498,10 @@ def assemble(gen):
             gvars += ["%images_1d = OpVariable %_ptr_UC_rt_img1 UniformConstant"]
         if gen.uses_tex_3d:
             gvars += ["%images_3d = OpVariable %_ptr_UC_rt_img3 UniformConstant"]
+        if gen.uses_tex_2d_ms:
+            gvars += ["%images_2dms = OpVariable %_ptr_UC_rt_img2dms UniformConstant"]
+        if gen.uses_tex_2d_ms_array:
+            gvars += ["%images_2dmsa = OpVariable %_ptr_UC_rt_img2dmsa UniformConstant"]
         if gen.uses_storage3d:
             gvars += ["%simages3d = OpVariable %_ptr_UC_rt_simg3 UniformConstant"]
     if vs:
