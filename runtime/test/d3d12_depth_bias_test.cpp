@@ -80,14 +80,17 @@ int main() {
     }
 
     unsigned scenarios = 0, failures = 0;
-    // The whole scenario suite runs twice: on a native D32_FLOAT depth target, and on D24_UNORM_S8_UINT forced
+    // The whole scenario suite runs three times: on a native D32_FLOAT depth target; on D24_UNORM_S8_UINT forced
     // through the D24-less path (LEONIDA_D24_AS_D32: D32_SFLOAT_S8_UINT backing, the patched pixel stage of
     // depth24_fragment.h) — a GPU without D24 gets the same bias behaviour, so RSSetDepthBias must work there too,
-    // through the push-constant block the patched stage reads. The expected columns are the same on both: D24's
-    // r is fixed (no exponent scaling), and one column spans 2^17 of its steps.
-    const auto run_suite = [&](DXGI_FORMAT dsv_format, const char* suite) -> int {
+    // through the push-constant block the patched stage reads; and once more with the patch refused
+    // (LEONIDA_D24_PATCH_REFUSE), where the shader keeps float depth and the rasterizer's bias applies, so the
+    // dynamic values must travel the normal vkCmdSetDepthBias route. The expected columns are the same on all
+    // three: every scenario is clamp- or slope-driven, and one column spans 2^17 of D24's steps.
+    const auto run_suite = [&](DXGI_FORMAT dsv_format, const char* suite, bool refuse_patch) -> int {
         EXPECT(_putenv(dsv_format == DXGI_FORMAT_D24_UNORM_S8_UINT ? "LEONIDA_D24_AS_D32=1"
                                                                    : "LEONIDA_D24_AS_D32=0") == 0);
+        EXPECT(_putenv(refuse_patch ? "LEONIDA_D24_PATCH_REFUSE=1" : "LEONIDA_D24_PATCH_REFUSE=0") == 0);
         std::printf("%s\n", suite);
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -371,19 +374,24 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
         return 0;
     };
-    const int suites = run_suite(DXGI_FORMAT_D32_FLOAT, "native D32_FLOAT depth:") |
+    const int suites = run_suite(DXGI_FORMAT_D32_FLOAT, "native D32_FLOAT depth:", false) |
                        run_suite(DXGI_FORMAT_D24_UNORM_S8_UINT,
-                                 "D24_UNORM_S8_UINT depth stored as D32 (the D24-less path, LEONIDA_D24_AS_D32):");
+                                 "D24_UNORM_S8_UINT depth stored as D32 (the D24-less path, LEONIDA_D24_AS_D32):",
+                                 false) |
+                       run_suite(DXGI_FORMAT_D24_UNORM_S8_UINT,
+                                 "D24 stored as D32, the pixel-stage patch refused (the rasterizer fallback):",
+                                 true);
     std::filesystem::remove_all(library);
     EXPECT(!failures);
-    EXPECT(scenarios == 16);
+    EXPECT(scenarios == 24);
     EXPECT(suites == 0);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
     std::printf("RSSetDepthBias: %u scenarios matched (static, override, persistence, Reset, ClearState, ignored "
-                "without the flag, zero, slope bounds) on a %ux%u target, on native D32 and on D24 stored as D32\n",
+                "without the flag, zero, slope bounds) on a %ux%u target, on native D32, on D24 stored as D32, and "
+                "on the patch-refused rasterizer fallback\n",
                 scenarios, target_size, target_size);
     return 0;
 }

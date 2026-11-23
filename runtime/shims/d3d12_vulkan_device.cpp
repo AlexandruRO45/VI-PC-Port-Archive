@@ -2781,20 +2781,15 @@ public:
         // A dynamic PSO's pixel stage reads the bias from push constants instead of the baked values, so
         // RSSetDepthBias applies on D24-as-D32 too: replay pushes the values it resolved for the draw into a
         // {constant, clamp, slope} block past the 144 root-data bytes (vk.set_depth_bias would be a no-op — the
-        // rasterizer's bias is off here — and its float scaling is the wrong units for D24's fixed r).
+        // rasterizer's bias is off here — and its float scaling is the wrong units for D24's fixed r). The patch
+        // can still refuse the shader below (early fragment tests, say), which turns depth24_fragment off and
+        // restores the rasterizer's bias: the dynamic flag is re-derived after that, not taken from here.
         const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
                                                 desc.RasterizerState.SlopeScaledDepthBias,
                                                 desc.RasterizerState.DepthBiasClamp,
                                                 depth24_fragment && dynamic_depth_bias
                                                     ? std::uint32_t(sizeof(leonida::ShaderUserData))
                                                     : 0u};
-        if (depth24_bias.dynamic() &&
-            device_.info.max_push_constants_size < sizeof(leonida::ShaderUserData) + sizeof(leonida::DepthBias)) {
-            log_once("D24 stored as D32 with dynamic depth bias needs 156 bytes of push constants; "
-                     "maxPushConstantsSize",
-                     int(device_.info.max_push_constants_size));
-            return E_NOTIMPL;
-        }
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             stage.fssm = leonida::fssm_program(
@@ -2857,6 +2852,15 @@ public:
             if (depth24_fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
                 std::string why;
                 std::vector<std::uint32_t> patched = leonida::depth24_patch_fragment(stage.words, depth24_bias, why);
+                // LEONIDA_D24_PATCH_REFUSE: exercise the fallback (the shader keeps float depth, the rasterizer's
+                // bias applies) on a shader the patch would normally accept, so tests cover it on any GPU.
+                char refuse[8];
+                std::size_t refuse_len = 0;
+                if (getenv_s(&refuse_len, refuse, "LEONIDA_D24_PATCH_REFUSE") == 0 && refuse_len > 1 &&
+                    refuse[0] != '0') {
+                    patched.clear();
+                    why = "the patch is refused by LEONIDA_D24_PATCH_REFUSE (the fallback test seam)";
+                }
                 if (patched.empty()) {
                     std::fprintf(stderr, "[rt] d3d12: %s keeps float depth on a D24 target stored as D32: %s\n",
                                  stage.entry->name.c_str(), why.c_str());
@@ -2892,6 +2896,16 @@ public:
             info.module = module;
             info.pName = "main";
             stage_infos.push_back(info);
+        }
+        // Past the patch fallback above: a refused shader keeps float depth and the rasterizer's bias, so the
+        // dynamic values travel the normal vkCmdSetDepthBias route there, not push constants no stage reads.
+        const bool depth24_dynamic = depth24_fragment && dynamic_depth_bias;
+        if (depth24_dynamic &&
+            device_.info.max_push_constants_size < sizeof(leonida::ShaderUserData) + sizeof(leonida::DepthBias)) {
+            log_once("D24 stored as D32 with dynamic depth bias needs 156 bytes of push constants; "
+                     "maxPushConstantsSize",
+                     int(device_.info.max_push_constants_size));
+            return E_NOTIMPL;
         }
 
         // Input layout -> vertex input, by semantic.
@@ -3170,10 +3184,10 @@ public:
         // vkCmdPushConstants over those bytes must name all the range's stages
         // (VUID-vkCmdPushConstants-offset-01796), so the fragment bit joins the mask — the patched stage is a
         // fragment shader even when the pipeline has no pixel shader of its own (depth-only passes).
-        if (depth24_bias.dynamic()) graphics_.push_stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
+        if (depth24_dynamic) graphics_.push_stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
         const VkPushConstantRange push{graphics_.push_stages, 0,
                                        sizeof(leonida::ShaderUserData) +
-                                           (depth24_bias.dynamic() ? sizeof(leonida::DepthBias) : 0u)};
+                                           (depth24_dynamic ? sizeof(leonida::DepthBias) : 0u)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -3205,13 +3219,13 @@ public:
         // cannot honour). On D24-as-D32 the rasterizer's copy stays zero (skipped above), so the default is the
         // desc's own values, in the RSSetDepthBias units the patched pixel stage scales itself; the clamp runs in
         // the shader there, so the device feature is not asked for.
-        graphics_.depth_bias = depth24_bias.dynamic()
+        graphics_.depth_bias = depth24_dynamic
                                    ? leonida::DepthBias{float(r.DepthBias), r.DepthBiasClamp,
                                                         r.SlopeScaledDepthBias}
                                    : leonida::DepthBias{raster.depthBiasConstantFactor, raster.depthBiasClamp,
                                                         raster.depthBiasSlopeFactor};
         graphics_.depth_bias_dynamic = dynamic_depth_bias;
-        graphics_.depth_bias24_dynamic = depth24_bias.dynamic();
+        graphics_.depth_bias24_dynamic = depth24_dynamic;
         graphics_.depth_bias_clamp_supported = device_.info.features.depthBiasClamp == VK_TRUE;
         graphics_.pipeline = build(0);
         if (!graphics_.pipeline) return E_FAIL;
