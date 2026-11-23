@@ -275,5 +275,75 @@ class TestMed3I32AST(unittest.TestCase):
         self.assertEqual(words[0], ref_med3_i32(100, -200, 0))
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter (Commit 3)
+# ==============================================================================
+
+class ScalarCpuState:
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.exec_mask: int = 0xFFFFFFFFFFFFFFFF
+
+    def resolve_operand(self, op: OperandAST) -> int:
+        if op.kind == OperandKind.REG:
+            assert op.reg is not None
+            if op.reg.reg_type == RegType.VGPR:
+                return self.vgprs[op.reg.index]
+            else:
+                return self.sgprs[op.reg.index]
+        elif op.kind in (OperandKind.INLINE_INT, OperandKind.LITERAL_INT):
+            assert op.imm is not None
+            return u32(op.imm)
+        raise ValueError(f"Unknown operand kind {op.kind}")
+
+    def execute_med3_i32(self, inst: Med3I32InstructionAST) -> int:
+        s0 = self.resolve_operand(inst.src0)
+        s1 = self.resolve_operand(inst.src1)
+        s2 = self.resolve_operand(inst.src2)
+        res = ref_med3_i32(s0, s1, s2)
+        self.vgprs[inst.dst.index] = res
+        return res
+
+
+class TestMed3I32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interp_sequential_execution(self):
+        state = ScalarCpuState()
+        state.vgprs[1] = u32(50)
+        state.vgprs[2] = u32(-10)
+        state.vgprs[3] = u32(20)
+
+        inst1 = parse_med3_i32_asm("v_med3_i32 v4, v1, v2, v3")
+        res1 = state.execute_med3_i32(inst1)
+        self.assertEqual(res1, 20)
+        self.assertEqual(state.vgprs[4], 20)
+
+        # Chain output into another med3
+        state.vgprs[5] = u32(100)
+        inst2 = parse_med3_i32_asm("v_med3_i32 v6, v4, v5, 10")
+        res2 = state.execute_med3_i32(inst2)
+        self.assertEqual(res2, 20)  # median of (20, 100, 10) is 20
+        self.assertEqual(state.vgprs[6], 20)
+
+    def test_scalar_interp_matches_shader_execution(self):
+        triples = [
+            (-30, 40, -10),
+            (0x7FFFFFFF, 0, 0x80000000),
+            (-1, -2, -3),
+        ]
+        for s0, s1, s2 in triples:
+            state = ScalarCpuState()
+            state.vgprs[1] = u32(s0)
+            state.vgprs[2] = u32(s1)
+            state.vgprs[3] = u32(s2)
+            inst = parse_med3_i32_asm("v_med3_i32 v0, v1, v2, v3")
+            expected = state.execute_med3_i32(inst)
+
+            shader_res = run_shader_med3_i32(s0, s1, s2)
+            self.assertEqual(expected, shader_res)
+
+
 if __name__ == "__main__":
     unittest.main()
