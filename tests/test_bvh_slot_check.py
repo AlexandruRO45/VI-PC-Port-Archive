@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -203,6 +204,31 @@ class SlotControls(unittest.TestCase):
         self.assertEqual(bodies, [body, None, body])
         with self.assertRaises(ValueError):
             S.slots(desc, block)
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only file attribute")
+    def test_read_only_evidence_replace_preserves_output_and_removes_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "evidence.json"
+            original = b'{"manifest_items": 0}\n'
+            record = {"manifest_items": 1}
+            path.write_bytes(original)
+            try:
+                path.chmod(stat.S_IREAD)
+                with self.assertRaises(PermissionError) as raised:
+                    S.save_evidence(path, record)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertTrue(path.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+                self.assertEqual(set(root.iterdir()), {path})
+                error = raised.exception
+                self.assertIn(str(path), (error.filename, error.filename2))
+            finally:
+                # A failed cleanup can leave both the output and staging file read-only.
+                for entry in root.iterdir():
+                    entry.chmod(stat.S_IWRITE)
+
+            S.save_evidence(path, record)
+            self.assertEqual(json.loads(path.read_bytes()), record)
 
 
 if __name__ == "__main__":
