@@ -81,8 +81,9 @@ def pick(names, wanted):
 def find_exe(explicit):
     if explicit:
         return Path(explicit)
-    root = HERE.parent
-    for c in (root / "runtime" / "build" / "bink_play.exe", root / "runtime" / "build" / "Release" / "bink_play.exe"):
+    build = HERE.parent / "runtime" / "build"
+    for directory in (build, build / "Release", build / "RelWithDebInfo"):
+        c = directory / "bink_play.exe"
         if c.is_file():
             return c
     raise SystemExit("bink_play.exe not found; build the runtime (runtime/build) or pass --exe")
@@ -99,7 +100,7 @@ def main(argv=None):
     ap.add_argument("--game-dir", default=os.environ.get("LEONIDA_GAME_DIR"), help="the package folder")
     ap.add_argument("--archive", default="movies.rpf", help="the archive holding the movie (default movies.rpf)")
     ap.add_argument("--mount", default="common.rpf", help="where the mount lists are (default common.rpf)")
-    ap.add_argument("--exe", help="bink_play.exe (default runtime/build/bink_play.exe)")
+    ap.add_argument("--exe", help="override bink_play.exe discovery in runtime/build, Release or RelWithDebInfo")
     ap.add_argument("--list", action="store_true", help="list the names, filtered by NAME if given")
     ap.add_argument("--no-cache", action="store_true", help="name the streams again and keep nothing")
     a = ap.parse_args(argv)

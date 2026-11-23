@@ -35,6 +35,17 @@ class PickTest(unittest.TestCase):
         self.assertEqual(bink_play.pick(NAMES, "credits"), (None, []))
 
 
+class PlayerDiscoveryTest(unittest.TestCase):
+    def test_documented_multiconfig_build_needs_no_exe_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            player = root / "runtime" / "build" / "RelWithDebInfo" / "bink_play.exe"
+            player.parent.mkdir(parents=True)
+            player.touch()
+            with mock.patch.object(bink_play, "HERE", root / "tools"):
+                self.assertEqual(bink_play.find_exe(None), player)
+
+
 class CacheTest(unittest.TestCase):
     def test_the_table_is_named_once_and_rebuilt_when_the_archive_changes(self):
         with tempfile.TemporaryDirectory() as d:
