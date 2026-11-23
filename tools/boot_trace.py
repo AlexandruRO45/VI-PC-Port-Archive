@@ -131,18 +131,19 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["debug_strings"] += 1
             elif kind == "exception":
                 trace["exception_count"] += 1
+                stack = event.get("stack")
+                exc = {
+                    "code": event.get("code"),
+                    "at": event.get("at"),
+                    "cpp": event.get("cpp"),
+                    "access": event.get("access"),
+                    "address": event.get("address"),
+                    "stack": stack[:8] if isinstance(stack, list) else [],
+                }
                 if len(trace["exceptions"]) < limit:
-                    stack = event.get("stack")
-                    trace["exceptions"].append(
-                        {
-                            "code": event.get("code"),
-                            "at": event.get("at"),
-                            "cpp": event.get("cpp"),
-                            "access": event.get("access"),
-                            "address": event.get("address"),
-                            "stack": stack[:8] if isinstance(stack, list) else [],
-                        }
-                    )
+                    trace["exceptions"].append(exc)
+                else:
+                    trace["last_exception"] = exc
             elif kind == "exit":
                 trace["exit"] = event.get("code")
             elif kind == "error":
@@ -238,7 +239,14 @@ def format_text(summary: dict, limit: int) -> str:
             out.append(f"  debug strings: {startup['debug_strings']} (text not shown)")
         if startup["exception_count"]:
             out.append(f"  exceptions: {startup['exception_count']}")
-            for exc in startup["exceptions"][:limit]:
+            sampled = startup["exceptions"]
+            details = [("code", exc) for exc in sampled[:limit]]
+            last = startup.get("last_exception")
+            if last is None and len(sampled) > limit:
+                last = sampled[-1]
+            if last is not None:
+                details.append(("last observed exception: code", last))
+            for label, exc in details:
                 cpp = exc.get("cpp")
                 detail = " (C++ throw)" if cpp is True else f" ({cpp})" if cpp else ""
                 if exc.get("access"):
@@ -246,7 +254,7 @@ def format_text(summary: dict, limit: int) -> str:
                     if exc.get("address"):
                         detail += f" {exc['address']}"
                     detail += ")"
-                out.append(f"    code {exc['code']} at {exc['at']}{detail}")
+                out.append(f"    {label} {exc['code']} at {exc['at']}{detail}")
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
         if startup["error"]:
@@ -284,7 +292,8 @@ def main(argv=None) -> int:
     ap.add_argument("--d3d12", help="the stderr log written with --trace-d3d12")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     ap.add_argument(
-        "--limit", type=int, default=10, help="items listed per section (default 10)"
+        "--limit", type=int, default=10,
+        help="items listed per section (default 10), plus the last observed exception if omitted",
     )
     a = ap.parse_args(argv)
     if not a.startup and not a.d3d12:

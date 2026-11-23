@@ -135,7 +135,37 @@ class BootTraceTests(unittest.TestCase):
             trace["exceptions"][0]["stack"], ["game.exe+0x40", "game.exe+0x120"]
         )
         self.assertIs(trace["exceptions"][1]["cpp"], True)
+        self.assertNotIn("last_exception", trace)
         self.assertEqual(trace["exit"], 0)
+
+    def test_last_observed_exception_is_reported_beyond_limit(self):
+        first = {"seq": 2, "kind": "exception", "code": "0xe06d7363",
+                 "at": "fixture.exe+0x10", "cpp": True}
+        middle = dict(first, seq=3, at="fixture.exe+0x20")
+        last = {"seq": 4, "kind": "exception", "code": "0xc0000005",
+                "at": "last.dll+0x32", "stack": ["last.dll+0x46"]}
+        self.write(self.startup, [STARTUP[0], first, middle, last, {"seq": 5, "kind": "exit", "code": 0}])
+
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(bt.main([self.startup, "--limit", "1", "--json"]), 0)
+        summary = json.loads(output.getvalue())
+        startup = summary["startup"]
+        self.assertEqual(startup["exception_count"], 3)
+        self.assertEqual([e["at"] for e in startup["exceptions"]], [first["at"]])
+        self.assertIn("last_exception", startup)
+        self.assertEqual(startup["last_exception"]["at"], last["at"])
+        self.assertEqual(startup["last_exception"]["stack"], last["stack"])
+        self.assertEqual(startup["exit"], 0)
+
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(bt.main([self.startup, "--limit", "1"]), 0)
+        text = output.getvalue()
+        self.assertIn("code 0xe06d7363 at fixture.exe+0x10", text)
+        self.assertIn("last observed exception: code 0xc0000005 at last.dll+0x32", text)
+        self.assertIn("stack: last.dll+0x46", text)
+        self.assertNotIn(middle["at"], text)
+        full = bt.summarize(bt.parse_startup(self.startup), None)
+        self.assertIn("last observed exception: code 0xc0000005 at last.dll+0x32", bt.format_text(full, 1))
 
     def test_debug_text_is_not_printed(self):
         self.write(self.startup, STARTUP)
