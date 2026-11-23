@@ -117,17 +117,26 @@ def git_bash():
     return None
 
 
+def at_repository_root(root) -> bool:
+    """Whether `root` is the top level of the repository around it. `git ls-files` answers for that repository
+    either way: for a folder that merely sits inside it (a .git in the home folder makes every temporary folder one)
+    it exits 0 and lists nothing of the folder's own, so an empty listing is kept only at a top level."""
+    try:
+        p = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=root, capture_output=True, text=True)
+    except OSError:
+        return False
+    return p.returncode == 0 and not p.stdout.strip()
+
+
 def tracked_under_tests(root):
     try:
         result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
-        # An empty listing is not trusted either. For a folder that only sits inside another repository (a .git in
-        # the home folder makes every temporary folder one) git answers 0 and lists nothing, and the scan then saw
-        # no test file at all.
-        if result.returncode == 0 and result.stdout:
+        if result.returncode == 0 and (result.stdout or at_repository_root(root)):
             return [n for n in result.stdout.split("\0") if n]
     except OSError:
         pass
-    names = []                                     # no git, or no listing: walk, as tests/test_docs_links.py does
+    names = []                                     # no git, or a folder inside another repository: walk, as
+                                                   # tests/test_docs_links.py does
     for base, dirs, files in os.walk(os.path.join(root, "tests")):
         dirs[:] = [d for d in dirs if d not in (".git", "third_party", "__pycache__")]
         for name in files:
@@ -344,14 +353,31 @@ class RepositoryRegistrationTest(unittest.TestCase):
         self.assertGreaterEqual(len(files), 300)
         self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
 
-    def test_the_scan_falls_back_when_git_lists_nothing(self):
-        # A folder that only sits inside another repository: git answers 0 and lists nothing, which must not read
-        # as a repository without test files. In a temporary folder it made the scan below raise KeyError.
-        done = subprocess.CompletedProcess(["git", "ls-files"], 0, stdout="")
-        with mock.patch("subprocess.run", return_value=done):
+    def test_the_scan_falls_back_in_a_folder_inside_another_repository(self):
+        # git answers 0 and lists nothing for a folder that is not its repository's top level, which must not read
+        # as a repository without test files. With a .git in the home folder every temporary folder is one, and the
+        # scan below raised KeyError there.
+        def git(cmd, **kwargs):
+            if cmd[1] == "rev-parse":
+                return subprocess.CompletedProcess(cmd, 0, stdout="checkout/fixture/\n")   # below the top level
+            return subprocess.CompletedProcess(cmd, 0, stdout="")                        # nothing of the folder's own
+        with mock.patch("subprocess.run", side_effect=git):
             files = tracked_under_tests(ROOT)
         self.assertGreaterEqual(len(files), 300)
         self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
+
+    def test_the_scan_keeps_an_empty_listing_at_a_repository_root(self):
+        # At a top level the listing is the tracked files and nothing else: a file on disk that git ignores stays out.
+        def git(cmd, **kwargs):
+            if cmd[1] == "rev-parse":
+                return subprocess.CompletedProcess(cmd, 0, stdout="\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "tests"))
+            with open(os.path.join(tmp, "tests", "test_local.py"), "w", encoding="utf-8") as f:
+                f.write("x = 1\n")
+            with mock.patch("subprocess.run", side_effect=git):
+                self.assertEqual(tracked_under_tests(tmp), [])
 
     def test_every_test_file_is_selected_by_a_job(self):
         unselected = [f for f in self.files if job_of(ROOT, f, self.rules) is None]
