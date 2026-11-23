@@ -2097,7 +2097,11 @@ class Gen:
         vd = a[0]
         if vd["k"] != "vgpr" or vd.get("n", 1) != 1:
             raise Unsupported(op + " data")
-        addr, _, in_b, step = self.buffer_address(a, mods, elem="fmt", fixed_fmt=1 if nbytes == 1 else 7)
+        # elem=nbytes, not "fmt": the bounds check is the same (a 1- or 2-byte element), and only the raw form returns
+        # the scratch-swizzle `step`. A short at byte 3 writes its high byte into the next swizzled dword (+4*IS), as
+        # the loads read it (measured natively on gfx1036, wave32 and wave64: tools/buffer_swizzle_probe.py,
+        # multi_dword_stepping); with "fmt" the store wrote the linear next dword, the next lane's.
+        addr, _, in_b, step = self.buffer_address(a, mods, elem=nbytes)
         old = self.load_reg("vgpr", vd["r"])
         cond = self.tmp()
         self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")

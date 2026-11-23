@@ -146,5 +146,47 @@ class BufferSubDword(unittest.TestCase):
             [parse_line("\tbuffer_load_ushort v5, v1, s[8:11], 0 offen")]), {1})
 
 
+# Scratch swizzle (SWIZZLE_ENABLE=1, idxen=0, ADD_TID_ENABLE=1): a 16-bit access at byte 3 of a lane's dword reaches
+# the next swizzled dword, 4 * index_stride bytes on, for loads and stores alike. Measured natively on gfx1036, wave32
+# and wave64 (tools/buffer_swizzle_probe.py, multi_dword_stepping, scratch_swz_load_ushort_cross and
+# scratch_swz_store_short_cross): until then buffer_store_short wrote the linear next dword, the next lane's.
+SWZ_BASE, SWZ_LANE, SWZ_IS = 0x1000, 5, 16
+SWZ_DWORD = SWZ_BASE + 4 * SWZ_LANE                 # lane 5's dword (index_stride 16, stride 16, offset 0)
+SWZ_LINEAR, SWZ_NEXT = SWZ_DWORD + 4, SWZ_DWORD + 4 * SWZ_IS
+
+
+def run_scratch_swizzle(body):
+    """s[8:11]: stride 16, SWIZZLE_ENABLE, num_records 16, index stride 16, ADD_TID_ENABLE, RAW (mode 3); lane 5 only."""
+    w3 = 0x01000FAC | (22 << 12) | (1 << 21) | (1 << 23) | (3 << 28)
+    vsharp = [f"s_mov_b32 s8, {SWZ_BASE:#x}", f"s_mov_b32 s9, {(16 << 16) | (1 << 31):#x}", "s_mov_b32 s10, 16",
+              f"s_mov_b32 s11, {w3:#x}", f"v_cmpx_eq_u32_e32 {SWZ_LANE}, v0"]
+    mem = {a: 0x5EED0000 | (a & 0xFFFF) for a in (SWZ_DWORD, SWZ_LINEAR, SWZ_NEXT)}
+    si.run_workgroup(translate(vsharp + body), 8, 32,
+                     inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                     push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 28, memory=mem)
+    return mem
+
+
+class ScratchSwizzleCrossing(unittest.TestCase):
+    def test_store_short_at_byte_3_writes_the_next_swizzled_dword(self):
+        for op, shift in (("buffer_store_short", 0), ("buffer_store_short_d16_hi", 16)):
+            with self.subTest(op=op):
+                data = 0x12345678 if shift else 0xCCCC1234
+                lo, hi = (data >> shift) & 0xFF, (data >> (shift + 8)) & 0xFF
+                mem = run_scratch_swizzle(["v_mov_b32_e32 v1, 3", f"v_mov_b32_e32 v2, {data:#x}",
+                                           f"{op} v2, v1, s[8:11], 0 offen"])
+                self.assertEqual(mem[SWZ_DWORD], (0x5EED0000 | SWZ_DWORD & 0xFFFF) & 0x00FFFFFF | lo << 24)
+                self.assertEqual(mem[SWZ_NEXT], (0x5EED0000 | SWZ_NEXT & 0xFFFF) & 0xFFFFFF00 | hi)
+                self.assertEqual(mem[SWZ_LINEAR], 0x5EED0000 | SWZ_LINEAR & 0xFFFF)   # the next lane's: untouched
+
+    def test_load_short_at_byte_3_reads_the_next_swizzled_dword(self):
+        for op in ("buffer_load_ushort", "buffer_load_short_d16"):
+            with self.subTest(op=op):
+                mem = run_scratch_swizzle(["v_mov_b32_e32 v1, 3", "v_mov_b32_e32 v5, 0",
+                                           f"{op} v5, v1, s[8:11], 0 offen", "s_waitcnt vmcnt(0)",
+                                           f"v_mov_b32_e32 v6, {OUT:#x}", "buffer_store_dword v5, v6, s[0:3], 0 offen"])
+                self.assertEqual(mem[OUT] & 0xFFFF, (SWZ_NEXT & 0xFF) << 8 | 0x5E)
+
+
 if __name__ == "__main__":
     unittest.main()
