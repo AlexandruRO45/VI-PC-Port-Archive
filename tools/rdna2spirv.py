@@ -5776,6 +5776,15 @@ class Gen:
             return word, self.cu(0)
         self.uses_wave_bits = True
         lane = self.wave_lane()
+        if not self.wave64 and self.stage in ("cs", "ms"):
+            # A wave32 compute or mesh lane is LocalInvocationIndex mod 32 (wave_lane), always below 32, so lanes
+            # 32-63 of the mask are 0 and one reduction gives every bit. The second reduction this used to emit
+            # was always 0, and each costs several shuffles on a 32-wide NVIDIA subgroup.
+            sh, b, lo = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {lane}")
+            self.emit(f"{b} = OpSelect %uint {mine} {sh} {self.cu(0)}")
+            self.emit(f"{lo} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {b}")
+            return lo, self.cu(0)
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
         self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")
         self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
