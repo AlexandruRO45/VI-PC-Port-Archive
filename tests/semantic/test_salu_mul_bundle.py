@@ -322,5 +322,24 @@ class TestSMulHiI32Oracle(unittest.TestCase):
         # -2147483648 * -2147483648 = 2^62 = 0x40000000_00000000 -> high 32 bits is 0x40000000
         self.assertEqual(ref_s_mul_hi_i32(0x80000000, 0x80000000), 0x40000000)
 
+class TestSMulHiI32ASTAndSignExtensions(unittest.TestCase):
+    def test_ast_instruction_disasm(self) -> None:
+        inst = ASTInstruction(
+            Opcode.S_MUL_HI_I32,
+            ASTOperand.sgpr(3),
+            ASTOperand.sgpr(1),
+            ASTOperand.sgpr(2),
+        )
+        self.assertEqual(inst.disasm(), "s_mul_hi_i32 s3, s1, s2")
+
+    def test_imm_source_disasm(self) -> None:
+        inst = ASTInstruction(
+            Opcode.S_MUL_HI_I32,
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(1),
+            ASTOperand.imm(u32(-5)),
+        )
+        self.assertEqual(inst.disasm(), f"s_mul_hi_i32 s0, s1, {hex(u32(-5))}")
+
 if __name__ == "__main__":
     unittest.main()
