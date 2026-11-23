@@ -8,6 +8,7 @@ would give it for those raw per-vertex words.
 """
 import struct
 import unittest
+from pathlib import Path
 
 import support
 
@@ -69,6 +70,12 @@ class InterpF16High(unittest.TestCase):
                              "exp mrt0 v2, v3, v4, v6 done vm")
         _, words = run(asm)
         self.assertEqual(f"{words[3]:#010x}", "0xdead4880")            # 9.0 under the kept 0xdead
+
+    def test_p2_f16_keeps_the_incoming_barycentric_high_halves(self):
+        fixture = Path(support.FIXTURE_DIR).parent / "ps_interp_p2_f16_input_half.asm"
+        asm = fixture.read_text(encoding="utf-8")
+        _, words = run(asm)
+        self.assertEqual(words, [0x3E803F00, 0x3F003F00, 0x3E803F00, 0x3F003F00])
 
     def test_without_high_both_reads_are_the_low_half(self):
         _, words = run(SHADER.replace(" high", ""))

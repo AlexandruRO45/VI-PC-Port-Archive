@@ -15825,9 +15825,9 @@ def read_before_write_vgprs(insns):
                 regs += x["r"]
         if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
                             "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                            "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
+                            "v_dot8c_i32_i4", "v_dot8c_u32_u4", "v_interp_p2_f16") or
                 (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
-                a[0]["k"] == "vgpr":   # d16 keeps a half
+                a[0]["k"] == "vgpr":   # p2_f16 and d16 loads keep part of the destination
             regs.append(a[0]["r"])
         for r in regs:
             if r not in written and r not in first:
