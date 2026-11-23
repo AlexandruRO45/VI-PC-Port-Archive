@@ -602,7 +602,7 @@ function switchTab(tab) {
   } else {
     document.getElementById('tab-btn-textures').classList.add('active');
     document.getElementById('textures-view').classList.add('active');
-    if (allTextures.length === 0) loadTextures();
+    loadTextures();
   }
 }
 
@@ -954,15 +954,22 @@ function renderAccordionList() {
 }
 
 // Textures View Logic
+let textureListStatus = 'idle';
+
 async function loadTextures() {
+  if (textureListStatus !== 'idle') return;
+  textureListStatus = 'loading';
   try {
     const res = await fetch('/api/textures');
+    if (!res.ok) throw new Error(`Texture list request failed: HTTP ${res.status}`);
     const data = await res.json();
     allTextures = data.textures || [];
+    textureListStatus = 'loaded';
     document.getElementById('badge-textures').innerText = allTextures.length;
     document.getElementById('tex-count').innerText = `${allTextures.length} текстур найдено`;
     renderTexturesGrid();
   } catch (e) {
+    textureListStatus = 'idle';
     console.error('Failed to load textures:', e);
     document.getElementById('tex-count').innerText = 'Ошибка загрузки текстур';
   }

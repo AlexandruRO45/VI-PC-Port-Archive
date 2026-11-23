@@ -64,6 +64,42 @@ function fakeModel() {
         traverse(visit) { visit(this); visit(mesh); } };
 }
 
+test('reopening the texture tab reuses an in-flight request and a successful empty list', async () => {
+    const requests = [];
+    const studio = loadStudio();
+    studio.context.fetch = url => new Promise(resolve => requests.push({ url, resolve }));
+    const reopen = () => studio.run("switchTab('models'); switchTab('textures');");
+
+    reopen();
+    reopen();
+    assert.deepEqual(requests.map(request => request.url), ['/api/textures']);
+    requests[0].resolve({ ok: true, json: async () => ({ textures: [] }) });
+    await new Promise(setImmediate);
+
+    assert.equal(studio.elements.get('badge-textures').innerText, 0);
+    reopen();
+    assert.equal(requests.length, 1);
+});
+
+test('reopening the texture tab retries a failed request', async () => {
+    let attempts = 0;
+    const studio = loadStudio();
+    studio.context.fetch = async () => ({
+        ok: ++attempts > 1,
+        status: attempts === 1 ? 503 : 200,
+        json: async () => ({ textures: [{ name: 'sample.png', format: 'PNG Image', size: 4 }] }),
+    });
+
+    studio.run("switchTab('textures');");
+    await new Promise(setImmediate);
+    assert.notEqual(studio.elements.get('badge-textures')?.innerText, 1);
+
+    studio.run("switchTab('models'); switchTab('textures');");
+    await new Promise(setImmediate);
+    assert.equal(attempts, 2);
+    assert.equal(studio.elements.get('badge-textures').innerText, 1);
+});
+
 const HOSTILE = '"><img src=x onerror=alert(1)>';
 const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
 const tagShape = markup => markup.match(/<[^>]*>/g).map(tag => tag.replace(/"[^"]*"/g, '""'));
