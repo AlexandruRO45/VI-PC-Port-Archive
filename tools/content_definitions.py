@@ -1,6 +1,7 @@
 """Read local content-definition XML (ASSET-149), without resolving references.
 
-Accepts XML files or rpf9_carve directories. The CLI prints aggregate counts only.
+Accepts XML files or rpf9_carve directories. The CLI prints aggregate counts only, plus one ERROR line for each
+input it cannot read or parse: `failed_inputs` in the counts does not say which input it was.
 The Python API returns ordered records containing local game data: never publish
 those records. Archive offsets identify recovered spans, not named RPF entries.
 """
@@ -226,9 +227,14 @@ def main() -> int:
                     except _OtherRoot:
                         doc = None
                     add(doc)
-        except (OSError, ContentError, ValueError, KeyError, TypeError):
+        except OSError as error:
             counts["failed_inputs"] += 1
             status = max(status, 1)
+            print(f"ERROR: {path}: cannot read: {error.strerror or error}", file=sys.stderr)
+        except (ContentError, ValueError, KeyError, TypeError) as error:
+            counts["failed_inputs"] += 1
+            status = max(status, 1)
+            print(f"ERROR: {path}: {error}", file=sys.stderr)
     print(json.dumps(counts, sort_keys=True))
     return status
 
