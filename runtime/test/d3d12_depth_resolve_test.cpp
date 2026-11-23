@@ -151,6 +151,31 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     list->ClearDepthStencilView(source_view, flags, 0.75f, 0x22, 1, &clear_a);
     list->ClearDepthStencilView(source_view, flags, 1.0f, 0x33, 1, &clear_b);
     list->ClearDepthStencilView(target_view, flags, 0.0f, 0x5a, 0, nullptr);
+    // A refused case (run_invalid) runs as three lists: the clears, the list whose Close fails, and a copy of the
+    // destination. ExecuteCommandLists refuses a batch with a failed list as a whole (#6610), as D3D12 never runs
+    // one, so the clears must be in a list of their own; the copy then shows the destination still holds them.
+    UINT64 fence_value = 0;
+    const auto submit = [&]() -> bool {
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        CHECK(SUCCEEDED(queue->Signal(fence.p, ++fence_value)));
+        Event event;
+        CHECK(event.handle);
+        CHECK(SUCCEEDED(fence->SetEventOnCompletion(fence_value, event.handle)));
+        // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
+        // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
+        CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+        return true;
+    };
+    const auto restart = [&]() -> bool {
+        CHECK(SUCCEEDED(allocator->Reset()));
+        CHECK(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        return true;
+    };
+    if (run_invalid) {
+        CHECK(SUCCEEDED(list->Close()));
+        if (!submit() || !restart()) return false;
+    }
     Ref<ID3D12RootSignature> root;
     Ref<ID3D12PipelineState> pso;
     if (c.edge) {
@@ -203,30 +228,32 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     const UINT y = c.dst_y >= 0 ? UINT(c.dst_y) : c.rect ? UINT(rect.top) : 0;
     list1->ResolveSubresourceRegion(target.p, c.plane, x, y, source.p, c.plane, c.rect ? &rect : nullptr, c.format,
                                     c.mode);
-    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    list->ResourceBarrier(1, &barriers[1]);
-    for (UINT i = 0; i < planes; ++i) {
-        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-        src.pResource = target.p;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = i;
-        dst.pResource = readback.p;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint = placed[i];
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    }
+    const auto copy_out = [&](D3D12_RESOURCE_STATES from) {
+        barriers[1].Transition.StateBefore = from;
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &barriers[1]);
+        for (UINT i = 0; i < planes; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = target.p;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = i;
+            dst.pResource = readback.p;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = placed[i];
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+    };
+    copy_out(D3D12_RESOURCE_STATE_RESOLVE_DEST);
     out.close = list->Close();
     if (FAILED(out.close) && !run_invalid) return true;
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
-    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
-    Event event;
-    CHECK(event.handle);
-    CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
-    // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
-    // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
-    CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+    if (!submit()) return false;
+    if (run_invalid && FAILED(out.close)) {
+        // The refused list ran nothing, so the destination is still in DEPTH_WRITE with the clears in it.
+        if (!restart()) return false;
+        copy_out(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        CHECK(SUCCEEDED(list->Close()));
+        if (!submit()) return false;
+    }
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
