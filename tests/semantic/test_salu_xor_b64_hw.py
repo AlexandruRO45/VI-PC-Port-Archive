@@ -353,5 +353,23 @@ class TestSaluXorB64ConditionCodes(unittest.TestCase):
         self.assertEqual(state.scc, 0)
 
 
+class TestSaluXorB64IEEE754(unittest.TestCase):
+    """Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_float_pattern_preservation(self) -> None:
+        pos_zero = 0x0000000000000000
+        neg_zero = 0x8000000000000000
+        res, scc = ref_xor_b64(pos_zero, neg_zero)
+        self.assertEqual(res, neg_zero)
+        self.assertEqual(scc, 1)
+
+    def test_nan_payload_xor(self) -> None:
+        qnan64 = 0x7FF8000000000000
+        snan64 = 0x7FF0000000000001
+        res, _ = ref_xor_b64(qnan64, snan64)
+        expected = u64(qnan64 ^ snan64)
+        self.assertEqual(res, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
