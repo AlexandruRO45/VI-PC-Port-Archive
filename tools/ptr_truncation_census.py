@@ -301,6 +301,11 @@ def main(argv=None):
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
         return 2
+    if a.limit is not None and a.limit < 1:
+        # A file count, not a byte span: --limit 0 scans nothing and reports an empty census with exit 0, and a
+        # negative one slices the sorted listings from the end, silently dropping the last files from the count.
+        print(f"ERROR: --limit must be at least 1, got {a.limit}", file=sys.stderr)
+        return 2
     files = listings(a.src)[: a.limit] if a.limit is not None else listings(a.src)
     jobs = pool_workers.process_workers(max(1, a.jobs))
     if jobs == 1 or len(files) < 64:
