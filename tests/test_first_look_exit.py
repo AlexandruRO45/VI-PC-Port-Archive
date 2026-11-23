@@ -54,6 +54,18 @@ class FirstLookExitTest(unittest.TestCase):
             source.parent.mkdir()
             source.touch()
             marker = scripts / "built.txt"
+            cmake = scripts / "cmake.cmd"
+            cmake.write_text(
+                '@echo off\nset "cfg=%~6"\nif not defined cfg set "cfg=Debug"\n'
+                'if not exist "%~2\\%cfg%" mkdir "%~2\\%cfg%"\n'
+                'copy /y "%~dp0gta6rt.exe" "%~2\\%cfg%\\gta6rt.exe" >nul\n'
+                'echo %cfg% > "%~dp0built.txt"\n', encoding="ascii",
+            )
+            vs_configs = {
+                "vs-first": "Debug;Release;MinSizeRel;RelWithDebInfo",
+                "vs-release-only": "Release",
+                "vs-stale-Release": "Debug;Release;RelWithDebInfo",
+            }
             cases = (
                 ("Debug", ["Debug"], "Debug", False, 0),
                 ("MinSizeRel", ["MinSizeRel", "Debug"], "MinSizeRel", False, 0),
@@ -62,17 +74,26 @@ class FirstLookExitTest(unittest.TestCase):
                 ("flat", ["", "RelWithDebInfo"], "build", False, 17),
                 ("stale-Release", ["Release"], "build", True, 0),
                 ("missing", [], "build", True, 0),
+                ("vs-first", [], "RelWithDebInfo", True, 0),
+                ("vs-release-only", [], "Release", True, 0),
+                ("vs-stale-Release", ["Release"], "Release", True, 0),
             )
             for layout, folders, expected_dir, should_build, code in cases:
                 with self.subTest(layout=layout):
                     shutil.rmtree(build)
                     build.mkdir()
                     marker.unlink(missing_ok=True)
+                    if layout in vs_configs:
+                        (build / "CMakeCache.txt").write_text(
+                            "CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022\n"
+                            f"CMAKE_COMMAND:INTERNAL={cmake}\n"
+                            f"CMAKE_CONFIGURATION_TYPES:STRING={vs_configs[layout]}\n", encoding="utf-8",
+                        )
                     for folder in folders:
                         loader = build / folder / "gta6rt.exe"
                         loader.parent.mkdir(exist_ok=True)
                         shutil.copyfile(fixture, loader)
-                        if layout == "stale-Release":
+                        if layout in ("stale-Release", "vs-stale-Release"):
                             older = source.stat().st_mtime - 3600
                             os.utime(loader, (older, older))
                     image = root / f"fixture-{layout}.exe"
@@ -83,6 +104,8 @@ class FirstLookExitTest(unittest.TestCase):
                     )
                     report = root / "reports" / "exe" / image.stem
                     self.assertEqual(marker.exists(), should_build, result.stdout + result.stderr)
+                    if layout in vs_configs:
+                        self.assertEqual(marker.read_text(encoding="ascii").strip(), expected_dir)
                     self.assertTrue((report / "shim-todo.txt").is_file(), result.stdout + result.stderr)
                     self.assertIn("synthetic dry run from " + expected_dir,
                                   (report / "dryrun.txt").read_text(encoding="utf-16"))
