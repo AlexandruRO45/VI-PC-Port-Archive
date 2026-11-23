@@ -351,5 +351,50 @@ class TestVMax3F16SIMDDivergence(unittest.TestCase):
                 self.assertEqual(res[i], 0xBABE0000)
 
 
+class TestVMax3F16RegisterAliasing(unittest.TestCase):
+    """Register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+
+    def test_dst_aliases_src0(self):
+        self.rf.vgprs[1] = 0x12343C00  # 1.0 in low half
+        self.rf.vgprs[2] = 0x4000      # 2.0
+        self.rf.vgprs[3] = 0x3800      # 0.5
+        inst = VMax3F16Instruction(
+            dst=Operand(RegType.VGPR, 1),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        self.assertEqual(res, 0x12344000)
+        self.assertEqual(self.rf.vgprs[1], 0x12344000)
+
+    def test_dst_aliases_all_operands(self):
+        self.rf.vgprs[1] = 0x56783C00
+        inst = VMax3F16Instruction(
+            dst=Operand(RegType.VGPR, 1),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 1),
+            src2=Operand(RegType.VGPR, 1),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        self.assertEqual(res, 0x56783C00)
+        self.assertEqual(self.rf.vgprs[1], 0x56783C00)
+
+    def test_hw_translator_aliasing(self):
+        lines = [
+            "v_mov_b32 v0, 0x12343c00",
+            "v_mov_b32 v1, 0x4000",
+            "v_mov_b32 v2, 0x3800",
+            "v_max3_f16 v0, v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_f16_alias", lines)
+        self.assertEqual(support.mrt0_words(spv)[0], 0x12344000)
+
+
 if __name__ == "__main__":
     unittest.main()
