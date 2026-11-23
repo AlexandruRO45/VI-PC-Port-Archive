@@ -4248,6 +4248,7 @@ private:
         pool.heap_type = desc.Type;
         pool.count = desc.Count;
         pool.precise = device_.info.occlusion_query_precise;
+        pool.so_streams = device_.info.max_transform_feedback_streams;
         pool.ended.assign(desc.Count, false);
         device_.context->add_query_pool(id(), pool);
         registered_ = true;
@@ -4364,7 +4365,8 @@ public:
                     *tail = &conservative;
                     tail = &conservative.pNext;
                 }
-                if (info.transform_feedback && state_.info.max_transform_feedback_buffers == 0) {
+                if (info.transform_feedback &&
+                    (!info.max_transform_feedback_buffers || !info.max_transform_feedback_streams)) {
                     *tail = &transform_feedback_props;
                     tail = &transform_feedback_props.pNext;
                 }
@@ -4381,10 +4383,11 @@ public:
                     state_.info.transform_feedback_rasterization_stream_select =
                         transform_feedback_props.transformFeedbackRasterizationStreamSelect == VK_TRUE;
                     state_.info.max_transform_feedback_buffers = transform_feedback_props.maxTransformFeedbackBuffers;
-                    state_.info.max_transform_feedback_streams = transform_feedback_props.maxTransformFeedbackStreams;
                     state_.info.max_transform_feedback_buffer_size =
                         transform_feedback_props.maxTransformFeedbackBufferSize;
                 }
+                if (info.transform_feedback && !info.max_transform_feedback_streams)
+                    state_.info.max_transform_feedback_streams = transform_feedback_props.maxTransformFeedbackStreams;
             }
         }
 

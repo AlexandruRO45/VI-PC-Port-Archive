@@ -62,6 +62,7 @@ struct MockReplay {
     std::vector<std::pair<VkQueryPool, unsigned>> resets;
     std::set<VkQueryPool> statistics_pools;
     std::vector<unsigned> chunks;
+    unsigned counter_width = 0;
     std::vector<unsigned> groups;
     std::vector<VkBufferCopy> transfers;
     std::vector<std::string> events;
@@ -77,7 +78,8 @@ struct MockReplay {
         none,
         sum,
         binary,
-        statistics
+        statistics,
+        stream_output
     };
     Mode mode = none;
     MockReplay() {
@@ -112,7 +114,8 @@ struct MockReplay {
         auto& q = values.at(p);
         expect(first <= q.size() && count <= q.size() - first, "mock query access out of bounds");
         for (unsigned i = 0; i < count; ++i) {
-            for (unsigned j = 0; j < (stride == statistics_size ? statistics_counters : 1u); ++j) {
+            expect(stride == word_size || stride == 2 * word_size || stride == statistics_size, "query row size");
+            for (unsigned j = 0; j < stride / word_size; ++j) {
                 word(b, off + i * stride + word_size * j, q[first + i][j]);
             }
         }
@@ -286,8 +289,10 @@ void test_helper_chunks() {
         const VkDescriptorSet*, unsigned, const unsigned*) {};
     vk.vkCmdPushConstants = +[](VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, unsigned off, unsigned size,
         const void*p) {
-        expect(off == 0 && size == sizeof(unsigned), "chunk push constants");
-        MockReplay::current->chunks.push_back(*static_cast<const unsigned *>(p));
+        expect((off == 0 || off == sizeof(unsigned)) && size == sizeof(unsigned), "resolve push constants");
+        const auto value = *static_cast<const unsigned*>(p);
+        if (off == 0) MockReplay::current->chunks.push_back(value);
+        else MockReplay::current->counter_width = value;
     };
     vk.vkCmdDispatch = +[](VkCommandBuffer, unsigned x, unsigned y, unsigned z) {
         auto& c = *MockReplay::current;
@@ -299,8 +304,8 @@ void test_helper_chunks() {
                 c.word(VK_NULL_HANDLE, word_size * i, c.word(VK_NULL_HANDLE, word_size * i) != 0);
             }
         } else {
-            for (unsigned j = 0; j < (c.mode == MockReplay::statistics ? statistics_counters : 1u); ++j) {
-                unsigned width = c.mode == MockReplay::statistics ? statistics_counters : 1;
+            const unsigned width = c.mode == MockReplay::sum ? 1 : c.counter_width;
+            for (unsigned j = 0; j < width; ++j) {
                 auto total = c.word(VK_NULL_HANDLE, word_size * j);
                 for (unsigned i = 0; i < n; ++i) {
                     total += c.word(VK_NULL_HANDLE, word_size * (width * (i + 1) + j));
@@ -317,7 +322,7 @@ void test_helper_chunks() {
     OcclusionResolve helper(vk, VK_NULL_HANDLE);
     auto qp = handle<VkQueryPool>(1);
     auto dst = handle<VkBuffer>(2);
-    for (auto mode : {MockReplay::sum, MockReplay::binary, MockReplay::statistics}) {
+    for (auto mode : {MockReplay::sum, MockReplay::binary, MockReplay::statistics, MockReplay::stream_output}) {
         for (unsigned extra : {0u, 1u}) {
             c.mode = mode;
             const unsigned capacity = mode == MockReplay::sum ? sum_capacity
@@ -325,7 +330,8 @@ void test_helper_chunks() {
                                                                   : statistics_capacity;
             const unsigned n = capacity + extra;
             const unsigned first = first_query;
-            const unsigned width = mode == MockReplay::statistics ? statistics_counters : 1;
+            const unsigned width = mode == MockReplay::statistics ? statistics_counters :
+                                   mode == MockReplay::stream_output ? 2 : 1;
             c.values[qp].resize(first + n);
             for (unsigned i = 0; i < first + n; ++i) {
                 for (unsigned j = 0; j < statistics_counters; ++j) {
@@ -345,8 +351,10 @@ void test_helper_chunks() {
                     std::memcpy(expected.data() + output_offset + word_size * i, &v, word_size);
                 }
             } else {
-                if (mode == MockReplay::statistics) {
-                    helper.sum_statistics({}, qp, first, n, dst, output_offset);
+                if (width > 1) {
+                    c.counter_width = 0;
+                    helper.sum_statistics({}, qp, first, n, dst, output_offset, width);
+                    expect(c.counter_width == width, "statistics reducer received the query's counter width");
                 } else {
                     helper.sum({}, qp, first, n, dst, output_offset);
                 }

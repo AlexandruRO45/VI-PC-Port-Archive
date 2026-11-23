@@ -1,7 +1,8 @@
 // Stream Output on VK_EXT_transform_feedback (SOSetTargets, D3D12_STREAM_OUTPUT_DESC, BufferFilledSizeLocation counters):
 // tests PSO validation parity against Windows D3D12, SO-only draws (D3D12_SO_NO_RASTERIZED_STREAM with no PS/RTV/viewport),
 // append + reset across draws via BufferFilledSizeLocation, simultaneous SO + rasterization, multi-slot SO (slots 0 and 1),
-// SOSetTargets unbind / ClearState, bundle rejection, and standalone device caps.
+// SOSetTargets unbind / ClearState, bundle rejection, and standalone device caps. --queries-only runs the
+// same-stream overlap, overflow, multi-stream and zero-fill statistics readbacks.
 // No game data.
 #include "vk_test_device.h"
 #include "d3d12_copy_compare.h"
@@ -551,6 +552,7 @@ struct SoStatsResult {
     D3D12_QUERY_DATA_SO_STATISTICS stream0{};
     D3D12_QUERY_DATA_SO_STATISTICS stream1{};
     D3D12_QUERY_DATA_SO_STATISTICS unended{};
+    D3D12_QUERY_DATA_SO_STATISTICS same_draw{}, first_two{}, last_two{};
     UINT64 overflow_counter = 0;
 };
 
@@ -599,7 +601,7 @@ bool run_so_statistics_queries(Fixture& f, SoStatsResult& out) {
     }
 
     copycmp::Ptr<ID3D12QueryHeap> heap;
-    const D3D12_QUERY_HEAP_DESC qdesc{D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 5, 0};
+    const D3D12_QUERY_HEAP_DESC qdesc{D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 8, 0};
     CHECK(SUCCEEDED(f.run.device->CreateQueryHeap(&qdesc, IID_PPV_ARGS(&heap.p))));
 
     f.run.begin();
@@ -620,6 +622,7 @@ bool run_so_statistics_queries(Fixture& f, SoStatsResult& out) {
     // Query 0: 2 triangles fit inside 512 bytes.
     const D3D12_STREAM_OUTPUT_BUFFER_VIEW view0{so_buf->GetGPUVirtualAddress(), buf_size, cnt0->GetGPUVirtualAddress()};
     f.run.list->SOSetTargets(0, 1, &view0);
+    f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 6);
     f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
     f.run.list->DrawInstanced(6, 1, 0, 0);
     f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
@@ -627,27 +630,30 @@ bool run_so_statistics_queries(Fixture& f, SoStatsResult& out) {
     // Query 1: 2 triangles drawn into 128-byte buffer -> fits 1 triangle (96 bytes), overflows 2nd.
     const D3D12_STREAM_OUTPUT_BUFFER_VIEW view1{so_buf->GetGPUVirtualAddress(), 128, cnt1->GetGPUVirtualAddress()};
     f.run.list->SOSetTargets(0, 1, &view1);
+    f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 7);
     f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 1);
     f.run.list->DrawInstanced(6, 1, 0, 0);
     f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 1);
+    f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 6);
 
     // Queries 2 & 3: simultaneous STREAM0 + STREAM1 on a 1-triangle VS draw (only stream 0 receives primitives).
     const D3D12_STREAM_OUTPUT_BUFFER_VIEW view2{so_buf->GetGPUVirtualAddress(), buf_size, cnt2->GetGPUVirtualAddress()};
     f.run.list->SOSetTargets(0, 1, &view2);
     f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 2);
+    f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 5);
     f.run.list->BeginQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 3);
     f.run.list->DrawInstanced(3, 1, 0, 0);
     f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 3);
+    f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 5);
     f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 2);
+    f.run.list->EndQuery(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 7);
 
     // Resolve ended slots; D3D12 leaves un-ended query slots undefined on the host, while the layer guarantees zeros.
-    if (f.run.ours) {
-        f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 5, rb_stats.p, 0);
-    } else {
-        f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 3, rb_stats.p, 0);
-        f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 3, 1, rb_stats.p,
-                                     3 * sizeof(D3D12_QUERY_DATA_SO_STATISTICS));
-    }
+    constexpr UINT64 result_size = sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
+    f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 3, rb_stats.p, 0);
+    f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 3, 1, rb_stats.p, 3 * result_size);
+    if (f.run.ours)
+        f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 4, 1, rb_stats.p, 4 * result_size);
     f.run.barrier(cnt1.p, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
     f.run.list->CopyBufferRegion(rb_cnt1.p, 0, cnt1.p, 0, 8);
 
@@ -657,10 +663,19 @@ bool run_so_statistics_queries(Fixture& f, SoStatsResult& out) {
         return false;
     }
 
+    // Resolve after another submission so all three logical results must retain their physical segments.
+    f.run.begin();
+    f.run.list->ResolveQueryData(heap.p, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 5, 3, rb_stats.p, 5 * result_size);
+    const auto resolve_err = f.run.submit();
+    if (!resolve_err.empty()) {
+        std::fprintf(stderr, "SO query resolve (%s): %s\n", f.run.ours ? "Vulkan" : "host", resolve_err.c_str());
+        return false;
+    }
+
     void* p = nullptr;
-    const D3D12_RANGE r80{0, 5 * sizeof(D3D12_QUERY_DATA_SO_STATISTICS)};
-    CHECK(SUCCEEDED(rb_stats->Map(0, &r80, &p)));
-    D3D12_QUERY_DATA_SO_STATISTICS stats[5]{};
+    D3D12_QUERY_DATA_SO_STATISTICS stats[8]{};
+    const D3D12_RANGE range{0, sizeof(stats)};
+    CHECK(SUCCEEDED(rb_stats->Map(0, &range, &p)));
     std::memcpy(stats, p, sizeof(stats));
     rb_stats->Unmap(0, nullptr);
     out.normal = stats[0];
@@ -668,6 +683,9 @@ bool run_so_statistics_queries(Fixture& f, SoStatsResult& out) {
     out.stream0 = stats[2];
     out.stream1 = stats[3];
     out.unended = stats[4];
+    out.same_draw = stats[5];
+    out.first_two = stats[6];
+    out.last_two = stats[7];
 
     const D3D12_RANGE r8{0, 8};
     CHECK(SUCCEEDED(rb_cnt1->Map(0, &r8, &p)));
@@ -692,7 +710,12 @@ bool check_float_eq(const std::vector<std::uint8_t>& buf, std::size_t byte_offse
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool queries_only = argc == 2 && std::strcmp(argv[1], "--queries-only") == 0;
+    if (argc != 1 && !queries_only) {
+        std::fprintf(stderr, "usage: d3d12_stream_output_test [--queries-only]\n");
+        return 2;
+    }
     vktest::Device d;
     d.request_buffer_device_address = true;
     if (!d.create()) {
@@ -705,6 +728,11 @@ int main() {
     }
     if (!d.transform_feedback) {
         std::puts("SKIP: VK_EXT_transform_feedback is not supported on this device");
+        return 77;
+    }
+
+    if (queries_only && !d.transform_feedback_queries) {
+        std::puts("SKIP: transformFeedbackQueries is unavailable");
         return 77;
     }
 
@@ -839,93 +867,111 @@ int main() {
             }
         }
 
-        if (!check_validation_cases(f_ours, has_host ? &f_host : nullptr)) rc = 1;
-        if (!check_bundle_rejection(ours.p)) rc = 1;
+        if (!queries_only) {
+            if (!check_validation_cases(f_ours, has_host ? &f_host : nullptr)) rc = 1;
+            if (!check_bundle_rejection(ours.p)) rc = 1;
 
-        std::vector<std::uint8_t> ours_append, ours_reset, host_append, host_reset;
-        std::uint64_t ours_cnt_append = 0, ours_cnt_reset = 0, host_cnt_append = 0, host_cnt_reset = 0;
-        if (!run_single_slot_so_append_and_reset(f_ours, ours_append, ours_cnt_append, ours_reset, ours_cnt_reset))
-            rc = 1;
-        if (ours_cnt_append != 192 || ours_cnt_reset != 96) {
-            std::fprintf(stderr, "counter mismatch: append=%llu reset=%llu\n",
-                         ours_cnt_append, ours_cnt_reset);
-            rc = 1;
-        }
-        if (rc == 0) {
-            // Check exact captured floats (draw 1 off=(0.125,0.25), draw 2 off=(-0.25,0.375), reset off=(0.5,-0.5)).
-            bool ok = true;
-            ok &= check_float_eq(ours_append, 0,   {-0.5f + 0.125f,  0.5f + 0.25f, 0.25f, 1.0f, 1, 0, 0, 1});
-            ok &= check_float_eq(ours_append, 32,  { 0.5f + 0.125f,  0.5f + 0.25f, 0.25f, 1.0f, 0, 1, 0, 1});
-            ok &= check_float_eq(ours_append, 64,  {-0.5f + 0.125f, -0.5f + 0.25f, 0.25f, 1.0f, 0, 0, 1, 1});
-            ok &= check_float_eq(ours_append, 96,  {-0.5f - 0.25f,   0.5f + 0.375f, 0.25f, 1.0f, 1, 0, 0, 1});
-            ok &= check_float_eq(ours_append, 128, { 0.5f - 0.25f,   0.5f + 0.375f, 0.25f, 1.0f, 0, 1, 0, 1});
-            ok &= check_float_eq(ours_append, 160, {-0.5f - 0.25f,  -0.5f + 0.375f, 0.25f, 1.0f, 0, 0, 1, 1});
-            ok &= std::all_of(ours_append.begin() + 192, ours_append.end(), [](std::uint8_t b) { return b == 0xcd; });
-            ok &= check_float_eq(ours_reset, 0,  { 0.0f,  0.0f, 0.25f, 1.0f, 1, 0, 0, 1});
-            ok &= check_float_eq(ours_reset, 32, { 1.0f,  0.0f, 0.25f, 1.0f, 0, 1, 0, 1});
-            ok &= check_float_eq(ours_reset, 64, { 0.0f, -1.0f, 0.25f, 1.0f, 0, 0, 1, 1});
-            ok &= std::all_of(ours_reset.begin() + 96, ours_reset.end(), [](std::uint8_t b) { return b == 0xcd; });
-            if (!ok) rc = 1;
-        }
-        if (has_host) {
-            if (!run_single_slot_so_append_and_reset(f_host, host_append, host_cnt_append, host_reset, host_cnt_reset))
+            std::vector<std::uint8_t> ours_append, ours_reset, host_append, host_reset;
+            std::uint64_t ours_cnt_append = 0, ours_cnt_reset = 0, host_cnt_append = 0, host_cnt_reset = 0;
+            if (!run_single_slot_so_append_and_reset(f_ours, ours_append, ours_cnt_append, ours_reset, ours_cnt_reset))
                 rc = 1;
-            else if (ours_cnt_append != host_cnt_append || ours_cnt_reset != host_cnt_reset ||
-                     ours_append != host_append || ours_reset != host_reset) {
-                std::fprintf(stderr, "SO append/reset differed from host D3D12 (%s)\n", host_name.c_str());
+            if (ours_cnt_append != 192 || ours_cnt_reset != 96) {
+                std::fprintf(stderr, "counter mismatch: append=%llu reset=%llu\n",
+                             ours_cnt_append, ours_cnt_reset);
                 rc = 1;
             }
-        }
+            if (rc == 0) {
+                // Check exact captured floats (draw 1 off=(0.125,0.25), draw 2 off=(-0.25,0.375), reset off=(0.5,-0.5)).
+                bool ok = true;
+                ok &= check_float_eq(ours_append, 0,   {-0.5f + 0.125f,  0.5f + 0.25f, 0.25f, 1.0f, 1, 0, 0, 1});
+                ok &= check_float_eq(ours_append, 32,  { 0.5f + 0.125f,  0.5f + 0.25f, 0.25f, 1.0f, 0, 1, 0, 1});
+                ok &= check_float_eq(ours_append, 64,  {-0.5f + 0.125f, -0.5f + 0.25f, 0.25f, 1.0f, 0, 0, 1, 1});
+                ok &= check_float_eq(ours_append, 96,  {-0.5f - 0.25f,   0.5f + 0.375f, 0.25f, 1.0f, 1, 0, 0, 1});
+                ok &= check_float_eq(ours_append, 128, { 0.5f - 0.25f,   0.5f + 0.375f, 0.25f, 1.0f, 0, 1, 0, 1});
+                ok &= check_float_eq(ours_append, 160, {-0.5f - 0.25f,  -0.5f + 0.375f, 0.25f, 1.0f, 0, 0, 1, 1});
+                ok &= std::all_of(ours_append.begin() + 192, ours_append.end(), [](std::uint8_t b) { return b == 0xcd; });
+                ok &= check_float_eq(ours_reset, 0,  { 0.0f,  0.0f, 0.25f, 1.0f, 1, 0, 0, 1});
+                ok &= check_float_eq(ours_reset, 32, { 1.0f,  0.0f, 0.25f, 1.0f, 0, 1, 0, 1});
+                ok &= check_float_eq(ours_reset, 64, { 0.0f, -1.0f, 0.25f, 1.0f, 0, 0, 1, 1});
+                ok &= std::all_of(ours_reset.begin() + 96, ours_reset.end(), [](std::uint8_t b) { return b == 0xcd; });
+                if (!ok) rc = 1;
+            }
+            if (has_host) {
+                if (!run_single_slot_so_append_and_reset(f_host, host_append, host_cnt_append, host_reset, host_cnt_reset))
+                    rc = 1;
+                else if (ours_cnt_append != host_cnt_append || ours_cnt_reset != host_cnt_reset ||
+                         ours_append != host_append || ours_reset != host_reset) {
+                    std::fprintf(stderr, "SO append/reset differed from host D3D12 (%s)\n", host_name.c_str());
+                    rc = 1;
+                }
+            }
 
-        // Simultaneous Stream Output + Rasterization (RasterizedStream == 0).
-        std::vector<std::uint8_t> ours_sim_so, ours_sim_px, host_sim_so, host_sim_px;
-        std::uint64_t ours_sim_cnt = 0, host_sim_cnt = 0;
-        if (!run_simultaneous_so_and_raster(f_ours, ours_sim_so, ours_sim_cnt, ours_sim_px) ||
-            ours_sim_cnt != 96) {
-            rc = 1;
-        }
-        if (has_host) {
-            if (!run_simultaneous_so_and_raster(f_host, host_sim_so, host_sim_cnt, host_sim_px)) {
-                rc = 1;
-            } else if (ours_sim_cnt != host_sim_cnt || ours_sim_so != host_sim_so || ours_sim_px != host_sim_px) {
-                std::fprintf(stderr, "SO + raster differed from host D3D12 (%s)\n", host_name.c_str());
+            // Simultaneous Stream Output + Rasterization (RasterizedStream == 0).
+            std::vector<std::uint8_t> ours_sim_so, ours_sim_px, host_sim_so, host_sim_px;
+            std::uint64_t ours_sim_cnt = 0, host_sim_cnt = 0;
+            if (!run_simultaneous_so_and_raster(f_ours, ours_sim_so, ours_sim_cnt, ours_sim_px) ||
+                ours_sim_cnt != 96) {
                 rc = 1;
             }
-        } else if (rc == 0) {
-            // Check corner pixels when host is absent: top-left pixel is red, bottom-right is blue clear.
-            if (ours_sim_px[0] != 255 || ours_sim_px[1] != 0 || ours_sim_px[2] != 0 ||
-                ours_sim_px.back() != 255 || ours_sim_px[ours_sim_px.size() - 2] != 255) {
-                std::fprintf(stderr, "simultaneous SO+raster pixels wrong without host\n");
+            if (has_host) {
+                if (!run_simultaneous_so_and_raster(f_host, host_sim_so, host_sim_cnt, host_sim_px)) {
+                    rc = 1;
+                } else if (ours_sim_cnt != host_sim_cnt || ours_sim_so != host_sim_so || ours_sim_px != host_sim_px) {
+                    std::fprintf(stderr, "SO + raster differed from host D3D12 (%s)\n", host_name.c_str());
+                    rc = 1;
+                }
+            } else if (rc == 0) {
+                // Check corner pixels when host is absent: top-left pixel is red, bottom-right is blue clear.
+                if (ours_sim_px[0] != 255 || ours_sim_px[1] != 0 || ours_sim_px[2] != 0 ||
+                    ours_sim_px.back() != 255 || ours_sim_px[ours_sim_px.size() - 2] != 255) {
+                    std::fprintf(stderr, "simultaneous SO+raster pixels wrong without host\n");
+                    rc = 1;
+                }
+            }
+
+            // Multi-slot SO (slots 0 & 1) + SOSetTargets unbind / ClearState.
+            std::vector<std::uint8_t> ours_s0, ours_s1, host_s0, host_s1;
+            std::uint64_t ours_c0 = 0, ours_c1 = 0, host_c0 = 0, host_c1 = 0;
+            if (!run_multi_slot_and_unbind(f_ours, ours_s0, ours_c0, ours_s1, ours_c1) ||
+                ours_c0 != 48 || ours_c1 != 48) {
+                std::fprintf(stderr, "multi-slot counters wrong: c0=%llu c1=%llu\n", ours_c0, ours_c1);
                 rc = 1;
             }
-        }
-
-        // Multi-slot SO (slots 0 & 1) + SOSetTargets unbind / ClearState.
-        std::vector<std::uint8_t> ours_s0, ours_s1, host_s0, host_s1;
-        std::uint64_t ours_c0 = 0, ours_c1 = 0, host_c0 = 0, host_c1 = 0;
-        if (!run_multi_slot_and_unbind(f_ours, ours_s0, ours_c0, ours_s1, ours_c1) ||
-            ours_c0 != 48 || ours_c1 != 48) {
-            std::fprintf(stderr, "multi-slot counters wrong: c0=%llu c1=%llu\n", ours_c0, ours_c1);
-            rc = 1;
-        }
-        if (has_host) {
-            if (!run_multi_slot_and_unbind(f_host, host_s0, host_c0, host_s1, host_c1)) {
-                rc = 1;
-            } else if (ours_c0 != host_c0 || ours_c1 != host_c1 || ours_s0 != host_s0 || ours_s1 != host_s1) {
-                std::fprintf(stderr, "multi-slot SO / unbind differed from host D3D12 (%s)\n", host_name.c_str());
-                rc = 1;
+            if (has_host) {
+                if (!run_multi_slot_and_unbind(f_host, host_s0, host_c0, host_s1, host_c1)) {
+                    rc = 1;
+                } else if (ours_c0 != host_c0 || ours_c1 != host_c1 || ours_s0 != host_s0 || ours_s1 != host_s1) {
+                    std::fprintf(stderr, "multi-slot SO / unbind differed from %s: Vulkan counters %llu/%llu, "
+                                         "D3D12 %llu/%llu, captured bytes match per slot %d/%d\n",
+                                 host_name.c_str(), ours_c0, ours_c1, host_c0, host_c1,
+                                 ours_s0 == host_s0, ours_s1 == host_s1);
+                    rc = 1;
+                }
             }
+
+            if (rc == 0)
+                std::printf("stream output: 11 validation cases, append/reset (%llu/%llu), simultaneous raster, "
+                            "two slots, unbind/ClearState and bundle rejection passed\n", ours_cnt_append, ours_cnt_reset);
         }
 
-        // Hardware SO_STATISTICS queries (normal, overflow, simultaneous multi-stream, un-ended, and zero fallback).
+        // Hardware SO_STATISTICS, including nested and staggered intervals on stream 0.
         if (d.transform_feedback_queries) {
             SoStatsResult ours_q{};
-            if (!run_so_statistics_queries(f_ours, ours_q)) {
+            const bool ran_queries = run_so_statistics_queries(f_ours, ours_q);
+            if (!ran_queries) {
                 rc = 1;
             } else {
                 const auto eq = [](const D3D12_QUERY_DATA_SO_STATISTICS& a, UINT64 written, UINT64 needed) {
                     return a.NumPrimitivesWritten == written && a.PrimitivesStorageNeeded == needed;
                 };
+                if (!eq(ours_q.same_draw, 1, 1) || !eq(ours_q.first_two, 3, 4) || !eq(ours_q.last_two, 2, 3)) {
+                    std::fprintf(stderr, "SO overlap Vulkan: same draw=(%llu,%llu) first two=(%llu,%llu) "
+                                         "last two=(%llu,%llu)\n",
+                                 ours_q.same_draw.NumPrimitivesWritten, ours_q.same_draw.PrimitivesStorageNeeded,
+                                 ours_q.first_two.NumPrimitivesWritten, ours_q.first_two.PrimitivesStorageNeeded,
+                                 ours_q.last_two.NumPrimitivesWritten, ours_q.last_two.PrimitivesStorageNeeded);
+                    rc = 1;
+                }
                 if (!eq(ours_q.normal, 2, 2) || !eq(ours_q.overflow, 1, 2) || ours_q.overflow_counter != 96 ||
                     !eq(ours_q.stream0, 1, 1) || !eq(ours_q.stream1, 0, 0) || !eq(ours_q.unended, 0, 0)) {
                     std::fprintf(stderr,
@@ -940,7 +986,7 @@ int main() {
                     rc = 1;
                 }
             }
-            if (has_host && rc == 0) {
+            if (has_host && ran_queries) {
                 SoStatsResult host_q{};
                 if (!run_so_statistics_queries(f_host, host_q)) {
                     rc = 1;
@@ -952,14 +998,21 @@ int main() {
                     };
                     if (!qeq(ours_q.normal, host_q.normal) || !qeq(ours_q.overflow, host_q.overflow) ||
                         !qeq(ours_q.stream0, host_q.stream0) || !qeq(ours_q.stream1, host_q.stream1) ||
-                        ours_q.overflow_counter != host_q.overflow_counter) {
+                        !qeq(ours_q.same_draw, host_q.same_draw) || !qeq(ours_q.first_two, host_q.first_two) ||
+                        !qeq(ours_q.last_two, host_q.last_two) || ours_q.overflow_counter != host_q.overflow_counter) {
                         std::fprintf(stderr, "SO_STATISTICS differed from host D3D12 (%s)\n", host_name.c_str());
                         rc = 1;
+                    } else {
+                        std::printf("SO overlap matched native D3D12: same draw=(%llu,%llu) first two=(%llu,%llu) "
+                                    "last two=(%llu,%llu)\n",
+                                    host_q.same_draw.NumPrimitivesWritten, host_q.same_draw.PrimitivesStorageNeeded,
+                                    host_q.first_two.NumPrimitivesWritten, host_q.first_two.PrimitivesStorageNeeded,
+                                    host_q.last_two.NumPrimitivesWritten, host_q.last_two.PrimitivesStorageNeeded);
                     }
                 }
             }
             // Zero-fill fallback when transform_feedback_queries is disabled.
-            if (rc == 0) {
+            {
                 rt::d3d12::VulkanDeviceInfo no_tfq = info;
                 no_tfq.transform_feedback_queries = false;
                 copycmp::Ptr<ID3D12Device> dev_no_tfq;
@@ -972,19 +1025,12 @@ int main() {
                 SoStatsResult fb_q{};
                 if (!run_so_statistics_queries(f_no_tfq, fb_q) ||
                     fb_q.normal.NumPrimitivesWritten != 0 || fb_q.normal.PrimitivesStorageNeeded != 0 ||
-                    fb_q.overflow.NumPrimitivesWritten != 0 || fb_q.overflow.PrimitivesStorageNeeded != 0) {
+                    fb_q.overflow.NumPrimitivesWritten != 0 || fb_q.overflow.PrimitivesStorageNeeded != 0 ||
+                    fb_q.first_two.NumPrimitivesWritten != 0 || fb_q.first_two.PrimitivesStorageNeeded != 0) {
                     std::fprintf(stderr, "SO_STATISTICS fallback without transformFeedbackQueries failed\n");
                     rc = 1;
                 }
             }
-        }
-
-        if (rc == 0) {
-            std::printf("stream output: validation parity (11 cases), append/reset counters (%llu/%llu), "
-                        "simultaneous SO+raster, multi-slot (2 buffers), unbind/ClearState, bundle rejection%s%s passed\n",
-                        ours_cnt_append, ours_cnt_reset,
-                        d.transform_feedback_queries ? ", hardware SO_STATISTICS (normal/overflow/multi-stream/fallback)" : "",
-                        has_host ? (" (matched host " + host_name + ")").c_str() : "");
         }
     }
 

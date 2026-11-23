@@ -778,7 +778,11 @@ The compute path, end to end:
     `SOSetTargets` slot is bound, replay binds the active slots via `vkCmdBindTransformFeedbackBuffersEXT` and brackets
     the draw with `vkCmdBeginTransformFeedbackEXT` / `vkCmdEndTransformFeedbackEXT`. `BufferFilledSizeLocation` maps
     to Vulkan's 32-bit transform-feedback counter buffer for append offset read and post-draw writeback; zero-filled
-    8-byte counter storage matches D3D12's `UINT64` layout on little-endian hosts up to 4 GiB. (`d3d12_stream_output_test`)
+    8-byte counter storage matches D3D12's `UINT64` layout on little-endian hosts up to 4 GiB.
+    The next draw waits for the preceding transform-feedback counter write before reading its append offset.
+    On an RTX 3080 (617.14), the two-draw append and the subsequent reset matched native D3D12 at 192 and 96 bytes.
+    An open discrepancy remains in `d3d12_stream_output_test` after the two-slot unbind and `ClearState` sequence.
+    The captured bytes matched in both slots, but the final counters were 48/48 bytes on Vulkan and 0/96 on native D3D12.
   - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
@@ -2663,7 +2667,12 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   `vkCmdBeginQueryIndexedEXT`/`vkCmdEndQueryIndexedEXT` on stream `0..3`, and `ResolveQueryData` resolves the two
   `UINT64` counters (`NumPrimitivesWritten`, `PrimitivesStorageNeeded`, 16 bytes per query). Without
   `transformFeedbackQueries`, the heap stays poolless and resolves zeros (`vkCmdFillBuffer`), and un-ended query
-  slots always resolve zeros (`d3d12_stream_output_test`).
+  slots always resolve zeros (`d3d12_stream_output_test`). A stream index at or above
+  `maxTransformFeedbackStreams` also resolves to zero. When two queries overlap on the same supported stream,
+  replay starts a physical interval at each begin or end and sums each query's intervals on the GPU. An ended
+  query retains its intervals for resolves in later submissions. On an RTX 3080, both native D3D12 and Vulkan
+  returned (written, needed) of (1, 1) for two queries covering the same draw. Staggered queries across an
+  overflowing draw returned (3, 4) and (2, 3). Run `d3d12_stream_output_test --queries-only` to repeat the comparison.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and

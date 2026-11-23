@@ -202,7 +202,7 @@ public:
         write.pBufferInfo = &storage;
         vk_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 
-        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
+        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(std::uint32_t)};
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout.setLayoutCount = 1;
         layout.pSetLayouts = &set_layout_;
@@ -222,14 +222,14 @@ public:
                 create_pipeline(statistics_sum_spirv, statistics_pipeline_));
     }
 
-    // Adds `count` pipeline-statistics results (11 counters each) into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at
-    // dst + offset: the segments of a statistics query that was split around helper dispatches (D3D-162).
+    // Sum each 64-bit counter separately. Pipeline statistics have eleven counters and stream output has two.
     void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
-                        VkBuffer dst, VkDeviceSize offset) const {
-        constexpr VkDeviceSize result = statistics_counters * word_size;
+                        VkBuffer dst, VkDeviceSize offset, std::uint32_t counters = statistics_counters) const {
+        const VkDeviceSize result = counters * word_size;
         begin_scratch_write(cb);
         vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
         bind(cb, statistics_pipeline_);
+        vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, sizeof(counters), sizeof(counters), &counters);
         while (count) {
             const auto chunk = std::min(count, statistics_capacity);
             vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, result, result,
@@ -1811,22 +1811,28 @@ private:
                                            std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
                 occlusion_resolve_->sum_statistics(cb, pool, first, count, dst, offset);
             };
+            replay.sum_stream_output = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                              std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum_statistics(cb, pool, first, count, dst, offset, 2);
+            };
             replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                                  std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
                 occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
             };
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
-        std::uint32_t segments = 0, statistics_segments = 0;
+        std::uint32_t segments = 0, statistics_segments = 0, so_segments = 0;
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
             if (result != ReplayResult::success) return result;
             if (prepared[i].segment_count > UINT32_MAX - segments ||
-                prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
+                prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments ||
+                prepared[i].so_segment_count > UINT32_MAX - so_segments)
                 return ReplayResult::unsupported;
             segments += prepared[i].segment_count;
             statistics_segments += prepared[i].statistics_segment_count;
+            so_segments += prepared[i].so_segment_count;
             has_queries = has_queries || !prepared[i].queries.empty();
         }
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
@@ -1843,8 +1849,10 @@ private:
             if (type == VK_QUERY_TYPE_PIPELINE_STATISTICS) info.pipelineStatistics = 0x7ff;
             return vk.vkCreateQueryPool(out->device, &info, nullptr, &out->pool) == VK_SUCCESS;
         };
-        std::shared_ptr<OcclusionSegmentPool> physical, statistics;
+        std::shared_ptr<OcclusionSegmentPool> physical, statistics, stream_output;
         if (segments && !segment_pool(VK_QUERY_TYPE_OCCLUSION, segments, physical)) return ReplayResult::unsupported;
+        if (so_segments && !segment_pool(VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, so_segments, stream_output))
+            return ReplayResult::unsupported;
         // Without the compute helper a split query could not be summed: leave statistics queries whole, as before.
         if (statistics_segments && can_resolve_occlusion &&
             !segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
@@ -1854,12 +1862,14 @@ private:
         // see submission-order query state and remove_query_pool() waits until commit finishes.
         if (has_queries && !tracker_lock.owns_lock()) tracker_lock.lock();
         QueryReplay queries;
-        std::uint32_t base = 0, statistics_base = 0;
+        std::uint32_t base = 0, statistics_base = 0, so_base = 0;
         for (auto& list : prepared) {
-            const auto result = queries.plan(list, physical, base, can_resolve_occlusion, statistics, statistics_base);
+            const auto result = queries.plan(list, physical, base, can_resolve_occlusion, statistics, statistics_base,
+                                             stream_output, so_base, can_resolve_occlusion);
             if (result != ReplayResult::success) return result;
             base += list.segment_count;
             statistics_base += list.statistics_segment_count;
+            so_base += list.so_segment_count;
         }
         if (queries.needs_sum || queries.needs_binary || queries.needs_statistics_sum || queries.needs_sum_binary) {
             if (!occlusion_resolve_) {

@@ -2051,7 +2051,8 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_PS_SO_SPV="${LEONIDA_TEST_PS_SO}")
       target_compile_options(d3d12_stream_output_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stream_output COMMAND d3d12_stream_output_test)
-      set_tests_properties(d3d12_stream_output PROPERTIES SKIP_RETURN_CODE 77
+      add_test(NAME d3d12_stream_output_queries COMMAND d3d12_stream_output_test --queries-only)
+      set_tests_properties(d3d12_stream_output d3d12_stream_output_queries PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
       # D3D-309: D24 depth bias and 24-bit depth in draws, with and without a pixel shader and with a geometry shader
       # (src/depth24_fragment.h).

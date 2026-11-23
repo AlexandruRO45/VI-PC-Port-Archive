@@ -619,6 +619,24 @@ int main() {
         expect(trace.events == want, "pooled: the same segments and sums as the batched path");
     }
 
+    // A device can expose transform feedback queries but only stream 0. Unsupported streams issue no indexed
+    // Vulkan commands and a new interval replaces any result previously held in those D3D12 slots with zero.
+    {
+        Trace trace;
+        g_trace = &trace;
+        QueryPool so_heap{handle<VkQueryPool>(10), d3d12_query_heap::so_statistics, 2, false, {true, true}, {}, 1};
+        ReplayFunctions limited = vk;
+        limited.query_pool = [&](QueryHeapId) { return &so_heap; };
+        CommandList list;
+        const auto stream1 = d3d12_query::so_statistics_stream0 + 1;
+        expect(list.begin_query({10, stream1, 0}) && list.begin_query({10, stream1, 1}) &&
+               list.end_query({10, stream1, 0}) && list.end_query({10, stream1, 1}), "record unsupported stream");
+        expect(list.resolve_queries({10, stream1, 0, 2, 1, 0}) && list.close(), "resolve unsupported stream");
+        expect(replay(list, VK_NULL_HANDLE, resolve, limited) == ReplayResult::success, "one-stream device replays");
+        expect(trace.events == std::vector<std::string>{"fill"} && !so_heap.ended[0] && !so_heap.ended[1],
+               "unsupported stream resolves both slots to zero without issuing indexed queries");
+    }
+
     if (failures) return 1;
     std::puts("replay_query_predication_test: query resolves suspend conditional rendering around fills, copies and dispatches");
     return 0;
