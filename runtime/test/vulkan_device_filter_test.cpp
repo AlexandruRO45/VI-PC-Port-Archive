@@ -61,6 +61,23 @@ int main() {
     expect(!vulkan_device_wanted(nullptr), "a filter never matches a null name");
     expect(!vulkan_device_wanted(""), "a filter never matches an empty name");
 
+    // Leading/trailing ASCII whitespace (e.g. trailing space from Windows `set VAR=val ` or `\r` from CRLF scripts)
+    // is trimmed while interior spaces stay intact; a whitespace-only filter counts as unset.
+    set_filter("   \t\r\n");
+    expect(vulkan_device_filter().empty(), "whitespace-only filter trims to empty");
+    expect(vulkan_device_wanted("AMD Radeon RX 6900 XT"), "whitespace-only filter matches any device");
+    expect(vulkan_device_wanted(nullptr), "whitespace-only filter matches null name");
+
+    set_filter("  RTX 5070 \r\n");
+    expect(vulkan_device_filter() == "rtx 5070", "surrounding whitespace and CRLF are trimmed");
+    expect(vulkan_device_wanted("NVIDIA GeForce RTX 5070 Ti"), "trimmed filter with interior space matches");
+    expect(!vulkan_device_wanted("NVIDIA GeForce RTX 4070 Ti"), "trimmed filter still rejects non-matching model");
+
+    set_filter("\tNVIDIA\r");
+    expect(vulkan_device_filter() == "nvidia", "ASCII I lowers deterministically to i");
+    expect(vulkan_device_wanted("NVIDIA GeForce RTX 5070 Ti"), "trimmed NVIDIA filter matches");
+
+
     // The rank the runtime and every harness pick by (VkPhysicalDeviceType values: OTHER 0, INTEGRATED 1, DISCRETE 2,
     // VIRTUAL 3, CPU 4). A native driver beats Microsoft's layers of any type, so Dozen ("Microsoft Direct3D12 (...)",
     // reported as discrete) never wins over the GPU it wraps, nor over a native integrated GPU (#915).

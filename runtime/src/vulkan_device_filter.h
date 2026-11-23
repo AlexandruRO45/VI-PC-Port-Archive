@@ -6,14 +6,21 @@
 // one driver, so the loader's own driver filters cannot tell them apart. A value that matches no device must fail
 // the caller, not fall back, so a typo cannot silently test another GPU (as LEONIDA_HOST_ADAPTER does).
 
-#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
 
 namespace leonida {
 
-// The filter, lower-cased; empty when unset.
+inline constexpr char vulkan_ascii_lower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? char(c + ('a' - 'A')) : c;
+}
+
+inline constexpr bool vulkan_ascii_space(char c) noexcept {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+}
+
+// The filter, trimmed of leading/trailing ASCII whitespace and lower-cased; empty when unset or whitespace-only.
 inline std::string vulkan_device_filter() {
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -24,7 +31,12 @@ inline std::string vulkan_device_filter() {
 #pragma warning(pop)
 #endif
     std::string out = value ? value : "";
-    for (char& c : out) c = char(std::tolower(static_cast<unsigned char>(c)));
+    std::size_t begin = 0;
+    while (begin < out.size() && vulkan_ascii_space(out[begin])) ++begin;
+    std::size_t end = out.size();
+    while (end > begin && vulkan_ascii_space(out[end - 1])) --end;
+    out = out.substr(begin, end - begin);
+    for (char& c : out) c = vulkan_ascii_lower(c);
     return out;
 }
 
@@ -33,9 +45,10 @@ inline bool vulkan_device_wanted(const char* device_name) {
     const std::string filter = vulkan_device_filter();
     if (filter.empty()) return true;
     std::string name = device_name ? device_name : "";
-    for (char& c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : name) c = vulkan_ascii_lower(c);
     return name.find(filter) != std::string::npos;
 }
+
 
 // Microsoft is the vendor of the D3D12 translation layers Windows adds next to the real GPU (Mesa's Dozen from the
 // "OpenCL, OpenGL and Vulkan Compatibility Pack", and the Basic Render Driver); no native GPU driver uses it. Dozen
