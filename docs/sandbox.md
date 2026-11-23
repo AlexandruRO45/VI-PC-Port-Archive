@@ -64,8 +64,11 @@ python -I tools/sandbox.py --work <work> --entities <work>/entities.jsonl --mode
 `unsupported: shaderDrawParameters` and exits 77. Sampler anisotropy is used when `samplerAnisotropy` is present and
 falls back to a non-anisotropic sampler otherwise, so frames still render on devices without it.
 
-Exit codes: 0 frame passed, 1 frame check failed, 77 unsupported (tool not built, no shader pair, no entities or
-props, or the device lacks a required feature).
+Exit codes: with `--check`, `tools/sandbox.py` returns 0 when the frame check passes, 1 when it fails, and 77 when
+the tool is not built, no translated shader pair or entities file is found, no prop resolves, or `vk_sandbox` reports
+an unsupported device. `--window` returns `vk_sandbox`'s exit code. `vk_sandbox` itself returns 0 after rendering, 1
+for a device, pipeline, surface or output failure, 2 for bad usage or a bad scene, and 77 when the Vulkan loader,
+instance, physical device, push-constant budget, `shaderDrawParameters` or graphics queue is missing.
 
 Window keys: WASD move, right mouse button held to look, Q/E down/up (fly), Shift faster, 1 fly, 2 walk (eye 1.7 m
 over the highest scene triangle under the camera), 3 drive (eye 1.2 m, accelerates and steers), P screenshot,
