@@ -181,5 +181,57 @@ class TestVBfeU32AST(unittest.TestCase):
             inst.dst = Operand(RegType.VGPR, 4)  # type: ignore
 
 
+class ScalarMachine:
+    def __init__(self):
+        self.vgprs: dict[int, int] = {i: 0 for i in range(256)}
+        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs.get(op.index, 0)
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs.get(op.index, 0)
+        return op.val & MASK32
+
+    def write_operand(self, op: Operand, val: int):
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[op.index] = val & MASK32
+        elif op.reg_type == RegType.SGPR:
+            self.sgprs[op.index] = val & MASK32
+
+    def step(self, inst: VBfeU32Inst):
+        s0 = self.read_operand(inst.src0)
+        s1 = self.read_operand(inst.src1)
+        s2 = self.read_operand(inst.src2)
+        res = ref_bfe_u32(s0, s1, s2)
+        self.write_operand(inst.dst, res)
+
+
+class TestVBfeU32ScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar instruction interpreter."""
+
+    def test_scalar_rgb565_unpacking(self):
+        color = 0xF815
+        mach = ScalarMachine()
+        mach.vgprs[1] = color
+
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 2), Operand(RegType.VGPR, 1), Operand(RegType.IMM, 0, 0), Operand(RegType.IMM, 0, 5)))
+        self.assertEqual(mach.vgprs[2], 0b10101)
+
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 3), Operand(RegType.VGPR, 1), Operand(RegType.IMM, 0, 5), Operand(RegType.IMM, 0, 6)))
+        self.assertEqual(mach.vgprs[3], 0b000000)
+
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 4), Operand(RegType.VGPR, 1), Operand(RegType.IMM, 0, 11), Operand(RegType.IMM, 0, 5)))
+        self.assertEqual(mach.vgprs[4], 0b11111)
+
+    def test_scalar_sequential_pipeline(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = 0xCAFEBABE
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 1), Operand(RegType.VGPR, 0), Operand(RegType.IMM, 0, 8), Operand(RegType.IMM, 0, 8)))
+        self.assertEqual(mach.vgprs[1], 0xBA)
+        mach.step(VBfeU32Inst(Operand(RegType.VGPR, 2), Operand(RegType.VGPR, 1), Operand(RegType.IMM, 0, 4), Operand(RegType.IMM, 0, 4)))
+        self.assertEqual(mach.vgprs[2], 0xB)
+
+
 if __name__ == '__main__':
     unittest.main()
