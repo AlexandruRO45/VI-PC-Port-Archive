@@ -45,6 +45,9 @@ import sys
 import time
 import zlib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 PAGE = 4096
 MAX_SYS = 32 * 1024 * 1024
 MAX_GFX = 224 * 1024 * 1024
@@ -479,7 +482,7 @@ def main(argv=None):
             print(f"error: --json {a.json} is a directory", file=sys.stderr)
             return 2
         for path in a.inputs:
-            if same_output_path(a.json, path):
+            if same_report_path(a.json, path):
                 print(f"error: --json would overwrite the input {path}", file=sys.stderr)
                 return 2
     report, t0 = {}, time.time()
