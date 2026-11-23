@@ -28,6 +28,7 @@ Deterministic, zero game data, Python 3.9+ compatible.
 """
 from __future__ import annotations
 
+import gc
 import os
 import struct
 import sys
@@ -48,10 +49,12 @@ if HERE not in sys.path:
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+from support import mrt0_words, translate_lines  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+PUSH_VSHARP = [0x1000, 0, 0x1000, 0x31016FAC] + [0] * 28
 
 
 def u32(v: int) -> int:
@@ -286,6 +289,7 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     global _TMP_DIR, _SRC_PATH
     if _TMP_DIR is not None:
+        gc.collect()
         _TMP_DIR.cleanup()
         _TMP_DIR = None
         _SRC_PATH = None
@@ -305,7 +309,7 @@ def run_synthetic_s_brev_b32(x: int) -> int:
         "\texp mrt0 v0, v1, v0, v0 done vm\n"
         "\ts_endpgm\n"
     )
-    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+    with open(_SRC_PATH, "w", encoding="utf-8", newline="\n") as f:
         f.write(asm)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
@@ -329,7 +333,7 @@ def run_synthetic_s_brev_b64(x64: int) -> int:
         "\texp mrt0 v0, v1, v0, v0 done vm\n"
         "\ts_endpgm\n"
     )
-    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+    with open(_SRC_PATH, "w", encoding="utf-8", newline="\n") as f:
         f.write(asm)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
@@ -826,6 +830,285 @@ class TestSpirvTranslationAndExecution(unittest.TestCase):
             with self.subTest(val=hex(val)):
                 res = run_synthetic_s_brev_b64(val)
                 self.assertEqual(res, ref_brev64(val))
+
+
+def translate_ps_brev(lines: list[str]) -> str:
+    """Translate a hand-written pixel shader listing exporting v0..v3 to mrt0."""
+    return translate_lines(
+        "ps_salu_brev",
+        [*lines, "exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"],
+    )
+
+
+class EndToEndScalarBrevTranslatorTests(unittest.TestCase):
+    """End-to-end rdna2spirv.translate + spirv_mini_interp execution for s_brev_b32 and s_brev_b64."""
+
+    def test_runtime_s_brev_b32_patterns_involution_and_scc_preservation(self):
+        # Load runtime 32-bit value s4 from buffer memory (not in sgpr_imm), verify bit reversal,
+        # SCC preservation under both pre-seeded SCC=0 and SCC=1, and double-reversal involution.
+        spv = translate_ps_brev([
+            "s_buffer_load_dword s4, s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_brev_b32 s6, s4",
+            "s_cselect_b32 s7, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (must stay 1 even when s4 == 0)
+            "s_brev_b32 s8, s4",
+            "s_cselect_b32 s9, 1, 0",
+            "s_lshl_b32 s9, s9, 1",
+            "s_or_b32 s7, s7, s9",
+            "s_brev_b32 s10, s6",         # involution: brev32(brev32(s4)) == s4
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s8",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s7",
+        ])
+
+        vectors = (
+            list(TestReferenceBitReversal.VALUES32)
+            + [1 << b for b in range(32)]
+            + [(~(1 << b)) & MASK32 for b in range(32)]
+            + [0x80000001, 0xC0000003, 0x81818181, 0x42424242, 0x24242424, 0x18181818, 0x99999999]
+        )
+        for val in vectors:
+            with self.subTest(val=hex(val)):
+                want = ref_brev32(val)
+                words = mrt0_words(
+                    spv,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: val},
+                )
+                self.assertEqual(words, [want, want, val & MASK32, 0b10])
+
+    def test_runtime_s_brev_b32_special_registers_inplace_and_sgpr_imm_invalidation(self):
+        # Exercises:
+        # 1) special register destinations and sources (m0, vcc_lo, vcc_hi, null)
+        # 2) in-place destination aliasing (s_brev_b32 s4, s4)
+        # 3) sgpr_imm invalidation when a constant-initialized SGPR is overwritten by runtime s_brev_b32
+        # 4) lane-mask status reset when a v_cmp lane-mask SGPR is overwritten by s_brev_b32
+        spv = translate_ps_brev([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_brev_b32 m0, s4",          # special dst m0 = brev32(s4)
+            "s_brev_b32 vcc_lo, m0",      # special src m0 -> special dst vcc_lo = s4
+            "s_brev_b32 vcc_hi, s5",      # special dst vcc_hi = brev32(s5)
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1
+            "s_brev_b32 null, s4",        # null dst discards write and preserves SCC = 1
+            "s_brev_b32 s10, null",       # null src reads 0 -> brev32(0) == 0, preserves SCC = 1
+            "s_cselect_b32 s11, 1, 0",
+            "s_or_b32 s10, s10, s11",     # 0 | 1 == 1
+            "s_brev_b32 s4, s4",          # in-place aliasing on runtime s4
+            "s_mov_b32 s12, 0x11111111",  # populates sgpr_imm[12]
+            "s_brev_b32 s12, s5",         # runtime overwrite must invalidate sgpr_imm[12]
+            "s_not_b32 s13, s12",         # consults imm_val(s12); must not fold ~0x11111111
+            "v_mov_b32 v2, 1",
+            "v_cmp_eq_u32_e64 s14, 1, v2",
+            "s_brev_b32 s14, s5",         # clears lane-mask tracking on s14
+            "s_ff1_i32_b32 s15, s14",
+            "s_xor_b32 s10, s10, vcc_lo",
+            "s_xor_b32 s13, s13, vcc_hi",
+            "v_mov_b32 v0, m0",
+            "v_mov_b32 v1, s4",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s13",
+        ])
+        self.assertNotIn("OpGroupNonUniformBitwiseOr", spv)
+
+        for v4, v5 in (
+            (0x12345678, 0xDEADBEEF),
+            (0x80000000, 0x0000FFFF),
+            (0x00000001, 0xA5A55A5A),
+            (0xCAFEBABE, 0x00000000),
+        ):
+            with self.subTest(v4=hex(v4), v5=hex(v5)):
+                rev4 = ref_brev32(v4)
+                rev5 = ref_brev32(v5)
+                not_rev5 = (~rev5) & MASK32
+                words = mrt0_words(
+                    spv,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: v4, 0x1004: v5},
+                )
+                self.assertEqual(words, [rev4, rev4, 1 ^ v4, not_rev5 ^ rev5])
+
+    def test_runtime_s_brev_b64_cross_dword_reversal_involution_and_scc_preservation(self):
+        # Load runtime 64-bit value s[4:5] from buffer memory, verify cross-dword bit reversal
+        # (D.lo = brev32(S0.hi), D.hi = brev32(S0.lo)), SCC preservation under pre-seeded 0 and 1,
+        # and 64-bit involution back to s[4:5].
+        spv = translate_ps_brev([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_brev_b64 s[6:7], s[4:5]",
+            "s_cselect_b32 s10, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (must stay 1 even when s[4:5] == 0)
+            "s_brev_b64 s[8:9], s[6:7]",  # involution: brev64(brev64(s[4:5])) == s[4:5]
+            "s_cselect_b32 s11, 1, 0",
+            "s_lshl_b32 s11, s11, 1",
+            "s_or_b32 s10, s10, s11",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s10",
+            "s_xor_b32 s12, s8, s9",
+            "v_mov_b32 v3, s12",
+        ])
+
+        vectors64 = (
+            list(TestReferenceBitReversal.VALUES64)
+            + [1 << b for b in range(64)]
+            + [0x0123456789ABCDEF, 0x8000000000000001, 0x0000FFFF00000000, 0x00000000FFFF0000]
+        )
+        for val64 in vectors64:
+            with self.subTest(val64=hex(val64)):
+                lo, hi = split_dwords(val64)
+                want_lo, want_hi = split_dwords(ref_brev64(val64))
+                words = mrt0_words(
+                    spv,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: lo, 0x1004: hi},
+                )
+                self.assertEqual(words, [want_lo, want_hi, 0b10, lo ^ hi])
+
+    def test_runtime_s_brev_b64_inplace_overlapping_pairs_and_immediates(self):
+        # 1. In-place s_brev_b64 s[4:5], s[4:5] and overlapping pairs s[7:8], s[6:7] and s[9:10], s[10:11]
+        #    verify both source dwords are loaded before either destination dword is written.
+        spv_overlap = translate_ps_brev([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_mov_b64 s[10:11], s[6:7]",
+            "s_brev_b64 s[4:5], s[4:5]",    # in-place pair reversal
+            "s_brev_b64 s[7:8], s[6:7]",    # dst low (s7) overlaps src high (s7)
+            "s_brev_b64 s[9:10], s[10:11]", # dst high (s10) overlaps src low (s10)
+            "s_xor_b32 s12, s4, s5",
+            "s_xor_b32 s13, s7, s8",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "v_mov_b32 v2, s13",
+            "v_mov_b32 v3, s10",
+        ])
+
+        for a64, b64 in (
+            (0x123456789ABCDEF0, 0x0123456789ABCDEF),
+            (0xDEADBEEFCAFEBABE, 0x8000000000000001),
+            (0x00000000FFFFFFFF, 0x0000FFFF12345678),
+        ):
+            with self.subTest(a64=hex(a64), b64=hex(b64)):
+                alo, ahi = split_dwords(a64)
+                blo, bhi = split_dwords(b64)
+                want_a_lo, want_a_hi = split_dwords(ref_brev64(a64))
+                want_b_lo, want_b_hi = split_dwords(ref_brev64(b64))
+                words = mrt0_words(
+                    spv_overlap,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: alo, 0x1004: ahi, 0x1008: blo, 0x100C: bhi},
+                )
+                self.assertEqual(words, [want_a_lo, want_a_hi, want_b_lo ^ want_b_hi, want_b_hi])
+
+        # 2. 64-bit immediate sources (sign-extended negative inline constants and zero-extended 32-bit literals)
+        #    plus sgpr_imm invalidation on both halves of the destination SGPR pair.
+        spv_imm = translate_ps_brev([
+            "s_buffer_load_dwordx2 s[6:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_brev_b64 s[8:9], -16",        # -16 sign-extends to 0xFFFFFFFFFFFFFFF0 -> 0x0FFFFFFFFFFFFFFF
+            "s_brev_b64 s[10:11], 0x12345678",  # 32-bit literal zero-extends high half -> D.lo=0, D.hi=0x1E6A2C48
+            "s_mov_b32 s4, 0x11111111",
+            "s_mov_b32 s5, 0x22222222",
+            "s_brev_b64 s[4:5], s[6:7]",     # must invalidate sgpr_imm[4] and sgpr_imm[5]
+            "s_not_b32 s12, s4",
+            "s_not_b32 s13, s5",
+            "v_mov_b32 v0, s9",
+            "v_mov_b32 v1, s11",
+            "v_mov_b32 v2, s12",
+            "v_mov_b32 v3, s13",
+        ])
+        words_imm = mrt0_words(
+            spv_imm,
+            push_constants=PUSH_VSHARP,
+            memory={0x1000: 0x9ABCDEF0, 0x1004: 0x12345678},
+        )
+        rev_lo, rev_hi = split_dwords(ref_brev64(0x123456789ABCDEF0))
+        self.assertEqual(
+            words_imm,
+            [
+                split_dwords(ref_brev64((-16) & MASK64))[1],
+                split_dwords(ref_brev64(0x12345678))[1],
+                (~rev_lo) & MASK32,
+                (~rev_hi) & MASK32,
+            ],
+        )
+
+    def test_runtime_fft_radix2_bitrev_index_permutation_32_and_64(self):
+        # Execute the radix-2 Cooley-Tukey DIT FFT bit-reversal permutation sequences
+        # (s_brev_b32 + s_lshr_b32 and s_brev_b64 + s_lshr_b64) on runtime-loaded indices and shifts.
+        spv_fft32 = translate_ps_brev([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_brev_b32 s6, s4",
+            "s_lshr_b32 s6, s6, s5",         # rev_k(n) = brev32(n) >> (32 - k)
+            "s_brev_b32 s7, s6",
+            "s_lshr_b32 s7, s7, s5",         # rev_k(rev_k(n)) == n
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ])
+
+        for log2_n in (3, 4, 6, 10):
+            shift32 = 32 - log2_n
+            n_pts = 1 << log2_n
+            sample_indices = list(range(min(n_pts, 16))) + [n_pts // 2, n_pts - 2, n_pts - 1]
+            for idx in sample_indices:
+                with self.subTest(bits=32, log2_n=log2_n, idx=idx):
+                    want_rev = fft_bitrev_index_32(idx, log2_n)
+                    words = mrt0_words(
+                        spv_fft32,
+                        push_constants=PUSH_VSHARP,
+                        memory={0x1000: idx, 0x1004: shift32},
+                    )
+                    self.assertEqual(words[:2], [want_rev, idx])
+
+        spv_fft64 = translate_ps_brev([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_brev_b64 s[8:9], s[4:5]",
+            "s_lshr_b64 s[8:9], s[8:9], s6",   # rev_k(n) = brev64(n) >> (64 - k)
+            "s_brev_b64 s[10:11], s[8:9]",
+            "s_lshr_b64 s[10:11], s[10:11], s6",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+
+        for log2_n in (33, 40, 48, 60, 64):
+            shift64 = 64 - log2_n
+            for idx64 in (0, 1, (1 << (log2_n - 1)) | 0x55, (1 << log2_n) - 1):
+                with self.subTest(bits=64, log2_n=log2_n, idx64=hex(idx64)):
+                    idx_lo, idx_hi = split_dwords(idx64)
+                    want_lo, want_hi = split_dwords(fft_bitrev_index_64(idx64, log2_n))
+                    words = mrt0_words(
+                        spv_fft64,
+                        push_constants=PUSH_VSHARP,
+                        memory={0x1000: idx_lo, 0x1004: idx_hi, 0x1008: shift64, 0x100C: 0},
+                    )
+                    self.assertEqual(words, [want_lo, want_hi, idx_lo, idx_hi])
+
+    def test_s_brev_b64_unsupported_operands_rejected(self):
+        # Single-SGPR destination, single-SGPR source, special register destination/source,
+        # and lane-mask SGPR pair source must be rejected with rdna2spirv.Unsupported.
+        bad_listings = [
+            ["s_brev_b64 s0, s[2:3]"],
+            ["s_brev_b64 s[0:1], s2"],
+            ["s_brev_b64 vcc, s[2:3]"],
+            ["s_brev_b64 exec, s[2:3]"],
+            ["s_brev_b64 s[0:1], vcc"],
+            ["s_brev_b64 s[0:1], exec"],
+            ["v_mov_b32 v0, 1", "v_cmp_eq_u32_e64 s[2:3], 1, v0", "s_brev_b64 s[0:1], s[2:3]"],
+        ]
+        for lines in bad_listings:
+            with self.subTest(lines=lines):
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    translate_ps_brev(lines)
 
 
 if __name__ == "__main__":
