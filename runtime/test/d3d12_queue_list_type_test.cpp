@@ -169,7 +169,8 @@ int main() {
     // 5. A list that closed with S_OK stays executable when one more recording call reaches it before
     // ExecuteCommandLists: the PC runtime ignores the call (measured on an RTX 5070 Ti, driver 610.74, and on WARP:
     // every case below runs, a stray copy into bytes 4..8 never lands, the second Close is E_FAIL, the device is not
-    // removed).
+    // removed). Bytes 4..8 hold a sentinel other than the marker and zero, so a failed Map can't pass for untouched.
+    const std::uint32_t sentinel = 0x53454e54;  // "SENT"
     using StrayCall = void (*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
     struct Stray {
         const char* name;
@@ -207,7 +208,8 @@ int main() {
                                              IID_PPV_ARGS(&list.p))))
             return 1;
         if (FAILED(readback->Map(0, nullptr, &mapped))) return 1;
-        std::memset(mapped, 0, 8);
+        std::memset(mapped, 0, 4);
+        std::memcpy(static_cast<char*>(mapped) + 4, &sentinel, sizeof sentinel);
         readback->Unmap(0, nullptr);
         list->CopyBufferRegion(readback.p, 0, upload.p, 0, sizeof marker);
         const HRESULT closed = list->Close();
@@ -217,7 +219,7 @@ int main() {
         const bool ran = rt::d3d12::last_execute_result(queues[0].p) == leonida::ReplayResult::success;
         const bool idle = wait_idle(device.p, queues[0].p);
         const bool landed = idle && read_word() == marker;
-        const bool untouched = idle && read_word(4) == 0;  // only the stray CopyBufferRegion writes bytes 4..8
+        const bool untouched = idle && read_word(4) == sentinel;  // only the stray CopyBufferRegion writes there
         char what[192];
         std::snprintf(what, sizeof what, "a list closed with S_OK still runs after %s on the closed list "
                       "(Close 0x%08lx, batch %s, copy %s, bytes 4..8 %s)", stray.name,
