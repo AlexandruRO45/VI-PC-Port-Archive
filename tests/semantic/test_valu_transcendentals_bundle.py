@@ -735,5 +735,35 @@ class TestVRsqF32ASTInterpreter(unittest.TestCase):
         self.assertEqual(bits_to_f32(state.vgprs[0]), 0.25)
 
 
+def step_simd_rsq_f32(wave: WaveState, instr: Instruction) -> None:
+    if instr.opcode != "v_rsq_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            val = wave.read_lane_f32(lane, instr.src0)
+            res = ref_rsq_f32(val)
+            wave.write_lane_f32(lane, int(instr.dst.index_or_val), res)
+
+
+class TestVRsqF32SIMDAndIEEE(unittest.TestCase):
+    """SIMD multi-lane divergence and IEEE 754 edge cases for v_rsq_f32."""
+
+    def test_simd_divergence(self):
+        wave = WaveState(wave_size=32)
+        wave.exec_mask = 0xF0F0F0F0
+        for lane in range(32):
+            wave.vgprs[lane][1] = f32_to_bits(4.0)
+            wave.vgprs[lane][0] = f32_to_bits(0.0)
+
+        instr = Instruction("v_rsq_f32", Operand.vgpr(0), Operand.vgpr(1))
+        step_simd_rsq_f32(wave, instr)
+
+        for lane in range(32):
+            if ((0xF0F0F0F0 >> lane) & 1):
+                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.5)
+            else:
+                self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
