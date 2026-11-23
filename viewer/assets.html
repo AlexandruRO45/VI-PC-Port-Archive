@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Assets · Leonida Viewer</title>
+<style>
+  :root { color-scheme: dark; --bg: #0d1014; --panel: #151a21; --line: #37414d; --fg: #e6e8eb; --dim: #aab4c0; --accent: #8ac9ff; --blue: #24425c; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+  header { border-bottom: 1px solid var(--line); }
+  nav, main { max-width: 1440px; margin: auto; padding: 12px clamp(12px, 3vw, 36px); }
+  nav, .row, .pager { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  nav a, button, select, input { color: inherit; font: inherit; }
+  nav a, button, select, input { padding: 7px 10px; border-radius: 5px; }
+  nav a[aria-current="page"], button[aria-pressed="true"] { background: var(--blue); text-decoration: none; }
+  button, select, input { border: 1px solid var(--line); background: #1c242e; }
+  button { cursor: pointer; }
+  button:disabled { cursor: default; opacity: .55; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  main { padding-block: 24px; }
+  h1, h2, p { margin: 0; }
+  h1 { margin-bottom: 14px; font-size: 1.8rem; }
+  h2 { font-size: 1.15rem; overflow-wrap: anywhere; }
+  .layout { display: grid; grid-template-columns: minmax(240px, 310px) minmax(0, 1fr); gap: 16px; align-items: start; }
+  .panel { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  .stack { display: grid; gap: 12px; }
+  .hint, .status, .path { color: var(--dim); font-size: .875rem; overflow-wrap: anywhere; }
+  label { display: grid; gap: 4px; }
+  input[type="search"] { width: 100%; }
+  .file-controls input { width: 100%; min-width: 0; }
+  .files { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+  .files button { display: grid; gap: 2px; width: 100%; text-align: left; overflow-wrap: anywhere; }
+  .pager { justify-content: space-between; }
+  .stage { position: relative; display: grid; place-items: center; height: clamp(230px, 55vh, 620px); overflow: hidden; background: #10151c; border: 1px solid var(--line); border-radius: 7px; }
+  .stage canvas, .stage img { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+  .stage canvas { touch-action: none; }
+  .stage canvas:focus-visible { outline-offset: -3px; }
+  .stage img { object-fit: contain; }
+  .stage .status { position: absolute; max-width: 80%; padding: 8px 12px; text-align: center; }
+  .stage [role="alert"] { color: #ffc28c; }
+  .preview-frame { border-color: #a17c4d; }
+  .preview-file { max-width: 100%; }
+  @media (max-width: 740px) {
+    main { padding-block: 16px; }
+    .layout { grid-template-columns: minmax(0, 1fr); }
+    .stage { height: clamp(220px, 45vh, 420px); }
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module" src="/assets.js"></script>
+</head>
+<body>
+<header>
+  <nav aria-label="Viewer">
+    <a href="/">Map</a>
+    <a href="/assets.html" aria-current="page">Assets</a>
+  </nav>
+</header>
+<main>
+  <h1>Asset browser</h1>
+  <div class="layout">
+    <section class="panel stack" aria-labelledby="library-heading">
+      <h2 id="library-heading">Local library</h2>
+      <label>Category
+        <select id="category">
+          <option value="props">Props</option>
+          <option value="ped-parts">Ped parts</option>
+          <option value="vehicles">Vehicles</option>
+        </select>
+      </label>
+      <div class="stack file-controls" aria-describedby="import-help">
+        <label>Add GLB files
+          <input id="files" type="file" accept=".glb,.png" multiple>
+        </label>
+        <label>Add a folder
+          <input id="folder" type="file" webkitdirectory multiple>
+        </label>
+      </div>
+      <p class="hint" id="import-help">Files stay in your browser. Choose a category before adding files, or pick a folder with Props, Ped parts, or Vehicles subfolders.</p>
+      <p class="status" id="import-status" role="status" hidden></p>
+      <label>Search by name
+        <input id="search" type="search" autocomplete="off">
+      </label>
+      <p class="status" id="results" role="status">No assets added.</p>
+      <ul class="files" id="models" aria-label="Models"></ul>
+      <div class="pager" id="pager" aria-label="Results pages" hidden>
+        <button id="previous" type="button">Previous</button>
+        <span id="page"></span>
+        <button id="next" type="button">Next</button>
+      </div>
+    </section>
+    <section class="panel stack" aria-labelledby="name">
+      <h2 id="name">Asset preview</h2>
+      <div class="row" role="group" aria-label="Display mode">
+        <button id="interactive" type="button" aria-pressed="true" disabled>Interactive GLB</button>
+        <button id="translated" type="button" aria-pressed="false" disabled>Translated Vulkan preview</button>
+      </div>
+      <div class="stage" id="model-stage">
+        <p class="status" id="model-status" role="status">Select a GLB to view its model and materials.</p>
+        <p class="status" id="model-error" role="alert" hidden></p>
+      </div>
+      <div class="stage preview-frame" id="image-stage" hidden>
+        <p class="status" id="image-status" role="status"></p>
+      </div>
+      <div class="row" id="orbit-tools">
+        <button id="fit" type="button" disabled>Fit model</button>
+        <p class="hint" id="orbit-help">Drag to orbit, scroll or pinch to zoom. Focus the model to use arrow keys and +/−.</p>
+      </div>
+      <p class="hint" id="capture" hidden></p>
+      <label class="preview-file" id="attachment" hidden>Attach preview PNG
+        <input id="png" type="file" accept=".png,image/png" aria-describedby="preview-help">
+      </label>
+      <p class="hint" id="preview-help">The translated preview is a static offline PNG. Rename the <code>image.png</code> from First Light’s <code>--png</code> run to <code>&lt;model-stem&gt;.shader.png</code> and pick it with its GLB in the same folder, or attach the PNG directly.</p>
+    </section>
+  </div>
+</main>
+</body>
+</html>

@@ -8,7 +8,11 @@
   :root { --bg: #0d1014; --fg: #e6e8eb; --dim: #8b929b; --accent: #5fb3ff; --warn: #ffb454; --panel: rgba(13,16,20,.82); }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.45 ui-monospace, Consolas, monospace; overflow: hidden; }
   canvas { display: block; }
-  #hud { position: fixed; top: 12px; left: 12px; background: var(--panel); padding: 10px 12px; border-radius: 8px; min-width: 250px; pointer-events: none; }
+  .viewer-nav { position: fixed; z-index: 1; top: 12px; left: 12px; display: flex; gap: 4px; padding: 4px; background: var(--bg); border: 1px solid #343e4a; border-radius: 8px; }
+  .viewer-nav a { color: var(--fg); padding: 4px 10px; border-radius: 4px; }
+  .viewer-nav a[aria-current] { background: #24425c; text-decoration: none; }
+  .viewer-nav a:focus-visible { outline: 2px solid var(--accent); }
+  #hud { position: fixed; top: 58px; left: 12px; background: var(--panel); padding: 10px 12px; border-radius: 8px; min-width: 250px; pointer-events: none; }
   #hud b { color: var(--accent); font-weight: 600; }
   #banner { position: fixed; top: 12px; right: 12px; max-width: 360px; background: var(--panel); border-left: 3px solid var(--warn); padding: 10px 12px; border-radius: 8px; }
   #banner.hidden { display: none; }
@@ -24,6 +28,10 @@
 </style>
 </head>
 <body>
+<nav class="viewer-nav" aria-label="Viewer">
+  <a href="/" aria-current="page">Map</a>
+  <a href="/assets.html">Assets</a>
+</nav>
 <div id="hud"></div>
 <div id="banner" class="hidden">
   <b>TEST TERRAIN</b>: generated in the browser. <span id="world-status"></span><br>

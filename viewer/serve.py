@@ -109,10 +109,10 @@ def safe_world_path(world_dir: str, req_path: str) -> str | None:
     return real_target
 
 
-# Outside /world/ the viewer is one page. Serving only these two request paths, matched before any decoding,
+# Outside /world/ serve only the viewer's named files, matched before any decoding. This
 # keeps the guards of safe_world_path from being needed twice: a device name (/NUL), an alternate data stream
 # (/index.html::$DATA) or a trailing dot or space (/index.html.) never reaches the file system.
-_VIEWER_PAGES = frozenset({"/", "/index.html"})
+_VIEWER_FILES = frozenset({"/", "/index.html", "/assets.html", "/assets.js"})
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -144,7 +144,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if safe_world_path(self.world, self.path) is None:
                 self.send_error(403, "Forbidden")
                 return None
-        elif clean not in _VIEWER_PAGES:
+        elif clean not in _VIEWER_FILES:
             self.send_error(404, "File not found")
             return None
         return super().send_head()
@@ -154,7 +154,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.world and clean.startswith("/world/"):
             resolved = safe_world_path(self.world, path)
             return resolved if resolved is not None else ""
-        if clean not in _VIEWER_PAGES:
+        if clean not in _VIEWER_FILES:
             return ""
         return super().translate_path(path)
 

@@ -195,6 +195,9 @@ class HandlerTest(unittest.TestCase):
         (world / "model.glb").write_bytes(b"glTF")
         (root / "site").mkdir()
         (root / "site" / "index.html").write_text("<!doctype html><title>viewer</title>", encoding="utf-8")
+        (root / "site" / "assets.html").write_text("<!doctype html><title>assets</title>", encoding="utf-8")
+        (root / "site" / "assets.js").write_text("export {};", encoding="utf-8")
+        (root / "site" / "studio.html").write_text("<!doctype html><title>studio</title>", encoding="utf-8")
         (root / "secret.txt").write_text("secret", encoding="utf-8")
 
         class QuietHandler(serve.Handler):
@@ -307,6 +310,20 @@ class HandlerTest(unittest.TestCase):
                     if method == "GET":
                         self.assertIn(b"<title>viewer</title>", body)
 
+    def test_asset_page_and_script_are_served_only_to_loopback_hosts(self):
+        for target, mime, content in (("/assets.html", "text/html", b"<title>assets</title>"),
+                                      ("/assets.js", "javascript", b"export {};")):
+            with self.subTest(target=target):
+                status, head, body = raw_request(self.port, target + "?v=1")
+                self.assertEqual(status, 200)
+                self.assertIn(mime, head.lower())
+                self.assertIn(content, body)
+                status, _, body = raw_request(self.port, target, method="HEAD")
+                self.assertEqual((status, body), (200, b""))
+                status, _, body = raw_request(self.port, target, host="foreign.example")
+                self.assertEqual(status, 403)
+                self.assertNotIn(content, body)
+
     def test_nothing_else_outside_world_is_served(self):
         # These reached SimpleHTTPRequestHandler unguarded: on Windows /NUL opened the device (200, empty) and
         # the stream, trailing-dot and trailing-space forms returned the page or the server's own source.
@@ -318,7 +335,8 @@ class HandlerTest(unittest.TestCase):
                    "/index.html.", "/index.html%20", "/index.html/", "/INDEX.HTML", "/index%2Ehtml",
                    "/./index.html", "/sub/../index.html", "/other.txt", "/other.txt::$DATA",
                    "/sub/", "/sub/index.html", "/../secret.txt", "/%2e%2e/secret.txt", "/..%5csecret.txt",
-                   "/world", "/worldx/ok.bin", "/favicon.ico")
+                   "/world", "/worldx/ok.bin", "/favicon.ico", "/studio.html",
+                   "/assets.html.", "/assets%2Ejs", "/assets.js::$DATA", "/assets.html/")
         with mock.patch("builtins.open", side_effect=AssertionError("a refused path reached open")) as opened:
             for method in ("GET", "HEAD"):
                 for target in targets:
