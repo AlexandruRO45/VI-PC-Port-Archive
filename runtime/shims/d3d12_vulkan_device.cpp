@@ -2730,7 +2730,8 @@ class RootSignature;
 // signature: CreateRootSignature with bytes it already made a signature from returns that object with one more
 // reference, and the last Release destroys it (WARP and an RTX 3080 Ti, Windows 11 26200; d3d12_compute_test compares
 // with the host). So a title that sets a second signature made from the same bytes sets the one already bound, and
-// its root arguments stay. The entries own nothing: a signature takes its own out when it dies.
+// its root arguments stay. The entries own nothing: a signature leaves the map in its last Release, under `mutex`,
+// so one that CreateRootSignature finds there under the same lock is alive and stays alive while it takes a reference.
 struct RootSignatures {
     std::mutex mutex;
     std::map<std::string, RootSignature*> live;
@@ -2743,11 +2744,21 @@ public:
     static constexpr GUID kTag{0x3e9b4a61, 0x2d7c, 0x4f18, {0xb5, 0xa0, 0xc7, 0x1e, 0x8d, 0x92, 0xf0, 0x36}};
     RootSignature(RootArgumentLayout layout, std::string content, std::shared_ptr<RootSignatures> siblings)
         : layout_(std::move(layout)), content_(std::move(content)), siblings_(std::move(siblings)) {}
-    // The entry is another object's when CreateRootSignature met this one after its last Release (see there).
-    ~RootSignature() override {
-        std::lock_guard lock(siblings_->mutex);
-        const auto it = siblings_->live.find(content_);
-        if (it != siblings_->live.end() && it->second == this) siblings_->live.erase(it);
+    // Its own count instead of Object's, so that the step from one reference to none and leaving the map are one
+    // step for CreateRootSignature's lookup. The object is deleted after the lock is dropped: its destructor releases
+    // the device, and whatever that runs must not run under the lock.
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++count_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const std::shared_ptr<RootSignatures> siblings = siblings_;  // outlives this object
+        {
+            std::lock_guard lock(siblings->mutex);
+            const ULONG left = --count_;
+            if (left) return left;
+            const auto it = siblings->live.find(content_);
+            if (it != siblings->live.end() && it->second == this) siblings->live.erase(it);
+        }
+        delete this;
+        return 0;
     }
     const RootArgumentLayout& layout() const { return layout_; }
     // SHA-256 of the serialized root signature: a cached PSO matches root signatures with the same content.
@@ -2757,6 +2768,7 @@ private:
     RootArgumentLayout layout_;
     std::string content_;
     std::shared_ptr<RootSignatures> siblings_;  // shared with the device, so it is there whenever this object dies
+    std::atomic<ULONG> count_{1};
 };
 
 // The ID3DBlob GetCachedBlob returns.
@@ -5833,15 +5845,15 @@ public:
         }
         register_static_samplers(parsed.sig);
         // One object per serialized signature (RootSignatures). The reference for the caller is taken under the lock
-        // a dying signature needs to leave the map, so an entry is either alive or past its last Release: AddRef
-        // then returns 1, the object gets no caller (its destructor is waiting for this lock) and the entry is
-        // replaced. The lock is dropped before hand_out, whose Release can be a signature's last.
+        // a signature's last Release takes to leave the map, so an entry is alive. The lock is dropped before
+        // hand_out, whose Release can be a signature's last.
         std::string content = leonida::sha256_hex({bytes, size});
         RootSignature* signature = nullptr;
         {
             std::lock_guard lock(root_signatures_->mutex);
             RootSignature*& live = root_signatures_->live[content];
-            if (live && live->AddRef() > 1) {
+            if (live) {
+                live->AddRef();
                 signature = live;
             } else {
                 signature = new RootSignature(std::move(layout), std::move(content), root_signatures_);
