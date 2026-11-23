@@ -212,7 +212,7 @@ def main(argv=None):
     import json
     index_path = os.path.join(old, "index.json")
     try:
-        with open(index_path, encoding="utf-8") as f:
+        with open(index_path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
         ap.error(f"cannot read {index_path}: {getattr(e, 'strerror', None) or e}")

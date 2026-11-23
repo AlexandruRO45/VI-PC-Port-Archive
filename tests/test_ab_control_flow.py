@@ -887,7 +887,15 @@ class PipelineExecutionTest(unittest.TestCase):
     def test_main_rejects_identical_truncated_images(self, mock_run) -> None:
         self.assert_pipeline_outcome(mock_run, 16, "dispatch form failed to run")
 
-    def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str) -> None:
+    @patch("subprocess.run")
+    def test_main_reads_utf8_bom_index(self, mock_run) -> None:
+        self.assert_pipeline_outcome(
+            mock_run, 64 * 64 * 16, "identical", index_encoding="utf-8-sig"
+        )
+
+    def assert_pipeline_outcome(
+        self, mock_run, image_size: int, expected: str, index_encoding: str = "utf-8"
+    ) -> None:
         import json
 
         # Prepare synthetic index
@@ -898,7 +906,7 @@ class PipelineExecutionTest(unittest.TestCase):
                 "features": ["bufferDeviceAddress"],
             }
         }
-        with open(os.path.join(self.shaders, "spirv", "index.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(self.shaders, "spirv", "index.json"), "w", encoding=index_encoding) as f:
             json.dump(index, f)
 
         # Prepare disassembly and placeholder spirv
