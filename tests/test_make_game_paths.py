@@ -41,12 +41,14 @@ class BuildDestinationTest(unittest.TestCase):
 
     def run_build(self, game, out, work, rejected):
         argv = ["make_game.py", "--game", game, "--out", out, "--work", work,
-                "--stages", "runtime"]
+                "--stages", "runtime", "--no-tui"]
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
             stack.enter_context(patch("make_game.below_normal"))
             stack.enter_context(patch("make_game.check", return_value={}))
             stack.enter_context(patch("make_game.log"))
+            # These tests include synthetic drive roots. Real folder locks are tested separately.
+            locks = stack.enter_context(patch("make_game.lock_build_directories"))
             preflight = stack.enter_context(patch("make_game.preflight"))
             build_runtime = stack.enter_context(patch("make_game.runtime"))
             stderr = stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
@@ -55,6 +57,7 @@ class BuildDestinationTest(unittest.TestCase):
                     make_game.main()
                 self.assertEqual(error.exception.code, 1)
                 self.assertIn("--out and --work must be outside the game folder", stderr.getvalue())
+                locks.assert_not_called()
                 preflight.assert_not_called()
                 build_runtime.assert_not_called()
             else:

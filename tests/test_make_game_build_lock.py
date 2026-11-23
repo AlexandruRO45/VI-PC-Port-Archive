@@ -43,11 +43,17 @@ ready.with_suffix('.result').write_bytes(b'old worker')
     if hold == "yes":
         sys.stdin.buffer.read(1)
 
+def fake_assets(*args, **kwargs):
+    if hold == "shard":
+        return
+    fake_stage(*args, **kwargs)
+
 make_game.check = lambda *args: {}
 make_game.preflight = lambda *args, **kwargs: None
 make_game.below_normal = lambda: None
 make_game.ROOT = str(Path(ready).parent / "synthetic checkout")
-make_game.assets = make_game.runtime = make_game.pipelines = make_game.shaders = fake_stage
+make_game.assets = fake_assets
+make_game.runtime = make_game.pipelines = make_game.shaders = fake_stage
 sys.argv = ["make_game.py", *cli]
 sys.exit(make_game.main())
 """
@@ -158,6 +164,9 @@ class BuildLockTest(unittest.TestCase):
 
     def test_live_shader_shard_retains_the_lock_after_its_builder_dies(self):
         self.assert_live_worker_retains_lock("shaders", "shard")
+
+    def test_parallel_shader_stage_passes_the_lock_to_its_worker(self):
+        self.assert_live_worker_retains_lock("shaders,assets", "shard")
 
     def test_a_folder_shared_by_work_and_output_is_locked_once(self):
         folder = self.root / "combined"
