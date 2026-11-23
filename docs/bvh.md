@@ -496,18 +496,20 @@ not fit.
 **Where the triangles come from.** A leaf's geometry index is a position in the geometry list of one model of a
 drawable in `levels.rpf`, counting only the geometries whose shader the BVH keeps: a model of its primary LOD on
 the 10 samples, of its second LOD for most of the interior's other BLAS (below). Over the 10 samples a geometry
-is left out exactly when its shader is one of a set of shaders: the 65 geometries left out use 7 shader hashes, the
-67 kept use 8 others, and no hash is in both. Two of the 7 cover 54 of the 65; the other five occur only in the two
-drawables that hold decals and baked room dressing. (On the 8 samples identified first, the skipped geometries were
-read as using only two shaders; the decals drawable among them skips geometries of all 7.) The hashes stay out of
-this repository (§8). They are the shader-group
-hashes (first word of the shader record; shader group at drawable `+0x10`, pointer array at group `+0x10`, `u16`
-count at `+0x18`, shader index per geometry in the model's `u16` array at `+0x20`) that only skipped geometries
-carry, so any identified BLAS that skips a geometry lets a user recover them locally. The positions in the samples
-are the RAGE9 quantized-8 form: a 32-byte origin/axis/scale header at the vertex-format position offset minus 32,
-then one contiguous stream of 8-byte records; the other vertex attributes follow in their own streams, so the bytes
-per vertex of the whole block are not a position stride. The leaves address triangles in primitive order of the
-meshlet index buffer.
+is left out when its shader is one of 7 shader hashes (two covering 54 of 65 skipped geometries). Measuring across
+the first 1,231 BLAS of `core_bvh4.rpf` matched against 373,087 exported models finds 663 matched BLAS (401 with
+skipped geometries; 3,258 kept vs 2,670 skipped geometry materials) spanning 18 distinct skipped shader hashes, rather
+than a fixed shader list. The kept/skipped split matches the shader record's `RenderBucket` byte at shader `+57`
+(masking bit 7, `RenderBucket & 0x7F`) on **5,923 / 5,928** (99.92%) of those geometries: `RenderBucket` `{1, 2}` is
+skipped (2,587 in bucket 2, 81 in bucket 1, 2 in bucket 0) while `{0, 3}` is kept (2,816 in bucket 0, 439 in
+bucket 3, 3 in bucket 2). `tools/bvh_match.py` supports `--skip-buckets 1,2` directly from manifest `RenderBucket`
+fields without needing game shader hashes, alongside `--skip-shaders` (whose hashes stay out of this repository, §8).
+The shader-group hashes are the first word of the shader record (shader group at drawable `+0x10`, pointer array at
+group `+0x10`, `u16` count at `+0x18`, shader index per geometry in the model's `u16` array at `+0x20`). The positions
+in the samples are the RAGE9 quantized-8 form: a 32-byte origin/axis/scale header at the vertex-format position offset
+minus 32, then one contiguous stream of 8-byte records; the other vertex attributes follow in their own streams, so
+the bytes per vertex of the whole block are not a position stride. The leaves address triangles in primitive order of
+the meshlet index buffer.
 
 **How a match is verified.** A byte-identical library result checks the packing, not the geometry: the model and
 the library agree on any input. These checks use what the dehydrated stream recorded from the true geometry:

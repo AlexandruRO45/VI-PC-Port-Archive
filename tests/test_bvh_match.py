@@ -322,6 +322,24 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("shader rule not applied", out)
 
+    def test_skip_buckets_filters_skipped_buckets_including_bit7_flag(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        manifest_item = item(0x1000, "a.obj", [2, 2, 2])
+        manifest_item["MeshShaders"] = [0, 1, 2]
+        manifest_item["Materials"] = [{"RenderBucket": 1}, {"RenderBucket": 130}, {"RenderBucket": 0}]
+        status, out, _ = self.guide(src, [manifest_item], {"a.obj": [group(2), group(2), group(2)]},
+                                    ["--skip-buckets", "1,2"])
+        self.assertEqual(status, 0, out)
+        self.assertIn("1 candidates from 1 models", out)
+        self.assertIn("model 0 geometry [2]", out)
+
+    def test_the_bucket_rule_is_not_applied_without_every_render_bucket(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        status, out, _ = self.guide(src, [item(0x1000, "a.obj", [2, 7])], {"a.obj": [group(2), group(7)]},
+                                    ["--skip-buckets", "1,2"])
+        self.assertEqual(status, 0, out)
+        self.assertIn("bucket rule not applied", out)
+
     def test_json_in_a_missing_directory_is_one_error_line(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         nested = os.path.join(self.dir, "nodir", "r.json")
@@ -429,6 +447,13 @@ class TestPieces(unittest.TestCase):
         self.assertEqual(M.parse_shader_hashes("0xAA, bb"), frozenset({0xAA, 0xBB}))
         self.assertEqual(M.parse_shader_hashes(""), frozenset())
         self.assertEqual(M.parse_shader_hashes(None), frozenset())
+
+    def test_render_buckets_parse_from_a_list(self):
+        self.assertEqual(M.parse_render_buckets("1, 2"), frozenset({1, 2}))
+        self.assertEqual(M.parse_render_buckets(""), frozenset())
+        self.assertEqual(M.parse_render_buckets(None), frozenset())
+        with self.assertRaises(ValueError):
+            M.parse_render_buckets("bad")
 
 
 if __name__ == "__main__":
