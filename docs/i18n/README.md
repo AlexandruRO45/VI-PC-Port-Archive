@@ -21,5 +21,5 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | 日本語 (`ja`) | [`ja/quickstart.md`](ja/quickstart.md) | `003e781` | `@bingll123` |
 | Español (`es`) | [`es/quickstart.md`](es/quickstart.md) | `aa2988cc` | `@NolanCotter` |
 | Deutsch (`de`) | [`de/quickstart.md`](de/quickstart.md) | `aa2988cc` | `@zGLados` |
-| Italiano (`it`) | [`it/quickstart.md`](it/quickstart.md) | `49475796` | `@MeNoSkills` |
+| Italiano (`it`) | [`it/quickstart.md`](it/quickstart.md) | `561b65a8` | `@MeNoSkills` |
 | العربية (`ar`) | [`ar/quickstart.md`](ar/quickstart.md) | `561b65a` | `@Mohamed-Leo` |
