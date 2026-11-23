@@ -217,6 +217,7 @@ bool write_ppm(const char* path, const uint8_t* bgra_or_rgba, uint32_t w, uint32
         const char px[3] = {char(p[bgra ? 2 : 0]), char(p[1]), char(p[bgra ? 0 : 2])};
         o.write(px, 3);
     }
+    o.close();
     return bool(o);
 }
 
