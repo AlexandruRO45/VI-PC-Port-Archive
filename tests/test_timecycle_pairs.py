@@ -1,6 +1,8 @@
 """Synthetic unit tests for tools/timecycle_pairs.py (no game files)."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -86,6 +88,48 @@ class TimecyclePairsTests(unittest.TestCase):
                 data = json.load(f)
             self.assertEqual(data["modifiers"]["plain"], 2)
             self.assertEqual(data["second_number"]["count"], 7)
+
+    def test_non_finite_modifier_and_keyframe_numbers_are_refused(self):
+        for token in (b"NaN", b"inf", b"-Infinity", b"1e400", b"-1e400"):
+            cases = (
+                ("timecycle_modifier_data", SYNTH_MOD.replace(b"0.5 0.0", token + b" 0.0")),
+                ("timecycle_modifier_data", SYNTH_MOD.replace(b"0.5 0.0", b"0.5 " + token)),
+                ("timecycle_keyframe_data", SYNTH_KF.replace(b"500 600 700", b"500 " + token + b" 700")),
+            )
+            for position, (kind, blob) in enumerate(cases):
+                with self.subTest(token=token, kind=kind, position=position):
+                    with self.assertRaisesRegex(ValueError, "non-finite"):
+                        tp.summarize_documents([(kind, blob)])
+
+    def test_cli_non_finite_input_preserves_report_and_emits_no_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "mod.xml")
+            report = os.path.join(tmp, "report.json")
+            with open(source, "wb") as f:
+                f.write(SYNTH_MOD.replace(b"0.5 0.0", b"NaN 0.0"))
+            with open(report, "wb") as f:
+                f.write(b"previous report\n")
+            for extra in ([], ["--out", report]):
+                with self.subTest(extra=extra):
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        status = tp.main([source] + extra)
+                    self.assertEqual(status, 2)
+                    self.assertEqual(out.getvalue(), "")
+                    self.assertIn("non-finite", err.getvalue())
+                    self.assertEqual(len(err.getvalue().splitlines()), 1)
+                    with open(report, "rb") as f:
+                        self.assertEqual(f.read(), b"previous report\n")
+
+    def test_finite_scientific_notation_is_still_accepted(self):
+        summary = tp.summarize_documents([
+            ("timecycle_modifier_data", SYNTH_MOD.replace(b"0.5 0.0", b"-5e-1 1e-3")),
+            ("timecycle_keyframe_data", SYNTH_KF.replace(b"500 600 700", b"5e2 6e2 7e2")),
+        ])
+        self.assertEqual(summary["first_number"]["min"], -0.5)
+        self.assertEqual(summary["second_number"]["between_0_1"], 4)
+        self.assertEqual(summary["vars_with_b_outside_0_1"]["far_clip"]["keyframe_range"], [500, 700])
+        json.dumps(summary, allow_nan=False)
 
     def test_cli_validation_guards(self):
         with tempfile.TemporaryDirectory() as tmp:

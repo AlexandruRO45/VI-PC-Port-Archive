@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import statistics
 import sys
@@ -30,6 +31,13 @@ import gamedata_index as gi  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 TARGET_ROOTS = ("timecycle_modifier_data", "timecycle_keyframe_data")
+
+
+def _finite_number(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("non-finite number in timecycle data")
+    return value
 
 
 def _iter_source_docs(source) -> list[tuple[str, bytes]]:
@@ -99,7 +107,7 @@ def summarize_documents(docs: list[tuple[str, bytes]]) -> dict:
                 text = (child.text or "").strip()
                 if not text:
                     continue
-                vals = [float(x) for x in text.split()]
+                vals = [_finite_number(x) for x in text.split()]
                 lo, hi = min(vals), max(vals)
                 if child.tag in kf_range:
                     p_lo, p_hi = kf_range[child.tag]
@@ -138,7 +146,7 @@ def summarize_documents(docs: list[tuple[str, bytes]]) -> dict:
                 token_counts[len(toks)] += 1
                 if len(toks) != 2:
                     continue
-                a, b = float(toks[0]), float(toks[1])
+                a, b = _finite_number(toks[0]), _finite_number(toks[1])
                 as_.append(a)
                 bs_.append(b)
                 by_var[ch.tag].append((a, b))
