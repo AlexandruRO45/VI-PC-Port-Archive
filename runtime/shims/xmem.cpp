@@ -35,6 +35,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "../src/title_page_watch.h"
 
 namespace {
 
@@ -262,6 +263,23 @@ std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
 std::unordered_map<uintptr_t, uint64_t> g_mapped;  // mapped 64 KiB address -> page number
+std::unordered_map<uint64_t, std::set<uintptr_t>> g_page_addresses;  // page number -> the addresses it is mapped at
+
+// With g_phys_mutex held. Keeps leonida::title_page_aliases in step: a page mapped at two or more addresses is
+// aliased at each of them (the D3D12 layer's slot-133 shadows copy those pages at every submission instead of
+// waiting for a write fault, which a write through another address doesn't raise).
+void note_mapping(uint64_t page, uintptr_t address, bool mapped) {
+    auto& addresses = g_page_addresses[page];
+    if (mapped) {
+        addresses.insert(address);
+    } else {
+        addresses.erase(address);
+        leonida::title_page_aliases::set(address, false);
+    }
+    const bool aliased = addresses.size() > 1;
+    for (const uintptr_t at : addresses) leonida::title_page_aliases::set(at, aliased);
+    if (addresses.empty()) g_page_addresses.erase(page);
+}
 
 // With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
 // kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
@@ -433,6 +451,7 @@ bool unmap_page(uintptr_t address) {
                                        MEM_PRESERVE_PLACEHOLDER)) {
         return false;
     }
+    note_mapping(it->second, address, false);
     g_mapped.erase(it);
     return true;
 }
@@ -454,6 +473,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
                                                    protect, nullptr, 0);
     if (!view) return false;
     g_mapped[address] = page;
+    note_mapping(page, address, true);
     return true;
 }
 

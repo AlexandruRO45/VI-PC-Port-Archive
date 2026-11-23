@@ -10,7 +10,9 @@
 #include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
+#include "../src/title_page_watch.h"
 #include <dxgi1_4.h>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -366,6 +368,371 @@ int check_title_placed_all(ID3D12Device* device) {
     return failures;
 }
 
+// Submits a GPU copy of all of `buffer` to a READBACK buffer and waits for it: what the GPU read at that submission.
+struct GpuReader {
+    const char* who = "vulkan slot-133 written pages";
+    ID3D12Device* device = nullptr;
+    UINT64 size = 0;
+    Ref<ID3D12Resource> readback;
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    HANDLE done = nullptr;
+    UINT64 fence_value = 0;
+
+    ~GpuReader() {
+        if (done) CloseHandle(done);
+    }
+    int init(ID3D12Device* d, UINT64 bytes) {
+        device = d;
+        size = bytes;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = size;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&readback.p))));
+        D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+        EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                   IID_PPV_ARGS(&list.p))));
+        EXPECT(SUCCEEDED(list->Close()));
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+        done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(done != nullptr);
+        return 0;
+    }
+    int read(ID3D12Resource* buffer, std::vector<std::uint8_t>& out) {
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->CopyBufferRegion(readback.p, 0, buffer, 0, size);
+        EXPECT(SUCCEEDED(list->Close()));
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, ++fence_value)));
+        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(fence_value, done)));
+        EXPECT(WaitForSingleObject(done, 30000) == WAIT_OBJECT_0);
+        void* mapped = nullptr;
+        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        out.assign(static_cast<const std::uint8_t*>(mapped), static_cast<const std::uint8_t*>(mapped) + size);
+        readback->Unmap(0, nullptr);
+        return 0;
+    }
+};
+
+// The first byte where the GPU's copy differs from `want`, or -1.
+long long first_difference(const std::vector<std::uint8_t>& got, const std::vector<std::uint8_t>& want) {
+    for (size_t i = 0; i < got.size() && i < want.size(); ++i)
+        if (got[i] != want[i]) return static_cast<long long>(i);
+    return got.size() == want.size() ? -1 : static_cast<long long>(std::min(got.size(), want.size()));
+}
+
+ID3D12Resource* place_shadow(ID3D12Device* device, void* pages, UINT64 size) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* buffer = nullptr;
+    if (FAILED(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer))))
+        return nullptr;
+    if (buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages)) {
+        buffer->Release();
+        return nullptr;
+    }
+    return buffer;
+}
+
+DWORD protection_of(const void* address) {
+    MEMORY_BASIC_INFORMATION region{};
+    return VirtualQuery(address, &region, sizeof(region)) && region.State == MEM_COMMIT ? region.Protect : 0;
+}
+
+// A shadow is copied again only where the title wrote since the last submission (the shadow's pages are read-only
+// between submissions, and a write fault marks them). Checked by what a GPU copy reads after each step, compared byte
+// for byte with what the CPU wrote, over the whole buffer:
+//   1. a pattern over everything committed, then a submission;
+//   2. one 4 KiB page rewritten (plus the last byte of the range), then a submission: the new page arrives and the rest
+//      keeps the first pattern;
+//   3. nothing written: the same bytes again;
+//   4. a page that was read-only after a submission is written by a second thread while the first waits, then a
+//      submission.
+// `committed` bytes from the start are committed; the rest reads as zeros. The protection after a submission is
+// printed: PAGE_READONLY with the range's cache attribute when the writes are watched.
+int check_written_pages(ID3D12Device* device, const char* kind, std::uint8_t* pages, UINT64 committed, UINT64 size) {
+    const char* who = "vulkan slot-133 written pages";
+    Ref<ID3D12Resource> buffer;
+    buffer.p = place_shadow(device, pages, size);
+    EXPECT(buffer.p != nullptr);
+    GpuReader reader;
+    if (reader.init(device, size)) return 1;
+    std::vector<std::uint8_t> want(size, 0), got;
+    for (UINT64 i = 0; i < committed; ++i) want[i] = pages[i] = pattern_byte(i, 11);
+    EXPECT(reader.read(buffer.p, got) == 0);
+    EXPECT(first_difference(got, want) == -1);
+    const DWORD watched = protection_of(pages);
+
+    // Step 2: one page in the middle of the committed part, and the last committed byte.
+    const UINT64 page = (committed / 2) & ~UINT64(0xfff);
+    for (UINT64 i = page; i < page + 0x1000 && i < committed; ++i) want[i] = pages[i] = pattern_byte(i, 201);
+    want[committed - 1] = pages[committed - 1] = 0xa5;
+    EXPECT(reader.read(buffer.p, got) == 0);
+    long long wrong = first_difference(got, want);
+    if (wrong >= 0) std::fprintf(stderr, "%s: %s: one page rewritten: first wrong byte at %lld\n", who, kind, wrong);
+    EXPECT(wrong == -1);
+
+    // Step 3: nothing written since.
+    EXPECT(reader.read(buffer.p, got) == 0);
+    EXPECT(first_difference(got, want) == -1);
+
+    // Step 4: a write from another thread, to the first page.
+    HANDLE writer = CreateThread(nullptr, 0, [](void* p) -> DWORD {
+        auto* bytes = static_cast<std::uint8_t*>(p);
+        for (int i = 0; i < 64; ++i) bytes[i] = std::uint8_t(0xc0 + i);
+        return 0;
+    }, pages, 0, nullptr);
+    EXPECT(writer != nullptr && WaitForSingleObject(writer, 10000) == WAIT_OBJECT_0);
+    CloseHandle(writer);
+    for (int i = 0; i < 64; ++i) want[i] = std::uint8_t(0xc0 + i);
+    EXPECT(reader.read(buffer.p, got) == 0);
+    EXPECT(first_difference(got, want) == -1);
+    const DWORD after = protection_of(pages);
+    buffer.p->Release();
+    buffer.p = nullptr;
+    // Released: the pages are the title's again, read-write, and a write doesn't fault.
+    EXPECT(protection_of(pages) == 0 || (protection_of(pages) & 0xff) == PAGE_READWRITE);
+    pages[0] ^= 1;
+    std::printf("%s: %s, %llu bytes (%llu committed): a rewritten page, a write from another thread and an unchanged "
+                "submission all read back right; protection between submissions 0x%lx, 0x%lx\n",
+                who, kind, static_cast<unsigned long long>(size), static_cast<unsigned long long>(committed), watched,
+                after);
+    return 0;
+}
+
+// Pages that change under a live shadow: committed later, decommitted, written after a submission. A reserved range
+// whose first half is committed; then a page of the second half is committed and written, and the first 64 KiB is
+// decommitted (it reads as zeros again).
+int check_commit_changes(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 written pages";
+    constexpr SIZE_T size = 4 * 0x10000;
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
+    EXPECT(pages != nullptr && VirtualAlloc(pages, size / 2, MEM_COMMIT, PAGE_READWRITE) == pages);
+    int failures = 0;
+    {
+        Ref<ID3D12Resource> buffer;
+        buffer.p = place_shadow(device, pages, size);
+        EXPECT(buffer.p != nullptr);
+        GpuReader reader;
+        if (reader.init(device, size)) return 1;
+        std::vector<std::uint8_t> want(size, 0), got;
+        for (UINT64 i = 0; i < size / 2; ++i) want[i] = pages[i] = pattern_byte(i, 3);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        // Committed after the shadow was made, then written.
+        std::uint8_t* later = pages + 3 * 0x10000;
+        EXPECT(VirtualAlloc(later, 0x1000, MEM_COMMIT, PAGE_READWRITE) == later);
+        for (UINT64 i = 0; i < 0x1000; ++i) want[3 * 0x10000 + i] = later[i] = pattern_byte(i, 77);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        long long wrong = first_difference(got, want);
+        if (wrong >= 0) std::fprintf(stderr, "%s: page committed later: first wrong byte at %lld\n", who, wrong);
+        EXPECT(wrong == -1);
+        // Decommitted: zeros, and the rest unchanged.
+        EXPECT(VirtualFree(pages, 0x10000, MEM_DECOMMIT));
+        std::fill(want.begin(), want.begin() + 0x10000, std::uint8_t(0));
+        EXPECT(reader.read(buffer.p, got) == 0);
+        wrong = first_difference(got, want);
+        if (wrong >= 0) std::fprintf(stderr, "%s: decommitted page: first wrong byte at %lld\n", who, wrong);
+        EXPECT(wrong == -1);
+        // Committed again and written: it arrives.
+        EXPECT(VirtualAlloc(pages, 0x1000, MEM_COMMIT, PAGE_READWRITE) == pages);
+        for (UINT64 i = 0; i < 0x1000; ++i) want[i] = pages[i] = pattern_byte(i, 5);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+    }
+    std::printf("%s: a page committed after the shadow, a decommitted page and a recommitted one read back right\n",
+                who);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return failures;
+}
+
+// The negative control, and the case it stands for. One pagefile-backed section (SEC_RESERVE, half committed, as xmem
+// backs physical pages) is mapped at two addresses, A and B; the shadow is placed at A. A write through B doesn't fault
+// at A, so without a mark the page it changed is not copied: the GPU still reads the old bytes. That shows the test
+// sees a page the tracking missed. Once the page is reported aliased (what xmem does when it maps one physical page
+// at two addresses: leonida::title_page_aliases), it is copied at every submission and the write arrives.
+int check_aliased_write(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 aliased page";
+    constexpr SIZE_T size = 4 * 0x10000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, DWORD(size),
+                                        nullptr);
+    EXPECT(section != nullptr);
+    auto* a = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size));
+    auto* b = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size));
+    EXPECT(a != nullptr && b != nullptr && VirtualAlloc(a, size / 2, MEM_COMMIT, PAGE_READWRITE) == a);
+    const UINT64 committed = size / 2;
+    long long unmarked = -1, marked = -1;
+    {
+        Ref<ID3D12Resource> buffer;
+        buffer.p = place_shadow(device, a, size);
+        EXPECT(buffer.p != nullptr);
+        GpuReader reader;
+        if (reader.init(device, size)) return 1;
+        std::vector<std::uint8_t> want(size, 0), got;
+        for (UINT64 i = 0; i < committed; ++i) want[i] = a[i] = pattern_byte(i, 19);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        // Through B, the page at offset 0x11000 (in A's second 64 KiB).
+        constexpr UINT64 at = 0x11000;
+        for (UINT64 i = at; i < at + 0x1000; ++i) want[i] = b[i] = pattern_byte(i, 133);
+        EXPECT(std::memcmp(a + at, want.data() + at, 0x1000) == 0);  // the same memory
+        EXPECT(reader.read(buffer.p, got) == 0);
+        unmarked = first_difference(got, want);
+        // Reported aliased: copied from now on.
+        leonida::title_page_aliases::set(reinterpret_cast<std::uintptr_t>(a + at), true);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        marked = first_difference(got, want);
+        // And a later write through B, while it stays aliased.
+        for (UINT64 i = at; i < at + 64; ++i) want[i] = b[i] = 0x3c;
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        leonida::title_page_aliases::set(reinterpret_cast<std::uintptr_t>(a + at), false);
+    }
+    UnmapViewOfFile(b);
+    UnmapViewOfFile(a);
+    CloseHandle(section);
+    std::printf("%s: a write through another view of the page, not marked: first stale byte at %lld (expected: in "
+                "the page, 69632); marked aliased: %s\n",
+                who, unmarked, marked == -1 ? "arrives" : "STILL STALE");
+    EXPECT(unmarked == 0x11000);
+    EXPECT(marked == -1);
+    return 0;
+}
+
+// Kernel writes into a watched page. ReadFile writes from kernel mode, so a page a shadow made read-only fails it
+// with ERROR_NOACCESS instead of faulting into the layer: the plain call fails (the control). Through the file shims'
+// path (leonida::kernel_writes::read_file, what the title's ReadFile import resolves to), the destination is pinned
+// and opened first: the read succeeds and its bytes reach the GPU at the next submission, synchronously and with an
+// overlapped read on an asynchronous handle.
+int check_kernel_write(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 kernel write";
+    constexpr SIZE_T size = 4 * 0x10000;
+    constexpr DWORD chunk = 0x2000;
+    wchar_t directory[MAX_PATH]{}, path[MAX_PATH]{};
+    EXPECT(GetTempPathW(MAX_PATH, directory) && GetTempFileNameW(directory, L"lsh", 0, path));
+    std::vector<std::uint8_t> file_bytes(2 * chunk);
+    for (size_t i = 0; i < file_bytes.size(); ++i) file_bytes[i] = std::uint8_t(i * 29u + 1u);
+    {
+        const HANDLE out = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        DWORD wrote = 0;
+        EXPECT(out != INVALID_HANDLE_VALUE);
+        const BOOL ok = WriteFile(out, file_bytes.data(), DWORD(file_bytes.size()), &wrote, nullptr);
+        CloseHandle(out);
+        EXPECT(ok && wrote == file_bytes.size());
+    }
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE | PAGE_WRITECOMBINE));
+    EXPECT(pages != nullptr && VirtualAlloc(pages, size / 2, MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE) == pages);
+    DWORD plain_error = 0, watched = 0;
+    bool plain_failed = false;
+    {
+        Ref<ID3D12Resource> buffer;
+        buffer.p = place_shadow(device, pages, size);
+        EXPECT(buffer.p != nullptr);
+        GpuReader reader;
+        if (reader.init(device, size)) return 1;
+        std::vector<std::uint8_t> want(size, 0), got;
+        for (UINT64 i = 0; i < size / 2; ++i) want[i] = pages[i] = pattern_byte(i, 41);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        watched = protection_of(pages + 0x4000);
+
+        // The control: a plain ReadFile into a page made read-only by the last submission.
+        HANDLE in = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        EXPECT(in != INVALID_HANDLE_VALUE);
+        DWORD read = 0;
+        plain_failed = !::ReadFile(in, pages + 0x4000, chunk, &read, nullptr);
+        plain_error = plain_failed ? GetLastError() : 0;
+        if (!plain_failed) std::memcpy(want.data() + 0x4000, file_bytes.data(), chunk);  // not watched after all
+
+        // Through the shims' path: the same read succeeds.
+        SetFilePointer(in, 0, nullptr, FILE_BEGIN);
+        read = 0;
+        const BOOL ok = leonida::kernel_writes::read_file(in, pages + 0x4000, chunk, &read, nullptr);
+        CloseHandle(in);
+        EXPECT(ok && read == chunk);
+        std::memcpy(want.data() + 0x4000, file_bytes.data(), chunk);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        long long wrong = first_difference(got, want);
+        if (wrong >= 0) std::fprintf(stderr, "%s: synchronous read: first wrong byte at %lld\n", who, wrong);
+        EXPECT(wrong == -1);
+
+        // Overlapped, on an asynchronous handle, into the next page (read-only again after that submission).
+        in = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        EXPECT(in != INVALID_HANDLE_VALUE);
+        OVERLAPPED overlapped{};
+        overlapped.Offset = chunk;
+        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        BOOL queued = leonida::kernel_writes::read_file(in, pages + 0x8000, chunk, nullptr, &overlapped);
+        const bool pending = !queued && GetLastError() == ERROR_IO_PENDING;
+        EXPECT(queued || pending);
+        // A submission while it may still be in flight leaves the pinned page writable.
+        EXPECT(reader.read(buffer.p, got) == 0);
+        read = 0;
+        EXPECT(GetOverlappedResult(in, &overlapped, &read, TRUE) && read == chunk);
+        CloseHandle(overlapped.hEvent);
+        CloseHandle(in);
+        std::memcpy(want.data() + 0x8000, file_bytes.data() + chunk, chunk);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        wrong = first_difference(got, want);
+        if (wrong >= 0) std::fprintf(stderr, "%s: overlapped read: first wrong byte at %lld\n", who, wrong);
+        EXPECT(wrong == -1);
+        // Its pin is gone once the read completed: nothing is left pinned.
+        EXPECT(leonida::kernel_writes::state().count.load() == 0);
+    }
+    VirtualFree(pages, 0, MEM_RELEASE);
+    DeleteFileW(path);
+    std::printf("%s: plain ReadFile into a watched page (protection 0x%lx): %s (error %lu); through the file shims: "
+                "synchronous and overlapped reads succeed and reach the GPU\n",
+                who, watched, plain_failed ? "fails" : "succeeds", plain_error);
+    // The control must show the failure the shims prevent, wherever the page was watched.
+    if ((watched & 0xff) == PAGE_READONLY) EXPECT(plain_failed && plain_error == ERROR_NOACCESS);
+    return 0;
+}
+
+int check_written_pages_all(ID3D12Device* device) {
+    int failures = 0;
+    constexpr SIZE_T size = 4 * 0x10000;
+    for (DWORD modifier : {DWORD(0), DWORD(PAGE_WRITECOMBINE)}) {
+        // Half committed, so the import is refused whatever the cache attribute and the shadow answers.
+        auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE | modifier));
+        if (!pages || VirtualAlloc(pages, size / 2, MEM_COMMIT, PAGE_READWRITE | modifier) != pages) return failures + 1;
+        failures += check_written_pages(device, modifier ? "half-committed write-combined range"
+                                                         : "half-committed range",
+                                        pages, size / 2, size);
+        VirtualFree(pages, 0, MEM_RELEASE);
+        // Wholly committed and write-combined (not imported), and placed 64 bytes into its first page.
+        if (modifier) {
+            pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT,
+                                                            PAGE_READWRITE | modifier));
+            if (!pages) return failures + 1;
+            failures += check_written_pages(device, "write-combined range", pages, size, size);
+            failures += check_written_pages(device, "write-combined range, 64 bytes in", pages + 64, size - 64,
+                                            size - 64);
+            VirtualFree(pages, 0, MEM_RELEASE);
+        }
+    }
+    failures += check_commit_changes(device);
+    failures += check_aliased_write(device);
+    failures += check_kernel_write(device);
+    return failures;
+}
+
 void print_cases(const std::vector<Case>& cases, const char* who) {
     for (const Case& c : cases)
         std::printf("%s: %-44s hr=0x%08lX size=%llu align=%llu type=%d cpu=%d pool=%d flags=0x%x\n", who, c.name,
@@ -398,6 +765,7 @@ int main() {
         print_cases(vulkan_cases, "vulkan");
         failures += check_import(ours.p, vk.host_pointer_alignment != 0);
         if (vk.host_pointer_alignment) failures += check_title_placed_all(ours.p);
+        failures += check_written_pages_all(ours.p);
         Ref<IDXGIFactory4> factory;
         if (!hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
             for (const bool warp : {false, true}) {

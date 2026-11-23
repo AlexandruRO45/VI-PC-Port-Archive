@@ -26,6 +26,7 @@
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
+#include "../src/title_page_watch.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
@@ -115,25 +116,348 @@ bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes,
     }
 }
 
-// Copies [from, from + bytes) of the title's address space to `to`, for a slot-133 shadow buffer. Only committed,
-// readable pages are read (xmem commits on first touch, and a read of a reserved page faults); the rest is zero.
-void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
-    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    for (std::size_t at = 0; at < bytes;) {
-        MEMORY_BASIC_INFORMATION region{};
-        std::size_t run = bytes - at;
-        bool read = false;
-        if (VirtualQuery(from + at, &region, sizeof(region))) {
-            const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
-            run = std::min<std::size_t>(run, end - reinterpret_cast<std::uintptr_t>(from + at));
-            read = region.State == MEM_COMMIT && (region.Protect & readable) &&
-                   !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS));
-        }
-        if (!read || !copy_guarded(to + at, from + at, run, (region.Protect & PAGE_WRITECOMBINE) != 0))
-            std::memset(to + at, 0, run);
-        at += run;
+// Copies a run of the title's pages that VirtualQuery saw committed and readable. A page decommitted since then reads
+// as zeros, and only that page: the run is redone page by page, so the rest of it keeps its bytes.
+void copy_run(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
+    if (copy_guarded(to, from, bytes, streaming)) return;
+    for (std::size_t off = 0; off < bytes;) {
+        const std::size_t in_page = reinterpret_cast<std::uintptr_t>(from + off) & 4095;
+        const std::size_t n = std::min<std::size_t>(bytes - off, 4096 - in_page);
+        if (!copy_guarded(to + off, from + off, n, streaming)) std::memset(to + off, 0, n);
+        off += n;
     }
+}
+
+// The title's pages behind one slot-133 shadow buffer, and which of them the title wrote since the shadow was last
+// brought up to date. Nothing says which pages a title writes, so the pages say it themselves: once copied, a
+// read-write page is made read-only (its cache attribute kept: PAGE_READONLY | PAGE_WRITECOMBINE for a write-combined
+// one), and the title's next write to it faults. The fault handler (shadow_write_fault) makes the 64 KiB around it
+// writable again and the write goes on; the page is now read-write, which is what marks it written. Each refresh()
+// walks the range with VirtualQuery:
+//   - read-write pages were written (or newly committed, or newly mapped by xmem): made read-only, then copied. A
+//     write landing between the two faults again, so it reaches the next refresh at the latest;
+//   - pages this tracker made read-only weren't written: skipped;
+//   - other readable pages (read-only or copy-on-write pages of the title's own, pages another shadow protected)
+//     can't be watched: copied every time, as before;
+//   - pages not committed, or not readable, are zero in the shadow (written once);
+//   - pages xmem reports mapped at another address too (title_page_watch.h) are copied every time: a write
+//     through the other address doesn't fault here;
+//   - pages a file shim pinned for a kernel write (ReadFile into title memory, which fails with ERROR_NOACCESS on a
+//     read-only page instead of faulting) are left writable and copied every time until the pin ends.
+// If the protection can't be changed (VirtualProtect refuses, or the fault handler couldn't be installed), those
+// pages stay read-write and are copied at every submission: the whole-range copy this replaces.
+//
+class ShadowPages {
+public:
+    static constexpr std::uintptr_t kPage = 0x1000;
+    static constexpr std::uintptr_t kBlock = 0x10000;  // what one write fault makes writable again
+
+    ShadowPages(const std::uint8_t* pages, std::uint8_t* shadow, std::size_t size, bool watch)
+        : pages_(pages), shadow_(shadow), size_(size), watch_(watch) {
+        begin_ = reinterpret_cast<std::uintptr_t>(pages);
+        end_ = begin_ + size;
+        first_ = begin_ & ~(kPage - 1);
+        last_ = (end_ + kPage - 1) & ~(kPage - 1);
+        state_.assign((last_ - first_) / kPage, 0);
+    }
+    // Every page made read-only here is read-write again: the title's pages outlive the buffer.
+    void reopen_all() {
+        AcquireSRWLockExclusive(&lock_);
+        reopen_locked(first_, last_);
+        ReleaseSRWLockExclusive(&lock_);
+    }
+    ShadowPages(const ShadowPages&) = delete;
+    ShadowPages& operator=(const ShadowPages&) = delete;
+
+    std::uint8_t* shadow() const { return shadow_; }
+    std::size_t size() const { return size_; }
+    bool contains(std::uintptr_t address) const { return address >= first_ && address < last_; }
+    std::uint64_t faults() const { return faults_.load(std::memory_order_relaxed); }
+
+    // Brings the shadow up to date with the pages. Returns the bytes copied from them.
+    std::size_t refresh() {
+        jobs_.clear();
+        const std::uint64_t generation = leonida::title_page_aliases::generation();
+        AcquireSRWLockExclusive(&lock_);
+        if (generation != alias_generation_) {
+            alias_generation_ = generation;
+            for (std::uint8_t& s : state_) s &= ~kAliased;
+            leonida::title_page_aliases::for_each_in(begin_, end_, [&](std::uintptr_t va) {
+                const std::uintptr_t from = std::max(va, first_), to = std::min(va + kBlock, last_);
+                for (std::uintptr_t p = from; p < to; p += kPage) state_[(p - first_) / kPage] |= kAliased;
+            });
+        }
+        if (pinned_) {
+            for (std::uint8_t& s : state_) s &= ~kPinned;
+            pinned_ = false;
+        }
+        leonida::kernel_writes::for_each_pin(begin_, end_, [&](std::uintptr_t from, std::uintptr_t to) {
+            for (std::uintptr_t p = from & ~(kPage - 1); p < to; p += kPage) state_[(p - first_) / kPage] |= kPinned;
+            pinned_ = true;
+        });
+        for (std::uintptr_t at = first_; at < last_;) {
+            MEMORY_BASIC_INFORMATION region{};
+            std::uintptr_t next = at + kPage;
+            Kind kind = Kind::zero;
+            if (VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region))) {
+                next = std::min(last_, reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize);
+                kind = classify(region);
+            }
+            const std::size_t i0 = (at - first_) / kPage, i1 = (next - first_) / kPage;
+            const bool streaming = (region.Protect & PAGE_WRITECOMBINE) != 0;
+            switch (kind) {
+            case Kind::zero:
+                for (std::size_t i = i0; i < i1; ++i) {
+                    if (state_[i] & kZero) continue;
+                    const auto [offset, bytes] = span_of(i, i + 1);
+                    std::memset(shadow_ + offset, 0, bytes);
+                    state_[i] = std::uint8_t(kZero | (state_[i] & (kAliased | kPinned)));
+                }
+                break;
+            case Kind::writable:
+                // Written since the last refresh, or newly committed or mapped: watched from now on, then copied.
+                for (std::size_t i = i0; i < i1;) {
+                    const bool unwatched = state_[i] & (kAliased | kPinned);
+                    std::size_t j = i + 1;
+                    while (j < i1 && bool(state_[j] & (kAliased | kPinned)) == unwatched) ++j;
+                    if (!unwatched && watch_) protect(i, j, region.Protect);
+                    for (std::size_t k = i; k < j; ++k) state_[k] &= ~kZero;
+                    add_job(i, j, streaming);
+                    i = j;
+                }
+                break;
+            case Kind::read_only:
+                // Pages this tracker protected are as the last refresh left them; any other is copied again.
+                for (std::size_t i = i0; i < i1;) {
+                    const bool clean = (state_[i] & (kProtected | kAliased | kPinned)) == kProtected;
+                    std::size_t j = i + 1;
+                    while (j < i1 && ((state_[j] & (kProtected | kAliased | kPinned)) == kProtected) == clean) ++j;
+                    if (!clean) {
+                        for (std::size_t k = i; k < j; ++k) state_[k] &= ~kZero;
+                        add_job(i, j, streaming);
+                    }
+                    i = j;
+                }
+                break;
+            case Kind::unwatched:
+                for (std::size_t i = i0; i < i1; ++i) state_[i] &= kAliased | kPinned;
+                add_job(i0, i1, streaming);
+                break;
+            }
+            at = next;
+        }
+        ReleaseSRWLockExclusive(&lock_);
+        // The copies run without the lock: a write that faults meanwhile is let through and copied next time.
+        std::size_t copied = 0;
+        for (const Job& job : jobs_) {
+            copy_run(shadow_ + job.offset, pages_ + job.offset, job.bytes, job.streaming);
+            copied += job.bytes;
+        }
+        return copied;
+    }
+
+    // From a file shim, before the kernel writes [from, to): the pages there this tracker protected are writable again.
+    void reopen_range(std::uintptr_t from, std::uintptr_t to) {
+        from = std::max(from & ~(kPage - 1), first_);
+        to = std::min((to + kPage - 1) & ~(kPage - 1), last_);
+        if (from >= to) return;
+        AcquireSRWLockExclusive(&lock_);
+        reopen_locked(from, to);
+        ReleaseSRWLockExclusive(&lock_);
+    }
+
+    // From the fault handler: a write to `address`, inside this range, faulted. When the page is one this tracker
+    // made read-only, the 64 KiB around it that it protected are read-write again: true, the write can be retried.
+    bool reopen(std::uintptr_t address) {
+        AcquireSRWLockExclusive(&lock_);
+        const std::size_t index = (address - first_) / kPage;
+        bool ours = (state_[index] & kProtected) != 0;
+        if (ours) {
+            const std::uintptr_t block = address & ~(kBlock - 1);
+            reopen_locked(std::max(block, first_), std::min(block + kBlock, last_));
+            ours = !(state_[index] & kProtected);
+            faults_.fetch_add(1, std::memory_order_relaxed);
+        }
+        ReleaseSRWLockExclusive(&lock_);
+        return ours;
+    }
+
+private:
+    enum : std::uint8_t {
+        kProtected = 1,  // made read-only here: unchanged since it was copied
+        kZero = 2,       // zero in the shadow (not committed when last looked at)
+        kAliased = 4,    // xmem maps its physical page at another address too
+        kPinned = 8,     // a kernel write into it may be in flight (leonida::kernel_writes)
+    };
+    enum class Kind { zero, writable, read_only, unwatched };
+    struct Job {
+        std::size_t offset, bytes;
+        bool streaming;
+    };
+
+    static Kind classify(const MEMORY_BASIC_INFORMATION& region) {
+        if (region.State != MEM_COMMIT || (region.Protect & PAGE_GUARD)) return Kind::zero;
+        switch (region.Protect & 0xff) {
+        case PAGE_READWRITE:
+        case PAGE_EXECUTE_READWRITE: return Kind::writable;
+        case PAGE_READONLY:
+        case PAGE_EXECUTE_READ: return Kind::read_only;
+        case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_WRITECOPY: return Kind::unwatched;
+        default: return Kind::zero;  // PAGE_NOACCESS, PAGE_EXECUTE: not readable
+        }
+    }
+
+    // Offset and size in the buffer of pages [i, j): the first and last pages may stick out of it.
+    std::pair<std::size_t, std::size_t> span_of(std::size_t i, std::size_t j) const {
+        const std::uintptr_t from = std::max(first_ + i * kPage, begin_), to = std::min(first_ + j * kPage, end_);
+        return {from - begin_, to - from};
+    }
+
+    void add_job(std::size_t i, std::size_t j, bool streaming) {
+        const auto [offset, bytes] = span_of(i, j);
+        if (!jobs_.empty() && jobs_.back().streaming == streaming &&
+            jobs_.back().offset + jobs_.back().bytes == offset) {
+            jobs_.back().bytes += bytes;
+            return;
+        }
+        jobs_.push_back({offset, bytes, streaming});
+    }
+
+    // Pages [i, j) of one region, read-write with protection `current`: read-only from now on, same cache attribute.
+    void protect(std::size_t i, std::size_t j, DWORD current) {
+        const DWORD base = current & 0xff;
+        const DWORD read_only = (current & ~DWORD(0xff)) | (base == PAGE_READWRITE ? PAGE_READONLY : PAGE_EXECUTE_READ);
+        DWORD old = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(first_ + i * kPage), (j - i) * kPage, read_only, &old)) {
+            log_once("slot-133 shadow: VirtualProtect refused to watch the title's pages for writes, so they are "
+                     "copied at every submission; error",
+                     int(GetLastError()));
+            return;
+        }
+        for (std::size_t k = i; k < j; ++k) state_[k] |= kProtected;
+    }
+
+    // With the lock held: the pages in [from, to) this tracker made read-only are read-write again.
+    void reopen_locked(std::uintptr_t from, std::uintptr_t to) {
+        for (std::uintptr_t at = from; at < to;) {
+            MEMORY_BASIC_INFORMATION region{};
+            std::uintptr_t next = at + kPage;
+            DWORD base = 0;
+            if (VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region))) {
+                next = std::min(to, reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize);
+                if (region.State == MEM_COMMIT) base = region.Protect & 0xff;
+            }
+            const std::size_t i0 = (at - first_) / kPage, i1 = (next - first_) / kPage;
+            if (base != PAGE_READONLY && base != PAGE_EXECUTE_READ) {
+                // Not read-only any more (remapped, decommitted, opened by another thread): nothing to undo.
+                for (std::size_t i = i0; i < i1; ++i) state_[i] &= ~kProtected;
+            } else {
+                const DWORD writable =
+                    (region.Protect & ~DWORD(0xff)) | (base == PAGE_READONLY ? PAGE_READWRITE : PAGE_EXECUTE_READWRITE);
+                for (std::size_t i = i0; i < i1;) {
+                    const bool ours = state_[i] & kProtected;
+                    std::size_t j = i + 1;
+                    while (j < i1 && bool(state_[j] & kProtected) == ours) ++j;
+                    DWORD old = 0;
+                    if (ours &&
+                        VirtualProtect(reinterpret_cast<void*>(first_ + i * kPage), (j - i) * kPage, writable, &old))
+                        for (std::size_t k = i; k < j; ++k) state_[k] &= ~kProtected;
+                    i = j;
+                }
+            }
+            at = next;
+        }
+    }
+
+    const std::uint8_t* pages_;
+    std::uint8_t* shadow_;
+    std::size_t size_;
+    bool watch_;
+    std::uintptr_t begin_ = 0, end_ = 0;   // the buffer
+    std::uintptr_t first_ = 0, last_ = 0;  // the pages it touches
+    SRWLOCK lock_ = SRWLOCK_INIT;          // state_, and the protection of the pages
+    std::vector<std::uint8_t> state_;      // per 4 KiB page
+    std::uint64_t alias_generation_ = ~std::uint64_t(0);
+    bool pinned_ = false;  // some page has kPinned
+    std::vector<Job> jobs_;  // refresh() only, which DeviceState::shadow_mutex serializes
+    std::atomic<std::uint64_t> faults_{0};
+};
+
+// The live ShadowPages of every device, for the fault handler. Never freed: a fault can come at any time.
+SRWLOCK g_shadow_pages_lock = SRWLOCK_INIT;
+std::vector<ShadowPages*>& shadow_pages_list() {
+    static auto* list = new std::vector<ShadowPages*>;
+    return *list;
+}
+
+// A write to a page a shadow made read-only: the page is made writable again and the write retried. First in the
+// handler chain, so a startup trace doesn't log these as exceptions; any other access violation goes on down it.
+LONG CALLBACK shadow_write_fault(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* record = info ? info->ExceptionRecord : nullptr;
+    if (!record || record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 ||
+        record->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+    bool inside = false, reopened = false;
+    AcquireSRWLockShared(&g_shadow_pages_lock);
+    for (ShadowPages* pages : shadow_pages_list())
+        if (pages->contains(address)) {
+            inside = true;
+            reopened |= pages->reopen(address);
+        }
+    ReleaseSRWLockShared(&g_shadow_pages_lock);
+    if (reopened) return EXCEPTION_CONTINUE_EXECUTION;
+    if (inside) {
+        // Another thread's fault reopened the page between this write and the handler: retry.
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) &&
+            region.State == MEM_COMMIT && !(region.Protect & PAGE_GUARD) &&
+            ((region.Protect & 0xff) == PAGE_READWRITE || (region.Protect & 0xff) == PAGE_EXECUTE_READWRITE))
+            return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// leonida::kernel_writes' opener: a file shim is about to let the kernel write [from, to).
+void open_shadow_pages(std::uintptr_t from, std::uintptr_t to) {
+    AcquireSRWLockShared(&g_shadow_pages_lock);
+    for (ShadowPages* pages : shadow_pages_list()) pages->reopen_range(from, to);
+    ReleaseSRWLockShared(&g_shadow_pages_lock);
+}
+
+// Installs the handler once. false: it couldn't be, and shadows copy every page at every submission.
+bool watch_shadow_writes() {
+    static const bool installed = [] {
+        if (!AddVectoredExceptionHandler(1, &shadow_write_fault)) return false;
+        leonida::kernel_writes::set_opener(&open_shadow_pages);
+        return true;
+    }();
+    return installed;
+}
+
+// A ShadowPages the fault handler knows of for its whole life: registered before it protects anything, removed once
+// its destructor has made every page writable again.
+struct ShadowPagesDeleter {
+    void operator()(ShadowPages* pages) const {
+        pages->reopen_all();
+        AcquireSRWLockExclusive(&g_shadow_pages_lock);
+        std::erase(shadow_pages_list(), pages);
+        ReleaseSRWLockExclusive(&g_shadow_pages_lock);
+        delete pages;
+    }
+};
+using ShadowPagesPtr = std::unique_ptr<ShadowPages, ShadowPagesDeleter>;
+
+ShadowPagesPtr make_shadow_pages(const std::uint8_t* pages, std::uint8_t* shadow, std::size_t size) {
+    const bool watch = watch_shadow_writes();
+    auto* tracker = new ShadowPages(pages, shadow, size, watch);
+    if (watch) {
+        AcquireSRWLockExclusive(&g_shadow_pages_lock);
+        shadow_pages_list().push_back(tracker);
+        ReleaseSRWLockExclusive(&g_shadow_pages_lock);
+    }
+    return ShadowPagesPtr(tracker);
 }
 
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
@@ -693,42 +1017,49 @@ struct DeviceState {
     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
 
     // The live shadow buffers of Xbox device slot 133 (Resource::create_shadow_buffer): title-placed buffers whose
-    // pages the driver would not import. Each is re-copied from the title's pages before every submission of
-    // command lists (VulkanContext::set_before_execute), since nothing says which pages the title wrote. The first
-    // per-submission copy of each buffer size is timed and logged, so the cost shows in a run's log.
-    struct Shadow {
-        const std::uint8_t* pages;  // the title's
-        std::uint8_t* mapped;       // the shadow's memory
-        std::size_t size;
-    };
-    std::mutex shadow_mutex;  // a leaf: nothing else is taken under it
-    std::vector<Shadow> shadows;
-    std::set<std::size_t> shadow_sizes_logged;
+    // pages the driver would not import. Each is brought up to date from the title's pages before every submission
+    // of command lists (VulkanContext::set_before_execute), copying only what the title wrote since the last one
+    // (ShadowPages). The first refresh and then every 4096th are logged with what they cost.
+    std::mutex shadow_mutex;  // nothing else is taken under it but the ShadowPages' own locks
+    std::vector<ShadowPagesPtr> shadows;
+    std::uint64_t shadow_submissions = 0;
+    std::uint64_t shadow_bytes = 0;     // copied since the last log line
+    double shadow_ms = 0;               // spent since the last log line
+    std::uint64_t shadow_faults = 0;    // the write faults counted at the last log line
 
-    void add_shadow(const Shadow& shadow) {
+    void add_shadow(ShadowPagesPtr pages) {
         std::lock_guard lock(shadow_mutex);
-        shadows.push_back(shadow);
+        shadows.push_back(std::move(pages));
     }
     void remove_shadow(const std::uint8_t* mapped) {
         std::lock_guard lock(shadow_mutex);
-        std::erase_if(shadows, [mapped](const Shadow& s) { return s.mapped == mapped; });
+        std::erase_if(shadows, [mapped](const ShadowPagesPtr& s) { return s->shadow() == mapped; });
     }
     void refresh_shadows() {
+        constexpr std::uint64_t kLogEvery = 4096;
         std::lock_guard lock(shadow_mutex);
-        for (const Shadow& s : shadows) {
-            if (!shadow_sizes_logged.insert(s.size).second) {
-                copy_title_pages(s.mapped, s.pages, s.size);
-                continue;
-            }
-            const auto start = std::chrono::steady_clock::now();
-            copy_title_pages(s.mapped, s.pages, s.size);
-            const double ms =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-            std::fprintf(stderr, "[rt] d3d12: slot-133 shadow buffer of %llu KiB: copied from the title's pages in "
-                                 "%.3f ms (%.0f MiB/s), paid at every submission\n",
-                         static_cast<unsigned long long>(s.size / 1024), ms,
-                         ms > 0 ? double(s.size) / (1024.0 * 1024.0) / (ms / 1000.0) : 0.0);
-        }
+        if (shadows.empty()) return;
+        const auto start = std::chrono::steady_clock::now();
+        std::uint64_t copied = 0;
+        for (const ShadowPagesPtr& s : shadows) copied += s->refresh();
+        shadow_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        shadow_bytes += copied;
+        ++shadow_submissions;
+        if (shadow_submissions != 1 && shadow_submissions % kLogEvery) return;
+        std::uint64_t size = 0, faults = 0;
+        for (const ShadowPagesPtr& s : shadows) size += s->size(), faults += s->faults();
+        const std::uint64_t count = shadow_submissions == 1 ? 1 : kLogEvery;
+        std::fprintf(stderr,
+                     "[rt] d3d12: slot-133 shadow buffers (%llu KiB): submissions %llu-%llu copied %.1f KiB each "
+                     "from the title's pages in %.3f ms on average, %llu write faults\n",
+                     static_cast<unsigned long long>(size / 1024),
+                     static_cast<unsigned long long>(shadow_submissions - count + 1),
+                     static_cast<unsigned long long>(shadow_submissions), double(shadow_bytes) / 1024.0 / double(count),
+                     shadow_ms / double(count),
+                     static_cast<unsigned long long>(faults >= shadow_faults ? faults - shadow_faults : faults));
+        shadow_bytes = 0;
+        shadow_ms = 0;
+        shadow_faults = faults;
     }
 
     // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
@@ -2100,10 +2431,10 @@ public:
     // VK_ERROR_OUT_OF_DEVICE_MEMORY after about 64 MiB of imports). The buffer has its own host-visible memory, a
     // shadow of the title's pages, but keeps the title's VA as its console VA, so the descriptors and views the title
     // builds from that VA still find it (an ordinary buffer here had another VA and none of the data: slot 70 wrote
-    // a null SRV and the UI draws sampled nothing). It is filled from the pages now and again before every
-    // submission of command lists (DeviceState::refresh_shadows).
-    // One way only: what the GPU writes to the shadow is NOT copied back to the title's pages, and the next
-    // submission's copy overwrites it. A title that reads GPU output at `address` needs the import.
+    // a null SRV and the UI draws sampled nothing). It is filled from the pages now, and before every submission
+    // of command lists the pages the title wrote since are copied again (ShadowPages, DeviceState::refresh_shadows).
+    // One way only: what the GPU writes to the shadow is NOT copied back to the title's pages, and the next copy of
+    // a page overwrites it. A title that reads GPU output at `address` needs the import.
     HRESULT create_shadow_buffer(void* address) {
         auto& vk = device_.context->vk;
         if (!address || !desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
@@ -2133,7 +2464,8 @@ public:
             return E_OUTOFMEMORY;
         shadow_ = static_cast<std::uint8_t*>(shadow);
         const auto* pages = static_cast<const std::uint8_t*>(address);
-        copy_title_pages(shadow_, pages, std::size_t(desc_.Width));
+        ShadowPagesPtr tracker = make_shadow_pages(pages, shadow_, std::size_t(desc_.Width));
+        tracker->refresh();
         // Map() answers the title's own pages, as the imported buffer does: a write to the shadow's memory would be
         // overwritten by the next copy.
         mapped_ = address;
@@ -2153,7 +2485,7 @@ public:
         binding.host = shadow_;
         binding.va = va_;
         device_.context->add_resource(id(), binding);
-        device_.add_shadow({pages, shadow_, std::size_t(desc_.Width)});
+        device_.add_shadow(std::move(tracker));
         return S_OK;
     }
 
@@ -7156,7 +7488,7 @@ public:
             // xmem's physical pages take (found in review on an RX 9070 XT under Wine), and a device without
             // VK_EXT_external_memory_host has no import at all; write-combined and uncommitted pages are not tried,
             // and some drivers stop importing after a budget (create_shadow_buffer). The title then gets a shadow
-            // buffer at its VA, copied from its pages before every submission.
+            // buffer at its VA, brought up to date from its pages before every submission.
             resource->Release();
             resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
             resource->attach_device(identity());

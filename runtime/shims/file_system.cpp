@@ -41,6 +41,7 @@
 #include "file_system.h"
 #include "shims.h"
 #include "startup_trace.h"
+#include "../src/title_page_watch.h"
 
 namespace rt::fs {
 namespace {
@@ -1341,9 +1342,24 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
 namespace {
 using namespace rt::fs;
 
+// Reads into title memory. The D3D12 layer keeps some of the title's pages read-only between submissions to see
+// which ones the title writes (slot-133 shadow buffers); the kernel fails a read into such a page with
+// ERROR_NOACCESS instead of faulting, so the destination is pinned and opened first (title_page_watch.h).
+BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped) {
+    return leonida::kernel_writes::read_file(file, buffer, bytes, read, overlapped);
+}
+BOOL WINAPI read_file_ex(HANDLE file, LPVOID buffer, DWORD bytes, LPOVERLAPPED overlapped,
+                         LPOVERLAPPED_COMPLETION_ROUTINE routine) {
+    return leonida::kernel_writes::read_file_ex(file, buffer, bytes, overlapped, routine);
+}
+BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWORD bytes, LPDWORD reserved,
+                              LPOVERLAPPED overlapped) {
+    return leonida::kernel_writes::read_file_scatter(file, segments, bytes, reserved, overlapped);
+}
+
 // CreateFile, the FindFirstFile family, the attribute queries and DeleteFile arrive through kernel32/kernelbase
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
-// file-l1-2-0 and file-l2-1-0 for CreateFile).
+// file-l1-2-0 and file-l2-1-0 for CreateFile; ReadFile and its variants are in file-l1-1-0).
 #define FILE_API(dll)                                                                                    \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
@@ -1377,7 +1393,10 @@ using namespace rt::fs;
         {dll, "CopyFileExW", reinterpret_cast<void*>(&copy_file_ex_w)},                                  \
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
-        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
+        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
+        {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                     \
+        {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)}
 }  // namespace
 
 SHIM_TABLE(file_system,
