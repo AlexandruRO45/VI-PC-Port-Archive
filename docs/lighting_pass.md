@@ -76,6 +76,42 @@ With these set (for example a constant ray (0, 0, 1) and n = f = 1) the response
 and the eye, as a specular lobe should. A value-for-value CPU reference is not ready: with the ramp of A + 0xc80 above
 the direct diffuse still has a 6 % rms residual, and no single extra factor removes it ((1 − N·L)⁵ is the best, 4.6 %).
 
+### 3.2 A second fit with a consistent camera
+
+The fit was repeated with the camera filled in as a real state: a 60° vertical field of view, aspect 64/36, the ray
+rows of §3.1 from them, n = 0.1 and f = 100, and every pixel at 2 m (the depth byte back-computed with the formula of
+§3.1). The normals are random per pixel and face the eye; the light runs are paired with the opposite light (L and
+−L), so the L-independent ambient cancels on pixels with N·L > 0, and A + 0xc80 holds a step table whose sampled value
+is max(N·L, 0). Further inputs had to be set before the direct light is clean:
+
+| Where | What it does in this pass | Set to |
+|---|---|---|
+| A + 0x1240, r | the smoothness r of the G-buffer: GGX α = max(0.001, ρ²) with ρ = 1 − r after the remap below; lowering r widens the highlight monotonically (peak 14.1 at r = 255 to 5.4 at r = 0) | the roughness under test |
+| A + 0x300 dwords 0x634..0x63c | a remap of ρ (an add with clamp, then a lerp) | 0 |
+| A + 0x2c0 dwords 0x108, 0x10c | a second lerp, ρ → lerp(ρ, 1, w): at the 0.5 fill it makes every highlight much wider (and also changes the diffuse) | 0 |
+| A + 0x2c0 dwords 0x118, 0x11c | sin and cos of the sun's angular radius: the light vector of the specular is the point of that disc closest to the reflection vector R. With 0x11c below every R·L the shader uses R itself, H = N, and the specular no longer depends on L | sin, cos of 0.00465 |
+| B + 0x160 dwords 0x210..0x23c | two groups of plane-like constants tested against the camera-relative position: at the 0.5 fill they remove the direct light from 467 of 1,694 lit pixels in one screen region | 0 |
+
+Measured (3 light directions, 2,304 pixels each, fp16 readback):
+
+* **Direct diffuse** (diffuse albedo 255 or 128, F0 0, minus the same run with albedo 0): proportional to the albedo
+  and to the A + 0xc80 sample, k·c80(u) with rms residual 3.9 %, 5.4 % and 6.2 %. Adding free terms in N·V, N·L, L·H
+  and their (1 − x)⁵ gets no lower than 4.9 %. The residual is not noise: its median is ≈ 0 (the quartiles are
+  −0.6 % and +5 %), but the 90th percentile is +19 % and the 99th +59 %, on normals seen at grazing angles. With the
+  second roughness lerp (0x108/0x10c) also at 0 the same model is at 14.8 %.
+* **Direct specular** (F0 255 or 64, albedo 0): GGX × height-correlated Smith × Schlick with α from r as above is at
+  26–46 % rms at the rough end (r = 64, 0) even with α fitted freely, and is not meaningful at the smooth end, where the
+  lobe is too narrow for random normals to sample. Other multipliers (the 2D table at A + 0xca0, the multiple-scattering
+  term, the sun-disc normalisation) are not separated.
+
+So no CPU BRDF reaches the 1 % needed for a value-for-value check, and `tools/lighting_pass.py` has no such mode.
+
+HAIR, with the same camera (and A + 0x13c0 at alpha 128, §6), is not zero. It reads two dwords that STANDARD does
+not, B + 0x160 dword 0x158 and B + 0x80 dword 0x4. With either at 0 its output no longer depends on the light (mean
+8.94, the paired difference 0.0013). With both non-zero (0.25, 1 and 4 give identical outputs) the side that faces
+−L is the bright one: the paired difference is −3.02 on pixels with N·L > 0. A hair model that reads a tangent instead
+of a normal from A + 0x1240 would behave like this; that is not checked.
+
 ## 4. The check
 
 The total lighting term is the mean of output 0's red channel with the tint 1 minus the same run with the tint 0, with
@@ -152,8 +188,8 @@ hand-written listings without a GPU.
 
 ## 8. Limits and next
 
-* A CPU BRDF reference: the camera is decoded (§3.1), but the remaining factors (the second coordinate of the
-  A + 0xc80 table, the energy and sun-disc terms) leave a 6 % residual, so the test still compares ratios.
+* A CPU BRDF reference: the camera is decoded (§3.1) and the inputs of §3.2 are set, but the direct diffuse keeps a
+  3.9–6.2 % residual with a grazing-angle tail and the specular is at 26–46 %, so the test still compares ratios.
 * The real G-buffer: running this pass on `vk_gbuffer`'s targets needs a GPU with fragment barycentrics.
 * The mask here is a constant image. Whether the game fills it from the `shadowmask` compute shaders is not checked.
 * The albedo and non-directional checks run on the picked pair only; 52 of the 120 directional variants do not pass
