@@ -228,3 +228,31 @@ class TestQuadmaskB32SIMDAndProperties(unittest.TestCase):
             "v_mov_b32 v0, s0",
         ])
         self.assertEqual(val_a | val_b, val_ab)
+
+
+# ------------------------------------------------------------------------------
+# s_quadmask_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestQuadmaskB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.SGPR, 106)
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.SGPR, -1)
+
+    def test_boundary_extremes_hardware(self):
+        val_max, _ = run_shader_words("ps_qm32_max", [
+            "s_mov_b32 s1, 0xFFFFFFFF",
+            "s_quadmask_b32 s0, s1",
+            "v_mov_b32 v0, s0",
+        ])
+        self.assertEqual(val_max, 0xFF)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        _, spv = run_shader_words("ps_qm32_lowering", [
+            "s_mov_b32 s1, 0x12345678",
+            "s_quadmask_b32 s0, s1",
+            "v_mov_b32 v0, s0",
+        ])
+        self.assertIn("OpBitwiseOr", spv)
