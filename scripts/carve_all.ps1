@@ -8,13 +8,15 @@ $tool = Join-Path $root "tools\rpf9_carve.py"
 # there), which stops at `-I` with "Unknown option". Keep `python` unless it reports an older version; then take the
 # py launcher's newest Python 3, as Build.bat does.
 function Get-PythonVersion([string]$Exe, [string[]]$Prefix) {
+    # No spaces in the probe, so it reaches a .cmd wrapper (pyenv-win, a venv shim) without cmd.exe re-quoting it;
+    # and the answer is the last all-digit line, so text a wrapper or cmd's AutoRun prints first doesn't hide it.
     try {
-        $v = & $Exe @Prefix -c "import sys; print(sys.version_info[0] * 100 + sys.version_info[1])" 2>$null |
-            Select-Object -Last 1
+        $v = & $Exe @Prefix -c "import sys;print(sys.version_info[0]*100+sys.version_info[1])" 2>$null |
+            ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\d+$' } | Select-Object -Last 1
     } catch {
         return $null
     }
-    if ($LASTEXITCODE -eq 0 -and "$v" -match '^\d+$') { return [int]"$v" }
+    if ($LASTEXITCODE -eq 0 -and $v) { return [int]$v }
     return $null
 }
 $pythonExe, $pythonPrefix = "python", @()
