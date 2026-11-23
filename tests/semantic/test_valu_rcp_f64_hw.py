@@ -665,5 +665,76 @@ class TestValuRcpF64StatusFlags(unittest.TestCase):
         flags = classify_f64(0x0000000000000001)
         self.assertTrue(flags.subnormal)
 
+# ---------------------------------------------------------------------------
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+F64_POS_ZERO: int = 0x0000000000000000
+F64_NEG_ZERO: int = 0x8000000000000000
+F64_POS_INF: int = 0x7FF0000000000000
+F64_NEG_INF: int = 0xFFF0000000000000
+F64_POS_QNAN: int = 0x7FF8000000000000
+F64_POS_SNAN: int = 0x7FF0000000000001
+F64_MIN_SUBNORMAL: int = 0x0000000000000001
+F64_MAX_SUBNORMAL: int = 0x000FFFFFFFFFFFFF
+F64_ONE: int = 0x3FF0000000000000
+
+
+class TestValuRcpF64BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Comprehensive IEEE 754 edge cases for double precision reciprocal."""
+
+    def test_ieee754_signed_zero_division(self) -> None:
+        # 1.0 / +0.0 = +infinity
+        res_pos = oracle_rcp_f64_bits(F64_POS_ZERO)
+        self.assertEqual(res_pos, F64_POS_INF)
+
+        # 1.0 / -0.0 = -infinity
+        res_neg = oracle_rcp_f64_bits(F64_NEG_ZERO)
+        self.assertEqual(res_neg, F64_NEG_INF)
+
+    def test_ieee754_infinity_division(self) -> None:
+        # 1.0 / +inf = +0.0
+        res_pos = oracle_rcp_f64_bits(F64_POS_INF)
+        self.assertEqual(res_pos, F64_POS_ZERO)
+
+        # 1.0 / -inf = -0.0
+        res_neg = oracle_rcp_f64_bits(F64_NEG_INF)
+        self.assertEqual(res_neg, F64_NEG_ZERO)
+
+    def test_ieee754_nans(self) -> None:
+        # 1.0 / qNaN = NaN
+        res_q = oracle_rcp_f64_bits(F64_POS_QNAN)
+        self.assertTrue(math.isnan(u64_to_f64(res_q)))
+
+        # 1.0 / sNaN = NaN
+        res_s = oracle_rcp_f64_bits(F64_POS_SNAN)
+        self.assertTrue(math.isnan(u64_to_f64(res_s)))
+
+    def test_ieee754_subnormals_overflow_to_infinity(self) -> None:
+        # Smallest subnormal (approx 4.9e-324): 1.0 / min_subnormal overflows double range -> +inf
+        res = oracle_rcp_f64_bits(F64_MIN_SUBNORMAL)
+        self.assertEqual(res, F64_POS_INF)
+
+    def test_ieee754_powers_of_two_exactness(self) -> None:
+        # Exact reciprocal of powers of two
+        for exp in range(-50, 50):
+            val = math.pow(2.0, exp)
+            expected = math.pow(2.0, -exp)
+            res = oracle_rcp_f64(val)
+            self.assertEqual(res, expected)
+
+    def test_translator_vop3_modifiers_neg_abs(self) -> None:
+        """Verify support.translate_lines emits OpFNegate and FAbs for VOP3 modifiers."""
+        lines = [
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0x40000000",
+            "v_rcp_f64_e64 v[0:1], -|v[2:3]|",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_rcp_f64_neg_abs", lines)
+        self.assertIn("FAbs", spv)
+        self.assertIn("OpFNegate", spv)
+
 if __name__ == "__main__":
     unittest.main()
