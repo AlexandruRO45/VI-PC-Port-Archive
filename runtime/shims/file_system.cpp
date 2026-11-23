@@ -446,8 +446,29 @@ bool writes(DWORD access, DWORD disposition) {
            disposition == TRUNCATE_EXISTING;
 }
 
-Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
+// CREATE_ALWAYS replaces an existing file, which the host refuses with ERROR_ACCESS_DENIED for a read-only file, and
+// for a hidden or system one unless `attributes` (what the open asks for) carries the same bit. The open goes to the
+// overlay name, which a file only the package has does not have yet, so the host would make a new file there without
+// looking at the package file: the package file's attributes are checked here, before the overlay is touched.
+DWORD replace_refused(const std::wstring& path, DWORD attributes) {
+    std::vector<std::wstring> parts;
+    if (parse_console(path, parts) != Parsed::Console || parts.empty()) return 0;
+    const Roots r = roots();
+    if (r.game.empty() || r.overlay.empty()) return 0;
+    const View v = view(r, parts);
+    // A missing parent folder is write_target's ERROR_PATH_NOT_FOUND, as on the host.
+    if (v.kind != Kind::File || v.in_overlay || !v.in_package || !is_folder(r, parent_of(parts))) return 0;
+    const DWORD existing = ::GetFileAttributesW(join(r.game, parts).c_str());
+    if (existing == INVALID_FILE_ATTRIBUTES) return 0;
+    constexpr DWORD kKept = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    if ((existing & FILE_ATTRIBUTE_READONLY) != 0 || (existing & kKept & ~attributes) != 0) return ERROR_ACCESS_DENIED;
+    return 0;
+}
+
+Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DWORD attributes) {
     if (!writes(access, disposition)) return read_target(path);
+    if (disposition == CREATE_ALWAYS)
+        if (const DWORD error = replace_refused(path, attributes)) return fail(error);
     // OPEN_ALWAYS and TRUNCATE_EXISTING read what is already there, and a write-open must not lose a package file's
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
@@ -660,7 +681,7 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    const Target t = open_target(name, access, disposition);
+    const Target t = open_target(name, access, disposition, flags);
     if (t.error) {
         note_open_failure("CreateFileW", name, t.error, _ReturnAddress());
         SetLastError(t.error);
@@ -691,7 +712,7 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    const Target t = open_target(name, access, disposition);
+    const Target t = open_target(name, access, disposition, params ? params->dwFileAttributes : 0);
     if (t.error) {
         note_open_failure("CreateFile2", name, t.error, _ReturnAddress());
         SetLastError(t.error);
