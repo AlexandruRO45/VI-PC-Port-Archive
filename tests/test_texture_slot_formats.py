@@ -20,6 +20,18 @@ def dump(path, doc):
         json.dump(doc, f, indent=1)
 
 
+def pool(folder, rows, files=True):
+    """A pool manifest whose rows point at existing (empty) files unless files is False."""
+    textures = []
+    for i, (key, fmt) in enumerate(rows):
+        name = f"t{i}.dds"
+        if files:
+            os.makedirs(folder, exist_ok=True)
+            open(os.path.join(folder, name), "wb").close()
+        textures.append({"AssetKey": key, "DxgiFormat": fmt, "File": name})
+    dump(os.path.join(folder, "manifest.json"), {"Count": len(rows), "Textures": textures})
+
+
 def model(bindings, embedded=None):
     item = {"Name": "m", "Materials": [{"Shader": "00000000", "Textures": [
         {"Param": p, "Id64": key, "Name": h} for p, key, h in bindings]}]}
@@ -30,12 +42,10 @@ def model(bindings, embedded=None):
 
 def build_export(tmp):
     exp = os.path.join(tmp, "assets")
-    dump(os.path.join(exp, "ttpf", "pool1", "manifest.json"), {"Count": 3, "Textures": [
-        {"AssetKey": "00000000000000AA", "DxgiFormat": 71}, {"AssetKey": "00000000000000BB", "DxgiFormat": 83},
-        {"AssetKey": "00000000000000CC", "DxgiFormat": 72}]})
+    pool(os.path.join(exp, "ttpf", "pool1"), [("00000000000000AA", 71), ("00000000000000BB", 83),
+                                              ("00000000000000CC", 72)])
     # the same key in a second pool with another format: conflicting
-    dump(os.path.join(exp, "ttpf_pack", "pk", "pool2", "manifest.json"), {"Count": 2, "Textures": [
-        {"AssetKey": "00000000000000CC", "DxgiFormat": 99}, {"AssetKey": "00000000000000DD", "DxgiFormat": 98}]})
+    pool(os.path.join(exp, "ttpf_pack", "pk", "pool2"), [("00000000000000CC", 99), ("00000000000000DD", 98)])
     # dictionaries: hash 11111111 once (candidate), 22222222 twice (ambiguous)
     dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 2, "Items": [
         {"Offset": 0, "Textures": [{"Hash": "11111111", "Format": "BC7_UNORM_SRGB", "Key": None},
@@ -103,7 +113,8 @@ class Census(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
-    def run_main(self, argv):
+    @staticmethod
+    def run_main(argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
@@ -153,6 +164,102 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(sum(line.startswith("0x") for line in out.splitlines()), 1)
 
+
+
+def minimal(tmp, items, count=None, pools=(), emb_hash_rows=()):
+    exp = os.path.join(tmp, "assets")
+    for i, rows in enumerate(pools):
+        pool(os.path.join(exp, "ttpf", f"p{i}"), rows)
+    doc = {"Items": items}
+    if count is not None:
+        doc["Count"] = count
+    dump(os.path.join(exp, "lv", "models", "manifest.json"), doc)
+    if emb_hash_rows:
+        dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 1, "Items": [
+            {"Offset": 0, "Textures": list(emb_hash_rows)}]})
+    return exp
+
+
+class ReviewCases(unittest.TestCase):
+    def test_pool_and_embedded_formats_disagreeing_is_a_counted_conflict(self):
+        # kacper-serewis on #5067: a key in a pool and as an embedded texture with different formats
+        emb = {"Textures": [{"Hash": "44444444", "Format": "BC7_UNORM", "Key": "00000000000000A1"}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = minimal(tmp, [model([(BUMP, "00000000000000A1", "44444444"),
+                                       (BUMP, "00000000000000A2", "55555555")], embedded=emb)],
+                          pools=[[("00000000000000A1", 71), ("00000000000000A2", 71)]])
+            d = tsf.census(exp)["parameters"][BUMP]
+        self.assertEqual((d["exact"], d["exact_conflicting"], d["exact_pool_and_embedded"]), (2, 1, 1))
+        self.assertEqual(d["formats"], {"71": 1})           # only the key whose sources agree
+
+    def test_pool_and_embedded_formats_agreeing_are_tallied_once(self):
+        emb = {"Textures": [{"Hash": "44444444", "Format": "BC1_UNORM", "Key": "00000000000000A1"}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = minimal(tmp, [model([(BUMP, "00000000000000A1", "44444444")], embedded=emb)],
+                          pools=[[("00000000000000A1", 71)]])
+            d = tsf.census(exp)["parameters"][BUMP]
+        self.assertEqual((d["exact"], d["exact_conflicting"], d["exact_pool_and_embedded"], d["formats"]),
+                         (1, 0, 1, {"71": 1}))
+
+    def test_zero_keys_and_hashes_are_never_joined(self):
+        # whattheflop on #5067: zero Id64 bindings, a zero pool key, and a zero name hash on a dictionary entry
+        emb = {"Textures": [{"Hash": "00000000", "Format": "BC1_UNORM", "Key": "0000000000000000", "Index": 0},
+                            {"Hash": "00000000", "Format": "BC7_UNORM", "Key": "0000000000000000", "Index": 1}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = minimal(tmp, [model([(BUMP, "0000000000000000", "00000000"),
+                                       (BUMP, "0000000000000000", "00000000"),
+                                       (DIFF, "00000000000000B1", "00000000")], embedded=emb)],
+                          pools=[[("0000000000000000", 71)]],
+                          emb_hash_rows=[{"Hash": "00000000", "Format": "BC1_UNORM", "Key": None}])
+            r = tsf.census(exp)
+        self.assertEqual((r["bindings"], r["bindings_without_key"]), (3, 2))
+        self.assertEqual(r["parameters"][BUMP]["distinct_textures"], 0)
+        d = r["parameters"][DIFF]
+        self.assertEqual((d["exact"], d["candidate"], d["ambiguous"], d["unresolved"]), (0, 0, 0, 1))
+
+    def test_pool_row_without_an_exported_file_is_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = minimal(tmp, [model([(BUMP, "00000000000000C1", "1"), (BUMP, "00000000000000C2", "2"),
+                                       (BUMP, "00000000000000C3", "3")])])
+            folder = os.path.join(exp, "ttpf", "nofile")
+            pool(folder, [("00000000000000C1", 71), ("00000000000000C2", 71), ("00000000000000C3", 71)], files=False)
+            open(os.path.join(folder, "t2.dds"), "wb").close()
+            with open(os.path.join(folder, "manifest.json"), encoding="utf-8") as f:
+                doc = json.load(f)
+            doc["Textures"][0]["File"] = None
+            dump(os.path.join(folder, "manifest.json"), doc)
+            d = tsf.census(exp)["parameters"][BUMP]
+        self.assertEqual((d["exact"], d["exact_pool_without_file"]), (3, 2))   # null File, missing file
+
+    def test_coverage_gap_is_reported_and_extra_rows_are_a_problem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = minimal(tmp, [model([(BUMP, "00000000000000A1", "1")])], count=2)
+            code, out, _ = Cli.run_main([exp])
+            self.assertEqual(code, 0)
+            self.assertIn("coverage lv/models: 1 of 2 rows (1 not exported)", out)
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = minimal(tmp, [model([]), model([])], count=1)
+            code, _, err = Cli.run_main([exp])
+            self.assertEqual(code, 1)
+            self.assertIn("more than the manifest Count", err)
+
+    def test_empty_export_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "assets", "lv"))
+            code, _, err = Cli.run_main([os.path.join(tmp, "assets")])
+        self.assertEqual(code, 2)
+        self.assertIn("no <archive>/models/manifest.json", err)
+
+    def test_archive_name_must_match_exactly(self):
+        # on Windows a case variant passed a file-exists preflight and then selected no models
+        with tempfile.TemporaryDirectory() as tmp:
+            exp = minimal(tmp, [model([(BUMP, "00000000000000A1", "1")])])
+            code, _, err = Cli.run_main([exp, "--archive", "LV"])
+            self.assertEqual(code, 2)
+            self.assertIn("--archive LV", err)
+            code, out, _ = Cli.run_main([exp, "--archive", "lv"])
+            self.assertEqual(code, 0)
+            self.assertIn("models 1,", out)
 
 if __name__ == "__main__":
     unittest.main()

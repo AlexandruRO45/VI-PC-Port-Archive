@@ -3,23 +3,28 @@
 Reads an ``make_game.py`` export folder (``<work>/assets``), listing folders with ``os.listdir`` only. Each material
 texture binding in ``<archive>/models/manifest.json`` (streamed item by item; the levels manifest is several GB)
 carries ``Param`` (the stored 32-bit parameter name hash as eight hex digits), ``Id64`` and ``Name`` (the stored
-32-bit texture name hash). Per parameter, each distinct texture (``Id64``) is counted once and resolved the way
-``texture_dicts.py`` does it:
+32-bit texture name hash). Per parameter, each distinct texture (``Id64``) is counted once and resolved as metadata:
 
-* exact: the 64-bit key is a texture pool ``AssetKey`` (``ttpf``/``ttpf_pack`` manifests, ``DxgiFormat``) or an
-  embedded texture ``Key`` (``Format``);
+* exact: the 64-bit key is a texture pool ``AssetKey`` (``ttpf``/``ttpf_pack`` manifests, ``DxgiFormat``) and/or an
+  embedded texture ``Key`` (``Format``) of any model. The formats from both sources are pooled: a key with one format
+  is tallied, a key with more than one (two pools, or a pool and an embedded copy, disagreeing) is counted as
+  conflicting and left out of the tally. Exact keys found in both sources, and pool matches whose row has no
+  exported file (``File`` null or missing on disk), are counted too: an exact match is a metadata match, not proof
+  that a texture file is available;
 * candidate: otherwise the stored name hash is on exactly one embedded or dictionary entry (``Hash``); not proof of
-  the same asset, so its formats are listed apart. A hash on more than one entry is ambiguous and not counted;
+  the same asset, so its formats are listed apart. A hash on more than one entry is ambiguous;
 * unresolved: neither.
 
-Formats are DXGI numbers (names from ``tex_headers.DXGI`` are mapped back). A key found with more than one format is
-counted as conflicting and left out of the format tally.
+An all-zero key or name hash is a sentinel for "none" (as in ``world_build.py``): it is never joined, and a binding
+whose ``Id64`` is zero counts as a binding without a usable key. A manifest whose ``Count`` is above the rows it holds
+is reported as export coverage; more rows than ``Count`` is a problem (exit 1). Formats are DXGI numbers (names from
+``tex_headers.DXGI`` are mapped back).
 
     python -I tools/texture_slot_formats.py <export dir> [--archive NAME ...] [--top N] [--json FILE]
 
-``--archive`` limits the bindings to those archives' models (the pools and dictionaries used for resolving are
-always the whole export). Prints counts and parameter hashes only: no texture, model or shader names. ``--json``
-may not be inside the export folder. Standard library only.
+``--archive`` (the folder name exactly as listed) limits the bindings to those archives' models; the pools,
+dictionaries and embedded textures used for resolving are always the whole export. Prints counts and parameter
+hashes only: no texture, model or shader names. ``--json`` may not be inside the export folder. Standard library only.
 """
 import argparse
 import json
@@ -32,9 +37,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from manifest_stream import iter_items  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from tex_headers import DXGI  # noqa: E402
-from texture_dicts import archives, inside, key64, pool_manifests, stored_hash  # noqa: E402
+from texture_dicts import archives, check_count, inside, key64, pool_manifests, stored_hash  # noqa: E402
 
 DXGI_BY_NAME = {name: num for num, name in DXGI.items()}
+ZERO_KEY = "0" * 16
 
 
 def dxgi(value):
@@ -60,30 +66,58 @@ def param_hash(value):
     return None
 
 
+def usable_key(value):
+    """A 64-bit key as 16 lowercase hex digits, or None when absent, malformed or the all-zero sentinel."""
+    k = key64(value)
+    return None if k is None or k == ZERO_KEY else k
+
+
+def usable_hash(row, **kw):
+    """The stored 32-bit name hash, or None when absent or zero."""
+    hv, _ = stored_hash(row, **kw)
+    return hv or None
+
+
 def add(index, key, fmt):
     if key is not None and fmt is not None:
         index.setdefault(key, set()).add(fmt)
 
 
-def resolvers(export):
-    """Exact 64-bit key -> formats (pools and embedded keys); stored name hash -> formats, one per entry."""
-    exact, by_hash = {}, {}
-    for _label, m in pool_manifests(export):
+def models_archives(export):
+    return [a for a in archives(export) if os.path.isfile(os.path.join(export, a, "models", "manifest.json"))]
+
+
+def resolvers(export, problems, coverage):
+    """Pool key -> formats, pool key -> whether any row has its exported file, stored name hash -> formats (one per
+    dictionary entry)."""
+    pool, pool_file, by_hash = {}, {}, {}
+    for label, m in pool_manifests(export):
         with open(m, encoding="utf-8") as f:
             doc = json.load(f)
-        for t in doc.get("Textures") or []:
-            add(exact, key64(t.get("AssetKey")), dxgi(t.get("DxgiFormat")))
+        rows = doc.get("Textures") or []
+        check_count(label, len(rows), doc.get("Count"), problems, coverage, "textures")
+        base = os.path.dirname(m)
+        for t in rows:
+            k = usable_key(t.get("AssetKey"))
+            if k is None:
+                continue
+            add(pool, k, dxgi(t.get("DxgiFormat")))
+            fn = t.get("File")
+            has = isinstance(fn, str) and bool(fn) and os.path.isfile(os.path.join(base, fn))
+            pool_file[k] = pool_file.get(k, False) or has
     for arc in archives(export):
         m = os.path.join(export, arc, "textures", "manifest.json")
         if os.path.isfile(m):
             with open(m, encoding="utf-8") as f:
                 doc = json.load(f)
-            for it in doc.get("Items") or []:
+            items = doc.get("Items") or []
+            check_count(f"{arc}/textures", len(items), doc.get("Count"), problems, coverage, "dictionaries")
+            for it in items:
                 for t in it.get("Textures") or []:
-                    hv, _ = stored_hash(t, name_key=None)
+                    hv = usable_hash(t, name_key=None)
                     if hv is not None:
                         by_hash.setdefault(hv, []).append(dxgi(t.get("Format")))
-    return exact, by_hash
+    return pool, pool_file, by_hash
 
 
 def embedded(item):
@@ -94,20 +128,27 @@ def embedded(item):
 
 
 def census(export, only=None):
-    exact, by_hash = resolvers(export)
+    problems, coverage = [], {}
+    pool, pool_file, by_hash = resolvers(export, problems, coverage)
+    emb = {}                           # embedded Key -> formats
     refs = {}                          # param -> {Id64: set of stored name hashes}
     bindings, no_key, no_param = Counter(), 0, 0
     models = 0
-    for arc in archives(export):
+    for arc in models_archives(export):
         m = os.path.join(export, arc, "models", "manifest.json")
-        if not os.path.isfile(m):
-            continue
         use = only is None or arc in only
-        for item in iter_items(m):
+        gen, rows = iter_items(m), 0
+        while True:
+            try:
+                item = next(gen)
+            except StopIteration as stop:
+                check_count(f"{arc}/models", rows, stop.value, problems, coverage, "models")
+                break
+            rows += 1
             # embedded textures resolve references from every archive, so they are read even when filtered out
             for t in embedded(item):
-                add(exact, key64(t.get("Key")), dxgi(t.get("Format")))
-                hv, _ = stored_hash(t)
+                add(emb, usable_key(t.get("Key")), dxgi(t.get("Format")))
+                hv = usable_hash(t)
                 if hv is not None:
                     by_hash.setdefault(hv, []).append(dxgi(t.get("Format")))
             if not use:
@@ -120,23 +161,26 @@ def census(export, only=None):
                         no_param += 1
                         continue
                     bindings[p] += 1
-                    k = key64(t.get("Id64"))
-                    if not k:
+                    k = usable_key(t.get("Id64"))
+                    if k is None:
                         no_key += 1
                         continue
-                    hv, _ = stored_hash(t, hash_key=None)
-                    refs.setdefault(p, {}).setdefault(k, set()).add(hv)
+                    refs.setdefault(p, {}).setdefault(k, set()).add(usable_hash(t, hash_key=None))
 
     params = {}
     for p, keys in refs.items():
         part, fmts, cand_fmts = Counter(), Counter(), Counter()
         for k, hashes in keys.items():
-            if k in exact:
+            in_pool, in_emb = k in pool, k in emb
+            if in_pool or in_emb:
                 part["exact"] += 1
-                if len(exact[k]) == 1:
-                    fmts[next(iter(exact[k]))] += 1
+                part["both"] += in_pool and in_emb
+                part["no file"] += in_pool and not pool_file.get(k, False)
+                found = pool.get(k, set()) | emb.get(k, set())
+                if len(found) == 1:
+                    fmts[next(iter(found))] += 1
                 else:
-                    part["exact, conflicting formats"] += 1
+                    part["conflicting"] += 1
                 continue
             entries = [f for h in hashes if h is not None for f in by_hash.get(h, [])]
             if len(entries) == 1:
@@ -148,20 +192,22 @@ def census(export, only=None):
                 part["unresolved"] += 1
         params[p] = {
             "bindings": bindings[p], "distinct_textures": len(keys),
-            "exact": part["exact"], "exact_conflicting": part["exact, conflicting formats"],
+            "exact": part["exact"], "exact_conflicting": part["conflicting"], "exact_pool_and_embedded": part["both"],
+            "exact_pool_without_file": part["no file"],
             "candidate": part["candidate"], "ambiguous": part["ambiguous"], "unresolved": part["unresolved"],
             "formats": {str(f): n for f, n in sorted(fmts.items(), key=lambda kv: (-kv[1], str(kv[0])))},
             "candidate_formats": {str(f): n for f, n in sorted(cand_fmts.items(),
                                                                key=lambda kv: (-kv[1], str(kv[0])))},
         }
-    for p in bindings:                  # parameters seen only without a key
+    for p in bindings:                  # parameters seen only without a usable key
         params.setdefault(p, {"bindings": bindings[p], "distinct_textures": 0, "exact": 0, "exact_conflicting": 0,
-                              "candidate": 0, "ambiguous": 0, "unresolved": 0, "formats": {},
-                              "candidate_formats": {}})
+                              "exact_pool_and_embedded": 0, "exact_pool_without_file": 0, "candidate": 0,
+                              "ambiguous": 0, "unresolved": 0, "formats": {}, "candidate_formats": {}})
     order = sorted(params, key=lambda p: (-params[p]["bindings"], p))
     return {"archives": sorted(only) if only is not None else "all", "models": models,
             "bindings": sum(bindings.values()), "bindings_without_key": no_key,
-            "bindings_without_param": no_param, "parameters": {p: params[p] for p in order}}
+            "bindings_without_param": no_param, "parameters": {p: params[p] for p in order},
+            "coverage": coverage, "problems": problems}
 
 
 def fmt_list(d, n=4):
@@ -174,7 +220,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("export", help="the make_game assets folder (<work>/assets)")
     ap.add_argument("--archive", action="append", metavar="NAME",
-                    help="count bindings from this archive's models only (repeatable)")
+                    help="count bindings from this archive's models only (the folder name as listed; repeatable)")
     ap.add_argument("--top", type=int, default=20, metavar="N", help="parameters to print (default 20; 0 = all)")
     ap.add_argument("--json", metavar="FILE", help="write the full report as JSON (not inside the export folder)")
     a = ap.parse_args(argv)
@@ -182,31 +228,43 @@ def main(argv=None) -> int:
         ap.error(f"{a.export}: not a folder")
     if a.json and (inside(a.json, a.export) or same_report_path(a.json, a.export)):
         ap.error(f"--json {a.json} is inside the export folder; write the report elsewhere")
+    listed = models_archives(a.export)
+    if not listed:
+        ap.error(f"{a.export}: no <archive>/models/manifest.json; is this a make_game assets folder?")
     only = set(a.archive) if a.archive else None
     if only is not None:
-        missing = sorted(n for n in only if not os.path.isfile(os.path.join(a.export, n, "models", "manifest.json")))
+        missing = sorted(only - set(listed))   # exact names, so a case variant on Windows does not select nothing
         if missing:
-            ap.error(f"no models manifest for --archive {', '.join(missing)}")
+            ap.error(f"no models manifest for --archive {', '.join(missing)} (archives with models: "
+                     f"{', '.join(listed)})")
     try:
         r = census(a.export, only)
     except ValueError as e:
         print(f"error: invalid manifest JSON: {e}", file=sys.stderr)
         return 2
-    print(f"models {r['models']:,}, bindings {r['bindings']:,} ({r['bindings_without_key']:,} without Id64, "
+    print(f"models {r['models']:,}, bindings {r['bindings']:,} ({r['bindings_without_key']:,} without a usable Id64, "
           f"{r['bindings_without_param']:,} without Param), parameters {len(r['parameters']):,}")
     print("parameter | bindings | textures | exact | candidate | ambiguous | unresolved | formats (DXGI: textures)"
           " | candidate formats")
     shown = list(r["parameters"].items())
     for p, d in (shown[:a.top] if a.top else shown):
-        conflict = f" ({d['exact_conflicting']:,} conflicting)" if d["exact_conflicting"] else ""
-        print(f"0x{p} | {d['bindings']:,} | {d['distinct_textures']:,} | {d['exact']:,}{conflict} | "
+        notes = [f"{d[k]:,} {label}" for k, label in (("exact_conflicting", "conflicting"),
+                                                      ("exact_pool_and_embedded", "pool and embedded"),
+                                                      ("exact_pool_without_file", "pool row without file"))
+                 if d[k]]
+        note = f" ({', '.join(notes)})" if notes else ""
+        print(f"0x{p} | {d['bindings']:,} | {d['distinct_textures']:,} | {d['exact']:,}{note} | "
               f"{d['candidate']:,} | {d['ambiguous']:,} | {d['unresolved']:,} | {fmt_list(d['formats'])} | "
               f"{fmt_list(d['candidate_formats'])}")
+    for label, c in r["coverage"].items():
+        print(f"coverage {label}: {c['rows']:,} of {c['declared']:,} rows ({c['missing']:,} not exported)")
+    for msg in r["problems"]:
+        print("problem:", msg, file=sys.stderr)
     if a.json:
         with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(r, f, indent=1)
             f.write("\n")
-    return 0
+    return 1 if r["problems"] else 0
 
 
 if __name__ == "__main__":
