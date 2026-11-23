@@ -20,7 +20,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mc_command import mc_command  # noqa: E402
+from mc_command import WSL_LLVM_MC_POWERSHELL, mc_command, not_found  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 import rdna2_decode  # noqa: E402
@@ -77,16 +77,14 @@ def probe(mcpu: str) -> None:
                            input=PROBE, capture_output=True, text=True, errors="replace",
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
-        fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it (on Windows,\n"
-             f"scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
-             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+        fail(not_found(MC[0], e))
     if p.returncode != 0 or "s_endpgm" not in p.stdout:
         why = (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[0]
         fail(f"'{' '.join(MC)}' did not disassemble an s_endpgm: {why}\n"
              f"The disassembler needs LLVM 21+ with the AMDGPU target. The official Windows LLVM build has no\n"
              f"AMDGPU target: build a native one with scripts\\build_llvm_mc.ps1, or run it from WSL\n"
-             f"(docs/design.md, 'Disassembling shaders'), e.g.\n"
-             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+             "(docs/design.md, 'Disassembling shaders'). For WSL from PowerShell, use\n"
+             f"  {WSL_LLVM_MC_POWERSHELL}")
 
 
 def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):

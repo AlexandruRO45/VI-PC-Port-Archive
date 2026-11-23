@@ -147,6 +147,7 @@ class MissingLlvmMcTest(unittest.TestCase):
         self.assertIn(f"'{self.missing}' could not be started", message)
         self.assertIn("LLVM_MC", message)
         self.assertIn("build_llvm_mc.ps1", message)
+        self.assertIn("$env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'", message)
         self.assertNotIn("--llvm-mc", message)   # only a tool that has the option names it
 
     def test_run_names_the_tools_own_option(self):

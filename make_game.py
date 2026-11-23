@@ -68,7 +68,7 @@ if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an old
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
-from mc_command import mc_command  # noqa: E402
+from mc_command import WSL_LLVM_MC_POWERSHELL, mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
@@ -837,9 +837,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         if not (os.path.isfile(mc) or shutil.which(mc)):
             missing.append(
                 "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
-                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
-                "LLVM_MC to the whole command, e.g. "
-                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
+                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and use "
+                f"{WSL_LLVM_MC_POWERSHELL} in PowerShell (docs/design.md)." + appdata_hint(mc))
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")

@@ -59,6 +59,7 @@ class DisasmFailureTest(unittest.TestCase):
         p = self.run_tool("definitely-not-an-llvm-mc", out)
         self.assertEqual(p.returncode, 1)
         self.assertIn("could not be started", p.stderr)
+        self.assertIn("$env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'", p.stderr)
 
     def test_no_amdgpu_target(self):
         mc = self.fake("import sys\n"
@@ -69,6 +70,7 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("No available targets", p.stderr)
         self.assertIn("AMDGPU target", p.stderr)
+        self.assertIn("$env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'", p.stderr)
 
     def test_undecodable_probe_error_is_reported_without_a_traceback(self):
         # 0x81 is invalid in both UTF-8 and cp1252 (the -I locale on Windows).

@@ -132,6 +132,7 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
                 mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
             err = self.assert_preflight_fails(["shaders", "pipelines"], "vk_pipeline_check")
         self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
+        self.assertIn("$env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'", err)
         self.assertEqual(err.count("vk_pipeline_check"), 1)
 
 

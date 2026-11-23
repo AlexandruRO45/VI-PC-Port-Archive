@@ -57,6 +57,9 @@ def split_windows_command(raw: str) -> list[str]:
     return args
 
 
+WSL_LLVM_MC_POWERSHELL = "$env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'"
+
+
 def split_command(raw: str) -> list[str]:
     """Split a command line without eating the backslashes of a Windows path (POSIX shlex would)."""
     raw = raw.strip()
@@ -88,8 +91,8 @@ def not_found(exe: str, error: OSError, flag: str | None = None) -> str:
     option for the command, if it has one (run_gpu_tests.py's --llvm-mc); the others read LLVM_MC only."""
     where = f"set LLVM_MC (or pass {flag})" if flag else "set LLVM_MC"
     return (f"'{exe}' could not be started: {error}. Put llvm-mc on PATH or {where} to it\n"
-            f"(on Windows, scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
-            f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+            "(on Windows, scripts\\build_llvm_mc.ps1 builds one and sets it). For WSL from PowerShell, use\n"
+            f"  {WSL_LLVM_MC_POWERSHELL}")
 
 
 def run(cmd: list, flag: str | None = None, **kwargs) -> subprocess.CompletedProcess:
