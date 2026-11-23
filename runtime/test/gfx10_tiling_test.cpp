@@ -147,9 +147,34 @@ int main() {
     CHECK(!invalid.detile({}, {}, 0));
     TiledSurface2D surface;
     CHECK(TiledSurface2D::make(TileMode::sw_4kb_s, 4, 1, 3, surface));
+    CHECK(surface.width() == 1 && surface.height() == 3 && surface.element_bytes() == 4);
     std::vector<std::byte> tiled(surface.tiled_size()), linear(12);
     CHECK(!surface.tile(linear, tiled, max));
     CHECK(!surface.detile(tiled, linear, max));
+
+    // 1. Null-pointer spans with non-zero length must return false without dereferencing nullptr.
+    const std::span<const std::byte> null_const(static_cast<const std::byte*>(nullptr), tiled.size());
+    const std::span<std::byte> null_mut(static_cast<std::byte*>(nullptr), tiled.size());
+    CHECK(!surface.tile(null_const, tiled, 4));
+    CHECK(!surface.tile(linear, null_mut, 4));
+    CHECK(!surface.detile(null_const, linear, 4));
+    CHECK(!surface.detile(tiled, null_mut, 4));
+
+    // 2. Adjacent slices in one staging buffer with an oversized source span whose active accessed
+    // region [0, required_source) does not overlap destination [required_source, required_source + required_dest)
+    // must succeed.
+    std::vector<std::byte> arena(linear.size() + tiled.size(), std::byte{0x5a});
+    CHECK(surface.tile(std::span<const std::byte>(arena.data(), arena.size()),
+                       std::span<std::byte>(arena.data() + linear.size(), tiled.size()), 4));
+    CHECK(surface.detile(std::span<const std::byte>(arena.data() + linear.size(), tiled.size()),
+                         std::span<std::byte>(arena.data(), arena.size()), 4));
+
+    // 3. A failed make() on an already-initialized TiledSurface2D must reset `out` to invalid.
+    CHECK(!TiledSurface2D::make(TileMode::sw_4kb_s, 0, 1, 1, surface));
+    CHECK(surface.tiled_size() == 0 && surface.tile_width() == 0 && surface.tile_height() == 0);
+    CHECK(surface.width() == 0 && surface.height() == 0 && surface.element_bytes() == 0);
+    CHECK(!surface.element_offset(0, 0, offset));
+
     std::puts("gfx10_tiling: 40 surface round trips, padded bijections, 30 Python offsets and invalid arguments passed");
     return 0;
 }

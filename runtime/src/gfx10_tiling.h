@@ -41,7 +41,9 @@ class TiledSurface2D {
 public:
     static bool make(TileMode mode, std::size_t element_bytes, std::size_t width, std::size_t height,
                      TiledSurface2D& out) {
+        out = {};
         if (!width || !height) return false;
+
         unsigned index = 0;
         switch (element_bytes) {
         case 1: break;
@@ -86,6 +88,10 @@ public:
     std::size_t tiled_size() const { return size_; }
     std::size_t tile_width() const { return tile_width_; }
     std::size_t tile_height() const { return tile_height_; }
+    std::size_t width() const { return width_; }
+    std::size_t height() const { return height_; }
+    std::size_t element_bytes() const { return element_bytes_; }
+
 
     bool element_offset(std::size_t x, std::size_t y, std::size_t& offset) const {
         if (!size_ || x >= width_ || y >= height_) return false;
@@ -120,9 +126,13 @@ private:
         if (pitch < row_bytes || (height_ - 1 &&
             pitch > (std::numeric_limits<std::size_t>::max() - row_bytes) / (height_ - 1))) return false;
         const std::size_t linear_size = (height_ - 1) * pitch + row_bytes;
-        if (source.size() < (to_tiled ? linear_size : size_) ||
-            destination.size() < (to_tiled ? size_ : linear_size) ||
-            tiling_detail::overlap(source, destination)) return false;
+        const std::size_t source_bytes = to_tiled ? linear_size : size_;
+        const std::size_t dest_bytes = to_tiled ? size_ : linear_size;
+        if (!source.data() || !destination.data() ||
+            source.size() < source_bytes ||
+            destination.size() < dest_bytes ||
+            tiling_detail::overlap(source.first(source_bytes), destination.first(dest_bytes))) return false;
+
         const auto tile_x_bits = std::countr_zero(tile_width_);
         std::size_t x_offsets[256]{};
         for (std::size_t x = 0; x < tile_width_; ++x) {
