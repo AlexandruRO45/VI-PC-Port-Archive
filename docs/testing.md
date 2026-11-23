@@ -323,7 +323,10 @@ LEONIDA_VK_DEVICE=9070 python3 -I runtime/test/shaders/w64_graphics.py /tmp/w64g
 LEONIDA_VK_DEVICE=9070 python3 -I runtime/test/shaders/w64_graphics.py /tmp/w64g runtime/build/linux gs_w64_a_ring
 ```
 
-Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixture:
+Each line prints `ok`, a `SKIP` with its reason, or what differed. The `tools dir` can be the CMake *build* folder
+even when a multi-config generator (Visual Studio, Xcode) put the programs in its `RelWithDebInfo` or `Release`
+subfolder: it is found by itself, and a `vk_harness` that was not built is one error line instead of a traceback
+(TEST-1764). To add a fixture:
 
 1. Write `runtime/test/shaders/{ps,vs,gs}_w64_<tier>_<name>.asm` with `; mattr: +wavefrontsize64,-wavefrontsize32`
    and a header that says what every result word is. Vertex and geometry fixtures store four words per vertex or
