@@ -589,5 +589,73 @@ class TestSXorSaveExecIEEE754Bitwise(unittest.TestCase):
                 self.assertEqual(d, pattern)
                 self.assertEqual(scc, 0)
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+class TestSXorSaveExecNegativeAndMutation(unittest.TestCase):
+    """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
+
+    def test_reject_odd_aligned_sgpr_destination(self):
+        for odd_idx in (1, 3, 5, 7, 99, 101):
+            with self.subTest(odd_idx=odd_idx):
+                instr = SXorSaveExecB64Instruction(
+                    dst=RegOperand(RegisterKind.SGPR, index=odd_idx, size_bits=64),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_out_of_bounds_sgpr_destination(self):
+        for oob_idx in (104, 106, 120, 256):
+            with self.subTest(oob_idx=oob_idx):
+                instr = SXorSaveExecB64Instruction(
+                    dst=RegOperand(RegisterKind.SGPR, index=oob_idx, size_bits=64),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_invalid_destination_register_kind(self):
+        for bad_kind in (RegisterKind.VGPR, RegisterKind.EXEC, RegisterKind.VCC, RegisterKind.SCC):
+            with self.subTest(bad_kind=bad_kind):
+                instr = SXorSaveExecB64Instruction(
+                    dst=RegOperand(bad_kind, index=0, size_bits=64),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64)
+                )
+                with self.assertRaises(TypeError):
+                    instr.validate()
+
+    def test_mutation_detector_logic(self):
+        """Verify detection of mutant logic implementations (OR vs XOR)."""
+        def mutant_or(s0: int, e: int):
+            new_e = s0 | e
+            return new_e, e, int(new_e != 0)
+
+        def mutant_and(s0: int, e: int):
+            new_e = s0 & e
+            return new_e, e, int(new_e != 0)
+
+        s0 = 0xFFFF
+        e = 0xFFFF
+        # Correct oracle: 0xFFFF ^ 0xFFFF = 0
+        correct_new, correct_d, correct_scc = s_xor_saveexec_b64_oracle(s0, e)
+        self.assertEqual(correct_new, 0)
+        self.assertEqual(correct_d, 0xFFFF)
+        self.assertEqual(correct_scc, 0)
+
+        # Mutant OR produces 0xFFFF != 0
+        m_new, m_d, m_scc = mutant_or(s0, e)
+        self.assertNotEqual(m_new, correct_new)
+        self.assertNotEqual(m_scc, correct_scc)
+
+        # Mutant AND on differing patterns
+        s0_diff = 0x5555
+        e_diff = 0xAAAA
+        correct_new2, _, _ = s_xor_saveexec_b64_oracle(s0_diff, e_diff)
+        m_new2, _, _ = mutant_and(s0_diff, e_diff)
+        self.assertNotEqual(m_new2, correct_new2)
+
+
 if __name__ == "__main__":
     unittest.main()
