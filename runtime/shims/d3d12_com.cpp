@@ -114,6 +114,34 @@ bool is_bc_format(DXGI_FORMAT format) {
     return (f >= 70 && f <= 84) || (f >= 94 && f <= 99);
 }
 
+UINT bc_block_bytes(DXGI_FORMAT family) {
+    switch (family) {
+    case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC4_TYPELESS:
+        return 8;
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC5_TYPELESS:
+    case DXGI_FORMAT_BC6H_TYPELESS:
+    case DXGI_FORMAT_BC7_TYPELESS:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+UINT raw_bc_reinterpret_bytes(DXGI_FORMAT family) {
+    switch (family) {
+    case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return 8;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
 UINT format_plane_count(DXGI_FORMAT format) {
     switch (copy_format_family(format)) {
     case DXGI_FORMAT_R32G8X24_TYPELESS:
@@ -137,6 +165,10 @@ bool footprint_format_compatible(ID3D12Resource* texture, DXGI_FORMAT texture_fo
     const DXGI_FORMAT fp_family = copy_format_family(footprint_format);
     if (fp_family == tex_family) return true;
     if (resource_lists_castable_format(texture, footprint_format)) return true;
+    if (const UINT bc_bytes = bc_block_bytes(tex_family); bc_bytes && bc_bytes == raw_bc_reinterpret_bytes(fp_family))
+        return true;
+    if (const UINT bc_bytes = bc_block_bytes(fp_family); bc_bytes && bc_bytes == raw_bc_reinterpret_bytes(tex_family))
+        return true;
     switch (tex_family) {
     case DXGI_FORMAT_R32G8X24_TYPELESS:
         return plane == 0 ? (fp_family == DXGI_FORMAT_R32_TYPELESS ||
@@ -239,28 +271,32 @@ bool valid_copy_texture_region(const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, U
     // Empty or inverted source box is a legal no-op in D3D12.
     if (box && (box->right <= box->left || box->bottom <= box->top || box->back <= box->front)) return true;
 
+    const UINT src_block = src_fp ? (is_bc_format(src->PlacedFootprint.Footprint.Format) ? 4u : 1u) : src_info.block;
+    const UINT64 src_limit_w =
+        src_fp ? (UINT64(src->PlacedFootprint.Footprint.Width) + src_block - 1) / src_block * src_block
+               : (src_info.width + src_info.block - 1) / src_info.block * src_info.block;
+    const UINT64 src_limit_h =
+        src_fp ? (UINT64(src->PlacedFootprint.Footprint.Height) + src_block - 1) / src_block * src_block
+               : (UINT64(src_info.height) + src_info.block - 1) / src_info.block * src_info.block;
+    const UINT64 src_limit_d = src_fp ? UINT64(src->PlacedFootprint.Footprint.Depth) : UINT64(src_info.depth);
+    if (box && (box->right > src_limit_w || box->bottom > src_limit_h || box->back > src_limit_d)) return false;
+
     if (dst_sub) {
         const UINT64 dst_limit_w = (dst_info.width + dst_info.block - 1) / dst_info.block * dst_info.block;
         const UINT64 dst_limit_h = (UINT64(dst_info.height) + dst_info.block - 1) / dst_info.block * dst_info.block;
-        UINT64 copy_w = 0, copy_h = 0, copy_d = 0;
-        if (src_fp) {
-            const auto& fp = src->PlacedFootprint.Footprint;
-            copy_w = box ? UINT64(box->right - box->left) : UINT64(fp.Width);
-            copy_h = box ? UINT64(box->bottom - box->top) : UINT64(fp.Height);
-            copy_d = box ? UINT64(box->back - box->front) : UINT64(fp.Depth);
-        } else {
-            const UINT64 raw_w = box ? UINT64(box->right - box->left) : src_info.width;
-            const UINT64 raw_h = box ? UINT64(box->bottom - box->top) : UINT64(src_info.height);
-            copy_d = box ? UINT64(box->back - box->front) : UINT64(src_info.depth);
-            if (src_info.block != dst_info.block) {
-                copy_w = dst_info.block > src_info.block ? raw_w * dst_info.block
-                                                         : (raw_w + src_info.block - 1) / src_info.block;
-                copy_h = dst_info.block > src_info.block ? raw_h * dst_info.block
-                                                         : (raw_h + src_info.block - 1) / src_info.block;
-            } else {
-                copy_w = raw_w;
-                copy_h = raw_h;
-            }
+        const UINT64 raw_w =
+            box ? UINT64(box->right - box->left)
+                : (src_fp ? UINT64(src->PlacedFootprint.Footprint.Width) : src_info.width);
+        const UINT64 raw_h =
+            box ? UINT64(box->bottom - box->top)
+                : (src_fp ? UINT64(src->PlacedFootprint.Footprint.Height) : UINT64(src_info.height));
+        const UINT64 copy_d =
+            box ? UINT64(box->back - box->front)
+                : (src_fp ? UINT64(src->PlacedFootprint.Footprint.Depth) : UINT64(src_info.depth));
+        UINT64 copy_w = raw_w, copy_h = raw_h;
+        if (src_block != dst_info.block) {
+            copy_w = dst_info.block > src_block ? raw_w * dst_info.block : (raw_w + src_block - 1) / src_block;
+            copy_h = dst_info.block > src_block ? raw_h * dst_info.block : (raw_h + src_block - 1) / src_block;
         }
         if (x > dst_limit_w || copy_w > dst_limit_w - x ||
             y > dst_limit_h || copy_h > dst_limit_h - y ||

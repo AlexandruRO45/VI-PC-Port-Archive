@@ -43,6 +43,7 @@ constexpr HRESULT not_run = HRESULT(0x7fff0000);  // the case needs an interface
 struct Env {
     ID3D12Device* device = nullptr;
     Ref<ID3D12Resource> buffer, upload, readback, target, target2, depth, msaa, tex, mips;
+    Ref<ID3D12Resource> bc1, raw64, bc7, raw128;
     Ref<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
     Ref<ID3D12QueryHeap> occlusion;
@@ -60,10 +61,10 @@ struct Env {
                                                              IID_PPV_ARGS(&out.p)));
         };
         const auto texture = [](DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags, UINT samples = 1, UINT16 mip_levels = 1,
-                                UINT16 layers = 1) {
+                                UINT16 layers = 1, UINT size = 64) {
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            desc.Width = desc.Height = 64;
+            desc.Width = desc.Height = size;
             desc.DepthOrArraySize = layers;
             desc.MipLevels = mip_levels;
             desc.Format = format;
@@ -86,6 +87,14 @@ struct Env {
                      D3D12_RESOURCE_STATE_DEPTH_WRITE, depth));
         CHECK(create(default_heap, texture(rgba, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 4),
                      D3D12_RESOURCE_STATE_COMMON, msaa));
+        CHECK(create(default_heap, texture(DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 1, 1, 8),
+                     D3D12_RESOURCE_STATE_COMMON, bc1));
+        CHECK(create(default_heap, texture(DXGI_FORMAT_R32G32_UINT, D3D12_RESOURCE_FLAG_NONE, 1, 1, 1, 2),
+                     D3D12_RESOURCE_STATE_COMMON, raw64));
+        CHECK(create(default_heap, texture(DXGI_FORMAT_BC7_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 1, 1, 8),
+                     D3D12_RESOURCE_STATE_COMMON, bc7));
+        CHECK(create(default_heap, texture(DXGI_FORMAT_R32G32B32A32_UINT, D3D12_RESOURCE_FLAG_NONE, 1, 1, 1, 2),
+                     D3D12_RESOURCE_STATE_COMMON, raw128));
         const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                                                   0};
         const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
@@ -120,12 +129,13 @@ D3D12_TEXTURE_COPY_LOCATION subresource(ID3D12Resource* resource, UINT index) {
 }
 
 D3D12_TEXTURE_COPY_LOCATION footprint(ID3D12Resource* resource, UINT64 offset, UINT row_pitch,
-                                      DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
+                                      DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, UINT width = 64,
+                                      UINT height = 64) {
     D3D12_TEXTURE_COPY_LOCATION location{};
     location.pResource = resource;
     location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     location.PlacedFootprint.Offset = offset;
-    location.PlacedFootprint.Footprint = {format, 64, 64, 1, row_pitch};
+    location.PlacedFootprint.Footprint = {format, width, height, 1, row_pitch};
     return location;
 }
 
@@ -248,6 +258,59 @@ std::vector<Case> cases() {
                RECORD_COPY(subresource(e.tex.p, 0), 32, subresource(e.tex.p, 0), &box))},
         {"CopyTextureRegion into a null location", false, match,
          CALLS(const auto s = subresource(e.tex.p, 0); e.list->CopyTextureRegion(nullptr, 0, 0, 0, &s, nullptr))},
+        // CopyTextureRegion BC <-> raw reinterpret placed footprints
+        {"CopyTextureRegion upload, footprint R32G32_UINT into BC1_UNORM", true, match,
+         CALLS(RECORD_COPY(subresource(e.bc1.p, 0), 0,
+                           footprint(e.upload.p, 0, 256, DXGI_FORMAT_R32G32_UINT, 2, 2), nullptr))},
+        {"CopyTextureRegion readback, BC1_UNORM into footprint R32G32_UINT", true, match,
+         CALLS(RECORD_COPY(footprint(e.readback.p, 0, 256, DXGI_FORMAT_R32G32_UINT, 2, 2), 0,
+                           subresource(e.bc1.p, 0), nullptr))},
+        {"CopyTextureRegion upload, footprint BC1_UNORM into R32G32_UINT", true, match,
+         CALLS(RECORD_COPY(subresource(e.raw64.p, 0), 0,
+                           footprint(e.upload.p, 0, 256, DXGI_FORMAT_BC1_UNORM, 8, 8), nullptr))},
+        {"CopyTextureRegion readback, R32G32_UINT into footprint BC1_UNORM", true, match,
+         CALLS(RECORD_COPY(footprint(e.readback.p, 0, 256, DXGI_FORMAT_BC1_UNORM, 8, 8), 0,
+                           subresource(e.raw64.p, 0), nullptr))},
+        {"CopyTextureRegion upload, footprint R32G32B32A32_UINT into BC7_UNORM", true, match,
+         CALLS(RECORD_COPY(subresource(e.bc7.p, 0), 0,
+                           footprint(e.upload.p, 0, 256, DXGI_FORMAT_R32G32B32A32_UINT, 2, 2), nullptr))},
+        {"CopyTextureRegion readback, BC7_UNORM into footprint R32G32B32A32_UINT", true, match,
+         CALLS(RECORD_COPY(footprint(e.readback.p, 0, 256, DXGI_FORMAT_R32G32B32A32_UINT, 2, 2), 0,
+                           subresource(e.bc7.p, 0), nullptr))},
+        {"CopyTextureRegion upload, footprint BC7_UNORM into R32G32B32A32_UINT", true, match,
+         CALLS(RECORD_COPY(subresource(e.raw128.p, 0), 0,
+                           footprint(e.upload.p, 0, 256, DXGI_FORMAT_BC7_UNORM, 8, 8), nullptr))},
+        {"CopyTextureRegion readback, R32G32B32A32_UINT into footprint BC7_UNORM", true, match,
+         CALLS(RECORD_COPY(footprint(e.readback.p, 0, 256, DXGI_FORMAT_BC7_UNORM, 8, 8), 0,
+                           subresource(e.raw128.p, 0), nullptr))},
+        // CopyTextureRegion source-box bounds overruns
+        {"CopyTextureRegion readback, box right past source width (65 of 64)", false, match,
+         CALLS(const D3D12_BOX box{0, 0, 0, 65, 64, 1};
+               RECORD_COPY(footprint(e.readback.p, 0, 256), 0, subresource(e.tex.p, 0), &box))},
+        {"CopyTextureRegion readback, box bottom past source height (65 of 64)", false, match,
+         CALLS(const D3D12_BOX box{0, 0, 0, 64, 65, 1};
+               RECORD_COPY(footprint(e.readback.p, 0, 256), 0, subresource(e.tex.p, 0), &box))},
+        {"CopyTextureRegion readback, box back past source depth (2 of 1)", false, match,
+         CALLS(const D3D12_BOX box{0, 0, 0, 64, 64, 2};
+               RECORD_COPY(footprint(e.readback.p, 0, 256), 0, subresource(e.tex.p, 0), &box))},
+        {"CopyTextureRegion upload, box right past source footprint width (65 of 64)", false, match,
+         CALLS(const D3D12_BOX box{32, 0, 0, 65, 64, 1};
+               RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 256), &box))},
+        {"CopyTextureRegion upload, box bottom past source footprint height (65 of 64)", false, match,
+         CALLS(const D3D12_BOX box{0, 32, 0, 64, 65, 1};
+               RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 256), &box))},
+        {"CopyTextureRegion upload, box back past source footprint depth (2 of 1)", false, match,
+         CALLS(const D3D12_BOX box{0, 0, 0, 64, 64, 2};
+               RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 256), &box))},
+        {"CopyTextureRegion subresource to subresource, box right past source width (65 of 64)", false, match,
+         CALLS(const D3D12_BOX box{32, 0, 0, 65, 64, 1};
+               RECORD_COPY(subresource(e.target.p, 0), 0, subresource(e.tex.p, 0), &box))},
+        {"CopyTextureRegion subresource to subresource, box bottom past source height (65 of 64)", false, match,
+         CALLS(const D3D12_BOX box{0, 32, 0, 64, 65, 1};
+               RECORD_COPY(subresource(e.target.p, 0), 0, subresource(e.tex.p, 0), &box))},
+        {"CopyTextureRegion subresource to subresource, box back past source depth (2 of 1)", false, match,
+         CALLS(const D3D12_BOX box{0, 0, 0, 64, 64, 2};
+               RECORD_COPY(subresource(e.target.p, 0), 0, subresource(e.tex.p, 0), &box))},
         // CopyResource
         {"CopyResource with the destination as the source", true, match,
          CALLS(e.list->CopyResource(e.tex.p, e.tex.p))},
