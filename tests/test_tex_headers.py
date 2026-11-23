@@ -972,6 +972,33 @@ class CliInputTest(unittest.TestCase):
             self.assertIn("is a directory", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
 
+    def test_out_under_a_regular_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            file_as_dir = os.path.join(tmp, "file.txt")
+            with open(file_as_dir, "w", encoding="utf-8") as f:
+                f.write("not a directory")
+            out = os.path.join(file_as_dir, "sub", "textures.json")
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("is a file", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+
+    def test_out_directory_creation_failure_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            out = os.path.join(tmp, "new_dir", "textures.json")
+            with mock.patch("os.makedirs", side_effect=OSError(13, "Permission denied")):
+                with mock.patch("sys.argv", ["tex_headers.py", os.path.join(tmp, "carve"), "--out", out]), \
+                     mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                    code = tex_headers.main()
+                    self.assertEqual(code, 2)
+                    self.assertIn("ERROR: cannot write", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

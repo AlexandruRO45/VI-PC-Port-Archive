@@ -84,6 +84,17 @@ class ReportPathTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("is a directory", result.stderr)
 
+    def test_out_under_a_regular_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, _, _ = make_carve(td)
+            file_as_dir = pathlib.Path(td) / "file.txt"
+            file_as_dir.write_text("not a directory", encoding="utf-8")
+            out = file_as_dir / "sub" / "report.json"
+            result = self.run_tool(carve, "--out", out)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("is a file", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     def test_report_inside_the_carve_folder_still_works(self):
         with tempfile.TemporaryDirectory() as td:
             carve, cpu_path, gpu_path = make_carve(td)

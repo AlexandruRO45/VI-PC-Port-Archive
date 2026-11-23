@@ -765,6 +765,12 @@ def main():
     path = a.out or os.path.join(a.carve, "textures_index.json")
     if os.path.isdir(path):
         ap.error(f"{path} is a directory, not a .json file")
+    parent = os.path.dirname(os.path.abspath(path))
+    check = parent
+    while check and check != os.path.dirname(check):
+        if os.path.exists(check) and not os.path.isdir(check):
+            ap.error(f"cannot create {parent}: {check} is a file")
+        check = os.path.dirname(check)
     for kind, source in input_files(a.carve, archs):
         if same_output_path(source, path):
             ap.error(f"output would overwrite an input {kind}: {path}")
@@ -779,9 +785,9 @@ def main():
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
     parent = os.path.dirname(os.path.abspath(path))
-    if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
-        os.makedirs(parent, exist_ok=True)
     try:
+        if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(allt, f)
     except OSError as e:
