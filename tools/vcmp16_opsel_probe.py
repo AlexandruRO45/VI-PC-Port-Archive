@@ -12,7 +12,10 @@ it: the compares are written here as raw words. Their encodings are llvm-mc's (g
 
 Each row loads v1 and v2 with two halves, runs one compare and stores bit 0 of s10 (lane 0's result). The rows'
 values are chosen so that honouring op_sel and ignoring it (reading the low halves) give different answers on most
-of them. Standard library only, no game files.
+of them. The source rows after them repeat the question for the other operand kinds: an SGPR as src0 or src1, a
+32-bit literal (operand 255 and the dword after the instruction), inline integer and float constants, and a VGPR
+src0 with an SGPR src1 in one instruction; the output names, per kind, whether OPSEL counted (#3487's revert asked
+whether it is ignored for VGPR sources only). Standard library only, no game files.
 
 Exit codes: 0 every row matches op_sel being ignored (the gfx1036 measurement), 1 a row differs, 2 harness error, 77 no hardware oracle.
 """
@@ -126,8 +129,87 @@ def control_kernel(start):
     return out
 
 
+# Source kinds (#3487's revert): does OPSEL count for some operand kinds only? Each source is
+#   ("v", word)        a VGPR (v1 as src0, v2 as src1)
+#   ("s", word)        an SGPR (s12 as src0, s13 as src1)
+#   ("lit", word)      the 32-bit literal (operand 255, the dword after the instruction; one per instruction)
+#   ("inl", code, word) an inline constant: its operand code and the 32-bit value it stands for (an integer is
+#                      sign-extended; a float on a 16-bit op is the f16 value in the low half, docs/design.md
+#                      "f16 inline constants")
+SRC_CODE = {("v", 0): 0x101, ("v", 1): 0x102, ("s", 0): 12, ("s", 1): 13, ("lit", 0): 255, ("lit", 1): 255}
+INL_ONE, INL_MONE, INL_F1 = (129, 0x00000001), (193, 0xFFFFFFFF), (242, 0x00003C00)
+
+
+def source_rows():
+    """(name, op, kind, src0, src1, op_sel). Every row tells honouring OPSEL on its selected sources from ignoring it."""
+    out = []
+    v1 = ("v", pack(F3, F1))                       # f16 hi 3.0, lo 1.0
+    for opsel in ((0, 1), (1, 1)):
+        for op in ("lt", "gt"):
+            out.append((f"f16_vgpr_sgpr_{op}_{opsel[0]}{opsel[1]}", op, "f16", v1, ("s", pack(F1, F2)), opsel))
+            out.append((f"f16_vgpr_lit_{op}_{opsel[0]}{opsel[1]}", op, "f16", v1, ("lit", pack(F1, F2)), opsel))
+    for op in ("lt", "gt"):
+        out.append((f"f16_sgpr_vgpr_{op}_10", op, "f16", ("s", pack(F3, F1)), ("v", pack(F1, F2)), (1, 0)))
+        out.append((f"f16_sgpr_sgpr_{op}_11", op, "f16", ("s", pack(F3, F1)), ("s", pack(F1, F2)), (1, 1)))
+    # inline float 1.0 = 0x00003c00: its high half is +0.0
+    out.append(("f16_vgpr_inl1.0_eq_01", "eq", "f16", ("v", pack(F1, 0x0000)), ("inl",) + INL_F1, (0, 1)))
+    out.append(("f16_vgpr_inl1.0_eq_00", "eq", "f16", ("v", pack(F1, 0x0000)), ("inl",) + INL_F1, (0, 0)))
+    # u16 / i16 with an SGPR, a literal and inline 1 / -1
+    out.append(("u16_vgpr_sgpr_eq_01", "eq", "u16", ("v", pack(0, 0xFFFF)), ("s", pack(0xFFFF, 0x7FFF)), (0, 1)))
+    out.append(("u16_vgpr_lit_eq_01", "eq", "u16", ("v", pack(0, 0x8000)), ("lit", pack(0x8000, 0x7FFF)), (0, 1)))
+    out.append(("u16_vgpr_inl1_eq_01", "eq", "u16", ("v", pack(0, 0)), ("inl",) + INL_ONE, (0, 1)))
+    out.append(("i16_vgpr_lit_lt_01", "lt", "i16", ("v", pack(0, 0)), ("lit", pack(0x8000, 0x7FFF)), (0, 1)))
+    out.append(("i16_sgpr_vgpr_lt_10", "lt", "i16", ("s", pack(0xFFFF, 5)), ("v", pack(0, 0)), (1, 0)))
+    out.append(("i16_vgpr_inl-1_gt_01", "gt", "i16", ("v", pack(0, 0)), ("inl",) + INL_MONE, (0, 1)))  # does not tell
+    # mixed: OPSEL on a VGPR src0 and on an SGPR src1 in one instruction
+    for op in ("lt", "eq", "gt"):
+        out.append((f"f16_mixed_vgpr_sgpr_{op}_11", op, "f16", ("v", pack(F2, F4)), ("s", pack(F2, F1)), (1, 1)))
+    return out
+
+
+def src_word(src):
+    return src[2] if src[0] == "inl" else src[1]
+
+
+def source_answer(row, honour):
+    """Lane 0's result when OPSEL counts for the source kinds in `honour` (a set of "v", "s", "lit", "inl")."""
+    _name, op, kind, s0, s1, opsel = row
+    halves = []
+    for src, sel in ((s0, opsel[0]), (s1, opsel[1])):
+        w = src_word(src)
+        halves.append((w >> 16 if sel and src[0] in honour else w) & 0xFFFF)
+    return compare(op, half_value(halves[0], kind), half_value(halves[1], kind))
+
+
+def source_words(row):
+    _name, op, kind, s0, s1, opsel = row
+    codes = [s0[1] if s0[0] == "inl" else SRC_CODE[(s0[0], 0)], s1[1] if s1[0] == "inl" else SRC_CODE[(s1[0], 1)]]
+    w0 = 0xD4000000 | OPCODES[(op, kind)] << 16 | SDST
+    w0 |= (OPSEL_SRC0 if opsel[0] else 0) | (OPSEL_SRC1 if opsel[1] else 0)
+    out = [w0, codes[0] | codes[1] << 9]
+    lits = [src[1] for src in (s0, s1) if src[0] == "lit"]
+    assert len(lits) <= 1, row[0]
+    return out + lits
+
+
+def source_kernel(start):
+    out = []
+    for i, row in enumerate(source_rows()):
+        _name, _op, _kind, s0, s1, _opsel = row
+        for src, v, s in ((s0, "v1", "s12"), (s1, "v2", "s13")):
+            if src[0] == "v":
+                out.append(f"v_mov_b32 {v}, 0x{src[1]:08x}")
+            elif src[0] == "s":
+                out.append(f"s_mov_b32 {s}, 0x{src[1]:08x}")
+        out += ["s_mov_b32 s10, 0", "s_mov_b32 s11, 0",
+                ".long " + ", ".join(f"0x{w:08x}" for w in source_words(row)),
+                "v_mov_b32 v8, s10", "v_and_b32 v8, 1, v8",
+                f"v_mov_b32 v5, {4 * (start + i)}", "global_store_b32 v5, v8, s[2:3]"]
+    return out
+
+
 def kernel(table):
-    out = control_kernel(len(table))
+    out = control_kernel(len(table)) + source_kernel(len(table) + len(control_rows()))
     for i, (_name, op, kind, (v1, v2), opsel, neg0) in enumerate(table):
         w0, w1 = words(op, kind, opsel, neg0)
         out += [f"v_mov_b32 v1, 0x{v1:08x}", f"v_mov_b32 v2, 0x{v2:08x}", "s_mov_b32 s10, 0", "s_mov_b32 s11, 0",
@@ -158,7 +240,8 @@ def main():
     got = {}
     controls = control_rows()
     for wave in (32, 64):
-        res = oracle.run([asm.Kernel(kernel(table), wave=wave, threads=1, words=len(table) + len(controls),
+        res = oracle.run([asm.Kernel(kernel(table), wave=wave, threads=1,
+                                     words=len(table) + len(controls) + len(source_rows()),
                                      raw=True, vgprs=16, sgprs=24)])[0]
         if isinstance(res, str):
             print(f"wave{wave}: kernel rejected: {res}")
@@ -184,6 +267,24 @@ def main():
         note = "" if h == ig else ("  op_sel ignored" if ok else "  op_sel HONOURED")
         print(f"{row[0]:22} hw {g32}{extra:12} honoured {h} ignored {ig}  {'ok' if ok else 'DIFFERS'}{note}")
     print(f"{len(table) - bad}/{len(table)} rows match op_sel being ignored; {telling} of them tell the two apart")
+    # Other source kinds: per row, whether the hardware read the selected halves of the selected sources.
+    base = len(table) + len(controls)
+    kinds = {}
+    for i, row in enumerate(source_rows()):
+        g32, g64 = got[32][base + i], got[64][base + i]
+        everything = source_answer(row, {"v", "s", "lit", "inl"})
+        nothing = source_answer(row, set())
+        verdict = ("does not tell" if everything == nothing else
+                   "op_sel honoured" if g32 == everything else "op_sel ignored" if g32 == nothing else "NEITHER")
+        extra = "" if g32 == g64 else f" (wave64 {g64})"
+        print(f"{row[0]:28} hw {g32}{extra:12} honoured {everything} ignored {nothing}  {verdict}")
+        if everything != nothing:
+            for src, sel in ((row[3], row[5][0]), (row[4], row[5][1])):
+                if sel:
+                    kinds.setdefault(src[0], set()).add(verdict)
+    for k in ("v", "s", "lit", "inl"):
+        if k in kinds:
+            print(f"source kind {k:3}: {', '.join(sorted(kinds[k]))}")
     return 1 if bad else 0
 
 

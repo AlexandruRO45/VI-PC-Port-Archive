@@ -61,9 +61,32 @@ class RowsTest(unittest.TestCase):
     def test_kernel_builds(self):
         rows = p.rows()
         lines = p.kernel(rows)
-        self.assertEqual(sum(ln.startswith(".long 0xd4") for ln in lines), len(rows))
+        self.assertEqual(sum(ln.startswith(".long 0xd4") for ln in lines), len(rows) + len(p.source_rows()))
         self.assertEqual(sum(ln.startswith(".long 0xd703") for ln in lines), len(p.control_rows()))
-        self.assertEqual("\n".join(lines).count("global_store_b32"), len(rows) + len(p.control_rows()))
+        self.assertEqual("\n".join(lines).count("global_store_b32"),
+                         len(rows) + len(p.control_rows()) + len(p.source_rows()))
+
+
+class SourceKindsTest(unittest.TestCase):
+    def test_operand_codes_and_literal(self):
+        # v_cmp_lt_f16_e64 s10, v1, s13: src1 = 13; with a literal src1 = 255 and the literal follows (llvm-mc order)
+        row = next(r for r in p.source_rows() if r[0] == "f16_vgpr_sgpr_lt_01")
+        w = p.source_words(row)
+        self.assertEqual(len(w), 2)
+        self.assertEqual((w[1] & 0x1FF, (w[1] >> 9) & 0x1FF), (0x101, 13))
+        self.assertEqual(w[0] & p.OPSEL_SRC1, p.OPSEL_SRC1)
+        row = next(r for r in p.source_rows() if r[0] == "u16_vgpr_lit_eq_01")
+        w = p.source_words(row)
+        self.assertEqual(((w[1] >> 9) & 0x1FF, w[2]), (255, p.pack(0x8000, 0x7FFF)))
+        row = next(r for r in p.source_rows() if r[0] == "u16_vgpr_inl1_eq_01")
+        self.assertEqual((p.source_words(row)[1] >> 9) & 0x1FF, 129)
+
+    def test_every_source_kind_has_a_telling_row(self):
+        telling = [r for r in p.source_rows()
+                   if p.source_answer(r, {"v", "s", "lit", "inl"}) != p.source_answer(r, set())]
+        for kind in ("v", "s", "lit", "inl"):
+            with self.subTest(kind=kind):
+                self.assertTrue(any((r[3][0] == kind and r[5][0]) or (r[4][0] == kind and r[5][1]) for r in telling))
 
 
 if __name__ == "__main__":

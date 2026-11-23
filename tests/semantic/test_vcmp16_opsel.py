@@ -3,9 +3,10 @@
   - v_cmp_*_u16_e64 / v_cmpx_*_u16_e64 (eq, ne, lg, lt, le, gt, ge)
   - v_cmp_*_i16_e64 / v_cmpx_*_i16_e64 (eq, ne, lg, lt, le, gt, ge, including signed negative high halves)
 
-VOP3 op_sel:[s0,s1] selects bit 15:0 (0) or bit 31:16 (1) of each 16-bit source operand before float
-input modifiers (neg/abs) or integer zero/sign extension. VOPC writes a scalar lane mask (VCC/SGPR
-or EXEC for v_cmpx), so there is no destination op_sel bit.
+RDNA2 ignores VOP3 OPSEL on these compares: each reads bits 15:0 of both sources whatever op_sel says, then
+applies the f16 input modifiers (neg/abs) or the integer zero/sign extension (measured on gfx1036 through two
+launchers, tools/vcmp16_opsel_probe.py, TEST-650). Every listing here still carries op_sel, and the translation must
+give the low-half answer. VOPC writes a scalar lane mask (VCC/SGPR or EXEC for v_cmpx).
 
 Run directly:
     python -I tests/semantic/test_vcmp16_opsel.py -v
@@ -101,6 +102,20 @@ def int_rel(cond: str, x: int, y: int) -> int:
     }[cond])
 
 
+def pick(_sel: int) -> int:
+    """The half a compare reads for an op_sel bit: always the low one on RDNA2 (TEST-650)."""
+    return 0
+
+
+def low_half_pass(tag: str, v1: int, v2: int) -> int:
+    """A tag's ("<type>_<cond>_<op_sel>") compare of v1 with v2 on the low halves."""
+    ty, cond, _ = tag.split("_")
+    if ty == "f16":
+        return f16_rel(cond, f16_half(v1, 0), f16_half(v2, 0))
+    half = u16_half if ty == "u16" else i16_half
+    return int_rel(cond, half(v1, 0), half(v2, 0))
+
+
 _TMP_DIR = None
 _PS_PATH = None
 
@@ -191,7 +206,7 @@ class F16CompareOpSelTests(unittest.TestCase):
         for cond in ("lt", "le", "gt", "ge", "eq", "lg", "neq"):
             for xw, yw in pairs:
                 for s0, s1 in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                    want = f16_rel(cond, f16_half(xw, s0), f16_half(yw, s1))
+                    want = f16_rel(cond, f16_half(xw, pick(s0)), f16_half(yw, pick(s1)))
                     with self.subTest(cond=cond, x=hex(xw), y=hex(yw), opsel=(s0, s1)):
                         got = run_ps_bit(
                             xw, yw,
@@ -215,7 +230,7 @@ class F16CompareOpSelTests(unittest.TestCase):
         for cond in ("o", "u", "lt", "eq", "neq"):
             for a, b in cases:
                 for s0, s1 in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                    want = f16_rel(cond, f16_half(a, s0), f16_half(b, s1))
+                    want = f16_rel(cond, f16_half(a, pick(s0)), f16_half(b, pick(s1)))
                     with self.subTest(cond=cond, a=hex(a), b=hex(b), opsel=(s0, s1)):
                         got = run_ps_bit(
                             a, b,
@@ -225,24 +240,22 @@ class F16CompareOpSelTests(unittest.TestCase):
                         self.assertEqual(got, want)
 
     def test_f16_opsel_neg_abs_modifiers(self):
-        # v1 = (lo=+1.0, hi=-4.0), v2 = (lo=+2.0, hi=+4.0)
-        # Selecting hi of v1 (-4.0):
-        #   -v1 -> +4.0: eq v2.hi (+4.0) is 1, gt v2.lo (+2.0) is 1
-        #   |v1| -> +4.0: eq v2.hi (+4.0) is 1, lt v2.lo (+2.0) is 0
-        #   -|v1| -> -4.0: lt v2.lo (+2.0) is 1
-        # Reading lo of v1 (+1.0) instead would flip every case below.
+        # v1 = (lo=+1.0, hi=-4.0), v2 = (lo=+2.0, hi=+4.0). The modifiers apply to the low halves whatever op_sel
+        # selects; reading a selected high half instead changes every row marked "hi would".
         xw = pack16(H_ONE, H_MFOUR)
         yw = pack16(H_TWO, H_FOUR)
+        lo1, lo2 = f16_half(xw, 0), f16_half(yw, 0)
         cases = [
-            ("v_cmp_eq_f16_e64 s4, -v1, v2 op_sel:[1,1]", 1),
-            ("v_cmp_gt_f16_e64 s4, -v1, v2 op_sel:[1,0]", 1),
-            ("v_cmp_eq_f16_e64 s4, |v1|, v2 op_sel:[1,1]", 1),
-            ("v_cmp_lt_f16_e64 s4, |v1|, v2 op_sel:[1,0]", 0),
-            ("v_cmp_lt_f16_e64 s4, v1, -v2 op_sel:[0,1]", 0),   # +1.0 < -4.0 -> 0 (lo of v2 would give +1.0 < -2.0 -> 0, check gt below)
-            ("v_cmp_lt_f16_e64 s4, -|v1|, v2 op_sel:[1,0]", 1), # -4.0 < +2.0 -> 1
-            ("v_cmp_gt_f16_e64 s4, -|v1|, -v2 op_sel:[1,0]", 0), # -4.0 > -2.0 -> 0 (lo would be -1.0 > -2.0 -> 1!)
-            ("v_cmp_eq_f16_e64 s4, v1, -v2 op_sel:[1,1]", 1),   # -4.0 == -4.0 -> 1
+            ("v_cmp_eq_f16_e64 s4, -v1, v2 op_sel:[1,1]", f16_rel("eq", -lo1, lo2)),          # 0; hi would 1
+            ("v_cmp_gt_f16_e64 s4, -v1, v2 op_sel:[1,0]", f16_rel("gt", -lo1, lo2)),          # 0; hi would 1
+            ("v_cmp_eq_f16_e64 s4, |v1|, v2 op_sel:[1,1]", f16_rel("eq", abs(lo1), lo2)),     # 0; hi would 1
+            ("v_cmp_lt_f16_e64 s4, |v1|, v2 op_sel:[1,0]", f16_rel("lt", abs(lo1), lo2)),     # 1; hi would 0
+            ("v_cmp_lt_f16_e64 s4, v1, -v2 op_sel:[0,1]", f16_rel("lt", lo1, -lo2)),          # 0
+            ("v_cmp_lt_f16_e64 s4, -|v1|, v2 op_sel:[1,0]", f16_rel("lt", -abs(lo1), lo2)),   # 1
+            ("v_cmp_gt_f16_e64 s4, -|v1|, -v2 op_sel:[1,0]", f16_rel("gt", -abs(lo1), -lo2)), # 1; hi would 0
+            ("v_cmp_eq_f16_e64 s4, v1, -v2 op_sel:[1,1]", f16_rel("eq", lo1, -lo2)),          # 0; hi would 1
         ]
+        self.assertEqual([want for _l, want in cases], [0, 0, 0, 1, 0, 1, 1, 0])
         for line, want in cases:
             with self.subTest(line=line):
                 self.assertEqual(run_ps_bit(xw, yw, line, mask="s4"), want)
@@ -261,7 +274,7 @@ class Int16CompareOpSelTests(unittest.TestCase):
         for cond in ("eq", "ne", "lg", "lt", "le", "gt", "ge"):
             for xw, yw in pairs:
                 for s0, s1 in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                    want = int_rel(cond, u16_half(xw, s0), u16_half(yw, s1))
+                    want = int_rel(cond, u16_half(xw, pick(s0)), u16_half(yw, pick(s1)))
                     with self.subTest(cond=cond, x=hex(xw), y=hex(yw), opsel=(s0, s1)):
                         got = run_ps_bit(
                             xw, yw,
@@ -286,7 +299,7 @@ class Int16CompareOpSelTests(unittest.TestCase):
         for cond in ("eq", "ne", "lg", "lt", "le", "gt", "ge"):
             for xw, yw in pairs:
                 for s0, s1 in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                    want = int_rel(cond, i16_half(xw, s0), i16_half(yw, s1))
+                    want = int_rel(cond, i16_half(xw, pick(s0)), i16_half(yw, pick(s1)))
                     with self.subTest(cond=cond, x=hex(xw), y=hex(yw), opsel=(s0, s1)):
                         got = run_ps_bit(
                             xw, yw,
@@ -298,10 +311,10 @@ class Int16CompareOpSelTests(unittest.TestCase):
 
 class CmpxWaveExecOpSelTests(unittest.TestCase):
     def test_cmpx_compute_wave32_and_wave64(self):
-        # For each type (f16, u16, i16) and wave size (32, 64), give even lanes a packed value whose
-        # high half PASSES the compare (low half FAILS), and odd lanes a packed value whose high half
-        # FAILS (low half PASSES). v_cmpx_*_e64 with op_sel:[1,0] must keep even lanes active and
-        # switch off odd lanes, writing lane|0x100 only for even lanes and leaving SENTINEL on odd lanes.
+        # For each type (f16, u16, i16) and wave size (32, 64), even and odd lanes get packed values whose
+        # halves answer the compare differently. v_cmpx_*_e64 with op_sel keeps the lanes whose LOW halves pass
+        # (RDNA2 ignores OPSEL here, TEST-650) and switches the others off: lane|0x100 where a lane stays on,
+        # SENTINEL where it doesn't.
         cases = [
             # (tag, cmp_line, even_v1, odd_v1, v2)
             ("f16_lt_10", "v_cmpx_lt_f16_e64 v1, v2 op_sel:[1,0]",
@@ -337,8 +350,9 @@ class CmpxWaveExecOpSelTests(unittest.TestCase):
                         "buffer_store_dword v5, v4, s[0:3], 0 offen",
                     ]
                     mem = run_cs(f"cs_cmpx_{tag}_w{wave}", body, wave_size=wave)
+                    passes = (low_half_pass(tag, even_v1, v2_word), low_half_pass(tag, odd_v1, v2_word))
                     for lane in range(wave):
-                        want = (0x100 | lane) if (lane % 2 == 0) else SENTINEL
+                        want = (0x100 | lane) if passes[lane % 2] else SENTINEL
                         self.assertEqual(mem.get(lane * 4), want, f"lane {lane}")
 
     def test_cmpx_int16_spirv_wave_interp(self):
@@ -379,8 +393,9 @@ class CmpxWaveExecOpSelTests(unittest.TestCase):
                     spv = translate_ps(lines)
                     self.assertEqual(rdna2spirv.translate.last_gen.wave64, wave == 64)
                     outputs = wi.run_wave(spv, wave=wave)["outputs"]
+                    passes = (low_half_pass(tag, even_v1, v2_word), low_half_pass(tag, odd_v1, v2_word))
                     for lane in range(wave):
-                        if lane % 2 == 0:
+                        if passes[lane % 2]:
                             self.assertIsNotNone(outputs[lane], f"lane {lane} should stay active")
                             self.assertEqual(outputs[lane]["%out_mrt0"][0], 0x40000000 | lane)
                         else:
@@ -425,37 +440,49 @@ class VcmpInactiveLanesSdstTests(unittest.TestCase):
 
 
 class ConstantsAndLiteralsOpSelTests(unittest.TestCase):
+    # Inline constants and literals read their low half whatever op_sel says, like VGPR and SGPR sources: the source
+    # rows of tools/vcmp16_opsel_probe.py on gfx1036 (raw words through tools/hw_oracle). Each case is the listing,
+    # v1, and the 32-bit value the operand stands for (an inline integer sign-extended, an inline float on a 16-bit
+    # op the f16 value in the low half, a literal as written).
+    def check(self, cases):
+        for line, v1, operand in cases:
+            cond, ty = line.split()[0].split("_")[2:4]
+            want = low_half_pass(f"{ty}_{cond}_x", v1, operand)
+            with self.subTest(line=line, v1=hex(v1)):
+                self.assertEqual(run_ps_bit(v1, 0, line, mask="s4"), want)
+
     def test_inline_float_constants_opsel(self):
-        # 1.0 has 0x3C00 in low half, +0.0 in high half
-        v1 = pack16(H_ONE, H_TWO)
-        self.assertEqual(run_ps_bit(v1, 0, "v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,0]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(v1, 0, "v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[1,0]", mask="s4"), 0)
-        self.assertEqual(run_ps_bit(pack16(H_ZERO, H_TWO), 0, "v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,1]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(v1, 0, "v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,1]", mask="s4"), 0)
-        self.assertEqual(run_ps_bit(pack16(H_MTWO, H_ONE), 0, "v_cmp_eq_f16_e64 s4, v1, -2.0 op_sel:[0,0]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(H_ZERO, H_ONE), 0, "v_cmp_eq_f16_e64 s4, v1, -2.0 op_sel:[0,1]", mask="s4"), 1)
+        self.check([
+            ("v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,0]", pack16(H_ONE, H_TWO), 0x00003C00),    # 1
+            ("v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[1,0]", pack16(H_ONE, H_TWO), 0x00003C00),    # 1; hi would 0
+            ("v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,1]", pack16(H_ZERO, H_TWO), 0x00003C00),   # 0; hi (+0.0) would 1
+            ("v_cmp_eq_f16_e64 s4, v1, 1.0 op_sel:[0,1]", pack16(H_ONE, H_TWO), 0x00003C00),    # 1; hi would 0
+            ("v_cmp_eq_f16_e64 s4, v1, -2.0 op_sel:[0,0]", pack16(H_MTWO, H_ONE), 0x0000C000),  # 1
+            ("v_cmp_eq_f16_e64 s4, v1, -2.0 op_sel:[0,1]", pack16(H_ZERO, H_ONE), 0x0000C000),  # 0; hi would 1
+        ])
 
     def test_inline_integer_constants_opsel(self):
-        # Inline integer constant 1: opsel=0 -> 1; opsel=1 -> 0
-        self.assertEqual(run_ps_bit(pack16(1, 2), 0, "v_cmp_eq_u16_e64 s4, v1, 1 op_sel:[0,0]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(0, 2), 0, "v_cmp_eq_u16_e64 s4, v1, 1 op_sel:[0,1]", mask="s4"), 1)
-        # Inline integer constant -1: opsel=0 -> 0xFFFF; opsel=1 -> 0xFFFF
-        self.assertEqual(run_ps_bit(pack16(0xFFFF, 0), 0, "v_cmp_eq_u16_e64 s4, v1, -1 op_sel:[0,0]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(0xFFFF, 0), 0, "v_cmp_eq_u16_e64 s4, v1, -1 op_sel:[0,1]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(0xFFFF, 0), 0, "v_cmp_eq_i16_e64 s4, v1, -1 op_sel:[0,0]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(0xFFFF, 0), 0, "v_cmp_eq_i16_e64 s4, v1, -1 op_sel:[0,1]", mask="s4"), 1)
+        self.check([
+            ("v_cmp_eq_u16_e64 s4, v1, 1 op_sel:[0,0]", pack16(1, 2), 0x00000001),      # 1
+            ("v_cmp_eq_u16_e64 s4, v1, 1 op_sel:[0,1]", pack16(0, 2), 0x00000001),      # 0; hi would 1
+            ("v_cmp_eq_u16_e64 s4, v1, -1 op_sel:[0,0]", pack16(0xFFFF, 0), 0xFFFFFFFF),
+            ("v_cmp_eq_u16_e64 s4, v1, -1 op_sel:[0,1]", pack16(0xFFFF, 0), 0xFFFFFFFF),
+            ("v_cmp_eq_i16_e64 s4, v1, -1 op_sel:[0,0]", pack16(0xFFFF, 0), 0xFFFFFFFF),
+            ("v_cmp_eq_i16_e64 s4, v1, -1 op_sel:[0,1]", pack16(0xFFFF, 0), 0xFFFFFFFF),
+        ])
 
     def test_32bit_literals_opsel(self):
-        # Literal 0x80007FFF: lo=0x7FFF (+32767), hi=0x8000 (-32768 in i16, 32768 in u16)
-        self.assertEqual(run_ps_bit(pack16(0x7FFF, 0), 0, "v_cmp_eq_u16_e64 s4, v1, 0x80007FFF op_sel:[0,0]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(0x8000, 0), 0, "v_cmp_eq_u16_e64 s4, v1, 0x80007FFF op_sel:[0,1]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(0x7FFF, 0), 0, "v_cmp_eq_i16_e64 s4, v1, 0x80007FFF op_sel:[0,0]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(0, 0x8000), 0, "v_cmp_eq_i16_e64 s4, v1, 0x80007FFF op_sel:[1,1]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(0, 0), 0, "v_cmp_lt_i16_e64 s4, v1, 0x80007FFF op_sel:[0,1]", mask="s4"), 0)
-
-        # f16 literal 0x40003C00 (lo = 1.0, hi = 2.0)
-        self.assertEqual(run_ps_bit(pack16(H_ONE, H_FOUR), 0, "v_cmp_eq_f16_e64 s4, v1, 0x40003C00 op_sel:[0,0]", mask="s4"), 1)
-        self.assertEqual(run_ps_bit(pack16(H_FOUR, H_TWO), 0, "v_cmp_eq_f16_e64 s4, v1, 0x40003C00 op_sel:[1,1]", mask="s4"), 1)
+        # 0x80007FFF: lo 0x7FFF, hi 0x8000. Only a hand-encoded word has a literal with both halves on these compares
+        # (llvm-mc accepts only literals that fit 16 bits), but the hardware reads the low half either way.
+        self.check([
+            ("v_cmp_eq_u16_e64 s4, v1, 0x80007FFF op_sel:[0,0]", pack16(0x7FFF, 0), 0x80007FFF),   # 1
+            ("v_cmp_eq_u16_e64 s4, v1, 0x80007FFF op_sel:[0,1]", pack16(0x8000, 0), 0x80007FFF),   # 0; hi would 1
+            ("v_cmp_eq_i16_e64 s4, v1, 0x80007FFF op_sel:[0,0]", pack16(0x7FFF, 0), 0x80007FFF),   # 1
+            ("v_cmp_eq_i16_e64 s4, v1, 0x80007FFF op_sel:[1,1]", pack16(0, 0x8000), 0x80007FFF),   # 0; hi would 1
+            ("v_cmp_lt_i16_e64 s4, v1, 0x80007FFF op_sel:[0,1]", pack16(0, 0), 0x80007FFF),        # 1; hi would 0
+            ("v_cmp_eq_f16_e64 s4, v1, 0x40003C00 op_sel:[0,0]", pack16(H_ONE, H_FOUR), 0x40003C00),  # 1
+            ("v_cmp_eq_f16_e64 s4, v1, 0x40003C00 op_sel:[1,1]", pack16(H_FOUR, H_TWO), 0x40003C00),  # 0; hi would 1
+        ])
 
     @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"),
                          "needs spirv-as and spirv-val on PATH")
@@ -479,83 +506,44 @@ class ConstantsAndLiteralsOpSelTests(unittest.TestCase):
 
 
 class SgprHighHalvesOpSelTests(unittest.TestCase):
-    def test_sgpr_high_halves_f16(self):
-        user_s4 = pack16(H_ONE, H_FOUR)
-        # s4 as src1: opsel:[0, 0] reads lo(s4)=1.0
-        lines = [
-            f"v_mov_b32 v1, {pack16(H_ONE, 0):#x}",
-            "v_cmp_eq_f16_e64 s5, v1, s4 op_sel:[0,0]",
-            "v_and_b32_e32 v2, 1, s5",
-            "v_lshlrev_b32_e32 v3, 2, v0",
-            "buffer_store_dword v2, v3, s[0:3], 0 offen",
-        ]
-        mem = run_cs("cs_sgpr_f16_0", lines, 32, user_sgprs=[user_s4])
-        self.assertEqual(mem.get(0), 1)
+    # An SGPR source reads its low half whatever op_sel says, as a VGPR does (gfx1036, tools/vcmp16_opsel_probe.py
+    # source rows). Each case: (tag, compare line on s4 and v1, v1, s4, whether s4 is src0, neg on the s4 operand).
+    CASES = [
+        ("f16_src1_00", "v_cmp_eq_f16_e64 s5, v1, s4 op_sel:[0,0]", pack16(H_ONE, 0), pack16(H_ONE, H_FOUR), False, False),
+        ("f16_src1_01", "v_cmp_eq_f16_e64 s5, v1, s4 op_sel:[0,1]", pack16(H_FOUR, 0), pack16(H_ONE, H_FOUR), False, False),
+        ("f16_src0_10", "v_cmp_eq_f16_e64 s5, s4, v1 op_sel:[1,0]", pack16(H_FOUR, 0), pack16(H_ONE, H_FOUR), True, False),
+        ("f16_neg_01", "v_cmp_eq_f16_e64 s5, v1, -s4 op_sel:[0,1]", pack16(H_MFOUR, 0), pack16(H_ONE, H_FOUR), False, True),
+        ("f16_neg_lo_01", "v_cmp_eq_f16_e64 s5, v1, -s4 op_sel:[0,1]", pack16(H_MONE, 0), pack16(H_ONE, H_FOUR), False, True),
+        ("u16_src1_01", "v_cmp_eq_u16_e64 s5, v1, s4 op_sel:[0,1]", pack16(0xFFFF, 0), pack16(0x7FFF, 0xFFFF), False, False),
+        ("u16_src1_01_lo", "v_cmp_eq_u16_e64 s5, v1, s4 op_sel:[0,1]", pack16(0x7FFF, 0), pack16(0x7FFF, 0xFFFF), False, False),
+        ("i16_src0_10_lt", "v_cmp_lt_i16_e64 s5, s4, v1 op_sel:[1,0]", 0, pack16(0x7FFF, 0xFFFF), True, False),
+        ("u16_src0_10_lt", "v_cmp_lt_u16_e64 s5, s4, v1 op_sel:[1,0]", 0, pack16(0x7FFF, 0xFFFF), True, False),
+    ]
 
-        # opsel:[0, 1] reads hi(s4)=4.0
-        lines = [
-            f"v_mov_b32 v1, {pack16(H_FOUR, 0):#x}",
-            "v_cmp_eq_f16_e64 s5, v1, s4 op_sel:[0,1]",
-            "v_and_b32_e32 v2, 1, s5",
-            "v_lshlrev_b32_e32 v3, 2, v0",
-            "buffer_store_dword v2, v3, s[0:3], 0 offen",
-        ]
-        mem = run_cs("cs_sgpr_f16_1", lines, 32, user_sgprs=[user_s4])
-        self.assertEqual(mem.get(0), 1)
-
-        # s4 as src0:
-        lines = [
-            f"v_mov_b32 v1, {pack16(H_FOUR, 0):#x}",
-            "v_cmp_eq_f16_e64 s5, s4, v1 op_sel:[1,0]",
-            "v_and_b32_e32 v2, 1, s5",
-            "v_lshlrev_b32_e32 v3, 2, v0",
-            "buffer_store_dword v2, v3, s[0:3], 0 offen",
-        ]
-        mem = run_cs("cs_sgpr_f16_src0", lines, 32, user_sgprs=[user_s4])
-        self.assertEqual(mem.get(0), 1)
-
-        # s4 with neg / abs on high half:
-        lines = [
-            f"v_mov_b32 v1, {pack16(H_MFOUR, 0):#x}",
-            "v_cmp_eq_f16_e64 s5, v1, -s4 op_sel:[0,1]",
-            "v_and_b32_e32 v2, 1, s5",
-            "v_lshlrev_b32_e32 v3, 2, v0",
-            "buffer_store_dword v2, v3, s[0:3], 0 offen",
-        ]
-        mem = run_cs("cs_sgpr_f16_neg", lines, 32, user_sgprs=[user_s4])
-        self.assertEqual(mem.get(0), 1)
-
-    def test_sgpr_high_halves_int16(self):
-        user_s4 = pack16(0x7FFF, 0xFFFF)
-        lines = [
-            f"v_mov_b32 v1, {pack16(0xFFFF, 0):#x}",
-            "v_cmp_eq_u16_e64 s5, v1, s4 op_sel:[0,1]",
-            "v_and_b32_e32 v2, 1, s5",
-            "v_lshlrev_b32_e32 v3, 2, v0",
-            "buffer_store_dword v2, v3, s[0:3], 0 offen",
-        ]
-        mem = run_cs("cs_sgpr_u16_1", lines, 32, user_sgprs=[user_s4])
-        self.assertEqual(mem.get(0), 1)
-
-        lines = [
-            "v_mov_b32 v1, 0",
-            "v_cmp_lt_i16_e64 s5, s4, v1 op_sel:[1,0]",
-            "v_and_b32_e32 v2, 1, s5",
-            "v_lshlrev_b32_e32 v3, 2, v0",
-            "buffer_store_dword v2, v3, s[0:3], 0 offen",
-        ]
-        mem = run_cs("cs_sgpr_i16_lt", lines, 32, user_sgprs=[user_s4])
-        self.assertEqual(mem.get(0), 1)
-
-        lines = [
-            "v_mov_b32 v1, 0",
-            "v_cmp_lt_u16_e64 s5, s4, v1 op_sel:[1,0]",
-            "v_and_b32_e32 v2, 1, s5",
-            "v_lshlrev_b32_e32 v3, 2, v0",
-            "buffer_store_dword v2, v3, s[0:3], 0 offen",
-        ]
-        mem = run_cs("cs_sgpr_u16_lt", lines, 32, user_sgprs=[user_s4])
-        self.assertEqual(mem.get(0), 0)
+    def test_sgpr_sources_read_the_low_half(self):
+        for tag, line, v1, s4, s4_first, neg in self.CASES:
+            cond, ty = line.split()[0].split("_")[2:4]
+            if ty == "f16":
+                x, y = f16_half(v1, 0), f16_half(s4, 0)
+                if neg:
+                    y = -y
+                a, b = (y, x) if s4_first else (x, y)
+                want = f16_rel(cond, a, b)
+            else:
+                half = u16_half if ty == "u16" else i16_half
+                x, y = half(v1, 0), half(s4, 0)
+                a, b = (y, x) if s4_first else (x, y)
+                want = int_rel(cond, a, b)
+            lines = [
+                f"v_mov_b32 v1, {v1:#x}",
+                line,
+                "v_and_b32_e32 v2, 1, s5",
+                "v_lshlrev_b32_e32 v3, 2, v0",
+                "buffer_store_dword v2, v3, s[0:3], 0 offen",
+            ]
+            with self.subTest(case=tag):
+                mem = run_cs(f"cs_sgpr_{tag}", lines, 32, user_sgprs=[s4])
+                self.assertEqual(mem.get(0), want)
 
 
 if __name__ == "__main__":
