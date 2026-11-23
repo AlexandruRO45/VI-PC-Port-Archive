@@ -519,7 +519,7 @@ class UniformBranchCheck(unittest.TestCase):
 
 
 class Wave32LaneDumps(unittest.TestCase):
-    """run_gpu_tests.py skips cs_wqm_w32 and cs_w32_lane_wrap below 32 lanes with check.py's rule."""
+    """run_gpu_tests.py skips cs_wqm_w32, cs_w32_lane_wrap and cs_scc_mask32 below 32 lanes with check.py's rule."""
     def test_process_exit_takes_precedence_in_both_runners(self):
         import check
         name = "cs_w32_lane_wrap"
@@ -555,6 +555,7 @@ class Wave32LaneDumps(unittest.TestCase):
         self.assertIs(rgt.wave32_lane_skip, check.wave32_lane_skip)
         self.assertIs(rgt.WAVE32_LANE_DUMPS, check.WAVE32_LANE_DUMPS)
         self.assertIs(rgt.WAVE32_LANE_ENV, check.WAVE32_LANE_ENV)
+        self.assertIn("cs_scc_mask32", rgt.WAVE32_LANE_DUMPS)
 
     def test_unpinned_rule(self):
         self.assertEqual(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32 not available\n"),
