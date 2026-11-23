@@ -1,11 +1,11 @@
 // Tests for the startup trace (gta6rt --trace FILE, shims/startup_trace.h).
 //
-// Everything is synthetic: the test writes a small x86-64 DLL image with two imports, one that binds to nothing
-// (an unimplemented thunk) and kernel32!OutputDebugStringA (bound to the host), plus three functions in its .text:
+// Everything is synthetic: the test writes a small x86-64 DLL image with three imports and four functions in .text:
 //   0x1200  calls the unimplemented import
 //   0x1210  calls OutputDebugStringA with the caller's rcx
-//   0x1220  reads address 0 (an access violation the test catches)
-// The loader maps it with the trace open, the test calls the three functions, closes the trace and checks the lines:
+//   0x1220  tail-jumps to RaiseException with the caller's arguments
+//   0x1230  reads address 0 (an access violation the test catches)
+// The loader maps it with the trace open, the test calls the functions, closes the trace and checks the lines:
 // map, unimplemented_call with the caller as module+RVA, debug_string with the text, exception with the faulting
 // RVA and access kind. No game data and no GPU are involved.
 // LEONIDA_TEST_DIR names the folder for the image and the trace, as for loader_test; the default is the temp folder.
@@ -21,6 +21,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -65,11 +66,13 @@ struct Import {
     const char* dll;
     const char* name;
 };
-const Import kImports[2] = {{"leonida_trace_probe.dll", "TraceProbeMissing"}, {"kernel32.dll", "OutputDebugStringA"}};
+const Import kImports[] = {{"leonida_trace_probe.dll", "TraceProbeMissing"},
+                           {"kernel32.dll", "OutputDebugStringA"},
+                           {"kernel32.dll", "RaiseException"}};
 constexpr uint32_t kTextRva = 0x1000;
 constexpr uint32_t kCallerBase = kTextRva + 0x200;  // caller i at kCallerBase + 0x10 * i
 constexpr uint32_t kCallRetOffset = 10;             // sub rsp,0x28 (4) + call [rip+disp] (6)
-constexpr uint32_t kFaultRva = kTextRva + 0x220;
+constexpr uint32_t kFaultRva = kTextRva + 0x230;
 constexpr const char* kImageName = "trace_image.bin";
 constexpr const char* kDebugText = "leonida trace probe \"quoted\"";
 constexpr const char* kAnsiText = "caf\xe9 probe";  // 0xE9: 'é' in code page 1252, never valid alone in UTF-8
@@ -103,9 +106,9 @@ std::vector<uint8_t> make_image() {
     sec->Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
 
     uint8_t* text = b.data() + 0x200;
-    for (int i = 0; i < 2; ++i) {
-        const uint32_t name_off = 0x040 + 0x30u * i, lookup_off = 0x0A0 + 0x20u * i, iat_off = 0x0E0 + 0x20u * i,
-                       hint_off = 0x120 + 0x40u * i;
+    for (int i = 0; i < static_cast<int>(std::size(kImports)); ++i) {
+        const uint32_t name_off = 0x240 + 0x40u * i, lookup_off = 0x300 + 0x10u * i, iat_off = 0x330 + 0x10u * i,
+                       hint_off = 0x360 + 0x30u * i;
         auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(text) + i;
         d->Name = kTextRva + name_off;
         d->OriginalFirstThunk = kTextRva + lookup_off;
@@ -114,11 +117,19 @@ std::vector<uint8_t> make_image() {
         *reinterpret_cast<uint64_t*>(text + lookup_off) = kTextRva + hint_off;
         std::strcpy(reinterpret_cast<char*>(text + hint_off + 2), kImports[i].name);
 
+        uint8_t* fn = text + (caller_rva(i) - kTextRva);
+        if (i == 2) {
+            // No extra stack frame is needed to forward the caller's four arguments.
+            fn[0] = 0xFF;
+            fn[1] = 0x25;
+            const int32_t disp = static_cast<int32_t>((kTextRva + iat_off) - (caller_rva(i) + 6));
+            std::memcpy(fn + 2, &disp, sizeof disp);
+            continue;
+        }
         const uint8_t code[] = {0x48, 0x83, 0xEC, 0x28,  // sub rsp, 0x28
                                 0xFF, 0x15, 0,    0, 0, 0,  // call [rip + disp32]
                                 0x48, 0x83, 0xC4, 0x28,  // add rsp, 0x28
                                 0xC3};                   // ret
-        uint8_t* fn = text + (caller_rva(i) - kTextRva);
         std::memcpy(fn, code, sizeof code);
         const int32_t disp = static_cast<int32_t>((kTextRva + iat_off) - return_rva(i));
         std::memcpy(fn + 6, &disp, 4);
@@ -128,7 +139,7 @@ std::vector<uint8_t> make_image() {
     std::memcpy(text + (kFaultRva - kTextRva), fault, sizeof fault);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     dir.VirtualAddress = kTextRva;
-    dir.Size = 3 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    dir.Size = static_cast<DWORD>((std::size(kImports) + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR));
     return b;
 }
 
@@ -148,6 +159,31 @@ fs::path write_file(const fs::path& p, const std::vector<uint8_t>& bytes) {
 }
 
 using VoidFn = uint64_t(__cdecl*)(const char*);
+
+constexpr DWORD kThreadNameCode = 0x406D1388;
+bool g_unhandled_name = false;
+
+LONG CALLBACK catch_unhandled_name(EXCEPTION_POINTERS* info) {
+    if (info->ExceptionRecord->ExceptionCode != kThreadNameCode) return EXCEPTION_CONTINUE_SEARCH;
+    g_unhandled_name = true;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+bool call_thread_name(void* fn, const char* name, DWORD thread_id) {
+    // The MSVC sample packs the DWORD thread ID and zero flags in one ULONG_PTR on x64.
+    const ULONG_PTR args[] = {0x1000, reinterpret_cast<ULONG_PTR>(name), thread_id};
+    g_unhandled_name = false;
+    reinterpret_cast<decltype(&RaiseException)>(fn)(kThreadNameCode, 0, 3, args);
+    return !g_unhandled_name;
+}
+
+bool current_thread_has_name(const wchar_t* expected) {
+    PWSTR name = nullptr;
+    const bool matches = SUCCEEDED(GetThreadDescription(GetCurrentThread(), &name)) && name &&
+                         std::wstring_view(name) == expected;
+    LocalFree(name);
+    return matches;
+}
 
 // Separate function: __try cannot share a frame with objects that have destructors.
 bool call_faulting(void* fn) {
@@ -245,7 +281,16 @@ void test_trace(const fs::path& dir) {
         OutputDebugStringW(L"wide probe \u00e9\u4e2d");  // its ANSI fallback must not be a second, lossy line
         OutputDebugStringA("after_wide_probe");
         check(call_faulting(m.base + kFaultRva), "the access violation reached the test's handler");
+        void* raise = m.base + caller_rva(2);
+        void* fallback = AddVectoredExceptionHandler(0, &catch_unhandled_name);
+        if (!fallback) throw std::runtime_error("cannot install the test's fallback handler");
+        check(call_thread_name(raise, "trace \"worker\"", DWORD(-1)), "the guest resumes after naming its thread");
+        check(current_thread_has_name(L"trace \"worker\""), "the legacy name becomes the native thread description");
         rt::startup_trace::event("exit", "\"code\":0");
+        rt::startup_trace::close();
+        check(call_thread_name(raise, "quiet worker", GetCurrentThreadId()), "legacy naming resumes with tracing off");
+        check(current_thread_has_name(L"quiet worker"), "an explicit thread ID works with tracing off");
+        RemoveVectoredExceptionHandler(fallback);
     }
     rt::startup_trace::close();
 
@@ -288,6 +333,14 @@ void test_trace(const fs::path& dir) {
                                                  std::to_string(wide_lines) + ")");
     check(after_wide == 1, "an OutputDebugStringA after it is still logged");
     check(valid_utf8(trace), "the whole trace is valid UTF-8");
+    const std::string* thread_name = find_line(lines, "thread_name");
+    check(has(thread_name, "\"thread_id\":" + std::to_string(GetCurrentThreadId()) + ",") &&
+              has(thread_name, "\"name\":\"trace \\\"worker\\\"\""), "thread_name carries the ID and escaped name");
+    int name_events = 0;
+    for (const auto& line : lines)
+        name_events += line.find("\"kind\":\"thread_name\"") != std::string::npos ||
+                       line.find("\"code\":\"0x406d1388\"") != std::string::npos;
+    check(name_events == 1, "one name event and no generic exception event for legacy naming");
 
     const std::string* e = find_line(lines, "exception");
     check(has(e, "\"code\":\"0xc0000005\""), "exception code");

@@ -11,9 +11,10 @@
 //   {"seq":7,"t":0.020,"kind":"exception","code":"0xc0000005","at":"a.dll+0x4a00","access":"read","address":"0x0",
 //        "stack":["a.dll+0x4a00","a.dll+0x2210"]}
 //   {"seq":8,"t":0.030,"kind":"exit","code":0}
+//   {"seq":9,"t":0.031,"kind":"thread_name","thread_id":123,"name":"worker"}
 //
-// The exception handler is vectored, logs and returns EXCEPTION_CONTINUE_SEARCH: it never changes what the process
-// does (except LEONIDA_SKIP_INT3, below).
+// The vectored handler consumes MSVC's legacy thread-name notification even with tracing off. Other exceptions
+// continue searching after logging, except a breakpoint stepped over by LEONIDA_SKIP_INT3.
 // OutputDebugStringA/W raise DBG_PRINTEXCEPTION_C / DBG_PRINTEXCEPTION_WIDE_C when no debugger is attached, so the
 // same handler records their text without a shim.
 //
@@ -29,12 +30,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 
 #include "shims.h"
 
 namespace rt::startup_trace {
+
+inline constexpr DWORD kThreadNameCode = 0x406D1388;
 
 namespace detail {
 inline std::atomic<bool> on{false};
@@ -47,7 +51,6 @@ inline std::mutex& mutex() {
 inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
-inline void* veh = nullptr;
 inline thread_local bool in_handler = false;
 // With nothing to handle it, OutputDebugStringW's DBG_PRINTEXCEPTION_WIDE_C falls back to OutputDebugStringA on its
 // own ANSI copy (ExceptionInformation[3]), a second, lossy exception for the same text. Every debug string on the
@@ -143,12 +146,53 @@ inline std::string utf8_from_wide(const wchar_t* w, int len) {
 
 // OutputDebugStringA text is in the ANSI code page, not UTF-8: convert it, or a byte such as 0xE9 would land in the
 // file as is and break the JSON lines for a strict UTF-8 reader.
-inline std::string utf8_from_ansi(const char* a, int len) {
+inline std::wstring wide_from_ansi(const char* a, int len) {
     const int chars = len > 0 ? MultiByteToWideChar(CP_ACP, 0, a, len, nullptr, 0) : 0;
     if (chars <= 0) return {};
     std::wstring w(static_cast<size_t>(chars), L'\0');
     MultiByteToWideChar(CP_ACP, 0, a, len, w.data(), chars);
-    return utf8_from_wide(w.data(), chars);
+    return w;
+}
+
+inline std::string utf8_from_ansi(const char* a, int len) {
+    const auto w = wide_from_ansi(a, len);
+    return utf8_from_wide(w.data(), static_cast<int>(w.size()));
+}
+
+// Keep C++ objects outside the handler's SEH frame in optimized clang-cl builds.
+#ifdef _MSC_VER
+__declspec(noinline)
+#endif
+inline bool name_thread(const EXCEPTION_RECORD& r) {
+    const auto& args = r.ExceptionInformation;
+    // The MSVC x64 sample packs the ID and flags in slot 2. Also accept the four-slot form.
+    if (r.ExceptionCode != kThreadNameCode || (r.ExceptionFlags & EXCEPTION_NONCONTINUABLE) ||
+        (r.NumberParameters != 3 && r.NumberParameters != 4) || static_cast<DWORD>(args[0]) != 0x1000 ||
+        !args[1] || (r.NumberParameters == 3 ? args[2] >> 32 : args[3])) return false;
+
+    const auto* text = reinterpret_cast<const char*>(args[1]);
+    constexpr size_t max_name = 32767;  // bound the scan to the native description's UTF-16 size limit
+    const size_t len = strnlen(text, max_name);
+    if (len == max_name) return false;
+    try {
+        const auto name = wide_from_ansi(text, static_cast<int>(len));
+        if (len && name.empty()) return true;
+        const DWORD id = static_cast<DWORD>(args[2]);
+        const bool current = id == DWORD(-1);
+        const HANDLE thread = current ? GetCurrentThread() :
+            OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);
+        if (!thread) return true;
+        const HRESULT result = GetProcessIdOfThread(thread) == GetCurrentProcessId() ?
+            SetThreadDescription(thread, name.c_str()) : E_ACCESSDENIED;
+        if (!current) CloseHandle(thread);
+        if (SUCCEEDED(result) && enabled()) {
+            event("thread_name", "\"thread_id\":" + std::to_string(current ? GetCurrentThreadId() : id) +
+                ",\"name\":" + quote(utf8_from_wide(name.data(), static_cast<int>(name.size()))));
+        }
+    } catch (...) {
+        // Allocation failure in a diagnostic notification must not interrupt the caller.
+    }
+    return true;
 }
 
 inline std::string debug_text(const EXCEPTION_RECORD& r) {
@@ -212,26 +256,37 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
-    if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
-    if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    const bool tracing = enabled();
+    if (!tracing && info->ExceptionRecord->ExceptionCode != kThreadNameCode) return EXCEPTION_CONTINUE_SEARCH;
+    if (tracing && skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
     in_handler = true;
+    bool named = false;
 #ifdef _MSC_VER
     // Under /EHsc, catch(...) does not catch SEH faults (e.g. a bad DBG_PRINTEXCEPTION_C pointer or corrupt unwind).
     // Keep the __try frame free of C++ destructors so in_handler is always reset and the exception still propagates.
     __try {
-        log_exception(*info);
+        named = name_thread(*info->ExceptionRecord);
+        if (!named && tracing) log_exception(*info);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 #else
     struct Reset {
         ~Reset() { in_handler = false; }
     } reset;
-    log_exception(*info);
+    named = name_thread(*info->ExceptionRecord);
+    if (!named && tracing) log_exception(*info);
 #endif
     in_handler = false;
-    return EXCEPTION_CONTINUE_SEARCH;
+    return named ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 }  // namespace detail
+
+// One handler per process. Closing the trace leaves legacy naming available to guest threads.
+inline void install_exception_handler() {
+    static void* const veh = AddVectoredExceptionHandler(1, &detail::handler);
+    (void)veh;
+}
 
 inline void close();
 
@@ -253,17 +308,15 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
         static const int atexit_registered = std::atexit(&close);
         (void)atexit_registered;
     }
-    detail::veh = AddVectoredExceptionHandler(1, &detail::handler);
+    install_exception_handler();
     detail::on.store(true, std::memory_order_release);
     event("trace_open", "\"pid\":" + std::to_string(GetCurrentProcessId()));
     return true;
 }
 
-// Removes the handler and closes the file (tests and process exit via atexit).
+// Disables logging and closes the file (tests and process exit via atexit).
 inline void close() {
     detail::on.store(false, std::memory_order_release);
-    if (detail::veh) RemoveVectoredExceptionHandler(detail::veh);
-    detail::veh = nullptr;
     const std::lock_guard lock(detail::mutex());
     if (detail::file) std::fclose(detail::file);
     detail::file = nullptr;

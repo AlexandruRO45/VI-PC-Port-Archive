@@ -36,6 +36,7 @@
 
 #include "process_shim.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::process {
 namespace {
@@ -420,6 +421,11 @@ int run_entry(void* entry, size_t stack_bytes) {
 
 namespace {
 using namespace rt::process;
+
+void WINAPI game_raise_exception(DWORD code, DWORD flags, DWORD count, const ULONG_PTR* args) {
+    if (code == rt::startup_trace::kThreadNameCode) rt::startup_trace::install_exception_handler();
+    ::RaiseException(code, flags, count, args);
+}
 #define UCRT(dll) \
     {dll, "exit", reinterpret_cast<void*>(&game_exit)}, {dll, "_exit", reinterpret_cast<void*>(&game_quick_exit)}, \
     {dll, "_Exit", reinterpret_cast<void*>(&game_quick_exit)}, \
@@ -466,4 +472,7 @@ SHIM_TABLE(process,
     THREAD_DESCRIPTION("kernel32.dll"),
     THREAD_DESCRIPTION("kernelbase.dll"),
     THREAD_DESCRIPTION("api-ms-win-core-processthreads-l1-1-3.dll"),
+    {"kernel32.dll", "RaiseException", reinterpret_cast<void*>(&game_raise_exception)},
+    {"kernelbase.dll", "RaiseException", reinterpret_cast<void*>(&game_raise_exception)},
+    {"api-ms-win-core-errorhandling-l1-1-0.dll", "RaiseException", reinterpret_cast<void*>(&game_raise_exception)},
 );
