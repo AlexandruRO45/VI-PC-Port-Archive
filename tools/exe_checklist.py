@@ -125,6 +125,8 @@ def called_classes(paths: list[str]) -> set[str]:
         images = doc.get("images", [doc])
         if not isinstance(images, list):
             raise ValueError(f"{p}: expected an images array")
+        if not images:
+            raise ValueError(f"{p}: expected at least one image")
         for index, image in enumerate(images):
             location = f"{p}: image {index + 1}"
             if not isinstance(image, dict) or not isinstance(image.get("classes"), list):

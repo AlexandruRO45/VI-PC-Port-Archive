@@ -102,16 +102,17 @@ class ExeChecklist(unittest.TestCase):
 
     def test_malformed_reports_fail_without_publishing_a_checklist(self):
         report = os.path.join(self.root, "malformed.json")
-        out = os.path.join(self.root, "checklist.md")
-        for payload, reason in (
+        for case, (payload, reason) in enumerate((
             (None, "report object"),
             ({"images": None}, "images array"),
+            ({"images": []}, "at least one image"),
             ({"images": [None]}, "classes array"),
             ({"images": [{"classes": 1}]}, "classes array"),
             ({}, "classes array"),
             ({"classes": [{"class_id": 42}]}, "class_id string"),
-        ):
+        )):
             with self.subTest(payload=payload):
+                out = os.path.join(self.root, f"checklist-{case}.md")
                 with open(report, "w", encoding="utf-8", newline="\n") as f:
                     json.dump(payload, f)
                 stderr = io.StringIO()
@@ -120,6 +121,14 @@ class ExeChecklist(unittest.TestCase):
                 self.assertIn(report, stderr.getvalue())
                 self.assertIn(reason, stderr.getvalue())
                 self.assertFalse(os.path.exists(out))
+
+    def test_scanned_image_with_no_classes_is_valid(self):
+        report = os.path.join(self.root, "empty-classes.json")
+        for payload in ({"images": [{"classes": []}]}, {"classes": []}):
+            with self.subTest(payload=payload):
+                with open(report, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(payload, f)
+                self.assertEqual(ec.called_classes([report]), set())
 
     def test_this_repository(self):
         notes = ec.collect(ROOT)
