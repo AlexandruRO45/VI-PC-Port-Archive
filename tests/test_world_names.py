@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -149,6 +150,36 @@ class DictionaryTest(unittest.TestCase):
             self.assertNotIn("Traceback", err.getvalue())
         finally:
             os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_is_a_clean_error_when_chmod_is_not_enough(self):
+        # The chmod case above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard went unexercised there. Forcing os.scandir to raise for one
+        # folder gives the same PermissionError os.walk hits for real, on every platform.
+        assets = os.path.join(self.dir, "assets")
+        models = os.path.join(assets, "models")
+        os.makedirs(models)
+        with open(os.path.join(models, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump({"Items": [{"Name": "synthetic_root.#dr"}]}, handle)
+        sub = os.path.join(assets, "sub")
+        os.makedirs(os.path.join(sub, "models"))
+        real_scandir = os.scandir
+        locked = os.path.normcase(os.path.abspath(sub))
+
+        def scandir(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(str(path))) == locked:
+                raise PermissionError(13, "Access is denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        out = os.path.join(self.dir, "dict.json")
+        err = io.StringIO()
+        with mock.patch.object(WN.os, "scandir", scandir):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = WN.main(["build", "--manifest", assets, "--out", out])
+        self.assertEqual(rc, 1, err.getvalue())
+        self.assertIn("ERROR:", err.getvalue())
+        self.assertIn("sub", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertFalse(os.path.exists(out), "a partial dictionary must not be written")
 
     def test_collision_is_ambiguous_without_key64_and_resolved_with_it(self):
         dictionary = WN.NameDictionary()
