@@ -30,6 +30,12 @@ DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12
 per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
 summary leaves them as a count, so grep `^\[rt\]` for those.
 
+On Windows, `--symbols <build dir>` resolves the stack frames of the modules that build produced
+(`host:gta6rt.exe+0x…`, `host:gta6rt_tls_host.dll+0x…`) against their PDB with `llvm-symbolizer`, printing the
+function and file:line under each frame. The title's own frames and the host's modules keep the `module+RVA`
+text. The symbolizer comes from `--symbolizer`, then `LLVM_SYMBOLIZER`, then PATH; the MSVC install ships one at
+`VC\Tools\MSVC\<version>\bin\Hostx64\x64\llvm-symbolizer.exe`.
+
 ## 2. Commands
 
 Windows (from the repository root):

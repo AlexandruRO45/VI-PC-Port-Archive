@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -449,6 +450,232 @@ class BootTraceTests(unittest.TestCase):
                 text = bt.format_text(summary, 10)
                 self.assertIn("tls callbacks: 2", text)
                 self.assertIn(f"last observed TLS callback: fixture.exe+0x2200 ({phase})", text)
+
+
+def make_pe(path, base, pe32plus=True):
+    """A minimal PE header that only carries the optional header's ImageBase, for the symbol tests."""
+    dos = 0x80
+    optional = dos + 4 + 20
+    image = bytearray(optional + 32)
+    image[0:2] = b"MZ"
+    image[0x3C:0x40] = dos.to_bytes(4, "little")
+    image[dos:dos + 4] = b"PE\0\0"
+    if pe32plus:
+        image[optional:optional + 2] = (0x20B).to_bytes(2, "little")
+        image[optional + 24:optional + 32] = base.to_bytes(8, "little")
+    else:
+        image[optional:optional + 2] = (0x10B).to_bytes(2, "little")
+        image[optional + 28:optional + 32] = base.to_bytes(4, "little")
+    with open(path, "wb") as f:
+        f.write(image)
+
+
+class SymbolTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.startup = os.path.join(self.dir, "boot.jsonl")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def module(self, name, base, pe32plus=True, pdb=True):
+        path = os.path.join(self.dir, name)
+        make_pe(path, base, pe32plus)
+        if pdb:
+            with open(os.path.splitext(path)[0] + ".pdb", "wb") as f:
+                f.write(b"synthetic debug directory, never parsed by these tests")
+        return path
+
+    def write_trace(self, stack, at=None):
+        events = [
+            {"seq": 1, "kind": "trace_open", "pid": 1},
+            {
+                "seq": 2,
+                "kind": "exception",
+                "code": "0xc0000005",
+                "at": at or stack[0],
+                "access": "write",
+                "stack": stack,
+            },
+        ]
+        with open(self.startup, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(event) + "\n" for event in events)
+
+    def test_image_base_reads_both_optional_headers(self):
+        plus = self.module("a.exe", 0x140000000)
+        flat = self.module("b.exe", 0x400000, pe32plus=False)
+        self.assertEqual(bt.image_base(plus), 0x140000000)
+        self.assertEqual(bt.image_base(flat), 0x400000)
+
+    def test_image_base_rejects_a_non_pe_file(self):
+        path = os.path.join(self.dir, "not-a-pe.bin")
+        with open(path, "wb") as f:
+            f.write(b"not a PE image")
+        with self.assertRaises(bt.TraceError):
+            bt.image_base(path)
+
+    def test_host_frames_keeps_host_modules_in_first_seen_order(self):
+        trace = {"exceptions": [
+            {"stack": ["game.exe+0x10", "host:gta6rt.exe+0x20", "host:gta6rt.exe+0x20"]},
+            {"stack": ["host:gta6rt_tls_host.dll+0x5", "0x7ff61234", "host:bad.dll+0xzz"]},
+        ]}
+        self.assertEqual(
+            bt.host_frames(trace),
+            [("gta6rt.exe", 0x20), ("gta6rt_tls_host.dll", 0x5)],
+        )
+
+    def test_symbolize_resolves_only_modules_the_build_produced(self):
+        self.module("gta6rt.exe", 0x140000000)
+        self.module("gta6rt_tls_host.dll", 0x180000000)
+        self.write_trace(
+            [
+                "game.exe+0x10",
+                "host:gta6rt.exe+0x20",
+                "host:kernel32.dll+0x30",
+                "host:gta6rt_tls_host.dll+0x40",
+            ]
+        )
+        trace = bt.parse_startup(self.startup)
+        calls = []
+
+        def fake(command, addresses):
+            calls.append((command, addresses))
+            return "\n".join(
+                f"frame_{address:x}\nC:\\src\\f{address:x}.cpp:{address & 0xfff}:0"
+                for address in addresses
+            ) + "\n"
+
+        symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=fake)
+        self.assertEqual(symbols["frames"], 3)
+        self.assertEqual(symbols["resolved"], 2)
+        self.assertEqual(symbols["unresolved"], 1)
+        self.assertEqual(symbols["skipped"], ["kernel32.dll"])
+        self.assertEqual(symbols["modules"], ["gta6rt.exe", "gta6rt_tls_host.dll"])
+        self.assertEqual(
+            [addresses for _, addresses in calls],
+            [[0x140000020], [0x180000040]],
+        )
+        self.assertIn("--no-inlines", calls[0][0])
+        self.assertIn("--obj=" + os.path.join(self.dir, "gta6rt.exe"), calls[0][0])
+        stack_symbols = trace["exceptions"][0]["stack_symbols"]
+        self.assertEqual(
+            stack_symbols["host:gta6rt.exe+0x20"],
+            {"function": "frame_140000020", "file": "C:\\src\\f140000020.cpp", "line": 32},
+        )
+        self.assertNotIn("game.exe+0x10", stack_symbols)
+        self.assertNotIn("host:kernel32.dll+0x30", stack_symbols)
+
+    def test_a_module_without_a_pdb_is_left_alone(self):
+        self.module("gta6rt.exe", 0x140000000, pdb=False)
+        self.write_trace(["host:gta6rt.exe+0x20"])
+        trace = bt.parse_startup(self.startup)
+
+        def fake(command, addresses):
+            raise AssertionError("no symbolizer run expected")
+
+        symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=fake)
+        self.assertEqual(symbols["frames"], 1)
+        self.assertEqual(symbols["resolved"], 0)
+        self.assertEqual(symbols["skipped"], ["gta6rt.exe"])
+        self.assertNotIn("stack_symbols", trace["exceptions"][0])
+
+    def test_unresolved_addresses_keep_the_frame_text(self):
+        self.module("gta6rt.exe", 0x140000000)
+        self.write_trace(["host:gta6rt.exe+0x20"])
+        trace = bt.parse_startup(self.startup)
+        symbols = bt.symbolize(
+            trace, self.dir, "fake-symbolizer", run=lambda command, addresses: "??\n??:0:0\n"
+        )
+        self.assertEqual((symbols["resolved"], symbols["unresolved"]), (0, 1))
+        self.assertNotIn("stack_symbols", trace["exceptions"][0])
+
+    def test_a_symbolizer_failure_is_reported_not_fatal(self):
+        self.module("gta6rt.exe", 0x140000000)
+        self.write_trace(["host:gta6rt.exe+0x20"])
+        trace = bt.parse_startup(self.startup)
+
+        def fake(command, addresses):
+            raise bt.TraceError("llvm-symbolizer exited 1: bad object file")
+
+        symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=fake)
+        self.assertEqual(symbols["errors"], {"gta6rt.exe": "llvm-symbolizer exited 1: bad object file"})
+        self.assertEqual(symbols["resolved"], 0)
+
+    def test_parse_output_pairs_functions_and_locations(self):
+        text = "frame_a\nC:\\src\\a.cpp:12:0\n\nframe_b\nC:\\src\\b.cpp:34:0\n\n??\n??:0:0\n"
+        self.assertEqual(
+            bt.parse_symbolizer_output(text, [1, 2, 3]),
+            {
+                1: {"function": "frame_a", "file": "C:\\src\\a.cpp", "line": 12},
+                2: {"function": "frame_b", "file": "C:\\src\\b.cpp", "line": 34},
+            },
+        )
+
+    def test_report_prints_the_function_and_line_under_the_frame(self):
+        self.module("gta6rt.exe", 0x140000000)
+        self.write_trace(["game.exe+0x10", "host:gta6rt.exe+0x20"])
+        trace = bt.parse_startup(self.startup)
+        trace["symbols"] = bt.symbolize(
+            trace,
+            self.dir,
+            "fake-symbolizer",
+            run=lambda command, addresses: "rt::shims::rt_unimplemented\nC:\\src\\registry.cpp:184:0\n",
+        )
+        text = bt.format_text(bt.summarize(trace, None), 10)
+        self.assertIn("host:gta6rt.exe+0x20 -> rt::shims::rt_unimplemented (C:\\src\\registry.cpp:184)", text)
+        self.assertIn("symbols: 1 of 1 frame(s) resolved from " + os.path.abspath(self.dir), text)
+        self.assertNotIn("game.exe+0x10 ->", text)
+
+    def test_json_carries_the_stack_symbols(self):
+        self.module("gta6rt.exe", 0x140000000)
+        self.write_trace(["host:gta6rt.exe+0x20"])
+        with mock.patch.object(
+            bt,
+            "_run_symbolizer",
+            lambda command, addresses: "f\nC:\\src\\f.cpp:7:0\n",
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    bt.main([self.startup, "--symbols", self.dir, "--symbolizer", sys.executable, "--json"]),
+                    0,
+                )
+        startup = json.loads(output.getvalue())["startup"]
+        self.assertEqual(startup["symbols"]["resolved"], 1)
+        self.assertEqual(
+            startup["exceptions"][0]["stack_symbols"]["host:gta6rt.exe+0x20"],
+            {"function": "f", "file": "C:\\src\\f.cpp", "line": 7},
+        )
+
+    def test_option_errors(self):
+        self.write_trace(["host:gta6rt.exe+0x20"])
+        cases = [
+            (["--symbolizer", sys.executable], "--symbolizer needs --symbols"),
+            (["--symbols", os.path.join(self.dir, "missing")], "--symbols is not a directory"),
+            (
+                ["--symbols", self.dir, "--symbolizer", os.path.join(self.dir, "no-such-symbolizer")],
+                "--symbolizer is not a file",
+            ),
+        ]
+        for extra, message in cases:
+            with self.subTest(message=message):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    self.assertEqual(bt.main([self.startup, *extra]), 2)
+                self.assertIn(message, error.getvalue())
+
+        error = io.StringIO()
+        with mock.patch.object(bt, "find_symbolizer", lambda explicit=None: None):
+            with contextlib.redirect_stderr(error):
+                self.assertEqual(bt.main([self.startup, "--symbols", self.dir]), 2)
+        self.assertIn("--symbols needs llvm-symbolizer", error.getvalue())
+
+        error = io.StringIO()
+        with mock.patch.object(bt, "find_symbolizer", lambda explicit=None: "llvm-symbolizer"):
+            with contextlib.redirect_stderr(error):
+                self.assertEqual(bt.main(["--d3d12", os.path.join(self.dir, "x.log"), "--symbols", self.dir]), 2)
+        self.assertIn("--symbols needs the startup trace", error.getvalue())
 
 
 if __name__ == "__main__":

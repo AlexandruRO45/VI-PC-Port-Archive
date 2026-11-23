@@ -379,6 +379,10 @@ stack, the exit, and the D3D12 calls by outcome and first call per method):
 python -I tools\boot_trace.py startup.jsonl --d3d12 d3d12.log
 ```
 
+`--symbols <build dir>` resolves the `host:` frames of the modules that build produced against their PDB with
+`llvm-symbolizer` (function and file:line under the frame); frames from the title and the host's own modules keep
+the `module+RVA` text.
+
 [docs/boot.md](../docs/boot.md) is the runbook around it: the commands, the triage order and the open questions'
 trace signals.
 

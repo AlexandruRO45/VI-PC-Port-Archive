@@ -13,24 +13,42 @@ tag is accepted too. The reader accepts UTF-8 and BOM-marked UTF-16, including P
 
 Usage:
     python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
+                                  [--symbols BUILD_DIR [--symbolizer PATH]]
+
+`--symbols` resolves the stack frames of host modules that the build produced (`host:gta6rt.exe+0x…`,
+`host:gta6rt_tls_host.dll+0x…`) against that build's PDB with `llvm-symbolizer`, printing the function and
+file:line under each frame. Mapped images (the title and its own DLLs) and host modules the build did not produce
+keep the module+RVA text the runtime wrote; frames are never rewritten, only annotated. The frame's RVA is
+converted with the image's preferred base from its PE header, so a relocated module resolves the same way. The
+symbolizer is looked up in `--symbolizer`, then `LLVM_SYMBOLIZER`, then PATH.
 
 The traces can quote what the game prints, so they stay on the player's machine: the text report counts debug
 strings instead of printing them, and only the tests' synthetic fixtures go into the repository. Share counts and
 error classes from a real run, not its trace (AGENTS.md, "No game data").
 
-Standard library only; reads files, never runs them. A truncated last line (the expected shape after a crash) is
-counted, not fatal; a file with no valid event is an error (exit 2). When one of two requested traces fails to
-parse, the report still includes the other trace.
+Standard library only apart from the optional external symbolizer; reads files, never runs them. A truncated last
+line (the expected shape after a crash) is counted, not fatal; a file with no valid event is an error (exit 2).
+When one of two requested traces fails to parse, the report still includes the other trace.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+
+# A host-module frame, as runtime/shims/registry.cpp writes it: `host:name.dll+0xRVA`. Mapped images (the title and
+# its own DLLs) have no `host:` prefix, so they are left alone.
+HOST_FRAME = re.compile(r"^host:(?P<module>[^+]+)\+(?P<rva>0x[0-9a-fA-F]+)$")
+
+# llvm-symbolizer's location line: `file:line:column`. A PDB without line information prints `file:line:0`.
+SYMBOL_LOCATION = re.compile(r"^(?P<file>.+):(?P<line>\d+):(?P<column>\d+)$")
 
 
 class TraceError(ValueError):
@@ -211,6 +229,169 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
     return trace
 
 
+def image_base(path: str) -> int:
+    """The preferred image base from a PE's optional header.
+
+    A PDB stores its symbols against this base, not against wherever the loader mapped the image, so a relocated
+    module resolves from the same RVA.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(0x40)
+            if len(head) < 0x40 or head[:2] != b"MZ":
+                raise TraceError(f"{path} is not a PE image")
+            offset = int.from_bytes(head[0x3C:0x40], "little")
+            fh.seek(offset)
+            if fh.read(4) != b"PE\0\0":
+                raise TraceError(f"{path} has no PE header")
+            fh.seek(offset + 4 + 20)
+            optional = fh.read(32)
+    except OSError as e:
+        raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
+    magic = int.from_bytes(optional[0:2], "little")
+    if magic == 0x20B:  # PE32+
+        return int.from_bytes(optional[24:32], "little")
+    if magic == 0x10B:  # PE32
+        return int.from_bytes(optional[28:32], "little")
+    raise TraceError(f"{path} has no PE optional header")
+
+
+def host_frames(startup: dict) -> list[tuple[str, int]]:
+    """Every (module, RVA) in an exception stack that belongs to a host module, in first-seen order."""
+    frames, seen = [], set()
+    for exception in startup.get("exceptions", []):
+        for frame in exception.get("stack") or []:
+            match = HOST_FRAME.match(str(frame))
+            if not match:
+                continue
+            key = (match.group("module"), int(match.group("rva"), 16))
+            if key not in seen:
+                seen.add(key)
+                frames.append(key)
+    return frames
+
+
+def find_symbolizer(explicit: str | None = None) -> str | None:
+    """The llvm-symbolizer to run: the option, then LLVM_SYMBOLIZER, then PATH."""
+    for candidate in (explicit, os.environ.get("LLVM_SYMBOLIZER")):
+        if candidate:
+            return candidate if os.path.isfile(candidate) else None
+    return shutil.which("llvm-symbolizer")
+
+
+def _run_symbolizer(command: list[str], addresses: list[int]) -> str:
+    """Run llvm-symbolizer once for a batch of addresses. The tests replace this with a fake."""
+    request = "\n".join(f"0x{address:x}" for address in addresses) + "\n"
+    try:
+        done = subprocess.run(
+            command,
+            input=request,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise TraceError(f"cannot run {command[0]}: {e}") from e
+    if done.returncode != 0:
+        detail = (done.stderr or "").strip().splitlines()
+        raise TraceError(
+            f"{command[0]} exited {done.returncode}" + (f": {detail[-1]}" if detail else "")
+        )
+    return done.stdout
+
+
+def parse_symbolizer_output(text: str, addresses: list[int]) -> dict[int, dict]:
+    """Pair llvm-symbolizer's lines with the addresses it was asked about.
+
+    With `--no-inlines` each address prints one function line and, when the PDB has line information, one
+    `file:line:column` line; an address it cannot resolve prints `??` and `??:0:0`.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    results, index = {}, 0
+    for address in addresses:
+        if index >= len(lines):
+            break
+        function = lines[index]
+        index += 1
+        location = None
+        if index < len(lines):
+            match = SYMBOL_LOCATION.match(lines[index])
+            if match:
+                index += 1
+                if match.group("file") != "??":
+                    location = {
+                        "file": match.group("file"),
+                        "line": int(match.group("line")),
+                    }
+        if function != "??":
+            results[address] = {"function": function, **(location or {"file": None, "line": None})}
+    return results
+
+
+def symbolize(startup: dict, build_dir: str, symbolizer: str, run=None) -> dict:
+    """Annotate the exception frames that belong to modules this build produced.
+
+    A frame is resolved only when the build folder holds both the module and a `.pdb` beside it, so the title and
+    the host's own modules keep the `module+RVA` text the runtime wrote. Returns the `symbols` block the report
+    prints; each resolved frame is also added to its exception as `stack_symbols[frame]`.
+    """
+    run = run or _run_symbolizer
+    frames = host_frames(startup)
+    by_module: dict[str, list[tuple[int, str]]] = {}
+    skipped = set()
+    for module, rva in frames:
+        image = os.path.join(build_dir, module)
+        if not os.path.isfile(image) or not os.path.isfile(os.path.splitext(image)[0] + ".pdb"):
+            skipped.add(module)
+            continue
+        by_module.setdefault(module, []).append((rva, image))
+
+    resolved, errors = {}, {}
+    for module, items in by_module.items():
+        image = items[0][1]
+        try:
+            base = image_base(image)
+            addresses = [base + rva for rva, _ in items]
+            found = run(
+                [symbolizer, f"--obj={image}", "--functions=short", "--no-inlines"],
+                addresses,
+            )
+            symbols = parse_symbolizer_output(found, addresses)
+        except TraceError as e:
+            errors[module] = str(e)
+            continue
+        for rva, _ in items:
+            symbol = symbols.get(base + rva)
+            if symbol:
+                resolved[(module, rva)] = symbol
+
+    for exception in startup.get("exceptions", []):
+        stack_symbols = {}
+        for frame in exception.get("stack") or []:
+            match = HOST_FRAME.match(str(frame))
+            if not match:
+                continue
+            symbol = resolved.get((match.group("module"), int(match.group("rva"), 16)))
+            if symbol:
+                stack_symbols[frame] = symbol
+        if stack_symbols:
+            exception["stack_symbols"] = stack_symbols
+
+    return {
+        "dir": os.path.abspath(build_dir),
+        "symbolizer": symbolizer,
+        "frames": len(frames),
+        "resolved": len(resolved),
+        "unresolved": len(frames) - len(resolved),
+        "modules": sorted(by_module),
+        "skipped": sorted(skipped),
+        "errors": errors,
+    }
+
+
 def summarize(startup: dict | None, d3d12: dict | None) -> dict:
     return {"startup": startup, "d3d12": d3d12}
 
@@ -283,6 +464,22 @@ def format_text(summary: dict, limit: int) -> str:
                 out.append(f"    code {exc['code']} at {exc['at']}{detail}")
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
+                    for frame in exc["stack"][:limit]:
+                        symbol = (exc.get("stack_symbols") or {}).get(frame)
+                        if not symbol:
+                            continue
+                        location = f" ({symbol['file']}:{symbol['line']})" if symbol.get("file") else ""
+                        out.append(f"        {frame} -> {symbol['function']}{location}")
+        symbols = startup.get("symbols")
+        if symbols:
+            out.append(
+                f"  symbols: {symbols['resolved']} of {symbols['frames']} frame(s) "
+                f"resolved from {symbols['dir']}"
+            )
+            if symbols["skipped"]:
+                out.append(f"    no PE with a PDB there: {_tail(symbols['skipped'], limit)}")
+            for module, message in symbols["errors"].items():
+                out.append(f"    {module}: {message}")
         if startup["error"]:
             out.append(f"  error: {startup['error']}")
         if startup["exit"] is not None:
@@ -323,12 +520,31 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--limit", type=int, default=10, help="items listed per section (default 10)"
     )
+    ap.add_argument(
+        "--symbols",
+        metavar="BUILD_DIR",
+        help="resolve exception stack frames of the modules this build produced against their PDB",
+    )
+    ap.add_argument(
+        "--symbolizer",
+        metavar="PATH",
+        help="llvm-symbolizer to run (default: LLVM_SYMBOLIZER, then PATH)",
+    )
     a = ap.parse_args(argv)
     if not a.startup and not a.d3d12:
         print("error: give the startup trace, --d3d12, or both", file=sys.stderr)
         return 2
     if a.limit < 1:
         print("error: --limit must be at least 1", file=sys.stderr)
+        return 2
+    if a.symbolizer and not a.symbols:
+        print("error: --symbolizer needs --symbols", file=sys.stderr)
+        return 2
+    if a.symbolizer and not os.path.isfile(a.symbolizer):
+        print(f"error: --symbolizer is not a file: {a.symbolizer}", file=sys.stderr)
+        return 2
+    if a.symbols and not os.path.isdir(a.symbols):
+        print(f"error: --symbols is not a directory: {a.symbols}", file=sys.stderr)
         return 2
     summary = summarize(None, None)
     exit_code = 0
@@ -339,6 +555,22 @@ def main(argv=None) -> int:
             except TraceError as e:
                 print(f"error: {e}", file=sys.stderr)
                 exit_code = 2
+    if a.symbols:
+        if not summary.get("startup"):
+            print("error: --symbols needs the startup trace", file=sys.stderr)
+            return 2
+        symbolizer = find_symbolizer(a.symbolizer)
+        if not symbolizer:
+            print(
+                "error: --symbols needs llvm-symbolizer (--symbolizer PATH, LLVM_SYMBOLIZER, or PATH)",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            summary["startup"]["symbols"] = symbolize(summary["startup"], a.symbols, symbolizer)
+        except TraceError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
     if not any(summary.values()):
         return 2
     if a.json:
