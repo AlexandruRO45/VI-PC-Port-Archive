@@ -1297,8 +1297,8 @@ public:
             // Slices, so a clamped CPU signal (which moves the semaphore to less than `value`) is noticed through
             // completed() and not waited for on the semaphore.
             while (completed() < value) {
-                if (context_.is_device_lost()) return S_OK;
-                fence_.wait(wait_value(value), kBlockSliceNs);
+                // A wait that fails with the device lost answers E_FAIL, as the unsliced wait did.
+                if (!fence_.wait(wait_value(value), kBlockSliceNs) && context_.is_device_lost()) return E_FAIL;
             }
             return S_OK;
         }
