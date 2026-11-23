@@ -8,6 +8,7 @@ import errno
 import importlib.util
 import io
 import json
+import math
 import os
 import struct
 import sys
@@ -598,6 +599,26 @@ class WorldIndexTest(unittest.TestCase):
         with open(entities, encoding="utf-8") as f:
             rows = [json.loads(line) for line in f]
         self.assertEqual([row["archetype"] for row in rows], ["deadbeef"])
+
+    def test_non_finite_placement_row_keeps_valid_json(self):
+        # A NaN/infinite position, rotation and scale must not reach a --entities-out line: null, never NaN/Infinity.
+        b = bytearray(make_resource())
+        struct.pack_into("<3f", b, 0x400 + 0x38, math.nan, 2.5, math.inf)
+        struct.pack_into("<4f", b, 0x400 + 0x10, math.inf, 0.0, 0.0, 1.0)
+        struct.pack_into("<2f", b, 0x400 + 0x54, math.nan, 1.0)
+        source = os.path.join(self.dir, "nonfinite.bin")
+        entities = os.path.join(self.dir, "entities.jsonl")
+        with open(source, "wb") as f:
+            f.write(bytes(b))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([source, "--out", os.path.join(self.dir, "out.json"),
+                                      "--entities-out", entities]), 0)
+        with open(entities, encoding="utf-8") as f:
+            row = json.loads(f.readline(), parse_constant=lambda c: self.fail("non-finite %s in a placement row" % c))
+        self.assertEqual(row["position"], [None, 2.5, None])
+        self.assertEqual(row["rotation"], [None, 0.0, 0.0, 1.0])
+        self.assertEqual(row["scale_xy"], None)
+        self.assertEqual(row["scale_z"], 1.0)
 
     @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
     def test_verbatim_placement_report_stays_distinct_from_summary(self):

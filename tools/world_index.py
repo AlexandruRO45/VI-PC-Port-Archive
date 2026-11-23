@@ -28,6 +28,7 @@ JSON summary. Place reports outside a directory input if you want to overwrite t
 import argparse
 import csv
 import json
+import math
 import mmap
 import os
 import re
@@ -597,6 +598,19 @@ class ArchetypeCounts:
                             "incomplete_entities": self.incomplete}}
 
 
+def _finite(value):
+    """NaN and infinity become null: JSON has no such number, so a strict reader cannot parse the line.
+
+    ``world_build.py --placements`` already skips a row without a finite position or rotation and defaults a
+    non-finite scale to 1.0, so a null changes no placed model.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, list):
+        return [_finite(v) for v in value]
+    return value
+
+
 class EntityRows:
     """A ``parse_resource`` collector that writes one JSON line per complete entity (``--entities-out``)."""
 
@@ -621,7 +635,8 @@ class EntityRows:
         for k in ("map_name", "entity_index", "parent_map_name"):
             if k in entity:
                 row[k] = entity[k]
-        self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        self.handle.write(json.dumps({k: _finite(v) for k, v in row.items()},
+                                     separators=(",", ":"), allow_nan=False) + "\n")
         self.written += 1
 
 
