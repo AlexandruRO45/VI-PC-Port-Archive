@@ -41,8 +41,12 @@ class ResumeShardsTest(unittest.TestCase):
             def __init__(self, args):
                 self.i, self.n = map(int, args[args.index("--shard") + 1].split("/"))
                 started.append(self.i)
+                self.returncode = self.finish()
 
-            def wait(self):
+            def poll(self):
+                return self.returncode
+
+            def finish(self):
                 if self.i in crash:
                     return 1
                 with open(os.path.join(spirv, f"shader{self.i}.spv"), "wb") as f:
