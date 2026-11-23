@@ -381,6 +381,44 @@ class TestSIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.vgprs[lane][2], sentinel)
             self.assertEqual(lds.data[lane], to_unsigned_u32(-50))
 
+class TestRegisterAliasing(unittest.TestCase):
+    def test_alias_vaddr_equals_vdata(self):
+        # Address and data share the same register v0
+        # If v0 is 0, address is 0 and data is 0.
+        # Seed LDS[0] with -5. After max with 0, LDS[0] should be 0.
+        instructions = [
+            "v_mov_b32_e32 v0, 0",
+            f"v_mov_b32_e32 v1, {to_unsigned_u32(-5):#x}",
+            "ds_write_b32 v0, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_max_i32 v0, v0",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v0",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v31, 0",
+            "buffer_store_dword v3, v31, s[0:3], 0 offen",
+        ]
+        mem = run_cs_lds(instructions)
+        self.assertEqual(mem.get(0), 0)
+
+    def test_alias_vdst_equals_vaddr(self):
+        # In returning form: vdst and vaddr share v0
+        # Seed LDS[0] with 42. vaddr=0, vdata=10.
+        # ds_max_rtn_i32 v0, v0, v1 -> returns old 42 into v0.
+        instructions = [
+            "v_mov_b32_e32 v0, 0",
+            "v_mov_b32_e32 v1, 42",
+            "ds_write_b32 v0, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 10",
+            "ds_max_rtn_i32 v0, v0, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v31, 0",
+            "buffer_store_dword v0, v31, s[0:3], 0 offen",
+        ]
+        mem = run_cs_lds(instructions)
+        self.assertEqual(mem.get(0), 42)
+
 
 if __name__ == "__main__":
     unittest.main()
