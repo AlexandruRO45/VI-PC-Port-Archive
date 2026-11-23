@@ -265,6 +265,12 @@ class CliTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("invalid int value: 'nope'", p.stderr)
         self.assertNotIn("at_least_one", p.stderr)
+        # A zero limit sliced the list to nothing and reported an empty corpus with exit 0.
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "0"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2, p.stdout)
+        self.assertIn("must be 1 or more", p.stderr)
+        self.assertEqual(p.stdout, "")
 
     def test_ignores_fssm_subdirectories_and_reports_read_errors_cleanly(self):
         os.makedirs(os.path.join(self.fssm_dir, "nested.fssm"))
