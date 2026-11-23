@@ -902,8 +902,10 @@ void check_run_time_load() {
         const std::string config = dir + "\\MicrosoftGame.Config";
         DeleteFileA(config.c_str());
         SetEnvironmentVariableA("LEONIDA_GAME_DIR", dir.c_str());
-        Options inline_options{1, TRUE, "<Game><TitleId>CAFEBABE</TitleId><Resources><Resource Language=\"fr-FR\"/></Resources></Game>"};
+        char inline_config[] = "<Game><TitleId>CAFEBABE</TitleId><Resources><Resource Language=\"fr-FR\"/></Resources></Game>";
+        Options inline_options{1, TRUE, inline_config};
         check(init_ex2(0x2410, 0, 2, &inline_options) == S_OK, "initialize with inline config");
+        std::memset(inline_config, 0, sizeof(inline_config));
         void* game = get(game_cls);
         void* package = get(package_cls);
         using TitleId = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
@@ -924,6 +926,9 @@ void check_run_time_load() {
         check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
               "empty disk config falls back to inline config");
         DeleteFileA(config.c_str());
+        id = 0;
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
+              "inline config remains available before uninitialize");
         check(uninit_api() == S_OK && init_ex2(0x2410, 0, 2, nullptr) == S_OK,
               "uninitialize and reinitialize without options");
         id = 0;
