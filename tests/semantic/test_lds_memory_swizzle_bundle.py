@@ -310,6 +310,31 @@ class TestDsPermuteB32SIMD(unittest.TestCase):
         for l in range(16, 32):
             self.assertEqual(out[l], old_dst[l])
 
+class TestDsPermuteB32Translator(unittest.TestCase):
+    def test_translator_permute_execution(self) -> None:
+        # ds_permute_b32 v3, v1, v2 offset:4
+        body = [
+            "v_lshlrev_b32_e32 v1, 2, v0",  # addr = lane * 4
+            "v_add_nc_u32_e32 v2, 200, v0",  # data = 200 + lane
+            "ds_permute_b32 v3, v1, v2 offset:4",  # writes to ((4*l + 4)/4)%32 = (l+1)%32
+            "buffer_store_dword v3, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_permute_exec")
+        for s in range(32):
+            d = (s + 1) % 32
+            self.assertEqual(results[d], 200 + s)
+
+    def test_translator_permute_zero_offset(self) -> None:
+        body = [
+            "v_lshlrev_b32_e32 v1, 2, v0",
+            "v_add_nc_u32_e32 v2, 300, v0",
+            "ds_permute_b32 v3, v1, v2",
+            "buffer_store_dword v3, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_permute_zero_off")
+        for l in range(32):
+            self.assertEqual(results[l], 300 + l)
+
 
 if __name__ == "__main__":
     unittest.main()
