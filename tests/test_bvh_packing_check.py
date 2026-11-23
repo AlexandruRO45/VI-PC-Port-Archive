@@ -295,6 +295,38 @@ class TestArchive(unittest.TestCase):
                 if sys.platform == "win32":
                     self.assertEqual(C.main([good, "--json", good.upper()]), 2)  # case-distinct spelling on Windows
 
+    def test_scan_archive_clamps_workers(self):
+        good = payload(build())
+        path = self.write_rpf([good])
+        asked = []
+        orig = C.process_workers
+        try:
+            C.process_workers = lambda n: asked.append(n) or 1
+            C.scan_archive(path, 100, 1 << 20, progress=False)
+            self.assertEqual(asked, [100])
+        finally:
+            C.process_workers = orig
+
+    def test_scan_archive_pool_bounded_by_jobs(self):
+        good = payload(build())
+        path = self.write_rpf([good])
+        asked_pool = []
+        orig_pool = C.multiprocessing.Pool
+        def mock_pool(processes, *args, **kwargs):
+            asked_pool.append(processes)
+            return orig_pool(1, *args, **kwargs)
+        C.multiprocessing.Pool = mock_pool
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as fh:
+                lo = struct.unpack("<I", fh.read(8)[4:8])[0]
+            window = max(1, (size - lo + 1) // 2)
+            self.assertEqual(len(range(lo, size, window)), 2)
+            C.scan_archive(path, 8, window, progress=False)
+            self.assertEqual(asked_pool, [2])
+        finally:
+            C.multiprocessing.Pool = orig_pool
+
 
 if __name__ == "__main__":
     unittest.main()

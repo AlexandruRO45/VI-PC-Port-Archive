@@ -49,6 +49,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_index as I  # noqa: E402
 import bvh_rehydrate as R  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 BOX_TYPES = (R.BOX16, R.BOX32)
@@ -445,6 +446,7 @@ def _short():
 
 
 def scan_archive(path, workers, window, start=None, limit=None, progress=True):
+    workers = process_workers(max(1, workers))
     size = os.path.getsize(path)
     with open(path, "rb") as fh:
         first = struct.unpack("<I", fh.read(8)[4:8])[0] if size >= 8 else size
@@ -459,7 +461,7 @@ def scan_archive(path, workers, window, start=None, limit=None, progress=True):
         results = map(scan_window, jobs)
         pool = None
     else:
-        pool = multiprocessing.Pool(workers, initializer=I.below_normal)
+        pool = multiprocessing.Pool(min(workers, len(jobs)), initializer=I.below_normal)
         results = pool.imap_unordered(scan_window, jobs)
     try:
         for done, t in enumerate(results, 1):
