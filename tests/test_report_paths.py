@@ -172,9 +172,10 @@ class FoldingVolumeTests(unittest.TestCase):
 
     def test_same_report_path_asks_the_volume_when_the_name_rules_disagree(self):
         # The name rules say "different"; the volume has the last word on a pair that differs only by case.
-        with mock.patch.object(report_paths, "path_key", side_effect=os.path.realpath),                 mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe:
+        with mock.patch.object(report_paths, "_resolved_key", side_effect=os.path.realpath), \
+                mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe:
             self.assertTrue(report_paths.same_report_path(self.p("R.json"), self.p("r.json")))
-        probe.assert_called_once()
+        probe.assert_called_once_with(os.path.realpath(self.p("R.json")), os.path.realpath(self.p("r.json")))
 
 
 class NoPrivateCopiesTests(unittest.TestCase):
