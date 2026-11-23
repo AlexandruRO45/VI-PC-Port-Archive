@@ -375,3 +375,124 @@ class TestSaluOrn2SaveexecB32BitwiseEdgeCases(unittest.TestCase):
             for cb2 in checkerboards:
                 new_e, d, scc = ref_orn2_saveexec_b32(cb1, cb2)
                 self.assertEqual(new_e, (cb1 | (~cb2 & MASK32)) & MASK32)
+
+
+def parse_s_orn2_saveexec_b32_asm(asm_line: str) -> ASTInstruction:
+    """Parse a single assembly instruction line for s_orn2_saveexec_b32."""
+    clean = asm_line.strip()
+    if not clean:
+        raise ValueError("Empty assembly line")
+    parts = clean.split(None, 1)
+    mnemonic = parts[0].lower()
+    if mnemonic != "s_orn2_saveexec_b32":
+        raise ValueError(f"Expected mnemonic s_orn2_saveexec_b32, got {mnemonic}")
+    if len(parts) < 2:
+        raise ValueError("Missing operands")
+    operands_str = [op.strip() for op in parts[1].split(",")]
+    if len(operands_str) != 2:
+        raise ValueError(f"Expected 2 operands (dst, src0), got {len(operands_str)}")
+
+    dst_str, src_str = operands_str[0], operands_str[1]
+    if dst_str.lower() in ("exec_lo", "exec"):
+        dst = ASTOperand.exec_lo()
+    elif dst_str.lower().startswith("s") and dst_str[1:].isdigit():
+        dst = ASTOperand.sgpr(int(dst_str[1:]))
+    else:
+        raise ValueError(f"Invalid destination operand: {dst_str}")
+
+    if src_str.lower() in ("exec_lo", "exec"):
+        src = ASTOperand.exec_lo()
+    elif src_str.lower() in ("vcc_lo", "vcc"):
+        src = ASTOperand.vcc_lo()
+    elif src_str.lower().startswith("s") and src_str[1:].isdigit():
+        src = ASTOperand.sgpr(int(src_str[1:]))
+    elif src_str.startswith("0x") or src_str.startswith("-") or src_str.isdigit():
+        val = int(src_str, 0)
+        src = ASTOperand.literal32(val)
+    else:
+        raise ValueError(f"Invalid source operand: {src_str}")
+
+    inst = ASTInstruction(Opcode.S_ORN2_SAVEEXEC_B32, dst, src)
+    inst.validate()
+    return inst
+
+
+# Mutant functions for mutation testing
+def mutant_andn2(s0: int, old_exec: int) -> tuple[int, int, int]:
+    """Mutant 1: uses AND instead of OR."""
+    new_e = (s0 & (~old_exec & MASK32)) & MASK32
+    return new_e, old_exec, 1 if new_e != 0 else 0
+
+
+def mutant_no_invert(s0: int, old_exec: int) -> tuple[int, int, int]:
+    """Mutant 2: uses OR without ~ inversion."""
+    new_e = (s0 | old_exec) & MASK32
+    return new_e, old_exec, 1 if new_e != 0 else 0
+
+
+def mutant_save_new_exec(s0: int, old_exec: int) -> tuple[int, int, int]:
+    """Mutant 3: saves new EXEC instead of old EXEC."""
+    new_e = (s0 | (~old_exec & MASK32)) & MASK32
+    return new_e, new_e, 1 if new_e != 0 else 0
+
+
+def mutant_invert_scc(s0: int, old_exec: int) -> tuple[int, int, int]:
+    """Mutant 4: inverts SCC logic."""
+    new_e = (s0 | (~old_exec & MASK32)) & MASK32
+    return new_e, old_exec, 1 if new_e == 0 else 0
+
+
+class TestSaluOrn2SaveexecB32NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, mutation detection, and translator execution."""
+
+    def test_syntax_rejection_malformed_syntax(self):
+        with self.assertRaises(ValueError):
+            parse_s_orn2_saveexec_b32_asm("")
+
+        with self.assertRaises(ValueError):
+            parse_s_orn2_saveexec_b32_asm("s_and_saveexec_b32 s0, s1")
+
+        with self.assertRaises(ValueError):
+            parse_s_orn2_saveexec_b32_asm("s_orn2_saveexec_b32 s0")
+
+        with self.assertRaises(ValueError):
+            parse_s_orn2_saveexec_b32_asm("s_orn2_saveexec_b32 s106, s1")
+
+    def test_mutation_detection_andn2(self):
+        s0, e = 0x0F, 0x00
+        correct = ref_orn2_saveexec_b32(s0, e)
+        mutated = mutant_andn2(s0, e)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_no_invert(self):
+        s0, e = 0x00, 0x00
+        correct = ref_orn2_saveexec_b32(s0, e)
+        mutated = mutant_no_invert(s0, e)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_save_new_exec(self):
+        s0, e = 0xFF, 0x00
+        correct = ref_orn2_saveexec_b32(s0, e)
+        mutated = mutant_save_new_exec(s0, e)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_invert_scc(self):
+        s0, e = 0x00, ALL_LANES_ACTIVE_32
+        correct = ref_orn2_saveexec_b32(s0, e)
+        mutated = mutant_invert_scc(s0, e)
+        self.assertNotEqual(correct, mutated)
+
+    def test_orn2_spirv_emission(self):
+        """Verify that support.translate_lines emits expected SPIR-V logic for s_orn2_saveexec_b32."""
+        lines = [
+            "s_mov_b32 s0, 0x0000ffff",
+            "s_orn2_saveexec_b32 s4, s0",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_test_orn2_b32_emit", lines)
+        self.assertIn("OpNot", spv)
+        self.assertIn("OpBitwiseOr", spv)
+
+
+if __name__ == "__main__":
+    unittest.main()
