@@ -645,5 +645,34 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
+
+
+class MsClipFailureDetail(unittest.TestCase):
+    """The ms_clip FAIL line carries the harness exit code: the AMD failure printed only the device line,
+    so nothing said what failed (TEST-1353). No device needed: the readback call is stubbed."""
+    def test_fail_line_carries_the_exit_code(self):
+        name = "ms_clip"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                for module in (name, "ps_passthru"):
+                    (Path(tmp) / "spirv" / (module + ".spv")).touch()
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "mesh_env", return_value={}),
+                  patch.object(rgt, "run_readback", return_value=(5, "device: AMD Radeon (subgroup 32..32)\n")),
+                  contextlib.redirect_stdout(output)):
+                self.assertEqual(rgt.run_suite(args, tmp), 1)
+        text = output.getvalue()
+        self.assertIn("FAIL", text)
+        self.assertIn("ms_clip", text)
+        self.assertIn("exit 5", text, "the FAIL detail must carry the harness exit code")
+        self.assertIn("device: AMD Radeon", text)
+
 if __name__ == "__main__":
     unittest.main()
