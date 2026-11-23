@@ -582,5 +582,25 @@ class TestDsWriteB16ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.lds.read_u16(4), 0xBEEF)
 
 
+# ------------------------------------------------------------------------------
+# ds_write_b16 SIMD Divergence & Halfword Masking
+# ------------------------------------------------------------------------------
+
+class TestDsWriteB16SIMD(unittest.TestCase):
+    def test_simd_halfword_stores(self):
+        wave = SIMDWaveDS(wave_size=32)
+        for i in range(32):
+            wave.vgprs[1][i] = i * 4
+            wave.vgprs[2][i] = 0x1000 + i
+
+        for i in range(32):
+            addr = wave.vgprs[1][i]
+            data = wave.vgprs[2][i]
+            wave.lds.write_u16(addr, data)
+
+        for i in range(32):
+            self.assertEqual(wave.lds.read_u16(i * 4), 0x1000 + i)
+
+
 if __name__ == '__main__':
     unittest.main()
