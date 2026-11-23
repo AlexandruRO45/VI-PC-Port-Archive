@@ -571,5 +571,28 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(reflect.call_count, 2)
 
 
+class PublishTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.report = self.directory / "report.json"
+
+    def test_failed_replace_leaves_no_temporary_and_keeps_existing_report(self):
+        # A read-only destination makes os.replace fail on Windows; simulate
+        # that here so the staging cleanup is covered on every platform.
+        self.report.write_text(json.dumps({"status": "old"}) + "\n", encoding="utf-8")
+        with patch.object(link.os, "replace", side_effect=OSError("simulated")):
+            with self.assertRaises(OSError):
+                link.write_report(self.report, {"status": "new"})
+        self.assertEqual(sorted(p.name for p in self.directory.iterdir()), ["report.json"])
+        self.assertEqual(json.loads(self.report.read_text(encoding="utf-8"))["status"], "old")
+
+    def test_successful_write_publishes_one_report(self):
+        link.write_report(self.report, {"status": "new"})
+        self.assertEqual(sorted(p.name for p in self.directory.iterdir()), ["report.json"])
+        self.assertEqual(json.loads(self.report.read_text(encoding="utf-8"))["status"], "new")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
