@@ -259,6 +259,12 @@ class TestPermLane16Translator(unittest.TestCase):
             spv = run_cs_permlane("v_permlane16_b32", s1, s2, name=f"cs_p16_exec_{s1:x}")
             self.assertIn("OpGroupNonUniformShuffle", spv)
 
+class TestPermLaneX16Reference(unittest.TestCase):
+    def test_reference_cross_half(self):
+        spv = run_cs_permlane("v_permlanex16_b32", 0x76543210, 0xFEDCBA98, name="cs_px16_ref")
+        self.assertIn("OpBitwiseXor", spv)
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
