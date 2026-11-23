@@ -196,7 +196,7 @@ def test_shapes():
             ob = _o[b]
             k = _v[ob] = _v.get(ob, 0) + 1
             opts = _ns[b]
-            return S.END if not opts else opts[random.Random(f"{_s}/{ob}/{k}").randrange(len(opts))]
+            return S.END if not opts else opts[branch_index(_s, ob, k, len(opts))]
 
         assert [orig3[b] for b in S.run(S.structure(ns3), sc_choose, 200)] == want
     # Cap enforcement: max_splits=0 must refuse an irreducible graph cleanly.
