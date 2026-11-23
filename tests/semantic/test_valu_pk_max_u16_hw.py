@@ -180,5 +180,54 @@ class TestVPkMaxU16AST(unittest.TestCase):
             inst.dst = Operand(RegType.VGPR, 3)  # type: ignore
 
 
+class ScalarMachine:
+    def __init__(self):
+        self.vgprs: dict[int, int] = {i: 0 for i in range(256)}
+        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs.get(op.index, 0)
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs.get(op.index, 0)
+        return op.val & MASK32
+
+    def write_operand(self, op: Operand, val: int):
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[op.index] = val & MASK32
+        elif op.reg_type == RegType.SGPR:
+            self.sgprs[op.index] = val & MASK32
+
+    def step(self, inst: VPkMaxU16Inst):
+        s0 = self.read_operand(inst.src0)
+        s1 = self.read_operand(inst.src1)
+        res = ref_pk_max_u16(s0, s1, inst.op_sel, inst.op_sel_hi)
+        self.write_operand(inst.dst, res)
+
+
+class TestVPkMaxU16ScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar instruction interpreter."""
+
+    def test_scalar_packed_component_selection(self):
+        mach = ScalarMachine()
+        mach.vgprs[1] = P(100, 500)
+        mach.vgprs[2] = P(200, 300)
+        inst = VPkMaxU16Inst(Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 1), Operand(RegType.VGPR, 2))
+        mach.step(inst)
+        self.assertEqual(mach.vgprs[0], P(200, 500))
+
+    def test_scalar_sequential_pipeline(self):
+        mach = ScalarMachine()
+        mach.vgprs[1] = P(10, 20)
+        mach.vgprs[2] = P(15, 5)
+        # v0 = max(v1, v2) -> P(15, 20)
+        mach.step(VPkMaxU16Inst(Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 1), Operand(RegType.VGPR, 2)))
+        self.assertEqual(mach.vgprs[0], P(15, 20))
+        # v3 = max(v0, P(25, 10)) -> P(25, 20)
+        mach.vgprs[4] = P(25, 10)
+        mach.step(VPkMaxU16Inst(Operand(RegType.VGPR, 3), Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 4)))
+        self.assertEqual(mach.vgprs[3], P(25, 20))
+
+
 if __name__ == '__main__':
     unittest.main()
