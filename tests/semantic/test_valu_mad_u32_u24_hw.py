@@ -166,5 +166,57 @@ class MadU32U24ScalarInterpreterTests(unittest.TestCase):
         execute_scalar_mad_u32_u24(state, ast)
         self.assertEqual(state.get_vgpr(2), (100 * 3) + 25)
 
+class WavefrontState:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.exec_mask = (1 << lane_count) - 1
+        self.lanes = [ScalarRegisterState() for _ in range(lane_count)]
+
+    def execute_instruction(self, ast: InstructionAST) -> None:
+        for lane in range(self.lane_count):
+            if (self.exec_mask >> lane) & 1:
+                execute_scalar_mad_u32_u24(self.lanes[lane], ast)
+
+
+class MadU32U24SimdDivergenceTests(unittest.TestCase):
+    def test_simd_wave32_all_active(self):
+        wave = WavefrontState(lane_count=32)
+        for i in range(32):
+            wave.lanes[i].set_vgpr(0, i + 1)
+            wave.lanes[i].set_vgpr(1, 2)
+            wave.lanes[i].set_vgpr(2, 10)
+        ast = InstructionAST(
+            "v_mad_u32_u24",
+            Operand(RegKind.VGPR, 3),
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+            Operand(RegKind.VGPR, 2),
+        )
+        wave.execute_instruction(ast)
+        for i in range(32):
+            self.assertEqual(wave.lanes[i].get_vgpr(3), ((i + 1) * 2) + 10)
+
+    def test_simd_exec_divergence_mask(self):
+        wave = WavefrontState(lane_count=32)
+        wave.exec_mask = 0x0000FFFF  # Lower 16 lanes active only
+        for i in range(32):
+            wave.lanes[i].set_vgpr(0, 10)
+            wave.lanes[i].set_vgpr(1, 20)
+            wave.lanes[i].set_vgpr(2, 5)
+            wave.lanes[i].set_vgpr(3, 0xDEADBEEF)
+        ast = InstructionAST(
+            "v_mad_u32_u24",
+            Operand(RegKind.VGPR, 3),
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+            Operand(RegKind.VGPR, 2),
+        )
+        wave.execute_instruction(ast)
+        for i in range(32):
+            if i < 16:
+                self.assertEqual(wave.lanes[i].get_vgpr(3), 205)
+            else:
+                self.assertEqual(wave.lanes[i].get_vgpr(3), 0xDEADBEEF)  # Inactive lanes unchanged
+
 if __name__ == "__main__":
     unittest.main()
