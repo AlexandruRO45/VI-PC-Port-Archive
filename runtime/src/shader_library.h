@@ -836,7 +836,13 @@ private:
             const auto path = index.u8string();
             return fail("cannot open " + std::string(path.begin(), path.end()));
         }
-        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        file.seekg(0, std::ios::end);
+        const std::streamoff size = file.tellg();
+        std::string text;
+        if (size < 0 || std::cmp_greater(size, text.max_size())) return fail("index.json could not be read");
+        text.resize(static_cast<std::size_t>(size));
+        file.seekg(0);
+        if (!file.read(text.data(), size)) return fail("index.json could not be read");
         constexpr std::string_view utf8_bom = "\xef\xbb\xbf";
         std::string_view json(text);
         if (json.starts_with(utf8_bom)) json.remove_prefix(utf8_bom.size());
