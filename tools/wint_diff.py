@@ -591,7 +591,7 @@ def reference(lines, wave):
 def translated(lines, wave, name="ps_wint"):
     """Translate and run one subgroup; returns per lane the four words, or raises Skip."""
     import rdna2spirv
-    from spirv_wave_interp import run_wave
+    from spirv_wave_interp import UnsupportedConstruct, run_wave
     with tempfile.TemporaryDirectory(prefix="wint-diff-") as tmp:
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
@@ -615,8 +615,10 @@ def translated(lines, wave, name="ps_wint"):
         raise Skip(f"translator compiled the wave{wave} program as wave{64 if wave == 32 else 32}")
     try:
         out = run_wave(spv, wave=wave)["outputs"]
-    except Exception as e:  # noqa: BLE001 - an interpreter gap is a counted skip, never a pass
+    except UnsupportedConstruct as e:
         raise Skip(f"wave interp: {type(e).__name__}: {str(e)[:80]}") from None
+    except Exception as e:  # noqa: BLE001 - invalid modules and interpreter crashes are harness errors
+        raise RuntimeError(f"wave interp: {type(e).__name__}: {str(e)[:80]}") from e
     res = []
     for lane in range(wave):
         words = (out[lane] or {}).get("%out_mrt0")

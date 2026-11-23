@@ -8,10 +8,12 @@ import re
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 TOOL = Path(__file__).resolve().parents[1] / "tools" / "wint_diff.py"
 sys.path.insert(0, str(TOOL.parent))
 import wint_diff as d  # noqa: E402
+import spirv_wave_interp as interp  # noqa: E402
 
 
 def program(body, wave=32, obs=(1, 2, 3, 4)):
@@ -195,6 +197,102 @@ class Cli(unittest.TestCase):
             except SystemExit as e:
                 rc = e.code
         return rc, out.getvalue()
+
+    def interpreter_cli(self, wave, *extra):
+        return self.main("--programs", "2", "--seed", "1", "--max-ops", "1", "--wave", str(wave), *extra)
+
+    def assert_interpreter_error(self, rc, output, kind):
+        self.assertEqual(rc, 2, output)
+        self.assertIn("harness error: wave interp: " + kind + ":", output)
+
+    def test_invalid_module_after_a_passing_program(self):
+        run_wave = interp.run_wave
+        for wave in (32, 64):
+            for instruction in ("OpSelectionMerge %bad None",
+                                "%before = OpCopyObject %uint %uint_0\n%bad = OpPhi %uint %uint_0 %entry"):
+                with self.subTest(wave=wave, instruction=instruction):
+                    calls = 0
+
+                    def corrupt_second(text, **kwargs):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            self.assertIn("OpReturn", text)
+                            text = text.replace("OpReturn", instruction + "\nOpReturn", 1)
+                        return run_wave(text, **kwargs)
+
+                    with mock.patch.object(interp, "run_wave", side_effect=corrupt_second):
+                        rc, output = self.interpreter_cli(wave)
+                    self.assertEqual(calls, 2)
+                    self.assert_interpreter_error(rc, output, "InvalidModule")
+
+    def test_crashes_after_a_passing_program(self):
+        run_wave = interp.run_wave
+        for wave in (32, 64):
+            for error in (RuntimeError, KeyError, ValueError):
+                with self.subTest(wave=wave, error=error.__name__):
+                    calls = 0
+
+                    def fail_second(text, **kwargs):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            raise error("synthetic interpreter failure")
+                        return run_wave(text, **kwargs)
+
+                    with mock.patch.object(interp, "run_wave", side_effect=fail_second):
+                        rc, output = self.interpreter_cli(wave)
+                    self.assertEqual(calls, 2)
+                    self.assert_interpreter_error(rc, output, error.__name__)
+
+    def test_explicit_unsupported_remains_a_counted_skip(self):
+        run_wave = interp.run_wave
+        for wave in (32, 64):
+            with self.subTest(wave=wave):
+                def skip_second(text, **kwargs):
+                    if patched.call_count == 2:
+                        raise interp.UnsupportedConstruct("unmodelled operation")
+                    return run_wave(text, **kwargs)
+
+                with mock.patch.object(interp, "run_wave", side_effect=skip_second) as patched:
+                    rc, output = self.interpreter_cli(wave)
+                self.assertEqual(rc, 0, output)
+                self.assertIn("1 pass, 0 mismatch, 1 skipped", output)
+                self.assertIn("wave interp: UnsupportedConstruct: unmodelled operation", output)
+
+    def test_invalid_module_during_shrinking_is_a_harness_error(self):
+        run_wave = interp.run_wave
+        for wave in (32, 64):
+            with self.subTest(wave=wave):
+                def mismatch_then_invalid(text, **kwargs):
+                    if patched.call_count > 1:
+                        text = text.replace("OpReturn", "OpSelectionMerge %bad None\nOpReturn", 1)
+                    result = run_wave(text, **kwargs)
+                    words = result["outputs"][0]["%out_mrt0"]
+                    result["outputs"][0]["%out_mrt0"] = (words[0] ^ 1, *words[1:])
+                    return result
+
+                with mock.patch.object(interp, "run_wave", side_effect=mismatch_then_invalid) as patched:
+                    rc, output = self.interpreter_cli(wave, "--programs", "1")
+                self.assertGreater(patched.call_count, 1)
+                self.assertIn("0 pass, 1 mismatch", output)
+                self.assert_interpreter_error(rc, output, "InvalidModule")
+
+    def test_hardware_match_does_not_hide_error_and_oracle_is_closed(self):
+        from hw_oracle import runner
+        for wave in (32, 64):
+            with self.subTest(wave=wave), contextlib.ExitStack() as stack:
+                prog = program(["v_mov_b32_e32 v1, 5"], wave)
+                words = [word for lane in d.reference(prog.lines(), wave) for word in lane]
+                oracle = mock.Mock(device="synthetic")
+                oracle.run.return_value = [words, words]
+                stack.enter_context(mock.patch.object(runner, "open_oracle", return_value=oracle))
+                stack.enter_context(mock.patch.object(d, "generate", return_value=prog))
+                stack.enter_context(mock.patch.object(interp, "run_wave",
+                                                     side_effect=interp.InvalidModule("invalid merge")))
+                rc, output = self.interpreter_cli(wave, "--oracle", "translator,hw")
+                self.assert_interpreter_error(rc, output, "InvalidModule")
+                oracle.close.assert_called_once_with()
 
     def test_exit_codes(self):
         rc, out = self.main("--list-ops")
