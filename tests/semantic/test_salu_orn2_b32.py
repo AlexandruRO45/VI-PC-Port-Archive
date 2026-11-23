@@ -663,5 +663,96 @@ class TestSaluOrn2B32IEEE754EdgeCases(unittest.TestCase):
         res, _ = ref_orn2_b32(float_one, exp_mask)
         self.assertEqual(res, float_one | (~exp_mask & MASK32))
 
+class TestSaluOrn2B32TranslatorIntegration(unittest.TestCase):
+    """Live translator regression tests verifying tools/rdna2spirv.py emits valid SPIR-V."""
+
+    def test_translator_emits_valid_spirv_op_bitwise_or_not(self) -> None:
+        if support is None:
+            self.skipTest(f"Translator not available: {TRANSLATOR_ERROR}")
+
+        body = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x00FF00FF",
+            "s_orn2_b32 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_test_s_orn2_b32", body)
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("OpStore %scc", spv)
+
+    def test_translator_execution_matches_oracle(self) -> None:
+        if support is None or si is None:
+            self.skipTest(f"Translator or mini-interp not available: {TRANSLATOR_ERROR}")
+
+        test_vectors = [
+            (0x12345678, 0x00FF00FF),
+            (0xAAAAAAAA, 0x55555555),
+            (0x00000000, 0xFFFFFFFF),
+            (0xFFFFFFFF, 0x00000000),
+            (0x80000000, 0x7FFFFFFF),
+            (0xCAFEBABE, 0x12345678),
+        ]
+
+        for s0_val, s1_val in test_vectors:
+            expected_res, expected_scc = ref_orn2_b32(s0_val, s1_val)
+            body = [
+                f"s_mov_b32 s0, {s0_val:#x}",
+                f"s_mov_b32 s1, {s1_val:#x}",
+                "s_orn2_b32 s2, s0, s1",
+                "s_cselect_b32 s3, 1, 0",
+                "v_mov_b32 v0, s2",
+                "v_mov_b32 v1, s3",
+                "exp mrt0 v0, v1, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_salu_orn2_{s0_val:x}_{s1_val:x}", body)
+            words = support.mrt0_words(spv)
+            actual_res = words[0]
+            actual_scc = words[1]
+            self.assertEqual(actual_res, expected_res, f"Mismatch for inputs ({s0_val:#x}, {s1_val:#x})")
+            self.assertEqual(actual_scc, expected_scc, f"SCC mismatch for inputs ({s0_val:#x}, {s1_val:#x})")
+
+
+class TestSaluOrn2B32NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_invalid_operand_counts(self) -> None:
+        with self.assertRaises(ValueError):
+            SALUInstruction(
+                Opcode.S_ORN2_B32,
+                sdst=RegOperand(RegKind.SGPR, 0),
+                ssrc0=RegOperand(RegKind.SGPR, 1),
+                ssrc1=None,
+            )
+
+    def test_negative_two_literals_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            SALUInstruction(
+                Opcode.S_ORN2_B32,
+                sdst=RegOperand(RegKind.SGPR, 0),
+                ssrc0=RegOperand(RegKind.LITERAL, 0x12345678),
+                ssrc1=RegOperand(RegKind.LITERAL, 0x9ABCDEF0),
+            )
+
+    def test_mutation_detection_inverted_operand(self) -> None:
+        def mutated_orn1_oracle(s0: int, s1: int) -> int:
+            return ((~u32(s0)) | u32(s1)) & MASK32
+
+        s0 = 0x0F0F0F0F
+        s1 = 0x33333333
+        real_orn2, _ = ref_orn2_b32(s0, s1)
+        mutated = mutated_orn1_oracle(s0, s1)
+        self.assertNotEqual(real_orn2, mutated)
+
+    def test_mutation_detection_scc_inverted(self) -> None:
+        def mutated_scc(res: int) -> int:
+            return 1 if res == 0 else 0
+
+        _, correct_scc = ref_orn2_b32(0x1234, 0x5678)
+        self.assertNotEqual(correct_scc, mutated_scc(0x1234 | (~0x5678 & MASK32)))
+
 if __name__ == "__main__":
     unittest.main()
