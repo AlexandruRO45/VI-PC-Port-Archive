@@ -273,5 +273,27 @@ class FogVolumesTests(unittest.TestCase):
         self.assertEqual(seen, [61])
 
 
+@unittest.skipIf(os.name == "nt", "POSIX permission bits")
+class ReportModeTests(unittest.TestCase):
+    """_write_json_atomic stages through mkstemp (0600): the published report gets the bits a plain open() would
+    give it, or those of the report it replaces, as every other staged writer does through file_mode."""
+
+    def test_a_new_report_gets_the_bits_of_a_plain_open(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "fog.json")
+            fv._write_json_atomic(out, {"a": 1})
+            self.assertEqual(os.stat(out).st_mode & 0o777, file_mode.new_file_mode(tmp))
+
+    def test_a_replaced_report_keeps_its_bits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "fog.json")
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}\n")
+            os.chmod(out, 0o640)
+            fv._write_json_atomic(out, {"a": 1})
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+
+
 if __name__ == "__main__":
     unittest.main()

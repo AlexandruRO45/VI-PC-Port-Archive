@@ -28,6 +28,7 @@ if _TOOLS_DIR not in sys.path:
 import pool_workers  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -399,6 +400,7 @@ def _write_json_atomic(path: str, doc: dict) -> None:
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(out_abs))   # mkstemp creates 0600
         os.replace(tmp, out_abs)
     except Exception:
         try:
