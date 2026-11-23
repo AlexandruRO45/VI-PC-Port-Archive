@@ -789,10 +789,10 @@ public:
 
     // AtomicCopyBufferUINT/UINT64: both offsets aligned to the copy's size and each dependency on a named resource with
     // a non-empty, non-inverted range (zero dependencies is accepted by the Windows 11 WARP and RTX 5090 D3D12
-    // runtimes). A copy of a value onto itself (vkCmdCopyBuffer forbids the overlap) is refused too.
+    // runtimes). A UINT self-copy keeps its dependency ordering without a Vulkan transfer.
     bool atomic_copy(const AtomicCopyBuffer& copy) {
         if ((copy.bytes != 4 && copy.bytes != 8) || !copy.dst || !copy.src) return false;
-        if (copy.dst == copy.src && copy.dst_offset == copy.src_offset) return false;
+        if (copy.bytes == 8 && copy.dst == copy.src && copy.dst_offset == copy.src_offset) return false;
         if (copy.dst_offset % copy.bytes || copy.src_offset % copy.bytes) return false;
         for (const auto& d : copy.dependencies)
             if (!d.resource || d.begin >= d.end) return false;

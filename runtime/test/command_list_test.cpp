@@ -184,7 +184,10 @@ int main() {
     const DependentRange dependent{41, 0, 0, 64};
     CHECK(list.atomic_copy({42, 8, 43, 16, 8, {dependent}}));
     CHECK(list.atomic_copy({42, 4, 42, 8, 4, {dependent}}));      // within one buffer
-    CHECK(!list.atomic_copy({42, 8, 42, 8, 8, {dependent}}));     // onto itself
+    CHECK(list.atomic_copy({42, 8, 42, 8, 4, {}}));              // UINT onto itself
+    CHECK(list.atomic_copy({42, 8, 42, 8, 4, {dependent}}));
+    CHECK(!list.atomic_copy({42, 8, 42, 8, 8, {dependent}}));     // UINT64 onto itself
+    CHECK(!list.atomic_copy({42, 2, 42, 2, 4, {dependent}}));     // misaligned UINT onto itself
     CHECK(!list.atomic_copy({42, 4, 43, 16, 8, {dependent}}));    // UINT64 at an offset that is not 8-aligned
     CHECK(!list.atomic_copy({42, 8, 43, 16, 2, {dependent}}));    // neither UINT nor UINT64
     CHECK(list.atomic_copy({42, 8, 43, 16, 4, {}}));              // zero dependencies is valid on Windows D3D12
@@ -194,7 +197,7 @@ int main() {
     CHECK(!list.atomic_copy({0, 8, 43, 16, 4, {dependent}}));
     CHECK(list.close());
     CHECK(!list.discard({40, 0, 0, false, true}) && !list.discard({40, 0, 0, false}));
-    CHECK(list.commands().size() == 6);
+    CHECK(list.commands().size() == 8);
     CHECK(std::get<DiscardResource>(list.commands()[0]).whole);
     CHECK(std::get<DiscardResource>(list.commands()[1]).first_subresource == 2 &&
           std::get<DiscardResource>(list.commands()[1]).partial && !std::get<DiscardResource>(list.commands()[1]).whole);

@@ -10,6 +10,7 @@
 
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -199,8 +200,8 @@ bool test_clear_state_resets_predication_gpu(const char* label, ID3D12Device* de
     return true;
 }
 
-// GPU proof on Vulkan layer: AtomicCopyBufferUINT with count=0 and UINT64_MAX end sentinels
-// ({0, UINT64_MAX}, {1, UINT64_MAX}, {63, UINT64_MAX}), plus replay bounds check on {64, UINT64_MAX}.
+// GPU proof on Vulkan layer: AtomicCopyBufferUINT with zero dependencies, UINT64_MAX end sentinels, and self-copies.
+// Also checks replay bounds for {64, UINT64_MAX}.
 bool test_atomic_copy_gpu(ID3D12Device* device) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
@@ -215,9 +216,10 @@ bool test_atomic_copy_gpu(ID3D12Device* device) {
     CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
-    Ref<ID3D12Resource> src, dst;
+    Ref<ID3D12Resource> src, dst, self;
     CHECK(create_buffer(device, 64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, src));
     CHECK(create_buffer(device, 64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, dst));
+    CHECK(create_buffer(device, 64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, self));
 
     const std::array<std::uint32_t, 4> input{0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
     CHECK(write_buffer(src.p, input.data(), sizeof(input)));
@@ -230,13 +232,22 @@ bool test_atomic_copy_gpu(ID3D12Device* device) {
     list1->AtomicCopyBufferUINT(dst.p, 4, src.p, 4, 1, &dep, &full_buf);
     list1->AtomicCopyBufferUINT(dst.p, 8, src.p, 8, 1, &dep, &tail_1);
     list1->AtomicCopyBufferUINT(dst.p, 12, src.p, 12, 1, &dep, &tail_63);
+    list->CopyBufferRegion(self.p, 0, src.p, 0, sizeof(input));
+    const auto to_common = transition(self.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    list->ResourceBarrier(1, &to_common);
+    list1->AtomicCopyBufferUINT(self.p, 4, self.p, 4, 0, nullptr, nullptr);
+    list1->AtomicCopyBufferUINT(self.p, 4, self.p, 4, 1, &dep, &full_buf);
+    const auto to_src = transition(self.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &to_src);
+    list->CopyBufferRegion(dst.p, sizeof(input), self.p, 0, sizeof(input));
 
     CHECK(submit_and_wait(list.p, queue.p, fence.p, 1));
     CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
 
-    std::array<std::uint32_t, 4> out{};
+    std::array<std::uint32_t, 8> out{};
     CHECK(read_buffer(dst.p, out.data(), sizeof(out)));
-    CHECK(out == input);
+    CHECK(std::equal(input.begin(), input.end(), out.begin()));
+    CHECK(std::equal(input.begin(), input.end(), out.begin() + input.size()));
 
     // {64, UINT64_MAX} on a 64-byte buffer passes Close() (matching WARP + HW D3D12) but fails replay bounds check.
     CHECK(SUCCEEDED(allocator->Reset()));
@@ -248,7 +259,7 @@ bool test_atomic_copy_gpu(ID3D12Device* device) {
     queue->ExecuteCommandLists(1, lists);
     CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
 
-    std::printf("PASS [layer] AtomicCopyBufferUINT count=0 and UINT64_MAX sentinel GPU readback\n");
+    std::printf("PASS [layer] AtomicCopyBufferUINT distinct and self-copy GPU readback with sentinel bounds checks\n");
     return true;
 }
 
@@ -352,6 +363,13 @@ std::vector<ParityCase> build_cases() {
          }},
         {"AtomicCopyUINT count=0, null/null", D, true, true,
          [=](Env& e, auto*, auto* l1) { l1->AtomicCopyBufferUINT(e.buf64.p, 0, e.buf64_2.p, 0, 0, nullptr, nullptr); }},
+        {"AtomicCopyUINT same buffer and offset, count=0", D, true, true,
+         [=](Env& e, auto*, auto* l1) { l1->AtomicCopyBufferUINT(e.buf64.p, 4, e.buf64.p, 4, 0, nullptr, nullptr); }},
+        {"AtomicCopyUINT same buffer and offset, count=1", D, true, true,
+         [=](Env& e, auto*, auto* l1) {
+             ID3D12Resource* r = e.buf64_2.p;
+             l1->AtomicCopyBufferUINT(e.buf64.p, 4, e.buf64.p, 4, 1, &r, &dep_ok);
+         }},
         {"AtomicCopyUINT64 count=0, null/null", D, true, false,
          [=](Env& e, auto*, auto* l1) {
              l1->AtomicCopyBufferUINT64(e.buf64.p, 0, e.buf64_2.p, 0, 0, nullptr, nullptr);

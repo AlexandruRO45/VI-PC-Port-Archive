@@ -2499,9 +2499,12 @@ The trace will enumerate them.
   global barrier does not already cover. Recording matches live Windows 11 WARP and hardware D3D12 `Close`
   validation: offsets aligned to and within the buffer for the copy size, zero dependencies allowed (with null
   arrays), buffer dependency ranges with `begin < end` and either `end == UINT64_MAX` or `end <= width`, and
-  texture dependency ranges `{0, UINT64_MAX}` on a valid subresource or `ALL_SUBRESOURCES`. **ASSUMPTION:** Vulkan
-  promises no atomicity for a transfer, and the layer relies on a naturally aligned 4- or 8-byte copy being a
-  single write on the GPU. This matters only to a reader racing the copy on another queue or on the host.
+  texture dependency ranges `{0, UINT64_MAX}` on a valid subresource or `ALL_SUBRESOURCES`. A UINT copy to the same
+  offset of the same resource emits an
+  `ALL_COMMANDS`/`MEMORY_WRITE` → `ALL_COMMANDS`/`MEMORY_READ|WRITE` barrier without a transfer.
+  **ASSUMPTION:** Vulkan promises no atomicity for a transfer, and the layer relies on a naturally aligned 4- or
+  8-byte copy being a single write on the GPU. This matters only to a reader racing the copy on another queue or on
+  the host.
 - Clears: a full-subresource clear maps to `vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` (UAV buffers to
   `vkCmdFillBuffer`); a rect clear uses `vkCmdClearAttachments` inside the rendering scope. UAV image clears use
   `vkCmdClearColorImage` in `GENERAL`, and rectangles `vkCmdClearAttachments`. Buffer patterns of other sizes

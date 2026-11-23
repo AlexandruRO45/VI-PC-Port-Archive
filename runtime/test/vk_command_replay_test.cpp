@@ -780,6 +780,8 @@ int part_f(vktest::Device& d) {
     EXPECT(list.write_immediate({va_a + 4, 0x22222222, m::marker_in}));
     EXPECT(list.write_immediate({va_c, 0x33333333, m::marker_out}));       // lands at b + 128
     EXPECT(list.write_immediate({va_c + c_size - 4, 0x55555555, m::normal}));  // the last word of c
+    EXPECT(list.atomic_copy({a_id, 4, a_id, 4, 4, {}}));
+    EXPECT(list.atomic_copy({a_id, 4, a_id, 4, 4, {{a_id, 0, 0, 8}}}));
     // The copies wait for the writes before them (RAW on a); the MARKER_OUT write after them waits for them (WAR).
     EXPECT(list.atomic_copy({b_id, 0, a_id, 4, 4, {{a_id, 0, 0, 8}}}));
     EXPECT(list.atomic_copy({b_id, 8, a_id, 0, 8, {{a_id, 0, 0, 8}, {c_id, 0, 0, 4}}}));

@@ -2911,8 +2911,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             out.wrote_readback = true;
             out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
-            if (!vk.copy_buffer) return ReplayResult::unsupported;
-            if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
+            const bool same_location = atomic->dst == atomic->src && atomic->dst_offset == atomic->src_offset;
+            if (!same_location && !vk.copy_buffer) return ReplayResult::unsupported;
             const ResourceBinding* source = resolve(atomic->src);
             if (!bind(atomic->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
@@ -2928,6 +2928,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         return ReplayResult::invalid_copy;
                 }
             }
+            // The empty region list leaves the atomic command in place for its memory dependency.
+            if (same_location) continue;
+            if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             p.buffer_copies.push_back({p.source.buffer_offset + atomic->src_offset,
                                        p.binding.buffer_offset + atomic->dst_offset, atomic->bytes});
             if (p.binding.host_readable) {
@@ -3899,6 +3902,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.update_buffer(command_buffer, p.write_buffer, p.write_offset, 4, &write->value);
             if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
         } else if (std::holds_alternative<AtomicCopyBuffer>(command)) {
+            if (p.buffer_copies.empty()) {
+                // An identical range cannot be copied by Vulkan. Order the dependent writes before later accesses.
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                continue;
+            }
             // Every earlier write, to the dependent resources among others, finishes and is visible before the copy.
             // Vulkan promises no atomicity for a transfer; that a naturally aligned 4- or 8-byte copy is one write
             // is an assumption about the hardware (docs/d3d12_vulkan.md, section 4.2).

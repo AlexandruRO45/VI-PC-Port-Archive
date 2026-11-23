@@ -15,12 +15,22 @@ std::vector<VkBufferImageCopy> b2i_copies;
 std::vector<VkBufferImageCopy> i2b_copies;
 std::vector<leonida::Depth24Job> depth24_jobs;
 
-VKAPI_ATTR void VKAPI_CALL noop_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
-                                        std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
-                                        const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+enum class CopyEvent { copy, memory_barrier };
+std::vector<CopyEvent> copy_events;
+
+VKAPI_ATTR void VKAPI_CALL rec_barrier(VkCommandBuffer, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+                                      VkDependencyFlags, std::uint32_t count, const VkMemoryBarrier* barriers,
+                                      std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t,
+                                      const VkImageMemoryBarrier*) {
+    if (count == 1 && src == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && dst == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT &&
+        barriers[0].srcAccessMask == VK_ACCESS_MEMORY_WRITE_BIT &&
+        barriers[0].dstAccessMask == (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT))
+        copy_events.push_back(CopyEvent::memory_barrier);
+}
 
 VKAPI_ATTR void VKAPI_CALL rec_copy_buffer(VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t count,
                                            const VkBufferCopy* regions) {
+    copy_events.push_back(CopyEvent::copy);
     for (std::uint32_t i = 0; i < count; ++i) buffer_copies.push_back(regions[i]);
 }
 
@@ -56,7 +66,7 @@ int main() {
     using namespace leonida;
 
     ReplayFunctions vk{};
-    vk.pipeline_barrier = noop_barrier;
+    vk.pipeline_barrier = rec_barrier;
     vk.copy_buffer = rec_copy_buffer;
     vk.copy_buffer_to_image = rec_copy_b2i;
     vk.copy_image_to_buffer = rec_copy_i2b;
@@ -138,6 +148,7 @@ int main() {
         b2i_copies.clear();
         i2b_copies.clear();
         depth24_jobs.clear();
+        copy_events.clear();
         return replay(list, VK_NULL_HANDLE, resolve, vk);
     };
 
@@ -308,6 +319,26 @@ int main() {
         expect(run(up) == ReplayResult::unsupported, "rgb96 upload rejects misaligned backing buffer_offset");
         src_buf = saved_src;
         dst_buf = saved_dst;
+    }
+
+    // 6. AtomicCopyBufferUINT onto itself orders dependent writes without emitting an overlapping Vulkan copy.
+    {
+        CommandList list;
+        expect(list.copy_buffer({2, 0, 1, 0, 4}), "record copy before self atomic copies");
+        expect(list.atomic_copy({2, 0, 2, 0, 4, {{2, 0, 0, 4}}}), "record dependent self atomic copy");
+        expect(list.atomic_copy({2, 0, 2, 0, 4, {}}), "record self atomic copy with no dependencies");
+        expect(list.copy_buffer({1, 0, 2, 0, 4}) && list.close(), "record copy after self atomic copies");
+        expect(run(list) == ReplayResult::success, "self atomic copies replay");
+        const std::vector<CopyEvent> want{CopyEvent::copy, CopyEvent::memory_barrier, CopyEvent::memory_barrier,
+                                          CopyEvent::copy};
+        expect(copy_events == want && buffer_copies.size() == 2,
+               "self atomic copies emit only global memory barriers between the two data copies");
+
+        CommandList invalid;
+        expect(invalid.atomic_copy({2, 0, 2, 0, 4, {{1, 0, 0, src_buf.size + 4}}}) && invalid.close(),
+               "record self atomic copy with an out-of-bounds dependency");
+        expect(run(invalid) == ReplayResult::invalid_copy && copy_events.empty(),
+               "self atomic copy still validates dependencies before emitting commands");
     }
 
     if (failures) return 1;
