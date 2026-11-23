@@ -42,7 +42,8 @@ constexpr HRESULT not_run = HRESULT(0x7fff0000);  // the case needs an interface
 
 struct Env {
     ID3D12Device* device = nullptr;
-    Ref<ID3D12Resource> buffer, upload, readback, target, target2, depth, msaa, tex, mips;
+    Ref<ID3D12Resource> buffer, upload, readback, target, target2, depth, msaa, msaa2, tex, mips;
+    Ref<ID3D12Resource> typeless_target, typeless_msaa, r32f_target, small_target, small_msaa, tex1d, tex3d;
     Ref<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
     Ref<ID3D12QueryHeap> occlusion;
@@ -88,6 +89,42 @@ struct Env {
                      D3D12_RESOURCE_STATE_DEPTH_WRITE, depth));
         CHECK(create(default_heap, texture(rgba, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 4),
                      D3D12_RESOURCE_STATE_COMMON, msaa));
+        CHECK(create(default_heap, texture(rgba, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 4),
+                     D3D12_RESOURCE_STATE_COMMON, msaa2));
+        CHECK(create(default_heap, texture(DXGI_FORMAT_R8G8B8A8_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                     D3D12_RESOURCE_STATE_COMMON, typeless_target));
+        CHECK(create(default_heap, texture(DXGI_FORMAT_R8G8B8A8_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 4),
+                     D3D12_RESOURCE_STATE_COMMON, typeless_msaa));
+        CHECK(create(default_heap, texture(DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                     D3D12_RESOURCE_STATE_COMMON, r32f_target));
+        {
+            auto small_desc = texture(rgba, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 1);
+            small_desc.Width = small_desc.Height = 32;
+            CHECK(create(default_heap, small_desc, D3D12_RESOURCE_STATE_COMMON, small_target));
+            small_desc.SampleDesc.Count = 4;
+            CHECK(create(default_heap, small_desc, D3D12_RESOURCE_STATE_COMMON, small_msaa));
+        }
+        {
+            D3D12_RESOURCE_DESC d1{};
+            d1.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+            d1.Width = 64;
+            d1.Height = 1;
+            d1.DepthOrArraySize = 1;
+            d1.MipLevels = 1;
+            d1.Format = rgba;
+            d1.SampleDesc.Count = 1;
+            CHECK(create(default_heap, d1, D3D12_RESOURCE_STATE_COMMON, tex1d));
+        }
+        {
+            D3D12_RESOURCE_DESC d3{};
+            d3.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            d3.Width = d3.Height = 64;
+            d3.DepthOrArraySize = 2;
+            d3.MipLevels = 1;
+            d3.Format = rgba;
+            d3.SampleDesc.Count = 1;
+            CHECK(create(default_heap, d3, D3D12_RESOURCE_STATE_COMMON, tex3d));
+        }
         const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                                                   0};
         const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
@@ -291,16 +328,44 @@ std::vector<Case> cases() {
         // ResolveSubresource
         {"ResolveSubresource 4x -> 1x", true, match,
          CALLS(e.list->ResolveSubresource(e.target.p, 0, e.msaa.p, 0, rgba))},
-        {"ResolveSubresource with format UNKNOWN", false, looser,
+        {"ResolveSubresource with format UNKNOWN", false, match,
          CALLS(e.list->ResolveSubresource(e.target.p, 0, e.msaa.p, 0, DXGI_FORMAT_UNKNOWN))},
+        {"ResolveSubresource with format TYPELESS", false, match,
+         CALLS(e.list->ResolveSubresource(e.typeless_target.p, 0, e.typeless_msaa.p, 0, DXGI_FORMAT_R8G8B8A8_TYPELESS))},
         {"ResolveSubresource as RGBA8_SRGB of RGBA8 textures", true, match,
          CALLS(e.list->ResolveSubresource(e.target.p, 0, e.msaa.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB))},
-        {"ResolveSubresource as R32_FLOAT of RGBA8 textures", false, looser,
+        {"ResolveSubresource as RGBA8_UNORM of RGBA8_TYPELESS textures", true, match,
+         CALLS(e.list->ResolveSubresource(e.typeless_target.p, 0, e.typeless_msaa.p, 0, rgba))},
+        {"ResolveSubresource as R32_FLOAT of RGBA8 textures", false, match,
          CALLS(e.list->ResolveSubresource(e.target.p, 0, e.msaa.p, 0, DXGI_FORMAT_R32_FLOAT))},
-        {"ResolveSubresource from a single-sampled texture", false, looser,
+        {"ResolveSubresource into mismatched R32_FLOAT destination", false, match,
+         CALLS(e.list->ResolveSubresource(e.r32f_target.p, 0, e.msaa.p, 0, rgba))},
+        {"ResolveSubresource from a single-sampled texture", false, match,
          CALLS(e.list->ResolveSubresource(e.target.p, 0, e.target2.p, 0, rgba))},
+        {"ResolveSubresource into a multisampled texture", false, match,
+         CALLS(e.list->ResolveSubresource(e.msaa2.p, 0, e.msaa.p, 0, rgba))},
         {"ResolveSubresource with the destination as the source", false, match,
          CALLS(e.list->ResolveSubresource(e.msaa.p, 0, e.msaa.p, 0, rgba))},
+        {"ResolveSubresource with dst subresource out of range", false, match,
+         CALLS(e.list->ResolveSubresource(e.target.p, 1, e.msaa.p, 0, rgba))},
+        {"ResolveSubresource with src subresource out of range", false, match,
+         CALLS(e.list->ResolveSubresource(e.target.p, 0, e.msaa.p, 1, rgba))},
+        {"ResolveSubresource 32x32 -> 64x64 mip 1 (32x32)", true, match,
+         CALLS(e.list->ResolveSubresource(e.mips.p, 1, e.small_msaa.p, 0, rgba))},
+        {"ResolveSubresource 32x32 -> 64x64 mip 0 (larger dst)", true, match,
+         CALLS(e.list->ResolveSubresource(e.mips.p, 0, e.small_msaa.p, 0, rgba))},
+        {"ResolveSubresource 64x64 -> 64x64 mip 1 (top-level 64x64)", true, match,
+         CALLS(e.list->ResolveSubresource(e.mips.p, 1, e.msaa.p, 0, rgba))},
+        {"ResolveSubresource 64x64 -> 32x32 (smaller dst)", false, match,
+         CALLS(e.list->ResolveSubresource(e.small_target.p, 0, e.msaa.p, 0, rgba))},
+        {"ResolveSubresource into a buffer", false, match,
+         CALLS(e.list->ResolveSubresource(e.buffer.p, 0, e.msaa.p, 0, rgba))},
+        {"ResolveSubresource from a buffer", false, match,
+         CALLS(e.list->ResolveSubresource(e.target.p, 0, e.buffer.p, 0, rgba))},
+        {"ResolveSubresource into a 1D texture", false, match,
+         CALLS(e.list->ResolveSubresource(e.tex1d.p, 0, e.msaa.p, 0, rgba))},
+        {"ResolveSubresource into a 3D texture", false, match,
+         CALLS(e.list->ResolveSubresource(e.tex3d.p, 0, e.msaa.p, 0, rgba))},
         // Input assembler, rasterizer, output merger
         {"IASetVertexBuffers(30, 4): slots past 31", true, stricter,
          CALLS(const D3D12_VERTEX_BUFFER_VIEW v[4] = {}; e.list->IASetVertexBuffers(30, 4, v))},
@@ -482,6 +547,18 @@ int main() {
         Env env;
         REQUIRE(env.init(ours.p));
         for (std::size_t i = 0; i < table.size(); ++i) REQUIRE(run_case(env, table[i], layer[i]));
+        // Null resources crash the native runtime, so check them on the layer only.
+        const Case null_cases[] = {
+            {"ResolveSubresource with null destination", false, Known::match,
+             CALLS(e.list->ResolveSubresource(nullptr, 0, e.msaa.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM))},
+            {"ResolveSubresource with null source", false, Known::match,
+             CALLS(e.list->ResolveSubresource(e.target.p, 0, nullptr, 0, DXGI_FORMAT_R8G8B8A8_UNORM))},
+        };
+        for (const auto& c : null_cases) {
+            HRESULT hr = S_OK;
+            REQUIRE(run_case(env, c, hr));
+            REQUIRE(hr == E_INVALIDARG);
+        }
     }
 
     bool warp_ran = false;

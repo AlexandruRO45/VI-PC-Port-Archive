@@ -8446,6 +8446,36 @@ bool color_resolve_format_is_integer(DXGI_FORMAT format) {
     return DeviceState::numeric_class(vulkan_format(format, false).format) != 0;
 }
 
+bool resolve_subresource_valid(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource,
+                               ID3D12Resource* src, UINT src_subresource) {
+    if (!dst || !src || dst == src) return false;
+    const D3D12_RESOURCE_DESC dst_desc = dst->GetDesc();
+    const D3D12_RESOURCE_DESC src_desc = src->GetDesc();
+    if (dst_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        return false;
+    if (src_desc.SampleDesc.Count <= 1 || dst_desc.SampleDesc.Count != 1) return false;
+    if (format == DXGI_FORMAT_UNKNOWN) return false;
+    const Format requested = texture_storage_format(format, false);
+    const bool depth_plane_view = format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                  format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    if (!depth_plane_view && (requested.format == VK_FORMAT_UNDEFINED || requested.typeless)) return false;
+    const auto integer_color = [](const D3D12_RESOURCE_DESC& desc) {
+        return !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+               color_resolve_format_is_integer(desc.Format);
+    };
+    if (color_resolve_format_is_integer(format) || integer_color(dst_desc) || integer_color(src_desc)) return false;
+    const DXGI_FORMAT family = format_family(format);
+    if (format_family(dst_desc.Format) != family || format_family(src_desc.Format) != family) return false;
+    const UINT dst_mips = dst_desc.MipLevels ? dst_desc.MipLevels : 1;
+    const UINT dst_array = dst_desc.DepthOrArraySize ? dst_desc.DepthOrArraySize : 1;
+    const UINT src_mips = src_desc.MipLevels ? src_desc.MipLevels : 1;
+    const UINT src_array = src_desc.DepthOrArraySize ? src_desc.DepthOrArraySize : 1;
+    if (dst_subresource >= UINT64(dst_mips) * dst_array || src_subresource >= UINT64(src_mips) * src_array)
+        return false;
+    return dst_desc.Width >= src_desc.Width && dst_desc.Height >= src_desc.Height;
+}
+
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
     if (!dst || !src) return false;
     const Format requested = vulkan_format(format, false);

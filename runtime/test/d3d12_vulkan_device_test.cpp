@@ -6281,16 +6281,13 @@ int main() {
                                             DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, D3D12_RESOLVE_MODE_AVERAGE);
             EXPECT(list->Close() == E_INVALIDARG);
 
-            // A resolve of a resource into itself is refused when it is recorded, one from a single-sampled
-            // texture when it is executed; nothing is submitted.
+            // A resolve of a resource into itself or from a single-sampled texture is refused when recorded.
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list->ResolveSubresource(resolved.p, 0, resolved.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
             EXPECT(list->Close() == E_INVALIDARG);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list->ResolveSubresource(resolved.p, 0, source.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
-            EXPECT(list->Close() == S_OK);
-            queue->ExecuteCommandLists(1, lists);
-            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
+            EXPECT(list->Close() == E_INVALIDARG);
         }
 
         // D3D-26 through COM: AtomicCopyBufferUINT/UINT64 from the upload buffer to the readback buffer, discards of a

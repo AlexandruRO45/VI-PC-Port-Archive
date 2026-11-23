@@ -227,6 +227,11 @@ VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
 // Whether the requested colour format has an integer numeric class.
 bool color_resolve_format_is_integer(DXGI_FORMAT format);
 
+// Whether a plain ResolveSubresource call has valid 2D textures, sample counts, subresources, dimensions and
+// compatible non-typeless, non-integer resolve format (measured on Windows 11 WARP and RTX 5090 D3D12).
+bool resolve_subresource_valid(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource,
+                               ID3D12Resource* src, UINT src_subresource);
+
 // Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
 
