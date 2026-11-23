@@ -42,13 +42,16 @@ import json
 import os
 import re
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict, deque
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import gamedata_xml as gx  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 MANIFEST_ROOTS = ("CDataFileMgr__ContentChangeSetDef", "CDataFileMgr__ContentDef")
 MANIFEST_ROOT_SET = frozenset(MANIFEST_ROOTS)
@@ -587,6 +590,16 @@ def print_summary(graph: dict) -> None:
           f'{unresolved["include_id_missing"]} missing include id)')
 
 
+def write_report(path: str, graph: dict) -> None:
+    destination = Path(path).resolve()
+    with tempfile.TemporaryDirectory(prefix=".gamedata-graph-", dir=destination.parent) as folder:
+        staged = Path(folder) / "report.json"
+        with staged.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(graph, f, indent=1)
+        os.chmod(staged, published_mode(destination))
+        staged.replace(destination)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("targets", nargs="+", help="carve directory or XML file(s)")
@@ -629,8 +642,7 @@ def main() -> int:
     print_summary(graph)
     if args.json:
         try:
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(graph, f, indent=1)
+            write_report(args.json, graph)
         except OSError as exc:
             print(f"cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2

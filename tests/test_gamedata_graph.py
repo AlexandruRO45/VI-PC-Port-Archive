@@ -7,12 +7,16 @@ content definition that includes the first, a missing set id, all four documente
 unknown ``common:/`` scheme, two parent locators, a tail-only document and a malformed document.
 No game data is used.
 """
+import contextlib
+import io
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_graph.py")
@@ -471,6 +475,27 @@ class ParentPathInheritanceTest(unittest.TestCase):
         text = json.dumps(self.graph(INHERIT))
         for word in ("base", "leaf", "twin", "loopa", "far"):
             self.assertNotIn(word, text)
+
+
+class ReportPublicationTest(unittest.TestCase):
+    def test_failed_report_write_preserves_previous_report(self):
+        def interrupted_write(doc, stream, **kwargs):
+            stream.write('{"summary":')
+            raise OSError("simulated report write failure")
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "fixture.xml"
+            source.write_bytes(ALPHA)
+            report = Path(folder) / "graph.json"
+            previous = b'{"previous": true}\n'
+            report.write_bytes(previous)
+            args = [TOOL, str(source), "--json", str(report)]
+            with patch.object(sys, "argv", args), patch.object(gg.json, "dump", interrupted_write), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(gg.main(), 2)
+            self.assertIn("simulated report write failure", err.getvalue())
+            self.assertEqual(report.read_bytes(), previous)
+            self.assertCountEqual(Path(folder).iterdir(), [source, report])
 
 
 if __name__ == "__main__":
