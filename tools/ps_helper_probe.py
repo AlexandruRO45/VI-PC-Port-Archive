@@ -273,10 +273,14 @@ def main(argv=None):
     good = sum(ok for _n, ok, _d in checks)
     print(f"{good}/{len(checks)} checks hold")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"device": device, "checks": [[n, ok, d] for n, ok, d in checks],
-                       "words": {n: {f"{x},{y}": list(w) for (x, y), w in px.items()} for n, px in res.items()}},
-                      fh, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"device": device, "checks": [[n, ok, d] for n, ok, d in checks],
+                           "words": {n: {f"{x},{y}": list(w) for (x, y), w in px.items()} for n, px in res.items()}},
+                          fh, indent=1)
+        except OSError as error:
+            print(f"ERROR: cannot write {a.json}: {error}", file=sys.stderr)
+            return 2
     return 0 if good == len(checks) else 1
 
 

@@ -1,10 +1,14 @@
 """tools/ps_helper_probe.py: the analysis on a CPU model of what gfx1036 does (each check, and that it fails when the
 model breaks that rule), the programs' shape, and (with LEONIDA_PS_ORACLE_BUILD set to a runtime build
 and an AMD GPU selected) the measurement itself. Standard library only."""
+import io
 import os
+import tempfile
 import struct
 import sys
 import unittest
+from contextlib import redirect_stderr
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -116,6 +120,16 @@ class OnHardware(unittest.TestCase):
         except H.ps_oracle.Unavailable as e:
             self.skipTest(str(e))
         self.assertEqual([(n, d) for n, ok, d in H.analyze(res) if not ok], [])
+
+
+class ReportErrorTests(unittest.TestCase):
+    def test_json_directory_is_a_write_error(self):
+        with tempfile.TemporaryDirectory() as report, redirect_stderr(io.StringIO()) as error:
+            with mock.patch.object(H, "measure", return_value=("synthetic", {})), \
+                    mock.patch.object(H, "coverage_map", return_value=[]), \
+                    mock.patch.object(H, "analyze", return_value=[]):
+                self.assertEqual(H.main(["--build", ".", "--json", report]), 2)
+            self.assertIn(f"ERROR: cannot write {report}", error.getvalue())
 
 
 if __name__ == "__main__":
