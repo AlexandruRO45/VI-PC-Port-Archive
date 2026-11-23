@@ -189,6 +189,19 @@ class TestDenormModeTranslator(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("cs_denorm_trans", prog, fssm=saveexec_run.fssm())
 
+class TestSetPrioOracle(unittest.TestCase):
+    def test_oracle_clamping(self):
+        self.assertEqual(model_setprio(0), 0)
+        self.assertEqual(model_setprio(1), 1)
+        self.assertEqual(model_setprio(2), 2)
+        self.assertEqual(model_setprio(3), 3)
+
+    def test_translator_setprio_oracle(self):
+        prog = ["s_setprio 0", "s_endpgm"]
+        spv = support.translate_lines("cs_prio_oracle", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
