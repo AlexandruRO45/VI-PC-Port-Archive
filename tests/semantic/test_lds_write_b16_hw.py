@@ -323,5 +323,82 @@ class TestDSWriteB16IEEE754BitPatterns(unittest.TestCase):
             self.assertEqual(lds.read_u16(addr + i * 2), pat)
 
 
+# ==============================================================================
+# Negative Controls, Rejection, and Translator Hardware Execution
+# ==============================================================================
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import support
+import lds_run as L
+import rdna2spirv
+
+
+class TestDSWriteB16RejectionAndHardwareTranslator(unittest.TestCase):
+    def test_negative_controls_and_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            VGPR(300)
+        with self.assertRaises(ValueError):
+            DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(2), offset=70000)
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("bad_ds_write", ["ds_write_b16 v1"])
+
+    def test_translator_hardware_aligned_and_offset_writes(self):
+        """Validates ds_write_b16 execution through tools/rdna2spirv.py and spirv_mini_interp."""
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 0x12345678",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            # Overwrite low 16 bits with 0xABCD
+            "v_mov_b32_e32 v3, 0xABCD",
+            "ds_write_b16 v1, v3",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v5, v1",
+            "s_waitcnt lgkmcnt(0)",
+            # Overwrite high 16 bits with 0x9999 (offset: 2)
+            "v_mov_b32_e32 v4, 0x9999",
+            "ds_write_b16 v1, v4 offset:2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v6, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v31, 0",
+            "buffer_store_dword v5, v31, s[0:3], 0 offen",
+            "v_mov_b32_e32 v31, 4",
+            "buffer_store_dword v6, v31, s[0:3], 0 offen",
+        ]
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 0x1234ABCD)
+        self.assertEqual(mem.get(4), 0x9999ABCD)
+
+    def test_translator_hardware_cross_dword_write(self):
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 0x11111111",
+            "ds_write_b32 v1, v2",
+            "v_mov_b32_e32 v1, 0x44",
+            "v_mov_b32_e32 v2, 0x22222222",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v1, 0x43",
+            "v_mov_b32_e32 v3, 0xBBAA",
+            "ds_write_b16 v1, v3",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v1, 0x40",
+            "ds_read_b32 v5, v1",
+            "v_mov_b32_e32 v1, 0x44",
+            "ds_read_b32 v6, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v31, 0",
+            "buffer_store_dword v5, v31, s[0:3], 0 offen",
+            "v_mov_b32_e32 v31, 4",
+            "buffer_store_dword v6, v31, s[0:3], 0 offen",
+        ]
+        mem = L.run(body, lanes=1)
+        self.assertEqual(mem.get(0), 0xAA111111)
+        self.assertEqual(mem.get(4), 0x222222BB)
+
+
 if __name__ == '__main__':
     unittest.main()
