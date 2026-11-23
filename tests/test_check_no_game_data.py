@@ -38,6 +38,8 @@ CAUGHT = [
     ("pool.dat", b"TTPF" + bytes(12), "TTPF texture pool"),
     ("resource.dat", b"RSC8" + bytes(12), "RAGE resource"),
     ("page.dat", b"0DRP" + bytes(12), "RAGE page directory"),
+    # The measured header: the marker at +0x10, version 122 at +0x14 (docs/page_directory.md).
+    ("page_header.dat", bytes(0x10) + b"0DRP" + b"\x7a" + bytes(0x4E), "RAGE page directory"),
     ("tree.dat", b"RBF0" + bytes(12), "RBF0 tree"),
     ("shader.txt", b"XBCH" + (3).to_bytes(4, "little") + bytes(8), "XBCH shader container"),
     ("shader2.txt", b"FSSM" + bytes(12), "FSSM shader"),
