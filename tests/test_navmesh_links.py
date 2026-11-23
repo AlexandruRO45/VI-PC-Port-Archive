@@ -463,6 +463,18 @@ class NavmeshLinksTest(unittest.TestCase):
                     self.assertIn("past the end", err.getvalue())
                     self.assertIn(str(size), err.getvalue())
 
+    def test_cli_start_at_the_data_area_still_scans(self):
+        """The new guard must not refuse a start that is inside the archive."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "nav.rpf")
+            make_rpf(rpf, build_tile())
+            with open(rpf, "rb") as fh:
+                data_start = struct.unpack_from("<I", fh.read(8), 4)[0]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(nl.main([rpf, "--start", str(data_start)]), 0)
+            self.assertEqual(json.loads(out.getvalue())["tiles"], 1)
+
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             rpf = os.path.join(tmp, "nav.rpf")
