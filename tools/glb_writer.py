@@ -1381,6 +1381,11 @@ def main(argv: list[str] | None = None) -> int:
         default="z",
         help="Source up axis: 'z' converts RAGE Z-up to glTF Y-up (default), 'y' keeps Y-up",
     )
+    parser.add_argument(
+        "--flip-v",
+        action="store_true",
+        help="Flip V coordinate (1.0 - v) for bottom-left Wavefront OBJs; off by default for rpf9dump OBJs",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1388,7 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
         if os.path.exists(args.out_glb) and os.path.exists(args.in_obj) and os.path.samefile(
                 args.in_obj, args.out_glb):
             raise GlbError(f"output must not overwrite the input OBJ: {args.in_obj}")
-        primitives = parse_obj(args.in_obj, is_path=True, up_axis=args.up)
+        primitives = parse_obj(args.in_obj, is_path=True, up_axis=args.up, flip_v=args.flip_v)
         stats = write_glb(args.out_glb, primitives)
     except (GlbError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -1168,6 +1168,30 @@ class TestGlbWriterMainCli(unittest.TestCase):
                 with open(obj_path, encoding="utf-8", newline="") as f:
                     self.assertEqual(f.read(), text)
 
+    def test_main_cli_uv_flip_flag(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            obj_path = os.path.join(tmp_dir, "uv.obj")
+            glb_default = os.path.join(tmp_dir, "default.glb")
+            glb_flipped = os.path.join(tmp_dir, "flipped.glb")
+            with open(obj_path, "w", encoding="utf-8") as f:
+                f.write("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0.25 0.1\nvt 0.5 0.2\nvt 0.0 0.3\nf 1/1 2/2 3/3\n")
+
+            def read_v0(path: str) -> float:
+                with open(path, "rb") as f:
+                    data = f.read()
+                gltf = glb_writer.read_glb_summary(data)["json"]
+                acc = gltf["accessors"][gltf["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_0"]]
+                bv = gltf["bufferViews"][acc["bufferView"]]
+                json_len = struct.unpack_from("<I", data, 12)[0]
+                off = 28 + json_len + bv["byteOffset"]
+                return struct.unpack_from("<2f", data, off)[1]
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(glb_writer.main([obj_path, glb_default]), 0)
+                self.assertEqual(glb_writer.main([obj_path, glb_flipped, "--flip-v"]), 0)
+            self.assertAlmostEqual(read_v0(glb_default), 0.1, places=5)
+            self.assertAlmostEqual(read_v0(glb_flipped), 0.9, places=5)
+
 
 if __name__ == "__main__":
     unittest.main()
