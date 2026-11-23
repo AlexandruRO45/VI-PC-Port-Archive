@@ -2261,11 +2261,59 @@ def build_pipeline_check(jobs: int) -> None:
                 "or VULKAN_SDK); the CMake output above says which is missing.")
 
 
+def package_discord_presence(game: str, out: str, image: str, profile: str | None = None) -> None:
+    """Prepare the user's setup beside the runtime; never write to the input package or replace edits on rebuild."""
+    destination = os.path.join(out, "discord_presence.json")
+    logo = os.path.join(game, "xbs_logo_480.png")
+    if os.path.isfile(logo):
+        copied_logo = os.path.join(out, "xbs_logo_480.png")
+        if not os.path.exists(copied_logo) or not os.path.samefile(logo, copied_logo):
+            shutil.copy2(logo, copied_logo)
+    if profile:
+        # This is private user configuration, including their local presence catalogue; never a repository asset.
+        with open(profile, encoding="utf-8") as f:
+            presence = json.load(f)
+        if not isinstance(presence, dict) or not isinstance(presence.get("application_id"), str) or \
+                not re.fullmatch(r"[0-9]{16,20}", presence["application_id"]) or not presence.get("strings"):
+            fail("runtime: Discord configuration needs an Application ID and a verified local strings catalogue "
+                 "(docs/discord_presence.md)")
+        with open(image, "rb") as f:
+            digest = hashlib.file_digest(f, "sha256").hexdigest()
+        if presence.get("image_sha256") != digest:
+            fail("runtime: Discord profile SHA-256 does not match this executable")
+        if os.path.exists(destination) and os.path.samefile(profile, destination):
+            return
+    elif os.path.exists(destination):
+        return
+    else:
+        digest = ""
+        if os.path.isfile(image):
+            with open(image, "rb") as f:
+                digest = hashlib.file_digest(f, "sha256").hexdigest()
+        presence = {
+            "_comment": [
+                "Discord setup: https://discord.com/developers/applications",
+                "Create an application named Grand Theft Auto VI. Under General Information, copy Application ID.",
+                "Paste that public ID into application_id below. Leave it empty to disable presence.",
+                "Do not enter a client secret, password, or user token.",
+                "Upload the bundled xbs_logo_480.png under Rich Presence > Art Assets as xbs_logo_480.",
+                "Restart the game after editing. This file is read automatically; no launch flags are needed.",
+                "The hook RVAs and strings must come from a verified profile for this exact executable.",
+                "0x0 and an empty strings object are unconfigured placeholders, not working Xbox presence data."
+            ],
+            "application_id": "", "image_sha256": digest,
+            "call_rva": "0x0", "setter_rva": "0x0", "strings": {}
+        }
+    with open(destination, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(presence, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
             *, work: str | None = None, discord_presence: str | None = None) -> None:
-    destinations = [*RUNTIME_FILES, "game_path.txt"]
-    if discord_presence:
-        destinations.append("discord_presence.json")
+    destinations = [*RUNTIME_FILES, "game_path.txt", "discord_presence.json"]
+    if os.path.isfile(os.path.join(game, "xbs_logo_480.png")):
+        destinations.append("xbs_logo_480.png")
     if os.name == "nt":
         destinations.extend(("Play.ps1", "Play.cmd"))
     if work is not None:
@@ -2302,24 +2350,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             shutil.copy2(built, out)
     with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(os.path.abspath(game))
-    if discord_presence:
-        # This is private user configuration, including their local presence catalogue; never a repository asset.
-        with open(discord_presence, encoding="utf-8") as f:
-            presence = json.load(f)
-        if not isinstance(presence, dict) or not isinstance(presence.get("application_id"), str) or \
-                not re.fullmatch(r"[0-9]{16,20}", presence["application_id"]) or not presence.get("strings"):
-            fail("runtime: Discord configuration needs an Application ID and a verified local strings catalogue "
-                 "(docs/discord_presence.md)")
-        image_path = os.path.join(game, v["expected_exe"])
-        with open(image_path, "rb") as f:
-            digest = hashlib.file_digest(f, "sha256").hexdigest()
-        if presence.get("image_sha256") != digest:
-            fail("runtime: Discord profile SHA-256 does not match this executable")
-        destination = os.path.join(out, "discord_presence.json")
-        if os.path.abspath(discord_presence) != os.path.abspath(destination):
-            with open(destination, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(presence, f, ensure_ascii=False, indent=2)
-                f.write("\n")
+    package_discord_presence(game, out, os.path.join(game, v["expected_exe"]), discord_presence)
     if os.name == "nt":
         executable = "'" + re.sub(r"['\u2018-\u201b]", r"\g<0>\g<0>", v["expected_exe"]) + "'"
         with open(os.path.join(out, "Play.ps1"), "w", encoding="utf-8", newline="\n") as f:

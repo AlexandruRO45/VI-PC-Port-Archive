@@ -9,13 +9,32 @@ The activity is Playing (`type: 0`), named **Grand Theft Auto VI**, with the res
 Its large image asset is `xbs_logo_480`, and its **Leonida** button links to
 <https://github.com/ItsNotRexed/Leonida>.
 
-## Set up before building
+## Setup file beside the output game
+
+Every runtime build creates `discord_presence.json` beside `gta6rt.exe`, even without a presence option.
+It contains an empty `application_id` and `_comment` instructions for creating your own Discord application,
+copying its public Application ID, and setting up its artwork. `_comment` is ordinary JSON data so the file
+remains valid JSON. Rebuilding preserves an existing setup file, including your edits.
+
+The builder copies `xbs_logo_480.png` from your game package into the output when present. It never writes into
+the package. Discord cannot display that local file directly: upload the copied image to your own application's
+Rich Presence assets under `xbs_logo_480`. This is required once per Discord application.
+
+Leave `application_id` empty to disable presence. A blank or invalid configuration does not prevent the game
+from starting. After setup, restart the game; the runtime reads the adjacent file automatically.
+
+The generated template records the executable hash, but its zero hook RVAs and empty strings are placeholders.
+Entering an Application ID alone does not supply the missing Xbox text catalogue or a verified hook profile.
+For a complete profile, supply the file during the build as described below.
+
+## Supplying a complete profile before building
 
 1. In the [Discord Developer Portal](https://discord.com/developers/applications), create an application named
    **Grand Theft Auto VI**. Copy its Application ID. The portal application name must match: Discord may display
    that registered name instead of the activity's `name` field.
 2. Upload your own `xbs_logo_480.png` in that application's Rich Presence art assets, using the asset key
-   **xbs_logo_480**. No artwork is distributed here. Wait for Discord to finish processing the asset.
+   **xbs_logo_480**. The runtime output includes the image copied from your game package; none is distributed in
+   the repository. Wait for Discord to finish processing the asset.
 3. Create a private configuration outside the repository and game package, following the schema below.
    Use the SHA-256 and verified callsite/setter RVAs for your exact executable. RVAs are hexadecimal strings.
    Populate `strings` with verified local text in your chosen language. Do not upload the resulting catalogue.

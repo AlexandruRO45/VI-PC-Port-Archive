@@ -230,6 +230,8 @@ int main() {
     s.token_ids.clear();
     check(!resolve(config, s), "missing positional token is not published");
     Config bad;
+    check(parse_config(R"({"application_id":"","_comment":["Enter your own public Application ID"]})", bad, error) &&
+          bad.application_id.empty(), "generated blank Application ID disables optional presence");
     check(!parse_config("{}", bad, error), "incomplete configuration is rejected");
     std::string changed = config_text;
     changed.replace(changed.find("123456789012345678"), 18, "not-an-app-id");

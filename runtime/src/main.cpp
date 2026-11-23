@@ -169,10 +169,17 @@ int wmain(int argc, wchar_t** argv) {
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         std::unique_ptr<leonida::discord_presence::Bridge> discord;
         if (!discord_config.empty()) {
-            discord = std::make_unique<leonida::discord_presence::Bridge>(
-                leonida::discord_presence::load_config(discord_config));
-            discord->install(main_module.base, main_module.size, image);
-            std::fprintf(stderr, "[rt] presence: local Discord bridge enabled\n");
+            try {
+                auto config = leonida::discord_presence::load_config(discord_config);
+                if (!config.application_id.empty()) {
+                    discord = std::make_unique<leonida::discord_presence::Bridge>(std::move(config));
+                    discord->install(main_module.base, main_module.size, image);
+                    std::fprintf(stderr, "[rt] presence: local Discord bridge enabled\n");
+                } else std::fprintf(stderr, "[rt] presence: disabled; enter your Application ID in discord_presence.json\n");
+            } catch (const std::exception& e) {
+                discord.reset();
+                std::fprintf(stderr, "[rt] presence: disabled: %s\n", e.what());
+            }
         }
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.

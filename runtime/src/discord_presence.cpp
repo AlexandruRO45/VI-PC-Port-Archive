@@ -124,7 +124,12 @@ bool parse_config(std::string_view json, Config& config, std::string& error) {
     Json root;
     error = "presence: invalid configuration (see docs/discord_presence.md)";
     if (json.size() > 4 * 1024 * 1024 || !JsonReader(json).parse(root) || root.kind != Json::Kind::object ||
-        !string_field(root, "application_id", next.application_id) || next.application_id.size() < 16 ||
+        !string_field(root, "application_id", next.application_id)) return false;
+    if (next.application_id.empty()) {
+        config = std::move(next); error.clear();
+        return true;  // The generated setup file leaves the optional bridge disabled until an ID is supplied.
+    }
+    if (next.application_id.size() < 16 ||
         next.application_id.size() > 20 || next.application_id.find_first_not_of("0123456789") != std::string::npos ||
         !string_field(root, "image_sha256", next.image_sha256) || next.image_sha256.size() != 64 ||
         next.image_sha256.find_first_not_of("0123456789abcdef") != std::string::npos ||

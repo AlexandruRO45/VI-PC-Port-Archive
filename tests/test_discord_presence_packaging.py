@@ -13,6 +13,32 @@ import make_game
 
 
 class PackagingTest(unittest.TestCase):
+    def test_default_setup_is_created_and_preserves_user_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game, output = root / "game", root / "output"
+            game.mkdir()
+            output.mkdir()
+            image = game / "synthetic.exe"
+            image.write_bytes(b"synthetic image")
+            logo = game / "xbs_logo_480.png"
+            logo.write_bytes(b"synthetic artwork fixture")
+            source = {p.name: p.read_bytes() for p in game.iterdir()}
+            make_game.package_discord_presence(str(game), str(output), str(image))
+            config = output / "discord_presence.json"
+            setup = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(setup["application_id"], "")
+            self.assertIn("https://discord.com/developers/applications", " ".join(setup["_comment"]))
+            self.assertEqual(setup["image_sha256"], hashlib.sha256(b"synthetic image").hexdigest())
+            self.assertEqual((output / logo.name).read_bytes(), logo.read_bytes())
+            setup["application_id"] = "123456789012345678"
+            with config.open("w", encoding="utf-8", newline="\n") as stream:
+                json.dump(setup, stream)
+            before = config.read_bytes()
+            make_game.package_discord_presence(str(game), str(output), str(image))
+            self.assertEqual(config.read_bytes(), before)
+            self.assertEqual({p.name: p.read_bytes() for p in game.iterdir()}, source)
+
     def test_stage_runner_forwards_private_configuration(self):
         for overlap in (False, True):
             with self.subTest(overlap=overlap), mock.patch.object(make_game, "runtime") as runtime, \
