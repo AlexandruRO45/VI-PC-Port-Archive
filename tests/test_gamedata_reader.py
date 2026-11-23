@@ -385,6 +385,25 @@ class Run(unittest.TestCase):
                                            "Carve without --index-only.")
         self.assertEqual(r.stdout, "")
 
+    def test_cli_carved_stream_of_the_wrong_length(self):
+        # A .bin is the inflated stream, its row's "size" bytes: a cut-off one is one ERROR line, not a repr.
+        carve = os.path.join(self.tmp.name, "x.rpf")
+        os.mkdir(carve)
+        xml = b'<?xml version="1.0"?>\n<COther><x value="1"/></COther>\n'
+        row = {"off": 0x1000, "stored": len(xml), "size": len(xml), "head": xml[:16].hex()}
+        with open(os.path.join(carve, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"files": [row]}, f)
+        stream = os.path.join(carve, "000000001000.bin")
+        with open(stream, "wb") as f:
+            f.write(xml[:30])
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"), carve],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertTrue(r.stderr.startswith(f"ERROR: {stream} is 30 bytes"), r.stderr)
+        self.assertNotIn("IndexMismatch(", r.stderr)
+        self.assertEqual(r.stdout, "")
+
     def _cli(self, *args):
         return subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"), *args],
                               capture_output=True, text=True)

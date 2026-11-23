@@ -65,6 +65,7 @@ import unicodedata
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gamedata_index as gi  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MAGIC = (b"MHIU", b"PAMH")
@@ -303,10 +304,14 @@ def is_bink(row: dict) -> bool:
 
 
 def _read_row(directory: str, row: dict) -> bytes:
-    # A missing .bin raises FileNotFoundError naming it; the index head is 16 bytes, not the stream.
-    # Callers skip Bink rows (is_bink): they have no .bin to read.
-    with open(os.path.join(directory, f'{row["off"]:012x}.bin'), "rb") as f:
-        return f.read()
+    # A missing .bin raises FileNotFoundError naming it; the index head is 16 bytes, not the stream. One whose
+    # length is not the row's size raises gamedata_index.IndexMismatch. Callers skip Bink rows (is_bink): they
+    # have no .bin to read.
+    path = os.path.join(directory, f'{row["off"]:012x}.bin')
+    with open(path, "rb") as f:
+        data = f.read()
+    gi.check_stream_length(path, len(data), row)
+    return data
 
 
 def _join(row: dict, data: bytes) -> dict:
@@ -529,6 +534,13 @@ def main() -> int:
         if a.json:
             check_report_path(a.json, a.carve_dir, rows=rows)
         payloads = read_payloads(a.carve_dir, rows=rows)
+    except FileNotFoundError as e:
+        # A row's stream is missing (an --index-only carve): an input problem like a missing index.json (exit 2).
+        print(f"ERROR: {gi.missing_file_line(e)}", file=sys.stderr)
+        return 2
+    except gi.IndexMismatch as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     except (OSError, ValueError, KeyError, TypeError, struct.error) as e:
         print("error:", e, file=sys.stderr)
         return 1

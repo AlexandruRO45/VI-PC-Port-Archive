@@ -117,6 +117,33 @@ class ContentTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 list(carve_documents(directory))
 
+    def test_carve_block_of_the_wrong_length_is_an_error(self):
+        # A .bin is the inflated stream, its row's "size" bytes; a cut-off one parsed as a shorter document.
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_carve(directory, [CHANGE])
+            with open(os.path.join(directory, f'{rows[0]["off"]:012x}.bin'), 'wb') as f:
+                f.write(CHANGE[:120])
+            with self.assertRaisesRegex(ValueError, f"is 120 bytes.*{len(CHANGE)}"):
+                list(carve_documents(directory))
+
+    def test_carve_bink_row_is_checked_without_reading_the_video(self):
+        # Grouping reads only 64 bytes of a .bk2, but its length on disk still has to be the row's size.
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_carve(directory, [CHANGE])
+            video = b"KB2j" + bytes(196)
+            off = rows[-1]["off"] + 1000
+            path = os.path.join(directory, f'{off:012x}.bk2')
+            with open(path, 'wb') as f:
+                f.write(video)
+            rows.append(dict(off=off, size=len(video), stored=len(video), type="bink2", head=video[:16].hex()))
+            with open(os.path.join(directory, 'index.json'), 'w', encoding='utf-8', newline='\n') as f:
+                json.dump(dict(files=rows), f)
+            self.assertEqual([d.kind for _, _, d in carve_documents(directory)], ['change_set'])
+            with open(path, 'wb') as f:
+                f.write(video[:64])
+            with self.assertRaisesRegex(ValueError, "is 64 bytes"):
+                list(carve_documents(directory))
+
     def test_cli_counts_unrelated_standalone_xml_separately(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = [os.path.join(directory, name) for name in ("setup.xml", "other.xml", "broken.xml")]

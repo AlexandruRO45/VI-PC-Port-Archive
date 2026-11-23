@@ -226,6 +226,51 @@ class GamedataIndexTest(unittest.TestCase):
         finally:
             source.close()
 
+    def test_directory_stream_of_the_wrong_length_is_an_error(self):
+        # rpf9_carve.py writes the inflated stream, so a .bin is exactly its row's "size" bytes. A truncated or
+        # replaced .bin used to be read as the stream: here a cut-off document indexed as an incomplete one.
+        doc = b'<?xml version="1.0"?>\n<Foo a="1">' + b"<Bar/>" * 40 + b"</Foo>\n"
+        self.add(doc)
+        self.finish()
+        stream = os.path.join(self.carve, "000000001000.bin")
+        with open(stream, "wb") as f:
+            f.write(doc[:100])
+        source = T.DirectorySource(self.carve)
+        with self.assertRaisesRegex(T.IndexMismatch, f"is 100 bytes.*{len(doc)}"):
+            source.read(source.rows[0])
+        out = os.path.join(self.root, "out.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+        self.assertTrue(p.stderr.startswith(f"ERROR: {stream} is 100 bytes"), p.stderr)
+        self.assertIn(str(len(doc)), p.stderr)
+        self.assertNotIn("IndexMismatch(", p.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_directory_row_without_a_size_is_not_checked(self):
+        doc = b'<?xml version="1.0"?>\n<Foo a="1"><Bar/></Foo>\n'
+        self.add(doc)
+        del self.rows[0]["size"]
+        self.finish()
+        source = T.DirectorySource(self.carve)
+        self.assertEqual(source.read(source.rows[0]), doc)
+
+    def test_directory_reads_a_whole_bink_stream(self):
+        # A .bk2 is the video as stored: its length is the row's size (== stored), so a full carve still reads.
+        video = b"KB2j" + struct.pack("<I", 120 - 8) + bytes(112)
+        off = self.next_off
+        with open(os.path.join(self.carve, f"{off:012x}.bk2"), "wb") as f:
+            f.write(video)
+        self.rows.append({"off": off, "stored": len(video), "size": len(video), "type": "bink2", "w": 64, "h": 64,
+                          "frames": 1, "head": video[:16].hex(), "pre": ""})
+        self.finish()
+        source = T.DirectorySource(self.carve)
+        self.assertEqual(source.read(source.rows[0]), video)
+        with open(os.path.join(self.carve, f"{off:012x}.bk2"), "wb") as f:
+            f.write(video[:64])
+        with self.assertRaisesRegex(T.IndexMismatch, "is 64 bytes"):
+            source.read(source.rows[0])
+
     def test_directory_groups_chunks_and_roots(self):
         self.add(b'<?xml version="1.0"?>\n<RootA><!-- synthetic fixture, longer than 64 bytes --><Item value="1"/></RootA>')
         second = b'<?xml version="1.0"?>\n<RootB>' + b"x" * (65536 - len(b'<?xml version="1.0"?>\n<RootB>'))

@@ -272,10 +272,31 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertIn("000000001000.bin", cm.exception.filename)
         result = subprocess.run([sys.executable, "-I", TOOL, self.carve],
                                 capture_output=True, text=True, errors="replace")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("000000001000.bin", result.stderr)
-        self.assertNotIn("truncated", result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
+        # The same one line and exit 2 as gamedata_index, gamedata_xml and the other carve readers, not
+        # "error: [Errno 2] ..." and exit 1.
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        stream = os.path.join(self.carve, "000000001000.bin")
+        self.assertEqual(result.stderr.strip(), f"ERROR: {stream} is missing (an --index-only carve?). "
+                                                "Carve without --index-only.")
+        self.assertEqual(result.stdout, "")
+
+    def test_stream_of_the_wrong_length_is_an_error(self):
+        # A .bin is the inflated stream, exactly its row's "size" bytes; a cut-off one used to fail as a
+        # "truncated MHIU header", blaming the payload instead of the carve.
+        self.add(mhiu_payload(4, 3, [(0, 0, []), (0, 0, []), (0, 0, [])], pixels=b""))
+        self.finish()
+        stream = os.path.join(self.carve, "000000001000.bin")
+        with open(stream, "r+b") as f:
+            f.truncate(20)
+        with self.assertRaisesRegex(ValueError, "is 20 bytes"):
+            gamedata_maps.read_payloads(self.carve)
+        result = subprocess.run([sys.executable, "-I", TOOL, self.carve],
+                                capture_output=True, text=True, errors="replace")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith(f"ERROR: {stream} is 20 bytes"), result.stderr)
+        self.assertNotIn("MHIU header", result.stderr)
 
     def add_bink(self):
         # rpf9_carve.py saves a Bink 2 row as <off>.bk2 with type "bink2"; there is no .bin for it.

@@ -161,7 +161,8 @@ def carve_documents(directory):
     """Yield (offset, stored size, document) for XML payloads in an existing carve.
 
     Existing grouping determines spans; it does not recover encrypted TOC names.
-    A missing .bin raises OSError; a .bk2 is read only as far as grouping needs.
+    A missing .bin raises OSError and one whose length is not its row's size raises gamedata_index.IndexMismatch;
+    a .bk2 is read only as far as grouping needs, but its length on disk is still checked.
     Non-content XML yields None; malformed content raises ContentError.
     """
     tools_dir = os.path.dirname(os.path.abspath(__file__))
@@ -172,9 +173,15 @@ def carve_documents(directory):
     class Source(gi.DirectorySource):
         def read(self, row):
             ext = ".bk2" if row.get("type") == "bink2" else ".bin"
-            with open(os.path.join(self.directory, f'{row["off"]:012x}{ext}'), "rb") as stream:
+            path = os.path.join(self.directory, f'{row["off"]:012x}{ext}')
+            with open(path, "rb") as stream:
                 # Grouping only needs the Bink signature, not the video payload.
-                return stream.read(64) if ext == ".bk2" else stream.read()
+                if ext == ".bk2":
+                    gi.check_stream_length(path, os.fstat(stream.fileno()).st_size, row)
+                    return stream.read(64)
+                data = stream.read()
+            gi.check_stream_length(path, len(data), row)
+            return data
 
     source = Source(directory)
     positions = {r["off"]: i for i, r in enumerate(source.rows)}

@@ -179,6 +179,16 @@ class TestChains(unittest.TestCase):
         with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as fh:
             json.dump({"files": files, "summary": {}}, fh)
 
+    def test_stream_of_the_wrong_length_is_an_error(self):
+        # A .bin is the inflated stream, its row's "size" bytes; a cut-off one used to be scanned as the stream.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.carve(tmp, [make_resource(EN), CONV])
+            stream = os.path.join(tmp, f"{0x1000:012x}.bin")
+            with open(stream, "r+b") as fh:
+                fh.truncate(100)
+            with self.assertRaisesRegex(ValueError, "is 100 bytes"):
+                list(T.blobs(tmp))
+
     def test_resource_across_64k_streams(self):
         res = make_resource(EN, pad=T.BLOCK)            # tables start past the first 64 KiB
         streams = [res[:T.BLOCK], res[T.BLOCK:], make_resource(DE), CONV]

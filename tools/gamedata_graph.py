@@ -615,7 +615,7 @@ def main() -> int:
     except FileNotFoundError as exc:
         print(f"ERROR: {gi.missing_file_line(exc)}", file=sys.stderr)
         return 2
-    except RuntimeError as exc:
+    except (RuntimeError, gi.IndexMismatch) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except (OSError, ValueError, KeyError, TypeError) as exc:

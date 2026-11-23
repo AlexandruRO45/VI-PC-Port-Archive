@@ -599,6 +599,11 @@ def main(argv=None) -> int:
         line = gi.missing_file_line(e, "Pass script.rpf instead, or carve without --index-only.", "{}: does not exist")
         print(f"ERROR: {line}", file=sys.stderr)
         return 2
+    except gi.IndexMismatch as e:
+        # A carved stream of the wrong length (or an index that does not match the archive) is a bad input, not a
+        # verdict on the payload (exit 1).
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     except OSError as e:
         print(f"ERROR: cannot read {a.target}: {e.strerror or e}", file=sys.stderr)
         return 2

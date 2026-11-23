@@ -67,6 +67,20 @@ class BadGamedataXmlIndexTest(unittest.TestCase):
             self.assertIn("000000000000.bin is missing", result.stderr)
             self.assertIn("--index-only", result.stderr)
 
+    def test_stream_of_the_wrong_length_is_one_error_line(self):
+        # A .bin is the inflated stream, its row's "size" bytes; a cut-off one used to be scanned as the document.
+        with tempfile.TemporaryDirectory() as td:
+            doc = {"files": [{"off": 0, "stored": len(XML), "size": len(XML), "head": XML[:16].hex()}]}
+            carve = self.make_carve(td, doc, payload=XML[:50])
+            result = self.run_tool(carve)
+            self.assertNotIn("Traceback", result.stderr, result.stderr)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+            self.assertTrue(result.stderr.startswith(f"ERROR: {carve / '000000000000.bin'} is 50 bytes"),
+                            result.stderr)
+            self.assertIn(str(len(XML)), result.stderr)
+            self.assertNotIn("IndexMismatch(", result.stderr)
+
     def test_missing_target_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "nope")

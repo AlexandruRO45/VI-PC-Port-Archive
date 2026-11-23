@@ -116,7 +116,8 @@ class ScriptQtableTests(unittest.TestCase):
             carve = os.path.join(tmp, "carve")
             os.makedirs(carve)
             rows = [
-                {"off": 0x1000, "stored": 500, "size": len(b"PSIN" + bytes(120)), "head": (b"PSIN" + bytes(12)).hex()},
+                # "size" is the length of the .bin written below, as rpf9_carve.py records it.
+                {"off": 0x1000, "stored": 500, "size": len(b"PSIN" + bytes(124)), "head": (b"PSIN" + bytes(12)).hex()},
                 {"off": 0x2000, "stored": 10000, "size": len(chunk0), "head": chunk0[:16].hex()},
                 {"off": 0x5000, "stored": 2000, "size": len(chunk1), "head": chunk1[:16].hex()},
                 {"off": 0x9000, "stored": 400, "size": 128, "head": (b"PSIN" + bytes(12)).hex()},
@@ -217,6 +218,28 @@ class ScriptQtableTests(unittest.TestCase):
             stream = os.path.join(carve, "000000001000.bin")
             self.assertEqual(lines[0], f"ERROR: {stream} is missing (an --index-only carve?). "
                                        "Pass script.rpf instead, or carve without --index-only.")
+            self.assertEqual(p.stdout, "")
+
+    def test_carved_stream_of_the_wrong_length_is_one_error_line_and_exit_2(self):
+        # A .bin is the inflated stream, its row's "size" bytes; a cut-off one is a bad carve, not a payload verdict.
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "script.rpf")
+            os.mkdir(carve)
+            rows = [{"off": 0x1000, "stored": 64, "size": 128, "head": (b"PSIN" + bytes(12)).hex()}]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": {"archive": "synthetic", "files": 1}, "files": rows}, f)
+            stream = os.path.join(carve, "000000001000.bin")
+            with open(stream, "wb") as f:
+                f.write(b"PSIN" + bytes(60))
+            p = subprocess.run(
+                [sys.executable, "-I", TOOL, carve],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            lines = [line for line in p.stderr.splitlines() if line.strip()]
+            self.assertEqual(len(lines), 1, p.stderr)
+            self.assertTrue(lines[0].startswith(f"ERROR: {stream} is 64 bytes"), p.stderr)
+            self.assertIn("128", lines[0])
             self.assertEqual(p.stdout, "")
 
     def test_json_it_cannot_write_is_one_error_line_and_exit_2(self):

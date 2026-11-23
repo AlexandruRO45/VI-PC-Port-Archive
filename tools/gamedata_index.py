@@ -204,6 +204,25 @@ def carved_stream(address: str, directory: str):
     return candidate if os.path.isfile(candidate) and same_report_path(address, candidate) else None
 
 
+class IndexMismatch(ValueError):
+    """An index.json row that does not describe a whole stream of the archive it is read against, or the carved
+    stream file it names."""
+
+
+def check_stream_length(path: str, length: int, row: dict) -> None:
+    """Raise IndexMismatch when `length`, the length of the carved stream at `path`, is not its row's "size".
+
+    rpf9_carve.py writes a zlib row's inflated bytes as <off>.bin with "size" = their length ("stored" is the
+    compressed length in the archive), and a Bink 2 video as stored as <off>.bk2 with "size" == "stored". Any other
+    length is a truncated or replaced stream, which used to be read as the real one. A row without an integer
+    "size" (a hand-built index) is not checked.
+    """
+    size = row.get("size")
+    if isinstance(size, int) and not isinstance(size, bool) and length != size:
+        raise IndexMismatch(f"{path} is {length} bytes, but its index.json row gives size {size} "
+                            "(a truncated or replaced stream?). Carve the archive again.")
+
+
 class DirectorySource:
     """Reads .bin/.bk2 files next to an rpf9_carve.py index.json."""
 
@@ -216,17 +235,17 @@ class DirectorySource:
     def read(self, row: dict) -> bytes:
         # A missing or unreadable stream (an --index-only carve, a deleted .bin) raises OSError naming the file.
         # Its 16 index head bytes are not the stream: read as one, XML indexed as fragments and resources as binary.
+        # One of the wrong length (truncated or replaced) raises IndexMismatch, as a mismatched archive does.
         ext = ".bk2" if row.get("type") == "bink2" else ".bin"
-        with open(os.path.join(self.directory, f'{row["off"]:012x}{ext}'), "rb") as f:
-            return f.read()
+        path = os.path.join(self.directory, f'{row["off"]:012x}{ext}')
+        with open(path, "rb") as f:
+            data = f.read()
+        check_stream_length(path, len(data), row)
+        return data
 
     @property
     def summary(self) -> dict:
         return self.index.get("summary", {})
-
-
-class IndexMismatch(ValueError):
-    """An index.json row that does not describe a whole stream of the archive it is read against."""
 
 
 class ArchiveSource:

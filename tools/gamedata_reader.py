@@ -313,6 +313,10 @@ def main(argv=None):
         return 2
     except (OSError, ValueError, KeyError, TypeError) as e:
         # an unreadable file, or a carve folder whose index.json is not JSON or not the rpf9_carve.py shape
+        import gamedata_index as gi
+        if isinstance(e, gi.IndexMismatch):   # a carved stream of the wrong length names itself: no repr
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         where = getattr(e, "filename", None) or ", ".join(a.targets)
         print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
         return 2
