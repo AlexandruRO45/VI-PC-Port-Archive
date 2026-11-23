@@ -32,6 +32,11 @@ Usage:
 
 A DXBC container is read through `fssm_unpack.unpack_all`, so every tag-0x0D payload is reported (195
 containers have two).  `--limit` counts files, not payloads.
+
+Exit 0 when at least one blob was decoded and 2 when the path does not exist, cannot be listed, or held no
+FSSM blob and no tag-0x0D payload; the first such error is repeated on stderr, so a run that decoded nothing
+reads as a failure instead of `0 blobs, errors N`.  A folder with some readable shaders still exits 0: the
+per-file errors stay in the report and its `errors` count.
 """
 import argparse
 import json
@@ -231,11 +236,16 @@ def main(argv=None):
         stem = os.path.splitext(row["name"])[0]
         decoded.append(summarize(row, stages.get(stem)))
     summary = tally(decoded)
+    nothing_read = summary["blobs"] == 0 and summary["errors"] > 0
+    if nothing_read:
+        # Nothing was decoded, so the report alone (0 blobs, errors N) cannot be told from a successful run.
+        first = next(row for row in decoded if "error" in row)
+        print(f"ERROR: {first['name']}: {first['error']}", file=sys.stderr)
 
     if args.json:
         json.dump({"blobs": decoded, "tally": summary}, sys.stdout, indent=1)
         sys.stdout.write("\n")
-        return 0
+        return 2 if nothing_read else 0
 
     for row in decoded:
         label = f"[{row['payload']}]" if row["payload"] else ""
@@ -261,7 +271,7 @@ def main(argv=None):
         print(f"API stage matches the index: {total['stage_matches']}/{total['stage_known']}")
     else:
         print("(no index.json found: no stage to compare the API id with)")
-    return 0
+    return 2 if nothing_read else 0
 
 
 if __name__ == "__main__":
