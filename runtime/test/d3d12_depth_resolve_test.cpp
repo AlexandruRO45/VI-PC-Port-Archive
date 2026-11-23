@@ -89,10 +89,9 @@ struct Planes {
 };
 
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
-// `c` and reads every plane of the destination back. A list whose Close fails is executed only when `run_invalid`
-// (the layer runs what it recorded; the host runtime must not be given such a list).
-bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
-                      const EdgeDraw* edge = nullptr) {
+// `c` and reads every plane of the destination back. A list whose Close fails is not executed: the host runtime must
+// not be given one, and the layer refuses it in ExecuteCommandLists (#6610), so its planes stay empty.
+bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -217,7 +216,7 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     out.close = list->Close();
-    if (FAILED(out.close) && !run_invalid) return true;
+    if (FAILED(out.close)) return true;
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
     CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
@@ -430,12 +429,12 @@ int main() {
                 ++edge_skipped;
                 continue;
             }
-            if (!resolve_and_read(ours.p, c, results[i], true, &ours_edge)) return 1;
-            // A mode the device lacks is refused like the cases below. An edge case has no CPU model of its
-            // coverage: only its Close is checked here, and its planes against the host below.
+            if (!resolve_and_read(ours.p, c, results[i], &ours_edge)) return 1;
+            // A mode the device lacks is refused like the cases below, so only its Close is checked. An edge case has no
+            // CPU model of its coverage: only its Close is checked here, and its planes against the host below.
             const Planes expected = expected_planes(c, can);
             if (results[i].close != (can ? S_OK : E_INVALIDARG) ||
-                (!c.edge && !same_planes(results[i], expected, false, c.plane))) {
+                (can && !c.edge && !same_planes(results[i], expected, false, c.plane))) {
                 std::fprintf(stderr, "%s %s rect %d: Close 0x%08lx, destination %s the clears\n", c.name,
                              mode_name(c.mode), int(c.rect), results[i].close,
                              same_planes(results[i], expected, false, c.plane) ? "matches" : "differs from");
@@ -466,11 +465,10 @@ int main() {
         }
         for (const Case& c : refused) {
             Planes p;
-            if (!resolve_and_read(ours.p, c, p, true)) return 1;
-            if (p.close != E_INVALIDARG || !same_planes(p, expected_planes(c, false), false, c.plane)) {
-                std::fprintf(stderr, "refused %s %s rect %d: Close 0x%08lx, destination %s\n", c.name,
-                             mode_name(c.mode), int(c.rect), p.close,
-                             same_planes(p, expected_planes(c, false), false, c.plane) ? "kept" : "changed");
+            if (!resolve_and_read(ours.p, c, p)) return 1;
+            if (p.close != E_INVALIDARG) {
+                std::fprintf(stderr, "refused %s %s rect %d: Close 0x%08lx, not E_INVALIDARG\n", c.name,
+                             mode_name(c.mode), int(c.rect), p.close);
                 ++failures;
             }
             ++refusals;
@@ -501,7 +499,7 @@ int main() {
                 // See the top of the file; D32S8 by its own format is kept off WARP for the same reason.
                 if (results[i].depth.empty() || (warp && (c.format == d32 || c.format == d32s8))) continue;
                 Planes expected;
-                if (!resolve_and_read(host.p, c, expected, false, &host_edge)) return 1;
+                if (!resolve_and_read(host.p, c, expected, &host_edge)) return 1;
                 ++compared;
                 // The layer's result was checked against the clears above. A host that differs from the clears is a
                 // host quirk, not a layer bug: report, don't fail. Which D24S8 resolves is the driver's: with stencil
@@ -537,7 +535,7 @@ int main() {
             for (const Case& c : refused) {
                 if (!c.host_refuses) continue;
                 Planes expected;
-                if (!resolve_and_read(host.p, c, expected, false)) return 1;
+                if (!resolve_and_read(host.p, c, expected)) return 1;
                 if (expected.close != E_INVALIDARG) {
                     std::fprintf(stderr, "refused %s %s rect %d: %s's Close 0x%08lx\n", c.name, mode_name(c.mode),
                                  int(c.rect), name, expected.close);
@@ -560,7 +558,7 @@ int main() {
     const bool need_host = !hostwine::host_is_wine();
     if (need_host && !references) std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
     if (run_failed || failures || validation_errors || (need_host && (!references || !matched))) return 1;
-    std::printf("depth/stencil resolves: %u host comparisons matched, %u refusals kept the destination, %u modes the "
+    std::printf("depth/stencil resolves: %u host comparisons matched, %u refusals failed at Close, %u modes the "
                 "device lacks were refused; %u edge MIN/MAX pairs differ%s\n", matched, refusals, lacking, edges,
                 edge_skipped ? " (edge cases skipped: no glslangValidator at build time)" : "");
     return 0;
