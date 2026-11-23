@@ -294,8 +294,10 @@ TlsHostModule ensure_tls_host(size_t slot) {
                                             : 0;
                 const uint64_t total_sz = raw_sz + tls->SizeOfZeroFill;
                 if (tls->AddressOfIndex && *reinterpret_cast<DWORD*>(tls->AddressOfIndex) == 0 && total_sz > 0 &&
-                    total_sz <= 16) {
+                    total_sz <= 512) {
                     g_tls_hosts[0].index = 0;
+                    std::fprintf(stderr, "[rt] tls: zero-CRT stub detected (total_sz=%llu); reserving TLS slot 0 for primary mapped EXE\n",
+                                 static_cast<unsigned long long>(total_sz));
                 }
             }
         }
