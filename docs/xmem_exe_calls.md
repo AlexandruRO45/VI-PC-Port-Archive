@@ -18,7 +18,7 @@ bounds, not a proof that every site is reached.
 
 | Import | Call sites | Shim at `main` (since #6919) |
 |---|---:|---|
-| `XMemVirtualAlloc` | 23 | yes, attributes recorded and accepted (below) |
+| `XMemVirtualAlloc` | 23 | yes, all 23 types served (below) |
 | `XMemMapPhysicalPages` | 12 | yes (pagefile-backed 64 KiB pool) |
 | `XMemAllocatePhysicalPages` | 4 | yes |
 | `XMemFreePhysicalPages` | 3 | yes |
@@ -52,13 +52,14 @@ The 23 sites pass these constants (`allocation_type`, `attributes`, `protect`; t
 | `0x42000` | `0x7` | `0x1` | 1 |
 
 Every `attributes` value is nonzero. Since #6919 `runtime/shims/xmem.cpp` does not decode them: `XMemVirtualAlloc`
-records the word (`xmem_attributes` in the startup trace) and accepts it. The shim does check `allocation_type`, and
-that is where five of the 23 sites are still refused: `0x20406000` is the 64 KiB page mode plus
-`MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_PHYSICAL` (`0x400000`), and the shim does not forward `MEM_PHYSICAL`, so
-those sites get `ERROR_INVALID_PARAMETER`. The other 18 are served: 12 use the 64 KiB page mode `0x20400000` (3
-committed, 8 reserve-only windows, 1 plain commit), five use the 2 MiB mode `0x20000000` (committed 2 MiB-aligned
-through `VirtualAlloc2`), and one `0x42000` is `MEM_RESERVE | MEM_RESERVE_PLACEHOLDER`, the ~185 MiB reservation the
-five windows are carved out of (`docs/retail_boot_chain.md`, stops 10-11). That agrees with `docs/runtime_imports.md`
+records the word (`xmem_attributes` in the startup trace) and accepts it. All 23 allocation types are served as well.
+The page-mode mask is `kXmem64kPages` `0x20400000`, which *is* `MEM_LARGE_PAGES | MEM_PHYSICAL`, so `0x20406000`
+(`0x20400000 | MEM_RESERVE | MEM_REPLACE_PLACEHOLDER`) selects the 64 KiB page mode and replaces part of the
+placeholder — `test_placeholders` in `runtime/test/xmem_test.cpp` allocates that exact shape and maps physical pages
+into the carved window. The 23 sites divide as 17 in the 64 KiB mode (3 committed, 8 reserve-only windows, 1 plain
+commit, 5 placeholder replacements), five in the 2 MiB mode `0x20000000` (committed 2 MiB-aligned through
+`VirtualAlloc2`), and one `0x42000` = `MEM_RESERVE | MEM_RESERVE_PLACEHOLDER`, the ~185 MiB reservation the five
+windows are carved out of (`docs/retail_boot_chain.md`, stops 10-11). That agrees with `docs/runtime_imports.md`
 ("The retail executable", `xmem.dll` notes), which records the same 2 MiB and placeholder paths.
 
 The `protect` values are not Win32 protections alone. The Windows SDK's `winnt.h` defines the graphics page protections
