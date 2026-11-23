@@ -21,7 +21,13 @@ inline HANDLE file = INVALID_HANDLE_VALUE;
 inline char* view = nullptr;
 inline std::size_t capacity = 0;
 inline std::size_t written = 0;
-inline bool full = false;
+inline std::atomic<bool> full{false};
+
+inline bool trim_file(HANDLE handle, std::size_t size) noexcept {
+    LARGE_INTEGER end{};
+    end.QuadPart = static_cast<LONGLONG>(size);
+    return SetFilePointerEx(handle, end, nullptr, FILE_BEGIN) && SetEndOfFile(handle);
+}
 
 // The first byte of the next line is kept zero. Write the rest of the new line, including its
 // newline, before replacing that zero. A process killed during the copy leaves the old terminator.
@@ -46,6 +52,7 @@ inline DWORD open_file(const wchar_t* path, DWORD capacity = detail::file_capaci
     HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, capacity, nullptr);
     if (!mapping) {
         const DWORD error = GetLastError();
+        detail::trim_file(file, 0);  // this handle was opened with CREATE_NEW
         CloseHandle(file);
         return error;
     }
@@ -53,6 +60,7 @@ inline DWORD open_file(const wchar_t* path, DWORD capacity = detail::file_capaci
     const DWORD error = view ? ERROR_SUCCESS : GetLastError();
     CloseHandle(mapping);  // the view keeps the mapping alive until close_file()
     if (!view) {
+        detail::trim_file(file, 0);
         CloseHandle(file);
         return error;
     }
@@ -61,7 +69,7 @@ inline DWORD open_file(const wchar_t* path, DWORD capacity = detail::file_capaci
     detail::view = view;
     detail::capacity = capacity;
     detail::written = 0;
-    detail::full = false;
+    detail::full.store(false, std::memory_order_relaxed);
     detail::sequence = 0;
     tracing.store(true, std::memory_order_release);
     return ERROR_SUCCESS;
@@ -73,14 +81,13 @@ inline void close_file() noexcept {
     tracing.store(false, std::memory_order_relaxed);
     const bool flushed = !detail::written || FlushViewOfFile(detail::view, detail::written) != FALSE;
     UnmapViewOfFile(detail::view);
-    LARGE_INTEGER end{};
-    end.QuadPart = static_cast<LONGLONG>(detail::written);
-    if (!SetFilePointerEx(detail::file, end, nullptr, FILE_BEGIN) || !SetEndOfFile(detail::file))
+    if (!detail::trim_file(detail::file, detail::written))
         std::fprintf(stderr, "[rt] d3d12 trace file could not be trimmed; it retains its terminator\n");
     if (!flushed) std::fprintf(stderr, "[rt] d3d12 trace file could not be flushed\n");
     CloseHandle(detail::file);
     detail::file = INVALID_HANDLE_VALUE;
     detail::view = nullptr;
+    detail::full.store(false, std::memory_order_relaxed);
 }
 
 inline void set_enabled(bool enable) noexcept {
@@ -93,23 +100,22 @@ inline bool enabled() noexcept {
 
 // Callers supply fixed method names and outcomes only. Keep one ordered record per call across threads.
 inline void record(const char* method, const char* outcome = "called") noexcept {
-    if (!enabled()) return;
+    if (!enabled() || detail::full.load(std::memory_order_relaxed)) return;
     const std::lock_guard lock(detail::mutex);
-    if (!enabled()) return;  // the mapped sink may have closed while this caller waited
+    if (!enabled() || detail::full.load(std::memory_order_relaxed)) return;
     if (!detail::view) {
         std::fprintf(stderr, "[d3d12-trace] #%llu %s %s\n", ++detail::sequence, method, outcome);
         std::fflush(stderr);
         return;
     }
-    if (detail::full) return;
     char line[512];
     const int size = std::snprintf(line, sizeof(line), "[d3d12-trace] #%llu %s %s\n", detail::sequence + 1,
                                    method, outcome);
     if (size <= 0 || std::size_t(size) >= sizeof(line) ||
         std::size_t(size) > detail::capacity - detail::written - sizeof(detail::truncated_line)) {
         detail::append(detail::truncated_line, sizeof(detail::truncated_line) - 1);
-        detail::full = true;
-        tracing.store(false, std::memory_order_relaxed);
+        // Keep enabled() true so the other D3D12 diagnostics still suppress run-specific pointers.
+        detail::full.store(true, std::memory_order_relaxed);
         return;
     }
     detail::append(line, std::size_t(size));

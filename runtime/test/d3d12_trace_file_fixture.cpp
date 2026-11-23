@@ -41,6 +41,9 @@ int wmain(int argc, wchar_t** argv) {
     rt::d3d12_trace::result("ID3D12GraphicsCommandList::SetProtectedResourceSession", E_NOTIMPL);
     if (small) {
         for (int i = 0; i < 40; ++i) record("ID3D12CommandQueue::ExecuteCommandLists", "ok");
+        if (!rt::d3d12_trace::enabled()) return 4;
+        record("Fixture_AfterLimit", "called");
+        if (!rt::d3d12_trace::enabled()) return 5;
     } else if (concurrent) {
         std::array<std::jthread, 4> workers;
         for (unsigned thread = 0; thread < workers.size(); ++thread) {
@@ -60,5 +63,6 @@ int wmain(int argc, wchar_t** argv) {
         Sleep(INFINITE);
     }
     rt::d3d12_trace::close_file();
+    if (small && rt::d3d12_trace::enabled()) return 6;
     return 0;
 }

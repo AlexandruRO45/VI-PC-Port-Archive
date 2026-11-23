@@ -55,10 +55,13 @@ def main():
         assert next_call == [128] * 4
 
         full = root / "full.log"
-        run(fixture, "small", full)
+        assert run(fixture, "small", full).stderr == b""
         truncated = parse_d3d12(str(full))
         assert 3 < truncated["calls"] < 43 and truncated["limit_reached"], truncated
         assert truncated["last_seq"] == truncated["calls"] and full.stat().st_size < 512
+        limited_lines = records(full.read_bytes())
+        assert sum(line.startswith("[rt] d3d12 trace file reached") for line in limited_lines) == 1
+        assert not any("Fixture_AfterLimit" in line for line in limited_lines)
 
         crash = root / "crash.log"
         with subprocess.Popen([str(fixture), "crash", str(crash)], stdout=subprocess.PIPE) as child:
