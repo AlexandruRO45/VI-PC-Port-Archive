@@ -396,5 +396,77 @@ class TestSNorSaveExecSIMDDivergence(unittest.TestCase):
         self.assertEqual(new_exec, expected)
         self.assertEqual(scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestSNorSaveExecAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0(self):
+        """s_nor_saveexec_b32 s4, s4: D and S0 share the same SGPR.
+
+        In RDNA2 hardware, S0 is sampled into the ALU before destination D
+        is updated with the old EXEC_LO.
+        """
+        state = ScalarHardwareState32()
+        initial_s4 = 0x1234_5678
+        initial_exec = 0xF0E1_D2C3
+        state.set_sgpr(4, initial_s4)
+        state.exec_lo = initial_exec
+
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=4, size_bits=32),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=32)
+        )
+        ScalarInterpreter32.step(instr, state)
+
+        # D receives old EXEC_LO
+        self.assertEqual(state.get_sgpr(4), initial_exec)
+        # EXEC_LO receives ~(initial_s4 | initial_exec)
+        expected_exec = (~(initial_s4 | initial_exec)) & MASK32
+        self.assertEqual(state.exec_lo, expected_exec)
+        self.assertEqual(state.scc, 1)
+
+    def test_src0_is_exec_lo(self):
+        """s_nor_saveexec_b32 s6, exec_lo: S0 is EXEC_LO itself.
+
+        ~(EXEC_LO | EXEC_LO) = ~EXEC_LO. D receives old EXEC_LO.
+        """
+        state = ScalarHardwareState32()
+        exec_val = 0xCAFE_BABE
+        state.exec_lo = exec_val
+
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=32),
+            src0=RegOperand(RegisterKind.EXEC_LO, size_bits=32)
+        )
+        ScalarInterpreter32.step(instr, state)
+
+        self.assertEqual(state.get_sgpr(6), exec_val)
+        self.assertEqual(state.exec_lo, (~exec_val) & MASK32)
+        self.assertEqual(state.scc, 1)
+
+    def test_multiple_sgpr_independence(self):
+        """Ensure un-aliased SGPRs remain untouched."""
+        state = ScalarHardwareState32()
+        state.set_sgpr(4, 0x1111_1111)
+        state.set_sgpr(5, 0x2222_2222)
+        state.set_sgpr(6, 0x3333_3333)
+        state.exec_lo = 0x0F0F_0F0F
+
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=4, size_bits=32),
+            src0=RegOperand(RegisterKind.SGPR, index=5, size_bits=32)
+        )
+        ScalarInterpreter32.step(instr, state)
+
+        # s4 updated with old EXEC_LO
+        self.assertEqual(state.get_sgpr(4), 0x0F0F_0F0F)
+        # s5 (src0) preserved
+        self.assertEqual(state.get_sgpr(5), 0x2222_2222)
+        # s6 untouched
+        self.assertEqual(state.get_sgpr(6), 0x3333_3333)
+
 if __name__ == "__main__":
     unittest.main()
