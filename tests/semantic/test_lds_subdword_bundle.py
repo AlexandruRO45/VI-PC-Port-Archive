@@ -449,5 +449,28 @@ class TestDsReadI16HardwareTranslator(unittest.TestCase):
         self.assertEqual(L.out(mem, 0, 0), 0xFFFF_FF00)
 
 
+# ------------------------------------------------------------------------------
+# ds_write_b8 Reference Oracle
+# ------------------------------------------------------------------------------
+
+class TestDsWriteB8Oracle(unittest.TestCase):
+    def setUp(self):
+        self.lds = LDSMemory()
+
+    def test_byte_write_preserves_adjacent_bytes(self):
+        # Write 0x11223344 as dword
+        self.lds.write_u8(0, 0x44)
+        self.lds.write_u8(1, 0x33)
+        self.lds.write_u8(2, 0x22)
+        self.lds.write_u8(3, 0x11)
+
+        # Overwrite only byte 1 with 0x99
+        self.lds.write_u8(1, 0x99)
+        self.assertEqual(self.lds.read_u8(0), 0x44)
+        self.assertEqual(self.lds.read_u8(1), 0x99)
+        self.assertEqual(self.lds.read_u8(2), 0x22)
+        self.assertEqual(self.lds.read_u8(3), 0x11)
+
+
 if __name__ == '__main__':
     unittest.main()
