@@ -27,8 +27,8 @@ bool owns_dll(const std::string& dll_lower);
 
 // What a call to an import that has no binding does. Chosen by the environment variable LEONIDA_UNIMPLEMENTED
 // (read once, on the first call):
-//   log   (default)  print the name once and return 0, in rax and xmm0
-//   fail             as log, but return E_NOTIMPL for imports classified as HRESULT-returning (classify_import)
+//   fail   (default) return E_NOTIMPL for imports classified as HRESULT-returning (classify_import)
+//   log              compatibility mode: print the name once and return 0, in rax and xmm0
 //   stop             on the first call print the import, the caller's return address as module+RVA and rcx, rdx, r8,
 //                    r9 as received; then break if a debugger is attached, else end the process with exit code 3
 // Out parameters are never written in any mode.
@@ -40,7 +40,7 @@ enum class ReturnClass { HResult, Other };
 
 inline constexpr uint32_t kENotImpl = 0x80004001u;  // E_NOTIMPL
 
-// "log", "fail" or "stop", any case. Empty or null is log without complaint; anything else is log with *valid = false.
+// "log", "fail" or "stop", any case. Empty or null defaults to fail; anything else defaults to fail with *valid = false.
 UnimplementedPolicy parse_unimplemented_policy(const char* text, bool* valid = nullptr);
 UnimplementedPolicy unimplemented_policy();
 void set_unimplemented_policy(UnimplementedPolicy policy);  // overrides the environment (tests)
