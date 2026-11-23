@@ -20,6 +20,9 @@ function fakeElement() {
             };
         },
         setAttribute() {},
+        open: false,
+        showModal() { this.open = true; },
+        close() { this.open = false; },
         focus() { this.focused = true; },
         replaceChildren(...children) { this.children = children; },
         appendChild(child) { this.children.push(child); },
@@ -35,7 +38,7 @@ function loadStudio() {
     const elements = new Map(), loads = [], alerts = [];
     const document = {
         getElementById: id => elements.get(id) ?? elements.set(id, fakeElement()).get(id),
-        createElement: fakeElement,
+        createElement: tag => Object.assign(fakeElement(), { tagName: tag.toUpperCase() }),
         querySelectorAll: () => [],
     };
     const context = vm.createContext({
@@ -89,6 +92,26 @@ function renderTextureGrid(name) {
     assert.equal(cards.length, 81);
     return cards[0].innerHTML + cards[80].innerHTML;
 }
+
+test('initial and expanded texture cards open a native dialog from a button', () => {
+    const studio = loadStudio();
+    studio.run(`allTextures = Array.from({ length: 81 }, (_, i) => ({
+        name: 'texture ' + i, format: 'PNG Image', size: 4, preview: '/textures/fixture.png'
+    })); renderTexturesGrid();`);
+    const grid = studio.elements.get('textures-grid');
+    grid.children.at(-1).onclick();
+    const cards = grid.children.filter(child => child.className === 'tex-card');
+    assert.equal(cards.length, 81);
+    assert.match(html, /<dialog[^>]+id="tex-modal"[^>]+aria-labelledby="modal-title"/);
+    for (const card of [cards[0], cards.at(-1)]) {
+        assert.equal(card.tagName, 'BUTTON');
+        assert.equal(card.type, 'button');
+        card.onclick();
+        assert.equal(studio.elements.get('tex-modal').open, true);
+        studio.run('closeModal()');
+        assert.equal(studio.elements.get('tex-modal').open, false);
+    }
+});
 
 test('hostile model and texture file names render as text, not as elements or attributes', () => {
     for (const render of [renderModelList, renderTextureGrid]) {

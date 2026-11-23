@@ -274,6 +274,8 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
   padding-bottom: 30px;
 }
 .tex-card {
+  font: inherit;
+  text-align: left;
   background: var(--bg-panel);
   border: 1px solid var(--bg-panel-border);
   border-radius: 8px;
@@ -283,7 +285,7 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
   transition: all .2s;
   cursor: pointer;
 }
-.tex-card:hover {
+.tex-card:hover, .tex-card:focus-visible {
   transform: translateY(-3px);
   border-color: var(--accent-pink);
   box-shadow: 0 4px 16px rgba(255, 42, 133, 0.25);
@@ -305,13 +307,17 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
 }
 .tex-card:hover .tex-preview img { transform: scale(1.05); }
 .tex-info { padding: 10px; font-size: 11px; }
-.tex-name { font-weight: 600; margin-bottom: 4px; word-break: break-all; color: #fff; }
+.tex-name { display: block; font-weight: 600; margin-bottom: 4px; word-break: break-all; color: #fff; }
 .tex-meta { color: var(--text-muted); font-size: 10px; display: flex; justify-content: space-between; }
 
 /* Modal Lightbox */
 .modal-overlay {
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
+  width: 100%; height: 100%;
+  max-width: none; max-height: none;
+  border: 0;
+  color: inherit;
   background: rgba(0, 0, 0, 0.85);
   backdrop-filter: blur(6px);
   z-index: 100;
@@ -319,7 +325,7 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
   align-items: center;
   justify-content: center;
 }
-.modal-overlay.active { display: flex; }
+.modal-overlay[open] { display: flex; }
 .modal-content {
   background: var(--bg-panel);
   border: 1px solid var(--accent-pink);
@@ -440,18 +446,19 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
 </main>
 
 <!-- Lightbox Modal -->
-<div class="modal-overlay" id="tex-modal" onclick="closeModal(event)">
+<dialog class="modal-overlay" id="tex-modal" aria-labelledby="modal-title"
+        onclick="closeModal()" oncancel="event.preventDefault(); closeModal()">
   <div class="modal-content" onclick="event.stopPropagation()">
     <div class="modal-header">
       <span id="modal-title" style="font-size: 13px; font-weight: 600;">Просмотр текстуры</span>
-      <button class="tool-btn" onclick="closeModal()">✕</button>
+      <button type="button" class="tool-btn" id="modal-close" aria-label="Закрыть" autofocus onclick="closeModal()">✕</button>
     </div>
     <div id="dds-controls"></div>
     <div class="modal-body">
       <img id="modal-img" src="" alt="">
     </div>
   </div>
-</div>
+</dialog>
 
 <script>
 
@@ -973,6 +980,27 @@ function onTextureSearch() {
   renderTexturesGrid();
 }
 
+function textureCard(texture) {
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'tex-card';
+  const name = escapeHtml(texture.name);
+  card.innerHTML = `
+    <span class="tex-preview">
+      <img src="${texture.preview}" alt="" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
+    </span>
+    <span class="tex-info">
+      <span class="tex-name" title="${name}">${name}</span>
+      <span class="tex-meta">
+        <span>${texture.format}</span>
+        <span>${formatBytes(texture.size)}</span>
+      </span>
+    </span>
+  `;
+  card.onclick = () => openModal(texture);
+  return card;
+}
+
 function renderTexturesGrid() {
   const grid = document.getElementById('textures-grid');
   grid.innerHTML = '';
@@ -986,24 +1014,7 @@ function renderTexturesGrid() {
 
   // Render initial batch (up to 80 for speed)
   const batch = filtered.slice(0, 80);
-  batch.forEach(t => {
-    const card = document.createElement('div');
-    card.className = 'tex-card';
-    card.innerHTML = `
-      <div class="tex-preview">
-        <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
-      </div>
-      <div class="tex-info">
-        <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
-        <div class="tex-meta">
-          <span>${t.format}</span>
-          <span>${formatBytes(t.size)}</span>
-        </div>
-      </div>
-    `;
-    card.onclick = () => openModal(t);
-    grid.appendChild(card);
-  });
+  batch.forEach(t => grid.appendChild(textureCard(t)));
 
   if (filtered.length > 80) {
     const loadMore = document.createElement('div');
@@ -1013,24 +1024,9 @@ function renderTexturesGrid() {
     loadMore.innerHTML = `<button class="tab-btn" style="margin: 0 auto;">Показать все (${filtered.length - 80} ещё)</button>`;
     loadMore.onclick = () => {
       loadMore.remove();
-      filtered.slice(80).forEach(t => {
-        const card = document.createElement('div');
-        card.className = 'tex-card';
-        card.innerHTML = `
-          <div class="tex-preview">
-            <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
-          </div>
-          <div class="tex-info">
-            <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
-            <div class="tex-meta">
-              <span>${t.format}</span>
-              <span>${formatBytes(t.size)}</span>
-            </div>
-          </div>
-        `;
-        card.onclick = () => openModal(t);
-        grid.appendChild(card);
-      });
+      const more = filtered.slice(80).map(textureCard);
+      more.forEach(card => grid.appendChild(card));
+      more[0].focus();
     };
     grid.appendChild(loadMore);
   }
@@ -1045,7 +1041,9 @@ async function openModal(texture) {
   controls.replaceChildren();
   document.getElementById('modal-title').innerText = texture.name;
   image.src = texture.preview;
-  document.getElementById('tex-modal').classList.add('active');
+  document.getElementById('modal-close').setAttribute('aria-label', currentLang === 'ru' ? 'Закрыть' : 'Close');
+  const modal = document.getElementById('tex-modal');
+  if (!modal.open) modal.showModal();
   if (!texture.ddsPreview) return;
 
   try {
@@ -1149,7 +1147,7 @@ async function openModal(texture) {
 
 function closeModal() {
   ++modalVersion;
-  document.getElementById('tex-modal').classList.remove('active');
+  document.getElementById('tex-modal').close();
 }
 
 window.onload = () => {
