@@ -413,5 +413,76 @@ class TestSXorSaveExecSIMDDivergence(unittest.TestCase):
         self.assertEqual(d, initial_exec)
         self.assertEqual(scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestSXorSaveExecAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0(self):
+        """s_xor_saveexec_b64 s[4:5], s[4:5]: D and S0 share the same SGPR pair.
+
+        In RDNA2 hardware, S0 is sampled into the ALU before destination D
+        is updated with the old EXEC.
+        """
+        state = ScalarHardwareState()
+        initial_s4_5 = 0x1234_5678_9ABC_DEF0
+        initial_exec = 0xF0E1_D2C3_B4A5_9687
+        state.set_sgpr_pair(4, initial_s4_5)
+        state.exec_mask = initial_exec
+
+        instr = SXorSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=4, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, state)
+
+        # D receives old EXEC
+        self.assertEqual(state.get_sgpr_pair(4), initial_exec)
+        # EXEC receives S0 ^ old EXEC
+        self.assertEqual(state.exec_mask, initial_s4_5 ^ initial_exec)
+        self.assertEqual(state.scc, 1)
+
+    def test_src0_is_exec(self):
+        """s_xor_saveexec_b64 s[6:7], exec: S0 is the EXEC mask itself.
+
+        EXEC ^ EXEC = 0, so new EXEC becomes 0 and SCC becomes 0. D receives old EXEC.
+        """
+        state = ScalarHardwareState()
+        exec_val = 0xCAFE_BABE_DEAD_BEEF
+        state.exec_mask = exec_val
+
+        instr = SXorSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.EXEC, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, state)
+
+        self.assertEqual(state.get_sgpr_pair(6), exec_val)
+        self.assertEqual(state.exec_mask, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_multiple_sgpr_pair_independence(self):
+        """Ensure un-aliased SGPR pairs are completely untouched."""
+        state = ScalarHardwareState()
+        state.set_sgpr_pair(4, 0x1111_1111_1111_1111)
+        state.set_sgpr_pair(8, 0x8888_8888_8888_8888)
+        state.set_sgpr_pair(10, 0xAAAA_AAAA_AAAA_AAAA)
+        state.exec_mask = 0x0F0F_0F0F_0F0F_0F0F
+
+        instr = SXorSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=4, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=8, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, state)
+
+        # s[4:5] updated with old EXEC
+        self.assertEqual(state.get_sgpr_pair(4), 0x0F0F_0F0F_0F0F_0F0F)
+        # s[8:9] (src0) preserved
+        self.assertEqual(state.get_sgpr_pair(8), 0x8888_8888_8888_8888)
+        # s[10:11] untouched
+        self.assertEqual(state.get_sgpr_pair(10), 0xAAAA_AAAA_AAAA_AAAA)
+
 if __name__ == "__main__":
     unittest.main()
