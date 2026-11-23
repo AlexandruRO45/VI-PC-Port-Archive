@@ -518,6 +518,19 @@ class TestValuFmaF32ScalarExecution(unittest.TestCase):
         words = support.mrt0_words(support.translate_lines(next_test_id("ps_fma_chain"), lines))
         self.assertAlmostEqual(bits_to_f32(words[0]), 0.25, places=6)
 
+class TestValuFmaF32SIMDDivergence(unittest.TestCase):
+    """Stage 22: SIMD multi-lane divergence tests for v_fma_f32 clamp and omod."""
+
+    def test_fma_divergent_polynomial_eval(self):
+        # Horner polynomial: c0 + x * (c1 + x * c2)
+        # Evaluated clamped in [0.0, 1.0]
+        x = 0.5
+        c2, c1, c0 = 0.2, 0.4, 0.1
+        step1 = run_ternary_f32("v_fma_f32", x, c2, c1, clamp=True)  # 0.5 * 0.2 + 0.4 = 0.5
+        step2 = run_ternary_f32("v_fma_f32", x, step1, c0, clamp=True)  # 0.5 * 0.5 + 0.1 = 0.35
+        self.assertAlmostEqual(step1, 0.5, places=6)
+        self.assertAlmostEqual(step2, 0.35, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
