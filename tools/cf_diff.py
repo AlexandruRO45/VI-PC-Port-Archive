@@ -18,6 +18,10 @@ Shapes (each nests, up to --depth):
   irr       two-entry cycle on uniform SCC branches                                   (irreducible graph)
   sccmask   s_and/andn2/or/xor of VCC and EXEC, or s_not of VCC -> s_cbranch_scc0/1 (SCC = whole mask != 0)
   csel      the same SCC read by s_cselect_b32 into a uniform SGPR
+  wrelse    s_and_saveexec -> then -> s_andn2_wrexec D, save (EXEC = save & ~EXEC: the else lanes) ->
+            [s_cbranch_execz/scc0] -> else -> s_mov exec, save
+  wrloop    per-lane trip counts closed by s_andn1_wrexec D, vcc (EXEC = ~done & EXEC), back edge
+            s_cbranch_scc1 or s_cbranch_execnz, then s_mov exec, save
   ifs       v_cmp_*_e64 into an SGPR mask -> s_and_saveexec from it [-> v_cndmask_b32_e64 on it]
   cexec     a constant EXEC (s_mov_b32 exec_lo/exec_hi, literal) around a body
   halfexec  s_and_b32 on one half of EXEC (wave64: exec_lo or exec_hi; the other half's lanes are untouched)
@@ -154,7 +158,7 @@ class Gen:
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
                          "vloop", "irr", "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask",
                          "cselmask", "vccloop", "cmpxloop", "mread", "mread", "waterfall",
-                         "waterfall", "wqm", "wqm", "lanes", "lanes", "far"))
+                         "waterfall", "wqm", "wqm", "lanes", "lanes", "far", "wrelse", "wrloop"))
         if kind == "far":
             if r.random() < 0.5:
                 return ("far", "fwd", 0, [self.probe()] + self.block(depth))
@@ -182,8 +186,15 @@ class Gen:
             # v1 / v2 / v3 hold 8 or 16 distinct values; a source with one value per lane (v8) costs 64 rounds and,
             # nested, runs past the wave interpreter's step limit.
             return ("waterfall", r.choice((1, 2, 3)), r.random() < 0.5, [self.probe()] + self.block(depth))
+        if kind == "wrelse":
+            return ("wrelse", self.cmp(), r.random() < 0.5, r.choice((None, "s_cbranch_execz", "s_cbranch_scc0")),
+                    [self.probe()] + self.block(depth), [self.probe()] + self.block(depth))
+        if kind == "wrloop":
+            return ("wrloop", (r.choice((0, 1, 2, 3)), r.choice((1, 3))),
+                    r.choice(("s_cbranch_scc1", "s_cbranch_execnz")), [self.probe()] + self.block(depth))
         if kind == "saveexec":
-            return ("saveexec", self.cmp(), r.choice(("andn2", "orn2", "xor", "nand", "nor", "xnor")),
+            return ("saveexec", self.cmp(),
+                    r.choice(("andn1", "andn2", "orn1", "orn2", "xor", "nand", "nor", "xnor")),
                     r.choice((None, "s_cbranch_execz", "s_cbranch_scc0")), [self.probe()] + self.block(depth))
         if kind in ("vccloop", "cmpxloop"):
             return (kind, (r.choice((0, 1, 2, 3)), r.choice((1, 3))), [self.probe()] + self.block(depth))
@@ -657,6 +668,44 @@ class Emitter:
             # Loop again while any lane is left: EXECNZ, or SCC of the s_andn2 (= new EXEC != 0).
             self.br("s_cbranch_scc1" if scc_exit else "s_cbranch_execnz", head)
             self.ins(f"s_or_{w} {ex}, {ex}, {brk_mask}")
+        elif kind == "wrelse":
+            # The else switch through s_andn2_wrexec: EXEC = save & ~EXEC is the lanes of `save` the then side did
+            # not run, and D gets the same mask (D is scratch, as for sccmask: nothing reads it).
+            _, c, skip_then, skip_else, then, other = n
+            save, dst, els, end = self.sreg(20), self.sreg(50), self.label(), self.label()
+            self.vcmp(c)
+            self.ins(f"s_and_saveexec_{w} {save}, {self.vcc()}")
+            if skip_then:
+                self.br("s_cbranch_execz", els)
+            self.depth += 1
+            self.nodes(then)
+            self.depth -= 1
+            self.place(els)
+            self.ins(f"s_andn2_wrexec_{w} {dst}, {save}")
+            if skip_else is not None:
+                self.br(skip_else, end)
+            self.depth += 1
+            self.nodes(other)
+            self.depth -= 1
+            self.place(end)
+            self.ins(f"s_mov_{w} {ex}, {save}")
+        elif kind == "wrloop":
+            # A loop whose finished lanes leave through s_andn1_wrexec: EXEC = ~vcc & EXEC, SCC = (EXEC != 0).
+            _, (src, mask), back, body = n
+            it, lim, save, dst, head = 4 + self.depth, 30 + self.depth, self.sreg(20), self.sreg(50), self.label()
+            self.ins(f"v_and_b32 v{lim}, {mask}, v{src}")
+            self.ins(f"v_add_nc_u32 v{lim}, 1, v{lim}")
+            self.ins(f"v_mov_b32 v{it}, 0")
+            self.ins(f"s_mov_{w} {save}, {ex}")
+            self.place(head)
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.ins(f"v_add_nc_u32 v{it}, 1, v{it}")
+            self.ins(f"v_cmp_ge_u32_e32 {self.vcc()}, v{it}, v{lim}")
+            self.ins(f"s_andn1_wrexec_{w} {dst}, {self.vcc()}")
+            self.br(back, head)
+            self.ins(f"s_mov_{w} {ex}, {save}")
         elif kind == "irr":
             _, (sr, k), part_a, part_b = n
             ctr, a_lbl, b_lbl, end = 14 + self.depth, self.label(), self.label(), self.label()

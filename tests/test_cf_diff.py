@@ -170,6 +170,41 @@ def test_wave64_mask_reads(case, structured):
     assert status == "match", detail
 
 
+# s_andn1/andn2_wrexec (tools/cf_diff.py wrelse / wrloop) and the andn1/orn1 saveexec kinds. Each case runs a
+# part of the wave on a side the other part skips, so swapping a complemented operand changes some lane's export.
+WREXEC_CASES = {
+    "andn2_wrexec else switch": [("wrelse", FEW_LANES, False, None,
+                                  [("probe", 11)], [("probe", 12), ("op", "v_add_nc_u32 v9, 1, v9")])],
+    "andn2_wrexec else switch, skips": [("wrelse", FEW_LANES, True, "s_cbranch_scc0",
+                                         [("probe", 11)], [("probe", 12)])],
+    "andn1_wrexec loop, execnz": [("wrloop", (0, 3), "s_cbranch_execnz", [("probe", 9)])],
+    "andn1_wrexec loop, scc1": [("wrloop", (1, 3), "s_cbranch_scc1",
+                                 [("probe", 9), ("op", "v_add_nc_u32 v8, 3, v8")])],
+    "andn1_saveexec": [("saveexec", FEW_LANES, "andn1", "s_cbranch_execz", [("probe", 13)])],
+    "orn1_saveexec": [("saveexec", FEW_LANES, "orn1", "s_cbranch_scc0", [("probe", 13)])],
+}
+
+
+@pytest.mark.parametrize("case", sorted(WREXEC_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_wrexec_and_n1_saveexec_match(case, wave, structured):
+    status, detail = cf_diff.run_case("ps_wrexec", WREXEC_CASES[case], wave, structured)
+    assert status == "match", detail
+
+
+@pytest.mark.parametrize("case", sorted(WREXEC_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+def test_wrexec_cases_catch_a_swapped_complement(case, wave, monkeypatch):
+    """The cases above are sensitive: with n1 and n2 swapped (S0 complemented instead of EXEC) they mismatch."""
+    logic = dict(rdna2spirv.Gen.EXEC_LOGIC)
+    for a, b in (("andn1", "andn2"), ("orn1", "orn2")):
+        logic[a], logic[b] = logic[b], logic[a]
+    monkeypatch.setattr(rdna2spirv.Gen, "EXEC_LOGIC", logic)
+    status, _ = cf_diff.run_case("ps_wrexec", WREXEC_CASES[case], wave)
+    assert status == "mismatch"
+
+
 @pytest.mark.parametrize("count", ["0", "-1"])
 def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
     def unexpected_suite(*args, **kwargs):
@@ -304,10 +339,11 @@ def test_generator_covers_every_shape():
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
     assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe",
-            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm", "lanes", "far"} <= kinds
+            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm", "lanes", "far",
+            "wrelse", "wrloop"} <= kinds
 
 
-@pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))
+@pytest.mark.parametrize("op_name", ("andn1", "andn2", "orn1", "orn2", "xor", "nand", "nor", "xnor"))
 @pytest.mark.parametrize("wave", (32, 64))
 def test_saveexec_variants_match(op_name, wave):
     body = [("saveexec", FEW_LANES, op_name, "s_cbranch_scc0", [("probe", 13), ("op", "v_add_nc_u32 v9, 1, v9")])]
