@@ -9,7 +9,8 @@ every Nth static 128 m tile the same way, as a control.
 
 With ``--common`` (a ``tools/rpf9_carve.py`` carve of ``common.rpf``), the ``CVehiclePoints`` documents'
 ``fNavOverrideRecastCellSize`` values are counted, and every non-grid mesh is searched at every byte offset for the
-``joaat`` of each document's ``ModelName`` (as written, lower-cased, and with ``.yft``).
+``joaat`` of each document's ``ModelName`` (as written, lower-cased, and with ``.yft``). A ``--common`` path that is
+not a directory is one error line and exit 2, not a report with zero documents.
 
 Only aggregates are printed and written: counts, cell sizes, extents and fractions. No model name, no vertex, no
 file name.
@@ -186,6 +187,9 @@ def main():
     a = ap.parse_args()
     if a.out and same_report_path(a.out, a.archive):
         ap.error("--out would overwrite the archive")
+    if a.common and not os.path.isdir(a.common):  # a typo would otherwise count zero documents
+        print(f"error: --common {a.common}: not a directory", file=sys.stderr)
+        return 2
     hashes, docs = None, None
     try:
         if a.common:
