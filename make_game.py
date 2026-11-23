@@ -42,6 +42,7 @@ import struct
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
@@ -1207,7 +1208,8 @@ def smallest_max_subgroup(vulkaninfo_text: str):
     return min(per_device)
 
 
-def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
+def wave64_settings(mode: str, *, mesh_compute: bool = False,
+                    probe_gpu: Callable[[], dict] | None = None) -> tuple[bool, bool]:
     """Return whether to translate with emulation and whether to reuse emulated shaders. A wave64 compute or mesh
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
     size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA1/2
@@ -1217,7 +1219,7 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
         return True, False
     if mode == "off":
         return False, False
-    gpu = runtime_gpu_info()
+    gpu = (probe_gpu or runtime_gpu_info)()
     rdna1 = gpu.get("rdna1_amd_windows", False)
     # On RDNA1 the native mesh modules cannot run. Both the default build's compute pipelines and
     # any mesh shaders translated with --mesh-compute use the GPU's compute subgroup capabilities.
@@ -1270,21 +1272,16 @@ def runtime_gpu_info() -> dict:
         return {}
 
 
-def runtime_gpu_per_vertex():
+def runtime_gpu_per_vertex(*, probe_gpu: Callable[[], dict] | None = None) -> bool | None:
     """per_vertex_inputs as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
     driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
-    try:
-        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
-                           capture_output=True, text=True, timeout=60)
-        v = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
-        return None if v is None else bool(v)
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return None
+    v = (probe_gpu or runtime_gpu_info)().get("per_vertex_inputs")
+    return None if v is None else bool(v)
 
 
-def runtime_gpu_max_push_constants():
+def runtime_gpu_max_push_constants(*, probe_gpu: Callable[[], dict] | None = None) -> int | None:
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
-    v = runtime_gpu_info().get("max_push_constants_size")
+    v = (probe_gpu or runtime_gpu_info)().get("max_push_constants_size")
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
 
 
@@ -2064,10 +2061,12 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
-    emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
-                              else (False, a.wave64_emulate == "auto"))
+    # Reuse the same Vulkan device information for this build, including when the probe cannot report it.
+    probe_gpu = functools.cache(runtime_gpu_info)
+    emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute, probe_gpu=probe_gpu)
+                              if "shaders" in stages else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback:
-        per_vertex = runtime_gpu_per_vertex()
+        per_vertex = runtime_gpu_per_vertex(probe_gpu=probe_gpu)
         if per_vertex is False:
             log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
                 "fragmentShaderBarycentric): translating with --f16-interp-fallback")
@@ -2076,7 +2075,7 @@ def main() -> int:
             a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
-        max_pc = runtime_gpu_max_push_constants()
+        max_pc = runtime_gpu_max_push_constants(probe_gpu=probe_gpu)
         if max_pc is None:
             a.pc_tail_ubo = keep_recorded_fallback("--pc-tail-ubo", work)
         elif max_pc < need_pc:

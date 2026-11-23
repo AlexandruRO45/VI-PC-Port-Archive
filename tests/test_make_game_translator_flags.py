@@ -205,6 +205,32 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(pre, ())
         self.assertEqual(sh, ())
 
+    def test_automatic_flags_share_one_gpu_probe_per_build(self):
+        with tempfile.TemporaryDirectory() as root:
+            argv = ["make_game.py", "--stages", "shaders", "--game", os.path.join(root, "synthetic"),
+                    "--out", os.path.join(root, "out")]
+            with (mock.patch.object(sys, "argv", argv),
+                  mock.patch.object(make_game, "below_normal"),
+                  mock.patch.object(make_game, "check", return_value={"expected_exe": "synthetic.exe"}),
+                  mock.patch.object(make_game, "preflight"),
+                  mock.patch.object(make_game, "shaders") as shaders,
+                  mock.patch.object(make_game, "log"),
+                  mock.patch.object(make_game.shutil, "which", return_value=None),
+                  mock.patch.object(make_game.subprocess, "run") as probe):
+                probe.return_value.stdout = '{"per_vertex_inputs": false, "max_push_constants_size": 128}'
+                self.assertEqual(make_game.main(), 0)
+                self.assertEqual(probe.call_count, 1)
+                self.assertEqual(shaders.call_args.kwargs["fallbacks"], ("--f16-interp-fallback", "--pc-tail-ubo"))
+
+                probe.return_value.stdout = '{"per_vertex_inputs": true, "max_push_constants_size": 256}'
+                self.assertEqual(make_game.main(), 0)
+                self.assertEqual(probe.call_count, 2)
+                self.assertEqual(shaders.call_args.kwargs["fallbacks"], ())
+
+                argv.extend(["--wave64-emulate", "off", "--f16-interp-fallback", "--pc-tail-ubo"])
+                self.assertEqual(make_game.main(), 0)
+                self.assertEqual(probe.call_count, 2)
+
     def test_f16_interp_fallback_follows_the_device(self):
         """On by itself where vk_subgroup_info says the GPU can't take PerVertexKHR inputs (MoltenVK), not where
         it can or can't tell; asked for explicitly, it is on everywhere."""
