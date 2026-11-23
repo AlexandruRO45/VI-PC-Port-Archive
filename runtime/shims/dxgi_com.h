@@ -11,10 +11,8 @@
 
 namespace rt::dxgi {
 
-// Creates an IDXGIFactory4 COM object whose CreateSwapChainForHwnd creates a VulkanSwapchain
-// and registers its back-buffer images with `context` (keyed by the returned ID3D12Resource* pointer).
-HRESULT create_factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
-                       VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
-                       std::uint32_t queue_family, REFIID riid, void** out);
+// The adapter is enumerated from this instance. Swapchains use the supplied command queue's Vulkan objects.
+HRESULT create_factory(IUnknown* instance_owner, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
+                       VkPhysicalDevice physical, REFIID riid, void** out);
 
 }  // namespace rt::dxgi

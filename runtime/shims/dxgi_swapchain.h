@@ -36,6 +36,9 @@ struct SwapchainFunctions {
     PFN_vkGetSwapchainImagesKHR get_images = nullptr;
     PFN_vkAcquireNextImageKHR acquire_next_image = nullptr;
     PFN_vkQueuePresentKHR queue_present = nullptr;
+    PFN_vkQueueWaitIdle queue_wait_idle = nullptr;
+    PFN_vkCreateSemaphore create_semaphore = nullptr;
+    PFN_vkDestroySemaphore destroy_semaphore = nullptr;
     PFN_vkCreateFence create_fence = nullptr;
     PFN_vkDestroyFence destroy_fence = nullptr;
     PFN_vkWaitForFences wait_for_fences = nullptr;
@@ -73,6 +76,9 @@ struct SwapchainFunctions {
         LOAD_D(get_images, vkGetSwapchainImagesKHR);
         LOAD_D(acquire_next_image, vkAcquireNextImageKHR);
         LOAD_D(queue_present, vkQueuePresentKHR);
+        LOAD_D(queue_wait_idle, vkQueueWaitIdle);
+        LOAD_D(create_semaphore, vkCreateSemaphore);
+        LOAD_D(destroy_semaphore, vkDestroySemaphore);
         LOAD_D(create_fence, vkCreateFence);
         LOAD_D(destroy_fence, vkDestroyFence);
         LOAD_D(wait_for_fences, vkWaitForFences);
@@ -97,7 +103,8 @@ struct SwapchainFunctions {
 #undef LOAD_D
         return create_win32_surface && destroy_surface && surface_support && surface_caps && surface_formats &&
                mem_props && create_swapchain && destroy_swapchain && get_images && acquire_next_image &&
-               queue_present && create_fence && destroy_fence && wait_for_fences && reset_fences && device_wait_idle &&
+               queue_present && queue_wait_idle && create_semaphore && destroy_semaphore &&
+               create_fence && destroy_fence && wait_for_fences && reset_fences && device_wait_idle &&
                create_image && destroy_image && image_mem_req && alloc_mem && free_mem && bind_image_mem &&
                create_cmd_pool && destroy_cmd_pool && alloc_cmd_bufs && reset_cmd_buf && begin_cmd_buf &&
                end_cmd_buf && cmd_barrier && cmd_blit && queue_submit;
@@ -108,9 +115,9 @@ class VulkanSwapchain {
 public:
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex)
+                    std::mutex& submit_mutex, bool maintenance1)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
-          submit_mutex_(submit_mutex) {
+          submit_mutex_(submit_mutex), maintenance1_(maintenance1) {
         loaded_ = fn_.load(gipa, instance, gdpa, device);
         if (loaded_) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -188,6 +195,17 @@ public:
         } else {
             current_index_ = out_index;
         }
+        // Reacquisition and its fence guarantee the preceding present has consumed this image's semaphore.
+        if (maintenance1_) {
+            PresentSync& sync = present_sync_[out_index];
+            if (sync.fence_queued) {
+                if (fn_.wait_for_fences(device_, 1, &sync.done, VK_TRUE, UINT64_MAX) != VK_SUCCESS ||
+                    fn_.reset_fences(device_, 1, &sync.done) != VK_SUCCESS)
+                    return false;
+                sync.fence_queued = false;
+            }
+            sync.submitted = false;
+        }
         // D3D12 swapchain backbuffers begin in D3D12_RESOURCE_STATE_PRESENT; transition each newly acquired
         // native swapchain image once from UNDEFINED -> PRESENT_SRC_KHR so presenting an untouched backbuffer
         // or transitioning from PRESENT matches the tracked layout.
@@ -212,7 +230,39 @@ public:
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &image_index;
         std::lock_guard lock(submit_mutex_);
+        if (!maintenance1_) {
+            // Without present fences, finish queued rendering before presenting. This avoids giving
+            // the presentation engine a semaphore that cannot be safely retired on resize or teardown.
+            if (fn_.queue_wait_idle(queue_) != VK_SUCCESS) return false;
+            const VkResult r = fn_.queue_present(queue_, &pi);
+            return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
+        }
+        PresentSync& sync = present_sync_[image_index];
+        // A failed present can still enqueue the wait. Reacquire or resize before signalling it again.
+        if (sync.submitted) return false;
+        if (!sync.ready) {
+            const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            if (fn_.create_semaphore(device_, &info, nullptr, &sync.ready) != VK_SUCCESS) return false;
+        }
+        if (!sync.done) {
+            const VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            if (fn_.create_fence(device_, &info, nullptr, &sync.done) != VK_SUCCESS) return false;
+        }
+        VkSwapchainPresentFenceInfoEXT fence{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT};
+        fence.swapchainCount = 1;
+        fence.pFences = &sync.done;
+        pi.pNext = &fence;
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &sync.ready;
+        // A signal submitted to the rendering queue orders presentation after its earlier image writes.
+        VkSubmitInfo signal{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        signal.signalSemaphoreCount = 1;
+        signal.pSignalSemaphores = &sync.ready;
+        if (fn_.queue_submit(queue_, 1, &signal, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+        sync.submitted = true;
         const VkResult r = fn_.queue_present(queue_, &pi);
+        sync.fence_queued = r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_OUT_OF_DATE_KHR ||
+                            r == VK_ERROR_SURFACE_LOST_KHR || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
         return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     }
 
@@ -284,11 +334,21 @@ private:
         offscreen_memory_.clear();
     }
 
+    void destroy_present_sync() {
+        for (const PresentSync& sync : present_sync_) {
+            if (sync.fence_queued) fn_.wait_for_fences(device_, 1, &sync.done, VK_TRUE, UINT64_MAX);
+            if (sync.done) fn_.destroy_fence(device_, sync.done, nullptr);
+            if (sync.ready) fn_.destroy_semaphore(device_, sync.ready, nullptr);
+        }
+        present_sync_.clear();
+    }
+
     void destroy_swapchain() {
         if (swapchain_ || !offscreen_images_.empty()) {
             std::lock_guard lock(submit_mutex_);
             fn_.device_wait_idle(device_);
             destroy_offscreen();
+            destroy_present_sync();
             if (swapchain_) {
                 fn_.destroy_swapchain(device_, swapchain_, nullptr);
                 swapchain_ = VK_NULL_HANDLE;
@@ -541,6 +601,7 @@ private:
 
         VkSwapchainKHR next = VK_NULL_HANDLE;
         if (fn_.create_swapchain(device_, &ci, nullptr, &next) != VK_SUCCESS) return false;
+        destroy_present_sync();
         if (swapchain_) fn_.destroy_swapchain(device_, swapchain_, nullptr);
         destroy_offscreen();
         swapchain_ = next;
@@ -554,6 +615,7 @@ private:
         if (img_count == 0) return false;
         images_.resize(img_count);
         fn_.get_images(device_, swapchain_, &img_count, images_.data());
+        if (maintenance1_) present_sync_.resize(img_count);
         image_initialized_.assign(img_count, false);
         const std::uint32_t requested = buffer_count ? buffer_count : 2u;
         const bool blit_needed = extent_.width != surface_extent_.width || extent_.height != surface_extent_.height ||
@@ -582,6 +644,7 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     std::uint32_t queue_family_ = 0;
     std::mutex& submit_mutex_;
+    bool maintenance1_ = false;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFence acquire_fence_ = VK_NULL_HANDLE;
@@ -594,6 +657,13 @@ private:
     VkExtent2D surface_extent_{0, 0};
     VkExtent2D extent_{0, 0};
     std::vector<VkImage> images_;
+    struct PresentSync {
+        VkSemaphore ready = VK_NULL_HANDLE;
+        VkFence done = VK_NULL_HANDLE;
+        bool submitted = false;
+        bool fence_queued = false;
+    };
+    std::vector<PresentSync> present_sync_;
     std::vector<bool> image_initialized_;
     std::vector<VkImage> offscreen_images_;
     std::vector<VkDeviceMemory> offscreen_memory_;

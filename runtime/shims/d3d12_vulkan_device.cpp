@@ -8336,6 +8336,25 @@ HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::
     return all ? S_OK : E_FAIL;
 }
 
+bool get_presentation_queue(ID3D12CommandQueue* queue, PresentationQueue& out) {
+    if (!get_direct_vulkan_queue(queue, out.queue, out.family)) return false;
+    ID3D12Device* device = nullptr;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) || !device) return false;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* owner = Device::from<Device>(real ? real : device);
+    device->Release();  // The queue still holds the device alive.
+    if (!owner) return false;
+    const auto& info = owner->info();
+    out.context = &owner->context();
+    out.get_instance_proc = info.get_instance_proc;
+    out.get_device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+        info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
+    out.instance = info.instance;
+    out.physical = info.physical;
+    out.swapchain_maintenance1 = info.swapchain_maintenance1;
+    return out.get_device_proc != nullptr;
+}
+
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -8344,10 +8363,7 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
     Device* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
     const auto& i = d->info();
-    const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(i.get_instance_proc(i.instance, "vkGetDeviceProcAddr"));
-    if (!gdpa) return E_FAIL;
-    return rt::dxgi::create_factory(d->context(), i.get_instance_proc, i.instance, i.physical, gdpa, i.queue,
-                                    i.queue_family, riid, out);
+    return rt::dxgi::create_factory(d, i.get_instance_proc, i.instance, i.physical, riid, out);
 }
 
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and

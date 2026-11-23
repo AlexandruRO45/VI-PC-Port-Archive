@@ -49,6 +49,21 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
                              IUnknown* device = nullptr, const QueueClock& clock = {},
                              std::shared_ptr<void> queue_lease = {});
+bool get_direct_vulkan_queue(ID3D12CommandQueue* queue, VkQueue& handle, std::uint32_t& family);
+
+struct PresentationQueue {
+    leonida::VulkanContext* context = nullptr;
+    PFN_vkGetInstanceProcAddr get_instance_proc = nullptr;
+    PFN_vkGetDeviceProcAddr get_device_proc = nullptr;
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    std::uint32_t family = 0;
+    bool swapchain_maintenance1 = false;
+};
+
+// The caller keeps the queue alive while using the returned Vulkan objects.
+bool get_presentation_queue(ID3D12CommandQueue* queue, PresentationQueue& out);
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);

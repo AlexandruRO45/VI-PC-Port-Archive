@@ -1348,6 +1348,12 @@ public:
     }
 
     bool ok() const { return queue_.ok(); }
+    bool direct_vulkan_queue(VkQueue& handle, std::uint32_t& family) const {
+        if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+        handle = vk_queue_;
+        family = family_;
+        return true;
+    }
     leonida::ReplayResult last_result() {
         // A batch the queue held fails when it is released, after the call returned: the failure is the result.
         if (const auto held = queue_.take_held_failure(); held != leonida::ReplayResult::success) last_result_ = held;
@@ -1777,6 +1783,12 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
     if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     const CommandQueue* q = CommandQueue::from(queue);
     return q && q->uses_calibrated_timestamps();
+}
+
+bool get_direct_vulkan_queue(ID3D12CommandQueue* queue, VkQueue& handle, std::uint32_t& family) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;
+    const CommandQueue* q = CommandQueue::from(queue);
+    return q && q->direct_vulkan_queue(handle, family);
 }
 
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,

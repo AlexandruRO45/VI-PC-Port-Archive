@@ -397,6 +397,7 @@ int main() {
 
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     std::uint32_t family = 0;
+    std::uint32_t queue_count = 1;
     VkPhysicalDeviceProperties chosen{};
     int best_rank = -1;
     for (auto cand : physicals) {
@@ -415,6 +416,7 @@ int main() {
                 best_rank = rank;
                 physical = cand;
                 family = i;
+                queue_count = std::min(2u, fams[i].queueCount);
                 chosen = props;
             }
             break;
@@ -437,11 +439,11 @@ int main() {
     f12.timelineSemaphore = VK_TRUE;
     f12.separateDepthStencilLayouts = VK_TRUE;
 
-    const float prio = 1.0f;
+    const float priorities[] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
+    qci.queueCount = queue_count;
+    qci.pQueuePriorities = priorities;
 
     const char* dev_ext = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f12};
@@ -455,7 +457,8 @@ int main() {
     const auto destroy_dev = reinterpret_cast<PFN_vkDestroyDevice>(gdpa(vk_dev, "vkDestroyDevice"));
     const auto wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(gdpa(vk_dev, "vkDeviceWaitIdle"));
     VkQueue vk_queue = VK_NULL_HANDLE;
-    reinterpret_cast<PFN_vkGetDeviceQueue>(gdpa(vk_dev, "vkGetDeviceQueue"))(vk_dev, family, 0, &vk_queue);
+    const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(gdpa(vk_dev, "vkGetDeviceQueue"));
+    get_queue(vk_dev, family, 0, &vk_queue);
 
     rt::d3d12::VulkanDeviceInfo info{};
     info.get_instance_proc = gipa;
@@ -465,6 +468,12 @@ int main() {
     info.queue = vk_queue;
     info.queue_family = family;
     info.separate_depth_stencil_layouts = true;
+    if (queue_count > 1) {
+        // Use a different Vulkan queue from the device's staging queue for rendering and presentation.
+        VkQueue direct = VK_NULL_HANDLE;
+        get_queue(vk_dev, family, 1, &direct);
+        info.command_queues = {direct, vk_queue};
+    }
 
     ID3D12Device* dev = nullptr;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&dev))) || !dev) return fail("create_vulkan_device");
@@ -689,6 +698,8 @@ int main() {
 
         ID3D12CommandList* lists[1] = {cl};
         queue->ExecuteCommandLists(1, lists);
+        // As in a frame loop, the app can present immediately after submitting its rendering.
+        const HRESULT presented = sc->Present(0, 0);
         queue->Signal(fence, ++fence_val);
         if (!wait_fence(fence, fence_val)) {
             rb->Release();
@@ -735,7 +746,7 @@ int main() {
                          bad_b, bad_a, exp_r, exp_g, exp_b);
             return 1;
         }
-        if (FAILED(sc->Present(0, 0))) return fail("Present");
+        if (FAILED(presented)) return fail("Present");
         return 0;
     };
 
