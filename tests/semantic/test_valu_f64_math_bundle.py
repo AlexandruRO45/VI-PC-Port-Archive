@@ -398,5 +398,22 @@ class VMinF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 4, oracle_min_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
         self.assertEqual(wave.get_f64(0, 4), f64_to_u64(50.0))
 
+class VMinF64SimdIeeeTests(unittest.TestCase):
+    def test_min_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x00FF00FF
+        for i in range(32):
+            wave.set_f64(i, 4, 0x5555555566666666)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_f64(i, 4, oracle_min_f64(f64_to_u64(i), f64_to_u64(10.0)))
+        for i in range(32):
+            if (0x00FF00FF >> i) & 1:
+                self.assertEqual(wave.get_f64(i, 4), f64_to_u64(min(float(i), 10.0)))
+            else:
+                self.assertEqual(wave.get_f64(i, 4), 0x5555555566666666)
+
+    def test_min_infinities(self):
+        self.assertEqual(oracle_min_f64(F64_NEG_INF, f64_to_u64(0.0)), F64_NEG_INF)
+
 if __name__ == "__main__":
     unittest.main()
