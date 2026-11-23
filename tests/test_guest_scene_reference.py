@@ -82,7 +82,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "spirv").mkdir()
-            bad_loader = root / "invalid.exe"
+            # A non-PE file named *.exe makes Windows show a modal "Unsupported 16-Bit Application" dialog that
+            # blocks until dismissed; any other extension fails CreateProcess with ERROR_BAD_EXE_FORMAT and no dialog.
+            bad_loader = root / ("invalid.dat" if sys.platform == "win32" else "invalid.exe")
             bad_loader.write_bytes(b"synthetic input that is not an executable")
             bad_loader.chmod(0o700)
             out = root / "output"
