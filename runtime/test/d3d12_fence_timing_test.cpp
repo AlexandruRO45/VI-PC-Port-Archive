@@ -205,6 +205,37 @@ void require_progress(bool ok, const char* who, const char* what) {
     std::_Exit(1);
 }
 
+// Cover both consumer-Wait orderings after a CPU signal, even when an earlier GPU signal is still gated.
+int check_cross_queue_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* producer, const char* who) {
+    Ref<ID3D12CommandQueue> consumer;
+    const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&consumer.p))));
+    for (const bool wait_first : {true, false}) {
+        Event consumed, produced;
+        EXPECT(consumed.h && produced.h);
+        Ref<ID3D12Fence> gate, fence, consumer_done, producer_done;
+        for (auto* current : {&gate, &fence, &consumer_done, &producer_done})
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&current->p))));
+        EXPECT(SUCCEEDED(consumer_done->SetEventOnCompletion(1, consumed.h)));
+        EXPECT(SUCCEEDED(producer_done->SetEventOnCompletion(1, produced.h)));
+        require_progress(SUCCEEDED(producer->Wait(gate.p, 1)) && SUCCEEDED(producer->Signal(fence.p, 60)) &&
+                             SUCCEEDED(producer->Signal(producer_done.p, 1)), who, "could not gate the producer");
+        if (!wait_first)
+            require_progress(SUCCEEDED(fence->Signal(70)), who, "CPU Signal before consumer Wait failed");
+        require_progress(SUCCEEDED(consumer->Wait(fence.p, 70)) && SUCCEEDED(consumer->Signal(consumer_done.p, 1)),
+                         who, "could not submit the consumer wait and signal");
+        const bool early = wait_first && consumed.set_within(50);
+        if (wait_first)
+            require_progress(SUCCEEDED(fence->Signal(70)), who, "CPU Signal after consumer Wait failed");
+        const bool woke = early || consumed.set_within(5000);
+        require_progress(SUCCEEDED(gate->Signal(1)) && produced.set_within(5000) &&
+                             (woke || consumed.set_within(5000)), who, "queues did not finish after opening the gate");
+        EXPECT(!early && woke && fence->GetCompletedValue() == 60);
+    }
+    std::printf("%s: CPU signal releases cross-queue waits before and after registration\n", who);
+    return 0;
+}
+
 // The host applies CPU signals immediately, even while an earlier queue Signal is held at a gate. When the
 // queue reaches its lower value it rewinds the fence, but the event set by the CPU signal stays set.
 int check_pending_gpu_rewind(ID3D12Device* device, ID3D12CommandQueue* queue, const char* who) {
@@ -298,6 +329,7 @@ int check_standalone_rewinds(ID3D12Device* device, ID3D12CommandQueue* direct, c
     const bool has_copy = SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&copy.p)));
     int failures = check_cpu_rewind(device, who);
     failures += check_pending_gpu_rewind(device, has_copy ? copy.p : direct, who);
+    failures += check_cross_queue_cpu_signal(device, has_copy ? copy.p : direct, who);
     if (has_copy) {
         failures += check_queue_rewind(device, copy.p, direct, who);
         failures += check_held_producer_rewind(device, copy.p, direct, who);
@@ -346,7 +378,8 @@ int check_custom_heap_properties(ID3D12Device* device) {
 
     // The host runtime on a NUMA adapter (the answer the layer gives in D3D12_FEATURE_ARCHITECTURE) must agree.
     Ref<ID3D12Device> host;
-    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+    if (hostwine::host_is_wine() ||
+        FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
         std::printf("GetCustomHeapProperties: no host D3D12 device to compare with\n");
         return 0;
     }
