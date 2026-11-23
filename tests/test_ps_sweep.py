@@ -173,6 +173,23 @@ class CompareCommand(unittest.TestCase):
             self.assertIn("OK on both: 2", buf.getvalue())
             self.assertNotIn("timeout", buf.getvalue())
 
+    def test_cli_rejects_invalid_n_timeout_only_and_file_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file_out = os.path.join(tmp, "not_a_dir")
+            with open(file_out, "wb") as f:
+                f.write(b"x")
+            for argv in (
+                ["sample", "--spirv", tmp, "--out", tmp, "--n", "0"],
+                ["sample", "--spirv", tmp, "--out", tmp, "--n", "-5"],
+                ["run", "--spirv", tmp, "--out", tmp, "--tag", "a", "--exe", "x", "--timeout", "0"],
+                ["run", "--spirv", tmp, "--out", tmp, "--tag", "a", "--exe", "x", "--only", ""],
+                ["run", "--spirv", tmp, "--out", tmp, "--tag", "a", "--exe", "x", "--only", "-1"],
+                ["sample", "--spirv", tmp, "--out", file_out],
+            ):
+                with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
+                    ps_sweep.main(argv)
+                self.assertEqual(cm.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

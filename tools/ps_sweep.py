@@ -254,24 +254,52 @@ def cmd_compare(a):
             print(f"    {c} / {sc}: {n}")
 
 
+def _positive_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def _only_indices(text):
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("must name at least one shader index")
+    out = []
+    for p in parts:
+        try:
+            v = int(p)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid shader index: {p!r}") from None
+        if v < 0:
+            raise argparse.ArgumentTypeError(f"shader index must be 0 or more: {v}")
+        out.append(v)
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["sample", "run", "compare"])
     ap.add_argument("--spirv", help="the translated SPIR-V folder (index.json and the .spv files)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--n", type=int, default=480)
+    ap.add_argument("--n", type=_positive_int, default=480)
     ap.add_argument("--seed", type=int, default=20261122)
     ap.add_argument("--tag", help="a label for the GPU this run uses")
     ap.add_argument("--tags", nargs=2, default=["a", "b"])
     ap.add_argument("--variant", choices=["z", "t"], default="z")
     ap.add_argument("--exe", help="vk_ps_sweep")
     ap.add_argument("--glslang", default="glslangValidator")
-    ap.add_argument("--timeout", type=int, default=20, help="seconds the GPU may take for one draw")
+    ap.add_argument("--timeout", type=_positive_int, default=20, help="seconds the GPU may take for one draw")
     ap.add_argument("--lo", type=int, default=0)
     ap.add_argument("--hi", type=int, default=0)
-    ap.add_argument("--only", type=lambda s: [int(x) for x in s.split(",")], default=None)
+    ap.add_argument("--only", type=_only_indices, default=None)
     ap.add_argument("--suffix", default="", help="results folder suffix (a re-run uses _re)")
     a = ap.parse_args(argv)
+    if os.path.exists(a.out) and not os.path.isdir(a.out):
+        ap.error(f"--out is not a directory: {a.out}")
     if a.cmd == "run" and not (a.tag and a.exe and a.spirv):
         ap.error("run needs --tag, --exe and --spirv")
     if a.cmd == "run" and a.only and not a.suffix:
