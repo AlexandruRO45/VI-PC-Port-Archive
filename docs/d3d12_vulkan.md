@@ -345,8 +345,11 @@ What is implemented (all of it testable without the game):
     asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)
     and NaN payloads. A whole view is `vkCmdClearColorImage`; rectangles are `vkCmdClearAttachments` in a
     dynamic-rendering scope, so a texture created with `ALLOW_UNORDERED_ACCESS` also gets `COLOR_ATTACHMENT` usage
-    when its format supports it. Both run in place in `GENERAL`, the UAV layout. Rectangle clears of volumes, or of
-    formats without attachment support, are refused as `unsupported`.
+    when its format supports it. Both run in place in `GENERAL`, the UAV layout. Rectangle clears of volumes,
+    partial-W volume views, formats without attachment support (such as `R9G9B9E5_SHAREDEXP`), and compute-queue
+    rectangle clears execute via `vkCmdCopyBufferToImage` from transfer scratch storage filled with the encoded clear
+    element (capped at 64 KiB and tiled across slices/rows as needed), also in `GENERAL` layout on both Direct and
+    Compute queues.
   - The clear is fenced as the UAV state widened to transfers, so a following UAV barrier, transition, or enhanced
     barrier from `SYNC_CLEAR_UNORDERED_ACCESS_VIEW` sees it.
   - Under `SetPredication`, a whole-view texture clear runs as one rectangle through the attachment path, as

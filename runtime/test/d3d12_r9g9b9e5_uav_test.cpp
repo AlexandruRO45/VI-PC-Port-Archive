@@ -367,7 +367,6 @@ int main() {
         d.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &e5_props);
     const bool native_storage = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     const bool native_attach = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
-    const bool rect_clears_supported = !native_storage || native_attach;
 
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -609,13 +608,11 @@ int main() {
             {{true, {1.0f, 2.0f, 4.0f, 0.0f}, {}, {}},
              {false, {}, {0x3f800000u, 0xffffffffu, 0x12345678u, 7u}, {}}},
         };
-        if (rect_clears_supported) {
-            clear_cases.push_back({
-                {true, {1.0f, 2.0f, 4.0f, 0.0f}, {}, {}},
-                {true, {0.5f, 0.25f, 0.125f, 0.0f}, {}, {{1, 1, 3, 3}}},
-                {false, {}, {0xdeadbeefu, 0x3f800000u, 0u, 0u}, {{2, 2, 4, 4}}},
-            });
-        }
+        clear_cases.push_back({
+            {true, {1.0f, 2.0f, 4.0f, 0.0f}, {}, {}},
+            {true, {0.5f, 0.25f, 0.125f, 0.0f}, {}, {{1, 1, 3, 3}}},
+            {false, {}, {0xdeadbeefu, 0x3f800000u, 0u, 0u}, {{2, 2, 4, 4}}},
+        });
         // WARP's words for each case, row by row (docs/d3d12_vulkan.md: half-up rounding, uint clears write 0).
         const auto same = [](std::uint32_t w) {
             std::array<std::uint32_t, 16> a{};

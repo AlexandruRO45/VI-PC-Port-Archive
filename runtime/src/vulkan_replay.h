@@ -1000,8 +1000,10 @@ struct Prepared {
     uav_clear::Element element;                      // unordered-access clears: one element of the view's format
     VkClearColorValue clear_color{};                 // ... the value that writes it into the image
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
-    VkBuffer fill_scratch = VK_NULL_HANDLE;         // short buffer clears: one repeated 8-byte pattern
+    VkBuffer fill_scratch = VK_NULL_HANDLE;         // short buffer clears & transfer-copy texture UAV rect clears
     VkDeviceSize fill_scratch_offset = 0;
+    VkDeviceSize fill_scratch_size = 0;
+    std::vector<std::uint32_t> uav_copy_groups;     // regions per clipped rect for transfer-copy texture UAV clears
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
@@ -1630,6 +1632,132 @@ inline void emit_buffer_fill(const ReplayFunctions& vk, VkCommandBuffer command_
         vk.copy_buffer(command_buffer, buffer, buffer, 1, &copy);
         filled += step;
     }
+}
+
+// Prepares a texture UAV clear via vkCmdCopyBufferToImage from transfer scratch filled with the encoded clear
+// element: used for rectangle clears on 3D volumes, non-attachment formats (e.g. R9G9B9E5_SHAREDEXP), compute
+// queues, and partial-W 3D views (where vkCmdClearColorImage would touch slices outside the view's W range).
+inline ReplayResult prepare_texture_uav_copy_clear(const ClearUnorderedAccess& clear, const ReplayFunctions& vk,
+                                                   Prepared& p) {
+    const UavView& view = clear.view;
+    const VkExtent2D mip = mip_extent(p.binding, view.mip);
+    const Rect full_mip{0, 0, std::int32_t(mip.width), std::int32_t(mip.height)};
+    const std::span<const Rect> src_rects =
+        clear.rects.empty() ? std::span<const Rect>(&full_mip, 1) : std::span<const Rect>(clear.rects);
+
+    struct ClippedRect {
+        std::int32_t x, y;
+        std::uint32_t w, h;
+    };
+    std::vector<ClippedRect> clipped;
+    clipped.reserve(src_rects.size());
+    for (const Rect& r : src_rects) {
+        const std::int64_t left = std::max<std::int64_t>(r.left, 0);
+        const std::int64_t top = std::max<std::int64_t>(r.top, 0);
+        const std::int64_t right = std::min<std::int64_t>(r.right, mip.width);
+        const std::int64_t bottom = std::min<std::int64_t>(r.bottom, mip.height);
+        if (right <= left || bottom <= top) continue;
+        clipped.push_back({std::int32_t(left), std::int32_t(top), std::uint32_t(right - left),
+                           std::uint32_t(bottom - top)});
+    }
+    if (clipped.empty() || !view.layer_count) {
+        p.skip = true;
+        return ReplayResult::success;
+    }
+
+    const std::uint32_t texel = p.element.size;
+    const bool can_fill = texel <= 4 ? (vk.fill_buffer != nullptr) : (vk.update_buffer != nullptr);
+    if (!vk.copy_scratch || !vk.copy_buffer_to_image || !can_fill) return ReplayResult::unsupported;
+
+    // Cap scratch at 64 KiB (vkCmdUpdateBuffer's limit and a multiple of every element size 1..16).
+    constexpr VkDeviceSize kMaxChunk = 65536;
+    const VkDeviceSize align = std::max<VkDeviceSize>(4, texel);
+    VkDeviceSize needed = 0;
+    for (const ClippedRect& r : clipped) {
+        const std::uint64_t slice_bytes = std::uint64_t(r.w) * r.h * texel;
+        if (slice_bytes >= kMaxChunk) {
+            needed = kMaxChunk;
+            break;
+        }
+        const std::uint64_t total_bytes =
+            view.layer_count > kMaxChunk / slice_bytes ? kMaxChunk : slice_bytes * view.layer_count;
+        needed = std::max<VkDeviceSize>(needed, total_bytes);
+    }
+    const VkDeviceSize alloc_bytes = ((needed + align - 1) / align) * align;
+    if (!vk.copy_scratch(alloc_bytes, p.fill_scratch, p.fill_scratch_offset) || !p.fill_scratch ||
+        p.fill_scratch_offset % align || p.fill_scratch_offset > UINT64_MAX - alloc_bytes)
+        return ReplayResult::unsupported;
+    p.fill_scratch_size = alloc_bytes;
+
+    const VkDeviceSize cap = alloc_bytes;
+    const VkDeviceSize base_off = p.fill_scratch_offset;
+    for (const ClippedRect& r : clipped) {
+        const std::size_t before = p.buffer_image_copies.size();
+        const std::uint64_t row_bytes = std::uint64_t(r.w) * texel;
+        const std::uint64_t slice_bytes = row_bytes * r.h;
+        if (slice_bytes <= cap) {
+            const std::uint32_t per_copy = std::max<std::uint32_t>(
+                1u, std::uint32_t(std::min<std::uint64_t>(view.layer_count, cap / slice_bytes)));
+            for (std::uint32_t s = 0; s < view.layer_count; s += per_copy) {
+                const std::uint32_t n = std::min(per_copy, view.layer_count - s);
+                VkBufferImageCopy c{};
+                c.bufferOffset = base_off;
+                if (p.binding.volume) {
+                    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, view.mip, 0, 1};
+                    c.imageOffset = {r.x, r.y, std::int32_t(view.first_layer + s)};
+                    c.imageExtent = {r.w, r.h, n};
+                } else {
+                    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, view.mip, view.first_layer + s, n};
+                    c.imageOffset = {r.x, r.y, 0};
+                    c.imageExtent = {r.w, r.h, 1};
+                }
+                p.buffer_image_copies.push_back(c);
+            }
+        } else if (row_bytes <= cap) {
+            const std::uint32_t rows_per_copy =
+                std::max<std::uint32_t>(1u, std::uint32_t(std::min<std::uint64_t>(r.h, cap / row_bytes)));
+            for (std::uint32_t s = 0; s < view.layer_count; ++s) {
+                for (std::uint32_t y = 0; y < r.h; y += rows_per_copy) {
+                    const std::uint32_t eh = std::min(rows_per_copy, r.h - y);
+                    VkBufferImageCopy c{};
+                    c.bufferOffset = base_off;
+                    if (p.binding.volume) {
+                        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, view.mip, 0, 1};
+                        c.imageOffset = {r.x, r.y + std::int32_t(y), std::int32_t(view.first_layer + s)};
+                    } else {
+                        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, view.mip, view.first_layer + s, 1};
+                        c.imageOffset = {r.x, r.y + std::int32_t(y), 0};
+                    }
+                    c.imageExtent = {r.w, eh, 1};
+                    p.buffer_image_copies.push_back(c);
+                }
+            }
+        } else {
+            const std::uint32_t cols_per_copy =
+                std::max<std::uint32_t>(1u, std::uint32_t(std::min<std::uint64_t>(r.w, cap / texel)));
+            for (std::uint32_t s = 0; s < view.layer_count; ++s) {
+                for (std::uint32_t y = 0; y < r.h; ++y) {
+                    for (std::uint32_t x = 0; x < r.w; x += cols_per_copy) {
+                        const std::uint32_t ew = std::min(cols_per_copy, r.w - x);
+                        VkBufferImageCopy c{};
+                        c.bufferOffset = base_off;
+                        if (p.binding.volume) {
+                            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, view.mip, 0, 1};
+                            c.imageOffset = {r.x + std::int32_t(x), r.y + std::int32_t(y),
+                                             std::int32_t(view.first_layer + s)};
+                        } else {
+                            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, view.mip, view.first_layer + s, 1};
+                            c.imageOffset = {r.x + std::int32_t(x), r.y + std::int32_t(y), 0};
+                        }
+                        c.imageExtent = {ew, 1, 1};
+                        p.buffer_image_copies.push_back(c);
+                    }
+                }
+            }
+        }
+        p.uav_copy_groups.push_back(std::uint32_t(p.buffer_image_copies.size() - before));
+    }
+    return ReplayResult::success;
 }
 
 // The one plane of one subresource a texture copy location names.
@@ -2613,17 +2741,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const auto* image_layout = uav_clear::layout(p.binding.format);
             if (!image_layout || image_layout->bytes != p.element.size)
                 return ReplayResult::unsupported;
-            const bool attachment = p.binding.color_attachment && !p.binding.volume;
+            const bool attachment = p.binding.color_attachment && !p.binding.volume && !vk.queue_stages;
             const bool view_attachable = vk.color_attachment_format
                                              ? vk.color_attachment_format(view_format)
                                              : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
             const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
+            const bool partial_volume =
+                p.binding.volume && view.layer_count != std::max(1u, p.binding.depth >> view.mip);
+            if ((!uav->rects.empty() && !attachment) || partial_volume) {
+                if (predicated) ++out.unpredicated_copies;  // transfer copies ignore conditional rendering
+                if (const auto r = detail::prepare_texture_uav_copy_clear(*uav, vk, p); r != ReplayResult::success)
+                    return r;
+                continue;
+            }
             const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
             if (!uav_clear::decode(clear_format, p.element, p.clear_color))
                 return ReplayResult::unsupported;
             if (reinterpret) p.clear_format = view_format;
-            if (!uav->rects.empty() && !attachment)
-                return ReplayResult::unsupported;
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
             // render targets are; otherwise vkCmdClearColorImage runs unconditionally and is counted.
             if (predicated && uav->rects.empty() && !attachment) ++out.unpredicated_copies;
@@ -3495,6 +3629,27 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VkImageLayout layout = image_layout(p.binding, state.layout);
             auto pieces = detail::current(tracker, id, p.range, layout);
             detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
+            if (!p.buffer_image_copies.empty()) {
+                detail::emit_buffer_fill(vk, command_buffer, p.fill_scratch, p.element, p.fill_scratch_offset,
+                                         p.fill_scratch_size);
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
+                    std::size_t offset = 0;
+                    for (std::size_t g = 0; g < p.uav_copy_groups.size(); ++g) {
+                        if (g)  // rectangles may overlap
+                            detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        const std::uint32_t count = p.uav_copy_groups[g];
+                        vk.copy_buffer_to_image(command_buffer, p.fill_scratch, p.binding.image, layout, count,
+                                                p.buffer_image_copies.data() + offset);
+                        offset += count;
+                    }
+                });
+                continue;
+            }
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {

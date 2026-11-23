@@ -17,7 +17,8 @@ struct Write {
 };
 std::vector<Write> writes;
 
-unsigned image_clears = 0, attachment_clears = 0;
+unsigned image_clears = 0, attachment_clears = 0, buffer_to_image_calls = 0;
+std::vector<VkBufferImageCopy> captured_copies;
 VkFormat requested_view_format = VK_FORMAT_UNDEFINED;
 VkImageSubresourceRange requested_view_range{};
 VkClearColorValue captured_color{};
@@ -26,7 +27,8 @@ VkRect2D captured_render_area{};
 std::uint32_t captured_render_layers = 0;
 
 void reset_texture_capture() {
-    image_clears = attachment_clears = 0;
+    image_clears = attachment_clears = buffer_to_image_calls = 0;
+    captured_copies.clear();
     requested_view_format = VK_FORMAT_UNDEFINED;
     requested_view_range = {};
     captured_color = {};
@@ -64,6 +66,11 @@ VKAPI_ATTR void VKAPI_CALL clear_attachments(VkCommandBuffer, std::uint32_t coun
         captured_rect = rects[0];
         ++attachment_clears;
     }
+}
+VKAPI_ATTR void VKAPI_CALL copy_buf_to_img(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, std::uint32_t count,
+                                           const VkBufferImageCopy* regions) {
+    ++buffer_to_image_calls;
+    for (std::uint32_t i = 0; i < count; ++i) captured_copies.push_back(regions[i]);
 }
 
 int failures = 0;
@@ -300,6 +307,98 @@ int main() {
            "non-attachable view format falls back to backing format");
     expect(image_clears == 1 && attachment_clears == 0,
            "non-attachable view format whole-view clear uses vkCmdClearColorImage");
+
+    // 3D volume, non-attachment (e.g. native R9G9B9E5_SHAREDEXP), and compute-queue rectangle UAV clears execute via
+    // vkCmdCopyBufferToImage from transfer scratch.
+    ReplayFunctions copy_tex_vk = tex_vk;
+    copy_tex_vk.copy_buffer_to_image = copy_buf_to_img;
+    unsigned tex_scratch_allocs = 0;
+    copy_tex_vk.copy_scratch = [&](VkDeviceSize, VkBuffer& buffer, VkDeviceSize& offset) {
+        ++tex_scratch_allocs;
+        buffer = scratch;
+        offset = scratch_at;
+        return true;
+    };
+
+    ResourceBinding vol{};
+    vol.image = reinterpret_cast<VkImage>(std::uintptr_t{0x4000});
+    vol.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vol.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+    vol.width = 8;
+    vol.height = 8;
+    vol.depth = 4;
+    vol.mip_levels = 2;
+    vol.array_layers = 1;
+    vol.volume = true;
+    vol.color_attachment = false;
+
+    const std::array<Rect, 2> vol_rects{{{1, 2, 5, 6}, {3, 4, 20, 20}}};
+    tex_scratch_allocs = 0;
+    expect(run_tex(vol, {2, false, VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 1, 2}, false, {1, 2, 3, 4}, vol_rects,
+                   &copy_tex_vk) == ReplayResult::success,
+           "3D volume partial-W rect clear replays via copy_buffer_to_image");
+    expect(tex_scratch_allocs == 1 && image_clears == 0 && attachment_clears == 0 && buffer_to_image_calls == 2 &&
+               captured_copies.size() == 2 && captured_copies[0].imageOffset.x == 1 &&
+               captured_copies[0].imageOffset.y == 2 && captured_copies[0].imageOffset.z == 1 &&
+               captured_copies[0].imageExtent.width == 4 && captured_copies[0].imageExtent.height == 4 &&
+               captured_copies[0].imageExtent.depth == 2 && captured_copies[1].imageOffset.x == 3 &&
+               captured_copies[1].imageOffset.y == 4 && captured_copies[1].imageOffset.z == 1 &&
+               captured_copies[1].imageExtent.width == 5 && captured_copies[1].imageExtent.height == 4 &&
+               captured_copies[1].imageExtent.depth == 2,
+           "3D volume rect clear clips to mip and targets only [FirstWSlice, FirstWSlice+WSize)");
+
+    // Partial-W whole-view 3D clear also uses copy_buffer_to_image rather than vkCmdClearColorImage.
+    tex_scratch_allocs = 0;
+    expect(run_tex(vol, {2, false, VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 2, 1}, false, {9, 8, 7, 6}, {},
+                   &copy_tex_vk) == ReplayResult::success,
+           "3D volume partial-W whole-view clear replays via copy_buffer_to_image");
+    expect(tex_scratch_allocs == 1 && image_clears == 0 && buffer_to_image_calls == 1 &&
+               captured_copies.size() == 1 && captured_copies[0].imageOffset.z == 2 &&
+               captured_copies[0].imageExtent.width == 8 && captured_copies[0].imageExtent.height == 8 &&
+               captured_copies[0].imageExtent.depth == 1,
+           "3D volume partial-W whole-view clear writes only the selected W slice");
+
+    // Out-of-bounds volume rect clips to empty -> no-op without scratch allocation.
+    const Rect oob_rect{10, 10, 20, 20};
+    tex_scratch_allocs = 0;
+    expect(run_tex(vol, {2, false, VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 0, 4}, false, {1, 2, 3, 4},
+                   std::span<const Rect>(&oob_rect, 1), &copy_tex_vk) == ReplayResult::success,
+           "3D volume out-of-bounds rect is a no-op");
+    expect(tex_scratch_allocs == 0 && buffer_to_image_calls == 0 && image_clears == 0,
+           "3D volume out-of-bounds rect allocates no scratch and emits no commands");
+
+    // Non-attachment native E5B9G9R9 2D UAV rect clear uses copy_buffer_to_image.
+    ResourceBinding native_e5 = tex;
+    native_e5.format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    native_e5.color_attachment = false;
+    tex_scratch_allocs = 0;
+    expect(run_tex(native_e5, {2, false, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 0, 0, 0, 0, 0, 1}, true,
+                   {fbits(1.0f), fbits(2.0f), fbits(4.0f), 0}, std::span<const Rect>(&sub_rect, 1),
+                   &copy_tex_vk) == ReplayResult::success,
+           "non-attachment E5B9G9R9 2D rect clear replays via copy_buffer_to_image");
+    expect(tex_scratch_allocs == 1 && attachment_clears == 0 && buffer_to_image_calls == 1 &&
+               captured_copies.size() == 1 && captured_copies[0].imageOffset.x == 1 &&
+               captured_copies[0].imageOffset.y == 1 && captured_copies[0].imageExtent.width == 3 &&
+               captured_copies[0].imageExtent.height == 2,
+           "non-attachment E5B9G9R9 rect clear emits expected copy region");
+
+    // Compute queue rect clear on an attachable 2D texture avoids begin_rendering and uses copy_buffer_to_image.
+    ReplayFunctions compute_vk = copy_tex_vk;
+    compute_vk.queue_stages = detail::queue_stages_compute;
+    compute_vk.begin_rendering = nullptr;
+    tex_scratch_allocs = 0;
+    expect(run_tex(rgba8, {2, false, VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 0, 1}, false, {1, 2, 3, 4},
+                   std::span<const Rect>(&sub_rect, 1), &compute_vk) == ReplayResult::success,
+           "compute-queue 2D rect clear replays via copy_buffer_to_image");
+    expect(tex_scratch_allocs == 1 && attachment_clears == 0 && buffer_to_image_calls == 1,
+           "compute-queue 2D rect clear bypasses dynamic rendering");
+
+    // Missing copy_scratch refuses volume/non-attachment rect clears cleanly.
+    ReplayFunctions no_scratch_vk = copy_tex_vk;
+    no_scratch_vk.copy_scratch = {};
+    expect(run_tex(vol, {2, false, VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 0, 4}, false, {1, 2, 3, 4},
+                   std::span<const Rect>(&sub_rect, 1), &no_scratch_vk) == ReplayResult::unsupported,
+           "volume rect clear without copy_scratch returns unsupported");
 
     if (failures) return 1;
     std::printf("replay_uav_clear_offset: buffer offsets and typeless texture view-format clears all passed\n");

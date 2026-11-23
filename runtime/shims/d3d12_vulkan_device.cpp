@@ -1124,11 +1124,12 @@ struct DeviceState {
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
         // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
+        const bool is_3d = image.type == g::ImageType::image_3d;
         view_info.subresourceRange = {
             VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
                                : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
                                                                        : VK_IMAGE_ASPECT_COLOR_BIT),
-            image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+            image.first_mip, image.mip_count, is_3d ? 0u : image.first_layer, is_3d ? 1u : image.layer_count};
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
         leonida::StorageViews views{};
@@ -4095,7 +4096,8 @@ private:
 
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
-bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
+bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out,
+                      bool storage = false) {
     namespace g = leonida::gfx10;
     const D3D12_RESOURCE_DESC& desc = resource.desc();
     // Plane 1 of a depth-stencil texture is its stencil, viewed as X24_TYPELESS_G8_UINT (D24S8) or
@@ -4230,13 +4232,19 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("view format not supported for this texture:", int(view.format));
         return false;
     }
-    const UINT layers = volume ? 1 : desc.DepthOrArraySize;
-    if (view.first_mip >= desc.MipLevels || view.first_layer >= layers) {
+    if (view.first_mip >= desc.MipLevels) {
         log_once("view starts past the texture's mips or layers; first mip", int(view.first_mip));
         return false;
     }
-    if (msaa && view.layer_count != UINT_MAX && view.layer_count > UINT(desc.DepthOrArraySize) - view.first_layer) {
-        log_once("multisample shader view ends past the texture array; layers", int(view.layer_count));
+    const UINT mip_depth = volume ? std::max(1u, UINT(desc.DepthOrArraySize) >> view.first_mip) : 1u;
+    const UINT layers = volume ? (storage ? mip_depth : 1u) : UINT(desc.DepthOrArraySize);
+    if (view.first_layer >= layers) {
+        log_once("view starts past the texture's mips or layers; first mip", int(view.first_mip));
+        return false;
+    }
+    if ((msaa || (volume && storage)) && view.layer_count != UINT_MAX &&
+        view.layer_count > layers - view.first_layer) {
+        log_once("view ends past the texture's layers or depth; layers", int(view.layer_count));
         return false;
     }
     out = {};
@@ -4249,8 +4257,20 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     out.samples = desc.SampleDesc.Count;
     out.first_mip = view.first_mip;
     out.mip_count = std::min<UINT>(view.mip_count, desc.MipLevels - view.first_mip);
-    out.first_layer = view.first_layer;
-    out.layer_count = std::min<UINT>(view.layer_count, layers - view.first_layer);
+    if (volume && storage) {
+        const UINT w_count = view.layer_count == UINT_MAX ? (mip_depth - view.first_layer) : view.layer_count;
+        if (!w_count) {
+            log_once("view of no mips or no layers; type", int(view.type));
+            return false;
+        }
+        const bool partial = view.first_layer != 0 || w_count != mip_depth;
+        out.first_layer = partial ? view.first_layer : 0;
+        out.layer_count = 1;
+        out.w_size = partial ? w_count : 0;
+    } else {
+        out.first_layer = view.first_layer;
+        out.layer_count = std::min<UINT>(view.layer_count, layers - view.first_layer);
+    }
     if (view.type == g::ImageType::cube) out.layer_count -= out.layer_count % 6;  // whole cubes
     out.resource_mips = desc.MipLevels;
     out.min_lod = view.min_lod;
@@ -6065,6 +6085,8 @@ public:
             if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
                 view.type = leonida::gfx10::ImageType::image_1d;
                 view.layer_count = 1;
+            } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                view.type = leonida::gfx10::ImageType::image_3d;
             } else if (array)
                 view.type = leonida::gfx10::ImageType::image_2d_array;
         } else {
@@ -6086,6 +6108,12 @@ public:
                 view.first_layer = desc->Texture2DArray.FirstArraySlice;
                 view.layer_count = desc->Texture2DArray.ArraySize;
                 view.plane = desc->Texture2DArray.PlaneSlice;
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE3D:
+                view.type = leonida::gfx10::ImageType::image_3d;
+                view.first_mip = desc->Texture3D.MipSlice;
+                view.first_layer = desc->Texture3D.FirstWSlice;
+                view.layer_count = desc->Texture3D.WSize;
                 break;
             default:
                 log_once("unordered-access view dimension not supported:", desc->ViewDimension);
@@ -7591,7 +7619,7 @@ private:
     void write_image_descriptor(const Resource& resource, const TextureView& view,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
         leonida::gfx10::Image image{};
-        if (!image_descriptor(resource, view, image)) return;
+        if (!image_descriptor(resource, view, image, storage)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),

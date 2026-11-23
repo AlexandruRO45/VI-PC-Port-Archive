@@ -100,8 +100,9 @@ struct Image {
     std::uint32_t width = 1;          // of mip 0, 1..16384
     std::uint32_t height = 1;
     std::uint32_t depth = 1;          // of mip 0, for 3D: 1..8192
-    std::uint32_t first_layer = 0;    // arrays and cubes (a cube's layers are its faces, six to a cube)
+    std::uint32_t first_layer = 0;    // arrays and cubes (a cube's layers are its faces, six to a cube); 3D UAV: FirstWSlice
     std::uint32_t layer_count = 1;
+    std::uint32_t w_size = 0;         // 3D UAV sub-range WSize (0: full mip depth)
     std::uint32_t first_mip = 0;      // the view's range
     std::uint32_t mip_count = 1;
     std::uint32_t resource_mips = 1;  // of the whole resource
@@ -139,7 +140,8 @@ inline ImageWords encode(const Image& image) {
                field(image.swizzle[3], 9, 3) | field(base_level, 12, 4) | field(last_level, 16, 4) |
                field(std::uint32_t(image.type), 28, 4);
     words[4] = field(last, 0, 13) | field(image.first_layer, 16, 13);
-    words[5] = field(max_mip, 4, 4);
+    words[5] = field(max_mip, 4, 4) |
+               (image.type == ImageType::image_3d && image.w_size ? field(image.w_size, 8, 13) : 0u);
     return words;
 }
 
@@ -180,6 +182,7 @@ inline bool decode(const ImageWords& words, Image& out) {
     image.first_layer = get(words[4], 16, 13);
     if (image.type == ImageType::image_3d) {
         image.depth = last + 1;
+        image.w_size = get(words[5], 8, 13);
     } else {
         if (last < image.first_layer) return false;
         image.layer_count = last - image.first_layer + 1;

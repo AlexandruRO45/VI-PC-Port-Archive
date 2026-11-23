@@ -937,8 +937,14 @@ private:
             out.buffer = false;
             out.format = std::uint32_t(descriptor_format(image.format, image.swizzle));
             out.mip = image.first_mip;
-            out.first_layer = volume ? 0 : image.first_layer;  // a 3D view clears every slice of its mip
-            out.layer_count = volume ? 1 : image.layer_count;
+            if (volume) {
+                const std::uint32_t mip_depth = std::max(1u, image.depth >> image.first_mip);
+                out.first_layer = image.w_size ? image.first_layer : 0;
+                out.layer_count = image.w_size ? image.w_size : mip_depth;
+            } else {
+                out.first_layer = image.first_layer;
+                out.layer_count = image.layer_count;
+            }
             return out.format != VK_FORMAT_UNDEFINED;
         }
         g::BufferWords buffer_words{};

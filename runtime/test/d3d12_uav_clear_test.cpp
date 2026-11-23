@@ -660,18 +660,11 @@ int main() {
                                               floats(0.5f, 0.25f, 0.125f, 0.0f), 1, 1, 1),
                                 texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, false,
                                               {0x3f800000u, 0xffffffffu, 1u, 2u}, 0, 1, 1)}};
-                VkFormatProperties e5_props{};
-                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
-                    d.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &e5_props);
-                const bool native_storage = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
-                const bool native_attach = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
-                if (!native_storage || native_attach) {
-                    // Emulated R32_UINT images (or native ones with COLOR_ATTACHMENT) also clear partial rectangles.
-                    e5.clears.push_back(texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
-                                                      floats(100.0f, 0.001f, 0.5f, 0.0f), 0, 0, 1, {{1, 2, 5, 6}}));
-                    e5.clears.push_back(texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, false,
-                                                      {0x12345678u, 0x9abcdef0u, 0u, 0u}, 0, 0, 1, {{2, 3, 4, 5}}));
-                }
+                // Partial rectangles work whether R9G9B9E5 UAV is native (transfer scratch) or emulated (attachment).
+                e5.clears.push_back(texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
+                                                  floats(100.0f, 0.001f, 0.5f, 0.0f), 0, 0, 1, {{1, 2, 5, 6}}));
+                e5.clears.push_back(texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, false,
+                                                  {0x12345678u, 0x9abcdef0u, 0u, 0u}, 0, 0, 1, {{2, 3, 4, 5}}));
                 all_textures.push_back(std::move(e5));
             }
         }
@@ -719,7 +712,8 @@ int main() {
             }) == E_INVALIDARG);
 
             // Refused at execution, before anything is submitted: a buffer view of a texture, a texture view of a
-            // buffer, a mip the texture does not have, a buffer view past the end, a rectangle clear of a volume.
+            // buffer, a mip the texture does not have, a buffer view past the end. A rectangle clear of a volume
+            // succeeds via transfer scratch.
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             desc.Width = desc.Height = 4;
@@ -766,7 +760,7 @@ int main() {
             }) == leonida::ReplayResult::invalid_subresource);
             EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, v_view, volume.p, values, 1, &rect);
-            }) == leonida::ReplayResult::unsupported);
+            }) == leonida::ReplayResult::success);
         }
     }
 
