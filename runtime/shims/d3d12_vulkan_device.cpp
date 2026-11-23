@@ -19,6 +19,7 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
+#include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
@@ -1115,6 +1116,11 @@ struct DeviceState {
     // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
     // dereferences it.
     std::atomic<std::uint64_t> next_image_address{std::uint64_t(1) << 32};
+<<<<<<< HEAD
+=======
+    // VAs of buffers on a device with no GPU address arena (src/synthetic_va.h).
+    leonida::SyntheticVa synthetic_va;
+>>>>>>> 3ef855a24 (d3d12: buffers on a device without the GPU address arena always get a synthetic, aligned VA below 2^47)
 
     // 0 float, 1 unsigned integer, 2 signed integer: which of the three storage-image arrays a view belongs in.
     static int numeric_class(VkFormat format) {
@@ -1930,6 +1936,12 @@ public:
             bda.buffer = buffer_;
             buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
             gpu_va_ = buffer_va_;
+        }
+        if (!addressable) {
+            // No arena: the VA is always a synthetic one, never the raw device address, which can be above the 48 bits
+            // a V# keeps and is aligned only as the driver likes. Left at 0 it would send a title's root descriptors
+            // and V#s to address 0, in every heap and state.
+            if (!device_.synthetic_va.allocate(desc_.Width, va_)) return E_OUTOFMEMORY;
         }
         if (device_.info.ray_tracing && initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
             vk.vkCreateAccelerationStructureKHR && vk.vkGetAccelerationStructureDeviceAddressKHR) {
