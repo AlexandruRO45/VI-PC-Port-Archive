@@ -335,6 +335,13 @@ BOOL fail_bool(DWORD error) {
     return FALSE;
 }
 
+// Held by a copy-up from its deletion-marker check to the rename into place, and by DeleteFile and MoveFile from the
+// moment they look at a name to the marker they write for it, so a package file is never deleted or moved while it is
+// being copied up: one of the two goes first, as the host orders two calls on one name. Without it a delete could
+// write its marker during the copy and the rename then brought the name back. Taken after roots(); nothing holding it
+// takes another lock or calls back into the title.
+std::mutex g_copy_mutex;
+
 Target read_target(const std::wstring& path) {
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(path, parts);
@@ -402,15 +409,15 @@ Target write_target(const std::wstring& path, bool copy_up) {
     // make a new overlay file, which reads prefer over the package and so over the marker.
     const std::filesystem::path package_path = join(r.game, parts);
     // One copy-up at a time: a second thread writing the same file waits here and then finds the first one's copy, so
-    // it neither fails on the taken name nor collides with that file's open through a rename of its own.
-    static std::mutex s_copy_mutex;
-    std::unique_lock copy_lock(s_copy_mutex, std::defer_lock);
+    // it neither fails on the taken name nor collides with that file's open through a rename of its own. A delete
+    // waits here too, and then deletes the copy, or this one finds its marker and copies nothing.
+    std::unique_lock copy_lock(g_copy_mutex, std::defer_lock);
     if (copy_up) copy_lock.lock();
     if (copy_up && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
         std::filesystem::is_regular_file(package_path, ec)) {
         // Copied to a private name, then renamed into place: a process killed mid-copy leaves only a hidden leftover,
         // not a truncated file that reads would prefer over the package.
-        static unsigned s_copies = 0;  // under s_copy_mutex
+        static unsigned s_copies = 0;  // under g_copy_mutex
         const std::filesystem::path staging = r.overlay / kCopyDir;
         std::filesystem::create_directories(staging, ec);
         const std::filesystem::path tmp =
@@ -915,6 +922,8 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
         return FALSE;
     }
 
+    // A copy-up of this name finishes before the delete looks, or finds the marker: see g_copy_mutex.
+    std::lock_guard copy_lock(g_copy_mutex);
     bool removed = false;
     std::error_code ec;
     const std::filesystem::path overlay_path = join(r.overlay, parts);
@@ -1060,6 +1069,9 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
+    // From the source's view to its marker: a copy-up of the source either finished, and the overlay copy is what
+    // moves, or finds the marker (g_copy_mutex).
+    std::lock_guard copy_lock(g_copy_mutex);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     const std::filesystem::path overlay_from = join(r.overlay, src), overlay_to = join(r.overlay, dst);
