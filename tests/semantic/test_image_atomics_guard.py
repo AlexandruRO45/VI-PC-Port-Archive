@@ -73,11 +73,19 @@ def parse_blocks(spv):
     return blocks
 
 
-def find_guarded_texel_block(spv):
+def find_guarded_texel_block(spv, *, allow_static_exec=True):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    conditional branch whose condition is the lane's active bit, and return that block's instructions.
+
+    The active bit is an OpLoad %bool %active. In a shader that never writes EXEC, `active_b()` returns the
+    constant %true instead (the `exec_static_true` fast path, #4473), so that guard is accepted too unless
+    allow_static_exec is False. With the per-block %active cache (also #4473) the value an EXEC write just
+    stored to %active is reused without a new load, so the values stored to %active count as the active bit."""
     blocks = parse_blocks(spv)
     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+    active_loads |= set(re.findall(r"^\s*OpStore %active (%\w+)\s*$", spv, re.M))
+    if allow_static_exec:
+        active_loads.add("%true")
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
@@ -175,6 +183,37 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                     self.assertIn("OpAtomicLoad %uint ", spv)
                     self.assertIn("OpAtomicCompareExchange %uint ", spv)
                     self.assertIn("OpLoopMerge ", spv)
+
+    def test_guard_uses_dynamic_active_bit_after_exec_write(self):
+        # After an EXEC write exec_static_true is off, so the guard must be the real active bit, never %true.
+        for op in ("image_atomic_add", "image_atomic_inc"):
+            for dim, addr in (("dim:SQ_RSRC_IMG_2D", "v[1:2]"), ("dim:SQ_RSRC_IMG_3D", "v[1:3]")):
+                with self.subTest(op=op, dim=dim):
+                    lines = [
+                        "v_mov_b32_e32 v0, 5",
+                        "v_mov_b32_e32 v1, 1",
+                        "v_mov_b32_e32 v2, 2",
+                        "v_mov_b32_e32 v3, 3",
+                        "v_cmp_gt_u32_e32 vcc_lo, 3, v0",
+                        "s_and_saveexec_b32 s12, vcc_lo",
+                        f"{op} v0, {addr}, s[4:11] dmask:0x1 {dim} unorm glc",
+                    ]
+                    spv = translate(lines)
+                    validate_spirv(spv)
+                    find_guarded_texel_block(spv, allow_static_exec=False)
+
+    def test_guard_is_static_true_without_exec_writes(self):
+        # No EXEC write: every lane is active, so the guard condition folds to %true (#4473).
+        spv = translate([
+            "v_mov_b32_e32 v0, 5",
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 2",
+            "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+        ])
+        validate_spirv(spv)
+        find_guarded_texel_block(spv)
+        self.assertNotIn("OpLoad %bool %active", spv)
+        self.assertRegex(spv, r"OpBranchConditional %true %\w+_do ")
 
     def test_cmpswap_and_bad_data_width_rejected(self):
         # Valid 2-VGPR cmpswap (2D and 3D) stays guarded and valid.
