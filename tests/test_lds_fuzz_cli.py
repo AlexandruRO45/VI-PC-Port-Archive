@@ -142,6 +142,20 @@ class CLIValidation(unittest.TestCase):
                     self.assertEqual(seen_t, [want])
                     self.assertEqual(seen_g, [want])
 
+    def test_translate_reads_index_with_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+
+            def fake_run(cmd, **kw):
+                (tmp / "spirv").mkdir(parents=True, exist_ok=True)
+                (tmp / "spirv" / "index.json").write_bytes(b'\xef\xbb\xbf{"prog": {"subgroup_size": 32}}')
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with patch.object(f.mc_command, "mc_command", return_value=["llvm-mc"]), \
+                    patch.object(f.subprocess, "run", side_effect=fake_run):
+                index = f.translate([], tmp, False)
+            self.assertEqual(index, {"prog": {"subgroup_size": 32}})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -709,3 +709,16 @@ def test_parallel_assembly_bounds_submitted_jobs(monkeypatch, tmp_path):
     vf.translate(programs, tmp_path, False, asm_jobs=2)
     assert submitted == collected == len(programs)
     assert peak == 4
+
+
+def test_translate_reads_index_with_utf8_bom(monkeypatch, tmp_path):
+    def fake_translate(cmd, **kwargs):
+        output = Path(cmd[cmd.index("--out") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.json").write_bytes(b'\xef\xbb\xbf{"prog": {"subgroup_size": 32}}')
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(vf.mc_command, "mc_command", lambda: ["llvm-mc"])
+    monkeypatch.setattr(vf.subprocess, "run", fake_translate)
+    index, _ = vf.translate([], tmp_path, False)
+    assert index == {"prog": {"subgroup_size": 32}}

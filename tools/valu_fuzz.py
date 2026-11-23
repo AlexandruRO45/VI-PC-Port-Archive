@@ -889,7 +889,7 @@ def translate(progs, work, emulate, pc_tail=False, *, asm_jobs=1):
     index = spirv / "index.json"
     if not index.exists():
         raise RuntimeError(f"rdna2spirv.py exited {r.returncode} without an index.json:\n{(r.stdout + r.stderr)[-2000:]}")
-    return json.loads(index.read_text(encoding="utf-8")), (r.stdout + r.stderr)
+    return json.loads(index.read_text(encoding="utf-8-sig")), (r.stdout + r.stderr)
 
 
 def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
