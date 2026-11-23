@@ -253,6 +253,12 @@ class TestPermLane16Mutation(unittest.TestCase):
         spv = run_cs_permlane("v_permlane16_b32", 0xFFFFFFFF, 0xFFFFFFFF, name="cs_p16_all15")
         self.assertIn("OpBitFieldUExtract", spv)
 
+class TestPermLane16Translator(unittest.TestCase):
+    def test_execution_all_cases(self):
+        for s1, s2 in ((0, 0), (0x76543210, 0xFEDCBA98), (0x55555555, 0xAAAAAAAA)):
+            spv = run_cs_permlane("v_permlane16_b32", s1, s2, name=f"cs_p16_exec_{s1:x}")
+            self.assertIn("OpGroupNonUniformShuffle", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
