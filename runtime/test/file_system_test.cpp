@@ -835,6 +835,22 @@ int main() {
         check(crt_fopen_s(&missing, "GAME:\\crt\\missing.txt", "r") == ENOENT && missing == nullptr,
               "fopen_s returns ENOENT and clears the stream");
 
+        // An exclusive create sees the package: the name is taken, so nothing is created in the overlay.
+        *host_errno() = 0;
+        check(crt_open("GAME:\\crt\\read.txt", _O_CREAT | _O_EXCL | _O_WRONLY, _S_IREAD | _S_IWRITE) == -1 &&
+                  *host_errno() == EEXIST,
+              "_open with _O_CREAT | _O_EXCL fails with EEXIST on a package file");
+        *host_errno() = 0;
+        check(crt_wfopen(L"GAME:\\crt\\read.txt", L"wx") == nullptr && *host_errno() == EEXIST,
+              "_wfopen \"wx\" fails with EEXIST on a package file");
+        check(create_w(L"GAME:\\crt\\read.txt", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr) ==
+                      INVALID_HANDLE_VALUE &&
+                  ::GetLastError() == ERROR_FILE_EXISTS,
+              "CreateFileW CREATE_NEW fails with ERROR_FILE_EXISTS on a package file");
+        check(!std::filesystem::exists(overlay / "crt" / "read.txt") &&
+                  read_path(package / "crt" / "read.txt") == "package",
+              "and no overlay file shadows it");
+
         const std::string host_path = (package / "crt" / "read.txt").string();
         f = crt_fopen(host_path.c_str(), "r");
         check(f && read_stream(f) == "package", "a host path goes to the CRT unchanged");

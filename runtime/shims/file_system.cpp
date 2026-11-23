@@ -411,6 +411,13 @@ bool writes(DWORD access, DWORD disposition) {
 
 Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
     if (!writes(access, disposition)) return read_target(path);
+    // CREATE_NEW fails on any name the title can see; the host would only look in the overlay, so a file only the
+    // package has would be shadowed by a new empty one.
+    if (disposition == CREATE_NEW) {
+        std::vector<std::wstring> parts;
+        if (parse_console(path, parts) == Parsed::Console && !parts.empty() && view(roots(), parts).kind != Kind::None)
+            return fail(ERROR_FILE_EXISTS);
+    }
     // OPEN_ALWAYS and TRUNCATE_EXISTING read what is already there, and a write-open must not lose a package file's
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
