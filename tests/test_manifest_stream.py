@@ -113,6 +113,33 @@ class Memory(unittest.TestCase):
             size = os.path.getsize(path)
             self.assertLess(max(peaks.values()), size // 4, (peaks, size))   # far below the decoded size
 
+    def test_syntax_error_fails_without_reading_the_rest(self):
+        # tedin7 on #4946: a syntax error early in a large manifest read the whole file before it was reported
+        import io
+
+        class Counting(io.StringIO):
+            reads = 0
+
+            def read(self, n=-1):
+                Counting.reads += 1
+                return super().read(n)
+
+        tail = ',{"a":1}' * 200000                     # about 1.6 MB of valid items after the error
+        for bad in ('x', 'tru e', '1.x', '"a" "b"', '{"a" 1}', '[1 2]', '-x', 'nulL'):
+            for chunk in (64, 4096):
+                Counting.reads = 0
+                text = '{"Items":[{"a":1},' + bad + tail + ']}'
+                s = ms.Stream(Counting(text), chunk)
+                s.expect("{", "")
+                s.value("key")
+                s.expect(":", "")
+                s.expect("[", "")
+                with self.assertRaises(ValueError, msg=(bad, chunk)):
+                    while True:
+                        s.value("in Items")
+                        s.expect(",", "between items")
+                self.assertLess(Counting.reads * chunk, 3 * 4096 + 64, (bad, chunk, Counting.reads))
+
 
 if __name__ == "__main__":
     unittest.main()

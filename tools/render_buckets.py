@@ -18,8 +18,8 @@ an integer is counted on its own line rather than ending the run.
 
     python -I tools/render_buckets.py <export dir | manifest.json> [...] [--json FILE]
 
-``--json`` writes the totals (per archive and overall); it may not overwrite an input. Prints counts only: no model,
-texture or shader names. Standard library only.
+``--json`` writes the totals (per archive and overall); it may not overwrite an input. Prints counts, keyed by the
+export's archive folder names (or the manifest paths given): no model, texture or shader names. Standard library only.
 """
 import argparse
 import json
@@ -88,7 +88,9 @@ def count(paths, chunk=CHUNK):
                 raise ValueError(f"{label}: model entry {t['models'] + 1} is not an object")
             t["models"] += 1
             sig = []
-            mats = item.get("Materials") or []
+            mats = item.get("Materials")
+            if mats is None:          # absent or null: no materials (a falsy {} / "" / 0 / false is not an array)
+                mats = []
             if not isinstance(mats, list):
                 raise ValueError(f"{label}: Materials of model entry {t['models']} is not an array")
             for m in mats:

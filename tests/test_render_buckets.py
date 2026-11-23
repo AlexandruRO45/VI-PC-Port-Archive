@@ -326,7 +326,9 @@ class CliTests(unittest.TestCase):
             self.assertIn("materials without a shader hash: 2", out)
 
     def test_non_object_entries_exit_2(self):
-        for items in ([1], [{"Materials": [7]}], [{"Materials": {"Shader": "s"}}]):
+        # LILILI2007 on #4946: falsy non-arrays ({} "" 0 false) were read as "no materials"
+        for items in ([1], [{"Materials": [7]}], [{"Materials": {"Shader": "s"}}], [{"Materials": {}}],
+                      [{"Materials": ""}], [{"Materials": 0}], [{"Materials": False}]):
             with tempfile.TemporaryDirectory() as tmp:
                 write_manifest(os.path.join(tmp, "arc", "models"), items)
                 code, _, err = self.run_cli([tmp])

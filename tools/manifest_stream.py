@@ -23,6 +23,7 @@ def _reject_constant(name):
     """``json`` accepts ``NaN``, ``Infinity`` and ``-Infinity`` by default; they are not JSON."""
     raise ValueError(f"{name} is not valid JSON")
 _TERMINATORS = frozenset(",}]: \t\r\n")   # what may follow a complete value (":" only a key string)
+_CUT_MARGIN = 8   # a cut value's decode error lies at most this far before the buffer's end (longest: `\uXXXX`)
 
 
 class Stream:
@@ -66,11 +67,19 @@ class Stream:
         while True:
             try:
                 val, end = self.dec.raw_decode(self.buf, self.pos)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                # A value cut by the read buffer fails within a few characters of the buffer's end (`tru|`, `1.|`,
+                # `\u00|`), or as an unterminated string. Any other error is a syntax error, so it is raised at once
+                # instead of reading on to the end of a several-GB file (tedin7, #4946).
+                if not self.eof and len(self.buf) - e.pos > _CUT_MARGIN and not e.msg.startswith("Unterminated"):
+                    raise ValueError(f"invalid JSON value {where}: {e.msg}") from None
                 val, end = None, None
             if end is not None and end < len(self.buf) and self.buf[end] in _TERMINATORS:
                 self.pos = end
                 return val
+            if end is not None and len(self.buf) - end > _CUT_MARGIN:
+                # a value followed by a non-terminator, with enough read after it that it cannot grow (`1.x`)
+                raise ValueError(f"invalid JSON after a value {where}: {self.buf[end]!r}")
             if not self.fill():  # at the end of the file: what decoded is all there is
                 if end is None:
                     raise ValueError(f"invalid or truncated JSON value {where}")
