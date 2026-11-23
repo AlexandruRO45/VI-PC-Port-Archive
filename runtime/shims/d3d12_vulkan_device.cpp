@@ -6291,7 +6291,15 @@ public:
                                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
         if (!desc->Width || !desc->Height || !desc->DepthOrArraySize || !samples || (samples > 1 && !multisample_ok))
             return fail();
-        const Format format = texture_storage_format(desc->Format, true);  // typeless depth families are planar either way
+        // A depth-stencil view format lays out as its family's typeless format, two planes (host adapter and WARP,
+        // d3d12_footprint_fuzz_test): R32_FLOAT_X8X24_TYPELESS and X32_TYPELESS_G8X24_UINT as R32G8X24_TYPELESS,
+        // R24_UNORM_X8_TYPELESS and X24_TYPELESS_G8_UINT as R24G8_TYPELESS.
+        DXGI_FORMAT layout_format = desc->Format;
+        if (layout_format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || layout_format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)
+            layout_format = DXGI_FORMAT_R32G8X24_TYPELESS;
+        else if (layout_format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || layout_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT)
+            layout_format = DXGI_FORMAT_R24G8_TYPELESS;
+        const Format format = texture_storage_format(layout_format, true);  // typeless depth families are planar either way
         UINT mips = desc->MipLevels;
         const UINT depth = volume ? desc->DepthOrArraySize : 1;
         if (!mips)

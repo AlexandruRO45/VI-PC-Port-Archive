@@ -403,7 +403,13 @@ What is implemented (all of it testable without the game):
   - `GetCopyableFootprints` for buffers, 1D and 1D-array textures, 2D textures and volumes, including BC1–7 and the
     two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
-    depth-stencil rows are padded to 512 bytes, not 256.
+    depth-stencil rows are padded to 512 bytes, not 256. `d3d12_footprint_fuzz_test` asks the layer, the host
+    adapter and WARP about seeded random descriptions and compares where the two hosts agree. It found the
+    descriptions the PC runtime refuses before any driver is asked (`footprint_refused`): `ALLOW_DEPTH_STENCIL` on a
+    buffer or on a format outside the R32G8X24, R32, R24G8 and R16 families, an extent past 16384 (1D, 2D) or 2048
+    (3D), block-compressed 1D textures, and 3D textures in the R32G8X24 and R24G8 families, `D32_FLOAT` and
+    `D16_UNORM`. Depth-stencil view formats (`R24_UNORM_X8_TYPELESS` and the like) lay out as their typeless family.
+    The PC runtime wraps the offsets of a volume subresource of 4 GiB or more at 32 bits; the layer does not.
   - the `1`/`2`/`3` variants as wrappers over the methods above (D3D-28): `CreateCommittedResource1/2/3`,
     `CreateCommandQueue1` and `GetCopyableFootprints1`. `D3D12_RESOURCE_DESC1` drops to `D3D12_RESOURCE_DESC`,
     and the initial state or `D3D12_BARRIER_LAYOUT` is not used, because new textures start `UNDEFINED` and move

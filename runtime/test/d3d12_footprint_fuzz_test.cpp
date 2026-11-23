@@ -180,7 +180,10 @@ int main(int argc, char** argv) {
             }
             if (ours.refused()) {
                 ++gap_count;
-                if (gaps) describe("gap", d, first, count, base);
+                if (gaps) {
+                    describe("gap", d, first, count, base);
+                    print("host", theirs);
+                }
                 continue;
             }
             ++wrong;
