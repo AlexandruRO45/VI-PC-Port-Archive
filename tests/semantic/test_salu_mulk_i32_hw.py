@@ -115,5 +115,50 @@ class TestMulkReferenceOracle(unittest.TestCase):
                 self.assertEqual(words[0], expected)
 
 
+class SopkOpcode:
+    """Symbolic AST opcode descriptor for SOPK instructions."""
+
+    def __init__(self, mnemonic: str, dst_reg: str, simm16: int) -> None:
+        self.mnemonic = mnemonic
+        self.dst_reg = dst_reg
+        self.simm16 = simm16
+
+    def emit_assembly(self) -> str:
+        return f"{self.mnemonic} {self.dst_reg}, {self.simm16}"
+
+
+class TestMulkASTAndTypes(unittest.TestCase):
+    """Commit 2: symbolic AST opcode definitions and typed expressions for s_mulk_i32."""
+
+    def test_ast_emission_and_translation(self):
+        op = SopkOpcode("s_mulk_i32", "s0", 17)
+        self.assertEqual(op.emit_assembly(), "s_mulk_i32 s0, 17")
+        lines = [
+            "s_mov_b32 s0, 3",
+            op.emit_assembly(),
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        spv = support.translate_lines("ps_mulk_ast", lines + ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"])
+        self.assertIn("OpIMul", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 51)
+
+    def test_ast_negative_immediate_hex(self):
+        op = SopkOpcode("s_mulk_i32", "s0", -2)
+        lines = [
+            "s_mov_b32 s0, 16",
+            op.emit_assembly(),
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mulk_ps(lines, "ps_mulk_ast_neg")
+        self.assertEqual(words[0], (-32) & MASK32)
+
+
 if __name__ == '__main__':
     unittest.main()
