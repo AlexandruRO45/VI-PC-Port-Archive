@@ -85,11 +85,18 @@ bool same_vblank_cadence(IDXGIOutput* output, IDXGIOutput* host) {
     };
     double before = 0, actual = 0, after = 0;
     bool stable;
-    if (!sample(host, before, stable) || !stable || before < 1) return true;
-    if (!sample(output, actual, stable)) return false;
-    if (!sample(host, after, stable) || !stable || std::abs(after - before) > before * 0.1) return true;
+    if (!sample(host, before, stable) || !stable || before < 1) {
+        std::fprintf(stderr, "SKIP cadence comparison: no stable native reference\n");
+        return true;
+    }
+    bool shim_stable;
+    if (!sample(output, actual, shim_stable)) return false;
+    if (!sample(host, after, stable) || !stable || std::abs(after - before) > before * 0.1) {
+        std::fprintf(stderr, "SKIP cadence comparison: no stable native reference\n");
+        return true;
+    }
     std::fprintf(stderr, "WaitForVBlank: native %.2f ms, shim %.2f ms\n", after, actual);
-    return std::abs(actual - after) < after * 0.3;
+    return shim_stable && std::abs(actual - after) < after * 0.3;
 }
 
 bool compare_attached_modes(IDXGIAdapter1* adapter, IDXGIAdapter1* host_adapter, UINT output_count) {

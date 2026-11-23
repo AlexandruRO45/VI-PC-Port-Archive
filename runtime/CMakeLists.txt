@@ -2393,7 +2393,7 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(dxgi_swapchain_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_swapchain_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_swapchain COMMAND dxgi_swapchain_test)
-    set_tests_properties(dxgi_swapchain PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(dxgi_swapchain PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 
     # Synthetic (no GPU): VulkanSwapchain's DXGI BufferCount contract when Vulkan returns more images than the
     # app asked for, or the surface minimum exceeds the request (D3D-389).
