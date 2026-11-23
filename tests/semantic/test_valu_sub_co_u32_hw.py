@@ -106,5 +106,83 @@ class TestValuSubCoU32ReferenceOracle(unittest.TestCase):
             actual = run_translated_sub_co_u32(a, b)
             self.assertEqual(actual, expected, f"Mismatch on {a:#x} - {b:#x}")
 
+# ---------------------------------------------------------------------------
+# Stage 2: Symbolic AST definitions and typed expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    VGPR = enum.auto()
+    SGPR = enum.auto()
+    SPECIAL = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR and not (0 <= self.index < 256):
+            raise ValueError(f"VGPR index out of range: {self.index}")
+        if self.kind == RegKind.SGPR and not (0 <= self.index < 106):
+            raise ValueError(f"SGPR index out of range: {self.index}")
+
+    def __str__(self) -> str:
+        if self.name:
+            return self.name
+        if self.kind == RegKind.VGPR:
+            return f"v{self.index}"
+        if self.kind == RegKind.SGPR:
+            return f"s{self.index}"
+        return f"special_{self.index}"
+
+
+class Opcode(enum.Enum):
+    V_SUB_CO_U32 = "v_sub_co_u32"
+
+
+@dataclasses.dataclass(frozen=True)
+class VOP3COInstruction:
+    opcode: Opcode
+    vdst: Register
+    sdst: Register
+    src0: Register | int
+    src1: Register | int
+
+    def __post_init__(self) -> None:
+        if self.vdst.kind != RegKind.VGPR:
+            raise ValueError(f"Destination vdst must be VGPR, got {self.vdst.kind}")
+        if self.sdst.kind not in (RegKind.SGPR, RegKind.SPECIAL):
+            raise ValueError(f"Destination sdst must be SGPR or SPECIAL, got {self.sdst.kind}")
+
+
+class TestValuSubCoU32ASTDefinitions(unittest.TestCase):
+    """Stage 2: Symbolic AST definitions and typed expressions for v_sub_co_u32."""
+
+    def test_ast_construction_and_formatting(self) -> None:
+        vdst = Register(RegKind.VGPR, 0)
+        sdst = Register(RegKind.SPECIAL, 0, "vcc_lo")
+        src0 = Register(RegKind.VGPR, 1)
+        src1 = Register(RegKind.VGPR, 2)
+        inst = VOP3COInstruction(Opcode.V_SUB_CO_U32, vdst, sdst, src0, src1)
+
+        self.assertEqual(inst.opcode, Opcode.V_SUB_CO_U32)
+        self.assertEqual(str(inst.vdst), "v0")
+        self.assertEqual(str(inst.sdst), "vcc_lo")
+        self.assertEqual(str(inst.src0), "v1")
+        self.assertEqual(str(inst.src1), "v2")
+
+    def test_ast_with_literal_and_sgpr(self) -> None:
+        vdst = Register(RegKind.VGPR, 5)
+        sdst = Register(RegKind.SGPR, 4)
+        src0 = Register(RegKind.SGPR, 2)
+        inst = VOP3COInstruction(Opcode.V_SUB_CO_U32, vdst, sdst, src0, 42)
+
+        self.assertEqual(str(inst.vdst), "v5")
+        self.assertEqual(str(inst.sdst), "s4")
+        self.assertEqual(str(inst.src0), "s2")
+        self.assertEqual(inst.src1, 42)
+
 if __name__ == "__main__":
     unittest.main()
