@@ -70,6 +70,12 @@ def _a_skip(i):
 def _a_uniform_vote(i):
     return (_x(i) + 7, 11, 36, 27)
 
+
+def _a_uniform_vote_narrowed(i):
+    x = _x(i)
+    return (x + 7 if x < 20 else x, 3 if x < 20 and x % 2 else 0, 50 if x < 20 else 0, x + 1)
+
+
 CLEAR = 0xBF800000     # the harness clears the target to -1.0f: the words of a pixel no shader wrote
 
 
@@ -187,6 +193,7 @@ FIXTURES = {
     "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
     "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
     "ps_w64_a_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
+    "ps_w64_a_uniform_vote_narrowed": ("A", _a_uniform_vote_narrowed, {"VKH_SGPRS": "0,0,0,0,9"}),
 
     "ps_w64_a_discard": ("A", _a_discard, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),

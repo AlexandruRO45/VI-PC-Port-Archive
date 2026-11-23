@@ -899,12 +899,13 @@ class UniformVote(unittest.TestCase):
 
     def test_c_compare_under_a_narrowed_exec(self):
         # EXEC narrowed to lanes 0..31: the second half has no active lane, votes no and sets s20 = 2, which the lanes
-        # of that half read once EXEC is restored; the wave voted yes (s20 = 1)
+        # of that half read once EXEC is restored; the wave voted yes (s20 = 1). The vote itself is exact (the two
+        # sides meet again and do not widen EXEC: test_wave64_uniform_vote_narrowed.py); the scalar is what differs.
         whole, halves = self.differs("vs_uv_narrowed", [
             "v_mov_b32_e32 v1, s4", "v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_saveexec_b64 s[12:13], vcc",
             "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_vccz 3", "v_mov_b32_e32 v6, 7", "s_mov_b32 s20, 1",
             "s_branch 2", "v_mov_b32_e32 v6, 5", "s_mov_b32 s20, 2", "s_mov_b64 exec, s[12:13]",
-            "v_add_nc_u32_e32 v7, s20, v0"], "unsafe-vote-branch")
+            "v_add_nc_u32_e32 v7, s20, v0"], "stale-scalar")
         self.assertEqual([w[1] for w in whole[32:]], [1 + k for k in range(32, 64)])
         self.assertEqual([w[1] for w in halves[32:]], [2 + k for k in range(32, 64)])
 

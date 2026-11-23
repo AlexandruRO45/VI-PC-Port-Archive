@@ -10,7 +10,9 @@ there is no partner half to exchange values with (compute and mesh shaders have 
                                             "uniform_readlane": {id(ins), ...}}
 
     A  nothing wave-wide is consumed except votes that only skip lane-masked work, votes on a wave-uniform compare
-       (a v_cmp of untainted scalars and constants with EXEC the launch mask: every half votes as the wave does),
+       (a v_cmp of untainted scalars and constants with EXEC the launch mask: every half votes as the wave does;
+       under a narrowed EXEC, a compare that is uniform in the active lanes, when the two sides of the branch meet
+       again and do not widen EXEC: uniform_region),
        whole-quad masks and per-lane arithmetic: exact as translated, on any subgroup size.
     B  also uses a wave-wide idiom whose result is invariant by construction: a waterfall loop, a wave-aggregated
        atomic (ballot count, one atomic from the first lane, rank), a v_readfirstlane / v_readlane of a value that
@@ -851,6 +853,8 @@ class Analysis:
             tag, tj = self.cmp_tag(st, ins, op, srcs, t_src, idiom)
             if tag is None and self.uniform_cmp(st, ins, srcs, uses, tj):
                 tag = UVOTE
+            elif tag is None and self.active_uniform_cmp(st, ins, srcs, uses, tj):
+                tag = ("uvote", st["x"])        # all the lanes that this EXEC has on, or none of them
             put(d, tj, tag)
             if len(dests) > 1:
                 put(dests[1], t_src)
@@ -900,6 +904,11 @@ class Analysis:
                     for x in srcs) and any(_regs(x) != ["exec"] for x in srcs):
                 # a uniform compare ANDed with EXEC while EXEC is the launch mask (LLVM: s_and_b64 vcc, exec, s[..])
                 tag = UVOTE
+            elif op == "s_and_b64" and not t_src and len(srcs) == 2 and any(_regs(x) == ["exec"] for x in srcs):
+                # the same for a compare that is uniform in the active lanes of a narrowed EXEC
+                g = [st["g"].get(r) for x in srcs if _regs(x) != ["exec"] for r in _regs(x)]
+                if g and all(t is not None and t == g[0] for t in g) and self.active_uvote(st, g[0]):
+                    tag = g[0]
             put(dests[0], t_src, tag)
             if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
                 T["scc"] = X
@@ -1141,6 +1150,155 @@ class Analysis:
             return False
         return True
 
+    def active_uniform_cmp(self, st, ins, srcs, uses, tj):
+        """Whether a v_cmp made under a narrowed EXEC writes a mask that is all the active lanes or none of them:
+        every source is the same in every active lane (an immediate, an untainted scalar that is no lane mask, a
+        VGPR that is uniform in the active lanes, st["ua"]) and carries no taint. A half that has an active lane
+        then gets the same answer as the wave; a half that has none gets an empty mask (uniform_region)."""
+        if tj or uses or st["f"] or not srcs:
+            return False
+        for x in srcs:
+            k = x.get("k")
+            if k in ("imm", "fimm"):
+                continue
+            if self.rd(st, ins, x) or self.is_mask(ins, x):
+                return False
+            if k == "sgpr" or (k == "vgpr" and all(r[1] in st["ua"] for r in _regs(x))):
+                continue
+            return False
+        return True
+
+    def active_uvote(self, st, tag):
+        """Whether `tag` is the tag of active_uniform_cmp and EXEC is still the EXEC of that compare or a part of
+        it (narrowed only): then a half that has an active lane now had one at the compare."""
+        return bool(tag) and tag[0] == "uvote" and tag[1] is not None and (
+            tag[1] == st["x"] or self.ancestor(tag[1], st["x"]))
+
+    MASK_FROM_INSIDE = ("s_mov_b64", "s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64")
+
+    def uniform_region(self, n, run, skip):
+        """The two sides of a vote on a compare that is uniform in the active lanes of a narrowed EXEC
+        (active_uvote). A half that has an active lane votes as the wave does. A half that has none has an empty
+        mask and takes the no side, whatever the wave does, with all its lanes off. That is exact when
+          * the two sides meet again (a block J that every path from the vote reaches, and that is not the end of
+            the program): then the half is back on the path of the wave at J, and
+          * no side makes EXEC wider than it was at the vote: its lanes stay off up to J, in the wave and in the
+            half, so no lane work of a side can differ. EXEC may be narrowed, and set from EXEC copies and compare
+            results that the side made itself (an if/else or a loop inside the side).
+        Scalars are not covered here: the vote stays in `voted`, so a scalar that a side sets and that is read
+        after it is stale-scalar, as after any lane vote."""
+        succ = [list(s) for s in self.succ] + [[]]
+        exit_ = self.n
+        for b in range(self.n):
+            if not succ[b]:
+                succ[b] = [exit_]
+        full = (1 << (self.n + 1)) - 1
+        pdom = [full] * (self.n + 1)
+        pdom[exit_] = 1 << exit_
+        changed = True
+        while changed:
+            changed = False
+            for b in range(self.n - 1, -1, -1):
+                new = full
+                for s in succ[b]:
+                    new &= pdom[s]
+                new |= 1 << b
+                if new != pdom[b]:
+                    pdom[b], changed = new, True
+        strict = pdom[n] & ~(1 << n)
+        join = next((c for c in range(self.n + 1) if strict >> c & 1 and pdom[c] == strict), None)
+        if join is None or join == exit_:
+            return False                                # a side ends the program, or the sides never meet
+        region, work = set(), [run, skip]
+        while work:
+            b = work.pop()
+            if b == join or b in region:
+                continue
+            if b == n:
+                return False                            # a side comes back to the vote: not judged here
+            region.add(b)
+            work.extend(self.succ[b])
+        # forward dataflow over the region: the registers that hold a mask inside the EXEC of the vote
+        entry = {b: None for b in region}
+        for b in (run, skip):
+            if b in region:
+                entry[b] = frozenset()
+        work = [b for b in (run, skip) if b in region]
+        while work:
+            b = work.pop()
+            inside = set(entry[b])
+            for ins in self.blocks[b]:
+                if not self.confine_uniform(ins, inside):
+                    return False
+            for s in self.succ[b]:
+                if s not in region:
+                    continue
+                new = frozenset(inside) if entry[s] is None else entry[s] & inside
+                if new != entry[s]:
+                    entry[s] = new
+                    work.append(s)
+        return True
+
+    def confine_uniform(self, ins, inside):
+        """One instruction of a side of uniform_region. `inside` is the set of register keys that hold a mask inside
+        the EXEC of the vote; it is updated. False when the instruction can make EXEC wider than that."""
+        op, a = base_op(ins["op"]), ins["args"]
+        dests, srcs, defs, _ = operands(ins)
+        written = [r for d in dests for r in _regs(d) if r != "exec"] + [r for r in defs if r != "exec"]
+
+        def ok(x):                                      # an operand that is inside: EXEC, 0, or a tracked register
+            if x.get("k") == "imm":
+                return x.get("v") == 0
+            if _half(x):
+                return False
+            regs = _regs(x)
+            return regs == ["exec"] or (bool(regs) and all(r in inside for r in regs))
+
+        def keep(regs, is_inside):
+            for r in regs:
+                inside.discard(r)
+            if is_inside:
+                inside.update(regs)
+
+        if op.startswith(SAVEEXEC):
+            if len(a) != 2 or not op.endswith("_b64") or _half(a[0]) or _half(a[1]):
+                return False
+            narrowing = op.startswith(("s_and_saveexec_", "s_andn1_saveexec_", "s_and_wrexec_", "s_andn1_wrexec_"))
+            joins_inside = op.startswith(("s_or_saveexec_", "s_xor_saveexec_", "s_andn2_saveexec_",
+                                          "s_andn2_wrexec_"))       # EXEC | S, EXEC ^ S, S & ~EXEC
+            if not narrowing and not (joins_inside and ok(a[1])):
+                return False                            # a mask from outside, or a form that complements (nand, ...)
+            keep([r for r in _regs(a[0]) if r != "exec"], True)      # the old EXEC, or the new one: inside
+            return True
+        if op.startswith("v_cmpx"):
+            return True                                 # EXEC &= compare
+        writes_exec = "exec" in defs or any("exec" in _regs(d) for d in dests)
+        if writes_exec:
+            if any(_half(d) for d in dests) or not op.endswith("_b64"):
+                return False
+            if op == "s_wqm_b64":
+                return False                            # whole quads can add lanes
+            if op in ("s_and_b64", "s_andn2_b64") and len(srcs) == 2 and _regs(srcs[0]) == ["exec"]:
+                return True                             # EXEC & x, EXEC & ~x
+            if op == "s_and_b64" and len(srcs) == 2 and (ok(srcs[0]) or ok(srcs[1])):
+                return True
+            if op == "s_andn2_b64" and len(srcs) == 2 and ok(srcs[0]):
+                return True
+            if op in ("s_mov_b64", "s_or_b64", "s_xor_b64") and srcs and all(ok(x) for x in srcs):
+                return True
+            return False
+        # no EXEC write: which mask registers are inside after it
+        if op.startswith("v_cmp"):
+            keep(written, True)                         # a compare is 0 in the lanes that are off
+        elif op in self.MASK_FROM_INSIDE and len(dests) == 1 and not _half(dests[0]) and srcs and (
+                all(ok(x) for x in srcs) or (op in ("s_and_b64",) and any(ok(x) for x in srcs))
+                or (op == "s_andn2_b64" and ok(srcs[0]))):
+            keep([r for r in written if r != "scc"], True)
+            inside.discard("scc")
+        else:
+            keep(written, False)
+        return True
+
     def cmp_tag(self, st, ins, op, srcs, t_src, idiom):
         """(tag, taint) of the lane mask a v_cmp / v_cmpx writes. The two recognised comparisons: a waterfall
         scalar against the VGPR it was read from (every lane of the mask owns that value), and a lane rank
@@ -1332,6 +1490,13 @@ class Analysis:
         kregs = self.kill_vote(n, op, reg)
         if not ok and kregs and run is not None and skip is not None and self.inert_exit(skip, kregs) \
                 and self.confined(run, kregs) and not self.vm_export_before(n):
+            ok = True
+        # A compare that is uniform in the active lanes of a narrowed EXEC: every half that has an active lane votes
+        # as the wave does, and a half that has none has all its lanes off on the side it takes (uniform_region).
+        # st only for s_cbranch_vccz/vccnz, as above.
+        if not ok and reg == "vcc" and st is not None and run is not None and skip is not None \
+                and self.active_uvote(st, st["g"].get("vcc")) and not st["t"].get("vcc", 0) \
+                and (id(ins), "vcc") not in self.stale and self.uniform_region(n, run, skip):
             ok = True
         if not ok and ev is not None:
             ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
