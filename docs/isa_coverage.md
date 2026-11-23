@@ -52,19 +52,27 @@ listed separately ("handled but with operand forms that raise"). Names built by 
 Only the AMD XML defines the denominator: it omits a few gfx1013 instructions that LLVM accepts (below), and lists
 some that a desktop part does not execute.
 
-## Result (translator at `41f44826`, AMD XML of 2026-08-06)
+## Result (translator at `8575d36ed`, AMD XML of 2026-08-06)
 
 Every new translator rule moves these numbers; rerun the tool for the current ones.
 
-1,153 RDNA2 instructions: 436 handled-exact, 408 handled-family, 2 refused (`s_denorm_mode`, `s_round_mode`), 307
-unknown. The unknown ones cluster in groups the corpus does not need or that are not written yet: the f64
-transcendentals and `v_div_*`, FLAT and SCRATCH memory, the global atomics, the `image_gather4*` variants outside the
-four `_l`/`_lz` forms, packed image formats (`*_pck`, `*_by2`), the 16-bit `v_pk_*` integer forms, `v_dot*`, and the
-`*_saveexec` / `s_nand`/`s_nor`/`s_xnor` scalar forms. `python -I tools/isa_coverage.py --list` has the full list per
-encoding.
+1,153 RDNA2 instructions: 568 handled-exact, 424 handled-family, 1 refused (`s_denorm_mode`), 160 unknown. The
+unknown ones cluster in groups the corpus does not need or that are not written yet: FLAT and SCRATCH memory (76 of
+the 160), the `image_gather4*` variants outside the `_l`/`_lz` forms, the packed image formats (`*_pck`, `*_by2`,
+`*_by4`), `image_store_mip*` and `image_msaa_load`, the f64 conversions and arithmetic (`v_cvt_*_f64`, `v_fma_f64`,
+`v_mul_f64`, `v_min_f64`/`v_max_f64`, `v_fract_f64`, `v_div_scale_*`, `v_trig_preop_f64`), and a few other forms
+(`buffer_gl0_inv`/`buffer_gl1_inv`, `buffer_*_format_d16_hi_x`, `s_getreg_b32`, `s_trap`, `s_movreld_*`, the cache
+invalidates). The global atomics, the byte and short `buffer_store_*` and `buffer_load_*_d16*` forms, the scalar
+`s_nand`/`s_nor`/`s_xnor` forms, the `*_saveexec` forms and the `v_div_*`/`v_dot*`/16-bit `v_pk_*` names are no
+longer unknown: they have a rule, though 161 handled instructions still raise `Unsupported` for some operand forms
+(the report lists them). `python -I tools/isa_coverage.py --list` has the full list per encoding.
 
-Names the translator matches that are not in the RDNA2 XML (10), each checked with
-`llvm-mc -arch=amdgcn -mcpu=gfx1013`:
+The "matched but not in the XML" list is now 33 names, up from 10, because the tool also reports table-driven and
+compare-driven names (`v_cmp`, `v_readlane`, `buffer_store`, `v_dot*c_*`, `s_atc_probe`, ...). Of these, only the first 10 below have
+been checked with `llvm-mc -arch=amdgcn -mcpu=gfx1013`; the new ones have not been re-checked and several are
+prefixes or internal table keys rather than instruction names.
+
+First 10 names, each checked with `llvm-mc -arch=amdgcn -mcpu=gfx1013`:
 
 | name | llvm-mc for gfx1013 | verdict |
 |---|---|---|

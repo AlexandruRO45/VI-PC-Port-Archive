@@ -315,6 +315,29 @@ class RealIsaTests(unittest.TestCase):
         "v_sub_i16": "internal: v_sub_nc_i16 is re-dispatched under this name",
         "s_atc_probe": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
         "s_atc_probe_buffer": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
+        # Prefix keys of tools/rdna2spirv.py NOT_LANE_LOCAL, matched with startswith, not instruction names.
+        "v_cmp": "internal: NOT_LANE_LOCAL prefix key",
+        "v_div_scale": "internal: NOT_LANE_LOCAL prefix key",
+        "v_interp": "internal: NOT_LANE_LOCAL prefix key",
+        "v_mbcnt": "internal: NOT_LANE_LOCAL prefix key",
+        "v_permlane": "internal: NOT_LANE_LOCAL prefix key",
+        "v_readfirstlane": "internal: NOT_LANE_LOCAL prefix key",
+        "v_readlane": "internal: NOT_LANE_LOCAL prefix key",
+        "v_writelane": "internal: NOT_LANE_LOCAL prefix key",
+        # Prefix keys of tools/rdna2spirv.py VGPR_READ_ONLY_PREFIXES, matched with startswith.
+        "buffer_store": "internal: VGPR_READ_ONLY_PREFIXES prefix key",
+        "tbuffer_store": "internal: VGPR_READ_ONLY_PREFIXES prefix key",
+        "ds_write": "internal: VGPR_READ_ONLY_PREFIXES prefix key",
+        "flat_store": "internal: VGPR_READ_ONLY_PREFIXES prefix key",
+        "global_store": "internal: VGPR_READ_ONLY_PREFIXES prefix key",
+        "scratch_store": "internal: VGPR_READ_ONLY_PREFIXES prefix key",
+        # VOP2 dot-product accumulate forms the translator's v_dot* rule accepts. Absent from the RDNA2 XML;
+        # not yet checked with llvm-mc for gfx1013 (none was available when this entry was added).
+        "v_dot2c_i32_i16": "dot-product rule in rdna2spirv.py, missing from the XML, llvm-mc check pending",
+        "v_dot2c_u32_u16": "dot-product rule in rdna2spirv.py, missing from the XML, llvm-mc check pending",
+        "v_dot4c_u32_u8": "dot-product rule in rdna2spirv.py, missing from the XML, llvm-mc check pending",
+        "v_dot8c_i32_i4": "dot-product rule in rdna2spirv.py, missing from the XML, llvm-mc check pending",
+        "v_dot8c_u32_u4": "dot-product rule in rdna2spirv.py, missing from the XML, llvm-mc check pending",
     }
 
     @classmethod
