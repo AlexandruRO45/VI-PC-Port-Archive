@@ -117,6 +117,39 @@ class VinterpHwProbeTests(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("no AMD GPU", out.getvalue())
 
+    def test_malformed_or_rejected_oracle_batch_exits_2(self):
+        class FakeOracle:
+            device = "fake-gfx1035"
+            arch = "gfx1035"
+
+            def __init__(self, batch_fn):
+                self.batch_fn = batch_fn
+                self.closed = False
+
+            def run(self, kernels, words=5):
+                return self.batch_fn(kernels, words)
+
+            def close(self):
+                self.closed = True
+
+        ok_word = [*probe.CASE_LDS_LAYOUT.expected_hw, 0]
+        cases = (
+            (lambda _k, _w: [ok_word] * 3, "lds_param_layout wave32: the hardware runner returned 3 results for 4 kernels"),
+            (lambda _k, _w: [ok_word] * 5, "lds_param_layout wave32: the hardware runner returned 5 results for 4 kernels"),
+            (lambda _k, _w: ["assembler rejected: bad op"] * 4, "lds_param_layout wave32: assembler rejected: bad op"),
+            (lambda _k, _w: [None] * 4, "lds_param_layout wave32: no result"),
+            (lambda _k, _w: [ok_word[:4]] * 4, "lds_param_layout wave32: expected 5 words, got 4"),
+        )
+        for batch_fn, expected_msg in cases:
+            with self.subTest(msg=expected_msg):
+                oracle = FakeOracle(batch_fn)
+                out = io.StringIO()
+                with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), redirect_stdout(out):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, out.getvalue())
+                self.assertTrue(oracle.closed)
+                self.assertIn(f"harness error: {expected_msg}", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

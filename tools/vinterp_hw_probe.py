@@ -503,16 +503,20 @@ def run_hw(arch=None, waves=(32, 64)):
             for c in CASES:
                 k = asm.Kernel(c.kernel_lines(), wave=wave, threads=1, words=5, raw=True, lds=65536, mode=c.mode)
                 batch = oracle.run([k] * 4, words=5)
+                if len(batch) != 4:
+                    raise RuntimeError(
+                        f"{c.name} wave{wave}: the hardware runner returned {len(batch)} results for 4 kernels"
+                    )
                 picked = None
                 for r in batch:
-                    if not isinstance(r, list) or len(r) < 5:
-                        continue
+                    if r is None or isinstance(r, str) or len(r) < 5:
+                        why = "no result" if r is None else r if isinstance(r, str) else f"expected 5 words, got {len(r)}"
+                        raise RuntimeError(f"{c.name} wave{wave}: {why}")
                     if (r[4] & 0x100) == 0:
                         picked = tuple(r[:4])
                         break
                 if picked is None:
-                    first = batch[0]
-                    picked = tuple(first[:4]) if isinstance(first, list) else first
+                    picked = tuple(batch[0][:4])
                 per_wave[wave][c.name] = picked
         return device, hw_arch, per_wave
     finally:
@@ -556,6 +560,9 @@ def main(argv=None):
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
 
     print(f"hardware oracle: {device} ({hw_arch})")
     failures = 0
