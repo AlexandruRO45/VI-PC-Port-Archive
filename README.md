@@ -23,6 +23,10 @@
   <a href="https://discord.gg/rexed">Discord</a>
 </p>
 
+<p align="center">
+  <a href="https://recomplauncher.com/game/leonida"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+</p>
+
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
 and run natively, and the console's system software is reimplemented. The console's precompiled RDNA2 GPU programs
 are translated to SPIR-V for Vulkan. The game's models, textures and audio are read from your package. All of this
