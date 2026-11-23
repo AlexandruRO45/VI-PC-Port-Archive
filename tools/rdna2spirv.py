@@ -225,11 +225,22 @@ DPP_MODS = ("quad_perm", "row_", "wave_", "dpp8", "bank_mask", "bound_ctrl", "fi
 MIN_ACTIVE_RUN = 2
 
 
+_BASE_OP_CACHE_LIMIT = 4096
+_BASE_OP_CACHE = {}
+
+
 def base_op(op):
+    cached = _BASE_OP_CACHE.get(op)
+    if cached is not None:
+        return cached
+    res = op
     for suf in ("_e32", "_e64", "_sdwa", "_dpp"):
         if op.endswith(suf):
-            return op[: -len(suf)]
-    return op
+            res = op[: -len(suf)]
+            break
+    if len(_BASE_OP_CACHE) < _BASE_OP_CACHE_LIMIT:
+        _BASE_OP_CACHE[op] = res
+    return res
 
 
 class Unsupported(Exception):
