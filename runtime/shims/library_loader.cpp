@@ -13,8 +13,8 @@
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
 #include <windows.h>
 
+#include <atomic>
 #include <cstdio>
-#include <deque>
 #include <map>
 #include <mutex>
 #include <set>
@@ -28,8 +28,8 @@ namespace rt::shims::library_loader {
 // A module the shims own, identified by a pointer to one of these. Host modules are image bases (64 KiB aligned);
 // these live in the runtime's heap, and GetProcAddress tells them apart by lookup, not by address range.
 struct Pseudo {
-    char tag[8] = {'L', 'E', 'O', 'S', 'H', 'I', 'M', 0};
     std::string dll;  // lower case, with .dll
+    const Pseudo* next;
 };
 
 namespace {
@@ -41,10 +41,9 @@ std::mutex& loader_mutex() {
     return *m;
 }
 
-std::deque<Pseudo>& pseudos() {   // a deque never moves its elements, so handed-out handles stay valid
-    static auto* d = new std::deque<Pseudo>;
-    return *d;
-}
+// Nodes are fully constructed before publication and live for the process lifetime. A detach callback can inspect
+// pseudo-handles even if Windows stopped a worker while it held loader_mutex().
+std::atomic<const Pseudo*> g_pseudos{nullptr};
 
 std::string lower_ascii(std::string s) {
     for (auto& c : s)
@@ -69,45 +68,59 @@ std::string module_name(std::string path) {
     return path;
 }
 
-std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
-
+std::string read_host_module_name(HMODULE module) {
     std::vector<wchar_t> path(MAX_PATH);
     for (;;) {
         const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
         if (!length) return {};
-        if (length < path.size()) {
-            const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
-            return name;
-        }
+        if (length < path.size()) return module_name(narrow(path.data()));
         if (path.size() == 32768) return {};
         path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
     }
 }
 
+std::string host_module_name(HMODULE module) {
+    if (process_detach_lookup_active()) return read_host_module_name(module);
+    std::lock_guard lock(loader_mutex());
+    static auto* names = new std::map<HMODULE, std::string>;
+    if (auto it = names->find(module); it != names->end()) return it->second;
+    std::string name = read_host_module_name(module);
+    if (!name.empty()) names->emplace(module, name);
+    return name;
+}
+
 }  // namespace
+
+#ifdef LEONIDA_PROCESS_DETACH_TEST
+std::mutex& lookup_cache_test_mutex() { return loader_mutex(); }
+#endif
 
 // The pseudo-handle for an owned module, or nullptr when the shims don't own `path`'s module.
 HMODULE owned_handle(const std::string& path) {
     const std::string dll = module_name(path);
     if (dll.empty() || !owns_dll(dll)) return nullptr;
-    std::lock_guard lock(loader_mutex());
-    for (auto& p : pseudos())
-        if (p.dll == dll) return reinterpret_cast<HMODULE>(&p);
-    pseudos().push_back(Pseudo{});
-    pseudos().back().dll = dll;
-    std::fprintf(stderr, "[rt] loader: %s is served by the shims (run-time load)\n", dll.c_str());
-    return reinterpret_cast<HMODULE>(&pseudos().back());
+    const auto find_existing = [&] {
+        for (const Pseudo* p = g_pseudos.load(); p; p = p->next)
+            if (p->dll == dll) return reinterpret_cast<HMODULE>(const_cast<Pseudo*>(p));
+        return static_cast<HMODULE>(nullptr);
+    };
+    const bool detaching = process_detach_lookup_active();
+    std::unique_lock<std::mutex> lock;
+    // The detach callback is the only surviving thread. A worker stopped during insertion either
+    // published a complete node or left the list unchanged.
+    if (!detaching) lock = std::unique_lock(loader_mutex());
+    if (HMODULE handle = find_existing()) return handle;
+    auto* p = new Pseudo{dll, g_pseudos.load()};
+    g_pseudos.store(p);
+    if (!detaching)
+        std::fprintf(stderr, "[rt] loader: %s is served by the shims (run-time load)\n", dll.c_str());
+    return reinterpret_cast<HMODULE>(p);
 }
 
 // The owned module a handle names, or nullptr for a host module.
 const Pseudo* pseudo(HMODULE h) {
-    std::lock_guard lock(loader_mutex());
-    for (auto& p : pseudos())
-        if (reinterpret_cast<HMODULE>(&p) == h) return &p;
+    for (const Pseudo* p = g_pseudos.load(); p; p = p->next)
+        if (reinterpret_cast<const void*>(h) == p) return p;
     return nullptr;
 }
 
@@ -199,7 +212,7 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         const std::string what =
             IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
         if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
-        {
+        if (!process_detach_lookup_active()) {
             static auto* m = new std::mutex;
             static auto* seen = new std::set<std::string>;
             std::lock_guard lock(*m);

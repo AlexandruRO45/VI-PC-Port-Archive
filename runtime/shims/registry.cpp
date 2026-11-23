@@ -48,6 +48,7 @@ struct Lookup {
 };
 std::mutex g_lookup_mutex;
 std::vector<Lookup> g_lookups;
+thread_local const ProcessDetachLookup* g_detach_lookup = nullptr;
 
 // The imports known to return HRESULT. Everything else is "other" and keeps returning 0 under `fail`.
 // Each family was checked against the public Microsoft documentation (learn.microsoft.com), one signature per
@@ -323,29 +324,31 @@ void add_module_lookup(void* ctx, ModuleLookup fn) {
     g_lookups.push_back({ctx, fn});
 }
 
+namespace {
+bool lookup_mapped_address(uint64_t address, std::string& module, uint32_t& rva) {
+    if (g_detach_lookup) return g_detach_lookup->address(g_detach_lookup->context, address, module, rva);
+    std::lock_guard lock(g_lookup_mutex);
+    for (auto& lookup : g_lookups)
+        if (lookup.fn(lookup.ctx, address, module, rva)) return true;
+    return false;
+}
+}  // namespace
+
 bool mapped_image_base(uint64_t address, uint64_t& base) {
     std::string module;
     uint32_t rva = 0;
-    std::lock_guard lock(g_lookup_mutex);
-    for (auto& l : g_lookups)
-        if (l.fn(l.ctx, address, module, rva)) {
-            base = address - rva;
-            return true;
-        }
-    return false;
+    if (!lookup_mapped_address(address, module, rva)) return false;
+    base = address - rva;
+    return true;
 }
 
 std::string module_offset(uint64_t address) {
     char b[48];
     std::string module;
     uint32_t rva = 0;
-    {
-        std::lock_guard lock(g_lookup_mutex);
-        for (auto& l : g_lookups)
-            if (l.fn(l.ctx, address, module, rva)) {
-                std::snprintf(b, sizeof b, "+0x%x", rva);
-                return module + b;
-            }
+    if (lookup_mapped_address(address, module, rva)) {
+        std::snprintf(b, sizeof b, "+0x%x", rva);
+        return module + b;
     }
     HMODULE host = nullptr;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -400,6 +403,21 @@ std::vector<BundledLoaderEntry> snapshot_bundled_loaders() {
 
 }  // namespace
 
+ProcessDetachLookup::ProcessDetachLookup(void* ctx, const BundledModuleOps* ops, ModuleLookup address_lookup)
+    : context(ctx), bundled(ops), address(address_lookup), previous_(g_detach_lookup) {
+    if (ctx) g_detach_lookup = this;
+}
+
+ProcessDetachLookup::~ProcessDetachLookup() { g_detach_lookup = previous_; }
+
+bool process_detach_lookup_active(const void* ctx) {
+    return g_detach_lookup && (!ctx || g_detach_lookup->context == ctx);
+}
+
+#ifdef LEONIDA_PROCESS_DETACH_TEST
+std::mutex& bundled_loader_test_mutex() { return bundled_loader_mutex(); }
+#endif
+
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops) {
     if (!ctx || !ops) return;
     std::lock_guard lock(bundled_loader_mutex());
@@ -417,6 +435,7 @@ void remove_bundled_loader(void* ctx) {
 }
 
 void* find_loaded_bundled_module(const std::string& dll_lower) {
+    if (g_detach_lookup) return g_detach_lookup->bundled->find_loaded(g_detach_lookup->context, dll_lower);
     for (const auto& entry : snapshot_bundled_loaders())
         if (void* h = entry.ops->find_loaded(entry.ctx, dll_lower)) return h;
     return nullptr;
@@ -424,6 +443,7 @@ void* find_loaded_bundled_module(const std::string& dll_lower) {
 
 void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
     handled = false;
+    if (g_detach_lookup) return g_detach_lookup->bundled->load_bundled(g_detach_lookup->context, dll_lower, flags, handled);
     for (const auto& entry : snapshot_bundled_loaders()) {
         bool loader_handled = false;
         void* h = entry.ops->load_bundled(entry.ctx, dll_lower, flags, loader_handled);
@@ -437,6 +457,7 @@ void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& ha
 
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle) {
     owns_handle = false;
+    if (g_detach_lookup) return g_detach_lookup->bundled->get_proc(g_detach_lookup->context, module, sym, owns_handle);
     for (const auto& entry : snapshot_bundled_loaders()) {
         bool loader_owns = false;
         void* fn = entry.ops->get_proc(entry.ctx, module, sym, loader_owns);
@@ -449,6 +470,7 @@ void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_
 }
 
 bool owns_bundled_module_handle(void* module) {
+    if (g_detach_lookup) return g_detach_lookup->bundled->owns_handle(g_detach_lookup->context, module);
     for (const auto& entry : snapshot_bundled_loaders())
         if (entry.ops->owns_handle(entry.ctx, module)) return true;
     return false;

@@ -131,7 +131,12 @@ public:
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
 
+#ifdef LEONIDA_PROCESS_DETACH_TEST
+    std::recursive_mutex& process_detach_test_mutex() { return mutex_; }
+#endif
+
 private:
+    static void on_host_process_detach(void* reserved);
     void initialise(Module& m);
     static void set_initialised(Module& m, bool value);
     Module& map_image(const std::filesystem::path& path);
@@ -147,6 +152,7 @@ private:
     // Terminal once rollback/destruction starts. Never run process attach or map new images after this point.
     std::atomic<bool> detaching_{false};
     std::atomic<bool> detach_started_{false};
+    std::atomic<uint32_t> process_exit_thread_{0};
     std::filesystem::path game_dir_;
     std::map<std::string, Module*> by_name_;  // lower-case file name
     std::vector<Module*> order_;       // mapping order; owns the modules

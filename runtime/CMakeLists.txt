@@ -541,7 +541,8 @@ if(BUILD_TESTING)
     add_executable(process_detach_guest test/fixtures/process_detach_exe.cpp)
     target_link_libraries(process_detach_guest PRIVATE process_detach_dep)
     add_executable(process_detach_driver test/process_detach_driver.cpp
-      src/pe_loader.cpp shims/registry.cpp shims/process.cpp)
+      src/pe_loader.cpp shims/registry.cpp shims/process.cpp shims/library_loader.cpp)
+    target_compile_definitions(process_detach_driver PRIVATE LEONIDA_PROCESS_DETACH_TEST)
     target_link_options(process_detach_driver PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     target_link_libraries(process_detach_driver PRIVATE psapi)
     add_dependencies(process_detach_driver gta6rt_tls_host process_detach_guest)
@@ -550,7 +551,7 @@ if(BUILD_TESTING)
       target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /EHsc)
     endforeach()
     find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_FOUND)
+    if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
       add_test(NAME process_detach COMMAND "${Python3_EXECUTABLE}" -I
         "${CMAKE_CURRENT_SOURCE_DIR}/test/check_process_detach.py"
         --driver "$<TARGET_FILE:process_detach_driver>" --guest "$<TARGET_FILE:process_detach_guest>")

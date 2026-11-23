@@ -55,6 +55,12 @@ def check(events, mode, scenario):
             before = [e[4] for e in events if e[2] == 201]
             after = [e[4] for e in events if e[2] == 202]
             assert len(before) == 1 and before == after, (before, after)  # worker cannot execute during detach
+    if scenario.startswith('lookup'):
+        lookups = [(210, 1), (211, 1), (212, 1)]
+        if scenario == 'lookup_cache':
+            lookups.append((213, 1))
+        assert [(e[2], e[4]) for e in events if 210 <= e[2] <= 213] == lookups, events
+        assert sum(e[2] == 300 for e in events) == (scenario != 'lookup'), events
     return [(e[1], e[2], e[4], e[5]) for e in detaches]
 
 
@@ -83,7 +89,12 @@ def main():
     before = [e[4] for e in early if e[2] == 201]
     after = [e[4] for e in early if e[2] == 202]
     assert len(before) == len(after) == 1 and after[0] > before[0], (before, after)
-    print(f'PASS: {count + 3} child processes, including 20 independent exit races per implementation; '
+    native = check(run([args.guest], 'ExitProcess', 'lookup', args.evidence), 'ExitProcess', 'lookup')
+    for scenario in ('lookup', 'lookup_loader', 'lookup_registry', 'lookup_cache'):
+        mapped = check(run([args.driver, args.guest], 'ExitProcess', scenario, args.evidence), 'ExitProcess', scenario)
+        assert mapped == native, (scenario, native, mapped)
+        print(f'PASS detach lookup: {scenario}', flush=True)
+    print(f'PASS: {count + 8} child processes, including 20 independent exit races per implementation; '
           'early-detach control confirms the worker can run before native shutdown')
 
 

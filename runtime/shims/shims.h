@@ -66,6 +66,25 @@ struct BundledModuleOps {
     void* (*get_proc)(void* ctx, void* module, const std::string& sym, bool& owns_handle);
     bool (*owns_handle)(void* ctx, void* module);
 };
+
+// Native process detach runs on the exiting thread after Windows stops the other threads. Route lookups
+// straight to the prepared run Loader for this scope so a dead thread's registry locks cannot interfere.
+class ProcessDetachLookup {
+public:
+    ProcessDetachLookup(void* ctx, const BundledModuleOps* ops, ModuleLookup address);
+    ~ProcessDetachLookup();
+    ProcessDetachLookup(const ProcessDetachLookup&) = delete;
+    ProcessDetachLookup& operator=(const ProcessDetachLookup&) = delete;
+
+    void* const context;
+    const BundledModuleOps* const bundled;
+    const ModuleLookup address;
+
+private:
+    const ProcessDetachLookup* previous_;
+};
+bool process_detach_lookup_active(const void* ctx = nullptr);
+
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
 

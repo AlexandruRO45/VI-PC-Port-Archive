@@ -20,11 +20,24 @@ extern "C" __declspec(dllexport) void __cdecl detach_touch(unsigned value, HANDL
     InterlockedExchangePointer(&observed_thread, observed);
     detach_event(2, 100, dll_tls);
 }
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved) {
+BOOL WINAPI DllMain(HINSTANCE image, DWORD reason, LPVOID reserved) {
     detach_event(2, 10 + reason, dll_tls, reserved != nullptr);
     if (reason == DLL_PROCESS_DETACH) {
         char scenario[64]{};
         GetEnvironmentVariableA("LEONIDA_DETACH_CASE", scenario, sizeof(scenario));
+        if (!std::strncmp(scenario, "lookup", 6)) {
+            const auto module = GetModuleHandleW(L"process_detach_dep.dll");
+            detach_event(2, 210, module == image);
+            const auto proc = GetProcAddress(module, "detach_heartbeat");
+            detach_event(2, 211, proc == reinterpret_cast<FARPROC>(&detach_heartbeat));
+            const auto host = GetModuleHandleW(L"kernel32.dll");
+            detach_event(2, 212, GetProcAddress(host, "GetCurrentProcessId") != nullptr);
+            if (!std::strcmp(scenario, "lookup_cache")) {
+                const auto shim = GetModuleHandleW(L"process_detach_probe.dll");
+                const auto exported = reinterpret_cast<unsigned(WINAPI*)()>(GetProcAddress(shim, "detach_probe_export"));
+                detach_event(2, 213, shim && exported && exported() == 7);
+            }
+        }
         const HANDLE observed = InterlockedCompareExchangePointer(&observed_thread, nullptr, nullptr);
         if (observed && std::strcmp(scenario, "racing_exit"))
             detach_event(2, 200, WaitForSingleObject(observed, 0));

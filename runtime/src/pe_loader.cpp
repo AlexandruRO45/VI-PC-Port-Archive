@@ -29,10 +29,6 @@ namespace {
 
 std::atomic<Loader*> g_process_exit_loader{nullptr};
 
-void __cdecl on_host_process_detach(void* reserved) {
-    if (Loader* loader = g_process_exit_loader.load()) loader->detach_initialised_modules(reserved);
-}
-
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + p.string());
@@ -594,6 +590,12 @@ Loader::~Loader() {
     }
 }
 
+void Loader::on_host_process_detach(void* reserved) {
+    Loader* loader = g_process_exit_loader.load();
+    // A direct ExitThread or an exit that bypasses the shim never froze this Loader on an exit caller.
+    if (loader && loader->process_exit_thread_ == GetCurrentThreadId()) loader->detach_initialised_modules(reserved);
+}
+
 void Loader::enable_process_exit() {
     std::lock_guard alloc_lock(g_tls_alloc_mutex);
     const auto host = ensure_tls_host(0);
@@ -612,6 +614,7 @@ void Loader::prepare_process_exit() {
     // before native ExitProcess kills them. Do not take this mutex from DLL_PROCESS_DETACH.
     std::lock_guard lock(mutex_);
     detaching_ = true;
+    process_exit_thread_ = GetCurrentThreadId();
 }
 
 void Loader::detach_initialised_modules(void* process_termination) {
@@ -619,6 +622,8 @@ void Loader::detach_initialised_modules(void* process_termination) {
     // This is terminal, including after a failed startup. Repeated or recursive rollback is a no-op.
     if (detach_started_.exchange(true)) return;
     detaching_ = true;
+    const bool prepared_exit = process_termination && process_exit_thread_ == GetCurrentThreadId();
+    const shims::ProcessDetachLookup lookup(prepared_exit ? this : nullptr, &kBundledOps, &lookup_in_loader);
     // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
     // block alive throughout the notifications: a detach handler can still call an imported function or free an
     // FLS slot whose destructor lives in another mapped image.
@@ -690,7 +695,8 @@ Module& Loader::load(const std::filesystem::path& image) {
 }
 
 void* Loader::find_loaded_module(const std::string& dll_lower) const {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_, std::defer_lock);
+    if (!shims::process_detach_lookup_active(this)) lock.lock();
     auto it = by_name_.find(dll_lower);
     return it == by_name_.end() ? nullptr : static_cast<void*>(it->second->base);
 }
@@ -699,7 +705,8 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     handled = false;
     if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
 
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_, std::defer_lock);
+    if (!shims::process_detach_lookup_active(this)) lock.lock();
     const auto existing = by_name_.find(dll_lower);
     const std::filesystem::path candidate = game_dir_ / dll_lower;
     std::error_code ec;
@@ -750,7 +757,8 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
 void* Loader::resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle) {
     owns_handle = false;
     if (!module_handle) return nullptr;
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_, std::defer_lock);
+    if (!shims::process_detach_lookup_active(this)) lock.lock();
     Module* target = nullptr;
     for (Module* m : order_) {
         if (m->base == module_handle) {
@@ -781,7 +789,8 @@ void* Loader::resolve_module_export(void* module_handle, const std::string& sym,
 }
 
 bool Loader::find_address(uint64_t address, std::string& module, uint32_t& rva) const {
-    std::shared_lock lock(ranges_mutex_);
+    std::shared_lock lock(ranges_mutex_, std::defer_lock);
+    if (!shims::process_detach_lookup_active(this)) lock.lock();
     for (const MappedRange& r : ranges_) {
         if (address >= r.base && address - r.base < r.size) {
             module = r.name;
@@ -794,7 +803,8 @@ bool Loader::find_address(uint64_t address, std::string& module, uint32_t& rva) 
 
 bool Loader::owns_module_handle(void* module_handle) const {
     if (!module_handle) return false;
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_, std::defer_lock);
+    if (!shims::process_detach_lookup_active(this)) lock.lock();
     for (const Module* m : order_)
         if (m->base == module_handle) return true;
     return false;
