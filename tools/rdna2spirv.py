@@ -8302,6 +8302,51 @@ class Gen:
             self.uses_psb = True        # needs Int64 (declared with the PSB types)
             self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, rlo)
             self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
+        elif op in ("v_min_u64", "v_max_u64", "v_min_i64", "v_max_i64"):
+            # 64-bit integer min/max VALU (GFX10/RDNA2):
+            # v_min_u64 / v_max_u64: unsigned 64-bit minimum/maximum
+            # v_min_i64 / v_max_i64: signed 64-bit minimum/maximum
+            if a[0].get("n") != 2 and not (a[0]["k"] == "special" and a[0].get("t") == "null"):
+                raise Unsupported(op + " operands")
+            def pair64(s):
+                if s["k"] in ("vgpr", "sgpr") and s.get("n") == 2:
+                    return self.load_reg(s["k"], s["r"]), self.load_reg(s["k"], s["r"] + 1)
+                return self.src64_data(s, op, allow_vgpr=True)
+
+            (x0, x1), (y0, y1) = pair64(a[1]), pair64(a[2])
+            lx, hx, tx, x = (self.tmp() for _ in range(4))
+            ly, hy, ty, y = (self.tmp() for _ in range(4))
+            self.emit(f"{lx} = OpUConvert %ulong {x0}")
+            self.emit(f"{hx} = OpUConvert %ulong {x1}")
+            self.emit(f"{tx} = OpShiftLeftLogical %ulong {hx} %c64_32")
+            self.emit(f"{x} = OpBitwiseOr %ulong {tx} {lx}")
+            self.emit(f"{ly} = OpUConvert %ulong {y0}")
+            self.emit(f"{hy} = OpUConvert %ulong {y1}")
+            self.emit(f"{ty} = OpShiftLeftLogical %ulong {hy} %c64_32")
+            self.emit(f"{y} = OpBitwiseOr %ulong {ty} {ly}")
+            inst = {"v_min_u64": "UMin", "v_max_u64": "UMax",
+                    "v_min_i64": "SMin", "v_max_i64": "SMax"}[op]
+            res = self.tmp()
+            if op.endswith("_i64"):
+                sx, sy, sres = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{sx} = OpBitcast %long {x}")
+                self.emit(f"{sy} = OpBitcast %long {y}")
+                self.emit(f"{sres} = OpExtInst %long %glsl {inst} {sx} {sy}")
+                self.emit(f"{res} = OpBitcast %ulong {sres}")
+            else:
+                self.emit(f"{res} = OpExtInst %ulong %glsl {inst} {x} {y}")
+            rlo, hs, rhi = (self.tmp() for _ in range(3))
+            self.emit(f"{rlo} = OpUConvert %uint {res}")
+            self.emit(f"{hs} = OpShiftRightLogical %ulong {res} %c64_32")
+            self.emit(f"{rhi} = OpUConvert %uint {hs}")
+            self.uses_psb = True        # needs Int64 and %ulong/%long (declared with PSB types)
+            if a[0]["k"] == "vgpr":
+                self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, rlo)
+                self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
+            elif a[0]["k"] == "special" and a[0].get("t") == "null":
+                pass
+            else:
+                raise Unsupported(op + " operands")
         elif op == "v_fmac_f16":
             # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
             sel, dhi = self.opsel_bits(mods, 3)
