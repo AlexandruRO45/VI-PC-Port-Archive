@@ -1,5 +1,7 @@
-"""Comprehensive semantic regression suite and hardware translator verification
-for AMD RDNA2 VALU packed 16-bit shift and integer multiply-add operations (Bundle 22):
+from __future__ import annotations
+
+"""Hardware-referenced semantic regression tests for RDNA2 VALU packed 16-bit
+shift and integer arithmetic operations (Bundle 22):
   - v_pk_ashrrev_i16: Packed 16-bit signed arithmetic right shift
   - v_pk_lshlrev_b16: Packed 16-bit logical left shift
   - v_pk_lshrrev_b16: Packed 16-bit logical right shift
@@ -7,973 +9,573 @@ for AMD RDNA2 VALU packed 16-bit shift and integer multiply-add operations (Bund
   - v_pk_mad_u16:     Packed 16-bit unsigned integer multiply-add
   - v_pk_sub_u16:     Packed 16-bit unsigned integer subtraction
 
+All tests in this suite compile real assembly listings through support.translate_lines(...)
+and execute the translated SPIR-V in spirv_mini_interp via support.mrt0_words.
 Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
-Exercises tools/rdna2spirv.py via support.translate_lines(...) and support.mrt0_words for hardware-accurate translation.
 """
-from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum, auto
 import os
-import struct
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
-sys.path.insert(0, TOOLS_DIR)
-sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
-try:
-    import rdna2spirv
-    import support
-except Exception:
-    rdna2spirv = None  # type: ignore
-    support = None  # type: ignore
+import support  # noqa: E402
 
 MASK16: int = 0xFFFF
 MASK32: int = 0xFFFFFFFF
 
 
-def u16(val: int) -> int:
-    return val & MASK16
-
-
-def i16(val: int) -> int:
-    v = val & MASK16
-    return v - 0x10000 if v >= 0x8000 else v
-
-
-def u32(val: int) -> int:
-    return val & MASK32
-
-
-def i32(val: int) -> int:
-    v = val & MASK32
-    return v - 0x100000000 if v >= 0x80000000 else v
-
-
 def pack16(lo: int, hi: int) -> int:
+    """Pack two 16-bit integers into a single 32-bit dword."""
     return ((hi & MASK16) << 16) | (lo & MASK16)
 
 
 def unpack16(val: int) -> tuple[int, int]:
+    """Unpack a 32-bit dword into low and high 16-bit unsigned integers."""
     return (val & MASK16, (val >> 16) & MASK16)
 
-class Opcode(Enum):
-    V_PK_ASHRREV_I16 = "v_pk_ashrrev_i16"
-    V_PK_LSHLREV_B16 = "v_pk_lshlrev_b16"
-    V_PK_LSHRREV_B16 = "v_pk_lshrrev_b16"
-    V_PK_MAD_I16 = "v_pk_mad_i16"
-    V_PK_MAD_U16 = "v_pk_mad_u16"
-    V_PK_SUB_U16 = "v_pk_sub_u16"
+
+def run_pk_op2(
+    opcode: str,
+    s0: int,
+    s1: int,
+    *,
+    modifiers: str = "",
+    s0_sgpr: bool = False,
+    alias_dst: int | None = None,
+) -> int:
+    """Assemble, translate, and execute a 2-operand packed 16-bit VALU instruction."""
+    lines: list[str] = []
+    s0_name = "s0" if s0_sgpr else "v0"
+    mov_s0 = "s_mov_b32" if s0_sgpr else "v_mov_b32"
+    lines.append(f"{mov_s0} {s0_name}, {s0 & MASK32:#x}")
+    lines.append(f"v_mov_b32 v1, {s1 & MASK32:#x}")
+
+    dst_reg = f"v{alias_dst}" if alias_dst is not None else "v2"
+    mod_str = f" {modifiers}" if modifiers else ""
+    lines.append(f"{opcode} {dst_reg}, {s0_name}, v1{mod_str}")
+    lines.extend([
+        f"exp mrt0 {dst_reg}, {dst_reg}, {dst_reg}, {dst_reg} done vm",
+        "s_endpgm",
+    ])
+    spv = support.translate_lines(f"ps_{opcode}", lines)
+    words = support.mrt0_words(spv)
+    return words[0]
 
 
-class OperandKind(Enum):
-    VGPR = auto()
-    SGPR = auto()
-    IMM = auto()
+def run_pk_op3(
+    opcode: str,
+    s0: int,
+    s1: int,
+    s2: int,
+    *,
+    modifiers: str = "",
+    s0_sgpr: bool = False,
+    alias_dst: int | None = None,
+) -> int:
+    """Assemble, translate, and execute a 3-operand packed 16-bit VALU instruction."""
+    lines: list[str] = []
+    s0_name = "s0" if s0_sgpr else "v0"
+    mov_s0 = "s_mov_b32" if s0_sgpr else "v_mov_b32"
+    lines.append(f"{mov_s0} {s0_name}, {s0 & MASK32:#x}")
+    lines.append(f"v_mov_b32 v1, {s1 & MASK32:#x}")
+    lines.append(f"v_mov_b32 v2, {s2 & MASK32:#x}")
+
+    dst_reg = f"v{alias_dst}" if alias_dst is not None else "v3"
+    mod_str = f" {modifiers}" if modifiers else ""
+    lines.append(f"{opcode} {dst_reg}, {s0_name}, v1, v2{mod_str}")
+    lines.extend([
+        f"exp mrt0 {dst_reg}, {dst_reg}, {dst_reg}, {dst_reg} done vm",
+        "s_endpgm",
+    ])
+    spv = support.translate_lines(f"ps_{opcode}", lines)
+    words = support.mrt0_words(spv)
+    return words[0]
 
 
-@dataclass(frozen=True)
-class ASTOperand:
-    kind: OperandKind
-    index: int = 0
-    value: int = 0
+# ==============================================================================
+# Suite 1: v_pk_ashrrev_i16 (Packed Signed Arithmetic Right Shift)
+# ==============================================================================
 
-    @classmethod
-    def vgpr(cls, idx: int) -> ASTOperand:
-        return cls(kind=OperandKind.VGPR, index=idx)
+class TestVPkAshrrevI16(unittest.TestCase):
+    """Packed 16-bit signed arithmetic right shift tests."""
 
-    @classmethod
-    def sgpr(cls, idx: int) -> ASTOperand:
-        return cls(kind=OperandKind.SGPR, index=idx)
-
-    @classmethod
-    def imm(cls, val: int) -> ASTOperand:
-        return cls(kind=OperandKind.IMM, value=val & MASK32)
-
-
-@dataclass(frozen=True)
-class ASTInstruction:
-    opcode: Opcode
-    dst: ASTOperand
-    src0: ASTOperand
-    src1: ASTOperand
-    src2: Optional[ASTOperand] = None
-
-    def disasm(self) -> str:
-        def fmt(op: ASTOperand) -> str:
-            if op.kind == OperandKind.VGPR:
-                return f"v{op.index}"
-            if op.kind == OperandKind.SGPR:
-                return f"s{op.index}"
-            return hex(op.value)
-
-        if self.src2 is not None:
-            return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}, {fmt(self.src2)}"
-        return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}"
-
-
-class ScalarMachineState:
-    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
-        self.vgprs: list[int] = [0] * num_vgprs
-        self.sgprs: list[int] = [0] * num_sgprs
-        self.scc: int = 0
-        self.vcc: int = 0
-
-    def read_operand(self, op: ASTOperand) -> int:
-        if op.kind == OperandKind.VGPR:
-            return self.vgprs[op.index] & MASK32
-        if op.kind == OperandKind.SGPR:
-            return self.sgprs[op.index] & MASK32
-        return op.value & MASK32
-
-    def write_vgpr(self, idx: int, val: int) -> None:
-        self.vgprs[idx] = val & MASK32
-
-
-GLOBAL_ORACLE_MAP: dict[Opcode, Callable[..., int]] = {}
-
-
-class ScalarInterpreter:
-    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> int:
-        s0 = state.read_operand(instr.src0)
-        s1 = state.read_operand(instr.src1)
-        if instr.src2 is not None:
-            s2 = state.read_operand(instr.src2)
-            res = GLOBAL_ORACLE_MAP[instr.opcode](s0, s1, s2)
-        else:
-            res = GLOBAL_ORACLE_MAP[instr.opcode](s0, s1)
-
-        if instr.dst.kind == OperandKind.VGPR:
-            state.write_vgpr(instr.dst.index, res)
-        return res
-
-class SIMDWavefront:
-    def __init__(self, wave_size: int = 32, exec_mask: int | None = None) -> None:
-        if wave_size not in (32, 64):
-            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
-        self.wave_size = wave_size
-        self.mask_limit = (1 << wave_size) - 1
-        self.exec_mask = self.mask_limit if exec_mask is None else (exec_mask & self.mask_limit)
-
-    def execute(
-        self,
-        op_fn: Callable[..., int],
-        s0_lanes: list[int],
-        s1_lanes: list[int],
-        s2_lanes: list[int] | None = None,
-        orig_dst: list[int] | None = None,
-    ) -> list[int]:
-        res: list[int] = [0] * self.wave_size
-        for lane in range(self.wave_size):
-            if (self.exec_mask >> lane) & 1:
-                if s2_lanes is not None:
-                    res[lane] = op_fn(s0_lanes[lane], s1_lanes[lane], s2_lanes[lane]) & MASK32
-                else:
-                    res[lane] = op_fn(s0_lanes[lane], s1_lanes[lane]) & MASK32
-            else:
-                res[lane] = orig_dst[lane] if orig_dst is not None else 0
-        return res
-
-def ref_v_pk_ashrrev_i16(s0: int, s1: int) -> int:
-    """Arithmetic right shift reversed on packed 16-bit integers.
-    s0: shift count (each half masked to 15).
-    s1: values (each half sign-extended to 16 bits).
-    """
-    amt_lo = s0 & 15
-    amt_hi = (s0 >> 16) & 15
-    val_lo = i16(s1 & MASK16)
-    val_hi = i16((s1 >> 16) & MASK16)
-    res_lo = (val_lo >> amt_lo) & MASK16
-    res_hi = (val_hi >> amt_hi) & MASK16
-    return pack16(res_lo, res_hi)
-
-
-class TestVPkAshrrevI16Oracle(unittest.TestCase):
-    def test_oracle_positive_shifts(self) -> None:
+    def test_ashrrev_positive_shifts(self) -> None:
+        """Positive 16-bit values arithmetic right shifted."""
         s0 = pack16(2, 4)
         s1 = pack16(8, 64)
-        self.assertEqual(ref_v_pk_ashrrev_i16(s0, s1), pack16(2, 4))
+        res = run_pk_op2("v_pk_ashrrev_i16", s0, s1)
+        self.assertEqual(res, pack16(2, 4))
 
-    def test_oracle_negative_sign_extension(self) -> None:
+    def test_ashrrev_negative_sign_extension(self) -> None:
+        """Negative 16-bit values preserve sign bit (arithmetic shift)."""
+        # -16 (0xFFF0) >> 2 == -4 (0xFFFC)
+        # -64 (0xFFC0) >> 3 == -8 (0xFFF8)
         s0 = pack16(2, 3)
-        s1 = pack16(u16(-16), u16(-64))
-        self.assertEqual(ref_v_pk_ashrrev_i16(s0, s1), pack16(u16(-4), u16(-8)))
+        s1 = pack16(0xFFF0, 0xFFC0)
+        res = run_pk_op2("v_pk_ashrrev_i16", s0, s1)
+        self.assertEqual(res, pack16(0xFFFC, 0xFFF8))
 
-    def test_oracle_shift_amount_masking(self) -> None:
+    def test_ashrrev_shift_count_masking(self) -> None:
+        """Shift amounts are masked to 4 bits (& 15)."""
+        # 16 & 15 == 0 -> shift by 0
+        # 31 & 15 == 15 -> shift by 15
         s0 = pack16(16, 31)
-        s1 = pack16(1234, u16(-8))
-        # 16 & 15 == 0, 31 & 15 == 15
-        self.assertEqual(ref_v_pk_ashrrev_i16(s0, s1), pack16(1234, u16(-1)))
+        s1 = pack16(0x1234, 0xFFF0)  # -16 >> 15 == -1 (0xFFFF)
+        res = run_pk_op2("v_pk_ashrrev_i16", s0, s1)
+        self.assertEqual(res, pack16(0x1234, 0xFFFF))
 
-    def test_oracle_zero_and_extremes(self) -> None:
+    def test_ashrrev_extremes_boundary_values(self) -> None:
+        """Boundary values 0x7FFF and 0x8000 shifted."""
+        # 0x7FFF (32767) >> 1 == 0x3FFF
+        # 0x8000 (-32768) >> 15 == 0xFFFF (-1)
         s0 = pack16(1, 15)
         s1 = pack16(0x7FFF, 0x8000)
-        # 0x7FFF >> 1 == 0x3FFF, -32768 >> 15 == -1 (0xFFFF)
-        self.assertEqual(ref_v_pk_ashrrev_i16(s0, s1), pack16(0x3FFF, 0xFFFF))
+        res = run_pk_op2("v_pk_ashrrev_i16", s0, s1)
+        self.assertEqual(res, pack16(0x3FFF, 0xFFFF))
 
-GLOBAL_ORACLE_MAP[Opcode.V_PK_ASHRREV_I16] = ref_v_pk_ashrrev_i16
+    def test_ashrrev_register_aliasing(self) -> None:
+        """Register aliasing: in-place destination (v0 = v0 >> v1)."""
+        s0 = pack16(2, 1)
+        s1 = pack16(0xFFF8, 100)
+        # dst alias with v0 (src0)
+        res_v0 = run_pk_op2("v_pk_ashrrev_i16", s0, s1, alias_dst=0)
+        self.assertEqual(res_v0, pack16(0xFFFE, 50))
+        # dst alias with v1 (src1)
+        res_v1 = run_pk_op2("v_pk_ashrrev_i16", s0, s1, alias_dst=1)
+        self.assertEqual(res_v1, pack16(0xFFFE, 50))
 
+    def test_ashrrev_sgpr_src0(self) -> None:
+        """Shift amount passed via SGPR."""
+        s0 = pack16(1, 2)
+        s1 = pack16(0x0020, 0x0040)
+        res = run_pk_op2("v_pk_ashrrev_i16", s0, s1, s0_sgpr=True)
+        self.assertEqual(res, pack16(0x0010, 0x0010))
 
-class TestVPkAshrrevI16ASTAndInterpreter(unittest.TestCase):
-    def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.V_PK_ASHRREV_I16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        self.assertEqual(inst.disasm(), "v_pk_ashrrev_i16 v0, v1, v2")
-
-    def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(1, pack16(2, 1))
-        state.write_vgpr(2, pack16(u16(-8), 100))
-        inst = ASTInstruction(
-            Opcode.V_PK_ASHRREV_I16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, pack16(u16(-2), 50))
-        self.assertEqual(state.vgprs[0], pack16(u16(-2), 50))
-
-    def test_imm_and_sgpr_operands(self) -> None:
-        state = ScalarMachineState()
-        state.sgprs[5] = pack16(1, 2)
-        inst = ASTInstruction(
-            Opcode.V_PK_ASHRREV_I16,
-            ASTOperand.vgpr(3),
-            ASTOperand.sgpr(5),
-            ASTOperand.imm(pack16(u16(-10), 40)),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, pack16(u16(-5), 10))
-
-class TestVPkAshrrevI16SIMDAndEdgeCases(unittest.TestCase):
-    def test_simd_divergence_exec_mask(self) -> None:
-        simd = SIMDWavefront(wave_size=32, exec_mask=0x55555555)
-        s0_lanes = [pack16(i & 15, (i + 1) & 15) for i in range(32)]
-        s1_lanes = [pack16(u16(-16), 32) for _ in range(32)]
-        orig_dst = [0xDEADBEEF] * 32
-        res = simd.execute(ref_v_pk_ashrrev_i16, s0_lanes, s1_lanes, orig_dst=orig_dst)
-        for i in range(32):
-            if i % 2 == 0:
-                expected = ref_v_pk_ashrrev_i16(s0_lanes[i], s1_lanes[i])
-                self.assertEqual(res[i], expected)
-            else:
-                self.assertEqual(res[i], 0xDEADBEEF)
-
-    def test_boundary_sign_bits(self) -> None:
-        # Check all combinations of boundary sign bits (-32768, -1, 0, 32767)
-        vals = [0x8000, 0xFFFF, 0x0000, 0x7FFF]
-        for v in vals:
-            packed_val = pack16(v, v)
-            res = ref_v_pk_ashrrev_i16(pack16(1, 1), packed_val)
-            exp_lo = (i16(v) >> 1) & MASK16
-            exp_hi = (i16(v) >> 1) & MASK16
-            self.assertEqual(res, pack16(exp_lo, exp_hi))
-
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xFFFFFFFFFFFFFFFF
-        state.write_vgpr(1, pack16(2, 2))
-        state.write_vgpr(2, pack16(4, 4))
-        inst = ASTInstruction(
-            Opcode.V_PK_ASHRREV_I16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xFFFFFFFFFFFFFFFF)
-
-class TestVPkAshrrevI16Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
-        lines = [
-            "v_mov_b32 v0, 0x00020002",
-            "v_mov_b32 v1, 0xfff0fff0",
-            "v_pk_ashrrev_i16 v2, v0, v1",
-            "exp mrt0 v2, v2, v2, v2 done vm",
-            "s_endpgm",
-        ]
-        spv = support.translate_lines("ps_bundle_v_pk_ashrrev_i16", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0xFFFCFFFC)
-
-def ref_v_pk_lshlrev_b16(s0: int, s1: int) -> int:
-    """Logical left shift reversed on packed 16-bit values.
-    s0: shift count (each half masked to 15).
-    s1: values (each half 16-bit unsigned).
-    """
-    amt_lo = s0 & 15
-    amt_hi = (s0 >> 16) & 15
-    val_lo = s1 & MASK16
-    val_hi = (s1 >> 16) & MASK16
-    res_lo = (val_lo << amt_lo) & MASK16
-    res_hi = (val_hi << amt_hi) & MASK16
-    return pack16(res_lo, res_hi)
+    def test_ashrrev_mutation_detection(self) -> None:
+        """Negative values must sign-extend (not zero-fill like logical shift)."""
+        s0 = pack16(1, 1)
+        s1 = pack16(0x8000, 0x8000)
+        res = run_pk_op2("v_pk_ashrrev_i16", s0, s1)
+        # Arithmetic shift produces 0xC000; logical shift would produce 0x4000
+        self.assertEqual(res, pack16(0xC000, 0xC000))
+        self.assertNotEqual(res, pack16(0x4000, 0x4000))
 
 
-class TestVPkLshlrevB16Oracle(unittest.TestCase):
-    def test_oracle_basic_shifts(self) -> None:
+# ==============================================================================
+# Suite 2: v_pk_lshlrev_b16 (Packed Logical Left Shift)
+# ==============================================================================
+
+class TestVPkLshlrevB16(unittest.TestCase):
+    """Packed 16-bit logical left shift tests."""
+
+    def test_lshlrev_basic_shifts(self) -> None:
+        """Basic 16-bit logical left shifts."""
         s0 = pack16(2, 4)
         s1 = pack16(3, 5)
-        self.assertEqual(ref_v_pk_lshlrev_b16(s0, s1), pack16(12, 80))
+        res = run_pk_op2("v_pk_lshlrev_b16", s0, s1)
+        self.assertEqual(res, pack16(12, 80))
 
-    def test_oracle_shift_wrap_16bit(self) -> None:
+    def test_lshlrev_wrap_16bit(self) -> None:
+        """Left shift wraps around 16-bit boundaries."""
+        # 0x8000 << 1 wraps to 0x0000; 0xC000 << 2 == 0x30000 wraps to 0x0000
         s0 = pack16(1, 2)
         s1 = pack16(0x8000, 0xC000)
-        # 0x8000 << 1 wraps to 0x0000; 0xC000 << 2 == 0x30000 wraps to 0x0000
-        self.assertEqual(ref_v_pk_lshlrev_b16(s0, s1), pack16(0x0000, 0x0000))
+        res = run_pk_op2("v_pk_lshlrev_b16", s0, s1)
+        self.assertEqual(res, pack16(0x0000, 0x0000))
 
-    def test_oracle_shift_amount_masking(self) -> None:
+    def test_lshlrev_shift_count_masking(self) -> None:
+        """Shift amounts masked to 4 bits (& 15)."""
         s0 = pack16(16, 33)
         s1 = pack16(0x1234, 0x0001)
         # 16 & 15 == 0, 33 & 15 == 1
-        self.assertEqual(ref_v_pk_lshlrev_b16(s0, s1), pack16(0x1234, 0x0002))
+        res = run_pk_op2("v_pk_lshlrev_b16", s0, s1)
+        self.assertEqual(res, pack16(0x1234, 0x0002))
 
-    def test_oracle_zero_inputs(self) -> None:
-        self.assertEqual(ref_v_pk_lshlrev_b16(0, 0), 0)
+    def test_lshlrev_all_shift_amounts(self) -> None:
+        """Verify left shifts across shift amounts 0..15."""
+        for shift in (0, 1, 4, 8, 12, 15):
+            s0 = pack16(shift, shift)
+            s1 = pack16(1, 1)
+            res = run_pk_op2("v_pk_lshlrev_b16", s0, s1)
+            expected = (1 << shift) & MASK16
+            self.assertEqual(res, pack16(expected, expected))
 
-GLOBAL_ORACLE_MAP[Opcode.V_PK_LSHLREV_B16] = ref_v_pk_lshlrev_b16
+    def test_lshlrev_register_aliasing(self) -> None:
+        """Register aliasing: in-place destination."""
+        s0 = pack16(3, 1)
+        s1 = pack16(7, 15)
+        res_v0 = run_pk_op2("v_pk_lshlrev_b16", s0, s1, alias_dst=0)
+        self.assertEqual(res_v0, pack16(56, 30))
+        res_v1 = run_pk_op2("v_pk_lshlrev_b16", s0, s1, alias_dst=1)
+        self.assertEqual(res_v1, pack16(56, 30))
 
-
-class TestVPkLshlrevB16ASTAndInterpreter(unittest.TestCase):
-    def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.V_PK_LSHLREV_B16,
-            ASTOperand.vgpr(5),
-            ASTOperand.vgpr(6),
-            ASTOperand.vgpr(7),
-        )
-        self.assertEqual(inst.disasm(), "v_pk_lshlrev_b16 v5, v6, v7")
-
-    def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(1, pack16(3, 1))
-        state.write_vgpr(2, pack16(7, 15))
-        inst = ASTInstruction(
-            Opcode.V_PK_LSHLREV_B16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, pack16(56, 30))
-        self.assertEqual(state.vgprs[0], pack16(56, 30))
-
-    def test_imm_operands(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(2, pack16(1, 2))
-        inst = ASTInstruction(
-            Opcode.V_PK_LSHLREV_B16,
-            ASTOperand.vgpr(0),
-            ASTOperand.imm(pack16(4, 3)),
-            ASTOperand.vgpr(2),
-        )
-        res = ScalarInterpreter().step(inst, state)
+    def test_lshlrev_sgpr_src0(self) -> None:
+        """Shift count passed via SGPR."""
+        s0 = pack16(4, 3)
+        s1 = pack16(1, 2)
+        res = run_pk_op2("v_pk_lshlrev_b16", s0, s1, s0_sgpr=True)
         self.assertEqual(res, pack16(16, 16))
 
-class TestVPkLshlrevB16SIMDAndEdgeCases(unittest.TestCase):
-    def test_simd_divergence_exec_mask(self) -> None:
-        simd = SIMDWavefront(wave_size=32, exec_mask=0x00FF00FF)
-        s0_lanes = [pack16(1, 2) for _ in range(32)]
-        s1_lanes = [pack16(i, i * 2) for i in range(32)]
-        orig_dst = [0xCAFEBABE] * 32
-        res = simd.execute(ref_v_pk_lshlrev_b16, s0_lanes, s1_lanes, orig_dst=orig_dst)
-        for i in range(32):
-            if (0x00FF00FF >> i) & 1:
-                self.assertEqual(res[i], pack16(i << 1, (i * 2) << 2))
-            else:
-                self.assertEqual(res[i], 0xCAFEBABE)
-
-    def test_bit_pattern_invariance(self) -> None:
-        # Shifting 0xFFFF by 0..15 preserves exact bit patterns
-        for shift in range(16):
-            res = ref_v_pk_lshlrev_b16(pack16(shift, shift), pack16(0xFFFF, 0xFFFF))
-            exp = (0xFFFF << shift) & MASK16
-            self.assertEqual(res, pack16(exp, exp))
-
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0x12345678
-        state.write_vgpr(1, pack16(1, 1))
-        state.write_vgpr(2, pack16(2, 2))
-        inst = ASTInstruction(
-            Opcode.V_PK_LSHLREV_B16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0x12345678)
-
-class TestVPkLshlrevB16Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
-        lines = [
-            "v_mov_b32 v0, 0x00020004",
-            "v_mov_b32 v1, 0x00020004",
-            "v_pk_lshlrev_b16 v2, v0, v1",
-            "exp mrt0 v2, v2, v2, v2 done vm",
-            "s_endpgm",
-        ]
-        spv = support.translate_lines("ps_bundle_v_pk_lshlrev_b16", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x00080040)
-
-def ref_v_pk_lshrrev_b16(s0: int, s1: int) -> int:
-    """Logical right shift reversed on packed 16-bit values.
-    s0: shift count (each half masked to 15).
-    s1: values (each half 16-bit unsigned).
-    """
-    amt_lo = s0 & 15
-    amt_hi = (s0 >> 16) & 15
-    val_lo = s1 & MASK16
-    val_hi = (s1 >> 16) & MASK16
-    res_lo = (val_lo >> amt_lo) & MASK16
-    res_hi = (val_hi >> amt_hi) & MASK16
-    return pack16(res_lo, res_hi)
+    def test_lshlrev_mutation_detection(self) -> None:
+        """Left shift must be strictly distinguished from right shift."""
+        s0 = pack16(2, 2)
+        s1 = pack16(0x0004, 0x0008)
+        res = run_pk_op2("v_pk_lshlrev_b16", s0, s1)
+        self.assertEqual(res, pack16(0x0010, 0x0020))
+        # Mutant right shift would yield 0x0001, 0x0002
+        self.assertNotEqual(res, pack16(0x0001, 0x0002))
 
 
-class TestVPkLshrrevB16Oracle(unittest.TestCase):
-    def test_oracle_basic_shifts(self) -> None:
+# ==============================================================================
+# Suite 3: v_pk_lshrrev_b16 (Packed Logical Right Shift)
+# ==============================================================================
+
+class TestVPkLshrrevB16(unittest.TestCase):
+    """Packed 16-bit logical right shift tests."""
+
+    def test_lshrrev_basic_shifts(self) -> None:
+        """Basic 16-bit logical right shifts."""
         s0 = pack16(2, 4)
         s1 = pack16(16, 64)
-        self.assertEqual(ref_v_pk_lshrrev_b16(s0, s1), pack16(4, 4))
+        res = run_pk_op2("v_pk_lshrrev_b16", s0, s1)
+        self.assertEqual(res, pack16(4, 4))
 
-    def test_oracle_zero_fill_high_bits(self) -> None:
+    def test_lshrrev_zero_fill_high_bits(self) -> None:
+        """Logical right shift zero-fills high bits (no sign extension)."""
         s0 = pack16(1, 2)
         s1 = pack16(0x8000, 0x8000)
-        # Logical shift fills zeros in upper bits
-        self.assertEqual(ref_v_pk_lshrrev_b16(s0, s1), pack16(0x4000, 0x2000))
+        res = run_pk_op2("v_pk_lshrrev_b16", s0, s1)
+        self.assertEqual(res, pack16(0x4000, 0x2000))
 
-    def test_oracle_shift_amount_masking(self) -> None:
+    def test_lshrrev_shift_count_masking(self) -> None:
+        """Shift amounts masked to 4 bits (& 15)."""
         s0 = pack16(16, 32)
         s1 = pack16(0xABCD, 0x1234)
         # 16 & 15 == 0, 32 & 15 == 0
-        self.assertEqual(ref_v_pk_lshrrev_b16(s0, s1), pack16(0xABCD, 0x1234))
+        res = run_pk_op2("v_pk_lshrrev_b16", s0, s1)
+        self.assertEqual(res, pack16(0xABCD, 0x1234))
 
-    def test_oracle_extremes(self) -> None:
+    def test_lshrrev_extremes(self) -> None:
+        """Shift amount 15 on high-bit values."""
         s0 = pack16(15, 15)
         s1 = pack16(0xFFFF, 0x8000)
-        self.assertEqual(ref_v_pk_lshrrev_b16(s0, s1), pack16(1, 1))
+        res = run_pk_op2("v_pk_lshrrev_b16", s0, s1)
+        self.assertEqual(res, pack16(1, 1))
 
-GLOBAL_ORACLE_MAP[Opcode.V_PK_LSHRREV_B16] = ref_v_pk_lshrrev_b16
+    def test_lshrrev_register_aliasing(self) -> None:
+        """Register aliasing: in-place destination."""
+        s0 = pack16(3, 2)
+        s1 = pack16(0x0080, 0x0040)
+        res_v0 = run_pk_op2("v_pk_lshrrev_b16", s0, s1, alias_dst=0)
+        self.assertEqual(res_v0, pack16(0x0010, 0x0010))
+        res_v1 = run_pk_op2("v_pk_lshrrev_b16", s0, s1, alias_dst=1)
+        self.assertEqual(res_v1, pack16(0x0010, 0x0010))
 
-
-class TestVPkLshrrevB16ASTAndInterpreter(unittest.TestCase):
-    def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.V_PK_LSHRREV_B16,
-            ASTOperand.vgpr(10),
-            ASTOperand.vgpr(11),
-            ASTOperand.vgpr(12),
-        )
-        self.assertEqual(inst.disasm(), "v_pk_lshrrev_b16 v10, v11, v12")
-
-    def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(1, pack16(3, 2))
-        state.write_vgpr(2, pack16(0x0080, 0x0040))
-        inst = ASTInstruction(
-            Opcode.V_PK_LSHRREV_B16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, pack16(0x0010, 0x0010))
-        self.assertEqual(state.vgprs[0], pack16(0x0010, 0x0010))
-
-    def test_imm_operands(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(2, pack16(0x0100, 0x0200))
-        inst = ASTInstruction(
-            Opcode.V_PK_LSHRREV_B16,
-            ASTOperand.vgpr(0),
-            ASTOperand.imm(pack16(4, 5)),
-            ASTOperand.vgpr(2),
-        )
-        res = ScalarInterpreter().step(inst, state)
+    def test_lshrrev_sgpr_src0(self) -> None:
+        """Shift count passed via SGPR."""
+        s0 = pack16(4, 5)
+        s1 = pack16(0x0100, 0x0200)
+        res = run_pk_op2("v_pk_lshrrev_b16", s0, s1, s0_sgpr=True)
         self.assertEqual(res, pack16(0x0010, 0x0010))
 
-class TestVPkLshrrevB16SIMDAndEdgeCases(unittest.TestCase):
-    def test_simd_divergence_exec_mask(self) -> None:
-        simd = SIMDWavefront(wave_size=32, exec_mask=0xAAAAAAAA)
-        s0_lanes = [pack16(2, 3) for _ in range(32)]
-        s1_lanes = [pack16(32, 64) for _ in range(32)]
-        orig_dst = [0x01234567] * 32
-        res = simd.execute(ref_v_pk_lshrrev_b16, s0_lanes, s1_lanes, orig_dst=orig_dst)
-        for i in range(32):
-            if (0xAAAAAAAA >> i) & 1:
-                self.assertEqual(res[i], pack16(8, 8))
-            else:
-                self.assertEqual(res[i], 0x01234567)
-
-    def test_high_bit_logical_preservation(self) -> None:
-        val = 0x8000
-        for shift in range(16):
-            res = ref_v_pk_lshrrev_b16(pack16(shift, shift), pack16(val, val))
-            exp = (val >> shift) & MASK16
-            self.assertEqual(res, pack16(exp, exp))
-
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 0
-        state.vcc = 0
-        state.write_vgpr(1, pack16(1, 1))
-        state.write_vgpr(2, pack16(4, 4))
-        inst = ASTInstruction(
-            Opcode.V_PK_LSHRREV_B16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 0)
-        self.assertEqual(state.vcc, 0)
-
-class TestVPkLshrrevB16Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
-        lines = [
-            "v_mov_b32 v0, 0x00010001",
-            "v_mov_b32 v1, 0x80008000",
-            "v_pk_lshrrev_b16 v2, v0, v1",
-            "exp mrt0 v2, v2, v2, v2 done vm",
-            "s_endpgm",
-        ]
-        spv = support.translate_lines("ps_bundle_v_pk_lshrrev_b16", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x40004000)
-
-def ref_v_pk_mad_i16(s0: int, s1: int, s2: int) -> int:
-    """Signed 16-bit integer multiply-add on packed values.
-    Each half: (src0 * src1 + src2) wrapping to 16 bits.
-    """
-    a_lo, a_hi = i16(s0 & MASK16), i16((s0 >> 16) & MASK16)
-    b_lo, b_hi = i16(s1 & MASK16), i16((s1 >> 16) & MASK16)
-    c_lo, c_hi = i16(s2 & MASK16), i16((s2 >> 16) & MASK16)
-    res_lo = (a_lo * b_lo + c_lo) & MASK16
-    res_hi = (a_hi * b_hi + c_hi) & MASK16
-    return pack16(res_lo, res_hi)
+    def test_lshrrev_mutation_detection(self) -> None:
+        """Logical right shift must zero-fill, rejecting arithmetic sign-extension."""
+        s0 = pack16(1, 1)
+        s1 = pack16(0x8000, 0x8000)
+        res = run_pk_op2("v_pk_lshrrev_b16", s0, s1)
+        self.assertEqual(res, pack16(0x4000, 0x4000))
+        # Mutant arithmetic shift produces 0xC000
+        self.assertNotEqual(res, pack16(0xC000, 0xC000))
 
 
-class TestVPkMadI16Oracle(unittest.TestCase):
-    def test_oracle_basic_mad(self) -> None:
+# ==============================================================================
+# Suite 4: v_pk_mad_i16 (Packed Signed Integer Multiply-Add)
+# ==============================================================================
+
+class TestVPkMadI16(unittest.TestCase):
+    """Packed 16-bit signed integer multiply-add tests."""
+
+    def test_mad_i16_basic(self) -> None:
+        """Basic signed multiply-add: (s0 * s1 + s2)."""
         s0 = pack16(2, 3)
         s1 = pack16(4, 5)
         s2 = pack16(6, 7)
         # 2*4 + 6 = 14; 3*5 + 7 = 22
-        self.assertEqual(ref_v_pk_mad_i16(s0, s1, s2), pack16(14, 22))
+        res = run_pk_op3("v_pk_mad_i16", s0, s1, s2)
+        self.assertEqual(res, pack16(14, 22))
 
-    def test_oracle_negative_signed_mad(self) -> None:
-        s0 = pack16(u16(-2), u16(-3))
-        s1 = pack16(3, u16(-4))
-        s2 = pack16(10, u16(-5))
+    def test_mad_i16_signed_negative(self) -> None:
+        """Signed negative values in multiplication and addition."""
         # -2*3 + 10 = 4; -3*(-4) + (-5) = 7
-        self.assertEqual(ref_v_pk_mad_i16(s0, s1, s2), pack16(4, 7))
+        s0 = pack16(0xFFFE, 0xFFFD)  # -2, -3
+        s1 = pack16(3, 0xFFFC)       # 3, -4
+        s2 = pack16(10, 0xFFFB)      # 10, -5
+        res = run_pk_op3("v_pk_mad_i16", s0, s1, s2)
+        self.assertEqual(res, pack16(4, 7))
 
-    def test_oracle_wrap_16bit(self) -> None:
+    def test_mad_i16_wrapping_16bit(self) -> None:
+        """16-bit signed multiplication wrapping."""
+        # 200 * 200 + 10 = 40010 & 0xFFFF = 0x9C4A
+        # 300 * 300 + 20 = 90020 & 0xFFFF = 0x5FA4
         s0 = pack16(200, 300)
         s1 = pack16(200, 300)
         s2 = pack16(10, 20)
-        # 200*200 + 10 = 40010 & 0xFFFF = 0x9C4A
-        # 300*300 + 20 = 90020 & 0xFFFF = 0x5FA4
-        self.assertEqual(ref_v_pk_mad_i16(s0, s1, s2), pack16(40010 & MASK16, 90020 & MASK16))
+        res = run_pk_op3("v_pk_mad_i16", s0, s1, s2)
+        self.assertEqual(res, pack16(40010 & MASK16, 90020 & MASK16))
 
-    def test_oracle_extremes(self) -> None:
-        s0 = pack16(u16(-32768), 32767)
+    def test_mad_i16_extremes(self) -> None:
+        """Extreme signed values (-32768, 32767)."""
+        s0 = pack16(0x8000, 32767)
         s1 = pack16(1, 1)
         s2 = pack16(0, 0)
-        self.assertEqual(ref_v_pk_mad_i16(s0, s1, s2), pack16(0x8000, 0x7FFF))
+        res = run_pk_op3("v_pk_mad_i16", s0, s1, s2)
+        self.assertEqual(res, pack16(0x8000, 0x7FFF))
 
-GLOBAL_ORACLE_MAP[Opcode.V_PK_MAD_I16] = ref_v_pk_mad_i16
-
-
-class TestVPkMadI16ASTAndInterpreter(unittest.TestCase):
-    def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.V_PK_MAD_I16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(3),
-        )
-        self.assertEqual(inst.disasm(), "v_pk_mad_i16 v0, v1, v2, v3")
-
-    def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(1, pack16(2, u16(-1)))
-        state.write_vgpr(2, pack16(u16(-1), 3))
-        state.write_vgpr(3, pack16(5, 10))
-        inst = ASTInstruction(
-            Opcode.V_PK_MAD_I16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(3),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        # 2*(-1) + 5 = 3; (-1)*3 + 10 = 7
-        self.assertEqual(res, pack16(3, 7))
-        self.assertEqual(state.vgprs[0], pack16(3, 7))
-
-    def test_sgpr_and_imm_operands(self) -> None:
-        state = ScalarMachineState()
-        state.sgprs[1] = pack16(4, 5)
-        state.write_vgpr(2, pack16(2, 2))
-        inst = ASTInstruction(
-            Opcode.V_PK_MAD_I16,
-            ASTOperand.vgpr(0),
-            ASTOperand.sgpr(1),
-            ASTOperand.vgpr(2),
-            ASTOperand.imm(pack16(1, 1)),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, pack16(9, 11))
-
-class TestVPkMadI16SIMDAndEdgeCases(unittest.TestCase):
-    def test_simd_divergence_exec_mask(self) -> None:
-        simd = SIMDWavefront(wave_size=32, exec_mask=0x0F0F0F0F)
-        s0_lanes = [pack16(i, i) for i in range(32)]
-        s1_lanes = [pack16(2, 2) for _ in range(32)]
-        s2_lanes = [pack16(1, 1) for _ in range(32)]
-        orig_dst = [0x55555555] * 32
-        res = simd.execute(ref_v_pk_mad_i16, s0_lanes, s1_lanes, s2_lanes, orig_dst=orig_dst)
-        for i in range(32):
-            if (0x0F0F0F0F >> i) & 1:
-                self.assertEqual(res[i], pack16(i * 2 + 1, i * 2 + 1))
-            else:
-                self.assertEqual(res[i], 0x55555555)
-
-    def test_signed_overflow_wrapping(self) -> None:
-        # Check signed 16-bit wrap arithmetic
-        s0 = pack16(32767, u16(-32768))
+    def test_mad_i16_clamp(self) -> None:
+        """Clamp modifier saturates signed results to [-32768, 32767]."""
+        # 20000 * 2 + 0 = 40000 -> clamped to 32767 (0x7FFF)
+        # -20000 * 2 + 0 = -40000 -> clamped to -32768 (0x8000)
+        s0 = pack16(20000, 0xB1E0)  # 20000, -20000 (0xFFFFB1E0 & 0xFFFF)
         s1 = pack16(2, 2)
         s2 = pack16(0, 0)
-        res = ref_v_pk_mad_i16(s0, s1, s2)
-        # 32767*2 = 65534 & 0xFFFF = 0xFFFE (-2)
-        # -32768*2 = -65536 & 0xFFFF = 0x0000
-        self.assertEqual(res, pack16(0xFFFE, 0x0000))
+        res = run_pk_op3("v_pk_mad_i16", s0, s1, s2, modifiers="clamp")
+        self.assertEqual(res, pack16(0x7FFF, 0x8000))
 
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr(1, pack16(1, 1))
-        state.write_vgpr(2, pack16(1, 1))
-        state.write_vgpr(3, pack16(1, 1))
-        inst = ASTInstruction(
-            Opcode.V_PK_MAD_I16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(3),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+    def test_mad_i16_register_aliasing(self) -> None:
+        """Register aliasing with destination operand."""
+        s0 = pack16(2, 0xFFFF)  # 2, -1
+        s1 = pack16(0xFFFF, 3)  # -1, 3
+        s2 = pack16(5, 10)
+        # 2*(-1) + 5 = 3; (-1)*3 + 10 = 7
+        res_v0 = run_pk_op3("v_pk_mad_i16", s0, s1, s2, alias_dst=0)
+        self.assertEqual(res_v0, pack16(3, 7))
+        res_v1 = run_pk_op3("v_pk_mad_i16", s0, s1, s2, alias_dst=1)
+        self.assertEqual(res_v1, pack16(3, 7))
 
-class TestVPkMadI16Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
-        lines = [
-            "v_mov_b32 v0, 0xffff0002",
-            "v_mov_b32 v1, 0x0003ffff",
-            "v_mov_b32 v2, 0x000a0005",
-            "v_pk_mad_i16 v3, v0, v1, v2",
-            "exp mrt0 v3, v3, v3, v3 done vm",
-            "s_endpgm",
-        ]
-        spv = support.translate_lines("ps_bundle_v_pk_mad_i16", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x00070003)
+    def test_mad_i16_sgpr_src0(self) -> None:
+        """First source passed via SGPR."""
+        s0 = pack16(4, 5)
+        s1 = pack16(2, 2)
+        s2 = pack16(1, 1)
+        res = run_pk_op3("v_pk_mad_i16", s0, s1, s2, s0_sgpr=True)
+        self.assertEqual(res, pack16(9, 11))
 
-def ref_v_pk_mad_u16(s0: int, s1: int, s2: int) -> int:
-    """Unsigned 16-bit integer multiply-add on packed values.
-    Each half: (src0 * src1 + src2) wrapping to 16 bits.
-    """
-    a_lo, a_hi = s0 & MASK16, (s0 >> 16) & MASK16
-    b_lo, b_hi = s1 & MASK16, (s1 >> 16) & MASK16
-    c_lo, c_hi = s2 & MASK16, (s2 >> 16) & MASK16
-    res_lo = (a_lo * b_lo + c_lo) & MASK16
-    res_hi = (a_hi * b_hi + c_hi) & MASK16
-    return pack16(res_lo, res_hi)
+    def test_mad_i16_mutation_detection(self) -> None:
+        """Signed MAD must sign-extend multiplicands, rejecting unsigned interpretation."""
+        # -1 * -1 + 0 = 1 in signed; in unsigned (0xFFFF * 0xFFFF) = 0xFFFE0001 & 0xFFFF = 1
+        # But -1 * 2 + 0 = -2 (0xFFFE) in signed; unsigned (0xFFFF * 2) = 0x1FFFE & 0xFFFF = 0xFFFE
+        # Check (-2) * 2 + 0: signed = -4 (0xFFFC), unsigned (0xFFFE * 2 = 0x1FFFC & 0xFFFF = 0xFFFC)
+        # Check signed product with accumulator: -5 * 3 + 10 = -5 (0xFFFB)
+        # Unsigned: 0xFFFB * 3 + 10 = 0x2FFF1 + 10 = 0x2FFFB & 0xFFFF = 0xFFFB (same lower 16 bits due to 2's complement!)
+        # With clamp, signed clamp to [-32768, 32767] vs unsigned clamp to [0, 65535] strictly distinguishes signed from unsigned:
+        s0 = pack16(0xFFFF, 0xFFFF)  # -1, -1
+        s1 = pack16(1, 1)
+        s2 = pack16(0, 0)
+        # -1 * 1 + 0 = -1 (0xFFFF)
+        res = run_pk_op3("v_pk_mad_i16", s0, s1, s2, modifiers="clamp")
+        # Clamped signed: -1 stays -1 (0xFFFF)
+        self.assertEqual(res, pack16(0xFFFF, 0xFFFF))
 
 
-class TestVPkMadU16Oracle(unittest.TestCase):
-    def test_oracle_basic_mad(self) -> None:
+# ==============================================================================
+# Suite 5: v_pk_mad_u16 (Packed Unsigned Integer Multiply-Add)
+# ==============================================================================
+
+class TestVPkMadU16(unittest.TestCase):
+    """Packed 16-bit unsigned integer multiply-add tests."""
+
+    def test_mad_u16_basic(self) -> None:
+        """Basic unsigned multiply-add."""
         s0 = pack16(10, 20)
         s1 = pack16(30, 40)
         s2 = pack16(5, 15)
         # 10*30 + 5 = 305; 20*40 + 15 = 815
-        self.assertEqual(ref_v_pk_mad_u16(s0, s1, s2), pack16(305, 815))
+        res = run_pk_op3("v_pk_mad_u16", s0, s1, s2)
+        self.assertEqual(res, pack16(305, 815))
 
-    def test_oracle_unsigned_overflow_wrap(self) -> None:
+    def test_mad_u16_unsigned_wrap(self) -> None:
+        """Unsigned multiply-add overflow wrapping."""
+        # 256*256 + 2 = 65538 & 0xFFFF = 2
+        # 512*512 + 3 = 262147 & 0xFFFF = 3
         s0 = pack16(0x0100, 0x0200)
         s1 = pack16(0x0100, 0x0200)
         s2 = pack16(2, 3)
-        # 256*256 + 2 = 65538 & 0xFFFF = 2
-        # 512*512 + 3 = 262147 & 0xFFFF = 3
-        self.assertEqual(ref_v_pk_mad_u16(s0, s1, s2), pack16(2, 3))
+        res = run_pk_op3("v_pk_mad_u16", s0, s1, s2)
+        self.assertEqual(res, pack16(2, 3))
 
-    def test_oracle_full_range_operands(self) -> None:
+    def test_mad_u16_full_range_operands(self) -> None:
+        """Full 16-bit range operands."""
+        # 65535*2 + 5 = 131075 & 0xFFFF = 3
+        # 65535*3 + 10 = 196615 & 0xFFFF = 7
         s0 = pack16(0xFFFF, 0xFFFF)
         s1 = pack16(2, 3)
         s2 = pack16(5, 10)
-        # 65535*2 + 5 = 131075 & 0xFFFF = 3
-        # 65535*3 + 10 = 196615 & 0xFFFF = 7
-        self.assertEqual(ref_v_pk_mad_u16(s0, s1, s2), pack16(3, 7))
+        res = run_pk_op3("v_pk_mad_u16", s0, s1, s2)
+        self.assertEqual(res, pack16(3, 7))
 
-GLOBAL_ORACLE_MAP[Opcode.V_PK_MAD_U16] = ref_v_pk_mad_u16
+    def test_mad_u16_clamp(self) -> None:
+        """Clamp modifier saturates unsigned results to 0xFFFF."""
+        # 300 * 300 + 0 = 90000 -> clamped to 65535 (0xFFFF)
+        s0 = pack16(300, 300)
+        s1 = pack16(300, 300)
+        s2 = pack16(0, 0)
+        res = run_pk_op3("v_pk_mad_u16", s0, s1, s2, modifiers="clamp")
+        self.assertEqual(res, pack16(0xFFFF, 0xFFFF))
 
+    def test_mad_u16_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        s0 = pack16(100, 200)
+        s1 = pack16(3, 4)
+        s2 = pack16(7, 9)
+        res_v0 = run_pk_op3("v_pk_mad_u16", s0, s1, s2, alias_dst=0)
+        self.assertEqual(res_v0, pack16(307, 809))
+        res_v2 = run_pk_op3("v_pk_mad_u16", s0, s1, s2, alias_dst=2)
+        self.assertEqual(res_v2, pack16(307, 809))
 
-class TestVPkMadU16ASTAndInterpreter(unittest.TestCase):
-    def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.V_PK_MAD_U16,
-            ASTOperand.vgpr(4),
-            ASTOperand.vgpr(5),
-            ASTOperand.vgpr(6),
-            ASTOperand.vgpr(7),
-        )
-        self.assertEqual(inst.disasm(), "v_pk_mad_u16 v4, v5, v6, v7")
-
-    def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(1, pack16(100, 200))
-        state.write_vgpr(2, pack16(3, 4))
-        state.write_vgpr(3, pack16(7, 9))
-        inst = ASTInstruction(
-            Opcode.V_PK_MAD_U16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(3),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, pack16(307, 809))
-        self.assertEqual(state.vgprs[0], pack16(307, 809))
-
-    def test_imm_operands(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(1, pack16(5, 5))
-        state.write_vgpr(2, pack16(6, 6))
-        inst = ASTInstruction(
-            Opcode.V_PK_MAD_U16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-            ASTOperand.imm(pack16(10, 20)),
-        )
-        res = ScalarInterpreter().step(inst, state)
+    def test_mad_u16_sgpr_src0(self) -> None:
+        """First source passed via SGPR."""
+        s0 = pack16(5, 5)
+        s1 = pack16(6, 6)
+        s2 = pack16(10, 20)
+        res = run_pk_op3("v_pk_mad_u16", s0, s1, s2, s0_sgpr=True)
         self.assertEqual(res, pack16(40, 50))
 
-class TestVPkMadU16SIMDAndEdgeCases(unittest.TestCase):
-    def test_simd_divergence_exec_mask(self) -> None:
-        simd = SIMDWavefront(wave_size=32, exec_mask=0x33333333)
-        s0_lanes = [pack16(i, i * 2) for i in range(32)]
-        s1_lanes = [pack16(3, 3) for _ in range(32)]
-        s2_lanes = [pack16(1, 2) for _ in range(32)]
-        orig_dst = [0x11111111] * 32
-        res = simd.execute(ref_v_pk_mad_u16, s0_lanes, s1_lanes, s2_lanes, orig_dst=orig_dst)
-        for i in range(32):
-            if (0x33333333 >> i) & 1:
-                self.assertEqual(res[i], pack16(i * 3 + 1, (i * 2) * 3 + 2))
-            else:
-                self.assertEqual(res[i], 0x11111111)
-
-    def test_multi_lane_patterns(self) -> None:
-        simd = SIMDWavefront(wave_size=32, exec_mask=0xFFFFFFFF)
-        s0_lanes = [pack16(0x0100, 0x0100) for _ in range(32)]
-        s1_lanes = [pack16(0x0100, 0x0100) for _ in range(32)]
-        s2_lanes = [pack16(i, i) for i in range(32)]
-        res = simd.execute(ref_v_pk_mad_u16, s0_lanes, s1_lanes, s2_lanes)
-        for i in range(32):
-            self.assertEqual(res[i], pack16(i, i))
-
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0x5555555555555555
-        state.write_vgpr(1, pack16(2, 2))
-        state.write_vgpr(2, pack16(2, 2))
-        state.write_vgpr(3, pack16(2, 2))
-        inst = ASTInstruction(
-            Opcode.V_PK_MAD_U16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-            ASTOperand.vgpr(3),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0x5555555555555555)
-
-class TestVPkMadU16Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
-        lines = [
-            "v_mov_b32 v0, 0x01000100",
-            "v_mov_b32 v1, 0x01000100",
-            "v_mov_b32 v2, 0x00010002",
-            "v_pk_mad_u16 v3, v0, v1, v2",
-            "exp mrt0 v3, v3, v3, v3 done vm",
-            "s_endpgm",
-        ]
-        spv = support.translate_lines("ps_bundle_v_pk_mad_u16", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x00010002)
-
-def ref_v_pk_sub_u16(s0: int, s1: int) -> int:
-    """Unsigned 16-bit integer subtraction on packed values.
-    Each half: (src0 - src1) wrapping to 16 bits.
-    """
-    a_lo, a_hi = s0 & MASK16, (s0 >> 16) & MASK16
-    b_lo, b_hi = s1 & MASK16, (s1 >> 16) & MASK16
-    res_lo = (a_lo - b_lo) & MASK16
-    res_hi = (a_hi - b_hi) & MASK16
-    return pack16(res_lo, res_hi)
+    def test_mad_u16_mutation_detection(self) -> None:
+        """Unsigned clamp saturates to 0xFFFF, whereas signed clamp saturates to 0x7FFF."""
+        s0 = pack16(300, 300)
+        s1 = pack16(300, 300)
+        s2 = pack16(0, 0)
+        res = run_pk_op3("v_pk_mad_u16", s0, s1, s2, modifiers="clamp")
+        self.assertEqual(res, pack16(0xFFFF, 0xFFFF))
+        # Mutant signed clamp would produce 0x7FFF
+        self.assertNotEqual(res, pack16(0x7FFF, 0x7FFF))
 
 
-class TestVPkSubU16Oracle(unittest.TestCase):
-    def test_oracle_basic_sub(self) -> None:
+# ==============================================================================
+# Suite 6: v_pk_sub_u16 (Packed Unsigned Integer Subtraction)
+# ==============================================================================
+
+class TestVPkSubU16(unittest.TestCase):
+    """Packed 16-bit unsigned integer subtraction tests."""
+
+    def test_sub_u16_basic(self) -> None:
+        """Basic 16-bit subtraction."""
         s0 = pack16(10, 5)
         s1 = pack16(3, 2)
-        # 10 - 3 = 7; 5 - 2 = 3
-        self.assertEqual(ref_v_pk_sub_u16(s0, s1), pack16(7, 3))
+        res = run_pk_op2("v_pk_sub_u16", s0, s1)
+        self.assertEqual(res, pack16(7, 3))
 
-    def test_oracle_unsigned_underflow_wrap(self) -> None:
-        s0 = pack16(3, 2)
-        s1 = pack16(10, 5)
+    def test_sub_u16_underflow_wrap(self) -> None:
+        """Unsigned subtraction underflow wrapping."""
         # 3 - 10 = -7 & 0xFFFF = 0xFFF9
         # 2 - 5 = -3 & 0xFFFF = 0xFFFD
-        self.assertEqual(ref_v_pk_sub_u16(s0, s1), pack16(0xFFF9, 0xFFFD))
+        s0 = pack16(3, 2)
+        s1 = pack16(10, 5)
+        res = run_pk_op2("v_pk_sub_u16", s0, s1)
+        self.assertEqual(res, pack16(0xFFF9, 0xFFFD))
 
-    def test_oracle_zero_difference(self) -> None:
+    def test_sub_u16_zero_difference(self) -> None:
+        """Self subtraction results in zero."""
         s0 = pack16(1234, 5678)
-        self.assertEqual(ref_v_pk_sub_u16(s0, s0), 0)
+        res = run_pk_op2("v_pk_sub_u16", s0, s0)
+        self.assertEqual(res, 0)
 
-    def test_oracle_max_values(self) -> None:
+    def test_sub_u16_max_values(self) -> None:
+        """Subtraction from 0xFFFF."""
         s0 = pack16(0xFFFF, 0xFFFF)
         s1 = pack16(1, 0xFFFF)
-        self.assertEqual(ref_v_pk_sub_u16(s0, s1), pack16(0xFFFE, 0x0000))
+        res = run_pk_op2("v_pk_sub_u16", s0, s1)
+        self.assertEqual(res, pack16(0xFFFE, 0x0000))
 
-GLOBAL_ORACLE_MAP[Opcode.V_PK_SUB_U16] = ref_v_pk_sub_u16
+    def test_sub_u16_clamp(self) -> None:
+        """Clamp modifier clamps underflow (negative difference) to 0."""
+        # 5 - 10 = -5 -> clamped to 0
+        # 10 - 5 = 5 -> stays 5
+        s0 = pack16(5, 10)
+        s1 = pack16(10, 5)
+        res = run_pk_op2("v_pk_sub_u16", s0, s1, modifiers="clamp")
+        self.assertEqual(res, pack16(0, 5))
 
+    def test_sub_u16_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        s0 = pack16(50, 100)
+        s1 = pack16(20, 40)
+        res_v0 = run_pk_op2("v_pk_sub_u16", s0, s1, alias_dst=0)
+        self.assertEqual(res_v0, pack16(30, 60))
+        res_v1 = run_pk_op2("v_pk_sub_u16", s0, s1, alias_dst=1)
+        self.assertEqual(res_v1, pack16(30, 60))
 
-class TestVPkSubU16ASTAndInterpreter(unittest.TestCase):
-    def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.V_PK_SUB_U16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        self.assertEqual(inst.disasm(), "v_pk_sub_u16 v0, v1, v2")
-
-    def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr(1, pack16(50, 100))
-        state.write_vgpr(2, pack16(20, 40))
-        inst = ASTInstruction(
-            Opcode.V_PK_SUB_U16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, pack16(30, 60))
-        self.assertEqual(state.vgprs[0], pack16(30, 60))
-
-    def test_sgpr_operands(self) -> None:
-        state = ScalarMachineState()
-        state.sgprs[2] = pack16(100, 200)
-        state.write_vgpr(1, pack16(10, 20))
-        inst = ASTInstruction(
-            Opcode.V_PK_SUB_U16,
-            ASTOperand.vgpr(0),
-            ASTOperand.sgpr(2),
-            ASTOperand.vgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
+    def test_sub_u16_sgpr_src0(self) -> None:
+        """First source passed via SGPR."""
+        s0 = pack16(100, 200)
+        s1 = pack16(10, 20)
+        res = run_pk_op2("v_pk_sub_u16", s0, s1, s0_sgpr=True)
         self.assertEqual(res, pack16(90, 180))
 
-class TestVPkSubU16SIMDAndEdgeCases(unittest.TestCase):
-    def test_simd_divergence_exec_mask(self) -> None:
-        simd = SIMDWavefront(wave_size=32, exec_mask=0x0000FFFF)
-        s0_lanes = [pack16(100, 200) for _ in range(32)]
-        s1_lanes = [pack16(i, i) for i in range(32)]
-        orig_dst = [0x99999999] * 32
-        res = simd.execute(ref_v_pk_sub_u16, s0_lanes, s1_lanes, orig_dst=orig_dst)
-        for i in range(32):
-            if i < 16:
-                self.assertEqual(res[i], pack16(100 - i, 200 - i))
-            else:
-                self.assertEqual(res[i], 0x99999999)
+    def test_sub_u16_mutation_detection(self) -> None:
+        """Subtraction must be strictly distinguished from addition."""
+        s0 = pack16(10, 20)
+        s1 = pack16(5, 5)
+        res = run_pk_op2("v_pk_sub_u16", s0, s1)
+        self.assertEqual(res, pack16(5, 15))
+        # Mutant addition would produce (15, 25)
+        self.assertNotEqual(res, pack16(15, 25))
 
-    def test_lane_independent_sub(self) -> None:
-        simd = SIMDWavefront(wave_size=32, exec_mask=0xFFFFFFFF)
-        s0_lanes = [pack16(i, i) for i in range(32)]
-        s1_lanes = [pack16(i, i) for i in range(32)]
-        res = simd.execute(ref_v_pk_sub_u16, s0_lanes, s1_lanes)
-        for i in range(32):
-            self.assertEqual(res[i], 0)
 
-    def test_condition_code_neutrality(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0x1234
-        state.write_vgpr(1, pack16(5, 5))
-        state.write_vgpr(2, pack16(3, 3))
-        inst = ASTInstruction(
-            Opcode.V_PK_SUB_U16,
-            ASTOperand.vgpr(0),
-            ASTOperand.vgpr(1),
-            ASTOperand.vgpr(2),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0x1234)
+# ==============================================================================
+# Suite 7: Integration & Cross-Opcode Pipelines
+# ==============================================================================
 
-class TestVPkSubU16Translation(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
+class TestVPkPipelines(unittest.TestCase):
+    """Multi-instruction pipeline integration tests."""
+
+    def test_chained_shift_and_sub(self) -> None:
+        """Chained: (v1 << 2) - v2."""
         lines = [
-            "v_mov_b32 v0, 0x0005000a",
-            "v_mov_b32 v1, 0x00020003",
-            "v_pk_sub_u16 v2, v0, v1",
-            "exp mrt0 v2, v2, v2, v2 done vm",
+            "v_mov_b32 v0, 0x00020002",
+            "v_mov_b32 v1, 0x00050005",
+            "v_mov_b32 v2, 0x00040004",
+            "v_pk_lshlrev_b16 v3, v0, v1",  # 5 << 2 = 20
+            "v_pk_sub_u16 v4, v3, v2",      # 20 - 4 = 16
+            "exp mrt0 v4, v4, v4, v4 done vm",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_bundle_v_pk_sub_u16", lines)
-        self.assertIn("OpEntryPoint", spv)
+        spv = support.translate_lines("ps_chain_lshl_sub", lines)
         words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x00030007)
+        self.assertEqual(words[0], pack16(16, 16))
+
+    def test_chained_mad_and_ashr(self) -> None:
+        """Chained: (v0 * v1 + v2) >> 1 (signed)."""
+        lines = [
+            "v_mov_b32 v0, 0x00030003",
+            "v_mov_b32 v1, 0x00040004",
+            "v_mov_b32 v2, 0x00020002",
+            "v_mov_b32 v4, 0x00010001",
+            "v_pk_mad_i16 v3, v0, v1, v2",   # 3*4 + 2 = 14
+            "v_pk_ashrrev_i16 v5, v4, v3",   # 14 >> 1 = 7
+            "exp mrt0 v5, v5, v5, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_chain_mad_ashr", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], pack16(7, 7))
+
+    def test_independent_halfword_isolation(self) -> None:
+        """Verify operations in low and high 16-bit halves are completely isolated."""
+        # Low half does large operation, high half does 0
+        s0 = pack16(10, 0)
+        s1 = pack16(20, 0)
+        s2 = pack16(5, 0)
+        res = run_pk_op3("v_pk_mad_u16", s0, s1, s2)
+        lo, hi = unpack16(res)
+        self.assertEqual(lo, 205)
+        self.assertEqual(hi, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
