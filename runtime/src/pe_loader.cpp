@@ -1014,12 +1014,14 @@ Module& Loader::load(const std::filesystem::path& image) {
 
 Module* Loader::find_narrow_module(const std::string& dll_lower) const {
     if (dll_lower.empty()) return nullptr;
-    // library_loader and PE import names keep their existing narrow-byte contract. Do not reinterpret them
-    // as UTF-8 or widen already-folded bytes (which could be part of a multibyte code-page character).
+    // library_loader and PE import names keep their existing narrow-byte contract: the exact compare below is
+    // bytewise, and the key is never reinterpreted as UTF-8.
     for (const auto& entry : by_name_)
         if (entry.second->narrow_key == dll_lower) return entry.second;
     // The key is ASCII case-folded only. A name with letters outside ASCII (Cyrillic in code page 1251, say)
     // compares case-insensitively through the code page, as GetModuleHandleA does: GUEST_ДА.EXE finds guest_да.exe.
+    // Widening the folded key is safe here: rt::lower() folds ASCII letters only, and no ANSI code page's multibyte
+    // sequences contain ASCII letter bytes, so both sides widen to the same characters they were spelt with.
     if (const std::wstring wide = acp_to_wide(dll_lower); !wide.empty())
         for (const auto& entry : by_name_)
             if (!entry.second->narrow_key.empty() &&
