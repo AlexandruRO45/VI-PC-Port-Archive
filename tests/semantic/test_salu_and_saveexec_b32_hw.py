@@ -371,5 +371,53 @@ class TestSaluAndSaveexecB32Aliasing(unittest.TestCase):
                 self.assertEqual(state.get_sgpr(i), 0xBEEF0000 + i)
 
 
+
+
+class TestSaluAndSaveexecB32ConditionCodes(unittest.TestCase):
+    """Test suite for SCC status flag generation across all boundary scenarios."""
+
+    def test_scc_is_zero_when_result_is_zero(self):
+        state = ScalarRegisterState(exec_lo=0x55555555)
+        inst = ASTInstruction(
+            opcode=Opcode.S_AND_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(0, 1),
+            src0=ASTOperand.literal32(0xAAAAAAAA),
+        )
+        state.execute(inst)
+        self.assertEqual(state.exec_lo, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_scc_is_one_when_any_bit_active(self):
+        state = ScalarRegisterState(exec_lo=ALL_LANES_ACTIVE_32)
+        inst = ASTInstruction(
+            opcode=Opcode.S_AND_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(0, 1),
+            src0=ASTOperand.literal32(0x00000001),
+        )
+        state.execute(inst)
+        self.assertEqual(state.exec_lo, 1)
+        self.assertEqual(state.scc, 1)
+
+    def test_scc_overwrites_prior_flag_state(self):
+        state = ScalarRegisterState(exec_lo=0x0F)
+        state.scc = 1
+        inst = ASTInstruction(
+            opcode=Opcode.S_AND_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(0, 1),
+            src0=ASTOperand.literal32(0xF0),
+        )
+        state.execute(inst)
+        self.assertEqual(state.scc, 0)
+
+        inst2 = ASTInstruction(
+            opcode=Opcode.S_AND_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(0, 1),
+            src0=ASTOperand.literal32(0xFF),
+        )
+        state.exec_lo = 0xFF
+        state.execute(inst2)
+        self.assertEqual(state.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
