@@ -222,6 +222,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
+<<<<<<< HEAD
   # Audio boot shims: AcpHal.dll, xapu.dll and chad.dll. Resolves every name through the registry and calls it with
   # valid, null and fake arguments. The three measured out-pointer calls get real buffers. No game data, no device.
   add_executable(audio_stub_test
@@ -245,6 +246,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(xcrdapi_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xcrdapi_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xcrdapi_test PRIVATE /OPT:NOREF)
+
+  # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
+  # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
+  add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
+  target_include_directories(cpu_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -1088,6 +1096,9 @@ if(BUILD_TESTING)
     add_dependencies(bink_audio_test gta6rt_tls_host)
     add_test(NAME bink_audio COMMAND bink_audio_test)
     set_tests_properties(bink_audio PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  if(WIN32 AND TARGET cpu_emulation_test)
+    add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
