@@ -589,28 +589,29 @@ def detect_rebar(target_gpu: str | None = None) -> tuple[bool | None, int | None
 
     smi = shutil.which("nvidia-smi")
     if smi:
-        out = _run([smi, "-q", "-d", "MEMORY"])
+        # The MEMORY display filter omits Product Name. The full query has both the name and BAR1 usage.
+        out = _run([smi, "-q"])
         if out:
-            sections = re.split(r"\n(?=GPU [0-9a-fA-F:]+)", out)
-            matched_section = None
+            # The first part is the NVSMI LOG preamble, not a GPU.
+            sections = re.split(r"(?m)^(?=GPU [0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+\.[0-7][ \t\r]*$)", out)[1:]
             tg_clean = clean_name(target_gpu).lower() if target_gpu else ""
 
             if tg_clean:
                 if ("amd" in tg_clean or "radeon" in tg_clean or "intel" in tg_clean) and "nvidia" not in tg_clean:
                     return None, None
+                matching = []
                 for sec in sections:
-                    prod_m = re.search(r"Product Name\s*:\s*(.+)", sec)
+                    prod_m = re.search(r"Product Name[ \t]*:[ \t]*(.+)", sec)
                     if prod_m:
-                        prod = clean_name(prod_m.group(1).strip()).lower()
-                        if prod in tg_clean or tg_clean in prod:
-                            matched_section = sec
-                            break
+                        prod = clean_name(prod_m.group(1)).lower()
+                        if prod and (prod in tg_clean or tg_clean in prod):
+                            matching.append(sec)
+                    elif len(sections) == 1:
+                        matching.append(sec)
+                sections = matching
 
-            if matched_section is None and len(sections) == 1:
-                matched_section = sections[0]
-
-            if matched_section:
-                m = re.search(r"BAR1 Memory Usage\s+Total\s*:\s*(\d+)\s*MiB", matched_section, re.I)
+            if len(sections) == 1:
+                m = re.search(r"BAR1 Memory Usage\s+Total\s*:\s*(\d+)\s*MiB", sections[0], re.I)
                 if m:
                     bar1_mb = int(m.group(1))
                     return bar1_mb > 256, bar1_mb

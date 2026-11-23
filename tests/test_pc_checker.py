@@ -238,6 +238,36 @@ class Api(unittest.TestCase):
             self.assertFalse(active)
             self.assertEqual(size, 256)
 
+    def test_detect_rebar_nvidia_smi_query_preserves_name_with_log_header(self):
+        from unittest import mock
+        preamble = "==============NVSMI LOG==============\n\nAttached GPUs : 1\n"
+        gpu_header = "GPU 00000000:01:00.0\n"
+        product_name = "    Product Name : NVIDIA GeForce RTX 5060\n"
+        memory = (
+            "    FB Memory Usage\n"
+            "        Total : 8151 MiB\n"
+            "    BAR1 Memory Usage\n"
+            "        Total : 8192 MiB\n"
+        )
+        mock_vk = mock.MagicMock()
+        mock_vk.query.side_effect = RuntimeError("Vulkan unavailable")
+
+        def smi_output(cmd):
+            # NVIDIA's -d MEMORY filter omits Product Name.
+            name = product_name if cmd == ["nvidia-smi", "-q"] else ""
+            return preamble + gpu_header + name + memory
+
+        with mock.patch.dict(sys.modules, {"vk_subgroup_info": mock_vk}), \
+             mock.patch("shutil.which", return_value="nvidia-smi"), \
+             mock.patch.object(pc, "_run", side_effect=smi_output) as run:
+            self.assertEqual(pc.detect_rebar("NVIDIA GeForce RTX 5060 (8 GB VRAM)"), (True, 8192))
+            run.assert_called_once_with(["nvidia-smi", "-q"])
+            self.assertEqual(pc.detect_rebar(), (True, 8192))
+            self.assertEqual(pc.detect_rebar("NVIDIA GeForce RTX 4060"), (None, None))
+            run.side_effect = None
+            run.return_value = preamble + gpu_header + memory
+            self.assertEqual(pc.detect_rebar(), (True, 8192))
+
     def test_detect_rebar_nvidia_smi_multi_gpu(self):
         from unittest import mock
         smi_multi = (
@@ -258,6 +288,8 @@ class Api(unittest.TestCase):
             active, size = pc.detect_rebar(target_gpu="NVIDIA GeForce RTX 5060")
             self.assertTrue(active)
             self.assertEqual(size, 8192)
+
+            self.assertEqual(pc.detect_rebar(), (None, None))
 
             active, size = pc.detect_rebar(target_gpu="NVIDIA GeForce RTX 4060")
             self.assertFalse(active)
