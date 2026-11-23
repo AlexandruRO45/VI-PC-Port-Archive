@@ -292,5 +292,18 @@ class VMadU16TranslatorIntegrationTests(unittest.TestCase):
         self.assertNotEqual(mad_res, add_res)
         self.assertNotEqual(mad_res, ref_mul_lo_u16(a, b))
 
+class VMadI32I16OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_mad_i32_i16."""
+
+    def test_signed_multiplication_32bit_addend(self):
+        # -1000 * 2000 + 50 = -1999950
+        res = ref_mad_i32_i16(u16(-1000), 2000, 50)
+        self.assertEqual(i32(res), -1999950)
+
+    def test_positive_full_range(self):
+        # 10000 * 10000 + 100 = 100000100
+        res = ref_mad_i32_i16(10000, 10000, 100)
+        self.assertEqual(res, 100000100)
+
 if __name__ == "__main__":
     unittest.main()
