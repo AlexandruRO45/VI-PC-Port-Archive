@@ -210,5 +210,24 @@ class TestSadScalarInterpreter(unittest.TestCase):
         self.assertEqual(words[0], 30)
 
 
+class TestSadSimdInteraction(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for v_sad_u32."""
+
+    def test_simd_conditional_cndmask_selection(self):
+        lines = [
+            "v_mov_b32 v1, 50",
+            "v_mov_b32 v2, 20",
+            "v_mov_b32 v3, 5",
+            "v_sad_u32 v0, v1, v2, v3",   # 35
+            "v_mov_b32 v3, 100",
+            "v_sad_u32 v1, v1, v2, v3",   # 130
+            "v_cndmask_b32 v2, v0, v1, vcc",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_sad_ps(lines, "ps_sad_simd")
+        self.assertEqual(words[0], 35)
+        self.assertEqual(words[1], 130)
+
+
 if __name__ == '__main__':
     unittest.main()
