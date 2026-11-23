@@ -24,6 +24,18 @@ MISSING_INPUT_TOOLS = (
     "pe_inspect",
     "rtti_scan",
     "shader_disasm",
+    "audio_wav",
+    "feature_scan",
+    "fssm_header",
+    "fssm_unpack",
+    "gamedata_index",
+    "gamedata_reader",
+    "hashdict",
+    "mission_tables",
+    "psin_data",
+    "psin_index",
+    "rpf_probe",
+    "world_lights_paths",
     "tile_probe",
 )
 
