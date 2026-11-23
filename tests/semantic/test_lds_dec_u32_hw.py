@@ -242,5 +242,89 @@ class TestDSDecU32AST(unittest.TestCase):
         self.assertEqual(inst.to_asm(), "ds_dec_rtn_u32 v5, v1, v2")
 
 
+class RegisterFile:
+    """Architectural VGPR and SGPR register storage."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarThreadState:
+    """Thread state for scalar LDS execution."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.rf: RegisterFile = RegisterFile()
+        self.lds: LDSMemory = lds
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar interpreter for DS DEC instructions."""
+
+    def execute(self, state: ScalarThreadState, inst: DSDecInstruction) -> Tuple[Optional[int], int]:
+        addr = state.rf.get_vgpr(inst.vaddr)
+        data = state.rf.get_vgpr(inst.vdata)
+        eff_addr = (addr + inst.offset.value) & MASK32
+
+        if inst.opcode == DSOpcode.DS_DEC_RTN_U32:
+            old_val = state.lds.atomic_dec(eff_addr, data)
+            new_val = state.lds.read_dword(eff_addr)
+            assert inst.vdst is not None
+            state.rf.set_vgpr(inst.vdst, old_val)
+            return old_val, new_val
+        else:
+            old_val = state.lds.atomic_dec(eff_addr, data)
+            new_val = state.lds.read_dword(eff_addr)
+            return None, new_val
+
+
+class TestDSDecU32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_execution_decrement(self) -> None:
+        self.lds.write_dword(0x40, 5)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+        self.state.rf.set_vgpr(VGPR(2), 5)
+        self.state.rf.set_vgpr(VGPR(5), 0xDEADBEEF)
+
+        inst = DSDecInstruction(
+            opcode=DSOpcode.DS_DEC_RTN_U32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 5)
+        self.assertEqual(new, 4)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(5)), 5)
+        self.assertEqual(self.lds.read_dword(0x40), 4)
+
+    def test_scalar_execution_wrap(self) -> None:
+        self.lds.write_dword(0x40, 0)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+        self.state.rf.set_vgpr(VGPR(2), 10)
+
+        inst = DSDecInstruction(
+            opcode=DSOpcode.DS_DEC_U32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertIsNone(old)
+        self.assertEqual(new, 10)
+        self.assertEqual(self.lds.read_dword(0x40), 10)
+
+
 if __name__ == "__main__":
     unittest.main()
