@@ -198,7 +198,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   process has its own, `<overlay>\.gta6rt-temp\<YYYYMMDD-HHMMSS-mmm>-pid<id>` (start time in UTC and process id,
   `rt::fs::scratch_dir()`, named on the startup line), as the console's temporary drive is empty at launch and
   shared with no other run: with one folder for all runs, a `CREATE_NEW` of a name an earlier run left failed with
-  `ERROR_FILE_EXISTS` (#7913). Earlier runs' folders are kept, and `T:\..` cannot reach them. A path under
+  `ERROR_FILE_EXISTS` (#7913). `rt::fs::reserve_unique_dir` reserves it once per overlay with a create-only
+  `CreateDirectoryW`; a name that already exists (a reused process id in the same millisecond) is skipped for `-2`,
+  `-3`, ... up to 1000 names, after which `T:` paths fail with `ERROR_INVALID_NAME` and the reason is printed once.
+  Earlier runs' folders are kept, never reused, and `T:\..` cannot reach them. A path under
   `--game-dir` or the overlay is always a host path, so a package that sits on a host drive `G:` keeps working, and
   with no folders configured `G:` and `T:` stay host drives.
   `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything

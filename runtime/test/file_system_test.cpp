@@ -117,24 +117,27 @@ int count(const std::vector<std::wstring>& names, const wchar_t* name) {
 
 bool contains(const std::vector<std::wstring>& names, const wchar_t* name) { return count(names, name) != 0; }
 
-// The folder "T:\" names in process `pid`: the one below <overlay>\.gta6rt-temp whose name ends in "-pid<pid>"
-// (rt::fs::scratch_dir() in that process). Empty when there is none, as when every process shared .gta6rt-temp.
+// The folder "T:\" names in another process `pid`: the one below <overlay>\.gta6rt-temp whose name ends in
+// "-pid<pid>" or "-pid<pid>-<n>" (rt::fs::scratch_dir() in that process). Empty when there is none, as when every
+// process shared .gta6rt-temp.
 std::filesystem::path t_folder(const std::filesystem::path& overlay, DWORD pid) {
-    const std::wstring suffix = L"-pid" + std::to_wstring(pid);
+    const std::wstring marker = L"-pid" + std::to_wstring(pid);
     std::error_code ec;
     for (auto it = std::filesystem::directory_iterator(overlay / ".gta6rt-temp", ec);
          !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
         const std::wstring name = it->path().filename().wstring();
+        const size_t at = name.rfind(marker);
         std::error_code type_ec;
-        if (it->is_directory(type_ec) && name.size() > suffix.size() &&
-            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+        if (it->is_directory(type_ec) && at != std::wstring::npos &&
+            (at + marker.size() == name.size() || name[at + marker.size()] == L'-'))
             return it->path();
     }
     return {};
 }
 
+// This process's T: folder in the configured overlay.
 std::filesystem::path own_t_folder(const std::filesystem::path& overlay) {
-    return t_folder(overlay, ::GetCurrentProcessId());
+    return rt::fs::overlay_dir() == overlay ? rt::fs::scratch_dir() : std::filesystem::path();
 }
 
 // file_system_test started by itself as a second process (run_t_drive_child below): it opens T:\crash.dmp with
@@ -1332,6 +1335,7 @@ void run_checks(const std::filesystem::path& root) {
         check(digits(0, 8) && name.size() > 20 && name[8] == L'-' && digits(9, 6) && name[15] == L'-' &&
                   digits(16, 3) && name.compare(19, 4, L"-pid") == 0,
               "the folder is named YYYYMMDD-HHMMSS-mmm-pid<id>, the process's start time and id");
+        check(name == rt::fs::scratch_stem(), "with no folder of that name yet, it is the stem itself");
         check(read_path(temp / "crash.dmp") == "earlier run" &&
                   read_path(temp / "20200101-000000-000-pid1" / "crash.dmp") == "earlier process" &&
                   read_path(package / "crash.dmp") == "package",
@@ -1369,6 +1373,41 @@ void run_checks(const std::filesystem::path& root) {
               "the second process wrote into a folder of its own");
         check(read_path(mine / "crash.dmp") == "this process", "and this process's T: file is unchanged");
 
+        // A reused process id in the same millisecond gives the same stem as a folder an earlier run kept. The folder
+        // is reserved with a create-only call, so that one (and the next name, taken too) is never used again.
+        const std::filesystem::path stale_overlay = root / "t_stale_overlay";
+        const std::filesystem::path stale = stale_overlay / ".gta6rt-temp" / rt::fs::scratch_stem();
+        const std::filesystem::path stale_2 = stale_overlay / ".gta6rt-temp" / (rt::fs::scratch_stem() + L"-2");
+        write_path(stale / "crash.dmp", "same stem, earlier run");
+        std::filesystem::create_directories(stale_2);
+        rt::fs::configure(package, stale_overlay);
+        h = create_w(L"T:\\crash.dmp", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE,
+              "CreateFileW(T:\\crash.dmp, CREATE_NEW) succeeds when a kept folder has this process's own stem");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(rt::fs::scratch_dir() == stale_overlay / ".gta6rt-temp" / (rt::fs::scratch_stem() + L"-3") &&
+                  std::filesystem::exists(rt::fs::scratch_dir() / "crash.dmp"),
+              "T: is <stem>-3 when <stem> and <stem>-2 already existed");
+        check(read_path(stale / "crash.dmp") == "same stem, earlier run" && std::filesystem::is_empty(stale_2),
+              "and the folders that already existed are left as they were");
+
+        // Concurrent first T: calls on a new overlay reserve one folder between them.
+        const std::filesystem::path race_overlay = root / "t_race_overlay";
+        rt::fs::configure(package, race_overlay);
+        {
+            std::vector<std::thread> threads;
+            for (int i = 0; i < 8; ++i) threads.emplace_back([&] { attributes_w(L"T:\\"); });
+            for (auto& thread : threads) thread.join();
+        }
+        size_t reserved = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(race_overlay / ".gta6rt-temp")) {
+            (void)entry;
+            ++reserved;
+        }
+        check(reserved == 1 && std::filesystem::is_directory(rt::fs::scratch_dir()),
+              "eight threads making their first T: call at once reserve one folder");
+        rt::fs::configure(package, t_overlay);
+
         // GAME: is not affected: reads come from the package, writes land in the overlay's mirror of the package.
         h = create_w(L"GAME:\\crash.dmp", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
@@ -1382,6 +1421,32 @@ void run_checks(const std::filesystem::path& root) {
                   !std::filesystem::exists(package / "data" / "t_written.txt"),
               "and lands at <overlay>\\data, not in T:'s folder or the package");
         rt::fs::configure(package, overlay);
+    }
+
+    // reserve_unique_dir: a create-only CreateDirectoryW per name, so the folder it returns is new; a name that exists
+    // (a folder or a file) is skipped, and after max_tries names the call fails instead of reusing one.
+    {
+        const std::filesystem::path base = root / "reserve";
+        std::filesystem::create_directories(base / "stem");
+        write_path(base / "stem-2" / "old.txt", "old");
+        DWORD error = 1;
+        const std::filesystem::path third = rt::fs::reserve_unique_dir(base, L"stem", error);
+        check(third == base / "stem-3" && error == 0 && std::filesystem::is_directory(third) &&
+                  std::filesystem::is_empty(third),
+              "reserve_unique_dir(base, stem) with stem and stem-2 taken makes stem-3, new and empty");
+        check(read_path(base / "stem-2" / "old.txt") == "old", "and leaves the taken folders alone");
+        check(rt::fs::reserve_unique_dir(base, L"stem", error) == base / "stem-4",
+              "a second call never hands out stem-3 again: it makes stem-4");
+        write_path(base / "stem-5", "a file");
+        check(rt::fs::reserve_unique_dir(base, L"stem", error) == base / "stem-6",
+              "a file with the next name counts as taken too");
+        error = 0;
+        check(rt::fs::reserve_unique_dir(base, L"stem", error, 6).empty() && error == ERROR_ALREADY_EXISTS,
+              "with every name up to max_tries taken it fails with ERROR_ALREADY_EXISTS");
+        const std::filesystem::path fresh_base = root / "reserve_new" / "deep";
+        check(rt::fs::reserve_unique_dir(fresh_base, L"stem", error) == fresh_base / "stem" &&
+                  std::filesystem::is_directory(fresh_base / "stem"),
+              "a missing base folder is made first, and the stem itself is the first name");
     }
 
     // An open that writes needs its folder to exist in the title's view, and a failed open changes nothing.
