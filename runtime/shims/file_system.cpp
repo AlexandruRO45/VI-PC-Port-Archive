@@ -484,9 +484,9 @@ void mark_deleted_on_close(const std::wstring& path) {
 }
 
 // The marker for a delete-on-close open the host has just granted. The title may read the open's last error
-// (ERROR_ALREADY_EXISTS or 0), which the file queries behind the marker would replace, so it is put back.
-void opened_delete_on_close(const std::wstring& path) {
-    const DWORD last_error = GetLastError();
+// (ERROR_ALREADY_EXISTS or 0), which the file queries behind the marker would replace, so it is put back. The caller
+// reads it as the first thing after the host's open: building `path` allocates, and that may change it too.
+void opened_delete_on_close(const std::wstring& path, DWORD last_error) {
     mark_deleted_on_close(path);
     SetLastError(last_error);
 }
@@ -607,7 +607,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         return deleted(r.overlay, entry_parts);
     };
     // Names already listed, ordered by _wcsicmp itself, so two names are one entry exactly when same_name says so, in
-    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds Ã‰ and Ã©, _wcsicmp not).
+    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds É and é, _wcsicmp not).
     struct NoCase {
         bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; }
     };
@@ -703,12 +703,13 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         return INVALID_HANDLE_VALUE;
     }
     const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    const DWORD last_error = GetLastError();
     if (h == INVALID_HANDLE_VALUE) {
-        const DWORD error = GetLastError();
-        note_open_failure("CreateFileW", name, error, _ReturnAddress());
-        SetLastError(error);
+        note_open_failure("CreateFileW", name, last_error, _ReturnAddress());
+        SetLastError(last_error);
+    } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
+        opened_delete_on_close(name, last_error);
     }
-    if (h != INVALID_HANDLE_VALUE && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) opened_delete_on_close(name);
     return h;
 }
 
@@ -736,12 +737,13 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         return INVALID_HANDLE_VALUE;
     }
     const HANDLE h = ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    const DWORD last_error = GetLastError();
     if (h == INVALID_HANDLE_VALUE) {
-        const DWORD error = GetLastError();
-        note_open_failure("CreateFile2", name, error, _ReturnAddress());
-        SetLastError(error);
+        note_open_failure("CreateFile2", name, last_error, _ReturnAddress());
+        SetLastError(last_error);
+    } else if ((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
+        opened_delete_on_close(name, last_error);
     }
-    if (h != INVALID_HANDLE_VALUE && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) opened_delete_on_close(name);
     return h;
 }
 
