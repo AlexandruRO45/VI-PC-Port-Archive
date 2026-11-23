@@ -448,5 +448,53 @@ class TestBoundaryExtremes(unittest.TestCase):
         self.assertEqual(ref_frexp_mant_f32(0x7F7FFFFF), 0x3F7FFFFF)
 
 
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    def test_negative_dst_rejection(self):
+        with self.assertRaises(TypeError):
+            VFrexpMantF32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+            )
+
+    def test_out_of_bounds_register_rejection(self):
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_mutation_biased_exponent_must_be_126(self):
+        # Biased exponent for [0.5, 1.0) is 126 (0x3F000000).
+        # If mutated to 127 (0x3F800000), mantissa falls into [1.0, 2.0).
+        correct = ref_frexp_mant_f32(f32_to_u32(1.0))
+        mutated = (f32_to_u32(1.0) & 0x807FFFFF) | 0x3F800000
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(correct, f32_to_u32(0.5))
+        self.assertEqual(mutated, f32_to_u32(1.0))
+
+    def test_mutation_denormals_must_not_pass_through(self):
+        # If denormals were not flushed to zero, 0x00000001 would get exponent 126
+        correct = ref_frexp_mant_f32(0x00000001)
+        unflushed = 0x00000001 | 0x3F000000
+        self.assertNotEqual(correct, unflushed)
+        self.assertEqual(correct, 0)
+
+    def test_mutation_infinities_must_pass_through(self):
+        # If infinities were treated as normal, +inf would have its exponent forced to 126
+        correct = ref_frexp_mant_f32(0x7F800000)
+        corrupted = (0x7F800000 & 0x807FFFFF) | 0x3F000000
+        self.assertNotEqual(correct, corrupted)
+        self.assertEqual(correct, 0x7F800000)
+
+    def test_rejection_invalid_syntax_in_translator(self):
+        # Missing source operand should be rejected by translator
+        bad_lines = [
+            "v_frexp_mant_f32 v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_mant_bad_args", bad_lines)
+
+
 if __name__ == "__main__":
     unittest.main()
