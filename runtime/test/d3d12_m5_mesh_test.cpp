@@ -177,6 +177,7 @@ int main(int argc, char** argv) {
         info.draw_indirect_count = d.draw_indirect_count && !no_count_buffers;
         info.max_draw_indirect_count =
             max_draw_count ? std::min(max_draw_count, d.max_draw_indirect_count) : d.max_draw_indirect_count;
+        info.draw_indirect_first_instance = d.draw_indirect_first_instance;
         info.mesh_shader = mesh;
         info.subgroup = d.subgroup;  // so the wave64 mesh stage asks for 64 where the device can require it
         info.shader_dir = (root_dir / "spirv").string();
@@ -208,6 +209,24 @@ int main(int argc, char** argv) {
     }
     if (!d.mesh_shader) {
         std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
+        return 77;
+    }
+    // ms_m5 is wave64 (not built with --wave64-emulate): it needs 64-wide subgroups in the mesh stage. Decided from
+    // the library entry and the device's caps, as the layer decides it, so a device that cannot run it skips before
+    // any mesh PSO is created; the PSO's own request is checked against this below.
+    const leonida::ShaderEntry* ms_entry =
+        library.find("ms", leonida::sha256_hex(read_file(root_dir / "fssm" / "ms_m5.fssm")));
+    EXPECT(ms_entry);
+    const leonida::SubgroupRequest ms_request = leonida::decide_subgroup_size(*ms_entry, d.subgroup);
+    if (ms_request.outcome == leonida::SubgroupOutcome::unknown_device ||
+        ms_request.outcome == leonida::SubgroupOutcome::unknown_stage) {
+        std::fprintf(stderr, "the mesh stage's subgroup size was not decided (outcome %d)\n", int(ms_request.outcome));
+        return 1;
+    }
+    if (ms_request.outcome == leonida::SubgroupOutcome::unavailable) {
+        std::printf("SKIP: the wave64 mesh shader cannot run 64-wide here (subgroup sizes %u..%u, default %u, "
+                    "requirable stages 0x%x)\n", d.subgroup.min_size, d.subgroup.max_size, d.subgroup.default_size,
+                    unsigned(d.subgroup.required_stages));
         return 77;
     }
     const bool counts = d.draw_indirect_count && !no_count_buffers;
@@ -297,28 +316,24 @@ int main(int argc, char** argv) {
             s.add(BlendSubobject{.inner = opaque});
             a.add(BlendSubobject{.inner = additive});
             EXPECT(stream_pso(s, mesh_opaque) && stream_pso(a, mesh_additive));
-            // ms_m5 is wave64 (not built with --wave64-emulate): it needs 64-wide subgroups in the mesh stage.
+            // The PSO's mesh-stage request must be the one decided above.
             const auto* requests = rt::d3d12::pipeline_subgroup_requests(mesh_opaque.p);
             EXPECT(requests);
             bool mesh_request = false;
             for (const auto& request : *requests) {
                 if (request.stage != VK_SHADER_STAGE_MESH_BIT_EXT) continue;
                 mesh_request = true;
+                if (request.outcome != ms_request.outcome) {
+                    std::fprintf(stderr, "the mesh PSO's subgroup outcome %d is not the predicted %d\n",
+                                 int(request.outcome), int(ms_request.outcome));
+                    return 1;
+                }
                 switch (request.outcome) {
                 case leonida::SubgroupOutcome::required: subgroup = "required subgroup size 64"; break;
                 case leonida::SubgroupOutcome::device_fixed: subgroup = "the device's only subgroup size, 64"; break;
                 case leonida::SubgroupOutcome::device_default: subgroup = "the default subgroup size, 64"; break;
                 case leonida::SubgroupOutcome::emulated: subgroup = "wave64 emulation"; break;
-                case leonida::SubgroupOutcome::unknown_device:
-                case leonida::SubgroupOutcome::unknown_stage:
-                    std::fprintf(stderr, "the mesh stage's subgroup size was not decided (outcome %d)\n",
-                                 int(request.outcome));
-                    return 1;
-                default:
-                    std::printf("SKIP: the wave64 mesh shader cannot run 64-wide here (subgroup sizes %u..%u, default "
-                                "%u, requirable stages 0x%x)\n", d.subgroup.min_size, d.subgroup.max_size,
-                                d.subgroup.default_size, unsigned(d.subgroup.required_stages));
-                    return 77;
+                default: return 1;  // the unavailable and unknown outcomes returned before the PSOs
                 }
             }
             EXPECT(mesh_request);
@@ -399,7 +414,8 @@ int main(int argc, char** argv) {
 
         // ===== (a) DispatchMesh =====
         {
-            const FLOAT grey[4] = {0.5f, 0.5f, 0.5f, 1.0f};
+            // 128/255 exactly, so the UNORM store cannot round either way (0.5 is 127.5, stored as 127 on some GPUs).
+            const FLOAT grey[4] = {128.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f, 1.0f};
             Image want({128, 128, 128, 255});
             EXPECT(begin(mesh_opaque.p, grey));
             set_constants(constants(0, 200, 40));

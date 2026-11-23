@@ -187,7 +187,10 @@ def translate_tests(work, names):
         elif n.startswith("gs_"):
             (work / (n + ".dxbc")).write_bytes(gs_container())
         elif n.startswith("ms_"):
-            (work / (n + ".dxbc")).write_bytes(ms_container(*asm_psv0(asm_path)))
+            psv0 = asm_psv0(asm_path)
+            if psv0 is None:   # main() skips these; a direct caller gets a clear error, not a TypeError
+                raise ValueError(f"{n}: a mesh shader needs a '; psv0: threads vertices primitives' header")
+            (work / (n + ".dxbc")).write_bytes(ms_container(*psv0))
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
