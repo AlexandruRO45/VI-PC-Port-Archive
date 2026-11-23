@@ -1,0 +1,9 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 1, local_size_y = 1) in;
+layout(set = 0, binding = 0) uniform texture2D source_image;
+layout(std430, set = 0, binding = 1) writeonly buffer Output { uint rgba[]; };
+void main() {
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    rgba[xy.y * textureSize(source_image, 0).x + xy.x] = packUnorm4x8(texelFetch(source_image, xy, 0));
+}

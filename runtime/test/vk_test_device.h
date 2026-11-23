@@ -633,6 +633,10 @@ public:
         info.arrayLayers = layers;
         info.samples = VkSampleCountFlagBits(samples);
         info.usage = usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        return image(info);
+    }
+
+    VkImage image(VkImageCreateInfo info) {
         share(info);
         VkImage image = VK_NULL_HANDLE;
         if (fn<PFN_vkCreateImage>("vkCreateImage")(device, &info, nullptr, &image) != VK_SUCCESS) return VK_NULL_HANDLE;
