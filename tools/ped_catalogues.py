@@ -1077,8 +1077,15 @@ def iter_catalogues_in_file(path: str, *, max_inflate: int = MAX_INFLATE) -> Ite
                 yield cat
 
 
+def _walk_error(error: OSError) -> None:
+    raise error
+
+
 def iter_catalogues_in_dir(path: str, *, max_inflate: int = MAX_INFLATE) -> Iterator[CatalogueContainer]:
-    """Yield all `0x8dcb4cf5` catalogues in a carved directory (joining contiguous streams when `index.json` exists)."""
+    """Yield all `0x8dcb4cf5` catalogues in a carved directory (joining contiguous streams when `index.json` exists).
+
+    A folder the walk cannot list stops the scan: os.walk would skip it silently, and its catalogues would be
+    missing from the counts as if the carve held none."""
     manifest = os.path.join(path, "index.json")
     if os.path.isfile(manifest):
         try:
@@ -1140,7 +1147,7 @@ def iter_catalogues_in_dir(path: str, *, max_inflate: int = MAX_INFLATE) -> Iter
                 i = j + 1
             return
 
-    for root, dirs, files in os.walk(path):
+    for root, dirs, files in os.walk(path, onerror=_walk_error):
         dirs.sort()
         for name in sorted(files):
             fpath = os.path.join(root, name)

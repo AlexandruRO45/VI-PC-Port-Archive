@@ -776,6 +776,28 @@ class PedCataloguesTests(unittest.TestCase):
             self.assertEqual(rep["catalogues"], 1)
             self.assertEqual(rep["presets"], 5)
 
+    @unittest.skipIf(os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0,
+                     "needs a POSIX folder that a non-root user cannot list")
+    def test_cli_census_refuses_an_unlistable_sub_folder(self):
+        """A sub-folder the walk cannot list used to be skipped, so the census undercounted and exited 0."""
+        py = [sys.executable, "-I", os.path.join(TOOLS, "ped_catalogues.py")]
+        with tempfile.TemporaryDirectory() as tmp:
+            cat_dir = os.path.join(tmp, "carve")
+            hidden = os.path.join(cat_dir, "hidden")
+            os.makedirs(hidden)
+            with open(os.path.join(hidden, "sample.0drp"), "wb") as fh:
+                fh.write(build_synthetic_0drp(build_rich_catalogue_blocks()[0]))
+            os.chmod(hidden, 0)
+            try:
+                r = subprocess.run(py + ["census", cat_dir, "--json"], capture_output=True, text=True)
+            finally:
+                os.chmod(hidden, 0o700)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("ERROR:", r.stderr)
+        self.assertIn("hidden", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.stdout, "")
+
 
 if __name__ == "__main__":
     unittest.main()
