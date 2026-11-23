@@ -18,6 +18,19 @@ sys.path.insert(0, ROOT)
 import make_game  # noqa: E402
 
 
+def isolated_git_env():
+    """An environment whose Git commands see no contributor configuration.
+
+    A global `core.hooksPath` (a commit-msg hook rejecting the fixtures' messages) or `-c` overrides from a
+    wrapper would otherwise reach the temporary repositories. tests/test_make_game_submodule.py does the same.
+    """
+    env = dict(os.environ)
+    env.pop("GIT_CONFIG_COUNT", None)
+    env.pop("GIT_CONFIG_PARAMETERS", None)
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+    return env
+
+
 class AssetsDecoderTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -102,11 +115,8 @@ class AssetsDecoderTest(unittest.TestCase):
 
             # A contributor's global Git config must not reach this fixture: a `core.hooksPath` there makes the
             # commit below run an unrelated hook (a Conventional Commits commit-msg hook rejects "x"), and this
-            # test is about the digest. tests/test_make_game_submodule.py isolates its fixtures the same way.
-            git_env = dict(os.environ)
-            git_env.pop("GIT_CONFIG_COUNT", None)
-            git_env.pop("GIT_CONFIG_PARAMETERS", None)
-            git_env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+            # test is about the digest.
+            git_env = isolated_git_env()
 
             def git(*args):
                 subprocess.run(["git", "-C", sub, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
@@ -171,6 +181,43 @@ class AssetsDecoderTest(unittest.TestCase):
                  "AssetsDecoderTest.test_the_digest_follows_an_uncommitted_submodule_edit"],
                 cwd=root, env=env, capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_the_digest_follows_an_untracked_file_in_the_submodule(self):
+        """A file the submodule does not track yet is a decoder change, but `git diff HEAD` never shows it."""
+        with tempfile.TemporaryDirectory() as root:
+            sub = os.path.join(root, "third_party", "rpf9-explorer")
+            os.makedirs(sub)
+            git_env = isolated_git_env()
+
+            def git(*args):
+                subprocess.run(["git", "-C", sub, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                "-c", "commit.gpgsign=false", *args], check=True, capture_output=True,
+                               env=git_env)
+
+            with open(os.path.join(sub, "Decoder.cs"), "w", newline="\n") as f:
+                f.write("a\n")
+            git("init", "-q")
+            git("add", "Decoder.cs")
+            git("commit", "-q", "-m", "x")
+
+            def digest():
+                make_game.decoder_digest.cache_clear()
+                with mock.patch.object(make_game, "ROOT", root):
+                    return make_game.decoder_digest()
+
+            try:
+                before = digest()
+                with open(os.path.join(sub, "NewDecoder.cs"), "w", newline="\n") as f:
+                    f.write("b\n")
+                added = digest()
+                os.remove(os.path.join(sub, "NewDecoder.cs"))
+                removed = digest()
+            finally:
+                make_game.decoder_digest.cache_clear()
+        self.assertNotEqual(before, added)
+        # Removing the file puts the decoder back as it was, so a digest is not tied to the fixture's folder.
+        self.assertEqual(before, removed)
 
 
 if __name__ == "__main__":

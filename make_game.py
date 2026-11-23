@@ -1511,8 +1511,8 @@ DECODER_RECORD = "decoder.sha256"
 
 
 def compute_decoder_digest() -> str:
-    """SHA-256 over the checked-out third_party/rpf9-explorer commit and the name and exact bytes of each
-    tools/rpf9dump source file: what the model and texture exports come from."""
+    """SHA-256 over the checked-out third_party/rpf9-explorer commit (with the edits that are not committed in it)
+    and the name and exact bytes of each tools/rpf9dump source file: what the model and texture exports come from."""
     sub = os.path.join(ROOT, "third_party", "rpf9-explorer")
     pin = ""
     # Asked only inside the submodule's own checkout: in an empty folder git answers with this repository's HEAD.
@@ -1523,10 +1523,26 @@ def compute_decoder_digest() -> str:
         r = subprocess.run([git, "-C", sub, "rev-parse", "HEAD"], capture_output=True, text=True)
         pin = r.stdout.strip() if r.returncode == 0 else ""
         # An edit to a tracked submodule file that is not committed changes the decoder but not HEAD.
-        # shortcut: new untracked files in the submodule are not seen; hash them too if that comes up.
         r = subprocess.run([git, "-C", sub, "diff", "HEAD"], capture_output=True)
         if r.returncode == 0 and r.stdout:
             pin += "+" + hashlib.sha256(r.stdout).hexdigest()
+        # A file the submodule does not track at all is a decoder change that `git diff HEAD` never shows (a new
+        # source file added before `git add`). Hash its path and bytes; ignored files (bin/, obj/) stay out.
+        r = subprocess.run([git, "-C", sub, "ls-files", "--others", "--exclude-standard", "-z"],
+                           capture_output=True)
+        if r.returncode == 0 and r.stdout:
+            untracked = hashlib.sha256()
+            for name in sorted(filter(None, r.stdout.split(b"\0"))):
+                untracked.update(name + b"\0")
+                try:
+                    with open(os.path.join(os.fsencode(sub), name), "rb") as f:
+                        for block in iter(lambda: f.read(1 << 20), b""):
+                            untracked.update(block)
+                except OSError:
+                    # Still a fact about the checkout; a file that becomes readable changes the digest again.
+                    untracked.update(b"<unreadable>")
+                untracked.update(b"\0")
+            pin += "+" + untracked.hexdigest()
     folder = os.path.join(TOOLS, "rpf9dump")
     names = sorted(n for n in os.listdir(folder) if n.endswith((".cs", ".csproj", ".json")))
     return sources_digest(folder, names, pin)
