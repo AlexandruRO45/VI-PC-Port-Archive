@@ -65,7 +65,10 @@ class Assessment:
 
 def assess(entry, caps, *, in_chain=False):
     stage = entry["stage"]
-    if stage == "ms" and entry.get("mesh_compute"):
+    if stage == "ms" and "mesh_compute" in entry:
+        layout = entry["mesh_compute"]
+        if not isinstance(layout, dict) or not layout:
+            raise ValueError("mesh_compute in a mesh shader entry must be a nonempty JSON object")
         if in_chain:
             return Assessment("unsupported", "mesh-compute-is-not-a-graphics-stage")
         stage = "cs"

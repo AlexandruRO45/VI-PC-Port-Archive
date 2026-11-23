@@ -190,6 +190,29 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("no graphics shaders", proc.stderr)
 
+    def test_strict_rejects_invalid_mesh_compute_layout(self):
+        self.dump(self.caps, dict(DEVICE_JSON, supported_subgroup_stages=STAGE_BITS["cs"]))
+        for i, layout in enumerate(("false", True, ["layout"], 0, None, {})):
+            with self.subTest(layout=layout):
+                report = self.dir / f"invalid-{i}.json"
+                self.dump(self.index, {"private.mesh": shader("ms", width=32, mesh_compute=layout)})
+                proc = self.run_audit("--strict", "--report", report)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("mesh_compute", proc.stderr)
+                self.assertIn("nonempty JSON object", proc.stderr)
+                self.assertNotIn("private.mesh", proc.stderr)
+                self.assertFalse(report.exists())
+
+    def test_strict_distinguishes_native_and_lowered_mesh(self):
+        self.dump(self.caps, dict(DEVICE_JSON, supported_subgroup_stages=STAGE_BITS["cs"]))
+        layout = rdna2spirv.mesh_compute_layout(3, 1, 0, 0, [])
+        for fields, code, outcome in (({}, 1, "unsupported"), ({"mesh_compute": layout}, 0, "exact")):
+            with self.subTest(fields=fields):
+                self.dump(self.index, {"private.mesh": shader("ms", width=32, **fields)})
+                proc = self.run_audit("--strict")
+                self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
+                self.assertIn(f"shaders (1): {outcome}=1", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
