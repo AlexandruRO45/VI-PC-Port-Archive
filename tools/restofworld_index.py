@@ -33,6 +33,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from zero_span import gap_split  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 # zlib stream start, or Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -482,16 +483,8 @@ def byte_count(text):
 
 
 def _samefile(source, out):
-    """True when `out` names the same existing file as `source`.
-
-    os.path.samefile needs both paths on disk, so a not-yet-written output is
-    reported as "no alias" instead of forcing a scan or a write first. Any other
-    comparison failure propagates for the caller to report.
-    """
-    try:
-        return os.path.samefile(source, out)
-    except FileNotFoundError:
-        return False
+    """True when `out` names the same file or destination path as `source`."""
+    return same_report_path(source, out)
 
 
 def main():
@@ -512,13 +505,13 @@ def main():
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
     try:
-        overwrites_source = _samefile(args.source, args.out)
+        overwrites_source = same_report_path(args.source, args.out)
         if not overwrites_source and os.path.isdir(args.source) and os.path.isfile(args.out):
             # Protect scanned payloads and their carve manifest, including hard-link aliases.
             for name in sorted(os.listdir(args.source)):
                 if name == "index.json" or name.endswith(".bin") or name.endswith(".bk2"):
                     full = os.path.join(args.source, name)
-                    if os.path.isfile(full) and _samefile(full, args.out):
+                    if os.path.isfile(full) and same_report_path(full, args.out):
                         overwrites_source = True
                         break
     except OSError as e:
