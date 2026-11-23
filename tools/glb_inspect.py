@@ -302,6 +302,7 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
     channels: list[dict] = []
     paths: dict[str, int] = {}
     target_nodes: set[int] = set()
+    used_durations: list[float] = []
     for channel_index, channel in enumerate(raw_channels):
         if not isinstance(channel, dict):
             issues.append(f"channel[{channel_index}] is not an object")
@@ -313,8 +314,12 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
         node_index = _index(target.get("node"))
         path = _text(target.get("path"))
         node = _entry(gltf, "nodes", node_index)
-        if sampler_index is None or sampler_index >= len(raw_samplers):
+        sampler = samplers[sampler_index] if sampler_index is not None and sampler_index < len(samplers) else None
+        if sampler is None:
             issues.append(f"channel[{channel_index}] has no valid sampler")
+        elif sampler["duration"] is not None and (node is not None or _object(target.get("extensions"))):
+            # A core channel without a node is ignored. Extensions can supply their own target.
+            used_durations.append(sampler["duration"])
         if node_index is None:
             issues.append(f"channel[{channel_index}] has no target node")
         elif node is None:
@@ -329,7 +334,6 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             paths[path] = paths.get(path, 0) + 1
             expected_type = {"translation": "VEC3", "rotation": "VEC4",
                              "scale": "VEC3", "weights": "SCALAR"}[path]
-            sampler = samplers[sampler_index] if sampler_index is not None and sampler_index < len(samplers) else None
             output_type = sampler["output_type"] if sampler is not None else None
             if output_type is not None and output_type != expected_type:
                 issues.append(
@@ -344,13 +348,12 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             "path": path,
         })
 
-    known_durations = [sampler["duration"] for sampler in samplers if sampler["duration"] is not None]
     return {
         "index": index,
         "name": _text(animation.get("name")),
         "channel_count": len(raw_channels),
         "sampler_count": len(raw_samplers),
-        "duration": max(known_durations) if known_durations else None,
+        "duration": max(used_durations, default=None),
         "target_node_count": len(target_nodes),
         "paths": dict(sorted(paths.items())),
         "interpolations": sorted({sampler["interpolation"] for sampler in samplers
