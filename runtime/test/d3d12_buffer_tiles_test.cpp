@@ -1,12 +1,12 @@
 // Synthetic reserved buffers and real D3D12 heap mappings. Run the same cases on the Vulkan layer and the host.
 #include "../shims/d3d12_com.h"
+#include "host_adapter.h"
 
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -195,44 +195,32 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
     return true;
 }
 
-// The host adapter for the native half. LEONIDA_HOST_ADAPTER picks it as in d3d12_copy_compare.h: "warp", or part of
-// an adapter name (case-insensitive); a value that names no adapter with tiled resources tier 2 skips the native half
-// rather than testing another GPU. Unset: the first hardware adapter with tier 2 or more.
-ComPtr<ID3D12Device> native_device() {
+// The host adapter for the native half: the layer's own, resolved by host_adapter.h from the standalone device's
+// LUID, so on a PC with two GPUs the comparison is against the GPU the layer runs on rather than D3D12's default
+// (D3D-596). LEONIDA_HOST_ADAPTER picks another as host_adapter.h describes ("warp" for WARP). The native half
+// still needs tiled resources tier 2; without it the half is skipped rather than testing another GPU.
+ComPtr<ID3D12Device> native_device(ID3D12Device& layer) {
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
-    char want[128] = {};
-    GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want));
-    std::string needle(want);
-    std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    for (UINT i = 0;; ++i) {
-        ComPtr<IDXGIAdapter1> adapter;
-        if (needle == "warp") {
-            if (i > 0 || FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) break;
-        } else if (factory->EnumAdapters1(i, &adapter) != S_OK) {
-            break;
-        }
-        DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(adapter->GetDesc1(&desc))) continue;
-        if (needle.empty()) {
-            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-        } else if (needle != "warp") {
-            std::string name;
-            for (const wchar_t* c = desc.Description; *c; ++c) name += char(std::tolower(*c < 128 ? *c : '?'));
-            if (name.find(needle) == std::string::npos) continue;
-        }
-        ComPtr<ID3D12Device> device;
-        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) continue;
-        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
-        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
-            options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) continue;
-        std::printf("Native D3D12: %ls, tiled resources tier %u\n", desc.Description, unsigned(options.TiledResourcesTier));
-        return device;
+    IDXGIAdapter* selected = nullptr;
+    std::string name;
+    const LUID luid = layer.GetAdapterLuid();
+    if (!hostadapter::reference(factory.Get(), &luid, hostadapter::wanted() == "warp", &selected, name)) return {};
+    ComPtr<IDXGIAdapter> adapter;
+    adapter.Attach(selected);
+    ComPtr<ID3D12Device> device;
+    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) return {};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    UINT tier = 0;
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))))
+        tier = static_cast<UINT>(options.TiledResourcesTier);
+    if (tier < D3D12_TILED_RESOURCES_TIER_2) {
+        std::printf("Native D3D12: %s has tiled resources tier %u; native half skipped\n", name.c_str(),
+                    unsigned(tier));
+        return {};
     }
-    if (!needle.empty())
-        std::printf("Native D3D12: no adapter matching LEONIDA_HOST_ADAPTER=%s with tiled resources tier 2 or more; "
-                    "native half skipped\n", want);
-    return {};
+    std::printf("Native D3D12: %s, tiled resources tier %u\n", name.c_str(), unsigned(tier));
+    return device;
 }
 
 }  // namespace
@@ -252,7 +240,7 @@ int main() {
     if (!run(*vulkan.Get(), observed, true)) return 1;
     std::puts("Vulkan replay: 12 full tiles matched across aliased, skipped, unmapped, reused and remapped ranges");
     std::puts("A rejected update left all tile mappings intact");
-    if (auto device = native_device()) {
+    if (auto device = native_device(*vulkan.Get())) {
         if (!run(*device.Get(), native) || native != observed) return 1;
         std::puts("Native D3D12 matched all three GPU readbacks");
     }
