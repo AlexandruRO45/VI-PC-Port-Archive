@@ -299,6 +299,7 @@ def cross_reference_sgd5(payloads: list[dict], shaders_rpf: str) -> dict:
 
     db0_set = set(db0_list)
     db1_set = set(db1_list)
+    shipped = db0_set | db1_set
     preload_checks = []
     vfx_prefix_matches = []
 
@@ -312,7 +313,7 @@ def cross_reference_sgd5(payloads: list[dict], shaders_rpf: str) -> dict:
                 "entries": p["entries"],
                 "in_db0": len(in_db0),
                 "in_db1": len(in_db1),
-                "unshipped": p["entries"] - len(in_db0) - len(in_db1),
+                "unshipped": sum(1 for s in stems if s not in shipped),
                 "exact_order_db0": in_db0 == db0_list and _is_subsequence(db0_list, stems),
                 "exact_order_db1": in_db1 == db1_list and _is_subsequence(db1_list, stems),
             })

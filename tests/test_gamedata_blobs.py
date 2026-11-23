@@ -244,6 +244,35 @@ class GamedataBlobsTest(unittest.TestCase):
             self.assertIn("error:", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def test_cross_reference_sgd5_overlapping_db0_and_db1_unshipped_count(self):
+        # An effect present in both DB0 and DB1 must not be subtracted twice from
+        # entries when computing unshipped (which otherwise undercounts or goes negative).
+        archive_bytes, layouts = synthetic_sgd5_archive(
+            ["fx_shared", "fx_db0_only"],
+            ["fx_shared", "fx_db1_only"],
+        )
+        shaders_path = os.path.join(self.root, "overlap_shaders.rpf")
+        with open(shaders_path, "wb") as f:
+            f.write(archive_bytes)
+
+        all_shipped = {
+            "offset_hex": "1000",
+            **gamedata_blobs.parse_fx_preload_list("fx_shared.fx\n"),
+        }
+        mixed = {
+            "offset_hex": "2000",
+            **gamedata_blobs.parse_fx_preload_list("fx_shared.fx\nfx_missing.fx\n"),
+        }
+        with mock.patch.object(sgd5_effects, "DATABASES", layouts):
+            xref = gamedata_blobs.cross_reference_sgd5([all_shipped, mixed], shaders_path)
+
+        self.assertEqual(xref["preload_lists"][0]["in_db0"], 1)
+        self.assertEqual(xref["preload_lists"][0]["in_db1"], 1)
+        self.assertEqual(xref["preload_lists"][0]["unshipped"], 0)
+        self.assertEqual(xref["preload_lists"][1]["in_db0"], 1)
+        self.assertEqual(xref["preload_lists"][1]["in_db1"], 1)
+        self.assertEqual(xref["preload_lists"][1]["unshipped"], 1)
+
 
 class BadCarveIndexTest(unittest.TestCase):
     """A folder that is not an rpf9_carve.py carve is one error line naming the index and the bad row."""
