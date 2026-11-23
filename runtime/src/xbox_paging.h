@@ -147,7 +147,8 @@ public:
         std::lock_guard lock(mutex_);
         VkDeviceSize freed = 0;
         for (auto& chunk : chunks_) {
-            if (!chunk.memory || chunk.free_count != kPagesPerChunk || chunk.mapped || chunk.last_bind > completed_ticket)
+            if (!chunk.memory || chunk.free_count != kPagesPerChunk || chunk.mapped ||
+                chunk.last_bind > completed_ticket)
                 continue;
             free_(device_, chunk.memory, nullptr);
             chunk = Chunk{};
@@ -432,7 +433,7 @@ public:
                 if (page + range.page_count > region_.page_count()) return false;
                 for (std::uint32_t i = 0; i < range.page_count; ++i) {
                     const PageId id = pool->second[range.start_page_in_pool + i];
-                    if (!pool_.allocated(id)) return false;  // released (or never ours): binding it would bind freed memory
+                    if (!pool_.allocated(id)) return false;  // released, or never the pool's: nothing to bind
                     changes.emplace_back(page + i, id);
                 }
                 page += range.page_count;
