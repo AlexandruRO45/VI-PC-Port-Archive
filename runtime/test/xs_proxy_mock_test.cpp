@@ -853,9 +853,10 @@ int check_forwarded_caller() {
     void* device = make_device(mock, 11, true);
     EXPECT(device);
     xs::reset_device_proxy_stats();
-    EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);
+    // Slot 40: generic on main and in no open pull request (70, 61, 25, 127 and others are being routed).
+    EXPECT(hr_of(raw(device, 40)) == S_OK && mock->calls[40] == 1);
     EXPECT(g_located_count == 1 && in_this_image(g_located[0]));
-    EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 2 && g_located_count == 1);
+    EXPECT(hr_of(raw(device, 40)) == S_OK && mock->calls[40] == 2 && g_located_count == 1);
     EXPECT(release(device) == 0 && mock->refs == 0);
 
     // The same for a slot past the PC device's vtable (an ID3D12Device-only mock): E_NOTIMPL, caller logged once.
@@ -863,10 +864,10 @@ int check_forwarded_caller() {
     void* old_device = make_device(mock, 0, false);
     EXPECT(old_device);
     xs::reset_device_proxy_stats();
-    EXPECT(hr_of(raw(old_device, 70)) == E_NOTIMPL && mock->calls[70] == 0);
+    EXPECT(hr_of(raw(old_device, 90)) == E_NOTIMPL && mock->calls[90] == 0);
     // Two lines, each with the caller: the slot's first call and the refusal.
     EXPECT(g_located_count == 2 && in_this_image(g_located[0]) && g_located[1] == g_located[0]);
-    EXPECT(hr_of(raw(old_device, 70)) == E_NOTIMPL && g_located_count == 2);
+    EXPECT(hr_of(raw(old_device, 90)) == E_NOTIMPL && g_located_count == 2);
     EXPECT(release(old_device) == 0 && mock->refs == 0);
 
     xs::set_caller_locator(nullptr);

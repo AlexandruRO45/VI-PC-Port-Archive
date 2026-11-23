@@ -1124,7 +1124,8 @@ std::uint64_t forward_device(DeviceProxy* self, std::uint64_t a1, std::uint64_t 
 }
 
 // A device slot past the PC device's vtable (the real device predates the interface): E_NOTIMPL, logged once per
-// slot. The generic thunk and the slots the proxy handles itself (31/34/35/45/46/50, 75) log the same line.
+// slot. The generic thunk and the slots the proxy handles itself (31/34/35/45/46/50, 75) log the same line; only the
+// generic thunk reads the guest's return address, so the others end without a "from" tail.
 HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count, std::uint64_t caller = 0) {
     bool expected = false;
     if (slot < kMaxSlots && g_beyond_warned[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
