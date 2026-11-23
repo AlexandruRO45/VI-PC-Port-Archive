@@ -20,6 +20,7 @@ params' f16 halves goes out decoded to f32 at those locations too, as a translat
 
 Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
 A missing input path is a usage error: one `ERROR:` line to stderr and exit 2 (no traceback).
+Usage: `python -I tools/mesh_compute_vs.py --help` lists the options.
 """
 import json
 import os
