@@ -471,5 +471,93 @@ class SaluAndB64SimdExecMaskTests(unittest.TestCase):
         self.assertIn("OpBitwiseAnd", spv)
 
 
+class SaluAndB64AliasingTests(unittest.TestCase):
+    """Register aliasing and in-place operand preservation for s_and_b64."""
+
+    def test_src0_equals_dst(self):
+        state = ScalarMachineState()
+        a = 0xF0F0F0F0_0F0F0F0F
+        b = 0x33333333_CCCCCCCC
+        state.write_sgpr64(0, a)
+        state.write_sgpr64(2, b)
+        state.execute_and_b64("s[0:1]", "s[0:1]", "s[2:3]")
+        self.assertEqual(state.read_sgpr64(0), ref_s_and_b64(a, b))
+        self.assertEqual(state.read_sgpr64(2), b)
+
+    def test_src1_equals_dst(self):
+        state = ScalarMachineState()
+        a = 0xF0F0F0F0_0F0F0F0F
+        b = 0x33333333_CCCCCCCC
+        state.write_sgpr64(0, a)
+        state.write_sgpr64(2, b)
+        state.execute_and_b64("s[2:3]", "s[0:1]", "s[2:3]")
+        self.assertEqual(state.read_sgpr64(0), a)
+        self.assertEqual(state.read_sgpr64(2), ref_s_and_b64(a, b))
+
+    def test_src0_and_src1_equal_dst(self):
+        state = ScalarMachineState()
+        a = 0x12345678_9ABCDEF0
+        state.write_sgpr64(0, a)
+        state.execute_and_b64("s[0:1]", "s[0:1]", "s[0:1]")
+        self.assertEqual(state.read_sgpr64(0), a)
+
+    def test_null_destination_preservation(self):
+        state = ScalarMachineState()
+        a = 0x12345678_9ABCDEF0
+        b = 0x0F0F0F0F_F0F0F0F0
+        state.write_sgpr64(0, a)
+        state.write_sgpr64(2, b)
+        state.execute_and_b64("null", "s[0:1]", "s[2:3]")
+        self.assertEqual(state.read_sgpr64(0), a)
+        self.assertEqual(state.read_sgpr64(2), b)
+        self.assertEqual(state.scc, ref_scc_b64(ref_s_and_b64(a, b)))
+
+    def test_spirv_hardware_aliasing(self):
+        v0 = 0x12345678_9ABCDEF0
+        v1 = 0x0F0F0F0F_F0F0F0F0
+        lines = [
+            f"s_mov_b32 s0, {lo32(v0):#x}",
+            f"s_mov_b32 s1, {hi32(v0):#x}",
+            f"s_mov_b32 s2, {lo32(v1):#x}",
+            f"s_mov_b32 s3, {hi32(v1):#x}",
+            "s_and_b64 s[0:1], s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_salu_and_b64_alias", lines)
+        out = mrt0_words(spv)
+        res64 = join64(out[0], out[1])
+        expected = ref_s_and_b64(v0, v1)
+        self.assertEqual(res64, expected)
+        self.assertEqual(out[2], ref_scc_b64(expected))
+
+    def test_spirv_hardware_null_dst(self):
+        v0 = 0x12345678_9ABCDEF0
+        v1 = 0x0F0F0F0F_F0F0F0F0
+        lines = [
+            f"s_mov_b32 s0, {lo32(v0):#x}",
+            f"s_mov_b32 s1, {hi32(v0):#x}",
+            f"s_mov_b32 s2, {lo32(v1):#x}",
+            f"s_mov_b32 s3, {hi32(v1):#x}",
+            "s_and_b64 null, s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_salu_and_b64_null", lines)
+        out = mrt0_words(spv)
+        expected_scc = ref_scc_b64(ref_s_and_b64(v0, v1))
+        self.assertEqual(out[0], expected_scc)
+
+
 if __name__ == "__main__":
     unittest.main()
