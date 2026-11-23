@@ -548,6 +548,7 @@ def measure(blob, stats):
 
 def collect(src, limit=None):
     stats = collections.Counter()
+    stats["PSIN files"] = 0   # listed when it stays 0: a folder without PSIN prints that, not nothing
     seen = 0
     for _name, blob in psin_index.files_in(src):
         if blob[:4] != psin_index.MAGIC:

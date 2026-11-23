@@ -399,7 +399,17 @@ class TestCli(unittest.TestCase):
                 f.write(b"\x78\xda not psin")
             r = self.run_tool(tmp, "--json")
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(json.loads(r.stdout), {})
+            self.assertEqual(json.loads(r.stdout), {"PSIN files": 0})
+
+    def test_a_folder_without_psin_says_zero(self):
+        # An empty folder, or a carve folder of other streams, prints the zero count instead of nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self.run_tool(tmp, "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(json.loads(r.stdout), {"PSIN files": 0})
+            r = self.run_tool(tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.split(), ["PSIN", "files", "0"])
 
     def test_dump_missing_file_returns_2(self):
         with tempfile.TemporaryDirectory() as tmp:
