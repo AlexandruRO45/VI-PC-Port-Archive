@@ -784,12 +784,12 @@ class TestMainAndCli(unittest.TestCase):
                 subprocess.CompletedProcess([], 0, "", ""),
             ],
         ) as run_mock:
-            code, out, err = self._call_main(["spirv_metal_set0.py", "--print-layout", "out.spv"])
+            code, out, err = self._call_main(["spirv_metal_set0.py", "--print-layout", "-"])
         self.assertEqual((code, out, err), (0, "", ""))
         self.assertEqual(run_mock.call_args_list[0].args[0], ["spirv-dis", "--print-layout"])
         self.assertEqual(
             run_mock.call_args_list[1].args[0],
-            ["spirv-as", "--target-env", "vulkan1.2", "-", "-o", "out.spv"],
+            ["spirv-as", "--target-env", "vulkan1.2", "-", "-o", "-"],
         )
 
     def test_cli_subprocess_isolated_print_layout_and_bad_args(self):
@@ -838,10 +838,13 @@ class TestMainAndCli(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(out, "")
             self.assertEqual(err, "")
+            staged = calls[-1][-1]
             self.assertEqual(calls, [
                 ["spirv-dis", in_path],
-                ["spirv-as", "--target-env", "spv1.5", "-", "-o", out_path],
+                ["spirv-as", "--target-env", "spv1.5", "-", "-o", staged],
             ])
+            self.assertEqual(os.path.dirname(os.path.dirname(staged)), os.path.abspath(unicode_dir))
+            self.assertFalse(os.path.exists(os.path.dirname(staged)))
 
             # Original input file is preserved untouched for out-of-place conversion.
             with open(in_path, "rb") as f:
@@ -878,18 +881,25 @@ class TestMainAndCli(unittest.TestCase):
             inplace_path = os.path.join(unicode_dir, "inplace.spv")
             with open(inplace_path, "wb") as f:
                 f.write(in_bytes)
+            if os.name == "posix":
+                os.chmod(inplace_path, 0o640)
             calls.clear()
             with mock.patch.object(m.subprocess, "run", side_effect=fake_run):
                 code, out, err = self._call_main(["spirv_metal_set0.py", inplace_path, inplace_path])
             self.assertEqual(code, 0)
             self.assertEqual(out, "")
             self.assertEqual(err, "")
+            staged = calls[-1][-1]
             self.assertEqual(calls, [
                 ["spirv-dis", inplace_path],
-                ["spirv-as", "--target-env", "spv1.5", "-", "-o", inplace_path],
+                ["spirv-as", "--target-env", "spv1.5", "-", "-o", staged],
             ])
+            self.assertEqual(os.path.dirname(os.path.dirname(staged)), os.path.abspath(unicode_dir))
+            self.assertFalse(os.path.exists(os.path.dirname(staged)))
             with open(inplace_path, "rb") as f:
                 self.assertEqual(f.read(), out_bytes)
+            if os.name == "posix":
+                self.assertEqual(os.stat(inplace_path).st_mode & 0o777, 0o640)
 
     def test_utf8_operands_survive_the_rewrite_on_a_gbk_host(self):
         run = subprocess.run
@@ -933,14 +943,14 @@ class TestMainAndCli(unittest.TestCase):
 
                 with mock.patch.dict(os.environ, {"SPIRV_DIS": "/opt/bin/dis", "SPIRV_AS": "/opt/bin/as"}), \
                         mock.patch.object(m.subprocess, "run", side_effect=run_stub):
-                    code, out, err = self._call_main(["spirv_metal_set0.py", "in.spv", "out.spv"])
+                    code, out, err = self._call_main(["spirv_metal_set0.py", "in.spv", "-"])
 
                 self.assertEqual((code, out, err), (0, "", ""))
                 self.assertEqual(seen_cmds[0][0], ["/opt/bin/dis", "in.spv"])
                 self.assertTrue(seen_cmds[0][1])
                 self.assertTrue(seen_cmds[0][2])
                 self.assertFalse(seen_cmds[0][3])
-                self.assertEqual(seen_cmds[1][0], ["/opt/bin/as", "--target-env", expected_target, "-", "-o", "out.spv"])
+                self.assertEqual(seen_cmds[1][0], ["/opt/bin/as", "--target-env", expected_target, "-", "-o", "-"])
                 self.assertTrue(seen_cmds[1][1])
                 self.assertFalse(seen_cmds[1][3])
                 self.assertEqual(seen_cmds[1][4], disasm.encode("utf-8"))
@@ -1024,6 +1034,41 @@ class TestMainAndCli(unittest.TestCase):
                 with self.assertRaises(subprocess.CalledProcessError):
                     m.main(["spirv_metal_set0.py", in_path, out_path])
                 self.assertEqual(run_mock.call_count, 2)
+
+    def test_partial_assembler_failure_preserves_existing_output(self):
+        for in_place in (False, True):
+            with self.subTest(in_place=in_place), tempfile.TemporaryDirectory() as directory:
+                source = os.path.join(directory, "input.spv")
+                output = source if in_place else os.path.join(directory, "output.spv")
+                original = b"existing synthetic output"
+                with open(source, "wb") as file:
+                    file.write(b"synthetic input")
+                with open(output, "wb") as file:
+                    file.write(original)
+                before = set(os.listdir(directory))
+
+                def run(cmd, **kwargs):
+                    if cmd[0] == "dis":
+                        return subprocess.CompletedProcess(cmd, 0, b"OpCapability Shader\n", b"")
+                    with open(cmd[-1], "wb") as file:
+                        file.write(b"partial output")
+                    raise subprocess.CalledProcessError(7, cmd)
+
+                with mock.patch.object(m, "_tools", return_value=("dis", "as")), \
+                        mock.patch.object(m.subprocess, "run", side_effect=run):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        m.main(["spirv_metal_set0.py", source, output])
+                with open(output, "rb") as file:
+                    self.assertEqual(file.read(), original)
+                self.assertEqual(set(os.listdir(directory)), before)
+
+    def test_passes_device_output_directly_to_assembler(self):
+        with mock.patch.object(m, "_run") as run:
+            m._assemble_output("as", "spv1.5", b"assembly", os.devnull)
+        run.assert_called_once_with(
+            ["as", "--target-env", "spv1.5", "-", "-o", os.devnull],
+            input=b"assembly",
+        )
 
     def test_main_guard_handles_stdout_reconfigure_errors_and_exit_codes(self):
         class _Stream(io.StringIO):

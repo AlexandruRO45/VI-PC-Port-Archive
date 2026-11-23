@@ -20,11 +20,17 @@ Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
 import locale
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(TOOLS)
 BINDLESS_H = os.path.join(ROOT, "runtime", "src", "vulkan_bindless.h")
+
+sys.path.insert(0, TOOLS)
+from file_mode import published_mode  # noqa: E402
 
 
 def capacities(path=BINDLESS_H):
@@ -175,8 +181,31 @@ def main(argv):
     text = _run([dis, argv[1]], capture_output=True).stdout.decode("utf-8", errors="replace")
     env = re.search(r"; Version: (\d+)\.(\d+)", text)
     target = f"spv{env.group(1)}.{env.group(2)}" if env else "vulkan1.2"
-    _run([asm, "--target-env", target, "-", "-o", argv[2]], input=rewrite(text, counts).encode("utf-8"))
+    _assemble_output(asm, target, rewrite(text, counts).encode("utf-8"), argv[2])
     return 0
+
+
+def _assemble_output(assembler, target_env, assembly, output):
+    command = [assembler, "--target-env", target_env, "-", "-o"]
+    if output == "-":
+        _run([*command, "-"], input=assembly)
+        return
+    # Replace the target of a symlink, but leave streams such as /dev/null to the assembler.
+    destination = os.path.realpath(output or "out.spv")
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(mode):
+            _run([*command, output], input=assembly)
+            return
+    # A failed write must leave the prior module available, including for an in-place rewrite.
+    with tempfile.TemporaryDirectory(prefix=".metal-spv-", dir=os.path.dirname(destination)) as directory:
+        staged = os.path.join(directory, "module.spv")
+        _run([*command, staged], input=assembly)
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
 
 
 def _tools():
