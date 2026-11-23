@@ -3,6 +3,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -87,10 +88,19 @@ class ShaderSelectionTests(unittest.TestCase):
         self.entries[0]["name"] = fl.DEFAULT_VS
         self.entries[1]["name"] = fl.DEFAULT_PS
         self.entries[2]["name"] = fl.DEFAULT_TEXTURED_PS
+        self.compiler_metadata["shared"]["fssm_sha256"] = fl.UV_PS_FSSM_SHA256
         self.index.write_text(json.dumps(self.entries), encoding="utf-8", newline="\n")
         obj = self.work / "triangle.obj"
         obj.write_text("v -1 -1 0\nv 1 -1 0\nv 0 1 0\nf 1 2 3\n", encoding="utf-8", newline="\n")
-        args = ["--game", str(self.work), "--work", str(self.work), "--obj", str(obj)]
+        args = ["--game", str(self.work), "--work", str(self.work), "--obj", str(obj),
+                "--width", "16", "--height", "16", "--no-fit", "--min-coverage", "0.2"]
+        vertices, indices = fl.read_obj(obj)
+        covered = [fl.uv_at(vertices, indices, x, y, 16, 16) is not None for y in range(16) for x in range(16)]
+        clear = (-1.0,) * 4
+        frames = [
+            b"".join(struct.pack("<4f", *(color if inside else clear)) for inside in covered)
+            for color in ((0.0, 0.0, 0.0, 1.0), (0.0,) * 4)
+        ]
         texture = ["--dds", str(self.work / "texture.dds")]
         for options, expected in (([], 16), (texture, 32), (texture + ["--ps-offset", "0x10"], 16),
                                   (texture + ["--ps", fl.DEFAULT_PS], 16)):
@@ -104,6 +114,29 @@ class ShaderSelectionTests(unittest.TestCase):
                 manifest = json.loads((self.work / "first_light/out/manifest.json").read_text(encoding="utf-8"))
                 self.assertEqual(manifest["ps"]["offset"], expected)
                 self.assertEqual("texture" in manifest, "--dds" in options)
+                uv, copy = frames
+                good, wrong = (uv, copy) if expected == 16 else (copy, uv)
+                self.assertEqual(fl.check_image(good, manifest)["covered"], sum(covered))
+                with self.assertRaises(AssertionError):
+                    fl.check_image(wrong, manifest)
+
+        # Recheck an older UV manifest whose prepared expectations still contain DDS colours.
+        manifest["centre_rgba"] = [0.0] * 4
+        for probe in manifest["rgba_probes"]:
+            probe["rgba"] = [0.0] * 4
+        out = self.work / "first_light/out"
+        (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+        with patch.object(fl, "run_draw") as draw:
+            self.assertEqual(fl.main(["--check", "--out", str(out)]), 0)
+        checked = draw.call_args.args[1]
+        self.assertEqual(fl.check_image(uv, checked)["covered"], sum(covered))
+        with self.assertRaises(AssertionError):
+            fl.check_image(copy, checked)
+
+        # A same-name variant with other code cannot inherit the known UV shader's expectations.
+        manifest["ps"]["fssm_sha256"] = "0" * 64
+        fl.apply_uv_shader_expectations(manifest)
+        self.assertEqual(fl.check_image(copy, manifest)["covered"], sum(covered))
 
     def test_camera_requires_its_vertex_shader_when_selecting_by_offset(self):
         self.entries[0]["name"] = fl.CAMERA_VS

@@ -53,6 +53,7 @@ from compute_fixture import find_test_program  # noqa: E402
 
 DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
+UV_PS_FSSM_SHA256 = "ed4147a5f7514947c2eb8d79255bd80f72761ac1ba2205dd811d3e050cf1b495"
 DEFAULT_TEXTURED_PS = "PS_Copy_3ea4b38a_Wrapped"
 DEFAULT_TSHARP_VA = 0x100
 DEFAULT_PTR_SGPR = 9
@@ -687,6 +688,30 @@ def rgba_probes_for_mesh(
     return pool
 
 
+def apply_uv_shader_expectations(manifest: dict) -> None:
+    """Keep the DDS binding but compare UV output for the documented UV shader."""
+    ps = manifest.get("ps")
+    if manifest.get("texture") is None or not isinstance(ps, dict):
+        return
+    if ps.get("fssm_sha256") != UV_PS_FSSM_SHA256:
+        return
+
+    def uv_rgba(uv):
+        if not isinstance(uv, (list, tuple)) or len(uv) != 2 or any(type(c) not in (int, float) for c in uv):
+            raise SystemExit("a bound DDS with the UV pixel shader needs two numeric UV coordinates per probe")
+        return [*uv, 0.0, 1.0]
+
+    uv = manifest.get("centre_uv")
+    manifest["centre_rgba"] = uv_rgba(uv) if uv is not None else None
+    # Textured preparation includes covered probes even for an off-centre mesh with constant UVs.
+    # Earlier manifests already retain those probes' interpolated UVs alongside their DDS colours.
+    probes = manifest.get("rgba_probes") or manifest.get("uv_probes") or []
+    if not isinstance(probes, list) or any(not isinstance(p, dict) or "pixel" not in p for p in probes):
+        raise SystemExit("invalid pixel probes for the UV pixel shader")
+    manifest["rgba_probes"] = [{**p, "rgba": uv_rgba(p.get("uv"))} for p in probes]
+    manifest["rgba_tolerance"] = 2e-3
+
+
 def check_image(data: bytes, manifest: dict) -> dict:
     """The readback oracle: exact shape, coverage window, a clear corner and the centre UV.
 
@@ -1011,6 +1036,7 @@ def main(argv=None) -> int:
     existing = os.path.join(out_dir, "manifest.json")
     if a.check and not a.game and os.path.isfile(existing):
         manifest = load_json(existing, "first-light manifest", dict, keys=("width", "height"))
+        apply_uv_shader_expectations(manifest)
         run_draw(a, manifest, out_dir)
         return 0
     if not a.game:
@@ -1161,6 +1187,7 @@ def main(argv=None) -> int:
         )
         if tex_probes:
             manifest["rgba_probes"] = tex_probes
+        apply_uv_shader_expectations(manifest)
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")

@@ -80,6 +80,9 @@ indices), writes `manifest.json` with the counts and FSSM hashes, and runs `vk_h
 other names from the carve index. When a stage has multiple entries with the same name, use the
 `--vs-offset` or `--ps-offset` value shown by `--list` to choose the exact program. Decimal and hex offsets work.
 With `--camera`, a vertex offset must select the camera vertex shader.
+With `--dds`, selecting the documented UV pixel shader by name or offset keeps the texture bound and checks
+interpolated UV output. First Light identifies that program by its FSSM digest. For other pixel programs the
+DDS check assumes a texture copy; a shader with different output or resource bindings needs its own reference.
 `--no-fit` keeps a model that is already in NDC (the sky dome is). The test is
 package-gated: without `LEONIDA_FIRST_LIGHT_DIR` it skips, and it writes its image to that folder.
 
