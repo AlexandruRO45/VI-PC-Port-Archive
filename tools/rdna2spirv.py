@@ -11376,7 +11376,41 @@ class Gen:
             elif op in ("s_lshl_b32", "s_lshr_b32"):
                 self.scc_nonzero(r)
         elif op in SHIFT_REV:
-            sh_val = self.imm_val(a[1])
+            raw_op = ins["op"]
+            raw_args = self.cur_ins["args"]
+            if len(raw_args) != 3:
+                raise Unsupported(op + " operands")
+            if raw_args[0].get("k") != "vgpr" or raw_args[0].get("n", 1) != 1:
+                raise Unsupported(op + " destination")
+            if any(s.get("n", 1) != 1 for s in raw_args[1:]):
+                raise Unsupported(op + " operand width")
+            if (any(s.get("neg") or s.get("abs") for s in raw_args)
+                    or raw_args[0].get("sext")
+                    or (not raw_op.endswith("_sdwa") and any(s.get("sext") for s in raw_args[1:]))):
+                raise Unsupported(op + " operand modifier")
+            if raw_op.endswith("_sdwa"):
+                seen = set()
+                for m in mods:
+                    if ":" not in m:
+                        raise Unsupported(op + " modifier")
+                    k, v = m.split(":", 1)
+                    if k in seen:
+                        raise Unsupported(op + " duplicate SDWA modifier")
+                    seen.add(k)
+                    if k in ("src0_sel", "src1_sel", "dst_sel"):
+                        if v not in self.SDWA_SEL:
+                            raise Unsupported(op + " SDWA selector")
+                    elif k == "dst_unused":
+                        if v not in ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"):
+                            raise Unsupported(op + " SDWA dst_unused")
+                    else:
+                        raise Unsupported(op + " modifier")
+            elif raw_op.endswith("_dpp"):
+                if self.non_dpp_mods(raw_op, mods):
+                    raise Unsupported(op + " modifier")
+            elif mods:
+                raise Unsupported(op + " modifier")
+            sh_val = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
             if sh_val is not None:
                 m = self.cu(sh_val & 31)
             else:
