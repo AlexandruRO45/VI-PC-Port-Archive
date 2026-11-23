@@ -482,6 +482,8 @@ void test_deserializer() {
     auto versioned = reinterpret_cast<decltype(&D3D12CreateVersionedRootSignatureDeserializer)>(
         rt::shims::find("d3d12_xs.dll", "D3D12CreateVersionedRootSignatureDeserializer"));
     check(versioned != nullptr, "shim registry exposes the versioned deserializer");
+    check(versioned && rt::shims::find("d3d12_xs.dll", "#7") == reinterpret_cast<void*>(versioned),
+          "ordinal 7 resolves to the versioned deserializer");
     if (versioned) {
         ID3D12VersionedRootSignatureDeserializer* de = nullptr;
         auto bad_checksum = tampered;

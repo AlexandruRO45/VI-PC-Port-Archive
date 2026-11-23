@@ -251,6 +251,7 @@ SHIM_TABLE(d3d12_xs,
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12CreateVersionedRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
+    {"d3d12_xs.dll", "#7", reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
     {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );
