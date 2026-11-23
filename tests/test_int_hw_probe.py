@@ -93,9 +93,12 @@ class IntHwProbeTests(unittest.TestCase):
                     rc = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi", "--json", jpath])
             self.assertEqual(rc, 0)
             self.assertIn("3 match, 1 known divergence, 0 unexpected mismatch, 0 wave32/64 diff", out.getvalue())
-            data = json.loads(Path(jpath).read_text(encoding="utf-8"))
+            raw = Path(jpath).read_bytes()
+            self.assertNotIn(b"\r\n", raw)
+            data = json.loads(raw.decode("utf-8"))
             self.assertEqual(data["device"], "device=mock arch=gfx1035")
             self.assertEqual(len(data["cases"]), 4)
+            self.assertEqual(list(Path(tmp).glob(".int_hw_probe-*.tmp")), [])
 
             out2 = io.StringIO()
             with unittest.mock.patch.object(probe, "run_hw", return_value=fake_hw):
@@ -154,6 +157,61 @@ class IntHwProbeTests(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("ERROR:", err.getvalue())
             self.assertIn("disk full", err.getvalue())
+            self.assertFalse(os.path.exists(jpath))
+            self.assertEqual(list(Path(tmp).glob(".int_hw_probe-*.tmp")), [])
+
+    def test_json_write_failure_preserves_previous_report_and_cleans_temp(self):
+        fake_res = {"s_bfe_i32_past31": [0], "s_bfe_u32_past31": [0], "s_bfe_i32_width0": [0]}
+        previous = '{"previous": true}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "out.json")
+            Path(jpath).write_text(previous, encoding="utf-8", newline="\n")
+
+            with self.subTest(stage="mid_write"):
+                out, err = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(probe, "run_translator", return_value=fake_res), \
+                     unittest.mock.patch.object(probe.json, "dump", side_effect=OSError("disk full mid-write")), \
+                     redirect_stdout(out), redirect_stderr(err):
+                    rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
+                self.assertEqual(rc, 2)
+                self.assertIn("ERROR:", err.getvalue())
+                self.assertIn("disk full mid-write", err.getvalue())
+                self.assertEqual(Path(jpath).read_text(encoding="utf-8"), previous)
+                self.assertEqual(list(Path(tmp).glob(".int_hw_probe-*.tmp")), [])
+
+            with self.subTest(stage="replace"):
+                out, err = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(probe, "run_translator", return_value=fake_res), \
+                     unittest.mock.patch.object(probe, "replace_retry", side_effect=PermissionError("locked")), \
+                     redirect_stdout(out), redirect_stderr(err):
+                    rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
+                self.assertEqual(rc, 2)
+                self.assertIn("ERROR:", err.getvalue())
+                self.assertIn("locked", err.getvalue())
+                self.assertEqual(Path(jpath).read_text(encoding="utf-8"), previous)
+                self.assertEqual(list(Path(tmp).glob(".int_hw_probe-*.tmp")), [])
+
+    def test_readonly_existing_report_is_preserved_without_temp_files(self):
+        if getattr(os, "geteuid", lambda: 1)() == 0:
+            self.skipTest("root bypasses read-only file mode")
+        fake_res = {"s_bfe_i32_past31": [0], "s_bfe_u32_past31": [0], "s_bfe_i32_width0": [0]}
+        previous = '{"previous": true}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "out.json")
+            Path(jpath).write_text(previous, encoding="utf-8", newline="\n")
+            os.chmod(jpath, 0o444)
+            try:
+                out, err = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(probe, "run_translator", return_value=fake_res), \
+                     unittest.mock.patch.object(probe.tempfile, "mkstemp", side_effect=AssertionError("staged temp file")), \
+                     redirect_stdout(out), redirect_stderr(err):
+                    rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
+                self.assertEqual(rc, 2)
+                self.assertIn("ERROR:", err.getvalue())
+                self.assertEqual(Path(jpath).read_text(encoding="utf-8"), previous)
+                self.assertEqual(list(Path(tmp).glob(".int_hw_probe-*.tmp")), [])
+            finally:
+                os.chmod(jpath, 0o600)
 
 
 # v_bfe_u32 / v_bfe_i32 words measured natively on an AMD Radeon 610M (gfx1036, RDNA2), wave32 and wave64 identical:

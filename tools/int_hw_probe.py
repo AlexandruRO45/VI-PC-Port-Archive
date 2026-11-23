@@ -44,6 +44,7 @@ Exit codes:
 import argparse
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -56,6 +57,8 @@ for p in (HERE, os.path.join(ROOT, "tests", "semantic")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp  # noqa: E402
 
@@ -893,6 +896,55 @@ def _validate_json_out(raw_path):
     return out_path, None
 
 
+def _write_json_report(out_path, payload):
+    """Write `payload` as LF-terminated JSON via a sibling temp file so a write or replace failure
+    keeps any previous report intact."""
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    destination = os.path.realpath(out_path)
+    dest_parent = os.path.dirname(destination) or "."
+    if dest_parent != parent:
+        os.makedirs(dest_parent, exist_ok=True)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Keep the direct writer's permission check without truncating the previous report.
+        os.close(os.open(destination, os.O_WRONLY))
+    fd = None
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=dest_parent, prefix=".int_hw_probe-", suffix=".tmp")
+        with open(fd, "w", encoding="utf-8", newline="\n") as f:
+            fd = None
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        if os.name != "nt":
+            os.chmod(tmp, published_mode(destination))
+        replace_retry(tmp, destination)
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                if os.path.lexists(tmp):
+                    os.chmod(tmp, 0o600)
+                    os.unlink(tmp)
+            except OSError:
+                pass
+        raise
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("translator", "hw", "both"), default="translator")
@@ -993,12 +1045,7 @@ def main(argv=None):
 
     if out_path is not None:
         try:
-            parent = os.path.dirname(out_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
-                f.write("\n")
+            _write_json_report(out_path, {"device": hw_device, "waves": list(waves), "cases": records})
         except OSError as e:
             print(f"ERROR: failed to write --json {out_path}: {e}", file=sys.stderr)
             return 2
