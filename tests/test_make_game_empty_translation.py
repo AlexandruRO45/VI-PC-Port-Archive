@@ -141,7 +141,8 @@ class ShadersStageTest(unittest.TestCase):
 
         def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
             ran.append("translate")
-            write(os.path.join(self.spirv, "index.json"), json.dumps({"shader_0": {"stage": "ps"}}))
+            # The entry names the listing shader_disasm.py wrote: the stage compares the index with the listings.
+            write(os.path.join(self.spirv, "index.json"), json.dumps({"shader": {"stage": "ps"}}))
 
         with mock.patch.object(make_game, "py", fake_py), \
                 mock.patch.object(make_game, "need", lambda *a: None), \
@@ -162,7 +163,7 @@ class ShadersStageTest(unittest.TestCase):
         self.run_stage()
         self.assertEqual(self.run_stage(), [])
         with open(self.index(), encoding="utf-8") as f:
-            self.assertEqual(json.load(f), {"shader_0": {"stage": "ps"}})
+            self.assertEqual(json.load(f), {"shader": {"stage": "ps"}})
 
 
 if __name__ == "__main__":

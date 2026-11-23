@@ -326,7 +326,11 @@ class ShadersStageWithTheDll(unittest.TestCase):
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")
-                touch(spirv, "index.json")
+                # An index naming every listing present, as the real merge would publish it.
+                with os.scandir(disasm) as entries:
+                    names = sorted(e.name[:-2] for e in entries if e.name.endswith(".s"))
+                with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({name: {} for name in names}, f)
 
             def stage():
                 ran.clear()
