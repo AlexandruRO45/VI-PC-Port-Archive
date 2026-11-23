@@ -144,9 +144,19 @@ class PassPipelinesTest(unittest.TestCase):
             self.census(data, layout, index)
 
     def test_row_outside_the_measured_ranges_is_an_error(self):
-        data, layout, index = build([(1, 1, 0, 0, 0, 0)], {16: [bytes([2, 1]).ljust(16, b"\0")]})
-        with self.assertRaisesRegex(ValueError, "rasterizer row"):
-            self.census(data, layout, index)
+        good_depth = bytes([1, 1, 7, 1]).ljust(24, b"\0")
+        cases = (
+            ("rasterizer row", {16: [bytes([2, 1]).ljust(16, b"\0")]}),        # fill mode other than 3
+            ("depth/stencil row", {24: [bytes([1, 1, 7, 2]).ljust(24, b"\0")]}),  # stencil enable 2
+            ("depth/stencil row", {24: [bytes([1, 1, 9, 1]).ljust(24, b"\0")]}),  # compare function 9
+            ("blend row", {24: [good_depth], 68: [bytes([0, 0, 0, 0, 2]).ljust(68, b"\0")]}),  # target enable 2
+            ("blend row", {68: [bytes(4 + 8 * 3 + 7) + bytes([16]).ljust(68 - 35, b"\0")]}),  # target 3 mask 16
+        )
+        for message, tables in cases:
+            with self.subTest(message=message):
+                data, layout, index = build([(1, 1, 0, 0, 0, 0)], tables)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.census(data, layout, index)
 
     def test_states_file_lists_distinct_rows_with_counts(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(sgd5_effects, "DATABASES", [self.layout]):
