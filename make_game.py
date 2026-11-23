@@ -2269,24 +2269,27 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
             "crashes the driver is skipped instead of stopping the stage")
 
-    code = 0
     crashed: list[str] = []
-    failed_index = ""
+    failed_passes: list[tuple[str, int]] = []
     for directory, label in indexes:
         if label:
             log("pipelines: checking bvh/index.json with the shared pipeline cache")
         result, failures = check_pipeline_index(exe, directory, cache, out, jobs, recovery, batching, label)
         if result:
-            code = result
-            failed_index = label
+            failed_passes.append((label, result))
         crashed.extend(failures)
         if result == 2 or interrupted(result):
             break
-    if code:
+    if failed_passes:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
             if crashed else ""
-        checker = f"vk_pipeline_check ({failed_index})" if failed_index else "vk_pipeline_check"
-        fail(f"{checker} exited with {exit_label(code)}{why}")
+        summaries = []
+        for label, code in failed_passes:
+            if not label and len(failed_passes) > 1:
+                label = "root"
+            checker = f"vk_pipeline_check ({label})" if label else "vk_pipeline_check"
+            summaries.append(f"{checker} exited with {exit_label(code)}")
+        fail("; ".join(summaries) + why)
     log("pipelines: done")
 
 

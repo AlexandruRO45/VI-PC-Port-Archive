@@ -307,6 +307,18 @@ class PipelinesCrashRetryTest(unittest.TestCase):
                 self.assertIn("exited with 1", err.getvalue())
                 self.assertNotIn("pipelines: done", logs)
 
+    def test_both_failed_passes_keep_their_own_exit_status(self):
+        bvh = self.add_bvh_index()
+        for bvh_status in (1, 2):
+            with self.subTest(bvh_status=bvh_status), mock.patch("sys.stderr", io.StringIO()) as err:
+                self.calls.clear()
+                failed, logs = self.stage(lambda args, n: bvh_status if args[1] == bvh else 1)
+                self.assertIsNotNone(failed)
+                self.assertEqual([args[1] for args in self.calls], [self.spirv, bvh])
+                self.assertIn(f"vk_pipeline_check (root) exited with 1; "
+                              f"vk_pipeline_check (bvh) exited with {bvh_status}", err.getvalue())
+                self.assertNotIn("pipelines: done", logs)
+
     def test_fatal_root_exit_stops_before_bvh(self):
         self.add_bvh_index()
         for code in (2, 0xC000013A):
