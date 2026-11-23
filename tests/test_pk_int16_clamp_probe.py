@@ -9,7 +9,8 @@ import unittest
 import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOLS = os.path.join(ROOT, "tools")
+# LEONIDA_TOOLS_DIR lets a run load a different copy of the tool (e.g. the pre-change base) without editing tools/.
+TOOLS = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 sys.dont_write_bytecode = True
 for p in (TOOLS, os.path.join(TOOLS, "hw_oracle")):
     if p not in sys.path:
@@ -25,6 +26,19 @@ def _mock_oracle(results, *, arch="gfx1036", device="Mock GFX10"):
     oracle.device = device
     oracle.run.return_value = results
     return oracle
+
+
+def _kernel_keys(kernels):
+    """(wave, op, clamp) per kernel, read back from the real Kernel fields.
+
+    build_jobs sets wave= on each Kernel and appends " clamp" as a separate token on the VOP3P line only
+    in clamp mode, so the instruction mnemonic and that token identify the kernel.
+    """
+    keys = []
+    for k in kernels:
+        ins = next(l for l in k.lines if l.split()[0] in probe.OPS)
+        keys.append((k.wave, ins.split()[0], "clamp" in ins.split()))
+    return keys
 
 
 def _expected_results_for(ops, waves):
@@ -143,6 +157,42 @@ class PkInt16ClampProbeTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertIn("52 evaluations across 1 wave(s) x 1 op(s)", out.getvalue())
+        self.assertEqual(oracle.run.call_count, 1)
+        kernels = oracle.run.call_args.args[0]
+        # One wave x one op x the two clamp modes, and no (wave, op, clamp) key measured twice.
+        self.assertEqual(len(kernels), 2)
+        keys = _kernel_keys(kernels)
+        self.assertEqual(keys, [(32, op, False), (32, op, True)])
+        self.assertEqual(len(set(keys)), len(keys))
+
+    def test_repeated_mixed_selections_deduplicate_in_first_appearance_order(self):
+        op1, op2 = "v_pk_max_i16", "v_pk_min_u16"
+        expected = _expected_results_for([op1, op2], [32, 64])
+        oracle = _mock_oracle([])
+        oracle.run.side_effect = lambda kernels: [
+            expected[i % len(expected)] for i in range(len(kernels))
+        ]
+
+        out = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle):
+            with redirect_stdout(out):
+                rc = probe.main(["--waves", "32,64,32", "--ops", f"{op1},{op2},{op1}"])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("2 wave(s) x 2 op(s)", out.getvalue())
+        self.assertEqual(oracle.run.call_count, 1)
+        kernels = oracle.run.call_args.args[0]
+        # 2 waves x 2 ops x the two clamp modes, each combination exactly once, in first-appearance
+        # order (dict.fromkeys keeps it, so wave 32 precedes 64 and op1, first seen, precedes op2).
+        self.assertEqual(len(kernels), 8)
+        keys = _kernel_keys(kernels)
+        self.assertEqual(len(set(keys)), len(keys))
+        self.assertEqual(keys, [
+            (w, op, clamp)
+            for w in (32, 64)
+            for op in (op1, op2)
+            for clamp in probe.CLAMP_MODES
+        ])
 
     def test_unavailable_non_gfx10_and_cli_errors(self):
         with unittest.mock.patch.object(hw_runner, "open_oracle", side_effect=hw_runner.Unavailable("no gpu")):
