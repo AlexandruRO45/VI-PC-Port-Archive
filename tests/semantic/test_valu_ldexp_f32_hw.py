@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Architectural reference model, symbolic AST, interpreter, and hardware-rule tests for v_ldexp_f32.
+"""Architectural test suite for v_ldexp_f32.
 
 RDNA2 Instruction Set Architecture, VOP2/VOP3:
     v_ldexp_f32 D, S0, S1
@@ -8,637 +8,451 @@ RDNA2 Instruction Set Architecture, VOP2/VOP3:
 Semantic operation:
     D.f32 = S0.f32 * 2^(S1.i32)
 
-Bit-exact binary32 semantics:
+Bit-exact binary32 hardware semantics:
     - Normal inputs (biased exponent 1..254): exponent field is incremented by clamped S1 in [-512, 512].
     - Zero and denormals (biased exponent 0): flushed to signed zero (+0.0 / -0.0).
     - Infinities and NaNs (biased exponent 255): preserved bit-exact without modification.
     - Exponent overflow (> 254): saturates to +/-infinity with original sign.
     - Exponent underflow (<= 0): saturates to +/-zero with original sign.
+    - S1 clamping to [-512, 512] prevents 32-bit addition wrap-around (e.g. S1 = 0x7FFFFFFF saturates to +inf).
 
-Standard library Python only (unittest, struct, math, dataclasses, enum, typing).
+Standard library Python only (unittest, struct, math, os, sys).
 Strictly zero game data.
 """
 
-from dataclasses import dataclass, field
-from enum import Enum, auto
-import math
 import os
 import struct
 import sys
-from typing import Dict, List, Optional, Set, Tuple, Union
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import support
-import spirv_mini_interp as si
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS = os.path.join(ROOT, "tools")
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
 
-MASK32: int = 0xFFFF_FFFF
-SIGN_MASK: int = 0x8000_0000
-EXP_MASK: int = 0x7F80_0000
-MANT_MASK: int = 0x007F_FFFF
+import support
+import rdna2spirv
+
+POS_ZERO: int = 0x0000_0000
+NEG_ZERO: int = 0x8000_0000
 POS_INF: int = 0x7F80_0000
 NEG_INF: int = 0xFF80_0000
-
-# -----------------------------------------------------------------------------
-# Commit 1: Reference Mathematical Oracle and Architectural Model
-# -----------------------------------------------------------------------------
-
-def ref_ldexp_f32(s0_u32: int, s1_i32: int) -> int:
-    """Reference mathematical model for v_ldexp_f32 matching RDNA2 hardware semantics."""
-    x = s0_u32 & MASK32
-    sgn = x & SIGN_MASK
-    e = (x >> 23) & 0xFF
-
-    # Zero and denormals flush to signed zero (+-0.0)
-    if e == 0:
-        return sgn
-    # Infinities and NaNs pass through unchanged
-    if e == 255:
-        return x
-
-    # Normal input: clamp s1 to [-512, 512]
-    if s1_i32 >= 0x8000_0000:
-        s1_val = s1_i32 - 0x1_0000_0000
-    else:
-        s1_val = s1_i32
-
-    clamped_n = max(-512, min(512, s1_val))
-    new_e = e + clamped_n
-
-    if 1 <= new_e <= 254:
-        return sgn | (new_e << 23) | (x & MANT_MASK)
-    elif new_e > 254:
-        return sgn | POS_INF
-    else:
-        return sgn
+QNAN: int = 0x7FC0_0000
+SNAN: int = 0x7F80_0001
+MAX_NORMAL: int = 0x7F7F_FFFF
+MIN_NORMAL: int = 0x0080_0000
+MIN_SUBNORMAL: int = 0x0000_0001
+MAX_SUBNORMAL: int = 0x007F_FFFF
+ONE_F32: int = 0x3F80_0000
 
 
-class VLdexpF32Oracle:
-    """Architectural model and hardware-rule validator for v_ldexp_f32."""
+def _build_ldexp_lines(s0_u32: int, s1_i32: int, clamp: bool = False) -> list[str]:
+    mod = " clamp" if clamp else ""
+    return [
+        f"v_mov_b32_e32 v0, {s0_u32:#x}",
+        f"s_mov_b32 s0, {s1_i32 & 0xFFFF_FFFF:#x}",
+        f"v_ldexp_f32 v1, v0, s0{mod}",
+        "v_mov_b32_e32 v2, 0",
+        "exp mrt0 v1, v2, v2, v2 done vm",
+        "s_endpgm",
+    ]
 
-    @staticmethod
-    def eval(s0_u32: int, s1_i32: int) -> int:
-        return ref_ldexp_f32(s0_u32, s1_i32)
 
-    @staticmethod
-    def build_shader(s0_u32: int, s1_i32: int, clamp: bool = False) -> Tuple[str, List[str]]:
-        name = "ps_ldexp_f32_hw"
-        mod = " clamp" if clamp else ""
+class TestVLdexpF32BasicMath(unittest.TestCase):
+    """Basic scaling calculations and signed floating-point inputs."""
+
+    def test_identity_scale_zero(self):
+        """1.0f * 2^0 = 1.0f (0x3F80_0000)."""
+        lines = _build_ldexp_lines(ONE_F32, 0)
+        spv = support.translate_lines("ps_ldexp_ident", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, ONE_F32)
+
+    def test_positive_scale(self):
+        """1.0f * 2^2 = 4.0f (0x4080_0000)."""
+        lines = _build_ldexp_lines(ONE_F32, 2)
+        spv = support.translate_lines("ps_ldexp_pos_scale", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x4080_0000)
+
+    def test_negative_scale(self):
+        """1.0f * 2^-2 = 0.25f (0x3E80_0000)."""
+        lines = _build_ldexp_lines(ONE_F32, -2)
+        spv = support.translate_lines("ps_ldexp_neg_scale", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x3E80_0000)
+
+    def test_negative_float_scaled(self):
+        """-1.5f * 2^1 = -3.0f (0xC040_0000) and -2.0f * 2^-1 = -1.0f (0xBF80_0000)."""
+        lines1 = _build_ldexp_lines(0xBFC0_0000, 1)
+        spv1 = support.translate_lines("ps_ldexp_neg_float_1", lines1)
+        out1 = support.mrt0_words(spv1)[0]
+        self.assertEqual(out1, 0xC040_0000)
+
+        lines2 = _build_ldexp_lines(0xC000_0000, -1)
+        spv2 = support.translate_lines("ps_ldexp_neg_float_2", lines2)
+        out2 = support.mrt0_words(spv2)[0]
+        self.assertEqual(out2, 0xBF80_0000)
+
+    def test_fractional_mantissa_scale(self):
+        """1.75f * 2^3 = 14.0f (0x4160_0000)."""
+        lines = _build_ldexp_lines(0x3FE0_0000, 3)
+        spv = support.translate_lines("ps_ldexp_frac_mant", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x4160_0000)
+
+
+class TestVLdexpF32RegisterOperandsAndAliasing(unittest.TestCase):
+    """Register encoding flexibility and in-place operand aliasing."""
+
+    def test_vgpr_src0_vgpr_src1(self):
+        """Both operands sourced from VGPRs: v_ldexp_f32 v2, v0, v1."""
         lines = [
-            f"v_mov_b32_e32 v0, {s0_u32:#x}",
-            f"s_mov_b32 s0, {s1_i32 & 0xFFFF_FFFF:#x}",
-            f"v_ldexp_f32 v2, v0, s0{mod}",
+            f"v_mov_b32_e32 v0, {ONE_F32:#x}",
+            "v_mov_b32_e32 v1, 3",
+            "v_ldexp_f32 v2, v0, v1",
             "v_mov_b32_e32 v3, 0",
             "exp mrt0 v2, v3, v3, v3 done vm",
             "s_endpgm",
         ]
-        return name, lines
+        spv = support.translate_lines("ps_ldexp_vgpr_vgpr", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x4100_0000)  # 8.0f
 
-    @staticmethod
-    def translate_and_validate(s0_u32: int, s1_i32: int, clamp: bool = False) -> str:
-        name, lines = VLdexpF32Oracle.build_shader(s0_u32, s1_i32, clamp=clamp)
-        return support.translate_lines(name, lines)
+    def test_vgpr_src0_sgpr_src1(self):
+        """Scale factor sourced from SGPR: v_ldexp_f32 v2, v0, s0."""
+        lines = [
+            f"v_mov_b32_e32 v0, {ONE_F32:#x}",
+            "s_mov_b32 s0, 3",
+            "v_ldexp_f32 v2, v0, s0",
+            "v_mov_b32_e32 v3, 0",
+            "exp mrt0 v2, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_vgpr_sgpr", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x4100_0000)
 
-    @staticmethod
-    def execute_and_verify(s0_u32: int, s1_i32: int, clamp: bool = False) -> int:
-        spv = VLdexpF32Oracle.translate_and_validate(s0_u32, s1_i32, clamp=clamp)
-        out = support.mrt0_words(spv)
-        return out[0]
+    def test_aliased_dst_and_src0(self):
+        """In-place update where destination aliases src0: v_ldexp_f32 v0, v0, s0."""
+        lines = [
+            f"v_mov_b32_e32 v0, {ONE_F32:#x}",
+            "s_mov_b32 s0, 2",
+            "v_ldexp_f32 v0, v0, s0",
+            "v_mov_b32_e32 v1, 0",
+            "exp mrt0 v0, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_alias_dst_src0", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x4080_0000)  # 4.0f
+
+    def test_aliased_dst_and_src1(self):
+        """Destination aliases src1 register: v_ldexp_f32 v1, v0, v1."""
+        lines = [
+            f"v_mov_b32_e32 v0, {ONE_F32:#x}",
+            "v_mov_b32_e32 v1, 2",
+            "v_ldexp_f32 v1, v0, v1",
+            "v_mov_b32_e32 v2, 0",
+            "exp mrt0 v1, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_alias_dst_src1", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x4080_0000)
+
+    def test_all_operands_aliased(self):
+        """All operands alias the same VGPR: v_ldexp_f32 v0, v0, v0."""
+        # 2.0f (0x4000_0000) interpreted as integer scale > 512, overflows to +inf
+        lines = [
+            "v_mov_b32_e32 v0, 0x40000000",
+            "v_ldexp_f32 v0, v0, v0",
+            "v_mov_b32_e32 v1, 0",
+            "exp mrt0 v0, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_alias_all", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, POS_INF)
 
 
-class TestVLdexpF32Oracle(unittest.TestCase):
-    """Unit tests for reference oracle and translator execution."""
+class TestVLdexpF32OutputModifiers(unittest.TestCase):
+    """VOP3 clamp modifier and emitted SPIR-V instruction verification."""
 
-    def test_oracle_identity_scale_zero(self):
-        # 1.0f * 2^0 = 1.0f (0x3F80_0000)
-        one = 0x3F80_0000
-        res = VLdexpF32Oracle.eval(one, 0)
-        self.assertEqual(res, one)
+    def test_vop3_clamp_modifier_saturates_above_one(self):
+        """1.0f * 2^2 = 4.0f clamped to [0.0, 1.0] -> 1.0f (0x3F80_0000)."""
+        lines = _build_ldexp_lines(ONE_F32, 2, clamp=True)
+        spv = support.translate_lines("ps_ldexp_clamp_above", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, ONE_F32)
 
-    def test_oracle_positive_scale(self):
-        # 1.0f * 2^2 = 4.0f (0x4080_0000)
-        one = 0x3F80_0000
-        res = VLdexpF32Oracle.eval(one, 2)
-        self.assertEqual(res, 0x4080_0000)
+    def test_vop3_clamp_modifier_saturates_below_zero(self):
+        """-1.0f * 2^1 = -2.0f clamped to [0.0, 1.0] -> 0.0f (0x0000_0000)."""
+        lines = _build_ldexp_lines(0xBF80_0000, 1, clamp=True)
+        spv = support.translate_lines("ps_ldexp_clamp_below", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, POS_ZERO)
 
-    def test_oracle_negative_scale(self):
-        # 1.0f * 2^(-2) = 0.25f (0x3E80_0000)
-        one = 0x3F80_0000
-        res = VLdexpF32Oracle.eval(one, -2)
-        self.assertEqual(res, 0x3E80_0000)
+    def test_vop3_clamp_modifier_in_range_unaffected(self):
+        """1.0f * 2^-1 = 0.5f clamped to [0.0, 1.0] -> 0.5f (0x3F00_0000)."""
+        lines = _build_ldexp_lines(ONE_F32, -1, clamp=True)
+        spv = support.translate_lines("ps_ldexp_clamp_in_range", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x3F00_0000)
 
-    def test_oracle_overflow_to_infinity(self):
-        one = 0x3F80_0000
-        res = VLdexpF32Oracle.eval(one, 150)
-        self.assertEqual(res, POS_INF)
-
-    def test_oracle_underflow_to_zero(self):
-        one = 0x3F80_0000
-        res = VLdexpF32Oracle.eval(one, -150)
-        self.assertEqual(res, 0)
-
-    def test_translator_and_execution_pipeline(self):
-        """Verify translation and execution of 1.0f * 2^2 = 4.0f through rdna2spirv and spirv_mini_interp."""
-        one = 0x3F80_0000
-        got = VLdexpF32Oracle.execute_and_verify(one, 2)
-        self.assertEqual(got, 0x4080_0000)
-
-    def test_translator_negative_scale_and_negative_sign(self):
-        """Verify translator execution for negative exponents and negative float inputs."""
-        # 1.0f * 2^-2 = 0.25f (0x3E80_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, -2), 0x3E80_0000)
-        # -1.5f * 2^1 = -3.0f (0xC040_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBFC0_0000, 1), 0xC040_0000)
-        # -2.0f * 2^-1 = -1.0f (0xBF80_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xC000_0000, -1), 0xBF80_0000)
-
-    def test_translator_overflow_to_infinity(self):
-        """Verify translator execution saturating to signed infinity on exponent overflow."""
-        # +1.0f * 2^150 -> +inf (0x7F80_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, 150), POS_INF)
-        # -1.0f * 2^150 -> -inf (0xFF80_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBF80_0000, 150), NEG_INF)
-        # +1.5f * 2^200 -> +inf (0x7F80_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3FC0_0000, 200), POS_INF)
-
-    def test_translator_underflow_to_signed_zero(self):
-        """Verify translator execution saturating to signed zero on exponent underflow."""
-        # +1.0f * 2^-150 -> +0.0 (0x0000_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, -150), 0x0000_0000)
-        # -1.0f * 2^-150 -> -0.0 (0x8000_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBF80_0000, -150), 0x8000_0000)
-        # +1.5f * 2^-200 -> +0.0 (0x0000_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3FC0_0000, -200), 0x0000_0000)
-
-    def test_translator_clamped_exponent_scale_bounds(self):
-        """Verify translator execution respects S1 clamping to [-512, 512]."""
-        # S1 = +600 (> 512): clamped to 512, overflows to +inf / -inf
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, 600), POS_INF)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBF80_0000, 600), NEG_INF)
-        # S1 = -600 (< -512): clamped to -512, underflows to +0.0 / -0.0
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x3F80_0000, -600), 0x0000_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0xBF80_0000, -600), 0x8000_0000)
-
-    def test_translator_subnormal_flushing(self):
-        """Verify translator execution flushes subnormal inputs to signed zero (denormal-off mode)."""
-        min_sub = 0x0000_0001
-        max_sub = 0x007F_FFFF
-        # Positive subnormals flush to +0.0
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(min_sub, 10), 0x0000_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(max_sub, 10), 0x0000_0000)
-        # Negative subnormals flush to -0.0
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(min_sub | SIGN_MASK, 10), 0x8000_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(max_sub | SIGN_MASK, 10), 0x8000_0000)
-
-    def test_translator_special_values_passthrough(self):
-        """Verify translator execution preserves signed zeros, infinities, and NaNs bit-exact."""
-        # Signed zeros preserved
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x0000_0000, 5), 0x0000_0000)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(0x8000_0000, 5), 0x8000_0000)
-        # Infinities preserved
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(POS_INF, 5), POS_INF)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(NEG_INF, -5), NEG_INF)
-        # NaNs preserved bit-exact
-        qnan = 0x7FC0_0000
-        snan = 0x7F80_0001
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(qnan, 3), qnan)
-        self.assertEqual(VLdexpF32Oracle.execute_and_verify(snan, -3), snan)
-
-    def test_translator_clamp_output_modifier(self):
-        """Verify translator handles VOP3 clamp modifier and emits GLSL FClamp."""
-        # 1.0f * 2^2 = 4.0f clamped to [0.0, 1.0] -> 1.0f (0x3F80_0000)
-        got_clamped = VLdexpF32Oracle.execute_and_verify(0x3F80_0000, 2, clamp=True)
-        self.assertEqual(got_clamped, 0x3F80_0000)
-        # -1.0f * 2^1 = -2.0f clamped to [0.0, 1.0] -> 0.0f (0x0000_0000)
-        got_neg_clamped = VLdexpF32Oracle.execute_and_verify(0xBF80_0000, 1, clamp=True)
-        self.assertEqual(got_neg_clamped, 0x0000_0000)
-        # 1.0f * 2^-1 = 0.5f clamped to [0.0, 1.0] -> 0.5f (0x3F00_0000)
-        got_in_range = VLdexpF32Oracle.execute_and_verify(0x3F80_0000, -1, clamp=True)
-        self.assertEqual(got_in_range, 0x3F00_0000)
-        # Verify SPIR-V contains OpExtInst FClamp
-        spv = VLdexpF32Oracle.translate_and_validate(0x3F80_0000, 2, clamp=True)
-        self.assertIn("OpExtInst %float %glsl FClamp", spv)
-
-    def test_translator_emitted_spirv_instructions(self):
-        """Verify translator emits expected bitwise and selection instructions for v_ldexp_f32."""
-        spv = VLdexpF32Oracle.translate_and_validate(0x3F80_0000, 2)
+    def test_spirv_opcode_structure(self):
+        """Verify emitted SPIR-V contains bitfield extraction, shift, and clamp instructions."""
+        lines = _build_ldexp_lines(ONE_F32, 2, clamp=True)
+        spv = support.translate_lines("ps_ldexp_spirv_ops", lines)
         self.assertIn("OpShiftLeftLogical", spv)
         self.assertIn("OpBitFieldUExtract", spv)
         self.assertIn("OpSelect", spv)
-        self.assertIn("OpBitwiseOr", spv)
-        self.assertIn("OpBitwiseAnd", spv)
-
-# -----------------------------------------------------------------------------
-# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
-# -----------------------------------------------------------------------------
-
-class RegKind(Enum):
-    VGPR = auto()
-    SGPR = auto()
-    IMM = auto()
+        self.assertIn("OpExtInst %float %glsl FClamp", spv)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, ONE_F32)
 
 
-@dataclass(frozen=True)
-class Operand:
-    kind: RegKind
-    index: int = 0
-    imm_val: int = 0
+class TestVLdexpF32ExecutionControlAndFlags(unittest.TestCase):
+    """EXEC lane simulation and status flag / condition code preservation."""
 
-    def format(self) -> str:
-        if self.kind == RegKind.VGPR:
-            return f"v{self.index}"
-        elif self.kind == RegKind.SGPR:
-            return f"s{self.index}"
-        elif self.kind == RegKind.IMM:
-            return f"{self.imm_val:#x}"
-        return f"reg_{self.index}"
+    def test_exec_masking_active_inactive_simulation(self):
+        """Simulate divergent execution where active lane scales and inactive lane preserves input."""
+        lines = [
+            f"v_mov_b32_e32 v0, {ONE_F32:#x}",
+            "s_mov_b32 s0, 1",
+            "v_cmp_gt_u32_e64 vcc, 1, 0",  # Active condition True
+            "v_cndmask_b32_e32 v1, 0, v0, vcc",  # Active picks v0 (1.0f)
+            "v_ldexp_f32 v2, v1, s0",  # 1.0f * 2^1 = 2.0f
+            "v_mov_b32_e32 v3, 0",
+            "exp mrt0 v2, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_exec_sim", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x4000_0000)  # 2.0f
 
+    def test_vcc_flag_preservation(self):
+        """Verify that VCC flag state is not modified or clobbered by v_ldexp_f32."""
+        lines = [
+            f"v_mov_b32_e32 v0, {ONE_F32:#x}",
+            "v_cmp_gt_f32_e32 vcc, 0, v0",  # 0 > 1.0f is False: VCC=0
+            "s_mov_b32 s0, 1",
+            "v_ldexp_f32 v1, v0, s0",  # v_ldexp_f32 executes
+            "v_cndmask_b32_e32 v2, 0x1111, 0x2222, vcc",  # Should pick 0x1111 because VCC is 0
+            "exp mrt0 v1, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_vcc_preserve", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x4000_0000)  # 2.0f
+        self.assertEqual(out[1], 0x1111)  # VCC preserved False
 
-@dataclass
-class VLdexpF32Instruction:
-    dst: Operand
-    src0: Operand
-    src1: Operand
-    opcode: str = "v_ldexp_f32"
+    def test_scc_flag_preservation(self):
+        """Verify that scalar condition code (SCC) is preserved across v_ldexp_f32."""
+        lines = [
+            f"v_mov_b32_e32 v0, {ONE_F32:#x}",
+            "s_cmp_eq_u32 5, 5",  # SCC = 1
+            "s_mov_b32 s0, 1",
+            "v_ldexp_f32 v1, v0, s0",  # VALU op executes
+            "s_cselect_b32 s1, 0xAAAA, 0xBBBB",  # Should select 0xAAAA because SCC=1
+            "v_mov_b32_e32 v2, s1",
+            "exp mrt0 v1, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_scc_preserve", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x4000_0000)
+        self.assertEqual(out[1], 0xAAAA)
 
-    def validate(self) -> None:
-        if self.opcode != "v_ldexp_f32":
-            raise ValueError(f"Invalid opcode: {self.opcode}")
-        if self.dst.kind != RegKind.VGPR:
-            raise TypeError(f"Destination must be a VGPR, got {self.dst.kind}")
-        if not (0 <= self.dst.index <= 255):
-            raise ValueError(f"Destination VGPR out of bounds: v{self.dst.index}")
-        for src, name in ((self.src0, "src0"), (self.src1, "src1")):
-            if src.kind == RegKind.VGPR and not (0 <= src.index <= 255):
-                raise ValueError(f"{name} VGPR out of bounds: v{src.index}")
-            elif src.kind == RegKind.SGPR and not (0 <= src.index <= 105):
-                raise ValueError(f"{name} SGPR out of bounds: s{src.index}")
-
-    def emit_assembly(self) -> str:
-        self.validate()
-        return f"{self.opcode} {self.dst.format()}, {self.src0.format()}, {self.src1.format()}"
-
-
-class TestVLdexpF32AST(unittest.TestCase):
-    """Unit tests for symbolic AST representation and validation."""
-
-    def test_ast_valid_vgpr_operands(self):
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.VGPR, index=2),
-        )
-        self.assertEqual(instr.emit_assembly(), "v_ldexp_f32 v0, v1, v2")
-
-    def test_ast_valid_sgpr_scale(self):
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.SGPR, index=4),
-        )
-        self.assertEqual(instr.emit_assembly(), "v_ldexp_f32 v0, v1, s4")
-
-    def test_ast_reject_sgpr_destination(self):
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.SGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.VGPR, index=2),
-        )
-        with self.assertRaises(TypeError):
-            instr.validate()
-
-    def test_ast_reject_out_of_bounds_vgpr(self):
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=256),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.VGPR, index=2),
-        )
-        with self.assertRaises(ValueError):
-            instr.validate()
-
-# -----------------------------------------------------------------------------
-# Commit 3: Deterministic Scalar Instruction Interpreter
-# -----------------------------------------------------------------------------
-
-@dataclass
-class ScalarVALUState:
-    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
-    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
-    exec_mask: int = MASK32
-
-    def read_operand(self, op: Operand) -> int:
-        if op.kind == RegKind.VGPR:
-            return self.vgprs[op.index] & MASK32
-        elif op.kind == RegKind.SGPR:
-            return self.sgprs[op.index] & MASK32
-        elif op.kind == RegKind.IMM:
-            return op.imm_val & MASK32
-        raise NotImplementedError(f"Unsupported operand kind: {op.kind}")
-
-    def write_vgpr(self, index: int, val: int) -> None:
-        self.vgprs[index] = val & MASK32
-
-
-class ScalarVALUInterpreter:
-    """Deterministic single-lane VALU interpreter for v_ldexp_f32."""
-
-    @staticmethod
-    def step(instr: VLdexpF32Instruction, state: ScalarVALUState) -> None:
-        instr.validate()
-        s0_val = state.read_operand(instr.src0)
-        s1_val = state.read_operand(instr.src1)
-        res = ref_ldexp_f32(s0_val, s1_val)
-        state.write_vgpr(instr.dst.index, res)
-
-
-class TestVLdexpF32ScalarInterpreter(unittest.TestCase):
-    """Unit tests for deterministic scalar interpreter execution."""
-
-    def setUp(self):
-        self.state = ScalarVALUState()
-
-    def test_interpreter_step_basic(self):
-        # v1 = 1.0f (0x3F80_0000), s2 = 3 -> v0 = 8.0f (0x4100_0000)
-        self.state.vgprs[1] = 0x3F80_0000
-        self.state.sgprs[2] = 3
-
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.SGPR, index=2),
-        )
-        ScalarVALUInterpreter.step(instr, self.state)
-        self.assertEqual(self.state.vgprs[0], 0x4100_0000)
-
-    def test_interpreter_step_negative_scale(self):
-        # v1 = 8.0f (0x4100_0000), v2 = -3 (0xFFFF_FFFD) -> v0 = 1.0f (0x3F80_0000)
-        self.state.vgprs[1] = 0x4100_0000
-        self.state.vgprs[2] = (-3) & MASK32
-
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.VGPR, index=2),
-        )
-        ScalarVALUInterpreter.step(instr, self.state)
-        self.assertEqual(self.state.vgprs[0], 0x3F80_0000)
-
-# -----------------------------------------------------------------------------
-# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
-# -----------------------------------------------------------------------------
-
-class SIMDWavefrontState:
-    """Models SIMD multi-lane register states across Wave32 and Wave64."""
-
-    def __init__(self, lanes: int = 64):
-        self.lanes = lanes
-        self.vgprs: List[List[int]] = [[0] * lanes for _ in range(256)]
-        self.exec_mask: int = (1 << lanes) - 1
-
-    def step(self, instr: VLdexpF32Instruction, s1_scale: int) -> None:
-        instr.validate()
-        d_idx = instr.dst.index
-        s0_idx = instr.src0.index
-        for lane in range(self.lanes):
-            if (self.exec_mask & (1 << lane)) != 0:
-                s0_val = self.vgprs[s0_idx][lane]
-                self.vgprs[d_idx][lane] = ref_ldexp_f32(s0_val, s1_scale)
-
-
-class TestVLdexpF32SIMDDivergence(unittest.TestCase):
-    """Unit tests for multi-lane divergence and active/inactive lane masking."""
-
-    def test_wave32_even_odd_mask_divergence(self):
-        simd = SIMDWavefrontState(lanes=32)
-        # Initialize v1 with 1.0f in all lanes, canary in v0
-        one = 0x3F80_0000
-        canary = 0xDEAD_BEEF
-        for lane in range(32):
-            simd.vgprs[1][lane] = one
-            simd.vgprs[0][lane] = canary
-
-        # Active mask: even lanes only (0x5555_5555)
-        simd.exec_mask = 0x5555_5555
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.SGPR, index=0),
-        )
-        simd.step(instr, s1_scale=1)  # 1.0f * 2^1 = 2.0f (0x4000_0000)
-
-        for lane in range(32):
-            if lane % 2 == 0:
-                self.assertEqual(simd.vgprs[0][lane], 0x4000_0000)
-            else:
-                self.assertEqual(simd.vgprs[0][lane], canary)
-
-    def test_wave64_divergence(self):
-        simd = SIMDWavefrontState(lanes=64)
-        one = 0x3F80_0000
-        canary = 0xCAFE_BABE
-        for lane in range(64):
-            simd.vgprs[1][lane] = one
-            simd.vgprs[0][lane] = canary
-
-        # Active mask: lower 32 lanes only
-        simd.exec_mask = 0x0000_0000_FFFF_FFFF
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=1),
-            src1=Operand(RegKind.SGPR, index=0),
-        )
-        simd.step(instr, s1_scale=2)  # 1.0f * 2^2 = 4.0f (0x4080_0000)
-
-        for lane in range(64):
-            if lane < 32:
-                self.assertEqual(simd.vgprs[0][lane], 0x4080_0000)
-            else:
-                self.assertEqual(simd.vgprs[0][lane], canary)
-
-# -----------------------------------------------------------------------------
-# Commit 5: Register Aliasing and In-Place Operand Preservation
-# -----------------------------------------------------------------------------
-
-class TestVLdexpF32Aliasing(unittest.TestCase):
-    """Unit tests for in-place register aliasing."""
-
-    def test_alias_dst_equals_src0(self):
-        """v0 = v_ldexp_f32 v0, s0: in-place scale."""
-        state = ScalarVALUState()
-        state.vgprs[0] = 0x3F80_0000  # 1.0f
-        state.sgprs[0] = 3
-
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=0),
-            src1=Operand(RegKind.SGPR, index=0),
-        )
-        ScalarVALUInterpreter.step(instr, state)
-        self.assertEqual(state.vgprs[0], 0x4100_0000)  # 8.0f
-
-    def test_alias_dst_equals_src1(self):
-        """v1 = v_ldexp_f32 v0, v1: scale register overwritten."""
-        state = ScalarVALUState()
-        state.vgprs[0] = 0x3F80_0000  # 1.0f
-        state.vgprs[1] = 2
-
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=1),
-            src0=Operand(RegKind.VGPR, index=0),
-            src1=Operand(RegKind.VGPR, index=1),
-        )
-        ScalarVALUInterpreter.step(instr, state)
-        self.assertEqual(state.vgprs[1], 0x4080_0000)  # 4.0f
-        self.assertEqual(state.vgprs[0], 0x3F80_0000)  # src0 untouched
-
-    def test_all_operands_aliased(self):
-        """v0 = v_ldexp_f32 v0, v0."""
-        state = ScalarVALUState()
-        # 2.0f is 0x4000_0000 (interpreted as int: 1073741824) -> overflows to +inf
-        state.vgprs[0] = 0x4000_0000
-
-        instr = VLdexpF32Instruction(
-            dst=Operand(RegKind.VGPR, index=0),
-            src0=Operand(RegKind.VGPR, index=0),
-            src1=Operand(RegKind.VGPR, index=0),
-        )
-        ScalarVALUInterpreter.step(instr, state)
-        self.assertEqual(state.vgprs[0], POS_INF)
-
-# -----------------------------------------------------------------------------
-# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
-# -----------------------------------------------------------------------------
-
-class TestVLdexpF32ConditionCodes(unittest.TestCase):
-    """Unit tests verifying that v_ldexp_f32 preserves VCC, SCC, and status flags."""
-
-    def test_vcc_and_scc_preserved(self):
-        """VALU floating-point scaling operations do not write or clobber VCC or SCC."""
-        canary_vcc = 0x1234_5678_9ABC_DEF0
-        canary_scc = 1
-
-        vcc = canary_vcc
-        scc = canary_scc
-
-        one = 0x3F80_0000
-        res = ref_ldexp_f32(one, 4)
-        self.assertEqual(res, 0x4180_0000)  # 16.0f
-
-        # Flags must remain strictly unchanged
-        self.assertEqual(vcc, canary_vcc)
-        self.assertEqual(scc, canary_scc)
-
-# -----------------------------------------------------------------------------
-# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
-# -----------------------------------------------------------------------------
 
 class TestVLdexpF32IEEE754EdgeCases(unittest.TestCase):
-    """Unit tests verifying IEEE 754 float32 boundary handling according to RDNA2 hardware semantics."""
+    """IEEE 754 float32 boundary handling according to RDNA2 hardware semantics."""
 
-    FLOAT32_PATTERNS = {
-        "pos_zero": 0x0000_0000,
-        "neg_zero": 0x8000_0000,
-        "pos_inf": 0x7F80_0000,
-        "neg_inf": 0xFF80_0000,
-        "qnan": 0x7FC0_0000,
-        "snan": 0x7F80_0001,
-        "min_subnormal": 0x0000_0001,
-        "max_subnormal": 0x007F_FFFF,
-        "min_normal": 0x0080_0000,
-        "max_normal": 0x7F7F_FFFF,
-        "one_point_zero": 0x3F80_0000,
-    }
-
-    def test_signed_zero_preserved(self):
-        # +/-0.0 scaled by any exponent remains +/-0.0
-        pos_z = self.FLOAT32_PATTERNS["pos_zero"]
-        neg_z = self.FLOAT32_PATTERNS["neg_zero"]
-        for scale in (-100, -1, 0, 1, 100):
-            with self.subTest(scale=scale):
-                self.assertEqual(ref_ldexp_f32(pos_z, scale), pos_z)
-                self.assertEqual(ref_ldexp_f32(neg_z, scale), neg_z)
+    def test_signed_zeros_preserved(self):
+        """+/-0.0 scaled by any exponent remains +/-0.0."""
+        for z, name in ((POS_ZERO, "pos"), (NEG_ZERO, "neg")):
+            for scale in (-100, -1, 0, 1, 100):
+                lines = _build_ldexp_lines(z, scale)
+                spv = support.translate_lines(f"ps_ldexp_zero_{name}_{scale}", lines)
+                out = support.mrt0_words(spv)[0]
+                self.assertEqual(out, z)
 
     def test_infinities_pass_through(self):
-        pos_inf = self.FLOAT32_PATTERNS["pos_inf"]
-        neg_inf = self.FLOAT32_PATTERNS["neg_inf"]
-        for scale in (-10, 0, 10):
-            with self.subTest(scale=scale):
-                self.assertEqual(ref_ldexp_f32(pos_inf, scale), pos_inf)
-                self.assertEqual(ref_ldexp_f32(neg_inf, scale), neg_inf)
+        """+/-infinity with any exponent passes through unchanged."""
+        for inf, name in ((POS_INF, "pos_inf"), (NEG_INF, "neg_inf")):
+            for scale in (-50, 0, 50):
+                lines = _build_ldexp_lines(inf, scale)
+                spv = support.translate_lines(f"ps_ldexp_inf_{name}_{scale}", lines)
+                out = support.mrt0_words(spv)[0]
+                self.assertEqual(out, inf)
 
-    def test_nans_pass_through_bit_exact(self):
-        qnan = self.FLOAT32_PATTERNS["qnan"]
-        snan = self.FLOAT32_PATTERNS["snan"]
-        self.assertEqual(ref_ldexp_f32(qnan, 5), qnan)
-        self.assertEqual(ref_ldexp_f32(snan, -5), snan)
+    def test_nans_pass_through(self):
+        """Quiet and signaling NaNs pass through bit-exact without modification."""
+        for nan, name in ((QNAN, "qnan"), (SNAN, "snan")):
+            for scale in (-5, 0, 5):
+                lines = _build_ldexp_lines(nan, scale)
+                spv = support.translate_lines(f"ps_ldexp_nan_{name}_{scale}", lines)
+                out = support.mrt0_words(spv)[0]
+                self.assertEqual(out, nan)
 
     def test_subnormals_flushed_to_signed_zero(self):
-        # Under default RDNA2 denormal-off mode, subnormals are read as zero
-        min_sub = self.FLOAT32_PATTERNS["min_subnormal"]
-        max_sub = self.FLOAT32_PATTERNS["max_subnormal"]
-        self.assertEqual(ref_ldexp_f32(min_sub, 10), 0)
-        self.assertEqual(ref_ldexp_f32(max_sub, 10), 0)
-        # Negative subnormal flushes to -0.0
-        neg_sub = min_sub | SIGN_MASK
-        self.assertEqual(ref_ldexp_f32(neg_sub, 10), SIGN_MASK)
+        """Subnormal inputs are flushed to signed zero (+0.0 / -0.0) under default denormal-off mode."""
+        for sub, expected, name in (
+            (MIN_SUBNORMAL, POS_ZERO, "min_sub_pos"),
+            (MAX_SUBNORMAL, POS_ZERO, "max_sub_pos"),
+            (MIN_SUBNORMAL | NEG_ZERO, NEG_ZERO, "min_sub_neg"),
+            (MAX_SUBNORMAL | NEG_ZERO, NEG_ZERO, "max_sub_neg"),
+        ):
+            lines = _build_ldexp_lines(sub, 10)
+            spv = support.translate_lines(f"ps_ldexp_sub_{name}", lines)
+            out = support.mrt0_words(spv)[0]
+            self.assertEqual(out, expected)
 
-# -----------------------------------------------------------------------------
-# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
-# -----------------------------------------------------------------------------
+    def test_underflow_to_signed_zero(self):
+        """Normal values underflowing the exponent range saturate to signed zero."""
+        # +1.0f * 2^-150 -> +0.0
+        lines_pos = _build_ldexp_lines(ONE_F32, -150)
+        spv_pos = support.translate_lines("ps_ldexp_underflow_pos", lines_pos)
+        out_pos = support.mrt0_words(spv_pos)[0]
+        self.assertEqual(out_pos, POS_ZERO)
 
-class TestVLdexpF32NegativeAndMutation(unittest.TestCase):
-    """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
+        # -1.0f * 2^-150 -> -0.0
+        lines_neg = _build_ldexp_lines(0xBF80_0000, -150)
+        spv_neg = support.translate_lines("ps_ldexp_underflow_neg", lines_neg)
+        out_neg = support.mrt0_words(spv_neg)[0]
+        self.assertEqual(out_neg, NEG_ZERO)
 
-    def test_reject_sgpr_destination(self):
-        for idx in (0, 1, 2, 100):
-            with self.subTest(idx=idx):
-                instr = VLdexpF32Instruction(
-                    dst=Operand(RegKind.SGPR, index=idx),
-                    src0=Operand(RegKind.VGPR, index=0),
-                    src1=Operand(RegKind.VGPR, index=1),
-                )
-                with self.assertRaises(TypeError):
-                    instr.validate()
+    def test_overflow_to_signed_infinity(self):
+        """Normal values overflowing the exponent range saturate to signed infinity."""
+        # +1.0f * 2^150 -> +inf
+        lines_pos = _build_ldexp_lines(ONE_F32, 150)
+        spv_pos = support.translate_lines("ps_ldexp_overflow_pos", lines_pos)
+        out_pos = support.mrt0_words(spv_pos)[0]
+        self.assertEqual(out_pos, POS_INF)
 
-    def test_reject_out_of_bounds_vgpr(self):
-        for oob in (256, 257, 500):
-            with self.subTest(oob=oob):
-                instr = VLdexpF32Instruction(
-                    dst=Operand(RegKind.VGPR, index=oob),
-                    src0=Operand(RegKind.VGPR, index=0),
-                    src1=Operand(RegKind.VGPR, index=1),
-                )
-                with self.assertRaises(ValueError):
-                    instr.validate()
+        # -1.0f * 2^150 -> -inf
+        lines_neg = _build_ldexp_lines(0xBF80_0000, 150)
+        spv_neg = support.translate_lines("ps_ldexp_overflow_neg", lines_neg)
+        out_neg = support.mrt0_words(spv_neg)[0]
+        self.assertEqual(out_neg, NEG_INF)
 
-    def test_mutation_detector_logic(self):
-        """Verify that mutations in mathematical ldexp behavior are detected."""
-        def mutant_add(s0: int, s1: int) -> int:
-            # Mutant: mistakenly interprets ldexp as float addition
-            f0 = struct.unpack("<f", struct.pack("<I", s0))[0]
-            res_f = f0 + float(s1)
-            return struct.unpack("<I", struct.pack("<f", res_f))[0]
 
-        one = 0x3F80_0000  # 1.0f
-        correct = ref_ldexp_f32(one, 2)  # 1.0 * 2^2 = 4.0f (0x4080_0000)
-        mutant = mutant_add(one, 2)      # 1.0 + 2.0 = 3.0f (0x4040_0000)
+class TestVLdexpF32ReviewerMutationsAndBoundaries(unittest.TestCase):
+    """Pinning reviewer-identified mutations, hardware boundary cases, and syntax controls."""
 
-        self.assertEqual(correct, 0x4080_0000)
-        self.assertNotEqual(mutant, correct)
+    def test_mutation_pin_s1_clamp_int32_max_positive(self):
+        """Pin S1 clamp against 32-bit wrap mutation: 1.0f with S1=0x7FFFFFFF saturates to +inf.
 
-    def test_translator_negative_control_rejects_mutant(self):
+        If S1 is not clamped to [-512, 512], e + S1 (127 + 2147483647) wraps to 0x8000007E.
+        With bit 31 set, the unclamped translation misidentifies the result as negative/zero
+        and emits +0.0 instead of +inf. Clamping to 512 guarantees saturation to +inf.
+        """
+        lines = _build_ldexp_lines(ONE_F32, 0x7FFF_FFFF)
+        spv = support.translate_lines("ps_ldexp_pin_clamp_max", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, POS_INF)
+
+    def test_mutation_pin_s1_clamp_int32_min_negative(self):
+        """Pin S1 clamp against negative 32-bit wrap mutation: 1.0f with S1=0x80000000 underflows to +0.0."""
+        lines = _build_ldexp_lines(ONE_F32, -0x8000_0000)
+        spv = support.translate_lines("ps_ldexp_pin_clamp_min", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, POS_ZERO)
+
+    def test_mutation_pin_top_normal_binade_exponent_254(self):
+        """Pin top normal exponent boundary: 1.0f * 2^127 lands on biased exponent 254 (0x7F00_0000).
+
+        If the translator mistakenly uses 253 as the valid exponent upper bound, 1.0f * 2^127
+        would prematurely overflow to +inf. It must evaluate to the largest finite binade.
+        """
+        lines = _build_ldexp_lines(ONE_F32, 127)
+        spv = support.translate_lines("ps_ldexp_pin_exp_254", lines)
+        out = support.mrt0_words(spv)[0]
+        self.assertEqual(out, 0x7F00_0000)
+
+    def test_mutation_pin_exponent_254_to_255_overflow_boundary(self):
+        """Verify sharp step from highest normal exponent (254) to overflow infinity (255)."""
+        # +1.0f * 2^127 = 0x7F00_0000 (normal)
+        lines_pos_254 = _build_ldexp_lines(ONE_F32, 127)
+        spv_pos_254 = support.translate_lines("ps_ldexp_pos_254", lines_pos_254)
+        self.assertEqual(support.mrt0_words(spv_pos_254)[0], 0x7F00_0000)
+
+        # +1.0f * 2^128 = 0x7F80_0000 (+inf)
+        lines_pos_255 = _build_ldexp_lines(ONE_F32, 128)
+        spv_pos_255 = support.translate_lines("ps_ldexp_pos_255", lines_pos_255)
+        self.assertEqual(support.mrt0_words(spv_pos_255)[0], POS_INF)
+
+        # -1.0f * 2^127 = 0xFF00_0000 (normal)
+        lines_neg_254 = _build_ldexp_lines(0xBF80_0000, 127)
+        spv_neg_254 = support.translate_lines("ps_ldexp_neg_254", lines_neg_254)
+        self.assertEqual(support.mrt0_words(spv_neg_254)[0], 0xFF00_0000)
+
+        # -1.0f * 2^128 = 0xFF80_0000 (-inf)
+        lines_neg_255 = _build_ldexp_lines(0xBF80_0000, 128)
+        spv_neg_255 = support.translate_lines("ps_ldexp_neg_255", lines_neg_255)
+        self.assertEqual(support.mrt0_words(spv_neg_255)[0], NEG_INF)
+
+    def test_max_normal_float_boundary(self):
+        """Max normal float (0x7F7F_FFFF): scale 0 preserves, scale 1 overflows, scale -1 halves."""
+        # 0x7F7F_FFFF * 2^0 = 0x7F7F_FFFF
+        lines_zero = _build_ldexp_lines(MAX_NORMAL, 0)
+        spv_zero = support.translate_lines("ps_ldexp_maxnorm_zero", lines_zero)
+        self.assertEqual(support.mrt0_words(spv_zero)[0], MAX_NORMAL)
+
+        # 0x7F7F_FFFF * 2^1 -> overflows to +inf
+        lines_one = _build_ldexp_lines(MAX_NORMAL, 1)
+        spv_one = support.translate_lines("ps_ldexp_maxnorm_one", lines_one)
+        self.assertEqual(support.mrt0_words(spv_one)[0], POS_INF)
+
+        # 0x7F7F_FFFF * 2^-1 = 0x7EFF_FFFF
+        lines_neg = _build_ldexp_lines(MAX_NORMAL, -1)
+        spv_neg = support.translate_lines("ps_ldexp_maxnorm_neg", lines_neg)
+        self.assertEqual(support.mrt0_words(spv_neg)[0], 0x7EFF_FFFF)
+
+    def test_syntax_rejection_unsupported_modifier(self):
+        """Reject unrecognized or unsupported modifier on v_ldexp_f32."""
+        lines = [
+            "v_ldexp_f32 v0, v1, v2 invalid_modifier",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_ldexp_bad_mod", lines)
+
+    def test_syntax_rejection_missing_operand(self):
+        """Reject incomplete assembly instruction lacking operands."""
+        lines = [
+            "v_ldexp_f32 v0, v1",
+            "s_endpgm",
+        ]
+        with self.assertRaises(IndexError):
+            support.translate_lines("ps_ldexp_missing_op", lines)
+
+    def test_syntax_rejection_invalid_opcode(self):
+        """Reject unrecognized opcode variant."""
+        lines = [
+            "v_ldexp_f32_invalid v0, v1, v2",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_ldexp_bad_opcode", lines)
+
+    def test_negative_control_divergence_from_mutants(self):
         """Verify that a mutated exponent shift (shift 22 instead of 23) diverges from translated execution."""
-        def mutant_shift22_ldexp(s0: int, s1: int) -> int:
-            e = ((s0 >> 23) & 0xFF) + s1
-            return (s0 & 0x807F_FFFF) | (e << 22)
+        lines = _build_ldexp_lines(ONE_F32, 2)
+        spv = support.translate_lines("ps_ldexp_neg_ctrl", lines)
+        translated = support.mrt0_words(spv)[0]
 
-        translated = VLdexpF32Oracle.execute_and_verify(0x3F80_0000, 2)
-        mutant = mutant_shift22_ldexp(0x3F80_0000, 2)
+        # Shift-22 mutant
+        e = ((ONE_F32 >> 23) & 0xFF) + 2
+        mutant = (ONE_F32 & 0x807F_FFFF) | (e << 22)
+
         self.assertEqual(translated, 0x4080_0000)
         self.assertNotEqual(translated, mutant)
+
 
 if __name__ == "__main__":
     unittest.main()
