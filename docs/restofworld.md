@@ -335,6 +335,14 @@ for tag 0x42** and **4 bytes for tags 0x21, 0x25, 0x26, 0x27 and 0x28** wherever
 present with a measured successor. This supports separate vertex streams. It leaves the
 component types, final stream width and blocks without an independent count unresolved.
 
+The spans above are measured by `tools/analyze_4240_full.py`, which walks the `42 40 00 00` blocks of one or
+more RPF9 archives and records, per block, the populated slot tags and the stride between consecutive slots
+(and from slot 0), so the widths above can be re-measured:
+
+```powershell
+python -I tools/analyze_4240_full.py <archive.rpf> [<archive.rpf> ...] [--limit N] [--json OUT]
+```
+
 Across all 22 accessible RPF9 archives, a full data-area scan using the four zlib
 headers from #752 accepted 2,241,411 streams at checksum-validated EOF. There were
 309,007 target page starts and 41,342 streams in which a chunk walk reached the
