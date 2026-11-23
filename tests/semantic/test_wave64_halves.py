@@ -89,6 +89,13 @@ def _skip_then_exec_write(write):
     return [write if x == "s_mov_b64 exec, s[10:11]" and i == 4 else x for i, x in enumerate(WIDENED_OR)]
 ELSE_SWITCHES = ("s_andn2_saveexec_b64 s[14:15], s[12:13]", "s_andn2_wrexec_b64 s[14:15], s[12:13]")
 NARROWINGS = ("s_andn1_saveexec_b64 s[14:15], s[12:13]", "s_andn1_wrexec_b64 s[14:15], s[12:13]")
+# @paratustra on #4656: a def that is not lane-local earlier in the vote's region, which the lane-local OR then keeps
+def _dirty_then_def(dirty):
+    return ["v_cmp_gt_u32_e64 s[16:17], 0, v0", "v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_cbranch_execz 3", dirty, "v_cmp_gt_u32_e32 vcc, 64, v0", "s_or_b64 s[16:17], vcc, s[16:17]",
+            "s_mov_b64 exec, s[10:11]", "s_and_b64 exec, exec, s[16:17]", "v_add_nc_u32_e32 v6, 1, v6",
+            "s_mov_b64 exec, s[10:11]"]
+DIRTY_DEFS = ("s_not_b64 s[16:17], s[16:17]", "s_or_b64 s[16:17], s[16:17], s[10:11]")
 NARROWED_OR = _skip_then_def("v_cmp_gt_u32_e64 s[16:17], 0, v0", "s_or_b64 s[16:17], vcc, s[16:17]", False)
 
 
@@ -492,6 +499,14 @@ class Execution(unittest.TestCase):
         for write in ELSE_SWITCHES:
             with self.subTest(write):
                 tier, whole, halves = self.run_both("vs_c_else_switch", vs(_skip_then_exec_write(write)))
+                self.assertEqual(tier, "C")
+                self.assertNotEqual(whole, halves)
+
+    def test_lane_local_def_after_a_def_that_is_not_differs_and_is_c(self):
+        # @paratustra on #4656: the OR keeps the bits that the earlier def set for lanes that are off
+        for dirty in DIRTY_DEFS:
+            with self.subTest(dirty):
+                tier, whole, halves = self.run_both("vs_c_dirty_then_def", vs(_dirty_then_def(dirty)))
                 self.assertEqual(tier, "C")
                 self.assertNotEqual(whole, halves)
 

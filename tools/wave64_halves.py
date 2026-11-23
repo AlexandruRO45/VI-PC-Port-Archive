@@ -1587,6 +1587,30 @@ class Analysis:
                     if grew:
                         entry[s] = merged
                         work.append(s)
+        # a lane-local def keeps the bits D already had, so it counts only when every vote-dependent def of D reaching
+        # it is lane-local too: a `s_not_b64 D, D` or an OR with EXEC earlier in the vote's region sets the bits of
+        # lanes that are off, and the OR keeps them (@paratustra on #4656). A def outside every vote region (the
+        # `s_mov_b64 D, 0` before a break loop) runs alike in the wave and in the halves.
+        reach_at = {}
+        for b in range(n):
+            if entry[b] is None:
+                continue
+            st = dict(entry[b])
+            for i in range(len(self.blocks[b])):
+                if (b, i) in lane_local:
+                    reach_at[(b, i)] = {r: st.get(r, frozenset({(-1, 0)})) for r in lane_local[(b, i)]}
+                for r in defs_of[(b, i)]:
+                    st[r] = frozenset({(b, i)})
+        lane_local = {k: v for k, v in lane_local.items() if k in reach_at}
+        changed = True
+        while changed:
+            changed = False
+            for k in list(lane_local):
+                dk = lane_local[k]
+                if any(d[0] >= 0 and ctrl[d[0]] and r not in lane_local.get(d, ())
+                       for r in dk for d in reach_at[k][r]):
+                    del lane_local[k]
+                    changed = True
         stale = set()
         for b in range(n):
             if entry[b] is None:
