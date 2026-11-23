@@ -544,16 +544,18 @@ def test_ms_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     spvasm = shader.translate()
     shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
     assert "OpCapability ClipDistance" in spvasm
-    assert "OpDecorate %ms_vtx_blk Block" in spvasm
-    assert "OpMemberDecorate %ms_vtx_blk 0 BuiltIn Position" in spvasm
-    assert "OpMemberDecorate %ms_vtx_blk 1 BuiltIn ClipDistance" in spvasm
+    # Standalone arrayed built-ins, not a per-vertex Block: AMD's Windows driver 24.10.24 crashes compiling a mesh
+    # shader that writes a ClipDistance member of an output Block (ms_clip).
+    assert "OpDecorate %ms_out_pos BuiltIn Position" in spvasm
+    assert "OpDecorate %ms_out_clip BuiltIn ClipDistance" in spvasm
+    assert "%ms_vtx_blk" not in spvasm
     assert f"%ms_arr_clip = OpTypeArray %float %c{n_comp}" in spvasm
     chains = re.findall(r"OpAccessChain %_ptr_Function_float %ms_clip %c(\d+)", spvasm)
     assert [int(x) for x in chains] == list(range(n_comp)) * 2   # the export writes, then the copy to the output
     assert _vgpr_to_index_map(spvasm, "%ms_clip", "%_ptr_Function_float") == {i: 10 + i for i in range(n_comp)}
     # Copied to the mesh output one float at a time: SPIRV-Cross turns a whole-array store there into a C array
     # assignment that Metal rejects (SHADER-155).
-    out_chains = re.findall(r"OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli %c1 %c(\d+)", spvasm)
+    out_chains = re.findall(r"OpAccessChain %_ptr_Out_float_ms %ms_out_clip %mli %c(\d+)", spvasm)
     assert [int(x) for x in out_chains] == list(range(n_comp))
     assert "OpLoad %ms_arr_clip" not in spvasm
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
@@ -641,7 +643,7 @@ def test_ms_dummy_all_off_pos1_does_not_emit_clip(make_shader):
 
 
 def test_ms_clip_and_cull_distances_across_pos1_pos2(make_shader):
-    """Mesh shader with 2 clip + 3 cull distances emits both arrays in %ms_vtx_blk and maps v10..v14."""
+    """Mesh shader with 2 clip + 3 cull distances emits both as standalone arrayed outputs and maps v10..v14."""
     dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0x3), (2, 3, 0x7)])])
     asm = _ms_header_asm("exp pos1 v10, v11, v12, v13\nexp pos2 v14, off, off, off done")
     shader = make_shader(asm, name="ms_clip_cull", dxbc=dxbc)
@@ -649,9 +651,10 @@ def test_ms_clip_and_cull_distances_across_pos1_pos2(make_shader):
     shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
     assert "OpCapability ClipDistance" in spvasm
     assert "OpCapability CullDistance" in spvasm
-    assert "OpMemberDecorate %ms_vtx_blk 0 BuiltIn Position" in spvasm
-    assert "OpMemberDecorate %ms_vtx_blk 1 BuiltIn ClipDistance" in spvasm
-    assert "OpMemberDecorate %ms_vtx_blk 2 BuiltIn CullDistance" in spvasm
+    assert "OpDecorate %ms_out_pos BuiltIn Position" in spvasm
+    assert "OpDecorate %ms_out_clip BuiltIn ClipDistance" in spvasm
+    assert "OpDecorate %ms_out_culld BuiltIn CullDistance" in spvasm
+    assert "%ms_vtx_blk" not in spvasm
     assert "%ms_arr_clip = OpTypeArray %float %c2" in spvasm
     assert "%ms_arr_cull_d = OpTypeArray %float %c3" in spvasm
     assert _vgpr_to_index_map(spvasm, "%ms_clip", "%_ptr_Function_float") == {0: 10, 1: 11}

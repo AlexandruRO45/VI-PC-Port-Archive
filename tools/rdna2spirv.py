@@ -14585,10 +14585,15 @@ def assemble(gen):
         for v in (0, 1, 2, 3, 0x108, sx, sx * sy):
             gen.cu(v)
     model = "Vertex" if vs else "GLCompute" if cs or msc else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
-    ms_blk = ms and not msc and (gen.uses_clip or gen.uses_cull)
+    # Mesh clip and cull distances are standalone arrayed built-in outputs next to %ms_out_pos, not members of a
+    # per-vertex Block: AMD's Windows driver 24.10.24 (Vulkan driver 2.0.302) crashes in vkCreateGraphicsPipelines
+    # on a mesh shader that stores to a ClipDistance member of an arrayed output Block (ms_clip).
+    ms_clip_out = ms and not msc and gen.uses_clip
+    ms_cull_out = ms and not msc and gen.uses_cull
     iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index", "%base_vertex", "%base_instance"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
-         [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
+         ["%ms_out_pos"] + (["%ms_out_clip"] if ms_clip_out else []) + (["%ms_out_culld"] if ms_cull_out else []) +
+         ["%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
          [f"%ms_out_f16h{n}_{h}" for n in ms_halves for h in (0, 1)])) if ms else []) + (
         ["%x_buf"] if gen.emulate or gen.bar_rounds and not gen.bar_counts_in_lds() else []) + (
@@ -14752,25 +14757,17 @@ def assemble(gen):
             dec.append("OpDecorate %gs_in_pos BuiltIn Position" if sv == 1 else f"OpDecorate %gs_in{r} Location {r}")
         for r, sv in gen.gs["out"]:
             dec.append("OpDecorate %gs_out_pos BuiltIn Position" if sv == 1 else f"OpDecorate %gs_out{r} Location {r}")
-    ms_clip_member = ms_cull_member = None
     if ms:
         dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %num_wg BuiltIn NumWorkgroups",
                 "OpDecorate %local_index BuiltIn LocalInvocationIndex"]
         if msc:
             pass                            # no mesh outputs: the epilogue stores to the --mesh-compute buffer
-        elif ms_blk:
-            dec += ["OpDecorate %ms_vtx_blk Block", "OpMemberDecorate %ms_vtx_blk 0 BuiltIn Position"]
-            mi = 1
-            if gen.uses_clip:
-                dec.append(f"OpMemberDecorate %ms_vtx_blk {mi} BuiltIn ClipDistance")
-                ms_clip_member = mi
-                mi += 1
-            if gen.uses_cull:
-                dec.append(f"OpMemberDecorate %ms_vtx_blk {mi} BuiltIn CullDistance")
-                ms_cull_member = mi
-                mi += 1
         else:
             dec.append("OpDecorate %ms_out_pos BuiltIn Position")
+            if ms_clip_out:
+                dec.append("OpDecorate %ms_out_clip BuiltIn ClipDistance")
+            if ms_cull_out:
+                dec.append("OpDecorate %ms_out_culld BuiltIn CullDistance")
         if not msc:
             # CullPrimitiveEXT as Block+bool member (VUID-07036): array-of-bool is also legal, but
             # SPIRV-Tools ≤2025.1 falsely rejects it (#5980); the Block form passes both old and new validators.
@@ -14881,12 +14878,8 @@ def assemble(gen):
         gen.cu(gen.clip_count)
     if gen.uses_cull:
         gen.cu(gen.cull_count)
-    if ms_blk:
+    if ms_clip_out or ms_cull_out:
         gen.cu(0)
-        if ms_clip_member is not None:
-            gen.cu(ms_clip_member)
-        if ms_cull_member is not None:
-            gen.cu(ms_cull_member)
     # The buffer-format tables below (uses_fmt_size, uses_store_views/uses_int_fetch) build their
     # array types from gen.cu ids. Register those constants here, before the dump: a cu() call
     # after it returns an id that is never defined, and spirv-as then rejects the module.
@@ -15028,30 +15021,33 @@ def assemble(gen):
                   "%_ptr_Function_v4_ms = OpTypePointer Function %v4float",
                   "%_ptr_Function_bool_ms = OpTypePointer Function %bool",
                   "%null_v4_ms = OpConstantNull %v4float"]
-        if ms and (gen.uses_clip or gen.uses_cull):     # staging arrays; the Output block only without msc
+        if ms and (gen.uses_clip or gen.uses_cull):     # staging arrays; the Output arrays only without msc
             types += ["%_ptr_Function_float = OpTypePointer Function %float",
                       "%_ptr_Out_float_ms = OpTypePointer Output %float"]
-            blk_fields = ["%v4float"]
             if gen.uses_clip:
                 types += [f"%ms_arr_clip = OpTypeArray %float {gen.cu(gen.clip_count)}",
                           "%_ptr_Fn_ms_clip = OpTypePointer Function %ms_arr_clip",
                           "%null_ms_clip = OpConstantNull %ms_arr_clip"]
-                blk_fields.append("%ms_arr_clip")
+                if ms_clip_out:
+                    types += [f"%ms_arr_clip_v = OpTypeArray %ms_arr_clip {maxv}",
+                              "%_ptr_Out_ms_arr_clip_v = OpTypePointer Output %ms_arr_clip_v"]
             if gen.uses_cull:
                 types += [f"%ms_arr_cull_d = OpTypeArray %float {gen.cu(gen.cull_count)}",
                           "%_ptr_Fn_ms_cull_d = OpTypePointer Function %ms_arr_cull_d",
                           "%null_ms_cull_d = OpConstantNull %ms_arr_cull_d"]
-                blk_fields.append("%ms_arr_cull_d")
-            types += [f"%ms_vtx_blk = OpTypeStruct {' '.join(blk_fields)}",
-                      f"%ms_arr_vtx_blk = OpTypeArray %ms_vtx_blk {maxv}",
-                      "%_ptr_Out_ms_arr_vtx_blk = OpTypePointer Output %ms_arr_vtx_blk"]
+                if ms_cull_out:
+                    types += [f"%ms_arr_cull_d_v = OpTypeArray %ms_arr_cull_d {maxv}",
+                              "%_ptr_Out_ms_arr_cull_d_v = OpTypePointer Output %ms_arr_cull_d_v"]
         gvars += ["%wg_id = OpVariable %_ptr_Input_v3u Input", "%num_wg = OpVariable %_ptr_Input_v3u Input",
                   "%local_index = OpVariable %_ptr_Input_uint_ms Input",
                   "%ms_counts = OpVariable %_ptr_WG_uint_ms Workgroup"]
         if not msc:
-            gvars += [("%ms_out_vtx = OpVariable %_ptr_Out_ms_arr_vtx_blk Output" if ms_blk else
-                       "%ms_out_pos = OpVariable %_ptr_Out_ms_arr_v4 Output"),
-                      "%ms_prim_idx = OpVariable %_ptr_Out_ms_arr_idx Output",
+            gvars += ["%ms_out_pos = OpVariable %_ptr_Out_ms_arr_v4 Output"]
+            if ms_clip_out:
+                gvars += ["%ms_out_clip = OpVariable %_ptr_Out_ms_arr_clip_v Output"]
+            if ms_cull_out:
+                gvars += ["%ms_out_culld = OpVariable %_ptr_Out_ms_arr_cull_d_v Output"]
+            gvars += ["%ms_prim_idx = OpVariable %_ptr_Out_ms_arr_idx Output",
                       "%ms_cull = OpVariable %_ptr_Out_ms_arr_cull Output"]
             gvars += [f"%ms_out_param{n} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in sorted(gen.ms_params)]
             gvars += [f"%ms_out_f16h{n}_{h} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in ms_halves for h in (0, 1)]
@@ -15454,8 +15450,7 @@ def assemble(gen):
              "OpSelectionMerge %ms_vend None", "OpBranchConditional %mwv %ms_vdo %ms_vend",
              "%ms_vdo = OpLabel",
              "%mpv = OpLoad %v4float %ms_pos",
-             ("%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_vtx %mli %c0" if ms_blk else
-              "%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_pos %mli"),
+             "%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_pos %mli",
              "OpStore %mpp %mpv"]
         # Clip and cull distances are copied one float at a time, not as a whole array: SPIRV-Cross (1.4.363.0)
         # turns a whole-array store into a mesh output into a plain C array assignment, which Metal rejects
@@ -15464,13 +15459,13 @@ def assemble(gen):
             for i in range(gen.clip_count):
                 L += [f"%mcs{i} = OpAccessChain %_ptr_Function_float %ms_clip {c(i)}",
                       f"%mcv{i} = OpLoad %float %mcs{i}",
-                      f"%mcvp{i} = OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli {c(ms_clip_member)} {c(i)}",
+                      f"%mcvp{i} = OpAccessChain %_ptr_Out_float_ms %ms_out_clip %mli {c(i)}",
                       f"OpStore %mcvp{i} %mcv{i}"]
         if gen.uses_cull:
             for i in range(gen.cull_count):
                 L += [f"%mks{i} = OpAccessChain %_ptr_Function_float %ms_cull_dist {c(i)}",
                       f"%mkv{i} = OpLoad %float %mks{i}",
-                      f"%mkvp{i} = OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli {c(ms_cull_member)} {c(i)}",
+                      f"%mkvp{i} = OpAccessChain %_ptr_Out_float_ms %ms_out_culld %mli {c(i)}",
                       f"OpStore %mkvp{i} %mkv{i}"]
         for n in sorted(gen.ms_params):
             L += [f"%mq{n} = OpLoad %v4float %ms_param{n}",
