@@ -51,6 +51,31 @@ class CalibratedExport(unittest.TestCase):
                 self.assertEqual(dds[148:], expected_full)
                 self.assertEqual(decoder.dds(0, mips=1)[148:], b"".join(expected_top))
 
+    def test_profile_saved_with_a_utf8_bom_is_read(self) -> None:
+        # Old Notepad and PowerShell 5.1 Set-Content write UTF-8 with a BOM; the profile is hand-written JSON.
+        import calibrated_texture as ct
+
+        tile = 65536
+        tail0, tail1 = bytes([51, 0] + [0] * 14), bytes([102, 0] + [0] * 14)
+        top0, top1 = bytes([153, 0] + [0] * 14), bytes([204, 0] + [0] * 14)
+        source = b"".join(block * (tile // 16) for block in (tail0, tail1, top0, top1))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool_path = root / "array.ttpf"
+            desc = fixtures.pack_etpf_record(256, 256, 2, 0, 83, 2, 1, 1, 4096)
+            fixtures.write_rds5_pool(pool_path, [desc], [source])
+            profile = json.dumps({"version": 1})
+            plain, bom = root / "plain.json", root / "bom.json"
+            plain.write_text(profile, encoding="utf-8")
+            bom.write_bytes(b"\xef\xbb\xbf" + profile.encode("utf-8"))
+            written = []
+            with closing(ct.ttpf.Pool(pool_path)) as pool:
+                for name, path in (("plain.dds", plain), ("bom.dds", bom)):
+                    target = root / name
+                    ct.export_file(pool, 0, target, None, True, str(path))
+                    written.append(target.read_bytes())
+            self.assertEqual(written[1], written[0])
+
     def test_bc1_export_and_existing_output(self):
         import calibrated_texture
         try:
