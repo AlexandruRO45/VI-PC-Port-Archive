@@ -461,22 +461,27 @@ def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
 
 
 _PNG_CACHE: dict[tuple[str, str, int], bytes | None] = {}
+_PNG_CACHE_BYTES = 0
 _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 
 
 def _png_for(staging_dir: str, dds_path: str, max_tex_size: int) -> bytes | None:
     """Decode once per worker per build, keeping at most about 256 MB of PNGs (oldest dropped first)."""
+    global _PNG_CACHE_BYTES
     key = (staging_dir, os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
     if key in _PNG_CACHE:
         return _PNG_CACHE[key]
+    if not _PNG_CACHE:
+        _PNG_CACHE_BYTES = 0  # also account for an explicitly cleared cache
     dds_mod = _get_dds_png()
     try:
         png = dds_mod.dds_file_to_png_bytes(dds_path, max_size=max_tex_size)
     except (dds_mod.DdsError, OSError):
         png = None
     _PNG_CACHE[key] = png
-    while sum(len(v or b"") for v in _PNG_CACHE.values()) > _PNG_CACHE_BUDGET and len(_PNG_CACHE) > 1:
-        del _PNG_CACHE[next(iter(_PNG_CACHE))]
+    _PNG_CACHE_BYTES += len(png or b"")
+    while _PNG_CACHE_BYTES > _PNG_CACHE_BUDGET and len(_PNG_CACHE) > 1:
+        _PNG_CACHE_BYTES -= len(_PNG_CACHE.pop(next(iter(_PNG_CACHE))) or b"")
     return png
 
 
