@@ -4,6 +4,7 @@
 // LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "host_wine.h"
 #include <dxgi1_4.h>
 #include <algorithm>
 #include <vector>
@@ -170,6 +171,7 @@ int main() {
     if (device_status == vktest::DeviceStatus::unavailable) return 77;
     if (device_status != vktest::DeviceStatus::ready) return 1;
     unsigned failures = 0;
+    bool wine = false;
     {
         Ref<ID3D12Device> ours;
         rt::d3d12::VulkanDeviceInfo info{};
@@ -181,18 +183,20 @@ int main() {
         info.queue_family = vk.family;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
 
+        // Under Wine the host is vkd3d, not WARP: the layer still runs every copy, and nothing is compared.
+        wine = hostwine::host_is_wine();
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> adapter;
         Ref<ID3D12Device> warp;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
-            FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&warp.p)))) {
+        if (!wine && (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+                      FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
+                      FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&warp.p))))) {
             std::fprintf(stderr, "no WARP device, skipped\n");
             return 77;
         }
         for (const Family& family : families) {
             std::vector<unsigned char> expected, actual;
-            if (!copy_and_read(warp.p, family, expected)) {
+            if (!wine && !copy_and_read(warp.p, family, expected)) {
                 std::fprintf(stderr, "%s: WARP could not run the copy\n", family.name);
                 ++failures;
                 continue;
@@ -202,6 +206,7 @@ int main() {
                 ++failures;
                 continue;
             }
+            if (wine) continue;
             const long at = first_difference(actual, expected);
             if (at >= 0) {
                 std::fprintf(stderr, "%s: readback differs from WARP at byte %ld of %zu\n", family.name, at,
@@ -214,5 +219,6 @@ int main() {
         }
     }
     if (vk.validation_errors()) return 1;
-    return failures ? 1 : 0;
+    if (failures) return 1;
+    return wine ? 77 : 0;  // under Wine the copies ran but had no reference
 }

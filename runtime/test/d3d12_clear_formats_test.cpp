@@ -7,6 +7,7 @@
 // difference does.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "host_wine.h"
 #include <dxgi1_4.h>
 #include <array>
 #include <cstdio>
@@ -303,6 +304,7 @@ const DepthValues kDepthValues[] = {{0.25f, 0x5A, 0.75f, 0xA5}, {1.0f, 0xFF, 0.0
 
 struct Tally {
     unsigned matched = 0, differ = 0, not_exposed = 0, failed = 0, skipped = 0;
+    unsigned unchecked = 0;  // under Wine: the layer ran the clear, with no WARP to compare it with
 };
 
 // Names the first byte that differs.
@@ -327,6 +329,8 @@ int main() {
     if (device_status != vktest::DeviceStatus::ready) return 1;
     const unsigned errors_before = vk.validation_errors();
     Tally tally;
+    // Under Wine the host is vkd3d, not WARP: the layer still runs every clear, and nothing is compared.
+    const bool wine = hostwine::host_is_wine();
     {
         Ref<ID3D12Device> ours, host;
         rt::d3d12::VulkanDeviceInfo info{};
@@ -339,9 +343,9 @@ int main() {
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
-            FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+        if (!wine && (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+                      FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
+                      FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))) {
             std::fprintf(stderr, "WARP reference unavailable: differential test cannot run\n");
             return 1;
         }
@@ -353,7 +357,8 @@ int main() {
                 const Color& full = colors[i];
                 const Color& part = colors[(i + 1) % colors.size()];
                 std::vector<unsigned char> actual, expected;
-                const Result want = clear_color(host.p, c.format, c.resource, c.bytes, full, part, expected);
+                const Result want =
+                    wine ? Result::ok : clear_color(host.p, c.format, c.resource, c.bytes, full, part, expected);
                 if (want != Result::ok) {
                     ++tally.skipped;  // WARP itself does not offer the format as a render target here
                     continue;
@@ -368,6 +373,8 @@ int main() {
                 if (got != Result::ok) {
                     ++tally.failed;
                     std::printf("FAIL %-6s %-22s case %u: the layer could not run it\n", c.group, c.name, i);
+                } else if (wine) {
+                    ++tally.unchecked;
                 } else if (actual != expected) {
                     ++tally.differ;
                     report(c.group, c.name, i, "colour", actual, expected);
@@ -380,7 +387,9 @@ int main() {
             bool reported_exposure = false;
             for (unsigned i = 0; i < std::size(kDepthValues); ++i) {
                 std::vector<unsigned char> actual[2], expected[2];
-                const Result want = clear_depth(host.p, c.format, c.stencil, c.depth_bytes, kDepthValues[i], expected);
+                const Result want = wine ? Result::ok
+                                         : clear_depth(host.p, c.format, c.stencil, c.depth_bytes, kDepthValues[i],
+                                                       expected);
                 if (want != Result::ok) {
                     ++tally.skipped;
                     continue;
@@ -395,6 +404,10 @@ int main() {
                 if (got != Result::ok) {
                     ++tally.failed;
                     std::printf("FAIL DEPTH  %-22s case %u: the layer could not run it\n", c.name, i);
+                    continue;
+                }
+                if (wine) {
+                    ++tally.unchecked;
                     continue;
                 }
                 bool same = true;
@@ -412,7 +425,9 @@ int main() {
     std::printf("clears: %u matched WARP, %u differ, %u failed, %u in formats the layer does not expose, "
                 "%u skipped (WARP does not offer the format)\n",
                 tally.matched, tally.differ, tally.failed, tally.not_exposed, tally.skipped);
+    if (wine)
+        std::printf("%u clears ran on the layer without a WARP reference (host D3D12 is Wine's)\n", tally.unchecked);
     if (tally.differ || tally.failed) return 1;
     if (vk.validation_errors() != errors_before) return 1;
-    return 0;
+    return wine ? 77 : 0;
 }
