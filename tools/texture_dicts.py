@@ -16,15 +16,16 @@ Reads an ``make_game.py`` export folder (``<work>/assets``), listing folders wit
 embedded rows carry a stored ``Hash``. Those stored values are compared as they are (a name that is not eight hex
 digits, in a hand-written file, is hashed with joaat). Each distinct material reference (``Id64``) is then an exact
 64-bit key match (pool ``AssetKey`` or embedded ``Key``), else a 32-bit name-hash candidate (embedded or dictionary
-``Hash``; not proof of the same asset, and ambiguous when the hash is on more than one entry), else unresolved; the
-three add up to the total, and per-source counts (which can overlap) are listed too. A manifest whose ``Count`` is
-above the rows it holds is reported as export coverage (failed rows can be left out); more rows than ``Count`` is a
-problem.
+``Hash``; not proof of the same asset, and ambiguous when the hash is on more than one distinct texture, see
+``texture_identity``), else unresolved; the three add up to the total, and per-source counts (which can overlap) are
+listed too. A manifest whose ``Count`` is above the rows it holds is reported as export coverage (failed rows can be
+left out); more rows than ``Count`` is a problem.
 
     python -I tools/texture_dicts.py <export dir> [--json FILE]
 
-Prints counts only: no texture, model or shader names. ``--json`` may not be inside the export folder (drives other
-than the export's count as outside). Standard library only.
+Prints counts, keyed by the export's archive and pool folder names: no texture, model or shader names.
+``--json`` may not be inside the export folder (drives other than the export's count as outside). Standard library
+only.
 """
 import argparse
 import json
@@ -63,6 +64,26 @@ def load_object(path):
     if not isinstance(doc, dict):
         raise ValueError(f"{path}: the top level is not an object")
     return doc
+
+
+def texture_identity(t):
+    """What makes two dictionary or embedded rows the same texture: the same 64-bit ``Key``, or, without a key, the
+    same format and size. The same texture embedded in several models is one texture, not an ambiguous hash."""
+    k = key64(t.get("Key"))
+    if k:
+        return ("key", k)
+    return ("format and size", str(t.get("Format")), str(t.get("Width")), str(t.get("Height")))
+
+
+def embedded_textures(item, arc):
+    """The textures embedded in a model item: ``Embedded`` absent or null, a list of objects, or an object whose
+    ``Textures`` is one; anything else is invalid input."""
+    emb = item.get("Embedded")
+    if emb is None:
+        return []
+    if isinstance(emb, dict):
+        return objects(emb.get("Textures"), f"{arc}/models Embedded Textures")
+    return objects(emb, f"{arc}/models Embedded")
 
 
 def key64(value):
@@ -150,7 +171,7 @@ def census(export):
 
     # texture dictionaries: stored hashes, and how many entries carry each (more than one = an ambiguous candidate)
     dict_hashes = {}                  # archive -> set of 32-bit hashes
-    entries_per_hash = Counter()      # dictionary and embedded entries per stored hash
+    textures_per_hash = {}            # stored hash -> distinct textures carrying it (see texture_identity)
     for arc in archives(export):
         m = os.path.join(export, arc, "textures", "manifest.json")
         if not os.path.isfile(m):
@@ -164,7 +185,7 @@ def census(export):
             hv, _ = stored_hash(t, name_key=None)
             if hv is not None:
                 hashes.add(hv)
-                entries_per_hash[hv] += 1
+                textures_per_hash.setdefault(hv, set()).add(texture_identity(t))
             formats[str(t.get("Format"))] += 1
             name = t.get("Name")
             if isinstance(name, str) and name:
@@ -223,19 +244,15 @@ def census(export):
             if not isinstance(item, dict):
                 raise ValueError(f"{arc}/models: model entry {models + 1} is not an object")
             models += 1
-            emb = item.get("Embedded")
-            if isinstance(emb, dict):
-                emb = emb.get("Textures") or []
-            for t in emb if isinstance(emb, list) else []:
-                if isinstance(t, dict):
-                    emb_textures += 1
-                    k = key64(t.get("Key"))
-                    if k:
-                        emb_keys.add(k)
-                    hv, _ = stored_hash(t)
-                    if hv is not None:
-                        emb_hashes.add(hv)
-                        entries_per_hash[hv] += 1
+            for t in embedded_textures(item, arc):
+                emb_textures += 1
+                k = key64(t.get("Key"))
+                if k:
+                    emb_keys.add(k)
+                hv, _ = stored_hash(t)
+                if hv is not None:
+                    emb_hashes.add(hv)
+                    textures_per_hash.setdefault(hv, set()).add(texture_identity(t))
             for mat in objects(item.get("Materials"), f"{arc}/models Materials"):
                 for t in objects(mat.get("Textures"), f"{arc}/models material Textures"):
                     bindings += 1
@@ -253,7 +270,7 @@ def census(export):
     report["embedded"] = {"textures": emb_textures, "distinct_keys": len(emb_keys),
                           "distinct_name_hashes": len(emb_hashes)}
     report["material_name_hashes"] = dict(name_forms)
-    sources = (pool_keys, emb_keys, emb_hashes, all_dict_hashes, dict_hashes, entries_per_hash)
+    sources = (pool_keys, emb_keys, emb_hashes, all_dict_hashes, dict_hashes, textures_per_hash)
     for arc, (refs, bindings, no_key, models) in list(report["references"].items()):
         report["references"][arc] = summarise(refs, sources, bindings, no_key, models)
     report["references"]["total"] = summarise(overall_refs, sources,
@@ -267,7 +284,7 @@ def summarise(refs, sources, bindings, no_key, models):
     """Per distinct reference: an exact 64-bit key match (pool ``AssetKey`` or embedded ``Key``), else a 32-bit
     name-hash candidate (embedded or dictionary stored ``Hash``), else unresolved. The three add up to the total;
     the per-source counts below them can overlap."""
-    pool_keys, emb_keys, emb_hashes, all_dict_hashes, dict_hashes, entries_per_hash = sources
+    pool_keys, emb_keys, emb_hashes, all_dict_hashes, dict_hashes, textures_per_hash = sources
     part, source, by_dict_archive = Counter(), Counter(), Counter()
     for k, hashes in refs.items():
         hashes = {h for h in hashes if h is not None}
@@ -282,15 +299,15 @@ def summarise(refs, sources, bindings, no_key, models):
             part["exact 64-bit key"] += 1
         elif emb_cand or dict_cand:
             part["32-bit name-hash candidate only"] += 1
-            if any(entries_per_hash[h] > 1 for h in emb_cand | dict_cand) or len(emb_cand | dict_cand) > 1:
-                part["  of which ambiguous (hash on more than one entry)"] += 1
+            if any(len(textures_per_hash.get(h, ())) > 1 for h in emb_cand | dict_cand) or len(emb_cand | dict_cand) > 1:
+                part["  of which ambiguous (hash on more than one texture)"] += 1
         else:
             part["unresolved"] += 1
         if dict_cand:  # most references have no candidate: skip the per-archive loop (shdann, #4980)
             for arc, hs in dict_hashes.items():
                 if dict_cand & hs:
                     by_dict_archive[arc] += 1
-    order = ("exact 64-bit key", "32-bit name-hash candidate only", "  of which ambiguous (hash on more than one entry)",
+    order = ("exact 64-bit key", "32-bit name-hash candidate only", "  of which ambiguous (hash on more than one texture)",
              "unresolved")
     src_order = ("pool key", "embedded key", "pool and embedded key", "embedded name hash", "dictionary name hash")
     return {"models": models, "bindings": bindings, "bindings_without_key": no_key, "distinct_references": len(refs),
