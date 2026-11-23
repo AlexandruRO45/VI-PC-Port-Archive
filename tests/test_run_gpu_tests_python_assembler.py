@@ -100,6 +100,22 @@ class PythonAssemblerTests(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("--disasm-dir is not a directory", err.getvalue())
 
+    def test_replay_rejects_directory_named_like_listing(self) -> None:
+        for in_place in (False, True):
+            with self.subTest(in_place=in_place), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp) / "work"
+                source = work / "disasm" if in_place else Path(tmp) / "source"
+                listing = source / "cs_lds.s"
+                listing.mkdir(parents=True)
+                args = SimpleNamespace(assembler="python", no_validate=True, disasm_dir=str(source),
+                                       filter="cs_lds", build=str(work), require_pass=True)
+                err = io.StringIO()
+                with patch.object(sys, "stderr", err), patch.object(run_gpu_tests, "run_cmd") as launches:
+                    self.assertEqual(run_gpu_tests.run_suite(args, str(work)), 2)
+                self.assertIn("not a regular file", err.getvalue())
+                self.assertIn("cs_lds.s", err.getvalue())
+                launches.assert_not_called()
+
     def test_run_suite_reuses_existing_work_listings(self) -> None:
         listing = b"; synthetic\n\ts_endpgm\n"
         run_command = run_gpu_tests.run_cmd
