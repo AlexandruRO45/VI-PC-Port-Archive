@@ -79,7 +79,8 @@ def main():
             except ValueError:
                 ap.error(f"--lookup: {h!r} is not a hexadecimal hash")
         try:
-            with open(a.lookup[0], encoding="utf-8") as f:
+            # utf-8-sig: PowerShell 5.1 writes JSON with a UTF-8 BOM, as the other JSON readers here accept.
+            with open(a.lookup[0], encoding="utf-8-sig") as f:
                 d = json.load(f)
         except (OSError, ValueError) as e:
             print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",

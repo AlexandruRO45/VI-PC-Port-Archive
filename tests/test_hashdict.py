@@ -201,6 +201,16 @@ class LookupCLITest(unittest.TestCase):
         self.assertIn("list.json", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_lookup_reads_a_dictionary_saved_with_a_utf8_bom(self):
+        # Windows PowerShell 5.1 writes text files with a UTF-8 BOM (Set-Content, Out-File); the dictionary is
+        # still the one the user meant, as world_build.py and world_names.py already read such input.
+        bom = os.path.join(self.tmp.name, "hashes-bom.json")
+        with open(bom, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(self.mapping).encode("utf-8"))
+        p = self.run_tool("--lookup", bom, "0xb779a091")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("0xb779a091 adder", p.stdout)
+
     def test_build_rejects_a_malformed_archive_index(self):
         # #1043: a bad <carve>/<archive>/index.json is one ERROR line and exit 2, not a JSONDecodeError traceback
         for body in ("not json", "[]", '{"files": 3}', '{"other": []}'):
