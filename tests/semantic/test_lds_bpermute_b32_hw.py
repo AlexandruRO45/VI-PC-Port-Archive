@@ -455,8 +455,46 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(state.lgkm_cnt, 5)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    def test_signed_zeros_transport(self):
+        # Transports +0.0 and -0.0 without changing sign bits
+        vdata = [POS_ZERO if i % 2 == 0 else NEG_ZERO for i in range(32)]
+        for lane in range(32):
+            res = ref_ds_bpermute_b32(lane, lane * 4, vdata)
+            self.assertEqual(res, vdata[lane])
+
+    def test_infinities_transport(self):
+        vdata = [POS_INF if i % 2 == 0 else NEG_INF for i in range(32)]
+        for lane in range(32):
+            res = ref_ds_bpermute_b32(lane, lane * 4, vdata)
+            self.assertEqual(res, vdata[lane])
+
+    def test_nans_transport(self):
+        # QNAN and SNAN transported bit-identically
+        vdata = [QNAN if i % 2 == 0 else SNAN for i in range(32)]
+        for lane in range(32):
+            res = ref_ds_bpermute_b32(lane, lane * 4, vdata)
+            self.assertEqual(res, vdata[lane])
+
+    def test_subnormals_transport(self):
+        vdata = [SUBNORM_MIN if i % 2 == 0 else SUBNORM_MAX for i in range(32)]
+        for lane in range(32):
+            res = ref_ds_bpermute_b32(lane, lane * 4, vdata)
+            self.assertEqual(res, vdata[lane])
+
+    def test_translator_preserves_nan_and_subnormal_bits(self):
+        lines = [
+            "v_mov_b32_e32 v1, 0",           # lane 0
+            f"v_mov_b32_e32 v2, {QNAN:#x}",  # lane 0 has QNAN
+            "ds_bpermute_b32 v3, v1, v2",
+        ]
+        results = run_cs_bpermute(lines, 32)
+        self.assertTrue(all(v == QNAN for v in results))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
