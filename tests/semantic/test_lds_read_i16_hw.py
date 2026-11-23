@@ -259,5 +259,93 @@ class TestDSReadI16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.rf.get_vgpr(VGPR(6)), 0xFFFF8000)
 
 
+class SIMDWaveState:
+    """Wavefront state for SIMD execution (Wave32 or Wave64)."""
+
+    def __init__(
+        self,
+        wave_size: int = 32,
+        exec_mask: int = 0xFFFFFFFF,
+        lds: Optional[LDSMemory] = None,
+    ) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError("wave_size must be 32 or 64")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = exec_mask & ((1 << wave_size) - 1) if wave_size == 64 else exec_mask & MASK32
+        self.lds: LDSMemory = lds or LDSMemory()
+        self.lanes: List[RegisterFile] = [RegisterFile() for _ in range(wave_size)]
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        return bool((self.exec_mask >> lane_id) & 1)
+
+
+class SIMDDSInterpreter:
+    """SIMD interpreter executing LDS operations with EXEC masking."""
+
+    def execute(self, wave: SIMDWaveState, inst: DSReadInstruction) -> List[Tuple[int, int]]:
+        """Returns list of (lane_id, loaded_val) for executed active lanes."""
+        results = []
+        for lane_id in range(wave.wave_size):
+            if not wave.is_lane_active(lane_id):
+                continue
+            rf = wave.lanes[lane_id]
+            addr = rf.get_vgpr(inst.vaddr)
+            eff_addr = (addr + inst.offset.value) & MASK32
+            val = wave.lds.read_i16(eff_addr)
+            rf.set_vgpr(inst.vdst, val)
+            results.append((lane_id, val))
+        return results
+
+
+class TestDSReadI16SIMDDivergence(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_full_wave32(self) -> None:
+        lds = LDSMemory(num_dwords=1024)
+        for l in range(32):
+            raw = 0x8000 + l if (l % 2 == 1) else 0x1000 + l
+            lds.write_u16(l * 2, raw)
+
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        for l in range(32):
+            wave.lanes[l].set_vgpr(VGPR(1), l * 2)
+
+        inst = DSReadInstruction(DSOpcode.DS_READ_I16, vdst=VGPR(5), vaddr=VGPR(1))
+        results = SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(len(results), 32)
+        for l in range(32):
+            expected = sign_extend_i16(0x8000 + l if (l % 2 == 1) else 0x1000 + l)
+            self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), expected)
+
+    def test_simd_divergent_lanes(self) -> None:
+        lds = LDSMemory(num_dwords=1024)
+        lds.write_dword(0x40, 0xFFFF8000)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x55555555, lds=lds)
+        for l in range(32):
+            wave.lanes[l].set_vgpr(VGPR(1), 0x40)
+            wave.lanes[l].set_vgpr(VGPR(5), 0xCAFEBABE)
+
+        inst = DSReadInstruction(DSOpcode.DS_READ_I16, vdst=VGPR(5), vaddr=VGPR(1))
+        SIMDDSInterpreter().execute(wave, inst)
+        for l in range(32):
+            if l % 2 == 0:
+                self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), 0xFFFF8000)
+            else:
+                self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), 0xCAFEBABE)
+
+    def test_simd_exec_zero_neutrality(self) -> None:
+        lds = LDSMemory(num_dwords=1024)
+        lds.write_dword(0x40, 0x12345678)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)
+        for l in range(32):
+            wave.lanes[l].set_vgpr(VGPR(1), 0x40)
+            wave.lanes[l].set_vgpr(VGPR(5), 0xDEADBEEF)
+
+        inst = DSReadInstruction(DSOpcode.DS_READ_I16, vdst=VGPR(5), vaddr=VGPR(1))
+        SIMDDSInterpreter().execute(wave, inst)
+        for l in range(32):
+            self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), 0xDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
