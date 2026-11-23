@@ -80,6 +80,11 @@ indices), writes `manifest.json` with the counts and FSSM hashes, and runs `vk_h
 other names from the carve index; `--no-fit` keeps a model that is already in NDC (the sky dome is). The test is
 package-gated: without `LEONIDA_FIRST_LIGHT_DIR` it skips, and it writes its image to that folder.
 
+Where `vk_harness` comes from: `--harness <file>` first, then `LEONIDA_VK_HARNESS`, then `runtime/build/linux/vk_harness`,
+`runtime/build/windows/vk_harness.exe`, `runtime/build/vk_harness` (`vk_harness.exe` on Windows), and last a Visual
+Studio build's `RelWithDebInfo` or `Release` copy under any of those three folders. The first that is a file is used; when
+none is, the run stops and names the flag and the variable, so a harness built anywhere else needs one of them.
+
 Each run stages its pair in `<work>/first_light/dxbc` and translates it into `<work>/first_light/spirv`. Both folders
 are removed at the start of a run, so they hold that run's two shaders and nothing an earlier run selected; do not
 keep files there. The output folder (`first_light/out` or `--out`) and `<work>/shaders` are not emptied. If either
