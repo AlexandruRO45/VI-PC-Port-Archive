@@ -396,7 +396,44 @@ class TestSIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.vgprs[lane][3], 1034)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    def test_alias_dst_equals_vaddr(self):
+        # dst and vaddr share v1 (in-place gather overwriting address)
+        lines = [
+            "v_mov_b32_e32 v1, 28",         # addr = lane 7 * 4
+            "v_mad_u32_u24 v2, v0, 10, 1",  # data = 10 * lane + 1 (lane 7 has 71)
+            "ds_bpermute_b32 v1, v1, v2",
+            "v_mov_b32_e32 v3, v1",
+        ]
+        results = run_cs_bpermute(lines, 32)
+        self.assertTrue(all(v == 71 for v in results))
+
+    def test_alias_dst_equals_vdata(self):
+        # dst and vdata share v2 (in-place gather overwriting data)
+        lines = [
+            "v_mov_b32_e32 v1, 28",         # addr = lane 7 * 4
+            "v_mad_u32_u24 v2, v0, 10, 1",  # data = 10 * lane + 1 (lane 7 has 71)
+            "ds_bpermute_b32 v2, v1, v2",
+            "v_mov_b32_e32 v3, v2",
+        ]
+        results = run_cs_bpermute(lines, 32)
+        self.assertTrue(all(v == 71 for v in results))
+
+    def test_alias_all_registers_equal(self):
+        # v0 = ds_bpermute_b32 v0, v0
+        # Lane 0 has v0 = 0 (lane 0 * 4 = 0), so reads self (0)
+        lines = [
+            "v_lshlrev_b32_e32 v1, 2, v0",   # addr = lane * 4
+            "ds_bpermute_b32 v1, v1, v1",
+            "v_mov_b32_e32 v3, v1",
+        ]
+        results = run_cs_bpermute(lines, 32)
+        for lane in range(32):
+            self.assertEqual(results[lane], lane * 4)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
