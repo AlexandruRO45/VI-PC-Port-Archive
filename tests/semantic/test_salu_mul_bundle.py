@@ -524,5 +524,21 @@ class TestSMulHiU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res, 4)
         self.assertEqual(state.sgprs[2], 4)
 
+class TestSMulHiU32ConditionCodeAndSCC(unittest.TestCase):
+    def test_scc_preserved_neutral(self) -> None:
+        state = ScalarMachineState()
+        for initial_scc in (0, 1):
+            state.scc = initial_scc
+            state.write_sgpr(0, 0xFFFFFFFF)
+            state.write_sgpr(1, 0xFFFFFFFF)
+            inst = ASTInstruction(
+                Opcode.S_MUL_HI_U32,
+                ASTOperand.sgpr(2),
+                ASTOperand.sgpr(0),
+                ASTOperand.sgpr(1),
+            )
+            ScalarInterpreter().step(inst, state)
+            self.assertEqual(state.scc, initial_scc)
+
 if __name__ == "__main__":
     unittest.main()
