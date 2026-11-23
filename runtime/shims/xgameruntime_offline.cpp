@@ -286,15 +286,31 @@ const GUID kStreamingInterfaces[] = {
 
 std::mutex g_streaming_mutex;
 uint64_t g_next_token = 1;
+std::atomic<bool> g_streaming_initialized{false};
 
 // 3: HRESULT XGameStreamingInitialize()
-HRESULT STDMETHODCALLTYPE streaming_initialize(void*) { return S_OK; }
+HRESULT STDMETHODCALLTYPE streaming_initialize(void*) {
+    g_streaming_initialized = true;
+    return S_OK;
+}
 // 4: void XGameStreamingUninitialize()
-void STDMETHODCALLTYPE streaming_uninitialize(void*) {}
+void STDMETHODCALLTYPE streaming_uninitialize(void*) { g_streaming_initialized = false; }
 // 5: bool XGameStreamingIsStreaming(): no client is ever connected.
 bool STDMETHODCALLTYPE streaming_is_streaming(void*) { return false; }
 // 9: uint32_t XGameStreamingGetClientCount()
 uint32_t STDMETHODCALLTYPE streaming_client_count(void*) { return 0; }
+// 10: HRESULT XGameStreamingGetClients(uint32_t clientCount, XGameStreamingClientId* clients, uint32_t* clientsUsed)
+HRESULT STDMETHODCALLTYPE streaming_get_clients(void*, uint32_t, uint64_t*, uint32_t* used) {
+    if (!used) return E_INVALIDARG;
+    *used = 0;
+    return g_streaming_initialized ? S_OK : E_GAMESTREAMING_NOT_INITIALIZED;
+}
+// 25: HRESULT XGameStreamingUpdateTouchControlsState(size_t operationCount, const ...Operation* operations)
+// 27: HRESULT XGameStreamingShowTouchControlsWithStateUpdate(const char* layout, size_t operationCount, ...)
+// Both go to every connected client: none, so nothing to do.
+HRESULT STDMETHODCALLTYPE streaming_all_clients(void*) {
+    return g_streaming_initialized ? S_OK : E_GAMESTREAMING_NOT_INITIALIZED;
+}
 
 // 12: HRESULT XGameStreamingRegisterConnectionStateChanged(XTaskQueueHandle queue, void* context,
 //        XGameStreamingConnectionStateChangedCallback* callback, XTaskQueueRegistrationToken* token)
@@ -338,7 +354,7 @@ const void* const kStreamingVtable[] = {
     FN(streaming_unregister),              // 7  XGameStreamingUnregisterClientPropertiesChanged
     FN(client_not_connected<8>),           // 8  XGameStreamingGetStreamPhysicalDimensions
     FN(streaming_client_count),            // 9  XGameStreamingGetClientCount
-    FN(client_not_connected<10>),          // 10 XGameStreamingGetClients
+    FN(streaming_get_clients),             // 10 XGameStreamingGetClients
     FN(streaming_connection_state),        // 11 XGameStreamingGetConnectionState
     FN(streaming_register_connection),     // 12 XGameStreamingRegisterConnectionStateChanged
     FN(streaming_unregister),              // 13 XGameStreamingUnregisterConnectionStateChanged
@@ -353,9 +369,9 @@ const void* const kStreamingVtable[] = {
     FN(client_not_connected<22>),          // 22 XGameStreamingGetLastFrameDisplayed
     FN(client_not_connected<23>),          // 23 XGameStreamingGetAssociatedFrame
     FN(client_not_connected<24>),          // 24 XGameStreamingGetGamepadPhysicality
-    FN(client_not_connected<25>),          // 25 XGameStreamingUpdateTouchControlsState
+    FN(streaming_all_clients),             // 25 XGameStreamingUpdateTouchControlsState
     FN(client_not_connected<26>),          // 26 XGameStreamingUpdateTouchControlsStateOnClient
-    FN(client_not_connected<27>),          // 27 XGameStreamingShowTouchControlsWithStateUpdate
+    FN(streaming_all_clients),             // 27 XGameStreamingShowTouchControlsWithStateUpdate
     FN(client_not_connected<28>),          // 28 XGameStreamingShowTouchControlsWithStateUpdateOnClient
     FN(client_not_connected<29>),          // 29 XGameStreamingGetTouchBundleVersionNameSize
     FN(client_not_connected<30>),          // 30 XGameStreamingGetTouchBundleVersion

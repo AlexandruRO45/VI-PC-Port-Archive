@@ -289,9 +289,12 @@ The executable's first boot confirms them, or names the slots that differ.
   web authentication, invites, state share) fails before starting (`E_FAIL`); the docs' unnamed slots and the
   PC-hosted UI callbacks of `IXGameUiImpl4` answer `E_NOTIMPL`.
 - **Streaming:** never streamed. `XGameStreamingInitialize` succeeds, `XGameStreamingIsStreaming` is false, there
-  are no clients, and the connection-state registration hands out a token that never fires. Every per-client slot
-  answers `E_GAMESTREAMING_NOT_INITIALIZED` (0x89245400), which a caller reading a bool sees as false (low byte
-  0).
+  are no clients, and the connection-state registration hands out a token that never fires. Once initialized,
+  `XGameStreamingGetClients` returns `S_OK` with none, and the touch-control state updates sent to every client
+  (`XGameStreamingUpdateTouchControlsState`, `XGameStreamingShowTouchControlsWithStateUpdate`) succeed with none to
+  reach; before `XGameStreamingInitialize` (or after `XGameStreamingUninitialize`) they answer
+  `E_GAMESTREAMING_NOT_INITIALIZED` (0x89245400). Every per-client slot answers that too, which a caller reading a
+  bool sees as false (low byte 0).
 - **ASSUMPTION:** the parameter lists of `XGameUiShowMessageDialogAsync` and
   `XGameStreamingRegisterConnectionStateChanged`, from the GDK reference, not re-checked against the executable.
 

@@ -55,6 +55,12 @@ using NoArgs = HRESULT(STDMETHODCALLTYPE*)(void*);
 using Bool = bool(STDMETHODCALLTYPE*)(void*);
 using Count = uint32_t(STDMETHODCALLTYPE*)(void*);
 using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+using GetClients = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint64_t*, uint32_t*);
+using TouchState = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, const void*);
+using ShowWithState = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, size_t, const void*);
+using Void = void(STDMETHODCALLTYPE*)(void*);
+
+constexpr HRESULT E_GAMESTREAMING_NOT_INITIALIZED = static_cast<HRESULT>(0x89245400);
 
 using TryHdr = uint32_t(STDMETHODCALLTYPE*)(void*, uint32_t, float*);
 using FindUser = HRESULT(STDMETHODCALLTYPE*)(void*, const uint8_t*, void**);
@@ -127,7 +133,26 @@ int main() {
               query(&kStreamingClass, kStreamingImpl3, &streaming3) == S_OK && streaming3 == streaming,
           "XGameStreamingImpl for its class id and IXGameStreamingImpl3");
     if (!streaming) return 1;
+    uint64_t clients[4] = {};
+    uint32_t used_clients = 99;
+    check(at<GetClients>(streaming, 10)(streaming, 4, clients, &used_clients) == E_GAMESTREAMING_NOT_INITIALIZED &&
+              at<TouchState>(streaming, 25)(streaming, 0, nullptr) == E_GAMESTREAMING_NOT_INITIALIZED,
+          "before XGameStreamingInitialize, GetClients and UpdateTouchControlsState are not initialized");
     check(at<NoArgs>(streaming, 3)(streaming) == S_OK, "XGameStreamingInitialize succeeds");
+    used_clients = 99;
+    check(at<GetClients>(streaming, 10)(streaming, 4, clients, &used_clients) == S_OK && used_clients == 0,
+          "XGameStreamingGetClients: S_OK, no clients");
+    used_clients = 99;
+    check(at<GetClients>(streaming, 10)(streaming, 0, nullptr, &used_clients) == S_OK && used_clients == 0 &&
+              at<GetClients>(streaming, 10)(streaming, 4, clients, nullptr) == E_INVALIDARG,
+          "a zero-sized buffer is enough; a null clientsUsed is refused");
+    check(at<TouchState>(streaming, 25)(streaming, 0, nullptr) == S_OK &&
+              at<ShowWithState>(streaming, 27)(streaming, nullptr, 0, nullptr) == S_OK,
+          "touch-control state for every client succeeds with none connected");
+    at<Void>(streaming, 4)(streaming);
+    check(at<GetClients>(streaming, 10)(streaming, 4, clients, &used_clients) == E_GAMESTREAMING_NOT_INITIALIZED,
+          "after XGameStreamingUninitialize, GetClients is not initialized again");
+    check(at<NoArgs>(streaming, 3)(streaming) == S_OK, "XGameStreamingInitialize again");
     check(!at<Bool>(streaming, 5)(streaming), "XGameStreamingIsStreaming is false");
     check(at<Count>(streaming, 9)(streaming) == 0, "no streaming clients");
     check(at<Count>(streaming, 11)(streaming) == 0, "the connection state is the first enumerator");
@@ -135,7 +160,7 @@ int main() {
     check(at<Register>(streaming, 12)(streaming, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == S_OK &&
               token.token != 0 && at<Bool>(streaming, 13)(streaming),
           "connection-state registration hands out a token; unregistering is never pending");
-    check(FAILED(at<NoArgs>(streaming, 10)(streaming)) && !at<Bool>(streaming, 21)(streaming),
+    check(FAILED(at<NoArgs>(streaming, 8)(streaming)) && !at<Bool>(streaming, 21)(streaming),
           "a per-client call fails as an HRESULT and reads false as a bool");
 
     // ---- XDisplay ----
