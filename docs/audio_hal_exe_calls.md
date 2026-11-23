@@ -60,8 +60,8 @@ with a result queue, connected once and torn down once. How `chad.dll`'s handle 
 | `XGSuggestSwizzleMode` | 2 | not read further |
 | `DStorageGetFactory` | 1 | the first argument is the address of a constant (an interface id) and the second the address of a global; the global is loaded afterwards and tested for null |
 
-`DStorageGetFactory` has the shape of the public DirectStorage function `DStorageGetFactory(REFIID, void**)`. #4348 is an
-open pull request for it.
+`DStorageGetFactory` has the shape of the public DirectStorage function `DStorageGetFactory(REFIID, void**)`. #8461 is an
+open pull request for it (takeover of closed #4348).
 
 ## What the executable already does about a failure
 
