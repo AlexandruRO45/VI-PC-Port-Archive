@@ -33,7 +33,7 @@ between streams that did not inflate, not empty space.
 ## What each archive is
 
 | Archive | Byte-dominant payload | Models | Maps | Scripts |
-|---|---|---|---:|---:|---:|
+|---|---|---|---:|---:|
 | `core_restofworld` | Bink 2 video, 95.8% of the data span; 958 streams start with a graphics block, 13 more contain one later, and 924 system pages carry model names | 37 decoded in the existing manifest; 433 unique name strings measured here | 0 | 0 |
 | `story000_restofworld` | Bink 2 video 60.6% of the data span, then system pages and 101 `0DRP` metadata resources | 1 page with 3 `.#dr` strings; no decoded model | 0 | 0 |
 | `story000_script` | `PSIN` metadata, 79.2% of inflated bytes | 0 | 0 | 0 validated container |
