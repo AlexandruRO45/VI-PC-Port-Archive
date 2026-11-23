@@ -2882,8 +2882,10 @@ class Gen:
         fcmp = kind == "fcmpswap"           # float compare: see float_cmpswap_loop
         if (kind not in self.BUF_ATOMICS and not is_inc_dec and not fcmp) or "x2" in kind:
             raise Unsupported(op)
+        if any(m in mods for m in ("lds", "tfe")):
+            raise Unsupported(op + " form")
         vd = a[0]
-        if is_inc_dec and (vd["k"] != "vgpr" or vd.get("n", 1) != 1):
+        if vd["k"] != "vgpr" or vd.get("n", 1) != (2 if kind in ("cmpswap", "fcmpswap") else 1):
             raise Unsupported(op + " data")
         addr, _, in_b, _ = self.buffer_address(a, mods)
         val = self.load_reg("vgpr", vd["r"])
@@ -2927,7 +2929,7 @@ class Gen:
         the shared OpAtomicCompareExchange + GLSL.std.450 NMin/NMax CAS loop (no float-atomic extension needed).
         Enforces V# bounds and 4-byte natural alignment; with glc returns the old word (0 when OOB/unaligned,
         preserved when inactive)."""
-        if "lds" in mods:
+        if any(m in mods for m in ("lds", "tfe")):
             raise Unsupported(op + " form")
         vd = a[0]
         if vd["k"] != "vgpr" or vd.get("n", 1) != 1:
@@ -2951,6 +2953,8 @@ class Gen:
         between them could be seen half done. Measured natively on RDNA2 (gfx1036, wave32 & wave64): the bounds check
         covers the whole 8-byte element all or nothing (fixed_fmt=62) and addresses with (addr & 7) != 0 are dropped
         (memory untouched, active glc returns (0, 0), inactive preserves vdata)."""
+        if any(m in mods for m in ("lds", "tfe")):
+            raise Unsupported(op + " form")
         vd = a[0]
         if vd["k"] != "vgpr" or vd.get("n", 1) != 2:
             raise Unsupported(op + " data")
