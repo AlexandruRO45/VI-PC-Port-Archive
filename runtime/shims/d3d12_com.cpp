@@ -1034,11 +1034,8 @@ private:
             UINT64 end = r.Range.End;
             if (dep_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
                 if (r.Subresource != 0) return check(false);
-                if (begin == 0 && end == UINT64_MAX) {
-                    end = dep_desc.Width;
-                } else if (begin >= end || end > dep_desc.Width) {
+                if (begin >= end || (end != UINT64_MAX && end > dep_desc.Width))
                     return check(false);
-                }
             } else {
                 const UINT total_subresources = subresource_count(dep_desc);
                 if (r.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && r.Subresource >= total_subresources)

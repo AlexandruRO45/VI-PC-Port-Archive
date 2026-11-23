@@ -485,7 +485,8 @@ struct WriteImmediate {
     std::uint32_t mode;
 };
 
-// D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource.
+// D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource
+// (end == UINT64_MAX is the D3D12 sentinel meaning through the end of the subresource).
 struct DependentRange {
     ResourceId resource;
     std::uint32_t subresource;
