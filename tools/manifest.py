@@ -199,6 +199,8 @@ def load_manifest(manifest: str) -> dict:
             doc = json.load(f, object_pairs_hook=_reject_duplicate_keys)
         except ValueError as error:  # JSONDecodeError, duplicate keys, or UnicodeDecodeError for non-UTF-8
             raise ManifestError(f"{manifest} is not valid JSON ({error}); create it again") from None
+        except RecursionError:
+            raise ManifestError(f"{manifest} is not valid JSON: nesting is too deep") from None
     files = doc.get("files") if isinstance(doc, dict) else None
     if not isinstance(files, dict):
         raise ManifestError(f"{manifest} has no \"files\" table; create it again")

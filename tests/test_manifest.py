@@ -426,6 +426,7 @@ class ManifestCliTest(unittest.TestCase):
                 f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "{"0" * 64}"}}}}, '
                 f'"files": {{"sample.dat": {{"size": 22, "sha256": "{good_hash}"}}}}}}'
             ).encode(),
+            "deeply_nested": ("[" * 100000 + "]" * 100000).encode(),
         }
         for name, data in damaged.items():
             with self.subTest(name=name):
