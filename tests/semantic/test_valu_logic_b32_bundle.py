@@ -360,3 +360,52 @@ class TestOrB32ASTAndScalar(unittest.TestCase):
             "v_or_b32 v0, v0, v1",
         ])
         self.assertEqual(val_inplace, 0x00FFFF00)
+
+
+# ------------------------------------------------------------------------------
+# v_or_b32 SIMD Divergence & Multi-Lane Properties
+# ------------------------------------------------------------------------------
+
+def step_or_simd(wave: SIMDWaveLogic, insn: VOrB32Instruction):
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.vgprs[insn.src0.index][lane]
+            s1 = wave.vgprs[insn.src1.index][lane]
+            wave.vgprs[insn.dst.index][lane] = ref_or_b32(s0, s1)
+
+
+class TestOrB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveLogic(wave_size=32)
+        for i in range(32):
+            wave.vgprs[1][i] = 1 << i
+            wave.vgprs[2][i] = 0x8000_0000
+            wave.vgprs[0][i] = 0
+
+        insn = VOrB32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        step_or_simd(wave, insn)
+
+        val_lane0, _ = run_shader("ps_or_lane0", [
+            "v_mov_b32 v1, 1",
+            "v_mov_b32 v2, 0x80000000",
+            "v_or_b32 v0, v1, v2",
+        ])
+        self.assertEqual(wave.vgprs[0][0], val_lane0)
+        self.assertEqual(val_lane0, 0x8000_0001)
+
+    def test_algebraic_properties_hardware(self):
+        val_ab, _ = run_shader("ps_or_comm_ab", [
+            "v_mov_b32 v1, 0x0F0F0000",
+            "v_mov_b32 v2, 0x0000F0F0",
+            "v_or_b32 v0, v1, v2",
+        ])
+        val_ba, _ = run_shader("ps_or_comm_ba", [
+            "v_mov_b32 v1, 0x0F0F0000",
+            "v_mov_b32 v2, 0x0000F0F0",
+            "v_or_b32 v0, v2, v1",
+        ])
+        self.assertEqual(val_ab, val_ba)
