@@ -908,7 +908,10 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    if (vkCreateInstance(&ici, nullptr, &inst)) return 1;
+    if (VkResult r = vkCreateInstance(&ici, nullptr, &inst); r != VK_SUCCESS) {
+        std::fprintf(stderr, "vkCreateInstance failed (%d)\n", r);
+        return 1;
+    }
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceProperties2);
     LOADI(vkGetDeviceProcAddr); LOADI(vkEnumerateDeviceExtensionProperties); LOADI(vkGetPhysicalDeviceFeatures2);
