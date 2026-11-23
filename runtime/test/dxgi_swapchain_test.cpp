@@ -1228,6 +1228,9 @@ int main() {
             return fail("Output::GetParent did not return parent adapter");
         out_parent->Release();
 
+        // IDXGIObject private data on an output, as on the factory, adapter and swapchain.
+        if (const char* step = check_private_data(out0)) return fail(step);
+
         if (out0->GetDesc(nullptr) != E_INVALIDARG) return fail("Output::GetDesc(nullptr) should return E_INVALIDARG");
         DXGI_OUTPUT_DESC od{};
         if (FAILED(out0->GetDesc(&od)) || od.DeviceName[0] == L'\0' || !od.AttachedToDesktop ||
