@@ -267,7 +267,176 @@ int main() {
         bad_nt->FileHeader.NumberOfSections = 100;
         check(!hook_image_calls(bad, 0x100, &remap_lucia, 0).ok,
               "section table extending past SizeOfImage is refused");
+
+        // Test E.1: out-of-bounds and end-straddling e_lfanew / section table on a 0x1000-byte allocation.
+        std::memset(bad, 0, 0x1000);
+        bad_dos->e_magic = IMAGE_DOS_SIGNATURE;
+        bad_dos->e_lfanew = 0x1000;
+        check(!hook_image_calls(bad, 0x200, &remap_lucia, 0).ok,
+              "e_lfanew == 0x1000 past a 0x1000 allocation is refused by hook_image_calls");
+        check(!hook_image_results(bad, 0x200, first_person_on_foot).ok,
+              "e_lfanew == 0x1000 past a 0x1000 allocation is refused by hook_image_results");
+
+        bad_dos->e_lfanew = 0x40000000;
+        check(!hook_image_calls(bad, 0x200, &remap_lucia, 0).ok,
+              "e_lfanew == 0x40000000 is refused without dereferencing unmapped memory");
+        check(!hook_image_results(bad, 0x200, first_person_on_foot).ok,
+              "e_lfanew == 0x40000000 is refused by hook_image_results");
+
+        std::memset(bad, 0, 0x1000);
+        bad_dos->e_magic = IMAGE_DOS_SIGNATURE;
+        bad_dos->e_lfanew = 0x0FF0;
+        const DWORD pe_sig = IMAGE_NT_SIGNATURE;
+        std::memcpy(bad + 0x0FF0, &pe_sig, sizeof(pe_sig));
+        check(!hook_image_calls(bad, 0x200, &remap_lucia, 0).ok,
+              "IMAGE_NT_HEADERS64 straddling the end of the allocation is refused");
+        check(!hook_image_results(bad, 0x200, first_person_on_foot).ok,
+              "IMAGE_NT_HEADERS64 straddling the end of the allocation is refused by hook_image_results");
+
+        std::memset(bad, 0, 0x1000);
+        bad_dos->e_magic = IMAGE_DOS_SIGNATURE;
+        bad_dos->e_lfanew = 0x0E00;
+        auto* tail_nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(bad + 0x0E00);
+        tail_nt->Signature = IMAGE_NT_SIGNATURE;
+        tail_nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        tail_nt->FileHeader.NumberOfSections = 20;  // section table extends past 0x1000 allocation
+        tail_nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+        tail_nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        tail_nt->OptionalHeader.SizeOfImage = 0x4000;
+        check(!hook_image_calls(bad, 0x1000, &remap_lucia, 0).ok,
+              "section table extending past the mapped allocation is refused");
         VirtualFree(bad, 0, MEM_RELEASE);
+    }
+
+    // Test E.2: SizeOfImage larger than the actual allocation, with an executable section in unmapped pages.
+    uint8_t* img_e = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 0x2000);
+    check(img_e != nullptr, "synthetic PE64 image E allocated near module");
+    if (img_e) {
+        std::memset(img_e, 0, 0x2000);
+        IMAGE_SECTION_HEADER sec_mapped{};
+        std::memcpy(sec_mapped.Name, ".text", 5);
+        sec_mapped.Misc.VirtualSize = 0x200;
+        sec_mapped.VirtualAddress = 0x1000;
+        sec_mapped.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
+        IMAGE_SECTION_HEADER sec_unmapped{};
+        std::memcpy(sec_unmapped.Name, ".text2", 6);
+        sec_unmapped.Misc.VirtualSize = 0x1000;
+        sec_unmapped.VirtualAddress = 0x2000;  // outside the 0x2000-byte allocation
+        sec_unmapped.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
+        init_pe64(img_e, 0x10000, {sec_mapped, sec_unmapped});
+        put(img_e + 0x1000, {0x89, 0xC8, 0xC3});
+        caller(img_e + 0x1020, img_e + 0x1000);
+        uint8_t caller_e_before[16];
+        std::memcpy(caller_e_before, img_e + 0x1020, sizeof(caller_e_before));
+
+        const HookResult re1 = hook_image_calls(img_e, 0x2000, &remap_lucia, 0);
+        check(!re1.ok && std::strcmp(re1.error, "executable section is not mapped") == 0,
+              "target RVA inside an unmapped executable section is refused cleanly");
+        const HookResult re2 = hook_image_calls(img_e, 0x1000, &remap_lucia, 0);
+        check(!re2.ok && std::strcmp(re2.error, "executable section is not mapped") == 0,
+              "image with any unmapped executable section is refused before patching");
+        check(std::memcmp(img_e + 0x1020, caller_e_before, sizeof(caller_e_before)) == 0,
+              "mapped caller is left untouched when another executable section is unmapped");
+        VirtualFree(img_e, 0, MEM_RELEASE);
+    }
+
+    // Test F: when zero branches match the target RVA, the allocated 4 KiB thunk page is freed instead of leaked.
+    uint8_t* img_f = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 0x2000);
+    check(img_f != nullptr, "synthetic PE64 image F allocated near module");
+    if (img_f) {
+        std::memset(img_f, 0x90, 0x2000);
+        std::memset(img_f, 0, 0x400);
+        IMAGE_SECTION_HEADER sec_f{};
+        std::memcpy(sec_f.Name, ".text", 5);
+        sec_f.Misc.VirtualSize = 0x200;
+        sec_f.VirtualAddress = 0x1000;
+        sec_f.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
+        init_pe64(img_f, 0x2000, {sec_f});
+        put(img_f + 0x1000, {0x89, 0xC8, 0xC3});  // target with zero callers
+        FlushInstructionCache(GetCurrentProcess(), img_f + 0x1000, 0x200);
+
+        uint8_t* recorded_thunk = nullptr;
+        const HookResult rf = redirect_image_calls(img_f, 0x1000, [&](uint8_t* target) {
+            recorded_thunk = make_remap_thunk(target, 0, &remap_lucia, target);
+            return recorded_thunk;
+        });
+        check(recorded_thunk != nullptr, "thunk was created before scanning for callers");
+        check(rf.ok && rf.redirected == 0, "zero-caller hook succeeds with redirected == 0");
+        if (recorded_thunk) {
+            MEMORY_BASIC_INFORMATION thunk_mbi{};
+            check(VirtualQuery(recorded_thunk, &thunk_mbi, sizeof(thunk_mbi)) != 0 && thunk_mbi.State == MEM_FREE,
+                  "unused thunk page is released when redirected == 0");
+        }
+        const HookResult rf2 = hook_image_calls(img_f, 0x1000, &remap_lucia, 0);
+        check(rf2.ok && rf2.redirected == 0, "hook_image_calls succeeds cleanly with zero callers");
+        const HookResult rf3 = hook_image_results(img_f, 0x1000, first_person_on_foot);
+        check(rf3.ok && rf3.redirected == 0, "hook_image_results succeeds cleanly with zero callers");
+        VirtualFree(img_f, 0, MEM_RELEASE);
+    }
+
+    // Test G: rel32_reaches exact signed boundaries, 64-bit wide gaps, alloc_near_range, and unreachable thunk refusal.
+    {
+        const uintptr_t ip = 0x100000000ULL;
+        check(rel32_reaches(ip, ip), "rel32_reaches accepts zero displacement");
+        check(rel32_reaches(ip, ip + 0x7FFFFFFFULL), "rel32_reaches accepts +INT32_MAX (+2147483647)");
+        check(!rel32_reaches(ip, ip + 0x80000000ULL), "rel32_reaches rejects INT32_MAX + 1");
+        check(rel32_reaches(ip, ip - 0x80000000ULL), "rel32_reaches accepts INT32_MIN (-2147483648)");
+        check(!rel32_reaches(ip, ip - 0x80000001ULL), "rel32_reaches rejects INT32_MIN - 1");
+        check(!rel32_reaches(0x1000ULL, 0x800000000000ULL), "rel32_reaches rejects +128 TiB gap without overflow");
+        check(!rel32_reaches(0x800000000000ULL, 0x1000ULL), "rel32_reaches rejects -128 TiB gap without overflow");
+        check(!rel32_reaches(0x1000ULL, 0xFFFFFFFFFFFFF000ULL),
+              "rel32_reaches rejects near-UINT64_MAX gap without two's-complement wraparound");
+        check(!rel32_reaches(0xFFFFFFFFFFFFF000ULL, 0x1000ULL),
+              "rel32_reaches rejects reverse near-UINT64_MAX gap without wraparound");
+
+        check(alloc_near_range(ip + 0x1000ULL, ip, 4096) == nullptr, "alloc_near_range rejects inverted bounds");
+        check(alloc_near_range(ip, ip + 0x100000000ULL, 4096) == nullptr,
+              "alloc_near_range rejects > 4 GiB span that no single rel32 target can reach");
+
+        const uintptr_t anchor = reinterpret_cast<uintptr_t>(&remap_lucia);
+        uint8_t* ranged = alloc_near_range(anchor, anchor + 0x02000000ULL, 4096);
+        check(ranged != nullptr, "alloc_near_range allocates near a 32 MiB executable span");
+        if (ranged) {
+            const uintptr_t ranged_addr = reinterpret_cast<uintptr_t>(ranged);
+            check(rel32_reaches(anchor, ranged_addr) && rel32_reaches(anchor + 0x02000000ULL, ranged_addr),
+                  "alloc_near_range result reaches both ends of the requested span");
+            VirtualFree(ranged, 0, MEM_RELEASE);
+        }
+    }
+
+    uint8_t* img_g = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 0x2000);
+    check(img_g != nullptr, "synthetic PE64 image G allocated near module");
+    if (img_g) {
+        std::memset(img_g, 0, 0x2000);
+        IMAGE_SECTION_HEADER sec_g{};
+        std::memcpy(sec_g.Name, ".text", 5);
+        sec_g.Misc.VirtualSize = 0x200;
+        sec_g.VirtualAddress = 0x1000;
+        sec_g.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
+        init_pe64(img_g, 0x2000, {sec_g});
+        put(img_g + 0x1000, {0x89, 0xC8, 0xC3});
+        caller(img_g + 0x1020, img_g + 0x1000);
+        uint8_t caller_g_before[16];
+        std::memcpy(caller_g_before, img_g + 0x1020, sizeof(caller_g_before));
+
+        uint8_t* far_thunk = nullptr;
+        const uintptr_t img_g_addr = reinterpret_cast<uintptr_t>(img_g);
+        for (uintptr_t off = 0x100000000ULL; off < 0x200000000ULL && !far_thunk; off += 0x100000ULL) {
+            const uintptr_t hint = (img_g_addr + off) & ~uintptr_t(0xFFFFu);
+            far_thunk = static_cast<uint8_t*>(
+                VirtualAlloc(reinterpret_cast<void*>(hint), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READ));
+        }
+        check(far_thunk != nullptr, "allocated far thunk > 4 GiB from image G");
+        if (far_thunk) {
+            const HookResult rg = redirect_image_calls(img_g, 0x1000, [&](uint8_t*) { return far_thunk; });
+            check(!rg.ok && rg.redirected == 0, "redirect_image_calls refuses a thunk outside rel32 reach");
+            check(std::memcmp(img_g + 0x1020, caller_g_before, sizeof(caller_g_before)) == 0,
+                  "unreachable thunk leaves callers unpatched");
+            MEMORY_BASIC_INFORMATION far_mbi{};
+            check(VirtualQuery(far_thunk, &far_mbi, sizeof(far_mbi)) != 0 && far_mbi.State == MEM_FREE,
+                  "unreachable thunk page is freed on refusal");
+        }
+        VirtualFree(img_g, 0, MEM_RELEASE);
     }
 
     if (img_a) {
