@@ -11,6 +11,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import fssm_header  # noqa: E402
@@ -315,6 +316,18 @@ class CliTests(unittest.TestCase):
             self.assertNotIn(".s", blob)
             self.assertNotIn("ps_w64a", blob)
             self.assertIn("v_mbcnt_hi_u32_b32", blob)
+
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            out = os.path.join(tmp, "report.json")
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(scan, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    scan.write_json_report(out, {"per_stage": {}})
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

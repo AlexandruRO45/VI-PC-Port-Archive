@@ -30,18 +30,23 @@ Quad ops and `ds_swizzle`/`ds_bpermute` are left out on purpose: quads never cro
 translator models the permute ops per 32-lane half, matching hardware.
 
 Standard library only. Nothing from the game is printed or written: counts only — names, code and data stay in
-the work folder.
+the work folder. `--out` is published through a staged temp file so a mid-write failure leaves any previous
+complete report.
 Usage: `python -I tools/wave64_graphics_scan.py --help` lists the options.
 """
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import fssm_header  # noqa: E402
 import rdna2spirv  # noqa: E402  (same directory; WAVE64_RE, stage_of, base_op)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
 
@@ -187,10 +192,45 @@ def main(argv=None) -> int:
     o = report["other_stages"]
     print("other stages: %d shaders, %d wave64 (not counted)" % (o["shaders"], o["wave64"]))
     if args.out:
-        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        write_json_report(args.out, report)
         print("wrote %s" % args.out)
     return 0
+
+
+def write_json_report(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination.
+
+    Parent directories are not created: main() already requires the output folder to exist.
+    """
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".wave64_graphics_scan-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
