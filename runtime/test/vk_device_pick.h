@@ -90,6 +90,19 @@ inline int report_no_device(const std::vector<VkPhysicalDeviceProperties>& candi
     return 77;
 }
 
+// What a tool does with a failed vkCreateInstance: a loader or driver older than the apiVersion the tool asked for
+// may answer VK_ERROR_INCOMPATIBLE_DRIVER (as no ICD does), which is a machine that cannot run the test: print why and
+// return 77 (a skip). Any other result is a failure, 1.
+inline int report_instance_failure(VkResult result) {
+    if (result == VK_ERROR_INCOMPATIBLE_DRIVER) {
+        std::fprintf(stderr, "unsupported: vkCreateInstance -> VK_ERROR_INCOMPATIBLE_DRIVER (no Vulkan driver for the "
+                             "version the tool asks for)\n");
+        return 77;
+    }
+    std::fprintf(stderr, "FAILED vkCreateInstance -> %d\n", int(result));
+    return 1;
+}
+
 // A Vulkan 1.0 instance has no core 1.1 entry points: vkGetPhysicalDeviceFeatures2 and vkGetPhysicalDeviceProperties2
 // come back null from vkGetInstanceProcAddr, and calling one crashes. Prints why and returns 77 (a skip).
 inline int report_no_core11_entry_points() {

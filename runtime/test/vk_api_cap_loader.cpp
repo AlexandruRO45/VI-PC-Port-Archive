@@ -2,7 +2,9 @@
 // against a Vulkan 1.0 or 1.1 instance on a machine whose GPU is newer (TEST-1110).
 //
 //   LEONIDA_VK_API_CAP=1.0|1.1|1.2   the version to pretend (default: 1.0)
-//   LEONIDA_VK_REAL_LOADER=<path>    the real loader (default: libvulkan.so.1 from the system paths)
+//   LEONIDA_VK_REAL_LOADER=<path>    the real loader (default: libvulkan.so.1 in the usual library directories)
+//   LEONIDA_VK_API_CAP_REJECT=1      vkCreateInstance fails with VK_ERROR_INCOMPATIBLE_DRIVER when the tool asks for
+//                                    more than the cap, as a loader or driver that old does (default: ask for the cap)
 //
 // Put the directory of this library first on LD_LIBRARY_PATH: the tools dlopen("libvulkan.so.1") and take
 // vkGetInstanceProcAddr from it. Every call goes on to the real loader (and to the layers, such as
@@ -24,12 +26,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace {
 
 PFN_vkGetInstanceProcAddr real_gipa = nullptr;
 VkInstance last_instance = VK_NULL_HANDLE;
 std::uint32_t cap = VK_API_VERSION_1_0;
+bool reject_higher = false;
 
 void init() {
     if (real_gipa) return;
@@ -37,10 +41,22 @@ void init() {
         if (!std::strcmp(v, "1.1")) cap = VK_API_VERSION_1_1;
         else if (!std::strcmp(v, "1.2")) cap = VK_API_VERSION_1_2;
     }
-    const char* path = std::getenv("LEONIDA_VK_REAL_LOADER");
-    void* library = dlopen(path && *path ? path : "/usr/lib/x86_64-linux-gnu/libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (const char* reject = std::getenv("LEONIDA_VK_API_CAP_REJECT")) reject_higher = *reject && *reject != '0';
+    // dlopen("libvulkan.so.1") would find this library again (it is first on LD_LIBRARY_PATH), so name the directories.
+    static const char* const directories[] = {"/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64",
+                                              "/usr/lib", "/lib/x86_64-linux-gnu", "/lib64", "/usr/local/lib"};
+    void* library = nullptr;
+    if (const char* path = std::getenv("LEONIDA_VK_REAL_LOADER"); path && *path) {
+        library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    } else {
+        for (const char* directory : directories) {
+            const std::string candidate = std::string(directory) + "/libvulkan.so.1";
+            if ((library = dlopen(candidate.c_str(), RTLD_NOW | RTLD_LOCAL))) break;
+        }
+    }
     if (!library) {
-        std::fprintf(stderr, "vk_api_cap_loader: cannot load the real loader: %s\n", dlerror());
+        std::fprintf(stderr, "vk_api_cap_loader: cannot load the real loader (set LEONIDA_VK_REAL_LOADER): %s\n",
+                     dlerror());
         std::exit(1);
     }
     real_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
@@ -50,6 +66,7 @@ VKAPI_ATTR VkResult VKAPI_CALL capped_create_instance(const VkInstanceCreateInfo
                                                       VkInstance* instance) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     if (info->pApplicationInfo) app = *info->pApplicationInfo;
+    if (reject_higher && app.apiVersion > cap) return VK_ERROR_INCOMPATIBLE_DRIVER;
     if (app.apiVersion == 0 || app.apiVersion > cap) app.apiVersion = cap;
     VkInstanceCreateInfo changed = *info;
     changed.pApplicationInfo = &app;

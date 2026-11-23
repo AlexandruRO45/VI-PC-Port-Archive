@@ -31,13 +31,15 @@ struct SubgroupSizeCaps {
 };
 
 // Fills the limits of `caps` from vkGetPhysicalDeviceProperties2 and sets the two feature flags from what the
-// caller enables. Returns false when the device reports no subgroup size at all.
+// caller enables. size_control_known false leaves the 1.3 subgroup size control structure out of the query (a device
+// below Vulkan 1.3, without the extension enabled, does not know it): the size range then stays 0. Returns false when the device reports no subgroup size at all.
 template <class GetProperties2>
 bool query_subgroup_size_caps(GetProperties2 get_properties2, VkPhysicalDevice physical, bool enable_size_control,
-                              bool enable_full_subgroups, SubgroupSizeCaps& caps) {
+                              bool enable_full_subgroups, SubgroupSizeCaps& caps, bool size_control_known = true) {
     VkPhysicalDeviceSubgroupSizeControlProperties control{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
-    VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &control};
+    VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+                                                size_control_known ? &control : nullptr};
     VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
     get_properties2(physical, &properties);
     caps = {};

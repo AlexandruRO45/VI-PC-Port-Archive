@@ -160,7 +160,8 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    if (const VkResult created = vkCreateInstance(&ici, nullptr, &inst); created != VK_SUCCESS)
+        return leonida::vk_test::report_instance_failure(created);
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceProperties2); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
@@ -180,7 +181,8 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
-    subgroup.pNext = &sgProps;
+    // The subgroup size control structure is core in 1.3 only (the extension is not enabled): unknown below.
+    if (props.apiVersion >= VK_API_VERSION_1_3) subgroup.pNext = &sgProps;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &subgroup;
     vkGetPhysicalDeviceProperties2(pd, &props2);

@@ -908,7 +908,8 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    if (vkCreateInstance(&ici, nullptr, &inst)) return 1;
+    if (const VkResult created = vkCreateInstance(&ici, nullptr, &inst); created != VK_SUCCESS)
+        return leonida::vk_test::report_instance_failure(created);
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceProperties2);
     LOADI(vkGetDeviceProcAddr); LOADI(vkEnumerateDeviceExtensionProperties); LOADI(vkGetPhysicalDeviceFeatures2);
@@ -929,8 +930,13 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceFloatControlsProperties fcProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    props2.pNext = &sgProps;
-    sgProps.pNext = &fcProps;
+    // The subgroup size control structure is core in 1.3 only (the extension is not enabled): unknown below.
+    if (props.apiVersion >= VK_API_VERSION_1_3) {
+        props2.pNext = &sgProps;
+        sgProps.pNext = &fcProps;
+    } else {
+        props2.pNext = &fcProps;
+    }
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
 
@@ -1020,7 +1026,7 @@ int main(int argc, char** argv) {
     if (VkResult r = vkCreateDevice(pd, &dci, nullptr, &dev)) { std::fprintf(stderr, "vkCreateDevice %d\n", r); return 1; }
     leonida::SubgroupSizeCaps runtime_subgroups;
     leonida::query_subgroup_size_caps(vkGetPhysicalDeviceProperties2, pd, f13.subgroupSizeControl,
-                                     f13.computeFullSubgroups, runtime_subgroups);
+                                     f13.computeFullSubgroups, runtime_subgroups, props.apiVersion >= VK_API_VERSION_1_3);
     auto can_require_sg = [&](uint32_t sg, VkShaderStageFlagBits bit) -> bool {
         return f13.subgroupSizeControl &&
                sg >= sgProps.minSubgroupSize &&

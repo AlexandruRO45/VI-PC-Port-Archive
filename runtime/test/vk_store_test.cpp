@@ -68,7 +68,8 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    if (const VkResult created = vkCreateInstance(&ici, nullptr, &inst); created != VK_SUCCESS)
+        return leonida::vk_test::report_instance_failure(created);
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
     LOADI(vkGetPhysicalDeviceMemoryProperties); LOADI(vkGetPhysicalDeviceFeatures);

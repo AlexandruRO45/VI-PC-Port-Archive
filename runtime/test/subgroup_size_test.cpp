@@ -257,6 +257,21 @@ int main() {
         CHECK(caps.subgroup_size_control && !caps.compute_full_subgroups);
     }
 
+    // Below Vulkan 1.3 the size control structure is left out of the query: a device that does not know it must not
+    // see it in the pNext chain, and the range stays 0 while the default size is still read.
+    {
+        bool chained = true;
+        const auto fake = [&](VkPhysicalDevice, VkPhysicalDeviceProperties2* properties) {
+            auto* subgroup = static_cast<VkPhysicalDeviceSubgroupProperties*>(properties->pNext);
+            chained = subgroup->pNext != nullptr;
+            subgroup->subgroupSize = 32;
+        };
+        SubgroupSizeCaps caps;
+        CHECK(query_subgroup_size_caps(fake, VK_NULL_HANDLE, false, false, caps, false));
+        CHECK(!chained);
+        CHECK(caps.default_size == 32 && caps.min_size == 0 && caps.max_size == 0 && caps.required_stages == 0);
+    }
+
     std::printf("subgroup size decision: AMD-like, NVIDIA-like, old RADV, limits, create-info chain and query OK\n");
     return 0;
 }
