@@ -20,8 +20,6 @@ Standard library only: Python 3.9+ compatible, zero game data, zero external dep
 Exercises tools/rdna2spirv.py via support.translate_lines(...) and support.mrt0_words for hardware-accurate translation.
 """
 
-from dataclasses import dataclass
-from enum import Enum, auto
 import os
 import struct
 import sys
@@ -84,6 +82,10 @@ def run_hw_andn2(ssrc0: int, ssrc1: int, name: str = "ps_andn2_run") -> tuple[in
     return words[0], words[1]
 
 
+# -----------------------------------------------------------------------------
+# Commit 1: Reference Mathematical Oracle and Architectural Model
+# -----------------------------------------------------------------------------
+
 class TestSaluAndn2B32Oracle(unittest.TestCase):
     """Test suite for reference mathematical oracle of s_andn2_b32."""
 
@@ -141,158 +143,86 @@ class TestSaluAndn2B32Oracle(unittest.TestCase):
         self.assertEqual(hw_10, 0x00FF0000)
 
 
-class Opcode(Enum):
-    S_ANDN2_B32 = auto()
-
-
-class OperandKind(Enum):
-    SGPR = auto()
-    EXEC_LO = auto()
-    VCC_LO = auto()
-    LITERAL32 = auto()
-    INLINE_CONST = auto()
-
-
-@dataclass(frozen=True)
-class ASTOperand:
-    kind: OperandKind
-    index: int = 0
-    count: int = 1
-    value: int = 0
-
-    @classmethod
-    def sgpr(cls, index: int) -> ASTOperand:
-        if index < 0 or index > 105:
-            raise ValueError(f"SGPR index out of range: s{index}")
-        return cls(kind=OperandKind.SGPR, index=index)
-
-    @classmethod
-    def exec_lo(cls) -> ASTOperand:
-        return cls(kind=OperandKind.EXEC_LO)
-
-    @classmethod
-    def vcc_lo(cls) -> ASTOperand:
-        return cls(kind=OperandKind.VCC_LO)
-
-    @classmethod
-    def literal32(cls, val: int) -> ASTOperand:
-        return cls(kind=OperandKind.LITERAL32, value=u32(val))
-
-    @classmethod
-    def inline_const(cls, val: int) -> ASTOperand:
-        return cls(kind=OperandKind.INLINE_CONST, value=u32(val))
-
-
-@dataclass(frozen=True)
-class ASTInstruction:
-    opcode: Opcode
-    dst: ASTOperand
-    src0: ASTOperand
-    src1: ASTOperand
-
-    def validate(self) -> None:
-        if self.opcode != Opcode.S_ANDN2_B32:
-            raise ValueError(f"Unsupported opcode: {self.opcode}")
-        if self.dst.kind not in (OperandKind.SGPR, OperandKind.EXEC_LO, OperandKind.VCC_LO):
-            raise TypeError(f"Destination must be SGPR, EXEC_LO, or VCC_LO, got {self.dst.kind}")
-        if self.dst.count != 1 or self.src0.count != 1 or self.src1.count != 1:
-            raise ValueError("All operands must be 32-bit single registers")
-
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST and Register Formatting Validation
+# -----------------------------------------------------------------------------
 
 class TestSaluAndn2B32AST(unittest.TestCase):
     """Test suite for AST opcode definitions and operand validation."""
 
-    def test_ast_construction_valid_operands(self):
-        inst = ASTInstruction(
-            opcode=Opcode.S_ANDN2_B32,
-            dst=ASTOperand.sgpr(4),
-            src0=ASTOperand.sgpr(6),
-            src1=ASTOperand.sgpr(8),
-        )
-        inst.validate()
-        self.assertEqual(inst.opcode, Opcode.S_ANDN2_B32)
-        self.assertEqual(inst.dst.kind, OperandKind.SGPR)
-        self.assertEqual(inst.dst.index, 4)
-        self.assertEqual(inst.src0.index, 6)
-        self.assertEqual(inst.src1.index, 8)
+    def test_ast_register_operands(self):
+        """Verify translation of various SGPR registers and special registers."""
+        cases = [
+            ["s_andn2_b32 s4, s6, s8", "s_endpgm"],
+            ["s_andn2_b32 exec_lo, exec_lo, vcc_lo", "s_endpgm"],
+            ["s_andn2_b32 s2, s0, 0x123", "s_endpgm"],
+        ]
+        for idx, lines in enumerate(cases):
+            spv = support.translate_lines(f"ps_ast_andn2_{idx}", lines)
+            self.assertIn("OpBitwiseAnd", spv)
+            self.assertIn("OpNot", spv)
 
-    def test_ast_rejects_out_of_range_sgpr(self):
-        with self.assertRaises(ValueError):
-            ASTOperand.sgpr(106)
+    def test_ast_pipeline_execution(self):
+        """Verify that translated SPIR-V structure contains expected opcodes."""
+        lines = [
+            "s_andn2_b32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_pipe_exec", lines)
+        self.assertIn("OpCapability Shader", spv)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("OpSelect", spv)
+        self.assertIn("OpReturn", spv)
 
-    def test_ast_rejects_invalid_dst_kind(self):
-        inst = ASTInstruction(
-            opcode=Opcode.S_ANDN2_B32,
-            dst=ASTOperand.literal32(0x123),
-            src0=ASTOperand.sgpr(6),
-            src1=ASTOperand.sgpr(8),
-        )
-        with self.assertRaises(TypeError):
-            inst.validate()
 
-
-class ScalarRegisterState:
-    """Simulated state of GCN/RDNA Scalar Registers (SGPRs, EXEC_LO, and SCC)."""
-
-    def __init__(self, exec_lo: int = ALL_LANES_ACTIVE_32):
-        self.sgpr = [0] * 106
-        self.exec_lo = u32(exec_lo)
-        self.vcc_lo = 0
-        self.scc = 0
-
-    def read_operand_u32(self, op: ASTOperand) -> int:
-        if op.kind == OperandKind.SGPR:
-            return self.sgpr[op.index]
-        elif op.kind == OperandKind.EXEC_LO:
-            return self.exec_lo
-        elif op.kind == OperandKind.VCC_LO:
-            return self.vcc_lo
-        elif op.kind in (OperandKind.LITERAL32, OperandKind.INLINE_CONST):
-            return op.value
-        raise ValueError(f"Unsupported operand kind for read: {op.kind}")
-
-    def write_sgpr_u32(self, index: int, val: int) -> None:
-        self.sgpr[index] = u32(val)
-
-    def execute(self, inst: ASTInstruction) -> tuple[int, int]:
-        inst.validate()
-        s0 = self.read_operand_u32(inst.src0)
-        s1 = self.read_operand_u32(inst.src1)
-        sdst_val, scc = ref_andn2_b32(s0, s1)
-
-        if inst.dst.kind == OperandKind.SGPR:
-            self.write_sgpr_u32(inst.dst.index, sdst_val)
-        elif inst.dst.kind == OperandKind.EXEC_LO:
-            self.exec_lo = sdst_val
-        elif inst.dst.kind == OperandKind.VCC_LO:
-            self.vcc_lo = sdst_val
-
-        self.scc = scc
-        return sdst_val, scc
-
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter & Execution
+# -----------------------------------------------------------------------------
 
 class TestSaluAndn2B32ScalarInterpreter(unittest.TestCase):
     """Test suite for deterministic scalar instruction execution."""
 
     def test_scalar_interpreter_execution(self):
-        state = ScalarRegisterState()
-        state.write_sgpr_u32(0, 0x12345678)
-        state.write_sgpr_u32(2, 0x00FF00FF)
-        inst = ASTInstruction(
-            opcode=Opcode.S_ANDN2_B32,
-            dst=ASTOperand.sgpr(4),
-            src0=ASTOperand.sgpr(0),
-            src1=ASTOperand.sgpr(2),
-        )
-        sdst, scc = state.execute(inst)
-        expected = 0x12345678 & (~0x00FF00FF & MASK32)
-        self.assertEqual(sdst, expected)
-        self.assertEqual(state.sgpr[4], expected)
-        self.assertEqual(state.scc, 1)
-        hw_dst, hw_scc = run_hw_andn2(0x12345678, 0x00FF00FF, "ps_interp_crosscheck")
+        s0 = 0x12345678
+        s1 = 0x00FF00FF
+        expected = s0 & (~s1 & MASK32)
+        hw_dst, hw_scc = run_hw_andn2(s0, s1, "ps_interp_crosscheck")
         self.assertEqual(hw_dst, expected)
         self.assertEqual(hw_scc, 1)
 
+    def test_scalar_interpreter_zero_output(self):
+        hw_dst, hw_scc = run_hw_andn2(0x12345678, 0x12345678, "ps_interp_zero")
+        self.assertEqual(hw_dst, 0)
+        self.assertEqual(hw_scc, 0)
+
+    def test_sequential_chained_andn2(self):
+        """Execute chained s_andn2_b32 instructions in a single translated shader."""
+        lines = [
+            "s_mov_b32 s0, 0xFFFFFFFF",
+            "s_mov_b32 s1, 0x000000FF",
+            "s_mov_b32 s2, 0x0000FF00",
+            "s_andn2_b32 s3, s0, s1",
+            "s_andn2_b32 s4, s3, s2",
+            "s_cselect_b32 s5, 1, 0",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_interp_chained", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFF0000)
+        self.assertEqual(words[1], 1)
+
+
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32-Bit EXEC Masking
+# -----------------------------------------------------------------------------
 
 class TestSaluAndn2B32SimdDivergence(unittest.TestCase):
     """Test suite for SIMD multi-lane divergence and 32-bit EXEC masking."""
@@ -329,28 +259,17 @@ class TestSaluAndn2B32SimdDivergence(unittest.TestCase):
         self.assertEqual(hw_scc_z, 0)
 
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
 class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
     """Test suite for register aliasing and in-place operand preservation."""
 
     def test_dst_aliases_src0(self):
         # s0 = s0 & ~s2
-        state = ScalarRegisterState()
         s0_val = 0x12345678
         s1_val = 0x000000FF
-        state.write_sgpr_u32(0, s0_val)
-        state.write_sgpr_u32(2, s1_val)
-
-        inst = ASTInstruction(
-            opcode=Opcode.S_ANDN2_B32,
-            dst=ASTOperand.sgpr(0),
-            src0=ASTOperand.sgpr(0),
-            src1=ASTOperand.sgpr(2),
-        )
-        sdst, scc = state.execute(inst)
-        self.assertEqual(sdst, 0x12345600)
-        self.assertEqual(state.sgpr[0], 0x12345600)
-        self.assertEqual(scc, 1)
-
         lines = [
             f"s_mov_b32 s0, {s0_val:#x}",
             f"s_mov_b32 s2, {s1_val:#x}",
@@ -368,23 +287,8 @@ class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
 
     def test_dst_aliases_src1(self):
         # s2 = s0 & ~s2
-        state = ScalarRegisterState()
         s0_val = 0x12345678
         s1_val = 0x000000FF
-        state.write_sgpr_u32(0, s0_val)
-        state.write_sgpr_u32(2, s1_val)
-
-        inst = ASTInstruction(
-            opcode=Opcode.S_ANDN2_B32,
-            dst=ASTOperand.sgpr(2),
-            src0=ASTOperand.sgpr(0),
-            src1=ASTOperand.sgpr(2),
-        )
-        sdst, scc = state.execute(inst)
-        self.assertEqual(sdst, 0x12345600)
-        self.assertEqual(state.sgpr[2], 0x12345600)
-        self.assertEqual(scc, 1)
-
         lines = [
             f"s_mov_b32 s0, {s0_val:#x}",
             f"s_mov_b32 s2, {s1_val:#x}",
@@ -402,19 +306,6 @@ class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
 
     def test_self_cancellation_aliasing(self):
         # s0 = s0 & ~s0 = 0
-        state = ScalarRegisterState()
-        state.write_sgpr_u32(0, 0x12345678)
-        inst = ASTInstruction(
-            opcode=Opcode.S_ANDN2_B32,
-            dst=ASTOperand.sgpr(0),
-            src0=ASTOperand.sgpr(0),
-            src1=ASTOperand.sgpr(0),
-        )
-        sdst, scc = state.execute(inst)
-        self.assertEqual(sdst, 0)
-        self.assertEqual(state.sgpr[0], 0)
-        self.assertEqual(scc, 0)
-
         lines = [
             "s_mov_b32 s0, 0x12345678",
             "s_andn2_b32 s0, s0, s0",
@@ -429,6 +320,10 @@ class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
         self.assertEqual(words[0], 0)
         self.assertEqual(words[1], 0)
 
+
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and SCC Generation
+# -----------------------------------------------------------------------------
 
 class TestSaluAndn2B32ConditionCodes(unittest.TestCase):
     """Test suite for condition codes, status flags, and SCC generation."""
@@ -457,6 +352,10 @@ class TestSaluAndn2B32ConditionCodes(unittest.TestCase):
         self.assertEqual(hw_dst, 0)
         self.assertEqual(hw_scc, 0)
 
+
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
 
 class TestSaluAndn2B32BitwiseEdgeCases(unittest.TestCase):
     """Test suite for 32-bit IEEE-754 bit representations and boundary bitmasks."""
@@ -506,43 +405,9 @@ class TestSaluAndn2B32BitwiseEdgeCases(unittest.TestCase):
         self.assertEqual(hw_scc3, 1)
 
 
-def parse_s_andn2_b32_asm(asm_line: str) -> ASTInstruction:
-    """Parse a single assembly instruction line for s_andn2_b32."""
-    clean = asm_line.strip()
-    if not clean:
-        raise ValueError("Empty assembly line")
-    parts = clean.split(None, 1)
-    mnemonic = parts[0].lower()
-    if mnemonic != "s_andn2_b32":
-        raise ValueError(f"Expected mnemonic s_andn2_b32, got {mnemonic}")
-    if len(parts) < 2:
-        raise ValueError("Missing operands")
-    operands_str = [op.strip() for op in parts[1].split(",")]
-    if len(operands_str) != 3:
-        raise ValueError(f"Expected 3 operands (dst, src0, src1), got {len(operands_str)}")
-
-    def parse_op(op_str: str) -> ASTOperand:
-        op_lower = op_str.lower()
-        if op_lower in ("exec_lo", "exec"):
-            return ASTOperand.exec_lo()
-        elif op_lower in ("vcc_lo", "vcc"):
-            return ASTOperand.vcc_lo()
-        elif op_lower.startswith("s") and op_lower[1:].isdigit():
-            return ASTOperand.sgpr(int(op_lower[1:]))
-        elif op_str.startswith("0x") or op_str.startswith("-") or op_str.isdigit():
-            val = int(op_str, 0)
-            return ASTOperand.literal32(val)
-        else:
-            raise ValueError(f"Invalid operand: {op_str}")
-
-    dst = parse_op(operands_str[0])
-    src0 = parse_op(operands_str[1])
-    src1 = parse_op(operands_str[2])
-
-    inst = ASTInstruction(Opcode.S_ANDN2_B32, dst, src0, src1)
-    inst.validate()
-    return inst
-
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
 
 # Mutant functions for mutation testing
 def mutant_and(s0: int, s1: int) -> tuple[int, int]:
@@ -573,17 +438,22 @@ class TestSaluAndn2B32NegativeControlsAndMutations(unittest.TestCase):
     """Test suite for syntax rejection, negative controls, mutation detection, and translator execution."""
 
     def test_syntax_rejection_malformed_syntax(self):
-        with self.assertRaises(ValueError):
-            parse_s_andn2_b32_asm("")
+        bad_cases = [
+            ["s_andn2_b32 s0, s1"],
+            ["s_andn2_b32"],
+        ]
+        for idx, lines in enumerate(bad_cases):
+            with self.subTest(idx=idx):
+                with self.assertRaises(Exception):
+                    support.translate_lines(f"ps_neg_bad_{idx}", lines)
 
-        with self.assertRaises(ValueError):
-            parse_s_andn2_b32_asm("s_orn2_b32 s0, s1, s2")
-
-        with self.assertRaises(ValueError):
-            parse_s_andn2_b32_asm("s_andn2_b32 s0, s1")
-
-        with self.assertRaises(ValueError):
-            parse_s_andn2_b32_asm("s_andn2_b32 s106, s1, s2")
+    def test_reject_unsupported_opcode(self):
+        lines = [
+            "s_unknown_b32 s0, s1, s2",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_neg_unsupported", lines)
 
     def test_mutation_detection_and(self):
         s0, s1 = 0x0F, 0x0F
@@ -612,8 +482,6 @@ class TestSaluAndn2B32NegativeControlsAndMutations(unittest.TestCase):
     def test_andn2_spirv_emission(self):
         """Verify that support.translate_lines emits expected SPIR-V logic for s_andn2_b32."""
         lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x00ff00ff",
             "s_andn2_b32 s2, s0, s1",
             "s_endpgm",
         ]
