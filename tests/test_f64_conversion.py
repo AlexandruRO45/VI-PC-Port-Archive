@@ -49,9 +49,9 @@ class F64ConversionTest(unittest.TestCase):
             value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
         word = result(rf"OpBitcast %uint {value}")
         dest = result(r"OpAccessChain %_ptr_Function_uint %vgpr %c3")
-        old_word = result(rf"OpLoad %uint {dest}")
-        masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
-        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")
+        # Nothing in this listing writes EXEC, so every lane is active and the converted word is stored as computed
+        # (rdna2spirv's exec_static_true path, #4473); the modifiers are in the word, not in a masked select.
+        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {word}$")
 
 
 if __name__ == "__main__":
