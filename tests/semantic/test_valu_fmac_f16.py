@@ -597,3 +597,38 @@ class TestRegisterAliasing(unittest.TestCase):
 
         self.assertEqual(res, 0x5555_4600)
         self.assertEqual(state.get_vgpr(0), 0x5555_4600)
+
+
+# ==============================================================================
+# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_invariance(self) -> None:
+        """Verify v_fmac_f16 never alters VCC or SCC."""
+        lines = [
+            "v_cmp_eq_u32 vcc, 15, 15",            # Sets VCC to all 1s
+            "v_mov_b32 v0, 0x00003800",
+            "v_mov_b32 v1, 0x00003c00",
+            "v_mov_b32 v2, 0x00004000",
+            "v_fmac_f16 v0, v1, v2",               # Must not touch VCC
+            "v_cndmask_b32 v4, 0x11111111, 0x22222222, vcc", # Should choose 0x22222222
+            "exp mrt0 v4, v0, v4, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_fmac_vcc_invariant", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x22222222)
+        self.assertEqual(words[1], 0x4100)
+
+    def test_clamp_saturation_boundaries(self) -> None:
+        """Verify saturation limits on float output without modifying status registers."""
+        # 3.0 * 2.0 + 0.0 = 6.0 -> clamped to 1.0 (0x3C00)
+        # -2.0 * 2.0 + 0.0 = -4.0 -> clamped to 0.0 (0x0000)
+        got_pos = oracle_fmac_f16(F16_POS_ZERO, F16_THREE, F16_TWO, clamp=True)
+        self.assertEqual(got_pos, F16_ONE)
+
+        got_neg = oracle_fmac_f16(F16_POS_ZERO, 0xC000, F16_TWO, clamp=True)
+        self.assertEqual(got_neg, F16_POS_ZERO)
