@@ -23,17 +23,19 @@ def verify(case, size, result):
         check("failed allocation exit", result.returncode, 17)
         return b""
 
-    check("successful exit", result.returncode, 42)
-    check("exactly one allocation, dispatch, payload and release", len(trace), 3 * EVENT.size + 16)
+    rejected = case == "adapter_error"
+    check("EXE exit", result.returncode, 19 if rejected else 42)
+    payload_bytes = 0 if rejected else 16
+    check("allocation, dispatch, payload and release length", len(trace), 3 * EVENT.size + payload_bytes)
     kind, requested, attributes, address = EVENT.unpack_from(trace)
     check("allocation import", (kind, requested, attributes), (1, size, ATTRIBUTES))
     check("aligned non-null allocation", bool(address) and address % 256 == 0, True)
     seed = size ^ 0x12345678
     check("dispatch import", EVENT.unpack_from(trace, EVENT.size), (2, address, seed, 4))
-    payload = trace[2 * EVENT.size:2 * EVENT.size + 16]
+    payload = trace[2 * EVENT.size:2 * EVENT.size + payload_bytes]
     expected = struct.pack("<4I", *(((i + 1) * 33) ^ (seed + i * 7) for i in range(4)))
-    check("GPU readback", payload, expected)
-    check("matching address freed once", EVENT.unpack_from(trace, 2 * EVENT.size + 16),
+    check("published GPU bytes", payload, b"" if rejected else expected)
+    check("matching address freed once", EVENT.unpack_from(trace, 2 * EVENT.size + payload_bytes),
           (3, address, ATTRIBUTES, 1))
     return payload
 
@@ -48,8 +50,10 @@ def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
     map_command = [sys.executable, "-B", Path(__file__).with_name("shim_startup_check.py"), "--map",
                    mapper, exe, companion, io, xmem, d3d12, ""]
     markers = sorted(f"bound {dll}!{symbol}" for dll, symbols in SHIM_IMPORTS.items() for symbol in symbols)
-    for case, size in (("small", 4096), ("large", 8192), ("fail", (1 << 64) - 1)):
+    for case, size in (("small", 4096), ("large", 8192), ("fail", (1 << 64) - 1), ("adapter_error", 4096)):
         env = dict(os.environ, X2W_SHIM_COMPUTE_CASE=case)
+        if case == "adapter_error":
+            env.update(X2W_SHIM_COMPUTE_CASE="small", X2W_SHIM_COMPUTE_ADAPTER="invalid")
         for runner, command in (("native", [exe]), ("pe_map", map_command), ("AOT", [lifted])):
             child = subprocess.run(command, env=env, capture_output=True, timeout=30)
             lines = child.stderr.decode(errors="replace").splitlines()
@@ -57,6 +61,10 @@ def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
                     and child.returncode == 77 and lines == ["no D3D12 physical adapter"]):
                 print(lines[0])
                 sys.exit(77)
+            if case == "adapter_error":
+                diagnostic = "Select compute adapter failed (HRESULT 0x80070057)"
+                check("one provider rejection", lines.count(diagnostic), 1)
+                lines.remove(diagnostic)
             if runner == "pe_map":
                 check("mapper returned", lines[-1:], ["mapped host returned"])
                 check("explicit shim bindings", sorted(lines[:-1]), markers)
