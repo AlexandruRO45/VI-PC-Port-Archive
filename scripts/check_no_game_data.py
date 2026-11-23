@@ -169,18 +169,38 @@ def printable(name):
     return "".join(c if c.isprintable() else "?" for c in name)
 
 
-def archive_kind(f, head):
-    """The kind of archive the seekable file `f` (first bytes `head`) is, or None."""
+def is_tar_header(head):
+    """True when `head` has POSIX/GNU tar magic or a valid 512-byte V7 tar header."""
+    if head[TAR_MAGIC[0]:TAR_MAGIC[0] + len(TAR_MAGIC[1])] == TAR_MAGIC[1]:
+        return True
+    if len(head) < tarfile.BLOCKSIZE:
+        return False
+    try:
+        tarfile.TarInfo.frombuf(head[:tarfile.BLOCKSIZE], "utf-8", "surrogateescape")
+    except tarfile.HeaderError:
+        return False
+    return True
+
+
+def archive_kinds(f, head):
+    """All archive kinds the seekable file `f` (first bytes `head`) matches (e.g. a tar/stream with a zip appended)."""
+    kinds = []
     stream = next((s for s in STREAMS if head.startswith(s[1])), None)
     if stream:
-        return stream[0]
-    if head[TAR_MAGIC[0]:TAR_MAGIC[0] + len(TAR_MAGIC[1])] == TAR_MAGIC[1]:
-        return "tar archive"
+        kinds.append(stream[0])
+    elif is_tar_header(head):
+        kinds.append("tar archive")
     # is_zipfile finds the end-of-central-directory record, so a zip with bytes in front of it (a self-extracting
-    # archive, a spanned zip starting PK\x07\x08) is found as zipfile itself would open it.
+    # archive, a spanned zip starting PK\x07\x08, or a zip appended to a tar/stream) is found as zipfile opens it.
     if head.startswith(ZIP) or zipfile.is_zipfile(f):
-        return "zip archive"
-    return None
+        kinds.append("zip archive")
+    return kinds
+
+
+def archive_kind(f, head):
+    """The first archive kind the seekable file `f` (first bytes `head`) is, or None."""
+    kinds = archive_kinds(f, head)
+    return kinds[0] if kinds else None
 
 
 def classify_open(f, first, depth=0, budget=None):
@@ -195,49 +215,52 @@ def classify_open(f, first, depth=0, budget=None):
     for kind, magic in OPAQUE:
         if head.startswith(magic):
             return f"{kind} (contents can't be checked)"
-    kind = archive_kind(f, head)
-    if not kind:
+    kinds = archive_kinds(f, head)
+    if not kinds:
         return None
     if depth >= MAX_DEPTH:
-        return f"{kind} nested more than {MAX_DEPTH} deep (contents can't be checked)"
+        return f"{kinds[0]} nested more than {MAX_DEPTH} deep (contents can't be checked)"
 
     def look_into(member):
         inner = budget.spool(member)
         return classify_open(inner, read_head_from(inner), depth + 1, budget)
 
-    try:
-        f.seek(0)
-        if kind == "zip archive":
-            with zipfile.ZipFile(f) as archive:
-                for info in archive.infolist():
-                    budget.member()
-                    if info.is_dir():
-                        continue
-                    with archive.open(info) as member:
-                        inner = look_into(member)
-                    if inner:
-                        return f"{inner} in {kind} ({printable(info.filename)})"
-            return None
-        if kind == "tar archive":
-            with tarfile.open(fileobj=f, mode="r:") as archive:
-                for info in archive:
-                    budget.member()
-                    if not info.isfile():
-                        continue
-                    with archive.extractfile(info) as member:
-                        inner = look_into(member)
-                    if inner:
-                        return f"{inner} in {kind} ({printable(info.name)})"
-            return None
-        opener = next(s[2] for s in STREAMS if s[0] == kind)
-        with opener(f) as member:
-            inner = look_into(member)
-        return f"{inner} in {kind}" if inner else None
-    except TooLarge:
-        return (f"{kind} too large to check (over {MAX_EXPANDED >> 20} MiB expanded or {MAX_MEMBERS} members; "
-                "contents can't be checked)")
-    except ARCHIVE_ERRORS:
-        return f"{kind} that can't be opened (contents can't be checked)"
+    for kind in kinds:
+        try:
+            f.seek(0)
+            if kind == "zip archive":
+                with zipfile.ZipFile(f) as archive:
+                    for info in archive.infolist():
+                        budget.member()
+                        if info.is_dir():
+                            continue
+                        with archive.open(info) as member:
+                            inner = look_into(member)
+                        if inner:
+                            return f"{inner} in {kind} ({printable(info.filename)})"
+                continue
+            if kind == "tar archive":
+                with tarfile.open(fileobj=f, mode="r:") as archive:
+                    for info in archive:
+                        budget.member()
+                        if not info.isfile():
+                            continue
+                        with archive.extractfile(info) as member:
+                            inner = look_into(member)
+                        if inner:
+                            return f"{inner} in {kind} ({printable(info.name)})"
+                continue
+            opener = next(s[2] for s in STREAMS if s[0] == kind)
+            with opener(f) as member:
+                inner = look_into(member)
+            if inner:
+                return f"{inner} in {kind}"
+        except TooLarge:
+            return (f"{kind} too large to check (over {MAX_EXPANDED >> 20} MiB expanded or {MAX_MEMBERS} members; "
+                    "contents can't be checked)")
+        except ARCHIVE_ERRORS:
+            return f"{kind} that can't be opened (contents can't be checked)"
+    return None
 
 
 def classify_file(path):

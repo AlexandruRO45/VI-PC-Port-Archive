@@ -115,6 +115,31 @@ def tarred(members):
     return buf.getvalue()
 
 
+def v7_tarred(members):
+    """A V7 tar archive (bytes) without the POSIX/GNU ustar magic, holding `members`, {name: bytes}."""
+    buf = io.BytesIO()
+    for name, data in members.items():
+        hdr = bytearray(512)
+        name_b = name.encode("ascii")
+        hdr[0:len(name_b)] = name_b
+        hdr[100:108] = b"0000644\0"
+        hdr[108:116] = b"0000000\0"
+        hdr[116:124] = b"0000000\0"
+        hdr[124:136] = f"{len(data):011o}\0".encode("ascii")
+        hdr[136:148] = b"00000000000\0"
+        hdr[148:156] = b"        "
+        hdr[156:157] = b"0"
+        chksum = sum(hdr)
+        hdr[148:156] = f"{chksum:06o}\0 ".encode("ascii")
+        buf.write(hdr)
+        buf.write(data)
+        rem = len(data) % 512
+        if rem:
+            buf.write(bytes(512 - rem))
+    buf.write(bytes(1024))
+    return buf.getvalue()
+
+
 def corrupt_deflate(archive):
     """`archive` (one deflated zip member) with the first byte of its deflate data made an invalid block type."""
     data = bytearray(archive)
@@ -157,12 +182,20 @@ CAUGHT_IN_ARCHIVES = [
     ("bad_deflate.zip", corrupt_deflate(zipped({"a.bin": DDS * 64})),
      "zip archive that can't be opened (contents can't be checked)"),
     ("newline.zip", zipped({"a\nb.png": DDS}), "DDS texture in zip archive (a?b.png)"),
+    ("v7.bin", v7_tarred({"leaked.rpf": RPF}), "RPF9 archive in tar archive (leaked.rpf)"),
+    ("tar_zip.bin", tarred({"readme.txt": b"hello\n"}) + zipped({"secret.dds": DDS}),
+     "DDS texture in zip archive (secret.dds)"),
+    ("bz2_zip.bin", bz2.compress(b"clean text\n") + zipped({"secret.dds": DDS}),
+     "DDS texture in zip archive (secret.dds)"),
 ]
 
 PASSED_ARCHIVES = [
     ("docs.zip", zipped({"a.txt": b"plain text\n", "dir/b.md": b"# notes\n", "empty.txt": b""})),
     ("docs.tar", tarred({"a.txt": b"plain text\n"})),
+    ("docs_v7.tar", v7_tarred({"a.txt": b"plain text\n"})),
     ("docs.tar.bz2", bz2.compress(tarred({"a.txt": b"plain text\n"}))),
+    ("docs_tar_zip.bin", tarred({"a.txt": b"plain text\n"}) + zipped({"b.txt": b"also clean\n"})),
+    ("docs_bz2_zip.bin", bz2.compress(b"plain text\n") + zipped({"b.txt": b"also clean\n"})),
     ("prefixed_clean.bin", b"JUNK" + zipped({"a.txt": b"text\n"})),
     ("notes.gz", gzip.compress(b"The RPF9 magic is stored as 9FPR.\n")),
     ("notes.bz2", bz2.compress(b"plain text\n")),
