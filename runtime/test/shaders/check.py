@@ -85,7 +85,8 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
-                "cs_mask_vgpr_exec", "cs_w32_permlane_exec0", "cs_w32_writelane_permlane_exec0", "cs_w32_permlane_fi")
+                "cs_mask_vgpr_exec", "cs_w32_permlane_exec0", "cs_w32_writelane_permlane_exec0", "cs_w32_permlane_fi",
+                "cs_w32_dpp_exec0")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -93,7 +94,8 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
                      "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_w32_andn2_exec", "cs_mask_vgpr_exec",
-                     "cs_w32_permlane_exec0", "cs_w32_writelane_permlane_exec0", "cs_w32_permlane_fi")
+                     "cs_w32_permlane_exec0", "cs_w32_writelane_permlane_exec0", "cs_w32_permlane_fi",
+                     "cs_w32_dpp_exec0")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -142,6 +144,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_permlane_exec0", [7, 58, 109, 160, 211, 262, 313, 364]),
             # the same after a v_writelane_b32 to the destination (cs_w32_writelane_permlane_exec0.asm)
             ("cs_w32_writelane_permlane_exec0", [0x7E8B8958, 0xF6C106A1, 0x7E8B898C, 0xF6C106A9, 0x7E8B89C0, 0xF6C106B1, 0x7E8B89F4, 0xF6C106B9]),
+            # a DPP instruction under EXEC = 0 keeps v4 too (same miscompile, cs_w32_dpp_exec0.asm, SHADER-1035)
+            ("cs_w32_dpp_exec0", [7, 58, 109, 160, 211, 262, 313, 364]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),

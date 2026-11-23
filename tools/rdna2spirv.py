@@ -1485,7 +1485,10 @@ class Gen:
             p = self.reg_ptr("vgpr", a["r"])
             old, r = self.tmp(), self.tmp()
             self.emit(f"{old} = OpLoad %uint {p}")
-            fresh = after_subgroup and not self.emulate
+            # A DPP instruction's result is a subgroup value too: the value comes from another lane and the
+            # same select-after-shuffle miscompile applies to its write (SHADER-1035). dpp_guard is set only
+            # while dpp_insn re-enters _insn, so it names exactly those writes.
+            fresh = (after_subgroup or self.dpp_guard is not None) and not self.emulate
             if eager:
                 if fresh:
                     mask = self.tmp()
