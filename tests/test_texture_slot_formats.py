@@ -46,11 +46,11 @@ def build_export(tmp):
                                               ("00000000000000CC", 72)])
     # the same key in a second pool with another format: conflicting
     pool(os.path.join(exp, "ttpf_pack", "pk", "pool2"), [("00000000000000CC", 99), ("00000000000000DD", 98)])
-    # dictionaries: hash 11111111 once (candidate), 22222222 twice (ambiguous)
+    # dictionaries: hash 11111111 once (candidate), 22222222 on two different textures (ambiguous)
     dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": 2, "Items": [
         {"Offset": 0, "Textures": [{"Hash": "11111111", "Format": "BC7_UNORM_SRGB", "Key": None},
-                                   {"Hash": "22222222", "Format": "BC1_UNORM", "Key": None}]},
-        {"Offset": 4096, "Textures": [{"Hash": "22222222", "Format": "BC1_UNORM", "Key": None}]}]})
+                                   {"Hash": "22222222", "Format": "BC1_UNORM", "Key": None, "Width": 4}]},
+        {"Offset": 4096, "Textures": [{"Hash": "22222222", "Format": "BC1_UNORM", "Key": None, "Width": 8}]}]})
     emb = {"Textures": [{"Hash": "33333333", "Format": "BC5_UNORM", "Key": "0000000000000E01"}]}
     dump(os.path.join(exp, "lv", "models", "manifest.json"), {"Count": 3, "Items": [
         model([(BUMP, "00000000000000AA", "AAAAAAAA"), (BUMP, "00000000000000BB", "BBBBBBBB"),
@@ -288,6 +288,25 @@ class ReviewCases(unittest.TestCase):
                 dump(os.path.join(exp, *rel), doc)
                 code, _, err = Cli.run_main([exp])
                 self.assertEqual(code, 2, (rel, doc, err))
+                self.assertIn("invalid manifest JSON", err)
+
+    def test_one_texture_embedded_twice_is_one_candidate(self):
+        # tedin7 on #4980, same rule here: rows of one texture are not an ambiguous hash
+        emb = {"Textures": [{"Hash": "11111111", "Format": "BC7_UNORM", "Key": "00000000000000A1"}]}
+        for copies in (1, 2):
+            with tempfile.TemporaryDirectory() as tmp:
+                items = [model([], embedded=emb) for _ in range(copies)]
+                items.append(model([(BUMP, "00000000000000B2", "11111111")]))
+                d = tsf.census(minimal(tmp, items))["parameters"][BUMP]
+                self.assertEqual((d["candidate"], d["ambiguous"], d["candidate_formats"]), (1, 0, {"98": 1}), copies)
+
+    def test_falsy_non_arrays_and_bad_embedded_exit_2(self):
+        # LILILI2007 on #4946: {} "" 0 false were read as empty arrays
+        for item in ({"Materials": {}}, {"Materials": ""}, {"Materials": 0}, {"Materials": False},
+                     {"Embedded": 5}, {"Embedded": {"Textures": {}}}, {"Embedded": [3]}):
+            with tempfile.TemporaryDirectory() as tmp:
+                code, _, err = Cli.run_main([minimal(tmp, [item])])
+                self.assertEqual(code, 2, (item, err))
                 self.assertIn("invalid manifest JSON", err)
 
 if __name__ == "__main__":

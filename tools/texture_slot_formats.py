@@ -12,8 +12,9 @@ carries ``Param`` (the stored 32-bit parameter name hash as eight hex digits), `
   without format. Exact keys found in both sources, and pool matches whose row has no
   exported file (``File`` null or missing on disk), are counted too: an exact match is a metadata match, not proof
   that a texture file is available;
-* candidate: otherwise the stored name hash is on exactly one embedded or dictionary entry (``Hash``); not proof of
-  the same asset, so its formats are listed apart. A hash on more than one entry is ambiguous;
+* candidate: otherwise the stored name hash is on exactly one distinct embedded or dictionary texture (``Hash``; the
+  same usable ``Key``, or without one the same format and size, is one texture); not proof of the same asset, so
+  its formats are listed apart. A hash on more than one distinct texture is ambiguous;
 * unresolved: neither.
 
 An all-zero key or name hash is a sentinel for "none" (as in ``world_build.py``): it is never joined, and a binding
@@ -25,7 +26,8 @@ is reported as export coverage; more rows than ``Count`` is a problem (exit 1). 
 
 ``--archive`` (the folder name exactly as listed) limits the bindings to those archives' models; the pools,
 dictionaries and embedded textures used for resolving are always the whole export. Prints counts and parameter
-hashes only: no texture, model or shader names. ``--json`` may not be inside the export folder. Standard library only.
+hashes, keyed by the export's archive and pool folder names: no texture, model or shader names. ``--json`` may not be
+inside the export folder. Standard library only.
 """
 import argparse
 import json
@@ -38,8 +40,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from manifest_stream import iter_items  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from tex_headers import DXGI  # noqa: E402
-from texture_dicts import (archives, check_count, inside, key64, load_object, objects,  # noqa: E402
-                           pool_manifests, stored_hash)
+from texture_dicts import (archives, check_count, embedded_textures, inside, key64, load_object,  # noqa: E402
+                           objects, pool_manifests, stored_hash)
 
 DXGI_BY_NAME = {name: num for num, name in DXGI.items()}
 ZERO_KEY = "0" * 16
@@ -119,15 +121,17 @@ def resolvers(export, problems, coverage):
                 for t in objects(it.get("Textures"), f"{arc}/textures Textures"):
                     hv = usable_hash(t, name_key=None)
                     if hv is not None:
-                        by_hash.setdefault(hv, []).append(dxgi(t.get("Format")))
+                        by_hash.setdefault(hv, {})[identity(t)] = dxgi(t.get("Format"))
     return pool, pool_file, by_hash
 
 
-def embedded(item):
-    emb = item.get("Embedded")
-    if isinstance(emb, dict):
-        emb = emb.get("Textures") or []
-    return [t for t in emb if isinstance(t, dict)] if isinstance(emb, list) else []
+def identity(t):
+    """Rows that are the same texture: the same usable 64-bit ``Key``, or, without one, the same format and size (as
+    ``texture_dicts.texture_identity``). One texture embedded in many models is one candidate, not an ambiguous one."""
+    k = usable_key(t.get("Key"))
+    if k:
+        return ("key", k)
+    return ("format and size", str(t.get("Format")), str(t.get("Width")), str(t.get("Height")))
 
 
 def census(export, only=None):
@@ -151,11 +155,11 @@ def census(export, only=None):
                 raise ValueError(f"{arc}/models: model entry {rows + 1} is not an object")
             rows += 1
             # embedded textures resolve references from every archive, so they are read even when filtered out
-            for t in embedded(item):
+            for t in embedded_textures(item, arc):
                 add(emb, usable_key(t.get("Key")), dxgi(t.get("Format")))
                 hv = usable_hash(t)
                 if hv is not None:
-                    by_hash.setdefault(hv, []).append(dxgi(t.get("Format")))
+                    by_hash.setdefault(hv, {})[identity(t)] = dxgi(t.get("Format"))
             if not use:
                 continue
             models += 1
@@ -189,11 +193,16 @@ def census(export, only=None):
                 else:
                     part["no format"] += 1
                 continue
-            entries = [f for h in hashes if h is not None for f in by_hash.get(h, [])]
-            if len(entries) == 1:
+            textures = {}
+            for h in hashes:
+                if h is not None:
+                    textures.update(by_hash.get(h, {}))
+            if len(textures) == 1:
                 part["candidate"] += 1
-                cand_fmts[entries[0]] += 1
-            elif entries:
+                fmt = next(iter(textures.values()))
+                if fmt is not None:
+                    cand_fmts[fmt] += 1
+            elif textures:
                 part["ambiguous"] += 1
             else:
                 part["unresolved"] += 1
