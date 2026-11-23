@@ -209,3 +209,68 @@ class TestSaluAndn2B64AST(unittest.TestCase):
         )
         with self.assertRaises(TypeError):
             inst.validate()
+
+
+class ScalarRegisterState:
+    """Simulated state of GCN/RDNA Scalar Registers (SGPRs, EXEC, and SCC)."""
+
+    def __init__(self, exec_mask: int = ALL_LANES_ACTIVE):
+        self.sgpr = [0] * 106
+        self.exec_mask = u64(exec_mask)
+        self.vcc = 0
+        self.scc = 0
+
+    def read_operand_u64(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.SGPR:
+            lo = self.sgpr[op.index]
+            hi = self.sgpr[op.index + 1]
+            return (hi << 32) | lo
+        elif op.kind == OperandKind.EXEC:
+            return self.exec_mask
+        elif op.kind == OperandKind.VCC:
+            return self.vcc
+        elif op.kind in (OperandKind.LITERAL64, OperandKind.INLINE_CONST):
+            return op.value
+        raise ValueError(f"Unsupported operand kind for read: {op.kind}")
+
+    def write_sgpr_u64(self, index: int, val: int) -> None:
+        val = u64(val)
+        self.sgpr[index] = val & MASK32
+        self.sgpr[index + 1] = (val >> 32) & MASK32
+
+    def execute(self, inst: ASTInstruction) -> tuple[int, int]:
+        inst.validate()
+        s0 = self.read_operand_u64(inst.src0)
+        s1 = self.read_operand_u64(inst.src1)
+        sdst_val, scc = ref_andn2_b64(s0, s1)
+
+        if inst.dst.kind == OperandKind.SGPR:
+            self.write_sgpr_u64(inst.dst.index, sdst_val)
+        elif inst.dst.kind == OperandKind.EXEC:
+            self.exec_mask = sdst_val
+        elif inst.dst.kind == OperandKind.VCC:
+            self.vcc = sdst_val
+
+        self.scc = scc
+        return sdst_val, scc
+
+
+class TestSaluAndn2B64ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction execution."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ScalarRegisterState()
+        state.write_sgpr_u64(0, 0x123456789ABCDEF0)
+        state.write_sgpr_u64(2, 0x00FF00FF0F0F0F0F)
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_B64,
+            dst=ASTOperand.sgpr(4, 2),
+            src0=ASTOperand.sgpr(0, 2),
+            src1=ASTOperand.sgpr(2, 2),
+        )
+        sdst, scc = state.execute(inst)
+        expected = 0x123456789ABCDEF0 & (~0x00FF00FF0F0F0F0F & MASK64)
+        self.assertEqual(sdst, expected)
+        self.assertEqual(state.sgpr[4], expected & MASK32)
+        self.assertEqual(state.sgpr[5], (expected >> 32) & MASK32)
+        self.assertEqual(state.scc, 1)
