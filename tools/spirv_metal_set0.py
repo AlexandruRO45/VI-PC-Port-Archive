@@ -25,6 +25,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BINDLESS_H = os.path.join(ROOT, "runtime", "src", "vulkan_bindless.h")
+_ASSEMBLY_BOUNDARY = re.compile(r'"[^"\\]*(?:\\[\s\S][^"\\]*)*"|;[^\r\n]*|(\r\n?|\n)')
 
 
 def capacities(path=BINDLESS_H):
@@ -60,11 +61,23 @@ def _fresh_id(base, used):
     return cand
 
 
+def _assembly_lines(text):
+    # Leave line endings in quoted operands intact, including escaped quotes and literal CRLF.
+    lines = []
+    start = 0
+    for match in _ASSEMBLY_BOUNDARY.finditer(text):
+        if match[1] is not None:
+            lines.append(text[start:match.start()])
+            start = match.end()
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
+
+
 def rewrite(text, counts):
     """Rewrite the disassembly (spirv-dis --raw-id is not needed; names are kept) of one module."""
     ids = metal_ids(counts)
-    # Literals can contain Unicode separators such as U+2028.
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n").split("\n")
+    lines = _assembly_lines(text)
     sets, binds = {}, {}
     for ln in lines:
         m = re.match(r"\s*OpDecorate (%\S+) DescriptorSet (\d+)$", ln)

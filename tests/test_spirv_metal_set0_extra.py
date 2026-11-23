@@ -684,6 +684,17 @@ OpDecorate %orphan Binding 1
         idx9 = lines.index("%9 = OpTypePointer Function %5")
         self.assertEqual(lines[idx9 + 1], "%10 = OpVariable %msl_ptr_b1 UniformConstant")
 
+    def test_rewrite_normalizes_only_unquoted_line_endings(self):
+        for literal_ending in ("\r", "\r\n", "\n"):
+            with self.subTest(literal_ending=literal_ending):
+                lines = [
+                    '; An unmatched " in a comment is ordinary text.',
+                    f'OpName %shader "before \\"; middle{literal_ending}after"',
+                    "OpCapability Shader",
+                    "",
+                ]
+                self.assertEqual(m.rewrite("\r\n".join(lines), [4]), "\n".join(lines))
+
     def test_empty_and_no_set0_modules(self):
         self.assertEqual(m.rewrite("", [4]), "\n")
         plain = "OpCapability Shader\nOpMemoryModel Logical GLSL450\n"
