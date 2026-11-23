@@ -586,24 +586,34 @@ DWORD WINAPI get_file_attributes_a(LPCSTR name) {
 // "<current folder>\GAME:\x", which no longer names the console drive, so a caller that makes its path absolute
 // before opening it (Rust's std::fs, std::filesystem::absolute) lost the game folder: every "GAME:" open failed
 // with ERROR_PATH_NOT_FOUND while the same name through CreateFileW worked. A "GAME:" path is already absolute: it
-// comes back with one separator style and no "." or ".." parts. Every other path goes to the host.
-bool full_game_path(const wchar_t* name, std::wstring& full, bool& has_file_part) {
+// comes back with one separator style and no "." or ".." parts, and a trailing separator stays, as Windows keeps it
+// for "C:\foo\" (then there is no file part). A path that climbs above GAME:\ is refused with ERROR_INVALID_NAME,
+// as CreateFileW refuses the same name, and never reaches the host. Every other path goes to the host.
+enum class FullPath { NotGame, Refused, Answered };
+
+FullPath full_game_path(const wchar_t* name, std::wstring& full, bool& has_file_part) {
     const std::wstring path = name;
     size_t prefix_length = 0;
-    if (console_drive(path, prefix_length) != Drive::Game || prefix_length != kGamePrefixLength) return false;
+    if (console_drive(path, prefix_length) != Drive::Game || prefix_length != kGamePrefixLength) return FullPath::NotGame;
     std::vector<std::wstring> parts;
-    if (parse_console(path, parts) != Parsed::Console) return false;
+    if (parse_console(path, parts) != Parsed::Console) return FullPath::Refused;
     full = L"GAME:";
     for (const auto& part : parts) full += L'\\' + part;
-    has_file_part = !parts.empty();
-    if (!has_file_part) full += L'\\';
-    return true;
+    const bool trailing_separator = !path.empty() && is_separator(path.back());
+    if (parts.empty() || trailing_separator) full += L'\\';
+    has_file_part = !parts.empty() && !trailing_separator;
+    return FullPath::Answered;
 }
 
 DWORD WINAPI get_full_path_name_w(LPCWSTR name, DWORD length, LPWSTR buffer, LPWSTR* file_part) {
     std::wstring full;
     bool has_file_part = false;
-    if (!name || !full_game_path(name, full, has_file_part)) return ::GetFullPathNameW(name, length, buffer, file_part);
+    const FullPath kind = name ? full_game_path(name, full, has_file_part) : FullPath::NotGame;
+    if (kind == FullPath::NotGame) return ::GetFullPathNameW(name, length, buffer, file_part);
+    if (kind == FullPath::Refused) {
+        SetLastError(ERROR_INVALID_NAME);
+        return 0;
+    }
     if (full.size() + 1 > length) return static_cast<DWORD>(full.size() + 1);  // too small: the size with the NUL
     std::wmemcpy(buffer, full.c_str(), full.size() + 1);
     if (file_part) *file_part = has_file_part ? buffer + full.rfind(L'\\') + 1 : nullptr;
@@ -613,8 +623,12 @@ DWORD WINAPI get_full_path_name_w(LPCWSTR name, DWORD length, LPWSTR buffer, LPW
 DWORD WINAPI get_full_path_name_a(LPCSTR name, DWORD length, LPSTR buffer, LPSTR* file_part) {
     std::wstring full;
     bool has_file_part = false;
-    if (!name || !full_game_path(widen_ansi(name).c_str(), full, has_file_part))
-        return ::GetFullPathNameA(name, length, buffer, file_part);
+    const FullPath kind = name ? full_game_path(widen_ansi(name).c_str(), full, has_file_part) : FullPath::NotGame;
+    if (kind == FullPath::NotGame) return ::GetFullPathNameA(name, length, buffer, file_part);
+    if (kind == FullPath::Refused) {
+        SetLastError(ERROR_INVALID_NAME);
+        return 0;
+    }
     const int needed = WideCharToMultiByte(CP_ACP, 0, full.c_str(), -1, nullptr, 0, nullptr, nullptr);  // with the NUL
     if (needed <= 0) return 0;
     if (static_cast<DWORD>(needed) > length) return static_cast<DWORD>(needed);

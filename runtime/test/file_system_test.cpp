@@ -733,9 +733,50 @@ int main() {
         const DWORD ours = full_w(L"relative\\x.txt", MAX_PATH, host_ours, nullptr);
         const DWORD real = ::GetFullPathNameW(L"relative\\x.txt", MAX_PATH, host_real, nullptr);
         check(ours == real && std::wstring(host_ours) == std::wstring(host_real), "a host path is answered by the host");
-        // A GAME: path that climbs out of the drive is not made absolute here; the open refuses it.
-        const DWORD escaped = full_w(L"GAME:\\..\\x", MAX_PATH, full, nullptr);
-        check(escaped != 0 && std::wstring(full).rfind(L"GAME:", 0) != 0, "GAME:\\.. is left to the host, which does not call it a GAME: path");
+        // Empty string: the host's answer (0), not a GAME: path.
+        wchar_t empty_ours[4] = {1}, empty_real[4] = {1};
+        check(full_w(L"", 4, empty_ours, nullptr) == ::GetFullPathNameW(L"", 4, empty_real, nullptr),
+              "an empty name is answered by the host");
+
+        // A trailing separator stays and leaves no file part, as GetFullPathNameW(L"C:\\foo\\") does; a trailing "." does not.
+        file_part = nullptr;
+        check(full_w(L"GAME:\\nested\\", MAX_PATH, full, &file_part) == 13 && std::wstring(full) == L"GAME:\\nested\\" &&
+                  file_part == nullptr,
+              "a trailing separator is kept and there is no file part");
+        check(full_w(L"GAME:/nested/./", MAX_PATH, full, &file_part) == 13 && std::wstring(full) == L"GAME:\\nested\\" &&
+                  file_part == nullptr,
+              "\".\\\" before a trailing separator does not remove it");
+        check(full_w(L"GAME:\\nested\\.", MAX_PATH, full, &file_part) == 12 && std::wstring(full) == L"GAME:\\nested" &&
+                  file_part && std::wstring(file_part) == L"nested",
+              "a trailing \".\" removes itself, not the folder name");
+        check(full_w(L"GAME:\\nested\\..\\", MAX_PATH, full, &file_part) == 6 && std::wstring(full) == L"GAME:\\" &&
+                  file_part == nullptr,
+              "a folder left with \"..\\\" is the root");
+        check(full_a("GAME:\\nested\\", MAX_PATH, narrow, &narrow_part) == 13 && std::string(narrow) == "GAME:\\nested\\" &&
+                  narrow_part == nullptr,
+              "GetFullPathNameA keeps the trailing separator too");
+        check(full_a("GAME:\\nested\\deeper\\c.bin", 5, narrow, &narrow_part) == 26,
+              "GetFullPathNameA with a small buffer answers the size with the NUL");
+
+        // A path that climbs above GAME:\ is refused the way CreateFileW refuses the same name (ERROR_INVALID_NAME), and
+        // never reaches the host: Windows would clamp "C:\..\x" at the drive root, but the open of "GAME:\..\x" fails, and
+        // an answer that opens something else than the open would is worse than none.
+        for (const wchar_t* climbing : {L"GAME:\\..", L"GAME:\\..\\x", L"GAME:\\nested\\..\\..\\x", L"game:/../x"}) {
+            wchar_t untouched[MAX_PATH] = L"untouched";
+            SetLastError(0);
+            const bool refused = full_w(climbing, MAX_PATH, untouched, nullptr) == 0 && GetLastError() == ERROR_INVALID_NAME &&
+                                 std::wstring(untouched) == L"untouched";
+            SetLastError(0);
+            const bool same_as_open = create_w(climbing, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr) ==
+                                          INVALID_HANDLE_VALUE &&
+                                      GetLastError() == ERROR_INVALID_NAME;
+            check(refused && same_as_open, "a GAME: path above the root is refused by GetFullPathNameW as CreateFileW refuses it");
+        }
+        SetLastError(0);
+        char narrow_untouched[MAX_PATH] = "untouched";
+        check(full_a("GAME:\\..\\x", MAX_PATH, narrow_untouched, nullptr) == 0 && GetLastError() == ERROR_INVALID_NAME &&
+                  std::string(narrow_untouched) == "untouched",
+              "GetFullPathNameA refuses it too");
         }
     }
 
