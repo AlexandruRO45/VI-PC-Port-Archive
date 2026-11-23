@@ -1752,7 +1752,7 @@ RTX 4080 SUPER and Intel UHD 770 (32.0.101.6129), Windows 11, 480 of 12,101 pixe
   seeded heap was tried and abandoned, because a pointer read from float data is a wild address and takes NVIDIA's
   device down.
 
-**With the fallbacks (`--bary-fallback --min-lod-fallback`, same 480 shaders, variant z).** The same sample was
+**With the fallbacks (`--bary-fallback` plus the MinLod fallback of #4642, same 480 shaders, variant z).** The same sample was
 retranslated with both flags and drawn through `<name>.bary_gs.spv` where a shader reads raw barycentrics (`VKS_GS`,
 `tools/bary_fallback_gs.py`). The Intel UHD 770 creates 440 of the 480 (265 before; the 207 that needed
 `fragmentShaderBarycentric` or `shaderResourceMinLod` are gone), 32 time out (zeroed-heap loops, which the same
