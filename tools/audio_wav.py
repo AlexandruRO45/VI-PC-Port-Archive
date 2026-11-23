@@ -14,6 +14,7 @@ The output is pcm_s16le at the stream's own sample rate and channel count (Opus 
 stream is trimmed to its Ogg Opus end granule minus pre-skip, because ffmpeg can keep samples beyond its declared
 end. For chained streams, ffmpeg handles each link's timing. ffmpeg must be on PATH or given with
 --ffmpeg; without it the tool exits with an explanation instead of a traceback.
+The decode queue holds at most one outstanding job per worker, even for a large input tree.
 
 For PCM copies of the AWC banks' Opus streams, first repackage the banks with awc_opus.py, then run this tool on
 its output (make_game.py does both, the second only with --wav).
@@ -434,6 +435,24 @@ def decode(ffmpeg: str, src: str, dst: str):
         return False, str(e)
 
 
+def _decode_jobs(pool, ffmpeg, todo, workers):
+    """Yield (relative name, completed future) without retaining a future for every input."""
+    jobs = iter(todo)
+    pending = {}
+    while True:
+        while len(pending) < workers:
+            job = next(jobs, None)
+            if job is None:
+                break
+            path, rel, dst = job
+            pending[pool.submit(decode, ffmpeg, path, dst)] = rel
+        if not pending:
+            return
+        ready, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+        for future in ready:
+            yield pending.pop(future), future
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Decode Ogg Opus audio to 16-bit PCM WAV with ffmpeg.")
     ap.add_argument("src", help="a directory to search recursively, or one .ogg/.opus file")
@@ -510,10 +529,7 @@ def main(argv=None) -> int:
     if todo:
         print(f"Decoding {len(todo)} file(s) with {workers} job(s)...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(decode, ffmpeg, path, dst): (path, rel)
-                   for path, rel, dst in todo}
-        for future in concurrent.futures.as_completed(futures):
-            path, rel = futures[future]
+        for rel, future in _decode_jobs(pool, ffmpeg, todo, workers):
             try:
                 ok, message = future.result()
             except Exception as e:                  # never lose the summary to an unexpected worker error

@@ -29,6 +29,27 @@ import awc_opus  # noqa: E402
 import winbatch  # noqa: E402
 
 
+class DecodeQueueTest(unittest.TestCase):
+    def test_submission_stays_within_worker_window(self):
+        workers, consumed = 2, 0
+        expected = {str(i) for i in range(1000)}
+        received = set()
+
+        def jobs():
+            for submitted, name in enumerate(sorted(expected), 1):
+                self.assertLessEqual(submitted - consumed, workers)
+                yield name, name, name + ".wav"
+
+        with audio_wav.concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool, \
+                mock.patch.object(audio_wav, "decode", new=lambda _, src, dst: (src, dst)):
+            for rel, future in audio_wav._decode_jobs(pool, "unused", jobs(), workers):
+                self.assertEqual(future.result(), (rel, rel + ".wav"))
+                consumed += 1
+                received.add(rel)
+        self.assertEqual(received, expected)
+        self.assertEqual(consumed, len(expected))
+
+
 @unittest.skipUnless(FFMPEG, "ffmpeg is not on PATH")
 class AudioWavTest(unittest.TestCase):
     def setUp(self):
