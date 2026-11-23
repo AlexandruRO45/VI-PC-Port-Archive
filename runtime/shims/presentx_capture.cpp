@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -99,11 +100,25 @@ bool executable_pointer(const void* address) {
            protection == PAGE_EXECUTE_WRITECOPY;
 }
 
+// Every accepted format is one 32-bit texel: BGRA8/RGBA8 as four bytes, HDR10 as a packed R10G10B10A2 word.
+constexpr UINT kBytesPerTexel = 4;
+
+enum class PlaneFormat { Bgra8, Rgba8, Rgb10a2 };
+
+const char* format_name(PlaneFormat format) {
+    switch (format) {
+        case PlaneFormat::Bgra8: return "BGRA";
+        case PlaneFormat::Rgba8: return "RGBA";
+        case PlaneFormat::Rgb10a2: return "R10G10B10A2";
+    }
+    return "unknown";
+}
+
 // The caller's structures are its own; this side reads only the fields it names, after the range check.
 struct CapturePlane {
     ID3D12Resource* resource = nullptr;
     D3D12_RESOURCE_DESC desc{};
-    bool bgra = false;
+    PlaneFormat format = PlaneFormat::Bgra8;
 };
 
 // A mis-routed slot can call this path at frame rate with plausible-looking arguments. Each distinct refusal line is
@@ -220,14 +235,16 @@ bool check_resource(ID3D12Resource* resource, UINT plane_index, CapturePlane& ou
         return false;
     }
 
-    bool bgra = false;
+    PlaneFormat format = PlaneFormat::Bgra8;
     switch (desc.Format) {
         case DXGI_FORMAT_B8G8R8A8_UNORM:
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: bgra = true; break;
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: format = PlaneFormat::Bgra8; break;
         case DXGI_FORMAT_R8G8B8A8_UNORM:
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: bgra = false; break;
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: format = PlaneFormat::Rgba8; break;
+        // HDR10 presents R10G10B10A2_UNORM (PQ through the plane ColorSpace). dxgiformat.h has no _SRGB variant.
+        case DXGI_FORMAT_R10G10B10A2_UNORM: format = PlaneFormat::Rgb10a2; break;
         default:
-            refuse_plane(plane_index, "resource is not BGRA8 or RGBA8");
+            refuse_plane(plane_index, "resource is not BGRA8, RGBA8 or R10G10B10A2_UNORM");
             return false;
     }
 
@@ -244,11 +261,16 @@ bool check_resource(ID3D12Resource* resource, UINT plane_index, CapturePlane& ou
 
     out.resource = resource;
     out.desc = desc;
-    out.bgra = bgra;
+    out.format = format;
     return true;
 }
 
-bool write_ppm(const std::string& path, const void* pixels, UINT width, UINT height, UINT row_pitch, bool bgra) {
+std::uint8_t unorm10_to_8(std::uint32_t value) {
+    return static_cast<std::uint8_t>((value * 255u + 511u) / 1023u);
+}
+
+bool write_ppm(const std::string& path, const void* pixels, UINT width, UINT height, UINT row_pitch,
+               PlaneFormat format) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
     out << "P6\n" << width << ' ' << height << "\n255\n";
@@ -257,11 +279,21 @@ bool write_ppm(const std::string& path, const void* pixels, UINT width, UINT hei
     for (UINT y = 0; y < height; ++y) {
         const std::uint8_t* in = bytes + static_cast<std::size_t>(y) * row_pitch;
         for (UINT x = 0; x < width; ++x) {
-            const std::uint8_t* texel = in + static_cast<std::size_t>(x) * 4;
+            const std::uint8_t* texel = in + static_cast<std::size_t>(x) * kBytesPerTexel;
             std::uint8_t* rgb = row.data() + static_cast<std::size_t>(x) * 3;
-            rgb[0] = bgra ? texel[2] : texel[0];
-            rgb[1] = texel[1];
-            rgb[2] = bgra ? texel[0] : texel[2];
+            if (format == PlaneFormat::Rgb10a2) {
+                // Little-endian packed word: R in bits 0..9, G in 10..19, B in 20..29. The PPM stays 8-bit
+                // without a colour space, so an HDR10 (PQ) plane looks dark in it; that is expected.
+                std::uint32_t word = 0;
+                std::memcpy(&word, texel, sizeof(word));
+                rgb[0] = unorm10_to_8(word & 0x3ffu);
+                rgb[1] = unorm10_to_8((word >> 10) & 0x3ffu);
+                rgb[2] = unorm10_to_8((word >> 20) & 0x3ffu);
+            } else {
+                rgb[0] = format == PlaneFormat::Bgra8 ? texel[2] : texel[0];
+                rgb[1] = texel[1];
+                rgb[2] = format == PlaneFormat::Bgra8 ? texel[0] : texel[2];
+            }
         }
         out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
     }
@@ -289,8 +321,9 @@ HRESULT capture_plane(ID3D12Device* device, ID3D12CommandQueue* queue, const Cap
         return E_INVALIDARG;
     }
     const UINT64 row_pitch = footprint.Footprint.RowPitch;
+    // All accepted formats are 4 bytes per texel, so GetCopyableFootprints must give a row that holds Width * 4.
     const UINT64 last_row = static_cast<UINT64>(plane.desc.Height - 1) * row_pitch + row_bytes;
-    if (rows < plane.desc.Height || row_pitch < plane.desc.Width * 4 || row_bytes > row_pitch ||
+    if (rows < plane.desc.Height || row_pitch < plane.desc.Width * kBytesPerTexel || row_bytes > row_pitch ||
         footprint.Offset > total_bytes || last_row > total_bytes - footprint.Offset) {
         log_refusal("[rt] presentx: PresentX refused: readback footprint does not hold the texture "
                     "(rows=%u height=%u row_pitch=%llu row_bytes=%llu width=%llu offset=%llu total=%llu); "
@@ -379,7 +412,8 @@ HRESULT capture_plane(ID3D12Device* device, ID3D12CommandQueue* queue, const Cap
         hr = readback->Map(0, &read_range, &mapped);
         if (FAILED(hr) || !mapped) break;
         const bool wrote = write_ppm(path, mapped, static_cast<UINT>(plane.desc.Width),
-                                     static_cast<UINT>(plane.desc.Height), footprint.Footprint.RowPitch, plane.bgra);
+                                     static_cast<UINT>(plane.desc.Height), footprint.Footprint.RowPitch,
+                                     plane.format);
         readback->Unmap(0, nullptr);
         if (!wrote) {
             log_refusal("[rt] presentx: PresentX refused: cannot write %s; E_FAIL", path.c_str());
@@ -387,7 +421,7 @@ HRESULT capture_plane(ID3D12Device* device, ID3D12CommandQueue* queue, const Cap
         }
         std::fprintf(stderr, "[rt] presentx: wrote %s (%ux%u, %s)\n", path.c_str(),
                      static_cast<unsigned>(plane.desc.Width), static_cast<unsigned>(plane.desc.Height),
-                     plane.bgra ? "BGRA" : "RGBA");
+                     format_name(plane.format));
         result = S_OK;
     } while (false);
 
