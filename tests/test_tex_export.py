@@ -7,6 +7,7 @@ import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
 import json
 import os
 import struct
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -714,3 +715,22 @@ def test_main_refuses_to_overwrite_input_index_as_export_log(tmp_path, monkeypat
         err = capsys.readouterr().err
         assert "ERROR:" in err and "must not overwrite" in err, err
         assert index.read_text(encoding="utf-8") == original
+
+
+def test_help_works_without_numpy():
+    tool = Path(__file__).resolve().parents[1] / "tools" / "tex_export.py"
+    p = subprocess.run([sys.executable, "-I", "-S", str(tool), "--help"],
+                       capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0
+    assert "usage:" in p.stdout
+    assert "Traceback" not in p.stderr
+
+
+def test_missing_input_fails_without_traceback_when_numpy_missing(tmp_path):
+    tool = Path(__file__).resolve().parents[1] / "tools" / "tex_export.py"
+    missing = tmp_path / "no-such-index.json"
+    p = subprocess.run([sys.executable, "-I", "-S", str(tool), str(missing), str(tmp_path), str(tmp_path / "out")],
+                       capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2
+    assert "ERROR: cannot read" in p.stderr
+    assert "Traceback" not in p.stderr

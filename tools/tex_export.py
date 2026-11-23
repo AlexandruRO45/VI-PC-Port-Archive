@@ -30,10 +30,18 @@ import struct
 import sys
 from collections import Counter
 
-import numpy as np
+class _LazyNumpy:
+    """Import numpy on first use: --help and usage errors must work on a machine without it."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()["np"] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
 
 sys.path.insert(0, os.path.dirname(__file__))
-from amd_swizzle import _parity, equation, load  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from tex_headers import FMT_INFO  # noqa: E402
 
@@ -50,6 +58,8 @@ _PATTERNS = []  # (nibbles, tables) from addrlib, read on first use so the modul
 
 def eq4k(bpe):
     if bpe not in _EQ:
+        from amd_swizzle import equation, load
+
         if not _PATTERNS:
             _PATTERNS.append(load())
         nib, tab = _PATTERNS[0]
@@ -59,6 +69,8 @@ def eq4k(bpe):
 
 
 def detile_offsets(bpe, we, he):
+    from amd_swizzle import _parity
+
     eq = eq4k(bpe)
     elems = 4096 // bpe
     lb = elems.bit_length() - 1
