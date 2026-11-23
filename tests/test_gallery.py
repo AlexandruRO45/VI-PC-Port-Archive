@@ -291,6 +291,29 @@ class TestGalleryServer(unittest.TestCase):
                 self.assertIn("Content-Type: image/png", head)
                 self.assertTrue(body.startswith(b"\x89PNG"))
 
+    def test_dds_preview_lookup_keeps_path_safety(self) -> None:
+        # The case-insensitive suffix lookup lists the folder and then resolves the name it finds, so a preview
+        # URL that escapes must be refused before that lookup runs.
+        host = f"127.0.0.1:{self.port}"
+        for target in ("/textures/./inside.png", "/textures/%2e%2e/outside.png",
+                       "/textures/..%5coutside.png", "/textures/../textures_secret/loot.png",
+                       "/textures//outside.png", "/textures/%2foutside.png"):
+            with self.subTest(target=target):
+                status, _, body = _raw_get(self.port, target, host=host)
+                self.assertEqual(status, 403)
+                self.assertNotIn(b"\x89PNG", body)
+
+    def test_dds_suffix_lookup_does_not_follow_an_uppercase_symlink(self) -> None:
+        # The lookup resolves the on-disk name it found, so a link whose suffix case differs cannot escape either.
+        link = os.path.join(self.textures_dir, "escaped_upper.DDS")
+        try:
+            os.symlink(os.path.join(self.tmp.name, "outside.dds"), link)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"cannot create symlink here: {exc}")
+        status, _, body = _raw_get(self.port, "/textures/escaped_upper.png", host=f"127.0.0.1:{self.port}")
+        self.assertIn(status, (403, 404))
+        self.assertNotIn(b"\x89PNG", body)
+
     def test_dds_symlink_escape_is_forbidden(self) -> None:
         link = os.path.join(self.textures_dir, "escaped.dds")
         try:
