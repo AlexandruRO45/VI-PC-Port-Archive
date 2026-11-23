@@ -166,6 +166,66 @@ class TestContainer(unittest.TestCase):
         self.assertEqual(R.parts(b"not a container"), {})
 
 
+class TestArgumentTable(unittest.TestCase):
+    """Hand-written listings in the shape of a program that takes its root arguments from the table behind s[0:1]."""
+
+    def sig(self, *params):
+        sig, err = R.parse_rts0(rts0(params=list(params)))
+        self.assertEqual(err, "")
+        return sig
+
+    def test_the_layout_is_packed_in_root_order(self):
+        sig = self.sig(("uav", 0), ("srv", 0), ("constants", 0, 3), ("cbv", 0))
+        self.assertEqual(R.table_layout(sig), ([0, 8, 16, 28], 36))
+
+    def test_a_descriptor_table_has_no_measured_layout(self):
+        self.assertEqual(R.table_layout(self.sig(("uav", 0), ("table", 0, 1))), (None, 0))
+
+    def test_loads_through_a_copy_of_the_pointer(self):
+        got = R.table_scan(asm("s_and_b32 s7, s1, 0xff", "s_mov_b32 s6, s0", "s_load_dword s9, s[6:7], 0x18",
+                               "s_load_dwordx2 s[10:11], s[6:7], null", "s_load_dwordx4 s[12:15], s[6:7], 24"))
+        self.assertEqual(got, {"pointer": True, "reads": [[0x18, 4], [0, 8], [24, 16]], "indexed": 0})
+
+    def test_the_pointer_can_stay_in_s0_and_s1(self):
+        # The load that overwrites the pointer is the last one through it.
+        got = R.table_scan(asm("s_and_b32 s1, s1, 0xff", "s_load_dwordx4 s[0:3], s[0:1], 0x8",
+                               "s_load_dword s9, s[0:1], null"))
+        self.assertEqual(got, {"pointer": True, "reads": [[8, 16]], "indexed": 0})
+
+    def test_the_scan_ends_when_a_half_is_written(self):
+        got = R.table_scan(asm("s_and_b32 s3, s1, 0xff", "s_mov_b32 s2, s0", "s_load_dword s5, s[2:3], null",
+                               "s_mov_b32 s2, -1", "s_load_dword s6, s[2:3], 0x4"))
+        self.assertEqual(got["reads"], [[0, 4]])
+
+    def test_a_compare_does_not_write_its_first_operand(self):
+        got = R.table_scan(asm("s_and_b32 s3, s1, 0xff", "s_mov_b32 s2, s0", "s_cmp_eq_u32 s2, 0",
+                               "s_load_dword s5, s[2:3], 0x4"))
+        self.assertEqual(got["reads"], [[4, 4]])
+
+    def test_a_register_offset_is_counted_not_guessed(self):
+        got = R.table_scan(asm("s_and_b32 s3, s1, 0xff", "s_mov_b32 s2, s0", "s_load_dword s5, s[2:3], s8"))
+        self.assertEqual(got, {"pointer": True, "reads": [], "indexed": 1})
+
+    def test_no_pointer_without_the_masked_high_half(self):
+        self.assertFalse(R.table_scan(asm("s_mov_b32 s2, s0", "s_mov_b32 s3, 0",
+                                          "s_load_dword s5, s[2:3], null"))["pointer"])
+        # The two halves have to be neighbours.
+        self.assertFalse(R.table_scan(asm("s_and_b32 s9, s1, 0xff", "s_mov_b32 s2, s0"))["pointer"])
+
+    def test_loads_are_checked_against_the_layout(self):
+        sig = self.sig(("uav", 0), ("uav", 0), ("constants", 0, 3))  # 0, 8, 16..27: 28 bytes
+        clean = {"pointer": True, "reads": [[0, 8], [8, 8], [20, 4]], "indexed": 0}
+        self.assertEqual(R.table_check(sig, clean), {"size": 28, "off_parameter": 0, "overread": 0})
+        # A four-dword load of three constants runs one dword past the end; a load at +4 starts inside a VA.
+        wide = {"pointer": True, "reads": [[16, 16], [4, 4]], "indexed": 0}
+        self.assertEqual(R.table_check(sig, wide), {"size": 28, "off_parameter": 1, "overread": 4})
+
+    def test_nothing_to_check_without_a_pointer_or_a_layout(self):
+        sig = self.sig(("uav", 0))
+        self.assertIsNone(R.table_check(sig, {"pointer": False, "reads": [], "indexed": 0}))
+        self.assertIsNone(R.table_check(self.sig(("table", 0, 1)), {"pointer": True, "reads": [[0, 4]], "indexed": 0}))
+
+
 class TestCensus(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -206,6 +266,39 @@ class TestCensus(unittest.TestCase):
         self.assertEqual(rows[0]["reads"], {"read": [4, 6, 7], "table_bases": [4], "whole_pairs": [6]})
         self.assertEqual(R.summarize(rows)["read_scan"],
                          {"programs": 1, "low_read": 0, "table_bases": {4: 1}, "whole_pairs": {6: 1}})
+
+    def test_the_argument_table_is_joined_without_an_fspx_record(self):
+        # A container from a DLL whose programs are XBCH, not FSPX: no user_sgprs, and the table is still checked.
+        self.write("builder", [(b"RTS0", rts0(params=[("uav", 0), ("constants", 0, 2)]))])
+        self.write("upscaler", [(b"RTS0", rts0(params=[("table", 0, 1), ("cbv", 0)]))], user_sgprs=8)
+        disasm = os.path.join(self.tmp.name, "disasm")
+        os.makedirs(disasm, exist_ok=True)
+        with open(os.path.join(disasm, "builder.s"), "w", encoding="utf-8") as fh:
+            fh.write(asm("s_and_b32 s3, s1, 0xff", "s_mov_b32 s2, s0", "s_load_dwordx2 s[4:5], s[2:3], null",
+                         "s_load_dwordx4 s[8:11], s[2:3], 0x8"))
+        with open(os.path.join(disasm, "upscaler.s"), "w", encoding="utf-8") as fh:
+            fh.write(asm("s_mov_b32 s10, s4", "s_mov_b32 s11, 0", "s_load_dwordx8 s[16:23], s[10:11], null"))
+        rows, errors = R.census(self.tmp.name, disasm)
+        self.assertEqual(errors, [])
+        by_name = {r["name"]: r for r in rows}
+        self.assertNotIn("reads", by_name["builder"])
+        self.assertEqual(by_name["builder"]["table"], {"pointer": True, "reads": [[0, 8], [8, 16]], "indexed": 0,
+                                                       "size": 16, "off_parameter": 0, "overread": 8})
+        self.assertEqual(by_name["upscaler"]["table"], {"pointer": False, "reads": [], "indexed": 0})
+        self.assertEqual(R.summarize(rows)["argument_table"],
+                         {"programs": 1, "with_reads": 1, "compared": 1, "off_parameter": 0, "max_overread": 8,
+                          "indexed": 0})
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--disasm", disasm],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("argument table: 1 program(s) build the pointer from s[0:1], 1 load through it", r.stdout)
+
+    def test_no_argument_table_line_without_such_a_program(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        rows, _ = R.census(self.tmp.name)
+        self.assertEqual(R.summarize(rows)["argument_table"], {})
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name], capture_output=True, text=True)
+        self.assertNotIn("argument table", r.stdout)
 
     def test_a_folder_name_with_glob_characters_is_a_path(self):
         # The root went into glob.glob unescaped, so "[v1]" was read as a character class and the folder came

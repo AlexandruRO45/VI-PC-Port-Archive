@@ -20,6 +20,12 @@ signatures each model fits. `--disasm DIR` adds the program's own reads, from a 
 folder: which user SGPRs it reads, which one it zero-extends into an `s_load` base, and which 64-bit pairs it copies
 whole. That is where the tables and the root descriptors surface.
 
+`--disasm` also checks the argument table. A program that takes no root argument in a user SGPR builds a 40-bit
+pointer from `s0` and the low byte of `s1` and loads its arguments through it. The 52 compute programs of
+`XboxBvhBuilder.dll` all do (their containers carry `RTS0` too; `tools/pe_shader_containers.py --extract`, then
+`tools/fssm_unpack.py` and `tools/shader_disasm.py`). Each such load is compared with the packed layout of the
+program's own signature: root order, 8 bytes per root descriptor, 4 per constant, no padding.
+
 What it does not measure: which parameter a shader reads. A read set needs `tools/shader_disasm.py` (LLVM_MC) and
 `tools/rdna2spirv.py` on the program, and the game's own shaders have no signature to compare it with.
 
@@ -210,6 +216,99 @@ def read_scan(asm, user_sgprs):
     return {"read": sorted(read), "table_bases": sorted(bases), "whole_pairs": sorted(pairs)}
 
 
+def table_layout(sig):
+    """([byte offset of each root parameter], size) of the packed argument table, or (None, 0).
+
+    Root order, a root descriptor is its 64-bit VA and a constant 4 bytes per value, with no padding
+    (docs/d3d12_vulkan.md section 3.5). No measured signature has a descriptor table in the table, so one has no
+    layout here.
+    """
+    offsets, at = [], 0
+    for p in sig["params"]:
+        if p["type"] == "table":
+            return None, 0
+        offsets.append(at)
+        at += 4 * p.get("count", 0) if p["type"] == "constants" else 8
+    return offsets, at
+
+
+def _single(text):
+    """The register number of a single-register operand, else None."""
+    regs = _registers(text)
+    return regs[0][0] if len(regs) == 1 and regs[0][0] == regs[0][1] else None
+
+
+def table_scan(asm):
+    """The loads a program makes through the 40-bit pointer it builds from `s0` and the low byte of `s1`.
+
+    The pointer is `s[n:n+1]` after `s_and_b32 s<n+1>, s1, 0xff` and, unless n is 0, `s_mov_b32 s<n>, s0`. Loads are
+    taken in listing order until either half is written again. `reads` holds [offset, bytes] for each load with a
+    constant offset, and `indexed` counts the others.
+    """
+    low = high = None
+    reads, indexed = [], 0
+    live = False
+    for op, ops in instructions(asm):
+        if live:
+            m = re.fullmatch(r"s_load_dword(?:x(\d+))?", op)
+            if m and len(ops) >= 3 and _registers(ops[1]) == [(low, high)]:
+                size = 4 * int(m.group(1) or 1)
+                if ops[2] == "null":
+                    reads.append([0, size])
+                elif re.fullmatch(r"0x[0-9a-fA-F]+|\d+", ops[2]):
+                    reads.append([int(ops[2], 0), size])
+                else:
+                    indexed += 1
+            written = _registers(ops[0]) if ops and not op.startswith(NO_DEST) else []
+            if any(lo <= r <= hi for lo, hi in written for r in (low, high)):
+                break
+            continue
+        if op == "s_and_b32" and len(ops) == 3 and ops[1] == "s1" and ops[2] == "0xff" and high is None:
+            high = _single(ops[0])
+            if high == 1:
+                low = 0
+        elif op == "s_mov_b32" and len(ops) == 2 and ops[1] == "s0" and low is None:
+            low = _single(ops[0])
+        if low is not None and high is not None:
+            if high != low + 1:
+                break
+            live = True
+    return {"pointer": live, "reads": reads, "indexed": indexed}
+
+
+def table_check(sig, scan):
+    """How a program's table loads sit in the packed layout of its signature, or None when there is nothing to compare.
+
+    `off_parameter` counts loads that do not start at a root descriptor or at a constant, and `overread` is how far
+    the widest load runs past the table's end (the compiler rounds a load up to 2, 4, 8 or 16 dwords).
+    """
+    offsets, size = table_layout(sig)
+    if offsets is None or not scan["pointer"]:
+        return None
+    starts = set()
+    for p, at in zip(sig["params"], offsets):
+        starts.update(range(at, at + 4 * p.get("count", 0), 4) if p["type"] == "constants" else [at])
+    return {"size": size,
+            "off_parameter": sum(1 for at, _ in scan["reads"] if at not in starts),
+            "overread": max([at + n - size for at, n in scan["reads"]] + [0])}
+
+
+def _table_summary(rows):
+    """Counts over the rows whose program builds the table pointer; {} when none does."""
+    scans = [r["table"] for r in rows if r.get("table", {}).get("pointer")]
+    if not scans:
+        return {}
+    checked = [s for s in scans if "size" in s]
+    return {
+        "programs": len(scans),
+        "with_reads": sum(1 for s in scans if s["reads"]),
+        "compared": len(checked),
+        "off_parameter": sum(1 for s in checked if s["off_parameter"]),
+        "max_overread": max([s["overread"] for s in checked] + [0]),
+        "indexed": sum(s["indexed"] for s in scans),
+    }
+
+
 def _read_summary(rows):
     """Counts over the rows that carry a read scan; {} when no row does."""
     scans = [r["reads"] for r in rows if "reads" in r]
@@ -257,13 +356,19 @@ def census(root, disasm=None):
                "user_sgprs": user_sgprs,
                "span_table2": span(sig, 2), "span_table1": span(sig, 1),
                "visible_table2": span(sig, 2, VISIBILITY_ALL), "visible_table1": span(sig, 1, VISIBILITY_ALL)}
+        asm = None
+        asm_path = os.path.join(disasm, name + ".s") if disasm else None
+        if asm_path and os.path.exists(asm_path):
+            with open(asm_path, encoding="utf-8") as fh:
+                asm = fh.read()
         if user_sgprs is not None:
             row["spare_table2"] = user_sgprs - row["span_table2"]
             row["spare_table1"] = user_sgprs - row["span_table1"]
-            asm_path = os.path.join(disasm, name + ".s") if disasm else None
-            if asm_path and os.path.exists(asm_path):
-                with open(asm_path, encoding="utf-8") as fh:
-                    row["reads"] = read_scan(fh.read(), user_sgprs)
+            if asm is not None:
+                row["reads"] = read_scan(asm, user_sgprs)
+        if asm is not None:
+            row["table"] = table_scan(asm)
+            row["table"].update(table_check(sig, row["table"]) or {})
         rows.append(row)
     return rows, errors
 
@@ -286,6 +391,7 @@ def summarize(rows):
         "spare_table2": dict(sorted(Counter(r["spare_table2"] for r in ok if "spare_table2" in r).items())),
         "spare_table1": dict(sorted(Counter(r["spare_table1"] for r in ok if "spare_table1" in r).items())),
         "read_scan": _read_summary(ok),
+        "argument_table": _table_summary(ok),
     }
 
 
@@ -293,7 +399,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("root", help="tools/fspx_unpack.py --out folder")
     ap.add_argument("--json", help="also write the rows and the summary here")
-    ap.add_argument("--disasm", help="a tools/fspx_unpack.py --disasm folder; adds each program's reads")
+    ap.add_argument("--disasm", help="a folder of <name>.s listings (tools/fspx_unpack.py --disasm or "
+                                     "tools/shader_disasm.py); adds each program's reads and argument-table loads")
     a = ap.parse_args(argv)
     if a.json:
         try:
@@ -326,6 +433,11 @@ def main(argv=None):
         rs = summary["read_scan"]
         print(f"reads {rs['programs']} program(s): table bases {rs['table_bases']}, whole pairs {rs['whole_pairs']}, "
               f"{rs['low_read']} read s0-s3")
+    if summary["argument_table"]:
+        at = summary["argument_table"]
+        print(f"argument table: {at['programs']} program(s) build the pointer from s[0:1], {at['with_reads']} load "
+              f"through it; of {at['compared']} compared with their signature, {at['off_parameter']} have a load off a "
+              f"parameter; widest load past the end {at['max_overread']} bytes; {at['indexed']} indexed load(s)")
     for line in errors:
         print(f"error: {line}", file=sys.stderr)
     if a.json:
