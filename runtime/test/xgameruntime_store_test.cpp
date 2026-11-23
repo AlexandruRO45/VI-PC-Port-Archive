@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <ctime>
 
 #include <XAsync.h>
@@ -74,6 +75,9 @@ using Items = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t, void*);
 using IsValid = bool(STDMETHODCALLTYPE*)(void*, Handle);
 using ProductsAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, uint32_t, const char**, size_t, const char**, size_t,
                                                   XAsyncBlock*);
+using PackageQueryAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, uint32_t, const char*, XAsyncBlock*);
+using AssociatedIdAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, uint32_t, uint32_t, XAsyncBlock*);
+using UpdatesAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char**, size_t, XAsyncBlock*);
 using Enumerate = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, void*, void*);
 using Register = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, XTaskQueueHandle, void*, void(CALLBACK*)(void*),
                                              XTaskQueueRegistrationToken*);
@@ -170,6 +174,46 @@ int main() {
               !at<IsValid>(store, 16)(store, products),
           "the query has no products and no further pages");
     at<Close>(store, 19)(store, products);
+
+    // Required identifiers are validated before beginning an asynchronous operation.
+    const char* null_id[] = {"valid", nullptr};
+    const char* empty_id[] = {"valid", ""};
+    auto product_args = [&](const char** values, size_t n, const char** filters, size_t nf, HRESULT expected, const char* label) {
+        XAsyncBlock block{};
+        HRESULT hr = at<ProductsAsync>(store, 7)(store, context, 1, values, n, filters, nf, &block);
+        check(hr == expected, label);
+        if (hr == S_OK) { finished(&block); Handle q = nullptr; at<HandleResult>(store, 8)(store, &block, &q); at<Close>(store, 19)(store, q); }
+    };
+    product_args(nullptr, 1, nullptr, 0, E_INVALIDARG, "products reject null IDs");
+    product_args(ids, 0, nullptr, 0, E_INVALIDARG, "products reject zero IDs");
+    product_args(ids, 1, nullptr, 1, E_INVALIDARG, "products reject null filters with a count");
+    product_args(null_id, 2, nullptr, 0, E_INVALIDARG, "products reject null ID element");
+    product_args(empty_id, 2, nullptr, 0, E_INVALIDARG, "products reject empty ID element");
+    const char* filters[] = {"action"};
+    product_args(ids, 1, filters, 1, S_OK, "products accept valid IDs and filters");
+    auto single_id = [&](int index, const char* id, HRESULT expected, const char* label) {
+        XAsyncBlock block{};
+        HRESULT hr = index == 13 ? at<PackageQueryAsync>(store, 13)(store, context, 1, id, &block)
+                                 : at<AssociatedIdAsync>(store, 77)(store, context, id, 1, 1, &block);
+        check(hr == expected, label);
+        if (hr == S_OK) { finished(&block); Handle q = nullptr; at<HandleResult>(store, index == 13 ? 14 : 78)(store, &block, &q); at<Close>(store, 19)(store, q); }
+    };
+    for (int index : {13, 77}) {
+        single_id(index, nullptr, E_INVALIDARG, "single ID query rejects null");
+        single_id(index, "", E_INVALIDARG, "single ID query rejects empty");
+        single_id(index, "valid", S_OK, "single ID query accepts a valid ID");
+    }
+    auto update_args = [&](const char** values, size_t n, HRESULT expected, const char* label) {
+        XAsyncBlock block{};
+        HRESULT hr = at<UpdatesAsync>(store, 79)(store, context, values, n, &block);
+        check(hr == expected, label);
+        if (hr == S_OK) { finished(&block); uint32_t nout = 0; at<Count>(store, 80)(store, &block, &nout); }
+    };
+    update_args(nullptr, 1, E_INVALIDARG, "updates reject null IDs");
+    update_args(ids, 0, E_INVALIDARG, "updates reject zero IDs");
+    update_args(null_id, 2, E_INVALIDARG, "updates reject null ID element");
+    update_args(empty_id, 2, E_INVALIDARG, "updates reject empty ID element");
+    update_args(ids, 1, S_OK, "updates accept a valid ID");
 
     // ---- what needs the service fails before starting ----
     check(at<NoArgs>(store, 49)(store) == E_FAIL, "XStoreShowPurchaseUIAsync is not available offline");

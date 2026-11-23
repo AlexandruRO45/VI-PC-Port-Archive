@@ -207,8 +207,10 @@ HRESULT STDMETHODCALLTYPE store_query_associated_async(void*, XStoreContextHandl
     return begin(c, a, &kProductsIdentity, "XStoreQueryAssociatedProductsAsync");
 }
 // 7: XStoreQueryProductsAsync(context, kinds, const char** storeIds, size_t, const char** actionFilters, size_t, async)
-HRESULT STDMETHODCALLTYPE store_query_products_async(void*, XStoreContextHandle c, uint32_t, const char**, size_t,
-                                                     const char**, size_t, XAsyncBlock* a) {
+HRESULT STDMETHODCALLTYPE store_query_products_async(void*, XStoreContextHandle c, uint32_t, const char** store_ids, size_t count,
+                                                     const char** action_filters, size_t action_filters_count, XAsyncBlock* a) {
+    if (!store_ids || count == 0 || (action_filters_count > 0 && !action_filters)) return E_INVALIDARG;
+    for (size_t i = 0; i < count; ++i) if (!store_ids[i] || !*store_ids[i]) return E_INVALIDARG;
     return begin(c, a, &kProductsIdentity, "XStoreQueryProductsAsync");
 }
 // 9: XStoreQueryEntitledProductsAsync(context, kinds, uint32_t maxItemsToRetrievePerPage, XAsyncBlock*)
@@ -220,13 +222,15 @@ HRESULT STDMETHODCALLTYPE store_query_current_game_async(void*, XStoreContextHan
     return begin(c, a, &kProductsIdentity, "XStoreQueryProductForCurrentGameAsync");
 }
 // 13: XStoreQueryProductForPackageAsync(context, kinds, const char* packageIdentifier, XAsyncBlock*)
-HRESULT STDMETHODCALLTYPE store_query_for_package_async(void*, XStoreContextHandle c, uint32_t, const char*,
+HRESULT STDMETHODCALLTYPE store_query_for_package_async(void*, XStoreContextHandle c, uint32_t, const char* package_id,
                                                         XAsyncBlock* a) {
+    if (!package_id || !*package_id) return E_INVALIDARG;
     return begin(c, a, &kProductsIdentity, "XStoreQueryProductForPackageAsync");
 }
 // 77: XStoreQueryAssociatedProductsForStoreIdAsync(context, const char* storeId, kinds, uint32_t maxItems, async)
-HRESULT STDMETHODCALLTYPE store_query_associated_for_id_async(void*, XStoreContextHandle c, const char*, uint32_t,
+HRESULT STDMETHODCALLTYPE store_query_associated_for_id_async(void*, XStoreContextHandle c, const char* store_id, uint32_t,
                                                               uint32_t, XAsyncBlock* a) {
+    if (!store_id || !*store_id) return E_INVALIDARG;
     return begin(c, a, &kProductsIdentity, "XStoreQueryAssociatedProductsForStoreIdAsync");
 }
 // 6, 8, 10, 12, 14, 18, 78: HRESULT ...Result(XAsyncBlock* async, XStoreProductQueryHandle* productQueryHandle)
@@ -302,7 +306,9 @@ HRESULT STDMETHODCALLTYPE store_updates_async(void*, XStoreContextHandle c, XAsy
     return begin(c, a, &kUpdatesIdentity, "XStoreQueryGameAndDlcPackageUpdatesAsync");
 }
 // 79: HRESULT XStoreQueryPackageUpdatesAsync(context, const char** packageIdentifiers, size_t count, XAsyncBlock*)
-HRESULT STDMETHODCALLTYPE store_package_updates_async(void*, XStoreContextHandle c, const char**, size_t, XAsyncBlock* a) {
+HRESULT STDMETHODCALLTYPE store_package_updates_async(void*, XStoreContextHandle c, const char** package_ids, size_t count, XAsyncBlock* a) {
+    if (!package_ids || count == 0) return E_INVALIDARG;
+    for (size_t i = 0; i < count; ++i) if (!package_ids[i] || !*package_ids[i]) return E_INVALIDARG;
     return begin(c, a, &kUpdatesIdentity, "XStoreQueryPackageUpdatesAsync");
 }
 
