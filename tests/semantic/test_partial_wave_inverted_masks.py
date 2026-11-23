@@ -222,7 +222,7 @@ class PartialWaveWholeQuadMode(unittest.TestCase):
     # out[0..1]: launched bits fill their quad, never-launched lanes included (group 42: 44); out[2]: the reverse,
     # and out[3] the launched lanes' own bits of it (v_cndmask reads this lane's bit); out[4..5]: a constant leaves
     # launched-lane bits of ~vcc in the shadow, which must not reach the never-launched lanes of their quad
-    # (found by cache-review: group 10 gives SCC 0 and no bit, group 9 SCC 1 and 4 bits); out[6]: s_wqm_b32 of
+    # (group 10 gives SCC 0 and no bit, group 9 SCC 1 and 4 bits); out[6]: s_wqm_b32 of
     # vcc_hi, the high half.
     BODY64 = ("s_wqm_b64 s[12:13], vcc\n" + store_scc(0) + "s_bcnt1_i32_b64 s21, s[12:13]\n" + store(1, "s21")
               + "s_not_b64 s[14:15], vcc\ns_wqm_b64 s[16:17], s[14:15]\ns_bcnt1_i32_b64 s21, s[16:17]\n"
@@ -266,11 +266,14 @@ class PartialWaveWholeQuadMode(unittest.TestCase):
         for threads in (18, 20, 52, 32):
             self.run_group(32, self.BODY32, self.want32, threads, False)
 
-    def test_reviewer_values(self):
-        """The words cache-review's model gives, spelled out: group 10 -> SCC 0, 0 bits; 9 -> 1, 4; 42 -> 44."""
-        self.assertEqual(self.want64((1 << 10) - 1)[4:6], [0, 0])
-        self.assertEqual(self.want64((1 << 9) - 1)[4:6], [1, 4])
-        self.assertEqual(self.want64((1 << 42) - 1)[1], 44)
+    def test_split_quad_values(self):
+        """The translator's words on the stock interpreter, spelled out rather than taken from want64: group 10 ->
+        SCC 0 and 0 bits, group 9 -> SCC 1 and 4 bits (out[4..5]), group 42 -> 44 bits (out[1])."""
+        for threads, first, want in ((10, 4, [0, 0]), (9, 4, [1, 4]), (42, 1, [44])):
+            spv = translate("cs_pwm_wqm64", prologue(64) + self.BODY64 + "s_endpgm\n", threads, False)
+            mem = run_waves(spv, threads, 64)
+            with self.subTest(threads=threads):
+                self.assertEqual([mem.get(4 * (first + k)) for k in range(len(want))], want)
 
 
 class PartialWaveControlFlow(unittest.TestCase):

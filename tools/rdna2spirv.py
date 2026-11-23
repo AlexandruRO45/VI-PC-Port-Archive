@@ -240,6 +240,9 @@ class Unsupported(Exception):
 
 
 class Gen:
+    partial = None                 # see __init__; class defaults so emit/store_reg work on a Gen made without it
+    vcc_half = None
+
     def __init__(self, stage, hoist_reg_ptrs=False, cache_active=False):
         self.stage = stage
         self.hoist_reg_ptrs = hoist_reg_ptrs
