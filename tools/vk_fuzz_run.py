@@ -20,6 +20,9 @@ opaque=True (the default of run_programs) keeps the driver from folding the prog
 The program computes the same values at run time, but a compiler that sees literal operands folds them itself, and
 the AMD Windows driver (26.10.1) folds an ordered compare of a literal NaN to true in a wave32 pipeline, which says
 nothing about what the translated shader does with a NaN it is given.
+
+Each GPU process uses LEONIDA_GPU_TEST_TIMEOUT (default 120 seconds; 0 disables it), like the GPU test suite.
+A timeout stops the run with a harness error; it is not an unsupported-program skip or a reason to retry.
 """
 import json
 import os
@@ -89,7 +92,9 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
     if SHADERS not in sys.path:
         sys.path.insert(0, SHADERS)
     import mc_command
+    from check import gpu_test_timeout, timed_out
     from compute_fixture import compute_header, find_test_program, unpinned_subgroup
+    limit = gpu_test_timeout()
     build = build or os.path.join(os.path.dirname(HERE), "runtime", "build")
     folder = find_test_program(build, "vk_compute_test")   # the folder holding it (a Visual Studio config subfolder)
     if not folder:
@@ -147,7 +152,10 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
             for _ in range(retries + 1):
                 if os.path.isfile(dump):
                     os.remove(dump)
-                r = subprocess.run(args, capture_output=True, text=True, env=env)
+                try:
+                    r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=limit)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(f"{name}: {timed_out(exe, limit)}") from None
                 if r.returncode in (0, 77):
                     break
             msg = (r.stdout + r.stderr).strip()
