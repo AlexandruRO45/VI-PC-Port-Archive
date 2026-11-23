@@ -3375,9 +3375,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         const auto begin_statistics = [&] {
             detail::begin_statistics_segment(prepared, p.statistics_begin, command_buffer, vk);
         };
-        // A draw of the other kind inside a statistics query starts a segment in its pool (D3D-291), before the
-        // draw's own rendering scope begins.
-        if (std::holds_alternative<Draw>(command) || std::holds_alternative<ExecuteIndirect>(command)) {
+        // A draw of the other kind starts a statistics segment before its rendering scope (D3D-291).
+        // Counted dispatches split their query around the helper in the dispatch path below.
+        if (const auto* indirect = std::get_if<ExecuteIndirect>(&command);
+            std::holds_alternative<Draw>(command) || (indirect && indirect->kind != IndirectKind::dispatch)) {
             end_statistics();
             begin_statistics();
         }
