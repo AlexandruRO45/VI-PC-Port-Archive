@@ -1241,6 +1241,16 @@ if(TARGET Vulkan::Headers)
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
   add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
+  # Image registration and layout tracking stay in step across host allocation failures; no Vulkan device needed.
+  add_executable(vk_image_registration_oom_test test/vk_image_registration_oom_test.cpp)
+  target_link_libraries(vk_image_registration_oom_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_image_registration_oom_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(vk_image_registration_oom_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+  endif()
+  add_test(NAME vk_image_registration_oom COMMAND vk_image_registration_oom_test)
   if(MSVC)
     # Keep the checker and its worker threads on the toolchain's C++ runtime under Wine.
     set_property(TARGET vk_pipeline_check PROPERTY

@@ -1126,10 +1126,21 @@ public:
     }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
-        set_resource_locked(id, binding);
-        if (binding.image) {
+        if (!binding.image) {
+            set_resource_locked(id, binding);
+            return;
+        }
+        auto [it, inserted] = resources_.try_emplace(id, binding);
+        try {
             std::lock_guard tlock(tracker_mutex_);
             tracker_.track(id, binding, current_layout);
+        } catch (...) {
+            if (inserted) resources_.erase(it);
+            throw;
+        }
+        if (!inserted) {
+            unindex_buffer(id, it->second);
+            it->second = binding;
         }
     }
 
@@ -1150,11 +1161,25 @@ public:
 
     void add_sparse_resource(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseResource> sparse) {
         std::unique_lock lock(resource_mutex_);
-        set_resource_locked(id, binding);
-        sparse_resources_.emplace(id, std::move(sparse));
-        if (binding.image) {
+        if (!binding.image) {
+            set_resource_locked(id, binding);
+            sparse_resources_.emplace(id, std::move(sparse));
+            return;
+        }
+        auto [it, inserted] = resources_.try_emplace(id, binding);
+        bool sparse_inserted = false;
+        try {
+            sparse_inserted = sparse_resources_.emplace(id, std::move(sparse)).second;
             std::lock_guard tlock(tracker_mutex_);
             tracker_.track(id, binding, VK_IMAGE_LAYOUT_UNDEFINED);
+        } catch (...) {
+            if (sparse_inserted) sparse_resources_.erase(id);
+            if (inserted) resources_.erase(it);
+            throw;
+        }
+        if (!inserted) {
+            unindex_buffer(id, it->second);
+            it->second = binding;
         }
     }
 
