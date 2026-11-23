@@ -6713,8 +6713,32 @@ public:
         DWORD flags = 0;
         if (!file_mapping || !out || !GetHandleInformation(file_mapping, &flags))
             return d3d12_trace::result(method, E_INVALIDARG);
+        // A valid handle that is not a section (an event, a file) is E_INVALIDARG on the host too: RTX 4090 and WARP,
+        // d3d12_existing_heap_test.
+        if (!is_section_handle(file_mapping)) return d3d12_trace::result(method, E_INVALIDARG);
         log_once("OpenExistingHeapFromFileMapping (existing heaps are not supported)", 0);
         return d3d12_trace::result(method, E_NOTIMPL);
+    }
+
+    // Whether `handle` names a section object (what CreateFileMapping returns), from its object type name. Nothing is
+    // mapped. An unknown answer (ntdll without NtQueryObject) counts as a section, which keeps the earlier behaviour.
+    static bool is_section_handle(HANDLE handle) {
+        struct CountedString {
+            USHORT length;
+            USHORT maximum_length;
+            PWSTR buffer;
+        };
+        using QueryObject = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+        static const auto query = reinterpret_cast<QueryObject>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject")));
+        if (!query) return true;
+        alignas(8) unsigned char info[1024]{};
+        constexpr int kObjectTypeInformation = 2;
+        if (query(handle, kObjectTypeInformation, info, sizeof(info), nullptr) < 0) return false;
+        const auto* name = reinterpret_cast<const CountedString*>(info);
+        constexpr wchar_t kSection[] = L"Section";
+        return name->buffer && name->length == (std::size(kSection) - 1) * sizeof(wchar_t) &&
+               std::wmemcmp(name->buffer, kSection, std::size(kSection) - 1) == 0;
     }
 
     HRESULT STDMETHODCALLTYPE CreateLifetimeTracker(ID3D12LifetimeOwner* owner, REFIID, void** out) override {

@@ -37,8 +37,14 @@ int check(ID3D12Device* device, const char* who) {
     EXPECT_HR(device3->OpenExistingHeapFromAddress(nullptr, IID_PPV_ARGS(&heap.p)), E_INVALIDARG);
     EXPECT(heap.p == nullptr);
     EXPECT_HR(device3->OpenExistingHeapFromFileMapping(nullptr, IID_PPV_ARGS(&heap.p)), E_INVALIDARG);
-    EXPECT_HR(device3->OpenExistingHeapFromFileMapping(reinterpret_cast<HANDLE>(0x1234), IID_PPV_ARGS(&heap.p)),
-              E_INVALIDARG);
+    // A real handle that is not a section (an event). A made-up value such as 0x1234 makes GetHandleInformation
+    // raise STATUS_INVALID_HANDLE instead of failing when strict handle checking is on (Application Verifier, a
+    // debugger, some security software), which ended this test with 0xC0000008 on such setups.
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    EXPECT(event != nullptr);
+    const HRESULT event_hr = device3->OpenExistingHeapFromFileMapping(event, IID_PPV_ARGS(&heap.p));
+    CloseHandle(event);
+    EXPECT_HR(event_hr, E_INVALIDARG);
     EXPECT(heap.p == nullptr);
     Ref<ID3D12Device5> device5;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p)))) {
