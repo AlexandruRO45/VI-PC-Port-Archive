@@ -553,5 +553,40 @@ class TestLdsMaxU32ConditionCodes(unittest.TestCase):
         self.assertEqual(interp.scc, 1)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestLdsMaxU32BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, integer wrapping, and IEEE 754 bit representations."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=1024)
+
+    def test_32bit_integer_extremes(self) -> None:
+        # Unsigned max: 0xFFFFFFFF is maximum possible uint32
+        self.lds.write_dword(0, 0x7FFFFFFF)
+        updated = self.lds.atomic_max_u32(0, 0xFFFFFFFF)
+        self.assertEqual(updated, 0xFFFFFFFF)
+
+        # 0x80000000 > 0x7FFFFFFF in unsigned comparison
+        self.lds.write_dword(4, 0x7FFFFFFF)
+        updated_msb = self.lds.atomic_max_u32(4, 0x80000000)
+        self.assertEqual(updated_msb, 0x80000000)
+
+    def test_float32_bit_patterns_as_uint32(self) -> None:
+        # Untyped max compares bits as unsigned integers.
+        # quiet NaN (0x7FC00000) vs subnormal (0x00000001): 0x7FC00000 is larger as uint32
+        self.lds.write_dword(0x10, 0x00000001)
+        updated = self.lds.atomic_max_u32(0x10, 0x7FC00000)
+        self.assertEqual(updated, 0x7FC00000)
+
+    def test_lds_offset_boundary_max_16bit(self) -> None:
+        self.lds.write_dword(1023 * 4, 50)
+        updated = self.lds.atomic_max_u32(0, 150, offset16=0xFFFF)
+        self.assertEqual(updated, 150)
+        self.assertEqual(self.lds.read_dword(1023 * 4), 150)
+
+
 if __name__ == "__main__":
     unittest.main()
