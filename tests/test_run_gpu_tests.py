@@ -308,6 +308,32 @@ class NotWholeWave(unittest.TestCase):
                 self.assertIs(judge(0, DEVICE_64 + "out[0..7] = 55 48 BAD 0 0 0 0 0\n", **kw)[0], False)
 
 
+class SmulI32Suite(unittest.TestCase):
+    """The scalar multiply fixture is width-independent and must run, not skip, on a wave32-only GPU."""
+
+    def test_wave32_only_device_runs_without_require_wave64(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="cs_smul_i32", build=tmp, llvm_mc="unused")
+
+            def fake_run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_compute_test":
+                    if "--require-wave64" in cmd:
+                        return 77, DEVICE_32 + "full 64-wide compute subgroups unavailable\n"
+                    return 0, DEVICE_32 + dump(rgt.SMUL_I32_WORDS)
+                (Path(tmp) / "spirv" / "cs_smul_i32.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=fake_run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                code = rgt.run_suite(args, tmp)
+            self.assertEqual(code, 0, output.getvalue())
+            self.assertIn("PASS  cs_smul_i32", output.getvalue())
+            self.assertNotIn("SKIP", output.getvalue())
+
+
 
 class UniformBranchCheck(unittest.TestCase):
     """check_uniform_branch (ps_uniform_branch, ps_scc_mask32) must reject a readback in which no bit=0 pixel got
