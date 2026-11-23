@@ -2372,6 +2372,15 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_msaa_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_msaa_draw COMMAND d3d12_msaa_draw_test)
       set_tests_properties(d3d12_msaa_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # ResolveSubresource's Format: typed and typeless sources resolved as UNORM and as sRGB (D3D-411).
+      add_executable(d3d12_resolve_format_test test/d3d12_resolve_format_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_resolve_format_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_resolve_format_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_resolve_format_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_resolve_format COMMAND d3d12_resolve_format_test)
+      set_tests_properties(d3d12_resolve_format PROPERTIES SKIP_RETURN_CODE 77)
       # Geometry shaders: a VS+GS+PS pipeline whose GS emits each triangle twice.
       add_executable(d3d12_geometry_test test/d3d12_geometry_test.cpp shims/d3d12_xs_device.cpp
                      ${LEONIDA_TEST_VS} ${LEONIDA_TEST_GS_DOUBLE} ${LEONIDA_TEST_PS})

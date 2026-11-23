@@ -2847,7 +2847,10 @@ private:
         create.mipLevels = create.arrayLayers = 1;
         create.samples = VK_SAMPLE_COUNT_1_BIT;
         create.tiling = VK_IMAGE_TILING_OPTIMAL;
-        create.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        // A colour resolve's scratch (D3D-411) is a colour attachment; a depth or stencil one's a depth one.
+        create.usage = (aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                                             : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImage image = VK_NULL_HANDLE;

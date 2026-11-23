@@ -8046,6 +8046,29 @@ bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D1
     return matches(dst) && matches(src);
 }
 
+VkFormat color_resolve_view_format(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
+    const Resource* d = Resource::from<Resource>(dst);
+    const Resource* s = Resource::from<Resource>(src);
+    if (!d || !s || !d->image() || !s->image()) return VK_FORMAT_UNDEFINED;
+    const Format requested = vulkan_format(format, false);
+    if (requested.typeless || requested.rgb96 || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
+        DeviceState::numeric_class(requested.format) != 0)
+        return VK_FORMAT_UNDEFINED;
+    // A resource is viewed in the requested format when that is its own, or when it was created typeless
+    // (MUTABLE_FORMAT) and the format is a same-size member it may be viewed as (its view-format list, if any).
+    const leonida::BlockFormat want = leonida::block_format(requested.format, VK_IMAGE_ASPECT_COLOR_BIT);
+    const auto viewable = [&](const Resource* r) {
+        if (r->format() == requested.format) return true;
+        const D3D12_RESOURCE_DESC& desc = r->desc();
+        if (!vulkan_format(desc.Format, false).typeless || !r->allows_view_format(requested.format)) return false;
+        const leonida::BlockFormat own = leonida::block_format(r->format(), VK_IMAGE_ASPECT_COLOR_BIT);
+        return want.bytes && own.bytes == want.bytes && own.block == want.block;
+    };
+    if (!viewable(d) || !viewable(s)) return VK_FORMAT_UNDEFINED;
+    if (d->format() == requested.format && s->format() == requested.format) return VK_FORMAT_UNDEFINED;
+    return requested.format;
+}
+
 bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
                                      ID3D12Resource* src, UINT src_subresource, const D3D12_RECT* rect,
                                      D3D12_RESOLVE_MODE mode) {

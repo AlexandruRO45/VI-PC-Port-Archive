@@ -573,7 +573,8 @@ public:
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
     }
 
-    // The format picks the member of a typeless family to resolve as; the textures' own format is used.
+    // The format picks the member of a typeless family to resolve as: when it isn't the textures' own, both are
+    // viewed in it and averaged there (a typeless target resolved as sRGB averages in linear space, D3D-411).
     void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
                                               UINT src_subresource, DXGI_FORMAT format) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResolveSubresource");
@@ -588,7 +589,9 @@ public:
             note_once("ResolveSubresource refused: integer colour formats cannot be resolved");
             return check(false);
         }
-        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource}));
+        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource,
+                                         std::nullopt,
+                                         std::uint32_t(color_resolve_view_format(format, dst, src))}));
     }
 
     void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
@@ -597,7 +600,12 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList1::ResolveSubresourceRegion");
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         leonida::ResolveRegion region{x, y, std::nullopt};
-        if (mode != D3D12_RESOLVE_MODE_AVERAGE || !color_resolve_format_matches(format, dst, src)) {
+        // An average colour resolve in another member of the textures' family than their own (D3D-411).
+        const bool average = mode == D3D12_RESOLVE_MODE_AVERAGE;
+        const bool own_format = average && color_resolve_format_matches(format, dst, src);
+        const VkFormat view_format =
+            average && !own_format ? color_resolve_view_format(format, dst, src) : VK_FORMAT_UNDEFINED;
+        if (!own_format && view_format == VK_FORMAT_UNDEFINED) {
             if (!depth_stencil_resolve_supported(format, dst, dst_subresource, x, y, src, src_subresource, rect,
                                                  mode)) {
                 note_once("ResolveSubresourceRegion refused: neither an average colour resolve nor a depth or "
@@ -609,7 +617,8 @@ public:
                                                            : leonida::d3d12_resolve_mode::average;
         }
         if (rect) region.src_rect = leonida::Rect{rect->left, rect->top, rect->right, rect->bottom};
-        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
+        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region,
+                                         std::uint32_t(view_format)}));
     }
 
     // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.

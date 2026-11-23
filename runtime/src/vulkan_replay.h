@@ -982,10 +982,12 @@ struct Prepared {
     std::vector<VkImageCopy> image_copies;
     bool same_copy_subresource = false;
     VkImageResolve resolve{};  // resolves
-    // Depth or stencil resolves render into resolve_view. A displaced resolve uses a scratch image for this view.
+    // Depth or stencil resolves, and colour resolves in another format than the images' own (D3D-411), render
+    // into resolve_view. A resolve the destination can't take in place uses a scratch image for this view.
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
     VkImageView resolve_view = VK_NULL_HANDLE;
     VkImage resolve_scratch = VK_NULL_HANDLE;
+    VkFormat resolve_view_format = VK_FORMAT_UNDEFINED;  // a colour resolve's: both views in this format
     // Set: the resolve runs in this render pass and framebuffer instead of a dynamic-rendering scope.
     VkRenderPass resolve_pass = VK_NULL_HANDLE;
     VkFramebuffer resolve_framebuffer = VK_NULL_HANDLE;
@@ -1946,10 +1948,24 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
     } else if (from.width != to.width || from.height != to.height) {
         return ReplayResult::invalid_copy;
     }
-    if (src.aspectMask != dst.aspectMask || p.source.format != p.binding.format) return ReplayResult::unsupported;
+    const auto view_format = VkFormat(resolve.view_format);
+    if (src.aspectMask != dst.aspectMask ||
+        (view_format == VK_FORMAT_UNDEFINED && p.source.format != p.binding.format))
+        return ReplayResult::unsupported;
     const auto& region = resolve.region;
     if (src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
         if (region && region->mode != d3d12_resolve_mode::average) return ReplayResult::unsupported;
+        // Another format than the images' own (a typeless pair resolved as sRGB, D3D-411): vkCmdResolveImage
+        // needs one format for both images and averages in it, so the resolve runs in a rendering scope instead,
+        // the source and the destination viewed in that format. The D3D12 side checked that both can be. A
+        // destination without attachment usage, or a rectangle moved to other coordinates, resolves into a scratch
+        // image first (prepare).
+        if (view_format != VK_FORMAT_UNDEFINED) {
+            p.resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
+            p.resolve_view_format = view_format;
+        }
+    } else if (view_format != VK_FORMAT_UNDEFINED) {
+        return ReplayResult::unsupported;
     } else {
         if (!region || (region->mode == d3d12_resolve_mode::average && src.aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT))
             return ReplayResult::unsupported;
@@ -2787,18 +2803,27 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return result;
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
                 if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) return ReplayResult::unsupported;
-                p.view = vk.image_view(p.source, p.source_range);
+                ResourceBinding source_viewed = p.source, dest_viewed = p.binding;
+                if (p.resolve_view_format != VK_FORMAT_UNDEFINED)
+                    source_viewed.format = dest_viewed.format = p.resolve_view_format;
+                p.view = vk.image_view(source_viewed, p.source_range);
                 if (!p.view) return ReplayResult::unsupported;
-                if (p.resolve.srcOffset.x != p.resolve.dstOffset.x || p.resolve.srcOffset.y != p.resolve.dstOffset.y) {
-                    // Dynamic rendering resolves to the same coordinates in both attachments.
+                // Dynamic rendering resolves to the same coordinates in both attachments, and a resolve attachment
+                // needs attachment usage, which only render targets have here (D3D12 asks no flag of a resolve
+                // destination). Either way the resolve goes to a one-sample scratch image and is copied over.
+                const bool displaced =
+                    p.resolve.srcOffset.x != p.resolve.dstOffset.x || p.resolve.srcOffset.y != p.resolve.dstOffset.y;
+                const bool unattachable =
+                    p.range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && !p.binding.color_attachment;
+                if (displaced || unattachable) {
                     if (!vk.copy_image || !vk.depth_resolve_scratch ||
-                        !vk.depth_resolve_scratch(p.source.format, p.source_range.aspectMask,
+                        !vk.depth_resolve_scratch(source_viewed.format, p.source_range.aspectMask,
                                                   detail::mip_extent(p.source, p.source_range.baseMipLevel),
                                                   p.resolve_scratch, p.resolve_view) ||
                         !p.resolve_scratch || !p.resolve_view)
                         return ReplayResult::unsupported;
                 } else {
-                    p.resolve_view = vk.image_view(p.binding, p.range);
+                    p.resolve_view = vk.image_view(dest_viewed, p.range);
                     if (!p.resolve_view) return ReplayResult::unsupported;
                     if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
                         return result;
@@ -3690,8 +3715,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const auto source_range = detail::planes_for_layout(p.source, p.source_range, separate);
                 auto source_pieces = detail::current(tracker, src_id, source_range, source_layout);
                 detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker);
-                const VkImageLayout source_attachment =
-                    image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                // A colour resolve (D3D-411) uses a colour attachment; depth and stencil ones their own.
+                const bool color = p.range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+                const VkImageLayout attachment_layout =
+                    color ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                const VkImageLayout source_attachment = image_layout(p.source, attachment_layout);
                 const auto render_resolve = [&](VkImageLayout resolve_layout) {
                     if (p.resolve_framebuffer) {
                         VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -3715,13 +3743,20 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     rendering.renderArea = {{p.resolve.srcOffset.x, p.resolve.srcOffset.y},
                                             {p.resolve.extent.width, p.resolve.extent.height}};
                     rendering.layerCount = 1;
-                    if (p.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) rendering.pDepthAttachment = &info;
-                    else rendering.pStencilAttachment = &info;
+                    // One plane only, so independentResolve(None) never applies.
+                    if (color) {
+                        rendering.colorAttachmentCount = 1;
+                        rendering.pColorAttachments = &info;
+                    } else if (p.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) {
+                        rendering.pDepthAttachment = &info;
+                    } else {
+                        rendering.pStencilAttachment = &info;
+                    }
                     vk.begin_rendering(command_buffer, &rendering);
                     vk.end_rendering(command_buffer);
                 };
                 if (p.resolve_scratch) {
-                    constexpr VkImageLayout attachment = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    const VkImageLayout attachment = attachment_layout;
                     constexpr VkImageLayout transfer_src = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
                     ResourceBinding scratch{};
                     scratch.image = p.resolve_scratch;
@@ -3761,8 +3796,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                                            VK_PIPELINE_STAGE_TRANSFER_BIT);
                 }
-                const VkImageLayout dest_attachment =
-                    image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                const VkImageLayout dest_attachment = image_layout(p.binding, attachment_layout);
                 detail::round_trip(vk, command_buffer, p.source, source_pieces, source_attachment, source_state,
                                    attachment_access, attachment_stages, [&] {
                     detail::round_trip(vk, command_buffer, p.binding, dest_pieces, dest_attachment, dest_state,

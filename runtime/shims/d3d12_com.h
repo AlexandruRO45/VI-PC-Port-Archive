@@ -219,6 +219,11 @@ bool color_resolve_format_is_integer(DXGI_FORMAT format);
 // Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
 
+// The Vulkan format a colour ResolveSubresource averages in when Format names another member of a typeless
+// resource's family than the one it was created as (a typeless 4x target resolved as sRGB, D3D-411), or
+// VK_FORMAT_UNDEFINED when the resources' own formats are the requested one or the cast can't be viewed.
+VkFormat color_resolve_view_format(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
+
 // Whether a resolve of one depth or stencil plane can be replayed: both resources are depth-stencil textures of
 // `format` (a depth format, or a plane's shader-resource format such as R24_UNORM_X8_TYPELESS), the source
 // multisampled and the destination not, the same plane on both sides, MIN or MAX (or AVERAGE of the depth plane by
