@@ -51,10 +51,14 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
 import rdna2spirv  # noqa: E402  (stage_of, native_paths, base_op, BRANCHES)
@@ -257,10 +261,42 @@ def main(argv=None) -> int:
         only = " (%d with no other family)" % r["only_family"][fam] if fam in r["only_family"] else ""
         print("  %-12s %5d shaders, %6d instructions%s" % (fam, r["shaders"][fam], r["occurrences"][fam], only))
     if args.out:
-        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(r, f, indent=1)
+        write_json_report(args.out, r)
         print("wrote %s" % args.out)
     return 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".wave32_pixel_scan-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
