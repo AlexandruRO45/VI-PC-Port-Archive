@@ -11658,10 +11658,6 @@ class Gen:
         self.emit(f"{r} = OpFunctionCall %uint %desc_lookup_fn " + " ".join(words))
         if self.emulate:
             return r
-        if self.wave32_fragment:
-            b = self.tmp()
-            self.g_shuffle(b, r, self.cu(0))
-            return b
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
         # broadcast is an identity on every driver and makes that uniformity explicit to the compiler. Mesa ANV
         # (26.2.7, Alder Lake Xe-LP) segfaults compiling a sampler index straight from the probe loop when one

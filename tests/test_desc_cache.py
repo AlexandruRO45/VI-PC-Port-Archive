@@ -174,21 +174,18 @@ def test_desc_probe_defers_index_load_to_hit_block():
 def test_lookup_result_is_broadcast_before_use():
     # Mesa ANV 26.2.7 (Alder Lake Xe-LP) segfaults compiling a sampler index that comes straight out of the probe
     # loop when one sampler serves a float and an integer image (cs_sample_lz_int_d16, ps_ssharp). Each lookup's
-    # result goes through OpGroupNonUniformBroadcastFirst, and only the broadcast id indexes the descriptor arrays.
+    # result goes through OpGroupNonUniformBroadcastFirst (reading an active invocation rather than shuffling from
+    # hardcoded lane 0, which may be inactive on wave32 pixel edges in wider subgroups), and only the broadcast id
+    # indexes the descriptor arrays.
     asm = translate([SAMPLE, LOAD, EXP, "s_endpgm"])
     lines = [ln.strip() for ln in asm.splitlines()]
     results = {ln.split()[0] for ln in lines if CALL in ln}
-    bcast = {}
-    for ln in lines:
-        if "OpGroupNonUniformBroadcastFirst" in ln:
-            bcast[ln.split()[0]] = ln.split()[-1]
-        elif "OpGroupNonUniformShuffle" in ln:
-            # a wave32 pixel shader in a 64-lane subgroup takes its own half's first lane with a shuffle (SHADER-731,
-            # #4225; docs/design.md "Execution model")
-            bcast[ln.split()[0]] = ln.split()[-2]
+    bcast = {ln.split()[0]: ln.split()[-1] for ln in lines if "OpGroupNonUniformBroadcastFirst" in ln}
     assert results and sorted(bcast.values()) == sorted(results), (results, bcast)
+    assert not any("OpGroupNonUniformShuffle" in ln for ln in lines), "desc_lookup must use BroadcastFirst, not Shuffle"
     assert "OpCapability GroupNonUniform" in lines
-    assert "OpCapability GroupNonUniformBallot" in lines or "OpCapability GroupNonUniformShuffle" in lines
+    assert "OpCapability GroupNonUniformBallot" in lines
+    assert "OpCapability GroupNonUniformShuffle" not in lines
     for ln in lines:
         if ln.split()[1:2] == ["="] and "OpAccessChain" in ln and ("%images" in ln or "%samplers" in ln):
             assert not results & set(ln.split()), ln
