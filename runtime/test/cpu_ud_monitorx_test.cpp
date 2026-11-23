@@ -6,7 +6,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <initializer_list>
 
 #include "../src/cpu_ud_emulate.h"
 
@@ -60,18 +59,50 @@ void test_resumes_after(const uint8_t* code, const char* name) {
     check(std::memcmp(&expected, &f.context, sizeof expected) == 0, label);
 }
 
-void test_neighbours_pass() {
-    // 0F 01 F9 is RDTSCP, not MONITORX/MWAITX.
-    const uint8_t rdtscp[] = {0x0F, 0x01, 0xF9, 0x90};
+void test_truncated_instruction() {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const SIZE_T page_size = info.dwPageSize;
+    auto* pages = static_cast<uint8_t*>(VirtualAlloc(nullptr, 2 * page_size, MEM_RESERVE, PAGE_NOACCESS));
+    if (!pages) {
+        check(false, "reserve pages for the truncated instruction");
+        return;
+    }
+    if (!VirtualAlloc(pages, page_size, MEM_COMMIT, PAGE_READWRITE)) {
+        check(false, "commit the first page for the truncated instruction");
+        VirtualFree(pages, 0, MEM_RELEASE);
+        return;
+    }
+
     const uint8_t truncated[] = {0x0F, 0x01};
-    for (const uint8_t* code : {rdtscp, truncated}) {
-        Fault f(code);
+    uint8_t* at = pages + page_size - sizeof truncated;
+    std::memcpy(at, truncated, sizeof truncated);
+    uint8_t probe[sizeof truncated + 1];
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), at, probe, sizeof truncated, &got) || got != sizeof truncated) {
+        check(false, "read the two bytes of the truncated instruction");
+    } else if (ReadProcessMemory(GetCurrentProcess(), at, probe, sizeof probe, &got) && got == sizeof probe) {
+        std::printf("SKIP  truncated instruction: ReadProcessMemory can read into the uncommitted page\n");
+    } else {
+        Fault f(at);
         const CONTEXT before = f.context;
         check(ud::emulate(&f.pointers) == EXCEPTION_CONTINUE_SEARCH &&
                   std::memcmp(&before, &f.context, sizeof before) == 0,
-              code == rdtscp ? "an opcode next to MWAITX (0F 01 F9): passed on, nothing modified"
-                             : "a 2-byte prefix of the instruction: passed on, nothing modified");
+              "a 2-byte prefix at the page boundary: passed on, nothing modified");
     }
+    VirtualFree(pages, 0, MEM_RELEASE);
+}
+
+void test_neighbours_pass() {
+    // 0F 01 F9 is RDTSCP. Pad the buffer for the maximum instruction fetch.
+    const uint8_t rdtscp[15] = {0x0F, 0x01, 0xF9};
+    Fault f(rdtscp);
+    const CONTEXT before = f.context;
+    check(ud::emulate(&f.pointers) == EXCEPTION_CONTINUE_SEARCH &&
+              std::memcmp(&before, &f.context, sizeof before) == 0,
+          "an opcode next to MWAITX (0F 01 F9): passed on, nothing modified");
+
+    test_truncated_instruction();
     Fault other(kMonitorx);
     other.record.ExceptionCode = STATUS_ACCESS_VIOLATION;
     check(ud::emulate(&other.pointers) == EXCEPTION_CONTINUE_SEARCH,
