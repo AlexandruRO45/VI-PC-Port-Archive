@@ -833,7 +833,7 @@ all four LOD levels and high-poly models (`>65,535` triangles or vertex referenc
   `vbase |= ((w0 >> 14) & 1) << 16` and `tbase |= ((w0 >> 15) & 1) << 16` (`meshlet_bases`).
   Measured across **622,621 meshlets** in 17,897 high-poly groups: **622,621 / 622,621** exact
   running sums (0 mismatches), including **503** meshlets with `vbase >= 65,536` (`w0` bit 14 set)
-  and **1,048** meshlets with `tbase >= 65,536` (`w0` bit 15 set). Treating `w0` bits 14–15
+  and **1,048** meshlets with `tbase >= 65,536` (`w0` bit 15 set). Treating `w0` bits 14-15
   together as an 18-bit `vbase` disagrees on 762 meshlets.
 - **High-poly geometry descriptors and vertex layouts.** At `descriptor + 8` (`<HHI` =
   `meshlets, triangles_lo, binding`), the full counts are
@@ -842,7 +842,7 @@ all four LOD levels and high-poly models (`>65,535` triangles or vertex referenc
   (`pos_size=8, pos_fmt=16`) and float3 `0x3063` (`pos_size=12, pos_fmt=6`) vertex blocks.
 - **Multi-LOD `0..3` traversal.** Drawables store up to four LOD pointers at
   `drawable + 0x50 + 8 * lod` (`lod` in `0..3`). Across 386,431 indexed package models, 338,515
-  have LOD 0 only, 29,315 have LODs 0–1, 5,188 have LODs 0–2, and 13,407 have all four LODs 0–3.
+  have LOD 0 only, 29,315 have LODs 0-1, 5,188 have LODs 0-2, and 13,407 have all four LODs 0-3.
   `drawable_lods` and `drawable_geometries(system, drawable, lod=...)` walk any present LOD, and the
   CLI accepts `--lod`:
 
