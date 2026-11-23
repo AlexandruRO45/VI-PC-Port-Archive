@@ -49,24 +49,7 @@ ReturnClass classify_import(const std::string& dll, const std::string& name);
 // Resolves an address to a mapped module for the `stop` message. A Loader registers itself; `fn` returns true and
 // fills the module's file name and the address's RVA when the address is inside one of its modules.
 using ModuleLookup = bool (*)(void* ctx, uint64_t address, std::string& module, uint32_t& rva);
-
-// Which mapped module the library-loader shims ask a Loader for (GetModuleHandle*, GetModuleHandleEx*,
-// GetModuleFileName*): Windows doesn't know these images, so its answers would name gta6rt.exe or fail. `name` is a
-// file name ("tiny_dll.dll") or, when it holds a '\\', a full path, compared without case as Windows compares module
-// names; `base` an image base. With neither it is the Loader's main executable (Loader::set_main_module).
-struct ModuleQuery {
-    const wchar_t* name = nullptr;
-    uint64_t base = 0;
-};
-// Sets `base` and, when `path` isn't null, the image file's full path. False if the Loader has no such module. A
-// Loader registers one along with its ModuleLookup.
-using ModuleFind = bool (*)(void* ctx, const ModuleQuery& query, uint64_t& base, std::wstring* path);
-
-// GetProcAddress on the Loader's module at `base`: the export `name` ("#N" for an ordinal), a forwarder followed as for
-// an import, or null when the module has no such export.
-using ModuleProc = void* (*)(void* ctx, uint64_t base, const std::string& name);
-
-void add_module_lookup(void* ctx, ModuleLookup fn, ModuleFind find = nullptr, ModuleProc proc = nullptr);
+void add_module_lookup(void* ctx, ModuleLookup fn);
 // "a.dll+0x1234" for an address inside a mapped module, "host:ntdll.dll+0x1234" inside a host module, else the bare
 // address in hex. Used by the startup trace (startup_trace.h).
 std::string module_offset(uint64_t address);
@@ -75,17 +58,23 @@ void remove_module_lookup(void* ctx);
 // The base of the mapped module holding `address`, through the same lookups. False if no live Loader maps it.
 bool mapped_image_base(uint64_t address, uint64_t& base);
 
-// The first live Loader's answer to `query`, through the same registrations. False if none has the module.
-bool find_mapped_module(const ModuleQuery& query, uint64_t& base, std::wstring* path = nullptr);
+// Which module the library-loader shims ask a Loader for (GetModuleHandle*, GetModuleHandleEx*, GetModuleFileName*):
+// Windows doesn't know the images it maps, so its answers would name gta6rt.exe or fail. `name` is a file name
+// ("tiny_dll.dll") or, when it holds a '\\', a full path, compared without case as Windows compares module names;
+// `base` an image base. With neither it is the Loader's main executable (Loader::set_main_module).
+struct ModuleQuery {
+    const wchar_t* name = nullptr;
+    uint64_t base = 0;
+};
 
-// GetProcAddress on a mapped module, `base` 0 being the main executable: true when a live Loader maps it, with
-// `address` its answer (null if it doesn't export `name`); false when none does and Windows is to answer.
-bool mapped_proc_address(uint64_t base, const std::string& name, void*& address);
-
-// Run-time LoadLibrary / GetModuleHandle / GetProcAddress / FreeLibrary for bundled package DLLs managed by a live
-// Loader. Registered in Loader::Loader and removed in Loader::~Loader.
+// Run-time LoadLibrary / GetModuleHandle / GetModuleHandleEx / GetModuleFileName / GetProcAddress / FreeLibrary for the
+// modules a live Loader maps: bundled package DLLs, and the executable `gta6rt --run` runs. Registered in
+// Loader::Loader and removed in Loader::~Loader. The registry calls them outside its own lock, so a Loader may take
+// its own.
 struct BundledModuleOps {
-    void* (*find_loaded)(void* ctx, const std::string& dll_lower);
+    // Sets `base` and, when `path` isn't null, the full path the image was mapped from. False if the Loader has no such
+    // module.
+    bool (*find_module)(void* ctx, const ModuleQuery& query, uint64_t& base, std::wstring* path);
     void* (*load_bundled)(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled);
     void* (*get_proc)(void* ctx, void* module, const std::string& sym, bool& owns_handle);
     bool (*owns_handle)(void* ctx, void* module);
@@ -93,7 +82,8 @@ struct BundledModuleOps {
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
 
-void* find_loaded_bundled_module(const std::string& dll_lower);
+// The first live Loader's answer to `query`. False if none has the module, and Windows is to answer.
+bool find_mapped_module(const ModuleQuery& query, uint64_t& base, std::wstring* path = nullptr);
 void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);

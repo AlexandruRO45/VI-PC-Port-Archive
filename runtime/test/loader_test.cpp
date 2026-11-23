@@ -1203,6 +1203,75 @@ void test_lookup_during_loads() {
     }
 }
 
+// The same for the library-loader shims' module identity questions (GetModuleHandle*, GetModuleHandleEx*,
+// GetModuleFileName*, through rt::shims::find_mapped_module): by file name and full path, by base, and the main module,
+// asked on one thread while another loads modules. They used to walk the module vector with no lock as well; under
+// AddressSanitizer that read freed memory while load() appended. Here every answer during 300 loads must be right.
+void test_identity_during_loads() {
+    const char* what = "the module identity lookups are right while another thread loads modules";
+    try {
+        rt::Loader loader(g_dir);
+        auto first = make_image();
+        nt_of(first)->OptionalHeader.ImageBase = 0x200000000ull;
+        rt::Module& anchor = loader.load(write_image(first));
+        loader.set_main_module(anchor);
+        const uint64_t anchor_base = reinterpret_cast<uint64_t>(anchor.base);
+        const std::wstring anchor_path = anchor.path.native();
+        const std::wstring anchor_file = anchor.path.filename().native();
+
+        std::atomic<bool> stop{false};
+        std::atomic<unsigned> lookups{0}, wrong{0};
+        std::thread reader([&] {
+            while (!stop.load()) {
+                uint64_t base = 0;
+                std::wstring path;
+                rt::shims::ModuleQuery by_file;
+                by_file.name = anchor_file.c_str();
+                if (!rt::shims::find_mapped_module(by_file, base) || base != anchor_base) ++wrong;
+                rt::shims::ModuleQuery by_path;
+                by_path.name = anchor_path.c_str();
+                base = 0;
+                if (!rt::shims::find_mapped_module(by_path, base) || base != anchor_base) ++wrong;
+                rt::shims::ModuleQuery by_base;
+                by_base.base = anchor_base;
+                if (!rt::shims::find_mapped_module(by_base, base, &path) || path != anchor_path) ++wrong;
+                path.clear();
+                base = 0;
+                const rt::shims::ModuleQuery main_module{};
+                if (!rt::shims::find_mapped_module(main_module, base, &path) || base != anchor_base ||
+                    path != anchor_path)
+                    ++wrong;
+                rt::shims::ModuleQuery nowhere;
+                nowhere.base = 0x10;
+                if (rt::shims::find_mapped_module(nowhere, base)) ++wrong;
+                ++lookups;
+            }
+        });
+        unsigned found = 0;
+        for (unsigned i = 1; i <= 300; ++i) {
+            auto img = make_image();
+            nt_of(img)->OptionalHeader.ImageBase = 0x200000000ull + i * 0x10000ull;
+            rt::Module& m = loader.load(write_image(img));
+            rt::shims::ModuleQuery by_base;
+            by_base.base = reinterpret_cast<uint64_t>(m.base);
+            uint64_t base = 0;
+            std::wstring path;
+            if (rt::shims::find_mapped_module(by_base, base, &path) && path == m.path.native()) ++found;
+        }
+        while (lookups.load() < 1000) std::this_thread::yield();
+        stop = true;
+        reader.join();
+        if (wrong.load())
+            failed(what, std::to_string(wrong.load()) + " wrong answers in " + std::to_string(lookups.load()) + " lookups");
+        else if (found != 300)
+            failed(what, "only " + std::to_string(found) + " of 300 new modules were found by base");
+        else
+            pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_export_bounds() {
     auto outside = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
     nt_of(outside)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
@@ -1311,6 +1380,7 @@ int main() {
         test_tls_directory_count();
         test_unwind_registration();
         test_lookup_during_loads();
+        test_identity_during_loads();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());

@@ -87,20 +87,24 @@ public:
     // every C++ throw from a mapped image, and the trace and stop lines), and it reads its own table, not modules().
     bool find_address(uint64_t address, std::string& module, uint32_t& rva) const;
 
+    // What mapped code's GetModuleHandle*, GetModuleHandleEx* and GetModuleFileName* get for one of these modules
+    // (shims/library_loader.cpp, through shims::BundledModuleOps): with `name`, the module of that file name or, when
+    // it holds a '\\', that full path, compared without case as Windows compares module names; with `base`, the module
+    // mapped there; with neither, the main module. Sets `found` to its base and `path`, when not null, to the full path
+    // it was mapped from. A name is looked up as find_loaded_module looks one up, under the loader's lock: it waits for
+    // a load in progress on another thread, and a module whose load failed isn't found. A base and the main module are
+    // answered from find_address's table, so those answers never wait for a load on another thread.
+    bool find_module(const wchar_t* name, uint64_t base, uint64_t& found, std::wstring* path) const;
+
     // The order initialise() runs modules in: each module after every module it imports (a cycle is broken at the
     // module that closed it). modules() is mapping order, which puts an importer before its imports.
     const std::vector<Module*>& initialisation_order() const { return init_order_; }
 
     // The module that stands in for the process's executable: mapped code's GetModuleHandle(NULL), GetModuleHandleEx
-    // with no name and GetModuleFileName(NULL) answer it instead of gta6rt.exe. `gta6rt --run` sets the EXE it runs,
-    // before initialise(); without one those calls get Windows' answer. Throws if `m` isn't one of this Loader's.
+    // with no name, GetModuleFileName(NULL) and GetProcAddress(NULL, ...) answer it instead of gta6rt.exe. `gta6rt
+    // --run` sets the EXE it runs, before initialise(); without one those calls get Windows' answer. Throws if `m`
+    // isn't one of this Loader's.
     void set_main_module(Module& m);
-    Module* main_module() const { return main_.load(); }
-
-    // What GetProcAddress gives for `name` ("#N" for an ordinal) in `m` (shims/library_loader.cpp): the export, or its
-    // forwarder followed as for an import, except that a bundled module that isn't mapped yet is not mapped now (image
-    // code is running, and it would never be initialised). Null if neither resolves.
-    void* export_address(const Module& m, const std::string& name);
 
     // Runs each loaded module's TLS callbacks and then its DllMain(DLL_PROCESS_ATTACH), dependencies first.
     // Only DLLs get DllMain called: an EXE's entry point is the caller's to run. Throws on a corrupt TLS
@@ -125,8 +129,11 @@ public:
     void install_tls_for_thread(Module& m);
     void uninstall_tls_for_thread(Module& m);
 
-    // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
+    // The base of the module loaded under `dll_lower` (lower case, with its extension), or null; a module whose load
+    // failed is not found. The library_loader shims look modules up through find_module.
     void* find_loaded_module(const std::string& dll_lower) const;
+
+    // Run-time module loading and lookup used by the library_loader shim for bundled package DLLs.
     void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
@@ -138,7 +145,7 @@ private:
     void initialize_tls(Module& m);
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
-    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth, bool map_bundled = true);
+    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
     void register_unwind(Module& m);
@@ -150,13 +157,14 @@ private:
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
     std::atomic<Module*> main_{nullptr};  // read by the shims on any thread
 
-    // What find_address reads: one entry per mapped image, added once its memory exists. Under ranges_mutex_, a leaf
-    // lock: mutex_ is held while image code runs and the registry holds its own lock around the lookup, so the
-    // lookup must not wait for either.
+    // What find_address reads, and find_module for a base or the main module: one entry per mapped image, added once
+    // its memory exists. Under ranges_mutex_, a leaf lock: mutex_ is held while image code runs and the registry holds
+    // its own lock around the lookup, so the lookup must not wait for either.
     struct MappedRange {
         uint64_t base = 0;
         uint32_t size = 0;
         std::string name;
+        std::wstring path;  // Module::path, for GetModuleFileName
     };
     mutable std::shared_mutex ranges_mutex_;  // shared in find_address: lookups on different threads do not queue
     std::vector<MappedRange> ranges_;

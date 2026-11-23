@@ -41,20 +41,20 @@ All 16 DLLs in the package map at their preferred base `0x180000000` with no rel
 | `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 5 | 52 | 0 | 0 |
 | `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 8 | 78 | 0 | 0 |
 | `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 6 | 16 | 0 | 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 28 | 170 | 0 | 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 27 | 113 | 0 | 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 29 | 169 | 0 | 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 28 | 112 | 0 | 0 |
 | `concrt140.dll` | 303,104 | `0x29160` | 4 | 99 | 0 | 0 |
-| `msvcp140.dll` | 577,536 | `0x525a0` | 16 | 171 | 0 | 0 |
+| `msvcp140.dll` | 577,536 | `0x525a0` | 17 | 170 | 0 | 0 |
 | `msvcp140_1.dll` | 36,864 | `0x15c0` | 3 | 30 | 0 | 0 |
 | `msvcp140_2.dll` | 192,512 | `0x1efa0` | 4 | 92 | 0 | 0 |
 | `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 6 | 58 | 0 | 0 |
 | `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 3 | 21 | 0 | 0 |
 | `vccorlib140.dll` | 344,064 | `0x27e50` | 9 | 105 | 0 | 0 |
-| `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 |
-| `vcruntime140.dll` | 110,592 | `0xf890` | 4 | 37 | 0 | 0 |
+| `vcomp140.dll` | 86,016 | `0x6580` | 8 | 70 | 0 | 0 |
+| `vcruntime140.dll` | 110,592 | `0xf890` | 5 | 36 | 0 | 0 |
 | `vcruntime140_1.dll` | 49,152 | `0x3e90` | 2 | 32 | 0 | 0 |
 
-Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetModuleHandleEx*`, `GetModuleFileName*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. So do the file imports the [console-path shims](#console-paths-and-the-write-overlay) answer and the UCRT start-up and exit imports of `runtime/shims/process.cpp`. That is why the images above have more shim and fewer host imports than their Xbox-specific imports account for; those, below, are unchanged. `DisableThreadLibraryCalls` is served the same way: a mapped module gets `TRUE` (the real function refuses a module the Windows loader did not map, which failed the `DllMain` of the four `msvcp140_*` satellite DLLs), and any other handle goes to the real function.
+Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetModuleHandleEx*`, `GetModuleFileName*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. So do the file imports the [console-path shims](#console-paths-and-the-write-overlay) answer, the UCRT start-up and exit imports of `runtime/shims/process.cpp`, and the 15 WinHTTP imports each of `XCurl.dll` and `libHttpClient.GDK.dll` has, which the [offline WinHTTP shim](#winhttp-offline) owns. That is why the images above have more shim and fewer host imports than their Xbox-specific imports account for; those, below, are unchanged. `DisableThreadLibraryCalls` is served the same way: a mapped module gets `TRUE` (the real function refuses a module the Windows loader did not map, which failed the `DllMain` of the four `msvcp140_*` satellite DLLs), and any other handle goes to the real function.
 
 The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`.
 
@@ -414,25 +414,38 @@ the other loader functions, the way Windows 11 answers for a module it loaded (m
 host modules):
 
 - `GetModuleHandle*` and `GetModuleHandleEx*` find a mapped module by file name in any case, `.dll` added when the name
-  has no extension (a trailing `.` means none). A name with a path, `\` or `/`, is made full against the current folder
-  and compared with the full path the module was mapped from. `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` finds the mapped
-  module holding the address. The arguments are checked first, as Windows does: an unknown flag, `PIN` with
-  `UNCHANGED_REFCOUNT`, `FROM_ADDRESS` without an address, or no out pointer fail with `ERROR_INVALID_PARAMETER`.
+  has no extension (trailing dots, however many, mean none and are dropped). A name with a path, `\` or `/`, is
+  compared with the full path the module was mapped from. A full path is made full as `GetFullPathName` makes it (`/`,
+  `.` and `..` resolved). A relative one (`..\x.dll`, `.\x.dll`, `sub\x.dll`) is not made full against the current
+  folder: Windows looks for it along the DLL search path, as `LoadLibrary` would (the application's folder, which is
+  `gta6rt.exe`'s, the system folders, the current folder, then `PATH`, as `SetDllDirectory` leaves it; ntdll's
+  `LdrGetDllPath`), and the first entry under which the name exists, as a file or a folder, decides, even when that
+  file isn't loaded and one further along is. `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` finds the mapped module holding
+  the address. The arguments are checked first, as Windows does: an unknown flag, `PIN` with `UNCHANGED_REFCOUNT`,
+  `FROM_ADDRESS` without an address, or no out pointer fail with `ERROR_INVALID_PARAMETER`.
 - `GetModuleFileName*` of a mapped module is that full path. A buffer too small gets `size - 1` characters and a null,
   `size` is returned and the last error is `ERROR_INSUFFICIENT_BUFFER`; a whole answer sets `ERROR_SUCCESS`.
 - `GetProcAddress` on a mapped module answers from its export table, by name (with case) or ordinal, and follows a
-  forwarder as the loader does for an import, except that a bundled module not mapped yet is not mapped then. What the
-  module doesn't export is `NULL` with `ERROR_PROC_NOT_FOUND` for a name, `ERROR_INVALID_ORDINAL` for an ordinal and
-  `ERROR_INVALID_PARAMETER` for a null name.
+  forwarder as the loader does for an import, mapping and initialising a bundled module it names as a run-time
+  `LoadLibrary` does ([above](#run-time-loaded-modules)). What the module doesn't export is `NULL` with
+  `ERROR_PROC_NOT_FOUND` for a name and `ERROR_INVALID_ORDINAL` for an ordinal. A null name is ordinal 0:
+  `ERROR_INVALID_PARAMETER` when the image has an export directory, `ERROR_INVALID_ORDINAL` when it has none. Windows
+  decides that by the export data directory's RVA alone (measured on patched copies of a DLL).
 - `NULL` (`GetModuleHandle`, `GetModuleHandleEx` without a name, `GetModuleFileName`, `GetProcAddress`) is the EXE
-  `gta6rt --run` runs. Without `--run` it stays Windows' answer, `gta6rt.exe`.
+  `gta6rt --run` runs. Windows answers `GetProcAddress(NULL, name)` from the process's EXE (measured: its own export,
+  the same address as through `GetModuleHandle(NULL)`), so mapped code gets the game's export, through the same lookup
+  as its handle. Without `--run` it stays Windows' answer, from `gta6rt.exe`.
+- A name is looked up among the modules the loader has loaded, as `LoadLibrary*` of a bundled DLL looks one up: it
+  waits for a load in progress on another thread, and a module whose load failed isn't found. A handle, an address and
+  `NULL` are answered without waiting for a load.
 - A mapped module stays mapped until the loader is destroyed, so `GetModuleHandleEx`'s reference count and `PIN` need no
   bookkeeping, and `FreeLibrary` on a mapped module succeeds and leaves it mapped.
 - The A forms read a name in the file APIs' code page (`SetFileApisToOEM` switches it); `GetModuleFileNameA` writes the
   ANSI code page either way.
 
-`pe_loader_test` checks this on its fixture DLL and EXE, and `run_tiny_game` from inside the stand-in game.
-`LoadLibrary*` of a mapped module's name still goes to Windows, which doesn't know the module.
+`pe_loader_test` checks this on its fixture DLL and EXE, `loader_test` while another thread loads modules, and
+`run_tiny_game` from inside the stand-in game. `LoadLibrary*` of a mapped module's name gets the same module, through
+the run-time loading [above](#run-time-loaded-modules).
 
 ## What this proves and what it does not
 

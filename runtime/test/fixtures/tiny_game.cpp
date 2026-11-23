@@ -4,10 +4,10 @@
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, the xgameruntime.dll
 // imports (answered by the shim registry: the stub DLL it links against would fail them), and that it is the
 // process's own image (GetModuleHandle*, GetModuleHandleEx* and GetModuleFileName* name its own file, not
-// gta6rt.exe), then calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by
-// argument (CTest's run_tiny_game_tls and run_tiny_game_eh): `tls`, thread_local on the game's own threads, which
-// needs the loader's per-thread TLS (gta6rt starts main on a separate thread); and `eh`, a C++ exception caught
-// inside the image.
+// gta6rt.exe, and GetProcAddress(NULL, ...) finds its export), then calls exit() with 0 (42 with `exit-code`) when
+// everything held. Two checks are opt-in, by argument (CTest's run_tiny_game_tls and run_tiny_game_eh): `tls`,
+// thread_local on the game's own threads, which needs the loader's per-thread TLS (gta6rt starts main on a separate
+// thread); and `eh`, a C++ exception caught inside the image.
 // A third, `game-file` (run_tiny_game_dir), reads GAME:\tiny_game_probe.txt after moving the current directory.
 // On MSVC, `eh` needs more than the unwind tables #176 registers: _CxxThrowException finds the throwing image
 // with RtlPcToFileHeader, which the loader redirects in the host MSVC runtime. Arguments, not environment variables,
@@ -30,6 +30,9 @@ extern "C" __declspec(dllimport) void __stdcall XGameRuntimeUninitialize();
 extern "C" __declspec(dllimport) uint32_t __stdcall XSystemGetDeviceType();
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;  // this image's base, wherever it is mapped (the linker defines it)
+
+// An export of the game's own, for GetProcAddress on the game's handle (check_module_identity).
+extern "C" __declspec(dllexport) int tiny_game_export() { return 4242; }
 
 namespace {
 
@@ -150,6 +153,19 @@ void check_module_identity() {
               std::memcmp(a, ansi, ansi_len - 1) == 0,
           "GetModuleFileNameA(NULL) truncates the same way");
     check(GetModuleHandleA(ansi) == self, "GetModuleHandleA finds the game by its full path");
+
+    // GetProcAddress(NULL, name) looks in the process's executable, as in Windows (measured: an EXE's own export, the
+    // same address as through GetModuleHandle(NULL)). Under gta6rt that is the game, not gta6rt.exe, which exports
+    // nothing.
+    using Export = int (*)();
+    const FARPROC own = GetProcAddress(GetModuleHandleW(nullptr), "tiny_game_export");
+    check(own && reinterpret_cast<Export>(own)() == 4242,
+          "GetProcAddress(GetModuleHandleW(NULL), name) is the game's own export");
+    check(own && GetProcAddress(nullptr, "tiny_game_export") == own,
+          "GetProcAddress(NULL, name) is the same export, as Windows answers from the process's EXE");
+    SetLastError(ERROR_SUCCESS);
+    check(GetProcAddress(nullptr, nullptr) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "GetProcAddress(NULL, NULL) fails with ERROR_INVALID_PARAMETER: the game has an export directory");
 }
 
 }  // namespace

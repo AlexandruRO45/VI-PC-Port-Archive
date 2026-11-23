@@ -79,7 +79,8 @@ int main() {
     SetLastError(0);
     if (GetProcAddress(mod, "NoSuchExport") != nullptr || GetLastError() != ERROR_PROC_NOT_FOUND)
         return fail("missing export returns NULL with ERROR_PROC_NOT_FOUND", GetLastError());
-    // A null name is ordinal 0, which Windows' GetProcAddress refuses with ERROR_INVALID_PARAMETER.
+    // A null name is ordinal 0, which Windows' GetProcAddress refuses with ERROR_INVALID_PARAMETER when the module has
+    // an export directory, as this one does (ERROR_INVALID_ORDINAL when it has none).
     SetLastError(0);
     if (GetProcAddress(mod, nullptr) != nullptr || GetLastError() != ERROR_INVALID_PARAMETER)
         return fail("null export name returns NULL with ERROR_INVALID_PARAMETER", GetLastError());

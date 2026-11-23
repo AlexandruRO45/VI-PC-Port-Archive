@@ -45,8 +45,6 @@ std::atomic<int> g_policy{-1};  // -1: not decided yet, LEONIDA_UNIMPLEMENTED is
 struct Lookup {
     void* ctx;
     ModuleLookup fn;
-    ModuleFind find;  // may be null
-    ModuleProc proc;  // may be null
 };
 std::mutex g_lookup_mutex;
 std::vector<Lookup> g_lookups;
@@ -320,9 +318,9 @@ ReturnClass classify_import(const std::string& dll, const std::string& name) { r
 
 void set_unimplemented_test_hook(TestHook hook) { g_test_hook.store(hook); }
 
-void add_module_lookup(void* ctx, ModuleLookup fn, ModuleFind find, ModuleProc proc) {
+void add_module_lookup(void* ctx, ModuleLookup fn) {
     std::lock_guard lock(g_lookup_mutex);
-    g_lookups.push_back({ctx, fn, find, proc});
+    g_lookups.push_back({ctx, fn});
 }
 
 bool mapped_image_base(uint64_t address, uint64_t& base) {
@@ -335,35 +333,6 @@ bool mapped_image_base(uint64_t address, uint64_t& base) {
             return true;
         }
     return false;
-}
-
-// Under the same lock as remove_module_lookup, so a Loader can't be destroyed while it answers.
-bool find_mapped_module(const ModuleQuery& query, uint64_t& base, std::wstring* path) {
-    std::lock_guard lock(g_lookup_mutex);
-    for (auto& l : g_lookups)
-        if (l.find && l.find(l.ctx, query, base, path)) return true;
-    return false;
-}
-
-// The module's Loader is found under the lock and asked outside it: following a forwarder can load a host DLL, which
-// waits for the Windows loader lock, and a thread holding that (in a TLS callback) may be waiting for this lock. The
-// Loader outlives the call because mapped code runs only while its Loader is alive (~Loader's contract).
-bool mapped_proc_address(uint64_t base, const std::string& name, void*& address) {
-    Lookup owner{};
-    uint64_t module = 0;
-    {
-        ModuleQuery query;
-        query.base = base;
-        std::lock_guard lock(g_lookup_mutex);
-        for (auto& l : g_lookups)
-            if (l.find && l.proc && l.find(l.ctx, query, module, nullptr)) {
-                owner = l;
-                break;
-            }
-    }
-    if (!owner.proc) return false;
-    address = owner.proc(owner.ctx, module, name);
-    return true;
 }
 
 std::string module_offset(uint64_t address) {
@@ -447,10 +416,10 @@ void remove_bundled_loader(void* ctx) {
         }
 }
 
-void* find_loaded_bundled_module(const std::string& dll_lower) {
+bool find_mapped_module(const ModuleQuery& query, uint64_t& base, std::wstring* path) {
     for (const auto& entry : snapshot_bundled_loaders())
-        if (void* h = entry.ops->find_loaded(entry.ctx, dll_lower)) return h;
-    return nullptr;
+        if (entry.ops->find_module(entry.ctx, query, base, path)) return true;
+    return false;
 }
 
 void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& handled) {

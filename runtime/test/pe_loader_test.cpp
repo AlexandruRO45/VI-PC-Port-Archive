@@ -613,9 +613,12 @@ void test_module_identity(const fs::path& exe, const fs::path& dll) {
                   get_w(L"tiny_exe.exe") == exe_h,
               "GetModuleHandleW/A find mapped modules by file name, in any case, \".dll\" added when there's none");
         SetLastError(ERROR_SUCCESS);
-        check(get_w(L"tiny_dll.") == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND &&
-                  get_w(L"tiny_dll.dll.") == dll_h,
-              "a trailing '.' means no extension: \"tiny_dll.\" names nothing, \"tiny_dll.dll.\" names the DLL");
+        const bool no_extension_name = get_w(L"tiny_dll.") == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND;
+        SetLastError(ERROR_SUCCESS);
+        check(no_extension_name && get_w(L"tiny_dll..") == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND &&
+                  get_w(L"tiny_dll.dll.") == dll_h && get_w(L"tiny_dll.dll..") == dll_h,
+              "trailing dots mean no extension and are dropped: \"tiny_dll.\" and \"tiny_dll..\" name nothing, "
+              "\"tiny_dll.dll.\" and \"tiny_dll.dll..\" name the DLL");
         std::wstring slashed = dll_path;
         for (auto& c : slashed)
             if (c == L'\\') c = L'/';
@@ -623,12 +626,31 @@ void test_module_identity(const fs::path& exe, const fs::path& dll) {
         check(get_w(dll_path.c_str()) == dll_h && get_w(slashed.c_str()) == dll_h &&
                   get_w(no_extension.c_str()) == dll_h,
               "... and by full path, with '/' as well as '\\', the extension added there too");
+        // A relative name with a path is looked for along the DLL search path, as Windows does (measured: it is not
+        // made full against the current folder). The current folder is one entry of that path, after the
+        // application's folder (this test's, which holds no tiny_dll.dll) and the system folders; SetDllDirectory("")
+        // takes it out, and SetDllDirectory(folder) puts that folder in instead.
         wchar_t old_dir[1024] = {};
         GetCurrentDirectoryW(1024, old_dir);
-        SetCurrentDirectoryW(fs::path(dll_path).parent_path().c_str());
+        const std::wstring dll_dir = fs::path(dll_path).parent_path().wstring();
+        SetCurrentDirectoryW(dll_dir.c_str());
         const HMODULE relative = get_w(L".\\tiny_dll.dll");
+        const HMODULE relative_up = get_w((L"..\\" + fs::path(dll_dir).filename().wstring() + L"\\tiny_dll").c_str());
+        SetDllDirectoryW(L"");
+        SetLastError(ERROR_SUCCESS);
+        const HMODULE without_current = get_w(L".\\tiny_dll.dll");
+        const DWORD without_current_error = GetLastError();
         SetCurrentDirectoryW(old_dir);
-        check(relative == dll_h, "... and by a relative path, made full against the current folder");
+        SetDllDirectoryW(dll_dir.c_str());
+        const HMODULE through_dll_dir = get_w(L".\\tiny_dll.dll");
+        SetDllDirectoryW(nullptr);
+        check(relative == dll_h && relative_up == dll_h,
+              "... and by a relative path, found along the DLL search path (here through the current folder)");
+        check(without_current == nullptr && without_current_error == ERROR_MOD_NOT_FOUND,
+              "... but not once SetDllDirectory(\"\") takes the current folder out of that path, though the current "
+              "folder holds the DLL (ERROR_MOD_NOT_FOUND, as in Windows)");
+        check(through_dll_dir == dll_h,
+              "... and found from another current folder when SetDllDirectory puts the DLL's folder in that path");
         const std::wstring elsewhere = (fs::path(dll_path).parent_path() / L"elsewhere" / L"tiny_dll.dll").wstring();
         SetLastError(ERROR_SUCCESS);
         check(get_w(elsewhere.c_str()) == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND,
@@ -713,8 +735,9 @@ void test_module_identity(const fs::path& exe, const fs::path& dll) {
 }
 
 // GetProcAddress, reached as a mapped image's import reaches it, on the handle GetModuleHandleW gives for a mapped
-// module: the exports by name and ordinal, a forwarder followed as for an import, Windows' errors for what the module
-// doesn't export, and NULL as the main module once a Loader has one.
+// module: the exports by name and ordinal, a forwarder followed as for an import, and Windows' errors for what the
+// module doesn't export. A null module is the main module once a Loader has one, as Windows' GetProcAddress(NULL, name)
+// is the process EXE's own export (measured on Windows 11), and the host's answer before and after.
 void test_proc_address(const fs::path& exe, const fs::path& dll) {
     std::printf("\n-- GetProcAddress on mapped modules through the library-loader shims --\n");
     using GetModW = HMODULE(WINAPI*)(LPCWSTR);
@@ -729,9 +752,14 @@ void test_proc_address(const fs::path& exe, const fs::path& dll) {
         return it == m.exports.end() ? nullptr : it->second;
     };
     const auto as_ptr = [](FARPROC p) { return reinterpret_cast<void*>(p); };
+    const auto has_export_directory = [](const rt::Module& m) {
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+            m.base + reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+        return nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress != 0;
+    };
     {
         rt::Loader loader(exe.parent_path());
-        loader.load(exe);
+        rt::Module& tiny_exe = loader.load(exe);
         rt::Module* tiny = nullptr;
         for (auto* m : loader.modules())
             if (rt::lower(m->name) == "tiny_dll.dll") tiny = m;
@@ -756,21 +784,61 @@ void test_proc_address(const fs::path& exe, const fs::path& dll) {
         check(missing && !get_proc(h, "TINY_ADD") && GetLastError() == ERROR_PROC_NOT_FOUND,
               "a name the DLL doesn't export, or in another case, is NULL with ERROR_PROC_NOT_FOUND");
         SetLastError(ERROR_SUCCESS);
-        const bool bad_ordinal = !get_proc(h, MAKEINTRESOURCEA(9999)) && GetLastError() == ERROR_INVALID_ORDINAL;
+        check(!get_proc(h, MAKEINTRESOURCEA(9999)) && GetLastError() == ERROR_INVALID_ORDINAL,
+              "an ordinal it lacks is NULL with ERROR_INVALID_ORDINAL");
+        // A null name is ordinal 0. Windows refuses it with ERROR_INVALID_PARAMETER when the image has an export
+        // directory and with ERROR_INVALID_ORDINAL when it has none (measured on a DLL and an EXE of each kind).
+        const HMODULE exe_h = get_w(L"tiny_exe.exe");
         SetLastError(ERROR_SUCCESS);
-        check(bad_ordinal && !get_proc(h, nullptr) && GetLastError() == ERROR_INVALID_PARAMETER,
-              "an ordinal it lacks is NULL with ERROR_INVALID_ORDINAL, a null name NULL with ERROR_INVALID_PARAMETER");
+        const bool null_name_dll = !get_proc(h, nullptr) && GetLastError() == ERROR_INVALID_PARAMETER;
+        SetLastError(ERROR_SUCCESS);
+        check(has_export_directory(*tiny) && !has_export_directory(tiny_exe) && null_name_dll &&
+                  exe_h == reinterpret_cast<HMODULE>(tiny_exe.base) && !get_proc(exe_h, nullptr) &&
+                  GetLastError() == ERROR_INVALID_ORDINAL,
+              "a null name is NULL with ERROR_INVALID_PARAMETER on tiny_dll.dll, which has an export directory, and "
+              "with ERROR_INVALID_ORDINAL on tiny_exe.exe, which has none");
+        // tiny_exe.exe as the main module: NULL is its handle, so a null name has its error too.
+        loader.set_main_module(tiny_exe);
+        SetLastError(ERROR_SUCCESS);
+        const bool null_null = !get_proc(nullptr, nullptr) && GetLastError() == ERROR_INVALID_ORDINAL;
+        SetLastError(ERROR_SUCCESS);
+        check(null_null && !get_proc(nullptr, "tiny_add") && GetLastError() == ERROR_PROC_NOT_FOUND,
+              "with tiny_exe.exe as the main module, GetProcAddress(NULL, NULL) is ERROR_INVALID_ORDINAL and "
+              "GetProcAddress(NULL, \"tiny_add\"), a name it imports but doesn't export, ERROR_PROC_NOT_FOUND");
     }
     {
         rt::Loader loader(dll.parent_path());
         rt::Module& tiny = loader.load(dll);
-        const bool before = !get_proc(nullptr, "tiny_add");  // Windows: this test's EXE exports nothing
+        // No main module yet: NULL is Windows' answer, from this test's EXE, which exports nothing.
+        SetLastError(ERROR_SUCCESS);
+        const FARPROC host = GetProcAddress(nullptr, "tiny_add");
+        const DWORD host_error = GetLastError();
+        SetLastError(ERROR_SUCCESS);
+        const bool before = !host && !get_proc(nullptr, "tiny_add") && GetLastError() == host_error;
         loader.set_main_module(tiny);
-        check(before && export_of(tiny, "tiny_add") &&
-                  as_ptr(get_proc(nullptr, "tiny_add")) == export_of(tiny, "tiny_add"),
-              "GetProcAddress(NULL, name) is Windows' answer until a Loader has a main module (here tiny_dll.dll), "
-              "then that module's export");
+        const HMODULE main_handle = get_w(nullptr);
+        const void* add = export_of(tiny, "tiny_add");
+        check(main_handle == reinterpret_cast<HMODULE>(tiny.base) && add &&
+                  as_ptr(get_proc(main_handle, "tiny_add")) == add,
+              "GetProcAddress(GetModuleHandleW(NULL), name) is the main module's export (here tiny_dll.dll's)");
+        check(before && as_ptr(get_proc(nullptr, "tiny_add")) == add,
+              "GetProcAddress(NULL, name) is Windows' answer until a Loader has a main module, then the same export "
+              "as GetProcAddress(GetModuleHandleW(NULL), name), as Windows answers from the process's EXE");
+        const uint32_t ordinal = export_ordinal(tiny, "tiny_add");
+        SetLastError(ERROR_SUCCESS);
+        const bool null_name = !get_proc(nullptr, nullptr) && GetLastError() == ERROR_INVALID_PARAMETER;
+        SetLastError(ERROR_SUCCESS);
+        check(ordinal != 0 && as_ptr(get_proc(nullptr, MAKEINTRESOURCEA(ordinal))) == add && null_name &&
+                  !get_proc(nullptr, "tiny_missing") && GetLastError() == ERROR_PROC_NOT_FOUND,
+              "... by ordinal too; GetProcAddress(NULL, NULL) is ERROR_INVALID_PARAMETER (tiny_dll.dll has an export "
+              "directory) and a name it doesn't export ERROR_PROC_NOT_FOUND");
     }
+    SetLastError(ERROR_SUCCESS);
+    const FARPROC host = GetProcAddress(nullptr, nullptr);
+    const DWORD host_error = GetLastError();
+    SetLastError(ERROR_SUCCESS);
+    check(!host && !get_proc(nullptr, nullptr) && GetLastError() == host_error,
+          "once the Loader is gone, GetProcAddress(NULL, NULL) is Windows' answer again");
 }
 
 // True when the code at rva (or, through up to 4 `jmp rel32` thunks, the code they lead to) has an unwind entry.

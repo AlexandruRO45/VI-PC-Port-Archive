@@ -14,8 +14,9 @@
 // The loader's images are VirtualAlloc'd, so Windows doesn't know them: asked for one by name, handle or address it
 // fails, and asked for the process's executable (NULL) it names gta6rt.exe, from which a title would take its install
 // folder. GetModuleHandle*, GetModuleHandleEx*, GetModuleFileName* and GetProcAddress answer for them from the live
-// Loaders (rt::shims::find_mapped_module, mapped_image_base, mapped_proc_address), with Windows' name rules and return
-// conventions; NULL is the EXE `gta6rt --run` runs (Loader::set_main_module), and without one it stays Windows' answer.
+// Loaders (rt::shims::find_mapped_module, mapped_image_base, get_bundled_proc_address), with Windows' name rules and
+// return conventions. NULL, to all four, is the EXE `gta6rt --run` runs (Loader::set_main_module), as Windows answers
+// NULL with the process's executable; without one it stays Windows' answer, gta6rt.exe.
 //
 // Every other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
@@ -23,6 +24,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -123,16 +125,11 @@ const Pseudo* pseudo(HMODULE h) {
 namespace {
 
 // ---- Mapped images. The rules below are what Windows 11 does, measured by calling its functions on host modules;
-// pe_loader_test (test_module_identity) and the tiny_game fixture check the shims against them.
+// pe_loader_test (test_module_identity, test_proc_address) and the tiny_game fixture check the shims against them.
 
-// GetModuleHandle's name rules: ".dll" is added when the file name has no extension, a trailing '.' meaning "no
-// extension, add nothing"; a name with a path ('\\' or '/', relative ones too) is made full against the current
-// folder, as GetFullPathName does, and then names the module with that full path. Empty if it can't be made full.
-std::wstring mapped_name(std::wstring name) {
-    const size_t slash = name.find_last_of(L"\\/");
-    if (!name.empty() && name.back() == L'.') name.pop_back();
-    else if (name.find(L'.', slash == std::wstring::npos ? 0 : slash + 1) == std::wstring::npos) name += L".dll";
-    if (slash == std::wstring::npos) return name;
+// GetFullPathName's answer: '/' made '\\', "." and ".." resolved, a relative path made full against the current
+// folder. Empty if it fails.
+std::wstring full_path(const std::wstring& name) {
     const DWORD need = GetFullPathNameW(name.c_str(), 0, nullptr, nullptr);
     if (!need) return {};
     std::wstring full(need, L'\0');
@@ -140,6 +137,60 @@ std::wstring mapped_name(std::wstring name) {
     if (!got || got >= need) return {};
     full.resize(got);
     return full;
+}
+
+// A relative path as Windows types one (RtlDetermineDosPathNameType_U): neither rooted ("\\x", "\\\\server\\x",
+// "\\\\?\\x") nor on a drive ("C:\\x", "C:x").
+bool relative_path(const std::wstring& name) {
+    return !name.empty() && name[0] != L'\\' && name[0] != L'/' && !(name.size() >= 2 && name[1] == L':');
+}
+
+// The file a relative name with a path ("..\\x.dll", ".\\x.dll", "sub\\x.dll") names to GetModuleHandle. Windows
+// doesn't make it full against the current folder: it looks for it along the DLL search path, as LoadLibrary would,
+// and the first entry under which the name exists, as a file or a folder, decides, even when that file isn't loaded
+// and one further along is. The search path is ntdll's own (LdrGetDllPath, exported since Windows 8, with no flags,
+// as for LoadLibrary: the application's folder, here gta6rt.exe's, the system folders, the current folder, then PATH,
+// as SetDllDirectory leaves it). Empty when no candidate exists or there is no search path. The last error is left
+// alone.
+std::wstring searched_path(const std::wstring& name) {
+    using GetDllPath = LONG(NTAPI*)(PCWSTR, ULONG, PWSTR*, PWSTR*);
+    using ReleasePath = VOID(NTAPI*)(PWSTR);
+    static const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    static const auto get_path = reinterpret_cast<GetDllPath>(GetProcAddress(ntdll, "LdrGetDllPath"));
+    static const auto release = reinterpret_cast<ReleasePath>(GetProcAddress(ntdll, "RtlReleasePath"));
+    const DWORD error = GetLastError();
+    PWSTR path = nullptr, unused = nullptr;  // the second output was null in every case measured
+    std::wstring found;
+    if (get_path && release && get_path(name.c_str(), 0, &path, &unused) >= 0 && path) {
+        for (const wchar_t* entry = path; *entry && found.empty();) {
+            const wchar_t* end = std::wcschr(entry, L';');
+            if (!end) end = entry + std::wcslen(entry);
+            std::wstring candidate(entry, end);
+            entry = *end ? end + 1 : end;
+            if (candidate.empty()) continue;
+            if (candidate.back() != L'\\' && candidate.back() != L'/') candidate += L'\\';
+            candidate += name;
+            if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) found = full_path(candidate);
+        }
+        release(path);
+    }
+    SetLastError(error);
+    return found;
+}
+
+// GetModuleHandle's name rules: ".dll" is added when the file name has no extension, and trailing dots, however many,
+// mean "no extension, add nothing" and are dropped. A name with a path ('\\' or '/') names the module mapped from that
+// file: a relative one is looked for along the DLL search path (searched_path), any other is made full as
+// GetFullPathName makes it. Empty if it names no file.
+std::wstring mapped_name(std::wstring name) {
+    const size_t slash = name.find_last_of(L"\\/");
+    if (!name.empty() && name.back() == L'.') {
+        while (!name.empty() && name.back() == L'.') name.pop_back();
+    } else if (name.find(L'.', slash == std::wstring::npos ? 0 : slash + 1) == std::wstring::npos) {
+        name += L".dll";
+    }
+    if (slash == std::wstring::npos) return name;
+    return relative_path(name) ? searched_path(name) : full_path(name);
 }
 
 // The image a live Loader maps under `name`, or with a null name its main executable; null when there's none, and
@@ -342,10 +393,26 @@ std::string proc_key(LPCSTR name) {
     return IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
 }
 
-// GetProcAddress on an owned module resolves through the registry. On a mapped image (NULL: the main executable) it
-// answers from the image's exports, a forwarder followed as for an import (Loader::export_address), and what the image
-// doesn't export fails as in Windows: a name with ERROR_PROC_NOT_FOUND, an ordinal with ERROR_INVALID_ORDINAL, a null
-// name with ERROR_INVALID_PARAMETER. A hit leaves the last error alone.
+// Whether a mapped image has an export directory, which decides GetProcAddress's error for a null name: Windows looks
+// only at the export data directory's RVA (measured on patched copies of a DLL: with the size 0, or a directory that
+// lists no functions, it is still ERROR_INVALID_PARAMETER; with the RVA 0 it is ERROR_INVALID_ORDINAL). `module` is
+// the base of an image a live Loader maps, so its headers are there and were checked when it was mapped.
+bool has_export_directory(HMODULE module) {
+    const auto* base = reinterpret_cast<const BYTE*>(module);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    return nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT &&
+           nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress != 0;
+}
+
+// GetProcAddress on an owned module resolves through the registry. On a module a live Loader maps it answers from the
+// image's exports, a forwarder followed as for an import (Loader::resolve_module_export), and what the image doesn't
+// export fails as in Windows: a name with ERROR_PROC_NOT_FOUND, an ordinal with ERROR_INVALID_ORDINAL, and a null
+// name (ordinal 0) with ERROR_INVALID_PARAMETER when the image has an export directory, ERROR_INVALID_ORDINAL when it
+// has none. A hit leaves the last error alone. A null module is the process's executable: Windows answers
+// GetProcAddress(NULL, name) from the EXE's own exports (measured on Windows 11: the same address as through
+// GetModuleHandle(NULL)), so here it is the EXE `gta6rt --run` runs, through the same lookup as its handle, and
+// without one Windows' answer from gta6rt.exe.
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     if (const Pseudo* p = pseudo(module)) {
         if (!name) {
@@ -365,18 +432,11 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         return nullptr;
     }
 
-    void* mapped = nullptr;
-    if (mapped_proc_address(reinterpret_cast<uint64_t>(module), name ? proc_key(name) : std::string(), mapped)) {
-        if (!mapped)
-            SetLastError(!name                  ? ERROR_INVALID_PARAMETER
-                         : IS_INTRESOURCE(name) ? ERROR_INVALID_ORDINAL
-                                                : ERROR_PROC_NOT_FOUND);
-        return reinterpret_cast<FARPROC>(mapped);
-    }
+    if (!module) module = mapped_module(nullptr);  // the main module, or still null when no Loader has one
 
     if (!name) {
         if (owns_bundled_module_handle(module)) {
-            SetLastError(ERROR_PROC_NOT_FOUND);
+            SetLastError(has_export_directory(module) ? ERROR_INVALID_PARAMETER : ERROR_INVALID_ORDINAL);
             return nullptr;
         }
         return GetProcAddress(module, name);
@@ -387,7 +447,7 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     void* fn = get_bundled_proc_address(module, what, owns_handle);
     if (owns_handle) {
         if (fn) return reinterpret_cast<FARPROC>(fn);
-        SetLastError(ERROR_PROC_NOT_FOUND);
+        SetLastError(IS_INTRESOURCE(name) ? ERROR_INVALID_ORDINAL : ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
     if (module && !IS_INTRESOURCE(name)) {
