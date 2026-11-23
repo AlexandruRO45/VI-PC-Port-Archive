@@ -125,3 +125,131 @@ class TestDsMinU32ReferenceOracle(unittest.TestCase):
         # 0x1000 wraps to 0x0
         lds.ds_min_u32(0x1000, 50)
         self.assertEqual(lds.read_dword(0x0), 50)
+
+
+# -----------------------------------------------------------------------------
+# Part 2: AST Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+
+    def __str__(self) -> str:
+        return f"{self.kind.value}{self.index}"
+
+
+class DsOpcode(enum.Enum):
+    DS_MIN_U32 = "ds_min_u32"
+    DS_MIN_RTN_U32 = "ds_min_rtn_u32"
+
+
+@dataclasses.dataclass
+class DsInstruction:
+    opcode: DsOpcode
+    vaddr: Register
+    vdata0: Register
+    vdst: Register | None = None
+    offset: int = 0
+
+    def format_asm(self) -> str:
+        off_str = f" offset:{self.offset}" if self.offset != 0 else ""
+        if self.opcode == DsOpcode.DS_MIN_RTN_U32:
+            assert self.vdst is not None
+            return f"{self.opcode.value} {self.vdst}, {self.vaddr}, {self.vdata0}{off_str}"
+        return f"{self.opcode.value} {self.vaddr}, {self.vdata0}{off_str}"
+
+    @classmethod
+    def parse_asm(cls, line: str) -> DsInstruction:
+        line = line.strip()
+        parts = line.split(None, 1)
+        op_str = parts[0]
+        opcode = DsOpcode(op_str)
+        args_str = parts[1] if len(parts) > 1 else ""
+
+        offset = 0
+        tokens = [t.strip() for t in args_str.split(",") if t.strip()]
+        last_token = tokens[-1] if tokens else ""
+        if "offset:" in last_token:
+            m = re.search(r"offset:(\w+)", last_token)
+            if m:
+                raw_off = m.group(1)
+                offset = int(raw_off, 16) if raw_off.startswith("0x") else int(raw_off)
+            tokens[-1] = re.sub(r"\s*offset:\w+", "", last_token).strip()
+            if not tokens[-1]:
+                tokens.pop()
+
+        def parse_reg(name: str) -> Register:
+            name = name.strip()
+            if name.startswith("v"):
+                return Register(RegKind.VGPR, int(name[1:]))
+            if name.startswith("s"):
+                return Register(RegKind.SGPR, int(name[1:]))
+            raise ValueError(f"Invalid register name: {name}")
+
+        if opcode == DsOpcode.DS_MIN_RTN_U32:
+            vdst = parse_reg(tokens[0])
+            vaddr = parse_reg(tokens[1])
+            vdata0 = parse_reg(tokens[2])
+            if vdst.kind != RegKind.VGPR or vaddr.kind != RegKind.VGPR or vdata0.kind != RegKind.VGPR:
+                raise ValueError("LDS atomic operations require VGPRs for all operands")
+            return cls(opcode=opcode, vaddr=vaddr, vdata0=vdata0, vdst=vdst, offset=offset)
+        else:
+            vaddr = parse_reg(tokens[0])
+            vdata0 = parse_reg(tokens[1])
+            if vaddr.kind != RegKind.VGPR or vdata0.kind != RegKind.VGPR:
+                raise ValueError("LDS atomic operations require VGPRs for all operands")
+            return cls(opcode=opcode, vaddr=vaddr, vdata0=vdata0, vdst=None, offset=offset)
+
+
+@dataclasses.dataclass
+class DsMinU32Expr:
+    addr_expr: str
+    data_expr: str
+    old_val_expr: str
+
+    def evaluate(self, addr_val: int, data_val: int, mem_val: int) -> int:
+        return ref_min_u32(mem_val, data_val)
+
+
+class TestDsMinU32AST(unittest.TestCase):
+    """Test suite verifying AST definitions and assembly roundtripping."""
+
+    def test_instruction_formatting(self):
+        inst1 = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        self.assertEqual(inst1.format_asm(), "ds_min_u32 v0, v1")
+
+        inst2 = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1), offset=16)
+        self.assertEqual(inst2.format_asm(), "ds_min_u32 v0, v1 offset:16")
+
+        inst3 = DsInstruction(DsOpcode.DS_MIN_RTN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1),
+                              vdst=Register(RegKind.VGPR, 2), offset=32)
+        self.assertEqual(inst3.format_asm(), "ds_min_rtn_u32 v2, v0, v1 offset:32")
+
+    def test_instruction_parsing(self):
+        line1 = "ds_min_u32 v0, v1"
+        inst1 = DsInstruction.parse_asm(line1)
+        self.assertEqual(inst1.opcode, DsOpcode.DS_MIN_U32)
+        self.assertEqual(inst1.vaddr, Register(RegKind.VGPR, 0))
+        self.assertEqual(inst1.vdata0, Register(RegKind.VGPR, 1))
+        self.assertIsNone(inst1.vdst)
+        self.assertEqual(inst1.offset, 0)
+
+        line2 = "ds_min_rtn_u32 v5, v1, v2 offset:64"
+        inst2 = DsInstruction.parse_asm(line2)
+        self.assertEqual(inst2.opcode, DsOpcode.DS_MIN_RTN_U32)
+        self.assertEqual(inst2.vdst, Register(RegKind.VGPR, 5))
+        self.assertEqual(inst2.vaddr, Register(RegKind.VGPR, 1))
+        self.assertEqual(inst2.vdata0, Register(RegKind.VGPR, 2))
+        self.assertEqual(inst2.offset, 64)
+
+    def test_symbolic_expression_evaluation(self):
+        expr = DsMinU32Expr("v0 + offset", "v1", "LDS[addr]")
+        res = expr.evaluate(0x10, 50, 100)
+        self.assertEqual(res, 50)
