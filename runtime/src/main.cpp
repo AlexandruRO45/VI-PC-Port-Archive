@@ -31,6 +31,7 @@
 #include "code_hooks.h"
 #include "mods.h"
 #include "pe_loader.h"
+#include "timer_resolution.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
@@ -242,6 +243,8 @@ int wmain(int argc, wchar_t** argv) {
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
+        leonida::ScopedTimerResolution timer_scope(1);
+        leonida::configure_process_priority();
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);

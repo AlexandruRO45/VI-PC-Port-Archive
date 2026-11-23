@@ -236,6 +236,15 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
 
+  # High-resolution 1 ms timer period and priority tuning for game execution.
+  add_executable(timer_resolution_test
+    test/timer_resolution_test.cpp
+  )
+  target_include_directories(timer_resolution_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(timer_resolution_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(timer_resolution_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(timer_resolution_test PRIVATE /OPT:NOREF)
+
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
   add_executable(file_system_test
     test/file_system_test.cpp
@@ -1032,6 +1041,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET api_global_refs_test)
     add_test(NAME api_global_refs COMMAND api_global_refs_test)
     set_tests_properties(api_global_refs PROPERTIES TIMEOUT 10)
+  endif()
+  if(WIN32 AND TARGET timer_resolution_test)
+    add_test(NAME timer_resolution COMMAND timer_resolution_test)
   endif()
   # Internal XTaskQueue context pinning and rundown regression tests.
   if(WIN32 AND TARGET gta6rt_xtaskqueue)
