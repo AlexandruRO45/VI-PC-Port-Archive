@@ -235,6 +235,7 @@ class ScanTest(unittest.TestCase):
         self.assertNotIn("1111222233334444", json.dumps(doc))
         with contextlib.redirect_stderr(io.StringIO()) as se:
             self.assertEqual(bvh_groups.main([self.rpf, "--json", self.rpf]), 2)
+            self.assertEqual(bvh_groups.main([self.rpf, "--json", self.rpf.upper()]), 2)
             self.assertEqual(bvh_groups.main([self.rpf, "--start", str(10 ** 9)]), 2)
         self.assertIn("bvh_groups:", se.getvalue())
 

@@ -31,6 +31,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_index  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 VBASE = 0x50000000
 PBASE = 0x60000000
@@ -286,7 +287,7 @@ def main(argv=None):
     ap.add_argument("--start", type=_nonneg)
     ap.add_argument("--limit", type=_positive)
     a = ap.parse_args(argv)
-    if a.json and os.path.exists(a.json) and os.path.exists(a.archive) and os.path.samefile(a.json, a.archive):
+    if a.json and same_report_path(a.json, a.archive):
         print("bvh_groups: --json would replace the archive", file=sys.stderr)
         return 2
     try:
