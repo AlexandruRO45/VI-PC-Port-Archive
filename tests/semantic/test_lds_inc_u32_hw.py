@@ -123,6 +123,162 @@ class TestDSIncU32OracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(new, 0)
         self.assertEqual(lds.read_dword(addr), 0)
 
+class Register:
+    def __init__(self, name: str, index: int) -> None:
+        self.name = name
+        self.index = index
+
+    def __repr__(self) -> str:
+        return f"{self.name}{self.index}"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Register):
+            return False
+        return self.name == other.name and self.index == other.index
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.index))
+
+
+class VGPR(Register):
+    def __init__(self, index: int) -> None:
+        if not (0 <= index <= 255):
+            raise ValueError(f"VGPR index out of range [0, 255]: {index}")
+        super().__init__("v", index)
+
+
+class DSIncU32Instruction:
+    """Symbolic AST node representing ds_inc_u32 and ds_inc_rtn_u32 instructions."""
+
+    def __init__(
+        self,
+        mnemonic: str,
+        vaddr: VGPR,
+        vdata0: VGPR,
+        vdst: Optional[VGPR] = None,
+        offset: int = 0,
+        gds: bool = False,
+    ) -> None:
+        if mnemonic not in ("ds_inc_u32", "ds_inc_rtn_u32"):
+            raise ValueError(f"Invalid mnemonic for ds_inc_u32 AST: {mnemonic}")
+        if mnemonic == "ds_inc_rtn_u32" and vdst is None:
+            raise ValueError("ds_inc_rtn_u32 requires vdst operand")
+        if mnemonic == "ds_inc_u32" and vdst is not None:
+            raise ValueError("ds_inc_u32 does not accept vdst operand")
+        if not (0 <= offset <= 65535):
+            raise ValueError(f"Offset out of range [0, 65535]: {offset}")
+
+        self.mnemonic = mnemonic
+        self.vaddr = vaddr
+        self.vdata0 = vdata0
+        self.vdst = vdst
+        self.offset = offset
+        self.gds = gds
+
+    @property
+    def is_return(self) -> bool:
+        return self.mnemonic == "ds_inc_rtn_u32"
+
+    def __repr__(self) -> str:
+        parts = [self.mnemonic]
+        if self.vdst is not None:
+            parts.append(str(self.vdst))
+        parts.append(str(self.vaddr))
+        parts.append(str(self.vdata0))
+        text = f"{parts[0]} {', '.join(parts[1:])}"
+        if self.offset:
+            text += f" offset:{self.offset}"
+        if self.gds:
+            text += " gds"
+        return text
+
+    @classmethod
+    def parse(cls, asm: str) -> "DSIncU32Instruction":
+        line = asm.strip()
+        if not line:
+            raise ValueError("Empty assembly string")
+        tokens = line.split()
+        mnem = tokens[0]
+        if mnem not in ("ds_inc_u32", "ds_inc_rtn_u32"):
+            raise ValueError(f"Unsupported mnemonic: {mnem}")
+
+        rest = " ".join(tokens[1:])
+        mod_tokens = rest.split()
+        clean_operands: list[str] = []
+        offset = 0
+        gds = False
+
+        for tok in mod_tokens:
+            tok_clean = tok.rstrip(",")
+            if tok_clean.startswith("offset:"):
+                try:
+                    offset = int(tok_clean.split(":", 1)[1], 0)
+                except ValueError:
+                    raise ValueError(f"Invalid offset format: {tok_clean}")
+            elif tok_clean == "gds":
+                gds = True
+            elif tok_clean:
+                clean_operands.append(tok_clean)
+
+        def parse_vgpr(reg_str: str) -> VGPR:
+            m = re.fullmatch(r"v(\d+)", reg_str)
+            if not m:
+                raise ValueError(f"Expected VGPR (e.g. v1), got: {reg_str}")
+            return VGPR(int(m.group(1)))
+
+        if mnem == "ds_inc_u32":
+            if len(clean_operands) != 2:
+                raise ValueError(f"ds_inc_u32 requires 2 operands (vaddr, vdata0), got {len(clean_operands)}")
+            vaddr = parse_vgpr(clean_operands[0])
+            vdata0 = parse_vgpr(clean_operands[1])
+            return cls(mnem, vaddr, vdata0, vdst=None, offset=offset, gds=gds)
+        else:
+            if len(clean_operands) != 3:
+                raise ValueError(f"ds_inc_rtn_u32 requires 3 operands (vdst, vaddr, vdata0), got {len(clean_operands)}")
+            vdst = parse_vgpr(clean_operands[0])
+            vaddr = parse_vgpr(clean_operands[1])
+            vdata0 = parse_vgpr(clean_operands[2])
+            return cls(mnem, vaddr, vdata0, vdst=vdst, offset=offset, gds=gds)
+
+
+class TestDSIncU32ASTAndOpcodeDefinitions(unittest.TestCase):
+    """Part 2: Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_properties(self) -> None:
+        inst_non_rtn = DSIncU32Instruction("ds_inc_u32", VGPR(1), VGPR(2), offset=16)
+        self.assertFalse(inst_non_rtn.is_return)
+        self.assertEqual(inst_non_rtn.vaddr, VGPR(1))
+        self.assertEqual(inst_non_rtn.vdata0, VGPR(2))
+        self.assertIsNone(inst_non_rtn.vdst)
+        self.assertEqual(inst_non_rtn.offset, 16)
+        self.assertEqual(repr(inst_non_rtn), "ds_inc_u32 v1, v2 offset:16")
+
+        inst_rtn = DSIncU32Instruction("ds_inc_rtn_u32", VGPR(3), VGPR(4), vdst=VGPR(5), offset=32, gds=True)
+        self.assertTrue(inst_rtn.is_return)
+        self.assertEqual(inst_rtn.vdst, VGPR(5))
+        self.assertEqual(repr(inst_rtn), "ds_inc_rtn_u32 v5, v3, v4 offset:32 gds")
+
+    def test_ast_parsing_valid(self) -> None:
+        inst1 = DSIncU32Instruction.parse("ds_inc_u32 v10, v20")
+        self.assertEqual(inst1.mnemonic, "ds_inc_u32")
+        self.assertEqual(inst1.vaddr, VGPR(10))
+        self.assertEqual(inst1.vdata0, VGPR(20))
+
+        inst2 = DSIncU32Instruction.parse("ds_inc_rtn_u32 v5, v1, v2 offset:0x40")
+        self.assertEqual(inst2.mnemonic, "ds_inc_rtn_u32")
+        self.assertEqual(inst2.vdst, VGPR(5))
+        self.assertEqual(inst2.offset, 64)
+
+    def test_ast_parsing_invalid(self) -> None:
+        with self.assertRaises(ValueError):
+            DSIncU32Instruction.parse("")
+        with self.assertRaises(ValueError):
+            DSIncU32Instruction.parse("ds_inc_u32 v1")
+        with self.assertRaises(ValueError):
+            DSIncU32Instruction.parse("ds_inc_rtn_u32 v1, v2")
+        with self.assertRaises(ValueError):
+            DSIncU32Instruction.parse("ds_inc_u32 s1, v2")
+
 
 if __name__ == '__main__':
     unittest.main()
