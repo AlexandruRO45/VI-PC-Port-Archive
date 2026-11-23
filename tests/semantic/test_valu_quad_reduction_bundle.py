@@ -827,3 +827,37 @@ class TestDsBpermuteB32ASTAndScalar(unittest.TestCase):
         ]
         res, _ = run_workgroup_lanes("ps_bperm_id", lines, lanes=4)
         self.assertEqual(res, [500, 501, 502, 503])
+
+
+# ------------------------------------------------------------------------------
+# ds_bpermute_b32 SIMD Divergence & Backward Cross-Lane Gather
+# ------------------------------------------------------------------------------
+
+class TestDsBpermuteB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergent_gather_hardware(self):
+        # Rotate right: lane 0 reads 3, lane 1 reads 0, lane 2 reads 1, lane 3 reads 2
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_sub_nc_u32 v1, v0, 1",
+            "v_and_b32 v1, v1, 3",
+            "v_lshlrev_b32 v1, 2, v1",
+            "v_add_nc_u32 v2, v0, 10",
+            "ds_bpermute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_bperm_rot", lines, lanes=4)
+        self.assertEqual(res, [13, 10, 11, 12])
+
+    def test_algebraic_broadcast_consistency_hardware(self):
+        # All lanes read lane 2
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mov_b32 v1, 8",
+            "v_add_nc_u32 v2, v0, 200",
+            "ds_bpermute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_bperm_bcast", lines, lanes=4)
+        self.assertEqual(res, [202, 202, 202, 202])
