@@ -757,3 +757,19 @@ jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconst
    `levels.rpf` has a recovery count (343,327 models, +29,327) but no full OBJ export; triangle
    totals were not re-run.
 4. Keep the README and issue #29 in sync with the new counts.
+
+### Predict model offsets for placements
+
+Run `python -I tools/world_drawable_lookup.py entities.jsonl archetypes.json names.json`
+with the placement rows from `world_index.py --entities-out`, the definitions from
+`world_archetypes.py`, and a bounded `rpf9_names.py --types dr,ft` report. The command
+prints local scratch JSON. Supply `--manifest path/to/models/manifest.json` for each
+existing export whose listed identities should be excluded.
+
+The lookup requires agreement between the placement archetype, the definition's name and
+assetName, the resource stem's joaat and its 64-bit placement key. It considers type 1
+fragments and type 2 drawables at page offset +16. Multiple offsets for an identity in
+the indexed window are marked ambiguous. Even a single hit is a prediction: a stream
+can mention another model. Export a window around the predicted offset with
+`rpf9dump models <archive> <outdir> --start BYTES --length BYTES`, compare the manifest offset and
+model identity and run `world_build.py --placements` with the exported geometry.
