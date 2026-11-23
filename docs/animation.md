@@ -1016,3 +1016,5 @@ Game files, carved streams, name lists, payload dumps and reports that quote the
 the package. Do not commit them, attach them to an issue or PR, or paste them into a chat. Short header excerpts
 (a few bytes) and aggregate counts are allowed, as in `CONTRIBUTING.md`. The work folder is git-ignored; this
 document contains no archive data.
+
+For interactive playback of local character and vehicle exports, see the [animation viewer](animation-viewer.md).

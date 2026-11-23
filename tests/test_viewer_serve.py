@@ -307,6 +307,17 @@ class HandlerTest(unittest.TestCase):
                     if method == "GET":
                         self.assertIn(b"<title>viewer</title>", body)
 
+    def test_animation_page_and_modules_are_served(self):
+        site = Path(self._tmp.name) / "site"
+        for name, mime in (("animation.html", "text/html"), ("animation-data.mjs", "text/javascript"),
+                           ("animation-viewer.mjs", "text/javascript")):
+            with self.subTest(name=name):
+                (site / name).write_text("fixture", encoding="utf-8", newline="\n")
+                status, headers, body = raw_request(self.port, f"/{name}?v=1")
+                self.assertEqual(status, 200)
+                self.assertIn(f"content-type: {mime}", headers.lower())
+                self.assertEqual(body, b"fixture")
+
     def test_nothing_else_outside_world_is_served(self):
         # These reached SimpleHTTPRequestHandler unguarded: on Windows /NUL opened the device (200, empty) and
         # the stream, trailing-dot and trailing-space forms returned the page or the server's own source.

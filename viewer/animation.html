@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leonida Animation Viewer</title>
+<style>
+:root { color-scheme: dark; font: 15px system-ui, sans-serif; color: #e5e9ea; background: #1b2023; }
+body { min-height: 100dvh; margin: 0; display: grid; grid-template-rows: auto minmax(300px, 1fr) auto; }
+header, footer { padding: 1rem clamp(1rem, 3vw, 2rem); }
+h1 { font-size: 1.2rem; margin: 0 0 .65rem; }
+header label { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
+main { position: relative; }
+canvas { display: block; width: 100%; height: 100%; position: absolute; inset: 0; touch-action: none; cursor: grab; }
+canvas:active { cursor: grabbing; }
+#keys { position: absolute; bottom: 1rem; left: 1rem; display: flex; gap: .35rem; pointer-events: none; }
+#keys[hidden] { display: none; }
+kbd, button { border: 1px solid #657178; border-radius: .25rem; padding: .3rem .55rem; background: #20292d; color: inherit; }
+kbd[data-down="true"] { background: #a1e0d3; color: #101d20; }
+button { font: inherit; }
+button:disabled { opacity: .55; }
+p { margin: .6rem 0 0; color: #bac5c9; }
+#status { overflow-wrap: anywhere; }
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<header>
+  <h1>Leonida Animation Viewer</h1>
+  <label>Local manifest and GLB files <input id="files" type="file" accept=".json,.glb" multiple></label>
+  <p id="status" role="status">Select the manifest and its GLB files together.</p>
+</header>
+<main id="viewport" aria-label="3D preview">
+  <div id="keys" aria-label="Key input" hidden>
+    <kbd data-code="KeyW">W</kbd><kbd data-code="ShiftLeft">Shift</kbd><kbd data-code="KeyA">A</kbd>
+    <kbd data-code="KeyD">D</kbd><kbd data-code="KeyS">S</kbd><kbd data-code="KeyE">E</kbd>
+    <kbd data-code="KeyR">R</kbd>
+  </div>
+</main>
+<footer>
+  <button id="interact" type="button" disabled>Enter vehicle</button>
+  <button id="follow" type="button" aria-pressed="true">Follow camera</button>
+  <output id="speed" aria-label="Vehicle speed"></output>
+  <p>W to move · Shift to run or accelerate · A / D to turn · S to brake · E to enter or exit · R to recenter</p>
+</footer>
+<script type="module">
+import('./animation-viewer.mjs').catch(error => {
+  document.querySelector('#status').textContent = 'Viewer could not start · ' + error.message;
+});
+</script>
+</body>
+</html>
