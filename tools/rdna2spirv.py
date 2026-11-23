@@ -579,6 +579,81 @@ class Gen:
             return list(mods)
         return [m for m in mods if m not in cls._DPP_MODS and not m.startswith(cls._DPP_PREFIXES)]
 
+    _INT32_ARITH_BITWISE_OPS = frozenset({
+        "v_add_nc_i32", "v_sub_nc_i32",
+        "v_add_nc_u32", "v_sub_nc_u32",
+        "v_and_b32", "v_or_b32", "v_xor_b32",
+    })
+    _INT32_VOP3_ONLY_OPS = frozenset({"v_add_nc_i32", "v_sub_nc_i32"})
+    _INT32_CLAMP_OPS = frozenset({"v_add_nc_i32", "v_sub_nc_i32", "v_add_nc_u32", "v_sub_nc_u32"})
+    _SDWA_DST_UNUSED = frozenset({"UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"})
+
+    def _validate_int32_arith_bitwise(self, ins, op, a, mods):
+        """Validate encoding, operands, and modifiers for 32-bit integer arithmetic/bitwise VALU ops."""
+        raw_op = ins["op"]
+        is_sdwa = raw_op.endswith("_sdwa")
+        is_dpp = raw_op.endswith("_dpp")
+        is_e32 = raw_op.endswith("_e32")
+        if op in self._INT32_VOP3_ONLY_OPS and (is_e32 or is_dpp or is_sdwa):
+            raise Unsupported(f"{raw_op}: VOP3-only encoding")
+        orig_args = (self.cur_ins or ins)["args"]
+        if len(a) != 3 or len(orig_args) != 3:
+            raise Unsupported(f"{raw_op}: expected 3 operands")
+        dst = orig_args[0]
+        if dst.get("k") != "vgpr" or dst.get("n", 1) != 1:
+            raise Unsupported(f"{raw_op}: destination must be a single VGPR")
+        if dst.get("neg") or dst.get("abs") or dst.get("sext"):
+            raise Unsupported(f"{raw_op}: destination modifier")
+        for src in orig_args[1:]:
+            if src.get("n", 1) != 1:
+                raise Unsupported(f"{raw_op}: 64-bit source operand")
+            if src.get("neg") or src.get("abs"):
+                raise Unsupported(f"{raw_op}: source neg/abs modifier")
+            if src.get("sext") and not is_sdwa:
+                raise Unsupported(f"{raw_op}: sext requires SDWA")
+        allow_clamp = op in self._INT32_CLAMP_OPS
+        if is_sdwa:
+            seen_keys = set()
+            clamp_count = 0
+            for m in mods:
+                if m == "clamp":
+                    if not allow_clamp:
+                        raise Unsupported(f"{raw_op}: clamp")
+                    clamp_count += 1
+                    if clamp_count > 1:
+                        raise Unsupported(f"{raw_op}: duplicate clamp")
+                elif ":" in m:
+                    key, val = m.split(":", 1)
+                    if key in seen_keys:
+                        raise Unsupported(f"{raw_op}: duplicate {key}")
+                    if key in ("src0_sel", "src1_sel", "dst_sel"):
+                        if val not in self.SDWA_SEL:
+                            raise Unsupported(f"{raw_op}: {m}")
+                    elif key == "dst_unused":
+                        if val not in self._SDWA_DST_UNUSED:
+                            raise Unsupported(f"{raw_op}: {m}")
+                    else:
+                        raise Unsupported(f"{raw_op}: modifier {m}")
+                    seen_keys.add(key)
+                else:
+                    raise Unsupported(f"{raw_op}: modifier {m}")
+        elif is_dpp:
+            bad = self.non_dpp_mods(raw_op, mods)
+            if bad:
+                raise Unsupported(f"{raw_op}: modifier {bad[0]}")
+        elif is_e32:
+            if mods:
+                raise Unsupported(f"{raw_op}: modifier {mods[0]}")
+        else:
+            clamp_count = 0
+            for m in mods:
+                if m == "clamp" and allow_clamp:
+                    clamp_count += 1
+                    if clamp_count > 1:
+                        raise Unsupported(f"{raw_op}: duplicate clamp")
+                else:
+                    raise Unsupported(f"{raw_op}: modifier {m}")
+
     @staticmethod
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
@@ -7544,6 +7619,8 @@ class Gen:
             # 32-bit add/sub without carry out. The VOP3 clamp bit saturates an integer result (GFX9+: LLVM selects
             # uaddsat/usubsat to v_add/sub_nc_u32 clamp and saddsat/ssubsat to v_add/sub_nc_i32 clamp): unsigned to
             # [0, 0xFFFFFFFF], signed to [0x80000000, 0x7FFFFFFF]. Without clamp the result wraps.
+            if op in self._INT32_ARITH_BITWISE_OPS:
+                self._validate_int32_arith_bitwise(ins, op, a, mods)
             x, y = self.src_u(a[1]), self.src_u(a[2])
             if op == "v_subrev_nc_u32":
                 x, y = y, x
@@ -11321,6 +11398,8 @@ class Gen:
             self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
             self.dst(a[0], result)
         elif op in U2 or op in S2:
+            if op in self._INT32_ARITH_BITWISE_OPS:
+                self._validate_int32_arith_bitwise(ins, op, a, mods)
             to_mask_dst, dst_half = (self._mask_b32_dst_half(a[0], a[1:3])
                                      if op in self.MASK_SOP2_B32 else (False, None))
             if op in S2:
