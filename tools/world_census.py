@@ -516,7 +516,7 @@ def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_en
                 idx = bisect.bisect_right(max_end, cursor)
                 while idx < len(segments) and segments[idx][0] < a:
                     s0, s1, kind = segments[idx]
-                    if s1 <= pos:
+                    if s1 <= pos or (cursor > scan_start and s0 < cursor):
                         idx += 1
                         continue
                     start = max(pos, s0)
@@ -815,7 +815,7 @@ def main(argv=None):
     except SourceChanged as e:
         print(str(e), file=sys.stderr)
         return 1
-    if head[:4] != b"9FPR":
+    if len(head) < 8 or head[:4] != b"9FPR":  # the header ends with the u32 data start at +4
         print("not an RPF9 archive", file=sys.stderr)
         return 2
     data_start = struct.unpack_from("<I", head, 4)[0]

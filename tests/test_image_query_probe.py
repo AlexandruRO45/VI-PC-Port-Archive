@@ -5,8 +5,9 @@ Standard library only."""
 import io
 import math
 import sys
+import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -138,6 +139,29 @@ class Comparison(unittest.TestCase):
             other.arch = "gfx1150"
             with mock.patch.object(runner, "open_oracle", return_value=other):
                 self.assertEqual(pr.main([]), 77)
+
+    def test_json_output_creates_its_parent_and_reports_write_errors(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner, "open_oracle", return_value=FakeOracle()):
+            report = Path(tmp) / "new" / "report.json"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 0)
+            self.assertTrue(report.is_file())
+
+    def test_a_report_that_cannot_be_written_still_shows_the_result_and_exits_2(self):
+        # Exit 1 means a result off the rules; an unwritable --json must not look like one, nor hide the summary.
+        for oracle, summary in ((FakeOracle(), r"follow the rules, 0 do not"),
+                                (FakeOracle(depth_2d=1), r"follow the rules, [1-9]\d* do not")):
+            with self.subTest(summary=summary), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(runner, "open_oracle", return_value=oracle):
+                report = Path(tmp) / "directory"
+                report.mkdir()
+                out, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(error):
+                    self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 2)
+                self.assertRegex(out.getvalue(), summary)
+                self.assertIn(str(report), error.getvalue())
+                self.assertIn("cannot write", error.getvalue())
 
 
 class Hardware(unittest.TestCase):
