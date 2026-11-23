@@ -14,6 +14,11 @@ import os
 MAX_PROCESS_WORKERS = 61 if os.name == "nt" else None
 
 
-def process_workers(jobs):
-    """`jobs`, lowered to the most worker processes one pool can have here."""
-    return jobs if MAX_PROCESS_WORKERS is None else min(jobs, MAX_PROCESS_WORKERS)
+def process_workers(jobs=None):
+    """`jobs`, lowered to the most worker processes one pool can have here (at least 1)."""
+    if jobs is None:
+        jobs = os.cpu_count() or 1
+    elif isinstance(jobs, bool) or not isinstance(jobs, int):
+        raise TypeError("jobs must be an int or None")
+    workers = max(1, jobs)
+    return workers if MAX_PROCESS_WORKERS is None else min(workers, MAX_PROCESS_WORKERS)

@@ -90,6 +90,20 @@ class ProcessWorkersTest(unittest.TestCase):
         with mock.patch.object(pool_workers, "MAX_PROCESS_WORKERS", None):
             self.assertEqual([pool_workers.process_workers(n) for n in (1, 61, 62, 4096)], [1, 61, 62, 4096])
 
+    def test_none_non_positive_and_non_integer_jobs(self):
+        for limit, capped in ((WINDOWS_LIMIT, 61), (None, 128)):
+            with mock.patch.object(pool_workers, "MAX_PROCESS_WORKERS", limit):
+                self.assertEqual([pool_workers.process_workers(n) for n in (-5, 0, 1)], [1, 1, 1])
+                with mock.patch.object(pool_workers.os, "cpu_count", return_value=128):
+                    self.assertEqual(pool_workers.process_workers(None), capped)
+                with mock.patch.object(pool_workers.os, "cpu_count", return_value=None):
+                    self.assertEqual(pool_workers.process_workers(None), 1)
+                for bad in (True, False, "4", 2.5):
+                    with self.subTest(limit=limit, bad=bad):
+                        with self.assertRaises(TypeError):
+                            pool_workers.process_workers(bad)
+
+
 
 class ToolPoolSizeTest(unittest.TestCase):
     """Each tool, asked for more jobs than the limit, creates its pool at the limit and still does the work."""
