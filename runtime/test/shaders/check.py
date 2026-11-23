@@ -1119,8 +1119,9 @@ def table_fetch_test(tools, spirv):
         for mode in ("fetch-sint", "fetch-uint", "fetch-miss"):
             raw = os.path.join(tmp, mode + ".raw")
             code, output = run_readback(raw, run, tool, mode, raw, cwd=spirv)
-            if code == UNSUPPORTED:
-                return Skip(output.strip())
+            if code == UNSUPPORTED:   # without a Vulkan driver vk_texture_test exits 77 and prints nothing
+                m = re.search(r"unsupported: .*", output)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
             if code or f"{mode}: 4096 exact pixels" not in output:
                 return failure(code, output, 3)
     return ""
