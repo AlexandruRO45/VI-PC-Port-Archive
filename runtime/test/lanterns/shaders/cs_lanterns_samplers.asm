@@ -1,6 +1,7 @@
 ; Lanterns samplers (stage 20): three samplers held as literal S#s, as the console's compiler writes a root signature's
 ; static samplers (lanterns_samplers.h). One wave32 group of 32 lanes, one probe per lane.
-; s[0:1]: the table (2 user SGPRs, the current compute layout). Slot 0 (+ 0x0): the colour texture's T# (R32_FLOAT 4x4).
+; s[0:1]: the table (2 user SGPRs, the layout before D3D-448, which the moves below rebuild). Slot 0 (+ 0x0): the
+; colour texture's T# (R32_FLOAT 4x4).
 ; Slot 1 (+ 0x20): the depth texture's T# (its R32_FLOAT view). Slot 2 (+ 0x40): a raw V# of the output, 16 bytes a lane.
 ; Literal S#s (all CLAMP_X/Y/Z 2 = clamp to the last texel, MIP_FILTER 1 = point, MIP_POINT_PRECLAMP set):
 ;   s[24:27] POINT        0x92 0 0x14000000 0
@@ -11,9 +12,16 @@
 ; stage: cs
 ; wave: 32
 ; group: 32,1,1
-; rsrc2: 0x4
+; rsrc2: 0xa
 ;
-; RSRC2 0x4: two user SGPRs (s[0:1], the table), no thread-group IDs.
+; RSRC2 0x4 before D3D-448 (now 0xa, see the moves below): two user SGPRs (s[0:1], the table), no thread-group IDs.
+; D3D-448: a D3D12 compute PSO gets its root arguments in the console layout (rt::rootsig::pack_stage,
+; docs/d3d12_vulkan.md section 3.5): from s4 in root-signature order, a descriptor table as ONE dword (the 32-bit
+; VA of its first descriptor; the heaps live below 4 GiB), a constant one dword per value; s0..s3 are the driver's.
+; RSRC2 0xa therefore counts 5 user SGPRs (4 + 1). These moves rebuild the
+; layout the code below was written for: table s4 -> s[0:1] (high half 0).
+s_mov_b32 s0, s4
+s_mov_b32 s1, 0
 s_load_dwordx8 s[4:11], s[0:1], 0x0
 s_load_dwordx8 s[12:19], s[0:1], 0x20
 s_load_dwordx4 s[20:23], s[0:1], 0x40
