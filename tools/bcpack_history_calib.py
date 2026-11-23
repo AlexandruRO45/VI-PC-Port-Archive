@@ -22,6 +22,9 @@ import json
 import os
 import struct
 import sys
+from array import array
+from bisect import bisect_right
+from operator import add
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
@@ -113,159 +116,203 @@ def parse_codecs(spec):
 # Fast prefix rANS lane decoder
 # ---------------------------------------------------------------------------
 
+class _PrefixLane:
+    """Mutable state of one rANS lane inside `decode_lanes_prefix`."""
+
+    __slots__ = (
+        "width", "ctrl", "out_rem", "w", "q", "h3", "flush", "held", "vz", "inbuf",
+        "in_rem", "p1", "freq", "base", "adv_f", "adv_d", "stage", "out",
+    )
+
+
 def decode_lanes_prefix(raw, codec, out_size, max_sym):
     """Decode up to `max_sym` symbols per lane from a BCPack chunk.
 
     Because direct built-in history references (`d > i`) can only occur in
     blocks `0..255`, stopping the forward rANS scheduler after a short prefix
     avoids decoding tens of thousands of trailing blocks per chunk.
+
+    This is the cycle-accurate lane scheduler of `bcpack._decode_lanes_raw`
+    with the per-lane state in slotted objects and the two per-lane phases
+    fused (phase 2 of a lane reads and writes only that lane, so running it
+    right after the lane's own phase 1 gives the same result). The rest only
+    changes how the same values are reached:
+
+    * `_Model.lookup` is inlined with `bisect_right` (same band as its downward
+      scan), and the next state of `_Model.advance(sym, state)`, which is
+      `f * (state >> 16) + (state & 0xFFFF) - c`, is kept as `adv_f * (state >> 16)
+      + adv_d` with `adv_d = (state & 0xFFFF) - c`, both known at the lookup;
+    * a symbol goes to its lane's output when it is looked up. `held` marks it
+      as not yet in the output slot and `stage == emitted` marks the slot as
+      still waiting for the other lanes, so one synchronized emission is
+      `emitted += 1`, and the symbols still held when the loop ends are dropped;
+    * the input byte buffer is `inbuf` (-1 when empty) and a finished lane has
+      `ctrl == DONE`. A lane is only finished once its held symbol has moved to
+      the output slot, so the scheduler's "finished lane that still holds a symbol"
+      step never has anything to do and is not kept.
     """
     nsym = out_size // 8
     if max_sym <= 0 or max_sym >= nsym:
         return bcpack.decode_lanes(raw, codec, out_size)[0]
     widths = bcpack.LANE_WIDTHS[codec]
-    nl = len(widths)
-    HDR0, HDR1, HDR2, PROC = 0, 1, 2, 3
+    HDR0, HDR1, HDR2, PROC, DONE = 0, 1, 2, 3, 4
     L = bcpack.RANS_L
-    ctrl = [HDR0] * nl
-    out_rem = [nsym] * nl
-    w = [0] * nl
-    q = [0] * nl
-    h3 = [0] * nl
-    flush = [0] * nl
-    done = [False] * nl
-    full = [False] * nl
-    held = [False] * nl
-    vz = [0] * nl
-    inbuf = [0] * nl
-    sym = [0] * nl
-    in_rem = [0] * nl
-    p0 = [0] * nl
-    p1 = [0] * nl
-    model = [None] * nl
-    slotfull = [False] * nl
-    slotval = [0] * nl
-    stall = [False] * nl
-    out = [[] for _ in range(nl)]
+    get_model = bcpack._get_model
+    lanes = []
+    for wd in widths:
+        ln = _PrefixLane()
+        ln.width = wd
+        ln.ctrl = HDR0
+        ln.out_rem = nsym
+        ln.w = ln.q = ln.h3 = ln.flush = ln.vz = ln.in_rem = ln.p1 = ln.adv_f = ln.adv_d = 0
+        ln.inbuf = ln.stage = -1
+        ln.held = False
+        ln.freq = ln.base = None
+        ln.out = []
+        lanes.append(ln)
+    nl = len(lanes)
+    nslot = 0
     pos = 0
     nraw = len(raw)
     data = memoryview(raw)
     emitted = 0
     while emitted < max_sym:
         left = 8
-        for i in range(nl):
-            if done[i] or (held[i] and slotfull[i]):
-                stall[i] = True
+        for ln in lanes:
+            ctrl = ln.ctrl
+            inbuf = ln.inbuf
+            if ctrl == PROC:
+                held = ln.held
+                if held:
+                    if ln.stage == emitted:
+                        continue
+                    st = ln.adv_f * (ln.p1 >> 16) + ln.adv_d
+                else:
+                    st = ln.p1
+                in_rem = ln.in_rem
+                if inbuf < 0 and in_rem > 0:
+                    if left == 0:
+                        continue
+                    if pos >= nraw:
+                        raise bcpack.BcpackError("BCPack lane stream ended before prefix symbols finished")
+                    inbuf = ln.inbuf = data[pos]
+                    pos += 1
+                    left -= 1
+                if held:
+                    # The held symbol moves into the output slot.
+                    ln.stage = emitted
+                    nslot += 1
+                if st < L:
+                    if in_rem > 0:
+                        if inbuf >= 0:
+                            st = (st << 8) | inbuf
+                            in_rem -= 1
+                            ln.in_rem = in_rem
+                            ln.inbuf = -1
+                            if in_rem == 0 and ln.flush:
+                                vz = ln.vz
+                                while st < L and st != 0 and vz < 8:
+                                    st <<= 8
+                                    vz += 1
+                                ln.vz = vz
+                    elif ln.flush:
+                        vz = ln.vz
+                        while st < L and st != 0 and vz < 8:
+                            st <<= 8
+                            vz += 1
+                        ln.vz = vz
+                    else:
+                        ln.held = False
+                        ln.p1 = st
+                        if ln.out_rem > 0:
+                            ln.ctrl = HDR0
+                        else:
+                            ln.ctrl = DONE
+                        continue
+                out_rem = ln.out_rem
+                nxt = st > L and out_rem > 0
+                if nxt:
+                    # `_Model.lookup(st & 0xFFFF)`; the symbol joins the output at once.
+                    cf = st & 0xFFFF
+                    base = ln.base
+                    p = bisect_right(base, cf) - 1
+                    bp = base[p]
+                    fp = ln.freq[p]
+                    qq = (cf - bp) // fp
+                    ln.out.append(((1 << p) >> 1) + qq)
+                    c = bp + fp * qq
+                    if c == 0:
+                        fp -= 1
+                        c = 1
+                    ln.adv_f = fp
+                    ln.adv_d = cf - c
+                    out_rem -= 1
+                    ln.out_rem = out_rem
+                ln.held = nxt
+                ln.p1 = st
+                if in_rem == 0:
+                    if ln.flush:
+                        if st == L:
+                            if out_rem > 0:
+                                ln.ctrl = HDR0
+                                ln.p1 = 0
+                            else:
+                                ln.ctrl = DONE
+                    elif out_rem == 0 and not nxt:
+                        ln.ctrl = DONE
                 continue
-            stall[i] = False
-            if ctrl[i] == PROC:
-                p0[i] = model[i].advance(sym[i], p1[i]) if held[i] else p1[i]
-            if not full[i] and (ctrl[i] != PROC or in_rem[i] > 0):
+            if ctrl == DONE:
+                continue
+            # A lane that is parsing its fragment header holds no symbol.
+            if inbuf < 0:
                 if left == 0:
-                    stall[i] = True
                     continue
                 if pos >= nraw:
                     raise bcpack.BcpackError("BCPack lane stream ended before prefix symbols finished")
-                inbuf[i] = data[pos]
+                inbuf = ln.inbuf = data[pos]
                 pos += 1
-                full[i] = True
                 left -= 1
-            if held[i]:
-                slotfull[i] = True
-                slotval[i] = sym[i]
-                held[i] = False
-        for i in range(nl):
-            if done[i] or stall[i]:
-                continue
-            c = ctrl[i]
-            if c == HDR0:
-                if not full[i]:
-                    continue
-                h = inbuf[i]
-                q[i] = h & 15
-                flush[i] = (h >> 4) & 1
-                h3[i] = (h >> 5) & 1
-                w[i] = widths[i] - (h >> 6)
-                full[i] = False
-                ctrl[i] = HDR1
-                vz[i] = 0
-            elif c == HDR1:
-                if not full[i]:
-                    continue
-                full[i] = False
-                model[i] = bcpack._get_model(w[i], q[i])
-                if h3[i]:
-                    in_rem[i] = inbuf[i]
-                    ctrl[i] = HDR2
+            if ctrl == HDR0:
+                ln.q = inbuf & 15
+                ln.flush = (inbuf >> 4) & 1
+                ln.h3 = (inbuf >> 5) & 1
+                ln.w = ln.width - (inbuf >> 6)
+                ln.inbuf = -1
+                ln.ctrl = HDR1
+                ln.vz = 0
+            elif ctrl == HDR1:
+                ln.inbuf = -1
+                model = get_model(ln.w, ln.q)
+                if model is None:
+                    raise bcpack.BcpackError("BCPack lane has no probability table for its width and q")
+                ln.freq = model.freq
+                ln.base = model.base
+                if ln.h3:
+                    ln.in_rem = inbuf
+                    ln.ctrl = HDR2
                 else:
-                    in_rem[i] = inbuf[i] + 1
-                    ctrl[i] = PROC
-            elif c == HDR2:
-                if not full[i]:
-                    continue
-                in_rem[i] = ((inbuf[i] << 8) | (in_rem[i] & 0xFF)) + 257
-                ctrl[i] = PROC
-                full[i] = False
+                    ln.in_rem = inbuf + 1
+                    ln.ctrl = PROC
             else:
-                st = p0[i]
-                if st < L:
-                    if in_rem[i] > 0:
-                        if full[i]:
-                            st = (st << 8) | inbuf[i]
-                            in_rem[i] -= 1
-                            full[i] = False
-                            if in_rem[i] == 0 and flush[i]:
-                                while st < L and st != 0 and vz[i] < 8:
-                                    st <<= 8
-                                    vz[i] += 1
-                    elif flush[i]:
-                        while st < L and st != 0 and vz[i] < 8:
-                            st <<= 8
-                            vz[i] += 1
-                    else:
-                        p1[i] = st
-                        if out_rem[i] > 0:
-                            ctrl[i] = HDR0
-                        else:
-                            done[i] = True
-                        continue
-                nxt = st > L and out_rem[i] > 0
-                if nxt:
-                    sym[i] = model[i].lookup(st & 0xFFFF)
-                    out_rem[i] -= 1
-                held[i] = nxt
-                p1[i] = st
-                if in_rem[i] == 0:
-                    if flush[i]:
-                        if st == L:
-                            if out_rem[i] > 0:
-                                ctrl[i] = HDR0
-                                p0[i] = 0
-                                p1[i] = 0
-                            else:
-                                done[i] = True
-                    elif out_rem[i] == 0 and not nxt:
-                        done[i] = True
-        ready = True
-        anyfull = False
-        for i in range(nl):
-            if slotfull[i]:
-                anyfull = True
-            elif not (done[i] and not held[i]):
-                ready = False
-                break
-        if ready and anyfull:
-            for i in range(nl):
-                if slotfull[i]:
-                    out[i].append(slotval[i])
-                    slotfull[i] = False
+                ln.in_rem = ((inbuf << 8) | (ln.in_rem & 0xFF)) + 257
+                ln.ctrl = PROC
+                ln.inbuf = -1
+        # One element is emitted when every lane holds a symbol or is finished and has nothing held.
+        if nslot == nl:
             emitted += 1
-        for i in range(nl):
-            if done[i] and held[i] and not slotfull[i]:
-                slotfull[i] = True
-                slotval[i] = sym[i]
-                held[i] = False
-    return out
+            nslot = 0
+        elif nslot:
+            for ln in lanes:
+                if ln.stage != emitted and ln.ctrl != DONE:
+                    break
+            else:
+                emitted += 1
+                nslot = 0
+    # The loop ends right after an emission, so no slot is waiting; only held symbols are not emitted.
+    for ln in lanes:
+        if ln.held:
+            ln.out.pop()
+    return [ln.out for ln in lanes]
 
 
 # ---------------------------------------------------------------------------
@@ -1445,19 +1492,31 @@ class Bc6hCalibrator:
         if not obs_list:
             return 1 << (total_bits - 1)
         limit = 1 << total_bits
-        best_err = 1e30
-        best_r = 0
-        for r in range(limit):
-            err = 0.0
-            for dc, dz in obs_list:
+        # `errs[r]` is the sum, in observation order, of
+        # `abs(sign_extend(((r >> sh) + dz) & mD, dc)) / 2**(dc - 1)` with
+        # `sh = total_bits - dc` and `mD = 2**dc - 1`. For `0 < dc <= total_bits` the
+        # term depends on `r + (dz << sh)` modulo `limit` only, so it is the table
+        # for `dz = 0` rotated by that amount.
+        errs = array("d", bytes(8 * limit))
+        tables = {}
+        for dc, dz in obs_list:
+            if 0 < dc <= total_bits:
+                table = tables.get(dc)
+                if table is None:
+                    sh = total_bits - dc
+                    sign = 1 << (dc - 1)
+                    scale = float(sign)
+                    table = array("d", (abs((v ^ sign) - sign) / scale for v in range(1 << dc) for _ in range(1 << sh)))
+                    tables[dc] = table
+                turn = (dz << (total_bits - dc)) % limit
+                term = table[turn:] + table[:turn] if turn else table
+            else:
                 sh = total_bits - dc if dc < total_bits else 0
                 mD = (1 << dc) - 1
-                v = ((r >> sh) + dz) & mD
-                err += abs(_sign_extend(v, dc)) / float(1 << (dc - 1))
-            if err < best_err:
-                best_err = err
-                best_r = r
-        return best_r
+                scale = float(1 << (dc - 1))
+                term = array("d", (abs(_sign_extend(((r >> sh) + dz) & mD, dc)) / scale for r in range(limit)))
+            errs = array("d", map(add, errs, term))
+        return errs.index(min(errs))
 
     def build_document(self):
         eh = [[[0, 0, 0, 0] for _ in range(3)] for _ in range(256)]
@@ -1893,36 +1952,43 @@ class Bc7Calibrator:
 
     @staticmethod
     def _fit_ep_pair(obs_list):
-        cands = []
-        for h0 in range(0, 256, 16):
-            for h1 in range(0, 256, 16):
-                err = 0.0
-                for ops0, ops1, tgt, wt in obs_list:
-                    e0 = _eval_bc7_ops(ops0, h0 | 8)
-                    e1 = _eval_bc7_ops(ops1, h1 | 8)
+        # Each candidate's error is summed over the observations in order, as before; the
+        # observation loop is outermost so that the endpoint a candidate half evaluates to
+        # is computed once per observation rather than once per candidate.
+        errs = [0.0] * 256
+        for ops0, ops1, tgt, wt in obs_list:
+            ev0 = [_eval_bc7_ops(ops0, h0 | 8) for h0 in range(0, 256, 16)]
+            ev1 = [_eval_bc7_ops(ops1, h1 | 8) for h1 in range(0, 256, 16)]
+            at = 0
+            for e0 in ev0:
+                for e1 in ev1:
                     d = abs(0.5 * (e0 + e1) - tgt)
-                    err += wt * ((d if d < 40.0 else 40.0) + 0.01 * abs(e0 - e1))
-                cands.append((err, h0, h1))
+                    errs[at] += wt * ((d if d < 40.0 else 40.0) + 0.01 * abs(e0 - e1))
+                    at += 1
+        cands = [(errs[16 * i + j], 16 * i, 16 * j) for i in range(16) for j in range(16)]
         cands.sort()
         top = cands[:4]
         for step in (8, 4, 2, 1):
-            nxt = {}
+            keys = {}
             mid = step // 2
             for _, b0, b1 in top:
                 for d0 in (0, step):
                     for d1 in (0, step):
-                        h0, h1 = (b0 + d0) & 255, (b1 + d1) & 255
-                        key = (h0, h1)
-                        if key in nxt:
-                            continue
-                        err = 0.0
-                        for ops0, ops1, tgt, wt in obs_list:
-                            e0 = _eval_bc7_ops(ops0, h0 | mid)
-                            e1 = _eval_bc7_ops(ops1, h1 | mid)
-                            d = abs(0.5 * (e0 + e1) - tgt)
-                            err += wt * ((d if d < 40.0 else 40.0) + 0.01 * abs(e0 - e1))
-                        nxt[key] = err
-            top = sorted((e, a, b) for (a, b), e in nxt.items())[:4]
+                        keys.setdefault(((b0 + d0) & 255, (b1 + d1) & 255), 0.0)
+            for ops0, ops1, tgt, wt in obs_list:
+                ev0 = {}
+                ev1 = {}
+                for key in keys:
+                    h0, h1 = key
+                    e0 = ev0.get(h0)
+                    if e0 is None:
+                        e0 = ev0[h0] = _eval_bc7_ops(ops0, h0 | mid)
+                    e1 = ev1.get(h1)
+                    if e1 is None:
+                        e1 = ev1[h1] = _eval_bc7_ops(ops1, h1 | mid)
+                    d = abs(0.5 * (e0 + e1) - tgt)
+                    keys[key] += wt * ((d if d < 40.0 else 40.0) + 0.01 * abs(e0 - e1))
+            top = sorted((e, a, b) for (a, b), e in keys.items())[:4]
         return top[0][1], top[0][2]
 
     def build_document(self):
@@ -2566,11 +2632,51 @@ def _resolve_pools(paths):
     return unique
 
 
+def _pretty_json(obj, level=0):
+    """`json.dumps(obj, sort_keys=True, indent=2)` for the tables written here, built faster.
+
+    `json` formats an indented document in pure Python, one item at a time. Here a list that
+    holds only ints, which is nearly all of a history table, is joined in one step; every other
+    scalar goes through `json.dumps`. Raises `TypeError` for anything but dicts with `str` keys,
+    lists, tuples and scalars, and the caller then uses `json.dumps` itself.
+    """
+    kind = type(obj)
+    if kind is int:
+        return int.__repr__(obj)
+    if kind is str:
+        return json.dumps(obj)
+    if kind is list or kind is tuple:
+        if not obj:
+            return "[]"
+        gap = "\n" + "  " * (level + 1)
+        if set(map(type, obj)) == {int}:
+            body = ("," + gap).join(map(int.__repr__, obj))
+        else:
+            body = ("," + gap).join([_pretty_json(v, level + 1) for v in obj])
+        return "[" + gap + body + "\n" + "  " * level + "]"
+    if kind is dict:
+        if not obj:
+            return "{}"
+        gap = "\n" + "  " * (level + 1)
+        parts = []
+        for key in sorted(obj):
+            if type(key) is not str:
+                raise TypeError("non-str JSON key")
+            parts.append(json.dumps(key) + ": " + _pretty_json(obj[key], level + 1))
+        return "{" + gap + ("," + gap).join(parts) + "\n" + "  " * level + "}"
+    if obj is None or kind is bool or kind is float:
+        return json.dumps(obj)
+    raise TypeError(f"unsupported JSON value {kind.__name__}")
+
+
 def _write_json_deterministic(path, obj):
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    text = json.dumps(obj, sort_keys=True, indent=2) + "\n"
+    try:
+        text = _pretty_json(obj) + "\n"
+    except (TypeError, RecursionError):
+        text = json.dumps(obj, sort_keys=True, indent=2) + "\n"
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
 
