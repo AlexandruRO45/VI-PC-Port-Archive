@@ -6,9 +6,10 @@
 Usage:
   python -I tools/probe_gfx1036_vcmp16.py
 
-Needs a native RDNA2 GPU (the probe asks for LEONIDA_VK_DEVICE=radeon), a built
-runtime/build/vk_compute_test (cmake --build runtime/build --target vk_compute_test) and spirv-as on
-PATH. No game files. The probes want the GPU to themselves, so run it alone.
+Needs a native RDNA2 GPU (the probe asks for LEONIDA_VK_DEVICE=radeon), a built vk_compute_test
+(cmake --build runtime/build --target vk_compute_test; --build names another build folder, and a Visual
+Studio RelWithDebInfo/Release subfolder is found) and spirv-as on PATH. No game files. The probes want the
+GPU to themselves, so run it alone.
 """
 import argparse
 import math
@@ -23,11 +24,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests", "semantic"))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 
 from support import STUB_DXBC, rdna2spirv
 import spirv_mini_interp as si
+from compute_fixture import find_test_program  # noqa: E402
 
-VK_COMPUTE_TEST = os.path.join(ROOT, "runtime", "build", "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+DEFAULT_BUILD = os.path.join(ROOT, "runtime", "build")
+VK_COMPUTE_TEST = None     # set by main() from --build; run() is only reached after it exists
+
+
+def harness_path(build):
+    """vk_compute_test in `build` or its RelWithDebInfo/Release subfolder (a Visual Studio build), else None."""
+    folder = find_test_program(build, "vk_compute_test")
+    return os.path.join(folder, "vk_compute_test" + (".exe" if os.name == "nt" else "")) if folder else None
 
 # Half-precision bit constants
 H_ZERO = 0x0000      # +0.0
@@ -341,16 +351,21 @@ def test_f16_nan_and_modifiers(wave_size=32):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
-                                 epilog="Needs an RDNA2 GPU, a built runtime/build/vk_compute_test and spirv-as "
+                                 epilog="Needs an RDNA2 GPU, a built vk_compute_test and spirv-as "
                                         "on PATH; no game files. Run it alone: it wants the GPU to itself.")
-    ap.parse_args(argv)
+    ap.add_argument("--build", default=DEFAULT_BUILD,
+                    help="the runtime build folder holding vk_compute_test (default: runtime/build; a Visual Studio "
+                         "RelWithDebInfo or Release subfolder is found)")
+    a = ap.parse_args(argv)
     # The probe writes a temporary module per case, so a missing tool would stop it a dozen tracebacks deep.
     if not shutil.which("spirv-as"):
         print("ERROR: spirv-as is not on PATH (SPIRV-Tools, or the Vulkan SDK's bin)", file=sys.stderr)
         return 2
-    if not os.path.isfile(VK_COMPUTE_TEST):
-        print(f"ERROR: no {VK_COMPUTE_TEST}: build it with "
-              "cmake --build runtime/build --target vk_compute_test", file=sys.stderr)
+    global VK_COMPUTE_TEST
+    VK_COMPUTE_TEST = harness_path(a.build)
+    if VK_COMPUTE_TEST is None:
+        print(f"ERROR: no vk_compute_test in {a.build} or its RelWithDebInfo/Release folder: build it with "
+              f"cmake --build {a.build} --target vk_compute_test, or pass --build", file=sys.stderr)
         return 2
     print("=" * 70)
     print("PROBING GFX1036 SILICON FOR V_CMP(X) 16-BIT OP_SEL & CONSTANTS")

@@ -11,6 +11,7 @@ vk_compute_test, which is why this test can run anywhere.
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +43,29 @@ class ProbeCommandLineTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertEqual(r.stderr.strip(), "ERROR: spirv-as is not on PATH (SPIRV-Tools, or the Vulkan SDK's bin)")
         self.assertNotIn("PROBING", r.stdout)
+
+    def test_a_missing_harness_names_the_build_folder(self):
+        # The harness path used to be a hard-coded runtime/build/vk_compute_test.exe (TEST-953).
+        with tempfile.TemporaryDirectory() as build:
+            r = run("--build", build)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn(f"ERROR: no vk_compute_test in {build} or its RelWithDebInfo/Release folder", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertNotIn("PROBING", r.stdout)
+
+    def test_the_harness_is_found_in_a_visual_studio_config_folder(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import probe_gfx1036_vcmp16 as probe
+        exe = "vk_compute_test" + (".exe" if os.name == "nt" else "")
+        with tempfile.TemporaryDirectory() as build:
+            self.assertIsNone(probe.harness_path(build))
+            os.mkdir(os.path.join(build, "RelWithDebInfo"))
+            with open(os.path.join(build, "RelWithDebInfo", exe), "wb") as f:
+                f.write(b"")
+            self.assertEqual(probe.harness_path(build), os.path.join(build, "RelWithDebInfo", exe))
+            with open(os.path.join(build, exe), "wb") as f:
+                f.write(b"")
+            self.assertEqual(probe.harness_path(build), os.path.join(build, exe))   # the folder itself wins
 
 
 if __name__ == "__main__":
