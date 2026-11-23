@@ -315,6 +315,14 @@ bool commit_in_window(uintptr_t start, uintptr_t end, SIZE_T granularity, DWORD 
         SetLastError(ERROR_INVALID_ADDRESS);
         return false;
     }
+    // The table of mapped pages decides this, not what the host reports for a view.
+    for (uintptr_t page = start & ~(static_cast<uintptr_t>(kPhysicalPageSize) - 1); page < end;
+         page += static_cast<uintptr_t>(kPhysicalPageSize)) {
+        if (g_mapped.find(page) != g_mapped.end()) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return false;
+        }
+    }
     for (int pass = 0; pass < 2; ++pass) {  // 0: check every part, 1: commit them
         for (uintptr_t at = start; at < end;) {
             MEMORY_BASIC_INFORMATION info{};
@@ -467,11 +475,12 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                                                 &parameter, 1);
     }
     if (commit && !(host_type & MEM_RESERVE) && address != nullptr) {
-        // A commit into an existing reservation. A window is a placeholder, which refuses a plain commit.
-        const std::lock_guard lock(g_phys_mutex);
+        // A commit into an existing reservation. A window is a placeholder, which refuses a plain commit. The lock is
+        // taken only once the plain commit has failed, so an ordinary commit never waits behind a long map call.
         if (void* const result = VirtualAlloc(address, size, host_type, host_prot)) return result;
         const DWORD error = GetLastError();
         const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+        const std::lock_guard lock(g_phys_mutex);
         if (!placeholder_api().available() || !find_window(start, size)) {
             SetLastError(error);
             return nullptr;
