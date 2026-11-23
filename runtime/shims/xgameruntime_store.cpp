@@ -12,9 +12,10 @@
 // service or a store UI (purchases, consumables, tokens, collections ids, downloads) fails before starting, so no
 // XAsyncBlock waits, and logs once. License-changed and license-lost callbacks are never called: nothing changes.
 //
-// Two of the three sizes have an independent public corroboration: the MIT-licensed
+// Two of the three sizes have corroboration from a second public source outside this repo: the MIT-licensed
 // minecraft-linux/xgameruntime-rs, src/xstore.rs at c523673a9e, defines STORE_SKU_ID_SIZE = 18 and
 // TRIAL_UNIQUE_ID_MAX_SIZE = 64 and declares XStoreGameLicense in the same field order, giving 104 bytes.
+// That source marks the constants "from docs??", so this is a second written source, not an executable check.
 //
 // ASSUMPTION (UNVERIFIED): the remaining size SKU_ID_SIZE = 5 fixes XStoreCanAcquireLicenseResult (12 bytes);
 // that reference leaves the type opaque and the public GDK pages name the constants without values.
