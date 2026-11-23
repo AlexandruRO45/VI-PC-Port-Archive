@@ -631,11 +631,124 @@ class TestLoadBc7(unittest.TestCase):
             {"historyEndpointLastResort": [[1, 2, 3]]},
             {"historyEndpointLastResort": [[1, 2, 3, 4, 5]]},
             {"historyEndpointLastResort": [["bad", 0]]},
+            {"historyEndpointLastResort": ["12"]},
+            {"historyEndpointLastResort": [[-1, 0]]},
+            {"historyEndpointLastResort": [[256, 0]]},
+            {"historyEndpointLastResort": [[0, -1]]},
+            {"historyEndpointLastResort": [[0, 24]]},
+            {"historyEndpointLastResort": [[0, 3, 0, 0]]},
+            {"historyEndpointLastResort": [[0, 0, 2, 0]]},
+            {"historyEndpointLastResort": [[0, 0, 0, 4]]},
+            {"historyEndpointLastResort": [[True, 0]]},
+            {"historyEndpoints": {"0": [True] + [0] * 23}},
         ]
         for bad_sec in bad_sections:
             with self.subTest(bad_sec=bad_sec):
                 with self.assertRaises((ValueError, TypeError)):
                     bptc.load_bc7({"bc7": bad_sec})
+
+        for bad_wrapper in ({"bc7": []}, {"bc7": "not_a_dict"}, {"bc7": 123}):
+            with self.subTest(bad_wrapper=bad_wrapper):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc7(bad_wrapper)
+
+
+class TestLoadBcHistory(unittest.TestCase):
+    """Verifies load_bc_history() for BC1/BC3/BC4/BC5 and input validation."""
+
+    def test_defaults_and_supported_codecs(self) -> None:
+        for codec in (1, 3, 4, 5):
+            self.assertIsNone(bptc.load_bc_history(codec, None))
+            self.assertIsNone(bptc.load_bc_history(codec, {}))
+            self.assertIsNone(bptc.load_bc_history(codec, {"bc6h": _make_bc6h_section()}))
+
+        specs = {
+            1: ("bc1", (10, 20, 30, 1, 2, 3), (31, 63, 31, 31, 63, 31)),
+            3: ("bc3", (100, 200, 1, 2, 3, 4, 5, 6), (255, 255, 31, 63, 31, 31, 63, 31)),
+            4: ("bc4", (12, 240), (255, 0)),
+            5: ("bc5", (1, 2, 3, 4), (255, 128, 64, 32)),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            hist_dir = os.path.join(tmp, "bc_dir")
+            os.mkdir(hist_dir)
+            combined_doc = {}
+            for codec, (ckey, c_row, p_row) in specs.items():
+                sec = {
+                    "codec": ckey,
+                    "confirmed": {"0": list(c_row)},
+                    "provisional": {"255": list(p_row)},
+                    "replace": True,
+                }
+                combined_doc[ckey] = sec
+                # 1. Direct dict with wrapper or codec tag
+                self.assertEqual(
+                    bptc.load_bc_history(codec, {ckey: sec}),
+                    ({0: c_row}, {255: p_row}, True),
+                )
+                self.assertEqual(
+                    bptc.load_bc_history(codec, sec),
+                    ({0: c_row}, {255: p_row}, True),
+                )
+                # 2. Directory containing <codec_key>.json
+                self.assertIsNone(bptc.load_bc_history(codec, hist_dir))
+                per_file = os.path.join(hist_dir, f"{ckey}.json")
+                with open(per_file, "w", encoding="utf-8") as fh:
+                    json.dump(sec, fh)
+                self.assertEqual(
+                    bptc.load_bc_history(codec, Path(hist_dir)),
+                    ({0: c_row}, {255: p_row}, True),
+                )
+
+            combined_path = os.path.join(tmp, "all_bc.json")
+            with open(combined_path, "w", encoding="utf-8") as fh:
+                json.dump(combined_doc, fh)
+            for codec, (_, c_row, p_row) in specs.items():
+                self.assertEqual(
+                    bptc.load_bc_history(codec, combined_path),
+                    ({0: c_row}, {255: p_row}, True),
+                )
+
+    def test_validation_errors_and_strict_types(self) -> None:
+        for bad_codec in (0, 2, 6, 7, -1, "bc1", True, False, None):
+            with self.subTest(bad_codec=bad_codec):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc_history(bad_codec, {"bc1": {}})
+
+        bad_bc1_cases = [
+            {"bc1": "not_a_dict"},
+            {"bc1": []},
+            {"bc1": {"codec": "bc3"}},
+            {"bc1": {"replace": "false"}},
+            {"bc1": {"replace": 1}},
+            {"bc1": {"confirmed": {"0": "123456"}}},
+            {"bc1": {"confirmed": {"0": [0, 0, 0, 0, 0]}}},
+            {"bc1": {"confirmed": {"0": [32, 0, 0, 0, 0, 0]}}},
+            {"bc1": {"confirmed": {"0": [0, 64, 0, 0, 0, 0]}}},
+            {"bc1": {"confirmed": {"0": [-1, 0, 0, 0, 0, 0]}}},
+            {"bc1": {"confirmed": {"0": [True, 0, 0, 0, 0, 0]}}},
+            {"bc1": {"confirmed": {True: [0, 0, 0, 0, 0, 0]}}},
+            {"bc1": {"provisional": {"256": [0, 0, 0, 0, 0, 0]}}},
+        ]
+        for bad_doc in bad_bc1_cases:
+            with self.subTest(bad_doc=bad_doc):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc_history(1, bad_doc)
+
+        # Also verify load_bc6h rejects string rows, boolean values, and non-dict sections.
+        bad_bc6h_strict = [
+            {"bc6h": "not_a_dict"},
+            {"bc6h": []},
+            {"bc6h": {"endpointHistory": {"0": ["1234", "5678", "9012"]}}},
+            {"bc6h": {"indexHistory": {"0": "0123456789abcdef"}}},
+            {"bc6h": {"endpointClass": {"0": True}}},
+            {"bc6h": {"indexClass": {"0": False}}},
+            {"bc6h": {"endpointConfirmedBits": {"0": ["1234", "5678", "9012"]}}},
+            {"bc6h": {"indexConfirmedBits": {"0": "0123456789abcdef"}}},
+        ]
+        for bad_doc in bad_bc6h_strict:
+            with self.subTest(bad_bc6h=bad_doc):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc6h(bad_doc)
 
 
 if __name__ == "__main__":

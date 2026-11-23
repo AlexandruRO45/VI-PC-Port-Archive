@@ -140,13 +140,22 @@ def _bc7_static():
     return _BC7_STATIC_CACHE
 
 
+def _as_int(val):
+    if isinstance(val, bool):
+        raise ValueError("boolean is not a valid history integer")
+    return int(val)
+
+
 def _read_history_section(history, codec_key, marker_key):
     """Resolve `history` (None, dict, JSON file, or directory) for one codec."""
     if history is None:
         return None
     if isinstance(history, dict):
         if codec_key in history:
-            return history[codec_key]
+            sec = history[codec_key]
+            if not isinstance(sec, dict):
+                raise ValueError(f"{codec_key} history section must be a JSON object")
+            return sec
         return history if marker_key in history else None
     path = os.fspath(history)
     if os.path.isdir(path):
@@ -167,7 +176,10 @@ def _read_history_section(history, codec_key, marker_key):
             raise ValueError(f"{path}: expected a JSON object")
         _FILE_CACHE[abspath] = (cache_key, data)
     if codec_key in data:
-        return data[codec_key]
+        sec = data[codec_key]
+        if not isinstance(sec, dict):
+            raise ValueError(f"{codec_key} history section must be a JSON object")
+        return sec
     return data if marker_key in data else None
 
 
@@ -182,7 +194,7 @@ def _iter_entries(obj, count=256):
             yield i, v
     elif isinstance(obj, dict):
         for k, v in obj.items():
-            i = int(k)
+            i = _as_int(k)
             if not 0 <= i < count:
                 raise ValueError(f"history entry index {i} outside 0..{count - 1}")
             yield i, v
@@ -192,6 +204,8 @@ def _iter_entries(obj, count=256):
 
 def _flatten_bc7_entry(val, expected_len):
     """Flatten nested `[3][2][4]` / `[2][16]` or flat `24`/`32` BC7 entry to a tuple of ints."""
+    if not isinstance(val, (list, tuple)):
+        raise ValueError("BC7 history entry must be a list or tuple")
     out = []
 
     def _walk(x):
@@ -199,7 +213,7 @@ def _flatten_bc7_entry(val, expected_len):
             for item in x:
                 _walk(item)
         else:
-            out.append(int(x))
+            out.append(_as_int(x))
 
     _walk(val)
     if len(out) != expected_len:
@@ -227,17 +241,18 @@ def load_bc6h(history=None, *, with_confirmed_bits=False):
     ec = list(_EMPTY_BC6H_CLS)
     ic = list(_EMPTY_BC6H_CLS)
     for i, channels in _iter_entries(sec.get("endpointHistory")):
-        if len(channels) != 3 or any(len(ch) != 4 for ch in channels):
+        if (not isinstance(channels, (list, tuple)) or len(channels) != 3
+                or any(not isinstance(ch, (list, tuple)) or len(ch) != 4 for ch in channels)):
             raise ValueError(f"BC6H endpointHistory[{i}] must be 3x4 integers")
-        eh[i] = tuple(tuple(int(v) for v in ch) for ch in channels)
+        eh[i] = tuple(tuple(_as_int(v) for v in ch) for ch in channels)
     for i, pixels in _iter_entries(sec.get("indexHistory")):
-        if len(pixels) != 16:
+        if not isinstance(pixels, (list, tuple)) or len(pixels) != 16:
             raise ValueError(f"BC6H indexHistory[{i}] must have 16 integers")
-        ih[i] = tuple(int(v) for v in pixels)
+        ih[i] = tuple(_as_int(v) for v in pixels)
     for i, cls in _iter_entries(sec.get("endpointClass")):
-        ec[i] = int(cls)
+        ec[i] = _as_int(cls)
     for i, cls in _iter_entries(sec.get("indexClass")):
-        ic[i] = int(cls)
+        ic[i] = _as_int(cls)
     ep_cb = [tuple((16, 10, 6, 6) for _ in range(3)) if c == 3 else _EMPTY_BC6H_EH[0] for c in ec]
     ix_cb = [(4,) * 16 if c == 3 else _EMPTY_BC6H_IH[0] for c in ic]
     for key, target, empty, widths in (
@@ -250,20 +265,22 @@ def load_bc6h(history=None, *, with_confirmed_bits=False):
         target[:] = empty
         for i, row in _iter_entries(sec[key]):
             if key == "endpointConfirmedBits":
-                if len(row) != 3 or any(len(ch) != 4 for ch in row):
+                if (not isinstance(row, (list, tuple)) or len(row) != 3
+                        or any(not isinstance(ch, (list, tuple)) or len(ch) != 4 for ch in row)):
                     raise ValueError(f"BC6H {key}[{i}] must be 3x4 integers")
-                value = tuple(tuple(int(v) for v in ch) for ch in row)
+                value = tuple(tuple(_as_int(v) for v in ch) for ch in row)
                 valid = all(0 <= v <= widths[q] for ch in value for q, v in enumerate(ch))
             else:
-                if len(row) != 16:
+                if not isinstance(row, (list, tuple)) or len(row) != 16:
                     raise ValueError(f"BC6H {key}[{i}] must have 16 integers")
-                value = tuple(int(v) for v in row)
+                value = tuple(_as_int(v) for v in row)
                 valid = all(0 <= v <= 4 for v in value)
             if not valid:
                 raise ValueError(f"BC6H {key}[{i}] bit depth out of bounds")
             target[i] = value
     result = (tuple(eh), tuple(ih), tuple(ec), tuple(ic))
     return result + (tuple(ep_cb), tuple(ix_cb)) if with_confirmed_bits else result
+
 
 
 def load_bc7(history=None):
@@ -317,12 +334,22 @@ def load_bc7(history=None):
                 for v, d in zip(row, depth)
             )
     last_resort = set()
-    for item in sec.get("historyEndpointLastResort") or ():
+    last_resort_raw = sec.get("historyEndpointLastResort")
+    if last_resort_raw is not None and not isinstance(last_resort_raw, (list, tuple)):
+        raise ValueError("historyEndpointLastResort must be a list of 2- or 4-integer tuples")
+    for item in last_resort_raw or ():
+        if not isinstance(item, (list, tuple)):
+            raise ValueError("historyEndpointLastResort entries must have 2 or 4 integers")
         if len(item) == 4:
-            k, sub, e, c = (int(x) for x in item)
+            k, sub, e, c = (_as_int(x) for x in item)
+            if not (0 <= k < 256 and 0 <= sub < 3 and 0 <= e < 2 and 0 <= c < 4):
+                raise ValueError("historyEndpointLastResort 4-tuple out of bounds")
             last_resort.add((k, sub * 8 + e * 4 + c))
         elif len(item) == 2:
-            last_resort.add((int(item[0]), int(item[1])))
+            k, slot = _as_int(item[0]), _as_int(item[1])
+            if not (0 <= k < 256 and 0 <= slot < 24):
+                raise ValueError("historyEndpointLastResort 2-tuple out of bounds")
+            last_resort.add((k, slot))
         else:
             raise ValueError("historyEndpointLastResort entries must have 2 or 4 integers")
     return {
@@ -356,7 +383,7 @@ def load_bc_history(codec, history=None):
     """
     if history is None:
         return None
-    spec = _BC_HISTORY_SPEC.get(codec)
+    spec = None if isinstance(codec, bool) else _BC_HISTORY_SPEC.get(codec)
     if spec is None:
         raise ValueError(f"unsupported BC history codec: {codec}")
     codec_key, mods = spec
@@ -405,7 +432,7 @@ def load_bc_history(codec, history=None):
                 raise ValueError(f"{codec_key} {label}[{i}] must have {ncols} integers")
             row = []
             for v, mod in zip(vals, mods):
-                iv = int(v)
+                iv = _as_int(v)
                 if not 0 <= iv < mod:
                     raise ValueError(f"{codec_key} {label}[{i}] value {iv} outside 0..{mod - 1}")
                 row.append(iv)
@@ -414,5 +441,7 @@ def load_bc_history(codec, history=None):
 
     confirmed = _parse_map(sec.get("confirmed"), "confirmed")
     provisional = _parse_map(sec.get("provisional"), "provisional")
-    replace = bool(sec.get("replace", False))
+    replace = sec.get("replace", False)
+    if not isinstance(replace, bool):
+        raise ValueError(f"{codec_key} replace flag must be a boolean")
     return confirmed, provisional, replace
