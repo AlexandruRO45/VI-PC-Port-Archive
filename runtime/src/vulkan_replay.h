@@ -781,7 +781,11 @@ struct ShaderUserData {
     std::uint64_t ps_code_base;
 };
 static_assert(sizeof(ShaderUserData) == 160 && offsetof(ShaderUserData, ps_code_base) == 38 * 4);
-constexpr std::uint32_t shader_user_data_bytes = 144;  // the block without the pixel shader's slot
+// The block without the pixel shader's slot: compute and indirect-dispatch layouts, and graphics layouts whose PS
+// does not read its own code base. A layout size must come from here or from push_constant_bytes, never from
+// sizeof(ShaderUserData), which also counts dwords 36-39.
+constexpr std::uint32_t shader_user_data_bytes = 144;
+static_assert(shader_user_data_bytes == offsetof(ShaderUserData, mesh_output));
 
 // A host read of a small CPU-written input either succeeds, names no VA, or names GPU-written memory. The last is a
 // capability limit, not bad contents: DEFAULT and READBACK bytes may still be stale while replay prepares a command.

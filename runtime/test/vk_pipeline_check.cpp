@@ -505,7 +505,7 @@ constexpr uint32_t required_push_bytes(uint32_t push_constant_bytes, uint32_t pc
     return raw > (std::numeric_limits<uint32_t>::max() - 3u) ? raw : ((raw + 3u) & ~3u);
 }
 
-constexpr uint32_t runtime_compute_push_bytes = 144;  // sizeof(leonida::ShaderUserData)
+constexpr uint32_t runtime_compute_push_bytes = 144;  // leonida::shader_user_data_bytes (not sizeof(ShaderUserData))
 
 bool uses_runtime_compute_layout(const ShaderMeta& meta) {
     return meta.stage == "cs" && meta.no_set0_bindings && !meta.pc_tail_bytes &&
