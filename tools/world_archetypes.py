@@ -278,6 +278,25 @@ def run(path, start=None, limit=None, extents=False):
     return doc
 
 
+def start_error(path, start):
+    """Why --start cannot be used on ``path``, or None. Checked before the scan, so a bad window is one line
+    instead of a traceback from scan_rpf once the output folder exists."""
+    if start is None:
+        return None
+    if start < 0:
+        return "--start must not be negative"
+    if not os.path.isfile(path):
+        return None  # a carved file or folder has no data area and ignores --start
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if head[:4] != b"9FPR":
+        return None
+    data_start, size = WI._u32(head, 4), os.path.getsize(path)
+    if not data_start <= start < size:
+        return f"--start 0x{start:x} is outside the data area 0x{data_start:x}..0x{size:x} of {path}"
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved 0x7a file, or a folder of carved files")
@@ -289,6 +308,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error("no such file or folder: %s" % a.path)
+    if a.limit is not None and a.limit < 1:
+        ap.error("--limit must be at least 1 byte")  # 0 and negative scan nothing and report every count as 0
+    why = start_error(a.path, a.start)
+    if why:
+        ap.error(why)
     # Check the report path before the scan: --out equal to the archive used to truncate the input after the run, and
     # an --out under a regular file or naming a folder raised a traceback once all the work was done.
     if same_report_path(a.out, a.path):
