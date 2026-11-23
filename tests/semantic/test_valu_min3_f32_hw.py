@@ -535,6 +535,66 @@ class TestRegisterAliasing(unittest.TestCase):
         ])
         self.assertEqual(words[0], TWO_F32)
 
+@dataclass
+class FloatStatusFlags:
+    zero: bool = False
+    negative: bool = False
+    nan: bool = False
+    infinite: bool = False
+    clamped: bool = False
+
+
+def classify_float_status(val: int, clamped: bool = False) -> FloatStatusFlags:
+    val &= MASK32
+    nan = is_nan_u32(val)
+    zero = (val & 0x7FFFFFFF) == 0
+    negative = (val & 0x80000000) != 0 and not nan
+    infinite = (val & 0x7FFFFFFF) == 0x7F800000
+    return FloatStatusFlags(
+        zero=zero,
+        negative=negative,
+        nan=nan,
+        infinite=infinite,
+        clamped=clamped,
+    )
+
+
+class TestConditionCodesAndStatus(unittest.TestCase):
+    def test_vcc_and_scc_preservation(self):
+        # v_min3_f32 does not write VCC or SCC
+        interp = ScalarInterpreter()
+        interp.state.scc = 1
+        interp.state.vcc = 0x123456789ABCDEF0
+        interp.state.vgprs[0] = ONE_F32
+        interp.state.vgprs[1] = TWO_F32
+        interp.state.vgprs[2] = THREE_F32
+
+        insn = VMin3F32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        interp.step(insn)
+
+        self.assertEqual(interp.state.scc, 1)
+        self.assertEqual(interp.state.vcc, 0x123456789ABCDEF0)
+
+    def test_status_flag_classification(self):
+        s_pos = classify_float_status(ONE_F32)
+        self.assertFalse(s_pos.negative)
+        self.assertFalse(s_pos.zero)
+
+        s_neg = classify_float_status(f32_to_u32(-5.0))
+        self.assertTrue(s_neg.negative)
+
+        s_zero = classify_float_status(NEG_ZERO)
+        self.assertTrue(s_zero.zero)
+        self.assertTrue(s_zero.negative)
+
+        s_nan = classify_float_status(QNAN)
+        self.assertTrue(s_nan.nan)
+
 
 if __name__ == "__main__":
     unittest.main()
