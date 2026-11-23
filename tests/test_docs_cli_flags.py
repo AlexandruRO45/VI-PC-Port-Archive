@@ -22,10 +22,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLAG = re.compile(r"(?<![\w-])(--[a-z][\w-]*)")
 SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", ".txt", ".cs", ".cjs", ".js", ".html",
                    ".bat", ".sh", ".yml", ".yaml", ".csproj")
-# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md),
-# spirv-opt (docs/embedded_shaders.md), argparse itself.
-FOREIGN = {
-    "--search", "--state", "--index-url", "--help",
+# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself.
+FOREIGN = {"--search", "--state", "--index-url", "--help"}
+# External tool flags cited only in Markdown prose (spirv-opt passes in docs/embedded_shaders.md); kept out of
+# FOREIGN so fenced commands running Leonida's own tools still flag them as invalid.
+PROSE_FOREIGN = FOREIGN | {
     "--ssa-rewrite", "--eliminate-dead-code-aggressive", "--cfg-cleanup",
     "--eliminate-dead-branches", "--merge-blocks", "--merge-return", "--scalar-replacement",
 }
@@ -136,7 +137,7 @@ def unknown_flags(pages, code):
     for page, text in sorted(pages.items()):
         for n, line in enumerate(text.split("\n"), 1):
             for flag in sorted(set(FLAG.findall(line))):
-                if flag not in FOREIGN and flag not in code:
+                if flag not in PROSE_FOREIGN and flag not in code:
                     out.append((f"{page}:{n}", flag))
     return out
 
@@ -215,6 +216,17 @@ class DocsCliFlags(unittest.TestCase):
         ps1_pages = {"docs/b.md": "```\n.\\scripts\\test.ps1 -ValidParam -BadParam\n```\n"}
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
         self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
+
+    def test_prose_foreign_flags_do_not_bypass_tool_check(self):
+        for flag in sorted(PROSE_FOREIGN - FOREIGN):
+            with self.subTest(flag=flag):
+                prose = {"docs/p.md": f"Run `spirv-opt {flag}`.\n"}
+                self.assertEqual(unknown_flags(prose, ""), [])
+                fenced = {"docs/p.md": f"```\npython -I make_game.py {flag} --help\n```\n"}
+                self.assertEqual(
+                    tool_flag_mismatches(fenced, {"make_game.py": ""}),
+                    [("docs/p.md:2", "make_game.py", flag)],
+                )
 
     def test_docs_name_existing_flags(self):
         files = tracked_files()
