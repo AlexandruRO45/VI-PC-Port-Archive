@@ -1717,11 +1717,14 @@ public:
              D3D12_HEAP_FLAGS heap_flags)
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
 
-    // A placed resource lives inside a heap's arena range: the heap owns the range, so only the console VA is kept
-    // here and nothing goes back to the arena when this object dies.
+    // A placed buffer lives inside a heap's arena range: it shares ownership of the heap's arena allocation so
+    // releasing the ID3D12Heap while placed buffers remain alive does not return the range to the arena early.
+    // Placed textures allocate their own Vulkan images and pass an empty allocation pointer.
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
-             D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
+             D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va,
+             std::shared_ptr<const leonida::TileHeapAllocation> heap_allocation = {})
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va),
+          heap_allocation_(std::move(heap_allocation)) {}
 
     ~Resource() override {
         if (accel_) {
@@ -2430,6 +2433,7 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    std::shared_ptr<const leonida::TileHeapAllocation> heap_allocation_;
 };
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -2616,6 +2620,7 @@ public:
 
     bool reserved() const { return bool(allocation_); }
     VkDeviceSize offset() const { return allocation_->offset; }
+    std::shared_ptr<const leonida::TileHeapAllocation> arena_allocation() const { return allocation_; }
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
@@ -6943,7 +6948,9 @@ public:
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image, which
         // create_texture makes for 1D, 2D and 3D alike (arrays and mips included), as for a committed texture.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
-        auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
+        auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va,
+                                      buffer ? heap->arena_allocation()
+                                             : std::shared_ptr<const leonida::TileHeapAllocation>{});
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
