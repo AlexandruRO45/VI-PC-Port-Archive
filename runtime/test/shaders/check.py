@@ -179,6 +179,8 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
           ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed000c, 0, 0xbeef0000, 0xbeef0001])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+# cs_int_clamp.asm: VOP3 clamp on integer add/sub, wrapped then clamped word per input pair (derivation in its header).
+INT_CLAMP_WORDS = [0x00000000, 0xffffffff, 0x0000000c, 0x0000000c, 0x00000001, 0xffffffff, 0xffffffff, 0x00000000, 0x00000005, 0x00000005, 0xffffffff, 0x00000000, 0xffffffff, 0x00000000, 0x00000005, 0x00000005, 0xffffffff, 0x00000000, 0x80000000, 0x7fffffff, 0x00000002, 0x00000002, 0x7fffffff, 0x80000000, 0x7fffffff, 0x80000000, 0xfffffff9, 0xfffffff9, 0x80000000, 0x7fffffff, 0xbeef0000, 0xbeefffff, 0xbeef000c, 0xbeef000c, 0xbeef0001, 0xbeefffff, 0xbeefffff, 0xbeef0000, 0xbeef0005, 0xbeef0005, 0xbeef8001, 0xbeef0000] + [0xEEEEEEEE] * 22
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
@@ -679,6 +681,10 @@ def fmt_1010102_test(tools, spirv, env=None):
 
 def fmt_int_narrow_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_int_narrow", FMT_INT_NARROW_WORDS, len(FMT_INT_NARROW_WORDS), env)
+
+
+def int_clamp_test(tools, spirv, env=None):
+    return dump_test(tools, spirv, "cs_int_clamp", INT_CLAMP_WORDS, len(INT_CLAMP_WORDS), env)
 
 
 def fmt_sint32_test(tools, spirv, env=None):
@@ -1730,6 +1736,7 @@ def main():
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
+    results.append(("cs_int_clamp", int_clamp_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_int_narrow", fmt_int_narrow_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
