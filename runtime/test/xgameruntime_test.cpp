@@ -266,8 +266,9 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
 }
 
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
-// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path through the loader shims,
-// bound by the api set XCurl.dll imports them from, as a mapped image would be.
+// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll); the retail executable resolves six, adding
+// XErrorReport, from its first static initializer. Drive that path through the loader shims, bound by the api set
+// XCurl.dll imports them from, as a mapped image would be.
 void check_run_time_load() {
     using LoadW = HMODULE(WINAPI*)(LPCWSTR);
     using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
@@ -294,12 +295,12 @@ void check_run_time_load() {
           "the same module for a bare name, a full path in any case, LoadLibraryExA and GetModuleHandleW");
 
     const char* entry_points[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
-                                  "UninitializeApiImpl", "QueryApiImpl"};
+                                  "UninitializeApiImpl", "QueryApiImpl", "XErrorReport"};
     bool all = true;
     for (const char* n : entry_points)
         all = all && get_proc(rt_mod, n) &&
               reinterpret_cast<void*>(get_proc(rt_mod, n)) == rt::shims::find("xgameruntime.dll", n);
-    check(all, "GetProcAddress serves the five entry points xgameruntime.lib looks up");
+    check(all, "GetProcAddress serves the six entry points xgameruntime.lib and the title look up");
     SetLastError(0);
     check(get_proc(rt_mod, "NoSuchRuntimeFunction") == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
           "an unserved name is NULL with ERROR_PROC_NOT_FOUND, as from a real module");
@@ -433,6 +434,14 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        // The retail executable resolves XErrorReport by name, not only through the interface: the export reports
+        // through the same callback (measured in game_scarlett_master.exe's first static initializer).
+        using ReportExport = HRESULT(WINAPI*)(HRESULT, const char*);
+        auto report_export = reinterpret_cast<ReportExport>(get_proc(rt_mod, "XErrorReport"));
+        seen = {};
+        check(report_export && report_export(static_cast<HRESULT>(0x89240101), "named export") == S_OK &&
+                  seen.hr == static_cast<HRESULT>(0x89240101) && std::strcmp(seen.msg, "named export") == 0,
+              "the named XErrorReport export reports to the callback the interface set");
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None

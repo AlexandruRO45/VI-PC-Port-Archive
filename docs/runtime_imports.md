@@ -292,7 +292,11 @@ GDK runtime, but `dumpbin /imports` shows **no import of `xgameruntime.dll`** in
 thunks `LoadLibraryW` the runtime and `GetProcAddress` those five names at run time. xodus-gaming/xgameruntime-docs
 (GPL-3.0) documents the same mechanism for PC GDK titles: `InitializeApiImplEx2` is what
 `XGameRuntimeInitialize[WithOptions]` calls, and `QueryApiImpl` hands out the runtime's COM classes, whose methods
-mostly correspond one to one to the `xgameruntime.lib` functions. The executable is very likely linked the same way.
+mostly correspond one to one to the `xgameruntime.lib` functions. The executable is linked the same way and resolves a
+sixth name, `XErrorReport`, from its first static initializer: without that export the resolver logs
+`GetProcAddress(xgameruntime.dll, XErrorReport): not served`, the initializer returns `0x89240101` and its caller
+executes `int3` at `game_scarlett_master.exe+0x5a91c21`. With it served, the run passes that initializer and stops
+later, in a static initializer that reads address `-1`.
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
@@ -300,10 +304,11 @@ shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `
 with a pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
-`runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
-`XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
-(below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
+`runtime/shims/xgameruntime.cpp` serves the five entry points and the `XErrorReport` export. The initializers succeed
+offline and log the GDK version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`,
+`XNetworkingImpl`, `XSystemImpl`, `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`,
+`XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
+`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
 `XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and `XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
