@@ -17330,6 +17330,7 @@ def main():
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
+    missing_inputs = 0
 
     def drop_stale(name):
         # A shader that no longer translates must not stay published from an earlier run: remove its old
@@ -17342,6 +17343,13 @@ def main():
         name = os.path.splitext(os.path.basename(p))[0]
         try:
             asm = translate(p)
+        except FileNotFoundError as e:
+            # Optional inputs have fallbacks in translate(). A failed required read must also
+            # retire this shader's previous module and index entry on a retry.
+            print(f"ERROR: {name}: missing translation input {e.filename}", file=sys.stderr)
+            missing_inputs += 1
+            drop_stale(name)
+            continue
         except Unsupported as e:
             why[str(e)] += 1
             drop_stale(name)
@@ -17403,6 +17411,9 @@ def main():
               + (" (tier C is not exact there; see wave64_graphics_reasons in the index)" if W64G_COUNTS["C"] else ""))
     for k, v in why.most_common(25):
         print(f"  {v:6}  {k}")
+    if missing_inputs:
+        print(f"{missing_inputs} of {len(files)} selected shaders missing required inputs", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

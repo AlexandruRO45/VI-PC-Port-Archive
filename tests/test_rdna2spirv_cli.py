@@ -347,11 +347,35 @@ class ValidatedOutput(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
                 mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output):
-            rdna2spirv.main()
+            self.exit_code = rdna2spirv.main()
         return output.getvalue()
 
     def test_existing_single_s_file_still_translates(self):
         self.assertIn("1 pass spirv-val", self.translate())
+
+    def test_missing_required_inputs_retire_stale_outputs_and_continue(self):
+        listing_dir = self.src.parent
+        root = listing_dir.parent
+        missing = ("cs_dispatch", "ms_reanchor")
+        for name in missing:
+            (root / (name + ".dxbc")).write_bytes((root / "ps_fixture.dxbc").read_bytes())
+            (listing_dir / (name + ".s")).write_bytes(self.src.read_bytes())
+            (self.out / (name + ".spv")).write_bytes(b"previous module")
+        (listing_dir / "ms_reanchor.s").write_bytes(
+            b"\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n; invalid instruction encoding\n")
+        self.index.write_bytes(json.dumps(dict.fromkeys(missing, {})).encode())
+        self.src = listing_dir
+        err = io.StringIO()
+        with redirect_stderr(err):
+            output = self.translate()
+        self.assertEqual(self.exit_code, 1)
+        self.assertIn("3 shaders: 1 translated, 1 pass spirv-val", output)
+        self.assertIn("2 of 3 selected shaders missing required inputs", err.getvalue())
+        for name in missing:
+            self.assertIn(name, err.getvalue())
+            self.assertFalse((self.out / (name + ".spv")).exists())
+        self.assertTrue(self.module.exists())
+        self.assertEqual(set(json.loads(self.index.read_bytes())), {"ps_fixture"})
 
     def test_missing_assembler_is_one_setup_error(self):
         err = io.StringIO()
