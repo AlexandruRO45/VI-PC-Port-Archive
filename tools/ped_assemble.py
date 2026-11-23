@@ -2131,7 +2131,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except PedAssembleError as exc:
+    except (PedAssembleError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
