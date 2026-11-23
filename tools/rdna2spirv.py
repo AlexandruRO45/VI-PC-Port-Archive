@@ -16126,7 +16126,7 @@ def input_signature(path, name):
         if d[off:off + 4] == b"ISG1":
             p = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
             cnt, eo = struct.unpack_from("<II", p, 0)
-            if eo + 32 * cnt > len(p):
+            if cnt and eo + 32 * (cnt - 1) + 26 > len(p):
                 raise Unsupported("truncated ISG1 signature")
             out = []
             for i in range(cnt):
@@ -16228,7 +16228,7 @@ def output_signature(path, name):
         if d[off:off + 4] == b"OSG1":
             p = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
             cnt, eo = struct.unpack_from("<II", p, 0)
-            if eo + 32 * cnt > len(p):
+            if cnt and eo + 32 * (cnt - 1) + 26 > len(p):
                 raise Unsupported("truncated OSG1 signature")
             seen = {}
             for i in range(cnt):
@@ -16251,7 +16251,7 @@ def output_signature_full(path, name):
         if d[off:off + 4] == b"OSG1":
             p = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
             cnt, eo = struct.unpack_from("<II", p, 0)
-            if eo + 32 * cnt > len(p):
+            if cnt and eo + 32 * (cnt - 1) + 26 > len(p):
                 raise Unsupported("truncated OSG1 signature")
             out = []
             for i in range(cnt):
