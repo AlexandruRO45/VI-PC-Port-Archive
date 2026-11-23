@@ -270,6 +270,18 @@ class PsocacheInspectTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_limit_refused_without_meta(self):
+        # --limit only shapes the meta decode; before the guard it was silently ignored and the
+        # full meta decode never ran (the rbf0_encode.py convention: refuse such a flag).
+        cache = self.path
+        p = run(cache, "--limit", "1")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("--limit only applies to --meta", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        # and still accepted together with --meta
+        p = run(cache, "--meta", "--limit", "1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
