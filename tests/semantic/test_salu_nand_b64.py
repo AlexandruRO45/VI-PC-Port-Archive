@@ -150,6 +150,93 @@ class SaluNandB64OracleTests(unittest.TestCase):
             self.assertEqual(ref_nand_b64(a, b), expected)
             self.assertEqual(ref_scc(expected), 1 if expected != 0 else 0)
 
+class OperandKind:
+    SGPR_PAIR = "sgpr_pair"
+    SPECIAL = "special"
+    LITERAL64 = "literal64"
+
+
+class SaluOperand:
+    """Represents a 64-bit operand for SOP2 instructions."""
+
+    def __init__(self, raw: str | int) -> None:
+        self.raw = raw
+        if isinstance(raw, int):
+            self.kind = OperandKind.LITERAL64
+            self.val = raw & MASK64
+            self.name = f"{self.val:#x}"
+        elif raw in ("exec", "vcc", "null"):
+            self.kind = OperandKind.SPECIAL
+            self.name = raw
+        elif raw.startswith("s[") and ":" in raw and raw.endswith("]"):
+            self.kind = OperandKind.SGPR_PAIR
+            parts = raw[2:-1].split(":")
+            if len(parts) != 2:
+                raise ValueError(f"Malformed SGPR pair: {raw}")
+            lo, hi = int(parts[0]), int(parts[1])
+            if hi != lo + 1:
+                raise ValueError(f"SGPR pair must be consecutive registers: {raw}")
+            if lo < 0 or hi > 105:
+                raise ValueError(f"SGPR index out of range: {raw}")
+            self.name = raw
+            self.reg_lo = lo
+            self.reg_hi = hi
+        else:
+            raise ValueError(f"Unrecognized SALU operand: {raw}")
+
+
+class SaluNandB64Instruction:
+    """Structural AST node for RDNA2 s_nand_b64 instruction."""
+
+    def __init__(self, dst: str, src0: str | int, src1: str | int) -> None:
+        self.opcode = "s_nand_b64"
+        self.dst = SaluOperand(dst)
+        self.src0 = SaluOperand(src0)
+        self.src1 = SaluOperand(src1)
+        self.validate()
+
+    def validate(self) -> None:
+        if self.dst.kind == OperandKind.LITERAL64:
+            raise ValueError("Destination operand cannot be an immediate literal")
+
+    def to_asm(self) -> str:
+        s0 = f"{self.src0.val:#x}" if self.src0.kind == OperandKind.LITERAL64 else self.src0.name
+        s1 = f"{self.src1.val:#x}" if self.src1.kind == OperandKind.LITERAL64 else self.src1.name
+        return f"{self.opcode} {self.dst.name}, {s0}, {s1}"
+
+
+class SaluNandB64AstTests(unittest.TestCase):
+    """Structural AST and operand representation tests for s_nand_b64."""
+
+    def test_valid_ast_construction_sgpr_pairs(self):
+        inst = SaluNandB64Instruction("s[4:5]", "s[0:1]", "s[2:3]")
+        self.assertEqual(inst.opcode, "s_nand_b64")
+        self.assertEqual(inst.dst.kind, OperandKind.SGPR_PAIR)
+        self.assertEqual(inst.src0.kind, OperandKind.SGPR_PAIR)
+        self.assertEqual(inst.src1.kind, OperandKind.SGPR_PAIR)
+        self.assertEqual(inst.to_asm(), "s_nand_b64 s[4:5], s[0:1], s[2:3]")
+
+    def test_valid_ast_construction_special_operands(self):
+        for special in ("exec", "vcc", "null"):
+            inst = SaluNandB64Instruction(special, "s[0:1]", "s[2:3]")
+            self.assertEqual(inst.dst.kind, OperandKind.SPECIAL)
+            self.assertEqual(inst.to_asm(), f"s_nand_b64 {special}, s[0:1], s[2:3]")
+
+    def test_valid_ast_construction_literals(self):
+        inst = SaluNandB64Instruction("s[0:1]", "s[2:3]", 0x12345678_9ABCDEF0)
+        self.assertEqual(inst.src1.kind, OperandKind.LITERAL64)
+        self.assertIn("0x123456789abcdef0", inst.to_asm())
+
+    def test_ast_validation_failures(self):
+        with self.assertRaises(ValueError):
+            SaluNandB64Instruction(0x1234, "s[0:1]", "s[2:3]")
+        with self.assertRaises(ValueError):
+            SaluNandB64Instruction("s[0:2]", "s[0:1]", "s[2:3]")
+        with self.assertRaises(ValueError):
+            SaluNandB64Instruction("s[105:106]", "s[0:1]", "s[2:3]")
+        with self.assertRaises(ValueError):
+            SaluOperand("invalid_operand_string")
+
 
 if __name__ == "__main__":
     unittest.main()
