@@ -119,6 +119,71 @@ class FspxPrologueProbeTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("negative control failed", err_buf.getvalue())
 
+    def _run_malformed(self, outputs):
+        oracle = self._mock_oracle(outputs)
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle):
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                rc = probe.main(["--oracle", "hw"])
+        oracle.close.assert_called_once_with()
+        return rc, out_buf.getvalue(), err_buf.getvalue()
+
+    def assert_harness_error(self, outputs, detail):
+        rc, out, err = self._run_malformed(outputs)
+        self.assertEqual(rc, 2)
+        self.assertNotIn("PASS", out)
+        self.assertEqual(err.count("\n"), 1, err)
+        self.assertTrue(err.startswith("harness error: "), err)
+        self.assertIn(detail, err)
+        self.assertNotIn("Traceback", err)
+
+    def test_truncated_results_are_a_harness_error(self):
+        good = self._passing_outputs()
+        # Dropping the negative controls used to print "PASS: 50/50 ... 8/8 negative controls" and exit 0
+        _, negatives = probe.build_probe_plan()
+        self.assert_harness_error(good[:-len(negatives)], f"returned 50 results for {len(good)} kernels")
+        self.assert_harness_error(good[:10], f"returned 10 results for {len(good)} kernels")
+
+    def test_empty_results_are_a_harness_error(self):
+        self.assert_harness_error([], f"returned 0 results for {len(self._passing_outputs())} kernels")
+
+    def test_extra_results_are_a_harness_error(self):
+        good = self._passing_outputs()
+        self.assert_harness_error(good + [list(good[0])], f"returned {len(good) + 1} results for {len(good)} kernels")
+
+    def test_none_result_list_is_a_harness_error(self):
+        self.assert_harness_error(None, "returned NoneType results")
+
+    def test_none_entry_is_a_harness_error(self):
+        # runner.run() pre-fills its answer with None; a kernel that never ran comes back as None
+        for i in (0, -1):
+            outputs = self._passing_outputs()
+            outputs[i] = None
+            self.assert_harness_error(outputs, "returned None, not")
+
+    def test_int_entry_is_a_harness_error(self):
+        outputs = self._passing_outputs()
+        outputs[3] = 0
+        self.assert_harness_error(outputs, "kernel 3: the hardware runner returned 0, not")
+
+    def test_short_word_list_is_a_harness_error(self):
+        outputs = self._passing_outputs()
+        positives, _ = probe.build_probe_plan()
+        want = positives[0][1].words
+        outputs[0] = outputs[0][:want - 1]   # a matching prefix used to raise StopIteration
+        self.assert_harness_error(outputs, f"kernel 0: the hardware runner returned {want - 1} words, not {want}")
+        outputs = self._passing_outputs()
+        outputs[-1] = []                     # neg_multilane: an empty list used to count as a missed control
+        self.assert_harness_error(outputs, "returned 0 words")
+
+    def test_rejection_string_is_still_a_failure_not_a_harness_error(self):
+        outputs = self._passing_outputs()
+        outputs[0] = "assembler rejected the kernel"
+        rc, _, err = self._run_malformed(outputs)
+        self.assertEqual(rc, 1)
+        self.assertIn("assembler rejected the kernel", err)
+        self.assertNotIn("harness error", err)
+
 
 if __name__ == "__main__":
     unittest.main()

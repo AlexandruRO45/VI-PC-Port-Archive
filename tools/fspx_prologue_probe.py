@@ -15,7 +15,7 @@ Usage:
 Exit codes:
     0   all prologue checks passed and all negative controls detected their clobbers
     1   a prologue modified state, failed to assemble/run, or a negative control went undetected
-    2   bad CLI arguments
+    2   bad CLI arguments, or a harness error (the runner did not answer one result per kernel)
     77  hardware oracle unavailable on this machine
 """
 import argparse
@@ -250,6 +250,20 @@ def self_test():
     return 0
 
 
+def check_results(kernels, results):
+    """Raise RuntimeError unless the runner answered one result per kernel, each a rejection string or a list of at
+    least that kernel's words. A short answer would otherwise drop cases and negative controls from the zip below."""
+    if not isinstance(results, list) or len(results) != len(kernels):
+        n = len(results) if isinstance(results, list) else type(results).__name__
+        raise RuntimeError(f"the hardware runner returned {n} results for {len(kernels)} kernels")
+    for i, (k, got) in enumerate(zip(kernels, results)):
+        if isinstance(got, str):
+            continue
+        if not isinstance(got, list) or len(got) < k.words:
+            what = f"{len(got)} words" if isinstance(got, list) else repr(got)
+            raise RuntimeError(f"kernel {i}: the hardware runner returned {what}, not {k.words} words or a rejection")
+
+
 def run_hw(waves=(32, 64), arch=None):
     """Run all positive prologue checks and negative controls on the AMD GPU."""
     try:
@@ -265,6 +279,11 @@ def run_hw(waves=(32, 64), arch=None):
         device = oracle.device
     finally:
         oracle.close()
+    try:
+        check_results(all_kernels, raw_results)
+    except RuntimeError as e:
+        print(f"harness error: {e}", file=sys.stderr)
+        return 2
 
     pos_results = raw_results[:len(positives)]
     neg_results = raw_results[len(positives):]
