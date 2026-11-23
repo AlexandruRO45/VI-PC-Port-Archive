@@ -572,5 +572,63 @@ class CliTest(unittest.TestCase):
                         self.assertEqual(handle.read(), original)
 
 
+
+
+class WriteJsonPublishTest(unittest.TestCase):
+    """_write_json publishes with file_mode.published_mode, replace_retry, and read-only-safe cleanup."""
+
+    def test_applies_published_mode_without_flipping_umask_and_uses_replace_retry(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "names.json")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def record_chmod(path, mode):
+                chmod_calls.append((os.path.abspath(path), mode))
+                return real_chmod(path, mode)
+
+            with mock.patch.object(WN, "published_mode", wraps=WN.published_mode) as pub, \
+                    mock.patch.object(WN, "replace_retry", wraps=WN.replace_retry) as rep, \
+                    mock.patch.object(WN.os, "chmod", side_effect=record_chmod), \
+                    mock.patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+                WN._write_json(dest, {"ok": True})
+
+            self.assertEqual(pub.call_count, 1)
+            self.assertEqual(rep.call_count, 1)
+            self.assertEqual(len(chmod_calls), 1)
+            staged_path, staged_mode = chmod_calls[0]
+            self.assertNotEqual(staged_path, os.path.abspath(dest))
+            self.assertEqual(staged_mode, file_mode.published_mode(dest))
+            with open(dest, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), {"ok": True})
+            self.assertEqual(os.listdir(tmp), ["names.json"])
+
+    def test_failed_replace_cleans_read_only_staging_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "names.json")
+            with open(dest, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write('{"old": 1}\n')
+            os.chmod(dest, 0o444)
+            self.addCleanup(lambda: os.path.exists(dest) and os.chmod(dest, 0o600))
+            with mock.patch.object(WN, "replace_retry", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    WN._write_json(dest, {"new": 2})
+            with open(dest, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), '{"old": 1}\n')
+            self.assertEqual(os.listdir(tmp), ["names.json"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_new_and_replaced_json_preserve_posix_bits(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "names.json")
+            WN._write_json(dest, {"v": 1})
+            self.assertEqual(os.stat(dest).st_mode & 0o777, file_mode.new_file_mode(tmp))
+            os.chmod(dest, 0o640)
+            WN._write_json(dest, {"v": 2})
+            self.assertEqual(os.stat(dest).st_mode & 0o777, 0o640)
+
+
 if __name__ == "__main__":
     unittest.main()

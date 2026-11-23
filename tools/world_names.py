@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+from contextlib import suppress
 import json
 import os
 import re
@@ -38,6 +39,8 @@ import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
@@ -626,14 +629,23 @@ def _resolve(args) -> int:
 
 
 def _write_json(path: str, data: dict) -> None:
-    directory = os.path.dirname(os.path.abspath(path))
+    abs_path = os.path.abspath(path)
+    directory = os.path.dirname(abs_path)
     os.makedirs(directory, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=directory, prefix=".world-names-") as staging:
         tmp = os.path.join(staging, "report.json")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(data, handle, indent=1, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(data, handle, indent=1, sort_keys=True)
+                handle.write("\n")
+            os.chmod(tmp, published_mode(abs_path))
+            replace_retry(tmp, abs_path)
+        finally:
+            if os.path.exists(tmp):
+                with suppress(OSError):
+                    # The staged file may inherit a read-only target's mode; restore write bits so
+                    # TemporaryDirectory cleanup does not fail or strand it on Windows.
+                    os.chmod(tmp, 0o600)
 
 
 def main(argv=None) -> int:
