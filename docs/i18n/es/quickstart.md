@@ -75,7 +75,7 @@ empezar comprueba los requisitos y el espacio libre, y enumera de una vez todo l
 ### Si dispone de poco espacio
 
 Los 400 GB corresponden a la compilación completa. Puede omitir la exportación de recursos con
-`--stages check,shaders,runtime`, que necesita unos **30 GB**. La etapa `assets` (unos 300 GB) sirve para las
+`--stages check,shaders,runtime`, que necesita unos **30 GB**. La etapa `assets` (unos 370 GB) sirve para las
 herramientas de recursos; `--wav` añade varias veces el tamaño de los archivos Ogg Opus. La comprobación previa
 ofrece la alternativa sin `assets` cuando esa etapa no cabe. Puede situar tanto `--work` como `--out` en otra
 unidad.
