@@ -59,7 +59,7 @@ def run_cvt_ps(lines: list[str], name: str = "ps_cvt_f32_u32") -> list[int]:
 
 
 class TestVCvtF32U32Reference(unittest.TestCase):
-    """Stage 1: Reference mathematical oracle and translator hardware-level verification."""
+    """Reference mathematical oracle and translator hardware-level verification."""
 
     def test_reference_exact_integers(self) -> None:
         cases = [
@@ -102,61 +102,47 @@ class TestVCvtF32U32Reference(unittest.TestCase):
         self.assertEqual(support.mrt0_words(spv)[0], 0x3F800000)
 
 
-class Vop1Opcode:
-    """Symbolic AST opcode descriptor for VOP1 conversion instructions."""
+class TestVCvtF32U32OperandForms(unittest.TestCase):
+    """Source operand addressing modes: VGPR, inline literal, and SGPR."""
 
-    def __init__(self, mnemonic: str, dst: str, src0: str) -> None:
-        self.mnemonic = mnemonic
-        self.dst = dst
-        self.src0 = src0
-
-    def emit_assembly(self) -> str:
-        return f"{self.mnemonic} {self.dst}, {self.src0}"
-
-
-class TestVCvtF32U32AST(unittest.TestCase):
-    """Stage 2: Symbolic AST opcode definitions and typed expressions."""
-
-    def test_ast_construction_and_formatting(self) -> None:
-        inst = Vop1Opcode("v_cvt_f32_u32", "v0", "v1")
-        self.assertEqual(inst.emit_assembly(), "v_cvt_f32_u32 v0, v1")
+    def test_operand_vgpr(self) -> None:
         lines = [
             "v_mov_b32 v1, 42",
-            inst.emit_assembly(),
+            "v_cvt_f32_u32 v0, v1",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_ast_cvt", lines)
+        spv = support.translate_lines("ps_op_vgpr", lines)
         self.assertIn("OpConvertUToF %float", spv)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], ref_cvt_f32_u32(42))
 
-    def test_ast_with_literal(self) -> None:
-        inst = Vop1Opcode("v_cvt_f32_u32", "v0", "100")
+    def test_operand_literal(self) -> None:
         lines = [
-            inst.emit_assembly(),
+            "v_cvt_f32_u32 v0, 100",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_ast_lit", lines)
+        spv = support.translate_lines("ps_op_lit", lines)
+        self.assertIn("OpConvertUToF %float", spv)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], ref_cvt_f32_u32(100))
 
-    def test_ast_with_sgpr(self) -> None:
-        inst = Vop1Opcode("v_cvt_f32_u32", "v0", "s4")
+    def test_operand_sgpr(self) -> None:
         lines = [
             "s_mov_b32 s4, 250",
-            inst.emit_assembly(),
+            "v_cvt_f32_u32 v0, s4",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_ast_sgpr", lines)
+        spv = support.translate_lines("ps_op_sgpr", lines)
+        self.assertIn("OpConvertUToF %float", spv)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], ref_cvt_f32_u32(250))
 
 
-class TestVCvtF32U32ScalarInterpreter(unittest.TestCase):
-    """Stage 3: Deterministic scalar instruction interpreter."""
+class TestVCvtF32U32Chaining(unittest.TestCase):
+    """Sequential instruction pipeline and chained arithmetic."""
 
     def test_scalar_conversion_pipeline(self) -> None:
         lines = [
@@ -185,7 +171,7 @@ class TestVCvtF32U32ScalarInterpreter(unittest.TestCase):
 
 
 class TestVCvtF32U32SIMDDivergence(unittest.TestCase):
-    """Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+    """SIMD conditional lane selection via v_cndmask_b32."""
 
     def test_simd_conditional_cndmask_selection(self) -> None:
         lines = [
@@ -217,7 +203,7 @@ class TestVCvtF32U32SIMDDivergence(unittest.TestCase):
 
 
 class TestVCvtF32U32RegisterAliasing(unittest.TestCase):
-    """Stage 5: Register aliasing and in-place operand preservation."""
+    """Register aliasing and in-place operand preservation."""
 
     def test_dst_aliases_src(self) -> None:
         lines = [
@@ -246,7 +232,7 @@ class TestVCvtF32U32RegisterAliasing(unittest.TestCase):
 
 
 class TestVCvtF32U32ConditionCodes(unittest.TestCase):
-    """Stage 6: Condition codes, status flags, and carry/borrow preservation."""
+    """Condition codes and status flags preservation."""
 
     def test_zero_flag_via_comparison(self) -> None:
         lines = [
@@ -275,7 +261,7 @@ class TestVCvtF32U32ConditionCodes(unittest.TestCase):
 
 
 class TestVCvtF32U32IEEE754(unittest.TestCase):
-    """Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+    """IEEE 754 boundary extremes, subnormals, and range coverage."""
 
     def test_zero_is_always_positive_zero(self) -> None:
         res_bits = run_hw_cvt_f32_u32(0)
@@ -295,7 +281,7 @@ class TestVCvtF32U32IEEE754(unittest.TestCase):
 
 
 class TestVCvtF32U32NegativeAndMutation(unittest.TestCase):
-    """Stage 8: Negative controls, syntax rejection, and mutation detection."""
+    """Negative controls, syntax rejection, and mutation detection."""
 
     def test_syntax_extra_operands_accepted_by_translator(self) -> None:
         """The translator accepts surplus operands in VOP1 assembly and emits OpConvertUToF."""
