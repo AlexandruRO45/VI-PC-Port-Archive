@@ -45,6 +45,17 @@ class GuestSceneTests(unittest.TestCase):
         self.assertEqual(result.stdout, direct.stdout)
         self.assertEqual(result.stderr, direct.stderr)
 
+    def test_help_and_missing_output_value_follow_producer_order(self):
+        for option in ("--help", "-h"):
+            for argv, expected in (((option, "--out"), 0), (("--out", option), 2)):
+                with self.subTest(argv=argv):
+                    direct = self.invoke(self.producer, *argv)
+                    result = self.invoke(self.cli, "guest-scene", *argv)
+                    self.assertEqual(direct.returncode, expected)
+                    self.assertEqual(result.returncode, direct.returncode)
+                    self.assertEqual(result.stdout, direct.stdout)
+                    self.assertEqual(result.stderr, direct.stderr)
+
     def test_forwarding_and_required_output(self):
         scripts = self.cwd / "checkout with spaces" / "scripts"
         scripts.mkdir(parents=True)
@@ -56,10 +67,12 @@ class GuestSceneTests(unittest.TestCase):
             "print('runner diagnostic', file=sys.stderr)\nsys.exit(19)\n",
             encoding="utf-8", newline="\n",
         )
-        missing = self.invoke(cli, "guest-scene", "--loader", "loader with spaces")
-        self.assertEqual(missing.returncode, 2)
-        self.assertEqual(missing.stdout, b"")
-        self.assertIn(b"--out", missing.stderr)
+        for argv in (("--loader", "loader with spaces"), ("--", "--help"), ("--loader=--help",)):
+            with self.subTest(argv=argv):
+                missing = self.invoke(cli, "guest-scene", *argv)
+                self.assertEqual(missing.returncode, 2)
+                self.assertEqual(missing.stdout, b"")
+                self.assertIn(b"--out", missing.stderr)
         argv = ["--loader", "loader with spaces", "--out", "r\u00e9sultat", "--negative-controls"]
         forwarded = self.invoke(cli, "guest-scene", *argv)
         self.assertEqual(forwarded.returncode, 19)
