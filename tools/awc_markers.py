@@ -18,7 +18,8 @@ recursively for *.awc.
 Banks are reported in two groups: `streamed_music` (the bank has a 0x48 descriptor) and `other`. A chunk is compared
 with the length of its own stream in 48 kHz frames: for streamed music the descriptor channel with the stream's id
 (interleaved samples divided by the packet channel count, read from the TOC stereo bit of the channel's first
-packet), otherwise the Opus format tag (samples / channels). Streams with neither have no length and are counted.
+packet, in whichever block holds it), otherwise the Opus format tag (samples / channels). Streams with neither have
+no length and are counted.
 
 The report holds counts, sizes, 32-bit hashes and numeric ranges only.
 """
@@ -73,23 +74,40 @@ def _read(fh, at: int, size: int) -> bytes:
 
 
 def music_frames(fh, base: int, mus, data) -> dict:
-    """{channel id: 48 kHz frames per channel} for one 0x48 descriptor, or {} when it does not parse."""
+    """{channel id: 48 kHz frames per channel} for one 0x48 descriptor, or {} when it does not parse.
+
+    Each block of the 0x55 data (the descriptor's chunk size apart) has its own channel table (docs/audio.md), and
+    a channel can have no subblock in the first blocks, so the blocks are walked until every channel's first
+    packet is found, as awc_opus.music_channels does."""
     desc = _read(fh, base + mus[0], mus[1])
     if len(desc) < 12:
         return {}
-    channels = struct.unpack_from("<I", desc, 8)[0]
+    blocks, chunk, channels = struct.unpack_from("<III", desc, 0)
     if not 1 <= channels <= 32 or len(desc) != 12 + 16 * channels:
         return {}
-    table = _read(fh, base + data[0], min(data[1], 24 * channels))
-    if len(table) < 24 * channels:
-        return {}
-    counts = [struct.unpack_from("<I", table, 24 * c + 4)[0] for c in range(channels)]
-    first = (24 * channels + 4 * sum(counts) + 2047) & ~2047      # the first channel's first 2048-byte subblock
-    out, before = {}, 0
+    packets = {}                    # channel index: the 3 bytes at its first subblock (u16 packet size, TOC)
+    for b in range(max(blocks, 1)):
+        offset = b * chunk
+        if b and (chunk < 2048 or offset + 24 * channels > data[1]):
+            break
+        table = _read(fh, base + data[0] + offset, min(data[1] - offset, 24 * channels))
+        if len(table) < 24 * channels:
+            if b:
+                break
+            return {}
+        counts = [struct.unpack_from("<I", table, 24 * c + 4)[0] for c in range(channels)]
+        first = (24 * channels + 4 * sum(counts) + 2047) & ~2047      # the first channel's first 2048-byte subblock
+        before = 0
+        for c in range(channels):
+            if counts[c] and c not in packets:
+                packets[c] = _read(fh, base + data[0] + offset + first + before * 2048, 3)
+            before += counts[c]
+        if len(packets) == channels:
+            break
+    out = {}
     for c in range(channels):
         cid, samples = struct.unpack_from("<II", desc, 12 + 16 * c)
-        packet = _read(fh, base + data[0] + first + before * 2048, 3) if counts[c] else b""
-        before += counts[c]
+        packet = packets.get(c, b"")
         stereo = len(packet) == 3 and packet[:2] != b"\0\0" and packet[2] & 0x04
         out[cid & 0x1FFFFFFF] = samples // 2 if stereo else samples
     return out
