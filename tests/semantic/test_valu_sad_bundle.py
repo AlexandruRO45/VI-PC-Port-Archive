@@ -292,5 +292,26 @@ class TestVSadU16SIMD(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 777)
 
 
+def run_hw_sad_u16(s0: int, s1: int, s2: int) -> int:
+    lines = [
+        f"v_mov_b32 v0, {s0 & MASK32:#x}",
+        f"v_mov_b32 v1, {s1 & MASK32:#x}",
+        f"v_mov_b32 v2, {s2 & MASK32:#x}",
+        "v_sad_u16 v0, v0, v1, v2",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_sad_u16_hw", lines)
+    return support.mrt0_words(spv)[0]
+
+
+class TestVSadU16HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for v_sad_u16."""
+
+    def test_translator_hardware_cases(self):
+        self.assertEqual(run_hw_sad_u16(0x00200064, 0x00100032, 5), 71)
+        self.assertEqual(run_hw_sad_u16(0x00100020, 0x00200010, 0), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
