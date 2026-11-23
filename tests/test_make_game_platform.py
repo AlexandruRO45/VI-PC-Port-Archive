@@ -259,9 +259,13 @@ class RuntimePackagingTest(unittest.TestCase):
         self.assertIn(image, missing.stderr)
         with open(os.path.join(self.game, image), "wb"):
             pass
-        result = subprocess.check_output([launcher, "--dry-run"], cwd=self.root, env=env)
-        self.assertEqual(json.loads(result), [self.game, ["--dry-run", "./" + image, "--overlay", "Z:" + self.out + "/overlay"],
-                                              "Z:" + work + "/shaders/spirv", "vulkan"])
+        for mode in ("--dry-run", "--init"):
+            with self.subTest(mode=mode):
+                result = subprocess.check_output([launcher, mode], cwd=self.root, env=env)
+                self.assertEqual(json.loads(result), [
+                    self.game, [mode, "./" + image, "--overlay", "Z:" + self.out + "/overlay"],
+                    "Z:" + work + "/shaders/spirv", "vulkan",
+                ])
         env.update(LEONIDA_SHADERS="D:/custom", LEONIDA_D3D12="trace")
         result = subprocess.check_output([launcher, "--run"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[2:], ["D:/custom", "trace"])

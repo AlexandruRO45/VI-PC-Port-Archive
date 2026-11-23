@@ -220,8 +220,9 @@ Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and wri
 starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
 skips the build on Windows.
 
-On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, or
-`<out>/gta6rt.sh --run` to attempt startup. These forms use the game folder in `<out>/game_path.txt`,
+On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, then
+`<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` to
+enter the game. These forms use the game folder in `<out>/game_path.txt`,
 the translated shaders in `<work>/shaders/spirv`, and `<out>/overlay` for writes. They select the Vulkan
 backend by default. You can override it with `LEONIDA_D3D12` and the shader path with `LEONIDA_SHADERS`.
 
