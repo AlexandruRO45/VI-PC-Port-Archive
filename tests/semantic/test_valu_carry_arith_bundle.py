@@ -413,5 +413,23 @@ class VAddCoCiU32TranslatorIntegrationTests(unittest.TestCase):
         s1, c1 = ref_add_co_ci_u32(10, 10, 1)
         self.assertNotEqual(s0, s1)
 
+class VSubCoCiU32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_sub_co_ci_u32."""
+
+    def test_subtraction_with_borrow_in_zero(self):
+        d, b = ref_sub_co_ci_u32(50, 20, 0)
+        self.assertEqual(d, 30)
+        self.assertEqual(b, 0)
+
+    def test_subtraction_with_borrow_in_one(self):
+        d, b = ref_sub_co_ci_u32(50, 20, 1)
+        self.assertEqual(d, 29)
+        self.assertEqual(b, 0)
+
+    def test_ripple_borrow_chain(self):
+        d, b = ref_sub_co_ci_u32(0, 0, 1)
+        self.assertEqual(d, 0xFFFFFFFF)
+        self.assertEqual(b, 1)
+
 if __name__ == "__main__":
     unittest.main()
