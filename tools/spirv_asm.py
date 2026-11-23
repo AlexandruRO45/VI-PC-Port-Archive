@@ -57,17 +57,27 @@ _TYPE_DEFINITIONS = frozenset(
     if has_result and name.startswith("OpType")
 )
 
-# Precompute fixed-arity pure-Id instructions (e.g. OpIAdd, OpFMul, OpSelect, OpStore, OpBranch)
-# so the hot loop encodes ~80% of shader lines without per-operand dispatch overhead.
-_PURE_ID_INSNS: dict[str, tuple[int, bool, bool, int, bool]] = {}
+# Precompute fixed-arity / trailing-vararg pure-Id instructions (e.g. OpIAdd, OpFMul, OpSelect,
+# OpAccessChain, OpBranch), plus instructions whose required prefix is pure-Id followed by optional
+# ('?') operands (e.g. OpLoad, OpStore) when the optional tail is omitted.
+# Tuple: (opcode, has_rt, has_res, min_args, has_var, has_opt_tail)
+_PURE_ID_INSNS: dict[str, tuple[int, bool, bool, int, bool, bool]] = {}
 for _opname, (_opc, _hrt, _hres, _ospecs) in INSTRUCTIONS.items():
-    if _opname in ("OpSwitch", "OpExtInst"):
+    if _opname in ("OpSwitch", "OpExtInst", "OpTypeInt", "OpTypeFloat", "OpExtInstImport"):
         continue
     if all(_k in _ID_KINDS and _q in ("", "*") for _k, _q in _ospecs):
         _has_var = bool(_ospecs and _ospecs[-1][1] == "*")
         if not _has_var or all(_q == "" for _, _q in _ospecs[:-1]):
             _min_args = len(_ospecs) - (1 if _has_var else 0)
-            _PURE_ID_INSNS[_opname] = (_opc, _hrt, _hres, _min_args, _has_var)
+            _PURE_ID_INSNS[_opname] = (_opc, _hrt, _hres, _min_args, _has_var, False)
+    else:
+        _req_end = 0
+        while _req_end < len(_ospecs) and _ospecs[_req_end][1] == "":
+            _req_end += 1
+        if (_req_end < len(_ospecs)
+                and all(_k in _ID_KINDS for _k, _ in _ospecs[:_req_end])
+                and all(_q == "?" for _, _q in _ospecs[_req_end:])):
+            _PURE_ID_INSNS[_opname] = (_opc, _hrt, _hres, _req_end, False, True)
 
 
 class SpirvAsmError(ValueError):
@@ -269,6 +279,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         raise SpirvAsmError(f"unsupported target environment: {target_env!r}")
 
     sym_to_id: dict[str, int] = {}
+    sym_get = sym_to_id.get
     next_id = 1
     defined_types: set[str] = set()
     type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
@@ -276,21 +287,30 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
     # Only OpSwitch needs a value's result type, to choose the case literal width.
     track_switch_types = "OpSwitch" in text
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
+    pure_get = _PURE_ID_INSNS.get
+    type_defs = _TYPE_DEFINITIONS
 
-    def get_id(tok: str, lineno: int) -> int:
+    def _alloc_id(tok: str, lineno: int) -> int:
         nonlocal next_id
         if not tok or tok[0] != "%":
             raise SpirvAsmError(f"line {lineno}: expected %id, got {tok!r}")
-        vid = sym_to_id.get(tok)
-        if vid is None:
-            if not _ID_RE.fullmatch(tok):
-                raise SpirvAsmError(f"line {lineno}: invalid ID {tok!r}")
-            vid = next_id
-            next_id += 1
-            sym_to_id[tok] = vid
+        body = tok[1:]
+        if not body or not body.isascii() or not (body.isidentifier() or ("_" + body).isidentifier()):
+            raise SpirvAsmError(f"line {lineno}: invalid ID {tok!r}")
+        vid = next_id
+        next_id += 1
+        sym_to_id[tok] = vid
         return vid
 
-    words = array.array("I", [SPIRV_MAGIC, version, 0, 0, 0])
+    def get_id(tok: str, lineno: int) -> int:
+        vid = sym_get(tok)
+        if vid is not None:
+            return vid
+        return _alloc_id(tok, lineno)
+
+    words: list[int] = [SPIRV_MAGIC, version, 0, 0, 0]
+    w_append = words.append
+    w_extend = words.extend
 
     def encode_operand(kind: str, toks: list[str], idx: int, lineno: int,
                        res_type_id: int | None, cur_ext_table: dict[str, int] | None,
@@ -416,11 +436,15 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         raise SpirvAsmError(f"line {lineno}: unsupported operand kind {kind!r}")
 
     for lineno, raw_line in enumerate(text.splitlines(), 1):
-        toks = _tokenize_line(raw_line, lineno)
+        if '"' not in raw_line:
+            toks = (raw_line[:raw_line.find(";")] if ";" in raw_line else raw_line).split()
+        else:
+            toks = _tokenize_line(raw_line, lineno)
         if not toks:
             continue
+        n_toks = len(toks)
         res_tok = None
-        if len(toks) >= 3 and toks[1] == "=":
+        if n_toks >= 3 and toks[1] == "=":
             res_tok = toks[0]
             opname = toks[2]
             arg_idx = 3
@@ -428,41 +452,49 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             opname = toks[0]
             arg_idx = 1
 
-        if res_tok is not None and opname in _TYPE_DEFINITIONS:
+        if res_tok is not None and opname in type_defs:
             if res_tok in defined_types:
                 raise SpirvAsmError(f"line {lineno}: type ID {res_tok} is already defined")
             defined_types.add(res_tok)
 
-        fast = _PURE_ID_INSNS.get(opname)
+        fast = pure_get(opname)
         if fast is not None:
-            opcode, has_rt, has_res, min_args, has_var = fast
-            if has_res != (res_tok is not None):
-                raise SpirvAsmError(
-                    f"line {lineno}: {opname} "
-                    + ("requires '%id =' result" if has_res else "does not produce a result id"))
-            n_rem = len(toks) - arg_idx - (1 if has_rt else 0)
-            if n_rem < min_args or (not has_var and n_rem != min_args):
-                raise SpirvAsmError(f"line {lineno}: {opname} operand count mismatch (got {n_rem})")
-            out = []
-            if has_rt:
-                rt_id = get_id(toks[arg_idx], lineno)
-                out.append(rt_id)
-                arg_idx += 1
-            else:
-                rt_id = None
-            if has_res:
-                rid = get_id(res_tok, lineno)
-                out.append(rid)
-                if track_switch_types and rt_id is not None:
-                    id_to_type[rid] = rt_id
-            for k in range(arg_idx, len(toks)):
-                out.append(get_id(toks[k], lineno))
-            word_count = 1 + len(out)
-            if word_count > 0xFFFF:
-                raise SpirvAsmError(f"line {lineno}: {opname} word count {word_count} exceeds 65535")
-            words.append((word_count << 16) | opcode)
-            words.extend(out)
-            continue
+            opcode, has_rt, has_res, min_args, has_var, has_opt_tail = fast
+            n_rem = n_toks - arg_idx - (1 if has_rt else 0)
+            if not has_opt_tail or n_rem == min_args:
+                if has_res != (res_tok is not None):
+                    raise SpirvAsmError(
+                        f"line {lineno}: {opname} "
+                        + ("requires '%id =' result" if has_res else "does not produce a result id"))
+                if n_rem < min_args or (not has_var and n_rem != min_args):
+                    raise SpirvAsmError(f"line {lineno}: {opname} operand count mismatch (got {n_rem})")
+                word_count = 1 + (1 if has_rt else 0) + (1 if has_res else 0) + n_rem
+                if word_count > 0xFFFF:
+                    raise SpirvAsmError(f"line {lineno}: {opname} word count {word_count} exceeds 65535")
+                w_append((word_count << 16) | opcode)
+                if has_rt:
+                    rt_tok = toks[arg_idx]
+                    rt_id = sym_get(rt_tok)
+                    if rt_id is None:
+                        rt_id = _alloc_id(rt_tok, lineno)
+                    w_append(rt_id)
+                    arg_idx += 1
+                else:
+                    rt_id = None
+                if has_res:
+                    rid = sym_get(res_tok)
+                    if rid is None:
+                        rid = _alloc_id(res_tok, lineno)
+                    w_append(rid)
+                    if track_switch_types and rt_id is not None:
+                        id_to_type[rid] = rt_id
+                for k in range(arg_idx, n_toks):
+                    t = toks[k]
+                    vid = sym_get(t)
+                    if vid is None:
+                        vid = _alloc_id(t, lineno)
+                    w_append(vid)
+                continue
 
         spec = INSTRUCTIONS.get(opname)
         if spec is None:
@@ -535,13 +567,14 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         word_count = 1 + len(out)
         if word_count > 0xFFFF:
             raise SpirvAsmError(f"line {lineno}: {opname} word count {word_count} exceeds 65535")
-        words.append((word_count << 16) | opcode)
-        words.extend(out)
+        w_append((word_count << 16) | opcode)
+        w_extend(out)
 
     words[3] = next_id
+    arr = array.array("I", words)
     if sys.byteorder != "little":
-        words.byteswap()
-    return words.tobytes()
+        arr.byteswap()
+    return arr.tobytes()
 
 
 def main(argv=None) -> int:

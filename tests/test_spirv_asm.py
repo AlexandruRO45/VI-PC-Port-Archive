@@ -534,6 +534,42 @@ class IntegerLiteralRangeTests(unittest.TestCase):
                     b = struct.unpack(f"<{len(ref) // 4}I", ref)
                     self.assertEqual(a[:2] + a[3:], b[:2] + b[3:])
 
+    def test_pure_id_optional_tail_fast_path_and_fallback(self):
+        # OpLoad and OpStore use the pure-ID fast path when their optional MemoryAccess
+        # tail is omitted, and fall back to the general path when MemoryAccess is present.
+        self.assertIn("OpLoad", spirv_asm._PURE_ID_INSNS)
+        self.assertIn("OpStore", spirv_asm._PURE_ID_INSNS)
+        self.assertTrue(spirv_asm._PURE_ID_INSNS["OpLoad"][5])
+        self.assertTrue(spirv_asm._PURE_ID_INSNS["OpStore"][5])
+        asm = (
+            "OpCapability Shader\n"
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            "%void = OpTypeVoid\n"
+            "%u32 = OpTypeInt 32 0\n"
+            "%ptr = OpTypePointer Function %u32\n"
+            "%ft = OpTypeFunction %void\n"
+            "%main = OpFunction %void None %ft\n"
+            "%entry = OpLabel\n"
+            "%var = OpVariable %ptr Function\n"
+            "%v1 = OpLoad %u32 %var\n"
+            "OpStore %var %v1\n"
+            "%v2 = OpLoad %u32 %var Aligned 4\n"
+            "OpStore %var %v2 Aligned 4\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        spv = spirv_asm.assemble(asm, target_env="vulkan1.2")
+        _validate(spv)
+        # Error cases on optional-tail ops still raise SpirvAsmError.
+        with self.assertRaises(spirv_asm.SpirvAsmError):
+            spirv_asm.assemble("%v = OpLoad %u32\n")
+        with self.assertRaises(spirv_asm.SpirvAsmError):
+            spirv_asm.assemble("OpLoad %u32 %var\n")
+        with self.assertRaises(spirv_asm.SpirvAsmError):
+            spirv_asm.assemble("%x = OpStore %var %v1\n")
+
 
 def _selector_module(sel_type, literal, later):
     """A compute shader with an OpSwitch on `%sel = OpIAdd %sel_type %c0 %c0`.
