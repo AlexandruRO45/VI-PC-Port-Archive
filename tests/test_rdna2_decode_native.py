@@ -353,6 +353,24 @@ class Fallback(unittest.TestCase):
         self.assertIsNone(NATIVE(b"\0\0\x81\xbf", None, True))
         self.assertIsNone(NATIVE(memoryview(struct.pack("<I", 0xBF810000)).cast("I"), "gfx1013", True))
 
+    @unittest.skipIf(NATIVE is None, "tools/rdna2_decode_native is not built or is stale")
+    def test_signed_and_char_memoryviews_use_python(self):
+        raw = bytes.fromhex("6a0c49f2f04ec2d9e9e0b0ce")
+        for fmt in ("b", "c"):
+            view = memoryview(raw).cast(fmt)
+            with self.subTest(format=fmt):
+                self.assertIsNone(NATIVE(view, "gfx1013", True))
+                try:
+                    expected = python_disasm(view)
+                except Exception as exc:  # Python's own result for these views must be reproduced exactly
+                    with mock.patch.object(rdna2_decode, "_NATIVE", [NATIVE]):
+                        with self.assertRaises(type(exc)) as caught:
+                            rdna2_decode.disasm_bytes(view)
+                    self.assertEqual(str(caught.exception), str(exc))
+                else:
+                    with mock.patch.object(rdna2_decode, "_NATIVE", [NATIVE]):
+                        self.assertEqual(rdna2_decode.disasm_bytes(view), expected)
+
     def test_refused_call_falls_back(self):
         code = struct.pack("<2I", 0xBF800000, 0xBF810000)
         with mock.patch.object(rdna2_decode, "_NATIVE", [lambda *args: None]):

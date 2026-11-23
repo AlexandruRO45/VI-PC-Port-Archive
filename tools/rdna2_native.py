@@ -125,7 +125,8 @@ def load(g: dict):
         if any(g[name] is not fn for name, fn in zip(_WATCHED, originals)) or not isinstance(mcpu, str):
             return None
         if isinstance(code, memoryview):
-            if code.ndim != 1 or code.itemsize != 1 or not code.c_contiguous:
+            # Only format 'B': Python indexes 'b' and 'c' views as signed ints / 1-byte strings, so leave them to it.
+            if code.format != "B" or code.ndim != 1 or code.itemsize != 1 or not code.c_contiguous:
                 return None
             code = code.tobytes()
         elif isinstance(code, bytearray):
