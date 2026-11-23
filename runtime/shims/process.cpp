@@ -8,8 +8,9 @@
 //     exit;
 //   - the game's atexit registrations (_crt_atexit, which MSVC's atexit and static destructors reach; msvcrt's
 //     atexit and _onexit) go to a table of the run's own instead of the CRT's process-wide one, which the game
-//     shares with gta6rt. exit() runs it newest first, as the CRT does, before the run ends; _exit(), _Exit(),
-//     quick_exit(), ExitProcess() and abort() do not. _cexit() runs it and returns, _c_exit() returns. A second
+//     shares with gta6rt. exit() runs it newest first, as the CRT does, and flushes the open streams before the run ends;
+//     _exit(), _Exit(), quick_exit(), ExitProcess() and abort() do neither. _cexit() runs it, flushes and returns;
+//     _c_exit() returns. A second
 //     thread that calls exit(), _exit(), _Exit() or quick_exit() while the first is leaving waits, as with the
 //     CRT's exit lock. Not covered yet: at_quick_exit() handlers (quick_exit() runs none) and the thread-local
 //     destructor callback (_register_thread_local_exe_atexit_callback); both still reach the host CRT.
@@ -147,9 +148,24 @@ bool take_exit_lock() {
     }
     return false;
 }
-// exit(): the game's handlers and static destructors, then the end of the run.
+// The CRT flushes every open stream after the atexit handlers on exit() and _cexit(), not on _exit(), quick_exit(),
+// ExitProcess() or abort(). The host leaves with ExitProcess, which does not flush, so a stream the game wrote
+// without closing would lose its buffered tail (RT-368). The Universal CRT is the host's own; msvcrt.dll (a MinGW
+// title) keeps its streams in that DLL, so its fflush is called too when the DLL is loaded.
+void flush_streams() {
+    std::fflush(nullptr);
+    if (HMODULE msvcrt = GetModuleHandleW(L"msvcrt.dll")) {
+        using FflushFn = int(__cdecl*)(FILE*);
+        if (auto fflush_msvcrt = reinterpret_cast<FflushFn>(GetProcAddress(msvcrt, "fflush"))) fflush_msvcrt(nullptr);
+    }
+}
+
+// exit(): the game's handlers and static destructors, then the streams are flushed and the run ends.
 void __cdecl game_exit(int code) {
-    if (take_exit_lock()) run_atexit_handlers();
+    if (take_exit_lock()) {
+        run_atexit_handlers();
+        flush_streams();
+    }
     end_run(code);
 }
 // _exit(), _Exit(), quick_exit(): the end of the run without the atexit handlers.
@@ -160,7 +176,7 @@ void __cdecl game_quick_exit(int code) {
 // _cexit() runs the handlers and flushes the streams, then returns; _c_exit() only returns.
 void __cdecl game_cexit() {
     run_atexit_handlers();
-    std::fflush(nullptr);
+    flush_streams();
 }
 void __cdecl game_c_exit() {}
 void __stdcall game_exit_process(UINT code) { end_run(static_cast<int>(code)); }

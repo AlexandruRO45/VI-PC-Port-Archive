@@ -9,6 +9,7 @@
 //   cexit         _cexit() runs every handler and returns; main then returns 11
 //   c_exit        _c_exit() runs none and returns; main then returns 12, and exit runs them all
 //   concurrent_exit  a second thread calls _exit(7) while exit(7) runs a handler: it waits for them all
+//   buffered      a fully buffered file is written and never closed; main returns 13 and exit must flush it
 // One handler registers another while the handlers run: it must still run, next.
 #include <windows.h>
 #include <process.h>  // _cexit, _c_exit
@@ -73,6 +74,14 @@ int main(int argc, char** argv) {
         std::atexit(handler_slow);
         CloseHandle(CreateThread(nullptr, 0, quick_exit_thread, nullptr, 0, nullptr));
         std::exit(7);
+    }
+    if (!std::strcmp(mode, "buffered")) {
+        // check_atexit.cmake reads the file after the run: only the CRT's flush at exit can have written the line
+        FILE* f = std::fopen("tiny_atexit_buffered.txt", "w");
+        if (!f) return 1;
+        std::setvbuf(f, nullptr, _IOFBF, 4096);
+        std::fputs("buffered line\n", f);
+        return 13;
     }
     if (!std::strcmp(mode, "exit")) std::exit(7);
     if (!std::strcmp(mode, "_exit")) _exit(8);

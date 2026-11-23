@@ -26,6 +26,10 @@ set(code_c_exit 12)
 # exit(7) is running a slow handler when a second thread calls _exit(7): the exit lock holds it back.
 set(expect_concurrent_exit "${ctors};slow handler started;slow handler done;${handlers}")
 set(code_concurrent_exit 7)
+# A fully buffered file the program never closes: exit's flush is the only thing that writes its line.
+set(expect_buffered "${ctors};${handlers}")
+set(code_buffered 13)
+set(buffered_file "${guest_dir}/tiny_atexit_buffered.txt")
 
 # The program's own lines, in order, without the prefix; everything gta6rt prints is dropped.
 function(guest_lines output result)
@@ -42,13 +46,42 @@ function(guest_lines output result)
 endfunction()
 
 set(failures "")
-foreach(mode return exit _exit quick_exit ExitProcess cexit c_exit concurrent_exit)
+# The buffered file's content after a run, "" when it is missing.
+function(buffered_content result)
+  set(content "")
+  if(EXISTS "${buffered_file}")
+    file(READ "${buffered_file}" content)
+    string(REPLACE "\r\n" "\n" content "${content}")
+  endif()
+  set(${result} "${content}" PARENT_SCOPE)
+endfunction()
+
+foreach(mode return exit _exit quick_exit ExitProcess cexit c_exit concurrent_exit buffered)
+  file(REMOVE "${buffered_file}")
   execute_process(COMMAND ${RUNNER} "${GUEST}" ${mode}
     WORKING_DIRECTORY "${guest_dir}" TIMEOUT 60
     RESULT_VARIABLE native_code OUTPUT_VARIABLE native_out ERROR_VARIABLE native_err)
+  buffered_content(native_file)
+  file(REMOVE "${buffered_file}")
   execute_process(COMMAND ${RUNNER} "${LOADER}" --run "${guest_name}" -- ${mode}
     WORKING_DIRECTORY "${guest_dir}" TIMEOUT 60
     RESULT_VARIABLE run_code OUTPUT_VARIABLE run_out ERROR_VARIABLE run_err)
+  buffered_content(run_file)
+  file(REMOVE "${buffered_file}")
+  if(mode STREQUAL "buffered")
+    if(NOT native_file STREQUAL "buffered line\n")
+      set(native_diff "[buffered] the native run left \"${native_file}\" in the file, not the flushed line")
+      if(RUNNER)
+        message(STATUS "${native_diff}\n  (the host CRT differs from Windows; not a gta6rt failure)")
+      else()
+        string(APPEND failures "\n${native_diff}\n  (the fixture or the host changed)")
+      endif()
+    endif()
+    if(NOT run_file STREQUAL "buffered line\n")
+      string(APPEND failures "\n[buffered] gta6rt --run left \"${run_file}\" in the file: exit did not flush the "
+        "game's open streams (RT-368)")
+    endif()
+  endif()
   guest_lines("${native_out}" native_lines)
   guest_lines("${run_out}" run_lines)
   if(NOT native_code STREQUAL code_${mode} OR NOT native_lines STREQUAL expect_${mode})
@@ -68,4 +101,4 @@ endforeach()
 if(failures)
   message(FATAL_ERROR "atexit/termination differences:${failures}")
 endif()
-message(STATUS "tiny_atexit: 8 termination paths match the Windows sequence")
+message(STATUS "tiny_atexit: 9 termination paths match the Windows sequence")
