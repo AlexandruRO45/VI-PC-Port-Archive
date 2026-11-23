@@ -1092,16 +1092,20 @@ def check(game: str, full: bool) -> dict:
         fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
     exe = os.path.join(game, v["expected_exe"])
     present = "all files present" + (" and hashes match" if full else "")
-    if not os.path.isfile(exe):
+    exe_present = os.path.isfile(exe)
+    if exe_present:
+        # The size is one stat and the executable's hash is one file: check both before --full reads every file.
+        why = exe_mismatch(v, exe)
+        if why:
+            fail(f"{why} Use an unmodified {v['expected_exe']} from version {v['version']}.")
+    # --full-check verifies every manifest file whether or not the optional executable is there: returning early
+    # on a missing executable skipped it, and a same-size changed DLL then passed a full check (#8404, #7123).
+    if full:
+        py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
+    if not exe_present:
         log(f"check: {present}. "
             f"{v['expected_exe']} is not in the folder: the runtime stage can be built but not run.")
         return v
-    # The size is one stat and the executable's hash is one file: check both before --full reads every file.
-    why = exe_mismatch(v, exe)
-    if why:
-        fail(f"{why} Use an unmodified {v['expected_exe']} from version {v['version']}.")
-    if full:
-        py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
     log(f"check: {present}. Executable found"
         + (" and its sha256 matches." if v.get("expected_exe_sha256") else "."))
     return v

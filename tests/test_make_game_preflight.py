@@ -335,6 +335,19 @@ class GameCheckTest(PreflightTestBase):
                     self.assert_fails(make_game.check, game_dir, full=True,
                                       match="test_game.exe has sha256")
 
+    def test_full_check_still_verifies_every_file_when_the_executable_is_missing(self):
+        # A missing (optional) executable used to return before --full-check ran the manifest verifier, so a
+        # same-size changed DLL passed `--check --full-check` while the default check rejected it (#8404).
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_dir, game_dir = self.synthetic_with_exe(tmp, expected_exe_size=256)
+            os.remove(os.path.join(game_dir, "test_game.exe"))
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch.object(make_game, "py",
+                                       side_effect=lambda *a: make_game.fail("verify failed")) as verify:
+                    self.assert_fails(make_game.check, game_dir, full=True, match="verify failed")
+            verify.assert_called_once()
+            self.assertEqual(verify.call_args.args[:3], ("manifest.py", "verify", game_dir))
+
     def test_check_missing_files_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest_dir = os.path.join(tmp, "manifests")
