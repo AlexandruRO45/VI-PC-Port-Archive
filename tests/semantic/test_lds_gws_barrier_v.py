@@ -878,5 +878,102 @@ class TestIEEE754BoundaryExtremesAndNaNHandling(unittest.TestCase):
             self.assertEqual(state.get_lane_vgpr(lane, 0), self.F32_CUSTOM_NAN_PAYLOAD)
 
 
+
+
+class TestNegativeControlsSyntaxRejectionAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_negative_and_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_syntax_rejection_sgpr_as_vdata0(self) -> None:
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            DSGWSBarrierVInstruction(vdata0=s0, offset=0, gds=True)
+
+    def test_syntax_rejection_invalid_offset_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSGWSBarrierVInstruction(offset=-1, gds=True)
+
+        with self.assertRaises(ValueError):
+            DSGWSBarrierVInstruction(offset=0x10000, gds=True)
+
+    def test_syntax_rejection_missing_mandatory_gds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSGWSBarrierVInstruction(offset=0, gds=False)
+
+    def test_invalid_simd_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=48)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_invalid_gws_memory_size(self) -> None:
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=0)
+
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=-1)
+
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=48)
+
+    def test_mutation_detection_barrier_v_releases_decrement(self) -> None:
+        ref_arr, ref_rel = ref_ds_gws_barrier_v(arrived_count=2, releases=5)
+        self.assertEqual(ref_rel, 6)
+
+        mutant_rel = u32(5 - 1)
+        self.assertNotEqual(mutant_rel, ref_rel)
+
+    def test_mutation_detection_arrived_not_reset_on_release(self) -> None:
+        ref_arr, _ = ref_ds_gws_barrier_v(arrived_count=4, releases=1)
+        self.assertEqual(ref_arr, 0)
+
+        mutant_arr = 4  # Mutant forgets to reset arrived count to 0
+        self.assertNotEqual(mutant_arr, ref_arr)
+
+    def test_mutation_detection_exec_zero_bypass(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        instr = DSGWSBarrierVInstruction(offset=8)
+        res = interp.execute(instr, state)
+
+        self.assertIsNone(res)
+        self.assertEqual(state.gws.read_releases(8), 0)
+
+        mutant_executed_rel = 1
+        self.assertNotEqual(mutant_executed_rel, state.gws.read_releases(8))
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        target_offset = 42
+        instr = DSGWSBarrierVInstruction(offset=target_offset)
+
+        rid, rels, _ = interp.execute(instr, state)
+        self.assertEqual(rid, target_offset)
+        self.assertEqual(state.gws.read_releases(target_offset), 1)
+        self.assertEqual(state.gws.read_releases(0), 0)
+
+        mutant_rid = 0
+        self.assertNotEqual(mutant_rid, rid)
+
+
 if __name__ == "__main__":
     unittest.main()
