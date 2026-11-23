@@ -316,17 +316,26 @@ def info(paths):
             info_file(p)
 
 
+def _check_extract_outputs(source, out, names):
+    """Refuse every possible source alias before the first extraction file is written."""
+    for name in names:
+        target = os.path.join(out, name)
+        if same_report_path(source, target):
+            raise ValueError(f'extract would overwrite input {source}: output {target}')
+
+
 def extract(p, out):
     d = read(p)
     k = kind_of(d)
-    os.makedirs(out, exist_ok=True)
     if k == 'JSAV':
         h, es = parse_jsav(d)
+        for e in es:
+            e['file'] = f'blocks/{e["index"]:03d}_{e["group"]}_{e["hash"]}.json'
+        _check_extract_outputs(p, out, ['index.json', 'save.pretty.json', *(e['file'] for e in es)])
         bd = os.path.join(out, 'blocks')
         os.makedirs(bd, exist_ok=True)
         blocks = jsav_blocks(d, es)
         for e, b in zip(es, blocks):
-            e['file'] = f'blocks/{e["index"]:03d}_{e["group"]}_{e["hash"]}.json'
             with open(os.path.join(out, e['file']), 'wb') as f:
                 f.write(b)
         with open(os.path.join(out, 'index.json'), 'w', encoding='utf-8', newline="\n") as f:
@@ -338,6 +347,13 @@ def extract(p, out):
     elif k == 'ASAV':
         h = parse_asav(d)
         pl = asav_payload(d, h)
+        names = ['header.json', 'header.bin', 'payload.bin']
+        if pl[:1] == b'{':
+            names.append('payload.json')
+        elif h['kind'] == 3 and len(pl) >= 8:
+            names.append('profile.json')
+        _check_extract_outputs(p, out, names)
+        os.makedirs(out, exist_ok=True)
         with open(os.path.join(out, 'header.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump(h, f, indent=1)
         with open(os.path.join(out, 'header.bin'), 'wb') as f:

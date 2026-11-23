@@ -1033,5 +1033,93 @@ class PackIndexValidationTest(unittest.TestCase):
         self.assertEqual(saves.pack_from_dir(self.extracted), saves.build_jsav(3, 0, [], [], []))
 
 
+class ExtractSourcePreservationTest(unittest.TestCase):
+    """Generated extract files must never replace the container being inspected."""
+
+    @staticmethod
+    def snapshot(root):
+        return {os.path.relpath(os.path.join(base, name), root): rd(os.path.join(base, name))
+                for base, _, names in os.walk(root) for name in names}
+
+    def assert_refused_unchanged(self, source, out, root):
+        before = self.snapshot(root)
+        with self.assertRaisesRegex(ValueError, 'extract.*overwrite.*input'):
+            quiet(saves.extract, source, out)
+        self.assertEqual(self.snapshot(root), before)
+
+    def test_each_asav_output_refuses_the_source_before_writing_anything(self):
+        cases = [('header.json', make_asav()), ('header.bin', make_asav()),
+                 ('payload.bin', make_asav()), ('payload.json', make_asav(payload=b'{"x":1}')),
+                 ('profile.json', make_asav(payload=saves.build_profile()))]
+        for name, data in cases:
+            with self.subTest(output=name), tempfile.TemporaryDirectory() as root:
+                source = os.path.join(root, name)
+                write(os.path.join(root, 'keep.txt'), b'previous export')
+                write(source, data)
+                self.assert_refused_unchanged(source, root, root)
+
+    def test_each_jsav_output_refuses_the_source_before_writing_anything(self):
+        data, _, _ = make_jsav(1, 0)
+        for name in ('index.json', 'save.pretty.json', 'blocks/000_code_10000000.json'):
+            with self.subTest(output=name), tempfile.TemporaryDirectory() as root:
+                source = os.path.join(root, *name.split('/'))
+                write(os.path.join(root, 'keep.txt'), b'previous export')
+                write(source, data)
+                self.assert_refused_unchanged(source, root, root)
+
+    def linked_output(self, link):
+        for data, name in ((make_asav(), 'payload.bin'), (make_jsav(1, 0)[0], 'save.pretty.json')):
+            with self.subTest(output=name), tempfile.TemporaryDirectory() as root:
+                source, out = os.path.join(root, 'source.sav'), os.path.join(root, 'export')
+                write(source, data)
+                write(os.path.join(out, 'header.json'), b'previous header')
+                write(os.path.join(out, 'index.json'), b'previous index')
+                try:
+                    link(source, os.path.join(out, name))
+                except OSError as exc:
+                    self.skipTest(f'cannot create file links: {exc}')
+                self.assert_refused_unchanged(source, out, root)
+
+    def test_hard_link_output_cannot_replace_the_source(self):
+        self.linked_output(os.link)
+
+    def test_symlink_output_cannot_replace_the_source(self):
+        self.linked_output(os.symlink)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows case-insensitive filenames')
+    def test_windows_case_alias_cannot_replace_the_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, 'PAYLOAD.BIN')
+            write(source, make_asav())
+            self.assert_refused_unchanged(source, root, root)
+
+    def test_cli_refusal_is_one_error_and_preserves_existing_exports(self):
+        for name, data in (('payload.bin', make_asav()), ('index.json', make_jsav(1, 0)[0])):
+            with self.subTest(output=name), tempfile.TemporaryDirectory() as root:
+                source, out = os.path.join(root, 'source', name), os.path.join(root, 'source')
+                write(source, data)
+                write(os.path.join(out, 'keep.txt'), b'previous export')
+                before = self.snapshot(root)
+                result = subprocess.run([sys.executable, '-I', TOOL, 'extract', source, out],
+                                        capture_output=True, text=True, errors='replace', timeout=10)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn('ERROR:', result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assertEqual(self.snapshot(root), before)
+
+    def test_same_basename_in_another_directory_still_extracts(self):
+        for name, data in (('payload.bin', make_asav()), ('index.json', make_jsav(1, 0)[0])):
+            with self.subTest(output=name), tempfile.TemporaryDirectory() as root:
+                source, out = os.path.join(root, 'source', name), os.path.join(root, 'export')
+                write(source, data)
+                quiet(saves.extract, source, out)
+                self.assertEqual(rd(source), data)
+                if name == 'payload.bin':
+                    self.assertEqual(rd(os.path.join(out, name)), saves.asav_payload(data, saves.parse_asav(data)))
+                else:
+                    self.assertEqual(saves.pack_from_dir(out), data)
+
+
 if __name__ == "__main__":
     unittest.main()
