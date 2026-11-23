@@ -456,6 +456,17 @@ class TestSMovB64TransferAndPropagation(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x56780000)
 
+class TestSMovB64Translator(unittest.TestCase):
+    def test_translator_s_mov_b64_execution(self) -> None:
+        body = [
+            "s_mov_b64 s[4:5], 0x8877665544332211",
+            "v_mov_b32_e32 v1, s5",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_mov_b64_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 0x88776655)
+
 
 if __name__ == "__main__":
     unittest.main()
