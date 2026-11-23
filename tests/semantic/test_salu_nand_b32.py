@@ -548,5 +548,76 @@ class SaluNandB32ConditionCodesTests(unittest.TestCase):
         self.assertEqual(interp.scc, 0)
 
 
+class SaluNandB32EdgeCasesTests(unittest.TestCase):
+    """IEEE 754 float patterns, signed integer boundaries, and Sheffer stroke logic."""
+
+    def test_ieee754_float_bit_patterns(self):
+        """Verify NAND behavior on IEEE 754 single-precision float bit patterns."""
+        def float_to_u32(f: float) -> int:
+            return struct.unpack("<I", struct.pack("<f", f))[0]
+
+        patterns = {
+            "pos_zero": 0x00000000,
+            "neg_zero": 0x80000000,
+            "pos_one": float_to_u32(1.0),
+            "neg_one": float_to_u32(-1.0),
+            "pos_inf": 0x7F800000,
+            "neg_inf": 0xFF800000,
+            "qnan": 0x7FC00000,
+            "snan": 0x7F800001,
+            "denorm_min": 0x00000001,
+            "denorm_max": 0x007FFFFF,
+        }
+
+        self.assertEqual(ref_nand_b32(patterns["pos_zero"], patterns["neg_zero"]), MASK32)
+        pos_one = patterns["pos_one"]
+        neg_one = patterns["neg_one"]
+        self.assertEqual(ref_nand_b32(pos_one, neg_one), (~pos_one) & MASK32)
+        self.assertEqual(ref_nand_b32(patterns["pos_inf"], patterns["neg_inf"]), (~patterns["pos_inf"]) & MASK32)
+
+    def test_signed_integer_extremes(self):
+        """Verify two's complement integer extremes."""
+        int_max = 0x7FFFFFFF
+        int_min = 0x80000000
+        minus_one = 0xFFFFFFFF
+        zero = 0x00000000
+
+        self.assertEqual(ref_nand_b32(int_max, int_min), MASK32)
+        self.assertEqual(ref_nand_b32(int_max, minus_one), int_min)
+        self.assertEqual(ref_nand_b32(int_min, minus_one), int_max)
+        self.assertEqual(ref_nand_b32(zero, int_max), MASK32)
+
+    def test_sheffer_stroke_universal_logic_identities(self):
+        """Verify Sheffer stroke (NAND) functionally completeness for all Boolean logic gates."""
+        rng = random.Random(0x32A7)
+        for _ in range(64):
+            x = rng.getrandbits(32)
+            y = rng.getrandbits(32)
+
+            # NOT(x) = NAND(x, x)
+            not_x = ref_nand_b32(x, x)
+            self.assertEqual(not_x, (~x) & MASK32)
+
+            # AND(x, y) = NAND(NAND(x, y), NAND(x, y))
+            nand_xy = ref_nand_b32(x, y)
+            and_xy = ref_nand_b32(nand_xy, nand_xy)
+            self.assertEqual(and_xy, (x & y) & MASK32)
+
+            # OR(x, y) = NAND(NAND(x, x), NAND(y, y))
+            not_y = ref_nand_b32(y, y)
+            or_xy = ref_nand_b32(not_x, not_y)
+            self.assertEqual(or_xy, (x | y) & MASK32)
+
+            # NOR(x, y) = NOT(OR(x, y))
+            nor_xy = ref_nand_b32(or_xy, or_xy)
+            self.assertEqual(nor_xy, (~(x | y)) & MASK32)
+
+            # XOR(x, y) = NAND(NAND(x, NAND(x, y)), NAND(y, NAND(x, y)))
+            t1 = ref_nand_b32(x, nand_xy)
+            t2 = ref_nand_b32(y, nand_xy)
+            xor_xy = ref_nand_b32(t1, t2)
+            self.assertEqual(xor_xy, (x ^ y) & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
