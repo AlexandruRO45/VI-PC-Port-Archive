@@ -17,6 +17,15 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
+option(LEONIDA_AVX2 "Enable AVX2, FMA and BMI2 vector instructions for x86-64 host" OFF)
+if(LEONIDA_AVX2)
+  if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>)
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-mavx2 -mfma -mbmi2>)
+  endif()
+  add_compile_definitions(LEONIDA_AVX2=1)
+endif()
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
   # paths in the runtime and its libraries still destroy automatic objects when an exception leaves a frame.

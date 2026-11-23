@@ -22,6 +22,8 @@ cmake -S runtime -B runtime/build
 cmake --build runtime/build --config RelWithDebInfo
 ```
 
+Pass `-DLEONIDA_AVX2=ON` to enable AVX2, FMA and BMI2 vector acceleration for x86-64 host processors (Intel Haswell+, AMD Zen+).
+
 Requirements: Windows x64, Visual Studio 2022 with the C++ desktop workload. The GPU tools need the
 Vulkan SDK; the runtime and CPU tests do not. The loader is x64-only and the PE mapper rejects any
 other machine.
