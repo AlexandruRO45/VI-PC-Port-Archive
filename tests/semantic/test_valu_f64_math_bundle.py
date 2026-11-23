@@ -508,5 +508,38 @@ class VMaxF64TranslatorTests(unittest.TestCase):
         except rdna2spirv.Unsupported as caught:
             self.assertIn("v_max_f64", str(caught))
 
+# -----------------------------------------------------------------------------
+# Opcode 6: v_ldexp_f64
+# -----------------------------------------------------------------------------
+def oracle_ldexp_f64(x_bits: int, exp_i32: int) -> int:
+    """Reference mathematical oracle for v_ldexp_f64: computes x * 2^exp."""
+    if is_nan_u64(x_bits):
+        return F64_QNAN
+    fx = u64_to_f64(x_bits)
+    if math.isinf(fx) or fx == 0.0:
+        return x_bits
+    # Clamp exp to avoid Python float overflow / underflow crash
+    signed_exp = exp_i32 if exp_i32 < 0x80000000 else exp_i32 - 0x100000000
+    try:
+        res = math.ldexp(fx, signed_exp)
+        if res == 0.0:
+            return F64_NEG_ZERO if fx < 0 else F64_POS_ZERO
+        return f64_to_u64(res)
+    except OverflowError:
+        return F64_NEG_INF if fx < 0 else F64_POS_INF
+
+
+class VLdexpF64OracleTests(unittest.TestCase):
+    def test_ldexp_basic(self):
+        # 1.0 * 2^3 = 8.0
+        self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, 3), f64_to_u64(8.0))
+
+    def test_ldexp_negative_scale(self):
+        # 1.0 * 2^-2 = 0.25
+        self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, -2 & MASK32), f64_to_u64(0.25))
+
+    def test_ldexp_zero_preservation(self):
+        self.assertEqual(oracle_ldexp_f64(F64_POS_ZERO, 100), F64_POS_ZERO)
+
 if __name__ == "__main__":
     unittest.main()
