@@ -12,6 +12,8 @@ function fakeElement() {
         children: [], style: {}, innerHTML: '', innerText: '', value: '',
         classList: { add() {}, remove() {}, toggle() {} },
         appendChild(child) { this.children.push(child); },
+        replaceChildren() { this.children = []; },
+        get childElementCount() { return this.children.length; },
         remove() {},
     };
 }
@@ -27,7 +29,7 @@ function loadStudio() {
         querySelectorAll: () => [],
     };
     const context = vm.createContext({
-        document, localStorage: { getItem: () => null }, window: {}, setTimeout() {},
+        document, URLSearchParams, localStorage: { getItem: () => null }, window: {}, setTimeout() {},
         alert: message => alerts.push(message), console: { error() {} },
         THREE: {
             MeshStandardMaterial: Disposable, MeshNormalMaterial: Disposable, Vector3,
@@ -112,4 +114,24 @@ test('switching models in clay mode disposes the old model\'s geometry, material
     assert.deepEqual(modelA.parts.map(part => part.disposed), [true, true, true]);
     assert.deepEqual(modelB.parts.map(part => part.disposed), [false, false, false]);
     assert.equal(studio.run('clayMaterial.disposed'), false);
+});
+
+test('DDS inspector selects a mip and layer and clears controls for ordinary images', async () => {
+    const { context, elements, run } = loadStudio();
+    context.fetch = async () => ({ ok: true, json: async () => ({ width: 5, height: 3, mip_count: 3, array_size: 2 }) });
+    await run("openModal({name:'a', preview:'/a.png', ddsPreview:'/api/dds/a.dds'})");
+    const image = elements.get('modal-img');
+    const controls = elements.get('dds-controls');
+    const [mip, layer, dimensions] = controls.children;
+    assert.equal(image.src, '/api/dds/a.dds?mip=0&layer=0');
+    for (const label of [mip, layer]) {
+        const input = label.children[0];
+        Object.assign(input, {value: '1', valueAsNumber: 1, validity: {valid: true}});
+        input.onchange();
+    }
+    assert.equal(image.src, '/api/dds/a.dds?mip=1&layer=1');
+    assert.equal(dimensions.textContent, '2 \u00d7 1');
+    await run("openModal({name:'b', preview:'/b.png'})");
+    assert.equal(image.src, '/b.png');
+    assert.equal(controls.children.length, 0);
 });

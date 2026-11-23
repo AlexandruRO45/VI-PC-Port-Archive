@@ -221,6 +221,42 @@ class TestGalleryServer(unittest.TestCase):
                 self.assertEqual(textures[name]["format"], expected)
                 self.assertEqual(textures[name]["preview"], textures[name]["url"])
 
+    def test_dds_selection_by_catalog_url(self) -> None:
+        # Two RGBA8 layers with a 2x2 and 1x1 mip each.
+        hdr = bytearray(_make_1x1_rgba_dds()[:128])
+        struct.pack_into("<III", hdr, 8, 0x21007, 2, 2)
+        struct.pack_into("<I", hdr, 28, 2)
+        struct.pack_into("<I4s", hdr, 80, 4, b"DX10")
+        data = hdr + struct.pack("<5I", 28, 3, 0, 2, 0)
+        for value in (1, 3):
+            data += bytes([value]) * 16 + bytes([value + 1]) * 4
+        for name, contents in (("A #.DDS", data), ("A #.png", b"sidecar")):
+            with open(os.path.join(self.textures_dir, name), "wb") as f:
+                f.write(contents)
+
+        def get(url):
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}" + url, timeout=3) as response:
+                return response.read()
+
+        row = next(item for item in json.loads(get("/api/textures"))["textures"]
+                   if item["name"] == "A #.DDS")
+        self.assertEqual(get(row["preview"]), b"sidecar")
+        url = row["ddsPreview"]
+        info = json.loads(get(url + "?info"))
+        self.assertEqual([info[k] for k in ("width", "height", "mip_count", "array_size")], [2] * 4)
+        for layer in range(2):
+            for mip in range(2):
+                size = 2 >> mip
+                rgba = bytes([1 + layer * 2 + mip]) * (size * size * 4)
+                expected = gallery.dds_png.encode_png(size, size, rgba)
+                self.assertEqual(get(f"{url}?mip={mip}&layer={layer}"), expected)
+                if mip == layer == 0:
+                    self.assertEqual(get(url), expected)
+        for query in ("layer=2", "mip=2", "mip=-1", "layer=1.5", "mip=", "mip=0&mip=1", "other=0"):
+            with self.subTest(query=query), self.assertRaises(urllib.error.HTTPError) as caught:
+                get(url + "?" + query)
+            self.assertEqual(caught.exception.code, 400)
+
     def test_endpoints(self) -> None:
         base = f"http://127.0.0.1:{self.port}"
 
