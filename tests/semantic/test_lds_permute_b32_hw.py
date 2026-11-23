@@ -320,5 +320,64 @@ class TestDsPermuteSymbolicAST(unittest.TestCase):
         self.assertEqual(insn.data.index, 30)
         self.assertEqual(insn.offset, 64)
 
+
+class ScalarPermuteState:
+    """State tracking for scalar / single-lane instruction interpretation."""
+
+    def __init__(self) -> None:
+        self.registers: dict[int, int] = {}
+
+    def set_reg(self, idx: int, val: int) -> None:
+        self.registers[idx] = val & MASK32
+
+    def get_reg(self, idx: int) -> int:
+        return self.registers.get(idx, 0)
+
+
+class ScalarPermuteInterpreter:
+    """Interpreter modeling deterministic single-lane address calculation and message emission."""
+
+    def __init__(self, state: ScalarPermuteState) -> None:
+        self.state = state
+
+    def eval_instruction(self, insn: DsPermuteInsn) -> tuple[int, int]:
+        vaddr = self.state.get_reg(insn.addr.index)
+        vdata = self.state.get_reg(insn.data.index)
+        target = calc_target_lane(vaddr, insn.offset)
+        return target, vdata
+
+
+class TestDsPermuteScalarInterpreter(unittest.TestCase):
+    """Part 3: Deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarPermuteState()
+        self.interp = ScalarPermuteInterpreter(self.state)
+
+    def test_scalar_identity_mapping(self) -> None:
+        self.state.set_reg(1, 0)       # addr = 0 -> lane 0
+        self.state.set_reg(2, 0x1234)  # data = 0x1234
+        insn = DsPermuteInsn(RegisterNode("v0", 0), RegisterNode("v1", 1), RegisterNode("v2", 2))
+        target, data = self.interp.eval_instruction(insn)
+        self.assertEqual(target, 0)
+        self.assertEqual(data, 0x1234)
+
+    def test_scalar_target_lane_with_offset(self) -> None:
+        self.state.set_reg(1, 16)      # addr = 16 -> dword 4
+        self.state.set_reg(2, 0xCAFE)
+        insn = DsPermuteInsn(RegisterNode("v0", 0), RegisterNode("v1", 1), RegisterNode("v2", 2), offset=8)
+        # (16 + 8) = 24 -> 24 >> 2 = 6 -> lane 6
+        target, data = self.interp.eval_instruction(insn)
+        self.assertEqual(target, 6)
+        self.assertEqual(data, 0xCAFE)
+
+    def test_scalar_target_lane_wrapping(self) -> None:
+        self.state.set_reg(1, 128)     # addr = 128 -> lane 32 % 32 = 0
+        self.state.set_reg(2, 0x9999)
+        insn = DsPermuteInsn(RegisterNode("v0", 0), RegisterNode("v1", 1), RegisterNode("v2", 2))
+        target, data = self.interp.eval_instruction(insn)
+        self.assertEqual(target, 0)
+        self.assertEqual(data, 0x9999)
+
 if __name__ == "__main__":
     unittest.main()
