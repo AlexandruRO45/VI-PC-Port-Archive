@@ -557,35 +557,49 @@ bool held_signal_survives_release(Rig& rig, int seed) {
     return c.wait_fence(2, 1) && c.verify();
 }
 
-// Review item 3: Signal(F, 2) is held, Signal(F, 3) on another queue is not. When the held one is released the
-// timeline is already at 3 and must not be signaled lower; a wait for 2 passes and F reads 3. Layer only (D3D12 sets
-// the fence to the lower value).
-bool monotonic_shared_fence(Rig& rig, int seed) {
+// A held Signal(F, 2) can run after Signal(F, 3) on another queue and rewind the logical fence.
+// A queue that already waited for 3 still depends on the copy queue's completed work.
+bool held_signal_rewinds_shared_fence(Rig& rig, int seed) {
     if (!rig.available[direct_q] || !rig.available[copy_q] || !rig.available[compute_q]) return true;
     arm("held Signal below an unheld one");
     Case c(rig, seed);
     if (!c.make_resources()) return false;
-    ID3D12CommandQueue* a = rig.queues[direct_q][0].Get();
-    ID3D12CommandQueue* b = rig.queues[copy_q][0].Get();
-    ID3D12CommandQueue* w = rig.queues[compute_q][0].Get();
-    ID3D12Fence *gate = c.fence(0), *shared = c.fence(1);
+    ID3D12CommandQueue* rewind_queue = rig.queues[direct_q][0].Get();
+    ID3D12CommandQueue* copy_queue = rig.queues[copy_q][0].Get();
+    ID3D12CommandQueue* read_queue = rig.queues[compute_q][0].Get();
+    ID3D12Fence *rewind_gate = c.fence(0), *shared = c.fence(1), *read_done = c.fence(2),
+                *rewind_done = c.fence(3), *read_gate = c.fence(4);
     ID3D12GraphicsCommandList* produce = c.make_list(copy_q, nullptr, &c.stage[0], 3);
     ID3D12GraphicsCommandList* consume = c.make_list(compute_q, &c.stage[0], nullptr, 3);
-    if (!gate || !shared || !produce || !consume) return c.fail("setup", __LINE__);
-    if (FAILED(a->Wait(gate, 1)) || FAILED(a->Signal(shared, 2))) return c.fail("held Signal", __LINE__);  // held
-    ID3D12CommandList* pb[] = {produce};
-    b->ExecuteCommandLists(1, pb);
-    if (FAILED(b->Signal(shared, 3))) return c.fail("Signal", __LINE__);                                  // not held
-    if (c.wait_fence(1, 3) == false) return false;
-    if (FAILED(gate->Signal(1))) return c.fail("CPU Signal", __LINE__);                                  // releases a
-    // A queue that waits for 2 now: satisfied, and the data the copy queue wrote is what it reads.
-    if (FAILED(w->Wait(shared, 2))) return c.fail("Wait", __LINE__);
-    ID3D12CommandList* cb[] = {consume};
-    w->ExecuteCommandLists(1, cb);
-    if (FAILED(w->Signal(c.fence(2), 1))) return c.fail("Signal", __LINE__);
+    if (!rewind_gate || !shared || !read_done || !rewind_done || !read_gate || !produce || !consume)
+        return c.fail("setup", __LINE__);
+    if (FAILED(rewind_queue->Wait(rewind_gate, 1)) || FAILED(rewind_queue->Signal(shared, 2)) ||
+        FAILED(rewind_queue->Signal(rewind_done, 1)))
+        return c.fail("could not gate the lower signal", __LINE__);
+
+    ID3D12CommandList* copies[] = {produce};
+    copy_queue->ExecuteCommandLists(1, copies);
+    if (FAILED(copy_queue->Signal(shared, 3))) return c.fail("copy Signal(3)", __LINE__);
+    if (!c.wait_fence(1, 3)) return false;
+    if (shared->GetCompletedValue() != 3 || rewind_done->GetCompletedValue() != 0)
+        return c.fail("expected the copy signal at 3 before releasing the lower signal", __LINE__);
+
+    if (FAILED(read_queue->Wait(shared, 3)) || FAILED(read_queue->Wait(read_gate, 1)))
+        return c.fail("could not latch the copy dependency and gate the reader", __LINE__);
+    ID3D12CommandList* readbacks[] = {consume};
+    read_queue->ExecuteCommandLists(1, readbacks);
+    if (FAILED(read_queue->Signal(read_done, 1))) return c.fail("reader Signal", __LINE__);
+
+    if (FAILED(rewind_gate->Signal(1)) || !c.wait_fence(3, 1)) {
+        read_gate->Signal(1);
+        return c.fail("the lower GPU signal did not complete", __LINE__);
+    }
+    const UINT64 rewind_value = shared->GetCompletedValue();
+    const bool reader_was_held = read_done->GetCompletedValue() == 0;
+    if (FAILED(read_gate->Signal(1))) return c.fail("release the reader", __LINE__);
     if (!c.wait_fence(2, 1) || !c.verify()) return false;
-    Sleep(50);
-    if (shared->GetCompletedValue() != 3) return c.fail("the fence went below 3", __LINE__);
+    if (rewind_value != 2 || shared->GetCompletedValue() != 2 || !reader_was_held)
+        return c.fail("expected a completed rewind to 2 before the latched reader ran", __LINE__);
     ++cases_run;
     return true;
 }
@@ -749,7 +763,7 @@ bool run_all(ID3D12Device* device, bool layer) {
         ok &= never_signaled(rig, ++seed);
         ok &= fence_released(rig, ++seed);
         ok &= held_signal_survives_release(rig, ++seed);
-        ok &= monotonic_shared_fence(rig, ++seed);
+        ok &= held_signal_rewinds_shared_fence(rig, ++seed);
         ok &= teardown_wakes_cpu_waiters(rig, ++seed);
     }
     if (skipped) std::printf("(%d type assignments need more queues than the device gave)\n", skipped);

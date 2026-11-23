@@ -1850,6 +1850,22 @@ public:
         return value;
     }
 
+    // The dispatcher or a queue teardown has already observed this real ticket complete.
+    void complete_signal(const FencePoint& point) {
+        Notifications ready;
+        {
+            std::lock_guard lock(mutex_);
+            if (context_.is_device_lost()) return;
+            const auto signal = std::find_if(pending_.begin(), pending_.end(), [&](const auto& pending) {
+                return pending.point.queue == point.queue && pending.point.ticket == point.ticket;
+            });
+            if (signal == pending_.end()) return;
+            publish_completed_locked(signal + 1, ready);
+        }
+        dispatch(ready);
+        context_.holds().pump_ready();
+    }
+
     bool signal(std::uint64_t value) {
         Notifications ready;
         bool ok;
@@ -1994,6 +2010,11 @@ public:
     }
 
 private:
+    struct PendingSignal {
+        FencePoint point;
+        std::uint64_t value;
+    };
+
     using Notifications = std::vector<std::function<void()>>;
 
     static void dispatch(Notifications& ready) {
@@ -2039,6 +2060,10 @@ private:
             }
             if (signal.point.ticket <= it->second) break;
         }
+        publish_completed_locked(completed_end, ready);
+    }
+
+    void publish_completed_locked(std::vector<PendingSignal>::iterator completed_end, Notifications& ready) {
         for (auto it = pending_.begin(); it != completed_end; ++it)
             publish_locked(it->value, it->point, ready);
         pending_.erase(pending_.begin(), completed_end);
@@ -2069,10 +2094,6 @@ private:
         if (events_.empty()) context_.unwatch_fence_device_loss(this);
     }
 
-    struct PendingSignal {
-        FencePoint point;
-        std::uint64_t value;
-    };
     struct EventWait {
         std::uint64_t value;
         const void* owner;
@@ -2094,8 +2115,8 @@ private:
 // serialises its calls; state_mutex_ additionally serialises them against the thread that releases a held batch
 // (Wait-before-Signal, queue_holds.h), the only other thread that touches a queue.
 //
-// A Wait on a fence value no Signal has been submitted for yet holds the next batch (ExecuteCommandLists or Signal)
-// on the CPU, with everything the queue is asked to do after it, instead of replaying it against layouts from before
+// An unsatisfied Wait holds the next batch (ExecuteCommandLists or Signal) on the CPU with later queue work,
+// instead of replaying it against layouts from before
 // the work it waits for: Vulkan itself would accept the wait (timeline semaphores allow wait-before-signal), but the
 // layout tracker follows replay order. Holding on the CPU also keeps a Wait and the Signal that satisfies it from
 // landing on one VkQueue in the wrong order, which would never make progress on the GPU.
@@ -2360,13 +2381,14 @@ public:
         return ok;
     }
 
-    void wait_fence(const std::shared_ptr<LogicalFence>& fence, std::uint64_t value) {
+    void wait_fence(const std::shared_ptr<LogicalFence>& fence, std::uint64_t value, const PinFn& pin = {}) {
         // A waiter latches either the current value or a future completed signal, even if this queue
         // has no new submission until after the fence has returned to a lower value.
         auto wait = fence->wait(value);
         std::vector<std::shared_ptr<void>> retired;
         std::lock_guard state(state_mutex_);
         if (wait) logical_waits_.push_back(std::move(wait));
+        if (pin) wait_pins_.push_back(pin());
         drain_pins(retired);
     }
 
@@ -2970,7 +2992,7 @@ private:
         std::function<bool()> tile_mapping;  // owns backing objects and mapping arguments
         // Keep fences, pipeline states, root signatures and sparse image destinations alive for the submission.
         std::vector<std::shared_ptr<void>> pins;
-        std::vector<std::shared_ptr<void>> wait_pins;  // the fences of `waits`
+        std::vector<std::shared_ptr<void>> wait_pins;  // the fences named by both wait lists
     };
 
     bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
@@ -3080,7 +3102,7 @@ private:
             break;
         }
         // A rejected submission or a no-op mapping leaves its waits for the next submission.
-        if (!waits_.empty() || !logical_waits_.empty())
+        if (!waits_.empty() || !logical_waits_.empty() || !wait_pins_.empty())
             preserve_deferred_waits(later_waits, later_values, later_pins, later_logical);
         const auto pin_ticket = context_.is_device_lost() ? UINT64_MAX : submitted_;
         retire_pins(op.pins, pin_ticket);
@@ -3197,7 +3219,7 @@ private:
             info.pValues = &point.ticket;
             const VkResult result =
                 vk.vkWaitSemaphores(context_.device(), &info, FenceWaitDispatcher::kWaitSliceNs);
-            if (result == VK_SUCCESS) producer->completed();
+            if (result == VK_SUCCESS) producer->complete_signal(point);
             else if (result != VK_TIMEOUT) {
                 if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
                 return;
@@ -3703,11 +3725,11 @@ private:
             consume_logical_waits(ticket, std::move(predecessor_progress));
             if (logical_fence) {
                 auto* context = &context_;
-                context_.enqueue_fence_callback(progress_, ticket, [context, logical_fence, progress = progress_owner_] {
-                    // The dispatcher borrows the raw VkSemaphore until it invokes this callback.
-                    (void)progress;
+                context_.enqueue_fence_callback(progress_, ticket, [context, logical_fence,
+                                                 point = FencePoint{progress_owner_, ticket}] {
+                    // The dispatcher borrows the raw semaphore owned by point until it invokes this callback.
                     if (context->is_device_lost()) logical_fence->device_lost();
-                    else logical_fence->completed();
+                    else logical_fence->complete_signal(point);
                 });
             }
             for (auto& slot : buffers_)

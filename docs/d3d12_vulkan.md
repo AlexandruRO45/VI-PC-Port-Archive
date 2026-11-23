@@ -2638,13 +2638,13 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   waits when the producer's ticket completes. The dependent submission carries that ticket as a Vulkan wait
   to order memory accesses. Holding the operation until then also avoids submitting a wait before its signal
   on a shared `VkQueue`, where it can block progress (Vulkan-Docs issue 1262).
-  A held Signal keeps its fence alive through submission, and any progress semaphore used by a submitted
-  Wait stays alive until the Wait completes. A held batch also retains its pipeline states and root signatures.
+  A Wait or held Signal keeps its fence alive until the submission completes, along with every progress
+  semaphore the submission waits on. A held batch also retains its pipeline states and root signatures.
   The application must keep command-list resources alive until the work completes. Failures of held batches are
   reported when they are released, and their waits carry over to the next submission.
   Queue teardown drains waits whose signals were already submitted, and reports remaining held operations.
-  CPU events on the fences of abandoned Signals are completed. If a released fence has no submitted signal
-  that can satisfy a pending queue Wait, work blocked by that Wait is dropped.
+  CPU events on the fences of abandoned Signals are completed. Releasing a fence used by an unresolved
+  queue Wait leaves the operation held until a Signal satisfies the Wait or the queue is destroyed.
   `UpdateTileMappings` and `CopyTileMappings` can also be the first operation held by a Wait. The queued operation
   keeps its input ranges and sparse backing alive and reads the mappings at release. A held image destination
   also keeps its D3D12 resource registered for layout initialization. When a mapping submits no Vulkan work,

@@ -1199,7 +1199,7 @@ public:
     Fence(leonida::VulkanContext& context, UINT64 initial, D3D12_FENCE_FLAGS flags)
         : context_(context), fence_(std::make_shared<leonida::LogicalFence>(context, initial)), flags_(flags) {}
 
-    // Releasing the fence completes pending CPU events, as on D3D12, but cancels unsatisfied queue work.
+    // Complete pending CPU events when the last reference to the fence is released.
     ~Fence() override { fence_->close(); }
 
     bool belongs_to(const leonida::VulkanContext& context) const { return &context_ == &context; }
@@ -1408,7 +1408,7 @@ public:
         Fence* f = Fence::from(fence);
         if (!f || !f->belongs_to(context_)) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        queue_.wait_fence(f->logical(), value);
+        queue_.wait_fence(f->logical(), value, queue_pin(fence));
         return d3d12_trace::result(method, S_OK);
     }
 

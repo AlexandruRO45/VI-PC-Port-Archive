@@ -9,6 +9,7 @@
 //   5. cancel() blocks until a callback already dispatched for that semaphore has stopped using it.
 //   6. A re-entrant cancel() for a later callback in the same ready batch skips that callback.
 //   7. Logical fence rewinds keep already-satisfied waits latched even when a queue advances during a counter scan.
+//   8. A dispatcher-confirmed ticket publishes its logical signal without a second Vulkan counter query.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -49,6 +50,8 @@ struct AdvanceOnSample {
     std::uint64_t sampled_value = 0;
 };
 thread_local AdvanceOnSample advance_on_sample;
+thread_local unsigned rejected_counter_calls = 0;
+thread_local bool reject_counter_queries = false;
 
 VkResult signal(VkDevice device, VkSemaphore semaphore, std::uint64_t value) {
     VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
@@ -67,6 +70,10 @@ VKAPI_ATTR VkResult VKAPI_CALL wait_semaphores(VkDevice device, const VkSemaphor
 
 VKAPI_ATTR VkResult VKAPI_CALL get_semaphore_counter_value(VkDevice device, VkSemaphore sem, std::uint64_t* value) {
     counter_calls.fetch_add(1, std::memory_order_relaxed);
+    if (reject_counter_queries) {
+        ++rejected_counter_calls;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     if (fail_counter_device_lost.load(std::memory_order_acquire)) return VK_ERROR_DEVICE_LOST;
     if (sem == advance_on_sample.sampled) {
         const auto advance = std::exchange(advance_on_sample, AdvanceOnSample{});
@@ -215,6 +222,54 @@ void check_logical_fence_rewind(VkDevice device) {
     EXPECT(pending->status.load() == Status::cancelled);
     EXPECT(prior->status.load() == Status::ready);
     std::puts("logical fence: stable queue scan, latched waits, CPU rewind and device loss ok");
+}
+
+void check_confirmed_logical_signal(VkDevice device) {
+    using namespace leonida;
+    using Status = LogicalFenceWait::Status;
+
+    VulkanContext context(driver::get_device, device, true);
+    EXPECT(context.loaded());
+    const auto first = progress_timeline(context, reinterpret_cast<VkQueue>(std::uintptr_t{1}));
+    const auto second = progress_timeline(context, reinterpret_cast<VkQueue>(std::uintptr_t{2}));
+    const auto fence = std::make_shared<LogicalFence>(context, 0);
+    const FencePoint older{first, 1}, confirmed{second, 1}, later{first, 2};
+    const auto old_wait = fence->wait(10), later_wait = fence->wait(12);
+    unsigned notified = 0;
+    fence->notify(10, [&] { ++notified; });
+    const auto accept = [](const FencePoint&) { return VK_SUCCESS; };
+    EXPECT(fence->submit_signal(older, 10, accept) == VK_SUCCESS);
+    EXPECT(fence->submit_signal(confirmed, 4, accept) == VK_SUCCESS);
+    EXPECT(fence->submit_signal(later, 12, accept) == VK_SUCCESS);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool callback_finished = false;
+    unsigned redundant_queries = 0;
+    context.enqueue_fence_callback(confirmed.queue->semaphore, confirmed.ticket, [&] {
+        driver::rejected_counter_calls = 0;
+        driver::reject_counter_queries = true;
+        fence->complete_signal(confirmed);
+        driver::reject_counter_queries = false;
+        std::lock_guard lock(mutex);
+        redundant_queries = driver::rejected_counter_calls;
+        callback_finished = true;
+        cv.notify_all();
+    });
+    EXPECT(driver::signal(device, older.queue->semaphore, older.ticket) == VK_SUCCESS);
+    EXPECT(driver::signal(device, confirmed.queue->semaphore, confirmed.ticket) == VK_SUCCESS);
+    EXPECT(wait_flag(mutex, cv, callback_finished));
+    EXPECT(redundant_queries == 0 && notified == 1);
+    EXPECT(old_wait->status.load() == Status::ready && old_wait->point.queue == first &&
+           old_wait->point.ticket == older.ticket);
+    EXPECT(later_wait->status.load() == Status::pending && fence->completed() == 4);
+
+    EXPECT(fence->signal(3));
+    fence->complete_signal(older);
+    fence->complete_signal(confirmed);
+    EXPECT(fence->completed() == 3 && notified == 1 && later_wait->status.load() == Status::pending);
+    context.cancel_fence_waits(confirmed.queue->semaphore);
+    std::puts("logical fence: confirmed ticket publishes its prefix without re-querying or replaying it");
 }
 
 // Waits until run() has re-armed vkWaitSemaphores with exactly `count` semaphores (wakeup + N pending waits).
@@ -502,6 +557,7 @@ int main() {
     }
 
     check_logical_fence_rewind(d.device);
+    check_confirmed_logical_signal(d.device);
     EXPECT(d.validation_errors() == 0);
     std::printf("vk_fence_dispatcher_sync_test: ok\n");
     return 0;

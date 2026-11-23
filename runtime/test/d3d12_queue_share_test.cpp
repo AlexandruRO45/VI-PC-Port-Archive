@@ -6,11 +6,9 @@
 //   many      36 queues (12 per type, more than the VkQueues of any GPU we know: the RTX 5080 has 26), then a buffer
 //             copied through all 36 in a chain linked by fences, submitted consumer first (every Wait before its
 //             Signal) and then producer first; the readback must be exact.
-//   deferred  a CPU Signal that has to wait behind a queue Signal the GPU has not reached, and a queue that waits
-//             for the CPU value: the queue must run once the CPU value lands (on one VkQueue or two).
-//   release   a fence released right after the GPU passed the queue Signal its deferred CPU Signal waited behind,
-//             while another queue holds a batch for the CPU value: the batch runs, and under the validation layer
-//             the semaphore is not destroyed under it.
+//   deferred  a CPU Signal publishes while a GPU Signal is held. Another queue can wait for the CPU value.
+//   release   after a GPU Signal rewinds the fence, release it while a queue runs work whose Wait had already
+//             reached the CPU value. Verify the GPU work executes and the validation layer sees no lifetime errors.
 //   stress    4 threads, 9 queues (3 per type), each thread copying a buffer through 3 queues per iteration with
 //             a CPU-gated producer; every iteration's readback must be exact.
 // With LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1 and LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1 every GPU looks like the UHD 770 (one
@@ -233,11 +231,9 @@ bool many_queues(ID3D12Device* device) {
     return true;
 }
 
-// Queue a signals f = 1 behind a gate the CPU opens last; the CPU signals f = 2 before that, which the layer applies
-// only once the GPU has passed 1 (a Vulkan timeline must not be set past a pending signal); queue b waits for f = 2
-// and copies. b must run once the CPU value lands.
-bool deferred_cpu_signal(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE ta, D3D12_COMMAND_LIST_TYPE tb) {
-    arm(std::string("deferred CPU Signal, ") + type_name(ta) + " then " + type_name(tb), 30000);
+// Queue a signals f = 1 behind a gate. The CPU immediately publishes 2, which queue b waits on before copying.
+bool cpu_signal_ahead_of_held_signal(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE ta, D3D12_COMMAND_LIST_TYPE tb) {
+    arm(std::string("CPU Signal ahead of a held queue Signal, ") + type_name(ta) + " then " + type_name(tb), 30000);
     auto a = make_queue(device, ta);
     auto b = make_queue(device, tb);
     auto gate = make_fence(device), f = make_fence(device), done = make_fence(device);
@@ -250,23 +246,21 @@ bool deferred_cpu_signal(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE ta, D3D12
     CHECK(SUCCEEDED(a->Wait(gate.Get(), 1)));
     CHECK(SUCCEEDED(a->Signal(f.Get(), 1)));
     CHECK(SUCCEEDED(f->Signal(2)));
+    CHECK(f->GetCompletedValue() == 2);
     CHECK(SUCCEEDED(b->Wait(f.Get(), 2)));
     copy.execute(b.Get());
     CHECK(SUCCEEDED(b->Signal(done.Get(), 1)));
-    CHECK(SUCCEEDED(gate->Signal(1)));
     wait_for(done.Get(), 1);
+    CHECK(SUCCEEDED(gate->Signal(1)));
     if (!exact(readback.Get(), seed)) return false;
     std::printf("%s: completed, exact\n", current_case.load());
     return true;
 }
 
-// A fence released just after the GPU passed queue a's Signal of 1, while the CPU's Signal of 2 is still deferred
-// behind it and queue b holds a batch that waits for 2. Either the fence wait thread or the release applies the CPU
-// value; the fence reached 2 before it was released, so b's batch must run (as on D3D12, where the CPU Signal lands at
-// once), and the semaphore must outlive that batch (VUID-vkDestroySemaphore-semaphore-05149, formerly -01137, under
-// the validation layer). Every iteration's readback must hold the copy, never the sentinel the CPU left there.
+// Queue b's Wait for 2 is already satisfied when a's GPU Signal rewinds the fence to 1.
+// A separate gate holds b's batch until the application has released the rewound fence.
 bool release_while_held(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, int iterations) {
-    arm(std::string("fence released while a batch waits for its deferred CPU Signal, ") + type_name(type),
+    arm(std::string("fence released after rewinding a satisfied Wait, ") + type_name(type),
         30000 + ULONGLONG(iterations) * 200);
     constexpr std::uint32_t sentinel = 0xdeadbeefu;
     auto a = make_queue(device, type), b = make_queue(device, type);
@@ -279,20 +273,24 @@ bool release_while_held(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, int 
         CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
         for (UINT w = 0; w < words; ++w) mapped[w] = sentinel;
         readback->Unmap(0, nullptr);
-        auto gate = make_fence(device), f = make_fence(device), done = make_fence(device);
+        auto gate = make_fence(device), consumer_gate = make_fence(device);
+        auto f = make_fence(device), done = make_fence(device);
         CopyList copy;
-        CHECK(gate && f && done && copy.make(device, type, readback.Get(), false, upload.Get(), false));
+        CHECK(gate && consumer_gate && f && done && copy.make(device, type, readback.Get(), false, upload.Get(), false));
         CHECK(SUCCEEDED(a->Wait(gate.Get(), 1)));
         CHECK(SUCCEEDED(a->Signal(f.Get(), 1)));
-        CHECK(SUCCEEDED(f->Signal(2)));  // deferred: a's Signal of 1 is not on the GPU yet
+        CHECK(SUCCEEDED(f->Signal(2)));
+        CHECK(f->GetCompletedValue() == 2);
         CHECK(SUCCEEDED(b->Wait(f.Get(), 2)));
+        CHECK(SUCCEEDED(b->Wait(consumer_gate.Get(), 1)));
         copy.execute(b.Get());
         CHECK(SUCCEEDED(b->Signal(done.Get(), 1)));
         CHECK(SUCCEEDED(gate->Signal(1)));
         const ULONGLONG give_up = GetTickCount64() + 5000;
-        while (f->GetCompletedValue() < 1)
+        while (f->GetCompletedValue() != 1)
             CHECK(GetTickCount64() < give_up);
-        f.Reset();  // the release, as soon as the GPU has passed a's Signal
+        f.Reset();
+        CHECK(SUCCEEDED(consumer_gate->Signal(1)));
         wait_for(done.Get(), 1);  // b's Signal comes after its batch
         CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
         bool copied = true;
@@ -432,7 +430,7 @@ int main(int argc, char** argv) {
     if (which == "all" || which == "many") ok &= many_queues(device.Get());
     if (which == "all" || which == "deferred")
         for (const auto ta : types)
-            for (const auto tb : types) ok &= deferred_cpu_signal(device.Get(), ta, tb);
+            for (const auto tb : types) ok &= cpu_signal_ahead_of_held_signal(device.Get(), ta, tb);
     if (which == "all" || which == "release")
         for (const auto type : types) ok &= release_while_held(device.Get(), type, iterations);
     if (which == "all" || which == "stress") ok &= stress(device.Get(), iterations);
