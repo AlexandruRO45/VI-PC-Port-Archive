@@ -2126,7 +2126,7 @@ if(TARGET Vulkan::Headers)
     # with llvm-mc and translated by tools/rdna2spirv.py through test/shaders/build.py, which also writes the FSSM
     # programs their index entries are keyed by. Needs llvm-mc with the AMDGPU target (LLVM_MC in the environment, as
     # for the other shader tests, or llvm-mc on PATH or in C:/msys64/ucrt64/bin) and the Vulkan SDK's spirv-as and
-    # spirv-val; without them the test is not built.
+    # spirv-val; without them the test is not built and ctest lists it as "Not Run (Disabled)".
     if(NOT LEONIDA_LLVM_MC)
       if(DEFINED ENV{LLVM_MC})
         set(LEONIDA_LLVM_MC "$ENV{LLVM_MC}")
@@ -2344,6 +2344,13 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_buffer_uav PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test, d3d12_m2_formats_test, d3d12_m3_frame_test, d3d12_m4_compute_test and d3d12_buffer_uav_test are not built")
+      # Listed as "Not Run (Disabled)", as gameinput is without SDL3, so the test count is the same on every machine
+      # and a run shows which tests it did not run.
+      foreach(test d3d12_translated_draw vk_bindless_ps_tex vk_bindless_ps_imgatomic d3d12_m2_textured d3d12_m2_formats
+                   d3d12_m3_frame d3d12_m3_first_pass d3d12_m4_compute d3d12_buffer_uav)
+        add_test(NAME ${test} COMMAND ${CMAKE_COMMAND} -E echo "needs llvm-mc (LLVM_MC) and the SDK's spirv-as/spirv-val")
+        set_tests_properties(${test} PROPERTIES DISABLED TRUE)
+      endforeach()
     endif()
     # ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc (node masks, resolved heap flags) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.
@@ -2730,7 +2737,7 @@ if(TARGET Vulkan::Headers)
     # Subgroup size control in PSOs, end to end: runtime/test/shaders/cs_w64x_readlane.asm translated natively and with
     # --wave64-emulate, and cs_wqm_w32.asm, built here with tools/rdna2spirv.py through test/shaders/build.py. Needs
     # llvm-mc with the AMDGPU target (LLVM_MC in the environment, as for the other shader tests, or llvm-mc on PATH)
-    # and the Vulkan SDK's spirv tools; without them the test is not built.
+    # and the Vulkan SDK's spirv tools; without them the test is not built and ctest lists it as "Not Run (Disabled)".
     if(DEFINED ENV{LLVM_MC})
       set(LEONIDA_LLVM_MC "$ENV{LLVM_MC}")
     else()
@@ -2783,6 +2790,8 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_subgroup PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "llvm-mc (set LLVM_MC) or glslangValidator not found: d3d12_subgroup_test is not built")
+      add_test(NAME d3d12_subgroup COMMAND ${CMAKE_COMMAND} -E echo "needs llvm-mc (LLVM_MC) and glslangValidator")
+      set_tests_properties(d3d12_subgroup PROPERTIES DISABLED TRUE)   # "Not Run (Disabled)", as above
     endif()
 
     # Clears on every format class against WARP (needs a Vulkan GPU; exit 77 without one).
