@@ -627,7 +627,7 @@ void install_on_existing_threads(Module& m) {
                 CloseHandle(snapshot);
                 snapshot = INVALID_HANDLE_VALUE;
             }
-            for (Candidate& c : list)
+            for (const Candidate& c : list)
                 if (c.handle) CloseHandle(c.handle);
             list.clear();
         }
@@ -652,7 +652,9 @@ void install_on_existing_threads(Module& m) {
             candidates.push_back({GetThreadId(thread), thread});
             current = thread;
         }
-        complete = status == kStatusNoMoreEntries;
+        // A process always has its calling thread, so a walk that ended with no thread at all is treated as
+        // unavailable and retried through Toolhelp.
+        complete = status == kStatusNoMoreEntries && !candidates.empty();
         if (!complete) found.close();
     }
     // TH32CS_SNAPTHREAD lists the threads of every process; the loop keeps this one's. The fallback opens a handle
