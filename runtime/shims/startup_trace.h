@@ -183,7 +183,16 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
-            if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
+            if (info.ContextRecord) {
+                // The register set at the fault: a trap in guest code (an int3 filler, a bad indirect call) is only
+                // diagnosable with the operands that led to it, and the stack alone does not carry them.
+                const CONTEXT& c = *info.ContextRecord;
+                f += ",\"regs\":{\"rax\":" + quote(hex(c.Rax)) + ",\"rcx\":" + quote(hex(c.Rcx)) +
+                     ",\"rdx\":" + quote(hex(c.Rdx)) + ",\"r8\":" + quote(hex(c.R8)) +
+                     ",\"r9\":" + quote(hex(c.R9)) + ",\"rsp\":" + quote(hex(c.Rsp)) +
+                     ",\"rbp\":" + quote(hex(c.Rbp)) + "}";
+                f += ",\"stack\":" + stack_from(c);
+            }
             event("exception", f);
         }
     } catch (...) {
