@@ -102,6 +102,31 @@ test('a download that finishes or fails after a later click does not replace the
     assert.deepEqual(studio.alerts, []);
 });
 
+test('resizing a hidden model canvas preserves its projection until the Models tab reopens', () => {
+    const studio = loadStudio();
+    const container = studio.context.document.getElementById('canvas-container');
+    const camera = studio.run('camera');
+    camera.aspect = 2;
+    let projections = 0;
+    camera.updateProjectionMatrix = () => { projections++; };
+    const sizes = [];
+    studio.run('renderer = {}').setSize = (w, h) => sizes.push([w, h]);
+
+    for (const [width, height] of [[0, 0], [0, 400], [800, 0]]) {
+        Object.assign(container, { clientWidth: width, clientHeight: height });
+        studio.run('onWindowResize()');
+        assert.equal(camera.aspect, 2);
+    }
+    assert.equal(projections, 0);
+    assert.deepEqual(sizes, []);
+
+    Object.assign(container, { clientWidth: 900, clientHeight: 600 });
+    studio.run("switchTab('models')");
+    assert.equal(camera.aspect, 1.5);
+    assert.equal(projections, 1);
+    assert.deepEqual(sizes, [[900, 600]]);
+});
+
 test('switching models in clay mode disposes the old model\'s geometry, material and texture, not the clay', () => {
     const studio = loadStudio();
     const [modelA, modelB] = [fakeModel(), fakeModel()];
