@@ -2754,44 +2754,97 @@ class Gen:
         return self.block_label
 
     def image_get_lod(self, a, mods):
-        """image_get_lod vD, vaddr, T#, S#: (clamped lod, unclamped lod) like OpImageQueryLod (2D, 2D array). For
-        arrays the query takes only the 2D coordinate; the layer doesn't affect the LOD."""
+        """image_get_lod vD, vaddr, T#, S#: (clamped lod, unclamped lod) like OpImageQueryLod (1D, 2D, 2D array, 3D,
+        cube). For arrays and cubes (bound as 6-layer 2D-array views) the query takes only the 2D coordinate; the
+        layer doesn't affect the LOD."""
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
-        if dim not in ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D_ARRAY") or self.stage != "ps":
+        kinds = {
+            "dim:SQ_RSRC_IMG_1D": ("img1d", "%images_1d", "simg1d", "_ptr_UC_img1", 1),
+            "dim:SQ_RSRC_IMG_2D": ("img2d", "%images", "simg2d", "_ptr_UC_img", 2),
+            "dim:SQ_RSRC_IMG_2D_ARRAY": ("img2da", "%images_arr", "simg2da", "_ptr_UC_imga", 3),
+            "dim:SQ_RSRC_IMG_3D": ("img3d", "%images_3d", "simg3d", "_ptr_UC_img3", 3),
+            # Cube textures are bound as 6-layer 2D-array views; cube_coords maps (s, t, face) -> (u, v, layer).
+            "dim:SQ_RSRC_IMG_CUBE": ("img2da", "%images_arr", "simg2da", "_ptr_UC_imga", 3),
+        }
+        if dim not in kinds or self.stage != "ps":
             raise Unsupported("image_get_lod form")
         a16 = "a16" in mods
-        if a16 and ("tfe" in mods or "lwe" in mods):
+        if "tfe" in mods or "lwe" in mods or "d16" in mods:
             raise Unsupported("image_get_lod form")
-        arr = dim.endswith("_ARRAY")
-        if arr:
-            self.uses_tex_array = True
+        itype, iarr, stype, iptr, ncoord = kinds[dim]
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x3")
         dmask = int(dm.split(":")[1], 0)
         vdata = a[0]
         if vdata["k"] != "vgpr":          # `off`, an SGPR or a constant where the VGPR range of the result goes
             raise Unsupported("image_get_lod destination")
         addr = self.addr_regs(a[1])
+        need = (ncoord + 1) // 2 if a16 else ncoord
+        if len(addr) < need:
+            raise Unsupported("image_get_lod coords")
+        if dim == "dim:SQ_RSRC_IMG_1D":
+            self.uses_tex_1d = True
+        elif dim == "dim:SQ_RSRC_IMG_3D":
+            self.uses_tex_3d = True
+        elif dim in ("dim:SQ_RSRC_IMG_2D_ARRAY", "dim:SQ_RSRC_IMG_CUBE"):
+            self.uses_tex_array = True
         img_idx = self.desc_lookup_sgpr(a[2], 8)
         smp_idx = self.desc_lookup_sgpr(a[3], 4)
         ip, img, sp, smp, si = (self.tmp() for _ in range(5))
-        self.dynamic_sampled_access(ip, "%_ptr_UC_imga" if arr else "%_ptr_UC_img",
-                                    "%images_arr" if arr else "%images", img_idx)
-        self.emit(f"{img} = OpLoad {'%img2da' if arr else '%img2d'} {ip}")
+        self.dynamic_sampled_access(ip, f"%{iptr}", iarr, img_idx)
+        self.emit(f"{img} = OpLoad %{itype} {ip}")
         self.dynamic_sampled_access(sp, "%_ptr_UC_smp", "%samplers", smp_idx)
         self.emit(f"{smp} = OpLoad %smp {sp}")
-        self.emit(f"{si} = OpSampledImage {'%simg2da' if arr else '%simg2d'} {img} {smp}")
-        if a16:
-            # U and V occupy the low and high halves of the first address VGPR. The array layer
-            # is a separate address component and does not contribute to the LOD derivatives.
-            packed = self.load_reg("vgpr", addr[0])
-            uv = self.tmp()
-            self.emit(f"{uv} = OpExtInst %v2float %glsl UnpackHalf2x16 {packed}")
-        else:
-            f = [self.tof(self.load_reg("vgpr", r)) for r in addr[:2]]
-            uv = self.tmp()
-            self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+        self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
+        if dim == "dim:SQ_RSRC_IMG_1D":
+            if a16:
+                packed = self.load_reg("vgpr", addr[0])
+                uv, coord = self.tmp(), self.tmp()
+                self.emit(f"{uv} = OpExtInst %v2float %glsl UnpackHalf2x16 {packed}")
+                self.emit(f"{coord} = OpCompositeExtract %float {uv} 0")
+            else:
+                coord = self.tof(self.load_reg("vgpr", addr[0]))
+        elif dim in ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D_ARRAY"):
+            if a16:
+                # U and V occupy the low and high halves of the first address VGPR. The array layer
+                # is a separate address component and does not contribute to the LOD derivatives.
+                packed = self.load_reg("vgpr", addr[0])
+                coord = self.tmp()
+                self.emit(f"{coord} = OpExtInst %v2float %glsl UnpackHalf2x16 {packed}")
+            else:
+                f = [self.tof(self.load_reg("vgpr", r)) for r in addr[:2]]
+                coord = self.tmp()
+                self.emit(f"{coord} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+        elif dim == "dim:SQ_RSRC_IMG_3D":
+            if a16:
+                p0, p1 = self.load_reg("vgpr", addr[0]), self.load_reg("vgpr", addr[1])
+                uv, wz, u, v, w, coord = (self.tmp() for _ in range(6))
+                self.emit(f"{uv} = OpExtInst %v2float %glsl UnpackHalf2x16 {p0}")
+                self.emit(f"{wz} = OpExtInst %v2float %glsl UnpackHalf2x16 {p1}")
+                self.emit(f"{u} = OpCompositeExtract %float {uv} 0")
+                self.emit(f"{v} = OpCompositeExtract %float {uv} 1")
+                self.emit(f"{w} = OpCompositeExtract %float {wz} 0")
+                self.emit(f"{coord} = OpCompositeConstruct %v3float {u} {v} {w}")
+            else:
+                f = [self.tof(self.load_reg("vgpr", r)) for r in addr[:3]]
+                coord = self.tmp()
+                self.emit(f"{coord} = OpCompositeConstruct %v3float {f[0]} {f[1]} {f[2]}")
+        else:  # dim:SQ_RSRC_IMG_CUBE
+            if a16:
+                p0, p1 = self.load_reg("vgpr", addr[0]), self.load_reg("vgpr", addr[1])
+                st, fc, s, t, face = (self.tmp() for _ in range(5))
+                self.emit(f"{st} = OpExtInst %v2float %glsl UnpackHalf2x16 {p0}")
+                self.emit(f"{fc} = OpExtInst %v2float %glsl UnpackHalf2x16 {p1}")
+                self.emit(f"{s} = OpCompositeExtract %float {st} 0")
+                self.emit(f"{t} = OpCompositeExtract %float {st} 1")
+                self.emit(f"{face} = OpCompositeExtract %float {fc} 0")
+                f = [s, t, face]
+            else:
+                f = [self.tof(self.load_reg("vgpr", r)) for r in addr[:3]]
+            c = self.cube_coords(f)
+            coord = self.tmp()
+            self.emit(f"{coord} = OpCompositeConstruct %v2float {c[0]} {c[1]}")
         lod = self.tmp()
-        self.emit(f"{lod} = OpImageQueryLod %v2float {si} {uv}")
+        self.emit(f"{lod} = OpImageQueryLod %v2float {si} {coord}")
         self.uses_query = True
         out = 0
         for c in range(2):

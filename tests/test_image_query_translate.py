@@ -208,15 +208,16 @@ class ImageGetResinfoTranslateTests(unittest.TestCase):
 
 class ImageGetLodTranslateTests(unittest.TestCase):
     def test_2d_and_2d_array_emit_image_query_lod(self):
-        for dim, img_ty, arr_name, ptr_ty, simg_ty in (
-            ("SQ_RSRC_IMG_2D", "%img2d", "%images", "%_ptr_UC_img", "%simg2d"),
-            ("SQ_RSRC_IMG_2D_ARRAY", "%img2da", "%images_arr", "%_ptr_UC_imga", "%simg2da"),
+        for dim, vaddr, img_ty, arr_name, ptr_ty, simg_ty in (
+            ("SQ_RSRC_IMG_2D", "v[0:1]", "%img2d", "%images", "%_ptr_UC_img", "%simg2d"),
+            ("SQ_RSRC_IMG_2D_ARRAY", "v[0:2]", "%img2da", "%images_arr", "%_ptr_UC_imga", "%simg2da"),
         ):
             with self.subTest(dim=dim):
                 spv = translate_lines("ps_get_lod", [
                     "v_mov_b32 v0, 0.25",
                     "v_mov_b32 v1, 0.5",
-                    "image_get_lod v[4:5], v[0:1], s[8:15], s[16:19] dmask:0x3 dim:" + dim,
+                    "v_mov_b32 v2, 1.0",
+                    f"image_get_lod v[4:5], {vaddr}, s[8:15], s[16:19] dmask:0x3 dim:" + dim,
                     "exp mrt0 v4, v5, v4, v5 done vm",
                     "s_endpgm",
                 ])
@@ -284,17 +285,18 @@ class ImageGetLodTranslateTests(unittest.TestCase):
                 "image_get_lod v[4:5], v[0:1], s[8:15], s[16:19] dmask:0x3 dim:SQ_RSRC_IMG_2D",
                 "s_endpgm",
             ])
-        for dim in ("SQ_RSRC_IMG_1D", "SQ_RSRC_IMG_3D", "SQ_RSRC_IMG_CUBE", "SQ_RSRC_IMG_1D_ARRAY"):
+        for dim in ("SQ_RSRC_IMG_1D_ARRAY", "SQ_RSRC_IMG_2D_MSAA", "SQ_RSRC_IMG_2D_MSAA_ARRAY"):
             with self.subTest(dim=dim):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate_lines("ps_get_lod_bad_dim", [
                         "v_mov_b32 v0, 0.25",
                         "v_mov_b32 v1, 0.5",
-                        f"image_get_lod v[4:5], v[0:1], s[8:15], s[16:19] dmask:0x3 dim:{dim}",
+                        "v_mov_b32 v2, 0.0",
+                        f"image_get_lod v[4:5], v[0:2], s[8:15], s[16:19] dmask:0x3 dim:{dim}",
                         "exp mrt0 v4, v5, v4, v5 done vm",
                         "s_endpgm",
                     ])
-        for flag in ("tfe", "lwe"):
+        for flag in ("tfe", "lwe", "d16"):
             with self.subTest(flag=flag):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate_lines("ps_get_lod_a16_flag", [
