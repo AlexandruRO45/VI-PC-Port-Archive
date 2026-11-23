@@ -638,6 +638,17 @@ void install_on_existing_threads(Module& m) {
 
     // Only this process's threads: NtGetNextThread returns a handle for each, and the calling thread's is kept too
     // (skipped below) because it is the cursor for the next call. A call that fails part way falls back to Toolhelp.
+    struct ThreadHandle {
+        HANDLE value = nullptr;
+        ~ThreadHandle() {
+            if (value) CloseHandle(value);
+        }
+        HANDLE release() {
+            const HANDLE released = value;
+            value = nullptr;
+            return released;
+        }
+    };
     bool complete = false;
     if (const NextThreadFn next = next_thread_fn()) {
         HANDLE current = nullptr;
@@ -649,7 +660,10 @@ void install_on_existing_threads(Module& m) {
                 if (thread) CloseHandle(thread);
                 break;
             }
+            // The local owner closes the returned handle if the candidate vector cannot grow.
+            ThreadHandle owner{thread};
             candidates.push_back({GetThreadId(thread), thread});
+            owner.release();
             current = thread;
         }
         // A process always has its calling thread, so a walk that ended with no thread at all is treated as
