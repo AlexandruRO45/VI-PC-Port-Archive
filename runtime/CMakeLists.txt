@@ -2319,18 +2319,18 @@ if(TARGET Vulkan::Headers)
           COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
-          COMMENT "Compiling the depth-bias test shader ${source}"
+          COMMENT "Compiling the dynamic depth-bias test shader ${source}"
           VERBATIM)
       endforeach()
-      add_executable(d3d12_depth_bias_test test/d3d12_depth_bias_test.cpp shims/d3d12_xs_device.cpp
-                     ${LEONIDA_TEST_VS_SLOPE} ${LEONIDA_TEST_PS_SOLID})
-      target_link_libraries(d3d12_depth_bias_test PRIVATE gta6rt_d3d12_com)
-      target_compile_definitions(d3d12_depth_bias_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+      add_executable(d3d12_dynamic_depth_bias_test test/d3d12_dynamic_depth_bias_test.cpp
+                     shims/d3d12_xs_device.cpp ${LEONIDA_TEST_VS_SLOPE} ${LEONIDA_TEST_PS_SOLID})
+      target_link_libraries(d3d12_dynamic_depth_bias_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_dynamic_depth_bias_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_VS_SLOPE_SPV="${LEONIDA_TEST_VS_SLOPE}"
                                  LEONIDA_TEST_PS_SOLID_SPV="${LEONIDA_TEST_PS_SOLID}")
-      target_compile_options(d3d12_depth_bias_test PRIVATE /W4 /permissive- /utf-8)
-      add_test(NAME d3d12_depth_bias COMMAND d3d12_depth_bias_test)
-      set_tests_properties(d3d12_depth_bias PROPERTIES SKIP_RETURN_CODE 77)
+      target_compile_options(d3d12_dynamic_depth_bias_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_dynamic_depth_bias COMMAND d3d12_dynamic_depth_bias_test)
+      set_tests_properties(d3d12_dynamic_depth_bias PROPERTIES SKIP_RETURN_CODE 77)
       # Conservative raster Tier 1, with geometric coverage bounds and host D3D12 references.
       set(LEONIDA_CONSERVATIVE_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_conservative.spv)
       set(LEONIDA_CONSERVATIVE_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative.spv)
@@ -2511,7 +2511,8 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_stores_atomics COMMAND d3d12_stores_atomics_test)
       set_tests_properties(d3d12_stores_atomics PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_depth_bias_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and "
+                     "d3d12_dynamic_depth_bias_test are not built")
     endif()
 
     # Native D3D12 SV_InnerCoverage reference; its HLSL is compiled at runtime, so glslang is not needed.

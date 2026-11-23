@@ -1,6 +1,6 @@
 #version 460
 // A pixel shader written to the translator's runtime contract, standing in for a translated one in
-// d3d12_depth_bias_test: a solid red fragment, so the depth test's verdict is the only thing the render target
+// d3d12_dynamic_depth_bias_test: a solid red fragment, so the depth test's verdict is the only thing the render target
 // shows.
 
 layout(location = 0) out vec4 target;

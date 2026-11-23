@@ -63,7 +63,7 @@ int main() {
     const auto vs_program = fssm_program({0x56530003, 0xbf810000});
     const auto ps_program = fssm_program({0x50530002, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_depth_bias_test";
+    const auto library = std::filesystem::temp_directory_path() / "leonida_dynamic_depth_bias_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_VS_SLOPE_SPV, library / "vs_slope.spv",
                                std::filesystem::copy_options::overwrite_existing);
