@@ -159,6 +159,15 @@ class TestSSubI32AST(unittest.TestCase):
         expr_ovf = SSubI32Expr(0x80000000, 1)
         self.assertEqual(expr_ovf.eval(), (0x7FFFFFFF, 1))
 
+class TestSSubI32OverflowAndSCC(unittest.TestCase):
+    def test_same_signs_no_overflow(self) -> None:
+        # Subtracting same signs never overflows
+        self.assertEqual(ref_s_sub_i32(0x7FFFFFFF, 0x7FFFFFFF), (0, 0))
+        self.assertEqual(ref_s_sub_i32(0x80000000, 0x80000000), (0, 0))
+
+    def test_sub_zero_no_overflow(self) -> None:
+        self.assertEqual(ref_s_sub_i32(0x80000000, 0), (0x80000000, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
