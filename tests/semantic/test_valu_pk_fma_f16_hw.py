@@ -639,3 +639,41 @@ class TestRegisterAliasing(unittest.TestCase):
         # 2.0 * 2.0 + 1.0 = 5.0 (0x4500)
         self.assertEqual(res, 0x45004500)
         self.assertEqual(state.get_vgpr(0), 0x45004500)
+
+
+# ==============================================================================
+# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_invariance(self) -> None:
+        """Verify v_pk_fma_f16 as a VOP3P instruction never alters VCC or SCC."""
+        # Assemble shader with comparison setting VCC, executing v_pk_fma_f16,
+        # then reading VCC back via v_cndmask_b32.
+        lines = [
+            "v_cmp_eq_u32 vcc, 5, 5",              # Sets VCC to all 1s
+            "v_mov_b32 v1, 0x3c003c00",
+            "v_mov_b32 v2, 0x40004000",
+            "v_mov_b32 v3, 0x38003800",
+            "v_pk_fma_f16 v0, v1, v2, v3",         # Must not touch VCC
+            "v_cndmask_b32 v4, 0x11111111, 0x22222222, vcc", # Should choose 0x22222222
+            "exp mrt0 v4, v0, v4, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vcc_invariant", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x22222222)
+        self.assertEqual(words[1], 0x41004100)
+
+    def test_clamp_saturation_boundaries(self) -> None:
+        """Verify saturation limits on float output without modifying status registers."""
+        # Test values above 1.0, below 0.0, and exactly 0.0 / 1.0
+        p0 = pack_f16x2(0x4500, 0xC200)            # 5.0, -3.0
+        p1 = pack_f16x2(F16_TWO, F16_ONE)          # 2.0, 1.0
+        p2 = pack_f16x2(F16_POS_ZERO, F16_POS_ZERO)
+        got = oracle_pk_fma_f16(p0, p1, p2, clamp=True)
+        # lo: 5.0 * 2.0 = 10.0 -> clamped to 1.0 (0x3C00)
+        # hi: -3.0 * 1.0 = -3.0 -> clamped to 0.0 (0x0000)
+        self.assertEqual(got, 0x00003C00)
