@@ -229,8 +229,12 @@ DWORD host_protect(DWORD p) {
 // replace, and its protection is kept here: the map calls take none, so a mapped page gets its window's protection, as
 // AWE's MapUserPhysicalPages does.
 //
-// ASSUMPTION: a title does not commit memory inside such a window with kernel32!VirtualAlloc. A placeholder refuses a
-// plain commit; the measured windows are only ever passed to the map calls.
+// Nothing in the retail executable commits inside such a window: it has exactly one VirtualAlloc call (RVA 0x2216459,
+// through the api-ms-win-core-memory-l1-1-0 import slot), and that call passes a null address with
+// MEM_COMMIT | MEM_RESERVE (0x3000) and PAGE_READWRITE, so it commits fresh address space, never a window. The rest of
+// that import block is 23 VirtualFree call sites (and one tail jump through the same slot) plus one VirtualQueryEx,
+// all on memory the title allocated itself. A plain commit inside a placeholder would still be refused, which is why no
+// window is ever handed to kernel32.
 struct Window {
     SIZE_T size;
     DWORD protect;
@@ -489,8 +493,12 @@ void note_physical_attributes(uint64_t attributes, uint64_t count, const void* c
 //
 // Each call is backed by one pagefile-backed section of count * 64 KiB: committed (charged) at once, given physical
 // memory as it is touched, zero-filled. Pages keep their contents while unmapped or mapped elsewhere, and one page can
-// be mapped at several addresses. ASSUMPTION: the attribute word (memory type, perhaps the page size) is not decoded;
-// every page is 64 KiB, which all four callers' arithmetic agrees with.
+// be mapped at several addresses. The 64 KiB unit is measured from the callers, not inferred: 19 of the 21
+// physical-page call sites have a `shr $0x10` within 0x800 bytes before the call (4 of 4 allocate, 12 of 12 map, 3 of 3
+// free) -- four in a row at RVA 0x24730da..0x24730de ahead of the calls at 0x24730e9..0x247311f, and `add $0xffff`
+// then `shr $0x10` at 0x2216435..0x221643f. The two scatter sites pass a count already in pages (one read from a global,
+// one counted in a loop), so they have no byte size to shift. The attribute word is still not decoded: the 23
+// reservations use the 64 KiB page mode (0x20400000) at 17 sites, the 2 MiB mode (0x20000000) at 5, and none at 1.
 BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count, uint64_t* page_array) {
     note_physical_attributes(attributes, page_count ? *page_count : 0, _ReturnAddress());
     if (!page_count || (*page_count && !page_array)) {

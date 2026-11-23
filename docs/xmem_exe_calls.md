@@ -75,10 +75,14 @@ are **inferred** from the registers loaded before each call; no documentation of
 | `XMemFreePhysicalPages` | `? (ULONG_PTR pages, ULONG_PTR* pageArray)` | 3 sites. The count is passed by value (one site frees the sum of four counts it had just unmapped), the array by pointer. Only two of the three sites were read to the argument, so this one is the least certain |
 | `XMemMapPhysicalPagesScatter` | `BOOL (void** virtualAddresses, ULONG_PTR pages, const ULONG_PTR* pageArray)` | 2 sites. Shaped like the Win32 call; the result was not followed |
 
-The page unit looks like **64 KiB**: the code that unmaps shifts byte sizes right by 16 before it passes page counts,
-and the reservations that precede the map calls use the 64 KiB page mode (`0x20402000`, above). That is inferred from
-those two facts. The meaning of `flags`, and whether the page numbers in `pageArray` carry anything beyond an index,
-are **unmeasured**.
+The page unit is **64 KiB**, and the shift is measured at the unmaps as well as at the maps: 19 of the 21
+physical-page call sites have a `shr $0x10` within 0x800 bytes before the call — 4 of 4
+`XMemAllocatePhysicalPages`, 12 of 12 `XMemMapPhysicalPages`, 3 of 3 `XMemFreePhysicalPages` — with four shifts in a
+row at RVA `0x24730da`..`0x24730de` ahead of the calls at `0x24730e9`..`0x247311f`, and `add $0xffff` then
+`shr $0x10` at `0x2216435`..`0x221643f`. The two `XMemMapPhysicalPagesScatter` sites pass a count already in pages
+(one read from a global, one counted in a loop), so there is no byte size to shift there. The reservations use the
+64 KiB page mode (`0x20400000`) at 17 sites, the 2 MiB mode (`0x20000000`) at 5, and no page mode at 1. The meaning
+of `flags`, and whether the page numbers in `pageArray` carry anything beyond an index, are **unmeasured**.
 
 The sequence in the first function that calls them is: `XMemAllocatePhysicalPages`, then `XMemVirtualAlloc` of a range
 with `0x20402000` and attributes `0x23`, then `XMemMapPhysicalPages` of those pages at that range. So the physical-page calls depend on the
