@@ -976,19 +976,24 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             # Every bit of the operand counts: its width, not the result's (a 64-bit operand with a 32-bit result).
             t = types.t.get(id_type.get(a[1]))
             values[res] = (val(a[1]) & wmask(id_type[a[1]] if t is not None and t[0] == "int" else a[0])).bit_count()
-        elif op == "OpISubBorrow":
-            x, y = val(a[1]) & MASK, val(a[2]) & MASK
-            values[res] = ((x - y) & MASK, 1 if x < y else 0)
-        elif op in ("OpUMulExtended", "OpSMulExtended"):
-            # Result struct {low, high} of the full 64-bit product (SPIR-V spec, 32-bit scalars only).
-            x, y = val(a[1]) & MASK, val(a[2]) & MASK
-            if op == "OpSMulExtended":
-                x, y = _s32(x), _s32(y)
-            p = (x * y) & 0xFFFFFFFFFFFFFFFF
-            values[res] = (p & MASK, p >> 32)
-        elif op == "OpIAddCarry":
-            x, y = val(a[1]) & MASK, val(a[2]) & MASK
-            values[res] = ((x + y) & MASK, (x + y) >> 32)
+        elif op in ("OpIAddCarry", "OpISubBorrow", "OpUMulExtended", "OpSMulExtended"):
+            # Result struct {low half, carry / borrow / high half of the full product}. Both members have the
+            # operands' type, 32 or 64 bits (SPIR-V spec), so the width is the member type's, not a fixed 32.
+            kind = types.t[a[0]]
+            if kind[0] != "struct" or len(kind[1]) != 2:
+                raise UnsupportedConstruct(f"{op} with result type {a[0]}")
+            bits = types.bits(kind[1][0])
+            w = (1 << bits) - 1
+            x, y = val(a[1]) & w, val(a[2]) & w
+            if op == "OpIAddCarry":
+                values[res] = ((x + y) & w, (x + y) >> bits)
+            elif op == "OpISubBorrow":
+                values[res] = ((x - y) & w, 1 if x < y else 0)
+            else:
+                if op == "OpSMulExtended":
+                    x, y = signed(x, bits), signed(y, bits)
+                p = (x * y) & ((1 << 2 * bits) - 1)
+                values[res] = (p & w, p >> bits)
         elif op == "OpIEqual":
             values[res] = val(a[1]) == val(a[2])
         elif op == "OpINotEqual":
