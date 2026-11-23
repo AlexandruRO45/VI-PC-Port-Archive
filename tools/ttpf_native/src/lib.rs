@@ -602,10 +602,18 @@ impl Kind {
 /// does not cover; `out` is then unspecified.
 pub fn decode_surface(kind: Kind, data: &[u8], blocks_w: usize, blocks_h: usize, t: &Bptc,
                       modes: &[Option<Bc6hMode>], out: &mut [f64]) -> bool {
+    decode_rows(kind, data, blocks_w, 0, blocks_h, t, modes, out)
+}
+
+/// [`decode_surface`] for the block rows `by0..by1` only; `out` holds just those rows (the
+/// pixels of block row `by0` come first), so a caller can decode a large surface in bands.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_rows(kind: Kind, data: &[u8], blocks_w: usize, by0: usize, by1: usize, t: &Bptc,
+                   modes: &[Option<Bc6hMode>], out: &mut [f64]) -> bool {
     let row = blocks_w * 4 * 3;
     let stride = kind.block_bytes();
     let mut cache: Option<(u32, [[f64; 3]; 4])> = None;
-    for by in 0..blocks_h {
+    for by in by0..by1 {
         for bx in 0..blocks_w {
             let at = (by * blocks_w + bx) * stride;
             let px: [[f64; 3]; 16] = match kind {
@@ -646,7 +654,7 @@ pub fn decode_surface(kind: Kind, data: &[u8], blocks_w: usize, blocks_h: usize,
                 Kind::Bc7 => decode_bc7(data, at, t),
             };
             for y in 0..4 {
-                let dst = (by * 4 + y) * row + bx * 4 * 3;
+                let dst = ((by - by0) * 4 + y) * row + bx * 4 * 3;
                 for x in 0..4 {
                     out[dst + 3 * x..dst + 3 * x + 3].copy_from_slice(&px[y * 4 + x]);
                 }
@@ -743,6 +751,18 @@ pub unsafe extern "C" fn ttpf_detile(src: *const u8, src_len: usize, out: *mut u
     if d.run(src, out) { 0 } else { -1 }
 }
 
+/// Blocks decoded per band by [`DecodeArgs::decode_distinct`] (about 6 MiB of doubles).
+const BAND_BLOCKS: usize = 1 << 14;
+
+/// `n` zeroed doubles, or None when the allocation fails (a surface of a few hundred megapixels
+/// would otherwise abort the process).
+fn zeroed(n: usize) -> Option<Vec<f64>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0.0);
+    Some(v)
+}
+
 /// The decoder inputs shared by [`ttpf_decode_bc`] and [`ttpf_decode_means`].
 struct DecodeArgs<'a> {
     kind: Kind,
@@ -803,10 +823,36 @@ unsafe fn decode_args<'a>(kind: u32, data: *const u8, data_len: usize, blocks_w:
 }
 
 impl DecodeArgs<'_> {
+    /// The whole surface, or None when a block is not covered or the buffer cannot be allocated
+    /// (an allocation failure must reach the caller as -1, not abort the Python process).
     fn decode(&self) -> Option<Vec<f64>> {
-        let mut px = vec![0.0f64; self.blocks_w * self.blocks_h * 48];
+        let mut px = zeroed(self.blocks_w.checked_mul(self.blocks_h)?.checked_mul(48)?)?;
         decode_surface(self.kind, self.data, self.blocks_w, self.blocks_h, &self.bptc, &self.modes, &mut px)
             .then_some(px)
+    }
+
+    /// The surface as [`Distinct`] tables, decoded in bands of block rows so that only a band of
+    /// doubles is held at once (the same tables as `distinct(&self.decode()?)`).
+    fn decode_distinct(&self) -> Option<Distinct> {
+        self.decode_distinct_in((BAND_BLOCKS / self.blocks_w).max(1))
+    }
+
+    /// [`Self::decode_distinct`] with `band` block rows per band.
+    fn decode_distinct_in(&self, band: usize) -> Option<Distinct> {
+        let band = band.clamp(1, self.blocks_h);
+        let mut buf = zeroed(self.blocks_w.checked_mul(band)?.checked_mul(48)?)?;
+        let mut b = DistinctBuilder::new(self.blocks_w.checked_mul(self.blocks_h)?.checked_mul(16)?)?;
+        let mut by = 0;
+        while by < self.blocks_h {
+            let end = (by + band).min(self.blocks_h);
+            let part = &mut buf[..(end - by) * self.blocks_w * 48];
+            if !decode_rows(self.kind, self.data, self.blocks_w, by, end, &self.bptc, &self.modes, part) {
+                return None;
+            }
+            b.push(part)?;
+            by = end;
+        }
+        Some(b.finish())
     }
 }
 
@@ -852,37 +898,71 @@ pub struct Distinct {
     pub pixels: Vec<u32>,
 }
 
-pub fn distinct(px: &[f64]) -> Distinct {
-    let n = px.len() / 3;
-    let mut d = Distinct { pixels: Vec::with_capacity(n), ..Default::default() };
-    let mut scalars: FastMap<u64> = FastMap::default();
-    let mut triples: FastMap<[u64; 3]> = FastMap::with_capacity_and_hasher(n.min(1 << 16), Default::default());
-    let mut last: Option<([u64; 3], u32)> = None;
-    for p in px.chunks_exact(3) {
-        let key = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
-        // Neighbouring pixels often repeat; skip the table for them.
-        if let Some((k, i)) = last {
-            if k == key {
-                d.pixels.push(i);
-                continue;
-            }
-        }
-        let next = d.triples.len() as u32;
-        let i = *triples.entry(key).or_insert(next);
-        if i == next {
-            let mut t = [0u32; 3];
-            for (c, k) in key.iter().enumerate() {
-                t[c] = *scalars.entry(*k).or_insert_with(|| {
-                    d.scalars.push(p[c]);
-                    (d.scalars.len() - 1) as u32
-                });
-            }
-            d.triples.push(t);
-        }
-        last = Some((key, i));
-        d.pixels.push(i);
+/// Builds [`Distinct`] from pixel buffers pushed in raster order.
+struct DistinctBuilder {
+    d: Distinct,
+    scalars: FastMap<u64>,
+    triples: FastMap<[u64; 3]>,
+    last: Option<([u64; 3], u32)>,
+}
+
+impl DistinctBuilder {
+    /// None when the `n` pixel indices cannot be allocated.
+    fn new(n: usize) -> Option<Self> {
+        let mut d = Distinct::default();
+        d.pixels.try_reserve_exact(n).ok()?;
+        Some(DistinctBuilder {
+            d,
+            scalars: FastMap::default(),
+            triples: FastMap::with_capacity_and_hasher(n.min(1 << 16), Default::default()),
+            last: None,
+        })
     }
-    d
+
+    /// Add the next pixels (three doubles each). None when a table cannot grow.
+    fn push(&mut self, px: &[f64]) -> Option<()> {
+        for p in px.chunks_exact(3) {
+            let key = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+            // Neighbouring pixels often repeat; skip the table for them.
+            if let Some((k, i)) = self.last {
+                if k == key {
+                    self.d.pixels.push(i);
+                    continue;
+                }
+            }
+            let next = self.d.triples.len() as u32;
+            // Reserve first so that growing a table fails softly instead of aborting.
+            self.triples.try_reserve(1).ok()?;
+            let i = *self.triples.entry(key).or_insert(next);
+            if i == next {
+                self.d.triples.try_reserve(1).ok()?;
+                let mut t = [0u32; 3];
+                for (c, k) in key.iter().enumerate() {
+                    self.scalars.try_reserve(1).ok()?;
+                    self.d.scalars.try_reserve(1).ok()?;
+                    let d = &mut self.d;
+                    t[c] = *self.scalars.entry(*k).or_insert_with(|| {
+                        d.scalars.push(p[c]);
+                        (d.scalars.len() - 1) as u32
+                    });
+                }
+                self.d.triples.push(t);
+            }
+            self.last = Some((key, i));
+            self.d.pixels.push(i);
+        }
+        Some(())
+    }
+
+    fn finish(self) -> Distinct {
+        self.d
+    }
+}
+
+pub fn distinct(px: &[f64]) -> Distinct {
+    let mut b = DistinctBuilder::new(px.len() / 3).expect("pixel index buffer");
+    b.push(px).expect("distinct tables");
+    b.finish()
 }
 
 /// `decode_pixels` for the BC kinds of [`Kind::from_code`], as [`Distinct`] tables.
@@ -914,11 +994,10 @@ pub unsafe extern "C" fn ttpf_decode_bc(kind: u32, data: *const u8, data_len: us
         Some(a) => a,
         None => return -1,
     };
-    let px = match args.decode() {
-        Some(p) => p,
+    let d = match args.decode_distinct() {
+        Some(d) => d,
         None => return -1,
     };
-    let d = distinct(&px);
     // SAFETY: the caller guarantees the length (see the safety section).
     let counts = unsafe { slice::from_raw_parts_mut(counts, 2) };
     counts[0] = d.triples.len();
@@ -992,6 +1071,48 @@ pub unsafe extern "C" fn ttpf_decode_means(kind: u32, data: *const u8, data_len:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banded_distinct_equals_whole_surface_distinct() {
+        // BC4 blocks with varied endpoints and indices; every band size must give the same tables.
+        let (bw, bh) = (5usize, 7usize);
+        let mut data = vec![0u8; bw * bh * 8];
+        let mut x = 0x1234_5678u32;
+        for b in data.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 24) as u8;
+        }
+        let tables = vec![0u8; 2240];
+        let args = DecodeArgs {
+            kind: Kind::Bc4,
+            data: &data,
+            blocks_w: bw,
+            blocks_h: bh,
+            bptc: Bptc {
+                part2: &tables[0..1024],
+                part3: &tables[1024..2048],
+                anchor2: &tables[2048..2112],
+                anchor3a: &tables[2112..2176],
+                anchor3b: &tables[2176..2240],
+            },
+            modes: Vec::new(),
+        };
+        let whole = distinct(&args.decode().unwrap());
+        for band in [1, 2, 3, 7, 100] {
+            let d = args.decode_distinct_in(band).unwrap();
+            assert_eq!((d.scalars.len(), d.triples.len()), (whole.scalars.len(), whole.triples.len()), "band {band}");
+            assert_eq!(d.pixels, whole.pixels, "band {band}");
+            assert_eq!(d.triples, whole.triples, "band {band}");
+            let bits = |v: &[f64]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&d.scalars), bits(&whole.scalars), "band {band}");
+        }
+    }
+
+    #[test]
+    fn zeroed_reports_an_impossible_allocation() {
+        assert_eq!(zeroed(3), Some(vec![0.0; 3]));
+        assert!(zeroed(usize::MAX / 16).is_none());
+    }
 
     #[test]
     fn f16_matches_known_values() {

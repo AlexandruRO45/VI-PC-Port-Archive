@@ -106,6 +106,27 @@ class DetileMatchesPython(unittest.TestCase):
                     out = self.assert_same(ttpf.detile_volume, layout, tiled)
                     self.assertEqual(len(out), width * height * depth * eb)
 
+    def test_volume_from_bytearray_and_memoryview_converts_once(self):
+        rng = random.Random(0xB1)
+        layout = volume_surface_layout(33, 9, 5, 1, 4)
+        tiled = rng.randbytes(layout["size"])
+        want = ttpf.detile_volume(layout, tiled)
+        for make in (bytearray, memoryview):
+            with self.subTest(make=make.__name__):
+                seen = []
+                real = ttpf.detile_volume_slice
+
+                def spy(lay, buf, z):
+                    seen.append(buf)
+                    return real(lay, buf, z)
+
+                with mock.patch.object(ttpf, "detile_volume_slice", spy):
+                    self.assertEqual(ttpf.detile_volume(layout, make(tiled)), want)
+                self.assertEqual(len(seen), layout["depth"])
+                self.assertTrue(all(b is seen[0] and type(b) is bytes for b in seen))
+        with python_only():
+            self.assertEqual(ttpf.detile_volume(layout, bytearray(tiled)), want)
+
 
 @unittest.skipIf(NATIVE is None, "tools/ttpf_native is not built")
 class DecodeMatchesPython(unittest.TestCase):
@@ -334,6 +355,44 @@ class Fallback(unittest.TestCase):
         fake.ttpf_native_abi.return_value = 2
         with mock.patch.object(ttpf, "_NATIVE", []), mock.patch("ctypes.CDLL", return_value=fake):
             self.assertIsNone(ttpf._native())
+
+    def load_with(self, **patches):
+        """`_native()` on a fresh cache, for a library file that exists."""
+        with mock.patch.object(ttpf, "_NATIVE", []), mock.patch.object(ttpf.os.path, "isfile", return_value=True):
+            with mock.patch.dict(os.environ, {"LEONIDA_TTPF_NATIVE": "1"}):
+                return ttpf._native()
+
+    def test_missing_ctypes_falls_back(self):
+        with mock.patch.dict(sys.modules, {"ctypes": None}):
+            self.assertIsNone(self.load_with())
+
+    def test_unloadable_library_falls_back(self):
+        with mock.patch("ctypes.CDLL", side_effect=OSError("not a library")):
+            self.assertIsNone(self.load_with())
+
+    def test_stub_library_missing_a_symbol_falls_back(self):
+        for missing in ("ttpf_native_abi", "ttpf_detile", "ttpf_decode_bc", "ttpf_decode_means"):
+            with self.subTest(missing=missing):
+                names = {"ttpf_native_abi", "ttpf_detile", "ttpf_decode_bc", "ttpf_decode_means"} - {missing}
+                stub = mock.Mock(spec=sorted(names))  # any other attribute raises AttributeError
+                if "ttpf_native_abi" in names:
+                    stub.ttpf_native_abi.return_value = 1
+                with mock.patch("ctypes.CDLL", return_value=stub):
+                    self.assertIsNone(self.load_with())
+
+    def test_complete_stub_library_is_used(self):
+        stub = mock.Mock()
+        stub.ttpf_native_abi.return_value = 1
+        with mock.patch("ctypes.CDLL", return_value=stub):
+            self.assertIs(self.load_with(), stub)
+
+    def test_fallback_after_a_failed_load_still_decodes(self):
+        with mock.patch("ctypes.CDLL", return_value=mock.Mock(spec=["ttpf_native_abi"], **{
+                "ttpf_native_abi.return_value": 1})):
+            with mock.patch.object(ttpf, "_NATIVE", []), mock.patch.object(ttpf.os.path, "isfile", return_value=True):
+                layout = ttpf.surface_layout(16, 16, 71, 1, 4096)
+                self.assertEqual(len(ttpf.detile(layout, layout["mips"][0], bytes(layout["size"]))), 16 * 8)
+                self.assertEqual(ttpf._NATIVE, [None])
 
 
 if __name__ == "__main__":

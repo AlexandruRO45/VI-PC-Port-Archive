@@ -256,26 +256,27 @@ def _native():
     if not _NATIVE:
         lib = None
         if os.environ.get("LEONIDA_TTPF_NATIVE", "1") != "0":
-            import ctypes
             name = {"win32": "ttpf_native.dll",
                     "darwin": "libttpf_native.dylib"}.get(sys.platform, "libttpf_native.so")
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "ttpf_native", "target", "release", name)
             if os.path.isfile(path):
+                # A Python without ctypes, a library that does not load and one that lacks a
+                # symbol (a stub or another build) all mean: run the Python code.
                 try:
+                    import ctypes
                     lib = ctypes.CDLL(path)
                     if lib.ttpf_native_abi() != 1:
-                        lib = None
-                except (OSError, AttributeError):
+                        raise OSError("unsupported ttpf_native interface")
+                    n, p, buf = ctypes.c_size_t, ctypes.c_void_p, ctypes.c_char_p
+                    lib.ttpf_detile.argtypes = [buf, n, p, n, p, p, n, n]
+                    lib.ttpf_decode_bc.argtypes = [ctypes.c_uint32, buf, n, n, n, buf, p, n, p, p, p, n, p]
+                    lib.ttpf_decode_means.argtypes = [ctypes.c_uint32, buf, n, n, n, buf, p, n,
+                                                      n, n, n, n, n, p, n]
+                    for fn in (lib.ttpf_detile, lib.ttpf_decode_bc, lib.ttpf_decode_means):
+                        fn.restype = ctypes.c_ssize_t
+                except (ImportError, OSError, AttributeError):
                     lib = None
-            if lib is not None:
-                n, p, buf = ctypes.c_size_t, ctypes.c_void_p, ctypes.c_char_p
-                lib.ttpf_detile.argtypes = [buf, n, p, n, p, p, n, n]
-                lib.ttpf_decode_bc.argtypes = [ctypes.c_uint32, buf, n, n, n, buf, p, n, p, p, p, n, p]
-                lib.ttpf_decode_means.argtypes = [ctypes.c_uint32, buf, n, n, n, buf, p, n,
-                                                  n, n, n, n, n, p, n]
-                for fn in (lib.ttpf_detile, lib.ttpf_decode_bc, lib.ttpf_decode_means):
-                    fn.restype = ctypes.c_ssize_t
         _NATIVE.append(lib)
     return _NATIVE[0]
 
@@ -626,6 +627,8 @@ def detile_volume_slice(layout, tiled, z):
 
 def detile_volume(layout, tiled):
     """Detile all Z slices of a 3D SW_4KB_S volume into Z-major linear order."""
+    if isinstance(tiled, (bytearray, memoryview)):
+        tiled = _native_bytes(tiled) or tiled  # one copy here, not one per slice
     return b"".join(detile_volume_slice(layout, tiled, z) for z in range(layout["depth"]))
 
 
