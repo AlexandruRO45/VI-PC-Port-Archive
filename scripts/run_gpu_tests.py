@@ -24,7 +24,7 @@ TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
-from build import CLIP_CASES, clip_container, shader_source
+from build import CLIP_CASES, asm_fssm, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
                    fmt_xy_xyz_test, tbuffer_store_test)
 from compute_fixture import compute_header
@@ -582,6 +582,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
+              "ps_interp_f16_table": "vs_interp_f16.asm",
               SIGNED_MIP_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
@@ -754,10 +755,15 @@ def run_suite(a, work: str) -> int:
             dxbc = make_dxbc([])
         with open(os.path.join(work, f"{name}.dxbc"), "wb") as f:
             f.write(dxbc)
+        fname = shader_source(name) + ".asm"
         if name.startswith("cs_"):
             with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
                 f.write(compute_header(os.path.join(SHADER_DIR, fname)))
-        fname = shader_source(name) + ".asm"
+        elif program := asm_fssm(os.path.join(SHADER_DIR, fname)):
+            # A vs_/ps_ fixture's own "; fssm-at / ; fssm-data" words, as build.py publishes them. Without the
+            # sidecar the translator never sees a pixel-input table (or the FSSM wave size) for the fixture.
+            with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
+                f.write(program)
         disasm_path = os.path.join(disasm_dir, f"{name}.s")
         assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
         disasm_files.append(disasm_path)
@@ -1277,6 +1283,8 @@ def run_suite(a, work: str) -> int:
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
+                # 16-bit-flagged FSSM table positions read through a 32-bit v_interp: f16-rounded, unflagged exact
+                "ps_interp_f16_table": (0x3F8CC000, 0x3F8CCCCD, 0x3F8CC000, 0x3F8CCCCD),
                 # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)
                 "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),

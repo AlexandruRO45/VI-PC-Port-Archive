@@ -379,6 +379,9 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
               "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
               "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000),
+              # 32-bit v_interp reads of 16-bit-flagged FSSM table positions are rounded to f16, unflagged ones
+              # are not: both read methods (p1/p2 and mov) in one frame (ps_interp_f16_table.asm header)
+              "ps_interp_f16_table": (0x3f8cc000, 0x3f8ccccd, 0x3f8cc000, 0x3f8ccccd),
               # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (derivations in the .asm headers)
               "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
               "ps_valu16_subrev": (0xaaaabc00, 0xaaaac000, 0xaaaa3c00, 0x42003800),
@@ -431,7 +434,8 @@ PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_
                       "ps_mandelbrot"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
 PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
-                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
+                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts",
+                "ps_interp_f16_table": "vs_interp_f16"}
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 SIGNED_MIP_TEST = "ps_sample_implicit_sint"
