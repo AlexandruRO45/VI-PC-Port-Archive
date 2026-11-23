@@ -1,15 +1,18 @@
 // Cross-queue synchronization and lifetime regressions for storage-image initialization (runtime/src/vulkan_backend.h):
 //   1. Destroying the initializing queue before another queue submits must not leave storage_init waiting on a
-//      destroyed VkSemaphore (VUID-VkSubmitInfo-pWaitSemaphores-parameter), and a subsequent batch on another queue
-//      needs no redundant wait after initialization already completed.
+//      destroyed VkSemaphore (VUID-VkSubmitInfo-pWaitSemaphores-parameter); the first consumer (including a fresh
+//      shader queue submitting after GPU completion) retains a queue timeline wait to establish Vulkan's
+//      signal-to-batch memory dependency, and subsequent submissions on that queue omit redundant waits.
 //   2. Destroying the initializing queue while another queue's submission waiting on storage initialization is still
 //      in flight on the GPU must not destroy a waited-on VkSemaphore (VUID-vkDestroySemaphore-semaphore-05149).
-//   3. A second batch on another queue while storage initialization is still in flight on the initializing queue must
-//      still wait for storage initialization (not skip the wait after batch 1 submitted).
+//   3. While storage initialization on Queue A is still in flight, unrelated empty and CopyBuffer submissions on Queue B
+//      emit zero waits and finish immediately; a submission touching an initialized storage image waits on
+//      storage_init_timeline_, and a subsequent shader submission on Queue B emits zero redundant waits.
 //   4. Chained storage initializations across different queues stay strictly ordered via the context-owned timeline
 //      semaphore.
-//   5. Failed submission rolls back storage_pending_ without leaking waits_ entries, and remove_resource() clears
-//      pending storage-init entries.
+//   5. Failed submission rolls back storage_pending_ without leaking waits_ entries or advancing storage_init_seen_, and
+//      remove_resource() clears both pending and initialized storage-init entries.
+//   6. Timeline semaphore creation failure marks VulkanContext unloaded, VulkanQueue not ok, and execute unsupported.
 // Skips (77) without a Vulkan 1.3 device. No shaders or game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -90,6 +93,7 @@ std::vector<std::pair<VkSemaphore, std::uint64_t>> last_signals;
 std::atomic<bool> waited_on_destroyed{false};
 std::atomic<bool> destroyed_while_in_flight{false};
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
+std::atomic<VkResult> fail_next_create_semaphore{VK_SUCCESS};
 
 const VkTimelineSemaphoreSubmitInfo* find_timeline_info(const void* pNext) {
     for (const auto* next = static_cast<const VkBaseInStructure*>(pNext); next; next = next->pNext) {
@@ -101,6 +105,8 @@ const VkTimelineSemaphoreSubmitInfo* find_timeline_info(const void* pNext) {
 
 VKAPI_ATTR VkResult VKAPI_CALL create_semaphore(VkDevice device, const VkSemaphoreCreateInfo* info,
                                                   const VkAllocationCallbacks* alloc, VkSemaphore* out) {
+    const VkResult armed = fail_next_create_semaphore.exchange(VK_SUCCESS);
+    if (armed != VK_SUCCESS) return armed;
     const VkResult res = real_create_semaphore(device, info, alloc, out);
     if (res == VK_SUCCESS && out && *out) {
         std::lock_guard lock(mu);
@@ -344,6 +350,12 @@ CommandList make_copy_buf_list(ResourceId dst_buf, ResourceId src_buf, std::uint
     return list;
 }
 
+CommandList make_empty_list() {
+    CommandList list;
+    list.close();
+    return list;
+}
+
 bool check_zero_texels(const void* ptr) {
     const auto* words = static_cast<const std::uint32_t*>(ptr);
     for (std::uint32_t i = 0; i < kTex * kTex; ++i) {
@@ -472,7 +484,8 @@ int main() {
     const CommandList* dispatch_ptr = &dispatch_list;
 
     // 1. Destroying the initializing queue before another queue submits must not leave storage-init waiting on a
-    //    destroyed VkSemaphore, and subsequent Queue B submissions skip waits once complete.
+    //    destroyed VkSemaphore; first consumers (including a fresh shader queue after GPU completion) still wait once
+    //    for memory visibility, while subsequent submissions on the same consumer queue skip redundant waits.
     {
         void* rb1_map = nullptr;
         VkBuffer rb1_buf = d.buffer(kReadbackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb1_map);
@@ -487,22 +500,42 @@ int main() {
 
         VulkanQueue queueB(ctx, qB, qB_family, qB_kind);
         EXPECT(queueB.ok());
+        VkSemaphore timeline = VK_NULL_HANDLE;
+        std::uint64_t val1 = 0;
         {
             VulkanQueue queueA(ctx, d.queue, d.family, Kind::direct);
             EXPECT(queueA.ok());
             EXPECT(queueA.execute({&dispatch_ptr, 1}) == ReplayResult::success);
+            const auto a_signals = driver::signals();
+            EXPECT(a_signals.size() == 2);
+            timeline = a_signals[1].first;
+            val1 = a_signals[1].second;
+            EXPECT(timeline != VK_NULL_HANDLE && val1 > 0);
         }
 
         const CommandList copy1 = make_copy_tex_list(kRb1, kImg1);
         const CommandList* copy1_ptr = &copy1;
         EXPECT(queueB.execute({&copy1_ptr, 1}) == ReplayResult::success);
         EXPECT(!driver::waited_on_destroyed.load());
-        // Queue A already idled inside ~VulkanQueue, so Queue B's submission should not carry a redundant wait.
-        EXPECT(driver::waits().empty());
+        std::uint64_t b1_val = 0;
+        EXPECT(driver::waited_for(timeline, &b1_val) && b1_val == val1);
         EXPECT(queueB.idle());
         EXPECT(check_zero_texels(rb1_map));
+
+        EXPECT(queueB.execute({&copy1_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::waits().empty());
+        EXPECT(queueB.idle());
+
+        VulkanQueue queueC(ctx, qB, qB_family, qB_kind);
+        EXPECT(queueC.ok());
+        EXPECT(queueC.execute({&dispatch_ptr, 1}) == ReplayResult::success);
+        std::uint64_t c1_val = 0;
+        EXPECT(driver::waited_for(timeline, &c1_val) && c1_val == val1);
+        EXPECT(queueC.execute({&dispatch_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::waits().empty());
+        EXPECT(queueC.idle());
     }
-    std::printf("1/5 destroyed initializing queue before second queue submit: ok\n");
+    std::printf("1/6 destroyed initializing queue and first-consumer memory-dep wait: ok\n");
 
     // 2. Destroying the initializing queue while Queue B has an in-flight gated submission waiting on storage init
     //    must keep the awaited semaphore alive (no VUID-vkDestroySemaphore-semaphore-05149).
@@ -550,13 +583,13 @@ int main() {
         }
         EXPECT(queueB.idle());
         EXPECT(check_zero_texels(rb2_map));
-        std::printf("2/5 destroyed initializing queue during in-flight waiter: ok\n");
+        std::printf("2/6 destroyed initializing queue during in-flight waiter: ok\n");
     } else {
-        std::printf("2/5 skipped: device exposes a single queue\n");
+        std::printf("2/6 skipped: device exposes a single queue\n");
     }
 
-    // 3. Multiple Queue B batches while storage initialization on Queue A is still in flight: batch 2 must also wait
-    //    on storage init; batch 3 after completion has zero waits.
+    // 3. Unrelated empty and CopyBuffer work on Queue B must not block while Queue A's init is in flight, whereas
+    //    touching the initialized storage image waits once on storage_init_timeline_ and covers subsequent shaders.
     if (distinct_vk_queues) {
         VkSemaphore gateA3 = make_timeline();
         EXPECT(gateA3);
@@ -579,37 +612,43 @@ int main() {
 
         queueA.wait(gateA3, 1);
         EXPECT(queueA.execute({&dispatch_ptr, 1}) == ReplayResult::success);
-        const auto a_waits = driver::waits();
-        EXPECT(a_waits.size() == 1 && a_waits[0].first == gateA3 && a_waits[0].second == 1);
         const auto a_signals = driver::signals();
         EXPECT(a_signals.size() == 2);
         const VkSemaphore timeline = a_signals[1].first;
-        const std::uint64_t val1 = a_signals[1].second;
-        EXPECT(timeline != VK_NULL_HANDLE && val1 > 0);
+        const std::uint64_t val3 = a_signals[1].second;
+        EXPECT(timeline != VK_NULL_HANDLE && val3 > 1);
+        std::uint64_t gate_val = 0, chain_val = 0;
+        EXPECT(driver::waited_for(gateA3, &gate_val) && gate_val == 1);
+        EXPECT(driver::waited_for(timeline, &chain_val) && chain_val == val3 - 1);
+
+        const CommandList empty_list = make_empty_list();
+        const CommandList* empty_ptr = &empty_list;
+        EXPECT(queueB.execute({&empty_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::waits().empty());
+        EXPECT(queueB.idle());
 
         const CommandList dummy_copy = make_copy_buf_list(kDummyDst, kDummySrc);
         const CommandList* dummy_ptr = &dummy_copy;
         EXPECT(queueB.execute({&dummy_ptr, 1}) == ReplayResult::success);
-        std::uint64_t b1_val = 0;
-        EXPECT(driver::waited_for(timeline, &b1_val) && b1_val == val1);
+        EXPECT(driver::waits().empty());
+        EXPECT(queueB.idle());
 
         const CommandList copy3 = make_copy_tex_list(kRb3, kImg3);
         const CommandList* copy3_ptr = &copy3;
         EXPECT(queueB.execute({&copy3_ptr, 1}) == ReplayResult::success);
-        std::uint64_t b2_val = 0;
-        EXPECT(driver::waited_for(timeline, &b2_val) && b2_val == val1);
+        std::uint64_t b_copy_val = 0;
+        EXPECT(driver::waited_for(timeline, &b_copy_val) && b_copy_val == val3);
+
+        EXPECT(queueB.execute({&dispatch_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::waits().empty());
 
         EXPECT(host_signal(gateA3, 1));
         unblock.active = false;
         EXPECT(queueA.idle() && queueB.idle());
         EXPECT(check_zero_texels(rb3_map));
-
-        EXPECT(queueB.execute({&dummy_ptr, 1}) == ReplayResult::success);
-        EXPECT(driver::waits().empty());
-        EXPECT(queueB.idle());
-        std::printf("3/5 second batch on Queue B still waits while init is in flight: ok\n");
+        std::printf("3/6 unrelated non-shader Queue B work unblocked while storage-init waits once: ok\n");
     } else {
-        std::printf("3/5 skipped: device exposes a single queue\n");
+        std::printf("3/6 skipped: device exposes a single queue\n");
     }
 
     // 4. Chained monotonic storage-init signaling across two queues.
@@ -660,14 +699,16 @@ int main() {
         const CommandList copy4b = make_copy_tex_list(kRb4b, kImg4b);
         const CommandList* copies4[] = {&copy4a, &copy4b};
         EXPECT(queueB.execute(copies4) == ReplayResult::success);
+        EXPECT(driver::waits().empty());
         EXPECT(queueA.idle() && queueB.idle());
         EXPECT(check_zero_texels(rb4a_map) && check_zero_texels(rb4b_map));
-        std::printf("4/5 chained cross-queue storage-init signaling: ok\n");
+        std::printf("4/6 chained cross-queue storage-init signaling: ok\n");
     } else {
-        std::printf("4/5 skipped: device exposes a single queue\n");
+        std::printf("4/6 skipped: device exposes a single queue\n");
     }
 
-    // 5. Failed submit rollback (storage_pending_ restored, no leaked wait on next queue) and remove_resource() cleanup.
+    // 5. Failed submit rollback (storage_pending_ restored, no leaked wait or stale storage_init_seen_) and
+    //    remove_resource() cleanup of both pending and initialized entries.
     {
         // 5a: Failed submit on initializer preserves storage_pending_ for retry.
         void* rb5a_map = nullptr;
@@ -694,7 +735,7 @@ int main() {
         EXPECT(queueA.idle());
         EXPECT(check_zero_texels(rb5a_map));
 
-        // 5b: Failed submit while waiting on storage init must not leak the storage-init wait into waits_.
+        // 5b: Failed submit while waiting on storage init must not leak waits_ or advance storage_init_seen_.
         if (distinct_vk_queues) {
             VkSemaphore gate5b = make_timeline();
             EXPECT(gate5b);
@@ -716,23 +757,30 @@ int main() {
             const auto sig = driver::signals();
             EXPECT(sig.size() == 2);
 
-            const CommandList dummy_copy = make_copy_buf_list(kDummyDst, kDummySrc);
-            const CommandList* dummy_ptr = &dummy_copy;
             driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
-            EXPECT(queueB.execute({&dummy_ptr, 1}) == ReplayResult::unsupported);
-            EXPECT(driver::waited_for(sig[1].first));
+            EXPECT(queueB.execute({&dispatch_ptr, 1}) == ReplayResult::unsupported);
+            std::uint64_t failed_wait_val = 0;
+            EXPECT(driver::waited_for(sig[1].first, &failed_wait_val) && failed_wait_val == sig[1].second);
 
             EXPECT(host_signal(gate5b, 1));
             unblock.active = false;
             queueA2.reset();
 
+            const CommandList dummy_copy = make_copy_buf_list(kDummyDst, kDummySrc);
+            const CommandList* dummy_ptr = &dummy_copy;
             EXPECT(queueB.execute({&dummy_ptr, 1}) == ReplayResult::success);
             EXPECT(!driver::waited_on_destroyed.load());
+            EXPECT(driver::waits().empty());
+
+            EXPECT(queueB.execute({&dispatch_ptr, 1}) == ReplayResult::success);
+            std::uint64_t retry_wait_val = 0;
+            EXPECT(driver::waited_for(sig[1].first, &retry_wait_val) && retry_wait_val == sig[1].second);
+            EXPECT(queueB.execute({&dispatch_ptr, 1}) == ReplayResult::success);
             EXPECT(driver::waits().empty());
             EXPECT(queueB.idle());
         }
 
-        // 5c: remove_resource() clears storage_pending_ so reusing the ResourceId later triggers no spurious init.
+        // 5c: remove_resource() clears both storage_pending_ and storage_initialized_at_.
         VkImage img5c = d.image(VK_FORMAT_R32_UINT, kTex, kTex, 1,
                                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT);
@@ -748,8 +796,44 @@ int main() {
         EXPECT(queueA.execute({&dispatch_ptr, 1}) == ReplayResult::success);
         EXPECT(driver::signals().size() == 1);
         EXPECT(queueA.idle());
+
+        VkImage img5d = d.image(VK_FORMAT_R32_UINT, kTex, kTex, 1,
+                                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        VkImage img5d_reuse = d.image(VK_FORMAT_R32_UINT, kTex, kTex, 1,
+                                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                          VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        EXPECT(img5d && img5d_reuse && prefill_image(d, img5d) &&
+               prefill_image(d, img5d_reuse, VK_IMAGE_LAYOUT_GENERAL));
+        constexpr ResourceId kReuseInit = 54;
+        ctx.add_resource(kReuseInit, make_storage_binding(img5d), VK_IMAGE_LAYOUT_UNDEFINED);
+        ctx.note_storage_image(kReuseInit);
+        EXPECT(queueA.execute({&dispatch_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::signals().size() == 2);
+        EXPECT(queueA.idle());
+        ctx.remove_resource(kReuseInit);
+        ctx.add_resource(kReuseInit, make_storage_binding(img5d_reuse), VK_IMAGE_LAYOUT_GENERAL);
+
+        VulkanQueue queueB_5c(ctx, qB, qB_family, qB_kind);
+        EXPECT(queueB_5c.ok());
+        const CommandList copy5d = make_copy_tex_list(kRb5a, kReuseInit);
+        const CommandList* copy5d_ptr = &copy5d;
+        EXPECT(queueB_5c.execute({&copy5d_ptr, 1}) == ReplayResult::success);
+        EXPECT(driver::waits().empty());
+        EXPECT(queueB_5c.idle());
     }
-    std::printf("5/5 failed-submit rollback and remove_resource cleanup: ok\n");
+    std::printf("5/6 failed-submit rollback and remove_resource cleanup: ok\n");
+
+    // 6. Failed storage_init_timeline_ creation propagates through loaded(), ok(), and execute().
+    {
+        driver::fail_next_create_semaphore.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+        VulkanContext bad_ctx(driver::get_device, d.device, true);
+        EXPECT(!bad_ctx.loaded());
+        VulkanQueue bad_queue(bad_ctx, d.queue, d.family, Kind::direct);
+        EXPECT(!bad_queue.ok());
+        EXPECT(bad_queue.execute({&dispatch_ptr, 1}) == ReplayResult::unsupported);
+    }
+    std::printf("6/6 timeline semaphore creation failure propagation: ok\n");
 
     if (d.validation) {
         std::printf("validation errors: %u\n", d.validation_errors());
