@@ -135,7 +135,7 @@ def load_manifest(path: str) -> dict[str, dict]:
         return result
 
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             doc = json.load(f, object_pairs_hook=unique_object)
     except ValueError as err:
         raise ManifestError(f"{path} is not valid JSON ({err})") from None

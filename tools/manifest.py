@@ -194,7 +194,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
 def load_manifest(manifest: str) -> dict:
     """The manifest's "files" table, checked entry by entry, so a damaged file is reported by name rather than
     as a JSONDecodeError, KeyError or TypeError traceback halfway through verify."""
-    with open(manifest, encoding="utf-8") as f:
+    with open(manifest, encoding="utf-8-sig") as f:
         try:
             doc = json.load(f, object_pairs_hook=_reject_duplicate_keys)
         except ValueError as error:  # JSONDecodeError, duplicate keys, or UnicodeDecodeError for non-UTF-8
