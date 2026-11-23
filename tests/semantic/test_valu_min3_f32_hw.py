@@ -651,6 +651,48 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         ])
         self.assertEqual(words[0], SUBNORM_MIN)
 
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    def test_negative_dst_rejection(self):
+        with self.assertRaises(TypeError):
+            VMin3F32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+
+    def test_out_of_bounds_register_rejection(self):
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_mutation_operator_inverted_to_max(self):
+        # If min is mutated to max, min(1, 2, 3) would return 3 instead of 1
+        a, b, c = ONE_F32, TWO_F32, THREE_F32
+        correct = ref_min3_f32(a, b, c)
+        mutated = max(u32_to_f32(a), u32_to_f32(b), u32_to_f32(c))
+        self.assertNotEqual(correct, f32_to_u32(mutated))
+
+    def test_mutation_dropped_third_operand(self):
+        # If src2 is dropped, min(10.0, 8.0, 1.0) would return 8.0 instead of 1.0
+        s0 = f32_to_u32(10.0)
+        s1 = f32_to_u32(8.0)
+        s2 = f32_to_u32(1.0)
+        correct = ref_min3_f32(s0, s1, s2)
+        dropped = ref_min2_f32(s0, s1)
+        self.assertEqual(correct, s2)
+        self.assertNotEqual(correct, dropped)
+
+    def test_mutation_omitted_clamp(self):
+        # Clamping 2.0 must saturate to 1.0
+        val = TWO_F32
+        clamped = ref_min3_f32(val, val, val, clamp=True)
+        unclamped = ref_min3_f32(val, val, val, clamp=False)
+        self.assertEqual(clamped, ONE_F32)
+        self.assertEqual(unclamped, TWO_F32)
+        self.assertNotEqual(clamped, unclamped)
+
 
 if __name__ == "__main__":
     unittest.main()
