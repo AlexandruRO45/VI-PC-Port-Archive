@@ -1460,6 +1460,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_fma_packed COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/fma_packed.py"
         check "$<TARGET_FILE:cpu_fma_packed>" "$<TARGET_FILE:cpu_fma_packed_lifted>")
     set_tests_properties(cpu_aot_fma_packed PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_sse_float_arith sse_float_arith)
+    set(sse_float_arith_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse_float_arith_lifted.cpp")
+    add_custom_command(OUTPUT "${sse_float_arith_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse_float_arith.py"
+            emit "$<TARGET_FILE:cpu_sse_float_arith>" "${sse_float_arith_fixture}"
+        DEPENDS cpu_sse_float_arith tests/cpu/sse_float_arith.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_sse_float_arith_lifted SHARED "${sse_float_arith_fixture}")
+    add_test(NAME cpu_aot_sse_float_arith COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse_float_arith.py"
+        check "$<TARGET_FILE:cpu_sse_float_arith>" "$<TARGET_FILE:cpu_sse_float_arith_lifted>")
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.

@@ -180,6 +180,21 @@ template<class F, class U> static F fma_x86(F s0, F s1, F s2, int order, bool ne
     if (std::isnan(c)) return quiet_nan<F, U>(c);
     return std::fma(neg_p ? -a : a, b, neg_c ? -c : c);
 }
+static inline bool is_nan_f32(uint32_t u) {
+    return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0;
+}
+static inline uint32_t sse_arith_f32(uint32_t a, uint32_t b, char op) {
+    constexpr uint32_t quiet = 1u << 22;
+    if (is_nan_f32(a)) return a | quiet;
+    if (is_nan_f32(b)) return b | quiet;
+    float x, y;
+    memcpy(&x, &a, 4);
+    memcpy(&y, &b, 4);
+    const float r = (op == '+') ? x + y : (op == '-') ? x - y : (op == '*') ? x * y : x / y;
+    uint32_t ur;
+    memcpy(&ur, &r, 4);
+    return is_nan_f32(ur) ? 0xffc00000u : ur;
+}
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
@@ -308,9 +323,14 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.VPSLLDQ, M.VPUNPCKHQDQ, M.VPUNPCKLQDQ,
     }
     has_wide |= any(i.mnemonic in shuffle_ops for i in body)
+    sse_float_arith_ops = {
+        M.ADDPS: "'+'",
+        M.SUBPS: "'-'",
+        M.MULPS: "'*'",
+        M.DIVPS: "'/'",
+    }
     packed_float_ops = {
-        M.ADDPS: ("ps", "_mm_add_ps", False), M.SUBPS: ("ps", "_mm_sub_ps", False), M.MULPS: ("ps", "_mm_mul_ps", False),
-        M.DIVPS: ("ps", "_mm_div_ps", False), M.MAXPS: ("ps", "_mm_max_ps", False), M.MINPS: ("ps", "_mm_min_ps", False),
+        M.MAXPS: ("ps", "_mm_max_ps", False), M.MINPS: ("ps", "_mm_min_ps", False),
         M.ANDPS: ("ps", "_mm_and_ps", False), M.ANDNPS: ("ps", "_mm_andnot_ps", False), M.ORPS: ("ps", "_mm_or_ps", False),
         M.XORPS: ("ps", "_mm_xor_ps", False), M.SQRTPS: ("sqrt_ps", "_mm_sqrt_ps", False),
         M.MAXSS: ("ss", "_mm_max_ss", False), M.MINSS: ("ss", "_mm_min_ss", False), M.SQRTSS: ("sqrt_ss", "_mm_sqrt_ss", False),
@@ -336,10 +356,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
+    has_sse_float_arith = any(i.mnemonic in sse_float_arith_ops for i in body)
+    if has_sse_float_arith:
+        lines.append("_mm_setcsr((_mm_getcsr() & 0x3fu) | 0x1f80u);")
     avx2_perm_ops = (M.VBROADCASTI128, M.VEXTRACTI128, M.VINSERTI128, M.VPBLENDD,
                      M.VPERM2I128, M.VPERMD, M.VPERMPS, M.VPERMQ, M.VPERMPD)
     has_wide |= any(i.mnemonic in avx2_perm_ops for i in body)
-    has_wide |= any(i.mnemonic in sse2_int_ops for i in body)
+    has_wide |= any(i.mnemonic in sse2_int_ops or i.mnemonic in sse_float_arith_ops for i in body)
     needs_xmm_math = any(i.mnemonic == M.VMOVD or
                         (i.mnemonic == M.VPADDD and i.op2_kind == K.REGISTER) for i in body)
     if has_wide and needs_xmm_math:
@@ -1518,6 +1541,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                     f"std::array<uint8_t, 16> res; memcpy(res.data(), {src1}.data(), res.size()); "
                     f"memcpy(res.data(), &r, sizeof(float)); memcpy({dst}.data(), res.data(), res.size()); "
                     f"{' memset(' + dst + '.data()+16, 0, 16);' if is_vex else ''} }}")
+        elif op in sse_float_arith_ops and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and has_wide:
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                src_init = f"std::array<uint8_t,16> rhs; memcpy(rhs.data(), {wide_xmm[i.op1_register]}.data(), 16);"
+            else:
+                raise ValueError(f"unsupported SSE float arithmetic source at {i.ip:#x}: {i}")
+            sign = sse_float_arith_ops[op]
+            stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=4) {{ "
+                    f"uint32_t a, b; memcpy(&a, {dst}.data()+n, 4); memcpy(&b, rhs.data()+n, 4); "
+                    f"const uint32_t r = sse_arith_f32(a, b, {sign}); memcpy({dst}.data()+n, &r, 4); }} }}")
         elif op in packed_float_ops:
             kind, fn, is_vex = packed_float_ops[op]
             expected_encoding = EncodingKind.VEX if is_vex else EncodingKind.LEGACY

@@ -1,0 +1,11 @@
+EXPORTS
+    addps_op
+    subps_op
+    mulps_op
+    divps_op
+    addps_self_op
+    subps_self_op
+    mulps_self_op
+    divps_self_op
+    addps_xmm1_dst_op
+    addps_xmm2_dst_op
