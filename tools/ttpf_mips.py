@@ -248,42 +248,51 @@ def detile(layout, mip, tiled):
     x_bits = [(1 << bit, s - 1) for bit, s in enumerate(pat) if s > 0]
     y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
 
-    x_offs = [0] * w
-    max_x = 0
-    for x in range(w):
+    row_stride = tiles_x * tile
+
+    def y_base_of(y):
+        o = (y // bh) * row_stride
+        yy = y + ty
+        for mask, shift in y_bits:
+            if (yy >> shift) & 1:
+                o |= mask
+        return o
+
+    def x_off_of(x):
         o = (x // bw) * tile
         xx = x + tx
         for mask, shift in x_bits:
             if (xx >> shift) & 1:
                 o |= mask
-        x_offs[x] = o
-        if o > max_x:
-            max_x = o
+        return o
 
-    y_bases = [0] * h
-    max_y = 0
-    for y in range(h):
-        o = (y // bh) * tiles_x * tile
-        yy = y + ty
-        for mask, shift in y_bits:
-            if (yy >> shift) & 1:
-                o |= mask
-        y_bases[y] = o
-        if o > max_y:
-            max_y = o
+    if h == 1:
+        # A single row has no X-table reuse: stream it, allocating no per-column or per-row tables.
+        y_base = y_base_of(0)
+        for x in range(w):
+            off = y_base + x_off_of(x)
+            at = x * eb
+            out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    x_offs = [x_off_of(x) for x in range(w)]
+    max_x = max(x_offs)
+    max_y = max(map(y_base_of, range(h)))
 
     if len(tiled) >= max_y + max_x + eb:
         x_runs = _coalesce_x_runs(x_offs, eb)
         src = memoryview(tiled)
         dst = memoryview(out)
         at = 0
-        for y_base in y_bases:
+        for y in range(h):
+            y_base = y_base_of(y)
             for xo, run in x_runs:
                 off = y_base + xo
                 dst[at:at + run] = src[off:off + run]
                 at += run
     else:
-        for y, y_base in enumerate(y_bases):
+        for y in range(h):
+            y_base = y_base_of(y)
             row_at = y * w * eb
             for x, xo in enumerate(x_offs):
                 off = y_base + xo
@@ -312,40 +321,49 @@ def detile_volume_slice(layout, tiled, z):
     x_bits = [(1 << bit, s - 1) for bit, s in enumerate(pat) if 0 < s < 100]
     y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
 
-    x_offs = [0] * w
-    max_x = 0
-    for x in range(w):
+    row_stride = tiles_x * tile
+
+    def y_base_of(y):
+        o = z_base + (y // bh) * row_stride + z_in_tile
+        for mask, shift in y_bits:
+            if (y >> shift) & 1:
+                o |= mask
+        return o
+
+    def x_off_of(x):
         o = (x // bw) * tile
         for mask, shift in x_bits:
             if (x >> shift) & 1:
                 o |= mask
-        x_offs[x] = o
-        if o > max_x:
-            max_x = o
+        return o
 
-    y_bases = [0] * h
-    max_y = 0
-    for y in range(h):
-        o = z_base + (y // bh) * tiles_x * tile + z_in_tile
-        for mask, shift in y_bits:
-            if (y >> shift) & 1:
-                o |= mask
-        y_bases[y] = o
-        if o > max_y:
-            max_y = o
+    if h == 1:
+        # A single row has no X-table reuse: stream it, allocating no per-column or per-row tables.
+        y_base = y_base_of(0)
+        for x in range(w):
+            off = y_base + x_off_of(x)
+            at = x * eb
+            out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    x_offs = [x_off_of(x) for x in range(w)]
+    max_x = max(x_offs)
+    max_y = max(map(y_base_of, range(h)))
 
     if len(tiled) >= max_y + max_x + eb:
         x_runs = _coalesce_x_runs(x_offs, eb)
         src = memoryview(tiled)
         dst = memoryview(out)
         at = 0
-        for y_base in y_bases:
+        for y in range(h):
+            y_base = y_base_of(y)
             for xo, run in x_runs:
                 off = y_base + xo
                 dst[at:at + run] = src[off:off + run]
                 at += run
     else:
-        for y, y_base in enumerate(y_bases):
+        for y in range(h):
+            y_base = y_base_of(y)
             row_at = y * w * eb
             for x, xo in enumerate(x_offs):
                 off = y_base + xo
