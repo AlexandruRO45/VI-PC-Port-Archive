@@ -30,7 +30,14 @@
 #include <mutex>
 #include <string>
 
+#include "host_tls.h"
 #include "shims.h"
+
+// src/host_tls_pad.cpp: the runtime's only static TLS variable, the block the title's template is copied into.
+unsigned char* guest_tls_pad();
+
+// rt::t_in_handler, rt::t_wide_fallback and rt::t_single_stepping replace the thread_local variables this header
+// used to hold: the runtime's static TLS block belongs to the mapped title (host_tls.h).
 
 namespace rt::startup_trace {
 
@@ -46,11 +53,9 @@ inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
 inline void* veh = nullptr;
-inline thread_local bool in_handler = false;
 // With nothing to handle it, OutputDebugStringW's DBG_PRINTEXCEPTION_WIDE_C falls back to OutputDebugStringA on its
 // own ANSI copy (ExceptionInformation[3]), a second, lossy exception for the same text. Every debug string on the
 // thread resets this, so only the exception right after the wide one, with that same pointer, is skipped.
-inline thread_local ULONG_PTR wide_fallback = 0;
 
 inline void append_escaped(std::string& out, const char* s, size_t n) {
     static const char hex[] = "0123456789abcdef";
@@ -109,6 +114,7 @@ namespace detail {
 constexpr DWORD kDbgPrint = 0x40010006;      // DBG_PRINTEXCEPTION_C
 constexpr DWORD kDbgPrintWide = 0x4001000A;  // DBG_PRINTEXCEPTION_WIDE_C
 constexpr DWORD kCppException = 0xE06D7363;  // MSVC throw: logged with its address, never its payload
+constexpr DWORD kGuardPage = 0x80000001;      // STATUS_GUARD_PAGE_VIOLATION
 constexpr int kMaxFrames = 16;
 
 inline std::string stack_from(const CONTEXT& start_context) {
@@ -161,13 +167,92 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
+// Write watch on the page holding `address`. PAGE_GUARD faults on the next access and Windows clears the guard bit on
+// the way in. The handler logs the writer, re-arms, and sets the trap flag for one instruction so the retry does not
+// fault on that same guard again. Capped: the title's own install writes here too, so the interesting hit is a later one.
+inline std::atomic<uint64_t> watch_address{0};
+inline std::atomic<uint64_t> watched_page{0};
+inline std::atomic<DWORD> watch_protect{0};
+inline std::atomic<int> watch_hits{0};
+inline constexpr int kWatchCap = 8;
+
+inline bool watch_page(uint64_t address) {
+    const uint64_t page = address & ~static_cast<uint64_t>(0xfff);
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof info) != sizeof info) return false;
+    if (info.State != MEM_COMMIT) return false;
+    DWORD old = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(page), 0x1000, info.Protect | PAGE_GUARD, &old)) return false;
+    watch_protect.store(old);
+    watched_page.store(page);
+    watch_address.store(address);
+    watch_hits.store(0);
+    return true;
+}
+
+inline void log_guard_seen(const EXCEPTION_POINTERS& info, bool ours) {
+    try {
+        event("guard_seen", std::string("\"ours\":") + (ours ? "true" : "false") + ",\"at\":" +
+                                quote(where(reinterpret_cast<uint64_t>(info.ExceptionRecord->ExceptionAddress))));
+    } catch (...) {
+    }
+}
+
+inline bool readable_window(const void* p, size_t bytes) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(p, &info, sizeof info) != sizeof info) return false;
+    if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    const uintptr_t offset = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(info.BaseAddress);
+    return offset < info.RegionSize && bytes <= static_cast<size_t>(info.RegionSize - offset);
+}
+
+inline void log_guard(const EXCEPTION_POINTERS& info, uint64_t page, int hit) {
+    try {
+        std::string f = "\"hit\":" + std::to_string(hit) + ",\"watch\":\"" + hex(watch_address.load()) +
+                        "\",\"page\":\"" + hex(page) + "\",\"at\":" +
+                        quote(where(reinterpret_cast<uint64_t>(info.ExceptionRecord->ExceptionAddress)));
+        const uint64_t watch = watch_address.load();
+        if (watch >= 0x10000 && readable_window(reinterpret_cast<const void*>(watch), 32)) {
+            f += ",\"qwords\":[";
+            for (int i = 0; i < 4; ++i) {
+                if (i) f += ',';
+                f += quote(hex(reinterpret_cast<const uint64_t*>(watch)[i]));
+            }
+            f += "]";
+        }
+        if (info.ContextRecord) {
+            const CONTEXT& c = *info.ContextRecord;
+            f += ",\"regs\":[" + quote(hex(c.Rcx)) + "," + quote(hex(c.Rdx)) + "," + quote(hex(c.R8)) + "," +
+                 quote(hex(c.R9)) + "]";
+            f += ",\"stack\":" + stack_from(c);
+        }
+        event("guard_page", f);
+    } catch (...) {
+    }
+}
+
+// Last-resort record: a guard violation that no handler consumed terminates the process with 0x80000001 and leaves no
+// event behind. This writes one before the process dies.
+inline LONG WINAPI top_level(EXCEPTION_POINTERS* info) {
+    if (!enabled() || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    try {
+        std::string f = "\"code\":" + quote(hex(info->ExceptionRecord->ExceptionCode)) +
+                        ",\"at\":" + quote(where(reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress))) +
+                        ",\"watch\":\"" + hex(watch_address.load()) + "\"";
+        if (info->ContextRecord) f += ",\"stack\":" + stack_from(*info->ContextRecord);
+        event("unhandled", f);
+    } catch (...) {
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
-            const ULONG_PTR fallback = wide_fallback;
+            const ULONG_PTR fallback = t_wide_fallback::get();
             const bool wide = r.ExceptionCode == kDbgPrintWide;
-            wide_fallback = wide && r.NumberParameters >= 4 ? r.ExceptionInformation[3] : 0;
+            t_wide_fallback::set(wide && r.NumberParameters >= 4 ? r.ExceptionInformation[3] : 0);
             if (!wide && fallback && r.NumberParameters >= 2 && r.ExceptionInformation[1] == fallback) return;
             std::string text = debug_text(r);
             while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
@@ -181,6 +266,32 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
+            // The faulting registers separate "called through a bad pointer" from "loaded a bad field": for the
+            // 1.0.2.1 allocator fault the interesting pair is rcx and the qword it points at.
+            if (info.ContextRecord) {
+                const CONTEXT& c = *info.ContextRecord;
+                f += ",\"regs\":[" + quote(hex(c.Rcx)) + "," + quote(hex(c.Rdx)) + "," + quote(hex(c.R8)) + "," +
+                     quote(hex(c.R9)) + "]";
+                if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && c.Rcx >= 0x10000 &&
+                    !IsBadReadPtr(reinterpret_cast<const void*>(c.Rcx), 8)) {
+                    f += ",\"rcx0\":" + quote(hex(*reinterpret_cast<const uint64_t*>(c.Rcx)));
+                }
+            }
+            // The 1.0.2.1 allocator fault reads its cached interface from the guest TLS block at +0x13a8. Log the TEB's
+            // TLS vector, slot 0, and that qword so a garbage pointer there is distinguishable from a garbage table.
+            if (info.ContextRecord && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+                const auto* teb = NtCurrentTeb();
+                uint64_t vector = 0;
+                if (teb) vector = *reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(teb) + 0x58);
+                uint64_t slot0 = 0;
+                if (vector >= 0x10000 && readable_window(reinterpret_cast<const void*>(vector), 8))
+                    slot0 = *reinterpret_cast<const uint64_t*>(vector);
+                f += ",\"tls\":[" + quote(hex(vector)) + "," + quote(hex(slot0)) + "]";
+                if (slot0 >= 0x10000 && readable_window(reinterpret_cast<const void*>(slot0 + 0x13a0), 0x10)) {
+                    const auto* p = reinterpret_cast<const uint64_t*>(slot0 + 0x13a0);
+                    f += ",\"tls_13a8\":[" + quote(hex(p[0])) + "," + quote(hex(p[1])) + "]";
+                }
+            }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }
@@ -190,8 +301,29 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
-    if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
-    in_handler = true;
+    if (!enabled() || t_in_handler::flag() || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (info->ExceptionRecord->ExceptionCode == kGuardPage) {
+        const uint64_t page = watched_page.load();
+        log_guard_seen(*info, page != 0);
+        if (page) {
+            const int hit = watch_hits.fetch_add(1) + 1;
+            const DWORD protect = watch_protect.load();
+            VirtualProtect(reinterpret_cast<void*>(page), 0x1000, protect, nullptr);
+            log_guard(*info, page, hit);
+            if (hit < kWatchCap && info->ContextRecord) {
+                VirtualProtect(reinterpret_cast<void*>(page), 0x1000, protect | PAGE_GUARD, nullptr);
+                info->ContextRecord->EFlags |= 0x100;  // trap flag: one instruction, then the single-step handler
+                t_single_stepping::set_flag(true);
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && t_single_stepping::flag()) {
+        t_single_stepping::set_flag(false);
+        if (info->ContextRecord) info->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    t_in_handler::set_flag(true);
 #ifdef _MSC_VER
     // Under /EHsc, catch(...) does not catch SEH faults (e.g. a bad DBG_PRINTEXCEPTION_C pointer or corrupt unwind).
     // Keep the __try frame free of C++ destructors so in_handler is always reset and the exception still propagates.
@@ -201,16 +333,20 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     }
 #else
     struct Reset {
-        ~Reset() { in_handler = false; }
+        ~Reset() { t_in_handler::set_flag(false); }
     } reset;
     log_exception(*info);
 #endif
-    in_handler = false;
+    t_in_handler::set_flag(false);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 }  // namespace detail
 
 inline void close();
+
+// Watch one page for its next access and log the faulting instruction as a `guard_page` event. Used to name the code
+// that writes a guest structure when static reasoning cannot. The watch is one-shot and the access is allowed through.
+inline bool watch_page(uint64_t address) { return detail::watch_page(address); }
 
 // Creates the trace file and installs the exception handler. The file must not exist yet ("x" mode): the trace is
 // opened before the loader reads anything, so overwriting would let `--trace` destroy an input, such as the image
@@ -231,6 +367,29 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
         (void)atexit_registered;
     }
     detail::veh = AddVectoredExceptionHandler(1, &detail::handler);
+    SetUnhandledExceptionFilter(&detail::top_level);
+    if (const char* tls_info = std::getenv("LEONIDA_TLS_INFO")) {
+        if (*tls_info && *tls_info != '0') {
+            auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+            auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+            auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(base + dos->e_lfanew);
+            const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+            if (dir.VirtualAddress) {
+                auto* tls = reinterpret_cast<PIMAGE_TLS_DIRECTORY64>(base + dir.VirtualAddress);
+                const DWORD index = *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
+                void** vector = reinterpret_cast<void**>(__readgsqword(0x58));
+                const auto* pad = reinterpret_cast<const uint8_t*>(guest_tls_pad());
+                const uint64_t pad_offset = reinterpret_cast<uint64_t>(pad) - reinterpret_cast<uint64_t>(vector[0]);
+                std::fprintf(stderr,
+                             "[rt] host tls index=%lu block=%p vector[0]=%p vector[index]=%p template=%llu "
+                             "pad_offset=%llu pad_in_block=%d\n",
+                             static_cast<unsigned long>(index), vector[0], vector[0], vector[index],
+                             static_cast<unsigned long long>(tls->EndAddressOfRawData - tls->StartAddressOfRawData),
+                             static_cast<unsigned long long>(pad_offset),
+                             static_cast<int>(reinterpret_cast<const uint8_t*>(vector[0]) + pad_offset == pad));
+            }
+        }
+    }
     detail::on.store(true, std::memory_order_release);
     event("trace_open", "\"pid\":" + std::to_string(GetCurrentProcessId()));
     return true;

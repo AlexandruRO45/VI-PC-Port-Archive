@@ -16,9 +16,15 @@
 #include <system_error>
 #include <vector>
 
+#include "../shims/host_tls.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
+
+// src/host_tls_pad.cpp: the runtime's only static TLS variable and the end of the region the title's template may
+// overwrite. Host TLS variables live after that end, so the mirror below cannot touch them.
+unsigned char* guest_tls_pad();
+unsigned char* guest_tls_pad_end();
 
 namespace rt {
 
@@ -326,8 +332,16 @@ struct ThreadTlsSlot {
     uint32_t index = kNoTlsIndex;
 };
 
-// Per-thread installation state for each reserved TLS slot.
-thread_local std::array<ThreadTlsSlot, kMaxMappedTlsModules> g_thread_tls_slots{};
+// Per-thread installation state for each reserved TLS slot. It lives in a TlsAlloc slot, not in the EXE's static TLS
+// block: the mapped title's template occupies that block (shims/host_tls.h).
+std::array<ThreadTlsSlot, kMaxMappedTlsModules>& thread_tls_slots() {
+    auto* slots = reinterpret_cast<std::array<ThreadTlsSlot, kMaxMappedTlsModules>*>(t_thread_tls_slots::get());
+    if (!slots) {
+        slots = new std::array<ThreadTlsSlot, kMaxMappedTlsModules>{};
+        t_thread_tls_slots::set(reinterpret_cast<std::uintptr_t>(slots));
+    }
+    return *slots;
+}
 
 // Orders the TLS owners' publication, their `initialised` flags and their retirement against the thread events. Shared
 // in on_host_thread_event, exclusive only for those short writes (no allocation and no call that takes the Windows
@@ -350,7 +364,7 @@ struct ExclusiveTlsLock {
 // thread's record, so it also works after the module that installed the copy is gone.
 void release_thread_slot(size_t slot) {
     if (slot >= kMaxMappedTlsModules) return;
-    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    ThreadTlsSlot& entry = thread_tls_slots()[slot];
     if (!entry.module && !entry.block) return;
     if (entry.block) {
         void** slots = module_tls_slots();
@@ -362,7 +376,7 @@ void release_thread_slot(size_t slot) {
 }
 
 // A block load() put into a thread that was already running (install_on_existing_threads). Such a thread has no
-// g_thread_tls_slots record of it: the record is here, keyed by thread id, and the thread's own DLL_THREAD_DETACH or
+// thread_tls_slots() record of it: the record is here, keyed by thread id, and the thread's own DLL_THREAD_DETACH or
 // the module's ~Loader takes the block out again.
 struct ExistingThreadBlock {
     DWORD thread = 0;
@@ -400,10 +414,24 @@ bool has_existing_thread_block(DWORD thread, const Module& m) {
     return false;
 }
 
+// Writes the image's template into the host EXE's own static TLS block, at its base. The title's console CRT folds
+// every thread-local access to index 0 (module's mirror_index0), so those reads have to find the title's data. The
+// host block's first bytes are the pad from host_tls_pad.cpp; the range check keeps the copy behind the pad, where
+// the runtime's own TLS variables begin. Returns false when the block is missing or too small.
+bool mirror_index0_block(void* host_block, const Module& m) {
+    const uint64_t base = reinterpret_cast<uint64_t>(host_block);
+    const uint64_t pad_end = reinterpret_cast<uint64_t>(guest_tls_pad_end());
+    const uint64_t total = static_cast<uint64_t>(m.tls_raw_size) + m.tls_zero_fill;
+    if (!base || pad_end < base || base + total > pad_end) return false;
+    if (m.tls_raw_size) std::memcpy(host_block, m.tls_template, m.tls_raw_size);
+    if (m.tls_zero_fill) std::memset(static_cast<uint8_t*>(host_block) + m.tls_raw_size, 0, m.tls_zero_fill);
+    return true;
+}
+
 void install_thread_block(Module& m) {
     if (m.tls_slot >= kMaxMappedTlsModules) return;
     const size_t slot = m.tls_slot;
-    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    ThreadTlsSlot& entry = thread_tls_slots()[slot];
     if (entry.module == &m && entry.generation == m.tls_generation) return;
     if (has_existing_thread_block(GetCurrentThreadId(), m)) return;  // load() already gave this thread its copy
     if (entry.module) {
@@ -432,6 +460,11 @@ void install_thread_block(Module& m) {
     if (m.tls_raw_size) std::memcpy(block, m.tls_template, m.tls_raw_size);
     if (m.tls_zero_fill)
         std::memset(static_cast<uint8_t*>(block) + m.tls_raw_size, 0, m.tls_zero_fill);
+    if (m.mirror_index0 && !mirror_index0_block(slots[0], m))
+        throw std::runtime_error(m.name + ": the process index-0 static TLS block is missing or smaller than the template");
+    startup_trace::event("tls_block", "\"block\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(block))) +
+                                          ",\"size\":" + std::to_string(total) + ",\"tid\":" +
+                                          std::to_string(GetCurrentThreadId()));
 
     void* saved = slots[m.tls_index];
     slots[m.tls_index] = block;
@@ -445,7 +478,7 @@ void install_thread_block(Module& m) {
 void uninstall_thread_block(Module& m) {
     if (m.tls_slot >= kMaxMappedTlsModules) return;
     const size_t slot = m.tls_slot;
-    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    ThreadTlsSlot& entry = thread_tls_slots()[slot];
     if (entry.module != &m || entry.generation != m.tls_generation) return;
     if (m.tls_block == entry.block) {
         m.tls_block = nullptr;
@@ -622,6 +655,12 @@ void install_on_existing_threads(Module& m) {
             void** slots = nullptr;
             void* saved = nullptr;
             if (!vector || !read_thread_slot(vector, m.tls_index, slots, saved) || !slots || !saved) continue;
+            if (m.mirror_index0) {
+                void** host_slots = nullptr;
+                void* host_block = nullptr;
+                if (read_thread_slot(vector, 0, host_slots, host_block) && host_block)
+                    mirror_index0_block(host_block, m);
+            }
             // A copy an earlier module left in this slot of this thread goes first; what it replaced is kept.
             bool present = false;
             for (auto it = state.blocks.begin(); it != state.blocks.end();) {
@@ -641,6 +680,9 @@ void install_on_existing_threads(Module& m) {
             void* block = VirtualAlloc(nullptr, static_cast<SIZE_T>(total), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
             if (!block) continue;
             if (m.tls_raw_size) std::memcpy(block, m.tls_template, m.tls_raw_size);
+            startup_trace::event("tls_block", "\"block\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(block))) +
+                                                  ",\"size\":" + std::to_string(total) + ",\"tid\":" +
+                                                  std::to_string(c.id));
 
             // Write, then look at the thread's array pointer again: if Windows has replaced the array meanwhile, the
             // write went into the old one, and it is made again in the new one.
@@ -775,8 +817,8 @@ void __cdecl on_host_thread_event(DWORD reason) {
         }
         for (size_t i = kMaxMappedTlsModules; i-- > 0;) {
             Module* m = g_tls_slot_owners[i].load();
-            if (m && g_thread_tls_slots[i].module == m &&
-                g_thread_tls_slots[i].generation == m->tls_generation) {
+            if (m && thread_tls_slots()[i].module == m &&
+                thread_tls_slots()[i].generation == m->tls_generation) {
                 try {
                     if (m->initialised) run_callbacks(*m, DLL_THREAD_DETACH);
                 } catch (const std::exception& e) {
@@ -906,7 +948,8 @@ const shims::BundledModuleOps kBundledOps{
 };
 }  // namespace
 
-Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
+Loader::Loader(std::filesystem::path game_dir, bool mirror_index0)
+    : game_dir_(std::move(game_dir)), mirror_index0_(mirror_index0) {
     shims::add_module_lookup(this, &lookup_in_loader);
     shims::add_bundled_loader(this, &kBundledOps);
 }
@@ -1204,6 +1247,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
+    m->mirror_index0 = mirror_index0_ && order_.empty();
     by_name_[module_key(path)] = m;
     order_.push_back(m);
 
@@ -1369,9 +1413,9 @@ void Loader::initialize_tls(Module& m) {
         throw;
     }
     // The loading thread's copy is the one the Module records (and ~Loader frees on that thread).
-    if (g_thread_tls_slots[slot].module == &m && g_thread_tls_slots[slot].generation == m.tls_generation) {
-        m.tls_block = g_thread_tls_slots[slot].block;
-        m.tls_saved_block = g_thread_tls_slots[slot].saved;
+    if (thread_tls_slots()[slot].module == &m && thread_tls_slots()[slot].generation == m.tls_generation) {
+        m.tls_block = thread_tls_slots()[slot].block;
+        m.tls_saved_block = thread_tls_slots()[slot].saved;
     }
     // Threads started from here on get their copy from the helper DLL's DLL_THREAD_ATTACH; the ones already running
     // get it now.

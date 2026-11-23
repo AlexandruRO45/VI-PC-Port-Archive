@@ -102,6 +102,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   )
 
   add_executable(gta6rt
+    src/host_tls_pad.cpp
     src/main.cpp
     src/pe_loader.cpp
     shims/registry.cpp

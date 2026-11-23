@@ -41,6 +41,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "host_tls.h"
+
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
@@ -480,7 +482,6 @@ const char kInitIdentity = 0, kQuotaIdentity = 0, kDeleteIdentity = 0, kReadIden
            kFolderIdentity = 0;
 
 // The blob count of the last ReadBlobDataAsync result collected on this thread (GetResult runs on the caller's).
-thread_local uint32_t t_read_count = 0;
 
 HRESULT do_work(Job& job, size_t& size) {
     size = 0;
@@ -560,7 +561,7 @@ HRESULT CALLBACK job_provider(XAsyncOp op, const XAsyncProviderData* data) {
         if (job->identity == &kReadIdentity) {
             if (data->bufferSize < packed_size(job->blobs)) return E_GS_PROVIDED_BUFFER_TOO_SMALL;
             pack(job->blobs, data->buffer);
-            t_read_count = static_cast<uint32_t>(job->blobs.size());
+            rt::t_save_read_count::set(static_cast<std::uintptr_t>(job->blobs.size()));
             return S_OK;
         }
         if (job->identity == &kFolderIdentity) {
@@ -785,11 +786,11 @@ HRESULT STDMETHODCALLTYPE save_read_async(void*, XGameSaveContainerHandle c, con
 HRESULT STDMETHODCALLTYPE save_read_result(void*, XAsyncBlock* async, size_t size, XGameSaveBlob* out, uint32_t* count) {
     if (!out || !count) return E_POINTER;
     *count = 0;
-    t_read_count = 0;
+    rt::t_save_read_count::set(0);
     HRESULT hr = XAsyncGetResult(async, &kReadIdentity, size, out, nullptr);
     if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) || hr == E_NOT_SUFFICIENT_BUFFER)
         hr = E_GS_PROVIDED_BUFFER_TOO_SMALL;
-    if (SUCCEEDED(hr)) *count = t_read_count;
+    if (SUCCEEDED(hr)) *count = static_cast<uint32_t>(rt::t_save_read_count::get());
     return hr;
 }
 

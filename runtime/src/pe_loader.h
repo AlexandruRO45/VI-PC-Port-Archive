@@ -62,13 +62,20 @@ struct Module {
     const uint8_t* tls_template = nullptr;  // raw template in the mapped image
     uint32_t tls_raw_size = 0;
     uint32_t tls_zero_fill = 0;
+    // The title's console CRT folds every thread-local access to TEB->ThreadLocalStoragePointer[0] (7,802 sites in
+    // 1.0.2.1). For that image the loader also writes the template into the host EXE's own index-0 block, at its base,
+    // so those folded reads land in the title's data. The host block is large enough because the runtime reserves its
+    // static TLS behind a pad (host_tls_pad.cpp); the check in install_thread_block enforces that.
+    bool mirror_index0 = false;
 };
 
 class Loader {
 public:
     // Also registers the module list with the shim registry, so an unimplemented import called under
     // LEONIDA_UNIMPLEMENTED=stop can name the module and RVA of its caller.
-    explicit Loader(std::filesystem::path game_dir);
+    // mirror_index0: the first image loaded is given the index-0 mirror described on Module::mirror_index0. Set by
+    // `gta6rt --run` for the title; tests leave it off.
+    explicit Loader(std::filesystem::path game_dir, bool mirror_index0 = false);
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
     // Delivers process detach to initialised modules in reverse dependency order before freeing any mappings or TLS.
@@ -135,6 +142,7 @@ private:
 
     mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
+    bool mirror_index0_ = false;
     std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()

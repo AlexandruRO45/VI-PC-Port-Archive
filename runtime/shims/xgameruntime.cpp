@@ -34,6 +34,7 @@
 #include <XTaskQueue.h>
 
 #include "file_system.h"
+#include "host_tls.h"
 #include "shims.h"
 
 namespace rt::shims {
@@ -185,13 +186,12 @@ HRESULT STDMETHODCALLTYPE begin_alloc_not_provided(void*) {
 
 // XThreadSetTimeSensitive / XThreadIsTimeSensitive / XThreadAssertNotTimeSensitive. The flag is per thread, as in
 // the GDK; nothing is enforced offline (a time-sensitive thread may still block).
-thread_local bool t_time_sensitive = false;
 HRESULT STDMETHODCALLTYPE thread_set_time_sensitive(void*, bool value) {
-    t_time_sensitive = value;
+    rt::t_time_sensitive::set_flag(value);
     return S_OK;
 }
 void STDMETHODCALLTYPE thread_assert_not_time_sensitive(void*) {}
-bool STDMETHODCALLTYPE thread_is_time_sensitive(void*) { return t_time_sensitive; }
+bool STDMETHODCALLTYPE thread_is_time_sensitive(void*) { return rt::t_time_sensitive::flag(); }
 
 #define XM(fn) reinterpret_cast<const void*>(&Method<&fn>::call)
 const void* const kThreadingVtable[] = {

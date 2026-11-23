@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../shims/host_tls.h"
+
 namespace leonida {
 
 // Cross-queue Wait-before-Signal (docs section 4.4, "Wait before Signal across queues").
@@ -66,9 +68,9 @@ public:
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
+            set_in_pump(true);  // what is dropped may release other fences: they must not wait for this lock
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
+            set_in_pump(false);
         }
         pump_ready();
     }
@@ -165,7 +167,7 @@ public:
         for (;;) {
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
+            set_in_pump(true);
             while (dirty_.exchange(false, std::memory_order_acq_rel)) {
                 bool progress = true;
                 while (progress) {
@@ -174,7 +176,7 @@ public:
                 }
                 run_barriers();
             }
-            in_pump() = false;
+            set_in_pump(false);
             pump.unlock();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
@@ -187,10 +189,8 @@ private:
         std::function<void()> fn;
     };
 
-    static bool& in_pump() {
-        static thread_local bool pumping = false;
-        return pumping;
-    }
+    static bool in_pump() { return rt::t_queue_pump::flag(); }
+    static void set_in_pump(bool value) { rt::t_queue_pump::set_flag(value); }
 
     std::vector<Holder*> snapshot() const {
         std::lock_guard lock(mutex_);
