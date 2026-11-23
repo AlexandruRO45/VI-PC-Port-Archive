@@ -7,6 +7,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | GPU | Driver, OS | Commit | build.py | check.py | run_gpu_tests.py | Failed | Entry |
 |---|---|---|---|---|---|---|---|
 | AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](gpu-test-results/RX9070GRE.txt) |
+| NVIDIA GeForce RTX 4060 (Ada, AD107), subgroup 32..32 | NVIDIA 610.88, Vulkan SDK 1.4.363.0, Windows 11 | `867d922` | 270/270 translated and valid | 176/211 pass, 35 skipped | 192/241 passed, 48 skipped | `ms_wave_info_s3`, 3 of 3 reruns (see below) | [local note](../gpu-test-results/RTX4060.txt) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -31,3 +32,27 @@ Every pixel test other than the flaky mesh fixture was exact (4096/4096).
 
 AI-assisted (Hermes Agent): built `main` at `05961f0`, ran `build.py`, `check.py` and
 `run_gpu_tests.py` (native and emulated) on this GPU, and verified the isolated reruns of the one failure.
+
+## NVIDIA GeForce RTX 4060 — 2026-11-23
+
+```
+GPU:        NVIDIA GeForce RTX 4060 (Ada, AD107), subgroup 32..32
+Driver:     NVIDIA 610.88 (32.0.16.1088), Vulkan SDK 1.4.363.0 loader
+OS:         Windows 11 Pro 10.0.26300
+Commit:     867d922f09b86583859796a174df89555fb32da8 (main, 2026-11-23)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools), SPIRV-Tools v2026.4, MSVC 14.51 (VS 2026), CMake 4.2.3 + Ninja 1.13.2, Python 3.12.9
+build.py:   270 shaders: 270 translated, 270 pass spirv-val (the 6 mesh fixtures are built by run_gpu_tests.py)
+check.py:   176 of 211 pass, 35 skipped (30 need full 64-wide compute subgroups)
+run_gpu_tests.py: 192/241 passed, 48 skipped, 1 failed
+Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0); 3 of 3 isolated --filter reruns fail
+Skipped:    32 need 64-wide subgroups this 32-wide device lacks; 16 are the documented "run by d3d12_*_test / w64_graphics.py" cases.
+```
+
+Setup: the `runtime\build` Ninja configuration (RelWithDebInfo) with `DISABLE_RTSS_LAYER=1` and
+`DISABLE_VULKAN_OBS_CAPTURE=1`. VS 2026's linker crashed with `LNK1000` (`IncrCalcPtrs`) on incremental links;
+`_LINK_=/INCREMENTAL:NO` avoided it without a source change. Inside `run_gpu_tests.py`, 247/247 shaders translated
+and passed `spirv-val`. Unlike the RX 9070 GRE run, `ms_wave_info_s3` fails every time here, not intermittently
+(the same output as #6172 and #5273).
+
+AI-assisted (Claude Code): built `main` at `867d922`, ran `build.py`, `check.py` and `run_gpu_tests.py` on this GPU,
+and reran the one failure in isolation three times.

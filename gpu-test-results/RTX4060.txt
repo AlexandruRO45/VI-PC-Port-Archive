@@ -1,0 +1,17 @@
+GPU:        NVIDIA GeForce RTX 4060 (Ada, AD107), subgroup 32..32
+Driver:     NVIDIA 610.88 (32.0.16.1088), Vulkan SDK 1.4.363.0 loader
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32; default 32)
+OS:         Windows 11 Pro 10.0.26300
+Commit:     867d922f09b86583859796a174df89555fb32da8 (main, 2026-11-23)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools), SPIRV-Tools v2026.4, MSVC 14.51 (VS 2026 Community 18.6.1), CMake 4.2.3 + Ninja 1.13.2, Python 3.12.9
+build.py:   270 shaders: 270 translated, 270 pass spirv-val (6 mesh fixtures not built: ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3)
+check.py:   176 of 211 pass, 35 skipped (30 need full 64-wide compute subgroups, 3 are mesh fixtures built only by run_gpu_tests.py, 2 need 64 lanes in a fragment or requested stage)
+run_gpu_tests.py: 192/241 passed, 48 skipped, 1 failed (default settings: wave64 emulation is automatic on this 32-wide device)
+Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0). Fails 3 of 3 isolated --filter reruns (deterministic here, not flaky); same signature as the RX 9070 GRE entry, #6172 and #5273.
+Skipped:    30 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup", 1 "cannot require a 64-wide fragment subgroup", 16 "run by d3d12_*_test / w64_graphics.py".
+Notes:
+- Built with the repository's runtime\build Ninja configuration (RelWithDebInfo), targets vk_harness, vk_texture_test, vk_sampler_test, vk_compute_test, vk_store_test, vk_bindless_test.
+- VS 2026's linker crashed with LNK1000 (IncrCalcPtrs) during incremental links; _LINK_=/INCREMENTAL:NO avoided it. No source change.
+- DISABLE_RTSS_LAYER=1 and DISABLE_VULKAN_OBS_CAPTURE=1 set, as docs/testing.md recommends.
+- 247/247 shaders translated and passed spirv-val inside run_gpu_tests.py.
+- AI-assisted (Claude Code): built main at 867d922, ran build.py, check.py and run_gpu_tests.py on this GPU, and reran the one failure in isolation three times.
