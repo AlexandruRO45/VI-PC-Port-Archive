@@ -20,7 +20,15 @@ SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
 def make_bink():
-    return SENTINEL
+    # Plausible Bink 2 stream (KB2n) carrying SENTINEL as its body so bink_index accepts it.
+    extra = b"\x00\x05\xe9\x87"
+    body = len(SENTINEL)
+    frames = 4
+    total = 0x2C + len(extra) + 4 * frames + body
+    header = bytearray(0x2C)
+    header[0:4] = b"KB2n"
+    struct.pack_into("<10I", header, 4, total - 8, frames, body, frames, 320, 240, 30, 1, 0x40013, 0)
+    return bytes(header) + extra + bytes(4 * frames) + SENTINEL
 
 
 def make_rpf(payload, head_size=0x40):
