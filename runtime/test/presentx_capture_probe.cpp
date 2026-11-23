@@ -1,9 +1,9 @@
 // Synthetic probe for the opt-in PresentX slot routing and the windowless first-frame capture (docs section 4.5).
 //
 // Modes:
-//   capture    LEONIDA_PRESENTX_SLOT=40 and LEONIDA_CAPTURE=<temp dir>: a known BGRA8 ALLOW_DISPLAY 2D texture is
-//              uploaded, presented through the proxy's queue slot 40, and the PPM must hold the known pixels. A
-//              following 0-plane PresentX must return S_OK and write nothing.
+//   capture    LEONIDA_PRESENTX_SLOT=40 and LEONIDA_CAPTURE=<temp dir>: known BGRA8 and HDR10 (R10G10B10A2_UNORM)
+//              ALLOW_DISPLAY 2D textures are uploaded and each is presented through the proxy's queue slot 40; both
+//              PPMs must hold the known pixels. A following 0-plane PresentX must return S_OK and write nothing.
 //   malformed  The same environment, but the routed slot is called with a null plane array, a null ppResources, a
 //              null resource, 3 planes, unreadable (PAGE_NOACCESS) plane/ppResources/resource pointers, a texture
 //              without ALLOW_DISPLAY, a buffer and a foreign object with a readable/executable vtable. Each must
@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -66,6 +67,29 @@ void expected_texel(UINT x, UINT y, std::uint8_t* rgb) {
     rgb[0] = static_cast<std::uint8_t>(10 + x * 10);
     rgb[1] = static_cast<std::uint8_t>(20 + y * 10);
     rgb[2] = static_cast<std::uint8_t>(30 + x + y);
+}
+
+// HDR10 plane: four quadrants with known packed values. Red is 0x3FF, green 0x3FF << 10, blue 0x3FF << 20, and the
+// bottom-right is R=512, G=511, B=513 to exercise per-channel rounding. Expected PPM bytes are hard-coded:
+// 1023 -> 255, 0 -> 0, 512 -> 128, 511 -> 127, 513 -> 128.
+std::uint32_t expected_hdr_word(UINT x, UINT y) {
+    if (y < kHeight / 2) return x < kWidth / 2 ? 0x3ffu : (0x3ffu << 10);
+    if (x < kWidth / 2) return 0x3ffu << 20;
+    return 512u | (511u << 10) | (513u << 20);
+}
+
+void expected_hdr_texel(UINT x, UINT y, std::uint8_t* rgb) {
+    if (y < kHeight / 2) {
+        if (x < kWidth / 2) {
+            rgb[0] = 255; rgb[1] = 0; rgb[2] = 0;
+        } else {
+            rgb[0] = 0; rgb[1] = 255; rgb[2] = 0;
+        }
+    } else if (x < kWidth / 2) {
+        rgb[0] = 0; rgb[1] = 0; rgb[2] = 255;
+    } else {
+        rgb[0] = 128; rgb[1] = 127; rgb[2] = 128;
+    }
 }
 
 // A readable object with a readable, executable vtable that is NOT a Leonida layer resource. The capture guard must
@@ -116,6 +140,8 @@ struct Device {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12Resource> texture;
     Ref<ID3D12Resource> upload;
+    Ref<ID3D12Resource> hdr_texture;
+    Ref<ID3D12Resource> hdr_upload;
     Ref<ID3D12Resource> non_display;
     Ref<ID3D12Resource> buffer;
     Ref<ID3D12CommandAllocator> allocator;
@@ -130,6 +156,8 @@ struct Device {
         allocator.reset();
         buffer.reset();
         non_display.reset();
+        hdr_upload.reset();
+        hdr_texture.reset();
         upload.reset();
         texture.reset();
         queue.reset();
@@ -268,10 +296,58 @@ bool make_texture(Device& d) {
     to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     d.list->ResourceBarrier(1, &to_present);
+    if (!run_list(d)) return false;
+
+    // Second case: the same 8x8 footprint as HDR10 (R10G10B10A2_UNORM, also 4 bytes per texel), uploaded through a
+    // row-major buffer with the known packed words.
+    D3D12_RESOURCE_DESC hdr_desc = desc;
+    hdr_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    if (FAILED(d.proxy->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_ALLOW_DISPLAY, &hdr_desc,
+                                                 D3D12_RESOURCE_STATE_PRESENT, nullptr,
+                                                 IID_PPV_ARGS(&d.hdr_texture.p))))
+        return false;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT hdr_footprint{};
+    UINT64 hdr_total_bytes = 0;
+    d.proxy->GetCopyableFootprints(&hdr_desc, 0, 1, 0, &hdr_footprint, nullptr, nullptr, &hdr_total_bytes);
+    if (hdr_total_bytes == 0 || hdr_footprint.Footprint.RowPitch < kWidth * 4) return false;
+
+    D3D12_RESOURCE_DESC hdr_upload_desc = upload_desc;
+    hdr_upload_desc.Width = hdr_total_bytes;
+    if (FAILED(d.proxy->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &hdr_upload_desc,
+                                                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                 IID_PPV_ARGS(&d.hdr_upload.p))))
+        return false;
+
+    mapped = nullptr;
+    if (FAILED(d.hdr_upload->Map(0, nullptr, &mapped)) || !mapped) return false;
+    bytes = static_cast<std::uint8_t*>(mapped);
+    for (UINT y = 0; y < kHeight; ++y) {
+        auto* row = bytes + static_cast<std::size_t>(y) * hdr_footprint.Footprint.RowPitch;
+        for (UINT x = 0; x < kWidth; ++x) {
+            const std::uint32_t word = expected_hdr_word(x, y);
+            std::memcpy(row + x * 4, &word, sizeof(word));  // little-endian R10G10B10A2 texel
+        }
+    }
+    d.hdr_upload->Unmap(0, nullptr);
+
+    if (FAILED(d.allocator->Reset()) || FAILED(d.list->Reset(d.allocator.p, nullptr))) return false;
+    to_copy.Transition.pResource = d.hdr_texture.p;
+    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    d.list->ResourceBarrier(1, &to_copy);
+    destination.pResource = d.hdr_texture.p;
+    source.pResource = d.hdr_upload.p;
+    source.PlacedFootprint = hdr_footprint;
+    d.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    to_present.Transition.pResource = d.hdr_texture.p;
+    to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    d.list->ResourceBarrier(1, &to_present);
     return run_list(d);
 }
 
-bool check_ppm(const std::filesystem::path& path) {
+bool check_ppm(const std::filesystem::path& path, void (*expected)(UINT, UINT, std::uint8_t*)) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -288,13 +364,13 @@ bool check_ppm(const std::filesystem::path& path) {
     const std::uint8_t* pixels = bytes.data() + header.size();
     for (UINT y = 0; y < kHeight; ++y) {
         for (UINT x = 0; x < kWidth; ++x) {
-            std::uint8_t expected[3];
-            expected_texel(x, y, expected);
+            std::uint8_t want[3];
+            expected(x, y, want);
             const std::uint8_t* actual = pixels + (static_cast<std::size_t>(y) * kWidth + x) * 3;
-            if (actual[0] != expected[0] || actual[1] != expected[1] || actual[2] != expected[2]) {
+            if (actual[0] != want[0] || actual[1] != want[1] || actual[2] != want[2]) {
                 std::fprintf(stderr, "%s: texel (%u,%u) is (%u,%u,%u), expected (%u,%u,%u)\n",
-                             path.string().c_str(), x, y, actual[0], actual[1], actual[2], expected[0], expected[1],
-                             expected[2]);
+                             path.string().c_str(), x, y, actual[0], actual[1], actual[2], want[0], want[1],
+                             want[2]);
                 return false;
             }
         }
@@ -372,14 +448,24 @@ int main(int argc, char** argv) {
     if (mode == "capture") {
         EXPECT(as_hr(call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&plane), 0)) == S_OK);
         EXPECT(files_in(directory) == 1);
-        EXPECT(check_ppm(directory / "present-0-plane-0.ppm"));
+        EXPECT(check_ppm(directory / "present-0-plane-0.ppm", expected_texel));
+
+        XboxPresentPlaneParameters hdr_plane{};
+        hdr_plane.Token = 2;
+        hdr_plane.ResourceCount = 1;
+        hdr_plane.ppResources = &d.hdr_texture.p;
+        EXPECT(as_hr(call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&hdr_plane), 0)) == S_OK);
+        EXPECT(files_in(directory) == 2);
+        EXPECT(check_ppm(directory / "present-1-plane-0.ppm", expected_hdr_texel));
+
         // A blank PresentX writes nothing and is accepted. The optional SuspendX/ResumeX slots are routed too:
         // with capture configured they are accepted without touching a window or the capture path.
         EXPECT(as_hr(call_slot(d.queue.p, 0, 0, 0)) == S_OK);
         EXPECT(as_hr(call_slot_at(d.queue.p, 41, 0, 0, 0)) == S_OK);
         EXPECT(as_hr(call_slot_at(d.queue.p, 42, 0, 0, 0)) == S_OK);
-        EXPECT(files_in(directory) == 1);
-        std::printf("presentx_capture_probe: capture 1/1 present, 1 PPM (8x8 BGRA) checked, blank/SuspendX/ResumeX S_OK\n");
+        EXPECT(files_in(directory) == 2);
+        std::printf("presentx_capture_probe: capture 2/2 presents, 2 PPMs (8x8 BGRA, 8x8 R10G10B10A2) checked, "
+                    "blank/SuspendX/ResumeX S_OK\n");
         return 0;
     }
 
