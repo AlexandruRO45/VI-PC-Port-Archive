@@ -282,6 +282,15 @@ from one or more primary-LOD `rpf9dump models` exports, with each manifest besid
 python -I tools/bvh_slot_check.py <core_bvh4.rpf> <index-dir>/index.json <models>/manifest.json [...]
 ```
 
+For incremental scans, pass `--save-evidence <private-file>` when checking a window. Add another
+manifest with `--prior <private-file>`, or combine independent saved scans by repeating `--prior`
+without any manifests. Either form can save the combined evidence. Keep these files local.
+Each run still checks the core archive and carve index. Evidence is tied to the index bytes, the
+multi-slot descriptor and BLAS contents, and the evidence-format version. A SHA-256 digest over the
+ordered, length-prefixed candidate buffers identifies repeats across scans. Two distinct candidates
+leave the slot ambiguous even if their matrix verdicts agree. `manifest_items` counts entries read
+across the input histories, including overlaps. The CLI prints an aggregate report to stdout.
+
 The tool splits each descriptor's following buffer by the low entry sizes, preserving empty slot indices.
 For descriptors with distinct matrices it searches the supplied drawables for an ordered sequence of geometries
 within one model. Triangle counts must agree per geometry, and the BLAS must have at least 30 paired leaves.
@@ -302,6 +311,13 @@ descriptors passed with their own matrix and failed with the other distinct matr
 alternative. This supports positional pairing for those ten slots. In 2,679 slots all descriptor matrices were
 identical, 308 slots lacked sufficient topology, 3,694 had no topology match in these exports, and 10 had
 multiple distinct source buffers. Pairing remains unknown for those 6,691 slots.
+
+Two additional 1 GiB primary-LOD windows brought the total to 15,064 manifest entries. In the
+six-window scan, 43 slots in 25 descriptors passed only their own matrix, each rejecting one
+distinct alternative. Zero passed only an alternative. Of the remaining 6,658 occupied slots,
+2,679 had identical matrices, 308 lacked sufficient topology, 3,659 had no source match, 11 had
+multiple source buffers and one passed multiple matrix choices. Source uniqueness is relative
+to these exports.
 
 **Table template** (22,301 streams in core, 81 in the shared pack). Two arrays, each a pointer followed by a
 `u16 count, u16 capacity` pair:
