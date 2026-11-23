@@ -579,6 +579,85 @@ class Gen:
             return list(mods)
         return [m for m in mods if m not in cls._DPP_MODS and not m.startswith(cls._DPP_PREFIXES)]
 
+    _OMOD_MODS = ("mul:2", "mul:4", "div:2")
+    _SDWA_UNUSED = ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE")
+
+    def _validate_f32_valu(self, raw_op, op, a, mods, *, arity, allow_e32, allow_e64,
+                           allow_sdwa, allow_dpp, allow_mods=True):
+        """Validate encoding, arity, operand shapes/modifiers, and instruction modifiers for
+        binary/ternary f32 VALU instructions."""
+        if raw_op == op:
+            suffix = ""
+        elif raw_op == op + "_e32":
+            suffix = "_e32"
+        elif raw_op == op + "_e64":
+            suffix = "_e64"
+        elif raw_op == op + "_sdwa":
+            suffix = "_sdwa"
+        elif raw_op == op + "_dpp":
+            suffix = "_dpp"
+        else:
+            raise Unsupported(f"{raw_op} encoding")
+
+        if ((suffix == "_e32" and not allow_e32) or
+                (suffix == "_e64" and not allow_e64) or
+                (suffix == "_sdwa" and not allow_sdwa) or
+                (suffix == "_dpp" and not allow_dpp)):
+            raise Unsupported(f"{raw_op} encoding")
+
+        # Inspect the pre-rewrite operand list from self.cur_ins so DPP's args[1] SSA
+        # replacement cannot hide illegal modifiers such as sext() on src0.
+        orig_args = self.cur_ins["args"] if self.cur_ins is not None else a
+        if len(a) != arity or len(orig_args) != arity:
+            raise Unsupported(f"{op} operands")
+
+        dst = orig_args[0]
+        if (dst.get("k") != "vgpr" or dst.get("n", 1) != 1 or
+                dst.get("neg") or dst.get("abs") or dst.get("sext")):
+            raise Unsupported(f"{op} destination")
+
+        allow_src_mods = allow_mods and suffix != "_e32"
+        for s in orig_args[1:]:
+            if s.get("n", 1) != 1 or s.get("sext"):
+                raise Unsupported(f"{op} operand")
+            if not allow_src_mods and (s.get("neg") or s.get("abs")):
+                raise Unsupported(f"{raw_op} modifiers")
+
+        if not allow_mods or suffix == "_e32":
+            if mods:
+                raise Unsupported(f"{raw_op} modifiers")
+            return
+
+        if suffix == "_dpp":
+            if self.non_dpp_mods(raw_op, mods):
+                raise Unsupported(f"{raw_op} modifiers")
+            return
+
+        seen_clamp = False
+        seen_omod = False
+        seen_sdwa_keys = set()
+        for m in mods:
+            if m == "clamp":
+                if seen_clamp:
+                    raise Unsupported(f"{raw_op} modifiers")
+                seen_clamp = True
+            elif m in self._OMOD_MODS:
+                if seen_omod:
+                    raise Unsupported(f"{raw_op} modifiers")
+                seen_omod = True
+            elif suffix == "_sdwa" and ":" in m:
+                k, v = m.split(":", 1)
+                if k in seen_sdwa_keys:
+                    raise Unsupported(f"{raw_op} modifiers")
+                if k in ("src0_sel", "src1_sel", "dst_sel") and v in self.SDWA_SEL:
+                    seen_sdwa_keys.add(k)
+                elif k == "dst_unused" and v in self._SDWA_UNUSED:
+                    seen_sdwa_keys.add(k)
+                else:
+                    raise Unsupported(f"{raw_op} modifiers")
+            else:
+                raise Unsupported(f"{raw_op} modifiers")
+
     @staticmethod
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
@@ -10742,6 +10821,8 @@ class Gen:
             self.emit(f"{r} = OpFDiv %float %f1 {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
+            self._validate_f32_valu(ins["op"], op, a, mods, arity=3,
+                                    allow_e32=True, allow_e64=True, allow_sdwa=True, allow_dpp=True)
             read_source = self.src_f_sign_mods if F2[op] in ("max", "min") else self.src_f
             x, y = read_source(a[1]), read_source(a[2])
             r = self.tmp()
@@ -10751,19 +10832,32 @@ class Gen:
                 self.emit(f"{r} = {F2[op]} %float {x} {y}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_subrev_f32":
+            self._validate_f32_valu(ins["op"], op, a, mods, arity=3,
+                                    allow_e32=True, allow_e64=True, allow_sdwa=True, allow_dpp=True)
             x, y = self.src_f(a[1]), self.src_f(a[2])
             r = self.tmp()
             self.emit(f"{r} = OpFSub %float {y} {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32", "v_fmamk_f32", "v_med3_f32"):
-            if op in ("v_fma_f32", "v_fmaak_f32", "v_fmamk_f32"):
+            if op == "v_fmac_f32":
+                self._validate_f32_valu(ins["op"], op, a, mods, arity=3,
+                                        allow_e32=True, allow_e64=True, allow_sdwa=False, allow_dpp=True)
+                x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
+            elif op in ("v_fmaak_f32", "v_fmamk_f32"):
+                self._validate_f32_valu(ins["op"], op, a, mods, arity=4,
+                                        allow_e32=True, allow_e64=False, allow_sdwa=False, allow_dpp=False,
+                                        allow_mods=False)
                 # fmaak D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`; fmamk D = S0 * K + S1, printed
                 # `vdst, src0, K, vsrc1`. In print order both are fma(a[1], a[2], a[3]), like v_fma_f32. Until
                 # 2026-11-21 fmamk read a[3] as the factor, so it computed S0 * S1 + K.
                 x, y, z = (self.src_f(t) for t in a[1:4])
-            elif op == "v_fmac_f32":
-                x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
+            elif op == "v_fma_f32":
+                self._validate_f32_valu(ins["op"], op, a, mods, arity=4,
+                                        allow_e32=False, allow_e64=True, allow_sdwa=False, allow_dpp=False)
+                x, y, z = (self.src_f(t) for t in a[1:4])
             else:
+                self._validate_f32_valu(ins["op"], op, a, mods, arity=4,
+                                        allow_e32=False, allow_e64=True, allow_sdwa=False, allow_dpp=False)
                 r = self.med3_f([self.src_f_sign_mods(t) for t in a[1:4]], a[1:4])
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
