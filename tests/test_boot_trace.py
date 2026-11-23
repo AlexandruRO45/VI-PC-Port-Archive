@@ -265,6 +265,72 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["refused"], [{"seq": 6, "method": "MapTiles"}])
         self.assertEqual(trace["last_seq"], 9)
 
+    def test_device_params_and_feature_answers(self):
+        params = ["1234abcd", "00000000", "00000002"] + ["00000000"] * 21
+        self.write_lines(self.d3d12, [
+            "[rt] d3d12_xs: D3D12XboxCreateDevice params[24] =" + " ".join(params),
+            "[d3d12-trace] #1 D3D12XboxCreateDevice ok",
+            "[rt] d3d12_xs: device slot 13 (CheckFeatureSupport (answer logged)) first call",
+            "[rt] d3d12_xs: CheckFeatureSupport feature 0 size 60 -> 0x00000000: "
+            + " ".join(["01", "00", "00", "00"] * 5),
+            "[rt] d3d12_xs: CheckFeatureSupport feature 0 size 60 -> 0x00000000: 02 00 00 00",
+            "synthetic.exe : [rt] d3d12_xs: CheckFeatureSupport feature 27 size 32 -> 0x80070057",
+            "[d3d12-trace] #2 CreateCommandQueue ok",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["calls"], 2)
+        self.assertEqual(trace["ignored_lines"], 5)
+        self.assertEqual(trace["device_params"], params)
+        self.assertEqual(trace["feature_queries"], 3)
+        self.assertEqual(
+            trace["features"],
+            [
+                {"feature": 0, "size": 60, "hresult": "0x00000000",
+                 "bytes": ["01", "00", "00", "00"] * 5, "truncated": False},
+                {"feature": 27, "size": 32, "hresult": "0x80070057", "bytes": [], "truncated": False},
+            ],
+        )
+        text = bt.format_text(bt.summarize(None, trace), 10)
+        self.assertIn("device params: 24 word(s), nonzero [0]=1234abcd, [2]=00000002", text)
+        self.assertIn("CheckFeatureSupport: 2 feature(s) in 3 answer line(s), 1 not S_OK", text)
+        self.assertIn("feature 0 size 60 -> 0x00000000: " + " ".join(["01 00 00 00"] * 4) + " ...", text)
+        self.assertIn("feature 27 size 32 -> 0x80070057", text)
+        self.assertNotIn("02 00 00 00", text)
+        self.assertIn("other [rt] diagnostics are not summarized", text)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--json"]), 0)
+        parsed = json.loads(out.getvalue())["d3d12"]
+        self.assertEqual(parsed["device_params"], params)
+        self.assertEqual([f["feature"] for f in parsed["features"]], [0, 27])
+
+    def test_feature_list_follows_the_limit_and_keeps_truncation(self):
+        lines = ["[d3d12-trace] #1 D3D12XboxCreateDevice ok"]
+        lines += [
+            f"[rt] d3d12_xs: CheckFeatureSupport feature {n} size 4 -> 0x00000000: 0{n} 00 00 00 ..."
+            for n in range(3)
+        ]
+        self.write_lines(self.d3d12, lines)
+        trace = bt.parse_d3d12(self.d3d12, limit=1)
+        self.assertEqual(len(trace["features"]), 3)
+        self.assertIs(trace["features"][0]["truncated"], True)
+        text = bt.format_text(bt.summarize(None, trace), 1)
+        self.assertIn("feature 0 size 4 -> 0x00000000: 00 00 00 00 ...", text)
+        self.assertNotIn("feature 1 ", text)
+        self.assertIn("... 2 more", text)
+
+    def test_logs_without_the_rt_answers_report_none(self):
+        self.write_lines(self.d3d12, D3D12 + [
+            "[rt] d3d12_xs: D3D12XboxCreateDevice params[24] =1234abcd",  # not 24 words
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertIsNone(trace["device_params"])
+        self.assertEqual(trace["features"], [])
+        text = bt.format_text(bt.summarize(None, trace), 10)
+        self.assertNotIn("device params", text)
+        self.assertNotIn("CheckFeatureSupport:", text)
+
     def test_powershell_error_record_prefix_keeps_the_first_call(self):
         self.write_lines(
             self.d3d12,

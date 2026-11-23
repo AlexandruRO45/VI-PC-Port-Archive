@@ -6,6 +6,11 @@ survives a crash; `runtime/README.md`, "Startup trace"), and the D3D12 proxy wri
 triage needs: modules, unimplemented calls and their callers, DllMain/TLS results, exceptions and the exit, then
 the D3D12 calls by outcome and the first call per method.
 
+Two `[rt]` diagnostics in the same stderr log answer first-boot questions directly, so the D3D12 section reads them
+too: the 24 `D3D12XboxCreateDevice params[24]` words the title passed (`docs/boot.md`, question 1), and the
+device proxy's `CheckFeatureSupport feature <id> size <n> -> <HRESULT>: <bytes>` lines, the first answer per
+feature (questions 11 and 22). Every other `[rt]` line is counted, not summarized.
+
 The method field can contain spaces (`SetMarker/BeginEvent with unknown metadata`), so the parser takes the
 outcome as the last field instead of assuming a single-word method. PowerShell 5.1 wraps the first stderr line of
 a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a `<name> : ` prefix before the
@@ -31,6 +36,13 @@ import re
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+DEVICE_PARAMS_LINE = re.compile(
+    r"^(?:.+ : )?\[rt\] d3d12_xs: D3D12XboxCreateDevice params\[(\d+)\] =\s*((?:[0-9A-Fa-f]{8}\s*)+)$"
+)
+FEATURE_LINE = re.compile(
+    r"^(?:.+ : )?\[rt\] d3d12_xs: CheckFeatureSupport feature (\d+) size (\d+) -> (0x[0-9A-Fa-f]{8})(?::\s*(.*))?$"
+)
+FEATURE_BYTES_SHOWN = 16
 
 
 class TraceError(ValueError):
@@ -169,13 +181,19 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "refused": [],
         "partial": [],
         "last_seq": 0,
+        "device_params": None,
+        "feature_queries": 0,
+        "features": [],
     }
+    seen_features = set()
     with _open_text(path) as fh:
         for line in fh:
-            match = D3D12_LINE.match(line.rstrip("\n"))
+            text = line.rstrip("\r\n")
+            match = D3D12_LINE.match(text)
             if not match:
                 if line.strip():
                     trace["ignored_lines"] += 1
+                    _read_rt_line(text, trace, seen_features)
                 continue
             seq, method, outcome = int(match.group(1)), match.group(2), match.group(3)
             trace["calls"] += 1
@@ -194,6 +212,35 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
             "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
         )
     return trace
+
+
+def _read_rt_line(text: str, trace: dict, seen_features: set) -> None:
+    """Keep the device parameter words and the first CheckFeatureSupport answer per feature."""
+    params = DEVICE_PARAMS_LINE.match(text)
+    if params:
+        words = params.group(2).split()
+        if trace["device_params"] is None and len(words) == int(params.group(1)):
+            trace["device_params"] = words
+        return
+    feature = FEATURE_LINE.match(text)
+    if not feature:
+        return
+    trace["feature_queries"] += 1
+    number = int(feature.group(1))
+    if number in seen_features:
+        return
+    seen_features.add(number)
+    tail = (feature.group(4) or "").split()
+    data = [b.lower() for b in tail if re.fullmatch(r"[0-9A-Fa-f]{2}", b)]
+    trace["features"].append(
+        {
+            "feature": number,
+            "size": int(feature.group(2)),
+            "hresult": feature.group(3).lower(),
+            "bytes": data,
+            "truncated": "..." in tail,
+        }
+    )
 
 
 def summarize(startup: dict | None, d3d12: dict | None) -> dict:
@@ -270,9 +317,30 @@ def format_text(summary: dict, limit: int) -> str:
         outcomes = ", ".join(f"{k} {v}" for k, v in sorted(d3d12["outcomes"].items()))
         out.append(
             f"  {d3d12['calls']} call(s), {d3d12['ignored_lines']} other line(s)"
-            " (the [rt] diagnostics are not summarized)"
+            " (other [rt] diagnostics are not summarized)"
             + (f": {outcomes}" if outcomes else "")
         )
+        words = d3d12.get("device_params")
+        if words:
+            nonzero = [f"[{i}]={w}" for i, w in enumerate(words) if int(w, 16)]
+            out.append(
+                f"  device params: {len(words)} word(s), "
+                + (f"nonzero {_tail(nonzero, limit)}" if nonzero else "all zero")
+            )
+        features = d3d12.get("features")
+        if features:
+            failed = sum(1 for f in features if f["hresult"] != "0x00000000")
+            out.append(
+                f"  CheckFeatureSupport: {len(features)} feature(s) in {d3d12['feature_queries']} answer line(s)"
+                + (f", {failed} not S_OK" if failed else "")
+            )
+            for f in features[:limit]:
+                shown = " ".join(f["bytes"][:FEATURE_BYTES_SHOWN])
+                more = " ..." if f["truncated"] or len(f["bytes"]) > FEATURE_BYTES_SHOWN else ""
+                answer = f": {shown}{more}" if shown else ""
+                out.append(f"    feature {f['feature']} size {f['size']} -> {f['hresult']}{answer}")
+            if len(features) > limit:
+                out.append(f"    ... {len(features) - limit} more")
         if d3d12["methods"]:
             out.append(f"  first per method: {_tail(d3d12['methods'], limit)}")
         if d3d12["unsupported"]:
