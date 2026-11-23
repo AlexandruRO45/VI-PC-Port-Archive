@@ -196,6 +196,9 @@ def main():
     ap.add_argument("--json", dest="json_out", help="write the full report to this path")
     ap.add_argument("--self-test", action="store_true", help="check the models without a GPU")
     args = ap.parse_args()
+    if args.json_out and os.path.isdir(args.json_out):
+        print(f"ERROR: --json is a directory, not a report file: {args.json_out}", file=sys.stderr)
+        return 2
     if args.self_test:
         self_test()
         return 0
@@ -233,8 +236,12 @@ def main():
           f"{gfx10_diff} disagree with Mesa's GFX10 column, "
           f"{wave_diff} wave32/wave64 differences")
     if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=2)
+        try:
+            with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=2)
+        except OSError as e:
+            print(f"ERROR: cannot write {args.json_out}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            return 2
     return 1 if gfx11_diff or wave_diff else 0
 
 
