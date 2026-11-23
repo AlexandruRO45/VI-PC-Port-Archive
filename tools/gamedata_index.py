@@ -42,7 +42,7 @@ CARVER = os.path.join(ROOT, "rpf9_carve.py")
 BOM = b"\xef\xbb\xbf"
 XML_DECL = re.compile(rb"<\?xml[^>]*\?>")
 XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
-XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
+XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)$")
 # Tag-like text inside these cannot open or close an element.
 XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
 MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1": "SPS1", b"RBF0": "RBF0", b"PSIN": "PSIN"}
@@ -110,8 +110,23 @@ def xml_root(data: bytes) -> str:
     return m.group(1).decode("ascii", "replace") if m else ""
 
 
+def _trim_xml_space(data: bytes, end: int) -> int:
+    """Return the end offset before trailing XML whitespace."""
+    while end:
+        start = max(0, end - 512)
+        tail = data[start:end].rstrip(b" \t\r\n")
+        if tail:
+            return start + len(tail)
+        end = start
+    return 0
+
+
 def tail_root(data: bytes) -> str:
-    m = XML_CLOSE_TAIL.search(data[-512:])
+    end = _trim_xml_space(data, len(data))
+    if not end or data[end - 1] != ord(">"):
+        return ""
+    end = _trim_xml_space(data, end - 1)
+    m = XML_CLOSE_TAIL.search(data[max(0, end - 512):end])
     return m.group(1).decode("ascii", "replace") if m else ""
 
 

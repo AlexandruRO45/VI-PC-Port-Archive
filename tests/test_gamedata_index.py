@@ -323,6 +323,14 @@ class XmlClassificationTest(unittest.TestCase):
             with self.subTest(data=data):
                 self.assertFalse(self.tool.xml_complete("Foo", data))
 
+    def test_complete_root_with_end_tag_spacing_and_long_trailing_whitespace(self):
+        for end_tag in (b"</Foo>", b"</Foo \t>", b"</Foo" + b" " * 1024 + b">"):
+            for padding in (0, 511, 512, 1024):
+                with self.subTest(end_tag=end_tag, padding=padding):
+                    data = b"<Foo>hello" + end_tag + b" " * padding
+                    self.assertEqual(self.tool.tail_root(data), "Foo")
+                    self.assertTrue(self.tool.standalone_xml(data))
+
     def test_self_closing_root_is_standalone_xml(self):
         for data in (b"<Empty/>", b'  <Empty attr="a>b" />\n',
                      self.bom + self.decl + b"\n<!-- c --><Empty/>"):
