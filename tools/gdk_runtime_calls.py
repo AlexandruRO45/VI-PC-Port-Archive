@@ -41,8 +41,9 @@ xgameruntime_user.cpp, _gamesave.cpp, _store.cpp, _offline.cpp; the class only, 
 no thunk reaches. Text by default, --json for JSON. --out DIR writes both, as <image file name>.gdk_calls.txt and
 .json (x.dll-2.gdk_calls.txt for a second input named x.dll), and prints one summary line per image instead.
 
-Exit status 1 when an image (or the class table) can't be read, or an image is cut off before the end of its
-sections (the report of what is there is still written); 0 otherwise. Reads the files only; never runs them.
+Exit status 2 when a named image does not exist or is a directory (nothing is read or written); 1 when an image
+(or the class table) can't be read, or an image is cut off before the end of its sections (the report of what is
+there is still written); 0 otherwise. Reads the files only; never runs them.
 Standard library only.
 """
 from __future__ import annotations
