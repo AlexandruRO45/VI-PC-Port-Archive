@@ -187,10 +187,12 @@ int main() {
     using namespace leonida;
 
     vktest::Device d;
-    if (!d.create(true)) {
+    const auto device_status = d.initialize(true);
+    if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "vk_presenter_sync_test: no Vulkan device with presentation, skipped\n");
         return 77;
     }
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = window_proc;
