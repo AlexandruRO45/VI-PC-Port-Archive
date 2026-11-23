@@ -21,7 +21,7 @@ FENCE = re.compile(r"```.*?```", re.S)
 LINK = re.compile(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^)\s]+))(?:\s+\"[^\"]*\")?\)")
 HTML = re.compile(r'(?:href|src)\s*=\s*"([^"]+)"')
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$", re.M)
-EXTERNAL = ("http://", "https://", "mailto:", "tel:", "data:")
+EXTERNAL = ("http://", "https://", "//", "mailto:", "tel:", "data:")
 
 
 def strip_fences(text):
@@ -131,6 +131,15 @@ class SlugTest(unittest.TestCase):
 
 
 class RepositoryLinksTest(unittest.TestCase):
+    def test_ignores_protocol_relative_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "page.md")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write('[remote](//example.invalid/page)\n'
+                        '<img src="//example.invalid/image.png">\n'
+                        '[missing](missing.md)\n')
+            self.assertEqual(broken_links(tmp, [page]), [("page.md", "missing.md", "missing file")])
+
     @unittest.skipUnless(shutil.which("git"), "requires Git")
     def test_flags_broken_link_in_tracked_unicode_filename(self):
         with tempfile.TemporaryDirectory() as tmp:
