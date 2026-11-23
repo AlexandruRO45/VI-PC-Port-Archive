@@ -1022,8 +1022,21 @@ std::string package_config() {
     }
     const std::filesystem::path dir = env.empty() ? rt::fs::game_dir() : std::filesystem::path(env);
     if (dir.empty()) return {};
-    std::ifstream f(dir / L"MicrosoftGame.Config", std::ios::binary);
-    if (!f) return {};
+    const auto config = dir / L"MicrosoftGame.Config";
+    std::ifstream f(config, std::ios::binary);
+    if (!f) {
+        // A process without longPathAware can still open an absolute path through the extended-length namespace.
+        // Resolve relative paths and dot segments before adding the prefix, which disables Win32 normalization.
+        std::error_code ec;
+        const auto full = config.is_absolute() ? config : std::filesystem::absolute(config, ec);
+        if (ec || (config.native().size() < MAX_PATH && full.native().size() < MAX_PATH)) return {};
+        const std::wstring path = full.lexically_normal().native();
+        if (path.starts_with(L"\\\\?\\") || path.starts_with(L"\\\\.\\")) return {};
+        const std::filesystem::path extended = path.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + path.substr(2)
+                                                                         : L"\\\\?\\" + path;
+        f.open(extended, std::ios::binary);
+        if (!f) return {};
+    }
     return std::string{std::istreambuf_iterator<char>(f), {}};
 }
 
