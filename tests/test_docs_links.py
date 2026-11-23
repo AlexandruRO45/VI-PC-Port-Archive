@@ -8,9 +8,11 @@ checker that silently accepts everything cannot pass.
 """
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import unquote
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -57,9 +59,13 @@ def links(text):
 
 
 def markdown_files(root):
-    result = subprocess.run(["git", "ls-files", "*.md"], cwd=root, capture_output=True, text=True)
-    if result.returncode == 0:
-        return [os.path.join(root, name) for name in result.stdout.splitlines() if name]
+    try:
+        result = subprocess.run(["git", "ls-files", "-z", "--", "*.md"], cwd=root, capture_output=True)
+    except FileNotFoundError:
+        pass  # Git is optional when scanning a source archive.
+    else:
+        if result.returncode == 0:
+            return [os.path.join(root, os.fsdecode(name)) for name in result.stdout.split(b"\0") if name]
     found = []
     for base, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in (".git", "third_party", "node_modules", "__pycache__")]
@@ -125,6 +131,25 @@ class SlugTest(unittest.TestCase):
 
 
 class RepositoryLinksTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "requires Git")
+    def test_flags_broken_link_in_tracked_unicode_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True)
+            subprocess.run(["git", "config", "core.quotePath", "true"], cwd=tmp, check=True)
+            page = "café notes.md"
+            with open(os.path.join(tmp, page), "w", encoding="utf-8", newline="\n") as f:
+                f.write("[missing](missing.md)\n")
+            subprocess.run(["git", "add", "--", page], cwd=tmp, check=True)
+            self.assertEqual(broken_links(tmp, markdown_files(tmp)), [(page, "missing.md", "missing file")])
+
+    def test_markdown_files_walks_the_tree_when_git_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "README.md")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# README\n")
+            with patch.object(subprocess, "run", side_effect=FileNotFoundError):
+                self.assertEqual(markdown_files(tmp), [page])
+
     def test_every_relative_link_resolves(self):
         files = markdown_files(ROOT)
         self.assertGreaterEqual(len(files), 30, "expected the tracked Markdown files to be found")

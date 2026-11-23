@@ -441,6 +441,31 @@ int main() {
         EXPECT(stats[0].time_us == 5 * period && stats[0].percent_scanned == 0.0f);
     }
 
+    // Rescheduling changes future origins but not the vblank an issued token was due at.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1, period / 4));
+        clock.advance_us(period + period / 4);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, period / 2, 0) == pacer_hr::ok);
+
+        clock.advance_us(3 * period / 4);  // vblank 2, still the deadline of the original token
+        EXPECT(pacer.present_timing(token).late_us == 0);
+        clock.advance_us(period / 4);
+        const auto timing = pacer.present_timing(token);
+        EXPECT(timing.late_us == period / 4);
+        const auto sync = decide_present_sync(timing.late_us, timing.period_us, 30.0f);
+        EXPECT(sync == PresentSync::immediate);
+        pacer.commit_present_token(token, 1, sync);
+
+        FrameStatistic display{};
+        std::uint32_t count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &display) == pacer_hr::ok);
+        EXPECT(count == 1 && display.percent_scanned == 25.0f);
+    }
+
     // A frame behind one that still waits for its vblank cannot be shown at once (it would overtake it): not late.
     {
         ManualFrameClock clock;
@@ -459,6 +484,32 @@ int main() {
         clock.advance_us(period);      // 4.2: token1 was shown at vblank 4; token2 is late and nothing is queued
         EXPECT(pacer.present_timing(token2).late_us == 19200);  // 4.2 periods now, due at 3
         EXPECT(pacer.immediate_presents() == 0);
+    }
+
+    // Presents made after SetFrameIntervalX but before the origin event is scheduled are unpaced (PresentX does not
+    // hold them for a vblank), so they are shown at once and are not frames in flight: however many there were, the
+    // first wait returns at the first origin.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        EXPECT(!pacer.registered());
+        for (int i = 0; i < 1000; ++i) pacer.note_untokened_present();  // blank presents of a loading screen
+        pacer.commit_present_token(0, 1);                               // and one with the null token
+        EXPECT(pacer.frames_in_flight() == 0);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        auto wait = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(wait));
+        clock.advance_us(period);
+        if (wait.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+            pacer.suspend();  // lets the waiter go, so that the failure below ends the test and does not hang it
+            EXPECT(!"the first wait returns one period after the event is armed");
+        }
+        Result r = wait.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == 1);
+        // Once the event is armed, a present is a frame in flight again.
+        pacer.note_untokened_present();
+        EXPECT(pacer.frames_in_flight() == 1);
     }
 
     // Real clock: five 10 ms vblanks take about 50 ms.

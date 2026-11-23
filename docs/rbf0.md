@@ -421,9 +421,10 @@ carry `descriptor`, `type`, `payload_offset`, `size` and `value`; text nodes car
 `--csv PATH` writes one flat row per node. The `parent` column is the parent element's byte offset, `slot` is
 `attribute` or `content`, `sibling` is the index in that list, and `child_index` is the index among child elements;
 `attrs`, `children`, `content_count`, `type`, `length`, `nul`, `utf8` and `value` describe the node. The CSV is a
-convenience view of the same structural tree, not a second parse.
+convenience view of the same structural tree, not a second parse. Use `source` (the starting filename) with
+`resource` (the archive offset) to group rows: two files in a carve directory can specify the same offset.
 
-XML is a rendering, not a round-trip. Fixed tags avoid descriptor names that cannot be used as XML element names:
+XML is a rendering, not a round-trip; the JSON tree is the form that encodes back to bytes (9.6). Fixed tags avoid descriptor names that cannot be used as XML element names:
 `<node name="...">`, `<attr>`, `<value>` and `<text>`. A string containing XML markup is escaped by the writer. The
 `<rbf0>` root carries `status` and, on failure, `error`. JSON, CSV and XML all contain names or payloads and are
 game data.
@@ -443,11 +444,43 @@ the last byte. The corpus has 0 bad, 0 truncated and 0 trailing resources.
   element is a text-only leaf. The decoder marks `attribute_order_violation`, `multiple_text` and
   `text_after_child` if a future resource departs from it; the corpus has none of these.
 - The 26 invalid UTF-8 text payloads have no established encoding. The JSON, CSV and XML writers replace bad bytes,
-  so they are lossy for those records.
+  so they are lossy for those records, and `rbf0_encode.py` refuses the 23 resources that contain them (9.6).
 - `xmlns:xi` is a literal field name. Its namespace meaning is not decoded.
 - `0x50` (three floats) is accepted by the grammar but never occurs in this corpus.
 - No external schema or XSD validates the tree; JSON, CSV and XML output are structural renderings only.
 - A resource does not store its archive path. The source label is the carve offset or file name, not a game path.
+
+### 9.6 Encoder and round trip
+
+`tools/rbf0_encode.py` writes a tree document back to bytes with the grammar of section 3. It emits each descriptor
+name at its first use, then the element header words `0, 0, attribute count`, the attributes, and the content in tree
+order. Text and strings keep their recorded bytes and terminating NUL. `--check` decodes every resource of a carve,
+joining continuations as `rbf0_tree.py` does, encodes it, and compares the result with the original bytes. It exits 0
+only when every resource is byte-identical: a resource that encodes to different bytes or is refused makes it exit 1,
+as `rbf0_tree.py` does for a resource that is not `ok`.
+
+The encoder fails closed: it refuses a tree that cannot hold the original bytes instead of writing other bytes. A
+refusal is one of these: an incomplete parse, invalid UTF-8 that the decoder replaced, a NaN float (infinities are
+exact), an attribute after content, a descriptor out of order, a string or text whose byte length changed, or a
+value the record cannot hold: an integer out of range for the layout, a float that overflows it, an unknown type, or
+an element with more attribute records than its attribute count. An element short of its attribute count with a
+value in its content is refused as an attribute after content, because that value would decode as an attribute.
+
+Measured on the same 1,263 `data.rpf` resources:
+
+| Result | Resources |
+|---|---:|
+| Byte-identical after decode and encode | **1,240** |
+| Encoded to different bytes | 0 |
+| Refused: invalid UTF-8 | 23 |
+| Wide layout, exact | 1,237 of 1,260 |
+| Narrow layout, exact | 3 of 3 |
+
+The 23 refused resources are exactly those that hold the 26 invalid UTF-8 text payloads in 9.5. No other reason
+occurs, and with them `--check` exits 1 on this corpus. So the tree loses no byte anywhere else: element words, attribute counts, descriptor order, value widths,
+float bits and NUL terminators all survive. The encoder also writes an edited tree, for example a JSON report
+changed by hand. It then checks each string and text against the recorded byte length when one is present, so a
+change that alters a length needs that field dropped or updated.
 
 ## 10. Reproduction
 
@@ -465,9 +498,15 @@ python -I tools/rbf0_tree.py <work>\data-carve <work>\rbf0-tree.json --csv <work
 python -I tools/rbf0_tree.py <work>\data-carve <work>\rbf0-tree.json --xml <work>\rbf0-xml
 python -I tools/rbf0_tree.py <work>\data-carve <work>\subtitle.json --root CMovieSubtitleContainer --limit 1
 
+# Round trip: decode and re-encode every resource and compare with the original bytes (counts only)
+python -I tools/rbf0_encode.py --check <work>\data-carve
+# Write the resources of a (possibly edited) tree report back as .rbf files into a new folder
+python -I tools/rbf0_encode.py <work>\rbf0-tree.json <work>\rbf0-encoded
+
 # Unit tests: synthetic headers and trees only
 python -I tests/test_rbf0_index.py
 python -I tests/test_rbf0_tree.py
+python -I tests/test_rbf0_encode.py
 python -I tests/test_imhex_patterns.py
 ```
 

@@ -227,7 +227,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 make_game.preflight(["shaders", "assets"], self.work_dir, wav=False)
             self.assertEqual(ctx.exception.code, 1)
-            self.assertIn("330 GB is needed", stderr_buf.getvalue())
+            self.assertIn("400 GB is needed", stderr_buf.getvalue())
 
         with mock.patch("sys.version_info", (3, 12, 0)), \
                 mock.patch.object(make_game, "tool_available", return_value=True), \
@@ -318,7 +318,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
         index_path = os.path.join(spirv_dir, "index.json")
         with open(index_path, "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader_0": {}}')   # a finished translation is never empty
 
         dummy_exe = os.path.join(self.tmp.name, "vk_pipeline_check.exe")
         with open(dummy_exe, "w", encoding="utf-8") as f:
@@ -327,14 +327,21 @@ class PipelineStageIsolationTest(unittest.TestCase):
         expected_cache = os.path.join(self.out_dir, "pipeline_cache.bin")
         executed_cmds = []
 
-        def fake_run(args: list[str], **kwargs: object) -> None:
+        def fake_run(args: list[str], **kwargs: object) -> int:
             executed_cmds.append(args)
+            return 0
 
+        # The usage probe (checker_supports) really launches the checker, so it is stubbed too: CreateProcess on a
+        # text file named .exe makes native Windows show a modal "Unsupported 16-Bit Application" dialog that blocks
+        # the run. A checker without --inflight-file is what the old dummy answered.
         with mock.patch("make_game.pipeline_check_exe", return_value=dummy_exe), \
+                mock.patch("make_game.checker_supports", return_value=False) as supports, \
                 mock.patch("make_game.run", side_effect=fake_run), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=AssertionError("launched the dummy")), \
                 mock.patch("make_game.log"):
             make_game.pipelines(self.work_dir, self.out_dir)
 
+        supports.assert_called_once()
         self.assertEqual(len(executed_cmds), 1)
         self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache])
 
@@ -363,7 +370,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
             mock_assets.assert_not_called()
             mock_runtime.assert_not_called()
             mock_pipelines.assert_called_once_with(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir),
-                                                   mock.ANY)
+                                                   mock.ANY, runtime_build=None)
 
 
 class StageResumptionAndStepIsolationTest(unittest.TestCase):
@@ -386,13 +393,15 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
 
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('[{"file": "shader.dxbc"}]')
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('[{"name": "shader"}]')
+        with open(os.path.join(dxbc_dir, "disasm", "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("synthetic listing\n")
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
             f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader": {}}')   # a bare {} is an empty merge and is translated again (translated_index_is_empty)
         with open(os.path.join(spirv_dir, "wave64_emulate.txt"), "w", encoding="utf-8") as f:
             f.write("off\n")
         with open(os.path.join(spirv_dir, "translation_sources.sha256"), "w", encoding="utf-8") as f:
@@ -425,10 +434,15 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             fake_py_calls.append(tool)
             if tool == "shader_carve.py":
                 with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    f.write('[{"file": "shader.dxbc"}]')
             elif tool == "fssm_unpack.py":
                 with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    f.write('[{"name": "shader"}]')
+            elif tool == "shader_disasm.py":
+                disasm = os.path.join(dxbc_dir, "disasm")
+                os.makedirs(disasm, exist_ok=True)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
 
         with mock.patch("make_game.py", side_effect=fake_py), \
                 mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
@@ -452,6 +466,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 os.makedirs(dest, exist_ok=True)
                 with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
                     f.write("{}")
+                with open(os.path.join(dest, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                    f.write(make_game.decoder_digest())
 
         with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
             f.write("{}")
@@ -488,6 +504,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             src.touch()
             (dest / "sample").mkdir(parents=True)
             (dest / "sample" / "first.dds").write_bytes(b"completed sibling")
+            (dest / "sample" / make_game.DECODER_RECORD).write_text(make_game.decoder_digest(), encoding="utf-8")
         (pack_dest / "sample" / "second.dds").mkdir()
 
         valid = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": None}]})
@@ -517,7 +534,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 self.assertEqual(run.call_args_list, expected)
 
     def test_pending_exports_refresh_the_existing_helper_once(self) -> None:
-        output = os.path.join(self.work_dir, "tools", "rpf9dump")
+        # Built under the repo (not --work) so `dotnet -o` is not pointed at a locked remote path.
+        output = os.path.join(self.tmp.name, "tools", "rpf9dump", "bin", "Release", "net8.0")
         os.makedirs(output)
         exe = os.path.join(output, "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
         with open(exe, "wb") as f:
@@ -533,6 +551,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
 
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(commands[0][:2], ["dotnet", "build"])
+        self.assertIn("-o", commands[0])
+        self.assertEqual(commands[0][commands[0].index("-o") + 1], output)
         self.assertEqual([(cmd[0], cmd[1]) for cmd in commands[1:]],
                          [(exe, mode) for mode in ("models", "textures", "audio", "xma")])
 

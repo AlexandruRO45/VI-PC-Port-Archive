@@ -16,8 +16,8 @@ Usage:
 
 Exit code is 0 when every program matches, 1 on the first mismatch (with the
 case name, seed, lane, register, expected/actual bits and the RDNA2
-instruction that last wrote the value), 2 on harness errors. Skips are
-counted with reasons and never silent.
+instruction that last wrote the value), 2 on harness errors or when every
+program was skipped (nothing was compared). Skips are counted with reasons and never silent.
 """
 import argparse
 import gc
@@ -38,7 +38,7 @@ if SEM_DIR not in sys.path:
 
 import cpu_ref  # noqa: E402
 import rdna2spirv  # noqa: E402
-from spirv_mini_interp import run_fragment  # noqa: E402
+from spirv_mini_interp import UnsupportedConstruct, run_fragment  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
@@ -116,7 +116,7 @@ def _op_templates():
 # adds to OpIAddCarry, which tests/semantic/spirv_mini_interp.py does not
 # model yet, so every such program would skip with a reason instead of
 # proving anything. Scalar reads are still covered: seeds are moved through
-# s_regs and observed via the v_mov_b32/sgpr copy into v15. Extending the
+# s_regs and observed via the v_mov_b32/sgpr copy into an exported VGPR. Extending the
 # mini-interp (not this runner) re-enables scalar ALU coverage.
 _VEC_OPS = ("v_mov_b32", "v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32",
             "v_and_b32", "v_or_b32", "v_xor_b32", "v_lshlrev_b32",
@@ -170,9 +170,10 @@ def generate_program(rng, n_ops):
             tainted.add(dst)
         else:
             tainted.discard(dst)
-    # Observe one scalar through a VGPR so scalar ops are covered too.
-    lines.append(f"v_mov_b32 v15, s{rng.choice(s_regs)}")
-    writers[15] = ("v_mov_b32/sgpr-copy", len(lines))
+    # Reuse the oldest export: an untouched seed if possible, else an ALU result.
+    dst = min(EXPORT_REGS, key=lambda reg: writers[reg][1])
+    lines.append(f"v_mov_b32 v{dst}, s{rng.choice(s_regs)}")
+    writers[dst] = ("v_mov_b32/sgpr-copy", len(lines))
     return lines, writers
 
 
@@ -209,7 +210,7 @@ def compare_pair(cpu_words, spv_words, *, writers=None):
             if c_nan or s_nan:
                 mismatch = f"lane word {i}: only one side is NaN (cpu=0x{c:08x} spv=0x{s:08x})"
         if writer:
-            mismatch += f" (last writer {writer[0]} at body line {writer[1]})"
+            mismatch += f" (last writer {writer[0]} at body line {writer[1]} for v{EXPORT_REGS[i]})"
         return mismatch
     return None
 
@@ -239,11 +240,9 @@ def run_one(name, lines, writers):
                 gc.collect()
         except rdna2spirv.Unsupported as e:
             return ("skip", f"translator unsupported: {e}")
-        except (IndexError, KeyError, ValueError) as e:
-            return ("skip", f"translator error {type(e).__name__}: {e}")
         try:
             out = run_fragment(spvasm)
-        except Exception as e:  # noqa: BLE001 - the interpreter is part of the comparison
+        except UnsupportedConstruct as e:
             return ("skip", f"mini_interp unsupported: {type(e).__name__}: {e}")
         if list(out) != ["%out_mrt0"]:
             return ("skip", f"mini_interp gave outputs {sorted(out)}, want [%out_mrt0]")
@@ -353,7 +352,12 @@ def main(argv=None):
         print("FIRST FAILURE:\n" + first_failure)
     if counts["harness-error"]:
         return 2
-    return 1 if counts["mismatch"] else 0
+    if counts["mismatch"]:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

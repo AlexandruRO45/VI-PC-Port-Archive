@@ -1,7 +1,7 @@
 """Assemble, translate, and run the synthetic RDNA2->SPIR-V GPU test suite on Vulkan.
 
 Usage:
-    python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR]
+    python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR] [--require-pass]
 
 --llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc".
 """
@@ -25,22 +25,32 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
+from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
+                   fmt_xy_xyz_test, tbuffer_store_test)
+from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
-from check import SIGNED_MIP_TEST
+from check import SIGNED_MIP_TEST, UINT_MIP_TEST
+from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
+from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
+from check import failure   # "exit <status>: <last lines>", check.py's detail for a program that exited non-zero
+from check import run_readback
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
-                   wave32_lane_skip)   # as in check.py
-from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
+                   unpinned_subgroup_skip, wave32_lane_skip)   # as in check.py
+from check import PIXEL_VERTEX, VINT_ENV, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
+from check import barycentric_problem
+from check import NAN_PAYLOAD_TEST, nan_payload_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
+from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
+from check import bary_persp_problem   # ps_persp_bary's perspective-correct reference
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -238,12 +248,36 @@ def unsupported_skip(msg: str) -> str:
     return f"SKIP ({m.group(0) if m else 'unsupported device'})"
 
 
-def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True) -> tuple[int, str]:
+def verdict_line(rc: int, msg: str) -> str:
+    """The detail of a row whose test program judges itself and prints its verdict last: that line. A program that
+    exited non-zero gets its exit status in front, as in check.py, so one that died before its verdict (exit -11 on
+    Linux, 3221225477 = 0xC0000005 on Windows) does not read as a FAIL with only its device or extension line, or
+    with no detail at all."""
+    return failure(rc, msg, 1) if rc else msg.splitlines()[-1] if msg else ""
+
+
+def helper_result(rc: int, msg: str) -> tuple[bool | None, str]:
+    """(ok, detail) for a helper that judges its own output (vk_store_test): 77 is a SKIP that names the missing
+    feature, not a failure (TEST-469); otherwise the exit code decides and verdict_line gives the detail."""
+    if rc == UNSUPPORTED:
+        return None, unsupported_skip(msg)
+    return rc == 0, verdict_line(rc, msg)
+
+
+def compute_result(rc: int, msg: str, ok: bool, detail: str) -> tuple[bool | None, str]:
+    """(ok, detail) for a vk_compute_test run the caller judges itself, unless the module needs a feature the device
+    lacks (check.compute_unsupported: exit 77 with an "unsupported: ..." line), which is a SKIP quoting it."""
+    skip = compute_unsupported(rc, msg)
+    return (None, skip) if skip else (ok, detail)
+
+
+def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
+            cwd: str | None = None) -> tuple[int, str]:
     # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
     # gpu=False (the translator over the whole suite) runs without a limit.
     limit = gpu_test_timeout() if gpu else None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:   # e.g. Smart App Control blocked a fresh build: fail this test, keep running the others
@@ -292,22 +326,45 @@ def w64_emulated() -> bool:
     # subgroup, matching check.py (W64_EMULATED). Accepts "1"/"true"/"yes"/"on" and tolerates
     # the trailing space cmd.exe's `set VAR=1 &` leaves in the value.
     return (os.environ.get("LEONIDA_W64_EMULATE") or "").strip().lower() in ("1", "true", "yes", "on")
+def pc_tail_ubo() -> bool:
+    # LEONIDA_PC_TAIL_UBO=1: translate with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the tail in a uniform
+    # block at set 1), for devices whose maxPushConstantsSize is 128. The test programs read the same variable
+    # (runtime/test/vk_pc_tail.h) and bind the block; same accepted values as LEONIDA_W64_EMULATE.
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
 def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) -> tuple[bool | None, str]:
     """cs_wavemask, as in check.py: (passed, detail), passed None for a skip. The native build needs a 64-wide
     subgroup and skips where the device has none; with LEONIDA_W64_EMULATE=1 it was translated with
     --wave64-emulate and runs on any subgroup size, so it asks for none."""
     cmd = [vk_compute, spv, "1", "wavemask"] + ([] if emulated else ["--require-wave64"])
     rc, msg = run_cmd(cmd, env=env)
+    if skip := compute_unsupported(rc, msg):
+        return None, skip
     if not emulated and rc == 77:
         return None, "SKIP (no 64-wide compute subgroup on this device)"
     if not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
-    return rc == 0, msg.splitlines()[-1] if msg else ""
+    return rc == 0, verdict_line(rc, msg)
 def dump_words(msg: str) -> list[int] | None:
     """The eight words of vk_compute_test's "out[0..7] = ..." line, or None unless it is eight decimal words (as in
     check.py): trailing text, a missing word or a non-number is a malformed dump, not a result."""
     m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)
     return [int(x) for x in m.group(1).split()] if m else None
+
+
+def subgroup_pin_skip(msg: str, cs_env: dict | None) -> Skip | None:
+    """A Skip when the runner asked for a subgroup size (VKC_SUBGROUP_SIZE) and vk_compute_test says this device
+    cannot pin it, so the dispatched words are not the ones the fixture was written for. Only for the dumps in
+    WAVE32_PIN_DUMPS: everything else the runner judges at the device's own width, which is how cs_store and the
+    cs_w32_* fixtures keep being tested on a 64-only device (check.py is conservative and skips all of them)."""
+    if cs_env and "VKC_SUBGROUP_SIZE" in cs_env:
+        return unpinned_subgroup_skip(msg)
+    return None
+
+
+# Dumps whose expected words depend on the wave width but are not lane-mask dumps (those are WAVE32_LANE_DUMPS):
+# cs_barrier_loop's trip count is 4 waves of 32, so at 64 lanes it writes a different pattern and the words would
+# report a failure that is really an unpinnable wave size (GCN3/GCN4 expose 64..64 only).
+WAVE32_PIN_DUMPS = ("cs_barrier_loop",)
 
 
 def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
@@ -316,6 +373,10 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     wave64: it was run with --require-wave64, so exit 77 is a skip and the 64-wide confirmation must be printed.
     partial: a group smaller than a wave, run at subgroup size 64 without full subgroups; skipped when the device
     reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size."""
+    if rc == 77:   # the program refused the module and said why ("unsupported: <why>"): a skip with that reason, in every mode
+        why = next((ln for ln in msg.splitlines() if ln.startswith("unsupported:")), None)
+        if why:
+            return None, "SKIP (" + why[len("unsupported:"):].strip() + ")"
     no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
     if (wave64 and rc == 77) or (no64 and rc == 0):
         return None, "SKIP (no 64-wide compute subgroup on this device)"
@@ -325,7 +386,7 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     if rc != 0 or words is None:
         return False, msg
     vals = words[:len(want)]
-    return vals == want, " ".join((hex if hexwords else str)(x) for x in vals)
+    return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
 
 
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
@@ -347,17 +408,8 @@ def frame_problem(px) -> str:
 
 
 def check_bary(raw_path: str) -> tuple[bool, str]:
-    px = read_raw_rgba32f(raw_path)
-    if problem := frame_problem(px):
-        return False, problem
-    bad = 0
-    first = ""
-    for i, (ax, ay, bi, bj) in enumerate(px):
-        if abs(ax * 0.5 - bi) > 1e-4 or abs(ay * 0.5 - bj) > 1e-4:
-            if not bad:
-                first = f"at ({i%64},{i//64}): attr/2=({ax*0.5:.5f},{ay*0.5:.5f}) raw=({bi:.5f},{bj:.5f})"
-            bad += 1
-    return (bad == 0), (first if bad else "4096/4096 pixels exact")
+    problem = barycentric_problem(read_raw_rgba32f(raw_path), 1e-4)
+    return not problem, problem or "4096/4096 pixels match"
 
 
 def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
@@ -370,8 +422,6 @@ def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
     first = ""
     judged = 0
     for i, (lane, v1, v2, v3) in enumerate(px):
-        if lane >= 32:      # wave32 test: in a 64-wide subgroup lanes 32-63 hold values it never wrote
-            continue
         judged += 1
         w1 = lane ^ 9
         w2 = ((lane & 5) | 16) ^ 1
@@ -379,7 +429,7 @@ def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
             if not bad:
                 first = f"at ({i%64},{i//64}) lane={lane}: got ({v1},{v2},{v3}), want ({w1},{w2},0)"
             bad += 1
-    return (bad == 0 and judged > 0), (first if bad else f"{judged}/{judged} pixels in lanes 0-31 exact")
+    return (bad == 0 and judged > 0), (first if bad else f"{judged}/{judged} pixels exact")
 
 
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
@@ -392,12 +442,33 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                                             "0x1028=0x1,0x102c=0,0x1030=0x7,0x1034=0x80000000,0x1038=0x7,0x103c=0,"
                                             "0x1040=0x1,0x1044=0x5,0x1048=0x80000000,0x104c=0x5,0x1050=0x7,0x1054=0x5,"
                                             "0x1058=0x7,0x105c=0x5"},
+             # 32-bit integer compares: operands from memory (derivations in the .asm header)
+             "ps_vcmp_int32": {"VKH_SGPRS": "0x1000,0,32,0",
+                               "VKH_HEAP": "0x1000=0x1,0x1004=0,0x1008=0x80000000,0x100c=0x12345678,0x1010=0x3,"
+                                           "0x1014=0x5,0x1018=0,0x101c=0"},
              # float NaN / fract rows measured on RDNA2 hardware (see the .asm headers)
              "ps_fnan_med3": {"VKH_SGPRS": "0x1000,0,32,0",
                               "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"
                                           "0x100c=0x7fc10001,0x1010=0x40600000,0x1014=0xc0200000"},
              "ps_fnan_fract": {"VKH_SGPRS": "0x1000,0,16,0",
-                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"}}
+                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             "ps_fnan_med3_s2": {"VKH_SGPRS": "0x1000,0,16,0",
+                                 "VKH_HEAP": "0x1000=0x40a00000,0x1004=0x40e00000,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             "ps_f16_fnan_med3": {"VKH_SGPRS": "0x1000,0,16,0",
+                                  "VKH_HEAP": "0x1000=0x00004500,0x1004=0x00004700,0x1008=0x00007e01,0x100c=0x0000c100"},
+             # f32 VOPC with a NaN, 64-bit integer VOPC: inputs from memory (derivations in the .asm headers)
+             "ps_vcmp_f32_nan": {"VKH_SGPRS": "0x1000,0,16,0",
+                                 "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x3f800000,0x1008=0x40000000"},
+             "ps_vcmp_64": {"VKH_SGPRS": "0x1000,0,64,0",
+                            "VKH_HEAP": "0x1000=0x80000000,0x1004=0,0x1008=1,0x100c=0,0x1010=0xffffffff,"
+                                        "0x1014=0xffffffff,0x1018=1,0x101c=0,0x1020=1,0x1024=0,0x1028=0x80000000,"
+                                        "0x102c=0,0x1030=7,0x1034=5,0x1038=7,0x103c=5"},
+             # the ps_vint_* integer fixtures share one heap, h0..h7 (see their .asm headers)
+             "ps_vint_logic3": VINT_ENV,
+             "ps_vint_bits": VINT_ENV,
+             "ps_vint_mul24": VINT_ENV,
+             "ps_vint_minmax": VINT_ENV,
+             "ps_vint_minmax3": VINT_ENV}
 
 
 def check_flat(raw_path: str) -> tuple[bool, str]:
@@ -541,20 +612,24 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 # checker runs them: the test program that owns them judges them.
 OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_translated_draw_test",
                  "ps_m2": "d3d12_m2_textured_test", "vs_m2": "d3d12_m2_textured_test", "ps_m2_uoff": "d3d12_m2_textured_test",
+                 "ps_m2_literal": "d3d12_m2_textured_test", "ps_m2_array": "d3d12_m2_formats_test",
                  "ps_m3": "d3d12_m3_frame_test", "vs_m3": "d3d12_m3_frame_test",
-                 "ps_m3_post": "d3d12_m3_frame_test",
+                 "ps_m3_post": "d3d12_m3_frame_test", "ps_m3_query": "d3d12_m3_frame_test",
                  "cs_m4_fill": "d3d12_m4_compute_test", "cs_m4_indirect": "d3d12_m4_compute_test",
-                 "cs_buf_typed": "d3d12_buffer_uav_test", "cs_buf_counter": "d3d12_buffer_uav_test"}
+                 "cs_buf_typed": "d3d12_buffer_uav_test", "cs_buf_counter": "d3d12_buffer_uav_test",
+                 "ps_live_width": "w64_graphics.py"}
 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
-DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
+DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_bary": "vs_persp.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
+              "ps_sample_c": "vs_ids.asm", "ps_sample_c_b": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm", "ps_imgatomic": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
-              SIGNED_MIP_TEST: "vs_ids.asm"}
+              SIGNED_MIP_TEST: "vs_ids.asm", UINT_MIP_TEST: "vs_ids.asm",
+              "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
 
@@ -589,6 +664,31 @@ def find_test_programs(build: str, ext: str) -> str | None:
     return None
 
 
+def native_folder(path: str, ansi: str = "mbcs") -> str | None:
+    """`path` spelled so that the native programs this runner starts can open files under it, or None.
+
+    On Windows the test programs and the Vulkan SDK tools (spirv-val, spirv-as) read their command line in the ANSI
+    code page, so a character outside it, as in a Cyrillic or CJK user name under %TEMP%, reaches them as '?'. Such a
+    folder is replaced by its 8.3 short name, which is plain ASCII, when the volume keeps one. Elsewhere, and for a
+    path the code page holds, `path` comes back as it is. `ansi` is the codec of that code page (a parameter so a
+    test can pick a narrow one).
+    """
+    def fits(p: str) -> bool:
+        try:
+            p.encode(ansi)
+            return True
+        except UnicodeEncodeError:
+            return False
+
+    if os.name != "nt" or fits(path):
+        return path
+    import ctypes
+    buf = ctypes.create_unicode_buffer(32768)
+    n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+    short = buf.value if 0 < n < len(buf) else ""
+    return short if short and fits(short) else None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
@@ -598,6 +698,7 @@ def main() -> int:
                          "subfolder that has the test programs is found by itself")
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")
+    ap.add_argument("--require-pass", action="store_true", help="exit 1 if no GPU test passes")
     a = ap.parse_args()
     # Some test programs run with their working directory in <work>/spirv (vk_texture_test), so a relative path
     # given here would point somewhere else for them.
@@ -631,7 +732,18 @@ def main() -> int:
 
     work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
     try:
-        return run_suite(a, work)
+        try:
+            os.makedirs(work, exist_ok=True)
+        except OSError as exc:      # the same report run_suite gives for its own folders (#4544)
+            print(f"error: cannot prepare GPU test directory {work}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
+        native = native_folder(work)
+        if native is None:
+            print(f"error: the work folder {ascii(work)} has characters outside this PC's ANSI code page and no 8.3 "
+                  "short name, so the test programs and the Vulkan SDK tools can't open files in it. Pass --work "
+                  "with a folder whose path they can, such as C:\\leonida_gpu_work.", file=sys.stderr)
+            return 2
+        return run_suite(a, native)
     finally:
         if a.work is None:
             shutil.rmtree(work, ignore_errors=True)
@@ -664,8 +776,12 @@ def run_suite(a, work: str) -> int:
     disasm_dir = os.path.join(work, "disasm")
     spirv_dir = os.path.join(work, "spirv")
     raw_dir = os.path.join(work, "raw")
-    for d in (fssm_dir, disasm_dir, spirv_dir, raw_dir):
-        os.makedirs(d, exist_ok=True)
+    for directory in (work, fssm_dir, disasm_dir, spirv_dir, raw_dir):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            print(f"error: cannot prepare GPU test directory {directory}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
     disasm_files = []
@@ -717,7 +833,9 @@ def run_suite(a, work: str) -> int:
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
-        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add: GLSL Fma or OpFmaKHR (docs/design.md)
+        if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
+            cmd.append("--pc-tail-ubo")
+        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
@@ -776,16 +894,17 @@ def run_suite(a, work: str) -> int:
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
-            results.append((name, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches" in msg.splitlines(), msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
+                                                    in msg.splitlines(), msg))
         elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name in ("cs_bvh", "cs_bvh32"):   # the 64-bit and the 32-bit node pointer: one scene, the same words
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name in STORE_WORDS:
             # TEST-184: image atomics (cs_imgatomic, cs_imgatomic3d) and image_get_resinfo (cs_resinfo). vk_store_test
             # binds the images and prints the r32 ones after the dispatch; the expected words are check.py's.
@@ -804,11 +923,11 @@ def run_suite(a, work: str) -> int:
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
-        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
-                      "cs_buf_swizzle", "cs_cmpx_class_f32"):
+        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
+                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_buf_load_sub", "cs_buf_fmt8"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
-            # cs_cmpx_class_f32 is per-lane and needs no particular subgroup width either.
+            # cs_cmpx_class_f32 and cs_cvt_pk_u8 are per-lane and need no particular subgroup width either.
             # The other four pin the SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm).
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
             want = {
@@ -819,24 +938,33 @@ def run_suite(a, work: str) -> int:
                 # never run with a translator that zero-extends the s_load immediate (reads 4 GiB past the heap)
                 "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
                                       0xEEEEEEEE, 0xEEEEEEEE],
+                # SHADER-328: a constant SGPR offset gives what the run-time one gives (no 32-bit wrap)
+                "cs_smem_sconst_off": [0, 0x5EED0018, 0x5EED0018, 0x5EED0014],
                 "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
                 "cs_oob_select": [0x5EED000C, 0, 0x5EED0014, 0, 0x5EED0018, 0xEEEEEEEE, 0, 0],
                 "cs_oob_tail": [0, 0, 0x5EED0010, 0, 0xBEEF0000, 0xEEEEEEEE, 0, 0x5EED0010],
-                # swizzled MUBUF addressing and ADD_TID_ENABLE (lanes 0 and 1 store; derivation in the .asm header)
-                "cs_buf_swizzle": [0x5EED0024, 0x5EED0044, 0x5EED004C, 0x5EED0008, 0x5EED0028, 0, 0xBEEF0000,
+                # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE (lanes 0 and 1 store)
+                "cs_buf_swizzle": [0x5EED0024, 0x5EED0044, 0x5EED004C, 0x5EED0008, 0x5EED000C, 0, 0xBEEF0000,
                                    0xBEEF0001],
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
+                "cs_cvt_pk_u8": CVT_PK_U8_WORDS,
+                # TEST-510: sub-dword MUBUF loads (RAW end check by element size) and GFX10_FORMAT_8_UINT
+                "cs_buf_load_sub": [0x80, 0xFFFFFF80, 0x1FF, 0xFFFF807F, 0xAB01, 0xCD, 0, 0],
+                "cs_buf_fmt8": [0x7F, 0x80, 0xFF, 0x01, 0, 0, 0xFF, 1],
             }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
-            results.append((name, rc == 0 and vals == want,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == want,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_fmt_1010102":
             problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
         elif name == "cs_fmt_sint32":
             problem = fmt_sint32_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
+        elif name == "cs_fmt_int_narrow":
+            problem = fmt_int_narrow_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "136/136 dumped words exact"))
         elif name == "cs_fmt_xy_xyz":
             # TEST-185: xy/xyz format loads and stores, words measured natively on a Radeon 680M (the .asm header)
             problem = fmt_xy_xyz_test(a.build, spirv_dir, cs_env)
@@ -844,39 +972,87 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_tbuffer_store":
             # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
             problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
+        elif name == "cs_fmt_d16_xyz":
+            # d16_xyz / d16_xy typed-buffer loads and d16_xyz stores (cs_fmt_d16_xyz.asm header)
+            problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "80/80 dumped words exact"))
             results.append((name, not problem, problem or "128/128 dumped words exact"))
-        elif name == "cs_global_neg_offset":
+        elif name in ("cs_global_neg_offset", "cs_global_mem_ext"):
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
+            # cs_global_mem_ext.asm: global/buffer atomics, 8/16-bit global stores and d16 loads in the same heap.
             rc, msg = run_cmd([vk_compute, spv, "40", "dump"], env=cs_env)
-            want = [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4, 0x9E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE]
+            want = {"cs_global_neg_offset": [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4, 0x9E, 0xFFFF8BAD,
+                                             0x57023FFC, 0xEEEEEEEE],
+                    "cs_global_mem_ext": [0x5, 0xC, 0x977, 0xFFF00000, 0xEDCB5678, 0xEF332211, 0x887766BE, 0xFF801234]}[name]
             ok, detail = judge_cs_dump(rc, msg, want, wave64=False, partial=False, emulated=False, hexwords=True)
             results.append((name, ok, detail))
+        elif name == "cs_heap_init":
+            # vk_compute_test copies VKC_HEAP_INIT's file into the heap; the shader copies its words at 0x100 to 0.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **heap_init_env()))
+            words = dump_words(msg)
+            vals = words[:len(HEAP_INIT_EXPECTED)] if words else []
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == HEAP_INIT_EXPECTED,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_user_sgprs":
             # vk_compute_test seeds s4..s7 from VKC_SGPRS; the shader stores them back.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **USER_SGPRS_ENV))
             words = dump_words(msg)
             vals = words[:len(USER_SGPRS_WORDS)] if words else []
-            results.append((name, rc == 0 and vals == USER_SGPRS_WORDS,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == USER_SGPRS_WORDS,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_f64_add":
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            if rc == 77:   # Float64, or Int64 where the module declares both: quote whichever it names
+                results.append((name, None, compute_unsupported(rc, msg) or "SKIP (no shaderFloat64 on this device)"))
+            else:
+                ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
+                                           hexwords=True)
+                results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
-            wrong = []
+            wrong, skip = [], None
             for bits, unsigned, signed in CVT_F32_SAT_CASES:
                 rc, msg = run_cmd([vk_compute, spv, "1", "dump"],
                                   env=dict(cs_env or os.environ, VKC_SGPRS=f"{bits:#010x}"))
+                if skip := compute_unsupported(rc, msg):   # the module, not this input: no other input can run either
+                    break
                 words = dump_words(msg)
                 if rc != 0 or not words or words[:2] != [unsigned, signed]:
                     got = " ".join(hex(x) for x in words[:2]) if words else msg.splitlines()[-1] if msg else "no output"
                     wrong.append(f"{bits:#010x} gave {got}, want {unsigned:#x} {signed:#x}")
             n = len(CVT_F32_SAT_CASES)
-            results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
-                            else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
+            if skip:
+                results.append((name, None, skip))
+            else:
+                results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
+                                else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
+        elif name == "cs_fma_fused":
+            # Single-rounded f32 FMA (+ f16 round-to-odd): strict under LEONIDA_FMA=khr (OpFmaKHR, exit 77 if
+            # unsupported), fused-or-split f32 allowed under default --fma glsl (e.g. Mesa RADV splits 5/7).
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **FMA_FUSED_ENV))
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                # TEST-1147: judge by the mode the translator recorded in index.json, as check.py does.
+                # --fma exact has no KHR capability, so capability/env alone used to accept split words here.
+                meta = index.get("cs_fma_fused") or {}
+                mode = meta.get("fma") or ""
+                if mode:
+                    # The recorded mode wins over a stale LEONIDA_FMA, as in check.py.
+                    strict = mode in ("khr", "exact")
+                else:
+                    strict = ("shaderFmaFloat32" in (meta.get("features") or ())
+                              or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
+                ok, detail = judge_fma_fused(dump_words(msg), khr=strict)
+                results.append((name, ok, detail))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -885,7 +1061,8 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
-                      "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst"):
+                      "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
+                      "cs_mask_vgpr_exec"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -902,11 +1079,20 @@ def run_suite(a, work: str) -> int:
                 # 64-bit scalar data ops and v_mad_u64_u32 (cs_w32_salu64.asm)
                 # more ops with CPU-only checks until now (cs_w32_misc_ext.asm)
                 # ops merged on 2026-11-22 with CPU-only checks (cs_w32_new_ops.asm)
+                # plain 8/16-bit MUBUF stores, one crossing a dword (cs_w32_buffer_store_sub.asm)
+                "cs_w32_buffer_store_sub": [0x1122AB44, 0xCDEF7788, 0x34AABBCC, 0xDDDDDD12, 0x0102035A, 0x05061234, 0xAB, 0xFFFFCDEF],
+                # 8/16-bit MUBUF d16 loads and stores (cs_w32_buffer_sub16.asm)
+                "cs_w32_buffer_sub16": [0xBEEF00AA, 0x00AA1234, 0xBEEFFFAA, 0xFFAA1234, 0xBEEF8899, 0x88991234, 0x1122CD44, 0xABCD7788],
+                # ds_cmpst_f32 and buffer_atomic_fcmpswap: float compare (cs_w32_fcmpswap.asm)
+                "cs_w32_fcmpswap": [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000],
                 "cs_w32_new_ops": [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234],
                 "cs_w32_misc_ext": [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D],
                 "cs_w32_salu64": [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE],
                 # SHADER-85: ds_read_u8/i8_d16[_hi] (cs_w32_lds_u8_d16.asm header)
                 "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
+                # 8/16-bit and 64/96/128-bit LDS accesses (cs_w32_lds_subdword.asm / cs_w32_lds_wide.asm headers)
+                "cs_w32_lds_subdword": [0x11B2D444, 0xA1B2C3D4, 0xFFFFFFB2, 0x000000B2, 0x00000011, 0xFFFFA1B2, 0x0000A1B2, 0xFFFFC3D4],
+                "cs_w32_lds_wide": [0xCAFEF00D, 0xFEEDFACE, 0x600DD00D, 0x00000000, 0x8BADF00D, 0xDEADC0DE, 0x12345678, 0x9ABCDEF0],
                 # ds_cmpst_b32 and the b64 2-address forms (cs_lds_b64_cmpst.asm header)
                 "cs_lds_b64_cmpst": [0x11110001, 0x22220002, 0x33330003, 0x44440004,
                                      0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC],
@@ -924,6 +1110,9 @@ def run_suite(a, work: str) -> int:
                 "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
                 "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
                 "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
+                # SHADER-99: -0 and NaN survive (SignedZeroInfNanPreserve, cs_signed_zero_nan.asm); 0 in out[4..7]
+                # without it
+                "cs_signed_zero_nan": [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007C00],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -950,7 +1139,10 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
                 "cs_w64x_partial_scmp": [0, 1, 0, 1, 1, 1, 1, 0],     # s_cmp mask, -1 in a partial wave
                 "cs_w32_partial_scmp": [0, 1, 1, 0, 1, 1, 1, 1],      # the same in a 20-thread wave32
+                "cs_w32_andn2_exec": [1, 8, 16, 2064, 2068, 3, 20, 1544],   # s_andn2_saveexec/wrexec_b32 (.asm header)
                 "cs_w32_sincos": [1, 1, 1, 1, 1, 1],                  # SHADER-88 (cs_w32_sincos.asm): angles in turns
+                # SHADER-74: v_permlane16/x16 FI / BOUND_CTRL with the source lane off in EXEC (cs_w32_permlane_fi.asm)
+                "cs_w32_permlane_fi": [1000, 0, 4, 1, 1000, 0, 52, 49],
                 "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
                 "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
                 "cs_w64x_andn2_exec": [1, 16, 32, 4144, 2052, 3, 8, 1544],   # s_andn2_saveexec/wrexec_b64 (.asm header)
@@ -962,10 +1154,14 @@ def run_suite(a, work: str) -> int:
                 # differs per wave (cs_barrier_loop.asm)
                 "cs_barrier_early_end": [127, 126, 125, 124, 123, 122, 121, 120],
                 "cs_barrier_loop": [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE],
+                # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC —
+                # inactive lanes keep the old VGPR (cs_mask_vgpr_exec.asm)
+                "cs_mask_vgpr_exec": [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                                      0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
-            # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops, the wave32
+            # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops / cs_signed_zero_nan, the wave32
             # cs_wqm_w32 / cs_bpermute32 and the DPP tests is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip,
             # as check.py does, where the device has none
             # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
@@ -974,32 +1170,48 @@ def run_suite(a, work: str) -> int:
             # size 64 without them.
             emulated = w64_emulated()
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
-            wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
+            wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
-                                  "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
-                                  "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm",
+                                  "cs_w32_lds_subdword", "cs_w32_lds_wide",
+                                  "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
+                                  "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
                 cs_env = dict(os.environ, **WAVE32_LANE_ENV)
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
-            skip = wave32_lane_skip(msg) if name in WAVE32_LANE_DUMPS else None
+            skip = None
+            if name in WAVE32_LANE_DUMPS:
+                if rc == UNSUPPORTED:
+                    results.append((name, None, unsupported_skip(msg)))
+                    continue
+                if rc == 0:
+                    skip = wave32_lane_skip(msg)
+            if skip is None and name in WAVE32_PIN_DUMPS:
+                # the device may not be able to run the wave size this fixture was written for (a 64-only device
+                # can't pin 32, so cs_barrier_loop's words mean nothing); check.py skips it too
+                skip = subgroup_pin_skip(msg, cs_env)
             if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
                 ok, detail = None, str(skip)
             else:
+                want = judged_words(name, msg, want)   # cs_signed_zero_nan on Apple and llvmpipe (check.py)
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
-                                                             "cs_lds_b64_cmpst"))
+                                                             "cs_w32_lds_subdword", "cs_w32_lds_wide",
+                                                             "cs_lds_b64_cmpst", "cs_signed_zero_nan"))
+                if ok and None in want:
+                    unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
+                    detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, *helper_result(rc, msg)))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, *helper_result(rc, msg)))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
@@ -1009,41 +1221,31 @@ def run_suite(a, work: str) -> int:
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "4096 RGBA pixels matched"))
         elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16", "ps_sample_c_lz",
-                      "ps_sample_c_lz_a16"):
+                      "ps_sample_c_lz_a16", "ps_sample_c", "ps_sample_c_b"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
-                Path(raw).unlink(missing_ok=True)
                 cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
             else:
                 mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
-                        "ps_sample_c_lz_a16": ["dref_a16"]}.get(name, [])
+                        "ps_sample_c_lz_a16": ["dref_a16"], "ps_sample_c": ["dref_c"],
+                        "ps_sample_c_b": ["dref_c_b"]}.get(name, [])
                 cmd = [tool, *mode, raw]
-            try:
-                p = subprocess.run(cmd, capture_output=True, text=True, cwd=spirv_dir)
-                rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
-            except FileNotFoundError:
-                rc, msg = 1, f"missing {tool}"
-            except OSError as e:
-                rc, msg = 1, start_failure(tool, e)
+            rc, msg = run_readback(raw, run_cmd, cmd, cwd=spirv_dir)
             if rc == UNSUPPORTED:   # e.g. fewer push constant bytes than the texture tests need
                 results.append((name, None, unsupported_skip(msg)))
             elif name == "ps_texture_sample_d16" and rc == 0:
-                ok, detail = check_d16_texture(raw) if os.path.isfile(raw) else (False, "missing RGBA32F readback")
+                ok, detail = check_d16_texture(raw)
                 results.append((name, ok, detail))
             else:
-                results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
+                results.append((name, rc == 0 and "PASSED" in msg, verdict_line(rc, msg)))
         elif name in TEXTURE_CONSTANTS:
             expected = TEXTURE_CONSTANTS[name]
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
-            try:
-                p = subprocess.run([tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92", "c00000",
-                                    "14500000", "0"], capture_output=True, text=True, cwd=spirv_dir)
-                rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
-            except FileNotFoundError:
-                rc, msg = 1, f"missing {tool}"
+            rc, msg = run_readback(raw, run_cmd, [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92",
+                                                "c00000", "14500000", "0"], cwd=spirv_dir)
             bad = 4096
             if rc == 0 and os.path.isfile(raw):
                 data = Path(raw).read_bytes()
@@ -1051,8 +1253,10 @@ def run_suite(a, work: str) -> int:
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             else:
-                results.append((name, rc == 0 and bad == 0, "4096/4096 pixels exact" if bad == 0 else
-                                f"{bad} pixels differ from {expected}: {msg.splitlines()[-1] if msg else ''}"))
+                detail = ("4096/4096 pixels exact" if bad == 0 else
+                          f"{bad} pixels differ from {expected}: {verdict_line(0, msg)}")
+                # After a non-zero exit no frame was compared: the exit status, not a pixel count.
+                results.append((name, rc == 0 and bad == 0, verdict_line(rc, msg) if rc else detail))
         elif name in ("ps_tex", "ps_imgatomic"):
             # A texture through the descriptor hash table and the bindless set (ps_tex), or image atomics in a pixel
             # shader through the set's r32ui storage arrays (ps_imgatomic, drawn with vs_ids). vk_bindless_test
@@ -1064,25 +1268,25 @@ def run_suite(a, work: str) -> int:
                 reason = next((ln for ln in lines if ln.startswith("unsupported:")), "unsupported device")
                 results.append((name, None, f"SKIP ({reason})"))
             else:
-                results.append((name, rc == 0, lines[-1] if lines else ""))
+                results.append((name, rc == 0, verdict_line(rc, msg)))
         elif name == "ps_ssharp":
             # The S#/T# mip fields through vulkan_sampler() and the view range (check.py's SAMPLER_CASES).
             problem = sampler_test(a.build, spirv_dir)
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or f"{len(SAMPLER_CASES)} S#/T# cases, 4096 pixels each exact"))
-        elif name in ("ps_texoff", "ps_texoff_implicit"):
+        elif name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
             # Texel offsets: needs vk_texture_test's texture, sampler and descriptor table (vk_harness binds none),
             # and VK_KHR_maintenance8 for the non-constant Offset; the tool exits 77 without it.
             raw = os.path.join(raw_dir, f"{name}.raw")
-            rc, msg = run_cmd([os.path.join(a.build, "vk_texture_test" + ext), vs_tri, spv, raw, *TEXOFF_ARGS],
-                              env=texoff_env())
+            rc, msg = run_readback(raw, run_cmd, [os.path.join(a.build, "vk_texture_test" + ext), vs_tri, spv, raw,
+                                                *TEXOFF_ARGS], env=texoff_env())
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
                 results.append((name, False, msg))
             else:
                 with open(raw, "rb") as f:
-                    problem, covered = texoff_problem(f.read(), msg)
+                    problem, covered = texoff_problem(f.read(), msg, name=name)
                 results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
         elif name in OTHER_HARNESS:
             results.append((name, None, f"SKIP (run by {OTHER_HARNESS[name]})"))
@@ -1090,7 +1294,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             if name in PIXEL_VERTEX:
-                if bary_fallback() and name == "ps_interp_f16_high":   # no PerVertexKHR inputs under --bary-fallback
+                # --bary-fallback alone has no PerVertexKHR inputs, so the f16 halves can't be interpolated; with
+                # --f16-interp-fallback too (on by itself without fragmentShaderBarycentric) it reads decoded halves.
+                if name == "ps_interp_f16_high" and bary_fallback() and not f16_interp_fallback():
                     results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
                     continue
                 vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
@@ -1098,7 +1304,7 @@ def run_suite(a, work: str) -> int:
             bary_gs = os.path.join(spirv_dir, f"{name}.bary_gs.spv")
             if bary_fallback() and os.path.isfile(bary_gs):   # --bary-fallback PS: barycentrics from this GS
                 env = dict(env or os.environ, VKH_GS=bary_gs, VKH_GS_HELPER="1")
-            rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, vs, spv, raw], env=env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
                 results.append((name, None, unsupported_skip(msg)))
                 continue
@@ -1107,13 +1313,17 @@ def run_suite(a, work: str) -> int:
                 continue
             const_wants = {
                 "ps_clip_color": (0x3E800000, 0x3F000000, 0x3F400000, 0x3F800000),
+                "ps_exp_color_mask": (0x40000000, 0x40800000, 0x40000000, 0x40800000),   # .asm header
                 "ps_ops": (0x48804300, 5, 7, 0xBFFFFFFC),
                 "ps_ops2": (0xABCD4400, 0x46001234, 0xBFFFFFFA, 7),
                 "ps_ops3": (0xBFFFFFFA, 0x44660066, 0x44AABBCC, 16),
                 "ps_ops4": (0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00),
                 "ps_scc": (1, 1, 3, 0x80000000),
                 "ps_sdwa": (0x000000F1, 0xBFFEFFF2, 0x3C003344, 0xBFF70000),
+                "ps_sdwa_dword_hi": (0x00004000, 0x00000003, 0x00004700, 0x0000C000),   # 16-bit SDWA, dst_sel:DWORD
                 "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
+                "ps_mul_legacy_denorm": (0, 0, 0, 0x80000000),  # mode0 input FTZ + DX9 +0 override; output FTZ keeps sign
+                "ps_mul_legacy_denorm_mods": (0, 0, 0, 0x40400000),  # product FTZ before omod; omod -0 -> +0
                 "ps_ops5": (0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00),   # from the .asm headers
                 "ps_ops6": (0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0),
                 "ps_ops7": (0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003),
@@ -1121,12 +1331,15 @@ def run_suite(a, work: str) -> int:
                 "ps_f32_mods": (0xC0256A01, 0x3F800000, 0x41E00000, 0x3FC00000),
                 "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
                 "ps_vcmpx_forms": (0xF05B2A48, 0xF05E8A12, 0xB174BE18, 0x15550000),   # 14 v_cmpx forms (.asm header)
+                "ps_vcmp_int32": (0x963E52E8, 0x984DCEE8, 0xB9458EE8, 0xB73612E8),   # u32/i32 compares (.asm header)
                 "ps_med3_mods": (0x3F800000, 0x40400000, 0x40C00000, 0x3F400000),
                 "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
                 "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
                 "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
                 "ps_f64_mods": (0x40040000, 0x3FF00000, 0x3FE40000, 0x3FF00000),   # needs shaderFloat64
+                "ps_f64_round": (0xC12AF665, 0x3FE7FFFF, 0xBFFFFFFF, 0xC12AF666),  # needs shaderFloat64
+                "ps_outmods_f16": (0xAAAA3C00, 0xAAAA3E00, 0x7C000000, 0x3C000000),
                 # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)
                 "ps_f16_med3_opsel": (0xAAAA4100, 0xAAAA4200, 0xAAAA3E00, 0x40005555),
                 "ps_f16_med3_mods": (0x41005555, 0x3C005555, 0x41003800, 0xAAAABA00),
@@ -1138,19 +1351,38 @@ def run_suite(a, work: str) -> int:
                 "ps_f16_const2": (0x42003D00, 0x3D004200, 0xAAAABC00, 3),
                 "ps_f16_pack": (0x34003C00, 0x38003400, 0x34000000, 0x44004200),
                 "ps_f16_pack_mods": (0x4400B400, 0xC4003400, 0x4400C200, 0xB400B400),
+                "ps_sdwa_f16_const": (0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0),   # measured on gfx1036
                 "ps_sff_imm": (2, 1, 20, 16),                  # SHADER-46: s_ff0/s_ff1 of an immediate
                 "ps_fnan_med3": (0x40A00000, 0xC0200000, 0xC0200000, 0x40600000),   # measured on RDNA2 hardware
                 "ps_fnan_fract": (0x3F7FFFFF, 0x00003BFF, 0xC0200000, 0xC0200000),
+                # v_med3 with a NaN in S2 or in two operands, by the same measured rule (derivations in the .asm headers)
+                "ps_fnan_med3_s2": (0x40A00000, 0x40A00000, 0xC0200000, 0x40E00000),
+                "ps_f16_fnan_med3": (0xAAAA4500, 0xAAAA4500, 0xAAAAC100, 0xAAAA4700),
                 # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
                 "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3F800000),
+                "ps_far_branch": (0x00000007, 0x00000013, 0x00000051, 0x0000000B),   # far branches (.asm header)
+                "ps_vcmp_f16": (0x48A12080, 0x4CE9B1A2, 0x4BA72C98, 0x4FEFBDBA),   # 16-bit float v_cmp e32 (.asm header)
+                "ps_vcmp_f16_e64": (0x44C11100, 0x4CF171C1, 0x47C71D18, 0x4FF77DD9),   # same, e64 with swapped operands
+                "ps_vcmpx_f16": (0x68A12080, 0x6CE9B1A2, 0x6BA72C98, 0x6FEFBDBA),   # 16-bit float v_cmpx e32 (.asm header)
+                "ps_vcmpx_f16_e64": (0x64C11100, 0x6CF171C1, 0x67C71D18, 0x6FF77DD9),   # same, e64 with swapped operands
                 "ps_cvt_off": (0xBF000000, 0x3EE00000, 0xBE800000, 0x3F800000),
-                "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3E00, 0xAAAA0000, 0xAAAA4000),
+                "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3A00, 0xAAAA0000, 0xAAAA4400),
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
+                "ps_cndmask_sign_mods": (0xFF800001, 0x7F800001, 0x80000001, 0x7F800001),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
                 # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)
                 "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
+                "ps_valu16_mad_sel": (0x00008003, 0xDB880000, 0xFFFFFFFF, 0x80000000),   # measured on gfx1036
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
+                "ps_vcmp_f32_nan": (0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7),   # from the .asm headers
+                "ps_vcmp_64": (0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93),
+                # 32-bit integer VALU ops on VINT_ENV's heap (derivations in the .asm headers)
+                "ps_vint_logic3": (0xFFFFFFFE, 0xBBB05070, 0x1D3B5977, 0x123F5F7E),
+                "ps_vint_bits": (0xFFFFFFFE, 0x40000000, 0x1E6A2C48, 0x000001D5),
+                "ps_vint_mul24": (0x13345678, 0xFFFFFFFD, 0x00007FFF, 0x0000FFFF),
+                "ps_vint_minmax": (0x7FFFFFFE, 0x80000001, 0x80000001, 0x7FFFFFFE),
+                "ps_vint_minmax3": (0xF0F0F0F0, 0xAB800000, 0xF0F0F0F0, 0xAB800000),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge
@@ -1158,8 +1390,14 @@ def run_suite(a, work: str) -> int:
                 continue
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
+            elif name == NAN_PAYLOAD_TEST:
+                problem = nan_payload_problem(read_raw_u32(raw), msg)
+                ok, detail = not problem, problem or "4096/4096 pixels match the driver-aware NaN payload check"
             elif name == "ps_bary":
                 ok, detail = check_bary(raw)
+            elif name == "ps_persp_bary":
+                problem = bary_persp_problem(read_raw_rgba32f(raw))
+                ok, detail = not problem, problem or "perspective-correct on every covered pixel"
             elif name == "ps_bitmask_perm":
                 m = re.search(r"subgroup \d+\.\.(\d+)", msg)
                 if m and int(m.group(1)) < 32:
@@ -1173,17 +1411,15 @@ def run_suite(a, work: str) -> int:
             elif name == "ps_flat":
                 ok, detail = check_flat(raw)
             elif name == "ps_interp_f16_high":
-                with open(raw, "rb") as source:
-                    problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
+                # A missing or partial readback is an empty frame for this test, not a crash of the suite (as #3442).
+                problem = interp_f16_high_problem(read_raw_u32(raw) if os.path.isfile(raw) else [])
                 ok, detail = not problem, problem or "f16 low/high halves and f32 control within 2e-3"
             elif name == "ps_ij_computed":
-                with open(raw, "rb") as source:
-                    problem = ij_computed_problem(list(struct.iter_unpack("<4I", source.read())))
+                problem = ij_computed_problem(read_raw_u32(raw) if os.path.isfile(raw) else [])
                 ok, detail = not problem, problem or "computed I/J pair words and v/2 within 1e-6"
             elif name == "ps_mandelbrot":
-                with open(raw, "rb") as source:
-                    px = list(struct.iter_unpack("<4I", source.read()))
-                problem = mandelbrot_problem(px)
+                px = read_raw_u32(raw) if os.path.isfile(raw) else []
+                problem = frame_problem(px) or mandelbrot_problem(px)
                 ok, detail = not problem, problem or f"{len(px)}/{len(px)} iteration counts match the float32 model"
             else:
                 ok, detail = False, "no checker defined"
@@ -1191,7 +1427,7 @@ def run_suite(a, work: str) -> int:
         elif name == "gs_tri":
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_GS=spv)
-            rc, msg = run_cmd([vk_harness, vs_tri, fs_loc1, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, vs_tri, fs_loc1, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
@@ -1210,7 +1446,7 @@ def run_suite(a, work: str) -> int:
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
-            rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs_passthru, raw], env=env)
             # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
             # the wave64 compute dumps are.
             no64 = (name == "ms_w64x_ballot" and not w64_emulated() and
@@ -1228,28 +1464,41 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)   # VKH_MESH=1, or the --mesh-compute pass and its VS
             fs = os.path.join(spirv_dir, "ps_interp_f16_high.spv")
-            if bary_fallback():
+            if bary_fallback() and not f16_interp_fallback():
                 results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
                 continue
-            rc, msg = run_cmd([vk_harness, spv, fs, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
                 results.append((name, False, msg))
             else:
-                with open(raw, "rb") as source:
-                    problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
+                # A missing or partial readback is an empty frame for this test, not a crash of the suite (as #3442).
+                problem = interp_f16_high_problem(read_raw_u32(raw) if os.path.isfile(raw) else [])
                 results.append((name, not problem, problem or "f16 low/high halves and f32 control within 2e-3"))
         elif name == "ms_clip":
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
-            rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs_passthru, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
+                results.append((name, ok, detail))
+        elif name == "vs_base_ids":
+            # Zero-based v0 / v3 (the hardware's VS input VGPRs): drawn with firstVertex 16 and firstInstance 7,
+            # ps_flat must still see vertex 0 of instance 0 (0x101), as check.py checks.
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            env = dict(gfx_env or os.environ, VKH_DRAW="16,7")
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, os.path.join(spirv_dir, "ps_flat.spv"), raw], env=env)
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                ok, detail = check_flat(raw)
                 results.append((name, ok, detail))
 
     if a.filter and not results:   # the filter matched only inputs/partners: say so rather than "0/0 passed"
@@ -1266,13 +1515,23 @@ def run_suite(a, work: str) -> int:
     print("\n=== GPU TEST RESULTS ===")
     passed = skipped = 0
     for name, ok, detail in results:
+        ok = None if isinstance(detail, Skip) else ok   # a check.py helper's "this device can't run it" (cs_fmt_*)
         tag = "SKIP" if ok is None else "PASS" if ok else "FAIL"
         passed += ok is True
         skipped += ok is None
         print(f"  {tag:4s}  {name:<20s}  {detail}")
     print(f"\n{passed}/{len(results)} passed" + (f", {skipped} skipped" if skipped else ""))
-    return 0 if passed + skipped == len(results) else 1
+    if passed + skipped != len(results):
+        return 1
+    if getattr(a, "require_pass", False) and not passed:
+        print("error: --require-pass: no GPU tests passed", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

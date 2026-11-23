@@ -26,7 +26,7 @@ Read-only: no texture bytes are printed or committed. `scan` emits aggregate
 counters only (both the zlib/raw baseline and the BCPack-enabled projection).
 `layout` prints descriptor fields and offsets. `check` prints the BC
 block-average error against a 2x2 downsample of the parent mip (across all
-slices/faces for arrays and cubemaps; BC1, BC3, BC4_UNORM, BC5_UNORM, BC6H and
+slices/faces for arrays and cubemaps; BC1, BC2, BC3, BC4_UNORM, BC5_UNORM, BC6H and
 BC7) or 3D Z-continuity vs 2D control for float16 volumes. `export` writes a
 DX10 DDS when every source mip uses a supported codec.
 
@@ -92,14 +92,16 @@ PATTERNS_64K = {
     3: (0, 0, 0, 1, -1, 2, 3, -2, -3, 4, -4, 5, -5, 6, -6, 7),
     4: (0, 0, 0, 0, 1, -1, 2, -2, -3, 3, -4, 4, -5, 5, -6, 6),
 }
-# AMD Gfx10 3D SW_4KB_S intra-tile bit order (addrlib GFX10_SW_4K_S 3D):
-# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101).
+# AMD Gfx10 3D SW_4KB_S intra-tile bit order: Mesa addrlib GFX10_SW_4K_S3_PATINFO (and the identical
+# GFX10_SW_4K_S3_RBPLUS_PATINFO), first nibble01 + nibble2 entries per element size.
+# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101). The tile extents in
+# tex_headers._VOLUME_4K_TILE are 2**(number of X, Y and Z bits) of each row.
 VOLUME_PATTERNS_4K = {
     0: (1, 2, 101, -1, 102, -2, 3, 103, -3, 4, 104, -4),
-    1: (0, 1, 2, 101, -1, 102, 3, -2, 103, 4, -3, 104),
-    2: (0, 0, 1, 2, 101, -1, 102, -2, 3, 103, -3, 104),
+    1: (0, 1, 101, -1, 102, -2, 2, 103, -3, 3, 104, -4),
+    2: (0, 0, 1, -1, 101, -2, 2, 102, -3, 3, 103, -4),
     3: (0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3),
-    4: (0, 0, 0, 0, 1, -1, 101, 2, -2, 102, 3, 103),
+    4: (0, 0, 0, 0, 101, -1, 1, 102, -2, 2, 103, -3),
 }
 VOLUME_FLOAT_FORMATS = {10: 4, 54: 1}  # DXGI format -> float16 channels per voxel
 
@@ -212,54 +214,161 @@ def surface_layout(width, height, fmt, mips, tile=4096):
         raise LayoutError(str(exc)) from exc
 
 
+def _coalesce_x_runs(x_offs, eb):
+    """Merge consecutive contiguous X offsets into (start_offset, byte_len) runs."""
+    if not x_offs:
+        return []
+    runs = []
+    start = x_offs[0]
+    run_len = eb
+    for xo in x_offs[1:]:
+        if xo == start + run_len:
+            run_len += eb
+        else:
+            runs.append((start, run_len))
+            start = xo
+            run_len = eb
+    runs.append((start, run_len))
+    return runs
+
+
 def detile(layout, mip, tiled):
     """Copy the mip's elements out of the tiled allocation into block-linear order."""
-    pat = (PATTERNS_4K if layout["tile"] == 4096 else PATTERNS_64K)[
-        {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
-    bw, bh = layout["block_w"], layout["block_h"]
+    tile = layout["tile"]
     eb = layout["element_bytes"]
-    out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
-    for y in range(mip["blocks_h"]):
-        for x in range(mip["blocks_w"]):
-            off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
-            for bit, s in enumerate(pat):
-                if s > 0:
-                    off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
-                elif s < 0:
-                    off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
-            at = (y * mip["blocks_w"] + x) * eb
+    pat = (PATTERNS_4K if tile == 4096 else PATTERNS_64K)[
+        {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
+    bw, bh = layout["block_w"], layout["block_h"]
+    w, h = mip["blocks_w"], mip["blocks_h"]
+    out = bytearray(w * h * eb)
+    if w == 0 or h == 0:
+        return bytes(out)
+    tx, ty = mip["tile_x"], mip["tile_y"]
+    tiles_x = mip["padded_w"] // bw
+    x_bits = [(1 << bit, s - 1) for bit, s in enumerate(pat) if s > 0]
+    y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
+
+    row_stride = tiles_x * tile
+
+    def y_base_of(y):
+        o = (y // bh) * row_stride
+        yy = y + ty
+        for mask, shift in y_bits:
+            if (yy >> shift) & 1:
+                o |= mask
+        return o
+
+    def x_off_of(x):
+        o = (x // bw) * tile
+        xx = x + tx
+        for mask, shift in x_bits:
+            if (xx >> shift) & 1:
+                o |= mask
+        return o
+
+    if h == 1:
+        # A single row has no X-table reuse: stream it, allocating no per-column or per-row tables.
+        y_base = y_base_of(0)
+        for x in range(w):
+            off = y_base + x_off_of(x)
+            at = x * eb
             out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    x_offs = [x_off_of(x) for x in range(w)]
+    max_x = max(x_offs)
+    max_y = max(map(y_base_of, range(h)))
+
+    if len(tiled) >= max_y + max_x + eb:
+        x_runs = _coalesce_x_runs(x_offs, eb)
+        src = memoryview(tiled)
+        dst = memoryview(out)
+        at = 0
+        for y in range(h):
+            y_base = y_base_of(y)
+            for xo, run in x_runs:
+                off = y_base + xo
+                dst[at:at + run] = src[off:off + run]
+                at += run
+    else:
+        for y in range(h):
+            y_base = y_base_of(y)
+            row_at = y * w * eb
+            for x, xo in enumerate(x_offs):
+                off = y_base + xo
+                at = row_at + x * eb
+                out[at:at + eb] = tiled[off:off + eb]
     return bytes(out)
 
 
 def detile_volume_slice(layout, tiled, z):
     """Copy one Z slice out of a 3D SW_4KB_S tiled volume into row-major linear order."""
+    tile = layout["tile"]
     eb = layout["element_bytes"]
     pat = VOLUME_PATTERNS_4K[{1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
     bw, bh, bd = layout["block_w"], layout["block_h"], layout["block_d"]
     mip = layout["mips"][0]
     w, h = mip["blocks_w"], mip["blocks_h"]
+    out = bytearray(w * h * eb)
+    if w == 0 or h == 0:
+        return bytes(out)
     tiles_x = mip["padded_w"] // bw
     z_base = (z // bd) * layout["z_tile_stride"]
     z_in_tile = 0
     for bit, s in enumerate(pat):
         if s >= 101:
             z_in_tile |= ((z >> (s - 101)) & 1) << bit
-    out = bytearray(w * h * eb)
-    for y in range(h):
-        y_tile = (y // bh) * tiles_x
-        y_in_tile = z_in_tile
-        for bit, s in enumerate(pat):
-            if s < 0:
-                y_in_tile |= ((y >> (-s - 1)) & 1) << bit
-        row_at = y * w * eb
+    x_bits = [(1 << bit, s - 1) for bit, s in enumerate(pat) if 0 < s < 100]
+    y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
+
+    row_stride = tiles_x * tile
+
+    def y_base_of(y):
+        o = z_base + (y // bh) * row_stride + z_in_tile
+        for mask, shift in y_bits:
+            if (y >> shift) & 1:
+                o |= mask
+        return o
+
+    def x_off_of(x):
+        o = (x // bw) * tile
+        for mask, shift in x_bits:
+            if (x >> shift) & 1:
+                o |= mask
+        return o
+
+    if h == 1:
+        # A single row has no X-table reuse: stream it, allocating no per-column or per-row tables.
+        y_base = y_base_of(0)
         for x in range(w):
-            off = z_base + (y_tile + x // bw) * layout["tile"] + y_in_tile
-            for bit, s in enumerate(pat):
-                if 0 < s < 100:
-                    off |= ((x >> (s - 1)) & 1) << bit
-            at = row_at + x * eb
+            off = y_base + x_off_of(x)
+            at = x * eb
             out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    x_offs = [x_off_of(x) for x in range(w)]
+    max_x = max(x_offs)
+    max_y = max(map(y_base_of, range(h)))
+
+    if len(tiled) >= max_y + max_x + eb:
+        x_runs = _coalesce_x_runs(x_offs, eb)
+        src = memoryview(tiled)
+        dst = memoryview(out)
+        at = 0
+        for y in range(h):
+            y_base = y_base_of(y)
+            for xo, run in x_runs:
+                off = y_base + xo
+                dst[at:at + run] = src[off:off + run]
+                at += run
+    else:
+        for y in range(h):
+            y_base = y_base_of(y)
+            row_at = y * w * eb
+            for x, xo in enumerate(x_offs):
+                off = y_base + xo
+                at = row_at + x * eb
+                out[at:at + eb] = tiled[off:off + eb]
     return bytes(out)
 
 
@@ -614,8 +723,8 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
             at = (by * blocks_w + bx) * 16
             if fmt in (71, 72):
                 blk = decode_bc1_block(data, (by * blocks_w + bx) * 8)
-            elif fmt in (77, 78):
-                # BC3 colour uses four entries regardless of endpoint order.
+            elif fmt in (74, 75, 77, 78):
+                # BC2/BC3 use four RGB entries regardless of endpoint order.
                 blk = decode_bc1_block(data, at + 8, four_color=True)
             elif fmt in (80,):
                 blk = decode_bc4_block(data, (by * blocks_w + bx) * 8)
@@ -801,6 +910,7 @@ class Pool:
     """Read-only RDS5 texture pool, mirroring TtpfReader's catalog checks."""
 
     def __init__(self, path):
+        self._cache_token = object()
         # A pool that fails a check used to keep its file open and mapped (locked on Windows).
         self._fh = self.data = None
         try:
@@ -873,15 +983,23 @@ class Pool:
         if self._fh is not None:
             self._fh.close()
 
+    def asset_key(self, index):
+        """The entry's 64-bit native asset key. The key array follows the 16-byte records and
+        is longer than the record area has room for in most pools, so it continues into the
+        32-byte ID region; TtpfReader reads it across that boundary, and so does this."""
+        at = self.textures * 16 + index * 8
+        if at + 8 <= len(self.records):
+            return u64(self.records, at)
+        if at >= len(self.records):
+            return u64(self.ids, at - len(self.records))
+        raise ValueError("ETPF asset key straddles the records/ids boundary")
+
     def descriptor(self, index):
         if not 0 <= index < self.textures:
             raise IndexError(index)
         d = parse_etpf_texture_record(self.records[index * 16:index * 16 + 16])
         d["index"] = index
-        d["asset_key_at"] = (
-            u64(self.records, self.textures * 16 + index * 8)
-            if (self.textures * 16 + index * 8 + 8 <= len(self.records))
-            else None)
+        d["asset_key_at"] = self.asset_key(index)
         return d
 
     def chunks_for(self, start, size):
@@ -917,16 +1035,19 @@ class Pool:
             id(bcpack_history) if isinstance(bcpack_history, dict) else os.fspath(bcpack_history)
         )
         for virt, csize, src, packed, codec, pad in self.chunks_for(start, size):
-            key = (src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
-                   hist_key if codec in (6, 7) else None)
+            key = (self._cache_token, src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
+                   hist_key if codec not in (0, 8) else None)
             if key not in cache:
                 raw = self.data[src:src + packed]
                 if codec == 0:
-                    cache[key] = bytes(raw)
+                    decoded = bytes(raw)
                 elif codec == 8:
-                    cache[key] = zlib.decompress(raw)
+                    inflater = zlib.decompressobj()
+                    decoded = inflater.decompress(raw, csize + 1)
+                    if len(decoded) > csize or not inflater.eof:
+                        raise ValueError("zlib chunk is truncated or exceeds its declared size")
                 elif bcpack_mode != "off" and codec in bcpack.SUPPORTED_REBUILD_CODECS:
-                    cache[key] = bcpack.decode(
+                    decoded = bcpack.decode(
                         raw, codec, csize,
                         allow_provisional=(bcpack_mode == "provisional"),
                         history=bcpack_history,
@@ -935,20 +1056,30 @@ class Pool:
                     raise BcpackRequired(
                         f"range touches a BCPack chunk (codec {codec})"
                     )
-                if len(cache[key]) != csize:
+                if len(decoded) != csize:
                     raise ValueError("decoded chunk length disagrees with its range")
+                cache[key] = decoded
             lo, hi = max(start, virt), min(start + size, virt + csize)
             out[lo - start:hi - start] = cache[key][lo - virt:hi - virt]
         return bytes(out)
 
     def span(self, index, base):
+        if _is_unmapped_base(base) or base >= self.virtual_size:
+            return None
         for j in range(index + 1, self.textures):
             cand = (u32(self.records, j * 16 + 8) & 0x1FFFFF) * 4096
+            if _is_unmapped_base(cand):
+                continue
             if cand < base:
                 return None
             if cand > base:
                 return cand - base
         return self.virtual_size - base
+
+
+def _is_unmapped_base(base):
+    """True for ETPF unmapped-allocation sentinel bases (0 or 0x1FFFFF pages)."""
+    return base == 0 or (base >> 12) == 0x1FFFFF
 
 
 def compact_row(desc):
@@ -1057,7 +1188,7 @@ def analyze(pool, index, *, allow_bcpack=True):
     """Descriptor + layout + per-mip codec availability for one texture."""
     d = pool.descriptor(index)
     out = dict(descriptor=d, tile_mode=tile_mode(d["mode"]), tile=tile_bytes(d["mode"]))
-    if d["base"] == 0 or (d["base"] >> 12) == 0x1FFFFF:
+    if _is_unmapped_base(d["base"]):
         out["blocked"] = "no mapped allocation"
         return out
     span = pool.span(index, d["base"])
@@ -1255,8 +1386,10 @@ def find_pools(arg):
     pools = sorted(glob.glob(os.path.join(root, "data", "ttdb", "**", "*.ttpf"), recursive=True))
     pools += sorted(glob.glob(os.path.join(root, "pack", "*", "data", "ttdb", "**", "*.ttpf"),
                                 recursive=True))
+    pools = [path for path in pools if os.path.isfile(path)]
     if not pools:
-        pools = sorted(glob.glob(os.path.join(root, "**", "*.ttpf"), recursive=True))
+        pools = sorted(path for path in glob.iglob(os.path.join(root, "**", "*.ttpf"), recursive=True)
+                       if os.path.isfile(path))
     return pools
 
 
@@ -1296,7 +1429,7 @@ def scan_pools(paths, as_json=None, include_tuples=False):
                 total["entries"] += 1
                 tm = str(tile_mode(d["mode"]))
                 total["tile_modes"][tm] = total["tile_modes"].get(tm, 0) + 1
-                span = pool.span(i, d["base"]) if d["base"] else None
+                span = pool.span(i, d["base"])
                 if span is not None:
                     meta_ok, _ = validate_chunk_metadata(pool, d, span)
                     if meta_ok:
@@ -1683,7 +1816,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
             if all(m is None for m in means):
                 print(json.dumps(dict(index=index, shape=shape, blocked=(
                     f"format {d['format']} is not one of the formats this tool decodes "
-                    "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+                    "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
                 return 2
             per_slice_max.append(max((e for e in errs if e is not None), default=None))
             all_errs.extend(errs)
@@ -1722,7 +1855,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
             if all(m is None for m in means):
                 print(json.dumps(dict(index=index, shape=shape, blocked=(
                     f"format {d['format']} is not one of the formats this tool decodes "
-                    "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+                    "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
                 return 2
             if face == 0:
                 face0_preds = preds
@@ -1751,7 +1884,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
     if all(m is None for m in means):
         print(json.dumps(dict(index=index, blocked=(
             f"format {d['format']} is not one of the formats this tool decodes "
-            "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+            "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
         return 2
     control = None
     if 0 < layout["first_tail"] < d["mips"]:
@@ -1804,11 +1937,12 @@ def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
         raise ValueError(f"format {d['format']} is uncompressed and not validated for 2D export")
     if shape == "volume" and d["format"] not in VOLUME_FLOAT_FORMATS:
         raise ValueError(f"volume format {d['format']} is not validated for export")
-    if not a["full_chain"]:
-        raise ValueError("not every source mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     count = d["mips"] if mips is None else mips
     if count < 1 or count > d["mips"]:
         raise ValueError(f"--mips must be 1..{d['mips']}")
+    available = a["available"]
+    if len(available) < count or not all(available[:count]):
+        raise ValueError("not every requested mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     layout = a["layout"]
     block = 4 if d["format"] in BC_FORMATS else 1
     cache = {}
@@ -1868,8 +2002,12 @@ def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=F
     d = a["descriptor"]
     count = d["mips"] if mips is None else mips
     shape = a.get("shape", "2d")
-    with open(out_path, "wb") as f:
-        f.write(blob)
+    try:
+        with open(out_path, "wb") as f:
+            f.write(blob)
+    except OSError as exc:
+        print(f"{out_path}: cannot write: {exc.strerror or exc}", file=sys.stderr)
+        return 1
     dims = (f"{d['width']}x{d['height']}x{d['depth']}" if shape in ("2d_array", "volume")
             else f"{d['width']}x{d['height']}")
     print(f"texture {index}: {shape} {dims} fmt {d['format']} {count} mips "
@@ -1894,7 +2032,7 @@ def main(argv=None):
     pc.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
     pc.add_argument("--history",
-                    help="local JSON file or directory supplying BC6H/BC7 initial history tables")
+                    help="local JSON file or directory supplying BC6H/BC7 (and optional BC1-BC5) initial history tables")
     pe = sub.add_parser("export", help="write the full chain as DDS")
     pe.add_argument("pool")
     pe.add_argument("index", type=int)
@@ -1905,7 +2043,7 @@ def main(argv=None):
     pe.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
     pe.add_argument("--history",
-                    help="local JSON file or directory supplying BC6H/BC7 initial history tables")
+                    help="local JSON file or directory supplying BC6H/BC7 (and optional BC1-BC5) initial history tables")
     a = ap.parse_args(argv)
     if a.cmd == "scan":
         pools = []
@@ -1931,6 +2069,20 @@ def main(argv=None):
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         return 0
+    if a.cmd == "export":
+        # Refuse an output that aliases an input asset or metadata before the pool is
+        # opened (so its mmap can never be truncated on disk). --force may replace an
+        # ordinary DDS but never a pool, a calibration profile, or a supplied history file.
+        for asset, label in ((a.pool, "input pool"),
+                             (a.calibration, "--calibration profile"),
+                             (a.history, "--history file")):
+            if asset is None:
+                continue
+            if label == "--history file" and not os.path.isfile(asset):
+                continue
+            if same_output_path(a.out, asset):
+                print(f"ERROR: {a.out} would overwrite the {label} {asset}", file=sys.stderr)
+                return 2
     try:
         pool = Pool(a.pool)
     except (OSError, ValueError) as exc:

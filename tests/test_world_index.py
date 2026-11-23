@@ -162,9 +162,74 @@ class WorldIndexTest(unittest.TestCase):
         struct.pack_into("<Q", b, 0x28, 0x60000000)
         self.assertIsNone(WI.parse_resource(bytes(b)))
 
+    def test_schema_member_type_mismatch_is_rejected(self):
+        # Position declared as scalar float (0x21) instead of vector3 (0x32) (#5601).
+        b = bytearray(make_resource())
+        b[0x318] = 0x21
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+        # Archetype name declared as vector3 (0x32).
+        b = bytearray(make_resource())
+        b[0x308] = 0x32
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+        # LOD level declared as vector3 (0x32).
+        b = bytearray(make_resource())
+        b[0x378] = 0x32
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+        # Map extent declared as scalar float (0x21).
+        b = bytearray(make_resource())
+        # Map members start at 0x3A0; streamingExtentsMin is index 3 (offset 0x3A0 + 16*3 = 0x3D0)
+        b[0x3D8] = 0x21
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+        # Member offset + width overflowing struct size.
+        b = bytearray(make_resource())
+        # Position offset at 0x314 set to struct size (0x90), width 12 overflows struct.
+        struct.pack_into("<I", b, 0x314, 0x90)
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+    def test_non_finite_placement_floats_produce_valid_json(self):
+        # Placement position containing NaN and +inf is written as null in valid JSON (#5602).
+        b = bytearray(make_resource())
+        struct.pack_into("<3f", b, 0x438, float("nan"), 2.5, float("inf"))
+        row = WI.parse_resource(bytes(b))
+        self.assertIsNotNone(row)
+        self.assertEqual(row["position_min"], [None, 2.5, None])
+        self.assertEqual(row["position_max"], [None, 2.5, None])
+
+        src = os.path.join(self.dir, "non_finite.bin")
+        out = os.path.join(self.dir, "out.json")
+        with open(src, "wb") as f:
+            f.write(bytes(b))
+        self.assertEqual(WI.main([src, "--out", out]), 0)
+
+        with open(out, "r", encoding="utf-8") as f:
+            raw = f.read()
+        self.assertNotIn("NaN", raw)
+        self.assertNotIn("Infinity", raw)
+        # Parse with strict handler that rejects NaN/Infinity tokens.
+        parsed = json.loads(raw, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(f"non-JSON {c}")))
+        self.assertEqual(parsed["resources"][0]["position_min"], [None, 2.5, None])
+        self.assertEqual(parsed["resources"][0]["position_max"], [None, 2.5, None])
+
+    def test_non_finite_lod_dist_is_ignored(self):
+        b = bytearray(make_resource())
+        # lodDist at 0x460 set to +inf
+        struct.pack_into("<f", b, 0x460, float("inf"))
+        row = WI.parse_resource(bytes(b))
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["lod_dist_min"])
+        self.assertIsNone(row["lod_dist_max"])
+
     def test_split_resource_needs_continuation(self):
         self.assertFalse(WI._needs_continuation(make_resource()))
         self.assertTrue(WI._needs_continuation(make_resource()[:0x150]))
+        # CMapData starts at 0x500 with size 0x120: a split mid-block at 0x540 still needs continuation.
+        self.assertTrue(WI._needs_continuation(make_resource()[:0x540]))
+        # Non-map resource has a single block at 0x400..0x490: a split mid-block at 0x448 still needs continuation.
+        self.assertTrue(WI._needs_continuation(make_resource(map_file=False)[:0x448]))
 
     def test_rpf_scan_joins_a_split_stream(self):
         blob = make_resource()
@@ -176,6 +241,87 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(stats["streams"], 2)
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(rows[0]["entities"], 1)
+
+    def test_rpf_and_carve_join_block_split_across_streams(self):
+        # Splitting mid-CMapData (last block at 0x500..0x620) or mid-CEntityDef (moved after
+        # CMapData to 0x620..0x6B0 so no block starts past the cut) must join the continuation
+        # stream in both scan_rpf and carve-folder scan_path instead of reading zeroed fields.
+        blob_map = make_resource()
+        blob_ent = bytearray(make_resource())
+        blob_ent[0x620:0x6B0] = blob_ent[0x400:0x490]
+        struct.pack_into("<IIQ", blob_ent, 0x200, WI.ENTITY, 0x90, ptr(0x620))
+        cases = (
+            ("mid_mapdata", blob_map, 0x540),
+            ("mid_entity", bytes(blob_ent), 0x650),
+        )
+        for label, blob, cut in cases:
+            with self.subTest(case=label, cut=hex(cut)):
+                path = os.path.join(self.dir, f"{label}.rpf")
+                with open(path, "wb") as f:
+                    f.write(make_rpf_streams([blob[:cut], blob[cut:]]))
+                entities = []
+                rows, stats = WI.scan_rpf(path, collect=entities)
+                self.assertEqual(stats["streams"], 2)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["size"], len(blob))
+                self.assertEqual(rows[0]["parent"], 0xAABBCCDD)
+                self.assertEqual(rows[0]["extent_min"], [-10.0, -20.0, -30.0])
+                self.assertEqual(rows[0]["extent_max"], [10.0, 20.0, 30.0])
+                self.assertEqual(rows[0]["map_flags"], 2)
+                self.assertEqual(rows[0]["content_flags"], 65)
+                self.assertEqual(len(entities), 1)
+                self.assertTrue(entities[0]["complete"])
+                self.assertEqual(entities[0]["archetype"], 0xDEADBEEF)
+
+                carve_dir = os.path.join(self.dir, f"carve_{label}")
+                os.makedirs(carve_dir)
+                files, off = [], 0x1000
+                for part in (blob[:cut], blob[cut:]):
+                    stored = len(zlib.compress(part))
+                    with open(os.path.join(carve_dir, f"{off:012x}.bin"), "wb") as f:
+                        f.write(part)
+                    files.append({"off": off, "stored": stored, "size": len(part)})
+                    off = (off + stored + 15) & ~15
+                with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"summary": {}, "files": files}, f)
+                c_entities = []
+                c_rows, _ = WI.scan_path(carve_dir, collect=c_entities)
+                self.assertEqual(len(c_rows), 1)
+                self.assertEqual(c_rows[0]["size"], len(blob))
+                self.assertEqual(c_rows[0]["parent"], 0xAABBCCDD)
+                self.assertTrue(c_entities[0]["complete"])
+
+    def test_truncated_resource_does_not_swallow_following_0drp_resource(self):
+        # A truncated 0x7a map followed immediately by another 0DRPz resource must not consume
+        # the second resource as a continuation stream (both RPF and carve folder).
+        blob = make_resource()
+        for cut, expect_count in ((0x150, 1), (0x540, 2)):
+            with self.subTest(cut=hex(cut)):
+                truncated = blob[:cut]
+                path = os.path.join(self.dir, f"trunc_{cut:x}_then_valid.rpf")
+                with open(path, "wb") as f:
+                    f.write(make_rpf_streams([truncated, blob]))
+                rows, stats = WI.scan_rpf(path)
+                self.assertEqual(stats["streams"], 2)
+                self.assertEqual(len(rows), expect_count)
+                self.assertEqual(rows[-1]["size"], len(blob))
+                self.assertEqual(rows[-1]["parent"], 0xAABBCCDD)
+
+                carve_dir = os.path.join(self.dir, f"carve_trunc_{cut:x}")
+                os.makedirs(carve_dir)
+                files, off = [], 0x1000
+                for part in (truncated, blob):
+                    stored = len(zlib.compress(part))
+                    with open(os.path.join(carve_dir, f"{off:012x}.bin"), "wb") as f:
+                        f.write(part)
+                    files.append({"off": off, "stored": stored, "size": len(part)})
+                    off = (off + stored + 15) & ~15
+                with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"summary": {}, "files": files}, f)
+                c_rows, _ = WI.scan_path(carve_dir)
+                self.assertEqual(len(c_rows), expect_count)
+                self.assertEqual(c_rows[-1]["size"], len(blob))
+                self.assertEqual(c_rows[-1]["parent"], 0xAABBCCDD)
 
     def test_scan_window_options(self):
         blob = make_resource()
@@ -591,7 +737,7 @@ class WorldIndexTest(unittest.TestCase):
                 f.write(part)
             files.append({"off": off, "stored": stored, "size": len(part)})
             off = ((off + stored + 15) & ~15) + gap
-        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": {}, "files": files}, f)
         return folder
 

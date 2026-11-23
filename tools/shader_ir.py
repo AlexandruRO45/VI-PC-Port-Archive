@@ -29,6 +29,7 @@ _REG = re.compile(r"([sv])(\d+)")
 _REG_RANGE = re.compile(r"([sv])\[(\d+):(\d+)\]")
 _TTMP = re.compile(r"ttmp(\d+)|ttmp\[(\d+):(\d+)\]")
 _VLIST = re.compile(r"\[(v\d+(?:,\s*v\d+)+)\]")
+_SLIST = re.compile(r"\[((?:s\d+|vcc_lo|vcc_hi)(?:\s*,\s*(?:s\d+|vcc_lo|vcc_hi))+)\]")
 _ATTR = re.compile(r"attr(\d+)\.([xyzw])")
 _TARGET = re.compile(r"(pos|param|mrt|mrtz|null|prim)(\d*)")
 _INT = re.compile(r"-?(0x[0-9a-fA-F]+|\d+)")
@@ -42,15 +43,44 @@ def operand(tok):
     absm = len(core) > 2 and core.startswith("|") and core.endswith("|")
     if absm:
         core = core[1:-1]
-    # Fast path for the commonest operand, a single register (v3, s12): the same dict _REG builds below, and
-    # such a token can't match any of the neg/abs/sext forms tried before it.
+    # Fast path for the commonest operands: single register (v3, s12), special register, or unsigned decimal int.
     if len(core) > 1 and core[0] in "sv" and core[1:].isdigit():
         return {"k": core[0] + "gpr", "r": int(core[1:]), "n": 1, "neg": neg, "abs": absm}
-    m = _NEG.fullmatch(core)
-    if m:  # VOP3 FP negation: neg(0), neg(1.0), neg(0x3f800000), neg(|1.0|), neg(v1)
-        inner = operand(m.group(1))
+    if core in SPECIAL:
+        return {"k": "special", "t": core, "neg": neg, "abs": absm}
+    if core.isascii() and core.isdigit():
+        v = int(core, 10)
         if absm:
-            # Outer |...| absorbs the inner neg; outer '-' (if any) negates the result.
+            out = {"k": "imm", "v": v, "abs": True}
+            if neg:
+                out["neg"] = True
+            return out
+        return {"k": "imm", "v": -v if neg else v}
+    if "(" in core:
+        m = _NEG.fullmatch(core)
+        if m:  # VOP3 FP negation: neg(0), neg(1.0), neg(0x3f800000), neg(|1.0|), neg(v1)
+            inner = operand(m.group(1))
+            if absm:
+                # Outer |...| absorbs the inner neg; outer '-' (if any) negates the result.
+                inner["abs"] = True
+                if neg:
+                    inner["neg"] = True
+                elif inner.get("k") in ("imm", "fimm"):
+                    inner.pop("neg", None)
+                else:
+                    inner["neg"] = False
+            elif not neg:
+                # Keep neg as a VOP3 sign-bit modifier on constants instead of integer negation:
+                # in LLVM AMDGPU, neg(1) flips bit 31 (0x80000001) while -1 is 0xffffffff.
+                new_neg = not inner.get("neg", False)
+                if not new_neg and inner.get("k") in ("imm", "fimm"):
+                    inner.pop("neg", None)
+                else:
+                    inner["neg"] = new_neg
+            return inner
+        m = _ABS.fullmatch(core)
+        if m:  # VOP3 FP absolute value: abs(v0), abs(0xbf800000), neg(abs(1.0))
+            inner = operand(m.group(1))
             inner["abs"] = True
             if neg:
                 inner["neg"] = True
@@ -58,57 +88,40 @@ def operand(tok):
                 inner.pop("neg", None)
             else:
                 inner["neg"] = False
-        elif not neg:
-            # Keep neg as a VOP3 sign-bit modifier on constants instead of integer negation:
-            # in LLVM AMDGPU, neg(1) flips bit 31 (0x80000001) while -1 is 0xffffffff.
-            new_neg = not inner.get("neg", False)
-            if not new_neg and inner.get("k") in ("imm", "fimm"):
-                inner.pop("neg", None)
-            else:
-                inner["neg"] = new_neg
-        return inner
-    m = _ABS.fullmatch(core)
-    if m:  # VOP3 FP absolute value: abs(v0), abs(0xbf800000), neg(abs(1.0))
-        inner = operand(m.group(1))
-        inner["abs"] = True
-        if neg:
-            inner["neg"] = True
-        elif inner.get("k") in ("imm", "fimm"):
-            inner.pop("neg", None)
-        else:
-            inner["neg"] = False
-        return inner
-    m = _SEXT.fullmatch(core)
-    if m:  # SDWA integer sign-extension of the selected source bits
-        inner = operand(m.group(1))
-        inner["sext"] = True
-        if absm:
-            inner["abs"] = True
-        inner["neg"] = inner.get("neg", False) or neg
-        return inner
-    m = _REG.fullmatch(core)
-    if m:
-        return {"k": m.group(1) + "gpr", "r": int(m.group(2)), "n": 1, "neg": neg, "abs": absm}
-    m = _REG_RANGE.fullmatch(core)
-    if m:
-        lo, hi = int(m.group(2)), int(m.group(3))
-        return {"k": m.group(1) + "gpr", "r": lo, "n": hi - lo + 1, "neg": neg, "abs": absm}
-    m = _TTMP.fullmatch(core)
-    if m:
-        return {"k": "ttmp", "t": core}
-    m = _VLIST.fullmatch(core)
-    if m:  # NSA image address: non-contiguous VGPR list
-        return {"k": "vlist", "r": [int(x.strip()[1:]) for x in m.group(1).split(",")]}
-    m = _ATTR.fullmatch(core)
-    if m:
-        return {"k": "attr", "a": int(m.group(1)), "c": "xyzw".index(m.group(2))}
+            return inner
+        m = _SEXT.fullmatch(core)
+        if m:  # SDWA integer sign-extension of the selected source bits
+            inner = operand(m.group(1))
+            inner["sext"] = True
+            if absm:
+                inner["abs"] = True
+            inner["neg"] = inner.get("neg", False) or neg
+            return inner
+    if "[" in core:
+        m = _REG_RANGE.fullmatch(core)
+        if m:
+            lo, hi = int(m.group(2)), int(m.group(3))
+            return {"k": m.group(1) + "gpr", "r": lo, "n": hi - lo + 1, "neg": neg, "abs": absm}
+        m = _VLIST.fullmatch(core)
+        if m:  # NSA image address: non-contiguous VGPR list
+            return {"k": "vlist", "r": [int(x.strip()[1:]) for x in m.group(1).split(",")]}
+        m = _SLIST.fullmatch(core)
+        if m:  # LLVM VCCTuple scalar register list, e.g. [s100,s101,s102,s103,s104,s105,vcc_lo,vcc_hi]
+            items = [int(x[1:]) if x.startswith("s") else x for x in (t.strip() for t in m.group(1).split(","))]
+            return {"k": "slist", "r": items, "n": len(items)}
+    if core.startswith("ttmp"):
+        m = _TTMP.fullmatch(core)
+        if m:
+            return {"k": "ttmp", "t": core}
+    if core.startswith("attr"):
+        m = _ATTR.fullmatch(core)
+        if m:
+            return {"k": "attr", "a": int(m.group(1)), "c": "xyzw".index(m.group(2))}
     if core in ("p0", "p10", "p20"):
         return {"k": "interp", "t": core}
     m = _TARGET.fullmatch(core)
     if m and core not in ("null",):
         return {"k": "target", "t": core}
-    if core in SPECIAL:
-        return {"k": "special", "t": core, "neg": neg, "abs": absm}
     if _INT.fullmatch(core):
         # int(core, 0) rejects the leading-zero decimals this regex accepts ('010', '08', '0001'),
         # which aborts a whole parse_file() run on one disassembly line.
@@ -139,6 +152,11 @@ def operand(tok):
 
 
 def split_args(s):
+    if "(" not in s and "[" not in s:
+        parts = s.split(",")
+        if parts and not parts[-1].strip():
+            parts.pop()
+        return parts
     out, depth, cur = [], 0, ""
     for ch in s:
         if ch in "([":
@@ -157,7 +175,7 @@ def split_args(s):
 
 SENDMSG = re.compile(r"sendmsg\([^)]*\)")
 
-MODWORDS = re.compile(r"\b(offset:\S+|offen|idxen|glc|slc|dlc|lds|tfe|unorm|da|d16|a16|nv|r128|lwe|clamp|"
+MODWORDS = re.compile(r"\b(offset:(?:swizzle\([^)]*\)|\S+)|offen|idxen|glc|slc|dlc|lds|tfe|unorm|da|d16|a16|nv|r128|lwe|clamp|"
                       r"mul:\d+|div:\d+|op_sel(?:_hi)?:\[[^\]]*\]|neg_lo:\[[^\]]*\]|neg_hi:\[[^\]]*\]|"
                       r"dmask:\S+|dim:\S+|format:\S+|done|vm|compr|row_mask:\S+|bank_mask:\S+|"
                       r"bound_ctrl:\S+|fi:\S+|offset0:\S+|offset1:\S+|gds|inst_offset:\S+|"
@@ -169,9 +187,10 @@ MODWORDS = re.compile(r"\b(offset:\S+|offen|idxen|glc|slc|dlc|lds|tfe|unorm|da|d
 def parse_line(line):
     code, _, comment = line.partition(";")
     enc = None
-    m = ENC.search(line)
-    if m:
-        enc = bytes(int(x, 16) for x in m.group(1).split(",") if x.strip())
+    if comment and "encoding" in comment:
+        m = ENC.search(line)
+        if m:
+            enc = bytes(int(x, 16) for x in m.group(1).split(",") if x.strip())
     code = code.strip()
     if not code:
         return None
@@ -179,14 +198,30 @@ def parse_line(line):
     op = fields[0]
     rest = fields[1] if len(fields) > 1 else ""
     # sendmsg(MSG_GS, GS_OP_NOP) contains a comma: keep it as one operand.
-    rest = SENDMSG.sub(lambda m: m.group(0).replace(", ", "|").replace(",", "|"), rest)
-    mods = MODWORDS.findall(rest)
-    rest = MODWORDS.sub("", rest)
+    if "sendmsg(" in rest:
+        rest = SENDMSG.sub(lambda m: m.group(0).replace(", ", "|").replace(",", "|"), rest)
+    mods = []
+    if rest:
+        def _take_mod(match):
+            mods.append(match.group(1))
+            return ""
+        rest = MODWORDS.sub(_take_mod, rest)
     parts = [a for a in split_args(rest) if a.strip()]
-    # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
-    if parts and len(parts[0].split()) == 2:
+    if op in ("s_waitcnt", "s_waitcnt_depctr"):
+        # LLVM separates named wait counters with spaces.
+        parts = [token for part in parts for token in part.split()]
+    elif parts and len(parts[0].split()) == 2:
+        # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
+    if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
+                      "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_trunc_f64", "v_ceil_f64",
+                      "v_rndne_f64", "v_floor_f64")):
+        for src, spelling in zip(args[1:], parts[1:]):
+            # LLVM prints inline integers in decimal and the separate literal dword in hex,
+            # even for two sources with the same numeric value (e.g. 0x1 and 1).
+            if src["k"] == "imm" and ("0x" in spelling or not -16 <= src["v"] <= 64):
+                src["f64_literal"] = True
     return {"op": op, "args": args, "mods": mods, "enc": enc.hex() if enc else None}
 
 
@@ -197,6 +232,9 @@ def parse_file(path):
     m = HDR.match(lines[0]) if lines else None
     pc = int(m.group(2), 16) if m else 0
     info["code_start"] = pc
+    # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
+    # between the last printed instruction and it
+    info["code_end"] = int(m.group(3), 16) if m else None
     start = 1 if (lines and not lines[0].startswith("\t")) else 0
     for ln in lines[start:]:
         if ln.startswith("; ---"):
@@ -232,12 +270,20 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.isdir(a.src):
         ap.error(f"{a.src} is not a folder")
-    with os.scandir(a.src) as entries:
-        files = sorted(entry.path for entry in entries
-                       if entry.name.endswith(".s") and entry.is_file())[:a.limit]
+    try:
+        with os.scandir(a.src) as entries:
+            files = sorted(entry.path for entry in entries
+                           if entry.name.endswith(".s") and entry.is_file())[:a.limit]
+    except OSError as e:
+        print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     kinds, raw, n_ins, no_enc = Counter(), Counter(), 0, 0
     for path in files:
-        info = parse_file(path)
+        try:
+            info = parse_file(path)
+        except OSError as e:
+            print(f"ERROR: cannot read {e.filename or path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         for ins in info["insns"]:
             n_ins += 1
             no_enc += ins["enc"] is None

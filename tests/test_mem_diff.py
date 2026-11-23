@@ -49,6 +49,19 @@ class Harness(unittest.TestCase):
                 self.assertEqual(counts["pass"], 60)
 
 
+class EverythingSkipped(unittest.TestCase):
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        import contextlib
+        import io
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.object(md, "run_one", lambda *args: ("skip", "unsupported form")), \
+                contextlib.redirect_stdout(out):
+            rc = md.main(["--programs", "2", "--seed", "1"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
+
+
 class Reference(unittest.TestCase):
     """The reference model on hand-made cases (the expected words are worked out by hand)."""
 
@@ -81,6 +94,21 @@ class Reference(unittest.TestCase):
                  "v_mov_b32 v4, 9", "v_mov_b32 v5, 7", "buffer_atomic_cmpswap v[4:5], off, s[0:3], 0 glc"]
         ref = self.run_ref(lines, memory)
         self.assertEqual((ref.mem[0x6000], ref.v[4]), (9, 7))
+
+    def test_buffer_load_sbyte_lane_offset(self):
+        lines = ["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x10", "s_mov_b32 s3, 0",
+                 "buffer_load_sbyte v4, off, s[0:3], 0 offset:2"]
+        ref = self.run_ref(lines, {0x7000: 0x0080_0000})
+        self.assertEqual(ref.v[4], 0xFFFFFF80)
+
+    def test_global_atomic_cmpswap_glc_and_no_glc(self):
+        lines = ["s_mov_b32 s4, 0x8000", "s_mov_b32 s5, 0", "v_mov_b32 v2, 0x14",
+                 "v_mov_b32 v4, 11", "v_mov_b32 v5, 5",
+                 "global_atomic_cmpswap v6, v2, v[4:5], s[4:5] offset:-4 glc",
+                 "v_mov_b32 v4, 22",
+                 "global_atomic_add v2, v4, s[4:5] offset:-4"]
+        ref = self.run_ref(lines, {0x8010: 5})
+        self.assertEqual((ref.v[6], ref.mem[0x8010]), (5, 33))
 
 
 class FormatDecode(unittest.TestCase):
@@ -122,6 +150,20 @@ class FormatDecode(unittest.TestCase):
                  f"s_mov_b32 s3, {md.OOB_RAW | 20 << 12:#x}",
                  "tbuffer_load_format_xyzw v[8:11], off, s[0:3], 0 format:[BUF_FMT_32_UINT]"])
         self.assertEqual([ref.v[i] for i in range(8, 12)], [42, 0, 0, 0])
+
+    def test_mtbuf_default_format_matches_explicit_8_unorm(self) -> None:
+        descriptor = md.OOB_RAW | md.XYZW | (20 << 12)
+        setup = ["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x1000",
+                 f"s_mov_b32 s3, {descriptor:#x}"]
+        for modifier in (" format:[BUF_FMT_8_UNORM]", ""):
+            with self.subTest(modifier=modifier):
+                load = "tbuffer_load_format_xyzw v[8:11], off, s[0:3], 0" + modifier
+                probe = program(setup + [load, "s_waitcnt vmcnt(0)"], {0x7000: 0xFF})
+                ref = md.RefMachine(dict(probe.memory))
+                ref.run(probe.lines)
+                self.assertEqual([ref.v[reg] for reg in md.EXPORT], [0x3F800000, 0, 0, 0])
+                status, detail = md.run_one("ps_mem_default_mtbuf", probe)
+                self.assertEqual(status, "match", detail)
 
     def test_shader86_closed_open_questions(self):
         """Missing W repeats X; UNORM raw 3 matches correctly rounded 0x3c40c0c1 (no 1-ULP split)."""

@@ -14,10 +14,12 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+
 
 CASES = {
     # Minimal compute using the subgroup lane id (valid everywhere).
@@ -117,46 +119,39 @@ def run(cmd, **kw):
         return None
 
 
-def vulkan_matrix():
-    """Device/feature matrix from vulkaninfo JSON (Vulkan Profiles schema)."""
-    m = {"vulkaninfo": None, "device": None, "subgroup": None,
-         "subgroup_size_control": None, "mesh": None, "barycentric": None,
-         "maintenance8": None, "descriptor_heap": None,
-         "storageInputOutput16": None}
-    if not shutil.which("vulkaninfo"):
-        return m
-    with tempfile.TemporaryDirectory() as d:
-        r = run(["vulkaninfo", "-j"], cwd=d)
-        if r is None or r.returncode != 0:
-            return m
-        files = glob.glob(os.path.join(d, "VP_VULKANINFO_*.json"))
-        if not files:
-            return m
-        try:
-            with open(files[0], encoding="utf-8") as f:
-                doc = json.load(f)
-        except (OSError, ValueError):
-            return m
+def _device_rank(pdev):
+    type_ranks = {
+        2: 4, "VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU": 4,
+        1: 3, "VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU": 3,
+        3: 2, "VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU": 2,
+        4: 1, "VK_PHYSICAL_DEVICE_TYPE_CPU": 1,
+    }
+    vendor = pdev.get("vendorID")
+    native = 0 if vendor == 0x1414 else 10
+    return native + type_ranks.get(pdev.get("deviceType"), 0)
+
+
+def _extract_profile(doc):
     caps = doc.get("capabilities") if isinstance(doc, dict) else None
     dev = caps.get("device") if isinstance(caps, dict) else None
     if not isinstance(dev, dict):
-        return m
+        return None
     props = dev.get("properties")
     feats = dev.get("features")
     exts = dev.get("extensions")
     if not all(isinstance(x, dict) for x in (props, feats, exts)):
-        return m
+        return None
     pdev = props.get("VkPhysicalDeviceProperties")
     v11 = props.get("VkPhysicalDeviceVulkan11Properties", {})
     v13p = props.get("VkPhysicalDeviceVulkan13Properties", {})
     v13f = feats.get("VkPhysicalDeviceVulkan13Features", {})
     v11f = feats.get("VkPhysicalDeviceVulkan11Features", {})
     if not all(isinstance(x, dict) for x in (pdev, v11, v13p, v13f, v11f)):
-        return m
+        return None
     name = pdev.get("deviceName")
     if not isinstance(name, str) or not name:
-        return m
-    m.update({
+        return None
+    return _device_rank(pdev), {
         "vulkaninfo": "ok",
         "device": {"name": name,
                    "driver": pdev.get("driverVersion"),
@@ -175,8 +170,45 @@ def vulkan_matrix():
         "maintenance8": "VK_KHR_maintenance8" in exts,
         "descriptor_heap": "VK_EXT_descriptor_heap" in exts,
         "storageInputOutput16": v11f.get("storageInputOutput16"),
-    })
+    }
+
+
+def vulkan_matrix():
+    """Device/feature matrix from vulkaninfo JSON (Vulkan Profiles schema)."""
+    m = {"vulkaninfo": None, "device": None, "subgroup": None,
+         "subgroup_size_control": None, "mesh": None, "barycentric": None,
+         "maintenance8": None, "descriptor_heap": None,
+         "storageInputOutput16": None}
+    if not shutil.which("vulkaninfo"):
+        return m
+    best_rank = -1
+    best_profile = None
+    with tempfile.TemporaryDirectory() as d:
+        r = run(["vulkaninfo", "-j"], cwd=d)
+        if r is None or r.returncode != 0:
+            return m
+        summary = run(["vulkaninfo", "--summary"], cwd=d)
+        if summary is not None and summary.returncode == 0 and isinstance(summary.stdout, str):
+            seen_gpus = {"0"}
+            for idx in re.findall(r"(?m)^GPU(\d+)\s*:", summary.stdout):
+                if idx not in seen_gpus:
+                    seen_gpus.add(idx)
+                    run(["vulkaninfo", f"-j={idx}"], cwd=d)
+        files = sorted(glob.glob(os.path.join(d, "VP_VULKANINFO_*.json")))
+
+        for path in files:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except (OSError, ValueError):
+                continue
+            parsed = _extract_profile(doc)
+            if parsed is not None and parsed[0] > best_rank:
+                best_rank, best_profile = parsed
+    if best_profile is not None:
+        m.update(best_profile)
     return m
+
 
 
 def validate_cases():
@@ -198,6 +230,12 @@ def validate_cases():
             out[name] = {"assemble": True,
                          "valid": bool(rv and rv.returncode == 0),
                          "stderr": ((rv.stderr if rv else "") or "")[:300]}
+    # A broken toolchain can reject everything and still reject the malformed control.
+    compute = out["compute32"]
+    compute["control_ok"] = compute.get("valid") is True
+    if not compute["control_ok"]:
+        compute["error"] = ("compute32 did not assemble and validate: the spirv-as/spirv-val gate did not accept "
+                            "the known-good module, so the other case results are not trustworthy")
     # The control must be rejected: if spirv-as or spirv-val accepts a malformed module, none of the
     # other results say anything about the toolchain gate and the atlas must not be read as a pass.
     control = out.get("broken_negative")
@@ -214,9 +252,14 @@ def main():
     ap = argparse.ArgumentParser(description="Turing bring-up atlas (no game data).")
     ap.add_argument("--out", default=None, help="write JSON atlas to FILE (default: stdout)")
     a = ap.parse_args()
-    if a.out and os.path.isdir(a.out):
-        print(f"turing_atlas: error: --out is a folder, not a file: {a.out}", file=sys.stderr)
-        return 2
+    if a.out is not None:
+        if not a.out.strip():
+            print("turing_atlas: error: --out must not be empty", file=sys.stderr)
+            return 2
+        if os.path.isdir(a.out) or a.out.endswith((os.sep, os.altsep or os.sep)):
+            print(f"turing_atlas: error: --out is a folder, not a file: {a.out}", file=sys.stderr)
+            return 2
+
     cases = validate_cases()
     atlas = {"tool": "turing_atlas", "gpu": None, "features": vulkan_matrix(),
              "cases": cases}
@@ -227,18 +270,23 @@ def main():
         pass
     text = json.dumps(atlas, indent=2, sort_keys=True)
     if a.out:
-        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        try:
+            folder = os.path.dirname(a.out)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as error:
+            print(f"turing_atlas: error: cannot write {a.out}: {error.strerror or error}", file=sys.stderr)
+            return 2
         print(f"atlas -> {a.out}")
     else:
         print(text)
-    control = cases.get("broken_negative") if isinstance(cases, dict) else None
-    if isinstance(control, dict) and control.get("error"):
-        print(f"turing_atlas: error: {control['error']}", file=sys.stderr)
-        return 2
+    for name in ("compute32", "broken_negative"):
+        error = cases.get(name, {}).get("error")
+        if error:
+            print(f"turing_atlas: error: {error}", file=sys.stderr)
+            return 2
     return 0
 
 

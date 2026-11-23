@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -76,12 +77,14 @@ class ModuleFixture:
             self.decorate(identifier, decoration)
         return identifier
 
-    def entry(self, name, ids, stage=None):
+    def entry(self, name, ids, stage=None, *, model=None):
         raw = name.encode("utf-8") + b"\x00"
         raw += bytes(-len(raw) % 4)
         string = struct.unpack(f"<{len(raw) // 4}I", raw)
         function = self.allocate()
-        args = (self.MODELS[stage or self.stage], function, *string, *ids)
+        if model is None:
+            model = self.MODELS[stage or self.stage]
+        args = (model, function, *string, *ids)
         self.entries.extend([((len(args) + 1) << 16) | spv.OP_ENTRY_POINT, *args])
 
     def binary(self, big_endian=False):
@@ -166,6 +169,16 @@ class ReflectTest(unittest.TestCase):
         shader = input(component=2, components=3)
         with self.assertRaisesRegex(spv.InterfaceError, "extends beyond its Location"):
             shader.reflect()
+
+    def test_rejects_64_bit_vec2_at_component_2(self):
+        shader = output(width=64, components=2, component=2)
+        with self.assertRaisesRegex(spv.InterfaceError, "Component 0"):
+            shader.reflect()
+
+    def test_allows_64_bit_scalar_at_component_2(self):
+        shader = output(width=64, components=1, component=2)
+        used = list(shader.reflect().outputs[0].varyings[0].occupied())
+        self.assertEqual(used, [spv.Address(0, 2), spv.Address(0, 3)])
 
     def test_rejects_unbounded_expansion(self):
         shader = output(array_count=spv.MAX_EXPANDED_LOCATIONS + 1)
@@ -292,13 +305,31 @@ class LinkingTest(unittest.TestCase):
         self.assertEqual(kinds(output(), fragment), [])
         self.assertEqual(kinds(output(array_count=3), fragment), ["type-mismatch"])
 
-    def test_mesh_primitive_output_matches_fragment_domain(self):
-        mesh = simple("ms", spv.STORAGE_OUTPUT, 0, array_count=37)
-        mesh.decorate(mesh.ids[0], spv.DEC_PER_PRIMITIVE)
-        fragment = input()
-        self.assertEqual(kinds(mesh, fragment), ["per-primitive-mismatch"])
-        fragment.decorate(fragment.ids[0], spv.DEC_PER_PRIMITIVE)
-        self.assertEqual(kinds(mesh, fragment), [])
+    def test_mesh_nv_and_ext_outputs_match_fragment_domains(self):
+        for name, model in (("MeshNV", 5268), ("MeshEXT", 5365)):
+            with self.subTest(model=name):
+                mesh = ModuleFixture("ms")
+                vec4 = mesh.numeric(32, 4)
+                mesh.variable(spv.STORAGE_OUTPUT, mesh.array(vec4, 3), location=0)
+                primitive = mesh.variable(spv.STORAGE_OUTPUT, mesh.array(vec4, 1), location=1)
+                mesh.decorate(primitive, spv.DEC_PER_PRIMITIVE)
+                mesh.entry("main", mesh.ids, model=model)
+
+                reflected = mesh.reflect()
+                self.assertEqual(reflected.stage, "ms")
+                self.assertEqual(mesh.reflect(stage="ms"), reflected)
+                self.assertTrue(all(d.indexed_by_vertex_or_primitive for d in reflected.outputs))
+                shape = spv.NumericType("f", 32, 4)
+                self.assertEqual(
+                    [d.varyings for d in reflected.outputs],
+                    [(spv.Varying(spv.Address(0), shape),), (spv.Varying(spv.Address(1), shape, True),)],
+                )
+
+                fragment = input()
+                fragment_primitive = fragment.variable(spv.STORAGE_INPUT, fragment.numeric(32, 4), location=1)
+                self.assertEqual(kinds(mesh, fragment), ["per-primitive-mismatch"])
+                fragment.decorate(fragment_primitive, spv.DEC_PER_PRIMITIVE)
+                self.assertEqual(kinds(mesh, fragment), [])
 
     def test_matching_structure_members_keep_order_and_locations(self):
         def block(stage, storage, locations):
@@ -323,6 +354,17 @@ class LinkingTest(unittest.TestCase):
         shader.variable(spv.STORAGE_OUTPUT, shape, 5)
         declarations = shader.reflect().outputs
         self.assertEqual([v.address.location for v in declarations[0].varyings], [5, 7])
+
+    def test_array_length_uses_literal_specialization_default(self) -> None:
+        producer = ModuleFixture("vs")
+        length = producer.allocate()
+        producer.emit(50, producer.uint, length, 2)  # OpSpecConstant with default length 2
+        producer.decorate(length, 1, 7)  # SpecId 7
+        shape = producer.emit_type(spv.OP_TYPE_ARRAY, producer.numeric(components=4), length)
+        producer.variable(spv.STORAGE_OUTPUT, shape, location=0)
+
+        self.assertEqual(kinds(producer, input(array_count=2)), [])
+        self.assertEqual(kinds(producer, input(array_count=3)), ["type-mismatch"])
 
     def test_matrix_and_array_of_columns_are_distinct_types(self):
         vertices = ModuleFixture("vs")
@@ -412,6 +454,19 @@ class CommandLineTest(unittest.TestCase):
         result = self.run_batch()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_duplicate_manifest_key_is_rejected_with_path_and_key(self):
+        # The last stage value would produce a valid pipeline if the duplicate were ignored.
+        self.manifest.write_text(
+            '{"version": 1, "pipelines": ['
+            '{"name": "dup", "vs": "missing", "vs": "vertex", "ps": "pixel"}]}',
+            encoding="utf-8",
+        )
+        result = self.run_batch("--report", self.report)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(str(self.manifest), result.stderr)
+        self.assertIn("duplicate key 'vs'", result.stderr)
+        self.assertFalse(self.report.exists())
+
     def test_bad_manifest_fields_return_clean_error(self):
         cases = [
             {"version": True, "pipelines": []},
@@ -427,6 +482,31 @@ class CommandLineTest(unittest.TestCase):
                 self.assertIn("shader_link_check: error:", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
+    def test_manifest_saved_with_a_windows_bom_is_read(self):
+        # Notepad and PowerShell 5's Out-File -Encoding utf8 put a BOM first; that is not a manifest error.
+        self.manifest.write_bytes(b"\xef\xbb\xbf" + json.dumps(
+            {"version": 1, "pipelines": [{"name": "bom", "vs": "vertex", "ps": "pixel"}]}).encode("utf-8"))
+        result = self.run_batch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("bom: compatible", result.stdout)
+
+    def test_corpus_style_names_are_accepted_and_paths_are_not(self):
+        # make_game's corpus names (shader_carve stems) contain "~", "!", "&", "(", a leading "." and more: 21,043 of
+        # 26,503 on a 1.0.2.1 copy failed the old [a-zA-Z0-9_.-] rule. Only names that leave --shader-dir fail.
+        for stem in ("VS~1", "pixel!2&x", "a(b)c", "x y", "_~-.ok", ".dotted"):
+            with self.subTest(stem=stem):
+                (self.directory / (stem + ".spv")).write_bytes(self.vs.read_bytes())
+                self.write_manifest({"name": "n", "vs": stem, "ps": "pixel"})
+                result = self.run_batch()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for stem in ("../vertex", "..", ".", "sub/vertex", "sub\\vertex", "C:vertex", "a|b", "a\x00b",
+                     " vertex", ""):
+            with self.subTest(stem=stem):
+                self.write_manifest({"name": "n", "vs": stem, "ps": "pixel"})
+                result = self.run_batch()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("expected a shader name without directories", result.stderr)
+
     def test_report_preserves_inputs(self):
         original = self.vs.read_bytes()
         result = self.command("check", "--vs", self.vs, "--ps", self.ps, "--report", self.vs)
@@ -436,6 +516,22 @@ class CommandLineTest(unittest.TestCase):
         result = self.run_batch("--report", self.manifest)
         self.assertEqual(result.returncode, 2)
         self.assertTrue(json.loads(self.manifest.read_text())["pipelines"])
+
+    def test_existing_report_cannot_be_a_hard_link_to_an_input(self):
+        original = self.vs.read_bytes()
+        try:
+            os.link(self.vs, self.report)
+        except OSError as exc:
+            self.skipTest(f"hard links unavailable: {exc}")
+        result = self.command("check", "--vs", self.vs, "--ps", self.ps, "--report", self.report)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("report would overwrite an input file", result.stderr)
+        self.assertTrue(self.report.samefile(self.vs))
+        self.assertEqual(self.vs.read_bytes(), original)
+
+    def test_missing_report_path_still_cannot_match_an_input_path(self):
+        with self.assertRaisesRegex(ValueError, "report would overwrite an input file"):
+            link.ensure_report_is_separate(self.report, [self.report])
 
     def test_inspect_keeps_types_and_components(self):
         shader = self.module("with_component", input(location=3, component=2, components=2))

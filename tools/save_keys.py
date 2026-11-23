@@ -164,11 +164,17 @@ def read(p):
 INPUT_EXTENSIONS = (".jsav", ".asav", ".json", ".bin")
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a key collection must not report an
+    # incomplete directory as complete. main() turns the OSError into one error line naming the folder.
+    raise exc
+
+
 def input_files(paths):
     """Every save file (.jsav, .asav, .bin or no extension) or .json under the given paths, in reading order."""
     for p in paths:
         if os.path.isdir(p):
-            for dp, _, fs in os.walk(p):
+            for dp, _, fs in os.walk(p, onerror=_walk_error):
                 for f in sorted(fs):
                     if f.lower().endswith(INPUT_EXTENSIONS) or "." not in f:
                         yield os.path.join(dp, f)
@@ -257,7 +263,9 @@ def compose(strings, keys, n_words):
         for w in WORD.findall(s.decode("latin-1")):
             if len(w) >= 2 or w.isdigit():
                 words[w.lower()] += 1
-    vocab = [w for w, _ in words.most_common(n_words)]
+    # Ties are broken by the word, not by the order it was counted: `strings` is a set, so most_common()
+    # followed hash iteration and the same input reported a different composed count from run to run.
+    vocab = [w for w, _ in sorted(words.items(), key=lambda kv: (-kv[1], kv[0]))][:n_words]
     pascal = [w.capitalize().encode() for w in vocab]
     lower = [w.encode() for w in vocab]
     hits, tried = collections.defaultdict(set), 0
@@ -339,7 +347,14 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "resolve" and a.compose < 0:
         r.error("--compose must be 0 or more")
-    return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
+    try:
+        return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
+    except OSError as e:
+        if e.filename is None:                    # not a file we were asked to read (a closed pipe, say)
+            raise
+        # A missing or unreadable input or --dict file is one line naming it, not a traceback.
+        print(f"error: {e.filename}: {e.strerror or e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

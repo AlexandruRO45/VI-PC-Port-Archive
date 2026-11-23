@@ -20,8 +20,8 @@ reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (
 optional fragment pointers, skipping texture dictionaries in drawable-dictionary scans, 16-bit
 bone-palette indices, probe-count parity, and zero-radius drawables) plus BCPack BC1/BC3/BC4/BC5
 decoding (PR #7). A full ten-archive re-count at `e293917` recovers **382,781 models** (**+32,530**
-over `917e9b9`'s 350,251) with **0 decode failures**; the `levels.rpf` fragment, bone-binding and
-triangle cells are not independently reproduced (see the table note), and the earlier
+over `917e9b9`'s 350,251) with **0 decode failures**, **55,417 fragments** and **2,636,248,990
+triangles** (the `levels.rpf` cells from a full export, see the table note), and the earlier
 `917e9b9`, `c3708fb`, and `48557ea` measurements are kept below as controls. This page records the
 measured state; it is not a competing patch.
 
@@ -60,22 +60,29 @@ effect of upstream `v1.2` PRs #8–#12:
 | `pack/story000_restofworld/...` | 1 | **3** | 3 | 0 | 0 | 0 | 2,620 | 0 | 0 |
 | `pack/story000/story000.rpf` | 4,195 | **7,461** | 4,156 | 3,305 | 0 | 0 | 39,861,747 | 0 | +1 |
 | `packs.rpf` | 26,389 | **26,585** | 23,720 | 2,865 | 2,865 | 26,585 | 64,966,572 | 0 | +2,551 |
-| `levels.rpf` | 235,330 | **343,327** | 130,239 | 213,088 | † | † | † | 71 | +29,327 |
+| `levels.rpf` | 235,330 | **343,327** | 130,239 | 213,088 | 50,731 | 59,544 | 2,509,947,536 | 71 | +29,327 |
 | `textures.rpf` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 |
 | `common.rpf`, `core_restofworld001` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| **Total** | **270,819** | **382,781** | **159,511** | **223,270** | **†** | **†** | **†** | **72** | **+32,530** |
+| **Total** | **270,819** | **382,781** | **159,511** | **223,270** | **55,417** | **89,887** | **2,636,248,990** | **72** | **+32,530** |
 
-† `levels.rpf` was counted with `count.exe recover --verify`, which reports candidates, models,
-dictionary children, standalone models, rejects and decode failures only: no `levels.rpf` manifest
-exists and the harness emits no fragment, bone-binding or triangle field. Those three `levels.rpf`
-cells, and the totals that would include them, are therefore **not independently reproduced**. The
-other archives measure 4,686 fragments, 30,343 bone-bound and 126,301,454 triangles.
+`levels.rpf` was first counted with `count.exe recover --verify`, which reports candidates, models,
+dictionary children, standalone models, rejects and decode failures only, so its fragment,
+bone-binding and triangle cells were open. A full `rpf9dump models <levels.rpf> <out>` export at
+`e293917` (25 min, about 340 GB of OBJ, deleted afterwards) fills them from its manifest: 235,330
+candidates, 235,259 recovered, 71 not recovered, 343,327 entries, `fail=0`, the recovery count to
+the row. Its `Drawable` field is set on 130,239 entries and null on 213,088, the dictionary-children
+and standalone cells above (3,694 dictionaries have a single child, so counting shared offsets
+instead gives 126,545 / 216,782). `IsFragment` is true on 50,731 entries and `HasBoneBindings` on
+59,544; `Tris` sums to 2,509,947,536. The same counting on a fresh `data.rpf` export gives that
+row's 268 / 2,907, 1,758, 2,891 and 3,387,016. The other archives measure 4,686 fragments, 30,343
+bone-bound and 126,301,454 triangles.
 
 Every recovered entry was read back from its archive segments and decoded through
 `RageModelDecoder.Decode`: **382,781 / 382,781 decoded, 0 decode failures**. The other archives
 measure **236,311 meshes**, **104,183,438 vertices**, **126,301,454 triangles** and **512 embedded
-textures**; the `levels.rpf` mesh/vertex/triangle/embedded cells are not independently reproduced
-(see the table note).
+textures**; `levels.rpf` adds 3,854,587 meshes, 2,364,218,711 vertices, 2,509,947,536 triangles and
+1,293 embedded textures (the export's own summary line), for **4,090,898 meshes**, **2,468,402,149
+vertices**, **2,636,248,990 triangles** and **1,805 embedded textures** over all ten archives.
 
 What moved between `917e9b9` and `e293917`:
 
@@ -129,7 +136,7 @@ entries are dictionary children.
 ### Re-count at `e293917`
 
 A full `rpf9dump models` re-run over the same archives at the current pin (the manifests are
-local; `levels.rpf` has a recovery count but no full OBJ export):
+local; `levels.rpf` was exported separately, see the table note above):
 
 | Archive | Rows | Non-fragment | Fragments | Delta vs `917e9b9` |
 |---|---:|---:|---:|---:|
@@ -141,7 +148,8 @@ local; `levels.rpf` has a recovery count but no full OBJ export):
 | `story000_restofworld` | **3** | 3 | 0 | 0 |
 | `common`, `textures`, `story000_script`, `core_restofworld001` | 0 | 0 | 0 | 0 |
 | **Total, excluding `levels.rpf`** | **39,454** | **34,768** | **4,686** | **+3,203** |
-| `levels.rpf` | recovery count only, see below | - | - | +29,327 |
+| `levels.rpf` | **343,327** | 292,596 | 50,731 | +29,327 |
+| **Total** | **382,781** | **327,364** | **55,417** | **+32,530** |
 
 The gain outside `levels.rpf` is fragments: upstream `v1.2` PRs #8-#12 recover zero-radius
 fragments that the earlier export skipped (2,551 in `packs.rpf`, 594 in `data.rpf`), plus one
@@ -150,8 +158,8 @@ is 0.
 
 `levels.rpf` was re-counted at `e293917` (10 shards over 235,330 candidates): **343,327 models**
 (130,239 dictionary children + 213,088 standalone), against 314,000 at `917e9b9` (206,981
-candidates; 130,225 children + 183,801). The +29,327 is a recovery count, not a row-for-row delta,
-and no full OBJ export was run. Triangle totals were not re-run either.
+candidates; 130,225 children + 183,801). The +29,327 is a recovery count, not a row-for-row delta.
+The full OBJ export at `e293917` (table note above) gives the same 343,327 rows.
 
 The last column is the `c3708fb` recovery for comparison. `story000`'s standalone count is
 3,304 vs 3,305; the full new-pin standalone total is 190,765, 27 below the `c3708fb` 190,792.
@@ -248,9 +256,8 @@ reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
 The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archive recovers
 24,034 models (26,585 at `e293917`), and the other archives' new-pin counts are in the table above.
 The rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,251,
-and the `e293917` re-count outside `levels.rpf` is 39,454. Triangle totals have not been re-run at
-either new pin; the `e293917` `levels.rpf` geometry cells are not independently reproduced (see
-the table note above).
+and the `e293917` re-count outside `levels.rpf` is 39,454. The `e293917` triangle totals of all ten
+archives, `levels.rpf` included, are in the table above.
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
@@ -259,7 +266,7 @@ failures, no duplicate model names, and 2.22 billion triangles (1.95 billion bef
 ## How the exporter works
 
 ```
-rpf9dump models <archive.rpf> <outdir>
+rpf9dump models <archive.rpf> <outdir> [--start BYTES] [--length BYTES]
 ```
 
 `FindCandidateOffsets` scans 4 MiB blocks for a page-aligned 16-byte zero prefix followed by a zlib
@@ -267,6 +274,15 @@ stream at page offset +16. It inflates the first 176 bytes and keeps the offset 
 a drawable or fragment header (`RageModelDecoder.LooksLikeResource`). `RecoverAtOffsets` follows
 the following zlib blocks, splits the inflated bytes into the system segment and the graphics
 segment, probes the extents, and calls `RageModelDecoder.Decode`.
+
+`--start`/`--length` scan one window of the file instead of the whole archive. Neither `models`
+nor `textures` needs the archive directory: the entry list comes from this run's scan or from the
+index cache, and every resource is read from its own compression blocks
+(`tools/rpf9dump/Segments.cs`). A window is therefore a raw slice - a copy of `levels.rpf` from an
+offset, which has no `9FPR` header - and the scan covers exactly the slice. A sub-range is never
+written to the index cache, which describes a whole file; the manifest records `Scan.Start` and
+`Scan.Length` for it. One measured 1 GiB slice of `levels.rpf`: 1,228 models scanned, recovered,
+decoded and exported in about 2 s (497 MB of OBJ and manifest).
 
 To locate a named drawable before decoding, `tools/rpf9_names.py` indexes the measured
 `name.#dr`/`#ft`/`#dd` spellings in bounded zlib prefixes without the encrypted TOC; see
@@ -277,6 +293,12 @@ For each returned entry, `tools/rpf9dump/Program.cs` reads the segments, splits 
 `<outdir>/<archive>/models/manifest.json` with `src`, `Count`, and `Items[]`. Each item records the
 offset, OBJ name, model name, mesh/vertex/triangle counts, fragment and bone-binding flags, bounds,
 per-mesh shader indices, embedded textures, and material texture references.
+
+Three arrays describe the geometries one by one, in the same order as the OBJ's `o` groups:
+`MeshTris` (triangles), `MeshModels` (the position of the model in the drawable's primary-LOD model
+list) and `MeshGeoms` (the position of the geometry in that model). That pair is the geometry index
+a dehydrated BLAS leaf stores ([bvh.md](bvh.md) §4a), which is what `tools/bvh_match.py` matches on;
+`MeshShaders` maps each geometry to its entry in `Materials`, and therefore to its shader name hash.
 
 The manifest has no failure, skip, or layout fields. `Program.cs` increments `fail` only when a
 model entry returned by the carver fails `RageModelDecoder.Decode`; `skip` is not used in models
@@ -428,9 +450,39 @@ records. No unhandled layout tag appears:
 - **Sentinels.** On each surface, 11 entries have every estimate 0 and 10 more have zero speeds with an
   infinite time (`inf`). `inf` occurs in 38 road and 99 offroad blocks overall, so a parser must accept `inf`
   in these fields (it reads as "never reaches the test speed or distance").
+- **`fOverallRating` is a weighted mean of the other four ratings** (measured, confirmed to float noise) on the
+  345 of the 504 rating blocks whose four parts are all above 10: there `fOverallRating` = 0.21
+  `fSpeedRating` + 0.38 `fHandlingRating` + 0.40 `fAccelerationRating` + 0.01 `fBrakesRating`, with a residual
+  of at most 7e-5. The four weights sum to 1, so handling and acceleration weigh about twice speed and brakes is 1%.
+  Differencing a key's road and offroad blocks gives the same 0.2100 / 0.3800 / 0.4000 / 0.0100 on the 139 keys
+  that are above 10 on both surfaces, so the weights do not depend on the surface.
+- **The overall has the same observed minimum of 10.** The other 159 rating blocks each have at least one part
+  at exactly 10, and the formula does not hold for them: they sit up to 4.1 below the weighted mean, and 24 of
+  them carry an `fOverallRating` of exactly 10. No block without a part at 10 deviates. The exports show only
+  this minimum; they cannot tell where, or whether, the engine clamps.
+- **Scale.** The ratings are continuous floats, not a 0-1 or 0-100 score: 342 to 451 distinct values per field
+  over the 504 blocks, a floor of exactly 10, and `fAccelerationRating` the only field past 1,000 (22 blocks,
+  maximum 1,327).
 
-Not measured here (hypothesis): the rating scale and how `fOverallRating` weights its parts, and whether the
-estimates are precomputed from handling data or measured by simulation.
+Not measured here (hypothesis): whether the estimates are precomputed from handling data or measured by
+simulation, and what fixes the top of the rating scale.
+- **The estimates are a separate stored table, not the performance maps.** `common.rpf`'s data area at `0x9580`
+  also holds `CVehiclePerformanceMaps` (285 rows, 10 result fields) and `CTyreDataSet` (40 tyre types). 251 of the
+  252 estimate keys join the performance rows, but no field reproduces an estimate exactly: the best OLS over
+  all ten gives R^2 0.872, and `fAccelerationTime` against `accelZeroSixty` is R^2 0.811 with a median |residual|
+  of 0.54 s. The clearest relation is internal to the estimates: over the 231 rows with a finite top speed,
+  `fStandingQuarterTime = 6.73 + 401.0 / fTopSpeed` (R^2 0.99998, median |residual| 1.01 s; R^2 0.82 over the
+  209 rows under 30 s). For the seven top-speed-limited rows, `fTopSpeed * fStandingQuarterTime` is
+  402.339 +/- 0.0003 m, a quarter mile; the residual tracks the 0-60 time.
+- **The ratings are deterministic functions of the estimates.** Each of the 223 distinct road top speeds gives
+  one `fSpeedRating`; handling/corner has 221 levels, acceleration/acceleration time 204, brakes two collisions,
+  and `fOverallRating` uses more than one field. The rating scale and the overall weighting are still not fitted.
+- **The handling inputs are not in the readable archives.** No `CHandlingData`/`handling.meta`, `fMass`,
+  `fInitialDriveForce`, `fInitialDragCoeff`, `nInitialDriveGears`, `fTractionCurve*`, `fBrakeForce` or
+  `fSuspensionForce` occurs in `common.rpf`, `data.rpf`, `packs.rpf` or `script.rpf`; the executable is absent.
+  `levels.rpf` is map data and was not fully scanned. The table is therefore consistent with an offline
+  estimator fed by handling-derived scalars, but whether it was fitted to handling or copied from a simulation
+  cannot be verified from this package.
 
 ## Character skeletons
 
@@ -438,12 +490,33 @@ World drawables do not carry the shared 597-name humanoid skeleton. Character `.
 store that name/hash table, and each character `#dr` model points at a local bone-hash array that
 maps into it. The measured name table, the following 597-record hierarchy/reference-TRS table,
 the model mapping and the texture-parameter split are in
-[character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
-page records the reference-pose caveat rather than inventing a bind pose.
+[character_skeleton.md](character_skeleton.md). The character inverse bind matrices are at
+skeleton header `+0x30` and agree with the default bone transforms (see that page);
+`tools/anim_glb.py` exports a skinned part with them.
 
 The character-part inventory (Lucia's named records and decoded parts, the `player_story000_00`
 drawable set, slot-name counts and texture coverage) is in
 [character_models.md](character_models.md).
+
+### Character census
+
+`tools/character_census.py` totals a decoded model tree or an `rpf9dump models` manifest:
+
+```powershell
+python -I tools/character_census.py <models-dir-or-manifest> [--json FILE] [--csv FILE]
+```
+
+It reads every nested `model.json` (the decoded-pack layout: `type`, `vertex_count`,
+`triangle_count`, `materials[].shader_name_hash`, `materials[].textures[].hash64`,
+`drawable.skeleton`/`drawable.models[].bone_palette` and `meshes[].skin_influences`), or the
+`Items[]` of a manifest (`Verts`, `Tris`, `IsFragment`, `HasBoneBindings`, `Materials[]`). The
+local exporter does not write an index count, so the index column and total normally stay unknown;
+an input that supplies `index_count` is counted, but the field is optional and not part of the
+decoded layout. It prints one row per model with kind, vertex/triangle counts, bones, 8-influence
+skin, shader hashes and texture keys, then totals by kind and by shader hash. A missing or wrongly typed field
+is reported on that row instead of ending the run. An `rpf9dump models` manifest records only
+`HasBoneBindings`, not a bone count or influence width, so those cells stay `?`. Report paths that
+alias an input are refused. The tests are synthetic: `python -I tests/test_character_census.py`.
 
 ## Shader render buckets
 
@@ -470,6 +543,198 @@ Names are per model and a building holds glass, decal and opaque shaders alike, 
 in absolute terms; the enrichment against bucket 0 is the signal. For export: bucket 1 needs blending, 2 is
 a projected decal, 3 needs alpha testing, 6 is a water surface.
 
+`common.rpf` carries the matching preset-to-effect table (`SPS1`, decoded by `tools/gamedata_sps1.py`,
+[`gamedata.md`](gamedata.md#sps1-shader-preset-table)): `858` `.sps` presets map onto `539` `SGD5` Database 0 effects
+with a default `u8` render bucket (`0..7`), `63` effects accept multiple buckets, and the single bucket-`4`
+and bucket-`5` presets both resolve to effect `fc34f08b`.
+
+## Material shader hashes and the carved programs
+
+`rpf9dump` also writes each material's shader hash (`manifest.json` → `Materials[].Shader`, u32 as 8 hex digits).
+It is the joaat (lower-cased) of the material's **effect** name. The carve index (`<work>/shaders/dxbc/index.json`)
+names compute programs `<effect>:<entry>_<8 hex>_Wrapped` after a one-byte length prefix (the `:` becomes `_` in
+file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy, `data.rpf` models and the full
+26,503-program carve:
+
+| | Count |
+|---|---:|
+| Materials (3,175 models) | 3,340 |
+| Distinct material shader hashes | 18 |
+| Compute programs named `<effect>:<entry>` | 2,689 (every CS), 564 effects |
+| Effects with `RaytracingResolve` CS programs | 341 (1,004 programs; 3 each for 324) |
+| Materials whose hash is the joaat of a carved effect name | 3,211 (96%), 8 of the 18 hashes |
+| Materials whose hash is the joaat of a native effect record's name (both SGD5 databases, below) | 3,340 (100%), 18 of the 18 hashes, one record each |
+
+So a material leads to its effect. Through the carved compute names it reaches only 8 of the 18 hashes; the
+effect records' own names reach all 18 (@jeremygold02, `tools/sgd5_effects.py` in #3036). The draw (VS/PS/MS)
+programs are not reachable through the carved programs' names, order or suffixes:
+
+- None of the 23,619 graphics programs (2,236 VS, 12,101 PS, 9,282 MS; the 195 GS are left out here) carries an
+  effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
+- `shaders.rpf` stores programs grouped by kind, not by effect (the 1,004 `RaytracingResolve` programs sit next
+  to each other), so position doesn't group an effect's programs either.
+- Every one of the 23,619 has an 8-hex suffix. The suffixes group them: there are 1,228 distinct ones, the largest
+  shared by 1,806 programs and 53 used once. The suffix is not the joaat of the program name, and only 1 of the
+  896 suffixes on the effect-named CS programs appears on any graphics program.
+
+They are reachable through the **effect records** in `shaders.rpf` (found by @jeremygold02, #2519). All fields
+are little-endian:
+
+1. **The effect record.** It starts with a one-byte name length and the name, including its terminator, then a
+   u32 (below). Six stage lists follow, each a u32 count and that many u32 ordinals.
+
+   The u32 is a size computed from the record's own counted fields (@jeremygold02). Let G be the ordinals in the
+   six lists, T the techniques, P the passes, and W the post-pass word count. Let A and B be the two block
+   lengths after them, E the post-pass entry count, I the payload bytes of the entries whose tag is a length
+   (not `0x80000000`), and S the string-pool length. Lengths don't count their own prefixes. Then, with
+   `x = 4W + A + B`:
+
+   ```text
+   word = 48 + 8(G + T + E) + 32P + I + S + (round_up(x, 8) if E else x)
+   ```
+
+   This holds for all 932 records of this build (910 + 22, recomputed here). The value never equals the record's
+   serialized length (0 of 932), so the next record is found by the sequential walk, not by this word. What the
+   runtime uses it for is unknown. Groups 3 and 4 are empty here, so their share of it is unmeasured.
+
+   `shaders.rpf` holds **two shader databases** (SGD5), and an ordinal counts within one of them (found by
+   @jeremygold02). Each database stores six program groups, each a u32 count followed by its programs. A program
+   is a u8-length label including its NUL, one tag byte, a u32-length payload, 152 fixed bytes and a u32-length
+   trailer. The u32 after group 5 is the database's effect count. An ordinal is the zero-based position in the
+   group of the effect's own database, so a lookup needs the database, the group and the ordinal.
+
+   | Database (group walk starts at) | 0: VS + MS | 1: PS | 2: GS | 3 | 4 | 5: CS | Effects declared |
+   |---|---:|---:|---:|---:|---:|---:|---:|
+   | `0x10E39` | 11,018 | 10,944 | 195 | 0 | 0 | 2,647 | 910 |
+   | `0x10289C81` | 500 | 1,157 | 0 | 0 | 0 | 42 | 22 |
+
+   The two databases add up to the whole carve: 11,518 VS + MS, 12,101 PS, 195 GS and 2,689 CS. Groups 3 and 4 are
+   empty and their stages are not identified. The first database's programs come first in the archive, so for its
+   effects the ordinal also equals the program's position among the carve index's programs of that group, sorted
+   by `offset`. The three records here are all in the first database: the wiper's 11017 is the last entry of its
+   group 0.
+
+   On the rim and the tire, list 5's three entries are exactly the effect's own `<effect>:RaytracingResolve`
+   programs, the ones the material hash leads to in the table above. In the second database all 42 group-5
+   references resolve to programs that carry their effect's name; resolved against the archive-wide CS list
+   instead, none of them do (@jeremygold02).
+2. **The technique table.** A u32 count, then one 4-byte entry per technique: the low 15 bits of its first u16 are
+   the name's offset in a string block, and byte 3 is the pass count. A u32 pass total follows, then 24-byte pass
+   records. Where the table and its string block sit relative to the record is not derived yet: the three
+   tables were located by offset.
+3. **The pass records.** The first six bytes of each pass select an entry of each stage list: 0 is unused,
+   otherwise `stage_list[selector - 1]`.
+
+The group walk and its counts above were reproduced on a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256
+`0bc16345…`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
+--list-effects` (#3036, `0029eba7`): 932 effect records with 932 distinct name hashes, 913 of them with a
+technique table, 25,037 techniques and 28,798 passes. Since `c0439966` the tool also **walks** the records
+forward from each database's effect count, using only stored lengths: every record's string pool, the next
+record, and at the end the terminal word and zero padding. Its tests, run against this package
+(`LEONIDA_GAME_DIR` set, `tests/test_sgd5_effects.py`), pass: the walk and the earlier search agree on every
+record, technique and pass. The record and pass format below was also checked by hand on three records:
+
+| Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass list 0 / list 1 ordinal |
+|---|---|---:|---:|---|
+| windshield wiper mask | 1, 1, 0, 0, 0, 0 | 1 | 1 | 11017 / 10943 |
+| stock rim | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9143 / 8925 |
+| stock tire | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9089 / 8835 |
+
+Two things are still open:
+
+- **The u32 after an effect's name.** It is reproduced from the record's fields; how the runtime uses it is
+  still unknown.
+- **Which technique and pass the game draws with.** That is a run-time choice; it is presumably made in the
+  executable (RT-5).
+
+Until both are settled, a real model is drawn with a chosen pair ([first_light.md](first_light.md)). The effect
+records already give that choice a pair that can be checked independently.
+
+So a material leads to its effect. Through the carved compute names it reaches only 8 of the 18 hashes; the
+effect records' own names reach all 18 (@jeremygold02, `tools/sgd5_effects.py` in #3036). The draw (VS/PS/MS)
+programs are not reachable through the carved programs' names, order or suffixes:
+
+- None of the 23,619 graphics programs (2,236 VS, 12,101 PS, 9,282 MS; the 195 GS are left out here) carries an
+  effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
+- `shaders.rpf` stores programs grouped by kind, not by effect (the 1,004 `RaytracingResolve` programs sit next
+  to each other), so position doesn't group an effect's programs either.
+- Every one of the 23,619 has an 8-hex suffix. The suffixes group them: there are 1,228 distinct ones, the largest
+  shared by 1,806 programs and 53 used once. The suffix is not the joaat of the program name, and only 1 of the
+  896 suffixes on the effect-named CS programs appears on any graphics program.
+
+They are reachable through the **effect records** in `shaders.rpf` (found by @jeremygold02, #2519). All fields
+are little-endian:
+
+1. **The effect record.** It starts with a one-byte name length and the name, including its terminator, then a
+   u32 (below). Six stage lists follow, each a u32 count and that many u32 ordinals.
+
+   The u32 is a size computed from the record's own counted fields (@jeremygold02). Let G be the ordinals in the
+   six lists, T the techniques, P the passes, and W the post-pass word count. Let A and B be the two block
+   lengths after them, E the post-pass entry count, I the payload bytes of the entries whose tag is a length
+   (not `0x80000000`), and S the string-pool length. Lengths don't count their own prefixes. Then, with
+   `x = 4W + A + B`:
+
+   ```text
+   word = 48 + 8(G + T + E) + 32P + I + S + (round_up(x, 8) if E else x)
+   ```
+
+   This holds for all 932 records of this build (910 + 22, recomputed here). The value never equals the record's
+   serialized length (0 of 932), so the next record is found by the sequential walk, not by this word. What the
+   runtime uses it for is unknown. Groups 3 and 4 are empty here, so their share of it is unmeasured.
+
+   `shaders.rpf` holds **two shader databases** (SGD5), and an ordinal counts within one of them (found by
+   @jeremygold02). Each database stores six program groups, each a u32 count followed by its programs. A program
+   is a u8-length label including its NUL, one tag byte, a u32-length payload, 152 fixed bytes and a u32-length
+   trailer. The u32 after group 5 is the database's effect count. An ordinal is the zero-based position in the
+   group of the effect's own database, so a lookup needs the database, the group and the ordinal.
+
+   | Database (group walk starts at) | 0: VS + MS | 1: PS | 2: GS | 3 | 4 | 5: CS | Effects declared |
+   |---|---:|---:|---:|---:|---:|---:|---:|
+   | `0x10E39` | 11,018 | 10,944 | 195 | 0 | 0 | 2,647 | 910 |
+   | `0x10289C81` | 500 | 1,157 | 0 | 0 | 0 | 42 | 22 |
+
+   The two databases add up to the whole carve: 11,518 VS + MS, 12,101 PS, 195 GS and 2,689 CS. Groups 3 and 4 are
+   empty and their stages are not identified. The first database's programs come first in the archive, so for its
+   effects the ordinal also equals the program's position among the carve index's programs of that group, sorted
+   by `offset`. The three records here are all in the first database: the wiper's 11017 is the last entry of its
+   group 0.
+
+   On the rim and the tire, list 5's three entries are exactly the effect's own `<effect>:RaytracingResolve`
+   programs, the ones the material hash leads to in the table above. In the second database all 42 group-5
+   references resolve to programs that carry their effect's name; resolved against the archive-wide CS list
+   instead, none of them do (@jeremygold02).
+2. **The technique table.** A u32 count, then one 4-byte entry per technique: the low 15 bits of its first u16 are
+   the name's offset in a string block, and byte 3 is the pass count. A u32 pass total follows, then 24-byte pass
+   records. Where the table and its string block sit relative to the record is not derived yet: the three
+   tables were located by offset.
+3. **The pass records.** The first six bytes of each pass select an entry of each stage list: 0 is unused,
+   otherwise `stage_list[selector - 1]`.
+
+The group walk and its counts above were reproduced on a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256
+`0bc16345…`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
+--list-effects` (#3036, `0029eba7`): 932 effect records with 932 distinct name hashes, 913 of them with a
+technique table, 25,037 techniques and 28,798 passes. Since `c0439966` the tool also **walks** the records
+forward from each database's effect count, using only stored lengths: every record's string pool, the next
+record, and at the end the terminal word and zero padding. Its tests, run against this package
+(`LEONIDA_GAME_DIR` set, `tests/test_sgd5_effects.py`), pass: the walk and the earlier search agree on every
+record, technique and pass. The record and pass format below was also checked by hand on three records:
+
+| Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass list 0 / list 1 ordinal |
+|---|---|---:|---:|---|
+| windshield wiper mask | 1, 1, 0, 0, 0, 0 | 1 | 1 | 11017 / 10943 |
+| stock rim | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9143 / 8925 |
+| stock tire | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9089 / 8835 |
+
+Two things are still open:
+
+- **The u32 after an effect's name.** It is reproduced from the record's fields; how the runtime uses it is
+  still unknown.
+- **Which technique and pass the game draws with.** That is a run-time choice; it is presumably made in the
+  executable (RT-5).
+
+Until both are settled, a real model is drawn with a chosen pair ([first_light.md](first_light.md)). The effect
+records already give that choice a pair that can be checked independently.
+
 ## Vehicle distant-light recipes
 
 `common.rpf` has one `CVehicleDistantLightData` XML document (see [gamedata.md](gamedata.md)) that ties
@@ -494,22 +759,102 @@ vehicle models to far-away light recipes. Counts only; no model names.
   this build the document is an index from model and variant to recipe with the light positions absent,
   so distant vehicle lights cannot be reconstructed from it.
 
-Not measured here (hypothesis): what the secondary tokens name (per-model parts or liveries would fit the
-model-name substrings), and where the light positions are generated at runtime (for example from the model's
-own light bones).
+To reproduce the joins, locate the XML roots in the [common carve catalog](gamedata.md) with
+`python -I tools/gamedata_xml.py <common-carve-dir> --json xml.json`. Trim and lowercase the field
+text, then match each nonempty `CVehicleDistantLightData/recipeLights/Item` by `vehicleModelName`
+and its sorted list of `secondaryRecipes/Item` values against `vehicleName` and the same list on
+`CPaletteIndexedRecipeTintsArray` rows at `.//recipeCombinations/Item`. For the carriage check,
+expand the light lists to distinct pairs and compare with `CTrainConfigs` rows at `.//carriages/Item`.
+
+The sampled `CPaletteIndexedRecipeTintsArray` document reuses 746 of the 780 distinct distant-light
+secondary tokens in its own `secondaryRecipes` field. Of the 1,668 distant-light rows with at least one
+token, 1,339 match a palette recipe on both vehicle name and the complete token list, ignoring case and
+token order. Replacing each vehicle name with the next of the 319 distinct names from all light rows in sorted order
+(wrapping at the end) and keeping its tokens fixed gives 56 matches among the same 1,668 rows.
+
+For a single-token comparison, the distant-light rows give 1,547 distinct (vehicle, secondary token)
+pairs. Four match the `modelName` and `modelSetName` fields on the same `CTrainConfigs` carriage row,
+after trimming whitespace and ignoring case. These four pairs cover two vehicle models and four model
+sets. Rotating the 319 vehicle names as above gives zero matching pairs. Keeping the vehicle fixed and
+rotating the 780 distinct tokens in sorted order, with wraparound, gives two matching pairs.
+
+In the 34-row `CVehicleBoneOffsetsArray` document, 0 of the 780 distinct tokens match a whole text or
+attribute value case-insensitively. In the 2,447-row document of the same type, 178 of the 780 match
+`boneOffsets/Item/name`. All 2,447 rows have empty `vehicleName` fields, so those name matches provide
+no same-row vehicle association.
+Which physical parts or liveries a token selects, and where the runtime obtains light positions, remain open.
+
+## Skinned GLB export
+
+`tools/skinned_glb.py` writes a skinned GLB from decoded pack components and the shared ped
+skeleton:
+
+```
+python -I tools/skinned_glb.py out.glb --skeleton <dir> --component <dir> [--component ...]
+```
+
+It reads the 8-influence `JOINTS_0/1` and `WEIGHTS_0/1` streams from the graphics buffer, resolves
+the drawable's local joint palette through the drawable and ped tables, and emits `skins` and
+`inverseBindMatrices` with the ped bind pose. The measured stream offsets and joint mapping are
+in [character_skeleton.md](character_skeleton.md#skinned-glb-export). On the 1.0.2.1 package, the
+head (8,983 v) and biker jacket (9,818 v) produce one skin with 596 ped joints (703 with the
+jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconstruction error is
+6e-8 m. `python -I tests/test_skinned_glb.py` runs 19 synthetic tests and needs no game files.
+
+`tools/glb_inspect.py` reads such a GLB back without a library, so an export can be checked
+before it is opened in a viewer:
+
+```
+python -I tools/glb_inspect.py out.glb [--json report.json]
+```
+
+It prints the chunk layout and padding, the `counts` of scenes, nodes, meshes, materials, images,
+skins and animations, each mesh's primitive, vertex and triangle counts, each material's
+`baseColorTexture`, each skin's joint count, each animation's channels and duration, and the
+POSITION bounding box (marked `partial` when a POSITION accessor has no `min`/`max`). It reports
+what the JSON chunk says — a field the exporter dropped reads `(missing)` — and never infers
+geometry from the BIN chunk. Standard library only; no game files.
 
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
 2. **Done:** the pin is `e293917` (was `917e9b9`, originally `48557ea`).
 3. **Done:** all ten `MODEL_ARCHIVES` were re-counted and read-back decoded at `e293917` (**382,781
-   models**, **0 decode failures**; table above; the `levels.rpf` geometry cells are not
-   independently reproduced).
+   models**, **0 decode failures**; table above, `levels.rpf` geometry from a full export).
 4. Investigate the 71 remaining unrecovered fragment candidates in `levels.rpf` (and the 1
    texture-dictionary candidate in `textures.rpf`) if further upstream recovery is wanted.
 5. Keep issue #29 in sync with the `e293917` counts.
 3. **Done:** `tools/rpf9dump models` was re-run over the model-bearing archives at `e293917`;
    the six non-`levels.rpf` archives total 39,454 rows (+3,203, almost all recovered fragments).
-   `levels.rpf` has a recovery count (343,327 models, +29,327) but no full OBJ export; triangle
-   totals were not re-run.
+   `levels.rpf` has the same 343,327 rows in a full export (50,731 fragments, 2,509,947,536
+   triangles).
 4. Keep the README and issue #29 in sync with the new counts.
+
+### Predict model offsets for placements
+
+Run `python -I tools/world_drawable_lookup.py entities.jsonl archetypes.json names.json`
+with the placement rows from `world_index.py --entities-out`, the definitions from
+`world_archetypes.py`, and a bounded `rpf9_names.py --types dr,ft` report. The command
+prints local scratch JSON. Supply `--manifest path/to/models/manifest.json` for each
+existing export whose listed identities should be excluded.
+
+The lookup requires agreement between the placement archetype, the definition's name and
+assetName, the resource stem's joaat and its 64-bit placement key. It considers type 1
+fragments and type 2 drawables at page offset +16. Multiple offsets for an identity in
+the indexed window are marked ambiguous. Even a single hit is a prediction: a stream
+can mention another model. Export a window around the predicted offset with
+`rpf9dump models <archive> <outdir> --start BYTES --length BYTES`, compare the manifest offset and
+model identity and run `world_build.py --placements` with the exported geometry.
+
+Save the lookup JSON and run
+`python -I tools/world_drawable_verify.py lookup.json first/models/manifest.json second/models/manifest.json`
+to verify single-offset predictions. Supply completed normal model manifests from the
+same source archive. The verifier reads cached JSON only. It uses the world builder's
+name hashes and counts each identity and its placements once. A matching offset and both
+hashes confirm an observation, including dictionary children sharing an offset. The local
+report counts repeat exact observations and lists other offsets for the same identity.
+Without an exact match, a different name at the offset takes precedence over a matching
+identity elsewhere. The coverage flag independently records whether the predicted offset
+falls in a supplied scan (start inclusive, end exclusive). A full scan covers all offsets.
+A covered prediction with no named evidence remains missing. Geometry loadability is
+checked separately by running the normal world builder on confirmed placement rows.

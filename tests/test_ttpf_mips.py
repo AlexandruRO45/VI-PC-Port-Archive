@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stdout
+from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -264,12 +264,17 @@ def solid_chain(layout, fmt=71, color_fn=None):
     return out
 
 
-def write_rds5_pool(path, records, chunks):
-    """Write a synthetic RDS5/ETPF pool with one or more zlib-compressed chunks."""
+def write_rds5_pool(path, records, chunks, area=None):
+    """Write a synthetic RDS5/ETPF pool with one or more zlib-compressed chunks.
+
+    `area` is the size of the record region in bytes. The default, len(records) * 24, fits
+    every 8-byte asset key after the 16-byte descriptors. A smaller area (at least
+    len(records) * 16) lets the key array continue into the 32-byte ID region, as most
+    retail pools do."""
     count = len(chunks) + 2
     table_end = 24 + (count - 1) * 8
     etpf = ttpf.align(table_end, 256)
-    area = len(records) * 24
+    area = len(records) * 24 if area is None else area
     metadata = 16 + area + len(records) * 32
     padded = ttpf.align(metadata, 4096)
 
@@ -659,7 +664,7 @@ class BcDecodeTest(unittest.TestCase):
         self.assertAlmostEqual(sign_err, 255.0, places=5)
 
 
-class Bc3CheckTest(unittest.TestCase):
+class Bc2AndBc3CheckTest(unittest.TestCase):
     def run_check(self, fmt, lower_colour):
         import io
         from contextlib import redirect_stdout
@@ -669,11 +674,12 @@ class Bc3CheckTest(unittest.TestCase):
         payload = bytearray(layout["size"])
         for mip in layout["mips"]:
             colour = top_colour if mip["index"] == 0 else lower_colour
-            block = solid_bc4(255) + colour
+            alpha = b"\xff" * 8 if fmt in (74, 75) else solid_bc4(255)
+            block = alpha + colour
             retile_to(layout, mip, block * (mip["blocks_w"] * mip["blocks_h"]), payload)
         record = pack_etpf_record(256, 256, 6, 1, fmt, 1, 1, 4, 4096, 0x103)
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "bc3.ttpf")
+            path = os.path.join(tmp, "rgb-mips.ttpf")
             write_rds5_pool(path, [record], [payload])
             pool = ttpf.Pool(path)
             buf = io.StringIO()
@@ -684,10 +690,19 @@ class Bc3CheckTest(unittest.TestCase):
                 pool.close()
         return code, json.loads(buf.getvalue())
 
+    def test_bc2_decodes_all_four_rgb_selectors(self) -> None:
+        # Explicit alpha bytes precede the color block. Black comes before
+        # white, but BC2 still uses both interpolated colors.
+        block = struct.pack("<QHHI", 0xFEDCBA9876543210, 0, 0xFFFF, 0xE4E4E4E4)
+        expected = [(value, value, value) for value in (0.0, 255.0, 85.0, 170.0)] * 4
+        for fmt in (74, 75):
+            with self.subTest(fmt=fmt):
+                self.assertEqual(ttpf.decode_pixels(fmt, block, 1, 1), expected)
+
     def test_gray_chain_passes_whatever_the_endpoint_order(self):
         # Reversed endpoints with selector 2 describe the same gray as the top level.
         gray = struct.pack("<HHI", 0xFFFF, 0, 0xAAAAAAAA)
-        for fmt in (77, 78):
+        for fmt in (74, 75, 77, 78):
             with self.subTest(fmt=fmt):
                 code, result = self.run_check(fmt, gray)
                 self.assertEqual(code, 0, result)
@@ -695,7 +710,7 @@ class Bc3CheckTest(unittest.TestCase):
 
     def test_black_child_under_gray_top_fails(self):
         black = struct.pack("<HHI", 0, 0, 0)
-        for fmt in (77, 78):
+        for fmt in (74, 75, 77, 78):
             with self.subTest(fmt=fmt):
                 code, result = self.run_check(fmt, black)
                 self.assertEqual(code, 1, result)
@@ -1090,6 +1105,49 @@ class SyntheticPoolTest(unittest.TestCase):
         linear = solid_chain(self.layout)
         self.assertEqual(data[148:], b"".join(linear[m["index"]] for m in self.layout["mips"]))
 
+    def test_export_requested_mip_prefix_with_unavailable_lower_mips(self) -> None:
+        layout = self.layout
+        linear = solid_chain(layout)
+        payload = bytearray(layout["size"])
+        for mip in layout["mips"]:
+            retile_to(layout, mip, linear[mip["index"]], payload)
+        top_start = layout["mips"][0]["offset"]
+        path = os.path.join(self.tmp.name, "partially-readable.ttpf")
+        record = pack_etpf_record(256, 256, 6, 1, 71, 1, 1, 4, 4096, meta=0x103)
+        write_rds5_pool(path, [record], [payload[:top_start], payload[top_start:]])
+        # Give the lower mip chunk an unsupported codec. The second chunk is still valid zlib.
+        with open(path, "r+b") as f:
+            f.seek(24)
+            entry, = struct.unpack("<Q", f.read(8))
+            f.seek(24)
+            f.write(struct.pack("<Q", (entry & ~(15 << 26)) | (15 << 26)))
+
+        out = os.path.join(self.tmp.name, "top.dds")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.main(["export", path, "0", out, "--mips", "1"]), 0)
+        with open(out, "rb") as f:
+            data = f.read()
+        self.assertEqual(struct.unpack_from("<I", data, 28), (1,))
+        self.assertTrue(data[148:] == linear[0], "DDS payload differs from the source top mip")
+
+        full = os.path.join(self.tmp.name, "full.dds")
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ttpf.main(["export", path, "0", full]), 2)
+        self.assertIn("not every requested mip uses a supported codec", err.getvalue())
+        self.assertFalse(os.path.exists(full))
+
+    def test_export_write_error_names_the_output_without_a_traceback(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out = os.path.join(self.tmp.name, "destination")
+        os.mkdir(out)
+        error = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(error):
+            self.assertEqual(ttpf.export(self.pool, 0, out, force=True), 1)
+        self.assertIn(out, error.getvalue())
+        self.assertIn("cannot write", error.getvalue())
+
     def test_scan_reports_the_whitelist_gate(self):
         # The synthetic tuple is validated, so it is not gated: the partial export is
         # the descriptor non_tail limit, not the 319-byte profile table.
@@ -1135,6 +1193,27 @@ class SyntheticPoolTest(unittest.TestCase):
                 self.assertEqual(ttpf.main(["scan", self.path, bad]), 2, bad)
             self.assertIn(why, err.getvalue())
             self.assertIn(bad, err.getvalue())
+
+    def test_scan_skips_directories_named_like_pools(self):
+        root = os.path.join(self.tmp.name, "game")
+        standard = os.path.join(root, "data", "ttdb")
+        os.makedirs(os.path.join(standard, "backup.ttpf"))
+        os.makedirs(os.path.join(root, "pack", "patch", "data", "ttdb", "backup.ttpf"))
+
+        fallback = os.path.join(root, "extra", "backup.ttpf")
+        os.makedirs(fallback)
+        fallback_pool = os.path.join(fallback, "actual.ttpf")
+        build_pool(fallback_pool)
+        self.assertEqual(ttpf.find_pools(root), [fallback_pool])
+
+        standard_pool = os.path.join(standard, "actual.ttpf")
+        build_pool(standard_pool)
+        self.assertEqual(ttpf.find_pools(root), [standard_pool])
+        out = os.path.join(self.tmp.name, "scan.json")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.main(["scan", root, "--json", out]), 0)
+        with open(out, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["total"]["pools"], 1)
 
     def test_scan_counts_an_unlisted_tuple_as_gated(self):
         path = os.path.join(self.tmp.name, "unlisted.ttpf")
@@ -1269,6 +1348,79 @@ def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
     with open(path, "wb") as f:
         f.write(blob)
     return layout, linear, bytes(payload)
+
+
+class AssetKeyStraddleTest(unittest.TestCase):
+    """The asset-key array follows the 16-byte records and, in most retail pools, is longer
+    than the record area has room for, so it continues into the 32-byte ID region."""
+
+    RECORDS = 3
+
+    def write(self, tmp, name, area=None):
+        path = os.path.join(tmp, name)
+        records = [pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)] * self.RECORDS
+        write_rds5_pool(path, records, [bytes(4096)], area=area)
+        return path
+
+    def keys(self, path):
+        with closing(ttpf.Pool(path)) as pool:
+            return [pool.descriptor(i)["asset_key_at"] for i in range(self.RECORDS)]
+
+    def test_keys_past_the_record_area_come_from_the_id_region(self) -> None:
+        # Room for exactly one key after the descriptors: the other two sit in the ID region.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "straddle.ttpf", area=self.RECORDS * 16 + 8)
+            self.assertEqual(self.keys(path), [0x1234567890ABCDEF + i for i in range(self.RECORDS)])
+
+    def test_keys_inside_the_record_area_are_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "plain.ttpf")
+            self.assertEqual(self.keys(path), [0x1234567890ABCDEF + i for i in range(self.RECORDS)])
+
+    def test_a_key_split_by_the_records_ids_boundary_is_refused(self) -> None:
+        # A record area that cuts the first key in half, as TtpfReader refuses it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "split.ttpf", area=self.RECORDS * 16 + 4)
+            with closing(ttpf.Pool(path)) as pool:
+                with self.assertRaises(ValueError):
+                    pool.descriptor(0)
+
+
+class PoolCacheTest(unittest.TestCase):
+    def test_zlib_chunk_rejects_a_decoded_size_larger_than_its_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "pool.ttpf")
+            record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
+            write_rds5_pool(path, [record], [bytes(8192)])
+            with open(path, "r+b") as stream:
+                stream.seek(8)
+                stream.write(struct.pack("<Q", 8192 | (22 << 56)))
+                stream.seek(32)
+                sentinel = struct.unpack("<Q", stream.read(8))[0]
+                stream.seek(32)
+                stream.write(struct.pack("<Q", (sentinel & 0x3FFFFFF) | (2 << 30)))
+
+            with closing(ttpf.Pool(path)) as pool:
+                cache = {}
+                for _ in range(2):
+                    with self.assertRaises(ValueError):
+                        pool.read_range(4096, 16, cache)
+                    self.assertEqual(cache, {})
+
+    def test_shared_cache_keeps_matching_chunk_offsets_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
+            pools = []
+            payloads = (bytes((0x11,)) * 4096, bytes((0x22,)) * 4096)
+            for i, payload in enumerate(payloads):
+                path = os.path.join(temp, f"pool_{i}.ttpf")
+                write_rds5_pool(path, [record], [payload])
+                pools.append(stack.enter_context(closing(ttpf.Pool(path))))
+            self.assertEqual(pools[0].chunks, pools[1].chunks)
+            cache = {}
+            for pool, payload in zip(pools, payloads):
+                self.assertEqual(pool.read_range(4096, 4096, cache), payload)
+            self.assertEqual(pools[0].read_range(4096, 4096, cache), payloads[0])
 
 
 class SyntheticBcpackPoolTest(unittest.TestCase):
@@ -1623,6 +1775,25 @@ class BadPoolTest(unittest.TestCase):
             code, err = self.run_main("layout", self.good, index)
             self.assertEqual(code, 2)
             self.assertIn("out of range", err)
+
+    def test_export_force_protects_input_files(self):
+        metadata = os.path.join(self.tmp.name, "metadata.json")
+        with open(metadata, "wb") as f:
+            f.write(b"{}")
+        cases = [
+            (self.good, [], "input pool"),
+            (metadata, ["--calibration", metadata], "--calibration profile"),
+            (metadata, ["--history", metadata], "--history file"),
+        ]
+        for source, options, message in cases:
+            with self.subTest(options=options):
+                with open(source, "rb") as f:
+                    before = f.read()
+                code, err = self.run_main("export", self.good, "0", source, "--force", *options)
+                self.assertEqual(code, 2)
+                self.assertIn(message, err)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), before)
 
 
 class SyntheticArrayPoolTest(unittest.TestCase):
@@ -2303,6 +2474,193 @@ class Uncompressed2DTest(unittest.TestCase):
             self.assertEqual(ttpf.check(pool_u, 0), 2)
         with redirect_stderr(io.StringIO()):
             self.assertEqual(ttpf.export(pool_u, 0, os.path.join(self.tmp.name, "dxgi2.dds")), 2)
+
+
+class VolumePatternTest(unittest.TestCase):
+    """3D SW_4KB_S: the intra-tile bit order must be AMD's, and the tile extents must follow from it."""
+
+    # Mesa src/amd/addrlib/src/gfx10/gfx10SwizzlePattern.h, GFX10_SW_4K_S3_PATINFO (1 pipe, 1/2/4/8/16 bpe):
+    # nibble01 + nibble2 entries; GFX10_SW_4K_S3_RBPLUS_PATINFO gives the same rows.
+    MESA_SW_4K_S3 = {
+        0: (1, 2, 101, -1, 102, -2, 3, 103, -3, 4, 104, -4),
+        1: (0, 1, 101, -1, 102, -2, 2, 103, -3, 3, 104, -4),
+        2: (0, 0, 1, -1, 101, -2, 2, 102, -3, 3, 103, -4),
+        3: (0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3),
+        4: (0, 0, 0, 0, 101, -1, 1, 102, -2, 2, 103, -3),
+    }
+
+    def test_patterns_are_amds_sw_4k_s3(self):
+        self.assertEqual(ttpf.VOLUME_PATTERNS_4K, self.MESA_SW_4K_S3)
+
+    def test_each_row_uses_every_x_y_z_bit_once_from_bit_0(self):
+        for log, pat in ttpf.VOLUME_PATTERNS_4K.items():
+            with self.subTest(element_bytes=1 << log):
+                self.assertEqual(pat[:log], (0,) * log)        # the element's own byte-address bits
+                for axis, keep in (("x", lambda s: 0 < s < 100), ("y", lambda s: s < 0), ("z", lambda s: s >= 101)):
+                    bits = sorted(abs(s) - (100 if s >= 101 else 0) for s in pat if keep(s))
+                    self.assertEqual(bits, list(range(1, len(bits) + 1)), axis)
+
+    def test_tile_extents_follow_from_the_bit_order(self):
+        tex = sys.modules["tex_headers"]   # imported by ttpf_mips.py
+        for log, pat in ttpf.VOLUME_PATTERNS_4K.items():
+            with self.subTest(element_bytes=1 << log):
+                want = (1 << sum(0 < s < 100 for s in pat), 1 << sum(s < 0 for s in pat), 1 << sum(s >= 101 for s in pat))
+                self.assertEqual(tex._VOLUME_4K_TILE[log], want)
+                lay = tex.volume_surface_layout(64, 64, 32, 1, 1 << log)
+                self.assertEqual((lay["block_w"], lay["block_h"], lay["block_d"]), want)
+                self.assertEqual(lay["z_tile_stride"] % 4096, 0)
+
+
+class UnmappedSentinelSpanTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_span_skips_unmapped_sentinels_and_rejects_unmapped_base(self):
+        # A valid 256x256 BC1 texture followed by unmapped ETPF records (base=0 and base=0x1FFFFF*4096),
+        # and then a second valid texture, must resolve both mapped spans cleanly and return None for
+        # the unmapped records (including in scan_pools, which previously passed a negative span).
+        layout = ttpf.surface_layout(256, 256, 71, 7, ttpf.tile_bytes(4))
+        size = layout["size"]
+        base0 = 4096
+        base1 = base0 + size
+        rec0 = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, base0)
+        rec_zero = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, 0)
+        rec_max = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, 0x1FFFFF * 4096)
+        rec1 = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, base1)
+
+        for label, recs, chunks, mapped_indices in (
+            ("zero_between", [rec0, rec_zero, rec1], [bytes(size), bytes(size)], (0, 2)),
+            ("max_between", [rec0, rec_max, rec1], [bytes(size), bytes(size)], (0, 2)),
+            ("trailing_zero_and_max", [rec0, rec_zero, rec_max], [bytes(size)], (0,)),
+        ):
+            with self.subTest(case=label):
+                path = os.path.join(self.tmp.name, f"{label}.ttpf")
+                write_rds5_pool(path, recs, chunks)
+                pool = ttpf.Pool(path)
+                self.addCleanup(pool.close)
+                for idx in mapped_indices:
+                    d = pool.descriptor(idx)
+                    self.assertEqual(pool.span(idx, d["base"]), size)
+                    a = ttpf.analyze(pool, idx)
+                    self.assertTrue(a["span_matches"], a)
+                    self.assertNotIn("blocked", a)
+                for idx in range(len(recs)):
+                    if idx not in mapped_indices:
+                        d = pool.descriptor(idx)
+                        self.assertIsNone(pool.span(idx, d["base"]))
+                        a = ttpf.analyze(pool, idx)
+                        self.assertEqual(a["blocked"], "no mapped allocation")
+                scan_out = os.path.join(self.tmp.name, f"{label}.json")
+                with redirect_stdout(io.StringIO()):
+                    ttpf.scan_pools([path], scan_out)
+                with open(scan_out, encoding="utf-8") as f:
+                    total = json.load(f)["total"]
+                self.assertEqual(total["chunk_metadata_fail"], 0)
+                self.assertEqual(total["chunk_metadata_ok"], len(mapped_indices))
+
+
+class DetileFastPathTest(unittest.TestCase):
+    def test_coalesce_x_runs_merges_contiguous_blocks(self):
+        self.assertEqual(ttpf._coalesce_x_runs([], 16), [])
+        self.assertEqual(ttpf._coalesce_x_runs([0, 16, 32, 128, 144, 64], 16),
+                         [(0, 48), (128, 32), (64, 16)])
+
+    def test_detile_matches_reference_formula_across_all_element_sizes_and_tiles(self):
+        def ref_detile(layout, mip, tiled):
+            pat = (ttpf.PATTERNS_4K if layout["tile"] == 4096 else ttpf.PATTERNS_64K)[
+                {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
+            bw, bh = layout["block_w"], layout["block_h"]
+            eb = layout["element_bytes"]
+            out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
+            for y in range(mip["blocks_h"]):
+                for x in range(mip["blocks_w"]):
+                    off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
+                    for bit, s in enumerate(pat):
+                        if s > 0:
+                            off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
+                        elif s < 0:
+                            off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
+                    at = (y * mip["blocks_w"] + x) * eb
+                    out[at:at + eb] = tiled[off:off + eb]
+            return bytes(out)
+
+        for fmt, eb in ((61, 1), (49, 2), (28, 4), (71, 8), (98, 16)):
+            for tile in (4096, 65536):
+                layout = ttpf.surface_layout(60, 44, fmt, 4, tile=tile)
+                for idx, mip in enumerate(layout["mips"]):
+                    nbytes = max(mip["padded_w"] * mip["padded_h"] * eb, tile)
+                    tiled = bytes((i * 131 + 17) & 255 for i in range(nbytes))
+                    with self.subTest(fmt=fmt, tile=tile, level=idx):
+                        self.assertEqual(ttpf.detile(layout, mip, tiled), ref_detile(layout, mip, tiled))
+
+        # Truncated input falls back to the exact slice behavior without raising ValueError.
+        layout_t = ttpf.surface_layout(64, 64, 98, 1, tile=4096)
+        mip_t = layout_t["mips"][0]
+        short_tiled = bytes(range(200))
+        self.assertEqual(ttpf.detile(layout_t, mip_t, short_tiled), ref_detile(layout_t, mip_t, short_tiled))
+
+
+    @staticmethod
+    def _ref_detile(layout, mip, tiled):
+        pat = (ttpf.PATTERNS_4K if layout["tile"] == 4096 else ttpf.PATTERNS_64K)[
+            {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
+        bw, bh, eb = layout["block_w"], layout["block_h"], layout["element_bytes"]
+        out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
+        for y in range(mip["blocks_h"]):
+            for x in range(mip["blocks_w"]):
+                off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
+                for bit, s in enumerate(pat):
+                    if s > 0:
+                        off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
+                    elif s < 0:
+                        off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
+                at = (y * mip["blocks_w"] + x) * eb
+                out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    def test_narrow_shapes_stream_and_match_reference(self):
+        for w, h in ((16384, 1), (1, 16384), (1, 1), (3, 1), (1, 3)):
+            for tile in (4096, 65536):
+                layout = ttpf.surface_layout(w, h, 28, 1, tile=tile)
+                mip = layout["mips"][0]
+                nbytes = max(mip["padded_w"] * mip["padded_h"] * 4, tile)
+                full = bytes((i * 131 + 17) & 255 for i in range(nbytes))
+                for tiled in (full, full[:nbytes // 3 + 5]):  # complete and truncated input
+                    with self.subTest(w=w, h=h, tile=tile, size=len(tiled)):
+                        self.assertEqual(ttpf.detile(layout, mip, tiled),
+                                         self._ref_detile(layout, mip, tiled))
+
+    def test_volume_slice_nonzero_z_truncated_matches_reference(self):
+        layout = ttpf.volume_surface_layout(16, 8, 8, 1, 2)
+        w, h, d = (layout["mips"][0][k] for k in ("blocks_w", "blocks_h", "blocks_d"))
+        linear = bytes((i * 7 + 3) & 255 for i in range(w * h * d * 2))
+        tiled = retile_volume(layout, linear)
+        for z in (0, 3, 7):
+            self.assertEqual(ttpf.detile_volume_slice(layout, tiled, z),
+                             linear[z * w * h * 2:(z + 1) * w * h * 2])
+        # Truncated allocation: the exact slice-copy fallback must match a per-element reference.
+        eb = layout["element_bytes"]
+        pat = ttpf.VOLUME_PATTERNS_4K[{1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
+        bw, bh, bd = layout["block_w"], layout["block_h"], layout["block_d"]
+        tiles_x = layout["mips"][0]["padded_w"] // bw
+        cut = tiled[:len(tiled) // 2 + 3]
+        for z in (1, 5):
+            ref = bytearray(w * h * eb)
+            for y in range(h):
+                for x in range(w):
+                    off = (z // bd) * layout["z_tile_stride"] + ((y // bh) * tiles_x + x // bw) * layout["tile"]
+                    for bit, s in enumerate(pat):
+                        if s >= 101:
+                            off |= ((z >> (s - 101)) & 1) << bit
+                        elif s < 0:
+                            off |= ((y >> (-s - 1)) & 1) << bit
+                        elif 0 < s < 100:
+                            off |= ((x >> (s - 1)) & 1) << bit
+                    at = (y * w + x) * eb
+                    ref[at:at + eb] = cut[off:off + eb]
+            self.assertEqual(ttpf.detile_volume_slice(layout, cut, z), bytes(ref))
+        self.assertEqual(ttpf.detile_volume_slice(layout, tiled, 0), linear[:w * h * 2])
 
 
 if __name__ == "__main__":

@@ -71,20 +71,22 @@ RULES32 = ("f32_rte", "f32_rtz", "mul_f32")
 
 def round_frac(x, prec, emin, rtz=False):
     """x rounded to a binary float with prec significand bits (implicit bit included) and minimum normal exponent
-    emin, denormals kept; nearest even, or toward zero. No overflow: every value here is in [-1, 1]."""
-    if x == 0:
+    emin, denormals kept; nearest even, or toward zero. No overflow: every value here is in [-1, 1].
+    Exact, in integers: x = p/q, 2^e <= p/q < 2^(e+1), ulp = 2^k; the significand is p/q / 2^k rounded. Building
+    Fractions for 2^e and the quotient instead gave the same bits about 4x slower (minutes for a 16-bit sweep)."""
+    p, q = x.numerator, x.denominator
+    if p == 0:
         return Fraction(0)
-    sign = -1 if x < 0 else 1
-    a = abs(x)
-    e = a.numerator.bit_length() - a.denominator.bit_length()
-    if Fraction(2) ** e > a:
+    sign, p = (-1, -p) if p < 0 else (1, p)
+    e = p.bit_length() - q.bit_length()                   # floor(log2(p/q)) is e or e - 1
+    if (p << -e if e < 0 else p) < (q << e if e > 0 else q):
         e -= 1
-    if Fraction(2) ** (e + 1) <= a:
-        e += 1
-    ulp = Fraction(2) ** (max(e, emin) - prec + 1)
-    q = a / ulp
-    n = q.numerator // q.denominator if rtz else round(q)     # round() of a Fraction is half to even
-    return sign * n * ulp
+    k = max(e, emin) - prec + 1
+    num, den = (p, q << k) if k >= 0 else (p << -k, q)
+    n, r = divmod(num, den)
+    if not rtz and (2 * r > den or (2 * r == den and n & 1)):   # half to even
+        n += 1
+    return Fraction(sign * n << k) if k >= 0 else Fraction(sign * n, 1 << -k)
 
 
 def f16_bits(v):
@@ -185,11 +187,15 @@ def sweep(oracle, fmt, wave):
     kernels = [asm.Kernel(kernel_lines(inst, fmt, base), wave, THREADS, WORDS, raw=True, vgprs=8, sgprs=16)
                for inst, base in todo]
     got = oracle.run(kernels, words=WORDS)
+    # Every kernel must answer: zip() over a shorter list would drop the values of the missing ones and still
+    # succeed. hw_oracle's Oracle.run() returns one entry per kernel; this keeps that contract checked (BUILD-733).
+    if len(got) != len(todo):
+        raise RuntimeError(f"{fmt} wave{wave}: the oracle returned {len(got)} results for {len(todo)} kernels")
     out = {}
     for (inst, base), words in zip(todo, got):
-        if isinstance(words, str) or len(words) != WORDS:
-            raise RuntimeError(f"{fmt} {inst} wave{wave} base {base}: "
-                               f"{words if isinstance(words, str) else f'{len(words)} words'}")
+        if words is None or isinstance(words, str) or len(words) != WORDS:
+            why = "no result" if words is None else words if isinstance(words, str) else f"{len(words)} words"
+            raise RuntimeError(f"{fmt} {inst} wave{wave} base {base}: {why}")
         count = min(THREADS, (1 << n) - base)
         staged = words[:count]
         want = [(base + t) & ((1 << n) - 1) for t in range(count)]
@@ -268,6 +274,18 @@ def self_test():
     return 0
 
 
+def write_report(path, doc):
+    """Write the JSON report, creating its folder; one ERROR line instead of a traceback on failure."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=1)
+    except OSError as e:
+        print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--formats", default=",".join(FORMATS))
@@ -283,6 +301,8 @@ def main(argv=None):
     bad = [f for f in fmts if f not in FORMATS] + [w for w in a.waves.split(",") if w and w not in ("32", "64")]
     if bad or not fmts or not waves:
         ap.error("unknown or empty: " + ", ".join(bad or ["--formats/--waves"]))
+    if a.json and os.path.isdir(a.json):
+        ap.error(f"--json {a.json} is a folder, not a file")
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
@@ -327,9 +347,8 @@ def main(argv=None):
         return 2
     finally:
         oracle.close()
-    if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+    if a.json and not write_report(a.json, report):
+        return 2
     return rc
 
 

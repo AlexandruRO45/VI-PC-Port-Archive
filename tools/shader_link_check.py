@@ -22,7 +22,15 @@ from spirv_interface import (Address, Declaration, InterfaceError, NumericType, 
 
 STAGES = ("vs", "gs", "ms", "ps")
 CHAINS = {("vs", "ps"), ("vs", "gs", "ps"), ("ms", "ps"), ("vs", "gs")}
-STEM = re.compile(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]*\Z")
+# A manifest names a shader by its file stem in --shader-dir. The stem must stay one path component inside that
+# folder: no separators or drive colon, not "." or "..", and no character a Windows file name can't hold. Anything
+# else is allowed: make_game's corpus names use "~", "!", "&", "(" and a leading ".".
+BAD_STEM = re.compile(r'[\\/:<>"|?*\x00-\x1f]')
+
+
+def is_shader_stem(reference):
+    return isinstance(reference, str) and reference not in ("", ".", "..") \
+        and not BAD_STEM.search(reference) and reference == reference.strip()
 
 
 @dataclass(frozen=True)
@@ -119,10 +127,20 @@ def stage_chain(refs):
     return stages
 
 
+def reject_duplicate_keys(pairs):
+    doc = {}
+    for key, value in pairs:
+        if key in doc:
+            raise ValueError(f"duplicate key {key!r}")
+        doc[key] = value
+    return doc
+
+
 def load_pipeline_manifest(path: Path, shader_dir: Path):
     try:
-        with path.open(encoding="utf-8") as source:
-            doc = json.load(source)
+        # utf-8-sig: a hand-written manifest from Notepad or PowerShell 5 Out-File starts with a BOM.
+        with path.open(encoding="utf-8-sig") as source:
+            doc = json.load(source, object_pairs_hook=reject_duplicate_keys)
     except (OSError, ValueError) as exc:
         raise ValueError(f"{path}: {exc}") from exc
     if (not isinstance(doc, dict) or set(doc) - {"pipelines", "version"}
@@ -156,7 +174,7 @@ def manifest_module(reference, shader_dir, stage):
         if set(reference) - {"shader", "entry"}:
             raise ValueError(f"{stage}: unexpected shader reference field")
         entry, reference = reference.get("entry", entry), reference.get("shader")
-    if not isinstance(reference, str) or not STEM.fullmatch(reference):
+    if not is_shader_stem(reference):
         raise ValueError(f"{stage}: expected a shader name without directories")
     if not isinstance(entry, str) or not entry or "\x00" in entry:
         raise ValueError(f"{stage}: expected a nonempty entry-point name")
@@ -217,8 +235,20 @@ def ensure_report_is_separate(output, inputs):
     if output is None:
         return
     out = output.resolve()
+    try:
+        out_stat = out.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        out_stat = None
     for source in dict.fromkeys(inputs):
-        if out == source.resolve() or (out.exists() and source.exists() and out.samefile(source)):
+        if out_stat is None:
+            aliases = out == source.resolve()
+        else:
+            try:
+                # Existing targets can be compared by file identity, including hard links.
+                aliases = os.path.samestat(out_stat, source.stat())
+            except (FileNotFoundError, NotADirectoryError):
+                aliases = out == source.resolve()
+        if aliases:
             raise ValueError(f"report would overwrite an input file: {source}")
 
 

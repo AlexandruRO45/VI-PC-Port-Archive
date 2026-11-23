@@ -20,6 +20,7 @@ look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
 A streamed-music descriptor contributes one row per channel group; `channels` is the packet channel count read
 from the Opus TOC stereo bit, and `declared_samples`/`duration_s` are per channel (the descriptor stores the
 interleaved count). `data_offset`/`size` is the shared data tag.
+Usage: `python -I tools/awc_manifest.py --help` lists the options.
 """
 import argparse
 import csv
@@ -33,6 +34,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 FIELDS = ("bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes")
@@ -145,26 +147,20 @@ def _bank_rows(path: str, bank: str) -> list:
     return rows
 
 
-def _same_report_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def collect(src: str, *, out: str | None = None):
     """(parsed bank count, rows, streamed-music row count); one warning per skipped bank.
 
-    Invalid banks are reported on stderr and excluded from the bank count, so the summary cannot claim
-    that a directory was inventoried when none of its files could be read. If out is given, refuse a report
-    that would replace any input bank before reading even the first bank (including invalid ones).
+    Malformed banks are reported on stderr and excluded from the bank count. I/O errors propagate so an
+    incomplete scan cannot replace a previous manifest. If out is given, refuse a report that would replace
+    any input bank before reading even the first bank (including malformed ones).
     """
     recursive = os.path.isdir(src)
     if recursive:
+        def scan_failed(error):
+            raise error
+
         banks = []
-        for root, dirs, files in os.walk(src):
+        for root, dirs, files in os.walk(src, onerror=scan_failed):
             dirs.sort()
             banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
         banks.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
@@ -172,7 +168,7 @@ def collect(src: str, *, out: str | None = None):
         banks = [src]
     if out:
         for path in banks:
-            if _same_report_path(out, path):
+            if same_report_path(out, path):
                 raise ValueError(f"--out would overwrite the input {path}")
     rows = []
     parsed = 0
@@ -181,7 +177,7 @@ def collect(src: str, *, out: str | None = None):
             bank = os.path.relpath(path, src).replace(os.sep, "/") if recursive else os.path.basename(path)
             rows += _bank_rows(path, bank)
             parsed += 1
-        except (ValueError, struct.error, IndexError, OSError) as e:
+        except (ValueError, struct.error, IndexError) as e:
             print(f"awc_manifest: warning: skipping {path}: {e}", file=sys.stderr)
     rows.sort(key=lambda r: (r["bank"].lower(), int(r["stream"], 16)))
     return parsed, rows, sum(1 for r in rows if r["streamed_music"])
@@ -221,6 +217,12 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
         if f is not sys.stdout:
             f.close()
         if tmp:
+            # The staging file may have inherited a read-only destination's mode; make it deletable
+            # first, or Windows strands it beside the manifest when the replace fails.
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             try:
                 os.unlink(tmp)
             except OSError:
@@ -244,6 +246,9 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(f"awc_manifest: error: {e}", file=sys.stderr)
         return 2
+    except OSError as e:
+        print(f"awc_manifest: error: cannot read {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
+        return 1
     try:
         write_manifest(rows, banks, streamed, fmt, a.out)
     except OSError as e:

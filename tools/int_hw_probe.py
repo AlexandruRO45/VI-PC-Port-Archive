@@ -10,11 +10,12 @@ Groups covered (each references its contract row in docs/design.md):
     salu_sext_flbit     s_sext_i32_i8, s_sext_i32_i16, s_flbit_i32 (SCC kept)
     salu_cmov_pack      s_cmov_b32, s_cmovk_i32, s_pack_ll/lh/hh_b32_b16 (SCC kept)
     salu_bfe_past31     s_bfe_u32, s_bfe_i32 with offset + width > 32 and width 0
+    salu_cmov_b64       s_cmov_b64 on plain data pairs (SGPR pair, inline constants, literal, null, D itself)
     salu_64_data        s_brev_b64, s_bfe_u64/i64, s_bitset0/1_b64, s_flbit_i32_b64/i64
     salu_quad_bitrep    s_quadmask_b32/b64, s_bitreplicate_b64_b32
     salu_64_bitwise     s_and/or/xor/andn2/orn2/nand/nor/xnor/not_b64 on scalar data
     salu_movrels        s_movrels_b32, s_movrels_b64 (M0 indexing, SCC kept)
-    valu_add_nc_clamp   v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16 with clamp
+    valu_add_nc_clamp   v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16/i16 with clamp
     valu_add_co_clamp   v_add/sub/subrev_co[_ci]_u32 with clamp (saturation + carry)
     valu_mad64          v_mad_u64_u32, v_mad_i64_i32 (sdst bit 64 and inactive EXEC lane)
     valu_sad_lerp       v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32, v_msad_u8, v_lerp_u8
@@ -24,6 +25,8 @@ Groups covered (each references its contract row in docs/design.md):
     valu_cvt_16         v_cvt_f16_u16/i16, v_cvt_u16/i16_f16 (kept half, op_sel, NaN, inf)
     valu_cvt_flr_rpi    v_cvt_flr_i32_f32, v_cvt_rpi_i32_f32 (exact floor(x+0.5), signed NaN)
     valu_cvt_pknorm     v_cvt_pknorm_i16_f32, v_cvt_pknorm_u16_f32 (ties, saturation, NaN)
+    valu_cvt_norm_f16   v_cvt_pknorm_i16/u16_f16 and v_cvt_norm_i16/u16_f16 (near-ties, saturation, NaN, op_sel on the pk forms, neg/abs)
+    valu_bfe_past31     v_bfe_u32, v_bfe_i32 with offset + width > 32, width 0, offset/width bits above [4:0]
 
 Usage:
     python -I tools/int_hw_probe.py                         # translator side only (CPU)
@@ -114,6 +117,38 @@ def _salu64_case(group, name, setup, op_line, scc_in, note=""):
 
 def _valu4_case(group, name, body, note=""):
     return Case(group, name, body, note)
+
+
+# f16 inputs for the normalised conversions: +-0, +-1, 1 +- 1ulp, +-0.5 and the f16 neighbours of the 0.5 tie (0x37ff and 0x3801 are
+# 0.5 -+ 2^-11, so x * 32767 is 16383.5 -+ a hair), +-0.25 and its neighbours, a denormal, +-65504, +-inf, quiet and signalling NaN.
+F16_NORM_VALUES = (0x0000, 0x8000, 0x3C00, 0xBC00, 0x3BFF, 0x3C01, 0xBBFF, 0xBC01, 0x3800, 0xB800, 0x37FF, 0x3801, 0xB7FF, 0xB801,
+                   0x3400, 0xB400, 0x33FF, 0x3401, 0x0001, 0x8001, 0x03FF, 0x7BFF, 0xFBFF, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7C01,
+                   0xFC01, 0x3555, 0xB555, 0x2E66, 0x4000, 0xC000)
+
+
+def _cvt_norm_f16_cases():
+    cases = []
+    vals = F16_NORM_VALUES
+    for i in range(0, len(vals) - 1, 1):
+        a, b = vals[i], vals[(i + 5) % len(vals)]
+        cases.append(_valu4_case("valu_cvt_norm_f16", f"pknorm_f16_{a:04x}_{b:04x}", [
+            f"v_mov_b32 v1, 0x{(b << 16) | a:08x}", f"v_mov_b32 v2, 0x{(a << 16) | b:08x}",
+            "v_cvt_pknorm_i16_f16 v8, v1, v2",                        # lo(v1), lo(v2)
+            "v_cvt_pknorm_u16_f16 v9, v1, v2",
+            "v_cvt_pknorm_i16_f16 v10, -v1, |v2| op_sel:[1,0]",        # hi(v1) negated, lo(v2) abs
+            "v_cvt_pknorm_u16_f16 v11, |v1|, -v2 op_sel:[0,1]",       # lo(v1) abs, hi(v2) negated
+        ], f"v_cvt_pknorm_i16/u16_f16 on f16 {a:04x}/{b:04x} (op_sel, neg, abs)"))
+    for a in vals:
+        cases.append(_valu4_case("valu_cvt_norm_f16", f"norm_f16_{a:04x}", [
+            f"v_mov_b32 v1, 0x{(0x3555 << 16) | a:08x}", f"v_mov_b32 v2, 0x{(a << 16) | 0x3C00:08x}",
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}", f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}", f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_cvt_norm_i16_f16_e64 v8, v1",
+            "v_cvt_norm_u16_f16_e64 v9, v1",
+            "v_cvt_norm_i16_f16_e64 v10, -v2",                         # neg: GFX10 takes no op_sel on these two
+            "v_cvt_norm_u16_f16_e64 v11, |v2|",
+        ], f"v_cvt_norm_i16/u16_f16 on f16 {a:04x} (kept half, neg/abs)"))
+    return cases
 
 
 def build_cases():
@@ -214,6 +249,23 @@ def build_cases():
                      "s_bfe_i32 s6, s4, s5", "width=0 -> 0, SCC=0"),
     ]
 
+    # 5b. s_cmov_b64 on plain 64-bit data pairs: D = SCC ? S0 : D, SCC kept
+    for src_name, src_setup, src_op in (
+        ("sgpr_pair", ["s_mov_b32 s4, 0x11223344", "s_mov_b32 s5, 0x55667788"], "s[4:5]"),
+        ("inline_m1", [], "-1"),
+        ("inline_m16", [], "-16"),
+        ("inline_64", [], "64"),
+        ("literal", [], "0x89abcdef"),
+        ("null", [], "null"),
+        ("self", [], "s[6:7]"),
+    ):
+        for scc_in in (0, 1):
+            cases.append(_salu64_case(
+                "salu_cmov_b64", f"s_cmov_b64_{src_name}_scc{scc_in}",
+                [*src_setup, "s_mov_b32 s6, 0xaabbccdd", "s_mov_b32 s7, 0x99887766"],
+                f"s_cmov_b64 s[6:7], {src_op}", scc_in,
+                "SCC=1 takes S0 (literal zero-extended, null = 0), SCC=0 keeps D, SCC kept"))
+
     # 6. 64-bit scalar data ops (s_brev_b64, s_bfe_u64/i64, s_bitset0/1_b64, s_flbit_i32_b64/i64)
     cases += [
         _salu64_case("salu_64_data", "s_brev_b64_scc1",
@@ -291,7 +343,7 @@ def build_cases():
                      "s_movrels_b64 s[6:7], s[10:11]", 1, "SGPR[12:13], SCC kept"),
     ]
 
-    # 10. Integer clamp on v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16
+    # 10. Integer clamp on v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16, v_add/sub_nc_i16
     cases += [
         _valu4_case("valu_add_nc_clamp", "v_add_sub_nc_u32_clamp", [
             "v_mov_b32 v1, 0xfffffff0", "v_mov_b32 v2, 0x30",
@@ -319,6 +371,18 @@ def build_cases():
             "v_add_nc_u16_e64 v10, v1, v2 op_sel:[0,0,1] clamp",       # write hi saturates 0xffff, lo kept
             "v_sub_nc_u16_e64 v11, v1, v2 op_sel:[1,1,0] clamp",       # 0x1234 - 0x5678 -> 0x0000, hi kept
         ], "u16 nc add/sub with clamp and op_sel (untouched half kept)"),
+        _valu4_case("valu_add_nc_clamp", "v_add_sub_nc_i16_clamp", [
+            "v_mov_b32 v1, 0x12347ff0", "v_mov_b32 v2, 0x56780030",
+            "v_mov_b32 v3, 0x12348000", "v_mov_b32 v4, 0x56780001",
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_add_nc_i16_e64 v8, v1, v2 clamp",                       # 0x7ff0 + 0x0030 = 0x8020 -> saturates 0x7fff, hi kept
+            "v_sub_nc_i16_e64 v9, v3, v4 clamp",                       # -32768 - 1 = -32769 -> saturates 0x8000, hi kept
+            "v_add_nc_i16_e64 v10, v1, v2 op_sel:[0,0,1] clamp",       # write hi saturates 0x7fff, lo kept
+            "v_sub_nc_i16_e64 v11, v1, v2 op_sel:[1,1,0] clamp",       # 0x1234 - 0x5678 = -0x4444 in range -> 0xbbbc, hi kept
+        ], "i16 nc add/sub with clamp and op_sel (untouched half kept)"),
     ]
 
     # 11. v_add/sub/subrev_co[_ci]_u32 with clamp (known divergence: translator ignores clamp)
@@ -564,6 +628,188 @@ def build_cases():
         ], "v_cvt_pknorm_i16/u16_f32 ties at +-0.5 and +-1.0 endpoints"),
     ]
 
+    # 19b. v_cvt_pknorm_i16/u16_f16 and v_cvt_norm_i16/u16_f16 (f16 sources)
+    cases += _cvt_norm_f16_cases()
+
+    # 20. Packed 16-bit integer ops (v_pk_add/sub_u16/i16, v_pk_mul_lo_u16, v_pk_mad_u16/i16, v_pk_min/max_u16/i16)
+    cases += [
+        _valu4_case("valu_pk_int16", "v_pk_add_sub_u16_i16_clamp", [
+            "v_mov_b32 v1, 0xffff8000", "v_mov_b32 v2, 0x00028001",
+            "v_pk_add_u16 v8, v1, v2",               # wraps both halves
+            "v_pk_add_u16 v9, v1, v2 clamp",         # saturates both halves to 0xffff
+            "v_mov_b32 v3, 0x00010005", "v_mov_b32 v4, 0x00020003",
+            "v_pk_sub_u16 v10, v3, v4 clamp",        # hi clamps to 0, lo = 2
+            "v_mov_b32 v5, 0x7fff8000", "v_mov_b32 v6, 0x0001ffff",
+            "v_pk_add_i16 v11, v5, v6 clamp",        # hi clamps +32767, lo clamps -32768
+        ], "v_pk_add/sub_u16/i16 wrap and clamp saturation"),
+        _valu4_case("valu_pk_int16", "v_pk_sub_i16_mul_minmax", [
+            "v_mov_b32 v1, 0x80007fff", "v_mov_b32 v2, 0x0001ffff",
+            "v_pk_sub_i16 v8, v1, v2 clamp",         # hi clamps -32768, lo clamps +32767
+            "v_mov_b32 v3, 0x01000010", "v_mov_b32 v4, 0x02000020",
+            "v_pk_mul_lo_u16 v9, v3, v4",            # hi wraps to 0x0000, lo = 0x0200
+            "v_mov_b32 v5, 0xffff0005", "v_mov_b32 v6, 0x0001fffb",
+            "v_pk_min_i16 v10, v5, v6",
+            "v_pk_max_u16 v11, v5, v6",
+        ], "v_pk_sub_i16 clamp, v_pk_mul_lo_u16, v_pk_min_i16 and v_pk_max_u16"),
+        _valu4_case("valu_pk_int16", "v_pk_mad_u16_i16_clamp", [
+            "v_mov_b32 v1, 0x0100ffff", "v_mov_b32 v2, 0x02000002", "v_mov_b32 v3, 0x00010001",
+            "v_pk_mad_u16 v8, v1, v2, v3",           # wraps both halves
+            "v_pk_mad_u16 v9, v1, v2, v3 clamp",     # saturates both halves to 0xffff
+            "v_mov_b32 v4, 0x7fff8000", "v_mov_b32 v5, 0x00020002", "v_mov_b32 v6, 0x0001ffff",
+            "v_pk_mad_i16 v10, v4, v5, v6",          # wraps both halves
+            "v_pk_mad_i16 v11, v4, v5, v6 clamp",    # hi -> 0x7fff, lo -> 0x8000
+        ], "v_pk_mad_u16 / v_pk_mad_i16 wrap and full-width clamp"),
+        _valu4_case("valu_pk_int16", "v_pk_int16_opsel_minmax", [
+            "v_mov_b32 v1, 0x00100001", "v_mov_b32 v2, 0x00200002",
+            "v_pk_add_i16 v8, v1, v2 op_sel:[1,0] op_sel_hi:[0,1]",
+            "v_pk_sub_i16 v9, v1, v2 op_sel:[0,1] op_sel_hi:[1,0]",
+            "v_mov_b32 v3, 0xffff0005", "v_mov_b32 v4, 0x0001fffb",
+            "v_pk_max_i16 v10, v3, v4",
+            "v_pk_min_u16 v11, v3, v4",
+        ], "v_pk_*_i16/u16 op_sel/op_sel_hi, v_pk_max_i16 and v_pk_min_u16"),
+    ]
+
+    # 21. 16-bit three-operand min/max/median (v_min3/max3_f16, v_min3/max3/med3_i16/u16)
+    cases += [
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_f16_nan_zero", [
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_mov_b32 v1, 0x00007e00", "v_mov_b32 v2, 0x00003c00", "v_mov_b32 v3, 0x00004000",
+            "v_min3_f16 v8, v1, v2, v3",             # NaN yields other operand, hi kept
+            "v_max3_f16 v9, v2, v1, v3",
+            "v_mov_b32 v4, 0x00000000", "v_mov_b32 v5, 0x00008000", "v_mov_b32 v6, 0x0000bc00",
+            "v_min3_f16 v10, v4, v5, v2",            # -0 orders below +0
+            "v_max3_f16 v11, v4, v5, v6 clamp",      # +0 > -0 > -1.0, clamped to [0, 1]
+        ], "v_min3_f16 / v_max3_f16 NaN, -0/+0 ordering, clamp and untouched hi half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_med3_i16_u16", [
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_mov_b32 v1, 0xfff00005", "v_mov_b32 v2, 0x00010002", "v_mov_b32 v3, 0x0003fff8",
+            "v_min3_i16 v8, v1, v2, v3 op_sel:[1,0,0,1]",   # writes hi, keeps lo
+            "v_max3_u16 v9, v1, v2, v3 op_sel:[1,0,0,0]",   # writes lo, keeps hi
+            "v_min3_u16 v10, v1, v2, v3 op_sel:[1,0,0,0]",
+            "v_max3_i16 v11, v1, v2, v3 op_sel:[1,0,0,1]",
+        ], "v_min3/max3_i16/u16 with op_sel and untouched destination half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_med3_i16_u16_opsel", [
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_mov_b32 v1, 0xfff00010", "v_mov_b32 v2, 0x00050020", "v_mov_b32 v3, 0x0001fff5",
+            "v_med3_i16 v8, v1, v2, v3 op_sel:[1,1,0,1]",   # signed median of -16, 5, -11 = -11 in hi
+            "v_med3_u16 v9, v1, v2, v3 op_sel:[1,1,0,0]",   # unsigned median of 0xfff0, 5, 0xfff5 = 0xfff0 in lo
+            "v_med3_i16 v10, v1, v2, v3",
+            "v_med3_u16 v11, v1, v2, v3",
+        ], "v_med3_i16 / v_med3_u16 signed vs unsigned median with op_sel"),
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_i16_u16_clamp", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0xfff00005", "v_mov_b32 v2, 0x00010002", "v_mov_b32 v3, 0x0003fff8",
+            "v_min3_i16 v8, v1, v2, v3 op_sel:[1,0,0,1] clamp",   # writes hi (fff0), keeps lo (5a5a)
+            "v_max3_u16 v9, v1, v2, v3 op_sel:[1,0,0,0] clamp",   # writes lo (fff8), keeps hi (beef)
+            "v_min3_u16 v10, v1, v2, v3 op_sel:[1,0,0,0] clamp",  # writes lo (0002), keeps hi (beef)
+            "v_max3_i16 v11, v1, v2, v3 op_sel:[1,0,0,1] clamp",  # writes hi (0002), keeps lo (5a5a)
+        ], "v_min3/max3_i16/u16 clamp range-invariance and untouched destination half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_med3_i16_u16_clamp", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0xfff00010", "v_mov_b32 v2, 0x00050020", "v_mov_b32 v3, 0x0001fff5",
+            "v_med3_i16 v8, v1, v2, v3 op_sel:[1,1,0,1] clamp",   # writes hi (fff5), keeps lo (5a5a)
+            "v_med3_u16 v9, v1, v2, v3 op_sel:[1,1,0,0] clamp",   # writes lo (fff0), keeps hi (beef)
+            "v_med3_i16 v10, v1, v2, v3 clamp",                   # writes lo (0010), keeps hi (beef)
+            "v_med3_u16 v11, v1, v2, v3 clamp",                   # writes lo (0020), keeps hi (beef)
+        ], "v_med3_i16 / v_med3_u16 clamp range-invariance and untouched destination half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_med3_f16_clamp_nan", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0x38007e00",
+            "v_mov_b32 v2, 0xc0004000",
+            "v_mov_b32 v3, 0x3800bc00",
+            "v_min3_f16 v8, v1, v2, v3 clamp",
+            "v_max3_f16 v9, v1, v2, v3 clamp",
+            "v_med3_f16 v10, v1, v2, v3 clamp",
+            "v_med3_f16 v11, v1, v2, v3 op_sel:[1,1,1,1] clamp",
+        ], "v_min3/max3/med3_f16 NaN, DX10 clamp, dirty high-half sentinels and op_sel"),
+    ]
+
+    # 22. v_swaprel_b32 (M0[25:16] dst offset, M0[9:0] src offset, ignored upper M0 bits, self-swap, inactive EXEC)
+    cases += [
+        _valu4_case("valu_swaprel", "v_swaprel_offsets_and_ignored_m0", [
+            "v_mov_b32 v8, 0x11111111", "v_mov_b32 v9, 0x22222222",
+            "v_mov_b32 v10, 0x33333333", "v_mov_b32 v11, 0x44444444",
+            "s_mov_b32 m0, 0xfc01fc02",      # dst_off=1 (v9), src_off=2 (v10); upper M0 bits ignored
+            "v_swaprel_b32 v8, v8",
+        ], "v_swaprel_b32 M0[25:16] and M0[9:0] offsets with ignored upper M0 bits"),
+        _valu4_case("valu_swaprel", "v_swaprel_self_and_inactive_exec", [
+            "v_mov_b32 v8, 0x12345678", "v_mov_b32 v9, 0x9abcdef0",
+            "v_mov_b32 v10, 0x55555555", "v_mov_b32 v11, 0x66666666",
+            "s_mov_b32 m0, 0x00000001",
+            "v_swaprel_b32 v9, v8",          # self-swap v9 <-> v9 (unchanged)
+            "s_mov_b32 m0, 0x00010002",
+            "{smov} {stmp}, {exec}",
+            "{smov} {exec}, 0",
+            "v_swaprel_b32 v8, v8",          # inactive lane leaves v9 and v10 untouched
+            "{smov} {exec}, {stmp}",
+        ], "v_swaprel_b32 self-swap and inactive EXEC lane preservation"),
+    ]
+
+    # 23. v_pack_b32_f16 source abs / -|src| modifiers (including -0 and -qNaN payload)
+    cases += [
+        _valu4_case("valu_pack_b32_f16_abs", "v_pack_b32_f16_abs_neg_opsel", [
+            "v_mov_b32 v1, 0xfe01bc00", "v_mov_b32 v2, 0x8000fe05",
+            "v_pack_b32_f16 v8, |v1|, |v2|",
+            "v_pack_b32_f16 v9, |v1|, |v2| op_sel:[1,1]",
+            "v_pack_b32_f16 v10, -|v1|, -|v2| op_sel:[1,0]",
+            "v_pack_b32_f16 v11, -v1, |v2| op_sel:[0,1]",
+        ], "v_pack_b32_f16 abs and -|src| with op_sel on -1.0, -0.0 and -qNaN payloads"),
+    ]
+
+    # 24. v_bfe_u32 / v_bfe_i32 past bit 31 (offset + width > 32), width 0, and the bits above [4:0]. The first
+    # three cases take offset and width from VGPRs (the translator's bfe_width path), the last one from constants
+    # (folded at translation time).
+    cases += [
+        _valu4_case("valu_bfe_past31", "v_bfe_past31_vgpr", [
+            "v_mov_b32 v1, 0xd2f90159", "v_mov_b32 v2, 28", "v_mov_b32 v3, 16", "v_mov_b32 v4, 31",
+            "v_bfe_i32 v8, v1, v2, v3",      # off 28 + width 16: a field that would end at bit 43
+            "v_bfe_u32 v9, v1, v2, v3",
+            "v_bfe_i32 v10, v1, v2, v4",     # off 28 + width 31
+            "v_bfe_u32 v11, v1, v2, v4",
+        ], "v_bfe_i32/u32 with offset + width > 32 from VGPRs"),
+        _valu4_case("valu_bfe_past31", "v_bfe_past31_sign", [
+            "v_mov_b32 v1, 0x5f000000", "v_mov_b32 v2, 30", "v_mov_b32 v3, 4", "v_mov_b32 v4, 3",
+            "v_bfe_i32 v8, v1, v2, v3",      # field bits 30-31 = 01, bit 33 (width 4's top) does not exist
+            "v_bfe_i32 v9, v1, 24, v3",      # off 24 + width 4 inside: control, 0xf -> -1
+            "v_mov_b32 v5, 0x80000000", "v_mov_b32 v6, 1",
+            "v_bfe_i32 v10, v5, v4, v6",     # off 3 width 1 on bit 3 = 0: control
+            "v_bfe_i32 v11, v5, 31, v3",     # off 31 + width 4: only bit 31 exists, so -1 (not 1)
+        ], "v_bfe_i32 sign of a field cut at bit 31"),
+        _valu4_case("valu_bfe_past31", "v_bfe_high_bits", [
+            "v_mov_b32 v1, 0xd2f90159", "v_mov_b32 v2, 36", "v_mov_b32 v3, 32", "v_mov_b32 v4, 0xfffffffc",
+            "v_mov_b32 v5, 0xfffffff0",
+            "v_bfe_u32 v8, v1, v2, 8",       # offset 36: 4 if only [4:0] is read
+            "v_bfe_u32 v9, v1, 0, v3",       # width 32: 0 if only [4:0] is read
+            "v_bfe_i32 v10, v1, v4, v5",     # offset 0xfffffffc (28), width 0xfffffff0 (16)
+            "v_bfe_i32 v11, v1, v2, 0",      # width 0
+        ], "v_bfe offset and width bits above [4:0], and width 0"),
+        _valu4_case("valu_bfe_past31", "v_bfe_past31_const", [
+            "v_mov_b32 v1, 0xd2f90159",
+            "v_bfe_i32 v8, v1, 28, 16",      # constant offset and width: folded by the translator
+            "v_bfe_u32 v9, 0xd2f90159, 28, 31",
+            "v_bfe_i32 v10, v1, 60, 48",     # 60 & 31 = 28, 48 & 31 = 16
+            "v_bfe_i32 v11, v1, 31, 64",     # width 64 & 31 = 0
+        ], "v_bfe with constant offset and width past bit 31"),
+    ]
+
     return cases
 
 
@@ -627,6 +873,26 @@ def self_test():
     return 0
 
 
+def _validate_json_out(raw_path):
+    """Validate --json output path before running translator/hardware cases; return (abs_path, err_msg)."""
+    if not raw_path.strip():
+        return None, "ERROR: --json path must not be empty"
+    out_path = os.path.abspath(raw_path)
+    if os.path.isdir(out_path):
+        return None, f"ERROR: --json path is a directory: {out_path}"
+    cur = os.path.dirname(out_path)
+    while cur:
+        if os.path.exists(cur):
+            if not os.path.isdir(cur):
+                return None, f"ERROR: --json parent path is not a directory: {cur}"
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return out_path, None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("translator", "hw", "both"), default="translator")
@@ -660,6 +926,13 @@ def main(argv=None):
             return 2
         want = set(args.group)
         cases = [c for c in cases if c.group in want]
+
+    out_path = None
+    if args.json_out is not None:
+        out_path, err_msg = _validate_json_out(args.json_out)
+        if err_msg:
+            print(err_msg, file=sys.stderr)
+            return 2
 
     waves = (32, 64) if args.wave == "both" else (int(args.wave),)
     tr_res = run_translator(cases) if args.oracle in ("translator", "both") else None
@@ -718,17 +991,17 @@ def main(argv=None):
     print(f"summary: {total} cases: {matched} match, {known_diffs} known divergence, "
           f"{mismatches} unexpected mismatch, {wave_diffs} wave32/64 diff")
 
-    if args.json_out:
-        out_path = os.path.abspath(args.json_out)
-        if os.path.isdir(out_path):
-            print(f"ERROR: --json path is a directory: {out_path}", file=sys.stderr)
+    if out_path is not None:
+        try:
+            parent = os.path.dirname(out_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: failed to write --json {out_path}: {e}", file=sys.stderr)
             return 2
-        parent = os.path.dirname(out_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
-            f.write("\n")
 
     if mismatches or wave_diffs or (args.strict and known_diffs):
         return 1

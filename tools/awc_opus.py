@@ -26,8 +26,10 @@ and the descriptor's `samples` counts interleaved samples across those packet ch
 Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each bank's relative path.
 
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
+Usage: `python -I tools/awc_opus.py --help` lists the options.
 """
 import argparse
+import functools
 import os
 import struct
 import sys
@@ -35,7 +37,9 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
+from file_mode import new_file_mode, published_mode  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
+from report_paths import path_key  # noqa: E402
 
 # ---- Ogg ----
 _CRC = []
@@ -61,6 +65,8 @@ def ogg_page(serial: int, seq: int, granule: int, packets: list, flags: int) -> 
             lacing.append(255)
             n -= 255
         lacing.append(n)
+    if len(lacing) > 255:
+        raise ValueError("packet needs more than 255 Ogg segments")
     hdr = struct.pack("<4sBBqIIIB", b"OggS", 0, flags, granule, serial, seq, 0, len(lacing)) + bytes(lacing)
     body = b"".join(packets)
     page = bytearray(hdr + body)
@@ -138,6 +144,11 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
     return written
 
 
+@functools.cache
+def folder_file_mode(directory: str) -> int:
+    return new_file_mode(directory)
+
+
 def write_file(path: str, data: bytes) -> None:
     """Write under a private temporary name and rename into place: a stopped run or a full disk never leaves a
     short file under the final name, where a later run would keep it. The staging file is created in the
@@ -151,22 +162,31 @@ def write_file(path: str, data: bytes) -> None:
             tmp_path = f.name
             f.write(data)
         # NamedTemporaryFile creates 0600; give the staged file the mode of the file it replaces, or a new file's.
-        os.chmod(tmp_path, published_mode(out_path))
+        os.chmod(tmp_path, published_mode(out_path) if os.path.exists(out_path) else folder_file_mode(parent))
         os.replace(tmp_path, out_path)
     except BaseException:
-        try:
-            if tmp_path is not None:
+        if tmp_path is not None:
+            try:
+                os.chmod(tmp_path, 0o600)  # it may already carry a read-only mode, which Windows won't unlink
+            except OSError:
+                pass
+            try:
                 os.remove(tmp_path)
-        except OSError:
-            pass
+            except OSError:
+                pass
         raise
 
 
 def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = False) -> None:
     bits = 32 if float32 else 16
-    hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack(
-        "<IHHIIHH", 16, 3 if float32 else 1, channels, rate, rate * channels * bits // 8, channels * bits // 8, bits) +         b"data" + struct.pack("<I", len(pcm))
-    write_file(path, hdr + pcm)
+    block_align = channels * (bits // 8)
+    fmt = struct.pack("<HHIIHH", 3 if float32 else 1, channels, rate, rate * block_align, block_align, bits)
+    fact = b""
+    if float32:
+        fmt += struct.pack("<H", 0)  # WAVEFORMATEX.cbSize
+        fact = struct.pack("<4sII", b"fact", 4, len(pcm) // block_align)
+    header = b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + fact + b"data" + struct.pack("<I", len(pcm))
+    write_file(path, b"RIFF" + struct.pack("<I", len(header) + len(pcm)) + header + pcm)
 
 
 # ---- AWC ----
@@ -175,16 +195,23 @@ def parse_awc(d: bytes):
         raise ValueError("not a little-endian AWC")
     flags, n, header_size = struct.unpack_from("<III", d, 4)
     p = 16 + (4 if flags & 0x400000 else 0)
-    if flags & 0x10000:
+    index_at = p if flags & 0x10000 else -1
+    if index_at >= 0:
         p += n * 2
     if flags & 0x200000:
         p += (n + 1) * 4
     info = p
     p += n * 4
     streams, music = [], []
+    tags = 0
     for i in range(n):
         v = struct.unpack_from("<I", d, info + 4 * i)[0]
         sid, ntags = v & 0x1FFFFFFF, v >> 29
+        if index_at >= 0:
+            index, = struct.unpack_from("<H", d, index_at + 2 * i)
+            if index != tags:
+                raise ValueError(f"AWC index entry {i} does not match the cumulative tag count")
+        tags += ntags
         data = fmt = mus = None
         for _ in range(ntags):
             t = struct.unpack_from("<Q", d, p)[0]
@@ -211,6 +238,18 @@ def parse_awc(d: bytes):
     return streams, music
 
 
+def repeated_prefix_packets(packets: list[bytes], previous: list[bytes], samples: int) -> int | None:
+    """Count whole leading packets that repeat the previous chunk's tail, or reject a bad skip."""
+    for count, packet in enumerate(packets, 1):
+        duration = opus_samples(packet)
+        if not 0 < duration <= samples:
+            return None
+        samples -= duration
+        if samples == 0:
+            return count if packets[:count] == previous[-count:] else None
+    return None
+
+
 def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     """[(channel id, samples, rate, codec, [packets], packet channels)] for one streamed-music descriptor.
 
@@ -219,15 +258,17 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     Opus TOC stereo bit (bit 2) and defaults to 1 when no packet is present.
 
     collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py).
-    A descriptor whose declared blocks or subblock runs do not fit its data tag is rejected ([]), so a
-    corrupt descriptor cannot read past the tag into a sibling stream or past the end of the bank."""
+    The chunk size is the stride between blocks. The last block may be shorter, but each channel table and
+    subblock run must fit in its own block. A declared repeat must match whole packets from the same channel's
+    previous data. Channel rates outside 1000..192000 and non-Opus codecs are rejected as AwcRecovery.cs does.
+    Reject malformed descriptors without hiding other bank streams."""
     (m_at, m_size), (d_at, d_size) = mus, data
+    if m_size < 12:
+        return []
     blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
     if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
         return []
-    # Every block must start inside the data tag. The last block is usually shorter than `chunk` (game banks
-    # hold e.g. 1 block of a 524,288-byte chunk in a 264,192-byte tag), so `blocks * chunk` is not a bound;
-    # each block's own record table and subblock run are checked against the bytes left below.
+    # Every block must start inside the data tag. The last block can be shorter than the chunk stride.
     if (blocks - 1) * chunk >= d_size:
         return []
     info = []
@@ -236,33 +277,37 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         cid = struct.unpack_from("<I", d, base)[0] & 0x1FFFFFFF
         samples, = struct.unpack_from("<I", d, base + 4)
         rate, = struct.unpack_from("<H", d, base + 10)
-        info.append([cid, samples, rate, d[base + 12], [], 0])
-    for b in range(blocks):
-        at = d_at + b * chunk
-        if channels * 24 > d_size - b * chunk:
+        codec = d[base + 12]
+        # The field is u16 (max 65535), so the 192000 half of the reference bound cannot fire here.
+        if not (1000 <= rate <= 192000) or codec != 0x0B:
             return []
-        recs = [struct.unpack_from("<III", d, at + 24 * c + 4)[:2] for c in range(channels)]   # (count, skip)
+        info.append([cid, samples, rate, codec, [], 0])
+    previous = [[] for _ in range(channels)]
+    for b in range(blocks):
+        offset = b * chunk
+        at = d_at + offset
+        block_size = min(chunk, d_size - offset)
+        if channels * 24 > block_size:
+            return []
+        recs = [struct.unpack_from("<II", d, at + 24 * c + 4) for c in range(channels)]   # (count, skip)
         total = sum(r[0] for r in recs)
         header = (channels * 24 + total * 4 + 2047) & ~2047
-        if header + total * 2048 > d_size - b * chunk:
+        if header + total * 2048 > block_size:
             return []
         before = 0
         for c, (count, skip) in enumerate(recs):
             start = at + header + before * 2048
             before += count
-            if info[c][3] != 0x0B or count == 0:
-                continue
             packets = opus_packets(d, start, count * 2048)
+            repeated = repeated_prefix_packets(packets, previous[c], skip) if skip else 0
+            if repeated is None:
+                return []
+            if packets:
+                previous[c] = packets
             if packets and info[c][5] < 2:
                 info[c][5] = 2 if any(p[0] & 0x04 for p in packets) else 1
-            if not collect_packets:
-                continue
-            for pk in packets:
-                n = opus_samples(pk)
-                if skip >= n and skip > 0:
-                    skip -= n
-                    continue
-                info[c][4].append(pk)
+            if collect_packets:
+                info[c][4].extend(packets[repeated:] if repeated else packets)
     for x in info:
         if x[3] == 0x0B and x[5] > 1:
             x[1] //= x[5]
@@ -294,12 +339,16 @@ def export_stems(ids):
     return out
 
 
+def bank_output_dir(path, out_dir):
+    name = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(out_dir, name)
+
+
 def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
     with open(path, "rb") as f:
         d = f.read()
     streams, music = parse_awc(d)
-    name = os.path.splitext(os.path.basename(path))[0]
-    od = os.path.join(out_dir, name)
+    od = bank_output_dir(path, out_dir)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     for mus, data in music:
@@ -330,7 +379,7 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
             write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], True)
             counts["pcm"] += 1
             continue
-        if s["codec"] == 0 and s["channels"] in (1, 2):
+        if s["codec"] == 0 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 2:
             write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
             continue
@@ -360,15 +409,30 @@ def main(argv=None) -> int:
         ap.error(f"{a.out} is a file, not a folder")
     if os.path.isdir(a.src):
         banks = []
-        for root, _, files in os.walk(a.src):
-            output_parent = os.path.join(a.out, os.path.relpath(root, a.src))
-            banks.extend((os.path.join(root, name), output_parent)
-                         for name in files if name.lower().endswith(".awc"))
+
+        def scan_failed(error):
+            raise error
+
+        try:
+            for root, _, files in os.walk(a.src, onerror=scan_failed):
+                output_parent = os.path.join(a.out, os.path.relpath(root, a.src))
+                banks.extend((os.path.join(root, name), output_parent)
+                             for name in files if name.lower().endswith(".awc"))
+        except OSError as error:
+            print(f"ERROR: cannot list {error.filename or a.src}: {error.strerror or error}", file=sys.stderr)
+            return 1
         banks.sort()
     else:
         banks = [(a.src, a.out)]
     if a.limit is not None:
         banks = banks[:a.limit]
+    destinations = {}
+    for bank, parent in banks:
+        target = bank_output_dir(bank, parent)
+        key = path_key(target)
+        if key in destinations:
+            ap.error(f"{destinations[key]} and {bank} would both export to {target}")
+        destinations[key] = bank
     tot = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     jobs = max(1, a.jobs)
 
@@ -397,7 +461,7 @@ def main(argv=None) -> int:
             if (i + 1) % 200 == 0:
                 print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
     else:
-        with ProcessPoolExecutor(max_workers=jobs) as ex:
+        with ProcessPoolExecutor(max_workers=process_workers(jobs)) as ex:
             futures = {ex.submit(export_bank, b, output_parent, a.pre_skip): b for b, output_parent in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 b = futures[fut]

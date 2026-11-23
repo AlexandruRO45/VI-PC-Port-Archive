@@ -5,6 +5,8 @@ and a u32 size. The scan's job is to accept exactly that shape and to reject the
 strings that occur in ordinary code.
 """
 
+import contextlib
+import io
 import json
 import os
 import random
@@ -142,6 +144,27 @@ class ContainerTests(unittest.TestCase):
                     {"name": "RefitBVH4", "file": "RefitBVH4.dxbc", "stage": "cs"},
                 )
 
+    def test_extract_retries_existing_suffixes(self):
+        data = container(
+            [(b"ILDN", ildn("RefitBVH4")), (b"DXIL", dxil_payload("RefitBVH4"))]
+        )
+        found, _ = psc.inspect(data, "fake.dll")
+        with tempfile.TemporaryDirectory() as tmp:
+            # Occupy both initial candidates for the first record (index 0).
+            with open(os.path.join(tmp, "RefitBVH4.dxbc"), "wb") as f:
+                f.write(b"stale")
+            with open(os.path.join(tmp, "RefitBVH4_00.dxbc"), "wb") as f:
+                f.write(b"stale")
+            index = psc.extract(data, found, tmp)
+            self.assertEqual(index[0]["file"], "RefitBVH4_01.dxbc")
+            with open(os.path.join(tmp, index[0]["file"]), "rb") as f:
+                self.assertEqual(f.read(), data)
+            # The occupied candidates were untouched.
+            with open(os.path.join(tmp, "RefitBVH4.dxbc"), "rb") as f:
+                self.assertEqual(f.read(), b"stale")
+            with open(os.path.join(tmp, "RefitBVH4_00.dxbc"), "rb") as f:
+                self.assertEqual(f.read(), b"stale")
+
     def test_safe_stem(self):
         self.assertEqual(psc.safe_stem("a b/c", 1), "a_b_c")
         self.assertEqual(psc.safe_stem(None, 7), "container_07")
@@ -165,6 +188,134 @@ class ContainerTests(unittest.TestCase):
                 psc.inspect(bytes(data), "fuzz.dll")
             except Exception as e:  # noqa: BLE001 - any exception is the failure being asserted
                 self.fail(f"inspect raised {type(e).__name__}: {e}")
+
+
+class ReportPathTests(unittest.TestCase):
+    """--json and --extract must not overwrite an input, each other, or a folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.image = os.path.join(self.dir, "shader.dll")
+        with open(self.image, "wb") as f:
+            f.write(container([(b"SFI0", bytes(8))]))
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = psc.main(argv)
+            except SystemExit as e:
+                return e.code, out.getvalue(), err.getvalue()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_json_must_not_overwrite_an_image(self):
+        with open(self.image, "rb") as f:
+            before = f.read()
+        code, _, err = self.run_main([self.image, "--json", self.image])
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input image", err)
+        with open(self.image, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_json_creates_a_missing_folder(self):
+        out = os.path.join(self.dir, "reports", "containers.json")
+        code, _, err = self.run_main([self.image, "--json", out])
+        self.assertEqual(code, 0, err)
+        with open(out, encoding="utf-8") as f:
+            self.assertIsInstance(json.load(f), list)
+
+    def test_json_refuses_a_folder(self):
+        folder = os.path.join(self.dir, "folder")
+        os.makedirs(folder)
+        code, _, err = self.run_main([self.image, "--json", folder])
+        self.assertEqual(code, 2)
+        self.assertIn("is a folder, not a file", err)
+
+    def test_extract_refuses_an_existing_file(self):
+        blocker = os.path.join(self.dir, "blocked")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        code, _, err = self.run_main([self.image, "--extract", blocker])
+        self.assertEqual(code, 2)
+        self.assertIn("is not a folder", err)
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
+
+    def test_extract_index_must_not_overwrite_an_image(self):
+        with open(self.image, "rb") as f:
+            before = f.read()
+        index = os.path.join(self.dir, "index.json")
+        with open(index, "wb") as f:
+            f.write(before)
+        code, stdout, err = self.run_main([self.image, index, "--extract", self.dir])
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input image", err)
+        self.assertEqual(stdout, "")
+        self.assertCountEqual(os.listdir(self.dir), ["shader.dll", "index.json"])
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_json_must_not_overwrite_the_extract_index(self):
+        extract = os.path.join(self.dir, "out")
+        index = os.path.join(extract, "index.json")
+        code, _, err = self.run_main([self.image, "--extract", extract, "--json", index])
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the extract index", err)
+        self.assertFalse(os.path.exists(extract))
+
+    def test_a_failed_json_write_is_one_line(self):
+        blocker = os.path.join(self.dir, "not_a_folder")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        code, _, err = self.run_main([self.image, "--json", os.path.join(blocker, "containers.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: cannot write", err)
+        self.assertNotIn("Traceback", err)
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
+
+
+def psv0(stage_code: int) -> bytes:
+    """Build a minimal PSV0 chunk payload whose ShaderStage byte is `stage_code`."""
+    return struct.pack("<I", 48) + bytes(24) + bytes([stage_code]) + bytes(23)
+
+
+class Psv0StageTests(unittest.TestCase):
+    def test_psv0_stage_detection(self):
+        for code, expected in ((0, "ps"), (1, "vs"), (2, "gs"), (3, "hs"), (4, "ds"), (5, "cs"), (13, "ms"), (14, "as")):
+            with self.subTest(code=code):
+                self.assertEqual(psc.psv0_stage(psv0(code)), expected)
+        self.assertIsNone(psc.psv0_stage(psv0(99)))
+        self.assertIsNone(psc.psv0_stage(b""))
+        self.assertIsNone(psc.psv0_stage(bytes(20)))
+        self.assertIsNone(psc.psv0_stage(struct.pack("<I", 20) + bytes(28)))
+
+    def test_extract_writes_psv0_stage_to_index(self):
+        # Match the unnamed XBCH containers embedded in game_scarlett_master.exe (no ILDN, PSV0 present),
+        # plus a container without PSV0 to verify the "cs" fallback.
+        vs_blob = container([(b"PSV0", psv0(1)), (b"DXIL", dxil_payload("vs", xbch=True, bitcode=False))])
+        ps_blob = container([(b"PSV0", psv0(0)), (b"DXIL", dxil_payload("ps", xbch=True, bitcode=False))])
+        no_psv0 = container([(b"DXIL", dxil_payload("cs", xbch=True, bitcode=False))])
+        image_bytes = b"MZ" + vs_blob + ps_blob + no_psv0
+        records, rejected = psc.inspect(image_bytes, "fake.exe")
+        self.assertEqual(rejected, [])
+        self.assertEqual([r["stage"] for r in records], ["vs", "ps", None])
+        with tempfile.TemporaryDirectory() as tmp:
+            index = psc.extract(image_bytes, records, tmp)
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f, indent=0)
+            with open(os.path.join(tmp, "index.json"), encoding="utf-8") as f:
+                loaded = json.load(f)
+            self.assertEqual(
+                loaded,
+                [
+                    {"name": "container_00", "file": "container_00.dxbc", "stage": "vs"},
+                    {"name": "container_01", "file": "container_01.dxbc", "stage": "ps"},
+                    {"name": "container_02", "file": "container_02.dxbc", "stage": "cs"},
+                ],
+            )
 
 
 if __name__ == "__main__":

@@ -15,7 +15,8 @@
 //     first origin after ScheduleFrameEventX is the next vblank. The origin event of vblank n is signalled
 //     offset microseconds after it (ScheduleFrameEventX's offset).
 //   * A frame is "in flight" from PresentX until the vblank that shows it. Frames show one per vblank, in order.
-//     WaitFrameEventX does not return while `latency` frames are in flight.
+//     WaitFrameEventX does not return while `latency` frames are in flight. A frame presented while the origin event
+//     is not armed is not paced (PresentX does not hold it for a vblank): it shows at once and is never in flight.
 //   * A wait that comes late (after the next origin already passed) returns at once with the newest passed origin;
 //     the missed origins are skipped, not queued.
 //   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful wait, never reused, across suspend/resume.
@@ -282,10 +283,8 @@ public:
         timing.period_us = period_us_;
         if (!pending_.empty()) return timing;
         for (const Record& r : records_)
-            if (r.token == token && !r.presented && token > last_presented_) {
-                const std::uint64_t due = r.origin_us - std::min<std::uint64_t>(r.origin_us, offset_us_) + period_us_;
-                if (now > due) timing.late_us = now - due;
-            }
+            if (r.token == token && !r.presented && token > last_presented_ && now > r.due_us)
+                timing.late_us = now - r.due_us;
         return timing;
     }
 
@@ -298,7 +297,7 @@ public:
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
         last_presented_ = std::max(last_presented_, token);
-        if (!interval_set_) {  // not paced: shows at once
+        if (!interval_set_ || !armed_) {  // not paced (PresentX holds no vblank until the event is armed): shows at once
             for (Record& r : records_)
                 if (r.token == token) { r.presented = r.displayed = true; r.present_us = r.display_us = now; }
             return;
@@ -312,10 +311,7 @@ public:
             flip = now;
             std::uint64_t late_us = 0;
             for (const Record& r : records_)
-                if (r.token == token) {
-                    const std::uint64_t due = r.origin_us - std::min<std::uint64_t>(r.origin_us, offset_us_) + period_us_;
-                    if (now > due) late_us = now - due;
-                }
+                if (r.token == token && now > r.due_us) late_us = now - r.due_us;
             percent = scan_percent(late_us, period_us_);
             ++immediate_presents_;
         }
@@ -325,10 +321,11 @@ public:
         retire_locked(now);
         cv_.notify_all();
     }
-    // A blank present (no planes) carries no token: it is only counted as a frame to show.
+    // A blank present (no planes) carries no token: it is only counted as a frame to show. With no interval set or
+    // the origin event not armed it is not paced: it shows at once and is not counted.
     void note_untokened_present() {
         std::lock_guard guard(mutex_);
-        if (!interval_set_) return;
+        if (!interval_set_ || !armed_) return;
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
         const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;
@@ -374,6 +371,7 @@ private:
     };
     struct Record {
         std::uint64_t token = 0, origin_us = 0, present_us = 0, display_us = 0;
+        std::uint64_t due_us = 0;  // vblank after this token's origin, fixed when issued
         float percent_scanned = 0.0f;
         bool presented = false, displayed = false;
     };
@@ -412,6 +410,7 @@ private:
                     Record record;
                     record.token = *token;
                     record.origin_us = first + std::uint64_t(origin) * period_us_;
+                    record.due_us = record.origin_us - offset_us_ + period_us_;
                     records_.push_back(record);
                     if (records_.size() > 64) records_.pop_front();
                     return pacer_hr::ok;

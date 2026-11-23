@@ -6,6 +6,21 @@ cannot be mixed with this repository. This page records what we may learn from e
 The rule is the same for every entry: **facts are fine; code is not.** A format layout, an ABI observation or a
 measured behaviour can be reimplemented independently. The source that expressed it cannot be copied.
 
+## ivall/xcl
+
+<https://github.com/ivall/xcl>
+
+An Xbox Series compatibility layer for Windows. It runs a title's x64 code natively and reimplements the console
+system libraries, in the spirit of Wine. It recompiles RDNA2 shaders to HLSL/DXIL instead of SPIR-V. Its README
+reports several retail titles as playable, and its design notes record measured facts relevant here: root-argument
+placement in user SGPRs, thread-group lane layout on PC drivers and GFX10 texture tiling.
+
+**Licence:** **GPL-2.0-only**, which is **incompatible with GPL-3.0-or-later**, as for americas-recomp below. **No
+code, tables or comments may be copied.**
+
+**What we use it for:** its measured facts only. Verify each one with Leonida's own census, a synthetic test or a
+public specification before relying on it. This repository never contains game data, so a fact XCL measured on a retail package is checked here with synthetic inputs or a contributor's own copy.
+
 ## rpatty-dev/PercyStar
 
 <https://github.com/rpatty-dev/PercyStar>
@@ -27,10 +42,21 @@ specification. Do not paste even a small function "to save time".
 
 A **GPL-2.0-only** fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), on its `xbox-series` branch. It
 recompiles the same Xbox Series shaders and has run the package's DLLs against a PC D3D12 device behind an Xbox-ABI
-proxy.
+proxy. Since 2026-11-22 its pull requests are limited to collaborators and its README points contributors here.
 
-**Licence:** GPL-2.0-only is **incompatible with GPL-3.0-or-later**. GPLv2-only code cannot be combined into a
-GPLv3 work, so **no code may be copied**, and there is no "just this one file" exception.
+**Licence:** the repository is **GPL-2.0-only** (`LICENSE`), which is **incompatible with GPL-3.0-or-later**: GPLv2-only
+code cannot be combined into a GPLv3 work, so none of it may be copied, and there is no "just this one file" exception.
+Since 2026-11-22 its `REUSE.toml` on `xbox-series` (commit `f1c25d72`) lists **88 files under MIT**, each relicensed with
+the agreement of everyone who wrote lines in it ([realdody/americas-recomp#179](https://github.com/realdody/americas-recomp/issues/179),
+still open, so the list can change): 35 files at the top of its tools/xbox directory, 30 in tools/xbox/platform (for
+example `xbox_dxil_lower.py`, `d3d12_xs.cpp`, `xmem.cpp`, `xbox_device_proxy.h`), one each under tools/xbox/msvc and
+tools/xbox/platform/xgr, its 20 tools/tests/test_xbox_*.py tests and its docs/xbox/BVH_CONTAINER.md. Everything else,
+including the recompiler in its core directory and the `xgameruntime` stand-in sources, stays GPL-2.0-only.
+
+**Rule until the maintainer decides:** **no americas-recomp code is copied into Leonida**, MIT-listed or not. MIT is
+compatible with GPL-3.0-or-later, so the listed files could be used the way `third_party/xtaskqueue` is (per file, only
+paths listed in `REUSE.toml` at the commit used, the MIT notice kept); whether Leonida does that is the maintainer's
+decision, not a contributor's.
 
 **What we use it for:** the measured ABI facts only. The useful findings are summarised in
 [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi): the Xbox device entry point, the slot
@@ -51,6 +77,35 @@ tables or comments into Leonida. If a format fact learned from it is useful, ver
 write our own implementation. The model-recovery gap measured in [models.md](models.md) is in that submodule; the
 fix should go upstream, not into a copy.
 
+## meetox80/6stars
+
+<https://github.com/meetox80/6stars> — a macOS Swift/Metal engine that renders the world out of RPF9,
+with a Swift `RPFKit` format library and 44 Python research scripts. Independent work: it likewise
+does not decode the TOC.
+
+**Licence: none.** The repository has no `LICENSE` file (GitHub reports `license: null`); only the
+vendored cimgui/imgui carry MIT. With no grant, default copyright applies and the project is
+**all rights reserved** — stricter than PercyStar. **No 6stars code, comment, identifier or table may
+be copied into Leonida.**
+
+**What we use it for:** corroboration and a small number of hypotheses. As an independent reading of
+the same formats it matches our `CEntityDef` member hashes (9/9), the PRD0 header, the navmesh tile
+header, the meshlet group header and the PSIN/LSCH field layout. Its stream-role predicates and
+navmesh surface bits are recorded as hypotheses and tested from our own package, never copied.
+Where it disagrees with us (ETPF format and tile mode, the RDS5 codec field, `atArray` type `0x5C`,
+PSO member hashing) our measurements are the validated ones.
+<https://github.com/meetox80/6stars>
+
+A macOS Swift/Metal engine that reads the world from RPF9, with its own archive index and format readers.
+
+**Licence: none.** There is no `LICENSE` file and GitHub reports no licence, so all rights are reserved.
+**No 6stars code, comments, identifiers or tables may be copied into Leonida.**
+
+**What we use it for:** corroboration. Its RPF9 stream-boundary predicate and PRD0 member type codes were
+re-measured against this package before entering [rpf.md](rpf.md) and [world.md](world.md); its navmesh
+road/pavement bit labels did not reproduce and are not used. The navmesh polygon `+4` packing it reads is the one
+our decoder already validates ([navmesh.md](navmesh.md)).
+
 ## p-portela/SCARAB
 
 <https://github.com/p-portela/SCARAB>
@@ -69,6 +124,23 @@ licence allows it.
 lands), the IID/extension tables, and the call-sequence observations that Leonida's own
 [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) still lists as unknown. SCARAB forwards to
 D3D12; Leonida translates to Vulkan. The ABI facts carry over, the forwarding architecture does not.
+
+## holdmysocks/SixNG
+
+<https://github.com/holdmysocks/SixNG>
+
+A Rust extractor for the same package: models, textures, map placements, collision, navmesh, the lane graph and
+audio, with format notes in its module headers.
+
+**Licence:** GPL-3.0, compatible with this project's GPL-3.0-or-later. As with SCARAB, **facts first**: nothing of
+it is copied here.
+
+**What we use it for:** two navmesh facts, read in `crates/sixng-core/src/navmesh.rs` at commit `0619601` and
+re-measured on this package by `tools/navmesh_nodes.py`
+([navmesh.md](navmesh.md#polygon-flags-under-the-lane-graph)): its label "road surface" for polygon `+0x18` bit
+13, which it bases on a visual check, and the vertex formula `tile minimum + u16 / 65535 * extent`. The formula is
+confirmed by the lane-graph heights. The label is consistent with the count, but not settled by it: nine in ten
+lane nodes stand on polygons with both bit 8 and bit 13, and which bit or combination means road surface is open.
 
 ## microsoft/libHttpClient
 
