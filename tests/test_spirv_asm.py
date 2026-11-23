@@ -593,6 +593,18 @@ class SelectorMustBeDefinedBeforeTests(unittest.TestCase):
         with self.assertRaisesRegex(spirv_asm.SpirvAsmError, self.SELECTOR_ERROR):
             spirv_asm.assemble(text)
 
+    def test_selector_with_a_non_integer_type_is_refused(self):
+        for declaration in ("%float = OpTypeFloat 32", "%vec = OpTypeVector %uint 2", "%bool = OpTypeBool"):
+            type_id = declaration.split()[0]
+            for cases in ("", " 1 %exit"):
+                with self.subTest(type_id=type_id, cases=cases):
+                    text = _selector_module("uint", "1", later=False)
+                    text = text.replace("%sel = OpIAdd %uint %c0 %c0", f"%sel = OpUndef {type_id}")
+                    text = text.replace("%c0 = ", f"{declaration}\n%c0 = ")
+                    text = text.replace("OpSwitch %sel %exit 1 %exit", f"OpSwitch %sel %exit{cases}")
+                    with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "selector %sel must be an integer scalar"):
+                        spirv_asm.assemble(text)
+
     def test_the_error_names_the_line_of_the_switch(self):
         text = _selector_module("ulong", "1", later=True)
         switch_line = text.splitlines().index("OpSwitch %sel %exit 1 %exit") + 1

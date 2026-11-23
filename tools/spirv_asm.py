@@ -320,11 +320,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             return idx + 1
         if kind == "PairLiteralIntegerIdRef":
             tok = toks[idx]
-            if switch_type is not None:
-                width, signed = switch_type
-            else:
-                # Selector of unknown type: one word, read as signed only when the literal is negative.
-                width, signed = 32, tok.startswith("-")
+            width, signed = switch_type
             val = _int_literal(tok, width, signed, lineno)
             if width == 64:
                 out.append(val & 0xFFFFFFFF)
@@ -515,8 +511,12 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                     f"line {lineno}: OpSwitch selector {toks[arg_idx]} has no known type: it must be defined before "
                     "the OpSwitch (blocks are laid out in dominance order)")
             sel_ti = type_info.get(id_to_type[sel_id])
-            if sel_ti and sel_ti[0] == "int" and (sel_ti[1] <= 32 or sel_ti[1] == 64):
-                switch_type = (sel_ti[1], bool(sel_ti[2]))
+            if sel_ti is None or sel_ti[0] != "int":
+                raise SpirvAsmError(f"line {lineno}: OpSwitch selector {toks[arg_idx]} must be an integer scalar")
+            _, width, signed = sel_ti
+            if not (1 <= width <= 32 or width == 64):
+                raise SpirvAsmError(f"line {lineno}: unsupported OpSwitch selector width {width}")
+            switch_type = (width, bool(signed))
 
         for kind, quant in op_specs:
             if quant == "*":
