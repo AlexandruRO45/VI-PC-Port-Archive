@@ -159,6 +159,16 @@ jobs:
             fi
           done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
           python -m pytest "${pytest_files[@]}" -q
+          # Stdlib scripts that skip their only llvm-mc check without LLVM_MC must run here, where llvm-mc is
+          # installed. tests/test_ci_registration.py keeps this list equal to the files that skip on llvm-mc.
+          llvm_mc_stdlib_tests=(
+            tests/test_cvt_norm_mods_probe.py
+            tests/test_rdna2_decode.py
+          )
+          for t in "${llvm_mc_stdlib_tests[@]}"; do
+            echo "== $t"
+            python -I "$t"
+          done
   semantic-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}

@@ -296,6 +296,20 @@ def stdlib_loop_jobs_with_spirv_tools(workflow):
     return [name for name, job in jobs if re.search(r'python\s+-I\s+"\$t"', job)
             and re.search(r"apt-get\s+install[^\n]*\bspirv-tools\b", job)]
 
+def llvm_mc_gated_stdlib_files(root, files, rules):
+    """Standard-library test files whose only llvm-mc check skips when LLVM_MC is absent.
+
+    The `check` job has no llvm-mc, so running these there only exercises the skip path. They have to be
+    run again in `translator-tests`, which installs llvm-mc and sets LLVM_MC.
+    """
+    gated = []
+    for rel in files:
+        if not rel.endswith(".py") or job_of(root, rel, rules) != "stdlib":
+            continue
+        if re.search(r"skip(?:Test|Unless|If)\([^\n]*llvm-mc", read(root, rel), re.I):
+            gated.append(rel)
+    return sorted(gated)
+
 
 def has_main_guard(source):
     """A real ``if __name__ == "__main__":`` block that runs something.
@@ -393,6 +407,22 @@ class RepositoryRegistrationTest(unittest.TestCase):
         self.assertTrue(stdlib_loop_jobs_with_spirv_tools(workflow), "no job in ci.yml installs SPIRV-Tools and "
                         "runs the standard-library loop, so the spirv-val checks of these files never run:\n  " +
                         "\n  ".join(used))
+
+    def test_the_translator_job_runs_stdlib_tests_that_need_llvm_mc(self):
+        # The check job runs these with python -I but has no llvm-mc, so their parity check only skips there.
+        # Translator tests installs llvm-mc and sets LLVM_MC; it must run the same files as stdlib scripts.
+        gated = llvm_mc_gated_stdlib_files(ROOT, self.files, self.rules)
+        self.assertGreaterEqual(len(gated), 2, f"only found {gated}")
+        self.assertIn("tests/test_rdna2_decode.py", gated)
+        script = step_script(ROOT, "Translator tests")
+        match = re.search(r"llvm_mc_stdlib_tests=\(\s*\n(.*?)\n\s*\)", script, re.S)
+        self.assertIsNotNone(match, "the Translator tests step has no llvm_mc_stdlib_tests array to keep in sync")
+        listed = sorted(re.findall(r"tests/[A-Za-z0-9_./-]+\.py", match.group(1)))
+        self.assertEqual(listed, gated,
+                         "llvm_mc_stdlib_tests must list exactly the stdlib files that skip without llvm-mc; "
+                         "otherwise a new one silently goes untested")
+        self.assertIn('for t in "${llvm_mc_stdlib_tests[@]}"', script)
+        self.assertIn('python -I "$t"', script)
 
     def test_the_spirv_tools_check_flags_a_job_that_installs_nothing(self):
         workflow = read(ROOT, WORKFLOW)
