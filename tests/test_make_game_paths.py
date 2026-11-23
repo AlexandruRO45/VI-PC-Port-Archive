@@ -17,6 +17,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import make_game
 
+# Fake version manifest with the keys main() reads: its drive-root check uses expected_exe and the file names.
+FAKE_VERSION = {
+    "title": "Fake Game",
+    "version": "0.0.0.0",
+    "expected_exe": "Content/fake.exe",
+    "files": {
+        "Content/fake.exe": {"size": 0, "sha256": "0" * 64},
+        "MountedContent/fake.rpf": {"size": 0, "sha256": "0" * 64},
+    },
+}
+
 
 class BuildDestinationTest(unittest.TestCase):
     def setUp(self):
@@ -45,7 +56,7 @@ class BuildDestinationTest(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
             stack.enter_context(patch("make_game.below_normal"))
-            stack.enter_context(patch("make_game.check", return_value={}))
+            stack.enter_context(patch("make_game.check", return_value=FAKE_VERSION))
             stack.enter_context(patch("make_game.log"))
             preflight = stack.enter_context(patch("make_game.preflight"))
             build_runtime = stack.enter_context(patch("make_game.runtime"))
