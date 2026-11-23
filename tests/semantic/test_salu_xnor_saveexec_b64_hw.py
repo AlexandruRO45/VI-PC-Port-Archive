@@ -565,5 +565,87 @@ class TestBitwiseBoundaryExtremes(unittest.TestCase):
                 self.assertEqual(hw_bcnt, 64)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def parse_s_xnor_saveexec_b64_asm(asm_str: str) -> SXnorSaveexecInstruction:
+    """Parse canonical assembly syntax for s_xnor_saveexec_b64."""
+    text = asm_str.strip()
+    match = re.match(r"^s_xnor_saveexec_b64\s+s\[(\d+):(\d+)\]\s*,\s*(.+)$", text)
+    if not match:
+        raise ValueError(f"Malformed s_xnor_saveexec_b64 assembly: {asm_str}")
+
+    lo = int(match.group(1))
+    hi = int(match.group(2))
+    if hi != lo + 1:
+        raise ValueError(f"Invalid SGPR pair span: s[{lo}:{hi}]")
+
+    dst = Register64(RegKind.SGPR_PAIR, lo)
+    src_str = match.group(3).strip()
+
+    if src_str == "vcc":
+        src = Register64(RegKind.VCC)
+    elif src_str == "exec":
+        src = Register64(RegKind.EXEC)
+    elif src_str.startswith("s["):
+        src_match = re.match(r"^s\[(\d+):(\d+)\]$", src_str)
+        if not src_match or int(src_match.group(2)) != int(src_match.group(1)) + 1:
+            raise ValueError(f"Invalid source SGPR pair: {src_str}")
+        src = Register64(RegKind.SGPR_PAIR, int(src_match.group(1)))
+    elif src_str.startswith("0x") or src_str.isdigit():
+        src = Immediate64(int(src_str, 0))
+    else:
+        raise ValueError(f"Invalid source operand: {src_str}")
+
+    return SXnorSaveexecInstruction(dst=dst, src0=src)
+
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_reject_odd_aligned_sgpr_pair(self) -> None:
+        with self.assertRaises(ValueError):
+            Register64(RegKind.SGPR_PAIR, 1)
+
+        with self.assertRaises(ValueError):
+            Register64(RegKind.SGPR_PAIR, 7)
+
+    def test_reject_out_of_bounds_sgpr_pair(self) -> None:
+        with self.assertRaises(ValueError):
+            Register64(RegKind.SGPR_PAIR, 106)
+
+        with self.assertRaises(ValueError):
+            Register64(RegKind.SGPR_PAIR, -2)
+
+    def test_asm_parser_valid(self) -> None:
+        instr1 = parse_s_xnor_saveexec_b64_asm("s_xnor_saveexec_b64 s[6:7], s[12:13]")
+        self.assertEqual(instr1.dst.index, 6)
+
+        instr2 = parse_s_xnor_saveexec_b64_asm("s_xnor_saveexec_b64 s[6:7], vcc")
+        self.assertEqual(instr2.src0.kind, RegKind.VCC)
+
+        instr3 = parse_s_xnor_saveexec_b64_asm("s_xnor_saveexec_b64 s[6:7], exec")
+        self.assertEqual(instr3.src0.kind, RegKind.EXEC)
+
+    def test_asm_parser_rejections(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_s_xnor_saveexec_b64_asm("s_xnor_saveexec_b64 v[0:1], s[6:7]")
+
+        with self.assertRaises(ValueError):
+            parse_s_xnor_saveexec_b64_asm("s_xnor_saveexec_b64 s[1:2], s[6:7]")
+
+        with self.assertRaises(ValueError):
+            parse_s_xnor_saveexec_b64_asm("s_xnor_saveexec_b64 s[6:7], v[0]")
+
+    def test_mutation_detection_xor_instead_of_xnor(self) -> None:
+        s0 = 0x55555555_55555555
+        old_exec = 0x55555555_55555555
+        mutated_exec = s0 ^ old_exec
+        expected_exec, _, _ = ref_s_xnor_saveexec_b64(s0, old_exec)
+        self.assertNotEqual(mutated_exec, expected_exec)
+        self.assertEqual(expected_exec, ALL64)
+
+
 if __name__ == "__main__":
     unittest.main()
