@@ -322,8 +322,16 @@ class Analysis:
         return lane_masks.kind(self.masks.get(id(ins), {}), a) in lane_masks.MASK_KINDS
 
     def rd(self, st, ins, a):
-        """Taint of an operand; stale scalar reads add CTRL."""
+        """Taint of an operand; stale scalar reads add CTRL; src_execz/src_vccz read whole-wave masks (X)."""
         t = 0
+        if a.get("k") == "special":
+            spec_t = a.get("t", "")
+            if spec_t in ("src_execz", "src_vccz"):
+                t |= X
+                if spec_t == "src_vccz":
+                    t |= st["t"].get("vcc", 0)
+                    if (id(ins), "vcc") in self.stale:
+                        t |= CTRL
         for r in _regs(a):
             t |= st["t"].get(r, 0)
             if (id(ins), r) in self.stale:

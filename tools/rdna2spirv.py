@@ -479,6 +479,10 @@ class Gen:
         elif k == "special" and a["t"] in ("scc", "src_scc"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %scc")
+        elif k == "special" and a["t"] in ("src_execz", "src_vccz"):
+            z = self.mask_zero_bool("exec" if a["t"] == "src_execz" else "vcc")
+            v = self.tmp()
+            self.emit(f"{v} = OpSelect %uint {z} {self.cu(1)} {self.cu(0)}")
         elif k == "special" and a["t"] == "src_pops_exiting_wave_id":
             # POPS (primitive-ordered pixel shading): the hardware wait loop compares this against the
             # collision word. Ordering comes from fragment-shader interlock around the whole shader instead
@@ -1601,6 +1605,8 @@ class Gen:
             raise Unsupported(f"destination {a.get('t', a['k'])}")
 
     # ---- runs of lane-local VALU instructions under one `if (active)` ----
+    INLINE_FLAG_OPS = ("src_scc", "src_execz", "src_vccz")
+
     def lane_local(self, ins):
         """True when ins only reads and writes this invocation's own registers, and its VGPR writes are the only
         ones EXEC gates. Each invocation is one lane, so skipping it where the lane is inactive is the same as
@@ -1611,6 +1617,7 @@ class Gen:
         a = ins["args"]
         return (op.startswith("v_") and op not in NOOPS and not op.startswith(NOT_LANE_LOCAL) and "_co_" not in op
                 and not ins["op"].endswith("_dpp") and not any(m.startswith(DPP_MODS) for m in ins["mods"])
+                and not any(x.get("k") == "special" and x.get("t") in ("src_execz", "src_vccz") for x in a)
                 and bool(a) and a[0]["k"] == "vgpr" and id(ins) not in self.mask_writes)
 
     def insns(self, seq):
@@ -1700,6 +1707,8 @@ class Gen:
         elif s["k"] == "special" and s["t"] == "vcc":
             lo = hi = self.tmp()            # this lane's bit in both halves, as for EXEC
             self.emit(f"{lo} = OpLoad %uint %vcc")
+        elif s["k"] == "special" and s["t"] in self.INLINE_FLAG_OPS:
+            lo, hi = self.src_u(s), self.cu(0)
         else:
             raise Unsupported("s_mov_b64 source")
         self.store_reg("sgpr", d["r"], lo)
@@ -5599,7 +5608,10 @@ class Gen:
     @staticmethod
     def _maskable_b32(x):
         return x["k"] in ("sgpr", "imm") or (
-            x["k"] == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") == "null")
+            x["k"] == "special" and (
+                x.get("t", "").startswith(("exec", "vcc"))
+                or x.get("t") in ("null", "src_scc", "src_execz", "src_vccz")
+            )
         )
 
     def _mask_b32_dst_half(self, d, srcs):
@@ -5969,6 +5981,59 @@ class Gen:
         self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {v}")
         return lo_in, hi_in
 
+    def wave_mask_nonzero(self, which: str) -> str:
+        """Boolean SPIR-V id: whether the whole wave's VCC ('vcc') or EXEC ('exec') is nonzero.
+        Calls g_vote (OpGroupNonUniformAny or --wave64-emulate x_round), so callers must run in uniform control
+        flow (outside `if (active)`)."""
+        if which == "vcc":
+            s = self.tmp()
+            self.emit(f"{s} = OpLoad %uint %vcc")
+            lane = self.tmp()
+            self.emit(f"{lane} = OpINotEqual %bool {s} {self.cu(0)}")
+            if self.wave64 and "vcc" not in self.cur_masks:
+                # VCC holds data, not a lane mask: VCCZ/VCCNZ test all 64 bits, so the high word matters too.
+                # Each invocation holds the same data word, and the subgroup vote below reduces the bool once.
+                # A VCC certified as a lane mask keeps one bit per lane in %vcc; %vcc_hi is not the other half
+                # of the vote there, because that vote already covers both halves of the wave.
+                hi = self.tmp()
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+                hi_nz = self.tmp()
+                self.emit(f"{hi_nz} = OpINotEqual %bool {hi} {self.cu(0)}")
+                both = self.tmp()
+                self.emit(f"{both} = OpLogicalOr %bool {lane} {hi_nz}")
+                lane = both
+        else:
+            lane = self.active_b()
+        any_ = self.tmp()
+        self.g_vote(any_, "Any", lane)
+        self.uses_vote = True
+        return any_
+
+    def mask_zero_bool(self, which: str) -> str:
+        """Boolean SPIR-V id: whether the whole wave's VCC ('vcc') or EXEC ('exec') is zero."""
+        any_ = self.wave_mask_nonzero(which)
+        b = self.tmp()
+        self.emit(f"{b} = OpLogicalNot %bool {any_}")
+        return b
+
+    def _mask_from_scalar_words(self, lo_id: str, hi_id: str, w64: bool) -> str:
+        """Convert 32/64-bit scalar bitmask word ids (`lo_id`, `hi_id`) into per-lane 0xFFFFFFFF/0."""
+        lane = self.wave_lane()
+        sh, word, shr, bit, r = (self.tmp() for _ in range(5))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+        if w64 and hi_id != lo_id:
+            up = self.tmp()
+            self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+            self.emit(f"{word} = OpSelect %uint {up} {hi_id} {lo_id}")
+        else:
+            self.emit(f"{word} = OpCopyObject %uint {lo_id}")
+        # Shift and mask, not OpBitFieldUExtract (Intel's driver takes the offset mod 16 for a 16-bit constant;
+        # see exec_half_write).
+        self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        return r
+
     def mask_src(self, a, wide=True):
         """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane. A constant is a mask with one
         bit per lane, so lane L takes its bit L: of the 64-bit value (`wide`, the default: a 64-bit SALU operand or
@@ -6016,21 +6081,9 @@ class Gen:
             lo, hi = v & 0xFFFFFFFF, v >> 32
             if lo in (0, 0xFFFFFFFF) and (hi == lo or not w64):
                 return self.cu(lo)              # 0 or -1: no lane or every lane, as before
-            lane = self.wave_lane()
-            sh, word, shr, bit, r = (self.tmp() for _ in range(5))
-            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
-            if w64 and hi != lo:
-                up = self.tmp()
-                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
-                self.emit(f"{word} = OpSelect %uint {up} {self.cu(hi)} {self.cu(lo)}")
-            else:
-                self.emit(f"{word} = OpCopyObject %uint {self.cu(lo)}")
-            # Shift and mask, not OpBitFieldUExtract (Intel's driver takes the offset mod 16 for a 16-bit constant;
-            # see exec_half_write).
-            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
-            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
-            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
-            return r
+            return self._mask_from_scalar_words(self.cu(lo), self.cu(hi), w64)
+        if a["k"] == "special" and a.get("t") in self.INLINE_FLAG_OPS:
+            return self._mask_from_scalar_words(self.src_u(a), self.cu(0), self.wave64 and wide)
         raise Unsupported("mask operand")
 
     def is_mask_op(self, x):
@@ -6060,6 +6113,8 @@ class Gen:
             return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
         if s["k"] == "special" and s.get("t") == "null":
             return self.cu(0), self.cu(0)
+        if s["k"] == "special" and s.get("t") in self.INLINE_FLAG_OPS:
+            return self.src_u(s), self.cu(0)
         raise Unsupported(op + " source")
 
     def dst64_data(self, d, rlo, rhi, op, *, allow_null=False):
@@ -9097,6 +9152,8 @@ class Gen:
                         return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
                     if s["k"] == "special" and s.get("t") == "null":
                         return self.cu(0), self.cu(0)
+                    if s["k"] == "special" and s.get("t") in self.INLINE_FLAG_OPS:
+                        return self.src_u(s), self.cu(0)
                     if self.holds_lane_mask(s):
                         return self.wave_mask(s)
                     if s["k"] == "special" and s.get("t") == "vcc":
@@ -17508,28 +17565,7 @@ def branch_condition(g, op):
     # invocation per lane, each lane holds only its own bit, so the condition is reduced across the subgroup
     # (= the wave). Deciding per lane would let lanes skip scalar instructions the wave executes, leaving their
     # SGPRs stale, and would break cross-lane ops and barriers inside the block.
-    if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
-        s = g.tmp()
-        g.emit(f"{s} = OpLoad %uint %vcc")
-        lane = g.tmp()
-        g.emit(f"{lane} = OpINotEqual %bool {s} {g.cu(0)}")
-        if g.wave64 and "vcc" not in g.cur_masks:
-            # VCC holds data, not a lane mask: VCCZ/VCCNZ test all 64 bits, so the high word matters too.
-            # Each invocation holds the same data word, and the subgroup vote below reduces the bool once.
-            # A VCC certified as a lane mask keeps one bit per lane in %vcc; %vcc_hi is not the other half
-            # of the vote there, because that vote already covers both halves of the wave.
-            hi = g.tmp()
-            g.emit(f"{hi} = OpLoad %uint %vcc_hi")
-            hi_nz = g.tmp()
-            g.emit(f"{hi_nz} = OpINotEqual %bool {hi} {g.cu(0)}")
-            both = g.tmp()
-            g.emit(f"{both} = OpLogicalOr %bool {lane} {hi_nz}")
-            lane = both
-    else:
-        lane = g.active_b()
-    any_ = g.tmp()
-    g.g_vote(any_, "Any", lane)
-    g.uses_vote = True
+    any_ = g.wave_mask_nonzero("vcc" if op in ("s_cbranch_vccz", "s_cbranch_vccnz") else "exec")
     if op in ("s_cbranch_vccnz", "s_cbranch_execnz"):
         return any_
     b = g.tmp()

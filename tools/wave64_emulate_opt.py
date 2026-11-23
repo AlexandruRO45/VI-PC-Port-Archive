@@ -223,6 +223,12 @@ def base_op(op):
     return res
 
 
+def _has_wave_status_src(ins):
+    """True when ins reads src_execz or src_vccz (lowered via g_vote / x_round in uniform flow)."""
+    return any(x.get("k") == "special" and x.get("t") in ("src_execz", "src_vccz")
+               for x in ins["args"])
+
+
 def _get_op_meta(raw_op):
     """Return cached static metadata tuple for raw opcode `raw_op`."""
     meta = _OP_META_CACHE.get(raw_op)
@@ -480,7 +486,7 @@ def _operand_scalar_mask(x):
         return (((1 << (hi - lo)) - 1) << lo) if hi > lo else 0
     if k == "special":
         t = x.get("t", "")
-        if t.startswith("vcc"):
+        if t.startswith("vcc") or t == "src_vccz":
             return 1 << _BIT_VCC
         if t in ("scc", "src_scc"):
             return 1 << _BIT_SCC
@@ -575,7 +581,7 @@ def _scalar_rw_with_meta(ins, meta):
                     must_kill |= m
         elif k == "special":
             t = x.get("t", "")
-            if t.startswith("vcc"):
+            if t.startswith("vcc") or t == "src_vccz":
                 m = 1 << _BIT_VCC
             elif t in ("scc", "src_scc"):
                 m = 1 << _BIT_SCC
@@ -815,8 +821,9 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             # write_all_lanes VGPR store (parked lane mask): runs even when EXEC == 0, so must not be skipped.
             return False, _EMPTY_MEM_STATS, 0, (), ()
         flags = m[8]
-        # 1. Strictly forbidden opcodes inside a lane-local folded region (cross-lane, barrier, unmasked writes).
-        if flags & _FLAG_FORBIDDEN_FOLD:
+        # 1. Strictly forbidden opcodes or wave-status inline operands inside a lane-local folded region
+        #    (cross-lane, barrier / x_round, unmasked writes).
+        if (flags & _FLAG_FORBIDDEN_FOLD) or _has_wave_status_src(ins):
             return False, _EMPTY_MEM_STATS, 0, (), ()
 
         acc = m[9]
@@ -1182,7 +1189,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                 clean = False
                 continue
             flags = m[8]
-            if flags & _FLAG_FORBIDDEN_FOLD:
+            if (flags & _FLAG_FORBIDDEN_FOLD) or _has_wave_status_src(ins):
                 clean = False
                 continue
             acc = m[9]
@@ -1447,7 +1454,7 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if meta[1]:
         return False
     flags = meta[8]
-    if flags & _FLAG_ALWAYS_BARRIER:
+    if (flags & _FLAG_ALWAYS_BARRIER) or _has_wave_status_src(ins):
         return True
     mask_chk = meta[11]
     if not mask_chk:
