@@ -316,5 +316,17 @@ class OnHardware(unittest.TestCase):
                     o.close()
 
 
+class JsonGuard(unittest.TestCase):
+    """The --json guard fires before any device work."""
+
+    def test_a_json_that_names_a_folder_is_refused_first(self):
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(P.main(["--build", os.path.join(ROOT, "no_such_build"),
+                                     "--asm", "s_endpgm", "--json", ROOT]), 2)
+        self.assertIn("--json is a directory", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
