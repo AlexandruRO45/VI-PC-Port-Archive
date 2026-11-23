@@ -196,7 +196,7 @@ Current limits, by design:
 
 The `xgameruntime` shim (`shims/xgameruntime.cpp`) answers the title's questions about the console and its package
 with fixed values. Five environment variables change an answer, for trying another of the title's code paths. Each
-is read on every call, and a value that is empty or too long for its buffer is ignored.
+is read on every call; an empty value is ignored, and so is one too long for the fixed-size answer it fills.
 `tests/test_docs_env_vars.py` fails when the runtime or `make_game.py` reads a `LEONIDA_*` variable that no
 document names.
 
@@ -205,7 +205,7 @@ document names.
 | `LEONIDA_DEVICE_TYPE` | `7` | The `XSystemDeviceType` that `XSystemGetDeviceType` returns: `0` Unknown, `1` Pc, `2` XboxOne, `3` XboxOneS, `4` XboxOneX, `5` XboxOneXDevkit, `6` XboxScarlettLockhart (Series S), `7` XboxScarlettAnaconda (Series X), `8` XboxScarlettDevkit. A number outside 0..8 is ignored; text that is not a number counts as `0`. `6` also makes `XSystemGetAnalyticsInfo` report the form `Xbox Series S` instead of `Xbox Series X`. |
 | `LEONIDA_ANALYTICS_FORM` | unset | The `form` string of `XSystemGetAnalyticsInfo`, in place of the one the device type gives (up to 63 characters). |
 | `LEONIDA_PACKAGE_ID` | `LeonidaPackageIdentifier00000000` | The identifier `XPackageGetCurrentProcessPackageIdentifier` returns (up to 32 characters). It is also the one identifier `XPackageMount` refuses with `E_ACCESSDENIED`, as the game's own package. |
-| `LEONIDA_CONTENT_PACKAGES` | unset | The content packages `XPackageMount` can mount: `id1=path1;id2=path2` (up to 1,023 characters). The mount path of a listed identifier is its path, as written; any other identifier is `ERROR_NOT_FOUND`, and a path longer than 259 characters is `ERROR_INSUFFICIENT_BUFFER`. |
+| `LEONIDA_CONTENT_PACKAGES` | unset | The content packages `XPackageMount` can mount: `id1=path1;id2=path2`, read in full (the 1,023-character buffer is gone). The mount path of a listed identifier is its path, as written, at any length: `XPackageGetMountPathSize` reports the buffer it needs and `XPackageGetMountPath` fills it, refusing a smaller buffer with `ERROR_INSUFFICIENT_BUFFER`; any other identifier is `ERROR_NOT_FOUND`. |
 | `LEONIDA_PACKAGED` | `1` | `0`, or text that is not a number, makes `XPackageIsPackagedProcess` return false. Any other number keeps it true. |
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
