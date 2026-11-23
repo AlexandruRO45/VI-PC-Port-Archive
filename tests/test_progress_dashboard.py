@@ -253,14 +253,14 @@ class GpuLog(unittest.TestCase):
         "cs_bounds            ok",
         "ps_texoff            SKIP (VK_KHR_maintenance8 missing)",
         "cs_bpermute32        lane 3: got 0x00000000, want 0x00000007",
-        "2 of 3 pass, 1 skipped",
+        "1 of 3 pass, 1 skipped",
     ])
 
     def test_lines_and_summary(self):
         rows, summary = pd.parse_gpu_log(self.LOG)
         self.assertEqual([(n, r) for n, r, _ in rows], [("cs_bounds", "pass"), ("ps_texoff", "skip"), ("cs_bpermute32", "fail")])
         self.assertIn("want 0x00000007", rows[2][2])
-        self.assertEqual(summary, (2, 3, 1))
+        self.assertEqual(summary, (1, 3, 1))
 
     def test_panel_groups_by_gpu_label(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -273,6 +273,37 @@ class GpuLog(unittest.TestCase):
             self.assertEqual(sorted(c["status"] for c in col.components)[0], "failed")
             m = next(m for m in col.metrics if m["id"] == "gpu.current")
             self.assertEqual(m["denominator"], 2)                     # the skip is not counted
+
+    def test_incomplete_logs_keep_rows_but_do_not_contribute_to_the_metric(self):
+        body = self.LOG.rsplit("\n", 1)[0]
+        summaries = (
+            ("", "missing"),
+            ("1 of 4 pass, 1 skipped", "summary"),
+            ("2 of 3 pass, 1 skipped", "summary"),
+            ("1 of 3 pass, 0 skipped", "summary"),
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pd, "last_commit_time", return_value=1):
+            complete = Path(tmp) / "complete.txt"
+            incomplete = Path(tmp) / "incomplete.txt"
+            complete.write_text(self.LOG + "\n", encoding="utf-8", newline="\n")
+            for summary, diagnostic in summaries:
+                with self.subTest(summary=summary):
+                    incomplete.write_text(f"{body}\n{summary}\n", encoding="utf-8", newline="\n")
+                    col = pd.Collector()
+                    pd.collect_gpu(col, [str(incomplete)])
+                    self.assertEqual(col.sources[0]["status"], "partial")
+                    self.assertIn(diagnostic, col.sources[0]["note"])
+                    self.assertEqual(
+                        {c["name"]: c["status"] for c in col.components},
+                        {"cs_bounds": "partial", "ps_texoff": "unknown", "cs_bpermute32": "failed"},
+                    )
+                    self.assertFalse(col.metrics)
+
+                    col = pd.Collector()
+                    pd.collect_gpu(col, [str(incomplete), str(complete)])
+                    self.assertEqual(col.sources[1]["status"], "ok")
+                    metric = next(m for m in col.metrics if m["id"] == "gpu.current")
+                    self.assertEqual((metric["numerator"], metric["denominator"]), (1, 2))
 
 
 class Github(unittest.TestCase):

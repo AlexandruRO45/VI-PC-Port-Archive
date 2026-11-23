@@ -523,6 +523,7 @@ def collect_gpu(col, logs):
         col.source("gpu_logs", None, "missing", note="pass --gpu-log <saved check.py output>[=<GPU, driver, OS>]")
         return
     changed = max(t for t in (last_commit_time("runtime/test/shaders"), last_commit_time("tools/rdna2spirv.py"), 0) if t is not None)
+    verified = tested = 0
     for spec in logs:
         path, _, label = spec.partition("=")
         if not os.path.isfile(path):
@@ -530,25 +531,40 @@ def collect_gpu(col, logs):
             continue
         rows, summary = parse_gpu_log(read_utf8(path))
         label = label or os.path.splitext(os.path.basename(path))[0]
+        passed = sum(result == "pass" for _, result, _ in rows)
+        skipped = sum(result == "skip" for _, result, _ in rows)
+        complete = summary == (passed, len(rows), skipped)
         note = None
-        if summary and summary[1] != len(rows):
-            note = f"summary says {summary[1]} tests, {len(rows)} lines parsed"
-        col.source("gpu_log", path, "ok" if rows else "invalid", len(rows), note=note)
+        if summary is None:
+            note = "missing check.py summary"
+        elif not complete:
+            expected_passed, expected_total, expected_skipped = summary
+            note = (f"summary reports {expected_passed} of {expected_total} pass and {expected_skipped} skipped, "
+                    f"but parsed {passed} of {len(rows)} pass and {skipped} skipped")
+        source_status = "invalid"
+        if rows:
+            source_status = "ok" if complete else "partial"
+        col.source("gpu_log", path, source_status, len(rows), note=note)
         ran = os.path.getmtime(path)
         for name, res, detail in rows:
             if res == "fail":
                 status, fresh = "failed", "failed"
             elif res == "skip":
                 status, fresh = "unknown", "unknown"
+            elif not complete:
+                status, fresh = "partial", "incomplete_log"
             elif changed and ran < changed:
                 status, fresh = "partial", "revalidation_required"
             else:
                 status, fresh = "verified", "current"
             col.add(f"gpu.{label}.{name}", "gpu", label, name, status, detail=detail or None, freshness=fresh, ran_at=iso(ran))
-    tested = [c for c in col.components if c["panel"] == "gpu" and c["status"] != "unknown"]
+            if complete and res != "skip":
+                tested += 1
+                verified += status == "verified"
     if tested:
-        col.metric("gpu.current", "gpu", "GPU test programs passing on the current translator", sum(c["status"] == "verified" for c in tested),
-                   len(tested), "programs ok after the last commit touching runtime/test/shaders or tools/rdna2spirv.py / programs run (skips excluded)")
+        col.metric("gpu.current", "gpu", "GPU test programs passing on the current translator", verified, tested,
+                   "programs ok after the last commit touching runtime/test/shaders or tools/rdna2spirv.py / "
+                   "programs run in complete logs (skips excluded)")
 
 
 # ----------------------------------------------------------------------------------------------- docs
