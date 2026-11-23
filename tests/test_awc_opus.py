@@ -12,6 +12,7 @@ import sys
 import tempfile
 import tracemalloc
 import unittest
+import wave
 from pathlib import Path
 from unittest import mock
 
@@ -269,6 +270,37 @@ class WriteWavTest(unittest.TestCase):
                     awc.write_wav(first, pcm, 48000, channels, float32)
                     awc.write_wav(second, view, 48000, channels, float32)
                     self.assertEqual(Path(first).read_bytes(), Path(second).read_bytes())
+
+    def test_typed_pcm_views_use_byte_lengths_in_every_wav_chunk(self):
+        pcm = bytes(range(64))
+        views = [memoryview(pcm).cast(fmt) for fmt in ("h", "I", "f")]
+        views.append(memoryview(pcm).cast("B", shape=(8, 8)))
+        for view in views:
+            for float32 in (False, True):
+                for channels in (1, 2):
+                    with self.subTest(format=view.format, ndim=view.ndim, float32=float32, channels=channels):
+                        first, second = self.path("bytes.wav"), self.path("typed.wav")
+                        awc.write_wav(first, pcm, 48000, channels, float32)
+                        awc.write_wav(second, view, 48000, channels, float32)
+                        self.assertEqual(Path(first).read_bytes(), Path(second).read_bytes())
+                        wav = read_wav(second)
+                        self.assertEqual(wav["riff_size"], len(wav["data"]) - 8)
+                        self.assertEqual(wav["data_size"], view.nbytes)
+                        if float32:
+                            self.assertEqual(struct.unpack("<I", wav["chunks"][b"fact"])[0],
+                                             view.nbytes // (channels * 4))
+                        else:
+                            with wave.open(second, "rb") as reader:
+                                self.assertEqual(reader.getnframes(), view.nbytes // (channels * 2))
+                                self.assertEqual(reader.readframes(reader.getnframes()), pcm)
+
+    def test_noncontiguous_pcm_view_is_refused_before_staging(self):
+        destination = self.path("existing.wav")
+        Path(destination).write_bytes(b"previous complete file")
+        with self.assertRaises(TypeError):
+            awc.write_wav(destination, memoryview(bytes(64))[::2], 48000, 1)
+        self.assertEqual(Path(destination).read_bytes(), b"previous complete file")
+        self.assertEqual(os.listdir(self.tmp.name), ["existing.wav"])
 
     def test_payload_write_failure_preserves_destination_and_cleans_staging(self):
         destination = self.path("existing.wav")

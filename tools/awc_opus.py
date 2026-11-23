@@ -184,6 +184,9 @@ def _write_file_parts(path: str, parts: tuple[bytes | memoryview, ...]) -> None:
 
 
 def write_wav(path: str, pcm: bytes | memoryview, rate: int, channels: int, float32: bool = False) -> None:
+    # A typed or multidimensional view's len() counts elements, not bytes. Flatten the contiguous buffer
+    # without copying before sizing the RIFF/data chunks and the float sample count.
+    pcm = memoryview(pcm).cast("B")
     bits = 32 if float32 else 16
     block_align = channels * (bits // 8)
     fmt = struct.pack("<HHIIHH", 3 if float32 else 1, channels, rate, rate * block_align, block_align, bits)
