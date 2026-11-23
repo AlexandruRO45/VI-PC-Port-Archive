@@ -78,6 +78,39 @@ class TestPacket(unittest.TestCase):
 
 
 class TestRetag(unittest.TestCase):
+    def test_retag_refuses_bad_header_granule_serial_and_mapping_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stream.ogg")
+            make_ogg(path, packets=3)
+            original = Path(path).read_bytes()
+        (_, head_end), (_, tags_end), *_ = list(T.pages(original))
+        header = original[27 + original[26]:head_end]
+        serial, = struct.unpack_from("<I", original, 14)
+        # Family 1, six channels, four streams and two coupled streams.
+        mapped = header[:9] + b"\x06" + header[10:18] + bytes([1, 4, 2, 0, 4, 1, 2, 3, 5])
+        tags = T.tags_packet([])
+        cases = [
+            ("ID granule", header, 1, 0, serial, "zero granule position"),
+            ("tags granule", header, 0, 1, serial, "zero granule position"),
+            ("wrong logical stream", header, 0, 0, serial + 1, "different Ogg stream"),
+            ("no family-1 table", mapped[:19], 0, 0, serial, "channel mapping table"),
+            ("truncated family-1 table", mapped[:-1], 0, 0, serial, "channel mapping table"),
+        ]
+        packet = T.tags_packet([("TITLE", "new")])
+        for name, identification, head_granule, tags_granule, tags_serial, error in cases:
+            with self.subTest(name=name):
+                head_page = awc_opus.ogg_page(serial, 0, head_granule, [identification], 0x02)
+                tags_page = awc_opus.ogg_page(tags_serial, 1, tags_granule, [tags], 0)
+                data = head_page + tags_page + original[tags_end:]
+                self.assertTrue(crc_ok(data))
+                with self.assertRaisesRegex(ValueError, error):
+                    T.retag(data, packet)
+
+        head_page = awc_opus.ogg_page(serial, 0, 0, [mapped], 0x02)
+        result = T.retag(head_page + original[head_end:], packet)
+        self.assertTrue(result.startswith(head_page))
+        self.assertEqual(read_tags(result), (T.VENDOR, ["TITLE=new"]))
+
     def test_retag_requires_the_opus_identification_page(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "stream.ogg")

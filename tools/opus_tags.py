@@ -101,6 +101,9 @@ def retag(data: bytes, packet: bytes) -> bytes:
             or not id_segments or id_segments[-1] == 255
             or any(segment != 255 for segment in id_segments[:-1])):
         raise ValueError("first Ogg page does not contain a complete Opus identification header")
+    # A nonzero mapping family adds two stream counts and one mapping byte per channel (RFC 7845 §5.1).
+    if data[id_body + 18] and id_end - id_body < 21 + data[id_body + 9]:
+        raise ValueError("incomplete Opus channel mapping table")
     body = tags_at + 27 + data[tags_at + 26]
     if data[body:body + 8] != b"OpusTags":
         raise ValueError("page 1 does not start an OpusTags packet")
@@ -109,11 +112,16 @@ def retag(data: bytes, packet: bytes) -> bytes:
         raise ValueError("the OpusTags packet continues past page 1")
     if any(segment != 255 for segment in segments[:-1]):
         raise ValueError("the OpusTags page contains another packet")
-    for _ in it:  # also check the audio tail before publishing any replacement
-        pass
-    serial, seq = struct.unpack_from("<II", data, tags_at + 14)
+    id_granule, id_serial = struct.unpack_from("<QI", data, id_at + 6)
+    tags_granule, serial, seq = struct.unpack_from("<QII", data, tags_at + 6)
+    if id_granule or tags_granule:
+        raise ValueError("Opus header pages must have zero granule position")
+    if serial != id_serial:
+        raise ValueError("OpusTags page belongs to a different Ogg stream")
     if seq != 1:
         raise ValueError("the OpusTags page is not page 1")
+    for _ in it:  # also check the audio tail before publishing any replacement
+        pass
     return data[:tags_at] + ogg_page(serial, 1, 0, [packet], 0x00) + data[tags_end:]
 
 
