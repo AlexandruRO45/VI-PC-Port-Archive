@@ -229,5 +229,58 @@ class TestVPkMaxU16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(mach.vgprs[3], P(25, 20))
 
 
+class SimdWave:
+    def __init__(self, size: int = 32):
+        self.size = size
+        self.exec_mask: int = (1 << size) - 1
+        self.lanes: list[dict[int, int]] = [{i: 0 for i in range(32)} for _ in range(size)]
+
+    def step_pk_max(self, dst_idx: int, s0_idx: int, s1_idx: int):
+        for lane in range(self.size):
+            if self.exec_mask & (1 << lane):
+                s0 = self.lanes[lane].get(s0_idx, 0)
+                s1 = self.lanes[lane].get(s1_idx, 0)
+                self.lanes[lane][dst_idx] = ref_pk_max_u16(s0, s1)
+
+
+class TestVPkMaxU16SIMDDivergence(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergence_and_exec_mask(self):
+        wave = SimdWave(32)
+        for lane in range(32):
+            wave.lanes[lane][1] = P(lane * 10, 100 - lane)
+            wave.lanes[lane][2] = P(50, 50)
+            wave.lanes[lane][0] = 0xDEADBEEF
+
+        # Exec mask: only even lanes
+        wave.exec_mask = 0x55555555
+        wave.step_pk_max(0, 1, 2)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                expected = ref_pk_max_u16(wave.lanes[lane][1], wave.lanes[lane][2])
+                self.assertEqual(wave.lanes[lane][0], expected)
+            else:
+                self.assertEqual(wave.lanes[lane][0], 0xDEADBEEF)
+
+    def test_wave64_divergence(self):
+        wave = SimdWave(64)
+        for lane in range(64):
+            wave.lanes[lane][1] = P(lane * 100, 6000 - lane * 10)
+            wave.lanes[lane][2] = P(3000, 3000)
+            wave.lanes[lane][0] = 0xCAFEBABE
+
+        wave.exec_mask = 0x00000000FFFFFFFF  # lower 32 lanes active
+        wave.step_pk_max(0, 1, 2)
+
+        for lane in range(64):
+            if lane < 32:
+                expected = ref_pk_max_u16(wave.lanes[lane][1], wave.lanes[lane][2])
+                self.assertEqual(wave.lanes[lane][0], expected)
+            else:
+                self.assertEqual(wave.lanes[lane][0], 0xCAFEBABE)
+
+
 if __name__ == '__main__':
     unittest.main()
