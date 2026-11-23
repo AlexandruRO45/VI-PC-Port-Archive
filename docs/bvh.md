@@ -546,6 +546,72 @@ python -I tools/xdxr_bvh.py validate <dumped BVH buffer>    # structural check o
 python -I tests/test_xdxr_bvh.py
 ```
 
+## 7c. The native instruction against the translator on real nodes (measured)
+
+**Status: measured** on an AMD Radeon RX 6800 (gfx1030), Windows 11, AMD driver 32.0.21045.29003, through
+`tools/hw_oracle`. The nodes come from 39 console BLASes rehydrated with `tools/bvh_rehydrate.py` (§7). One
+`image_bvh_intersect_ray` step runs per case, with the default descriptor and types 0, 1, 4 and 5 only. Box nodes run
+with their child ids replaced by ids inside the oracle buffer. Only the counts below are reproduced here: no node,
+ray or structure.
+
+**Node types reachable from the 39 runtime roots:**
+
+| type | nodes | notes |
+|---|---:|---|
+| BOX32 | 81,290 | |
+| BOX16 | 3,346 | every root is a BOX16 |
+| TRI0 | 219,960 | every leaf |
+| TRI1, TRI2, TRI3, INSTANCE, AABB_GEOMETRY | 0 | never occur as a pointer |
+
+- 188,540 leaves (85.7%) hold a second primitive. In every one of them, the TRI1 slots (1, 3, 2) are exactly that
+  primitive's vertices.
+- Of the box nodes, 62,396 have 4 children, 10,493 have 3 and 11,747 have 2.
+
+**Runs:**
+- 118 dispatches with 2,289 sampled cases and 236 controls:
+  - 1,440 triangle cases: interior, shared-edge, vertex and outer-edge rays, each paired leaf under TRI0 and TRI1;
+  - 849 box cases (759 BOX32, 90 BOX16): rays at, inside and beside children, axis-parallel, and with the extent at
+    a child's entry distance.
+- Controls (cases copied from earlier hand-built kernels) 236/236 bit-exact. The 32- and 64-bit forms agree on every
+  triangle case.
+- BOX16 nodes give the same words whether a kernel holds 2 or 12 of them (6/6).
+
+**Hardware model:**
+- **Boxes:** the #3567 slab test with the extent rule `max(tnear, 0) <= extent`, with the slab distances
+  `(plane - o) * inv` **rounded toward zero**, reproduces 849/849 box results. Round-to-nearest gets 812/849. The
+  37 differences are a child at `t0 == extent` (36) and a sort tie (1).
+- **Triangles:** the Ray tracing row's model with **every operation rounded toward zero**:
+  - `V - o` first;
+  - word 1 formed as `(|d_kz| U + |d_kz| V) + |d_kz| W`, not `|d_kz| (U + V + W)`.
+
+  This reproduces words 1-3 in 1,440/1,440 cases, word 0 in all 627 hits, and every word in all 1,198 cases where no
+  edge function is exactly 0. In the 242 cases with an exactly-zero edge function, #4202's tie rule decides 202. The
+  other 40 are open.
+
+**Against the translators (hardware as the reference):**
+
+| translator | box: equal | box: differ | triangle: equal | triangle: differ |
+|---|---:|---:|---:|---:|
+| origin/main | 745 | 104 | 0 | 1,440 |
+| main + #4202 + #4750 | 812 | 37 | 11 | 1,429 |
+
+The rest of the merged translator's triangle rows differ only by rounding:
+- 498 hits with t within 16 ulp, 27 with equal quotients, 34 further apart;
+- 731 misses that differ in the barycentric words;
+- 139 hit/miss flips on rounding-sensitive rays (119), or at an exactly-zero edge function in round-to-nearest (20).
+
+The hardware's words are closer to zero than round-to-nearest in 75-92% of the differing words, depending on the word.
+
+**Exact arithmetic and t accuracy:**
+- On the 785 triangle cases whose edge functions are not within 16·2⁻²⁴ of their magnitude, the hardware's hit/miss
+  equals exact arithmetic in every case.
+- t = w0/w1 is within 16 ulp of the exact intersection in 586 of 627 hits; median 0.57 ulp.
+- Of the 169 rays through a shared edge, 165 hit exactly one of the two triangles. Exact arithmetic gives the same
+  pattern for the other 4, which are folded pairs (two hits, or none).
+
+The tool and its synthetic test: `python -I tools/bvh_hw_diff.py --self-test`, `python -I tests/test_bvh_hw_diff.py`.
+Running kernels needs the triangle probe of PR #4202 (tools/bvh_tri_probe.py there), for the kernel layout and checks.
+
 ## 8. No-sharing rule
 
 Nothing from the packs may be committed: no `.rpf`, carved stream, decompressed buffer, XML text, tile list,
