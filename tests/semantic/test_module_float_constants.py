@@ -82,14 +82,21 @@ class ModuleFloatConstantTests(unittest.TestCase):
         g.fconsts, g.fconsts_frozen, g.consts, g.body, g.n = {}, False, {}, [], 0
         g.emulate = False
         self.assertEqual(g.fconst(2.0 ** -126), "%cf_00800000")
-        self.assertEqual(g.fconst(1.0), "%cf_3f800000")
-        self.assertEqual(g.fconst(0.0), "%cf_00000000")
+        self.assertEqual(g.fconst(1.5), "%cf_3fc00000")
+        # +0 and 1 are the %f0 and %f1 every module declares, and 0.5 is %fhalf_g: no second constant of the same value.
+        self.assertEqual(g.fconst(0.0), "%f0")
+        self.assertEqual(g.fconst(1.0), "%f1")
+        g.uses_fhalf = False
+        self.assertEqual(g.fconst(0.5), "%fhalf_g")
+        self.assertTrue(g.uses_fhalf)
+        self.assertEqual(sorted(g.fconsts), [0x00800000, 0x3FC00000])
         self.assertIs(g.fconst(2.0 ** -126), g.fconsts[0x00800000])      # one declaration per value
         for x in (-0.0, 2.0 ** -149, float("inf"), float("-inf"), float("nan")):
             with self.subTest(x=x):
                 self.assertFalse(g.fconst(x).startswith("%cf_"))
         g.fconsts_frozen = True                                           # after the module's constants are written
-        self.assertFalse(g.fconst(0.5).startswith("%cf_"))
+        self.assertFalse(g.fconst(0.75).startswith("%cf_"))
+        self.assertEqual(g.fconst(1.0), "%f1")                           # declared in every module, so still usable
 
     def test_a_translated_module_declares_flt_min_once(self):
         lines = ["v_mov_b32 v0, 0x00800001", "v_mov_b32 v1, 0x3f000000",
@@ -98,6 +105,8 @@ class ModuleFloatConstantTests(unittest.TestCase):
         spv = support.translate_lines("ps_module_float_constants", lines)
         self.assertEqual(len(re.findall(r"^%cf_00800000 = OpConstant %float ", spv, re.M)), 1)
         self.assertNotIn("OpBitcast %float %c800000", spv)
+        values = re.findall(r"^%\S+ = OpConstant %float (\S+)$", spv, re.M)
+        self.assertEqual(len(values), len({float(v) for v in values}), "two float constants of the same value")
         support.mrt0_words(spv)     # the module still runs in the interpreter with the module-scope constants
 
 

@@ -5939,16 +5939,24 @@ class Gen:
         self.emit(f"{out} = OpSelect %float {hit} %f0 {r}")
         return out
 
+    MODULE_FLOATS = {0x00000000: "%f0", 0x3F800000: "%f1"}    # declared in every module, before any constant
+
     def fconst(self, x):
         """The f32 constant x. A finite normal value or +0 is one module-scope OpConstant, shared by every use (it was
         an OpBitcast of the uint constant at each use: 3.5% of the body lines on a corpus sample, most of them the
         FLT_MIN of flush_f32). Written in decimal as repr() of its exact value, which both spirv-as (decimal straight
         to binary32) and tools/spirv_asm.py (decimal via binary64, #3911) turn into these exact bits, since the value
-        is exactly representable in both. -0, subnormals, inf and NaN keep the bitcast, and so does any fconst after
-        the module's constants are written."""
+        is exactly representable in both. +0 and 1 are the %f0 and %f1 every module declares, and 0.5 is %fhalf_g.
+        -0, subnormals, inf and NaN keep the bitcast, and so does any other fconst after the module's constants are
+        written."""
         bits = struct.unpack("<I", struct.pack("<f", x))[0]
+        if bits in self.MODULE_FLOATS:
+            return self.MODULE_FLOATS[bits]
         exp = bits & 0x7F800000
-        if not self.fconsts_frozen and (bits == 0 or (exp and exp != 0x7F800000)):
+        if not self.fconsts_frozen and bits == 0x3F000000:
+            self.uses_fhalf = True
+            return "%fhalf_g"
+        if not self.fconsts_frozen and exp and exp != 0x7F800000:
             name = self.fconsts.get(bits)
             if name is None:
                 name = self.fconsts[bits] = f"%cf_{bits:08x}"
@@ -5959,6 +5967,7 @@ class Gen:
     def fconst_value(bits):
         """The decimal OpConstant literal for an f32 bit pattern fconst hoists (finite normal or +0)."""
         return repr(struct.unpack("<f", struct.pack("<I", bits))[0])
+
     def dconst(self, x):
         """A %double value (needs uses_f64): the two words of x, bitcast."""
         bits = struct.unpack("<Q", struct.pack("<d", x))[0]
