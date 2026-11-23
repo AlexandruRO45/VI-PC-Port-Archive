@@ -598,6 +598,37 @@ test('successful chunks unload and can load again with a fresh attempt budget', 
     assert.equal(f.state.live.get('chunk_0').attempts, 1);
 });
 
+test('an out-and-back stream keeps the shared resident chunk and reloads each evicted chunk', async t => {
+    const f = fixture(3);
+    for (const [i, chunk] of f.context.world.chunks.entries()) {
+        const x = i * 1500;
+        chunk.bounds = [x, 0, 0, x + 1, 1, 1];
+    }
+    function model() {
+        const geometry = { dispose: t.mock.fn() };
+        return { geometry, traverse(visit) { visit({ geometry }); } };
+    }
+    const [west, middle, east, westAgain, eastAgain] = Array.from({ length: 5 }, model);
+    const move = x => { f.context.camera.position.x = x; f.frame(); };
+
+    move(750);
+    await f.succeed(0, west);
+    await f.succeed(1, middle);
+    move(2250);
+    await f.succeed(2, east);
+    move(750);
+    await f.succeed(3, westAgain);
+    move(2250);
+    await f.succeed(4, eastAgain);
+
+    assert.deepEqual(f.requests.map(r => r.url), ['0.glb', '1.glb', '2.glb', '0.glb', '2.glb']);
+    assert.deepEqual([...f.state.live.keys()].sort(), ['chunk_1', 'chunk_2']);
+    assert.equal(f.state.live.get('chunk_1').obj, middle);
+    assert.equal(f.state.live.get('chunk_2').obj, eastAgain);
+    for (const retired of [west, east, westAgain]) assert.equal(retired.geometry.dispose.mock.callCount(), 1);
+    for (const retained of [middle, eastAgain]) assert.equal(retained.geometry.dispose.mock.callCount(), 0);
+});
+
 test('clay, wireframe and eviction preserve imported material metadata', async t => {
     const f = fixture();
     const materials = [{ dispose: t.mock.fn() }, { dispose: t.mock.fn() }];
