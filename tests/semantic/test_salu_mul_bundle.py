@@ -1,612 +1,438 @@
 """Comprehensive semantic regression suite and hardware translator verification
-for AMD RDNA2 SALU 32-bit integer multiplication and division helpers (Bundle 40):
+for AMD RDNA2 SALU 32-bit integer multiplication instructions (Bundle 40):
   - s_mul_i32:    32-bit integer multiplication (low 32 bits, signed/unsigned identical)
   - s_mul_hi_i32: Signed 32-bit integer multiplication high-half (high 32 bits of 64-bit product)
   - s_mul_hi_u32: Unsigned 32-bit integer multiplication high-half (high 32 bits of 64-bit product)
 
+100% translator-backed: every test executes real RDNA2 assembly through tools/rdna2spirv.py
+via support.translate_lines(...) and verifies lowered SPIR-V opcodes and output words via
+support.mrt0_words(...). Zero in-file mock models.
+
 Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
-Exercises tools/rdna2spirv.py via support.translate_lines(...) and support.mrt0_words for hardware-accurate translation.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum, auto
 import os
 import random
-import struct
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
-sys.path.insert(0, TOOLS_DIR)
-sys.path.insert(0, HERE)
 
-try:
-    import rdna2spirv
-    import support
-except Exception:
-    rdna2spirv = None  # type: ignore
-    support = None  # type: ignore
+sys.dont_write_bytecode = True
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support
 
 MASK32: int = 0xFFFFFFFF
 MASK64: int = 0xFFFFFFFFFFFFFFFF
 
 
-def u32(val: int) -> int:
-    return val & MASK32
+def _run_binary_op(
+    op: str,
+    s0_val: int,
+    s1_val: int,
+    s0_is_imm: bool = False,
+    s1_is_imm: bool = False,
+    tag: str = "",
+) -> int:
+    """Translates and runs a pixel shader executing `op s2, s0, s1`."""
+    s0_val = s0_val & MASK32
+    s1_val = s1_val & MASK32
+    s0_expr = f"{s0_val:#x}" if s0_is_imm else "s0"
+    s1_expr = f"{s1_val:#x}" if s1_is_imm else "s1"
+    lines = []
+    if not s0_is_imm:
+        lines.append(f"s_mov_b32 s0, {s0_val:#x}")
+    if not s1_is_imm:
+        lines.append(f"s_mov_b32 s1, {s1_val:#x}")
+    lines.extend([
+        f"{op} s2, {s0_expr}, {s1_expr}",
+        "v_mov_b32 v0, s2",
+        "v_mov_b32 v1, 0",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0, v0, v1, v2, v3 done",
+        "s_endpgm",
+    ])
+    shader_name = f"ps_{op}_{tag}_{s0_val}_{s1_val}".replace("-", "n")
+    spvasm = support.translate_lines(shader_name, lines)
+    words = support.mrt0_words(spvasm)
+    return words[0]
 
 
-def i32(val: int) -> int:
-    v = val & MASK32
-    return v - 0x100000000 if v >= 0x80000000 else v
-
-class Opcode(Enum):
-    S_MUL_I32 = "s_mul_i32"
-    S_MUL_HI_I32 = "s_mul_hi_i32"
-    S_MUL_HI_U32 = "s_mul_hi_u32"
-
-
-class OperandKind(Enum):
-    SGPR = auto()
-    IMM = auto()
-
-
-@dataclass(frozen=True)
-class ASTOperand:
-    kind: OperandKind
-    index: int = 0
-    value: int = 0
-
-    @classmethod
-    def sgpr(cls, idx: int) -> ASTOperand:
-        return cls(kind=OperandKind.SGPR, index=idx)
-
-    @classmethod
-    def imm(cls, val: int) -> ASTOperand:
-        return cls(kind=OperandKind.IMM, value=val & MASK32)
+def _run_with_scc(op: str, s0_val: int, s1_val: int, initial_scc: int) -> tuple[int, int]:
+    """Translates and runs a shader testing SCC flag preservation across `op`."""
+    s0_val = s0_val & MASK32
+    s1_val = s1_val & MASK32
+    # s_cmp_eq_u32 5, 5 sets SCC=1; s_cmp_eq_u32 5, 6 sets SCC=0
+    cmp_rhs = 5 if initial_scc else 6
+    lines = [
+        f"s_cmp_eq_u32 5, {cmp_rhs}",
+        f"s_mov_b32 s0, {s0_val:#x}",
+        f"s_mov_b32 s1, {s1_val:#x}",
+        f"{op} s2, s0, s1",
+        "s_cselect_b32 s3, 1, 0",
+        "v_mov_b32 v0, s2",
+        "v_mov_b32 v1, s3",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0, v0, v1, v2, v3 done",
+        "s_endpgm",
+    ]
+    shader_name = f"ps_{op}_scc_{initial_scc}_{s0_val}_{s1_val}"
+    spvasm = support.translate_lines(shader_name, lines)
+    words = support.mrt0_words(spvasm)
+    return words[0], words[1]
 
 
-@dataclass(frozen=True)
-class ASTInstruction:
-    opcode: Opcode
-    dst: ASTOperand
-    src0: ASTOperand
-    src1: ASTOperand
+def _run_aliased(op: str, s0_val: int, s1_val: int, mode: str) -> int:
+    """Translates and runs in-place register aliasing for `op`."""
+    s0_val = s0_val & MASK32
+    s1_val = s1_val & MASK32
+    lines = [
+        f"s_mov_b32 s0, {s0_val:#x}",
+        f"s_mov_b32 s1, {s1_val:#x}",
+    ]
+    if mode == "dst_src0":
+        lines.append(f"{op} s0, s0, s1")
+        dst_sgpr = "s0"
+    elif mode == "dst_src1":
+        lines.append(f"{op} s1, s0, s1")
+        dst_sgpr = "s1"
+    else:  # all_same
+        lines.append(f"{op} s0, s0, s0")
+        dst_sgpr = "s0"
 
-    def disasm(self) -> str:
-        def fmt(op: ASTOperand) -> str:
-            if op.kind == OperandKind.SGPR:
-                return f"s{op.index}"
-            return hex(op.value)
-
-        return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}"
-
-class ScalarMachineState:
-    def __init__(self, num_sgprs: int = 106) -> None:
-        self.sgprs: list[int] = [0] * num_sgprs
-        self.scc: int = 0
-
-    def read_operand(self, op: ASTOperand) -> int:
-        if op.kind == OperandKind.SGPR:
-            return self.sgprs[op.index] & MASK32
-        return op.value & MASK32
-
-    def write_sgpr(self, idx: int, val: int) -> None:
-        self.sgprs[idx] = val & MASK32
-
-
-GLOBAL_ORACLE_MAP: dict[Opcode, Callable[[int, int], int]] = {}
-
-
-class ScalarInterpreter:
-    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> int:
-        s0 = state.read_operand(instr.src0)
-        s1 = state.read_operand(instr.src1)
-        res = GLOBAL_ORACLE_MAP[instr.opcode](s0, s1)
-        if instr.dst.kind == OperandKind.SGPR:
-            state.write_sgpr(instr.dst.index, res)
-        # Note: s_mul_i32, s_mul_hi_i32, s_mul_hi_u32 do NOT modify SCC in RDNA2 ISA
-        return res
-
-class ScalarWaveModel:
-    """SALU scalar wave model: SALU operations execute once per wave and broadcast
-    identically across all active or inactive lanes.
-    """
-    def __init__(self, wave_size: int = 32, exec_mask: int = 0xFFFFFFFF) -> None:
-        self.wave_size = wave_size
-        self.exec_mask = exec_mask & ((1 << wave_size) - 1)
-
-    def broadcast_result(self, scalar_val: int) -> list[int]:
-        # Scalar result is uniform across all lanes of the wave
-        return [scalar_val & MASK32] * self.wave_size
-
-def ref_s_mul_i32(s0: int, s1: int) -> int:
-    """Low 32 bits of 32x32 integer multiply (identical for signed/unsigned)."""
-    return (s0 * s1) & MASK32
+    lines.extend([
+        f"v_mov_b32 v0, {dst_sgpr}",
+        "v_mov_b32 v1, 0",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0, v0, v1, v2, v3 done",
+        "s_endpgm",
+    ])
+    shader_name = f"ps_{op}_alias_{mode}_{s0_val}_{s1_val}"
+    spvasm = support.translate_lines(shader_name, lines)
+    words = support.mrt0_words(spvasm)
+    return words[0]
 
 
-class TestSMulI32Oracle(unittest.TestCase):
-    def test_oracle_basic_multiplication(self) -> None:
-        self.assertEqual(ref_s_mul_i32(6, 7), 42)
-        self.assertEqual(ref_s_mul_i32(100, 200), 20000)
+class TestSMulI32Translator(unittest.TestCase):
+    """100% translator-backed regression suite for s_mul_i32."""
 
-    def test_oracle_negative_operands(self) -> None:
-        self.assertEqual(ref_s_mul_i32(u32(-3), 4), u32(-12))
-        self.assertEqual(ref_s_mul_i32(u32(-5), u32(-6)), 30)
+    def test_basic_multiplication(self) -> None:
+        self.assertEqual(_run_binary_op("s_mul_i32", 6, 7, tag="basic1"), 42)
+        self.assertEqual(_run_binary_op("s_mul_i32", 100, 200, tag="basic2"), 20000)
 
-    def test_oracle_zero_and_identity(self) -> None:
-        self.assertEqual(ref_s_mul_i32(0, 12345), 0)
-        self.assertEqual(ref_s_mul_i32(12345, 1), 12345)
+    def test_negative_operands(self) -> None:
+        # (-3) * 4 = -12 -> 0xFFFFFFF4
+        self.assertEqual(_run_binary_op("s_mul_i32", -3, 4, tag="neg1"), (-12) & MASK32)
+        # (-5) * (-6) = 30
+        self.assertEqual(_run_binary_op("s_mul_i32", -5, -6, tag="neg2"), 30)
 
-    def test_oracle_wrapping_modulo_2_32(self) -> None:
-        # 0x10001 * 0x10001 = 0x200020001 & 0xFFFFFFFF = 0x00020001
-        self.assertEqual(ref_s_mul_i32(0x10001, 0x10001), 0x00020001)
+    def test_zero_and_identity(self) -> None:
+        self.assertEqual(_run_binary_op("s_mul_i32", 0, 12345, tag="zero"), 0)
+        self.assertEqual(_run_binary_op("s_mul_i32", 12345, 1, tag="ident"), 12345)
 
-class TestSMulI32ASTAndSignExtensions(unittest.TestCase):
-    def test_ast_instruction_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.S_MUL_I32,
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-        )
-        self.assertEqual(inst.disasm(), "s_mul_i32 s2, s0, s1")
+    def test_wrapping_modulo_2_32(self) -> None:
+        # 0x10001 * 0x10001 = 0x200020001 & MASK32 = 0x00020001
+        self.assertEqual(_run_binary_op("s_mul_i32", 0x10001, 0x10001, tag="wrap1"), 0x00020001)
+        # 0xFFFFFFFF * 0xFFFFFFFF = (-1)*(-1) = 1
+        self.assertEqual(_run_binary_op("s_mul_i32", 0xFFFFFFFF, 0xFFFFFFFF, tag="wrap2"), 1)
 
-    def test_imm_operands_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.S_MUL_I32,
-            ASTOperand.sgpr(4),
-            ASTOperand.sgpr(2),
-            ASTOperand.imm(0x100),
-        )
-        self.assertEqual(inst.disasm(), "s_mul_i32 s4, s2, 0x100")
-
-    def test_sign_extension_consistency(self) -> None:
-        val_neg = u32(-50)
-        self.assertEqual(i32(val_neg), -50)
-        self.assertEqual(u32(i32(val_neg)), val_neg)
-
-GLOBAL_ORACLE_MAP[Opcode.S_MUL_I32] = ref_s_mul_i32
-
-
-class TestSMulI32ScalarInterpreter(unittest.TestCase):
-    def test_step_sgpr_sources(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 25)
-        state.write_sgpr(1, 4)
-        inst = ASTInstruction(
-            Opcode.S_MUL_I32,
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
+    def test_imm_src1_operand(self) -> None:
+        res = _run_binary_op("s_mul_i32", 25, 4, s1_is_imm=True, tag="imm1")
         self.assertEqual(res, 100)
-        self.assertEqual(state.sgprs[2], 100)
 
-    def test_step_imm_source(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(5, 12)
-        inst = ASTInstruction(
-            Opcode.S_MUL_I32,
-            ASTOperand.sgpr(6),
-            ASTOperand.sgpr(5),
-            ASTOperand.imm(12),
-        )
-        res = ScalarInterpreter().step(inst, state)
+    def test_imm_src0_operand(self) -> None:
+        res = _run_binary_op("s_mul_i32", 12, 12, s0_is_imm=True, tag="imm0")
         self.assertEqual(res, 144)
-        self.assertEqual(state.sgprs[6], 144)
 
-class TestSMulI32ConditionCodeAndSCC(unittest.TestCase):
-    def test_scc_preservation_when_zero(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 0
-        state.write_sgpr(0, 10)
-        state.write_sgpr(1, 10)
-        inst = ASTInstruction(
-            Opcode.S_MUL_I32,
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 0)
+    def test_large_literal_operand(self) -> None:
+        a = 0x1234
+        b = 0x5678
+        res = _run_binary_op("s_mul_i32", a, b, s1_is_imm=True, tag="lit")
+        self.assertEqual(res, (a * b) & MASK32)
 
-    def test_scc_preservation_when_one(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.write_sgpr(0, 0)
-        state.write_sgpr(1, 10)
-        inst = ASTInstruction(
-            Opcode.S_MUL_I32,
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-        )
-        ScalarInterpreter().step(inst, state)
-        self.assertEqual(state.scc, 1)
+    def test_register_aliasing_dst_src0(self) -> None:
+        # s0 = s0 * s1
+        res = _run_aliased("s_mul_i32", 15, 3, "dst_src0")
+        self.assertEqual(res, 45)
 
-class TestSMulI32SIMDAndWaveDivergence(unittest.TestCase):
-    def test_wave_uniform_broadcast(self) -> None:
-        wave = ScalarWaveModel(wave_size=32, exec_mask=0x00FF00FF)
-        val = ref_s_mul_i32(15, 3)
-        lanes = wave.broadcast_result(val)
-        self.assertEqual(len(lanes), 32)
-        self.assertTrue(all(l == 45 for l in lanes))
+    def test_register_aliasing_dst_src1(self) -> None:
+        # s1 = s0 * s1
+        res = _run_aliased("s_mul_i32", 11, 8, "dst_src1")
+        self.assertEqual(res, 88)
 
-    def test_wave64_uniform_broadcast(self) -> None:
-        wave = ScalarWaveModel(wave_size=64, exec_mask=MASK64)
-        val = ref_s_mul_i32(u32(-1), 10)
-        lanes = wave.broadcast_result(val)
-        self.assertEqual(len(lanes), 64)
-        self.assertTrue(all(l == u32(-10) for l in lanes))
+    def test_register_aliasing_all_same(self) -> None:
+        # s0 = s0 * s0
+        res = _run_aliased("s_mul_i32", 9, 9, "all_same")
+        self.assertEqual(res, 81)
 
-class TestSMulI32IntegerOverflowExtremes(unittest.TestCase):
-    def test_int32_min_multiplied(self) -> None:
-        int32_min = 0x80000000
-        # -2147483648 * 2 = -4294967296 -> low 32 bits = 0
-        self.assertEqual(ref_s_mul_i32(int32_min, 2), 0)
-        # -2147483648 * -1 = 2147483648 -> low 32 bits = 0x80000000
-        self.assertEqual(ref_s_mul_i32(int32_min, u32(-1)), int32_min)
+    def test_scc_preservation_scc1(self) -> None:
+        # s_mul_i32 must not overwrite SCC when SCC=1
+        res, scc = _run_with_scc("s_mul_i32", 10, 10, initial_scc=1)
+        self.assertEqual(res, 100)
+        self.assertEqual(scc, 1)
 
-    def test_all_ones_squared(self) -> None:
-        # (-1) * (-1) = 1 in 32-bit wrap
-        self.assertEqual(ref_s_mul_i32(0xFFFFFFFF, 0xFFFFFFFF), 1)
+    def test_scc_preservation_scc0(self) -> None:
+        # s_mul_i32 must not overwrite SCC when SCC=0
+        res, scc = _run_with_scc("s_mul_i32", 10, 10, initial_scc=0)
+        self.assertEqual(res, 100)
+        self.assertEqual(scc, 0)
 
-    def test_large_prime_wrapping(self) -> None:
-        a = 0xDEADBEEF
-        b = 0xCAFEBABE
-        expected = (0xDEADBEEF * 0xCAFEBABE) & MASK32
-        self.assertEqual(ref_s_mul_i32(a, b), expected)
-
-class TestSMulI32TranslatorIntegration(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
+    def test_spirv_opimul_emission(self) -> None:
         lines = [
-            "s_mov_b32 s0, 0xa",
-            "s_mov_b32 s1, 0x14",
+            "v_readfirstlane_b32 s0, v0",
+            "s_mov_b32 s1, 4",
             "s_mul_i32 s2, s0, s1",
             "v_mov_b32 v0, s2",
-            "exp mrt0 v0, v0, v0, v0 done vm",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0, v0, v1, v2, v3 done",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_bundle_s_mul_i32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 200)
+        spvasm = support.translate_lines("ps_s_mul_i32_opcode_check", lines)
+        self.assertIn("OpIMul %uint", spvasm)
 
-class TestSMulI32Validation(unittest.TestCase):
-    def test_commutativity(self) -> None:
-        rng = random.Random(12345)
-        for _ in range(50):
-            a = rng.randint(0, MASK32)
-            b = rng.randint(0, MASK32)
-            self.assertEqual(ref_s_mul_i32(a, b), ref_s_mul_i32(b, a))
-
-    def test_distributivity_modulo_2_32(self) -> None:
-        rng = random.Random(67890)
-        for _ in range(50):
-            a = rng.randint(0, 0xFFFF)
-            b = rng.randint(0, 0xFFFF)
-            c = rng.randint(0, 0xFFFF)
-            left = ref_s_mul_i32(a, (b + c) & MASK32)
-            right = (ref_s_mul_i32(a, b) + ref_s_mul_i32(a, c)) & MASK32
-            self.assertEqual(left, right)
-
-def ref_s_mul_hi_i32(s0: int, s1: int) -> int:
-    """High 32 bits of 64-bit signed integer product."""
-    a = i32(s0)
-    b = i32(s1)
-    prod = a * b
-    return (prod >> 32) & MASK32
+    def test_random_fuzz_batches(self) -> None:
+        pairs = [
+            (0xDEADBEEF, 0x00000007),
+            (0x12345678, 0x000000FF),
+            (0x80000000, 0x00000002),
+            (0x7FFFFFFF, 0x00000003),
+            (0xAAAAAAAA, 0x55555555),
+        ]
+        for idx, (a, b) in enumerate(pairs):
+            with self.subTest(a=hex(a), b=hex(b)):
+                res = _run_binary_op("s_mul_i32", a, b, tag=f"fuzz_{idx}")
+                self.assertEqual(res, (a * b) & MASK32)
 
 
-class TestSMulHiI32Oracle(unittest.TestCase):
-    def test_oracle_small_positive_product(self) -> None:
-        # Small positive products fit in low 32 bits, high 32 bits is 0
-        self.assertEqual(ref_s_mul_hi_i32(100, 200), 0)
+class TestSMulHiI32Translator(unittest.TestCase):
+    """100% translator-backed regression suite for s_mul_hi_i32 (signed high product)."""
 
-    def test_oracle_small_negative_product(self) -> None:
-        # -2 * 100 = -200 -> in 64-bit two's complement, high 32 bits is 0xFFFFFFFF
-        self.assertEqual(ref_s_mul_hi_i32(u32(-2), 100), 0xFFFFFFFF)
+    def test_small_positive_zero_high(self) -> None:
+        # 100 * 200 = 20000 -> high 32 bits = 0
+        self.assertEqual(_run_binary_op("s_mul_hi_i32", 100, 200, tag="pos_zero"), 0)
 
-    def test_oracle_negative_times_negative(self) -> None:
-        # (-1) * (-1) = 1 -> high 32 bits is 0
-        self.assertEqual(ref_s_mul_hi_i32(0xFFFFFFFF, 0xFFFFFFFF), 0)
+    def test_small_negative_product(self) -> None:
+        # -2 * 100 = -200 -> in 64-bit signed two's complement, high 32 bits = 0xFFFFFFFF
+        self.assertEqual(_run_binary_op("s_mul_hi_i32", -2, 100, tag="neg_high"), 0xFFFFFFFF)
 
-    def test_oracle_large_signed_product(self) -> None:
-        # -2147483648 * -2147483648 = 2^62 = 0x40000000_00000000 -> high 32 bits is 0x40000000
-        self.assertEqual(ref_s_mul_hi_i32(0x80000000, 0x80000000), 0x40000000)
+    def test_negative_times_negative(self) -> None:
+        # (-1) * (-1) = 1 -> high 32 bits = 0
+        self.assertEqual(_run_binary_op("s_mul_hi_i32", -1, -1, tag="neg_neg"), 0)
 
-class TestSMulHiI32ASTAndSignExtensions(unittest.TestCase):
-    def test_ast_instruction_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.S_MUL_HI_I32,
-            ASTOperand.sgpr(3),
-            ASTOperand.sgpr(1),
-            ASTOperand.sgpr(2),
-        )
-        self.assertEqual(inst.disasm(), "s_mul_hi_i32 s3, s1, s2")
+    def test_large_signed_product(self) -> None:
+        # -2147483648 * -2147483648 = 2^62 = 0x40000000_00000000 -> high 32 bits = 0x40000000
+        self.assertEqual(_run_binary_op("s_mul_hi_i32", 0x80000000, 0x80000000, tag="min_min"), 0x40000000)
 
-    def test_imm_source_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.S_MUL_HI_I32,
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-            ASTOperand.imm(u32(-5)),
-        )
-        self.assertEqual(inst.disasm(), f"s_mul_hi_i32 s0, s1, {hex(u32(-5))}")
-
-GLOBAL_ORACLE_MAP[Opcode.S_MUL_HI_I32] = ref_s_mul_hi_i32
-
-
-class TestSMulHiI32ScalarInterpreter(unittest.TestCase):
-    def test_step_execution(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, u32(-1))
-        state.write_sgpr(1, 5)
-        inst = ASTInstruction(
-            Opcode.S_MUL_HI_I32,
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xFFFFFFFF)
-        self.assertEqual(state.sgprs[2], 0xFFFFFFFF)
-
-    def test_step_positive_overflow(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x40000000)
-        state.write_sgpr(1, 4)
-        inst = ASTInstruction(
-            Opcode.S_MUL_HI_I32,
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-        )
-        # 0x40000000 * 4 = 0x100000000 -> high 32 bits is 1
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 1)
-        self.assertEqual(state.sgprs[2], 1)
-
-class TestSMulHiI32ConditionCodeAndSCC(unittest.TestCase):
-    def test_scc_preserved_neutral(self) -> None:
-        state = ScalarMachineState()
-        for initial_scc in (0, 1):
-            state.scc = initial_scc
-            state.write_sgpr(0, 0x7FFFFFFF)
-            state.write_sgpr(1, 2)
-            inst = ASTInstruction(
-                Opcode.S_MUL_HI_I32,
-                ASTOperand.sgpr(2),
-                ASTOperand.sgpr(0),
-                ASTOperand.sgpr(1),
-            )
-            ScalarInterpreter().step(inst, state)
-            self.assertEqual(state.scc, initial_scc)
-
-class TestSMulHiI32SIMDAndWaveDivergence(unittest.TestCase):
-    def test_wave_broadcast(self) -> None:
-        wave = ScalarWaveModel(wave_size=32)
-        hi_val = ref_s_mul_hi_i32(0x80000000, 0x80000000)
-        lanes = wave.broadcast_result(hi_val)
-        self.assertTrue(all(l == 0x40000000 for l in lanes))
-
-    def test_inactive_lane_uniformity(self) -> None:
-        wave = ScalarWaveModel(wave_size=32, exec_mask=0x00000001)
-        hi_val = ref_s_mul_hi_i32(u32(-10), 100)
-        lanes = wave.broadcast_result(hi_val)
-        self.assertTrue(all(l == 0xFFFFFFFF for l in lanes))
-
-class TestSMulHiI32IntegerOverflowExtremes(unittest.TestCase):
     def test_int32_min_times_minus_one(self) -> None:
-        # -2147483648 * -1 = +2147483648 (0x00000000_80000000) -> high 32 bits is 0
-        self.assertEqual(ref_s_mul_hi_i32(0x80000000, 0xFFFFFFFF), 0)
+        # -2147483648 * -1 = +2147483648 (0x00000000_80000000) -> high 32 bits = 0
+        self.assertEqual(_run_binary_op("s_mul_hi_i32", 0x80000000, -1, tag="min_mone"), 0)
 
     def test_int32_max_times_int32_max(self) -> None:
-        # 0x7FFFFFFF * 0x7FFFFFFF = 0x3FFFFFFF_00000001 -> high 32 bits is 0x3FFFFFFF
-        self.assertEqual(ref_s_mul_hi_i32(0x7FFFFFFF, 0x7FFFFFFF), 0x3FFFFFFF)
+        # 0x7FFFFFFF * 0x7FFFFFFF = 0x3FFFFFFF_00000001 -> high 32 bits = 0x3FFFFFFF
+        self.assertEqual(_run_binary_op("s_mul_hi_i32", 0x7FFFFFFF, 0x7FFFFFFF, tag="max_max"), 0x3FFFFFFF)
 
     def test_int32_min_times_int32_max(self) -> None:
-        # (-2^31) * (2^31 - 1) = -2^62 + 2^31 = 0xC0000000_80000000 -> high 32 bits is 0xC0000000
-        self.assertEqual(ref_s_mul_hi_i32(0x80000000, 0x7FFFFFFF), 0xC0000000)
+        # (-2^31) * (2^31 - 1) = -2^62 + 2^31 = 0xC0000000_80000000 -> high 32 bits = 0xC0000000
+        self.assertEqual(_run_binary_op("s_mul_hi_i32", 0x80000000, 0x7FFFFFFF, tag="min_max"), 0xC0000000)
 
-class TestSMulHiI32TranslatorIntegration(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
-        lines = [
-            "s_mov_b32 s0, 0xffffffff",
-            "s_mov_b32 s1, 0x5",
-            "s_mul_hi_i32 s2, s0, s1",
-            "v_mov_b32 v0, s2",
-            "exp mrt0 v0, v0, v0, v0 done vm",
-            "s_endpgm",
-        ]
-        spv = support.translate_lines("ps_bundle_s_mul_hi_i32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0xFFFFFFFF)
-
-class TestSMulHiI32Validation(unittest.TestCase):
-    def test_commutativity(self) -> None:
-        rng = random.Random(4242)
-        for _ in range(50):
-            a = rng.randint(0, MASK32)
-            b = rng.randint(0, MASK32)
-            self.assertEqual(ref_s_mul_hi_i32(a, b), ref_s_mul_hi_i32(b, a))
-
-    def test_sign_property(self) -> None:
-        # If both a and b are positive, high half must be non-negative (>= 0 and < 0x40000000)
-        rng = random.Random(9999)
-        for _ in range(50):
-            a = rng.randint(1, 0x7FFFFFFF)
-            b = rng.randint(1, 0x7FFFFFFF)
-            hi = ref_s_mul_hi_i32(a, b)
-            self.assertLessEqual(hi, 0x3FFFFFFF)
-
-def ref_s_mul_hi_u32(s0: int, s1: int) -> int:
-    """High 32 bits of 64-bit unsigned integer product."""
-    a = u32(s0)
-    b = u32(s1)
-    prod = a * b
-    return (prod >> 32) & MASK32
-
-
-class TestSMulHiU32Oracle(unittest.TestCase):
-    def test_oracle_small_product(self) -> None:
-        self.assertEqual(ref_s_mul_hi_u32(100, 200), 0)
-
-    def test_oracle_exact_2_32_boundary(self) -> None:
-        # 0x80000000 * 2 = 0x100000000 -> high 32 bits is 1
-        self.assertEqual(ref_s_mul_hi_u32(0x80000000, 2), 1)
-
-    def test_oracle_max_uint32_squared(self) -> None:
-        # (2^32 - 1)^2 = 2^64 - 2^33 + 1 = 0xFFFFFFFE_00000001 -> high 32 bits is 0xFFFFFFFE
-        self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFE)
-
-    def test_oracle_zero_operands(self) -> None:
-        self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0), 0)
-
-class TestSMulHiU32ASTAndSignExtensions(unittest.TestCase):
-    def test_ast_instruction_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.S_MUL_HI_U32,
-            ASTOperand.sgpr(4),
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(3),
-        )
-        self.assertEqual(inst.disasm(), "s_mul_hi_u32 s4, s2, s3")
-
-    def test_imm_source_disasm(self) -> None:
-        inst = ASTInstruction(
-            Opcode.S_MUL_HI_U32,
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-            ASTOperand.imm(0x80000000),
-        )
-        self.assertEqual(inst.disasm(), "s_mul_hi_u32 s0, s1, 0x80000000")
-
-GLOBAL_ORACLE_MAP[Opcode.S_MUL_HI_U32] = ref_s_mul_hi_u32
-
-
-class TestSMulHiU32ScalarInterpreter(unittest.TestCase):
-    def test_step_execution(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x80000000)
-        state.write_sgpr(1, 2)
-        inst = ASTInstruction(
-            Opcode.S_MUL_HI_U32,
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(0),
-            ASTOperand.sgpr(1),
-        )
-        res = ScalarInterpreter().step(inst, state)
+    def test_imm_src1_operand(self) -> None:
+        # 0x40000000 * 4 = 0x100000000 -> high 32 bits = 1
+        res = _run_binary_op("s_mul_hi_i32", 0x40000000, 4, s1_is_imm=True, tag="imm1")
         self.assertEqual(res, 1)
-        self.assertEqual(state.sgprs[2], 1)
 
-    def test_step_imm_operand(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0xFFFFFFFF)
-        inst = ASTInstruction(
-            Opcode.S_MUL_HI_U32,
-            ASTOperand.sgpr(2),
-            ASTOperand.sgpr(1),
-            ASTOperand.imm(5),
-        )
-        # 0xFFFFFFFF * 5 = 0x4_FFFFFFFB -> high 32 bits is 4
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 4)
-        self.assertEqual(state.sgprs[2], 4)
+    def test_imm_src0_operand(self) -> None:
+        # -1 * 5 = -5 -> high 32 bits = 0xFFFFFFFF
+        res = _run_binary_op("s_mul_hi_i32", -1, 5, s0_is_imm=True, tag="imm0")
+        self.assertEqual(res, 0xFFFFFFFF)
 
-class TestSMulHiU32ConditionCodeAndSCC(unittest.TestCase):
-    def test_scc_preserved_neutral(self) -> None:
-        state = ScalarMachineState()
-        for initial_scc in (0, 1):
-            state.scc = initial_scc
-            state.write_sgpr(0, 0xFFFFFFFF)
-            state.write_sgpr(1, 0xFFFFFFFF)
-            inst = ASTInstruction(
-                Opcode.S_MUL_HI_U32,
-                ASTOperand.sgpr(2),
-                ASTOperand.sgpr(0),
-                ASTOperand.sgpr(1),
-            )
-            ScalarInterpreter().step(inst, state)
-            self.assertEqual(state.scc, initial_scc)
+    def test_register_aliasing_dst_src0(self) -> None:
+        res = _run_aliased("s_mul_hi_i32", 0x80000000, 0x80000000, "dst_src0")
+        self.assertEqual(res, 0x40000000)
 
-class TestSMulHiU32SIMDAndWaveDivergence(unittest.TestCase):
-    def test_wave_broadcast(self) -> None:
-        wave = ScalarWaveModel(wave_size=32)
-        val = ref_s_mul_hi_u32(0xFFFFFFFF, 0xFFFFFFFF)
-        lanes = wave.broadcast_result(val)
-        self.assertTrue(all(l == 0xFFFFFFFE for l in lanes))
+    def test_register_aliasing_all_same(self) -> None:
+        # (-1) * (-1) = 1 -> high 32 bits = 0
+        res = _run_aliased("s_mul_hi_i32", -1, -1, "all_same")
+        self.assertEqual(res, 0)
 
-    def test_wave64_broadcast(self) -> None:
-        wave = ScalarWaveModel(wave_size=64)
-        val = ref_s_mul_hi_u32(0x80000000, 4)
-        lanes = wave.broadcast_result(val)
-        self.assertTrue(all(l == 2 for l in lanes))
+    def test_scc_preservation_scc1(self) -> None:
+        res, scc = _run_with_scc("s_mul_hi_i32", 0x7FFFFFFF, 2, initial_scc=1)
+        self.assertEqual(scc, 1)
 
-class TestSMulHiU32IntegerOverflowExtremes(unittest.TestCase):
-    def test_full_range_upper_bound(self) -> None:
-        # Max 64-bit value product
-        self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFE)
+    def test_scc_preservation_scc0(self) -> None:
+        res, scc = _run_with_scc("s_mul_hi_i32", 0x7FFFFFFF, 2, initial_scc=0)
+        self.assertEqual(scc, 0)
 
-    def test_power_of_two_shifts(self) -> None:
-        # Multiplying by 2^k gives exact high bits
-        for k in range(32):
-            val = 1 << k
-            # (2^k) * (2^(32-k)) = 2^32 -> high 32 bits is 1
-            other = 1 << (32 - k) if k > 0 else 0
-            if other > 0 and other <= MASK32:
-                self.assertEqual(ref_s_mul_hi_u32(val, other), 1)
-
-    def test_asymmetric_high_product(self) -> None:
-        # 0xFFFFFFFF * 0x80000000 = 0x7FFFFFFF_80000000 -> high 32 bits is 0x7FFFFFFF
-        self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0x80000000), 0x7FFFFFFF)
-
-class TestSMulHiU32TranslatorIntegration(unittest.TestCase):
-    def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available in this Python environment")
+    def test_spirv_opsmulextended_emission(self) -> None:
         lines = [
             "s_mov_b32 s0, 0x80000000",
-            "s_mov_b32 s1, 0x2",
-            "s_mul_hi_u32 s2, s0, s1",
+            "s_mov_b32 s1, 2",
+            "s_mul_hi_i32 s2, s0, s1",
             "v_mov_b32 v0, s2",
-            "exp mrt0 v0, v0, v0, v0 done vm",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0, v0, v1, v2, v3 done",
             "s_endpgm",
         ]
-        spv = support.translate_lines("ps_bundle_s_mul_hi_u32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 1)
+        spvasm = support.translate_lines("ps_s_mul_hi_i32_opcode_check", lines)
+        self.assertIn("OpSMulExtended", spvasm)
 
-class TestSMulHiU32Validation(unittest.TestCase):
-    def test_commutativity(self) -> None:
-        rng = random.Random(8888)
-        for _ in range(50):
-            a = rng.randint(0, MASK32)
-            b = rng.randint(0, MASK32)
-            self.assertEqual(ref_s_mul_hi_u32(a, b), ref_s_mul_hi_u32(b, a))
+    def test_random_signed_fuzz_batches(self) -> None:
+        pairs = [
+            (-1000, 2000),
+            (0x3FFFFFFF, -2),
+            (-0x40000000, 3),
+            (-1234567, -7654321),
+            (0x10000000, 0x20),
+        ]
+        for idx, (a, b) in enumerate(pairs):
+            with self.subTest(a=a, b=b):
+                res = _run_binary_op("s_mul_hi_i32", a, b, tag=f"fuzz_hi_i_{idx}")
+                expected = ((a * b) >> 32) & MASK32
+                self.assertEqual(res, expected)
 
-    def test_unsigned_high_low_product_consistency(self) -> None:
-        # (hi << 32) | lo must equal full unsigned product
-        rng = random.Random(7777)
-        for _ in range(50):
-            a = rng.randint(0, MASK32)
-            b = rng.randint(0, MASK32)
-            full = a * b
-            hi = ref_s_mul_hi_u32(a, b)
-            lo = ref_s_mul_i32(a, b)
+
+class TestSMulHiU32Translator(unittest.TestCase):
+    """100% translator-backed regression suite for s_mul_hi_u32 (unsigned high product)."""
+
+    def test_small_unsigned_product_zero_high(self) -> None:
+        self.assertEqual(_run_binary_op("s_mul_hi_u32", 100, 200, tag="small"), 0)
+
+    def test_exact_2_32_boundary(self) -> None:
+        # 0x80000000 * 2 = 0x100000000 -> high 32 bits = 1
+        self.assertEqual(_run_binary_op("s_mul_hi_u32", 0x80000000, 2, tag="boundary"), 1)
+
+    def test_max_uint32_squared(self) -> None:
+        # (2^32 - 1)^2 = 0xFFFFFFFE_00000001 -> high 32 bits = 0xFFFFFFFE
+        self.assertEqual(_run_binary_op("s_mul_hi_u32", 0xFFFFFFFF, 0xFFFFFFFF, tag="max_sq"), 0xFFFFFFFE)
+
+    def test_zero_operand(self) -> None:
+        self.assertEqual(_run_binary_op("s_mul_hi_u32", 0xFFFFFFFF, 0, tag="zero"), 0)
+
+    def test_powers_of_two(self) -> None:
+        # (0x80000000) * 4 = 2^33 = 0x2_00000000 -> high 32 bits = 2
+        self.assertEqual(_run_binary_op("s_mul_hi_u32", 0x80000000, 4, tag="pow2_a"), 2)
+        # (0x40000000) * 8 = 2^33 = 0x2_00000000 -> high 32 bits = 2
+        self.assertEqual(_run_binary_op("s_mul_hi_u32", 0x40000000, 8, tag="pow2_b"), 2)
+
+    def test_asymmetric_high_product(self) -> None:
+        # 0xFFFFFFFF * 0x80000000 = 0x7FFFFFFF_80000000 -> high 32 bits = 0x7FFFFFFF
+        self.assertEqual(_run_binary_op("s_mul_hi_u32", 0xFFFFFFFF, 0x80000000, tag="asymm"), 0x7FFFFFFF)
+
+    def test_imm_src1_operand(self) -> None:
+        # 0xFFFFFFFF * 5 = 0x4_FFFFFFFB -> high 32 bits = 4
+        res = _run_binary_op("s_mul_hi_u32", 0xFFFFFFFF, 5, s1_is_imm=True, tag="imm1")
+        self.assertEqual(res, 4)
+
+    def test_imm_src0_operand(self) -> None:
+        res = _run_binary_op("s_mul_hi_u32", 5, 0xFFFFFFFF, s0_is_imm=True, tag="imm0")
+        self.assertEqual(res, 4)
+
+    def test_register_aliasing_dst_src0(self) -> None:
+        res = _run_aliased("s_mul_hi_u32", 0xFFFFFFFF, 0xFFFFFFFF, "dst_src0")
+        self.assertEqual(res, 0xFFFFFFFE)
+
+    def test_register_aliasing_all_same(self) -> None:
+        res = _run_aliased("s_mul_hi_u32", 0x80000000, 0x80000000, "all_same")
+        # 0x80000000 * 0x80000000 = 0x40000000_00000000 -> high = 0x40000000
+        self.assertEqual(res, 0x40000000)
+
+    def test_scc_preservation_scc1(self) -> None:
+        res, scc = _run_with_scc("s_mul_hi_u32", 0xFFFFFFFF, 0xFFFFFFFF, initial_scc=1)
+        self.assertEqual(scc, 1)
+
+    def test_scc_preservation_scc0(self) -> None:
+        res, scc = _run_with_scc("s_mul_hi_u32", 0xFFFFFFFF, 0xFFFFFFFF, initial_scc=0)
+        self.assertEqual(scc, 0)
+
+    def test_spirv_opumulextended_emission(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x80000000",
+            "s_mov_b32 s1, 2",
+            "s_mul_hi_u32 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0, v0, v1, v2, v3 done",
+            "s_endpgm",
+        ]
+        spvasm = support.translate_lines("ps_s_mul_hi_u32_opcode_check", lines)
+        self.assertIn("OpUMulExtended", spvasm)
+
+    def test_reconstruct_full_64bit_product(self) -> None:
+        """Executes both s_mul_i32 and s_mul_hi_u32 and reconstructs the full 64-bit product."""
+        pairs = [
+            (0x12345678, 0x87654321),
+            (0xFFFFFFFF, 0xFFFFFFFF),
+            (0x80000000, 0x00000002),
+            (0xDEADBEEF, 0xCAFEBABE),
+            (0x00001000, 0x00001000),
+        ]
+        for idx, (a, b) in enumerate(pairs):
+            lines = [
+                f"s_mov_b32 s0, {a:#x}",
+                f"s_mov_b32 s1, {b:#x}",
+                "s_mul_i32 s2, s0, s1",
+                "s_mul_hi_u32 s3, s0, s1",
+                "v_mov_b32 v0, s2",
+                "v_mov_b32 v1, s3",
+                "v_mov_b32 v2, 0",
+                "v_mov_b32 v3, 0",
+                "exp mrt0, v0, v1, v2, v3 done",
+                "s_endpgm",
+            ]
+            spvasm = support.translate_lines(f"ps_reconstruct_{idx}", lines)
+            words = support.mrt0_words(spvasm)
+            lo, hi = words[0], words[1]
             reconstructed = (hi << 32) | lo
-            self.assertEqual(reconstructed, full)
+            self.assertEqual(reconstructed, a * b)
+
+
+class TestSALUMulNegativeAndMutation(unittest.TestCase):
+    """Negative controls and mutation detection guards for SALU multiply lowering."""
+
+    def test_syntax_rejection_missing_operands(self) -> None:
+        lines = [
+            "s_mul_i32 s0, s1",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_s_mul_missing_op", lines)
+
+    def test_mutation_detection_signed_vs_unsigned_high(self) -> None:
+        # For operands 0xFFFFFFFF (-1 signed, 4294967295 unsigned) and 5:
+        # s_mul_hi_i32: (-1)*5 = -5 -> high = 0xFFFFFFFF
+        # s_mul_hi_u32: (4294967295)*5 = 21474836475 -> high = 4
+        # Asserts that lowered signed and unsigned high instructions never conflate
+        hi_signed = _run_binary_op("s_mul_hi_i32", 0xFFFFFFFF, 5, tag="mut_s")
+        hi_unsigned = _run_binary_op("s_mul_hi_u32", 0xFFFFFFFF, 5, tag="mut_u")
+        self.assertEqual(hi_signed, 0xFFFFFFFF)
+        self.assertEqual(hi_unsigned, 4)
+        self.assertNotEqual(hi_signed, hi_unsigned)
+
+    def test_mutation_detection_low_vs_high(self) -> None:
+        # For operands 0x10000 and 0x10000:
+        # Low 32 bits = (0x10000 * 0x10000) & 0xFFFFFFFF = 0
+        # High 32 bits = (0x10000 * 0x10000) >> 32 = 1
+        low = _run_binary_op("s_mul_i32", 0x10000, 0x10000, tag="mut_lo")
+        high = _run_binary_op("s_mul_hi_u32", 0x10000, 0x10000, tag="mut_hi")
+        self.assertEqual(low, 0)
+        self.assertEqual(high, 1)
+        self.assertNotEqual(low, high)
+
 
 if __name__ == "__main__":
     unittest.main()
