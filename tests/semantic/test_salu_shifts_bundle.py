@@ -282,6 +282,20 @@ class TestSLshlB64AST(unittest.TestCase):
         expr = SLshlB64Expr(0x1, 40)
         self.assertEqual(expr.eval(), (1 << 40, 1))
 
+class TestSLshlB64CrossDwordAndSCC(unittest.TestCase):
+    def test_scc_zero_result(self) -> None:
+        res, scc = ref_s_lshl_b64(0, 10)
+        self.assertEqual((res, scc), (0, 0))
+        # 1 shifted left by 63 is non-zero, but shift by another bit wraps via mask 63
+        res, scc = ref_s_lshl_b64(1 << 63, 1)
+        self.assertEqual((res, scc), (0, 0))
+
+    def test_dword_boundary_transitions(self) -> None:
+        val = 0x00000000FFFFFFFF
+        res, scc = ref_s_lshl_b64(val, 16)
+        self.assertEqual(res, 0x0000FFFFFFFF0000)
+        self.assertEqual(scc, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
