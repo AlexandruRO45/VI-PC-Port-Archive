@@ -24,9 +24,11 @@
 // RAX. Device slot 14 therefore wraps the created heap in a heap proxy that performs that conversion. The heap
 // proxy holds a reference to the device proxy, and its ID3D12DeviceChild::GetDevice returns that same proxy.
 // The proxy's heap slots 9/10 expose only the Xbox shape: a PC C++ caller using the PC header's return convention
-// would not receive the value, while GetDesc and the other heap slots forward the PC convention unchanged. A
-// direct one-argument call against a real PC heap is invalid, so the device test exercises the conversion on the
-// wrapper and compares it with a hidden-pointer call against the real heap.
+// would not receive the value. Heap slot 8 (GetDesc) and queue slot 18 (GetDesc) accept both the console x64 C-ABI
+// form (return buffer in RCX, proxy in RDX) and the PC C++ form (proxy in RCX, return buffer in RDX), while the
+// remaining heap slots forward the PC convention unchanged. A direct one-argument call against a real PC heap is
+// invalid, so the device test exercises the conversion on the wrapper and compares it with a hidden-pointer call
+// against the real heap.
 //
 // Every other PC device slot is forwarded by a generated thunk that swaps `this` to the PC device. The proxy's
 // vtable therefore follows the PC device order, with slots 62 and 76 and the public HLE's 48/73/78/79/80 deliberately
@@ -139,7 +141,7 @@ unsigned allocator_proxy_table_size();
 std::uint64_t allocator_slot_hits(unsigned slot);
 bool allocator_slot_first_call_seen(unsigned slot);
 std::uint64_t allocator_table_overruns();
-// Heap slots 0-2, 7 (GetDevice -> device proxy) and 9/10 (handle conversion).
+// Heap slots 0-2, 7 (GetDevice -> device proxy), 8 (GetDesc console C-ABI) and 9/10 (handle conversion).
 bool heap_slot_overridden(unsigned slot);
 
 // Number of live references on a device proxy. Test helper for the heap's GetDevice/lifetime checks.

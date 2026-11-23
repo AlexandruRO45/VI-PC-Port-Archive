@@ -70,11 +70,16 @@ namespace xs = rt::d3d12_xs;
 
 // ---- Mocks ----
 
-enum class Kind { device, queue, fence, resource, allocator, command_list };
+enum class Kind { device, queue, fence, resource, allocator, command_list, heap };
 
 constexpr unsigned kMockSlots = 128;
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
 constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
+constexpr D3D12_DESCRIPTOR_HEAP_DESC kMockHeapDesc{
+    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 64, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0x3u};
+constexpr D3D12_COMMAND_QUEUE_DESC kMockQueueDesc{
+    D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_QUEUE_PRIORITY_HIGH, D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT,
+    0x5u};
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
 constexpr GUID kExtraIid{0x5d1e0c4a, 0x2b7f, 0x4e61, {0x9a, 0x3d, 0x8c, 0x4b, 0x2f, 0x1e, 0x6a, 0x70}};
 
@@ -149,6 +154,7 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kLeonidaCommandAllocatorTag));
+        case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
         default: return false;
     }
 }
@@ -188,6 +194,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         switch (slot) {
             case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
+            case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));      // CreateDescriptorHeap
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
             case 32:                                                                          // OpenSharedHandle
@@ -202,6 +209,16 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         return S_OK;
     }
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::heap && slot == 8) {                         // PC GetDesc(this, &out)
+        auto* out = reinterpret_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(a1);
+        if (out) *out = kMockHeapDesc;
+        return a1;
+    }
+    if (m->kind == Kind::queue && slot == 18) {                       // PC GetDesc(this, &out)
+        auto* out = reinterpret_cast<D3D12_COMMAND_QUEUE_DESC*>(a1);
+        if (out) *out = kMockQueueDesc;
+        return a1;
+    }
     return S_OK;
 }
 
@@ -843,6 +860,100 @@ int check_tail(bool want_guarded) {
     return 0;
 }
 
+// ---- 10. Console C-ABI GetDesc (out in RCX, proxy in RDX) on heap slot 8 and queue slot 18 ----
+
+int check_get_desc_c_abi() {
+    EXPECT(xs::heap_slot_overridden(8));
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    const unsigned long device_refs = xs::device_proxy_ref_count(device);
+
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    void* heap = nullptr;
+    EXPECT(hr_of(raw(device, 14, word(&kMockHeapDesc), word(&heap_iid), word(&heap))) == S_OK);
+    EXPECT(xs::is_heap_proxy(heap));
+    Mock* const heap_mock = reinterpret_cast<Mock*>(xs::heap_proxy_real_heap(heap));
+    EXPECT(heap_mock && heap_mock->kind == Kind::heap);
+
+    void* queue = make_queue(device);
+    EXPECT(xs::is_queue_proxy(queue));
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    EXPECT(queue_mock && queue_mock->kind == Kind::queue);
+
+    xs::reset_device_proxy_stats();
+
+    // Heap slot 8: console C-ABI (out in RCX, proxy in RDX) + null out + PC C++ ABI (proxy in RCX, out in RDX).
+    {
+        void* const* heap_vtbl = *reinterpret_cast<void* const* const*>(heap);
+        using ConsoleHeapGetDescFn = D3D12_DESCRIPTOR_HEAP_DESC*(WINAPI*)(D3D12_DESCRIPTOR_HEAP_DESC*, void*);
+        using PcHeapGetDescFn = D3D12_DESCRIPTOR_HEAP_DESC*(WINAPI*)(void*, D3D12_DESCRIPTOR_HEAP_DESC*);
+        auto console_get_desc = reinterpret_cast<ConsoleHeapGetDescFn>(heap_vtbl[8]);
+        auto pc_get_desc = reinterpret_cast<PcHeapGetDescFn>(heap_vtbl[8]);
+
+        struct PaddedHeapDesc {
+            D3D12_DESCRIPTOR_HEAP_DESC value;
+            std::uint8_t after[64];
+        } padded;
+        std::memset(&padded, 0xA5, sizeof(padded));
+        EXPECT(console_get_desc(&padded.value, heap) == &padded.value);
+        EXPECT(std::memcmp(&padded.value, &kMockHeapDesc, sizeof(kMockHeapDesc)) == 0);
+        for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+        EXPECT(heap_mock->calls[8] == 1 && heap_mock->args[8][0] == word(&padded.value));
+        EXPECT(xs::heap_slot_hits(8) == 1 && xs::heap_slot_first_call_seen(8));
+        EXPECT(xs::is_heap_proxy(heap) &&
+               reinterpret_cast<Mock*>(xs::heap_proxy_real_heap(heap)) == heap_mock);
+
+        EXPECT(console_get_desc(nullptr, heap) == nullptr);
+        EXPECT(heap_mock->calls[8] == 1 && xs::heap_slot_hits(8) == 2);
+
+        D3D12_DESCRIPTOR_HEAP_DESC pc_out{};
+        EXPECT(pc_get_desc(heap, &pc_out) == &pc_out);
+        EXPECT(std::memcmp(&pc_out, &kMockHeapDesc, sizeof(kMockHeapDesc)) == 0);
+        EXPECT(heap_mock->calls[8] == 2 && heap_mock->args[8][0] == word(&pc_out));
+        EXPECT(xs::heap_slot_hits(8) == 3);
+    }
+
+    // Queue slot 18: console C-ABI (out in RCX, proxy in RDX) + null out + PC C++ ABI (proxy in RCX, out in RDX).
+    {
+        void* const* queue_vtbl = *reinterpret_cast<void* const* const*>(queue);
+        using ConsoleQueueGetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(D3D12_COMMAND_QUEUE_DESC*, void*);
+        using PcQueueGetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(void*, D3D12_COMMAND_QUEUE_DESC*);
+        auto console_get_desc = reinterpret_cast<ConsoleQueueGetDescFn>(queue_vtbl[18]);
+        auto pc_get_desc = reinterpret_cast<PcQueueGetDescFn>(queue_vtbl[18]);
+
+        struct PaddedQueueDesc {
+            D3D12_COMMAND_QUEUE_DESC value;
+            std::uint8_t after[64];
+        } padded;
+        std::memset(&padded, 0xA5, sizeof(padded));
+        EXPECT(console_get_desc(&padded.value, queue) == &padded.value);
+        EXPECT(std::memcmp(&padded.value, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
+        for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+        EXPECT(queue_mock->calls[18] == 1 && queue_mock->args[18][0] == word(&padded.value));
+        EXPECT(xs::queue_slot_hits(18) == 1 && xs::queue_slot_first_call_seen(18));
+        EXPECT(xs::is_queue_proxy(queue) &&
+               reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue)) == queue_mock);
+
+        EXPECT(console_get_desc(nullptr, queue) == nullptr);
+        EXPECT(queue_mock->calls[18] == 1 && xs::queue_slot_hits(18) == 2);
+
+        D3D12_COMMAND_QUEUE_DESC pc_out{};
+        EXPECT(pc_get_desc(queue, &pc_out) == &pc_out);
+        EXPECT(std::memcmp(&pc_out, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
+        EXPECT(queue_mock->calls[18] == 2 && queue_mock->args[18][0] == word(&pc_out));
+        EXPECT(xs::queue_slot_hits(18) == 3);
+    }
+
+    EXPECT(release(heap) == 0 && heap_mock->refs == 0);
+    EXPECT(release(queue) == 0 && queue_mock->refs == 0);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: heap slot 8 and queue slot 18 answer console C-ABI (out, proxy) and PC C++ (proxy, out) GetDesc\n",
+                g_label);
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -948,7 +1059,7 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_get_desc_c_abi())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
