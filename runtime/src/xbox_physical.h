@@ -104,10 +104,12 @@ public:
     }
 
     // XMemMapPhysicalPagesScatter's mechanism: page i of [va, va + n pages) shows physical page `pages[i]`
-    // (kUnmapped unmaps). The mapping starts clean (read-only) unless the page is already dirty. The call is checked
-    // in full first; only an OS failure part way leaves it partly applied.
+    // (kUnmapped unmaps). The mapping starts clean (read-only) unless the page is already dirty. `va` must be page
+    // aligned, as for MapViewOfFile3. The call is checked in full first; only an OS failure part way leaves it partly
+    // applied.
     static constexpr PhysicalPage kUnmapped = UINT32_MAX;
     bool map(void* va, std::span<const PhysicalPage> pages) {
+        if (reinterpret_cast<std::uintptr_t>(va) % kPageSize) return false;
         std::unique_lock lock(mutex_);
         Region* region = region_of(reinterpret_cast<std::uintptr_t>(va));
         if (!region) return false;

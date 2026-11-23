@@ -176,6 +176,13 @@ int main() {
     EXPECT(store.map(r1, phys));                               // r1 pages 0..3 = P0..P3
     const PhysicalPage one[1]{phys[1]};
     EXPECT(store.map(r2 + 2 * kPageSize, one));                // r2 page 2 = P1 as well
+    // A VA inside a page is refused, as MapViewOfFile3 refuses it, and r1 page 0 still shows P0.
+    const PhysicalPage other[1]{phys[3]};
+    store.data(phys[0])[0] = 0xA5;
+    for (std::size_t offset : {std::size_t(1), std::size_t(4096), std::size_t(kPageSize - 1)})
+        EXPECT(!store.map(r1 + offset, other));
+    EXPECT(r1[0] == 0xA5);
+    store.data(phys[0])[0] = 0;
     EXPECT(store.take_dirty().empty());                        // fresh pages start clean
     const auto faults0 = store.write_faults();
     std::memset(r1 + 1 * kPageSize, 0x11, kPageSize);          // write P1 through r1
