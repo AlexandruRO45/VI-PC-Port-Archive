@@ -187,7 +187,9 @@ def texture_file(row):
     special = '/\\<>:"|?*' if os.name == "nt" else "/"
     name = "".join("_" if ch in special or ord(ch) < 32 or 127 <= ord(ch) <= 159 else ch for ch in name)
     name = name.strip(" .") or "x"
-    name = name.encode("utf-16-le", "surrogatepass")[:240].decode("utf-16-le", "surrogatepass")
+    # .NET marshals POSIX paths as UTF-8, replacing a surrogate split by the truncation.
+    errors = "surrogatepass" if os.name == "nt" else "replace"
+    name = name.encode("utf-16-le", "surrogatepass")[:240].decode("utf-16-le", errors)
     return leaf(f"{index:03d}_{name}.dds")
 
 

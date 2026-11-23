@@ -40,6 +40,20 @@ class ManifestItemsTest(unittest.TestCase):
         self.assertEqual(loads.call_count, 6)  # three property names and one decoded value for each
 
 
+class TextureFileTest(unittest.TestCase):
+    def test_utf16_limit_keeps_a_complete_pair_and_marshals_a_split_pair(self):
+        emoji = "\U0001f600"
+        cases = (("nt", 118, emoji), ("posix", 118, emoji),
+                 ("nt", 119, "\ud83d"), ("posix", 119, "\ufffd"))
+        for platform, count, ending in cases:
+            with self.subTest(platform=platform, count=count):
+                prefix = "a" * count
+                with mock.patch.object(resume, "os") as native:
+                    native.name, native.path = platform, os.path
+                    filename = resume.texture_file({"Index": 0, "Name": prefix + emoji + "tail"})
+                self.assertEqual(filename, f"000_{prefix}{ending}.dds")
+
+
 class AssetsDecoderTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
