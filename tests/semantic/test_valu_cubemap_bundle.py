@@ -167,5 +167,11 @@ class VCubeIdAstTests(unittest.TestCase):
         self.assertEqual(ast.src_y.index, 1)
         self.assertEqual(ast.src_z.index, 2)
 
+class VCubeIdScalarInterpreterTests(unittest.TestCase):
+    def test_cubeid_scalar_execution(self):
+        x, y, z = 0.2, 0.5, 0.9  # Z major
+        res = oracle_cubeid_f32(x, y, z)
+        self.assertEqual(res, 4.0)
+
 if __name__ == "__main__":
     unittest.main()
