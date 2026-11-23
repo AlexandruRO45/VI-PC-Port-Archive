@@ -436,6 +436,10 @@ def normal_agreement(positions, normals, triangles):
     """For each vertex the triangles use, compare its stored normal with the sum of its faces' (area-weighted)
     normals. Counts vertices, dot > 0.99, dot > 0.9 and dot < 0."""
     limit = min(len(positions), len(normals))
+    if limit > 8 * len(triangles):
+        # A sparse group (few triangles over a long vertex block): three arrays of `limit` doubles would cost more than
+        # the dictionary of the vertices the triangles actually use.
+        return _normal_agreement_signed(positions, normals, triangles)
     sqrt, isfinite = math.sqrt, math.isfinite
     # Per-vertex running sums in three arrays of doubles; a vertex no triangle uses keeps (0, 0, 0) and is skipped below, as
     # a vertex whose faces cancel exactly is.
@@ -475,8 +479,9 @@ def normal_agreement(positions, normals, triangles):
 
 
 def _normal_agreement_signed(positions, normals, triangles):
-    """normal_agreement for triangles that name a vertex by a negative (from-the-end) index, which the list-based
-    sums of normal_agreement would fold onto the vertex of the same position from the other end."""
+    """normal_agreement with per-vertex sums in a dictionary: for triangles that name a vertex by a negative
+    (from-the-end) index, which the array sums of normal_agreement would fold onto the vertex of the same position from
+    the other end, and for sparse groups, where the arrays would be mostly empty."""
     acc = {}
     for a, b, c in triangles:
         if max(a, b, c) >= min(len(positions), len(normals)):

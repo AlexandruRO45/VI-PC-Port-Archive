@@ -12,6 +12,7 @@ import os
 import random
 import struct
 import sys
+import tracemalloc
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -458,6 +459,36 @@ class AgreementTests(unittest.TestCase):
         normals = [(0.0, 0.0, 1.0)] * 4
         self.assertEqual(mp.normal_agreement(positions, normals, tris)["vertices"], 0)
         self.check(positions, normals, tris)
+
+    def test_a_sparse_group_over_a_long_vertex_block_stays_small(self):
+        # One triangle naming vertices 0, 1 and 32767 of a 32768-vertex block: the work and the memory follow the
+        # triangles, not the length of the block.
+        count = 32768
+        positions = [(float(i % 7), float(i % 11), 0.0) for i in range(count)]
+        positions[1], positions[count - 1] = (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)
+        positions[0] = (0.0, 0.0, 0.0)
+        normals = [(0.0, 0.0, 1.0)] * count
+        tris = [(0, 1, count - 1)]
+        expected = ref_normal_agreement(positions, normals, tris)
+        self.assertEqual(expected["vertices"], 3)
+        self.assertEqual(mp.normal_agreement(positions, normals, tris), expected)
+        tracemalloc.start()
+        try:
+            mp.normal_agreement(positions, normals, tris)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 8 * 1024)
+
+    def test_density_threshold_gives_the_same_answer_on_both_sides(self):
+        rng = random.Random(29)
+        count = 400
+        positions = [(rng.uniform(-1, 1), rng.uniform(-1, 1), rng.uniform(-1, 1)) for _ in range(count)]
+        normals = [mp._octahedral(rng.uniform(-1, 1), rng.uniform(-1, 1)) for _ in range(count)]
+        for triangles in (1, 10, 49, 50, 51, 100, 400):   # 50 triangles is the block length / 8
+            tris = [tuple(rng.randrange(count) for _ in range(3)) for _ in range(triangles)]
+            self.assertEqual(mp.normal_agreement(positions, normals, tris),
+                             ref_normal_agreement(positions, normals, tris), triangles)
 
     def test_no_triangles(self):
         self.assertEqual(mp.face_agreement([], []), {"shared_edges": 0, "agree": 0, "opposed": 0})
