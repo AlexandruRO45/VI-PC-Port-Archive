@@ -299,6 +299,33 @@ class ParsingTests(unittest.TestCase):
             struct.pack_into(fmt, mut, offset, val)
             self.assertFalse(smh_groom.system_page_is_groom(mut))
 
+    def test_system_page_signature_reads_bounded_slices_of_strided_views(self):
+        sysd, _ = build_synthetic_groom_buffers()
+        page = bytearray(1 << 20)
+        page[:len(sysd)] = sysd
+        desc = struct.unpack_from("<Q", page, 0x70)[0] - smh_groom.SYS_BASE
+        # An unaligned descriptor exercises fields that cross element boundaries in a typed view.
+        page[desc + 1:desc + 0x21] = page[desc:desc + 0x20]
+        struct.pack_into("<Q", page, 0x70, smh_groom.SYS_BASE + desc + 1)
+        for fmt in ("B", "I"):
+            view = memoryview(bytearray(2 * len(page))).cast(fmt)[::2]
+            view[:] = memoryview(page).cast(fmt)
+            for first, valid in ((0, True), (1, False)):
+                with self.subTest(fmt=fmt, valid=valid):
+                    view[0] = first
+                    measure = not tracemalloc.is_tracing()
+                    if measure:
+                        tracemalloc.start()
+                    try:
+                        matches = smh_groom.system_page_is_groom(view)
+                        peak = tracemalloc.get_traced_memory()[1]
+                    finally:
+                        if measure:
+                            tracemalloc.stop()
+                    self.assertEqual(matches, valid)
+                    if measure:
+                        self.assertLess(peak, 64 << 10)
+
     def test_parse_full_groom_and_optional_sections(self):
         sysd, gpu = build_synthetic_groom_buffers(
             tri_count=[(10, 3, 0, 0), (14, 5, 0, 0)],

@@ -187,21 +187,29 @@ def _sys_ptr(sysd: bytes, at: int) -> int:
 
 def system_page_is_groom(sysd: bytes | bytearray | memoryview) -> bool:
     """Return True if ``sysd`` starts like an inflated smh groom LOD system page."""
-    sysd = _byte_source(sysd)
-    if len(sysd) < 0xE0 or bytes(sysd[:8]) != b"\x00" * 8:
+    unpack = struct.unpack_from
+    if isinstance(sysd, memoryview) and sysd.ndim == 1 and not sysd.c_contiguous:
+        size = sysd.nbytes
+
+        def unpack(fmt, view, offset):
+            # Copy only the elements that cover this byte range, even when a field starts inside an element.
+            itemsize = view.itemsize
+            first, skip = divmod(offset, itemsize)
+            last = (offset + struct.calcsize(fmt) + itemsize - 1) // itemsize
+            return struct.unpack_from(fmt, view[first:last].tobytes(), skip)
+    else:
+        sysd = _byte_source(sysd)
+        size = len(sysd)
+
+    if size < 0xE0 or unpack("<Q", sysd, 0)[0] != 0:
         return False
-    if struct.unpack_from("<I", sysd, 0x1C)[0] != TYPE_ID:
+    if unpack("<I", sysd, 0x1C)[0] != TYPE_ID:
         return False
-    desc = struct.unpack_from("<Q", sysd, 0x70)[0] - SYS_BASE
-    if not (0 < desc <= len(sysd) - 0x20):
+    desc = unpack("<Q", sysd, 0x70)[0] - SYS_BASE
+    if not (0 < desc <= size - 0x20):
         return False
-    words, stride, flag = struct.unpack_from("<IHH", sysd, desc + 8)
-    return (
-        stride == 4
-        and flag == 8
-        and struct.unpack_from("<Q", sysd, desc + 0x18)[0] == GPU_BASE
-        and words >= 40
-    )
+    words, stride, flag = unpack("<IHH", sysd, desc + 8)
+    return stride == 4 and flag == 8 and words >= 40 and unpack("<Q", sysd, desc + 0x18)[0] == GPU_BASE
 
 
 def scan_offsets(
