@@ -518,7 +518,11 @@ HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size
     if (!path) return E_POINTER;
     const std::string folder = utf8_of(persistent_storage_dir());
     if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
-    if (path_size < folder.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    if (path_size < folder.size() + 1) {
+        // The (size, buffer, used) convention of the XSystem id getters: a short buffer learns the size it needs.
+        if (path_used) *path_used = folder.size() + 1;
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
     std::memcpy(path, folder.c_str(), folder.size() + 1);
     if (path_used) *path_used = folder.size() + 1;
     return S_OK;
