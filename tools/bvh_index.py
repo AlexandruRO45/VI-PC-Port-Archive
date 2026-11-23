@@ -41,6 +41,7 @@ import time
 import unicodedata
 import zlib
 from contextlib import suppress
+from xml.parsers import expat
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
@@ -136,15 +137,15 @@ def classify(head, size, tail=None):
     body = head[3:] if head[:3] == b"\xef\xbb\xbf" else head
     if body.startswith(b"<?xml"):
         row.update(kind="xml", signature="xml", fragment=False)
-        rest = body
-        close = rest.find(b"?>")
-        if close >= 0:
-            rest = rest[close + 2:]
-        start = rest.find(b"<")
-        end = rest.find(b">", start + 1)
-        if 0 <= start < end:
-            name = rest[start + 1:end].strip().split(b" ")[0].split(b"/")[0].lstrip(b"!-")
-            row["root_element"] = name.decode("ascii", "replace")[:64]
+
+        def record_root(name, _attrs):
+            row.setdefault("root_element", name[:64])
+
+        parser = expat.ParserCreate()
+        parser.StartElementHandler = record_root
+        # The header probe may end mid-document. Only a complete start tag supplies a name.
+        with suppress(expat.ExpatError, LookupError, ValueError):
+            parser.Parse(head[:HEAD], False)
         return row
     probe = head[:256]
     if size >= 64 and len(probe) >= 64:

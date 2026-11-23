@@ -159,6 +159,31 @@ class ClassifyTest(unittest.TestCase):
         self.assertFalse(row_enc["fragment"])
         self.assertEqual(row_enc["root_element"], "CMapData")
 
+    def test_xml_root_skips_preamble_and_accepts_tab_before_attributes(self):
+        declaration = b'<?xml version="1.0"?>'
+        fixtures = (
+            (b'<!-- lead --><Root/>', "Root"),
+            (b'<?test lead?><Root\tflag="yes"/>', "Root"),
+            (b'<n:Root xmlns:n="urn:fixture"/>', "n:Root"),
+            (b'<' + b'x' * 100 + b'/>', "x" * 64),
+        )
+        for contents, expected in fixtures:
+            with self.subTest(contents=contents):
+                payload = declaration + b"\n" + contents
+                row = bvh_index.classify(payload, len(payload))
+                self.assertEqual(row["root_element"], expected)
+
+    def test_xml_root_is_omitted_when_the_header_probe_ends_inside_the_tag(self):
+        declaration = b'<?xml version="1.0"?><!-- lead -->'
+        for root in (b'<Partial', b'<Root flag=">'):
+            with self.subTest(root=root):
+                padding = b" " * (bvh_index.HEAD - len(declaration) - len(root))
+                head = declaration + padding + root
+                self.assertEqual(len(head), bvh_index.HEAD)
+                row = bvh_index.classify(head, len(head) + 16)
+                self.assertEqual(row["kind"], "xml")
+                self.assertNotIn("root_element", row)
+
     def test_xml_fragment(self):
         text = b"/americas/map/x_bvh.rpf</filename><Item/>" + b" " * 40
         row = bvh_index.classify(text, len(text))
