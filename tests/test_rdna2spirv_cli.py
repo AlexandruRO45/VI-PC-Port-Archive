@@ -23,6 +23,17 @@ TOOL = os.path.join(ROOT, "tools", "rdna2spirv.py")
 
 import rdna2spirv  # noqa: E402
 
+# These tests stand in for spirv-as and spirv-val; whether the SDK's library is on this machine must not change them.
+_NO_LIBRARY = mock.patch.object(rdna2spirv.spirv_tools_lib, "load", return_value=None)
+
+
+def setUpModule():
+    _NO_LIBRARY.start()
+
+
+def tearDownModule():
+    _NO_LIBRARY.stop()
+
 
 class ArgumentTypes(unittest.TestCase):
     def test_limit(self):
@@ -68,7 +79,7 @@ class SourceDiscovery(unittest.TestCase):
 
     def run_main(self, src, out):
         def spirv_tool(cmd, **kwargs):
-            tool = cmd[0]
+            tool = os.path.basename(cmd[0])
             if tool == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
@@ -333,7 +344,7 @@ class ValidatedOutput(unittest.TestCase):
 
     def translate(self, *, reject_at=None):
         def spirv_tool(cmd, **kwargs):
-            tool = cmd[0]
+            tool = os.path.basename(cmd[0])
             if tool == "spirv-as":
                 Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":

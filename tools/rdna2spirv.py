@@ -17417,6 +17417,9 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
     launches per module. Otherwise the two programs are launched.
     """
     lib = spirv_tools_lib.load()
+    # Resolved here, in the caller's folder: the programs run from the output folder, where a relative PATH entry
+    # would name other tools than the ones the library was matched with.
+    as_tool, val_tool = spirv_tools_lib.program("spirv-as"), spirv_tools_lib.program("spirv-val")
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
     # spirv-as reads the .spvasm from stdin, and both tools run in the output folder with the staging file's bare
@@ -17445,10 +17448,13 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
                 if lib is not None:
                     status, module, err = lib.assemble(source)
                     if status == 0:
-                        tmp.write_bytes(module)
+                        try:
+                            tmp.write_bytes(module)
+                        except OSError as exc:    # a full disk or a file size limit (EFBIG), as spirv-as would say
+                            status, err = 1, f"error: cannot write {tmp.name}: {exc}\n"
                     result = subprocess.CompletedProcess(["spirv-as"], status, "", err)
                 else:
-                    result = _run_spirv_tool(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
+                    result = _run_spirv_tool([as_tool, "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
                                             input=source, capture_output=True, cwd=folder)
                 # stdin is bytes, so the output is too; a test double may already answer in text.
                 if isinstance(result.stdout, bytes):
@@ -17458,10 +17464,10 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
         if result.returncode == 0:
             # Offset on non-gather: VK_KHR_maintenance8 (spirv_tools_lib.load() sets the same option)
             if lib is not None:
-                status, err = lib.validate(tmp.read_bytes())
+                status, err = lib.validate(module)
                 result = subprocess.CompletedProcess(["spirv-val"], status, "", err)
             else:
-                result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
+                result = _run_spirv_tool([val_tool, "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
                                          tmp.name], capture_output=True, text=True, cwd=folder)
         if result.returncode == 0:
             tmp.replace(sv)

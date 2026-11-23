@@ -20,10 +20,29 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 
 ENV = "LEONIDA_SPIRV_LIB"
-_NAMES = {"win32": ("SPIRV-Tools-shared.dll",), "darwin": ("libSPIRV-Tools-shared.dylib",)}
-_LIB_NAMES = _NAMES.get(sys.platform, ("libSPIRV-Tools-shared.so",))
+# MSYS2's mingw-w64-spirv-tools installs libSPIRV-Tools-shared.dll, the Vulkan SDK SPIRV-Tools-shared.dll.
+_NAMES = {"win32": ("SPIRV-Tools-shared.dll", "libSPIRV-Tools-shared.dll"),
+          "darwin": ("libSPIRV-Tools-shared.dylib",)}
+_MAX_ID_BOUND = 0x3FFFFF   # spirv-val's default limit; a build with another limit is not the same validator
+_PROBE_TEXT = b"""OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+
+
+def _lib_names():
+    return _NAMES.get(sys.platform, ("libSPIRV-Tools-shared.so",))
 
 
 class _Position(ctypes.Structure):
@@ -49,18 +68,22 @@ _SIGNATURES = {
                                                   ctypes.POINTER(_BIN), ctypes.POINTER(_DIAG)]),
     "spvBinaryDestroy": (None, [_BIN]),
     "spvDiagnosticDestroy": (None, [_DIAG]),
+    "spvContextDestroy": (None, [_P]),
     "spvValidatorOptionsCreate": (_P, []),
+    "spvValidatorOptionsDestroy": (None, [_P]),
     "spvValidatorOptionsSetAllowOffsetTextureOperand": (None, [_P, ctypes.c_bool]),
     "spvValidateWithOptions": (ctypes.c_int, [_P, _P, _BIN, ctypes.POINTER(_DIAG)]),
 }
 
 
 class SpirvTools:
-    """One library, one context and one set of validator options for the whole process (never destroyed: the
-    process ends first)."""
+    """One library, one context and one set of validator options, destroyed with the object. load() keeps one for
+    the process."""
 
-    def __init__(self, lib, target_env, allow_offset_texture_operand):
+    def __init__(self, lib, target_env, allow_offset_texture_operand, path=None):
         self._lib = lib
+        self._context = self._options = None
+        self.path = path
         env = ctypes.c_int()
         if not lib.spvParseTargetEnv(target_env.encode(), ctypes.byref(env)):
             raise ValueError(f"SPIRV-Tools does not know the target environment {target_env}")
@@ -69,6 +92,16 @@ class SpirvTools:
         if not self._context or not self._options:
             raise MemoryError("SPIRV-Tools could not create a context")
         lib.spvValidatorOptionsSetAllowOffsetTextureOperand(self._options, allow_offset_texture_operand)
+
+    def __del__(self):
+        try:
+            if self._context:
+                self._lib.spvContextDestroy(self._context)
+            if self._options:
+                self._lib.spvValidatorOptionsDestroy(self._options)
+        except Exception:    # the library may already be gone while the interpreter exits
+            pass
+        self._context = self._options = None
 
     def _take_diagnostic(self, diagnostic):
         if not diagnostic:
@@ -84,7 +117,9 @@ class SpirvTools:
         """(status, binary bytes, stderr) as `spirv-as - -o <file> --target-env <env>` gives them for `text`
         (bytes): status 0 and the module, or non-zero and the message spirv-as prints (spvDiagnosticPrint)."""
         binary, diagnostic = _BIN(), _DIAG()
-        status = self._lib.spvTextToBinaryWithOptions(self._context, text, len(text), 0,
+        # An empty input is a null pointer for the library, which then says "Missing assembly text." as spirv-as does
+        # (ctypes passes a non-null pointer for b"", and that assembles to a bare header).
+        status = self._lib.spvTextToBinaryWithOptions(self._context, text or None, len(text), 0,
                                                       ctypes.byref(binary), ctypes.byref(diagnostic))
         found = self._take_diagnostic(diagnostic)
         try:
@@ -124,6 +159,34 @@ def _print_diagnostic(found):
     return f"error: {index}: {message}\n" if index > 0 else f"error: {message}\n"
 
 
+def _verdict_of_program(validator, module, target_env, allow_offset_texture_operand):
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "probe.spv")
+        with open(path, "wb") as f:
+            f.write(module)
+        cmd = [validator, "--target-env", target_env] + (["--allow-offset-texture-operand"]
+                                                         if allow_offset_texture_operand else []) + [path]
+        return subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0
+
+
+def _same_verdicts(native, validator, target_env, allow_offset_texture_operand):
+    """True when the library and the spirv-val on PATH agree on a valid module and on one whose ID bound is one over
+    the default limit. The same banner does not mean the same rules: a build can change a limit."""
+    status, module, _ = native.assemble(_PROBE_TEXT)
+    if status or len(module) < 20:
+        return False
+    over = bytearray(module)
+    over[12:16] = (_MAX_ID_BOUND + 1).to_bytes(4, sys.byteorder)
+    for probe in (module, bytes(over)):
+        try:
+            by_program = _verdict_of_program(validator, probe, target_env, allow_offset_texture_operand)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if (native.validate(probe)[0] == 0) != by_program:
+            return False
+    return True
+
+
 def _first_line(tool):
     try:
         r = subprocess.run([tool, "--version"], capture_output=True, text=True, errors="replace", timeout=60)
@@ -140,13 +203,20 @@ def _candidates(tools):
     for tool in tools:
         here = os.path.dirname(os.path.realpath(tool))
         for folder in (here, os.path.join(here, "..", "lib"), os.path.join(here, "..", "lib64")):
-            for name in _LIB_NAMES:
+            for name in _lib_names():
                 path = os.path.join(folder, name)
                 if os.path.isfile(path):
                     yield os.path.normpath(path)
-    found = ctypes.util.find_library("SPIRV-Tools-shared")
-    if found:
-        yield found
+    for stem in ("SPIRV-Tools-shared", "libSPIRV-Tools-shared"):
+        found = ctypes.util.find_library(stem)
+        if found:
+            yield found
+
+
+def program(name):
+    """The absolute path of `name` on PATH as seen from the current folder, or `name` itself when it is not there."""
+    found = shutil.which(name)
+    return os.path.abspath(found) if found else name
 
 
 def _open(path):
@@ -161,8 +231,10 @@ def find(target_env="vulkan1.2", allow_offset_texture_operand=True):
     """A SpirvTools that matches the spirv-as and spirv-val on PATH, or None (then launch the programs)."""
     if os.environ.get(ENV, "").strip().lower() in ("off", "0", "no", "false"):
         return None
-    tools = [shutil.which("spirv-as"), shutil.which("spirv-val")]
-    if not all(tools):
+    # Absolute, so a relative PATH entry means the same folder to the version probe here and to the programs that
+    # rdna2spirv launches from the output folder (spirv_tools_lib.program()).
+    tools = [program("spirv-as"), program("spirv-val")]
+    if not all(os.path.isabs(t) for t in tools):
         return None
     versions = {_first_line(t) for t in tools}
     if len(versions) != 1 or None in versions:
@@ -173,18 +245,25 @@ def find(target_env="vulkan1.2", allow_offset_texture_operand=True):
             lib = _open(path)
             if (lib.spvSoftwareVersionDetailsString() or b"").decode("utf-8", "replace").strip() != want:
                 continue
-            return SpirvTools(lib, target_env, allow_offset_texture_operand)
+            native = SpirvTools(lib, target_env, allow_offset_texture_operand, path)
+            if not _same_verdicts(native, tools[1], target_env, allow_offset_texture_operand):
+                continue
+            return native
         except (OSError, AttributeError, ValueError, MemoryError):
             continue
     return None
 
 
 _cache = {}
+_cache_lock = threading.Lock()
 
 
 def load(target_env="vulkan1.2", allow_offset_texture_operand=True):
-    """find(), once per process for the same PATH and LEONIDA_SPIRV_LIB."""
-    key = (target_env, allow_offset_texture_operand, os.environ.get("PATH", ""), os.environ.get(ENV, ""))
-    if key not in _cache:
-        _cache[key] = find(target_env, allow_offset_texture_operand)
-    return _cache[key]
+    """find(), once per process for the same folder, PATH and LEONIDA_SPIRV_LIB (one context per key even when
+    threads ask at the same time)."""
+    key = (target_env, allow_offset_texture_operand, os.getcwd(), os.environ.get("PATH", ""),
+           os.environ.get(ENV, ""))
+    with _cache_lock:
+        if key not in _cache:
+            _cache[key] = find(target_env, allow_offset_texture_operand)
+        return _cache[key]
