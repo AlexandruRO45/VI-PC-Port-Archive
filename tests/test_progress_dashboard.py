@@ -61,8 +61,9 @@ class Contract(unittest.TestCase):
 
 class Tests(unittest.TestCase):
     def test_junit_rejects_unrelated_root_and_keeps_other_reports(self):
+        namespace = "urn:dashboard-private-namespace"
         reports = {
-            "coverage.xml": '<coverage><testsuite><testcase name="foreign"/></testsuite></coverage>',
+            "coverage.xml": f'<coverage xmlns="{namespace}"><testsuite><testcase name="foreign"/></testsuite></coverage>',
             "empty.xml": '<testsuite tests="0"/>',
             "pytest.xml": '<testsuites><testsuite><testcase name="valid"/></testsuite></testsuites>',
         }
@@ -73,12 +74,25 @@ class Tests(unittest.TestCase):
                 with open(path, "w", encoding="utf-8", newline="\n") as f:
                     f.write(xml)
                 paths.append(path)
-            col = pd.Collector()
-            with mock.patch.object(pd, "ROOT", root), mock.patch.object(pd, "last_commit_time", return_value=None):
-                pd.collect_ctest(col, SimpleNamespace(junit=paths))
-        self.assertEqual({s["path"]: s["status"] for s in col.sources if s["id"] == "junit"},
-                         {"coverage.xml": "invalid", "empty.xml": "ok", "pytest.xml": "ok"})
-        self.assertEqual([c["name"] for c in col.components], ["valid"])
+            out = os.path.join(root, "out")
+            result = subprocess.run([sys.executable, "-I", TOOL, "--out", out, "--junit", *paths],
+                                    capture_output=True, cwd=root, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            snapshots = os.path.join(out, "snapshots")
+            filename, = os.listdir(snapshots)
+            with open(os.path.join(snapshots, filename), encoding="utf-8") as f:
+                snapshot = json.load(f)
+            with open(os.path.join(out, "progress.html"), encoding="utf-8") as f:
+                page = f.read()
+        sources = {os.path.basename(s["path"]): s for s in snapshot["sources"] if s["id"] == "junit"}
+        self.assertEqual(sources["coverage.xml"]["status"], "invalid")
+        self.assertEqual(sources["coverage.xml"]["note"], "expected JUnit root testsuite or testsuites")
+        self.assertNotIn("records", sources["coverage.xml"])
+        for name, count in (("empty.xml", 0), ("pytest.xml", 1)):
+            self.assertEqual((sources[name]["status"], sources[name]["records"]), ("ok", count))
+        self.assertEqual([c["name"] for c in snapshot["components"] if c["group"].startswith("junit:")], ["valid"])
+        self.assertNotIn(namespace, json.dumps(snapshot))
+        self.assertNotIn(namespace, page)
 
     def test_junit_honors_each_reports_encoding(self):
         xml = '<?xml version="1.0" encoding="{}"?><testsuite><testcase name="{}"><failure/></testcase></testsuite>'
