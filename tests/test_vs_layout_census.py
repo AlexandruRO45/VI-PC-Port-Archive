@@ -289,6 +289,26 @@ class TestWriteJsonReport(unittest.TestCase):
             V._write_json_report(folder, {"ok": True})
         self.assertEqual(sorted(os.listdir(self._tmp.name)), before)
 
+    def test_devnull_destination_writes_directly_without_staging(self):
+        buf, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(V, "default_disasm", side_effect=fake_disasm), \
+                mock.patch.object(V.tempfile, "mkstemp", side_effect=AssertionError("must not stage non-regular dest")), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            code = V.main([self.dx, "--json", os.devnull])
+        self.assertEqual(code, 0, err.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlinks")
+    def test_symlinked_destination_keeps_link_and_updates_target(self):
+        target = os.path.join(self._tmp.name, "real.json")
+        link = os.path.join(self._tmp.name, "link.json")
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"old": true}\n')
+        os.symlink(target, link)
+        V._write_json_report(link, {"new": True})
+        self.assertTrue(os.path.islink(link))
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"new": True})
+
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_posix_mode_bits_preserved_for_new_and_replaced_reports(self):
         import file_mode

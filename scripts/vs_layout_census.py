@@ -23,6 +23,7 @@ import errno
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from collections import Counter, defaultdict
@@ -185,9 +186,18 @@ def survey(dxbc_dir, disasm_fn=None, limit=None):
 
 def _write_json_report(path, payload):
     """Write a JSON report via a sibling temp file so a failure never truncates an existing report."""
-    dest = os.path.abspath(path)
-    if os.path.isdir(dest) or path.endswith((os.sep, "/")) or (os.altsep and path.endswith(os.altsep)):
+    if os.path.isdir(path) or path.endswith((os.sep, "/")) or (os.altsep and path.endswith(os.altsep)):
         raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), path)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, indent=1)
+            stream.write("\n")
+        return
+    dest = os.path.realpath(path)
     parent = os.path.dirname(dest) or "."
     os.makedirs(parent, exist_ok=True)
     mode = published_mode(dest)
