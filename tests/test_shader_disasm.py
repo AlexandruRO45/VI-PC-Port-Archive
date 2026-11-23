@@ -470,5 +470,64 @@ class DisasmOutputCollisionTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.dir, "foo.s")))
 
 
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import shader_ir  # noqa: E402
+
+# s_load_dwordx8 into s[100:107] (its last two SGPRs are vcc), s_load_dwordx4 into s[104:107], image_sample with
+# resource s[100:107] and sampler s[104:107], buffer_load_dword with resource s[104:107], then v_mov_b32 v1, s1 and
+# s_endpgm. llvm-mc 21 rejects the four tuple instructions and decodes the words after each misaligned.
+VCC_CODE = bytes.fromhex("02190cf4100000fa" "021a08f4100000fa" "080f80f000005903" "001030e000001a80"
+                         "0102027e" "000081bf")
+X8, X4 = "[s100,s101,s102,s103,s104,s105,vcc_lo,vcc_hi]", "[s104,s105,vcc_lo,vcc_hi]"
+VCC_LISTS = [X8, X4, X8 + ", " + X4, X4]
+
+# Knows s_nop 0, s_endpgm and v_mov_b32 v1, s1; reports every other word as llvm-mc does an invalid one.
+FAKE_MC = r'''import sys
+names = {"0000 80bf": "s_nop 0", "0000 81bf": "s_endpgm", "0102 027e": "v_mov_b32_e32 v1, s1"}
+data = bytes(int(t, 16) for t in sys.stdin.read().split())
+for i in range(0, len(data), 4):
+    w = data[i:i + 4]
+    name = names.get(w[:2].hex() + " " + w[2:].hex())
+    if name is None:
+        print(f"<stdin>:1:{5 * i + 1}: warning: invalid instruction encoding", file=sys.stderr)
+    else:
+        print(f"\t{name} ; encoding: [{','.join(f'0x{b:02x}' for b in w)}]")
+'''
+
+
+class VccTupleFallbackTest(unittest.TestCase):
+    def check(self, asm, bad):
+        self.assertEqual(bad, 0)
+        insns = [shader_ir.parse_line(l) for l in asm.splitlines() if "; encoding:" in l]
+        self.assertEqual([i["op"] for i in insns], ["s_load_dwordx8", "s_load_dwordx4", "image_sample",
+                                                      "buffer_load_dword", "v_mov_b32_e32", "s_endpgm"])
+        self.assertEqual(b"".join(bytes.fromhex(i["enc"]) for i in insns), VCC_CODE)
+        for line, regs in zip(asm.splitlines(), VCC_LISTS):
+            self.assertIn(regs, line)
+        self.assertEqual(insns[0]["args"][0]["k"], "slist")
+
+    def test_tuples_into_vcc_take_the_python_decoder_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "fake_mc.py")
+            with open(fake, "w") as f:
+                f.write(FAKE_MC)
+            import shader_disasm
+            old = shader_disasm.MC
+            shader_disasm.MC = [sys.executable, fake]
+            try:
+                asm, bad, _ = shader_disasm.disasm(VCC_CODE, "gfx1013")
+            finally:
+                shader_disasm.MC = old
+        self.check(asm, bad)
+
+    def test_with_real_llvm_mc(self):
+        mc = os.environ.get("LLVM_MC")
+        if not mc:
+            self.skipTest("LLVM_MC not set")
+        import shader_disasm
+        asm, bad, err = shader_disasm.disasm(VCC_CODE, "gfx1013")
+        self.check(asm, bad)
+
+
 if __name__ == "__main__":
     unittest.main()

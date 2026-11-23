@@ -13,6 +13,7 @@ Set LLVM_MC to llvm-mc's path, or to a whole command such as
 """
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -93,6 +94,53 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
+    asm, bad, err = _llvm_mc(code, mcpu)
+    if bad and asm:
+        return _vcc_tuple_fallback(code, mcpu, wave32) or (asm, bad, err)
+    return asm, bad, err
+
+
+NOP = b"\x00\x00\x80\xbf"   # s_nop 0
+INVALID_AT = re.compile(r"<stdin>:\d+:(\d+): warning: invalid instruction encoding")
+
+
+def _vcc_tuple_fallback(code: bytes, mcpu: str, wave32: bool):
+    """llvm-mc rejects scalar register tuples that run into vcc (s[100:107], s[104:107], s[92:107] as SMEM data
+    or an image's resource) and then decodes the next words misaligned. rdna2_decode prints them as the
+    [s100,...,vcc_lo,vcc_hi] list the translator reads, so give llvm-mc s_nop words in their place and splice
+    the Python lines back in. None when there is no such instruction or the splice does not line up."""
+    lists = {ins["pc"]: ins for ins in rdna2_decode.decode_bytes(code, mcpu=mcpu, wave32=wave32)["insns"]
+             if "vcc_lo,vcc_hi]" in rdna2_decode.format_insn(ins)}
+    if not lists:
+        return None
+    patched = bytearray(code)
+    for pc, ins in lists.items():
+        n = len(ins["enc"]) // 2
+        patched[pc:pc + n] = NOP * (n // 4)
+    asm, _, err = _llvm_mc(bytes(patched), mcpu)
+    # Byte i of the input is at column 5*i+1 of its one line; llvm-mc skips 4 bytes per invalid word.
+    invalid = {(int(m.group(1)) - 1) // 5 for m in INVALID_AT.finditer(err)}
+    out, at, skip_to, placed = [], 0, 0, 0
+    for line in asm.splitlines(keepends=True):
+        enc = line.partition("; encoding: [")[2]
+        if not enc:
+            out.append(line)
+            continue
+        while at in invalid:
+            at += 4
+        size = enc.count("0x")
+        if at in lists:
+            out.append(rdna2_decode.format_insn(lists[at]) + "\n")
+            skip_to, placed = at + len(lists[at]["enc"]) // 2, placed + 1
+        elif at >= skip_to:
+            out.append(line)
+        at += size
+    if placed != len(lists) or at + 4 * sum(o >= at for o in invalid) != len(code):
+        return None
+    return "".join(out), len(invalid), err
+
+
+def _llvm_mc(code: bytes, mcpu: str):
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
