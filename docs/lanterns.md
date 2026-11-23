@@ -49,6 +49,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [10](#stage-10-4x-msaa-resolved-with-resolvesubresource) | The frame drawn at 4x MSAA and resolved with `ResolveSubresource` | The 1x render differs on exactly the predicted edge pixels; `SampleMask` isolates each sample |
 | [11](#stage-11-ray-traced-shadows-through-blastlas) | One shadow ray per pixel through a TLAS over two BLASes, walked with `image_bvh_intersect_ray` | Masking one instance or swapping two BLAS references changes the predicted pixels; a stalled BVH stops at the step cap |
 | [20](#stage-20-samplers-held-as-literals) | A compute shader samples through three samplers it builds from immediates, as the console compiles static samplers | A POINT sampler made LINEAR, or the comparison bits cleared, changes the predicted samples |
+| [22](#stage-22-a-g-buffer-round-trip) | Five and six G-buffer targets written through packed half exports, then decoded by a compute pass | A binary16 target in place of the RGBA8 IDs, or UNORM in place of sRGB, breaks the predicted values |
 | [24](#stage-24-local-x-and-y-thread-ids) | A compute shader with a 16x8 local size reads local X and local Y | X and Y swapped moves every predicted word |
 
 ## Stage 1
@@ -347,6 +348,42 @@ probes exact; the comparison bits cleared (`0x3092` to `0x92`) gives the raw dep
 
 ```
 Lanterns stage 20: PASS, three samplers the shader holds as literal S#s (as the console's compiler writes static samplers): POINT 32 of 32 probes exact, LINEAR 32 of 32 (differing from POINT at 30 as predicted), LESS_EQUAL comparison 32 of 32 (12 pass, 20 fail), and a plain POINT sample of the same depth texture 32 of 32 raw depths
+```
+
+## Stage 22: a G-buffer round trip
+
+The title's deferred pixel shaders write five or six targets and pack every colour export as half floats
+(`v_cvt_pkrtz_f16_f32`, `exp ... compr`); a lighting pass reads them back. `ps_lanterns_gbuf6` (fullscreen, with
+`vs_lanterns_full`) writes six targets from the pixel's integer position:
+
+| Target | Format | Holds |
+|---|---|---|
+| 0 | `R8G8B8A8_UNORM` | four byte IDs |
+| 1 | `R10G10B10A2_UNORM` | three 10-bit codes and a 2-bit alpha |
+| 2 | `R16G16_FLOAT` | signed motion |
+| 3 | `R8G8B8A8_UNORM_SRGB` | albedo, written linear and stored sRGB-encoded |
+| 4 | `R16G16B16A16_FLOAT` | emissive |
+| 5 | `R8G8B8A8_UNORM` | four more byte IDs |
+
+It runs twice: with all six targets bound, and with a 5-target pipeline, where the sixth export goes nowhere.
+`cs_lanterns_gbuf_decode` then reads targets 0, 1, 2, 4 and 5 through T#s and decodes them as a lighting pass does: byte
+IDs by multiplying by 255 and truncating, codes by rounding, and a lighting term from the decoded values.
+
+How the check works. `lanterns_gbuf6.h` computes every target's bytes and the decode's output, from the f16 values the
+exports round toward zero. Gated separately, over both runs:
+
+- byte IDs (targets 0 and 5, and their decode), the 10-bit codes, the motion and the emissive values: exact;
+- the sRGB albedo: within one code of the CPU's encoding, as D3D allows (the PASS line says how many are exact);
+- the decoded lighting: exact;
+- with 5 targets, the sixth target stays at its clear value.
+
+The byte IDs survive only because their target is RGBA8: an f16 rounded toward zero and decoded by multiplying by 255 and
+truncating loses one in 254 of 256 values. Mutations that fail: target 0 made `R16G16B16A16_FLOAT` (0 of 196,608 byte
+IDs right, the lighting at 1,536); the albedo target made UNORM instead of sRGB (22 of 196,608 albedo pixels within one
+code). The sRGB part follows #4251, which checks the sRGB formats the game uses.
+
+```
+Lanterns stage 22: PASS, G-buffers of 5 and 6 targets written through packed half-float exports: byte IDs 196608 of 196608 pixels exact (RGBA8, read back by a truncating x255 decode), 10-bit codes 196608 of 196608, signed RG16F motion 196608 of 196608, RGBA16F emissive 196608 of 196608, sRGB albedo 196608 of 196608 within one code (178702 exact), decoded lighting 196608 of 196608 exact; with 5 targets the sixth stayed clear at 98304 of 98304 pixels
 ```
 
 ## Stage 24: local X and Y thread IDs

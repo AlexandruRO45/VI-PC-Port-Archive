@@ -42,6 +42,7 @@ folder:
   stage 11: the ray-traced shadows; sheet: frame | reference / the control (one instance masked) | mask /
             the second control (two instances swap BLAS references) | frame
   stage 20: the probe card (rows POINT, LINEAR, comparison, plain depth sample; a cell per probe); sheet: card | reference
+  stage 22: the sRGB albedo target of the 6-target run; sheet: target | reference / target | mask
   stage 24: the 32x24 grid (own word left, mirror word right in each cell); sheet: grid | reference
 """
 import argparse
@@ -109,6 +110,12 @@ PASS_LINES = {
          rf"depth texture {N} of {N} raw depths",
          lambda p, pn, l, ln, d, c, cn, ps, fl, r, rn: p == pn == l == ln == c == cn == r == rn == 32 and d >= 8
          and ps > 0 and fl > 0 and ps + fl == 32),
+    22: (rf"Lanterns stage 22: PASS, G-buffers of 5 and 6 targets written through packed half-float exports: byte IDs "
+         rf"{N} of {N} pixels exact \(RGBA8, read back by a truncating x255 decode\), 10-bit codes {N} of {N}, signed "
+         rf"RG16F motion {N} of {N}, RGBA16F emissive {N} of {N}, sRGB albedo {N} of {N} within one code \({N} exact\), "
+         rf"decoded lighting {N} of {N} exact; with 5 targets the sixth stayed clear at {N} of {N} pixels",
+         lambda i, n1, c, n2, m, n3, e, n4, a, n5, ax, l, n6, s, n7: n1 == n2 == n3 == n4 == n5 == n6 == 196608
+         and i == c == m == e == a == l == 196608 and 0 <= ax <= a and s == n7 == 98304),
     24: (rf"Lanterns stage 24: PASS, a 16x8 local size \(four wave32 waves, local X in v0 and local Y in v1\) on a 2x3 "
          rf"grid: {N} of {N} positions exact, and {N} of {N} point-mirror words read through LDS after the barrier",
          lambda a, b, c, d: a == b == c == d == 768),
@@ -356,6 +363,8 @@ PANELS = {
          "sheet": [["stage11-frame.gpu", "stage11-frame.ref"], ["stage11-masked.gpu", "stage11-frame:mask"],
                    ["stage11-swapped.gpu", "stage11-frame.gpu"]]},
     20: {"main": [["stage20-probes.gpu"]], "sheet": [["stage20-probes.gpu", "stage20-probes.ref"]]},
+    22: {"main": [["stage22-albedo.gpu"]],
+         "sheet": [["stage22-albedo.gpu", "stage22-albedo.ref"], ["stage22-albedo.gpu", "stage22-albedo:mask"]]},
     24: {"main": [["stage24-grid.gpu"]], "sheet": [["stage24-grid.gpu", "stage24-grid.ref"]]},
 }
 

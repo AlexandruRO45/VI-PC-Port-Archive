@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20|24 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20|22|24 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -68,6 +68,10 @@
 // per lane, its own grid position and that of its point mirror in the group, read through LDS after the barrier
 // (lanterns_xy.h). Every word must be exact; with X and Y swapped the words move.
 //
+// Stage 22: a G-buffer round trip. A fullscreen pixel shader writes six targets (RGBA8 IDs, RGB10A2 codes, RG16F motion,
+// sRGB albedo, RGBA16F emissive, more RGBA8 IDs), every export packed as half floats; a compute pass reads them back
+// and decodes them as a lighting pass does (lanterns_gbuf6.h). Run with 5 and with 6 targets bound.
+//
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
 #include "lanterns_edges_gpu.h"
@@ -84,6 +88,7 @@
 #include "lanterns_rt_gpu.h"
 #include "lanterns_samplers_gpu.h"
 #include "lanterns_xy_gpu.h"
+#include "lanterns_gbuf6_gpu.h"
 #include "lanterns_textures_gpu.h"
 
 #include <algorithm>
@@ -1071,6 +1076,88 @@ int stage24(const std::filesystem::path& shader_dir, const std::filesystem::path
     return 0;
 }
 
+int stage22(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    const lanterns::Scene scene = lanterns::stage1();
+    lanterns::Shaders shaders;
+    lanterns::Gbuf6Shaders gbuf_shaders;
+    if (!lanterns::load_shaders(shader_dir, 1, shaders) || !lanterns::load_gbuf6_shaders(shader_dir, gbuf_shaders)) return 1;
+    std::array<lanterns::Gbuf6Result, 2> results;   // [0] 5 targets, [1] 6 targets
+    {
+        lanterns::Gpu gpu;
+        lanterns::Gbuf6 gbuf;
+        if (!gpu.create(scene, shaders) || !gbuf.create(gpu, gbuf_shaders) || !gbuf.run(false, results[0]) ||
+            !gbuf.run(true, results[1]) || !gpu.idle())
+            return 1;
+    }
+    enum { kIds, kCodes, kMotion, kEmissive, kAlbedo, kLit, kGates };
+    const char* names[kGates] = {"byte IDs", "10-bit codes", "motion", "emissive", "sRGB albedo", "decoded lighting"};
+    unsigned ok[kGates] = {}, albedo_exact = 0, sixth_clear = 0, reported[kGates] = {};
+    std::vector<Color> albedo(std::size_t(kWidth) * kHeight), albedo_ref = albedo;
+    for (unsigned run = 0; run < 2; ++run) {
+        const lanterns::Gbuf6Result& r = results[run];
+        for (unsigned y = 0; y < kHeight; ++y)
+            for (unsigned x = 0; x < kWidth; ++x) {
+                const lanterns::GbufPixel want = lanterns::gbuf_expect(x, y, run == 1);
+                const std::size_t i = std::size_t(y) * kWidth + x;
+                const auto at = [&](unsigned t) { return r.targets[t].data() + i * r.texel_bytes[t]; };
+                const std::uint32_t* d = r.decoded.data() + i * 8;
+                std::uint32_t codes = 0;
+                std::memcpy(&codes, at(1), 4);
+                const bool good[kGates] = {
+                    r.texel_bytes[0] == 4 && std::memcmp(at(0), want.ids.data(), 4) == 0 && d[0] == want.decoded[0] &&
+                        std::memcmp(at(5), want.ids2.data(), 4) == 0 && d[5] == want.decoded[5],
+                    codes == want.codes && d[1] == want.decoded[1],
+                    std::memcmp(at(2), want.motion.data(), 4) == 0 && d[2] == want.decoded[2] && d[3] == want.decoded[3],
+                    std::memcmp(at(4), want.emissive.data(), 8) == 0,
+                    [&] {
+                        for (unsigned ch = 0; ch < 4; ++ch)
+                            if (std::abs(int(at(3)[ch]) - int(want.albedo[ch])) > (ch < 3 ? 1 : 0)) return false;
+                        return true;
+                    }(),
+                    d[4] == want.decoded[4]};
+                for (unsigned g = 0; g < kGates; ++g) {
+                    ok[g] += good[g];
+                    if (!good[g] && reported[g]++ < 3)
+                        std::printf("lanterns: %u targets, pixel (%u, %u), %s wrong: ids %02x%02x%02x%02x/%08x (want "
+                                    "%02x%02x%02x%02x/%08x), codes %08x/%08x (want %08x/%08x), lighting %08x (want %08x)\n",
+                                    run ? 6 : 5, x, y, names[g], at(0)[0], at(0)[1], at(0)[2], at(0)[3], d[0], want.ids[0],
+                                    want.ids[1], want.ids[2], want.ids[3], want.decoded[0], codes, d[1], want.codes,
+                                    want.decoded[1], d[4], want.decoded[4]);
+                }
+                albedo_exact += std::memcmp(at(3), want.albedo.data(), 4) == 0;
+                if (run == 0) {
+                    std::uint32_t sixth = 0;
+                    std::memcpy(&sixth, at(5), 4);
+                    sixth_clear += sixth == 0;
+                } else {
+                    for (unsigned ch = 0; ch < 3; ++ch) albedo[i][ch] = float(at(3)[ch]) / 255.0f, albedo_ref[i][ch] = float(want.albedo[ch]) / 255.0f;
+                    albedo[i][3] = albedo_ref[i][3] = 1.0f;
+                }
+            }
+    }
+    const unsigned n = 2 * kWidth * kHeight, n5 = kWidth * kHeight;
+    for (unsigned g = 0; g < kGates; ++g) std::printf("lanterns: %s: %u of %u pixels (both runs)\n", names[g], ok[g], n);
+    std::printf("lanterns: sRGB albedo exactly the CPU's encoding at %u of %u; with 5 targets the sixth stayed clear at %u of "
+                "%u pixels\n", albedo_exact, n, sixth_clear, n5);
+    lanterns::Reference shown_ref;
+    shown_ref.color = albedo_ref;
+    shown_ref.candidates.resize(albedo.size());
+    if (!dump(out_dir, "stage22-albedo", albedo, shown_ref)) return 1;
+    bool all = sixth_clear == n5;
+    for (unsigned g = 0; g < kGates; ++g) all = all && ok[g] == n;
+    if (!all) {
+        std::fprintf(stderr, "lanterns: stage 22 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 22: PASS, G-buffers of 5 and 6 targets written through packed half-float exports: byte IDs "
+                "%u of %u pixels exact (RGBA8, read back by a truncating x255 decode), 10-bit codes %u of %u, signed "
+                "RG16F motion %u of %u, RGBA16F emissive %u of %u, sRGB albedo %u of %u within one code (%u exact), "
+                "decoded lighting %u of %u exact; with 5 targets the sixth stayed clear at %u of %u pixels\n",
+                ok[kIds], n, ok[kCodes], n, ok[kMotion], n, ok[kEmissive], n, ok[kAlbedo], n, albedo_exact, ok[kLit], n,
+                sixth_clear, n5);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1096,9 +1183,10 @@ int main(int argc, char** argv) {
     case 10: return stage10(shader_dir, out_dir);
     case 11: return stage11(shader_dir, out_dir);
     case 20: return stage20(shader_dir, out_dir);
+    case 22: return stage22(shader_dir, out_dir);
     case 24: return stage24(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20|24 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20|22|24 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }
