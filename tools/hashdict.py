@@ -78,7 +78,8 @@ def main():
     ap.add_argument("--archives", default="common,data,script,pack_story000_story000_script,textures")
     ap.add_argument("--extra", nargs="*", default=[])
     ap.add_argument("--min", type=int, default=3)
-    ap.add_argument("--lookup", nargs="+", metavar="VALUE", help="dictionary path followed by one or more hashes")
+    ap.add_argument("--lookup", nargs="+", metavar="VALUE",
+                    help="dictionary path followed by one or more 32-bit hexadecimal hashes")
     a = ap.parse_args()
     if a.lookup:
         if len(a.lookup) < 2:
@@ -86,9 +87,12 @@ def main():
         values = []
         for h in a.lookup[1:]:
             try:
-                values.append((h, int(h, 16)))
+                value = int(h, 16)
             except ValueError:
                 ap.error(f"--lookup: {h!r} is not a hexadecimal hash")
+            if not 0 <= value <= 0xFFFFFFFF:
+                ap.error(f"--lookup: {h!r} is outside the unsigned 32-bit range")
+            values.append((h, value))
         try:
             with open(a.lookup[0], encoding="utf-8") as f:
                 d = json.load(f)

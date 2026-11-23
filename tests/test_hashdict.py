@@ -264,6 +264,21 @@ class LookupBadInputTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(p.stdout, "")          # nothing printed for the valid value before the bad one
 
+    def test_lookup_rejects_out_of_range_hashes_before_any_output(self):
+        for value in ("-1", "100000000"):
+            with self.subTest(value=value):
+                result = self.run_tool("--lookup", self.hashes_file, "88f08ef3", value)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unsigned 32-bit range", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_lookup_accepts_both_unsigned_32_bit_endpoints(self):
+        with open(self.hashes_file, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"00000000": "zero", "ffffffff": "maximum"}, f)
+        result = self.run_tool("--lookup", self.hashes_file, "0", "0XFFFFFFFF")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["0 zero", "0XFFFFFFFF maximum"])
+
     def test_unreadable_dictionary_is_one_line(self):
         bad = os.path.join(self.tmp.name, "bad.json")
         with open(bad, "w", encoding="utf-8") as f:
