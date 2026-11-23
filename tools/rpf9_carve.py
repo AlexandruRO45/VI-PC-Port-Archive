@@ -12,6 +12,8 @@ bits/byte of its first ENTROPY_SAMPLE bytes (`sampled`). An all-zero gap is padd
 Usage:
     python -I rpf9_carve.py <archive.rpf> <out_dir> [--start N] [--limit BYTES] [--until-adat] [--index-only]
 
+Exit status: 0 after a carve (whatever it found), 2 for a bad argument or an archive it cannot read.
+
 --until-adat ends the scan at the first raw AWC bank (a little-endian `ADAT` whose header parses as one,
 rsc8_audio.parse_adat_header_bytes), so the zlib-compressed audio config at the start of audio.rpf is carved without
 touching the banks and without a build-specific --limit (docs/audio_config.md). The bytes `ADAT` alone are not
@@ -127,36 +129,44 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     below_normal()
     if os.path.isdir(a.archive):
-        sys.exit(f"{a.archive}: is a directory, not an RPF9 archive")
+        print(f"{a.archive}: is a directory, not an RPF9 archive", file=sys.stderr)
+        return 2
     try:
         size = os.path.getsize(a.archive)
     except OSError as e:
-        sys.exit(f"{a.archive}: {e.strerror or e}")
+        print(f"{a.archive}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if size == 0:
-        sys.exit(f"{a.archive}: empty file")
+        print(f"{a.archive}: empty file", file=sys.stderr)
+        return 2
     if size < 8:
-        sys.exit(f"{a.archive}: too short for an RPF9 header ({size} bytes)")
+        print(f"{a.archive}: too short for an RPF9 header ({size} bytes)", file=sys.stderr)
+        return 2
     try:
         with open(a.archive, "rb") as fh:
             hdr = fh.read(8)
     except OSError as e:
-        sys.exit(f"{a.archive}: {e.strerror or e}")
+        print(f"{a.archive}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if hdr[:4] != MAGIC:
-        sys.exit(f"{a.archive}: not an RPF9 archive (expected the magic {MAGIC.decode()} at offset 0)")
+        print(f"{a.archive}: not an RPF9 archive (expected the magic {MAGIC.decode()} at offset 0)", file=sys.stderr)
+        return 2
     if a.start is not None and not 0 <= a.start < size:
-        sys.exit(f"{a.archive}: --start {a.start} is outside the file (0..{size - 1})")
+        ap.error(f"{a.archive}: --start {a.start} is outside the file (0..{size - 1})")
     if a.start is None:
         base = struct.unpack_from("<I", hdr, 4)[0]
         if base > size:   # base == size is an empty data area, which is fine
-            sys.exit(f"{a.archive}: header data offset {base} is past the end of the file ({size} bytes)")
+            print(f"{a.archive}: header data offset {base} is past the end of the file ({size} bytes)", file=sys.stderr)
+            return 2
     else:
         base = a.start
     if os.path.exists(a.out) and not os.path.isdir(a.out):
-        sys.exit(f"{a.out}: output path is a file, not a directory")
+        ap.error(f"{a.out}: output path is a file, not a directory")
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
-        sys.exit(f"{a.out}: cannot create output directory: {e.strerror or e}")
+        print(f"{a.out}: cannot create output directory: {e.strerror or e}", file=sys.stderr)
+        return 2
     with open(a.archive, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         pos = base
         end = min(size, pos + a.limit) if a.limit else size
@@ -207,7 +217,8 @@ def main(argv=None) -> int:
                         with open(out_file, "wb") as f:
                             f.write(m[s:s + blen])
                     except OSError as e:
-                        sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
+                        print(f"{out_file}: cannot write: {e.strerror or e}", file=sys.stderr)
+                        return 2
                 last = pos = s + blen
                 system_pages.reset()
                 continue
@@ -244,7 +255,8 @@ def main(argv=None) -> int:
                     with open(out_file, "wb") as f:
                         f.write(out)
                 except OSError as e:
-                    sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
+                    print(f"{out_file}: cannot write: {e.strerror or e}", file=sys.stderr)
+                    return 2
             last = pos = s + used
             if len(rows) % 2000 == 0:
                 done = (pos - (a.start or 0)) / max(1, end - (a.start or 0))
@@ -265,7 +277,8 @@ def main(argv=None) -> int:
         with open(index_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows, "unread": unread_ranges}, f)
     except OSError as e:
-        sys.exit(f"{index_path}: cannot write: {e.strerror or e}")
+        print(f"{index_path}: cannot write: {e.strerror or e}", file=sys.stderr)
+        return 2
     print(json.dumps(summary, indent=1))
     span = max(1, span)   # an empty data area (or --start at the end) has nothing to divide by
     print(f"readable: {total / span:.1%}, zero padding {zero / span:.1%}, unread {unread / span:.1%}")
