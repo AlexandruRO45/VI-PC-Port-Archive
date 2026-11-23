@@ -331,5 +331,89 @@ class TestSaluNotB32ScalarInterpreter(unittest.TestCase):
             self.assertEqual(interp_res, hw_res)
             self.assertEqual(self.rf.scc, hw_scc)
 
+# --- Section 4: SIMD Multi-Lane Divergence and EXEC Masking ---
+
+class SimdWaveNotModel:
+    """Wavefront SIMD execution model for scalar bitfield broadcasting under EXEC masking."""
+
+    def __init__(self, wave_size: int = 32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError("wave_size must be 32 or 64")
+        self.wave_size = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: List[List[int]] = [[0] * 32 for _ in range(wave_size)]
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def broadcast_scalar(self, scalar_val: int, dst_vgpr: int) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                self.vgprs[lane][dst_vgpr] = scalar_val & MASK32
+
+    def get_lane_vgpr(self, lane: int, vgpr: int) -> int:
+        return self.vgprs[lane][vgpr]
+
+
+def run_salu_not_simd_ps(src_val: int) -> List[int]:
+    """Test scalar NOT broadcast in fragment shader with vector registers."""
+    lines = [
+        f"s_mov_b32 s0, {src_val & MASK32:#x}",
+        "s_not_b32 s1, s0",
+        "v_mov_b32 v0, s1",
+        "v_mov_b32 v1, s1",
+        "v_mov_b32 v2, s1",
+        "v_mov_b32 v3, s1",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_salu_not_simd", lines)
+    return mrt0_words(spv)
+
+
+class TestSaluNotB32SimdExecution(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking tests."""
+
+    def test_wave32_full_exec(self) -> None:
+        model = SimdWaveNotModel(wave_size=32)
+        val = 0x12345678
+        not_val = ref_s_not_b32(val)
+        model.broadcast_scalar(not_val, dst_vgpr=0)
+        for lane in range(32):
+            self.assertEqual(model.get_lane_vgpr(lane, 0), not_val)
+
+    def test_wave32_divergent_exec_mask(self) -> None:
+        model = SimdWaveNotModel(wave_size=32)
+        mask = 0x55555555
+        model.set_exec(mask)
+        for lane in range(32):
+            model.vgprs[lane][1] = 0xDEADBEEF
+        not_val = ref_s_not_b32(0xCAFEBABE)
+        model.broadcast_scalar(not_val, dst_vgpr=1)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(model.get_lane_vgpr(lane, 1), not_val)
+            else:
+                self.assertEqual(model.get_lane_vgpr(lane, 1), 0xDEADBEEF)
+
+    def test_wave64_divergent_exec_mask(self) -> None:
+        model = SimdWaveNotModel(wave_size=64)
+        mask = 0x00000000FFFFFFFF
+        model.set_exec(mask)
+        for lane in range(64):
+            model.vgprs[lane][2] = (0x11111111 * (lane + 1)) & MASK32
+        not_val = ref_s_not_b32(0x80000001)
+        model.broadcast_scalar(not_val, dst_vgpr=2)
+        for lane in range(32):
+            self.assertEqual(model.get_lane_vgpr(lane, 2), not_val)
+        for lane in range(32, 64):
+            self.assertEqual(model.get_lane_vgpr(lane, 2), (0x11111111 * (lane + 1)) & MASK32)
+
+    def test_hardware_simd_broadcast(self) -> None:
+        test_val = 0x87654321
+        expected = ref_s_not_b32(test_val)
+        words = run_salu_not_simd_ps(test_val)
+        self.assertEqual(words, [expected, expected, expected, expected])
+
 if __name__ == "__main__":
     unittest.main()
