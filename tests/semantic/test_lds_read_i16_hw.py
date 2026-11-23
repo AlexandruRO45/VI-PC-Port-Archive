@@ -722,5 +722,70 @@ class TestLdsReadI16EdgeCases(unittest.TestCase):
         self.assertEqual(oracle_ds_read_i16(0x8000), 0xFFFF8000)
 
 
+
+class TestLdsReadI16NegativeRejection(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_invalid_instruction_parameters(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_READ_I16,
+                vdst=Register(RegKind.SGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_READ_I16,
+                vdst=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.SGPR, 1),
+            )
+        with self.assertRaises(ValueError):
+            DSOffset(offset=-1)
+        with self.assertRaises(ValueError):
+            DSOffset(offset=65536)
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDLDSWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDLDSWavefrontInterpreter(wave_size=128)
+
+    def test_invalid_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=100)
+
+    def test_mutation_detection_zero_extension(self) -> None:
+        # Mutant: zero-extends instead of sign-extending
+        raw = 0x8000
+        correct = oracle_ds_read_i16(raw)  # 0xFFFF8000
+        mutant = raw & 0xFFFF              # 0x00008000
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_ignored_exec_mask(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter(wave_size=32, capacity_dwords=1024)
+        simd.set_exec_mask(0)  # Inactive
+        simd.lds.write_dword(0, 0x1234)
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 1, 0)
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 2, 0xCAFEBABE)
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        simd.step(inst)
+        # Lane 0 must remain unchanged
+        self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 2), 0xCAFEBABE)
+
+
 if __name__ == "__main__":
     unittest.main()
