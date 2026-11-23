@@ -47,6 +47,27 @@ class TtpfExportResumeTest(unittest.TestCase):
             self.assertEqual(struct.unpack_from("<II", header, 24), (row["Depth"], row["Mips"]))
             self.assertEqual(struct.unpack_from("<I", header, 132)[0], 4)  # D3D10_RESOURCE_DIMENSION_TEXTURE3D
 
+    def test_rbplus_64k_4bpp_tile_order_matches_ttpf_mips(self):
+        # RDNA2 SW_64KB_D with 4-byte elements puts X2 at bit 6 and Y2 at bit 7 ((3, -3) in
+        # ttpf_mips.PATTERNS_64K[2]), so tile offset 64 is pixel (4, 0) and offset 128 is pixel (0, 4).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "rbplus.ttpf"
+            tiled = bytearray(65536)
+            tiled[64:68] = b"\x11\x22\x33\x44"
+            tiled[128:132] = b"\x55\x66\x77\x88"
+            # 128x128 DXGI 28 (R8G8B8A8_UNORM), one mip, descriptor mode 0 (SW_64KB_D).
+            write_rds5_pool(pool, [pack_etpf_record(128, 128, 1, 0, 28, 1, 1, 0, 4096)], [bytes(tiled)])
+            result = export(pool, root / "out")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            folder = root / "out" / pool.stem
+            row, = textures(folder)
+            self.assertIsNotNone(row["File"], row["Limitation"])
+            pixels = (folder / row["File"]).read_bytes()[148:]
+            self.assertEqual(len(pixels), 128 * 128 * 4)
+            self.assertEqual(pixels[4 * 4:4 * 4 + 4], b"\x11\x22\x33\x44")
+            self.assertEqual(pixels[4 * 128 * 4:4 * 128 * 4 + 4], b"\x55\x66\x77\x88")
+
     def test_manifest_is_published_only_after_all_extractable_outputs_exist(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
