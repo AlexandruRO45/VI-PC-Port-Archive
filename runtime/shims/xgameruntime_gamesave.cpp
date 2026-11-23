@@ -349,12 +349,13 @@ void pack(const std::vector<BlobRead>& blobs, void* buffer) {
     }
 }
 
-// Reads the named blobs (every blob when names is null) of a live container.
-HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32_t count, std::vector<BlobRead>& out) {
+// Reads the named blobs (every blob when all is set) of a live container.
+HRESULT read_blobs(const XGameSaveContainer* c, bool all, const char* const* names, uint32_t count,
+                   std::vector<BlobRead>& out) {
     out.clear();
     const fs::path dir = c->dir();
     std::vector<std::string> wanted;
-    if (names) {
+    if (!all) {
         for (uint32_t i = 0; i < count; ++i) {
             if (!valid_blob_name(names[i])) return E_INVALIDARG;
             wanted.emplace_back(names[i]);
@@ -516,8 +517,8 @@ HRESULT do_work(Job& job, size_t& size) {
         if (!live_as(g_containers, job.container, job.serial)) return E_GS_HANDLE_EXPIRED;
         std::vector<const char*> names;
         for (const std::string& n : job.names) names.push_back(n.c_str());
-        const HRESULT hr = read_blobs(job.container, job.all_blobs ? nullptr : names.data(),
-                                      static_cast<uint32_t>(names.size()), job.blobs);
+        const HRESULT hr = read_blobs(job.container, job.all_blobs, names.data(), static_cast<uint32_t>(names.size()),
+                                      job.blobs);
         if (SUCCEEDED(hr)) size = packed_size(job.blobs);
         return hr;
     }
@@ -754,7 +755,7 @@ HRESULT STDMETHODCALLTYPE save_read(void*, XGameSaveContainerHandle c, const cha
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
     std::vector<BlobRead> blobs;
-    const HRESULT hr = read_blobs(c, names, names ? *count : 0, blobs);
+    const HRESULT hr = read_blobs(c, names == nullptr, names, *count, blobs);
     if (FAILED(hr)) return hr;
     if (size < packed_size(blobs)) return E_GS_PROVIDED_BUFFER_TOO_SMALL;
     pack(blobs, out);

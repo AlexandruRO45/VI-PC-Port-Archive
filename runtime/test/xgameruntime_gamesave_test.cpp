@@ -236,6 +236,14 @@ int main() {
           "blobNames = nullptr reads every blob");
 
     XAsyncBlock async{};
+    XAsyncBlock zero_read{};
+    uint32_t zero_count = 7;
+    uint64_t zero_buffer[2]{};
+    size_t zero_size = 99;
+    check(at<ReadAsync>(save, 21)(save, container, names, 0, &zero_read) == S_OK && finished(&zero_read) &&
+              XAsyncGetResultSize(&zero_read, &zero_size) == S_OK && zero_size == 0 &&
+              at<ReadResult>(save, 22)(save, &zero_read, 0, reinterpret_cast<Blob*>(zero_buffer), &zero_count) == S_OK && zero_count == 0,
+          "ReadBlobDataAsync of names with a count of 0 reads no blob, like ReadBlobData (not every blob)");
     check(at<ReadAsync>(save, 21)(save, container, names, 1, &async) == S_OK && finished(&async),
           "ReadBlobDataAsync runs");
     size_t needed = 0;
