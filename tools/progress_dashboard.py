@@ -5,7 +5,7 @@
 
 Writes, into --out only (a folder inside the repository is refused, so nothing here can be committed by accident):
     progress.html                 one self-contained page (no network, no packages; open it from disk)
-    snapshots/progress_<utc>.json the data behind it; a snapshot equal to the previous one is not written again
+    snapshots/progress_<utc>_<hash>.json the data behind it; a snapshot equal to the previous one is not written again
     history.json                  one summary line per snapshot, for the trend chart
     unit_results.json             the last --run-tests outcome, kept so a later run can show what changed since
 
@@ -984,7 +984,8 @@ def write_outputs(snap, out_dir):
     new = not history or history[-1]["content_hash"] != snap["content_hash"][:16]
     if new:
         stamp = snap["generated_at"].replace("-", "").replace(":", "")
-        save_text(os.path.join(out_dir, "snapshots", f"progress_{stamp}.json"), dump_json(snap))
+        content_hash = snap["content_hash"][:16]
+        save_text(os.path.join(out_dir, "snapshots", f"progress_{stamp}_{content_hash}.json"), dump_json(snap))
         history.append(summary_line(snap))
         save_text(hist_path, dump_json(history))
     save_text(os.path.join(out_dir, "progress.html"), render_page(snap, history))

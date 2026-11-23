@@ -502,6 +502,22 @@ class Outputs(unittest.TestCase):
             with open(os.path.join(out, "history.json"), encoding="utf-8") as f:
                 self.assertEqual(len(json.load(f)), 1)
 
+    def test_different_snapshots_in_the_same_second_are_preserved(self):
+        with tempfile.TemporaryDirectory() as out:
+            first = {"generated_at": "2026-01-01T12:00:00Z", "git": {}, "metrics": [], "content_hash": "a" * 64}
+            second = {**first, "content_hash": "b" * 64}
+            self.assertTrue(pd.write_outputs(first, out))
+            self.assertTrue(pd.write_outputs(second, out))
+            self.assertFalse(pd.write_outputs(second, out))
+            snapshots = os.path.join(out, "snapshots")
+            saved_hashes = set()
+            for name in os.listdir(snapshots):
+                with open(os.path.join(snapshots, name), encoding="utf-8") as f:
+                    saved_hashes.add(json.load(f)["content_hash"])
+            self.assertEqual(saved_hashes, {first["content_hash"], second["content_hash"]})
+            with open(os.path.join(out, "history.json"), encoding="utf-8") as f:
+                self.assertEqual([entry["content_hash"] for entry in json.load(f)], ["a" * 16, "b" * 16])
+
     def test_unmatched_test_filter_preserves_cached_results(self):
         with tempfile.TemporaryDirectory() as out:
             cached = os.path.join(out, "unit_results.json")
