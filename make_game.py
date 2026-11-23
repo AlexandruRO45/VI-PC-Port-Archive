@@ -2399,6 +2399,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
+    serial_args = ["--jobs", "1"] if checker_supports(exe, "--jobs") else []
+    probe_command = base + serial_args
     crashed: "list[str]" = []
 
     def check_range(start: int = 0, count: "int | None" = None) -> int:
@@ -2407,7 +2409,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         if count is not None:
             options.extend(["--start", str(start), "--count", str(count)])
             positions = {name: i for i, name in enumerate(names[start:start + count], start)}
-        workers = job_args
+        workers = job_args if serial_args else []
         retries = 0
         while retries <= PIPELINE_CRASH_RETRIES:
             drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
@@ -2423,14 +2425,14 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                                           if n not in crashed and (positions is None or n in positions)))
             # Even the last in-flight module can be innocent after other heavy compiles in the batch.
             if positions is not None:
-                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, positions[n], inflight)]
+                suspects = [n for n in suspects if crashes_alone(probe_command, n, positions[n], inflight)]
             elif len(suspects) > 1:
-                if workers == ["--jobs", "1"] or not checker_supports(exe, "--jobs"):
+                if workers == serial_args:
                     fail(f"pipelines: vk_pipeline_check exited with {exit_label(code)} with several modules in flight. "
                          f"Rebuild it with --start and --count support to check them individually. See {inflight}.")
                 log("pipelines: several modules were in flight and the checker cannot select a range. "
                     "Retrying the full index with --jobs 1.")
-                workers = ["--jobs", "1"]
+                workers = serial_args
                 continue
             if not suspects:
                 if count is not None and count > 1:
@@ -2529,10 +2531,10 @@ def pipeline_names(spirv: str) -> "list[str]":
     return sorted(index, key=lambda n: n.encode("utf-8"))
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str, position: int, inflight: str) -> bool:
+def crashes_alone(command: list[str], name: str, position: int, inflight: str) -> bool:
     """Confirm a crash only when this probe's fresh report names the selected module as in flight."""
     drop(inflight)
-    args = [exe, spirv, cache, "--jobs", "1", "--start", str(position), "--count", "1", "--inflight-file", inflight]
+    args = [*command, "--start", str(position), "--count", "1", "--inflight-file", inflight]
     code = run(args, check=False)
     if code == 1 and not os.path.isfile(inflight):
         fail(f"pipelines: checking {name} alone exited with 1 before writing its work report; "

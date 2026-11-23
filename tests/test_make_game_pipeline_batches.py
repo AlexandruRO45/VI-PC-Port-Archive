@@ -45,6 +45,8 @@ def record(event):
 record("started")
 if not config["range_support"] and ("--start" in args or "--count" in args):
     sys.exit(2)
+if config.get("no_job_option") and "--jobs" in args:
+    sys.exit(2)
 if config.get("setup_error") or config.get("probe_setup_error") and count == 1 and option("--jobs") == "1":
     print("no Vulkan physical devices found", file=sys.stderr)
     sys.exit(config.get("setup_exit", 2))
@@ -254,12 +256,28 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertEqual(report.splitlines(), [n + "\tpipeline" for n in self.names[:2]])
 
     def test_legacy_checker_without_job_control_keeps_ambiguous_names_out_of_the_skip_file(self):
-        code, _, err = self.invoke({"max_batch": 1, "no_job_option": True}, range_support=False, jobs=None)
+        code, _, err = self.invoke({"max_batch": 1, "no_job_option": True}, range_support=False)
         self.assertNotEqual(code, 0)
         self.assertIn("pipeline_inflight.txt", err)
         self.assertEqual(len(self.commands), 1)
         self.assertNotIn("--jobs", self.commands[0])
         self.assertFalse((self.out / "pipeline_crashes.txt").exists())
+
+    def test_legacy_checker_already_using_one_worker_keeps_the_first_ambiguous_report(self):
+        code, _, err = self.invoke({"max_batch": 1}, range_support=False, jobs=1)
+        self.assertNotEqual(code, 0)
+        self.assertIn("pipeline_inflight.txt", err)
+        self.assertEqual(len(self.commands), 1)
+        self.assertTrue((self.out / "pipeline_inflight.txt").is_file())
+        self.assertFalse((self.out / "pipeline_crashes.txt").exists())
+
+    def test_range_probes_without_job_control_still_check_every_module(self):
+        code, _, err = self.invoke({"max_batch": 2, "no_job_option": True})
+        self.assertEqual(code, 0, err)
+        self.assertTrue(all("--jobs" not in a for a in self.commands))
+        self.assertTrue(any(a[a.index("--count") + 1] == "1" for a in self.commands))
+        cached = json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8"))
+        self.assertEqual(set(cached), set(self.names))
 
     def test_legacy_serial_retry_skips_only_the_single_module_it_identifies(self):
         code, _, err = self.invoke({"parallel_failure": True, "crasher": self.names[1]}, range_support=False)
