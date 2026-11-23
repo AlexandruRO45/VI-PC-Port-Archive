@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +22,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "xmem_test_hooks.h"
 
 namespace {
 
@@ -590,6 +592,388 @@ void test_title_virtual_free(const PhysicalApi& api) {
     check(plain && title_free(plain, 0, MEM_RELEASE) == TRUE && released(plain), "VirtualFree of ordinary memory");
 }
 
+#ifdef LEONIDA_XMEM_TEST_HOOKS
+struct MemoryFailure {
+    const void* address = nullptr;
+    DWORD error = ERROR_SUCCESS;
+    unsigned remaining = 0;
+    unsigned skip = 0;
+
+    bool fire(const void* at) {
+        if (at != address || remaining == 0) return false;
+        if (skip != 0) {
+            --skip;
+            return false;
+        }
+        --remaining;
+        SetLastError(error);
+        return true;
+    }
+};
+
+std::array<MemoryFailure, 2> g_free_failures;
+MemoryFailure g_unmap_failure;
+MemoryFailure g_query_failure;
+
+BOOL WINAPI controlled_free(LPVOID address, SIZE_T size, DWORD flags) {
+    if (flags == MEM_RELEASE) {
+        for (auto& failure : g_free_failures) {
+            if (failure.fire(address)) return FALSE;
+        }
+    }
+    return VirtualFree(address, size, flags);
+}
+
+SIZE_T WINAPI controlled_query(LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T size) {
+    if (g_query_failure.fire(address)) return 0;
+    return VirtualQuery(address, info, size);
+}
+
+BOOL WINAPI controlled_unmap(HANDLE process, PVOID address, ULONG flags) {
+    if (g_unmap_failure.fire(address)) return FALSE;
+    using Fn = BOOL(WINAPI*)(HANDLE, PVOID, ULONG);
+    const auto native = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "UnmapViewOfFile2"));
+    if (!native) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
+    return native(process, address, flags);
+}
+
+void clear_memory_failures() {
+    g_free_failures = {};
+    g_unmap_failure = {};
+    g_query_failure = {};
+}
+
+struct MemoryFailureScope {
+    MemoryFailureScope() {
+        clear_memory_failures();
+        rt::shims::testing::set_xmem_memory_hooks({controlled_free, controlled_query, controlled_unmap});
+    }
+    ~MemoryFailureScope() {
+        rt::shims::testing::set_xmem_memory_hooks({});
+        clear_memory_failures();
+    }
+    MemoryFailureScope(const MemoryFailureScope&) = delete;
+    MemoryFailureScope& operator=(const MemoryFailureScope&) = delete;
+};
+
+bool writable_replacement(const void* address, DWORD memory_type = MEM_PRIVATE) {
+    MEMORY_BASIC_INFORMATION info{};
+    return address && VirtualQuery(address, &info, sizeof(info)) == sizeof(info) &&
+           info.AllocationBase == address && info.State == MEM_COMMIT && info.Type == memory_type &&
+           (info.Protect & 0xff) == PAGE_READWRITE && !(info.Protect & PAGE_GUARD);
+}
+
+// Each fixture owns a small reservation and its replacement allocations. Cleanup also works on the old head,
+// whose failed release loses its bookkeeping: unmap through XMem, then release each native piece it left.
+struct ReleaseFixture {
+    const PhysicalApi& api;
+    HostVirtualFreeFn title_free;
+    uint8_t* base = nullptr;
+    size_t length;
+    uint64_t pages[2]{};
+    bool ready = false;
+
+    explicit ReleaseFixture(const PhysicalApi& a, size_t page_count = 4)
+        : api(a), title_free(reinterpret_cast<HostVirtualFreeFn>(rt::shims::find("kernel32.dll", "VirtualFree"))),
+          length(page_count) {
+        base = static_cast<uint8_t*>(api.virtual_alloc(nullptr, length * kPage64k,
+                                                       MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+        uint64_t count = 2;
+        const bool allocated = base && api.allocate(0x280, &count, pages) == TRUE && count == 2;
+        ready = allocated && title_free && api.map(base + kPage64k, 1, &pages[0]) != nullptr &&
+                api.map(base + (length - 1) * kPage64k, 1, &pages[1]) != nullptr;
+        check(ready, "release-failure fixture: a small window with two physical views");
+    }
+
+    ~ReleaseFixture() {
+        rt::shims::testing::set_xmem_memory_hooks({});
+        if (!base) return;
+        api.map(base, length, nullptr);
+        if (title_free) title_free(base, 0, MEM_RELEASE);
+        const uintptr_t first = reinterpret_cast<uintptr_t>(base);
+        const uintptr_t end = first + length * kPage64k;
+        for (uintptr_t at = first; at < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info))) break;
+            const uintptr_t next = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+            const uintptr_t owner = reinterpret_cast<uintptr_t>(info.AllocationBase);
+            if (info.State != MEM_FREE && owner >= first && owner < end && next <= end) {
+                if (!title_free || !title_free(info.AllocationBase, 0, MEM_RELEASE)) {
+                    // A failed release may have unmapped the view before failing to free its placeholder.
+                    // Query again before choosing the native cleanup operation.
+                    MEMORY_BASIC_INFORMATION left{};
+                    if (VirtualQuery(info.AllocationBase, &left, sizeof(left)) &&
+                        left.State != MEM_FREE && left.AllocationBase == info.AllocationBase) {
+                        if (left.Type == MEM_MAPPED) {
+                            UnmapViewOfFile(left.AllocationBase);
+                        } else {
+                            VirtualFree(left.AllocationBase, 0, MEM_RELEASE);
+                        }
+                    }
+                }
+            }
+            at = next > at ? next : at + kPage64k;
+        }
+        for (const uint64_t page : pages) {
+            if (page != 0) api.free_pages(1, &page);
+        }
+    }
+};
+
+void test_title_virtual_free_failures(const PhysicalApi& api) {
+    // An unmap error precedes another release error. Preserve the first error and the one surviving view.
+    {
+        ReleaseFixture f(api);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_unmap_failure = {f.base + kPage64k, ERROR_ACCESS_DENIED, 1};
+        g_free_failures[0] = {f.base + 3 * kPage64k, ERROR_NOT_ENOUGH_MEMORY, 1};
+        const BOOL result = f.title_free(f.base, 0, MEM_RELEASE);
+        const DWORD error = GetLastError();
+        check(g_unmap_failure.remaining == 0 && g_free_failures[0].remaining == 0,
+              "both controlled native failures were exercised");
+        check(result == FALSE && error == ERROR_ACCESS_DENIED, "failed unmap preserves the first native error");
+        MEMORY_BASIC_INFORMATION info{};
+        check(VirtualQuery(f.base + kPage64k, &info, sizeof(info)) && info.Type == MEM_MAPPED,
+              "the failed unmap leaves the original view mapped");
+        check(released(f.base) && released(f.base + 2 * kPage64k), "other release pieces make progress");
+        check(api.map(f.base, 1, &f.pages[0]) == nullptr, "released holes no longer accept physical pages");
+        clear_memory_failures();
+        check(f.title_free(f.base, 0, MEM_RELEASE) == TRUE && all_released(f.base, f.length),
+              "retry at the original base releases the surviving view");
+    }
+    // The view unmaps, but releasing its resulting placeholder fails.
+    {
+        ReleaseFixture f(api);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_free_failures[0] = {f.base + kPage64k, ERROR_NOT_ENOUGH_MEMORY, 1};
+        const BOOL result = f.title_free(f.base, 0, MEM_RELEASE);
+        const DWORD error = GetLastError();
+        check(g_free_failures[0].remaining == 0, "the controlled VirtualFree failure was exercised");
+        check(result == FALSE && error == ERROR_NOT_ENOUGH_MEMORY, "failed VirtualFree preserves its native error");
+        check(reserved_only(f.base + kPage64k) && released(f.base), "only the failed placeholder remains reserved");
+        clear_memory_failures();
+        check(f.title_free(f.base, (f.length - 1) * kPage64k, MEM_RELEASE) == FALSE &&
+                  reserved_only(f.base + kPage64k),
+              "a retry with the wrong nonzero size leaves the survivor reserved");
+        check(f.title_free(f.base, f.length * kPage64k, MEM_RELEASE) == TRUE && all_released(f.base, f.length),
+              "full-size retry releases a failed placeholder");
+    }
+    // Both an initial query failure and a failure while measuring an allocation's end must be recoverable.
+    for (const unsigned skip : {0u, 1u}) {
+        ReleaseFixture f(api);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_query_failure = {f.base, ERROR_READ_FAULT, 1, skip};
+        const BOOL result = f.title_free(f.base, 0, MEM_RELEASE);
+        const DWORD error = GetLastError();
+        check(g_query_failure.remaining == 0, "the controlled query failure was exercised");
+        check(result == FALSE && error == ERROR_READ_FAULT,
+              skip == 0 ? "initial VirtualQuery failure preserves its error" : "allocation-end query failure is reported");
+        check(reserved_only(f.base), "a query failure does not release the unmeasured allocation");
+        clear_memory_failures();
+        check(f.title_free(f.base, 0, MEM_RELEASE) == TRUE && all_released(f.base, f.length),
+              "release retries after a query failure");
+    }
+    // A second attempt can itself fail while still releasing another surviving piece.
+    {
+        ReleaseFixture f(api);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_free_failures[0] = {f.base + kPage64k, ERROR_NOT_ENOUGH_MEMORY, 1};
+        g_free_failures[1] = {f.base + 3 * kPage64k, ERROR_ACCESS_DENIED, 1};
+        const BOOL first = f.title_free(f.base, 0, MEM_RELEASE);
+        const DWORD first_error = GetLastError();
+        check(g_free_failures[0].remaining == 0 && g_free_failures[1].remaining == 0,
+              "both controlled release failures were exercised");
+        check(first == FALSE && first_error == ERROR_NOT_ENOUGH_MEMORY, "two failed releases preserve the first error");
+        clear_memory_failures();
+        g_query_failure = {f.base + kPage64k, ERROR_READ_FAULT, 1};
+        const BOOL second = f.title_free(f.base, 0, MEM_RELEASE);
+        const DWORD second_error = GetLastError();
+        check(g_query_failure.remaining == 0, "the controlled retry query failure was exercised");
+        check(second == FALSE && second_error == ERROR_READ_FAULT, "a retry reports its own first query error");
+        check(reserved_only(f.base + kPage64k) && released(f.base + 3 * kPage64k),
+              "failed retry keeps one survivor and releases the other");
+        clear_memory_failures();
+        check(f.title_free(f.base, 0, MEM_RELEASE) == TRUE && all_released(f.base, f.length),
+              "a third attempt drains the remaining release state");
+    }
+    const auto title_alloc = reinterpret_cast<TitleVirtualAllocFn>(rt::shims::find("kernel32.dll", "VirtualAlloc"));
+    check(title_alloc != nullptr, "release-reuse tests resolve the title allocator");
+    if (!title_alloc) return;
+    // A new allocation in a successfully released hole does not belong to the original retry.
+    {
+        ReleaseFixture f(api);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_free_failures[0] = {f.base + kPage64k, ERROR_NOT_ENOUGH_MEMORY, 1};
+        check(f.title_free(f.base, 0, MEM_RELEASE) == FALSE, "hole-reuse setup leaves a failed release");
+        check(g_free_failures[0].remaining == 0, "hole-reuse setup exercised the controlled failure");
+        clear_memory_failures();
+        auto* replacement = static_cast<uint8_t*>(title_alloc(f.base + 2 * kPage64k, kPage64k,
+                                                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        const bool owns_replacement = replacement == f.base + 2 * kPage64k && writable_replacement(replacement);
+        check(owns_replacement, "a new writable allocation takes a released hole");
+        if (!owns_replacement) return;
+        replacement[0] = 0x6d;
+        check(f.title_free(f.base, 0, MEM_RELEASE) == TRUE && released(f.base + kPage64k),
+              "original retry releases only its surviving region");
+        check(writable_replacement(replacement) && replacement[0] == 0x6d,
+              "retry preserves the hole's new owner and contents");
+    }
+    // Reusing the original base retires the retry alias; its other survivors remain independently releasable.
+    {
+        ReleaseFixture f(api);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_free_failures[0] = {f.base + kPage64k, ERROR_NOT_ENOUGH_MEMORY, 1};
+        check(f.title_free(f.base, 0, MEM_RELEASE) == FALSE, "base-reuse setup leaves a failed release");
+        check(g_free_failures[0].remaining == 0, "base-reuse setup exercised the controlled failure");
+        clear_memory_failures();
+        auto* replacement = static_cast<uint8_t*>(title_alloc(f.base, kPage64k,
+                                                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        const bool owns_replacement = replacement == f.base && writable_replacement(replacement);
+        check(owns_replacement, "a new writable allocation takes the original release base");
+        if (!owns_replacement) return;
+        check(f.title_free(replacement, 0, MEM_RELEASE) == TRUE && reserved_only(f.base + kPage64k),
+              "free at a reused base releases the new allocation only");
+        check(api.map(f.base + kPage64k, 1, &f.pages[0]) == f.base + kPage64k,
+              "the old survivor retains its physical-window bookkeeping");
+        check(f.title_free(f.base + kPage64k, 0, MEM_RELEASE) == TRUE && all_released(f.base, f.length),
+              "the detached survivor releases from its own base");
+    }
+    // An unseen native free followed by a tracked replacement invalidates that old pending ownership.
+    {
+        ReleaseFixture f(api);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_free_failures[0] = {f.base + kPage64k, ERROR_NOT_ENOUGH_MEMORY, 1};
+        check(f.title_free(f.base, 0, MEM_RELEASE) == FALSE, "survivor-reuse setup leaves a failed release");
+        check(g_free_failures[0].remaining == 0, "survivor-reuse setup exercised the controlled failure");
+        clear_memory_failures();
+        check(VirtualFree(f.base + kPage64k, 0, MEM_RELEASE), "the host frees the survivor behind the shim");
+        void* replacement = api.virtual_alloc(f.base + kPage64k, kPage64k,
+                                               MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE);
+        check(replacement == f.base + kPage64k, "XMem reserves that address for a new owner");
+        if (!replacement) return;
+        check(f.title_free(f.base, 0, MEM_RELEASE) == FALSE && reserved_only(replacement),
+              "old retry cannot free a replacement of its former survivor");
+        check(api.map(replacement, 1, &f.pages[0]) == replacement, "the replacement still accepts physical pages");
+    }
+    // Mapping within an unreleased multi-page placeholder changes its native split topology, not its ownership.
+    {
+        ReleaseFixture f(api, 6);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_free_failures[0] = {f.base + 2 * kPage64k, ERROR_NOT_ENOUGH_MEMORY, 1};
+        check(f.title_free(f.base, 0, MEM_RELEASE) == FALSE, "split-survivor setup leaves a failed release");
+        check(g_free_failures[0].remaining == 0, "split-survivor setup exercised the controlled failure");
+        clear_memory_failures();
+        check(api.map(f.base + 3 * kPage64k, 1, &f.pages[0]) == f.base + 3 * kPage64k,
+              "a survivor can be split into a new view and adjacent placeholders");
+        check(f.title_free(f.base, 0, MEM_RELEASE) == TRUE && all_released(f.base, f.length),
+              "retry releases the survivor's changed native split topology");
+    }
+    // A failed child release must keep its ownership boundary. A fresh reservation in a released hole belongs to
+    // that child, while a window merely carved from the original reservation still belongs to the outer owner.
+    for (const bool independent : {false, true}) {
+        ReleaseFixture f(api, 6);
+        if (!f.ready) return;
+        check(f.title_free(f.base, 0, MEM_RELEASE) == TRUE && all_released(f.base, f.length),
+              "nested-failure setup releases the fixture's initial window");
+        void* const outer = api.virtual_alloc(f.base, f.length * kPage64k,
+                                              MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS);
+        check(outer == f.base, "nested-failure setup reserves an outer placeholder");
+        if (outer != f.base) return;
+        auto* const child = f.base + 2 * kPage64k;
+        void* const carved = api.virtual_alloc(child, 2 * kPage64k,
+                                               MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27,
+                                               PAGE_READWRITE);
+        check(carved == child, "nested-failure setup carves a child window");
+        if (carved != child) return;
+        if (independent) {
+            const bool hole_free = f.title_free(child, 0, MEM_RELEASE) == TRUE && all_released(child, 2);
+            check(hole_free, "release the carved hole before reserving an independent child");
+            if (!hole_free) return;
+            void* const replacement = api.virtual_alloc(child, 2 * kPage64k,
+                                                         MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE);
+            check(replacement == child, "a fresh XMem reservation owns the former hole independently");
+            if (replacement != child) return;
+        }
+        const bool mapped = api.map(child, 1, &f.pages[0]) == child && writable_replacement(child, MEM_MAPPED);
+        check(mapped, "nested-failure setup maps a writable physical view in the child");
+        if (!mapped) return;
+        child[0] = 0x4b;
+        MemoryFailureScope faults;
+        g_unmap_failure = {child, ERROR_ACCESS_DENIED, 1};
+        const BOOL failed = f.title_free(child, 0, MEM_RELEASE);
+        const DWORD error = GetLastError();
+        check(failed == FALSE && error == ERROR_ACCESS_DENIED, "the child's failed release preserves its error");
+        check(g_unmap_failure.remaining == 0, "the child's controlled unmap failure was exercised");
+        clear_memory_failures();
+        const BOOL outer_freed = f.title_free(f.base, 0, MEM_RELEASE);
+        if (independent) {
+            bool own_pages_freed = true;
+            for (size_t i = 0; i < f.length; ++i) {
+                if (i != 2) own_pages_freed &= released(f.base + i * kPage64k);
+            }
+            check(outer_freed == TRUE && own_pages_freed, "outer release frees only its own remaining pages");
+            check(writable_replacement(child, MEM_MAPPED) && child[0] == 0x4b,
+                  "outer release preserves the independent child's survivor and contents");
+            check(f.title_free(child, 0, MEM_RELEASE) == TRUE && all_released(child, 2),
+                  "the independent child drains through its own retry");
+        } else {
+            check(outer_freed == TRUE && all_released(f.base, f.length),
+                  "outer release also drains a failed carved window that retains the original ownership");
+        }
+    }
+    // A tracked replacement of one natively freed subrange must leave pending ownership and mapping support on
+    // both sides. The old retry releases those sides, while the replacement releases through its own base.
+    {
+        ReleaseFixture f(api, 6);
+        if (!f.ready) return;
+        MemoryFailureScope faults;
+        g_free_failures[0] = {f.base + 2 * kPage64k, ERROR_NOT_ENOUGH_MEMORY, 1};
+        check(f.title_free(f.base, 0, MEM_RELEASE) == FALSE,
+              "pending-subrange setup leaves a multi-page failed release");
+        check(g_free_failures[0].remaining == 0, "pending-subrange setup exercised the controlled failure");
+        clear_memory_failures();
+        auto* const middle = f.base + 3 * kPage64k;
+        const bool split = VirtualFree(middle, kPage64k, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == TRUE &&
+                           reserved_only(middle);
+        check(split, "the host splits one page out of the surviving placeholder");
+        if (!split) return;
+        const bool hole_free = VirtualFree(middle, 0, MEM_RELEASE) == TRUE && released(middle);
+        check(hole_free, "the host releases only that middle subrange");
+        if (!hole_free) return;
+        void* const replacement = api.virtual_alloc(middle, kPage64k,
+                                                     MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE);
+        check(replacement == middle, "a new XMem owner reserves the middle subrange");
+        if (replacement != middle) return;
+        check(api.map(f.base + 2 * kPage64k, 1, &f.pages[0]) == f.base + 2 * kPage64k &&
+                  api.map(f.base + 4 * kPage64k, 1, &f.pages[1]) == f.base + 4 * kPage64k,
+              "pending survivors on both sides retain physical-window mapping support");
+        const bool middle_mapped = api.map(middle, 1, &f.pages[0]) == middle &&
+                                   writable_replacement(middle, MEM_MAPPED);
+        check(middle_mapped, "the middle replacement maps its own writable physical view");
+        if (!middle_mapped) return;
+        middle[0] = 0x6e;
+        check(f.title_free(f.base, 0, MEM_RELEASE) == TRUE && released(f.base + 2 * kPage64k) &&
+                  released(f.base + 4 * kPage64k),
+              "old retry drains the retained sides of the replaced subrange");
+        check(writable_replacement(middle, MEM_MAPPED) && middle[0] == 0x6e,
+              "old retry preserves the middle replacement and its contents");
+        check(f.title_free(middle, 0, MEM_RELEASE) == TRUE && all_released(f.base, f.length),
+              "the middle replacement releases independently after the old retry");
+    }
+}
+#endif
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -836,6 +1220,9 @@ int main() {
         test_physical_pages(physical);
         test_placeholders(physical);
         test_title_virtual_free(physical);
+#ifdef LEONIDA_XMEM_TEST_HOOKS
+        test_title_virtual_free_failures(physical);
+#endif
     }
 
     print_result();

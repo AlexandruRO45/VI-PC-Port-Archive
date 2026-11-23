@@ -35,6 +35,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "xmem_test_hooks.h"
 
 namespace {
 
@@ -264,6 +265,33 @@ uint64_t g_next_slot = 1;
 std::unordered_map<uintptr_t, uint64_t> g_mapped;  // mapped 64 KiB address -> page number
 std::map<uintptr_t, SIZE_T> g_reservations;  // base -> size of each placeholder reservation XMemVirtualAlloc made
 
+#ifdef LEONIDA_XMEM_TEST_HOOKS
+rt::shims::testing::XmemMemoryHooks g_memory_hooks;
+#endif
+
+BOOL release_virtual_free(LPVOID address, SIZE_T size, DWORD flags) {
+#ifdef LEONIDA_XMEM_TEST_HOOKS
+    if (g_memory_hooks.virtual_free) return g_memory_hooks.virtual_free(address, size, flags);
+#endif
+    return VirtualFree(address, size, flags);
+}
+
+SIZE_T release_virtual_query(LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T size) {
+#ifdef LEONIDA_XMEM_TEST_HOOKS
+    if (g_memory_hooks.virtual_query) return g_memory_hooks.virtual_query(address, info, size);
+#endif
+    return VirtualQuery(address, info, size);
+}
+
+BOOL release_unmap_view2(PVOID address) {
+#ifdef LEONIDA_XMEM_TEST_HOOKS
+    if (g_memory_hooks.unmap_view2) {
+        return g_memory_hooks.unmap_view2(GetCurrentProcess(), address, MEM_PRESERVE_PLACEHOLDER);
+    }
+#endif
+    return placeholder_api().unmap_view2(GetCurrentProcess(), address, MEM_PRESERVE_PLACEHOLDER);
+}
+
 // With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
 // kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
 void record_window(void* base, SIZE_T size, DWORD protect) {
@@ -454,8 +482,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 bool unmap_page(uintptr_t address) {
     const auto it = g_mapped.find(address);
     if (it == g_mapped.end()) return true;
-    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                                       MEM_PRESERVE_PLACEHOLDER)) {
+    if (!release_unmap_view2(reinterpret_cast<void*>(address))) {
         return false;
     }
     g_mapped.erase(it);
@@ -725,7 +752,7 @@ uintptr_t allocation_end(uintptr_t owner) {
     uintptr_t a = owner;
     for (;;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<void*>(a), &info, sizeof(info)) || info.State == MEM_FREE ||
+        if (!release_virtual_query(reinterpret_cast<void*>(a), &info, sizeof(info)) || info.State == MEM_FREE ||
             reinterpret_cast<uintptr_t>(info.AllocationBase) != owner) {
             return a;
         }
@@ -758,11 +785,11 @@ bool release_range(uintptr_t base, SIZE_T size) {
     for (const uintptr_t address : mapped) ok &= unmap_page(address);
     for (uintptr_t a = base; a < end;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<void*>(a), &info, sizeof(info))) return false;
+        if (!release_virtual_query(reinterpret_cast<void*>(a), &info, sizeof(info))) return false;
         const uintptr_t next = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
         const uintptr_t owner = reinterpret_cast<uintptr_t>(info.AllocationBase);
         if (info.State != MEM_FREE && !is_nested(owner)) {
-            if (owner < base || allocation_end(owner) > end || !VirtualFree(info.AllocationBase, 0, MEM_RELEASE)) {
+            if (owner < base || allocation_end(owner) > end || !release_virtual_free(info.AllocationBase, 0, MEM_RELEASE)) {
                 ok = false;
             }
         }
@@ -799,6 +826,13 @@ BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
 }
 
 }  // namespace
+
+#ifdef LEONIDA_XMEM_TEST_HOOKS
+void rt::shims::testing::set_xmem_memory_hooks(XmemMemoryHooks hooks) {
+    const std::lock_guard lock(g_phys_mutex);
+    g_memory_hooks = hooks;
+}
+#endif
 
 #define TITLE_MEMORY(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, \
                                  {dll, "VirtualFree", reinterpret_cast<void*>(&TitleVirtualFree)}
