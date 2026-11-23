@@ -212,7 +212,8 @@ class Cli(unittest.TestCase):
 
     def test_llvm_22_1_2_misprinting_fspx_encodings_stops_before_any_listing(self):
         result, out = self.disassemble("print('\\ts_endpgm')\n",
-                                       fake_llvm_mc.preamble("22.1.2", fake_llvm_mc.LLVM_22_1_2))
+                                       fake_llvm_mc.preamble("22.1.2", fake_llvm_mc.LLVM_22_1_2,
+                                                            fake_llvm_mc.LLVM_22_1_2_WARNINGS))
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("LLVM 22.1.2", result.stderr)
         self.assertIn("LLVM 23.1.0 or newer", result.stderr)

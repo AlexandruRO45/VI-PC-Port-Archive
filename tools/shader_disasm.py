@@ -29,12 +29,18 @@ import rdna2_decode  # noqa: E402
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
-# Instructions that LLVM before 23.1.0 decodes wrongly, in the encoding the FidelityFX FSPX programs use (and LLVM
-# 23's assembler writes): an unused VALU source field holds 0x80, inline 0, not 0. Each must come back as one
-# instruction whose printed encoding is its input, or rdna2spirv.py's printed-encoding check refuses the listing
-# (SHADER-804; docs/design.md, 'Disassembling shaders').
+# Instructions that LLVM before 23.1.0 decodes wrongly: a scalar load into a register list that runs past s105 into
+# vcc_lo/vcc_hi (bytes from FidelityFX FSPX program 05), VALU code whose unused source fields hold 0x80 (inline 0, as
+# LLVM 23's assembler writes them), and a float inline constant in a 16-bit integer operand. Each must come back as one
+# instruction whose printed encoding is its input, or the listing loses it or rdna2spirv.py's printed-encoding check
+# refuses the listing (SHADER-804; docs/design.md, 'Disassembling shaders'). The scalar load comes first: it is what
+# the five FSPX programs hit.
 # (family, instruction, input bytes, first LLVM release that decodes it exactly, llvm-project commit)
 DECODER_CHECKS = (
+    ("a scalar load whose register list runs past s105 into vcc_lo/vcc_hi (with LLVM before 23.1.0 the invalid word "
+     "and the junk exp after it in FSPX programs 05, 06, 08, 09 and 28)",
+     "s_buffer_load_dwordx16 [s92..s105,vcc_lo,vcc_hi], s[44:47], 0x1d070", "161730f470d001fa",
+     "23.1.0", "1cd28beb7755"),
     ("packed math (VOP3P) with a 32-bit literal and an unused source field set to inline 0",
      "v_pk_mul_f16 v0, v1, 0xfbff3c00", "004010cc01ff011a003cfffb", "23.1.0", "ef0680ba54f7"),
     ("VOP3 with an unused source field set to inline 0",
@@ -78,22 +84,43 @@ def llvm_version(command: list) -> str:
 
 
 def decoder_faults(stdout: str, stderr: str) -> list:
-    """(family, instruction, what was printed, fixed in, commit) for each DECODER_CHECKS entry this output misreads.
+    """(family, instruction, what came out, fixed in, commit) for each DECODER_CHECKS entry the output misreads.
 
-    The checks are decoded in one run, so an entry printed with a different length leaves the rest misaligned: the
-    entries after it are not judged."""
+    The checks are decoded in one run, so the output is matched to them by byte offset: an invalid word (a warning at
+    column 5 * offset + 1 of the one input line) skips 4 bytes, an instruction covers its printed encoding. A check is
+    read exactly when one instruction starts at its first byte and prints its bytes. One that a misread neighbour ran
+    into is reported as read with that neighbour."""
+    invalid = {(int(m.group(1)) - 1) // 5 for m in re.finditer(r"^<stdin>:1:(\d+): warning", stderr, re.M)}
     got = [(m.group(1), bytes(int(x, 16) for x in m.group(2).split(",") if x.strip()))
            for m in ENCODED.finditer(stdout)]
+    starts, end = [], 0
+    for check in DECODER_CHECKS:
+        starts.append(end)
+        end += len(check[2]) // 2
+
+    def owner(offset: int) -> int:
+        return max(i for i, start in enumerate(starts) if start <= offset)
+
+    pieces, spilled, cursor, queue = [[] for _ in DECODER_CHECKS], set(), 0, iter(got)
+    while cursor < end:
+        k = owner(cursor)
+        if cursor in invalid:
+            pieces[k].append(("an invalid word", b"", cursor))
+            cursor += 4
+            continue
+        text, enc = next(queue, ("nothing", b""))
+        pieces[k].append((text, enc, cursor))
+        if not enc:
+            break
+        spilled.update(owner(o) for o in range(cursor + 1, min(cursor + len(enc), end)) if owner(o) != k)
+        cursor += len(enc)
     faults = []
-    for i, (family, insn, want, fixed, commit) in enumerate(DECODER_CHECKS):
-        text, enc = got[i] if i < len(got) else ("nothing", b"")
-        if enc != bytes.fromhex(want):
-            faults.append((family, insn, f"{text} [{enc.hex(' ')}]" if enc else text, fixed, commit))
-            if len(enc) != len(want) // 2:
-                break
-    if not faults and ("invalid instruction" in stderr or len(got) != len(DECODER_CHECKS)):
-        family, insn, _, fixed, commit = DECODER_CHECKS[0]
-        faults.append((family, insn, (stderr.strip().splitlines() or ["extra output"])[0], fixed, commit))
+    for k, (family, insn, want, fixed, commit) in enumerate(DECODER_CHECKS):
+        if k in spilled:
+            faults.append((family, insn, "part of the misread instruction before it", fixed, commit))
+        elif [(enc, at) for _, enc, at in pieces[k]] != [(bytes.fromhex(want), starts[k])]:
+            out = ", then ".join(f"{text} [{enc.hex(' ')}]" if enc else text for text, enc, _ in pieces[k])
+            faults.append((family, insn, out or "nothing", fixed, commit))
     return faults
 
 
@@ -101,11 +128,12 @@ def decoder_faults(stdout: str, stderr: str) -> list:
 def require_exact_decoding(mcpu: str) -> None:
     """Stop now, naming the llvm-mc version and the instruction families, unless this llvm-mc decodes DECODER_CHECKS.
 
-    LLVM 21 and 22.1.0 read an instruction whose unused source field is 0x80 as an invalid word and decode the words
-    after it as other instructions (the literal 0xfbff3c00 becomes an `exp`). 22.1.1 to 22.1.8 decode it but print
-    the unused field as 0, and print a 16-bit integer operand's float inline constant (0.5) as a 32-bit literal (a
-    12-byte encoding for 8 bytes of code). Either way the translator refuses the program or reads it at the wrong
-    offsets, so the listing has to come from LLVM 23.1.0 or later. Checked once per process. A llvm-mc that cannot
+    Before 23.1.0, LLVM reads a scalar load whose registers run past s105 into vcc as an invalid word and decodes
+    the words after it as other instructions (an `exp`). LLVM 21 and 22.1.0 do the same with an instruction whose
+    unused source field is 0x80; 22.1.1 to 22.1.8 decode that one but print the field as 0. Before 23.1.0, a 16-bit
+    integer operand's float inline constant (0.5) is printed as a 32-bit literal (12 bytes for 8 bytes of code).
+    Either way the translator loses the instruction, refuses the program or reads it at the wrong offsets, so the
+    listing has to come from LLVM 23.1.0 or later. Checked once per process. A llvm-mc that cannot
     be started is left to the callers, which report it with the shader."""
     text = " ".join(f"0x{b:02x}" for check in DECODER_CHECKS for b in bytes.fromhex(check[2]))
     try:

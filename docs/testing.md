@@ -21,8 +21,8 @@ This page collects the setup steps and the problems testers have run into so far
     `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc"`.
 
   On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough, if it is 23.1.0 or newer. Older
-  ones misread code the FidelityFX FSPX programs contain (LLVM 21 and 22.1.0 lose it, 22.1.1 to 22.1.8 print a different
-  encoding), so the disassembly tools refuse them, naming the instruction family
+  ones lose the scalar loads into `vcc` that the FidelityFX FSPX programs contain, and misread or misprint other
+  code, so the disassembly tools refuse them, naming the instruction family
   ([docs/design.md](design.md#disassembling-shaders)).
 
   An older `llvm-mc` is not enough for everything. Ubuntu 24.04's `llvm-18` (18.1.3) runs `run_gpu_tests.py`,

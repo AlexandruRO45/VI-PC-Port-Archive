@@ -29,8 +29,10 @@ PROBE = "0x00 0x00 0x81 0xbf"
 ASM = "\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
 
 
-# The decoding check's three instructions, then s_endpgm: the encodings the FidelityFX FSPX programs use.
-DECODER_CHECK_CODE = bytes.fromhex("004010cc01ff011a003cfffb" "000008d501050202" "000003d7f0040202" "000081bf")
+# The decoding check's four instructions, then s_endpgm.
+DECODER_CHECK_CODE = bytes.fromhex("161730f470d001fa" "004010cc01ff011a003cfffb" "000008d501050202" "000003d7f0040202"
+                                   "000081bf")
+SMEM_FAMILY = "a scalar load whose register list runs past s105 into vcc_lo/vcc_hi"
 
 
 def fssm(code: bytes = CODE) -> bytes:
@@ -172,17 +174,21 @@ class DecoderCheckTest(DisasmFailureTest):
         self.assertEqual(sorted(os.listdir(out)), [])
         return p.stderr
 
-    def test_llvm_21_is_refused_with_its_version_and_the_first_family(self):
+    def test_llvm_21_is_refused_with_its_version_and_the_scalar_load_first(self):
         err = self.refused(fake_llvm_mc.preamble("21.1.8", fake_llvm_mc.LLVM_21_1_8, fake_llvm_mc.LLVM_21_1_8_WARNINGS))
         self.assertIn("LLVM 21.1.8", err)
-        self.assertIn("packed math (VOP3P) with a 32-bit literal", err)
-        self.assertIn("came out as exp mrt0", err)
+        families = [line for line in err.splitlines() if line.startswith("  - ")]
+        self.assertTrue(families[0].startswith("  - " + SMEM_FAMILY), err)
+        self.assertIn("came out as an invalid word, then exp mrt7 off, off, off, off vm", families[0])
+        self.assertIn("v_add_nc_u16 v0, 0.5, v2 came out as an invalid word", err)
 
-    def test_llvm_22_1_2_is_refused_naming_each_family_it_misprints(self):
-        err = self.refused(fake_llvm_mc.preamble("22.1.2", fake_llvm_mc.LLVM_22_1_2))
+    def test_llvm_22_1_2_is_refused_naming_the_scalar_load_and_the_inline_constant(self):
+        err = self.refused(fake_llvm_mc.preamble("22.1.2", fake_llvm_mc.LLVM_22_1_2, fake_llvm_mc.LLVM_22_1_2_WARNINGS))
         self.assertIn("LLVM 22.1.2", err)
-        self.assertIn("came out as v_pk_mul_f16 v0, v1, 0xfbff3c00 [00 40 10 cc 01 ff 01 18 00 3c ff fb]", err)
-        self.assertIn("VOP3 with an unused source field set to inline 0", err)
+        families = [line for line in err.splitlines() if line.startswith("  - ")]
+        self.assertTrue(families[0].startswith("  - " + SMEM_FAMILY), err)
+        self.assertIn("llvm-project 1cd28beb7755", families[0])
+        self.assertIn("v_pk_mul_f16 v0, v1, 0xfbff3c00 came out as part of the misread instruction before it", err)
         self.assertIn("a float inline constant in a 16-bit integer operand: v_add_nc_u16 v0, 0.5, v2 came out as "
                       "v_add_nc_u16 v0, 0x3800, v2", err)
 
@@ -203,7 +209,8 @@ class DecoderCheckTest(DisasmFailureTest):
         with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
             listing = f.read()
         self.assertIn("0 invalid words", listing)
-        for insn in ("v_pk_mul_f16 v0, v1, 0xfbff3c00", "v_mul_f32_e64 v0, v1, v2", "v_add_nc_u16 v0, 0.5, v2"):
+        for insn in ("s_buffer_load_dwordx16 [s92,s93,s94,s95,s96,s97,s98,s99,s100,s101,s102,s103,s104,s105,vcc_lo,"
+                     "vcc_hi]", "v_pk_mul_f16 v0, v1, 0xfbff3c00", "v_mul_f32_e64 v0, v1, v2", "v_add_nc_u16 v0, 0.5, v2"):
             self.assertIn(insn, listing)
         self.assertIn("encoding: [0x00,0x00,0x03,0xd7,0xf0,0x04,0x02,0x02]", listing)   # 8 bytes, no literal
 

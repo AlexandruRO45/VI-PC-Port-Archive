@@ -848,7 +848,7 @@ def translator_flags_setting(fallbacks: tuple[str, ...]) -> str:
 
 # The revision of shader_disasm.py's decoding check (DECODER_CHECKS). It is part of the disassembly signature, so a
 # work folder disassembled before the check existed (by an llvm-mc it now refuses, e.g. 22.1.2) is disassembled again
-# and the check runs. Change it whenever DECODER_CHECKS changes.
+# and the check runs. Change it when a new check could refuse an llvm-mc that the previous checks accepted.
 DISASSEMBLY_CHECK = "exact decoding, LLVM 23.1.0+ (SHADER-804)"
 
 

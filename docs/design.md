@@ -516,28 +516,36 @@ the tests, `runtime/test/shaders/build.py` and `scripts/run_gpu_tests.py`; the a
 on stdin, so a WSL command never receives a Windows file path.
 
 `shader_disasm.py` disassembles one `s_endpgm` before starting, so a missing tool or AMDGPU target stops the run
-with that reason instead of writing empty `.s` files. It then disassembles three instructions in the encoding the
-FidelityFX FSPX programs use, where an unused VALU source field holds 0x80 (inline 0) rather than 0, as LLVM 23's
-assembler also writes it. This runs once per run (`fspx_unpack.py --disasm` does the same), and the tool stops, naming the LLVM
-version and each family it misreads, unless every instruction comes back as one instruction whose printed encoding is its input:
+with that reason instead of writing empty `.s` files. It then disassembles four instructions in one llvm-mc run, once
+per run (`fspx_unpack.py --disasm` does the same), and stops, naming the LLVM version and each family it misreads (the
+scalar load first), unless every one comes back as one instruction whose printed encoding is its input:
 
-| Family | Instruction (bytes) | LLVM 21.1.8, 22.1.0 | LLVM 22.1.1 to 22.1.8 |
-|---|---|---|---|
-| VOP3P with a literal, unused SRC2 = 0x80 | `v_pk_mul_f16 v0, v1, 0xfbff3c00` (`00 40 10 cc 01 ff 01 1a 00 3c ff fb`) | invalid word; the literal decodes as `exp mrt0 off, ... done compr vm` | decoded, printed with SRC2 = 0 (`... 01 18 ...`) |
-| VOP3, unused SRC2 = 0x80 | `v_mul_f32_e64 v0, v1, v2` (`00 00 08 d5 01 05 02 02`) | invalid word | decoded, printed with SRC2 = 0 |
-| float inline constant in a 16-bit integer operand | `v_add_nc_u16 v0, 0.5, v2` (`00 00 03 d7 f0 04 02 02`) | printed as a 12-byte `v_add_nc_u16 v0, 0x3800, v2` | the same |
+| Family | Instruction (bytes) | LLVM 21.1.8, 22.1.0 | LLVM 22.1.1 to 22.1.8 | Fixed in 23.1.0 by |
+|---|---|---|---|---|
+| scalar load whose register list runs past s105 into `vcc_lo`/`vcc_hi` | `s_buffer_load_dwordx16 [s92,...,s105,vcc_lo,vcc_hi], s[44:47], 0x1d070` (`16 17 30 f4 70 d0 01 fa`, FSPX program 05 at 0x2120) | two invalid words; the second and the next word decode as `exp mrt7 off, off, off, off vm` | the same | `1cd28beb7755` (#173870, VCC tuples in the SGPR classes) |
+| VOP3P with a literal, unused SRC2 = 0x80 | `v_pk_mul_f16 v0, v1, 0xfbff3c00` (`00 40 10 cc 01 ff 01 1a 00 3c ff fb`) | invalid word; the literal decodes as `exp mrt0 off, ... done compr vm` | decoded, printed with SRC2 = 0 (`... 01 18 ...`) | `ef0680ba54f7` (#175753) |
+| VOP3, unused SRC2 = 0x80 | `v_mul_f32_e64 v0, v1, v2` (`00 00 08 d5 01 05 02 02`) | invalid word | decoded, printed with SRC2 = 0 | `ef0680ba54f7` (#175753) |
+| float inline constant in a 16-bit integer operand | `v_add_nc_u16 v0, 0.5, v2` (`00 00 03 d7 f0 04 02 02`) | printed as a 12-byte `v_add_nc_u16 v0, 0x3800, v2` | the same | `d7ee01c0fa31` (#200944) |
 
-An invalid word loses the instruction and misreads the words after it; that was the one `exp` in FSPX programs 05, 06,
-08, 09 and 28 ("reachable instruction with normalized encoding"). A printed encoding that differs from the bytes is refused
-by the printed-encoding check ("Printed encodings" in the translator table), and a 12-byte encoding for 8 bytes of code shifts every later offset. LLVM
-23.1.0 decodes all three exactly. The fixes are llvm-project `ef0680ba54f7` (#175753, unused VALU source fields encoded
-and printed as inline 0, on top of `8099e127cde2`, #175182, which ignores them when decoding and is the one 22.1.1 got, as
-`fef02d48c08d`) and `d7ee01c0fa31` (#200944, float inline constants in i16 operands). Neither is in a 22.x release, so
-the minimum is LLVM 23.1.0 (SHADER-804). Measured with conda-forge `llvm-tools` 21.1.8, 22.1.0, 22.1.2, 22.1.8, 23.1.0 and
-23.1.6 (and 22.1.1 on the unused-field cases): every gfx1010 and gfx1030 VOP3P and VOP3 opcode with a literal in each
-source slot under each modifier and with unused fields of 0 and 0x80, every gfx1030 one with each inline constant in each
-slot, and 200,000 random words (about 580,000 encodings). 22.1.8 and 23.1.x differ only in these families and in a 64-bit
-float operand given a literal 0, which compilers encode as inline 0.
+The scalar loads are what the FidelityFX FSPX programs hit. abilliontokens classified all 322 invalid words that llvm-mc
+21.1.8 reports on the 29 programs of the real DLL (#4843): 220 `s_buffer_load_dwordx16`, 3 `s_buffer_load_dwordx8`/`x4`
+and 10 `buffer_load`/`store_dwordx4` whose register list runs past s105 into vcc (programs 03, 05, 06, 07, 08, 09,
+28), 87 `v_dot4_i32_i8` words with `op_sel` and 2 others; no `v_pk_*` or `v_fma_mix*` word with a literal. Each
+scalar load is lost from the listing, and its second word and the next decode as an `exp`: that is the one `exp` in
+programs 05, 06, 08, 09 and 28 ("reachable instruction with normalized encoding"). Every 22.x release reads them the
+same way; 23.1.0 decodes them, which leaves 89 invalid words on 23.1.6 (the 87 `v_dot4_i32_i8` `op_sel` words, which
+23 cannot decode either, see #3372 and #2323, and the 2 others). #4595 refuses a reachable fall-through into such words.
+The other three families are further reasons for 23: a word with an unused source field of 0x80, as LLVM 23's assembler
+writes it, is lost by 21.1.8 and 22.1.0 and printed with a different encoding (which the printed-encoding check, row
+"Printed encodings" in the translator table, refuses) by 22.1.1 to 22.1.8, which got only the decoding half
+(`8099e127cde2`, #175182, as `fef02d48c08d`); and before 23.1.0 a float inline constant in an i16 operand is printed as
+12 bytes for 8, which shifts every later offset. None of the four fixes is in a 22.x release, so the minimum is LLVM
+23.1.0 (SHADER-804). Measured with conda-forge `llvm-tools` 21.1.8, 22.1.0, 22.1.2, 22.1.8, 23.1.0 and 23.1.6 (and
+22.1.1 on the unused-field cases): every gfx1010 and gfx1030 VOP3P and VOP3 opcode with a literal in each source slot
+under each modifier and with unused fields of 0 and 0x80, every gfx1030 one with each inline constant in each slot,
+and 200,000 random words (about 580,000 encodings). 22.1.8 and 23.1.x differ only in these families (the random words
+also show MUBUF, MTBUF and MIMG resource tuples `[s104,s105,vcc_lo,vcc_hi]`, the same fix) and in a 64-bit float
+operand given a literal 0, which compilers encode as inline 0.
 To disassemble by hand inside WSL:
 
 ```
