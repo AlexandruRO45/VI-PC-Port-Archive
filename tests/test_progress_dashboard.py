@@ -419,6 +419,17 @@ class Outputs(unittest.TestCase):
             self.assertNotIn(b"Traceback", result.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_a_jobs_below_one_is_an_argument_error(self):
+        # max(1, jobs) used to make --jobs 0 mean one worker, so a script passing a computed 0 got a
+        # silent one-at-a-time run instead of an error.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            r = subprocess.run([sys.executable, "-I", TOOL, "--out", out, "--jobs", "0"],
+                               capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"--jobs must be at least 1", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
     def test_out_inside_the_repository_is_refused(self):
         r = subprocess.run([sys.executable, "-I", TOOL, "--out", os.path.join(ROOT, "progress_out_test")],
                            capture_output=True, cwd=ROOT, timeout=120)
