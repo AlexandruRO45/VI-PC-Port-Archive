@@ -157,6 +157,10 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                      "(console slot order, d3d12_xs_console_slots.h).\n");
         // The proxy's reports name a caller in the images this loader mapped, not only in the host's modules.
         rt::d3d12_xs::set_caller_describer(&rt::shims::module_offset);
+        rt::d3d12_xs::set_console_caller([](std::uint64_t address) {
+            std::uint64_t base = 0;
+            return rt::shims::mapped_image_base(address, base);
+        });
     }
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -173,7 +177,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<unsigned long>(vhr));
             return result(method, vhr);
         }
-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out, true);
         if (FAILED(vhr)) {
             vulkan->Release();
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
@@ -201,7 +205,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         return result(method, FAILED(hr) ? hr : E_FAIL);
     }
 
-    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out, true);
     if (FAILED(hr)) {
         // create_device_proxy keeps the caller's reference on failure.
         real->Release();

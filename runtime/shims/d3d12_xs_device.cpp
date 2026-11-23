@@ -9,7 +9,8 @@
 // PC hidden-pointer form to the Xbox RAX form. Slot 8 (command queues), 36 (fences) and 32 (a shared fence) wrap
 // what they create in queue and fence proxies built the same way, and slots 31/34/35 and 84/85/89 hand the real
 // objects behind heap, queue and fence proxies to the real device (see the command queue and fence section). Past
-// slot 42 the table follows the console order (d3d12_xs_console_slots.h, "Console device methods" below).
+// slot 42 the console view follows d3d12_xs_console_slots.h. The PC view keeps the PC order for extended
+// interfaces handed to host callers.
 //
 // A thunk declares 14 argument words, but the title passes only as many as the method takes, so the caller's frame
 // may end right after the four register homes. The compiler owns a function's incoming stack-argument slots and may
@@ -65,6 +66,7 @@ struct DeviceProxy {
     std::atomic<unsigned long> refs;
     // The device's IDXGIDevice1 (see "IDXGIDevice1 on the device" below): a title's IDXGIDevice1* points here.
     void** dxgi_vtable;
+    void** pc_vtable;       // host view for the public PC device interfaces
     DxgiAdapterProvider adapter_provider;
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
@@ -274,6 +276,12 @@ std::uint64_t hr_to_u64(HRESULT hr) {
 }
 
 std::atomic<CallerDescriber> g_caller_describer{nullptr};
+std::atomic<ConsoleCaller> g_console_caller{nullptr};
+
+bool is_console_caller(const void* address) {
+    const auto classify = g_console_caller.load(std::memory_order_acquire);
+    return classify && classify(reinterpret_cast<std::uint64_t>(address));
+}
 
 // "module+0xRVA" for a title's return address: through the describer gta6rt installs (it knows the images its own
 // loader mapped), else through the host's modules, else the bare address.
@@ -313,26 +321,28 @@ unsigned long proxy_release(DeviceProxy* self) {
     return refs;
 }
 
-bool is_device_iid(const IID& iid) {
+bool is_device_iid(const IID& iid, bool console_layout) {
     if (IsEqualIID(iid, __uuidof(ID3D12Device))) return true;
+    if (!console_layout) {
 #ifdef __ID3D12Device14_INTERFACE_DEFINED__
-    if (IsEqualIID(iid, __uuidof(ID3D12Device14))) return true;
+        if (IsEqualIID(iid, __uuidof(ID3D12Device14))) return true;
 #endif
 #ifdef __ID3D12Device13_INTERFACE_DEFINED__
-    if (IsEqualIID(iid, __uuidof(ID3D12Device13))) return true;
+        if (IsEqualIID(iid, __uuidof(ID3D12Device13))) return true;
 #endif
 #ifdef __ID3D12Device12_INTERFACE_DEFINED__
-    if (IsEqualIID(iid, __uuidof(ID3D12Device12))) return true;
+        if (IsEqualIID(iid, __uuidof(ID3D12Device12))) return true;
 #endif
 #ifdef __ID3D12Device11_INTERFACE_DEFINED__
-    if (IsEqualIID(iid, __uuidof(ID3D12Device11))) return true;
+        if (IsEqualIID(iid, __uuidof(ID3D12Device11))) return true;
 #endif
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
-    if (IsEqualIID(iid, __uuidof(ID3D12Device10))) return true;
+        if (IsEqualIID(iid, __uuidof(ID3D12Device10))) return true;
 #endif
 #ifdef __ID3D12Device9_INTERFACE_DEFINED__
-    if (IsEqualIID(iid, __uuidof(ID3D12Device9))) return true;
+        if (IsEqualIID(iid, __uuidof(ID3D12Device9))) return true;
 #endif
+    }
     if (IsEqualIID(iid, __uuidof(ID3D12Device8))) return true;
     if (IsEqualIID(iid, __uuidof(ID3D12Device7))) return true;
     if (IsEqualIID(iid, __uuidof(ID3D12Device6))) return true;
@@ -344,7 +354,7 @@ bool is_device_iid(const IID& iid) {
     return false;
 }
 
-HRESULT proxy_query_interface(DeviceProxy* self, const IID* riid, void** out) {
+HRESULT proxy_query_interface(DeviceProxy* self, const IID* riid, void** out, bool console_layout) {
     note_slot(0);
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -360,7 +370,7 @@ HRESULT proxy_query_interface(DeviceProxy* self, const IID* riid, void** out) {
         proxy_add_ref(self);
         return S_OK;
     }
-    if (!is_device_iid(*riid)) return E_NOINTERFACE;
+    if (!is_device_iid(*riid, console_layout)) return E_NOINTERFACE;
 
     // Only claim an interface the PC device really implements; the proxy vtable covers its slots.
     void* supported = nullptr;
@@ -368,7 +378,10 @@ HRESULT proxy_query_interface(DeviceProxy* self, const IID* riid, void** out) {
     if (FAILED(hr)) return hr;
     if (!supported) return E_NOINTERFACE;
     static_cast<IUnknown*>(supported)->Release();
-    *out = self;
+    // QueryInterface selects the view before slots with conflicting signatures can be called.
+    // Both views use the same IUnknown identity and counter.
+    *out = console_layout || IsEqualIID(*riid, __uuidof(ID3D12Device))
+               ? static_cast<void*>(self) : &self->pc_vtable;
     proxy_add_ref(self);
     return S_OK;
 }
@@ -422,7 +435,7 @@ void note_dxgi(const char* method) {
 }
 
 HRESULT WINAPI dxgi_query_interface(void* self, const IID* riid, void** out) {
-    return proxy_query_interface(dxgi_owner(self), riid, out);
+    return proxy_query_interface(dxgi_owner(self), riid, out, is_console_caller(_ReturnAddress()));
 }
 ULONG WINAPI dxgi_add_ref(void* self) { return proxy_add_ref(dxgi_owner(self)); }
 ULONG WINAPI dxgi_release(void* self) { return proxy_release(dxgi_owner(self)); }
@@ -545,13 +558,14 @@ HRESULT heap_query_interface(HeapProxy* self, const IID* riid, void** out) {
 }
 
 // ID3D12DeviceChild::GetDevice on the heap must hand back the Xbox-ABI device, not the raw PC device.
-HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
+HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out,
+                        const void* caller) {
     note_heap_slot(7);
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
     if (!self->device) return E_NOINTERFACE;
-    return proxy_query_interface(self->device, riid, out);
+    return proxy_query_interface(self->device, riid, out, is_console_caller(caller));
 }
 
 // The PC methods write through the hidden return pointer (RDX) on the measured runtime; the Xbox ABI wants the
@@ -593,7 +607,7 @@ std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t 
         return heap_release(self);
     } else if constexpr (Slot == 7) {
         return hr_to_u64(heap_get_device(self, reinterpret_cast<const IID*>(a1),
-                                         reinterpret_cast<void**>(a2)));
+                                         reinterpret_cast<void**>(a2), _ReturnAddress()));
     } else if constexpr (Slot == 9) {
         return static_cast<std::uint64_t>(heap_get_cpu_handle(self).ptr);
     } else if constexpr (Slot == 10) {
@@ -897,7 +911,8 @@ HRESULT child_query_interface(ChildProxy* self, const IID* riid, void** out) {
 // ID3D12DeviceChild::GetDevice hands back the Xbox-ABI device, not the real one. Without an output it is the real
 // object's own answer (what the PC runtime returns for a null pointer).
 template <ChildKind K>
-HRESULT child_get_device(ChildProxy* self, const IID* riid, void** out) {
+HRESULT child_get_device(ChildProxy* self, const IID* riid, void** out,
+                        const void* caller) {
     note_child_slot<K>(7);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure (bc59ef46)
     if (!riid) return E_POINTER;
@@ -906,7 +921,7 @@ HRESULT child_get_device(ChildProxy* self, const IID* riid, void** out) {
         return reinterpret_cast<Fn>(self->real_vtable[7])(self->real, riid, nullptr);
     }
     if (!self->device) return E_NOINTERFACE;
-    return proxy_query_interface(self->device, riid, out);
+    return proxy_query_interface(self->device, riid, out, is_console_caller(caller));
 }
 
 template <ChildKind K>
@@ -1095,7 +1110,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
     } else if constexpr (Slot == 7) {
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(child_get_device<K>(self, reinterpret_cast<const IID*>(a1),
-                                             reinterpret_cast<void**>(a2)));
+                                             reinterpret_cast<void**>(a2), _ReturnAddress()));
     } else if constexpr (K == ChildKind::queue && Slot > 10) {
         // Past ExecuteCommandLists the console queue has its own order, in one of two layouts
         // (d3d12_xs_console_slots.h). Every word keeps its position, as in the generic branch below.
@@ -1241,14 +1256,11 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
     return S_OK;
 }
 
-// Calls the real device's slot `Slot` with these five words in the positions the thunk received them (see "A thunk
-// declares 14 argument words" at the top: no word may move to another stack position on the way).
-template <unsigned Slot>
-std::uint64_t forward_device(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
-                             std::uint64_t a4, std::uint64_t a5) {
-    using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                      std::uint64_t);
-    return reinterpret_cast<Fn>(self->real_vtable[Slot])(self->real, a1, a2, a3, a4, a5);
+// Keep every argument in its original position, including any hidden struct-return pointer.
+template <unsigned Slot, class... Args>
+std::uint64_t forward_device(DeviceProxy* self, Args... args) {
+    using Fn = std::uint64_t(WINAPI*)(void*, Args...);
+    return reinterpret_cast<Fn>(self->real_vtable[Slot])(self->real, args...);
 }
 
 // A device slot past the PC device's vtable (the real device predates the interface): E_NOTIMPL, logged once per
@@ -1434,12 +1446,12 @@ HRESULT proxy_open_shared_handle(DeviceProxy* self, std::uint64_t handle, const 
 //   45 SetEventOnMultipleFenceCompletion(fences, values, count, flags, event)    (ID3D12Device1, console 84)
 //   46 SetResidencyPriority(count, objects, priorities)                          (ID3D12Device1, console 85)
 //   50 EnqueueMakeResident(flags, count, objects, fence, value)                  (ID3D12Device3, console 89)
-template <unsigned Slot, unsigned Console = console::device_console_slot(Slot)>
+template <unsigned Slot, unsigned DispatchSlot = console::device_console_slot(Slot)>
 HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                               std::uint64_t a4, std::uint64_t a5) {
-    static_assert(console::device_slot(Console).pc_slot == Slot, "console and PC slot must name the same method");
-    note_slot(Console);
-    if (Slot >= self->slot_count) return refuse_beyond_device(Console, self->slot_count);  // predates the interface
+    static_assert(DispatchSlot == Slot || console::device_slot(DispatchSlot).pc_slot == Slot);
+    note_slot(DispatchSlot);
+    if (Slot >= self->slot_count) return refuse_beyond_device(DispatchSlot, self->slot_count);  // predates the interface
     UnwrappedArray objects;
     std::uint64_t r1 = a1, r2 = a2, r3 = a3, r4 = a4;
     if constexpr (Slot == 31) {
@@ -1831,14 +1843,19 @@ void proxy_create_feedback_view(DeviceProxy* self, std::uint64_t target, std::ui
     reinterpret_cast<Fn>(self->real_vtable[71])(self->real, target, feedback, handle);
 }
 
-template <unsigned Slot>
-std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+template <unsigned Slot, bool Console = true>
+std::uint64_t WINAPI proxy_slot(void* view, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                 std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                 std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    auto* self = static_cast<DeviceProxy*>(view);
+    if constexpr (!Console)
+        self = reinterpret_cast<DeviceProxy*>(static_cast<char*>(view) - offsetof(DeviceProxy, pc_vtable));
+
     if constexpr (Slot == 0) {
         return hr_to_u64(proxy_query_interface(self, reinterpret_cast<const IID*>(a1),
-                                               reinterpret_cast<void**>(a2)));
+                                               reinterpret_cast<void**>(a2),
+                                               is_console_caller(_ReturnAddress())));
     } else if constexpr (Slot == 1) {
         return proxy_add_ref(self);
     } else if constexpr (Slot == 2) {
@@ -1855,8 +1872,13 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 32) {
         return hr_to_u64(proxy_open_shared_handle(self, a1, reinterpret_cast<const IID*>(a2),
                                                   reinterpret_cast<void**>(a3)));
-    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35) {
-        return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 ||
+                         (!Console && (Slot == 45 || Slot == 46 || Slot == 50))) {
+        return hr_to_u64(proxy_unwrapping_call<Slot, Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (!Console && Slot >= 43) {
+        note_slot(Slot);
+        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        return forward_device<Slot>(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     } else if constexpr (Slot == console::device_console_slot(45) || Slot == console::device_console_slot(46) ||
                          Slot == console::device_console_slot(50)) {
         return hr_to_u64(proxy_unwrapping_call<console::device_slot(Slot).pc_slot>(self, a1, a2, a3, a4, a5));
@@ -1963,27 +1985,21 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             constexpr unsigned pc = console::device_slot(Slot).pc_slot;
             if (pc >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
-            // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
-            // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
-            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t);
-            auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[pc]);
-            return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            return forward_device<pc>(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
         }
     }
 }
 
-template <std::size_t... I>
+template <bool Console, std::size_t... I>
 void fill_vtable(void** vtable, std::index_sequence<I...>) {
-    ((vtable[I] = reinterpret_cast<void*>(&proxy_slot<static_cast<unsigned>(I)>) ), ...);
+    ((vtable[I] = reinterpret_cast<void*>(&proxy_slot<static_cast<unsigned>(I), Console>) ), ...);
 }
 
+template <bool Console = true>
 void** get_vtable() {
     static void** vtable = [] {
         static void* storage[kMaxSlots];
-        fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
+        fill_vtable<Console>(storage, std::make_index_sequence<kMaxSlots>{});
         return storage;
     }();
     return vtable;
@@ -2031,7 +2047,7 @@ unsigned detect_slot_count(ID3D12Device* real) {
 
 }  // namespace
 
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool console_layout) {
     if (!real) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -2044,12 +2060,13 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     proxy->slot_count = detect_slot_count(real);
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->dxgi_vtable = get_dxgi_vtable();
+    proxy->pc_vtable = get_vtable<false>();
     proxy->adapter_provider = nullptr;
     proxy->gpu_thread_priority.store(0, std::memory_order_relaxed);
     proxy->max_frame_latency.store(3, std::memory_order_relaxed);
 
     const unsigned slot_count = proxy->slot_count;
-    HRESULT hr = proxy_query_interface(proxy, &riid, out);
+    HRESULT hr = proxy_query_interface(proxy, &riid, out, console_layout);
     if (FAILED(hr)) {
         // No reference escaped, and the caller still owns its reference to `real`.
         delete proxy;
@@ -2066,8 +2083,14 @@ void set_caller_describer(CallerDescriber describer) {
     g_caller_describer.store(describer, std::memory_order_release);
 }
 
+void set_console_caller(ConsoleCaller classify) {
+    g_console_caller.store(classify, std::memory_order_release);
+}
+
 bool is_device_proxy(const void* device) {
-    return device && *reinterpret_cast<void* const*>(device) == reinterpret_cast<void*>(get_vtable());
+    if (!device) return false;
+    const auto table = *static_cast<void** const*>(device);
+    return table == get_vtable() || table == get_vtable<false>();
 }
 
 void* device_proxy_from_dxgi_device(void* dxgi_device) {
@@ -2076,7 +2099,11 @@ void* device_proxy_from_dxgi_device(void* dxgi_device) {
 }
 
 void* device_proxy_primary(void* device) {
-    if (is_device_proxy(device)) return device;
+    if (is_device_proxy(device)) {
+        if (*static_cast<void***>(device) == get_vtable<false>())
+            return static_cast<char*>(device) - offsetof(DeviceProxy, pc_vtable);
+        return device;
+    }
     return device_proxy_from_dxgi_device(device);
 }
 
@@ -2103,12 +2130,12 @@ ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap) {
 
 unsigned device_proxy_slot_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
-    return static_cast<const DeviceProxy*>(device)->slot_count;
+    return static_cast<const DeviceProxy*>(device_proxy_primary(const_cast<void*>(device)))->slot_count;
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {
     if (!is_device_proxy(device)) return nullptr;
-    return static_cast<const DeviceProxy*>(device)->real;
+    return static_cast<const DeviceProxy*>(device_proxy_primary(const_cast<void*>(device)))->real;
 }
 
 bool device_slot_overridden(unsigned slot) {
@@ -2229,7 +2256,7 @@ bool device_slot_first_call_seen(unsigned slot) {
 
 unsigned long device_proxy_ref_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
-    return static_cast<const DeviceProxy*>(device)->refs.load(std::memory_order_relaxed);
+    return static_cast<const DeviceProxy*>(device_proxy_primary(const_cast<void*>(device)))->refs.load(std::memory_order_relaxed);
 }
 
 std::uint64_t heap_slot_hits(unsigned slot) {

@@ -58,8 +58,9 @@ namespace rt::d3d12_xs {
 
 // Wraps `real` and returns the requested device interface through `out`. Takes ownership of one reference to
 // `real` on success; on failure the caller keeps its reference. Returns E_NOINTERFACE if `riid` is not a D3D12
-// device interface the PC device implements.
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
+// device interface the PC device implements. Extended interfaces use the PC view unless requested by the
+// console creation entry point or queried by a mapped guest caller.
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool console_layout = false);
 
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);
@@ -68,6 +69,10 @@ bool is_device_proxy(const void* device);
 // rt::shims::module_offset, which knows the images its own loader mapped; without one the host's modules are asked.
 using CallerDescriber = std::string (*)(std::uint64_t address);
 void set_caller_describer(CallerDescriber describer);
+
+// The runtime identifies console callers by the images mapped by the guest loader.
+using ConsoleCaller = bool (*)(std::uint64_t address);
+void set_console_caller(ConsoleCaller classify);
 
 // IDXGIDevice1 on the device. A GDKX title asks its device for IDXGIDevice1, then GetAdapter and EnumOutputs(0),
 // to find the output it gives SetFrameIntervalX (docs/d3d12_vulkan.md section 4.5). The proxy answers IDXGIObject,
@@ -84,7 +89,7 @@ using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** 
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
 void* device_proxy_from_dxgi_device(void* dxgi_device);
-// The device proxy itself, given the proxy or its DXGI pointer; null for anything else.
+// The primary device proxy, given either D3D12 view or its DXGI pointer; null for anything else.
 void* device_proxy_primary(void* device);
 
 // True when `heap` is a descriptor-heap proxy created by device slot 14.
@@ -97,7 +102,7 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
-// True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 (queue proxies), 9
+// True for console slots the proxy handles itself instead of forwarding: IUnknown (0-2), 8 (queue proxies), 9
 // (allocator proxies), 14, 31/34/35 and 84/85/89 (proxies unwrapped), 32 and 36 (fence proxies), 111, every console
 // slot of d3d12_xs_console_slots.h that is not a public method, and the public HLE routes at their configured slots.
 // Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is

@@ -1255,7 +1255,7 @@ int check_identity(const Backend& b) {
         Ref<ID3D12Device1> owner1;
         EXPECT(SUCCEEDED(typed->GetDevice(IID_PPV_ARGS(&owner.p))));
         EXPECT(SUCCEEDED(typed->GetDevice(IID_PPV_ARGS(&owner1.p))));
-        EXPECT(owner.p == device && static_cast<void*>(owner1.p) == static_cast<void*>(device));
+        EXPECT(owner.p == device && xs::device_proxy_primary(owner1.p) == device);
         Ref<ID3D12Fence> not_a_device;
         EXPECT(typed->GetDevice(IID_PPV_ARGS(&not_a_device.p)) == E_NOINTERFACE && !not_a_device.p);
 

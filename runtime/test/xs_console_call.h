@@ -13,6 +13,7 @@ namespace xs_test {
 // The method at console slot "slot" of a proxy, called with the arguments as the console title calls it.
 template <class R = HRESULT, class... A>
 R console_call(void* object, unsigned slot, A... args) {
+    if (void* primary = rt::d3d12_xs::device_proxy_primary(object)) object = primary;
     using Fn = R(WINAPI*)(void*, A...);
     return reinterpret_cast<Fn>((*static_cast<void***>(object))[slot])(object, args...);
 }
@@ -23,7 +24,7 @@ constexpr unsigned device_slot(unsigned pc_slot) { return rt::d3d12_xs::console:
 // An ID3D12Device1..8 method by its PC slot: called there on a real device, at its console slot on a device proxy.
 template <class... A>
 HRESULT device_method(void* device, unsigned pc_slot, A... args) {
-    const bool proxy = rt::d3d12_xs::device_proxy_real_device(device) != nullptr;
+    const bool proxy = rt::d3d12_xs::is_device_proxy(device);
     return console_call(device, proxy ? device_slot(pc_slot) : pc_slot, args...);
 }
 
