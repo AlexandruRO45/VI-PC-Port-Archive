@@ -755,7 +755,7 @@ HRESULT STDMETHODCALLTYPE save_read(void*, XGameSaveContainerHandle c, const cha
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
     std::vector<BlobRead> blobs;
-    const HRESULT hr = read_blobs(c, names == nullptr, names, *count, blobs);
+    const HRESULT hr = read_blobs(c, names == nullptr, names, names ? *count : 0, blobs);
     if (FAILED(hr)) return hr;
     if (size < packed_size(blobs)) return E_GS_PROVIDED_BUFFER_TOO_SMALL;
     pack(blobs, out);
