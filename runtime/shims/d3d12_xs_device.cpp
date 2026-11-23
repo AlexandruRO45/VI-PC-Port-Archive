@@ -679,8 +679,6 @@ enum class ChildKind { queue, fence, allocator, list };
 // ID3D12GraphicsCommandList vtable is the same prefix, and the list proxy answers it.
 constexpr IID kXboxGraphicsCommandListIid = {
     0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
-constexpr IID kXboxCommandSignatureIid = {
-    0xc36a797c, 0xec80, 0x4f0a, {0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1}};
 
 constexpr unsigned kQueueSlots = 128;        // the table: 19 public slots plus a refused tail
 constexpr unsigned kFenceSlots = 64;         // the table: 12 public slots plus a refused tail
@@ -1671,9 +1669,9 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
 // arguments are a D3D12_DISPATCH_ARGUMENTS. HYPOTHESIS: what the console does differently for it (which command
 // stream it feeds) is not known; the PC layer has one compute path. Other descriptions are forwarded unchanged.
 //
-// The retail exe also asks for the console signature IID {c36a797c-ec80-4f0a-8985-a7b2475082d1}; the PC runtime does
-// not know it, so the call is made with the PC IID. A null output goes to the real device: its answer is the one
-// Windows gives (E_UNEXPECTED), and the validation suite compares it.
+// The retail title's signature IID is the PC ID3D12CommandSignature IID
+// {c36a797c-ec80-4f0a-8985-a7b2475082d1}, so it is passed through. A null output goes to the real device: its
+// answer is the one Windows gives (E_UNEXPECTED), and the validation suite compares it.
 // 105 is outside D3D12_INDIRECT_ARGUMENT_TYPE's range, so the field is read as its 32 bits (a constant expression that
 // casts 105 to the enum does not compile with clang-cl).
 constexpr std::uint32_t kXboxIndirectArgumentDispatch105 = 105;
@@ -1689,8 +1687,6 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     note_slot(41);
     if (out) *out = nullptr;
     if (!riid) return E_POINTER;
-    const IID& create_iid =
-        IsEqualIID(*riid, kXboxCommandSignatureIid) ? __uuidof(ID3D12CommandSignature) : *riid;
     auto* const root = reinterpret_cast<ID3D12RootSignature*>(root_signature);
 
     bool console = false;
@@ -1719,15 +1715,13 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     }
 
 #pragma warning(suppress : 6387)
-    if (!out) return self->real->CreateCommandSignature(pass, root, create_iid, nullptr);
-    const HRESULT hr = self->real->CreateCommandSignature(pass, root, create_iid, out);
+    if (!out) return self->real->CreateCommandSignature(pass, root, *riid, nullptr);
+    const HRESULT hr = self->real->CreateCommandSignature(pass, root, *riid, out);
     static std::atomic<bool> logged_console_iid{false};
     if (!logged_console_iid.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: device slot 41 CreateCommandSignature desc=%p root=%p console_iid=%d -> "
-                     "0x%08lx\n",
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot 41 CreateCommandSignature desc=%p root=%p -> 0x%08lx\n",
                      reinterpret_cast<const void*>(desc), reinterpret_cast<void*>(root),
-                     IsEqualIID(*riid, kXboxCommandSignatureIid) ? 1 : 0, static_cast<unsigned long>(hr));
+                     static_cast<unsigned long>(hr));
     }
     return hr;
 }
