@@ -242,6 +242,10 @@ class DocsCliFlags(unittest.TestCase):
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
         self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
 
+    def test_a_foreign_flag_does_not_hide_an_unknown_one(self):
+        pages = {"docs/embedded_shaders.md": "`spirv-opt` ran `--merge-return`; `--not-a-flag` did not.\n"}
+        self.assertEqual(unknown_flags(pages, "spirv-opt -O"), [("docs/embedded_shaders.md:1", "--not-a-flag")])
+
     def test_docs_name_existing_flags(self):
         files = tracked_files()
         code = "\n".join(read(p) for p in files if p.endswith(SOURCE_SUFFIXES) and not p.startswith("docs/"))
