@@ -38,6 +38,40 @@ def _validate(spvasm: str) -> None:
                 raise AssertionError(f"{cmd[0]} failed:\n{r.stderr}")
 
 
+class SpirvOptCommentTests(unittest.TestCase):
+    def setUp(self):
+        self.raw = support.translate_lines("ps_opt_comments", [
+            "v_mov_b32 v0, 7",
+            "v_add_nc_u32 v1, v0, 5",
+            "exp mrt0 v1, v0, v1, v0 done vm",
+            "s_endpgm",
+        ])
+
+    def test_trailing_comment_quotes_keep_live_output_store(self):
+        for comment in ("ordinary comment", 'output is "live"', 'unmatched "quote'):
+            with self.subTest(comment=comment):
+                annotated = "\n".join(
+                    line + " ; " + comment if line.strip().startswith("OpStore %out_mrt0 ") else line
+                    for line in self.raw.splitlines()
+                ) + "\n"
+                self.assertIn(" ; " + comment, annotated)
+                _validate(annotated)
+                self.assertEqual(support.mrt0_words(annotated), [12, 7, 12, 7])
+                optimized = spirv_opt.optimize(annotated)
+                _validate(optimized)
+                self.assertEqual(support.mrt0_words(optimized), [12, 7, 12, 7])
+
+    def test_header_strings_keep_semicolons_and_escaped_quotes(self):
+        name = 'OpName %out_mrt0 "mrt; \\"quoted\\" output" ; ignored "comment"'
+        first_decoration = next(line for line in self.raw.splitlines() if line.strip().startswith("OpDecorate "))
+        annotated = self.raw.replace(first_decoration, name + "\n" + first_decoration, 1)
+        _validate(annotated)
+        optimized = spirv_opt.optimize(annotated)
+        self.assertIn(name, optimized.splitlines())
+        _validate(optimized)
+        self.assertEqual(support.mrt0_words(optimized), [12, 7, 12, 7])
+
+
 class SpirvOptTests(unittest.TestCase):
     def test_alu_chain_bit_exact_and_shrinks_significantly(self):
         lines = [

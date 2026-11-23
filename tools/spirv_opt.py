@@ -90,12 +90,13 @@ _PURE_GLSL_EXT = frozenset((
 
 def _parse_line(line: str):
     """Return (res_id_or_None, opname, args_list) for one SPIR-V assembly line, or None if blank/comment."""
-    if '"' not in line:
-        semi = line.find(";")
-        toks = (line[:semi] if semi >= 0 else line).split()
-    else:
-        # Lines with quotes only appear in module header (OpExtension, OpEntryPoint, OpName, OpString).
+    semi = line.find(";")
+    code = line[:semi] if semi >= 0 else line
+    if '"' in code:
+        # Keep quoted header strings raw, even when they contain semicolons.
+        # Quotes in a trailing comment must not hide the instruction's SSA uses.
         return None
+    toks = code.split()
     if not toks:
         return None
     if len(toks) >= 3 and toks[1] == "=":
