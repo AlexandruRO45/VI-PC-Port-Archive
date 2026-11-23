@@ -32,6 +32,7 @@ HELPERS = {
     "gamedata_xml": None,
     "gamedata_index": None,
     "navmesh_decode": "same_report_path",
+    "vertex_types": "same_report_path",
     "world_census": "same_report_path",
 }
 
