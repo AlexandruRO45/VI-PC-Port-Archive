@@ -793,8 +793,10 @@ private:
     float gain_ = 1.0f;
     GameInputFeedbackEffectState state_ = GameInputFeedbackRunning;
     uint64_t version_ = 1;
+    uint64_t starts_ = 0;
     // Poll thread only.
     uint64_t applied_ = 0;   // the version SDL has
+    uint64_t started_ = 0;
     int sdl_effect_ = -1;
     bool sdl_running_ = false;
     bool endless_ = true;    // GameInput gave no duration: re-run before the SDL length runs out
@@ -2117,6 +2119,7 @@ GameInputFeedbackEffectState STDMETHODCALLTYPE ForceFeedbackEffect::GetState() {
 
 void STDMETHODCALLTYPE ForceFeedbackEffect::SetState(GameInputFeedbackEffectState state) {
     std::lock_guard lock(g().mu);
+    if (state == GameInputFeedbackRunning && state_ != GameInputFeedbackRunning) ++starts_;
     state_ = state;
     ++version_;
 }
@@ -2141,13 +2144,14 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     GameInputForceFeedbackParams params;
     float gain;
     GameInputFeedbackEffectState state;
-    uint64_t version;
+    uint64_t version, starts;
     {
         std::lock_guard lock(g().mu);
         params = params_;
         gain = gain_;
         state = state_;
         version = version_;
+        starts = starts_;
     }
     if (!d->haptic) return;
     // A stopped or paused effect is stopped in SDL: GameInput pauses one effect where SDL pauses the device, so a
@@ -2195,16 +2199,21 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     }
     // GameInput's playCount 0 means "until stopped", which is what SDL's 0 iterations means.
     const uint32_t iterations = endless ? 0 : play_count(params);
-    if (!haptics().run_effect(d->haptic, sdl_effect_, iterations)) {
+    const uint64_t run_for = endless || iterations == 0 ? 0 : static_cast<uint64_t>(length_ms) * 1000ull * iterations;
+    // SetParams' reference: a finite effect's timer is only refreshed by a new duration or a stop and restart.
+    const bool same_run = sdl_running_ && !endless_ && !endless && run_for == run_for_ && starts == started_;
+    if (!same_run && !haptics().run_effect(d->haptic, sdl_effect_, iterations)) {
         note_effect(d, sdl_effect_, false);
         return;
     }
     note_effect(d, sdl_effect_, true);
     sdl_running_ = true;
     applied_ = version;
+    if (same_run) return;
+    started_ = starts;
     endless_ = endless;
     run_at_ = now;
-    run_for_ = endless || iterations == 0 ? 0 : static_cast<uint64_t>(length_ms) * 1000ull * iterations;
+    run_for_ = run_for;
 }
 
 // ---- IGameInputDispatcher ----

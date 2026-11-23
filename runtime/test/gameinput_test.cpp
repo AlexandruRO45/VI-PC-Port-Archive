@@ -1452,6 +1452,40 @@ void test_force_feedback(IGameInput* input) {
         rt::gameinput::poll();
     }
 
+    // SetParams keeps a finite effect's run and timer while the duration stays the same.
+    GameInputForceFeedbackParams pulse = wave;
+    pulse.data.sineWave.envelope.sustainDuration = 200'000;
+    IGameInputForceFeedbackEffect* timed = nullptr;
+    check(dev->CreateForceFeedbackEffect(0, &pulse, reinterpret_cast<void**>(&timed)) == S_OK && timed,
+          "force feedback: CreateForceFeedbackEffect for a 200 ms wave");
+    if (timed) {
+        rt::gameinput::poll();
+        const int runs2 = g_fake.runs, updates2 = g_fake.updates;
+        Sleep(50);
+        pulse.data.sineWave.magnitude.linearX = 0.5f;
+        check(timed->SetParams(&pulse), "force feedback: SetParams on a running 200 ms wave");
+        rt::gameinput::poll();
+        check(g_fake.updates == updates2 + 1 && g_fake.runs == runs2 && g_fake.last.periodic.magnitude == 16384,
+              "force feedback: the same duration updates the running effect without running it again");
+        Sleep(180);
+        rt::gameinput::poll();
+        check(timed->GetState() == GameInputFeedbackStopped,
+              "force feedback: and it stops when the duration it started with is over");
+        timed->SetState(GameInputFeedbackRunning);
+        rt::gameinput::poll();
+        pulse.data.sineWave.envelope.sustainDuration = 300'000;
+        check(timed->SetParams(&pulse), "force feedback: SetParams with a new duration");
+        rt::gameinput::poll();
+        check(g_fake.runs == runs2 + 2 && g_fake.last.periodic.length == 300,
+              "force feedback: a new duration runs the effect again");
+        timed->SetState(GameInputFeedbackStopped);
+        timed->SetState(GameInputFeedbackRunning);
+        rt::gameinput::poll();
+        check(g_fake.runs == runs2 + 3, "force feedback: so does a stop and restart between two polls");
+        timed->Release();
+        rt::gameinput::poll();
+    }
+
     // A condition effect: coefficients, saturations, dead zone and centre.
     GameInputForceFeedbackParams spring{};
     spring.kind = GameInputForceFeedbackSpring;
