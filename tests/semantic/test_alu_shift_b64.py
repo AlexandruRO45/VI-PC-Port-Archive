@@ -84,6 +84,9 @@ def run_lines(lines) -> int:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
         spv = rdna2spirv.translate(_SRC_PATH)
+    assert "OpMemoryModel Logical" in spv
+    assert "OpCapability Int64" not in spv
+    assert "OpCapability PhysicalStorageBufferAddresses" not in spv
     w = si.run_fragment(spv)["%out_mrt0"]
     assert all(x >> 16 == 0x4000 for x in w), [hex(x) for x in w]
     return sum((x & 0xFFFF) << (16 * i) for i, x in enumerate(w))
@@ -112,6 +115,19 @@ class ShiftB64Tests(unittest.TestCase):
                 for x in VALUES:
                     with self.subTest(op=op, n=hex(n), x=hex(x)):
                         self.assertEqual(run_op(op, n, x), fn(n, x))
+
+    def test_scalar_in_place_and_scc(self):
+        for scalar, vector in (("s_lshl_b64", "v_lshlrev_b64"), ("s_lshr_b64", "v_lshrrev_b64"),
+                               ("s_ashr_i64", "v_ashrrev_i64")):
+            for x in (0, 1, 0x8123456789ABCDEF):
+                for n in SHIFTS:
+                    with self.subTest(op=scalar, x=hex(x), n=n):
+                        lines = [f"s_mov_b32 s8, {x & 0xFFFFFFFF:#x}", f"s_mov_b32 s9, {x >> 32:#x}",
+                                 f"s_mov_b32 s10, {n:#x}", f"{scalar} s[8:9], s[8:9], s10"]
+                        expected = OPS[vector](n, x)
+                        self.assertEqual(run_lines(lines + ["v_mov_b32 v0, s8", "v_mov_b32 v1, s9"]), expected)
+                        self.assertEqual(run_lines(lines + ["s_cselect_b32 s11, 1, 0", "v_mov_b32 v0, s11",
+                                                            "v_mov_b32 v1, 0"]), int(bool(expected)))
 
     def test_seeded(self):
         rng = random.Random(64)

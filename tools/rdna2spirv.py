@@ -846,6 +846,31 @@ class Gen:
         self.emit(f"{r} = OpBitwiseAnd %uint {v} {self.cu(k)}")
         return r
 
+    def shift_pair(self, op, lo, hi, count):
+        """Shift a register pair by count & 63 using only 32-bit operations."""
+        def word(inst, *args):
+            result = self.tmp()
+            self.emit(f"{result} = {inst} %uint {' '.join(args)}")
+            return result
+
+        n = self.emit_and(count, 31)
+        cross = self.tmp_bool_nz(self.emit_and(count, 32))
+        # For n == 0, both the field offset and width must be zero, not (32, 0).
+        offset = self.emit_and(word("OpISub", self.cu(0), n), 31)
+        if op in ("s_lshl_b64", "v_lshlrev_b64"):
+            hi = word("OpSelect", cross, lo, hi)
+            lo = word("OpSelect", cross, self.cu(0), lo)
+            carry = word("OpBitFieldUExtract", lo, offset, n)
+            high = word("OpBitwiseOr", word("OpShiftLeftLogical", hi, n), carry)
+            return word("OpShiftLeftLogical", lo, n), high
+
+        signed = op in ("s_ashr_i64", "v_ashrrev_i64")
+        fill = word("OpShiftRightArithmetic", hi, self.cu(31)) if signed else self.cu(0)
+        lo = word("OpSelect", cross, hi, lo)
+        hi = word("OpSelect", cross, fill, hi)
+        low = word("OpBitFieldInsert", word("OpShiftRightLogical", lo, n), hi, offset, n)
+        return low, word("OpShiftRightArithmetic" if signed else "OpShiftRightLogical", hi, n)
+
     def f16_res(self, f, exact_tiny=False):
         """f32 ``f`` -> f16 bits (low 16) as a VALU f16 result rounds it: to nearest even (f16_bits), or, when the
         program writes MODE.FP_ROUND[3:2], by the current mode in %mode_r16 (0 nearest even, 3 toward zero with
@@ -8287,22 +8312,7 @@ class Gen:
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu((v >> 32) & 0xFFFFFFFF)
             else:
                 raise Unsupported(op + " operands")
-            s = self.src_u(sh)
-            l64, h64, x, sh64, m, res, rlo, rhi, t = (self.tmp() for _ in range(9))
-            self.emit(f"{l64} = OpUConvert %ulong {lo}")
-            self.emit(f"{h64} = OpUConvert %ulong {hi}")
-            self.emit(f"{t} = OpShiftLeftLogical %ulong {h64} %c64_32")
-            self.emit(f"{x} = OpBitwiseOr %ulong {t} {l64}")
-            self.emit(f"{m} = OpBitwiseAnd %uint {s} {self.cu(63)}")
-            self.emit(f"{sh64} = OpUConvert %ulong {m}")
-            shop = {"v_lshlrev_b64": "OpShiftLeftLogical", "v_lshrrev_b64": "OpShiftRightLogical",
-                    "v_ashrrev_i64": "OpShiftRightArithmetic"}[op]
-            self.emit(f"{res} = {shop} %ulong {x} {sh64}")
-            self.emit(f"{rlo} = OpUConvert %uint {res}")
-            hs = self.tmp()
-            self.emit(f"{hs} = OpShiftRightLogical %ulong {res} %c64_32")
-            self.emit(f"{rhi} = OpUConvert %uint {hs}")
-            self.uses_psb = True        # needs Int64 (declared with the PSB types)
+            rlo, rhi = self.shift_pair(op, lo, hi, self.src_u(sh))
             self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, rlo)
             self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
         elif op == "v_fmac_f16":
@@ -9415,34 +9425,13 @@ class Gen:
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " source")
-            sh = self.src_u(a[2])
-            l64, h64, t, v64, m, s64, r, rlo, rh, rhi = (self.tmp() for _ in range(10))
-            self.emit(f"{l64} = OpUConvert %ulong {lo}")
-            self.emit(f"{h64} = OpUConvert %ulong {hi}")
-            self.emit(f"{t} = OpShiftLeftLogical %ulong {h64} %c64_32")
-            self.emit(f"{v64} = OpBitwiseOr %ulong {t} {l64}")
-            self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(63)}")
-            self.emit(f"{s64} = OpUConvert %ulong {m}")
-            if op == "s_ashr_i64":
-                vs64, rs64 = self.tmp(), self.tmp()
-                self.emit(f"{vs64} = OpBitcast %long {v64}")
-                self.emit(f"{rs64} = OpShiftRightArithmetic %long {vs64} {s64}")
-                self.emit(f"{r} = OpBitcast %ulong {rs64}")
-            elif op == "s_lshl_b64":
-                self.emit(f"{r} = OpShiftLeftLogical %ulong {v64} {s64}")
-            else:
-                self.emit(f"{r} = OpShiftRightLogical %ulong {v64} {s64}")
-            self.emit(f"{rlo} = OpUConvert %uint {r}")
-            self.emit(f"{rh} = OpShiftRightLogical %ulong {r} %c64_32")
-            self.emit(f"{rhi} = OpUConvert %uint {rh}")
+            rlo, rhi = self.shift_pair(op, lo, hi, self.src_u(a[2]))
             self.store_reg("sgpr", d["r"], rlo)
             self.store_reg("sgpr", d["r"] + 1, rhi)
-            nz, z = self.tmp(), self.tmp()
-            orr = self.tmp()
+            z, orr = self.tmp(), self.tmp()
             self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
             self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(orr)} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
-            self.uses_psb = True        # Int64 capability and %ulong come with the PSB declarations
         elif op == "s_ashr_i32":
             x, sh = self.src_u(a[1]), self.src_u(a[2])
             m, xi, ri, r = (self.tmp() for _ in range(4))

@@ -439,11 +439,10 @@ class TestSpirvTranslatorIntegration(unittest.TestCase):
         emitted = "\n".join(g.body)
 
         # Verify key SPIR-V instructions are present per translation rules:
-        self.assertIn("OpShiftLeftLogical %ulong", emitted)
+        self.assertIn("OpShiftLeftLogical %uint", emitted)
         self.assertIn("OpBitwiseAnd %uint", emitted)
-        self.assertIn("%c3f", emitted)
         self.assertIn("OpStore %scc", emitted)
-        self.assertTrue(g.uses_psb)
+        self.assertFalse(g.uses_psb)
 
     def test_rdna2spirv_lshr_b64_emission(self):
         g = rdna2spirv.Gen("ps")
@@ -459,9 +458,9 @@ class TestSpirvTranslatorIntegration(unittest.TestCase):
         g.insn(ins)
         emitted = "\n".join(g.body)
 
-        self.assertIn("OpShiftRightLogical %ulong", emitted)
+        self.assertIn("OpShiftRightLogical %uint", emitted)
         self.assertIn("OpStore %scc", emitted)
-        self.assertTrue(g.uses_psb)
+        self.assertFalse(g.uses_psb)
 
     def test_rdna2spirv_ashr_i64_emission(self):
         g = rdna2spirv.Gen("ps")
@@ -477,45 +476,10 @@ class TestSpirvTranslatorIntegration(unittest.TestCase):
         g.insn(ins)
         emitted = "\n".join(g.body)
 
-        self.assertIn("OpBitcast %long", emitted)
-        self.assertIn("OpShiftRightArithmetic %long", emitted)
-        self.assertIn("OpBitcast %ulong", emitted)
+        self.assertIn("OpShiftRightArithmetic %uint", emitted)
         self.assertIn("OpBitwiseAnd %uint", emitted)
         self.assertIn("OpStore %scc", emitted)
-        self.assertTrue(g.uses_psb)
-
-    def test_spirv_expansion_logic_matches_interpreter(self):
-        # Simulate the exact SPIR-V sequence emitted by rdna2spirv and verify equivalence with ref_s_lshl_b64.
-        vectors = [
-            (0x12345678, 0x9ABCDEF0, 4),
-            (0xFFFFFFFF, 0x00000000, 32),
-            (0x00000001, 0x00000000, 63),
-            (0x00000000, 0x80000000, 1),
-            (0x00000000, 0x00000000, 16),
-            (0xDEADBEEF, 0xCAFEBABE, 70),  # 70 & 63 = 6
-        ]
-        for lo, hi, sh in vectors:
-            with self.subTest(lo=hex(lo), hi=hex(hi), sh=sh):
-                # 1. SPIR-V expansion logic from rdna2spirv.py lines 2614-2630:
-                l64 = lo & MASK64
-                h64 = hi & MASK64
-                t = (h64 << 32) & MASK64
-                v64 = t | l64
-                m = sh & 63
-                s64 = m & MASK64
-                r = (v64 << s64) & MASK64
-                rlo = r & MASK32
-                rh = (r >> 32) & MASK64
-                rhi = rh & MASK32
-                orr = (rlo | rhi) & MASK32
-                spirv_scc = 1 if orr != 0 else 0
-                spirv_res = join_dwords(rlo, rhi)
-
-                # 2. Reference interpreter output:
-                ref_res, ref_scc = ref_s_lshl_b64(join_dwords(lo, hi), sh)
-
-                self.assertEqual(spirv_res, ref_res)
-                self.assertEqual(spirv_scc, ref_scc)
+        self.assertFalse(g.uses_psb)
 
 
 if __name__ == "__main__":
