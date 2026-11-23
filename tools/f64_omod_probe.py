@@ -25,13 +25,18 @@ import argparse
 import json
 import math
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 MODES = {
     # The mode the translator emits and the game runs with: scaling ignored, clamp applied.
@@ -264,9 +269,37 @@ def self_test():
 
 
 def write_report(path, report):
+    """Stage a complete JSON report; keep the previous file if publish fails."""
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(report, fh, ensure_ascii=False, indent=1)
+        destination = os.path.realpath(path)
+        parent = os.path.dirname(destination) or "."
+        try:
+            mode = os.stat(destination).st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and not stat.S_ISREG(mode):
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(report, fh, ensure_ascii=False, indent=1)
+            return True
+        if mode is not None:
+            # Retain the direct writer's permission check without truncating the report.
+            os.close(os.open(destination, os.O_WRONLY))
+
+        staged = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", delete=False,
+            dir=parent, prefix=".f64_omod_probe-", suffix=".tmp",
+        )
+        try:
+            with staged:
+                json.dump(report, staged, ensure_ascii=False, indent=1)
+            if os.name != "nt":
+                os.chmod(staged.name, published_mode(destination))
+            replace_retry(staged.name, destination)
+        finally:
+            try:
+                os.unlink(staged.name)
+            except FileNotFoundError:
+                pass
         return True
     except OSError as exc:
         print(f"cannot write {path}: {exc}")
