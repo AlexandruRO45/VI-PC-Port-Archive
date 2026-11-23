@@ -474,5 +474,54 @@ class TestDsPermuteSIMDExecution(unittest.TestCase):
         for i in range(48, 64):
             self.assertEqual(res[i], OLD_VDST)
 
+
+class TestDsPermuteRegisterAliasing(unittest.TestCase):
+    """Part 5: Register aliasing and in-place operand preservation."""
+
+    def test_aliasing_vdst_equals_vaddr(self) -> None:
+        engine = SIMDPermuteEngine(lanes=32)
+        # Rotate by 1: lane i sends to lane (i + 1) % 32
+        addrs = [((i + 1) % 32) * 4 for i in range(32)]
+        datas = [500 + i for i in range(32)]
+        engine.set_vgpr(1, addrs)  # v1 is addr AND dst
+        engine.set_vgpr(2, datas)  # v2 is data
+
+        # Instruction: ds_permute_b32 v1, v1, v2
+        engine.step_ds_permute(dst_idx=1, addr_idx=1, data_idx=2)
+        res = engine.get_vgpr(1)
+
+        # All lanes must sample their address before v1 is overwritten
+        self.assertEqual(res[0], 500 + 31)
+        for i in range(1, 32):
+            self.assertEqual(res[i], 500 + i - 1)
+
+    def test_aliasing_vdst_equals_vdata(self) -> None:
+        engine = SIMDPermuteEngine(lanes=32)
+        addrs = [((i + 1) % 32) * 4 for i in range(32)]
+        datas = [600 + i for i in range(32)]
+        engine.set_vgpr(1, addrs)  # v1 is addr
+        engine.set_vgpr(2, datas)  # v2 is data AND dst
+
+        # Instruction: ds_permute_b32 v2, v1, v2
+        engine.step_ds_permute(dst_idx=2, addr_idx=1, data_idx=2)
+        res = engine.get_vgpr(2)
+
+        self.assertEqual(res[0], 600 + 31)
+        for i in range(1, 32):
+            self.assertEqual(res[i], 600 + i - 1)
+
+    def test_aliasing_all_operands_same_register(self) -> None:
+        engine = SIMDPermuteEngine(lanes=32)
+        # Identity address: lane i has (i * 4) as both addr and data
+        vals = [i * 4 for i in range(32)]
+        engine.set_vgpr(0, vals)
+
+        # Instruction: ds_permute_b32 v0, v0, v0
+        engine.step_ds_permute(dst_idx=0, addr_idx=0, data_idx=0)
+        res = engine.get_vgpr(0)
+
+        for i in range(32):
+            self.assertEqual(res[i], i * 4)
+
 if __name__ == "__main__":
     unittest.main()
