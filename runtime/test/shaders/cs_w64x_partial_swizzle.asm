@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Partial wave64, ds_swizzle_b32 / ds_bpermute_b32 from a lane that doesn't exist: a 40x1x1 group is one wave with
 ; lanes 0-39 running and 40-63 missing. A source lane that doesn't exist reads 0 (RDNA2 ISA, ds_swizzle/ds_bpermute of
 ; a lane that isn't running; on gfx1036 through tools/hw_oracle, 40 threads, native wave64: lanes 32-39 of SWAP 8 and
