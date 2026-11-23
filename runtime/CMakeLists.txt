@@ -1165,10 +1165,11 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(xdxr_build_check PROPERTIES FIXTURES_REQUIRED xdxr_build_cases SKIP_RETURN_CODE 77)
     endif()
   endif()
-  # VulkanQueue/VulkanContext query-state synchronization (remove_query_pool vs commit, cross-queue plan/commit)
-  # and pending Wait() preservation across transient vkQueueSubmit failures.
+  # VulkanQueue/VulkanContext query/bindless-state synchronization (remove_query_pool vs commit, cross-queue
+  # plan/commit and failed bindless rollback) plus pending Wait() preservation across transient submit failures.
   add_executable(vk_queue_query_sync_test test/vk_queue_query_sync_test.cpp)
   target_link_libraries(vk_queue_query_sync_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  target_compile_definitions(vk_queue_query_sync_test PRIVATE LEONIDA_VULKAN_QUEUE_SYNC_TEST_HOOKS)
   if(WIN32)
     target_compile_definitions(vk_queue_query_sync_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   else()
@@ -1180,7 +1181,7 @@ if(TARGET Vulkan::Headers)
   endif()
   if(BUILD_TESTING)
     add_test(NAME vk_queue_query_sync COMMAND vk_queue_query_sync_test)
-    set_tests_properties(vk_queue_query_sync PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(vk_queue_query_sync PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
   endif()
   # With LEONIDA_VK_VALIDATION=1: synchronization validation reports a missing barrier (and not a present one), so
   # the other GPU tests' "0 validation errors" was checked by an active layer. 77 without validation or a device.

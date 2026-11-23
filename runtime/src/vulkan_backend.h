@@ -1380,8 +1380,9 @@ public:
         if (!scratch_->loaded()) scratch_.reset();
     }
 
-    // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
-    // set keeps its upload pending in the second case, because the copy never reached the GPU.
+    // Called after that command buffer's submit, while tracker_mutex_ still orders this result before another
+    // queue's prepare: true when it was accepted, false when vkQueueSubmit failed. The set keeps its upload pending
+    // in the second case, because the copy never reached the GPU.
     void set_bindless_commit(std::function<void(bool)> commit) {
         std::unique_lock lock(resource_mutex_);
         bindless_commit_ = std::move(commit);
@@ -1393,6 +1394,13 @@ public:
         std::unique_lock lock(resource_mutex_);
         bindless_current_ = std::move(current);
     }
+#ifdef LEONIDA_VULKAN_QUEUE_SYNC_TEST_HOOKS
+    // Test-only observation of the tracker lock attempt immediately before bindless preparation.
+    void set_tracker_lock_probe(std::function<void(bool)> probe) {
+        std::unique_lock lock(resource_mutex_);
+        tracker_lock_probe_ = std::move(probe);
+    }
+#endif
 
     void set_bindless_release(DeferredDeletionQueue::BindlessReleaseFn fn, void* user) {
         deletion_queue_.set_bindless_release(fn, user);
@@ -1663,6 +1671,9 @@ private:
     VkSemaphore bindless_upload_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t bindless_upload_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
+#ifdef LEONIDA_VULKAN_QUEUE_SYNC_TEST_HOOKS
+    std::function<void(bool)> tracker_lock_probe_;  // whether try_lock acquired tracker_mutex_
+#endif
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
@@ -2156,7 +2167,8 @@ private:
             ~KhrGuard() { queue->recycle_khr_stages(stages); }
         } khr_guard{this};
         std::function<void(bool)> bindless_commit;
-        // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
+        // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> bindless callback locks -> submit_mutex_.
+        // The device's bindless prepare/commit callbacks take descriptor_mutex_ in that callback-lock position.
         // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
         // prepare() only if a list actually converts a depth24_as_float copy, and otherwise right before
         // bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and submissions stay in order.
@@ -2374,7 +2386,18 @@ private:
             discard();
             return ReplayResult::unsupported;
         }
-        if (!tracker_lock.owns_lock()) tracker_lock.lock();
+        if (!tracker_lock.owns_lock()) {
+#ifdef LEONIDA_VULKAN_QUEUE_SYNC_TEST_HOOKS
+            if (context_.tracker_lock_probe_) {
+                const bool acquired = tracker_lock.try_lock();
+                context_.tracker_lock_probe_(acquired);
+                if (!acquired) tracker_lock.lock();
+            } else
+#endif
+            {
+                tracker_lock.lock();
+            }
+        }
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();

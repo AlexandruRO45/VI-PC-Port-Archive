@@ -1,21 +1,24 @@
-// VulkanQueue / VulkanContext query-state synchronization and failed-submit wait preservation regressions
+// VulkanQueue / VulkanContext query/bindless-state synchronization and failed-submit wait preservation regressions
 // (runtime/src/vulkan_backend.h):
 //   1. VulkanContext::remove_query_pool() must serialize with tracker_mutex_ so an in-flight VulkanQueue::execute()
 //      that already unlocked resource_mutex_ cannot suffer a use-after-free in QueryReplay::commit().
 //   2. VulkanQueue::execute() must acquire tracker_mutex_ before QueryReplay::plan() so concurrent queues see
 //      submission-order query state (no data race on QueryPool::ended / QueryPool::occlusion and no stale zero-fill).
 //   3. A transient vkQueueSubmit failure must preserve pending VulkanQueue::wait() timeline semaphores for the retry.
-//   4. Concurrent multi-queue query End/Resolve + add/remove_query_pool stress with zero Vulkan validation errors.
+//   4. Bindless failed-submit rollback must precede the next queue's prepare on both VulkanQueue submit paths.
+//   5. Concurrent multi-queue query End/Resolve + add/remove_query_pool stress with zero Vulkan validation errors.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -379,7 +382,107 @@ int main() {
             std::printf("queue/query sync: a failed Signal does not release its waiters; the retry does\n");
         }
 
-        // 4. Concurrent multi-queue EndQuery + ResolveQueries + temporary query pool add/remove stress.
+        // 4. A failed bindless upload must roll back before another queue can prepare. Exercise both the regular
+        //    path (prepare succeeds, list replay continues) and the early path (prepare returns false, but its
+        //    recorded upload is still submitted). The callbacks model BindlessSet's consumed upload obligation:
+        //    before rollback, queue B would see no work to retry and could submit stale table/fallback contents.
+        CommandList empty_list;
+        EXPECT(empty_list.close());
+        const CommandList* empty_ptr = &empty_list;
+        const auto bindless_rollback_case = [&](bool first_prepare_succeeds, const char* path) {
+            std::atomic<unsigned> prepare_calls{0};
+            std::atomic<unsigned> failed_commit_calls{0};
+            std::atomic<unsigned> successful_commit_calls{0};
+            std::atomic<unsigned> tracker_probe_calls{0};
+            std::atomic<bool> retry_pending{false};
+            std::atomic<bool> rollback_started{false};
+            std::mutex sync_mutex;
+            std::condition_variable sync_cv;
+            bool queue_b_probed = false;
+            bool queue_b_probe_before_rollback = false;
+            bool queue_b_acquired_tracker = false;
+            bool queue_b_prepared = false;
+            bool queue_b_saw_retry = false;
+            bool prepared_before_rollback = false;
+            ReplayResult queue_b_result = ReplayResult::unsupported;
+            std::thread queue_b_thread;
+
+            context.set_tracker_lock_probe([&](bool acquired) {
+                const unsigned call = tracker_probe_calls.fetch_add(1, std::memory_order_relaxed);
+                if (call == 0) return;  // queue A's uncontended tracker lock
+                {
+                    std::lock_guard lock(sync_mutex);
+                    queue_b_acquired_tracker = acquired;
+                    queue_b_probed = true;
+                }
+                sync_cv.notify_all();
+            });
+            context.set_bindless_prepare([&](VkCommandBuffer) {
+                const unsigned call = prepare_calls.fetch_add(1, std::memory_order_relaxed);
+                if (call == 0) return first_prepare_succeeds;
+                {
+                    std::lock_guard lock(sync_mutex);
+                    queue_b_saw_retry = retry_pending.load(std::memory_order_acquire);
+                    queue_b_prepared = true;
+                }
+                sync_cv.notify_all();
+                return true;
+            });
+            context.set_bindless_commit([&](bool submitted) {
+                if (submitted) {
+                    successful_commit_calls.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                failed_commit_calls.fetch_add(1, std::memory_order_relaxed);
+                if (rollback_started.exchange(true, std::memory_order_relaxed)) return;
+                queue_b_thread = std::thread([&] {
+                    queue_b_result = queue_b.execute({&empty_ptr, 1});
+                });
+
+                std::unique_lock lock(sync_mutex);
+                sync_cv.wait(lock, [&] { return queue_b_probed; });
+                queue_b_probe_before_rollback = true;
+                // On unfixed code queue A already released tracker_mutex_, so B's try_lock succeeds. Let B enter
+                // prepare before applying the modeled rollback, making the old stale-state interleaving exact.
+                if (queue_b_acquired_tracker) {
+                    sync_cv.wait(lock, [&] { return queue_b_prepared; });
+                    prepared_before_rollback = true;
+                }
+                lock.unlock();
+                retry_pending.store(true, std::memory_order_release);  // table_upload_result(false)
+            });
+
+            driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+            const ReplayResult queue_a_result = queue_a.execute({&empty_ptr, 1});
+            if (queue_b_thread.joinable()) queue_b_thread.join();
+            context.set_tracker_lock_probe(std::function<void(bool)>{});
+            context.set_bindless_prepare(std::function<bool(VkCommandBuffer)>{});
+            context.set_bindless_commit({});
+
+            const bool ok = queue_a_result == ReplayResult::unsupported &&
+                            queue_b_result == ReplayResult::success && prepare_calls.load() == 2 &&
+                            tracker_probe_calls.load() == 2 && queue_b_probe_before_rollback &&
+                            failed_commit_calls.load() == 1 && successful_commit_calls.load() == 1 &&
+                            !queue_b_acquired_tracker && !prepared_before_rollback && queue_b_saw_retry;
+            if (ok) {
+                std::printf("queue/query sync: bindless rollback precedes next prepare (%s path) ok\n", path);
+            } else {
+                std::fprintf(stderr,
+                             "bindless rollback %s: a=%d b=%d prepare=%u failed_commit=%u "
+                             "successful_commit=%u probes=%u probe_before_rollback=%d acquired_tracker=%d "
+                             "prepared_early=%d saw_retry=%d\n",
+                             path, int(queue_a_result), int(queue_b_result), prepare_calls.load(),
+                             failed_commit_calls.load(), successful_commit_calls.load(),
+                             tracker_probe_calls.load(), int(queue_b_probe_before_rollback),
+                             int(queue_b_acquired_tracker), int(prepared_before_rollback), int(queue_b_saw_retry));
+            }
+            return ok;
+        };
+        EXPECT(bindless_rollback_case(true, "regular"));
+        EXPECT(bindless_rollback_case(false, "early"));
+        EXPECT(queue_b.idle());
+
+        // 5. Concurrent multi-queue EndQuery + ResolveQueries + temporary query pool add/remove stress.
         //    Each iteration uses a distinct query slot so no slot is reset while another submission resolves it.
         {
             constexpr QueryHeapId main_heap = 99;
