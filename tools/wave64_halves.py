@@ -331,7 +331,7 @@ class Analysis:
         return t
 
     LMOD_KEEP = ("v_mov_b32", "v_add_nc_u32", "v_add_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_sub_u32",
-                 "v_subrev_u32", "v_xor_b32", "v_or_b32", "v_and_b32")
+                 "v_subrev_u32", "v_mul_lo_u32", "v_xor_b32", "v_or_b32", "v_and_b32")
 
     def lmod(self, st, ins, a):
         """k when the operand is the same in the wave and in a half modulo 2**k: 32 for a partition-invariant value
@@ -347,9 +347,11 @@ class Analysis:
             return -1
         return 32
 
-    def lmod_result(self, st, ins, op, a):
+    def lmod_result(self, n, i, st, ins, op, a):
         """k of a VALU result whose only partition-dependent source is a lane id exact modulo 2**k: sums,
-        differences and bitwise ops with invariant values keep k, a left shift by an immediate c raises it to k + c."""
+        differences, 32-bit products and bitwise ops with invariant values keep k, a left shift by an immediate c
+        raises it to k + c, and a constant mask / bitfield extract that clears or overwrites every differing bit
+        >= k raises it to 32."""
         # SDWA selects, DPP, op_sel and integer clamp change the value: no tag
         mods = ins.get("mods") or []
         if ins["op"].endswith(("_sdwa", "_dpp")) or any(
@@ -359,12 +361,49 @@ class Analysis:
         ks = [self.lmod(st, ins, x) for x in src]
         if not src or min(ks) < 0:
             return None
+
+        def const_val(idx):
+            return self.operand_literal(n, i, src[idx]) if ks[idx] == 32 else None
+
+        def and_k(k0, c0, k1, c1):
+            if c0 is not None and (c0 >> k1) == 0:
+                return 32
+            if c1 is not None and (c1 >> k0) == 0:
+                return 32
+            return min(k0, k1)
+
+        def or_k(k0, c0, k1, c1):
+            if c0 is not None and ((~c0 & 0xFFFFFFFF) >> k1) == 0:
+                return 32
+            if c1 is not None and ((~c1 & 0xFFFFFFFF) >> k0) == 0:
+                return 32
+            return min(k0, k1)
+
+        if op == "v_and_b32" and len(src) == 2:
+            return and_k(ks[0], const_val(0), ks[1], const_val(1))
+        if op == "v_or_b32" and len(src) == 2:
+            return or_k(ks[0], const_val(0), ks[1], const_val(1))
+        if op == "v_and_or_b32" and len(src) == 3:
+            ka = and_k(ks[0], const_val(0), ks[1], const_val(1))
+            return or_k(ka, None, ks[2], const_val(2))
         if op in self.LMOD_KEEP:
             return min(ks)
-        if op == "v_lshlrev_b32" and len(src) == 2 and src[0].get("k") == "imm":
-            return min(32, ks[1] + (src[0]["v"] & 31))
-        if op in ("v_lshl_add_u32", "v_lshl_or_b32") and len(src) == 3 and src[1].get("k") == "imm":
-            return min(32, ks[0] + (src[1]["v"] & 31), ks[2])
+        if op == "v_lshlrev_b32" and len(src) == 2:
+            c = const_val(0)
+            if c is not None:
+                return min(32, ks[1] + (c & 31))
+        if op in ("v_lshl_add_u32", "v_lshl_or_b32") and len(src) == 3:
+            c = const_val(1)
+            if c is not None:
+                return min(32, ks[0] + (c & 31), ks[2])
+        if op in ("v_bfe_u32", "v_bfe_i32") and len(src) == 3:
+            c_off, c_w = const_val(1), const_val(2)
+            if c_off is not None and c_w is not None:
+                off, w = c_off & 31, c_w & 31
+                if w == 0 or off + w <= ks[0]:
+                    return 32
+                if off < ks[0]:
+                    return ks[0] - off
         return None
 
     def join(self, a, b, blk=0):
@@ -1070,9 +1109,11 @@ class Analysis:
             elif tj & CNT:
                 ctok = scaled_cnt_token()
                 tag = ("cnt", ctok) if ctok is not None else None
-            if tag is None and tj == LANE and len(dests) == 1:
-                k = self.lmod_result(st, ins, op, a)
-                if k is not None:
+            if tag is None and tj == LANE and len(dests) == 1 and not partial_write(ins, op) and dests[0].get("n", 1) == 1:
+                k = self.lmod_result(n, i, st, ins, op, a)
+                if k == 32 and (st["f"] or all(T.get(r, 0) == 0 for r in _regs(dests[0]))):
+                    tj = 0
+                elif k is not None and k < 32:
                     tag = ("lmod", k)
             if st["xg"] and st["xg"][0] == "elect" and dests:
                 tj |= ELECT
