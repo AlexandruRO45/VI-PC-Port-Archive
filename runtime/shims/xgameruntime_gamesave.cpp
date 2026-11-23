@@ -18,14 +18,15 @@
 // its blob and removes the deleted ones, so a failed write leaves the container as it was.
 //
 // ASSUMPTION: the quota is a fixed 1 GiB (the GDK says the per-user quota "is not a fixed size"); a blob name is at
-// most 256 bytes (GS_MAX_BLOB_NAME_SIZE is not on the public pages). syncOnDemand is accepted and ignored: nothing
-// syncs offline.
-//
+// most 256 bytes (GS_MAX_BLOB_NAME_SIZE is not on the public pages); ReadBlobData with blobNames = nullptr reads
+// every blob of the container. syncOnDemand is accepted and ignored: nothing syncs offline.
+
 // GetContainerInfo of a container that does not exist returns S_OK without calling the callback. The retail
-// executable's one caller relies on that: it clears a flag that its callback sets, takes a callback that did not run
-// as "no container", and treats a failing HRESULT as an error. ReadBlobData with blobNames = nullptr reads every blob
-// of the container; no caller in the executable reaches it (its sync read names one blob, and its async read is not
-// started without at least one name).
+// executable's one caller accepts that: it clears a flag that its callback sets when the container name matches,
+// takes any successful HRESULT with the flag still clear as "no container", and turns a failing HRESULT into E_FAIL.
+// What the retail API returns there is not shown by the caller. Its reads always name their blobs (the sync read
+// one, checking that one comes back; the async read none started without a name), so blobNames = nullptr is never
+// passed.
 #include <windows.h>
 
 #include <algorithm>
