@@ -564,8 +564,20 @@ class UnreadableInput(unittest.TestCase):
             (root / (name + ".dxbc")).write_bytes(b"DXBC" + bytes(28))
 
     def run_tool(self, root):
-        return subprocess.run([sys.executable, "-I", TOOL, str(root / "disasm"), "--out", str(root / "spirv")],
-                              capture_output=True, text=True, errors="replace")
+        """main() with the SPIR-V binaries stubbed, as the other in-process tests here do: a run must translate the
+        readable shader next to the bad one, so it reaches spirv-as, and neither that nor spirv-val is required to
+        test how an unreadable input is reported. Returns (exit code, stderr)."""
+        def spirv_tool(cmd, **kwargs):
+            if cmd[0] == "spirv-as":
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(root / "disasm"), "--out", str(root / "spirv")]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = rdna2spirv.main()
+        return code, err.getvalue()
 
     def deny(self, path):
         """chmod 0 path, or skip when that does not deny a read here (root, or a volume that ignores the mode)."""
@@ -618,22 +630,22 @@ class UnreadableInput(unittest.TestCase):
                 (root / "disasm").mkdir()
                 self.shader(root, "ps_ok")      # a readable shader in the same run still translates
                 bad, basename = build(root)
-                p = self.run_tool(root)
-                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                errors = [line for line in p.stderr.splitlines() if line.startswith("ERROR: ")]
-                self.assertEqual(len(errors), 1, p.stderr)
+                code, stderr = self.run_tool(root)
+                self.assertEqual(code, 1, stderr)
+                self.assertNotIn("Traceback", stderr)
+                errors = [line for line in stderr.splitlines() if line.startswith("ERROR: ")]
+                self.assertEqual(len(errors), 1, stderr)
                 self.assertIn(f"ERROR: {bad}: cannot read translation input ", errors[0])
                 self.assertIn(basename, errors[0])
-                self.assertIn("1 of 2 selected shaders had unreadable inputs", p.stderr)
+                self.assertIn("1 of 2 selected shaders had unreadable inputs", stderr)
                 out = root / "spirv"
                 self.assertFalse((out / (bad + ".spv")).exists())
                 self.assertFalse((out / (bad + ".spvasm")).exists())
                 self.assertTrue((out / "ps_ok.spv").is_file())
                 self.assertEqual(set(json.loads((out / "index.json").read_text(encoding="utf-8"))), {"ps_ok"})
-                again = self.run_tool(root)     # the same command run twice fails the same way
-                self.assertEqual(again.returncode, 1, again.stderr)
-                self.assertEqual(again.stderr, p.stderr)
+                again_code, again_stderr = self.run_tool(root)  # the same command run twice fails the same way
+                self.assertEqual(again_code, 1, again_stderr)
+                self.assertEqual(again_stderr, stderr)
 
     def test_an_unreadable_shader_retires_its_previous_module_and_index_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -647,9 +659,9 @@ class UnreadableInput(unittest.TestCase):
             (out / "ps_bad.spv").write_bytes(b"old module")
             (out / "index.json").write_text(json.dumps({"ps_bad": {"stage": "ps"}, "ps_old": {"stage": "vs"}}),
                                             encoding="utf-8")
-            p = self.run_tool(root)
-            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-            self.assertNotIn("Traceback", p.stderr)
+            code, stderr = self.run_tool(root)
+            self.assertEqual(code, 1, stderr)
+            self.assertNotIn("Traceback", stderr)
             self.assertFalse((out / "ps_bad.spv").exists())
             self.assertEqual(set(json.loads((out / "index.json").read_text(encoding="utf-8"))), {"ps_ok", "ps_old"})
 
@@ -659,7 +671,8 @@ class UnreadableInput(unittest.TestCase):
             root = Path(tmp)
             (root / "disasm").mkdir()
             self.shader(root, "cs_gone", container=False)
-            p = self.run_tool(root)
+            p = subprocess.run([sys.executable, "-I", TOOL, str(root / "disasm"), "--out", str(root / "spirv")],
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 1, p.stderr)
             errors = [line for line in p.stderr.splitlines() if line.startswith("ERROR: ")]
             self.assertEqual(len(errors), 1, p.stderr)
@@ -667,6 +680,23 @@ class UnreadableInput(unittest.TestCase):
             self.assertIn("cs_gone.fssm", errors[0])
             self.assertIn("1 of 1 selected shaders missing required inputs", p.stderr)
             self.assertNotIn("unreadable", p.stderr)
+
+    def test_one_unreadable_input_alone_through_the_real_cli(self):
+        # Nothing translates here, so this is the real CLI exit code and needs neither spirv-as nor spirv-val.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "disasm").mkdir()
+            self.shader(root, "ps_bad", container=False)
+            (root / "ps_bad.dxbc").mkdir()
+            p = subprocess.run([sys.executable, "-I", TOOL, str(root / "disasm"), "--out", str(root / "spirv")],
+                               capture_output=True, text=True, errors="replace")
+            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            errors = [line for line in p.stderr.splitlines() if line.startswith("ERROR: ")]
+            self.assertEqual(len(errors), 1, p.stderr)
+            self.assertIn("ERROR: ps_bad: cannot read translation input ", errors[0])
+            self.assertIn("ps_bad.dxbc", errors[0])
+            self.assertIn("1 of 1 selected shaders had unreadable inputs", p.stderr)
 
     def test_a_readable_run_is_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
