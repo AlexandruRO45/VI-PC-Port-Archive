@@ -513,6 +513,16 @@ class Gen:
             u = g
         return u
 
+    def src_f_sign_mods(self, a):
+        """Read a float source with VOP3 abs/neg applied as raw sign-bit moves.
+
+        Min/max-family instructions preserve NaN payload and signaling state
+        when their source modifiers are applied. OpFNegate/OpFAbs can quiet a
+        signaling NaN before the min/max operation sees it, so these operations
+        must bitcast the integer sign-bit result instead.
+        """
+        return self.tof(self.src_u_sign_mods(a))
+
     def modify(self, v, a):
         if a.get("abs") or a.get("neg"):
             f = self.tof(v)
@@ -4496,9 +4506,12 @@ class Gen:
         return v
 
     def lds_load(self, addr, byte_off, bound=None):
+        # Volatile: another lane's ds_write may come between two accesses of this lane, and the Vulkan memory model
+        # orders nothing between invocations without a barrier, so a driver may otherwise move this read ahead of
+        # the wave's earlier writes or merge it with another read (docs/design.md, "LDS access order within a wave").
         def f(p):
             v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint {p}")
+            self.emit(f"{v} = OpLoad %uint {p} Volatile")
             return v
         return self.lds_access(addr, byte_off, f, bound)
 
@@ -4510,7 +4523,7 @@ class Gen:
         return min(self.lds_declared, self.lds_dwords) if self.lds_declared else self.lds_dwords
 
     def lds_store(self, addr, byte_off, val):
-        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val}"))
+        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val} Volatile"))   # as lds_load
 
     def lds_next_in_bounds(self, addr, byte_off):
         """Bool: the dword after the one at (addr + byte_off) is inside the allocation (lds_cross_bound)."""
@@ -4585,10 +4598,10 @@ class Gen:
             ptr = self.lds_ptr(addr, off)
             if op == "ds_read_addtid_b32":
                 value = self.tmp()
-                self.emit(f"{value} = OpLoad %uint {ptr}")
+                self.emit(f"{value} = OpLoad %uint {ptr} Volatile")       # as lds_load
                 self.dst(a[0], value)
             else:
-                self.emit(f"OpStore {ptr} {self.src_u(a[0])}")
+                self.emit(f"OpStore {ptr} {self.src_u(a[0])} Volatile")
         elif op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
             addr = self.src_u(a[1])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
@@ -6764,7 +6777,7 @@ class Gen:
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
-            x, y, z = (self.src_f(t) for t in a[1:4])
+            x, y, z = (self.src_f_sign_mods(t) for t in a[1:4])
             f = "NMax" if "max" in op else "NMin"      # RDNA2: f(f(s0, s1), s2) keeping S0 on all-NaN
             m = self.nminmax_f32(f, x, y, y_src=a[2])
             r = self.nminmax_f32(f, m, z, y_src=a[3])
@@ -10716,7 +10729,8 @@ class Gen:
             self.emit(f"{r} = OpFDiv %float %f1 {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
-            x, y = self.src_f(a[1]), self.src_f(a[2])
+            read_source = self.src_f_sign_mods if F2[op] in ("max", "min") else self.src_f
+            x, y = read_source(a[1]), read_source(a[2])
             r = self.tmp()
             if F2[op] in ("max", "min"):
                 r = self.nminmax_f32("NMax" if F2[op] == "max" else "NMin", x, y, y_src=a[2])
@@ -10737,7 +10751,7 @@ class Gen:
             elif op == "v_fmac_f32":
                 x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
             else:
-                r = self.med3_f([self.src_f(t) for t in a[1:4]], a[1:4])
+                r = self.med3_f([self.src_f_sign_mods(t) for t in a[1:4]], a[1:4])
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
             r = self.tmp()
