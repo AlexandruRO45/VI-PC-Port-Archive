@@ -39,8 +39,19 @@ class ResumeShardsTest(unittest.TestCase):
                 self.i = int(args[args.index("--shard") + 1].split("/")[0])
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
+                self.code = None
 
-            def wait(self):
+            # translate() polls every shard (#1797) and only waits on one it stops, so the shard finishes on the
+            # first poll and keeps its exit status, like a process that has already been reaped.
+            def poll(self):
+                if self.code is None:
+                    self.code = self.finish()
+                return self.code
+
+            def wait(self, timeout=None):
+                return self.poll()
+
+            def finish(self):
                 if self.i in crash:
                     return 1
                 with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
