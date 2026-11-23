@@ -174,5 +174,48 @@ class SummaryTests(unittest.TestCase):
             sys.stderr = stderr
 
 
+class LimitTests(unittest.TestCase):
+    """--limit counts listings: 0 scans nothing, and a negative count drops the last files instead of none."""
+
+    def run_cli(self, names, limit):
+        """(exit code, stderr, the summary's ``total`` when a report was written)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            for name in names:
+                write_listing(tmp, name, LISTINGS["ps_table32"])
+            out = os.path.join(tmp, "s.json")
+            stdout, stderr = sys.stdout, sys.stderr
+            sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", ResourceWarning)
+                    rc = P.main([disasm, "--jobs", "1", "--limit", limit, "--json", out])
+                err = sys.stderr.getvalue()
+            finally:
+                sys.stdout, sys.stderr = stdout, stderr
+            if not os.path.exists(out):
+                return rc, err, None
+            with open(out, encoding="utf-8") as f:
+                return rc, err, json.load(f)["total"]
+
+    def test_zero_is_refused_before_the_scan(self):
+        rc, err, total = self.run_cli(["ps_a"], "0")
+        self.assertEqual(rc, 2)
+        self.assertIn("--limit must be at least 1", err)
+        self.assertIsNone(total)  # before: exit 0 and a census of 0 shaders
+
+    def test_negative_limit_is_refused(self):
+        rc, err, total = self.run_cli(["ps_a", "ps_b", "ps_c"], "-1")
+        self.assertEqual(rc, 2)
+        self.assertIn("--limit must be at least 1", err)
+        self.assertIsNone(total)  # before: exit 0 and a census of the first two listings
+
+    def test_positive_limit_still_takes_the_first_listings(self):
+        rc, err, total = self.run_cli(["ps_a", "ps_b", "ps_c"], "2")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(total, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
