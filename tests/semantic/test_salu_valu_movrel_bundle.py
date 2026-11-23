@@ -148,3 +148,61 @@ class TestSMovrelsB32AST(unittest.TestCase):
         spv = support.translate_lines("ps_smovrels_b32_exec", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0xCAFEBABE)
+
+
+class TestSMovrelsB32Indexing(unittest.TestCase):
+    def test_dynamic_indexing_sweep(self):
+        for offset in range(4):
+            with self.subTest(offset=offset):
+                val = 0x10101010 * (offset + 1)
+                lines = [
+                    f"s_mov_b32 s{40 + offset}, {val}",
+                    f"s_mov_b32 m0, {offset}",
+                    "s_movrels_b32 s50, s40",
+                    "v_mov_b32 v0, s50",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_smovrels_sweep_{offset}", lines)
+                out = support.mrt0_words(spv)
+                self.assertEqual(out[0], val)
+
+    def test_destination_overlap_source(self):
+        # Read happens before destination write even when destination is base register
+        lines = [
+            "s_mov_b32 s20, 0x11111111",
+            "s_mov_b32 s22, 0x33333333",
+            "s_mov_b32 m0, 2",
+            "s_movrels_b32 s20, s20",
+            "v_mov_b32 v0, s20",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_overlap", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x33333333)
+
+    def test_scc_preserved(self):
+        # s_movrels_b32 must not overwrite SCC
+        lines = [
+            "s_cmp_eq_u32 5, 5",  # SCC = 1
+            "s_mov_b32 s10, 0x44444444",
+            "s_mov_b32 m0, 0",
+            "s_movrels_b32 s12, s10",
+            "s_cselect_b32 s13, 0x1111, 0x2222",  # Should pick 0x1111 because SCC == 1
+            "v_mov_b32 v0, s13",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_smovrels_scc", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x1111)
