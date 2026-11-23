@@ -9,8 +9,8 @@ FINGERPRINT (40 hex digits; spaces and case don't matter). A second primary key 
 too, since apt would trust it as well. Subkeys are allowed: they are bound to the primary key.
 
 Reads the key with `gpg --show-keys --with-colons` (GnuPG 2.2.8+), which lists a key file without importing it, so no
-keyring changes. Exits 0 when the key matches, 1 when it doesn't or gpg can't read it, 2 on a usage error. Standard
-library only.
+keyring changes. `-h`/`--help` prints this usage and exits 0. Exits 0 when the key matches, 1 when it doesn't or gpg
+can't read it, 2 on a usage error. Standard library only.
 """
 import argparse
 import os
