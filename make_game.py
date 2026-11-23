@@ -121,7 +121,7 @@ def py(tool: str, *args) -> None:
 
 def tool_available(cmd: str) -> bool:
     """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-21/bin/llvm-mc'."""
-        cmd = cmd.strip()
+    cmd = cmd.strip()
     if os.path.isfile(cmd.strip('"')):
         return True
     try:
