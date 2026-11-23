@@ -36,6 +36,7 @@ import math
 import os
 import struct
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +45,7 @@ if _TOOLS_DIR not in sys.path:
 
 import world_archetypes as WA  # noqa: E402
 import world_index as WI  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from world_names import hash64, joaat  # noqa: E402
@@ -371,6 +373,30 @@ def _inside(folder, path):
         return False
 
 
+def write_report(path, text):
+    """Stage the report next to its destination and swap it in, so a write or replace failure keeps any previous
+    report intact and preserves its permission bits."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
+                                         prefix=".world_interior_names-", suffix=".tmp", delete=False) as f:
+            tmp = f.name
+            f.write(text)
+        os.chmod(tmp, published_mode(path))
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                if os.path.lexists(tmp):
+                    os.chmod(tmp, 0o600)
+                    os.remove(tmp)
+            except OSError:
+                pass
+        raise
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="levels.rpf, one carved 0x7a file, or a folder of carved files")
@@ -407,9 +433,12 @@ def main(argv=None):
         print("world_interior_names.py: %s" % why, file=sys.stderr)
         return 2
     summary, rows = resolve(names, scan(a.path, a.start, a.limit, a.jobs), duplicate_keys, malformed)
-    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
+    try:
+        write_report(a.out, json.dumps({"summary": summary, "keys": rows}, indent=1, sort_keys=True))
+    except OSError as exc:
+        why = exc.strerror if exc.strerror else exc
+        print("world_interior_names.py: --out %s: %s" % (a.out, why), file=sys.stderr)
+        return 2
     print(json.dumps(summary, indent=1, sort_keys=True))
     return 0
 

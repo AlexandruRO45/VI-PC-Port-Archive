@@ -421,6 +421,48 @@ class CliTest(unittest.TestCase):
                 finally:
                     sys.stderr = saved
 
+    def test_failed_report_write_preserves_existing_report(self):
+        from unittest import mock
+
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(interiors())
+        out = os.path.join(self.tmp.name, "kept.json")
+        old_text = '{"previous": true}'
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_text)
+
+        real_named_temp = tempfile.NamedTemporaryFile
+
+        def failing(*args, **kwargs):
+            handle = real_named_temp(*args, **kwargs)
+
+            def fail_write(data):
+                handle.file.write(data[:8])
+                raise OSError(28, "No space left on device")
+
+            handle.write = fail_write
+            return handle
+
+        for label, patch in (
+            ("write", mock.patch.object(T.tempfile, "NamedTemporaryFile", side_effect=failing)),
+            ("replace", mock.patch.object(T.os, "replace", side_effect=PermissionError(13, "Permission denied"))),
+        ):
+            with self.subTest(label=label), patch:
+                err, so = io.StringIO(), io.StringIO()
+                sys.stderr, saved = err, sys.stderr
+                try:
+                    with redirect_stdout(so):
+                        self.assertEqual(T.main([folder, "--names", self.names, "--out", out]), 2)
+                finally:
+                    sys.stderr = saved
+                self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+                self.assertEqual(so.getvalue(), "")
+                with open(out, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), old_text)
+                self.assertFalse([n for n in os.listdir(self.tmp.name) if n.startswith(".world_interior_names-")])
+
 
 if __name__ == "__main__":
     unittest.main()
