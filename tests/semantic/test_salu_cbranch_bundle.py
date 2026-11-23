@@ -366,5 +366,22 @@ class SCbranchScc1TranslatorTests(unittest.TestCase):
         spv = translate_lines("ps_cbranch_scc1_not_taken", lines)
         self.assertEqual(mrt0_words(spv)[0], 0x40000000)  # 2.0
 
+# -----------------------------------------------------------------------------
+# Opcode 5: s_cbranch_vccnz
+# -----------------------------------------------------------------------------
+
+def ref_oracle_vccnz(vcc: int) -> bool:
+    return (vcc & MASK64) != 0
+
+
+class SCbranchVccnzOracleTests(unittest.TestCase):
+    def test_vcc_nonzero(self):
+        self.assertTrue(ref_oracle_vccnz(0x1))
+        self.assertTrue(ref_oracle_vccnz(0x8000000000000000))
+        self.assertTrue(ref_oracle_vccnz(0xFFFFFFFFFFFFFFFF))
+
+    def test_vcc_zero(self):
+        self.assertFalse(ref_oracle_vccnz(0))
+
 if __name__ == '__main__':
     unittest.main()
