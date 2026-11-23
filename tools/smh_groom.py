@@ -1674,8 +1674,6 @@ def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
             with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 if target.lower().endswith(".rpf") or mm[:4] in (b"9FPR", b"RPF9"):
                     for off in scan_offsets(mm):
-                        if remaining is not None and remaining <= 0:
-                            break
                         if remaining is not None:
                             remaining -= 1
                         try:
@@ -1683,6 +1681,8 @@ def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
                             rows.append(_row_from_groom(g, off))
                         except (GroomError, ValueError, IndexError) as exc:
                             rows.append({"offset": off, "error": str(exc)})
+                        if remaining == 0:
+                            break
                 else:
                     if remaining is not None:
                         remaining -= 1

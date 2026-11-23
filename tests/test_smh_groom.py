@@ -943,6 +943,33 @@ class ErrorHandlingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_census_stops_discovery_at_the_attempt_limit(self):
+        system, gpu = build_synthetic_groom_buffers()
+        data = b"9FPR" + bytes(0x3C) + pack_native_resource(system, gpu)
+        scan_offsets = smh_groom.scan_offsets
+
+        def guarded_offsets(archive):
+            yield next(scan_offsets(archive))
+            self.fail("discovery resumed after the last permitted groom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "sample.rpf")
+            later = os.path.join(tmp, "must-not-be-opened.rpf")
+            with open(archive, "wb") as f:
+                f.write(data)
+            baseline = smh_groom.run_census([archive, archive], limit=2)
+            self.assertEqual(baseline["totals"]["lods"], 2)
+
+            for error in (None, smh_groom.GroomError("synthetic decode failure")):
+                with self.subTest(decode_error=error is not None):
+                    with (mock.patch.object(smh_groom, "scan_offsets", guarded_offsets),
+                          mock.patch.object(smh_groom, "read_resource",
+                                            wraps=smh_groom.read_resource, side_effect=error) as read):
+                        report = smh_groom.run_census([archive, later], limit=1)
+                    read.assert_called_once()
+                    self.assertEqual(report["totals"]["lods"], int(error is None))
+                    self.assertEqual(report["totals"]["errors"], int(error is not None))
+
     def test_cli_inspect_census_and_export_glb(self):
         sysd, gpu = build_synthetic_groom_buffers(
             unset_rig_floats=True,
