@@ -7,7 +7,6 @@ or LEONIDA_AUDIO_NATIVE=0 is set; rsc8_audio.py then runs its pure-Python refere
 A call costs about a microsecond of ctypes overhead, so a table shorter than the ``MIN_*`` sizes below is left to
 the reference, which is as fast there; the result is the same either way.
 """
-import gc
 import os
 import struct
 import sys
@@ -98,15 +97,7 @@ def adat_header(hb, bank_offset, file_size, max_streams, max_header):
         return None
     flags, count, hdr_sz, end, ntags = head
     triples = struct.iter_unpack("=III", memoryview(tag_buf)[: 12 * ntags])
-    # Hundreds of thousands of small tuples would trigger the cyclic collector many times over; none of them
-    # can form a cycle, so collection waits until the list is built.
-    paused = gc.isenabled()
-    gc.disable()
-    try:
-        entries = [(sid, list(islice(triples, tc))) for sid, tc in struct.iter_unpack("=II", memoryview(st_buf)[: 8 * count])]
-    finally:
-        if paused:
-            gc.enable()
+    entries = [(sid, list(islice(triples, tc))) for sid, tc in struct.iter_unpack("=II", memoryview(st_buf)[: 8 * count])]
     return True, {
         "offset": bank_offset,
         "flags": flags,
