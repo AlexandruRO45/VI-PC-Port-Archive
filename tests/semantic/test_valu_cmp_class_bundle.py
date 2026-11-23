@@ -573,3 +573,50 @@ class TestCmpClassF64ASTAndScalar(unittest.TestCase):
     def test_scalar_sgpr_dst_hardware(self):
         val_sgpr, _ = run_cmp_shader("f64", 0xFFF0000000000000, CLASS_NEG_INF, is_cmpx=False, test_id="sgpr_dst")
         self.assertEqual(val_sgpr, 1)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f64 SIMD Divergence & 10-Bit Class Mapping
+# ------------------------------------------------------------------------------
+
+def step_cmp_class_f64_simd(wave: SIMDWaveClassLogic, insn: VCmpClassF64Instruction):
+    mask = insn.mask.value if isinstance(insn.mask, LiteralOperand) else wave.vgprs[insn.mask.index][0]
+    out_vcc = 0
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            lo = wave.vgprs[insn.src0_lo.index][lane] & MASK32
+            hi = wave.vgprs[insn.src0_hi.index][lane] & MASK32
+            val64 = (hi << 32) | lo
+            if ref_cmp_class_f64(val64, mask):
+                out_vcc |= (1 << lane)
+    wave.vcc = out_vcc
+
+
+class TestCmpClassF64SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveClassLogic(wave_size=32)
+        wave.vgprs[2][0] = 0
+        wave.vgprs[3][0] = 0x3FF00000  # +1.0
+        wave.vgprs[2][1] = 0
+        wave.vgprs[3][1] = 0x80000000  # -0.0
+
+        insn = VCmpClassF64Instruction(
+            dst=RegisterOperand(OperandType.VCC),
+            src0_lo=RegisterOperand(OperandType.VGPR, 2),
+            src0_hi=RegisterOperand(OperandType.VGPR, 3),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        step_cmp_class_f64_simd(wave, insn)
+
+        val_lane0, _ = run_cmp_shader("f64", 0x3FF0000000000000, CLASS_POS_NORMAL, is_cmpx=False, test_id="simd_l0")
+        val_lane1, _ = run_cmp_shader("f64", 0x8000000000000000, CLASS_POS_NORMAL, is_cmpx=False, test_id="simd_l1")
+        self.assertEqual(val_lane0, 1)
+        self.assertEqual(val_lane1, 0)
+        self.assertEqual(wave.vcc & 1, 1)
+        self.assertEqual((wave.vcc >> 1) & 1, 0)
+
+    def test_algebraic_partition_hardware(self):
+        val_nan, _ = run_cmp_shader("f64", 0x7FF8000000000000, CLASS_SNAN | CLASS_QNAN, is_cmpx=False, test_id="nan_part")
+        val_real, _ = run_cmp_shader("f64", 0x3FF0000000000000, CLASS_SNAN | CLASS_QNAN, is_cmpx=False, test_id="real_part")
+        self.assertEqual(val_nan, 1)
+        self.assertEqual(val_real, 0)
