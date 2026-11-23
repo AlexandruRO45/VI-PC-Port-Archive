@@ -33,15 +33,16 @@
 #include "host_tls.h"
 #include "shims.h"
 
-// src/host_tls_pad.cpp: the runtime's only static TLS variable, the block the title's template is copied into.
-unsigned char* guest_tls_pad();
-
 // rt::t_in_handler, rt::t_wide_fallback and rt::t_single_stepping replace the thread_local variables this header
 // used to hold: the runtime's static TLS block belongs to the mapped title (host_tls.h).
 
 namespace rt::startup_trace {
 
 namespace detail {
+// The block the title's template is copied into. Only gta6rt.exe has one (LEONIDA_MIRROR_INDEX0 in pe_loader.cpp,
+// which points this at its accessor during static initialisation), so every other target that includes this header
+// links without the pad: this is a null pointer and the TLS layout dump reports no pad.
+inline unsigned char* (*guest_tls_pad)() = nullptr;
 inline std::atomic<bool> on{false};
 // Intentionally immortal: vectored exception handlers or late teardown paths can still run after normal statics would
 // have been destroyed.
@@ -378,7 +379,7 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
                 auto* tls = reinterpret_cast<PIMAGE_TLS_DIRECTORY64>(base + dir.VirtualAddress);
                 const DWORD index = *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
                 void** vector = reinterpret_cast<void**>(__readgsqword(0x58));
-                const auto* pad = reinterpret_cast<const uint8_t*>(guest_tls_pad());
+                const auto* pad = reinterpret_cast<const uint8_t*>(detail::guest_tls_pad ? detail::guest_tls_pad() : nullptr);
                 const uint64_t pad_offset =
                     pad ? reinterpret_cast<uint64_t>(pad) - reinterpret_cast<uint64_t>(vector[0]) : 0;
                 std::fprintf(stderr,

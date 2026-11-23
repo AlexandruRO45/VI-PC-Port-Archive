@@ -34,6 +34,14 @@ unsigned char* guest_tls_pad() { return nullptr; }
 unsigned char* guest_tls_pad_end() { return nullptr; }
 #endif
 
+namespace {
+// startup_trace.h is included by targets that do not compile this file, so it reaches the pad through a function
+// pointer. Set it before main: startup_trace::open() runs there and reports the pad's offset inside the host block.
+struct GuestTlsPadRegistration {
+    GuestTlsPadRegistration() { rt::startup_trace::detail::guest_tls_pad = &guest_tls_pad; }
+} g_guest_tls_pad_registration;
+}  // namespace
+
 namespace rt {
 
 std::string lower(std::string s) {
@@ -338,6 +346,7 @@ struct ThreadTlsSlot {
     void* saved = nullptr;
     void* block = nullptr;
     uint32_t index = kNoTlsIndex;
+    bool mirror = false;  // block is the host EXE's index-0 block, not a VirtualAlloc'd copy; never free it
 };
 
 // Per-thread installation state for each reserved TLS slot. It lives in a TlsAlloc slot, not in the EXE's static TLS
@@ -374,6 +383,11 @@ void release_thread_slot(size_t slot) {
     if (slot >= kMaxMappedTlsModules) return;
     ThreadTlsSlot& entry = thread_tls_slots()[slot];
     if (!entry.module && !entry.block) return;
+    if (entry.mirror) {
+        // The block is the host EXE's own index-0 block; Windows owns it. Slot 0 must not be written back.
+        entry = ThreadTlsSlot{};
+        return;
+    }
     if (entry.block) {
         void** slots = module_tls_slots();
         if (slots && entry.index < kMaxModuleTlsSlots && slots[entry.index] == entry.block)
@@ -395,6 +409,7 @@ struct ExistingThreadBlock {
     void*** vector = nullptr;  // that thread's TEB->ThreadLocalStoragePointer field; the array itself can be replaced
     void* saved = nullptr;     // what the block replaced
     void* block = nullptr;
+    bool mirror = false;       // block is that thread's host index-0 block; Windows frees it, not the loader
 };
 
 // Immortal, like the thread events that use them. `ended` holds the ids of threads whose DLL_THREAD_DETACH has run:
@@ -422,15 +437,27 @@ bool has_existing_thread_block(DWORD thread, const Module& m) {
     return false;
 }
 
+// How much room the mirror may use: the distance from the base of the process's index-0 TLS block to the end of the
+// pad (src/pe_loader.cpp), the point where the runtime's own TLS variables begin. The pad's offset inside the block is
+// fixed at link time, so the distance is the same for every thread; only the block's base varies. One measurement,
+// taken on the thread that first asks, bounds them all. Zero when index 0 is not this process's block.
+uint64_t mirror_index0_capacity() {
+    static const uint64_t capacity = [] {
+        void** vector = module_tls_slots();
+        const uint64_t base = vector ? reinterpret_cast<uint64_t>(vector[0]) : 0;
+        const uint64_t pad_end = reinterpret_cast<uint64_t>(guest_tls_pad_end());
+        return base && pad_end > base ? pad_end - base : 0;
+    }();
+    return capacity;
+}
+
 // Writes the image's template into the host EXE's own static TLS block, at its base. The title's console CRT folds
 // every thread-local access to index 0 (module's mirror_index0), so those reads have to find the title's data. The
-// host block's first bytes are the pad from host_tls_pad.cpp; the range check keeps the copy behind the pad, where
-// the runtime's own TLS variables begin. Returns false when the block is missing or too small.
+// host block's first bytes are the pad from src/pe_loader.cpp; the capacity check keeps the copy behind the pad, where
+// the runtime's own TLS variables begin. Returns false when the block is missing or the template does not fit.
 bool mirror_index0_block(void* host_block, const Module& m) {
-    const uint64_t base = reinterpret_cast<uint64_t>(host_block);
-    const uint64_t pad_end = reinterpret_cast<uint64_t>(guest_tls_pad_end());
     const uint64_t total = static_cast<uint64_t>(m.tls_raw_size) + m.tls_zero_fill;
-    if (!base || pad_end < base || base + total > pad_end) return false;
+    if (!host_block || total > mirror_index0_capacity()) return false;
     if (m.tls_raw_size) std::memcpy(host_block, m.tls_template, m.tls_raw_size);
     if (m.tls_zero_fill) std::memset(static_cast<uint8_t*>(host_block) + m.tls_raw_size, 0, m.tls_zero_fill);
     return true;
@@ -460,7 +487,22 @@ void install_thread_block(Module& m) {
     }
     if (m.tls_index == kNoTlsIndex) return;
     void** slots = module_tls_slots();
-    if (!slots || m.tls_index >= kMaxModuleTlsSlots)
+    if (!slots) throw std::runtime_error(m.name + ": cannot install TLS in this thread");
+
+    if (m.mirror_index0) {
+        // The image reads the process's index-0 block directly, so its data goes there, not into a copy. The install
+        // only checks that the template still fits and records the attachment: slot 0 keeps the block the OS put in
+        // it, and nothing is allocated.
+        if (!mirror_index0_block(slots[0], m))
+            throw std::runtime_error(m.name + ": the process index-0 static TLS block is missing or smaller than the template");
+        entry.module = &m;
+        entry.generation = m.tls_generation;
+        entry.block = slots[0];
+        entry.index = 0;
+        entry.mirror = true;
+        return;
+    }
+    if (m.tls_index >= kMaxModuleTlsSlots)
         throw std::runtime_error(m.name + ": cannot install TLS in this thread");
 
     void* block = VirtualAlloc(nullptr, static_cast<SIZE_T>(total), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -468,8 +510,6 @@ void install_thread_block(Module& m) {
     if (m.tls_raw_size) std::memcpy(block, m.tls_template, m.tls_raw_size);
     if (m.tls_zero_fill)
         std::memset(static_cast<uint8_t*>(block) + m.tls_raw_size, 0, m.tls_zero_fill);
-    if (m.mirror_index0 && !mirror_index0_block(slots[0], m))
-        throw std::runtime_error(m.name + ": the process index-0 static TLS block is missing or smaller than the template");
     startup_trace::event("tls_block", "\"block\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(block))) +
                                           ",\"size\":" + std::to_string(total) + ",\"tid\":" +
                                           std::to_string(GetCurrentThreadId()));
@@ -609,6 +649,8 @@ void restore_thread_slot(void*** vector, uint32_t index, void* block, void* save
 // Takes a block out of its slot and frees it. The existing-threads lock is held; b.vector is null when the thread
 // is gone.
 void remove_existing_block(const ExistingThreadBlock& b) {
+    // A mirror record owns nothing: it names the thread's index-0 block, which the OS put there and frees itself.
+    if (b.mirror) return;
     if (b.vector && b.index < kMaxModuleTlsSlots) restore_thread_slot(b.vector, b.index, b.block, b.saved);
     VirtualFree(b.block, 0, MEM_RELEASE);
 }
@@ -660,15 +702,26 @@ void install_on_existing_threads(Module& m) {
             if (!c.handle) continue;
             if (std::find(state.ended.begin(), state.ended.end(), c.id) != state.ended.end()) continue;
             void*** vector = running_thread_tls_vector(c.handle);
+            if (m.mirror_index0) {
+                // Index 0 is the process's own block and exists in every thread. The template is copied into the base
+                // of that block; there is nothing to allocate, replace or retry. The record owns nothing and only
+                // carries the DLL_THREAD_DETACH for a thread that predates load().
+                void** host_slots = nullptr;
+                void* host_block = nullptr;
+                if (!vector || !read_thread_slot(vector, 0, host_slots, host_block) || !host_block ||
+                    !mirror_index0_block(host_block, m))
+                    continue;
+                bool present = false;
+                for (const auto& b : state.blocks)
+                    if (b.thread == c.id && b.module == &m && b.generation == m.tls_generation) present = true;
+                if (!present)
+                    state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, 0, vector, nullptr, host_block,
+                                            true});
+                continue;
+            }
             void** slots = nullptr;
             void* saved = nullptr;
             if (!vector || !read_thread_slot(vector, m.tls_index, slots, saved) || !slots || !saved) continue;
-            if (m.mirror_index0) {
-                void** host_slots = nullptr;
-                void* host_block = nullptr;
-                if (read_thread_slot(vector, 0, host_slots, host_block) && host_block)
-                    mirror_index0_block(host_block, m);
-            }
             // A copy an earlier module left in this slot of this thread goes first; what it replaced is kept.
             bool present = false;
             for (auto it = state.blocks.begin(); it != state.blocks.end();) {
@@ -748,7 +801,8 @@ void forget_ended_thread_id() {
             ++it;
             continue;
         }
-        VirtualFree(it->block, 0, MEM_RELEASE);
+        // A mirror record's block is the process's index-0 block; Windows owns it.
+        if (!it->mirror) VirtualFree(it->block, 0, MEM_RELEASE);
         it = state.blocks.erase(it);
     }
 }
@@ -839,6 +893,13 @@ void __cdecl on_host_thread_event(DWORD reason) {
             } else {
                 release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
             }
+        }
+        // No slot refers to this thread's record array after the releases above, and Windows delivers no further
+        // attach for it, so the array goes now instead of at process exit.
+        if (auto* records =
+                reinterpret_cast<std::array<ThreadTlsSlot, kMaxMappedTlsModules>*>(t_thread_tls_slots::get())) {
+            t_thread_tls_slots::set(0);
+            delete records;
         }
     }
 }
@@ -1400,14 +1461,16 @@ void Loader::initialize_tls(Module& m) {
         m.tls_slot = static_cast<uint32_t>(slot);
         m.tls_generation = g_next_tls_generation.fetch_add(1, std::memory_order_relaxed);
         g_tls_slot_generations[slot].store(m.tls_generation);
-        m.tls_index = index;
+        // A mirror module reads and writes the host EXE's index-0 block directly, so its _tls_index names 0 as well.
+        // The helper index above is still claimed and its DllMain still runs: that is what delivers the thread events.
+        m.tls_index = m.mirror_index0 ? 0u : static_cast<uint32_t>(index);
         m.tls_template = raw ? m.base + raw_rva : nullptr;
         m.tls_raw_size = static_cast<uint32_t>(raw);
         m.tls_zero_fill = tls->SizeOfZeroFill;
         m.tls_block_size = static_cast<uint32_t>(total);
         // The index lives in a writable section and protect_sections() has not run yet, so the write needs no
         // VirtualProtect dance.
-        if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = index;
+        if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = m.tls_index;
     }
     try {
         install_thread_block(m);
@@ -1420,8 +1483,10 @@ void Loader::initialize_tls(Module& m) {
         g_tls_slot_owners[slot].store(nullptr);
         throw;
     }
-    // The loading thread's copy is the one the Module records (and ~Loader frees on that thread).
-    if (thread_tls_slots()[slot].module == &m && thread_tls_slots()[slot].generation == m.tls_generation) {
+    // The loading thread's copy is the one the Module records (and ~Loader frees on that thread). A mirror module has
+    // no copy of its own: its data sits in the process's index-0 block, which ~Loader must not free.
+    if (!m.mirror_index0 && thread_tls_slots()[slot].module == &m &&
+        thread_tls_slots()[slot].generation == m.tls_generation) {
         m.tls_block = thread_tls_slots()[slot].block;
         m.tls_saved_block = thread_tls_slots()[slot].saved;
     }
