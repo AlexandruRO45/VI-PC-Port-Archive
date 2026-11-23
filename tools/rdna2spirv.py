@@ -10,7 +10,7 @@ Anything not modelled raises Unsupported and is reported, never guessed. The con
 ("Translator status and runtime contract") lists what each instruction family does and how it was confirmed.
 Vertex inputs: v0 = VertexIndex - BaseVertex and v3 = InstanceIndex - BaseInstance (the hardware's ids are zero-based).
 
-Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
+Usage (needs spirv-val on PATH, from the Vulkan SDK or spirv-tools; spirv-as too unless --assembler python):
     python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N] [--shard i/n]
 Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
 Prints coverage and validation results.
@@ -2614,6 +2614,8 @@ class Gen:
         wrapping atomic inc/dec (RDNA2 ISA):
           inc: M = (M >= DATA) ? 0 : M + 1
           dec: M = (M == 0 || M > DATA) ? DATA : M - 1
+          csub: M = (DATA > M) ? 0 : M - DATA, a subtract clamped at 0 (GFX10.3 BUFFER/GLOBAL_ATOMIC_CSUB; measured
+          on gfx1036, #3193)
         Returns `(old_val, exit_label)` where `old_val` is the pre-op word in memory."""
         lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
         init = self.tmp()
@@ -2622,7 +2624,12 @@ class Gen:
         self.emit(f"{lbl_hdr} = OpLabel")
         cur, got = self.tmp(), self.tmp()
         self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
-        if kind == "inc":
+        if kind == "csub":
+            wrap, step, new_u = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{wrap} = OpUGreaterThan %bool {val} {cur}")
+            self.emit(f"{step} = OpISub %uint {cur} {val}")
+            self.emit(f"{new_u} = OpSelect %uint {wrap} {self.cu(0)} {step}")
+        elif kind == "inc":
             wrap, step, new_u = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{wrap} = OpUGreaterThanEqual %bool {cur} {val}")
             self.emit(f"{step} = OpIAdd %uint {cur} {self.cu(1)}")
@@ -2706,7 +2713,7 @@ class Gen:
             return self.global_atomic_x2(op, kind[:-3], a, mods)
         if kind in ("fmin", "fmax"):
             return self.global_atomic_float(op, kind, a, mods)
-        is_inc_dec = kind in ("inc", "dec")
+        is_inc_dec = kind in ("inc", "dec", "csub")
         fcmp = kind == "fcmpswap"           # float compare: see float_cmpswap_loop
         known = kind in self.BUF_ATOMICS or is_inc_dec or fcmp
         if not known or any(m in mods for m in ("slc", "dlc", "lds")):
@@ -2848,7 +2855,7 @@ class Gen:
             return self.buffer_atomic_x2(op, kind[:-3], a, mods)
         if kind in ("fmin", "fmax"):
             return self.buffer_atomic_float(op, kind, a, mods)
-        is_inc_dec = kind in ("inc", "dec")
+        is_inc_dec = kind in ("inc", "dec", "csub")
         fcmp = kind == "fcmpswap"           # float compare: see float_cmpswap_loop
         if (kind not in self.BUF_ATOMICS and not is_inc_dec and not fcmp) or "x2" in kind:
             raise Unsupported(op)
@@ -5651,7 +5658,8 @@ class Gen:
     def park_masks(self, blocks):
         """Run the lane-mask analysis and give every VGPR lane a mask is fetched back from a slot of its own,
         after the real registers in the %sgpr array (the array grows by as many)."""
-        self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(*blocks, include_either=True)
+        self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(*blocks, include_either=True,
+                                                                                wave64=self.wave64)
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
@@ -7743,6 +7751,15 @@ class Gen:
             self.cmp_class_f64(op, a, exec_only=op == "v_cmpx_class_f64", mods=mods)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
+        elif op == "s_bfm_b64" and not self.wave64:
+            # In 32-lane waves a 64-bit result can't be a lane mask: D = ((1 << (S0 & 63)) - 1) << (S1 & 63) is 64-bit
+            # data, as for s_lshl_b64 (lane_masks.step leaves it data too). The pipeline library's wave32 compute
+            # programs build the first two words of an S# this way (3,342 times `s_bfm_b64 s[N:N+1], 2, 54`, then
+            # s_mov_b64 of the other two). SCC is not written. Every case seen has constant operands.
+            size, off = self.imm_val(a[1]), self.imm_val(a[2])
+            if size is None or off is None:
+                raise Unsupported(op + " with a run-time operand in wave32")
+            self.mov64(a[0], {"k": "imm", "v": (((1 << (size & 63)) - 1) << (off & 63)) & 0xFFFFFFFFFFFFFFFF})
         elif op == "s_bfm_b64":
             # D = ((1 << size) - 1) << offset as a lane mask: in the per-lane model this lane's bit is
             # offset <= lane < offset + size (size/offset taken mod 64).
@@ -16176,7 +16193,9 @@ def translate(path):
     g.round_mode = any(i["op"] == "s_round_mode" or
                        (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
                        for i in insns)
-    strict_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) for i in insns)
+    w64_marks = {base_op(i["op"]) for i in insns
+                 if WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]]))}
+    strict_w64 = bool(w64_marks)
     code_w64 = strict_w64 or any(base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc")
                                                                             for x in i["args"]) for i in insns)
     code_w32 = any(WAVE32_RE.search(i["op"]) for i in insns)
@@ -16194,6 +16213,8 @@ def translate(path):
     # An FSPX program (the FidelityFX DLL's) has no FSSM header; its kind-0 dispatch state carries the wave size
     # instead (word 4 bit 20 = wave32, docs/fspx.md). Only the strict markers count against it: a _b64 op on vcc or
     # exec is not one, since these programs move vcc as an ordinary SGPR pair (s_mov_b64 vcc, s[..]) in wave32 code.
+    # Nor is s_bfm_b64: it is 64-bit data in wave32 code (958 pipeline-library compute programs whose state says
+    # wave32, 905 of them with *_saveexec_b32, build an S# with it; see the s_bfm_b64 translation).
     fspx_ws = fspx_wave_size(path, info["name"]) if fssm_ws is None else None
     if fssm_ws is not None:
         if fssm_ws == 32 and code_w64:
@@ -16202,7 +16223,7 @@ def translate(path):
             raise Unsupported("FSSM wave64 header contradicts wave32 code")
         g.wave64 = fssm_ws == 64
     elif fspx_ws is not None:
-        if fspx_ws == 32 and strict_w64:
+        if fspx_ws == 32 and w64_marks - {"s_bfm_b64"}:
             raise Unsupported("FSPX wave32 dispatch state contradicts wave64 code")
         if fspx_ws == 64 and code_w32:
             raise Unsupported("FSPX wave64 dispatch state contradicts wave32 code")
