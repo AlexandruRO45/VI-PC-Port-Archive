@@ -820,6 +820,23 @@ if(BUILD_TESTING)
     target_link_options(startup_trace_test PRIVATE /OPT:NOREF)
     add_dependencies(startup_trace_test gta6rt_tls_host)
     add_test(NAME startup_trace COMMAND startup_trace_test)
+
+    # D3D12ConfigureVirtualMemoryX resolves through the registry and returns S_OK, the measured console
+    # shape being a no-parameter policy call (docs/d3d12_xs_surface.md ordinal 4; SCARAB's bridge). The
+    # retail title calls it during D3D12 init and exits on the unimplemented policy return without it
+    # (gta6rt --run, RT-5). CPU only, no adapter needed.
+    add_executable(d3d12_xs_vmem_test
+      test/d3d12_xs_vmem_test.cpp
+      shims/d3d12_xs.cpp
+      shims/registry.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_include_directories(d3d12_xs_vmem_test PRIVATE shims)
+    target_compile_definitions(d3d12_xs_vmem_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_xs_vmem_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_link_options(d3d12_xs_vmem_test PRIVATE /OPT:NOREF)
+    target_link_libraries(d3d12_xs_vmem_test PRIVATE gta6rt_d3d12_xs_rootsig d3d12 dxgi)
+    add_test(NAME d3d12_xs_vmem COMMAND d3d12_xs_vmem_test)
   endif()
 
   if(TARGET device_proxy_test)

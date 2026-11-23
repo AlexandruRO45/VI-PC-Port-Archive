@@ -213,6 +213,20 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     return result(method, S_OK);
 }
 
+// Measured shape: D3D12ConfigureVirtualMemoryX(), ordinal 4 of the console runtime
+// (docs/d3d12_xs_surface.md: "VM policy; PC/Vulkan owns it"). Console-only: there the title tells the runtime how
+// much physical/virtual address space it wants split between GPU and system; on this side the driver owns that
+// policy outright, so the call is recorded once and succeeds so the title proceeds. SCARAB measures the same export
+// with no parameters and also returns S_OK (components/runtime-bridge/src/d3d12_xs_bridge.cpp, ordinal 4). The
+// retail title calls it during D3D12 init before D3D12XboxCreateDevice; with no binding the unimplemented policy
+// returned 0 and the title exited within ~2 s of start (gta6rt --run on the 1.0.2.1 executable).
+HRESULT WINAPI configure_virtual_memory() {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX: recorded (the driver owns VM policy)\n");
+    return S_OK;
+}
+
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
@@ -225,4 +239,5 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );
