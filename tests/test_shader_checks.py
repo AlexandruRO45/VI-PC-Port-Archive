@@ -35,7 +35,7 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 13)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
+         + len(check.TEXTURE_CONSTANTS) + 14)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
          # ps_ssharp, vs_base_ids and the standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case)
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -95,6 +95,12 @@ class Wave64Checks(unittest.TestCase):
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
                 words = check.USER_SGPRS_WORDS if seeded else [0] * 4 + [0xEEEEEEEE] * 4
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
+            if name == "cs_code_base":
+                # The table comes back only if check.py passed VKC_CODE_BASE and sized the buffer for it.
+                seeded = (env or {}).get("VKC_CODE_BASE") == check.CODE_BASE_ENV["VKC_CODE_BASE"] and \
+                    (env or {}).get("VKC_OUT_WORDS") == check.CODE_BASE_ENV["VKC_OUT_WORDS"]
+                words = check.CODE_BASE_WORDS + [0xEEEEEEEE] * 3 if seeded else [0xEEEEEEEE] * 8
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_f32_sat":
                 return cvt_answer(env)
