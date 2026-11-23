@@ -98,6 +98,29 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertIn("chcp 65001 >nul", text)
         self.assertLess(text.index("chcp 65001 >nul"), text.index('call `"$vcvars`"'))
 
+    def test_cmake_exe_is_invoked_without_call(self):
+        """cmd's CALL doubles ^ in the rest of the line, so cmake.exe must not be launched with it (#3554).
+
+        .cmd/.bat wrappers still need CALL so they return to _build.cmd. Get-BatchCommand chooses.
+        """
+        text = SCRIPT.read_text(encoding="utf-8-sig")
+        self.assertNotRegex(
+            text, r'(?m)^call "\$cmake"',
+            "call \"$cmake\" doubles ^ in the checkout path; use Get-BatchCommand so cmake.exe is quoted only",
+        )
+        start = text.index("function Get-BatchCommand")
+        end = text.index("$root = Split-Path")
+        helper = text[start:end]
+        self.assertIn(r"\.(cmd|bat)$", helper)
+        self.assertIn("call", helper)
+        self.assertIn('return "`"$Tool`""', helper)
+        self.assertIn("$runCmake = Get-BatchCommand $cmake", text)
+        start = text.index("$runCmake = Get-BatchCommand $cmake")
+        cmake_body = text[start:text.index("} else {", start)]
+        self.assertIn("$runCmake -S", cmake_body)
+        self.assertIn("$runCmake --build", cmake_body)
+        self.assertNotIn("call", cmake_body)
+
     @unittest.skipUnless(sys.platform == "win32", "requires Windows PowerShell")
     def test_path_fallback_prefers_vs_and_skips_msys_cmake(self):
         text = SCRIPT.read_text(encoding="utf-8")

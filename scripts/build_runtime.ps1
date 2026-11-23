@@ -34,6 +34,13 @@ function Find-BuildTool([string]$Preferred, [string]$CommandName, [scriptblock]$
     return ""
 }
 
+function Get-BatchCommand([string]$Tool) {
+    # cmd's CALL doubles ^ in the remaining command (#3554). Use it only for .cmd/.bat so
+    # those wrappers return; cmake.exe is invoked quoted, with no CALL.
+    if ($Tool -match '\.(cmd|bat)$') { return "call `"$Tool`"" }
+    return "`"$Tool`""
+}
+
 $root = Split-Path $PSScriptRoot -Parent
 $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
 $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -61,9 +68,10 @@ $sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
 $vk = if ($env:VULKAN_SDK) { "-DLEONIDA_REQUIRE_VULKAN=ON" } else { "" }
 
 if ($cmake -and $ninja) {
+    $runCmake = Get-BatchCommand $cmake
     $body = @"
-call "$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk || exit /b 1
-call "$cmake" --build "$out" -j $jobs || exit /b 1
+$runCmake -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk || exit /b 1
+$runCmake --build "$out" -j $jobs || exit /b 1
 "@
 } else {
     # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
