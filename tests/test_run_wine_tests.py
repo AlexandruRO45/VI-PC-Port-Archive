@@ -123,7 +123,7 @@ class RunTestTest(unittest.TestCase):
         missing = self.command_for(self.artifact / "missing.exe")
         for command in (built, missing, None):
             with self.subTest(command=command), \
-                    mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                    mock.patch.object(rwt, "launch", wraps=rwt.launch) as launch:
                 status, detail = self.run_entry(ctest_entry("disabled", command, {"DISABLED": True}))
                 launch.assert_not_called()
                 self.assertEqual(status, "skip", detail)
@@ -188,7 +188,7 @@ class RunTestTest(unittest.TestCase):
     def test_malformed_ctest_environment_fails_before_launch(self) -> None:
         command = self.command_for(self.exiting(0))
         props = {"ENVIRONMENT": ["missing_equals"]}
-        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+        with mock.patch.object(rwt, "launch", wraps=rwt.launch) as launch:
             status, detail = self.run_entry(ctest_entry("bad_environment", command, props))
         launch.assert_not_called()
         self.assertEqual(status, "fail", detail)
@@ -245,7 +245,7 @@ class RunTestTest(unittest.TestCase):
         fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
         for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]},
                       {"SKIP_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
-            with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
+            with self.subTest(props=props), mock.patch.object(rwt, "launch", return_value=fake):
                 entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
                 status, detail = self.run_entry(entry)
                 self.assertEqual(status, "fail")
@@ -271,7 +271,7 @@ class RunTestTest(unittest.TestCase):
             with self.subTest(timeout=timeout):
                 entry = ctest_entry("bounded", self.command_for(exe), {"TIMEOUT": timeout})
                 result = rwt.subprocess.CompletedProcess([], 0, stdout=b"")
-                with mock.patch.object(rwt.subprocess, "run", return_value=result) as run:
+                with mock.patch.object(rwt, "launch", return_value=result) as run:
                     status, detail = self.run_entry(entry)
                 self.assertEqual(status, "pass", detail)
                 self.assertEqual(run.call_args.kwargs["timeout"], self.args.timeout)
@@ -809,6 +809,42 @@ class MainTest(unittest.TestCase):
         self.assertIn("[FAIL] boom", out)
         self.assertIn("the runner raised RuntimeError: synthetic", out)
         self.assertIn("[FAIL] fine", out)
+
+    def test_a_run_serial_test_with_a_fixture_still_runs_after_its_setup(self):
+        flag = (self.root / "serial.flag").as_posix()
+        (self.artifact / "setup.py").write_text(f"import time\ntime.sleep(0.3)\nopen({flag!r}, 'w').write('x')\n",
+                                                encoding="utf-8")
+        (self.artifact / "needs.py").write_text(f"import os, sys\nsys.exit(0 if os.path.exists({flag!r}) else 1)\n",
+                                                encoding="utf-8")
+        entries = [ctest_entry("setup", self.command("setup.py"), {"FIXTURES_SETUP": "cases"}),
+                   ctest_entry("needs", self.command("needs.py"), {"FIXTURES_REQUIRED": "cases", "RUN_SERIAL": "1"}),
+                   ctest_entry("other", self.marker("other.py", "time.sleep(0.3)"))]
+        code, out, _ = self.run_main(entries, "--require", "needs", "--jobs", "4")
+        self.assertEqual(code, 0, out)
+        self.assertIn("3 passed", out)
+
+    def test_tests_of_one_program_do_not_overlap_when_only_one_has_an_ordering(self):
+        entries = [ctest_entry("a_first", self.marker("a.py", "time.sleep(0.4)"), {"RESOURCE_LOCK": "gpu"}),
+                   ctest_entry("a_plain", self.marker("a.py", "time.sleep(0.4)")),
+                   ctest_entry("b", self.marker("b.py", "time.sleep(0.4)"))]
+        code, out, _ = self.run_main(entries, "--jobs", "4")
+        self.assertEqual(code, 0, out)
+        a_runs = sorted((t, what) for what, name, t in self.marks() if name.endswith("a.py"))
+        self.assertEqual([w for _, w in a_runs], ["start", "end", "start", "end"])
+
+    @unittest.skipIf(os.name == "nt", "the child below is a POSIX process group")
+    def test_a_timeout_also_stops_what_the_test_started(self):
+        flag = self.root / "orphan.flag"
+        child = self.root / "child.py"
+        child.write_text(f"import time\ntime.sleep(1.5)\nopen({flag.as_posix()!r}, 'w').write('x')\n", encoding="utf-8")
+        (self.artifact / "spawner.py").write_text(
+            f"import subprocess, sys, time\nsubprocess.Popen([sys.executable, {child.as_posix()!r}])\ntime.sleep(60)\n",
+            encoding="utf-8")
+        entries = [ctest_entry("spawner", self.command("spawner.py"))]
+        code, out, _ = self.run_main(entries, "--timeout", "0.5")
+        self.assertIn("timed out after 0.5 s", out)
+        time.sleep(2.0)
+        self.assertFalse(flag.exists(), "a process the timed-out test started kept running")
 
     def test_jobs_must_be_a_whole_number_of_at_least_one(self):
         for bad in ("0", "-2", "x", "1.5"):

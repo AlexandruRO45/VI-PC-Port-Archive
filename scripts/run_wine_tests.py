@@ -27,6 +27,7 @@ import ntpath
 import os
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -256,8 +257,7 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
             timeout = min(timeout, ctest_timeout)
     start = time.monotonic()
     try:
-        proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=timeout)
+        proc = launch(argv, cwd=cwd, env=env, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
         return "fail", f"timed out after {timeout} s\n{out}"
@@ -295,6 +295,40 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     return ("pass" if passed else "fail"), detail
 
 
+KILL_WAIT = 10.0   # seconds to collect a killed test's output before giving up on it
+
+
+def launch(argv, *, cwd, env, timeout) -> subprocess.CompletedProcess:
+    """subprocess.run for one test, in its own process group: at the timeout the test and everything it started (a
+    relaunched gta6rt, a helper) are stopped, so nothing of it runs on beside the next tests on the shared prefix.
+    Raises TimeoutExpired with the output so far, as subprocess.run does."""
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **group)
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        try:   # a descendant that escaped the kill may still hold the pipe: do not wait for it forever
+            stdout, _ = proc.communicate(timeout=KILL_WAIT)
+        except subprocess.TimeoutExpired as late:
+            proc.kill()
+            stdout = late.stdout
+        raise subprocess.TimeoutExpired(argv, timeout, output=stdout) from None
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout)
+
+
+def kill_tree(proc) -> None:
+    """Stop a test and everything it started (its process group, or on Windows its tree)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=KILL_WAIT)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        proc.kill()
+
+
 def positive_int(text: str) -> int:
     """--jobs: a whole number of at least 1."""
     try:
@@ -319,18 +353,31 @@ def plan_lanes(tests: list[dict], args) -> tuple[list[list[dict]], list[list[dic
     for test in tests:
         depends = properties(test).get("DEPENDS", [])
         named.update([depends] if isinstance(depends, str) else depends)
+    def program(test):
+        command = test.get("command") or [""]
+        return map_path(command[0], args.windows_root, args.root) or command[0]
+
+    def has_order(test):
+        return test.get("name") in named or any(p in properties(test) for p in ORDERING_PROPERTIES)
+
+    # the ordered lane also takes every test of a program that has an ordered test, so no two tests of one program
+    # overlap even when only one of them has an ordering
+    ordered_programs = {program(t) for t in tests if has_order(t)}
     alone, ordered, by_exe = [], [], {}
     for test in tests:
-        props = properties(test)
-        if truthy(props.get("RUN_SERIAL")):
-            alone.append([test])
-        elif test.get("name") in named or any(p in props for p in ORDERING_PROPERTIES):
+        if has_order(test) or program(test) in ordered_programs:
             ordered.append(test)
+        elif truthy(properties(test).get("RUN_SERIAL")):
+            alone.append([test])
         else:
-            command = test.get("command") or [""]
-            exe = map_path(command[0], args.windows_root, args.root) or command[0]
-            by_exe.setdefault(exe, []).append(test)
-    lanes = ([ordered] if ordered else []) + list(by_exe.values())
+            by_exe.setdefault(program(test), []).append(test)
+    lanes = list(by_exe.values())
+    if any(truthy(properties(t).get("RUN_SERIAL")) for t in ordered):
+        # a RUN_SERIAL test inside an ordering: the whole ordered lane runs alone, in order, so the test still
+        # follows its setup or the test it depends on and has nothing beside it
+        alone.append(ordered)
+    elif ordered:
+        lanes.insert(0, ordered)
     return alone, lanes
 
 
