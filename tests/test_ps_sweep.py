@@ -338,6 +338,21 @@ class CompareCommand(unittest.TestCase):
             os.mkdir(raw + ".depth")
             self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "missing"})
 
+    def test_unreadable_two_clear_group_is_missing(self):
+        # A two-clear draw reads a second group of files, with its own handler.
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = os.path.join(tmp, "0.raw")
+            with open(raw, "wb") as f:
+                f.write(bytes(ps_sweep.W * ps_sweep.H * 16))
+            with open(raw + ".zero", "wb") as f:
+                f.write(b"")
+            with open(raw + ".depth", "wb") as f:   # a complete, all-clear plane reaches the second group
+                f.write(struct.pack("<f", 1.0) * (ps_sweep.W * ps_sweep.H))
+            os.mkdir(raw + ".zero.depth")
+            rec = {"i": 0, "code": 0, "reason": "", "targets": 1, "dir": tmp, "depth": True, "samples_passed": 0,
+                   "two_clear": True}
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "missing"})
+
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker")
     def test_integer_texture_fetch(self):
         from pathlib import Path
