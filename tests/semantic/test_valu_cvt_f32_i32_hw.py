@@ -327,5 +327,60 @@ class VCvtF32I32Ieee754BoundariesTests(unittest.TestCase):
         for i in range(len(floats) - 1):
             self.assertLessEqual(floats[i], floats[i + 1])
 
+class VCvtF32I32NegativeControlsAndRejectionTests(unittest.TestCase):
+    def test_bare_opcode_rejection(self):
+        bad_lines = ["v_cvt_f32_i32"]
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_cvt_bare", bad_lines)
+
+    def test_missing_source_operand_rejection(self):
+        bad_lines = ["v_cvt_f32_i32 v0"]
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_cvt_missing", bad_lines)
+
+
+class VCvtF32I32TranslatorIntegrationTests(unittest.TestCase):
+    def _run_ps(self, lines: list[str]) -> int:
+        lines = list(lines) + [
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cvt_f32_i32", lines)
+        words = mrt0_words(spv)
+        return words[0]
+
+    def test_translator_positive_integer_conversion(self):
+        lines = [
+            "v_mov_b32 v0, 42",
+            "v_cvt_f32_i32 v0, v0",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, 0x42280000)  # 42.0f
+
+    def test_translator_negative_integer_conversion(self):
+        lines = [
+            "v_mov_b32 v0, -100",
+            "v_cvt_f32_i32 v0, v0",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, 0xC2C80000)  # -100.0f
+
+    def test_translator_zero_conversion(self):
+        lines = [
+            "v_mov_b32 v0, 0",
+            "v_cvt_f32_i32 v0, v0",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, 0x00000000)  # +0.0f
+
+    def test_translator_sgpr_source(self):
+        lines = [
+            "s_mov_b32 s0, 10",
+            "v_cvt_f32_i32 v0, s0",
+        ]
+        res = self._run_ps(lines)
+        self.assertEqual(res, 0x41200000)  # 10.0f
+
+
 if __name__ == "__main__":
     unittest.main()
