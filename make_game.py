@@ -1677,6 +1677,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
                 if _linked(folder):
                     fail(f"assets: {folder} is a link or junction, and the audio streams have to be exported again "
                          "into a plain folder. Replace it with a folder (or remove it) and run again.")
+            os.remove(ogg_done)  # a failed re-export must not leave an older exporter's marker over missing output
             for folder in stale:
                 shutil.rmtree(folder)
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)

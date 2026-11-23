@@ -215,6 +215,22 @@ class AudioStageResumeTest(unittest.TestCase):
                     self.assertEqual(f.read(), make_game.ogg_marker() + " finished\n")
                 self.assertEqual(self.run_stage(), [])
 
+    def test_a_failed_re_export_then_the_previous_exporter_exports_again(self):
+        self.run_stage()
+        self.write_ogg_marker(make_game.ogg_marker() + " finished\n")
+        self.touch(self.audio, "ogg", "bank", "kept.ogg")
+
+        def failing_py(tool, *args):
+            raise SystemExit(1)
+        with mock.patch.object(make_game, "ogg_marker", lambda: "awc_opus.py " + "1" * 64), \
+                mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+                mock.patch.object(make_game, "py", failing_py), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            with self.assertRaises(SystemExit):
+                make_game.assets(self.game, self.work, False, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.audio, "ogg.done")))
+        self.assertIn("awc_opus.py", self.run_stage())
+
     def test_a_linked_audio_folder_stops_before_anything_is_removed(self):
         self.run_stage()
         self.write_ogg_marker("awc_opus.py finished\n")
