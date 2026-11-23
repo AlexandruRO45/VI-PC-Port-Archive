@@ -118,6 +118,37 @@ def regex_list(value: str | list[str]) -> list[str]:
     return [value] if isinstance(value, str) else value
 
 
+def modify_environment(env: dict[str, str], entries: list[str]) -> None:
+    """Apply CTest's ordered environment edits after the per-test ENVIRONMENT assignments."""
+    if not isinstance(entries, list):
+        raise ValueError("expected a list of NAME=OP:VALUE entries")
+    original = env.copy()
+    separators = {"string": "", "path_list": os.pathsep, "cmake_list": ";"}
+    for entry in entries:
+        if not isinstance(entry, str) or "\0" in entry:
+            raise ValueError("expected NAME=OP:VALUE")
+        name, equals, edit = entry.partition("=")
+        op, colon, value = edit.partition(":")
+        if not name or not equals or not colon:
+            raise ValueError("expected NAME=OP:VALUE")
+        if op == "reset":
+            if name in original:
+                env[name] = original[name]
+            else:
+                env.pop(name, None)
+        elif op == "unset":
+            env.pop(name, None)
+        elif op == "set":
+            env[name] = value
+        else:
+            kind, _, direction = op.rpartition("_")
+            if kind not in separators or direction not in ("append", "prepend"):
+                raise ValueError(f"unknown operation {op!r}")
+            current = env.get(name, "")
+            parts = (current, value) if direction == "append" else (value, current)
+            env[name] = separators[kind].join(parts) if current else value
+
+
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
     props = properties(test)
@@ -151,6 +182,11 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
         if not key or not equals or "\0" in assignment:
             return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
         env[key] = value
+    if "ENVIRONMENT_MODIFICATION" in props:
+        try:
+            modify_environment(env, props["ENVIRONMENT_MODIFICATION"])
+        except ValueError as e:
+            return "fail", f"invalid CTest ENVIRONMENT_MODIFICATION: {e}"
     timeout = args.timeout
     if "TIMEOUT" in props:
         try:

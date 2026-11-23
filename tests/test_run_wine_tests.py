@@ -193,6 +193,44 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "fail", detail)
         self.assertIn("invalid CTest ENVIRONMENT", detail)
 
+    def test_ctest_environment_modifications_are_ordered_and_child_local(self):
+        keys = ("LX_STRING", "LX_PATH", "LX_LIST", "LX_RESET", "LX_UNSET", "LX_ABSENT")
+        exe = self.program("modified_environment.py",
+                           f"import json, os\nprint(json.dumps([os.getenv(k) for k in {keys!r}]))\n")
+        command = self.command_for(exe)
+        props = {
+            "ENVIRONMENT": ["LX_RESET=from-test", "LX_PATH="],
+            "ENVIRONMENT_MODIFICATION": [
+                "LX_STRING=set:middle:with=punctuation", "LX_STRING=string_prepend:<", "LX_STRING=string_append:>",
+                "LX_PATH=path_list_append:middle", "LX_PATH=path_list_prepend:first", "LX_PATH=path_list_append:last",
+                "LX_LIST=cmake_list_append:middle", "LX_LIST=cmake_list_append:last", "LX_LIST=cmake_list_prepend:first",
+                "LX_RESET=unset:", "LX_RESET=reset:", "LX_UNSET=unset:", "LX_ABSENT=set:value", "LX_ABSENT=reset:",
+            ],
+        }
+        with mock.patch.dict(os.environ, {"LX_RESET": "from-host", "LX_UNSET": "present"}):
+            for key in ("LX_STRING", "LX_PATH", "LX_LIST", "LX_ABSENT"):
+                os.environ.pop(key, None)
+            status, detail = self.run_entry(ctest_entry("modify_environment", command, props))
+            self.assertEqual(status, "pass", detail)
+            self.assertEqual(json.loads(detail.splitlines()[1]), [
+                "<middle:with=punctuation>", os.pathsep.join(("first", "middle", "last")),
+                "first;middle;last", "from-test", None, None,
+            ])
+            self.assertEqual(os.environ["LX_RESET"], "from-host")
+            self.assertEqual(os.environ["LX_UNSET"], "present")
+            self.assertNotIn("LX_STRING", os.environ)
+
+    def test_invalid_ctest_environment_modifications_fail_before_launch(self):
+        command = self.command_for(self.exiting(0))
+        for modifications in ("LX_VAR=set:one", [42], ["=set:xyz"], ["LX_VAR=set"], ["LX_VAR=unknown:one"]):
+            with self.subTest(modifications=modifications), \
+                    mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                props = {"ENVIRONMENT_MODIFICATION": modifications}
+                status, detail = self.run_entry(ctest_entry("bad_modification", command, props))
+                launch.assert_not_called()
+                self.assertEqual(status, "fail", detail)
+                self.assertIn("invalid CTest ENVIRONMENT_MODIFICATION", detail)
+
     def test_ctest_output_expressions_determine_the_result(self):
         usage = {"PASS_REGULAR_EXPRESSION": ["alternative", "usage: gta6rt"]}
         forbidden = {"FAIL_REGULAR_EXPRESSION": ["running ", r"module\(s\) mapped"]}
