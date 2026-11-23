@@ -444,6 +444,45 @@ class MainTests(unittest.TestCase):
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
 
+    def test_failed_write_preserves_existing_output_and_report(self):
+        source = self.make_source()
+        out = os.path.join(self.dir, "existing_stubs.h")
+        report = os.path.join(self.dir, "existing_report.json")
+        old_out = "// previous good stub header\n"
+        old_report = '[{"previous": true}]\n'
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_out)
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_report)
+
+        real_named_temp = tempfile.NamedTemporaryFile
+
+        def failing(*args, **kwargs):
+            handle = real_named_temp(*args, **kwargs)
+
+            def fail_write(data):
+                handle.file.write(data[:8])
+                raise OSError(28, "No space left on device")
+
+            handle.write = fail_write
+            return handle
+
+        for flag, target, previous in (("--out", out, old_out), ("--report", report, old_report)):
+            for label, patch in (
+                ("write", mock.patch.object(gen.tempfile, "NamedTemporaryFile", side_effect=failing)),
+                ("replace", mock.patch.object(gen.os, "replace", side_effect=PermissionError(13, "Permission denied"))),
+            ):
+                with self.subTest(flag=flag, label=label), patch:
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        code = self.run_args("--header", self.header, flag, target, "--source", source, "IChild")
+                    self.assertEqual(code, 2)
+                    self.assertIn("ERROR: cannot write", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    with open(target, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), previous)
+                    self.assertFalse([n for n in os.listdir(self.dir) if n.startswith(".gen_d3d12_stubs-")])
+
     def test_find_header_uses_the_include_environment(self):
         with mock.patch.dict(os.environ, {"INCLUDE": self.dir}, clear=False):
             self.assertEqual(gen.find_header(), self.header)

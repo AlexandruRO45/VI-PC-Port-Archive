@@ -18,8 +18,10 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402  one spelling comparison for every report pair
 
 INTERFACE = re.compile(
@@ -136,15 +138,31 @@ def coverage(interfaces, leaves, sources):
 
 
 def write_if_changed(path, text):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
     try:
         with open(path, encoding="utf-8") as f:
             if f.read() == text:
                 return
     except OSError:
         pass
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
+                                         prefix=".gen_d3d12_stubs-", suffix=".tmp", delete=False) as f:
+            tmp = f.name
+            f.write(text)
+        os.chmod(tmp, published_mode(path))
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                if os.path.lexists(tmp):
+                    os.chmod(tmp, 0o600)
+                    os.remove(tmp)
+            except OSError:
+                pass
+        raise
 
 
 def same_path(first, second):
