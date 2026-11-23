@@ -152,5 +152,22 @@ class VCvtPkrtzF16F32ScalarInterpreterTests(unittest.TestCase):
         expected = (ref_f32_to_f16_rtz(-2.5) << 16) | ref_f32_to_f16_rtz(1.5)
         self.assertEqual(res, expected)
 
+class VCvtPkrtzF16F32SimdDivergenceTests(unittest.TestCase):
+    def test_exec_masking(self):
+        wave = WavefrontSimdState(32)
+        wave.exec_mask = 0x55555555
+        for lane in range(32):
+            wave.set_vgpr(lane, 0, 0xDEADBEEF)
+            if (wave.exec_mask >> lane) & 1:
+                val0 = f32_to_bits(float(lane))
+                val1 = f32_to_bits(float(lane * 2))
+                wave.set_vgpr(lane, 0, interpret_cvt_pkrtz_f16_f32(val0, val1))
+        for lane in range(32):
+            if (wave.exec_mask >> lane) & 1:
+                exp = (ref_f32_to_f16_rtz(float(lane * 2)) << 16) | ref_f32_to_f16_rtz(float(lane))
+                self.assertEqual(wave.get_vgpr(lane, 0), exp)
+            else:
+                self.assertEqual(wave.get_vgpr(lane, 0), 0xDEADBEEF)
+
 if __name__ == '__main__':
     unittest.main()
