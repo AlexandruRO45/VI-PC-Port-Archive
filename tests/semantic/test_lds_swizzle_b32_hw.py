@@ -330,3 +330,31 @@ class TestDsSwizzleB32SIMD(unittest.TestCase):
         # Lanes 32..63 broadcast lane 32 (not lane 0!)
         for i in range(32, 64):
             self.assertEqual(state.vgprs[0][i], 32)
+
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+class TestDsSwizzleB32Aliasing(unittest.TestCase):
+    def test_in_place_swap_aliasing(self) -> None:
+        # v1 = ds_swizzle_b32 v1, v1 offset:swizzle(SWAP,1)
+        # Lockstep execution: hardware latches all source registers before writing destinations
+        state = SwizzleSimdState.create(32, 0xFFFFFFFF)
+        state.vgprs[1] = [100 + i for i in range(32)]
+        ast = DsSwizzleB32AST(1, 1, SwizzleKind.SWAP, encode_swap(1), (1,))
+        step_swizzle_instruction(ast, state)
+
+        # Symmetrical swap completes without clobbering
+        self.assertEqual(state.vgprs[1][0], 101)
+        self.assertEqual(state.vgprs[1][1], 100)
+        self.assertEqual(state.vgprs[1][2], 103)
+        self.assertEqual(state.vgprs[1][3], 102)
+
+    def test_in_place_quad_perm_cycle(self) -> None:
+        # Circular shift: (1, 2, 3, 0)
+        state = SwizzleSimdState.create(32, 0xFFFFFFFF)
+        state.vgprs[2] = [i for i in range(32)]
+        ast = DsSwizzleB32AST(2, 2, SwizzleKind.QUAD_PERM, encode_quad_perm(1, 2, 3, 0), (1, 2, 3, 0))
+        step_swizzle_instruction(ast, state)
+
+        self.assertEqual(state.vgprs[2][0:4], [1, 2, 3, 0])
+        self.assertEqual(state.vgprs[2][4:8], [5, 6, 7, 4])
