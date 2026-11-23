@@ -14,6 +14,7 @@ Standard library only. No game data is written: the report holds RVAs and counts
 """
 import argparse
 import json
+import os
 import struct
 import sys
 from collections import Counter, defaultdict
@@ -118,6 +119,9 @@ def main(argv=None):
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--json", help="also write the report here")
     a = ap.parse_args(argv)
+    if a.json and os.path.isdir(a.json):
+        print(f"ERROR: --json is a directory, not a report file: {a.json}", file=sys.stderr)
+        return 2
     try:
         hashes = [(h, parse_hash(h)) for h in (a.hash or ["player_story000_00", "cs_mandy"])]
     except ValueError as e:
@@ -137,9 +141,13 @@ def main(argv=None):
     for c in report["candidates"]:
         print(f"  {c['rva']:>12}  callers {c['direct_callers']:>6}  led by {', '.join(c['led_by'])}")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
-            f.write("\n")
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            return 2
     return 0
 
 
