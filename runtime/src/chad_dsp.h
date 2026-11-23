@@ -9,14 +9,15 @@
 //   - XDspDeactivate(pStream) -> HRESULT
 //   - XDspSubmitCommand(pStream, pCommand /* 0x20 bytes */, pOutToken) -> HRESULT
 //
-// Every live context and stream handle is tracked in-engine under a mutex so stale, double-freed, or foreign handles
-// are rejected cleanly without dereferencing invalid pointers.
+// Every live context and stream handle is tracked in-engine under a mutex using monotonic opaque handles so stale,
+// double-freed, or foreign handles are rejected cleanly even across allocator address reuse.
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 
 namespace leonida::chad {
@@ -77,18 +78,22 @@ public:
         if (!memory_buffer || memory_size == 0 || max_streams == 0 || max_commands == 0) {
             return Status::invalid_arg;
         }
-        auto ctx = std::make_unique<Context>();
-        ctx->memory_buffer = memory_buffer;
-        ctx->memory_size = memory_size;
-        ctx->max_streams = max_streams;
-        ctx->max_commands = max_commands;
-        ctx->flags = flags;
+        try {
+            auto ctx = std::make_unique<Context>();
+            ctx->memory_buffer = memory_buffer;
+            ctx->memory_size = memory_size;
+            ctx->max_streams = max_streams;
+            ctx->max_commands = max_commands;
+            ctx->flags = flags;
 
-        Context* raw = ctx.get();
-        std::lock_guard<std::mutex> lock(mu_);
-        contexts_.emplace(raw, std::move(ctx));
-        *out_context = raw;
-        return Status::ok;
+            std::lock_guard<std::mutex> lock(mu_);
+            void* handle = next_opaque_handle_locked();
+            contexts_.emplace(handle, std::move(ctx));
+            *out_context = handle;
+            return Status::ok;
+        } catch (const std::bad_alloc&) {
+            return Status::out_of_memory;
+        }
     }
 
     Status disconnect(void* context_handle) {
@@ -114,25 +119,30 @@ public:
         *out_stream = nullptr;
         if (!context_handle || !desc) return Status::invalid_arg;
 
-        std::lock_guard<std::mutex> lock(mu_);
-        auto cit = contexts_.find(context_handle);
-        if (cit == contexts_.end()) return Status::invalid_arg;
-        Context* ctx = cit->second.get();
-        if (ctx->active_streams >= ctx->max_streams) return Status::out_of_memory;
+        try {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto cit = contexts_.find(context_handle);
+            if (cit == contexts_.end()) return Status::invalid_arg;
+            Context* ctx = cit->second.get();
+            if (ctx->active_streams >= ctx->max_streams) return Status::out_of_memory;
 
-        auto stream = std::make_unique<Stream>();
-        stream->owner = ctx;
-        stream->desc = *desc;
-        stream->state.kind = desc->kind;
-        stream->state.channel_count = desc->channel_count;
-        stream->state.block_size = desc->block_size;
+            auto stream = std::make_unique<Stream>();
+            stream->owner = ctx;
+            stream->desc = *desc;
+            stream->state.kind = desc->kind;
+            stream->state.channel_count = desc->channel_count;
+            stream->state.block_size = desc->block_size;
 
-        Stream* raw = stream.get();
-        ++ctx->active_streams;
-        streams_.emplace(raw, std::move(stream));
-        if (out_state) *out_state = &raw->state;
-        *out_stream = raw;
-        return Status::ok;
+            DspStreamState* state_ptr = &stream->state;
+            void* handle = next_opaque_handle_locked();
+            streams_.emplace(handle, std::move(stream));
+            ++ctx->active_streams;  // commit slot count only after map insertion succeeds
+            if (out_state) *out_state = state_ptr;
+            *out_stream = handle;
+            return Status::ok;
+        } catch (const std::bad_alloc&) {
+            return Status::out_of_memory;
+        }
     }
 
     Status deactivate(void* stream_handle) {
@@ -198,7 +208,19 @@ private:
         std::uint32_t last_token = 0;
     };
 
+    void* next_opaque_handle_locked() {
+        // Monotonic non-zero opaque handle tokens prevent stale handles from aliasing later allocations.
+        std::uintptr_t id = next_handle_;
+        next_handle_ += 0x10u;
+        if (id == 0) {
+            id = next_handle_;
+            next_handle_ += 0x10u;
+        }
+        return reinterpret_cast<void*>(id);
+    }
+
     mutable std::mutex mu_;
+    std::uintptr_t next_handle_ = 0x1000u;
     std::unordered_map<void*, std::unique_ptr<Context>> contexts_;
     std::unordered_map<void*, std::unique_ptr<Stream>> streams_;
 };

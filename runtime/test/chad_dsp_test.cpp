@@ -3,10 +3,13 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <new>
 
 namespace {
 
 int g_failures = 0;
+int g_fail_alloc_after = -1;  // >= 0: fail when countdown reaches 0
 
 void expect(bool cond, const char* what) {
     if (!cond) {
@@ -16,6 +19,25 @@ void expect(bool cond, const char* what) {
 }
 
 }  // namespace
+
+#if defined(__GNUC__) || defined(__clang__)
+#define CHAD_TEST_NOINLINE __attribute__((noinline))
+#else
+#define CHAD_TEST_NOINLINE
+#endif
+
+CHAD_TEST_NOINLINE void* operator new(std::size_t size) {
+    if (g_fail_alloc_after == 0) {
+        g_fail_alloc_after = -1;
+        throw std::bad_alloc();
+    }
+    if (g_fail_alloc_after > 0) --g_fail_alloc_after;
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+
+CHAD_TEST_NOINLINE void operator delete(void* p) noexcept { std::free(p); }
+CHAD_TEST_NOINLINE void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 int main() {
     using namespace leonida::chad;
@@ -99,22 +121,67 @@ int main() {
            "submit on deactivated stream rejected");
     expect(engine.active_stream_count() == 1, "active_stream_count == 1 after deactivate");
 
-    // Re-activating reuses the freed slot.
-    expect(engine.activate(ctx, &desc, nullptr, &stream3) == Status::ok && stream3 != nullptr,
-           "activate after deactivate succeeds (null out_state allowed)");
+    // Re-activating reuses the freed slot with a fresh handle that never aliases the stale stream1 handle.
+    expect(engine.activate(ctx, &desc, nullptr, &stream3) == Status::ok && stream3 != nullptr && stream3 != stream1,
+           "activate after deactivate succeeds with a distinct handle (null out_state allowed)");
     expect(engine.active_stream_count() == 2, "active_stream_count == 2 again");
+    expect(engine.deactivate(stream1) == Status::invalid_arg,
+           "stale stream1 handle stays invalid even after reactivation");
+    expect(engine.submit_command(stream1, &cmd, &tok1) == Status::invalid_arg,
+           "stale stream1 handle rejected for submit_command after reactivation");
+    expect(engine.active_stream_count() == 2, "stale deactivate did not remove live stream3");
 
-    // Disconnect tears down remaining active streams cleanly without leaking.
+    // Disconnect tears down remaining active streams cleanly without leaking; reconnecting produces a distinct handle.
+    void* old_ctx = ctx;
     expect(engine.disconnect(ctx) == Status::ok, "disconnect succeeds");
     expect(engine.disconnect(ctx) == Status::invalid_arg, "double disconnect rejected");
     expect(engine.active_context_count() == 0 && engine.active_stream_count() == 0,
            "disconnect cleans up context and orphaned streams");
     expect(engine.deactivate(stream2) == Status::invalid_arg, "orphaned stream rejected after disconnect");
 
+    // Allocation fault injection: connect() and activate() translate std::bad_alloc to Status::out_of_memory
+    // without leaking max_streams slots, and subsequent calls recover cleanly.
+    {
+        void* oom_ctx = reinterpret_cast<void*>(1);
+        g_fail_alloc_after = 0;
+        expect(engine.connect(backing, sizeof(backing), 1, 64, 0, &oom_ctx) == Status::out_of_memory && !oom_ctx,
+               "connect translates allocation failure on Context to out_of_memory");
+        g_fail_alloc_after = -1;
+        expect(engine.active_context_count() == 0, "failed connect leaves active_context_count == 0");
+
+        void* ctx2 = nullptr;
+        expect(engine.connect(backing, sizeof(backing), 1, 64, 0, &ctx2) == Status::ok && ctx2 != nullptr &&
+                   ctx2 != old_ctx,
+               "reconnect recovers cleanly with a distinct context handle");
+        expect(engine.disconnect(old_ctx) == Status::invalid_arg,
+               "stale context handle stays invalid after reconnect");
+
+        // Fail Stream allocation (allocation #0), then fail map-node allocation (allocation #1) after Stream succeeds.
+        for (int fail_index = 0; fail_index <= 1; ++fail_index) {
+            void* oom_state = reinterpret_cast<void*>(1);
+            void* oom_stream = reinterpret_cast<void*>(1);
+            g_fail_alloc_after = fail_index;
+            const Status st = engine.activate(ctx2, &desc, &oom_state, &oom_stream);
+            g_fail_alloc_after = -1;
+            expect(st == Status::out_of_memory && !oom_state && !oom_stream,
+                   "activate translates allocation failure to out_of_memory");
+            expect(engine.active_stream_count() == 0, "failed activate leaves active_stream_count == 0");
+        }
+
+        // Verify the max_streams=1 slot was NOT leaked by the map-insertion OOM.
+        void* recovered_stream = nullptr;
+        expect(engine.activate(ctx2, &desc, nullptr, &recovered_stream) == Status::ok && recovered_stream != nullptr,
+               "activate recovers after map-insertion OOM without losing its stream slot");
+        expect(engine.active_stream_count() == 1, "active_stream_count == 1 after recovery");
+        expect(engine.disconnect(ctx2) == Status::ok && engine.active_context_count() == 0 &&
+                   engine.active_stream_count() == 0,
+               "disconnect cleans up recovered context and stream");
+    }
+
     if (g_failures) {
         std::fprintf(stderr, "chad_dsp_test: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("chad_dsp: connect, stream limits, command tokens, deactivate, and disconnect cleanup passed\n");
+    std::printf("chad_dsp: connect, stream limits, command tokens, stale handles, OOM recovery, and disconnect passed\n");
     return 0;
 }
