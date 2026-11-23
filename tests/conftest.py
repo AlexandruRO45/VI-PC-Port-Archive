@@ -4,6 +4,7 @@ Nothing here touches game data: shaders are tiny hand-written assembly programs,
 same ``; encoding:`` listing format that tools/shader_disasm.py produces, next to a synthetic empty DXBC container
 (rdna2spirv.translate() looks for ``<disasm dir>/../<name>.dxbc`` to read the input signature).
 """
+import functools
 import glob
 import os
 import re
@@ -192,16 +193,19 @@ class Shader:
         sa = self.workdir / f"{self.name}.spvasm"
         sv = self.workdir / f"{self.name}.spv"
         sa.write_text(spvasm)
-        r = subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"],
-                           capture_output=True, text=True)
+        # The tools run in the work folder with bare file names, as rdna2spirv.py's assemble_spirv does (#3423): on
+        # Windows they read their command line in the ANSI code page, so a tmp_path under a user name outside it
+        # would reach them with "?" in place of those letters.
+        run = functools.partial(subprocess.run, cwd=self.workdir, capture_output=True, text=True, errors="replace")
+        r = run(["spirv-as", sa.name, "-o", sv.name, "--target-env", "vulkan1.2"])
         assert r.returncode == 0, "spirv-as: " + r.stderr
         val = ["spirv-val", "--target-env", "vulkan1.2"]
-        r = subprocess.run(val + [str(sv)], capture_output=True, text=True)
+        r = run(val + [sv.name])
         if r.returncode != 0 and "Offset can only be used with OpImage*Gather" in r.stderr:
             # image_sample*_o (sample ps_texoff.asm): a non-constant Offset outside gather is VK_KHR_maintenance8, and
             # rdna2spirv.py validates with this flag (docs/design.md, "Texel offsets"). A spirv-val from before
             # maintenance8 prints its usage text for the flag it doesn't know: nothing can be validated there.
-            r = subprocess.run(val + ["--allow-offset-texture-operand", str(sv)], capture_output=True, text=True)
+            r = run(val + ["--allow-offset-texture-operand", sv.name])
             if r.returncode != 0 and "USAGE" in r.stdout + r.stderr:
                 pytest.skip("this spirv-val has no --allow-offset-texture-operand (VK_KHR_maintenance8)")
         if r.returncode != 0 and known_val_issue and known_val_issue in r.stderr:
