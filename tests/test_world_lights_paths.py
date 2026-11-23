@@ -578,6 +578,30 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(lines[4], "ERROR: --limit must be at least 1")
 
 
+    def test_truncated_rpf9_header_is_one_error_line(self) -> None:
+        # '9FPR' followed by fewer than four more bytes leaves the data-start field at +4 missing, and the
+        # unpack used to raise struct.error as a traceback instead of the one-line refusal.
+        for extra in (b"", b"\x40", b"\x40\x00", b"\x40\x00\x00"):
+            with self.subTest(header_bytes=len(b"9FPR" + extra)):
+                archive = os.path.join(self.tmp.name, "truncated-%d.rpf" % len(extra))
+                with open(archive, "wb") as f:
+                    f.write(b"9FPR" + extra)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(T.main([archive]), 2)
+                self.assertEqual(err.getvalue().strip(),
+                                 f"ERROR: {archive}: a truncated RPF9 header (fewer than 8 bytes)")
+                self.assertNotIn("Traceback", err.getvalue())
+
+    def test_eight_byte_header_alone_is_not_truncated(self) -> None:
+        # The check is on the header's own length, not on how many resources follow it.
+        archive = os.path.join(self.tmp.name, "header-only.rpf")
+        with open(archive, "wb") as f:
+            f.write(b"9FPR\x40\x00\x00\x00")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(T.main([archive]), 0)
+
+
 class GraphStatsFirstLinkTest(unittest.TestCase):
     @staticmethod
     def _node(idx, first_link):
