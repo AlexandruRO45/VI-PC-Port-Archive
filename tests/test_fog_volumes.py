@@ -240,6 +240,28 @@ class FogVolumesTests(unittest.TestCase):
                     fv.main([td, "--jobs", bad])
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_non_finite_floats_emit_strict_json(self):
+        raw = build_synthetic_fog_0x7a([
+            {"Position": (float("nan"), 2.5, float("inf")),
+             "PositionOffset": (float("-inf"), 1.0, float("nan")),
+             "Scale": (float("nan"), float("inf"), float("-inf"))},
+            {"Position": (1.0, float("nan"), 3.0),
+             "PositionOffset": (float("nan"), 2.0, float("nan")),
+             "Scale": (float("nan"), float("nan"), float("nan"))},
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            fp = os.path.join(td, "nonfinite.bin")
+            out_json = os.path.join(td, "out.json")
+            with open(fp, "wb") as f:
+                f.write(raw)
+            rc = fv.main([fp, "--out", out_json, "--jobs", "1"])
+            self.assertEqual(rc, 0)
+            with open(out_json, encoding="utf-8") as f:
+                doc = json.loads(f.read(), parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+            self.assertEqual(doc["position_range"], {"x": [1.0, 1.0], "y": [2.5, 2.5], "z": [3.0, 3.0]})
+            self.assertEqual(doc["position_offset_range"], {"x": None, "y": [1.0, 2.0], "z": None})
+            self.assertIsNone(doc["scale_range"])
+
 
 if __name__ == "__main__":
     unittest.main()

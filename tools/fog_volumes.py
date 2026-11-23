@@ -13,6 +13,7 @@ import collections
 import concurrent.futures
 import hashlib
 import json
+import math
 import mmap
 import os
 import re
@@ -347,12 +348,12 @@ def summarize(path: str, jobs: int = 1) -> dict:
                 tr_mtx_id += 1
 
     def _rng(axes):
-        if not axes[0]:
+        finite = [[v for v in axis if math.isfinite(v)] for axis in axes]
+        if not any(finite):
             return None
         return {
-            "x": [round(min(axes[0]), 4), round(max(axes[0]), 4)],
-            "y": [round(min(axes[1]), 4), round(max(axes[1]), 4)],
-            "z": [round(min(axes[2]), 4), round(max(axes[2]), 4)],
+            name: [round(min(vals), 4), round(max(vals), 4)] if vals else None
+            for name, vals in zip(("x", "y", "z"), finite)
         }
 
     out = {
@@ -394,7 +395,7 @@ def _write_json_atomic(path: str, doc: dict) -> None:
     fd, tmp = tempfile.mkstemp(prefix=".fog-volumes-", suffix=".tmp", dir=parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1, sort_keys=True)
+            json.dump(doc, f, indent=1, sort_keys=True, allow_nan=False)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
@@ -428,7 +429,7 @@ def main(argv=None) -> int:
     except OSError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(doc, indent=1, sort_keys=True))
+    print(json.dumps(doc, indent=1, sort_keys=True, allow_nan=False))
     return 0
 
 
