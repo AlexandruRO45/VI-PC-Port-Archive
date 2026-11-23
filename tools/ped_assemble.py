@@ -45,8 +45,10 @@ import json
 import math
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -55,6 +57,8 @@ TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import glb_writer  # noqa: E402
 
 GLB_MAGIC = b"glTF"
@@ -2169,12 +2173,41 @@ def _load_cli_parts(
 
 
 def _write_json_report(path: str, data: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".ped_assemble-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(data, staged, indent=2)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def _cmd_assemble(args: argparse.Namespace) -> int:
