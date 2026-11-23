@@ -459,5 +459,28 @@ class VMax3I32SimdBoundaryTests(unittest.TestCase):
             expected = max(i - 32, 0, 32 - i)
             self.assertEqual(i32(out[i]), expected)
 
+class VMax3I32TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution and negative mutation controls for v_max3_i32."""
+
+    def test_spirv_translation_execution(self):
+        lines = [
+            "v_mov_b32 v0, 50",
+            "v_mov_b32 v1, 100",
+            "v_mov_b32 v2, 90",
+            "v_max3_i32 v3, v0, v1, v2",
+            "v_mov_b32 v0, v3",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_max3_i32_int", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 100)
+
+    def test_negative_mutation_contrast(self):
+        a, b, c = 10, 50, 90
+        max_res = ref_max3_i32(a, b, c)
+        min_res = ref_min3_i32(a, b, c)
+        self.assertNotEqual(max_res, min_res)
+
 if __name__ == "__main__":
     unittest.main()
