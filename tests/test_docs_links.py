@@ -18,6 +18,7 @@ from urllib.parse import unquote
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FENCE = re.compile(r"```.*?```", re.S)
+FENCE_LINE = re.compile(r"(?m)^ {0,3}```")
 LINK = re.compile(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^)\s]+))(?:\s+\"[^\"]*\")?\)")
 HTML = re.compile(r'(?:href|src)\s*=\s*"([^"]+)"')
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$", re.M)
@@ -56,6 +57,26 @@ def links(text):
     found = [m.group(1) or m.group(2) for m in LINK.finditer(text)]
     found.extend(HTML.findall(text))
     return found
+
+
+def odd_fence_pages(root, files):
+    """Relative paths of the pages that open a code fence they never close.
+
+    A page with an odd number of fence markers renders every heading and link after the open one as code, so the
+    section it swallowed disappears from the page and from this test's anchors: a link to one of those headings then
+    reports a missing anchor. That is how runtime/README.md's unclosed fence was found, and the parity check names the
+    cause instead of the anchor it happened to break. CommonMark indents a fence at most three spaces.
+    """
+    odd = []
+    for path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        if len(FENCE_LINE.findall(text)) % 2:
+            odd.append(os.path.relpath(path, root))
+    return odd
 
 
 def markdown_files(root):
@@ -156,6 +177,23 @@ class RepositoryLinksTest(unittest.TestCase):
         problems = broken_links(ROOT, files)
         self.assertEqual(problems, [],
                          "\n".join(f"{page}: {link} ({why})" for page, link, why in problems))
+
+    def test_every_page_closes_its_code_fences(self):
+        files = markdown_files(ROOT)
+        self.assertGreaterEqual(len(files), 30, "expected the tracked Markdown files to be found")
+        self.assertEqual(odd_fence_pages(ROOT, files), [],
+                         "a code fence is never closed, so the rest of the page renders as code")
+
+    def test_the_fence_check_flags_only_the_unclosed_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def write(name, text):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+            write("closed.md", "# Closed\n\n```sh\necho hi\n```\n\n## After\n\n    ```\n")  # 4 spaces: code, no fence
+            write("unclosed.md", "# Unclosed\n\n```sh\necho hi\n\n## Swallowed\n")
+            write("none.md", "# No fences\n")
+            files = [os.path.join(tmp, name) for name in ("closed.md", "none.md", "unclosed.md")]
+            self.assertEqual(odd_fence_pages(tmp, files), ["unclosed.md"])
 
     def test_the_checker_flags_a_missing_file_and_a_bad_anchor(self):
         with tempfile.TemporaryDirectory() as tmp:
