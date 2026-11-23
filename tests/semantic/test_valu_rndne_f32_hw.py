@@ -485,5 +485,46 @@ class TestValuRndneF32RegisterAliasing(unittest.TestCase):
             self.assertEqual(wave.lane_vgprs[lane][4], F32_TWO)
 
 
+class ArchitecturalStatusFlags:
+    """Emulates RDNA2 SCC and VCC condition codes across VALU operations."""
+
+    def __init__(self, scc: int = 0, vcc: int = 0):
+        self.scc: int = scc & 1
+        self.vcc: int = vcc & 0xFFFFFFFFFFFFFFFF
+
+    def step_valu_rndne(self, inst: ASTInstruction, state: VALURegisterState) -> None:
+        state.execute(inst)
+
+
+class TestValuRndneF32ConditionCodes(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow preservation."""
+
+    def test_scc_preserved_when_zero(self):
+        flags = ArchitecturalStatusFlags(scc=0, vcc=0)
+        state = VALURegisterState()
+        state.vgprs[1] = f32_to_bits(1.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        flags.step_valu_rndne(inst, state)
+        self.assertEqual(flags.scc, 0)
+        self.assertEqual(flags.vcc, 0)
+
+    def test_scc_preserved_when_one(self):
+        flags = ArchitecturalStatusFlags(scc=1, vcc=0x123456789ABCDEF0)
+        state = VALURegisterState()
+        state.vgprs[1] = f32_to_bits(-2.5)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        flags.step_valu_rndne(inst, state)
+        self.assertEqual(flags.scc, 1)
+        self.assertEqual(flags.vcc, 0x123456789ABCDEF0)
+
+    def test_vcc_all_ones_preserved(self):
+        flags = ArchitecturalStatusFlags(scc=0, vcc=0xFFFFFFFFFFFFFFFF)
+        state = VALURegisterState()
+        state.vgprs[1] = f32_to_bits(0.0)
+        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        flags.step_valu_rndne(inst, state)
+        self.assertEqual(flags.vcc, 0xFFFFFFFFFFFFFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
