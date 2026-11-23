@@ -11,12 +11,15 @@
 ;   out[1] dword 5, byte at 1 (0x90)                       -> 0x0000FF90   out[5]              -> 0xBEEFFF90
 ;   out[2] dword 6, byte at 2 (0xCC)                       -> 0x0000FFCC   out[6]              -> 0xBEEFFFCC
 ;   out[3] dword 7, byte at 3 (0x80)                       -> 0x0000FF80   out[7]              -> 0xBEEFFF80
-; Every lane reads and writes the same values, so the lanes' writes cannot disagree.
+; Lane 0 alone fills the LDS (one writer per word, no data race), then EXEC goes back to all 64 lanes before the
+; barrier. Every lane then reads the same bytes and writes the same halves; ds_write_b16 is an atomic and/or pair, so
+; the lanes' writes to one word are ordered and each lane's "or" follows its own "and": the word ends as that value.
 ; group: 64,1,1
 ; Run: vk_compute_test cs_w64_lds_i8_d16_write.spv 1 dump
 ;   -> out[0..7] = 0x0000FFA5 0x0000FF90 0x0000FFCC 0x0000FF80 0xBEEFFFA5 0xBEEFFF90 0xBEEFFFCC 0xBEEFFF80
 ; mattr: +wavefrontsize64,-wavefrontsize32
 v_mov_b32_e32 v2, 0
+v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v3, 0x80cc90a5
 ds_write_b32 v2, v3
 v_mov_b32_e32 v3, 0
@@ -25,6 +28,7 @@ ds_write_b32 v2, v3 offset:20
 ds_write_b32 v2, v3 offset:24
 ds_write_b32 v2, v3 offset:28
 s_waitcnt lgkmcnt(0)
+s_mov_b64 exec, -1
 s_barrier
 v_mov_b32_e32 v10, 0xbeef1234
 v_mov_b32_e32 v11, 0xbeef1234
