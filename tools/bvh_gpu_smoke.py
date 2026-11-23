@@ -27,6 +27,7 @@ Windows driver; the translator's default is 65536). Over it, a program's LDS arr
 which the wave64 bitonic sorts need on a 32 KiB device.
 
 Nothing from the package is written outside --work. The report holds module names, statuses and counts only.
+Usage: `python -I tools/bvh_gpu_smoke.py --help` lists the options.
 """
 import argparse
 import json
