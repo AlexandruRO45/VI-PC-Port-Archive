@@ -423,6 +423,13 @@ class TestVCvtF32I32TranslatorAndControls(unittest.TestCase):
         with self.assertRaises(Exception):
             support.translate_lines("ps_neg_v_cvt_f32_i32", ["v_cvt_f32_i32", "s_endpgm"])
 
+class TestVCvtI32F32ReferenceOracle(unittest.TestCase):
+    """Stage 1 for v_cvt_i32_f32: reference mathematical oracle validation."""
+
+    def test_v_cvt_i32_f32_oracle_identity(self):
+        res = oracle_v_cvt_i32_f32(0xc0a00000)
+        self.assertEqual(res, 0xfffffffb)
+
 
 if __name__ == '__main__':
     unittest.main()
