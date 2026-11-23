@@ -36,7 +36,9 @@ def translate(lines, *, emulate=False):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        return support.translate_lines("cs_img_atomic_guard", lines + ["s_endpgm"], fssm=FSSM)
+        # Narrow EXEC immediately before the atomic. Unchanged EXEC can fold the guard to true.
+        narrowed = [*lines[:-1], "v_cmpx_eq_u32_e32 v1, v2", lines[-1], "s_endpgm"]
+        return support.translate_lines("cs_img_atomic_guard", narrowed, fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 
@@ -74,18 +76,20 @@ def parse_blocks(spv):
 
 
 def find_guarded_texel_block(spv):
-    """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    """Require each texel pointer's block to be entered by the current active lane predicate."""
     blocks = parse_blocks(spv)
-    active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
     guarded_targets = set()
     for insns in blocks.values():
+        active = None
         for i, ln in enumerate(insns):
+            load = re.fullmatch(r"(%\w+) = OpLoad %bool %active", ln)
+            store = re.fullmatch(r"OpStore %active (%\w+)", ln)
+            if load or store:
+                active = (load or store).group(1)
             if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
-                br = insns[i + 1]
-                m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
-                if m and m.group(1) in active_loads:
-                    guarded_targets.add(m.group(2))
+                branch = re.fullmatch(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", insns[i + 1])
+                if branch and branch.group(1) == active and active not in ("%true", "%false"):
+                    guarded_targets.add(branch.group(2))
     found = []
     for lbl, insns in blocks.items():
         if any("= OpImageTexelPointer " in ln for ln in insns):
