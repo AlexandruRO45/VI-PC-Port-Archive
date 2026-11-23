@@ -164,8 +164,10 @@ def _mnemonic_collection(node):
 
 
 def parse_translator(path):
-    with open(path, encoding="utf-8-sig") as f:
-        return ast.parse(f.read(), path)
+    with open(path, "rb") as f:
+        # Decode before removing the BOM so errors refer to offsets in the original file.
+        source = f.read().decode("utf-8")
+    return ast.parse(source.removeprefix("\ufeff"), path)
 
 
 def scan_translator(path):
