@@ -30,7 +30,7 @@ sizes only. When the file disagrees with the model it prints what does not fit a
 still in bounds.
 
 Usage:
-    python -I psocache_inspect.py <cache> [--json] [--quiet]
+    python -I psocache_inspect.py <cache> [--meta [--entry N] [--limit N]] [--json] [--quiet]
 
 Exit code: 0 when every region fits and the regions add up to the file size, 1 when the file disagrees with the
 model, 2 when it cannot be read or does not start with the magic.
@@ -741,6 +741,8 @@ def main(argv=None):
         "--quiet", action="store_true", help="print nothing, only set the exit code"
     )
     a = ap.parse_args(argv)
+    if a.limit is not None and not (a.meta or a.entry is not None):
+        ap.error("--limit only applies to --meta")
     try:
         report = inspect(
             a.cache,
