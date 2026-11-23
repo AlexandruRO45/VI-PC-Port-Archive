@@ -109,6 +109,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/winhttp_offline.cpp
     shims/xmem.cpp
     shims/xg_xs.cpp
+    shims/chad.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -223,6 +224,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(xg_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
+
+  # chad shim: the 5 XDsp* audio DSP exports resolved through the shim registry.
+  add_executable(chad_test
+    test/chad_test.cpp
+    shims/chad.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(chad_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(chad_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(chad_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(chad_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -439,6 +451,9 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
+
+  add_executable(chad_dsp_test test/chad_dsp_test.cpp)
+  add_test(NAME chad_dsp COMMAND chad_dsp_test)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
@@ -1012,6 +1027,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xg_xs_test)
     add_test(NAME xg_xs COMMAND xg_xs_test)
+  endif()
+  if(WIN32 AND TARGET chad_test)
+    add_test(NAME chad COMMAND chad_test)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
