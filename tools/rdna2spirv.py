@@ -1157,7 +1157,23 @@ class Gen:
         lane_masks.step(st, self.cur_ins)
         return st.get("vcc") in lane_masks.MASK_KINDS
 
-    def dst(self, a, val, *, eager=False):
+    def gate_after_subgroup(self, active):
+        """The lane's EXEC bit read back through a ballot taken after a subgroup op, for the write of that op's
+        result (v_permlane16/x16, ds_swizzle, ds_bpermute, ds_permute). NVIDIA's 580.65.06 Linux driver on an
+        RTX 5080 (Blackwell) returns the shuffle from select(active, shuffle, old) in lanes where active is false
+        when active was computed before the shuffle and old is itself a select (#3918): three wave32
+        crosslane_fuzz programs kept a v_permlane16/x16 result under EXEC = 0. A gate computed after the shuffle
+        avoids it. The ballot runs right after the shuffle, in the same lanes, so it needs no other convergence."""
+        bal, lane, own = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 {active}")
+        self.emit(f"{lane} = OpLoad %uint %sg_lane")
+        self.emit(f"{own} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {lane}")
+        self.uses_subgroup = self.uses_ballot = True
+        return own
+
+    def dst(self, a, val, *, eager=False, after_subgroup=False):
+        """after_subgroup: val is a subgroup op's result (native subgroups only), so the EXEC gate goes through
+        gate_after_subgroup."""
         if a.get("sdwa_dst") and a["k"] == "vgpr":
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
@@ -1174,8 +1190,14 @@ class Gen:
             p, old, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a['r'])}")
             self.emit(f"{old} = OpLoad %uint {p}")
+            fresh = after_subgroup and not self.emulate
             if eager:
-                mask = self.exec_value()
+                if fresh:
+                    mask = self.tmp()
+                    gate = self.gate_after_subgroup(self.active_b())
+                    self.emit(f"{mask} = OpSelect %uint {gate} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                else:
+                    mask = self.exec_value()
                 if self.dpp_guard is not None:
                     guarded = self.tmp()
                     self.emit(f"{guarded} = OpSelect %uint {self.dpp_guard} {mask} {self.cu(0)}")
@@ -1187,6 +1209,8 @@ class Gen:
                 self.emit(f"{r} = OpBitwiseOr %uint {write} {preserve}")
             else:
                 active = self.active_b()
+                if fresh:
+                    active = self.gate_after_subgroup(active)
                 if self.dpp_guard is not None:
                     guarded = self.tmp()
                     self.emit(f"{guarded} = OpLogicalAnd %bool {active} {self.dpp_guard}")
@@ -4297,7 +4321,7 @@ class Gen:
             self.emit(f"{result} = OpBitwiseAnd %uint {shuffled} {mask}")
             self.uses_subgroup = self.uses_ballot = True
         # Bitwise masks keep MSL from placing the ballot and shuffle in a short-circuiting ternary.
-        self.dst(dst, result, eager=not self.emulate)
+        self.dst(dst, result, eager=not self.emulate, after_subgroup=True)
 
     def ds_permute(self, a, mods):
         """ds_permute_b32 vD, vAddr, vData offset:N, the forward (scatter) permute: every source lane that is on in
@@ -4375,7 +4399,7 @@ class Gen:
             self.emit(f"{hit} = OpIEqual %bool {v} {mine}")
             self.emit(f"{nxt} = OpSelect %uint {hit} {shd} {acc}")
             acc = nxt
-        self.dst(d, acc)
+        self.dst(d, acc, after_subgroup=True)
 
     def sub_lane(self, r):
         """r = the lane the subgroup shuffles above index: the subgroup lane, or the wave lane when emulated."""
@@ -6454,7 +6478,7 @@ class Gen:
             self.emit(f"{src} = OpBitwiseOr %uint {row} {nib}")
             r = self.tmp()
             self.g_shuffle(r, v, src)
-            self.dst(a[0], r)
+            self.dst(a[0], r, after_subgroup=True)
         elif op.startswith("buffer_load_dword"):
             self.buffer_load(op, a, mods)
         elif op in self.BUFFER_SUB:

@@ -116,7 +116,7 @@ class NegativeControl(unittest.TestCase):
         spv = support.translate_fixture("cs_w64x_partial", fssm=bytes(header))
         bad, replaced = re.subn(
             r"(?P<ballot>(?P<present>%\w+) = OpGroupNonUniformBallotBitExtract[^\n]*\n\s*)"
-            r"(?P<index>%\w+) = OpSelect %uint (?P=present) (?P<source>%\w+) %\w+(?=\n)",
+            r"(?P<index>%\w+) = OpSelect %uint (?P=present) (?P<source>%t\w+) %\w+(?=\n)",   # not the EXEC mask's
             r"\g<ballot>\g<index> = OpCopyObject %uint \g<source>",
             spv,
         )
