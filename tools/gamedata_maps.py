@@ -86,6 +86,9 @@ def _bounds(blob: bytes, offset: int) -> dict:
     for value in lo + hi:
         if not math.isfinite(value):
             raise ValueError(f"non-finite bound {value!r} at offset {offset:#x}")
+    for axis, minimum, maximum in zip("xyz", lo, hi):
+        if minimum > maximum:
+            raise ValueError(f"inverted {axis} bounds at offset {offset:#x}: {minimum} > {maximum}")
     return {"min": lo, "max": hi}
 
 

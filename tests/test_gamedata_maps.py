@@ -210,6 +210,23 @@ class GamedataMapsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "non-finite bound"):
                     parser(bytes(head))
 
+    def test_bounds_reject_inverted_axes_and_accept_equal_endpoints(self):
+        for offset, payload in (
+                (0x0C, mhiu_payload(3, 1, [(0, 3, [1, 2, 3])], b"")),
+                (0x10, pamh_payload(3, 1, [1, 2, 3], [0, 0, 0]))):
+            for index, axis in enumerate("xyz"):
+                with self.subTest(magic=payload[:4], axis=axis):
+                    changed = bytearray(payload)
+                    minimum = struct.unpack_from("<f", payload, offset + 4 * index)[0]
+                    maximum_offset = offset + 12 + 4 * index
+                    struct.pack_into("<f", changed, maximum_offset, minimum)
+                    result = gamedata_maps.parse_payload(bytes(changed))
+                    self.assertEqual(result["header"]["bounds"]["max"][index], minimum)
+
+                    struct.pack_into("<f", changed, maximum_offset, minimum - 1)
+                    with self.assertRaisesRegex(ValueError, f"inverted {axis} bounds"):
+                        gamedata_maps.parse_payload(bytes(changed))
+
     def test_pamh_rejects_a_short_row_body(self):
         payload = pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3])
         head = bytearray(payload[:-1])
