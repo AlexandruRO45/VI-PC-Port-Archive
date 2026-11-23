@@ -63,6 +63,13 @@ class SceneWriteErrors(unittest.TestCase):
         self.assertEqual(len(err.strip().splitlines()), 1, err)
         self.assertTrue(err.startswith("ERROR:"), err)
 
+    def test_writable_scene_is_written_and_the_unsupported_path_still_returns_77(self):
+        scene = os.path.join(self.root, "scene.bin")
+        rc, err = self._run(scene)
+        self.assertEqual(rc, 77)   # no placed entity resolves to an exported model
+        self.assertEqual(err, "")
+        self.assertTrue(os.path.isfile(scene))
+
 
 if __name__ == "__main__":
     unittest.main()
