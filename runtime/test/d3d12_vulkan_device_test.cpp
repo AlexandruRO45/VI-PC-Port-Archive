@@ -5086,7 +5086,8 @@ int main() {
         {
             Ref<ID3D12Device11> device11;
             Ref<IUnknown> device12;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device11.p))) && device11.p == device.p);
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device11.p))) &&
+                   rt::d3d12_xs::device_proxy_primary(device11.p) == device.p);
             EXPECT(device->QueryInterface(__uuidof(ID3D12Device12), reinterpret_cast<void**>(&device12.p)) ==
                    E_NOINTERFACE);
         }

@@ -7,6 +7,7 @@
 #endif
 
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_device.h"
 #include "../shims/dxgi_com.h"
 #include "vulkan_loader.h"
 #include "window_station.h"
@@ -781,6 +782,28 @@ int main() {
         masks.front() = 0;
         if (FAILED(sc->ResizeBuffers1(0, before.Width, before.Height, DXGI_FORMAT_UNKNOWN, 0, masks.data(), queues.data())))
             return fail("ResizeBuffers1 should accept node masks zero and one with direct queues");
+
+        namespace xs = rt::d3d12_xs;
+        ID3D12Device* proxy_device = nullptr;
+        dev->AddRef();
+        if (FAILED(xs::create_device_proxy(dev, IID_PPV_ARGS(&proxy_device)))) {
+            dev->Release();
+            return fail("Create Xbox device proxy for ResizeBuffers1");
+        }
+        D3D12_COMMAND_QUEUE_DESC direct_desc{};
+        direct_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* proxy_queue = nullptr;
+        const HRESULT create_hr = proxy_device->CreateCommandQueue(&direct_desc, IID_PPV_ARGS(&proxy_queue));
+        proxy_device->Release();
+        if (FAILED(create_hr) || !proxy_queue) return fail("Create Xbox queue proxy for ResizeBuffers1");
+        queues.back() = proxy_queue;
+        // Old code always dispatched PC GetDesc through console slot 18, even if the garbage Type read as DIRECT.
+        const auto slot18_hits = xs::queue_slot_hits(18);
+        const HRESULT proxy_hr =
+            sc->ResizeBuffers1(0, before.Width, before.Height, DXGI_FORMAT_UNKNOWN, 0, masks.data(), queues.data());
+        proxy_queue->Release();
+        if (FAILED(proxy_hr) || xs::queue_slot_hits(18) != slot18_hits)
+            return fail("ResizeBuffers1 should validate the real direct queue behind the Xbox proxy");
     }
 
     // Invalid counts must leave the initial back buffers usable for the first frame.
