@@ -13,7 +13,16 @@ import zlib
 # `python -I` implies `-P`, so the script's directory is not on sys.path; the sibling modules are next to it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import numpy as np
+class _LazyNumpy:
+    """Import numpy on first use: --help and module import work on a machine without it (the GUI tests skip)."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()["np"] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
 import bcpack
 import bcpack_tables
 import ttpf_mips as ttpf

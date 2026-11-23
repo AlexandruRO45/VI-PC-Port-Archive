@@ -12,7 +12,16 @@ import itertools
 import os
 import sys
 
-import numpy as np
+class _LazyNumpy:
+    """Import numpy on first use: --help and module import work on a machine without it (the GUI tests skip)."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()["np"] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tile_probe import block_feature, score, same_report_path  # noqa: E402
