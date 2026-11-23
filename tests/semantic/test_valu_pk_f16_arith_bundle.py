@@ -125,6 +125,34 @@ def ref_pk_max_f16(w_a: int, w_b: int, *, clamp: bool = False,
     if clamp: r_hi = clamp_f16(r_hi)
     return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
 
+def ref_pk_fma_f16(w_a: int, w_b: int, w_c: int, *, clamp: bool = False,
+                   op_sel: tuple[int, int, int] = (0, 0, 0),
+                   op_sel_hi: tuple[int, int, int] = (1, 1, 1),
+                   neg_lo: tuple[int, int, int] = (0, 0, 0),
+                   neg_hi: tuple[int, int, int] = (0, 0, 0)) -> int:
+    a_halves = unpack_f16x2(w_a)
+    b_halves = unpack_f16x2(w_b)
+    c_halves = unpack_f16x2(w_c)
+
+    s0_lo = bits_to_f16(a_halves[op_sel[0]])
+    s1_lo = bits_to_f16(b_halves[op_sel[1]])
+    s2_lo = bits_to_f16(c_halves[op_sel[2]])
+    if neg_lo[0]: s0_lo = -s0_lo
+    if neg_lo[1]: s1_lo = -s1_lo
+    if neg_lo[2]: s2_lo = -s2_lo
+    r_lo = s0_lo * s1_lo + s2_lo
+    if clamp: r_lo = clamp_f16(r_lo)
+
+    s0_hi = bits_to_f16(a_halves[op_sel_hi[0]])
+    s1_hi = bits_to_f16(b_halves[op_sel_hi[1]])
+    s2_hi = bits_to_f16(c_halves[op_sel_hi[2]])
+    if neg_hi[0]: s0_hi = -s0_hi
+    if neg_hi[1]: s1_hi = -s1_hi
+    if neg_hi[2]: s2_hi = -s2_hi
+    r_hi = s0_hi * s1_hi + s2_hi
+    if clamp: r_hi = clamp_f16(r_hi)
+    return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
+
 class MachineState:
     def __init__(self, num_lanes: int = 64):
         self.num_lanes = num_lanes
@@ -277,6 +305,22 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
 
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             translate_lines("ps_bad_pk_max", ["v_pk_max_f16 v0, v1", "s_endpgm"])
+
+    def test_v_pk_fma_f16_reference_oracle(self):
+        w_a = pack_f16x2(0x4000, 0x4000) # 2.0, 2.0
+        w_b = pack_f16x2(0x4200, 0x4200) # 3.0, 3.0
+        w_c = pack_f16x2(0x3c00, 0x3c00) # 1.0, 1.0
+        # 2.0 * 3.0 + 1.0 = 7.0 (0x4700)
+        res = ref_pk_fma_f16(w_a, w_b, w_c)
+        lo, hi = unpack_f16x2(res)
+        self.assertEqual(lo, 0x4700)
+        self.assertEqual(hi, 0x4700)
+
+        # Clamped: 7.0 clamped to 1.0 (0x3c00)
+        res_c = ref_pk_fma_f16(w_a, w_b, w_c, clamp=True)
+        clo, chi = unpack_f16x2(res_c)
+        self.assertEqual(clo, 0x3c00)
+        self.assertEqual(chi, 0x3c00)
 
 if __name__ == '__main__':
     unittest.main()
