@@ -16,6 +16,7 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
+#include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
@@ -1062,20 +1063,8 @@ struct DeviceState {
     // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
     // dereferences it.
     std::atomic<std::uint64_t> next_image_address{std::uint64_t(1) << 32};
-    // Console VAs for buffers on a device with no GPU address arena (no bufferDeviceAddress): nothing on such a
-    // device can resolve them, but a title must still read a non-zero, 64 KiB-aligned, unique address, and the
-    // context finds the buffer by it. Never reused; 2^47 bytes of them are more than a process can ask for.
-    static constexpr std::uint64_t kSyntheticVaFirst = std::uint64_t(1) << 36;
-    static constexpr std::uint64_t kSyntheticVaLimit = std::uint64_t(1) << 47;
-    std::atomic<std::uint64_t> next_synthetic_va{kSyntheticVaFirst};
-    bool synthetic_va_allocate(std::uint64_t bytes, std::uint64_t& out) {
-        const std::uint64_t step = (bytes + D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT - 1) /
-                                   D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT *
-                                   D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-        if (step > kSyntheticVaLimit - kSyntheticVaFirst) return false;
-        out = next_synthetic_va.fetch_add(step);
-        return out <= kSyntheticVaLimit - step;
-    }
+    // VAs of buffers on a device with no GPU address arena (src/synthetic_va.h).
+    leonida::SyntheticVa synthetic_va;
 
     // 0 float, 1 unsigned integer, 2 signed integer: which of the three storage-image arrays a view belongs in.
     static int numeric_class(VkFormat format) {
@@ -1863,10 +1852,10 @@ public:
             gpu_va_ = buffer_va_;
         }
         if (!addressable) {
-            // No arena: the VA is the raw device address where there is one (heap_base is 0), else a synthetic one.
-            // Left at 0 it would send a title's root descriptors and V#s to address 0, in every heap and state.
-            if (buffer_va_) va_ = buffer_va_;
-            else if (!device_.synthetic_va_allocate(desc_.Width, va_)) return E_OUTOFMEMORY;
+            // No arena: the VA is always a synthetic one, never the raw device address, which can be above the 48 bits
+            // a V# keeps and is aligned only as the driver likes. Left at 0 it would send a title's root descriptors
+            // and V#s to address 0, in every heap and state.
+            if (!device_.synthetic_va.allocate(desc_.Width, va_)) return E_OUTOFMEMORY;
         }
         if (device_.info.ray_tracing && initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
             vk.vkCreateAccelerationStructureKHR && vk.vkGetAccelerationStructureDeviceAddressKHR) {
