@@ -499,5 +499,39 @@ class TestMed3I32RegisterAliasing(unittest.TestCase):
         self.assertEqual(words[0], u32(-15))
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation (Commit 6)
+# ==============================================================================
+
+class TestMed3I32ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_zero_flag_behavior(self):
+        res = ref_med3_i32(-10, 0, 10)
+        self.assertTrue(res == 0)
+
+    def test_sign_flag_behavior(self):
+        res_neg = ref_med3_i32(-50, -20, 100)
+        self.assertTrue(bool(res_neg & SIGN_BIT32))
+
+        res_pos = ref_med3_i32(-50, 20, 100)
+        self.assertFalse(bool(res_pos & SIGN_BIT32))
+
+    def test_downstream_vcc_condition_code_branching(self):
+        lines = [
+            "v_mov_b32_e32 v1, -5",
+            "v_mov_b32_e32 v2, 0",
+            "v_mov_b32_e32 v3, 5",
+            "v_med3_i32 v0, v1, v2, v3",
+            "v_cmp_eq_u32 vcc, 0, v0",
+            "v_cndmask_b32_e64 v4, 0x1111, 0x2222, vcc",
+            "exp mrt0, v4, v4, v4, v4 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_downstream_vcc", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x2222)
+
+
 if __name__ == "__main__":
     unittest.main()
