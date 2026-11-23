@@ -1,0 +1,4 @@
+LIBRARY vccorlib140
+EXPORTS
+    ?GetCmdArguments@Details@Platform@@YAPEAPEA_WPEAH@Z @130
+    cx_stub_other_export @7

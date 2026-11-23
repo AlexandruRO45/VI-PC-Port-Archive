@@ -463,6 +463,19 @@ void* find(const std::string& dll_lower, const std::string& name) {
     return it == table().end() ? nullptr : it->second;
 }
 
+void* find_host_export(const std::string& dll_lower, void* host_module, const void* host_fn) {
+    if (!host_module || !host_fn) return nullptr;
+    const std::string prefix = dll_lower + "!";
+    for (auto it = table().lower_bound(prefix);
+         it != table().end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it) {
+        const char* name = it->first.c_str() + prefix.size();
+        if (*name == '#') continue;  // an ordinal entry already matched by find()
+        const FARPROC named = GetProcAddress(static_cast<HMODULE>(host_module), name);
+        if (named && reinterpret_cast<const void*>(named) == host_fn) return it->second;
+    }
+    return nullptr;
+}
+
 bool owns_dll(const std::string& dll_lower) {
     static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
                                        "vulkan-1.dll", "ntdll.dll", "user32.dll",

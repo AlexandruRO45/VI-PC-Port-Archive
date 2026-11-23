@@ -1470,6 +1470,11 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
     FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
     if (!p) return nullptr;
+    if (by_ordinal)
+        if (void* s = shims::find_host_export(shim_key, h, reinterpret_cast<const void*>(p))) {
+            binding = Binding::Shim;
+            return s;
+        }
     if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
     binding = Binding::Host;
     return reinterpret_cast<void*>(p);
@@ -1503,6 +1508,11 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
     if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
         if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
         FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
+        // An ordinal import of a function the shims serve by name binds the shim, as the name would have.
+        if (void* s = p && by_ordinal ? shims::find_host_export(key, h, reinterpret_cast<const void*>(p)) : nullptr) {
+            m.imports.push_back({dll, sym, Binding::Shim});
+            return s;
+        }
         if (p) {
             if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
             m.imports.push_back({dll, sym, Binding::Host});

@@ -19,6 +19,13 @@ struct Table {
 
 void* find(const std::string& dll_lower, const std::string& name);
 
+// The shim for an export of a host DLL that was reached some other way than by a name the registry lists, in practice
+// by ordinal: an ordinal only names an export in one build of a DLL (GetCmdArguments is ordinal 130 in one
+// vccorlib140.dll and may not be in the next), so the registry is not keyed by ordinals for host DLLs. Instead
+// `host_fn`, what the host's GetProcAddress returned, is compared with the host's address for each name the registry
+// serves for `dll_lower`; nullptr when none matches. `host_module` is the host HMODULE.
+void* find_host_export(const std::string& dll_lower, void* host_module, const void* host_fn);
+
 // Whether the shims own a whole module: the registry serves names from it and it is not a host system DLL (kernel32,
 // kernelbase, the CRTs, api-ms-* sets, vulkan-1) of which only a few functions are replaced. A title's
 // LoadLibrary/GetModuleHandle of an owned module gets a pseudo-handle that GetProcAddress resolves through find()

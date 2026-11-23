@@ -1,7 +1,12 @@
-# GetCmdArguments (vccorlib140.dll) gives the mapped game's arguments, and serving that one name does not make the
-# shims claim the whole DLL: a run-time LoadLibrary of vccorlib140.dll is not answered with a shim pseudo-handle.
+# GetCmdArguments (vccorlib140.dll) gives the mapped game's arguments by name and by ordinal, and serving that one
+# name does not make the shims claim the whole DLL. STUB is the stand-in host vccorlib140.dll (cx_vccorlib_stub),
+# passed to the guest as a Windows path.
+file(TO_NATIVE_PATH "${STUB}" stub)
+if(RUNNER)  # Wine: the guest sees the Linux root as Z:
+  string(REPLACE "/" "\\" stub "Z:${STUB}")
+endif()
 execute_process(
-  COMMAND ${RUNNER} "${LOADER}" --run "${GUEST}" -- hello "two words"
+  COMMAND ${CMAKE_COMMAND} -E env "LEONIDA_TEST_CX_STUB=${stub}" ${RUNNER} "${LOADER}" --run "${GUEST}" -- hello "two words"
   TIMEOUT 90
   RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE error)
 if(NOT code STREQUAL "0" OR NOT output MATCHES "tiny_cx_args: PASS" OR NOT output MATCHES "game exited with code 0")

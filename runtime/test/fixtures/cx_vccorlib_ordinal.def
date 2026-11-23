@@ -1,0 +1,3 @@
+LIBRARY vccorlib140.dll
+EXPORTS
+    ?GetCmdArguments@Details@Platform@@YAPEAPEA_WPEAH@Z @130 NONAME

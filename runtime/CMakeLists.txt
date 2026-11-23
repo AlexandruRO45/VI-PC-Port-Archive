@@ -612,9 +612,34 @@ if(BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       )
     endforeach()
-    # C++/CX startup: vccorlib's GetCmdArguments (runtime/shims/process.cpp).
+    # C++/CX startup: vccorlib's GetCmdArguments (runtime/shims/process.cpp). cx_vccorlib_stub stands in for the host's
+    # vccorlib140.dll, outside the game folder so rt::Loader never maps it; cx_ordinal_user imports GetCmdArguments by
+    # ordinal only, through an import library made from a NONAME .def.
+    add_library(cx_vccorlib_stub SHARED test/fixtures/cx_vccorlib_stub.cpp test/fixtures/cx_vccorlib_stub.def)
+    set_target_properties(cx_vccorlib_stub PROPERTIES
+      OUTPUT_NAME vccorlib140
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/cx/$<CONFIG>"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/cx/$<CONFIG>"
+    )
+    set(cx_ordinal_lib "${CMAKE_CURRENT_BINARY_DIR}/fixtures/cx_ordinal/vccorlib140.lib")
+    add_custom_command(OUTPUT "${cx_ordinal_lib}"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/fixtures/cx_ordinal"
+      COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/cx_vccorlib_ordinal.def"
+              "/out:${cx_ordinal_lib}"
+      DEPENDS test/fixtures/cx_vccorlib_ordinal.def VERBATIM)
+    add_custom_target(cx_ordinal_importlib DEPENDS "${cx_ordinal_lib}")
+    add_library(cx_ordinal_user SHARED test/fixtures/cx_ordinal_user.cpp)
+    add_dependencies(cx_ordinal_user cx_ordinal_importlib)
+    target_link_libraries(cx_ordinal_user PRIVATE "${cx_ordinal_lib}")
+    set_target_properties(cx_ordinal_user PROPERTIES
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+    )
     add_executable(tiny_cx_args test/fixtures/tiny_cx_args.cpp)
     target_link_libraries(tiny_cx_args PRIVATE vccorlib)
+    add_dependencies(tiny_cx_args cx_vccorlib_stub cx_ordinal_user)
     target_compile_definitions(tiny_cx_args PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_cx_args PRIVATE /W4 /permissive- /utf-8)
     set_target_properties(tiny_cx_args PROPERTIES
@@ -1055,7 +1080,7 @@ if(BUILD_TESTING)
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
     add_test(NAME run_cx_args COMMAND ${CMAKE_COMMAND}
-      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_cx_args>"
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_cx_args>" "-DSTUB=$<TARGET_FILE:cx_vccorlib_stub>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_cx_args.cmake")
     add_test(NAME run_tiny_async COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_async>"

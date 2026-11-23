@@ -233,7 +233,16 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         SetLastError(error);
         if (shim) return reinterpret_cast<FARPROC>(shim);
     }
-    return GetProcAddress(module, name);
+    FARPROC host = GetProcAddress(module, name);
+    if (host && module && IS_INTRESOURCE(name)) {
+        // By ordinal: the shim when the ordinal is a function the registry serves by name (find_host_export).
+        const DWORD error = GetLastError();
+        const std::string dll = host_module_name(module);
+        void* shim = dll.empty() ? nullptr : find_host_export(dll, module, reinterpret_cast<const void*>(host));
+        SetLastError(error);
+        if (shim) return reinterpret_cast<FARPROC>(shim);
+    }
+    return host;
 }
 
 BOOL WINAPI free_library(HMODULE module) {
