@@ -484,5 +484,26 @@ class TestSFlbitI32B32Reference(unittest.TestCase):
         self.assertEqual(ref_flbit_i32_b32(0x00010000), 15)
 
 
+def step_scalar_flbit_i32_b32(state: SaluState, instr: Instruction) -> None:
+    if instr.opcode != "s_flbit_i32_b32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    src0 = state.read_u32(instr.src0)
+    res = ref_flbit_i32_b32(src0)
+    state.write_u32(instr.dst.index_or_val, res)
+
+
+class TestSFlbitI32B32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for s_flbit_i32_b32."""
+
+    def test_scalar_interpreter_execution(self):
+        state = SaluState()
+        state.write_u32(0, 0x00008000)  # bit 15 set -> 32 - 16 = 16 leading zeros
+        state.scc = 1
+        instr = Instruction("s_flbit_i32_b32", Operand.sgpr32(1), Operand.sgpr32(0))
+        step_scalar_flbit_i32_b32(state, instr)
+        self.assertEqual(state.sgprs[1], 16)
+        self.assertEqual(state.scc, 1)  # SCC preserved
+
+
 if __name__ == "__main__":
     unittest.main()
