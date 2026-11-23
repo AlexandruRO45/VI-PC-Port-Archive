@@ -19,6 +19,7 @@ import tempfile
 import tarfile
 import unittest
 import zipfile
+import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "check_no_game_data.py")
@@ -133,6 +134,12 @@ CAUGHT_IN_ARCHIVES = [
     ("data.bin", gzip.compress(FSSM), "FSSM shader in gzip stream"),
     ("tool.bin", bz2.compress(pe_header()), "PE executable in bzip2 stream"),
     ("pack.bin", lzma.compress(RPF), "RPF9 archive in xz stream"),
+    # The package's own compression: most of its data is zlib streams (docs/rpf.md).
+    ("chunk.bin", zlib.compress(FSSM), "FSSM shader in zlib stream"),
+    ("chunk_in_gzip.bin", gzip.compress(zlib.compress(RPF)), "RPF9 archive in zlib stream in gzip stream"),
+    ("broken.zlib", b"\x78\x9c" + b"\xff" * 12, "zlib stream that can't be opened (contents can't be checked)"),
+    ("deep_zlib.bin", zlib.compress(zlib.compress(zlib.compress(zlib.compress(DDS)))),
+     "zlib stream nested more than 3 deep (contents can't be checked) in zlib stream in zlib stream in zlib stream"),
     ("far.bin", gzip.compress(pe_header(0x400)), "PE executable in gzip stream"),
     ("nested.bin", gzip.compress(zipped({"inner/x.bin": RPF})), "RPF9 archive in zip archive (inner/x.bin) in gzip stream"),
     ("a.bin", b"7z\xbc\xaf\x27\x1c" + bytes(26), "7-Zip archive (contents can't be checked)"),
