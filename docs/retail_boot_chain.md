@@ -37,6 +37,22 @@ Without a debugger, the unhandled `int3` of a fatal assert ends the process with
 `C0000005` during teardown, not `80000003`. An exit code of `C0000374` from `--run` can be such an assert, not a
 heap bug.
 
+### Native Windows comparison of the TLS fix (#4313)
+
+On Windows 11 build 26200, the retail executable reached the missing `XErrorReport` lookup in three of three runs
+with #4313 (`28ea6b971`) and zero of three on its base (`98fa503f8`) when both builds included the same memory shims.
+Each build used MSVC 19.44, SDK 10.0.26100 and `RelWithDebInfo`. Each `gta6rt --run` started a new process with a
+fresh overlay and startup trace. These runs stopped before GPU initialization.
+
+| Changes applied to both builds | Base | With #4313 |
+|---|---|---|
+| None | 3/3 stopped at a breakpoint after the unimplemented `D3D12ConfigureVirtualMemoryX` call | Same in 3/3 |
+| Graphics configuration shim from #6792 | 3/3 stopped at a breakpoint without an unimplemented-call event | Same in 3/3 |
+| Same graphics shim plus `runtime/shims/xmem.cpp` from `dde82f27e` | 3/3 ended in an access violation before reporting `XErrorReport` | 3/3 recorded five `XMemVirtualAlloc` attribute events, reported the missing `XErrorReport` lookup and stopped at a breakpoint |
+
+The earlier chain includes #6582, which supplies `XErrorReport`. Leaving it out here makes that lookup an observable
+checkpoint for comparing the two TLS implementations.
+
 ## 2. Physical pages (`xmem.dll`)
 
 The shapes, from the call sites and the checks that follow them:
