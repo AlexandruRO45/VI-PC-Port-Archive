@@ -1137,7 +1137,6 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
   endif()
-<<<<<<< HEAD
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
     set_tests_properties(api_ref_state PROPERTIES TIMEOUT 10)
