@@ -755,6 +755,23 @@ class SkinnedGlbTest(unittest.TestCase):
                     handle.write(data)
                 self._assert_one_line_error(self._run_cli(skeleton, component), path)
 
+    def test_cli_non_object_ped_drawable_preserves_output(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        path = os.path.join(skeleton, "model.json")
+        output = os.path.join(self.root, "out.glb")
+        previous = b"previous output"
+        with open(output, "wb") as handle:
+            handle.write(previous)
+        for drawable in (["bad"], [], True, False, "bad", 7):
+            with self.subTest(drawable=drawable):
+                _write_json(path, {"drawable": drawable})
+                result = self._run_cli(skeleton, component)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.splitlines(),
+                                 [f"error: {path}: model.json drawable must be an object"])
+                self.assertEqual(_read(output), previous)
+
     def test_cli_bad_component_json_is_one_error_line(self):
         for name, data in self.BAD_JSON.items():
             with self.subTest(name):

@@ -817,8 +817,10 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
     if not component_paths:
         raise SkinError("at least one --component is required")
     _skeleton_dir, skeleton_json = model_json_path(skeleton_path)
-    ped_model = _load_json(skeleton_json)
-    ped_skeleton = (ped_model.get("drawable") or {}).get("skeleton")
+    ped_drawable = _load_json(skeleton_json).get("drawable")
+    if ped_drawable is not None and not isinstance(ped_drawable, dict):
+        raise SkinError(f"{skeleton_json}: model.json drawable must be an object")
+    ped_skeleton = (ped_drawable or {}).get("skeleton")
     joints = JointSet(ped_skeleton)
 
     builder = _GlbBuilder()
