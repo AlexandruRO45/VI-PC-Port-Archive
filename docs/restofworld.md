@@ -682,6 +682,13 @@ Bit 31 is set on 48,046 of the 60,600 sampled core_restofworld vertices (79.3%).
 0.36 there. Some core_restofworld blocks score lower under the matching decode than levels blocks do; this
 check does not say why.
 
+**Whole game.** `python -I tools/vertex_types.py` over all seven archives with `42 40 00 00` blocks (`data`,
+`packs`, `levels`, `story000`, `core_restofworld`, `shared_minigame000`, `story000_restofworld`) measures
+246,619 blocks and 769,408,772 vertices; tag `0x21` is in slot 2 of 214,086 of them (748,856,750 vertices, the
+same count kacper-serewis reports on #2708, where 722,586,753 words take the 10-bit branch and 26,269,997 the
+8-bit one). Under the decode above the block-weighted median face-normal score is **0.994** (`oct_bit31_10_or_8`),
+against 0.521 for the best fixed decoding (unorm10 xyz) and 0.13 to 0.34 for the rest.
+
 **The rest of the `0x21` word is the tangent frame.** The same mesh shaders go on to build a tangent.
 With bit 31 set, bits 20-29 are an angle, `v * 2pi/1023 - pi` (`v_fma_f32` by 2pi/1023 and -pi, then
 `v_sin_f32`/`v_cos_f32`), that turns a basis made from the normal alone (`s` = sign of z,
