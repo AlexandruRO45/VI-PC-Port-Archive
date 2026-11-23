@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check import EXE, run
+from check import EXE, not_found_message, pick_build_dir, run
 
 SIGN = 0x80000000
 INF = 0x7f800000
@@ -97,8 +97,14 @@ def mismatch(data, x, y, gate):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("work", type=Path)
-    parser.add_argument("build", type=Path)
+    parser.add_argument("build", type=Path, help="CMake build folder or a configuration subfolder")
     args = parser.parse_args()
+    program = "vk_harness" + EXE
+    build = pick_build_dir(str(args.build.absolute()), (program,))
+    harness = Path(build) / program
+    if not harness.is_file():
+        sys.exit(not_found_message(build, [program]))
+
     spirv = args.work / "spirv"
     cases = dict.fromkeys(operand_triples())
     with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +112,7 @@ def main():
         for inputs in cases:
             raw.unlink(missing_ok=True)
             words = ",".join(map(hex, inputs))
-            code, output = run(args.build / ("vk_harness" + EXE), spirv / "vs_ids.spv",
+            code, output = run(harness, spirv / "vs_ids.spv",
                                spirv / "ps_mullit.spv", raw, "4", "4", env=dict(os.environ, VKH_SGPRS=words))
             if code:
                 print(f"{words}: vk_harness exited {code}\n{output}", file=sys.stderr)
