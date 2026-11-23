@@ -790,17 +790,28 @@ void run_checks(const std::filesystem::path& root) {
             (copy_attributes & move_attributes & attribute) != 0) {
             check(!copy_w(copy_from, copy_to.c_str(), TRUE) && GetLastError() == ERROR_FILE_EXISTS,
                   "CopyFileW keeps fail-if-exists precedence on a protected destination");
-            check(!copy_w(copy_from, copy_to.c_str(), FALSE) && GetLastError() == ERROR_ACCESS_DENIED,
-                  "CopyFileW refuses to overwrite a protected package-only destination");
-            check(!copy_ex_w(copy_from, copy_to.c_str(), nullptr, nullptr, nullptr, 0) &&
-                      GetLastError() == ERROR_ACCESS_DENIED,
-                  "CopyFileExW refuses to overwrite a protected package-only destination");
-            for (const bool fallback : {false, true}) {
-                rt::fs::force_copy_file2_fallback(fallback);
-                check(copy2(copy_from, copy_to.c_str(), nullptr) == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED),
-                      "CopyFile2 refuses to overwrite a protected package-only destination");
+            const auto check_copy_error = [&](LPCWSTR from, DWORD error) {
+                check(!copy_w(from, copy_to.c_str(), FALSE) && GetLastError() == error,
+                      "CopyFileW reports the expected error for the protected copy");
+                check(!copy_ex_w(from, copy_to.c_str(), nullptr, nullptr, nullptr, 0) && GetLastError() == error,
+                      "CopyFileExW reports the expected error for the protected copy");
+                for (const bool fallback : {false, true}) {
+                    rt::fs::force_copy_file2_fallback(fallback);
+                    check(copy2(from, copy_to.c_str(), nullptr) == HRESULT_FROM_WIN32(error),
+                          "CopyFile2 reports the expected error for the protected copy");
+                }
+                rt::fs::force_copy_file2_fallback(false);
+            };
+            check_copy_error(copy_from, ERROR_ACCESS_DENIED);
+            check_copy_error(L"GAME:\\misc\\missing-protected-copy-source.txt", ERROR_FILE_NOT_FOUND);
+            const auto package_source = package / "misc" / "keep.txt";
+            const HANDLE held = ::CreateFileW(package_source.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                                              FILE_ATTRIBUTE_NORMAL, nullptr);
+            check(held != INVALID_HANDLE_VALUE, "hold the protected copy's source open exclusively");
+            if (held != INVALID_HANDLE_VALUE) {
+                check_copy_error(copy_from, ERROR_SHARING_VIOLATION);
+                ::CloseHandle(held);
             }
-            rt::fs::force_copy_file2_fallback(false);
             check(!std::filesystem::exists(overlay_copy), "a refused copy leaves no overlay destination");
 
             const bool moved = move_ex_w(move_from.c_str(), move_to.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;

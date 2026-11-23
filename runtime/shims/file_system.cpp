@@ -1148,7 +1148,8 @@ namespace {
 
 // Where a copy writes: a host path as given; a GAME: path is checked against the title's view (an existing name
 // counts even when only the package has it) and then means its overlay copy.
-bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& out, DWORD& error) {
+bool copy_destination(const std::filesystem::path& source, LPCWSTR to, bool fail_if_exists,
+                      std::filesystem::path& out, DWORD& error) {
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(to, parts);
     if (parsed == Parsed::Host) {
@@ -1164,7 +1165,15 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
     error = ERROR_ACCESS_DENIED;
     if (v.kind == Kind::Directory) return false;
     constexpr DWORD protected_attributes = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
-    if (!fail_if_exists && package_destination_has_attributes(r, parts, v, protected_attributes)) return false;
+    if (!fail_if_exists && package_destination_has_attributes(r, parts, v, protected_attributes)) {
+        // The host opens the source before checking the destination's attributes.
+        const HANDLE probe = ::CreateFileW(source.c_str(), GENERIC_READ,
+                                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (probe == INVALID_HANDLE_VALUE) error = GetLastError();
+        else ::CloseHandle(probe);
+        return false;
+    }
     error = ERROR_FILE_EXISTS;
     if (v.kind == Kind::File && fail_if_exists) return false;
     error = ERROR_PATH_NOT_FOUND;
@@ -1193,7 +1202,7 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::
         return false;
     }
     source = t.path;
-    return copy_destination(to, fail_if_exists, destination, error);
+    return copy_destination(source, to, fail_if_exists, destination, error);
 }
 
 }  // namespace
