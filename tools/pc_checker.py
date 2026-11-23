@@ -462,6 +462,19 @@ def _win_vram_map() -> dict:
     return found
 
 
+def windows_powershell() -> str:
+    """Windows PowerShell 5.1 by its full path.
+
+    CreateProcess searches System32, but powershell.exe is in System32\\WindowsPowerShell\\v1.0, so the bare name is
+    found only while that folder is on PATH. Where it isn't, _run turns the FileNotFoundError into no output and
+    detect_gpus leaves out every GPU nvidia-smi doesn't report, without a word. The bare name is still the answer
+    where the file is not at its usual place.
+    """
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    exe = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return exe if os.path.isfile(exe) else "powershell"
+
+
 def detect_gpus() -> list:
     """All GPUs found, as (name, vram_gb or None)."""
     gpus = []
@@ -478,7 +491,7 @@ def detect_gpus() -> list:
                 gpus.append((parts[0], None))
 
     if sys.platform == "win32":
-        out = _run(["powershell", "-NoProfile", "-Command",
+        out = _run([windows_powershell(), "-NoProfile", "-Command",
                     "Get-CimInstance Win32_VideoController | "
                     "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress"])
         try:

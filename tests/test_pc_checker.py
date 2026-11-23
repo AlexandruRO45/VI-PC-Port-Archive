@@ -1,7 +1,10 @@
 """Tests for tools/pc_checker.py. Run with: python -I tests/test_pc_checker.py"""
 import os
 import sys
+import tempfile
+import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -153,6 +156,57 @@ class Api(unittest.TestCase):
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
 
+
+
+class WindowsPowerShell(unittest.TestCase):
+    """detect_gpus on Windows starts PowerShell by its full path. CreateProcess doesn't search
+    System32\\WindowsPowerShell\\v1.0, and _run turns a program it can't start into no output, so with that folder
+    off PATH every GPU nvidia-smi doesn't report was left out."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        self.exe = os.path.join(self.root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        for name in ("SystemRoot", "windir"):
+            saved = os.environ.pop(name, None)
+            if saved is not None:
+                self.addCleanup(os.environ.__setitem__, name, saved)
+            self.addCleanup(os.environ.pop, name, None)
+
+    def install(self):
+        os.makedirs(os.path.dirname(self.exe))
+        open(self.exe, "wb").close()
+
+    def test_full_path_under_system_root(self):
+        self.install()
+        os.environ["SystemRoot"] = self.root
+        self.assertEqual(pc.windows_powershell(), self.exe)
+
+    def test_windir_when_system_root_is_unset(self):
+        self.install()
+        os.environ["windir"] = self.root
+        self.assertEqual(pc.windows_powershell(), self.exe)
+
+    def test_bare_name_when_the_file_is_not_at_its_usual_place(self):
+        os.environ["SystemRoot"] = self.root
+        self.assertEqual(pc.windows_powershell(), "powershell")
+
+    def test_detect_gpus_queries_the_video_controllers_through_the_full_path(self):
+        self.install()
+        os.environ["SystemRoot"] = self.root
+        calls = []
+
+        def run(cmd, timeout=10):
+            calls.append(cmd)
+            return '{"Name": "AMD Radeon RX 6700 XT", "AdapterRAM": 4293918720}'
+
+        with mock.patch.object(pc, "sys", types.SimpleNamespace(platform="win32")), \
+                mock.patch.object(pc, "_run", run), mock.patch.object(pc.shutil, "which", return_value=None), \
+                mock.patch.object(pc, "_win_vram_map", return_value={"amd radeon rx 6700 xt": 12.0}):
+            gpus = pc.detect_gpus()
+        self.assertEqual([cmd[0] for cmd in calls], [self.exe])
+        self.assertEqual(gpus, [("AMD Radeon RX 6700 XT", 12)])
 
 if __name__ == "__main__":
     unittest.main()
