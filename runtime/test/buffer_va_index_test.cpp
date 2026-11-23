@@ -103,8 +103,31 @@ void fixed_cases() {
     check(bound.longest() == 0x100 && at(bound, 0x20080) == 2, "a range of the same size keeps the bound");
     bound.insert(0x20000, 0x40, 2);  // re-registered with a smaller size: the old size goes
     check(bound.longest() == 0x40 && at(bound, 0x20040) == 0, "re-registering replaces the size");
-    bound.erase(0x20000, 2);
-    check(bound.longest() == 0 && bound.size() == 0, "an empty index has no bound");
+    bound.insert(0x20000, 0, 2);  // re-registered with 0: the old entry and its bound are dropped
+    check(bound.longest() == 0 && bound.size() == 0 && at(bound, 0x20000) == 0,
+          "re-registering with zero size erases the old entry");
+
+    // A span that wraps past UINT64_MAX is rejected (and drops any prior registration for (va, id)), while a span
+    // reaching the exact top byte UINT64_MAX is accepted.
+    bound.insert(0x50000, 0x100, 5);
+    bound.insert(0x50000, ~std::uint64_t(0), 5);
+    check(bound.size() == 0 && bound.longest() == 0 && at(bound, 0x50000) == 0,
+          "a wrapping span is rejected and drops any prior entry");
+    bound.insert(~std::uint64_t(0) - 0xff, 0x100, 6);
+    check(bound.size() == 1 && at(bound, ~std::uint64_t(0)) == 6,
+          "a span ending at UINT64_MAX without wrapping is indexed");
+    bound.erase(~std::uint64_t(0) - 0xff, 6);
+
+    // Signed integer Id types: max_id() must be std::numeric_limits<Id>::max() (not ~Id(0) == -1), or upper_bound
+    // at va == start misses every positive id starting at va.
+    BufferVaIndex<int> signed_index;
+    signed_index.insert(0x1000, 0x100, 1);
+    signed_index.insert(0x1000, 0x200, 7);
+    BufferVaIndex<int>::Hit signed_hit{};
+    check(signed_index.find(0x1000, signed_hit) && signed_hit.id == 7,
+          "signed Id finds the largest positive ID at an exact start VA");
+    check(signed_index.find(0x1180, signed_hit) && signed_hit.id == 7,
+          "signed Id finds the longer range past the shorter one");
 }
 
 // The rule BufferVaIndex follows, by a scan: among the ranges that hold all of [va, va + bytes), the greatest

@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <set>
 #include <utility>
@@ -26,9 +27,14 @@ namespace leonida {
 template<typename Id>
 class BufferVaIndex {
 public:
-    // Registers [va, va + size). A null VA or an empty range is not indexed (no lookup can land in it).
+    // Registers [va, va + size). A null VA, an empty range, or a span that wraps the 64-bit address space is not
+    // indexed (no lookup can land in it); re-registering an existing (va, id) with such a size drops its old entry.
     void insert(std::uint64_t va, std::uint64_t size, Id id) {
-        if (!va || !size) return;
+        if (!va) return;
+        if (!size || size - 1 > ~std::uint64_t(0) - va) {
+            erase(va, id);
+            return;
+        }
         const auto [it, added] = ranges_.try_emplace({va, id}, size);
         if (!added) {  // the same (va, id) again: its new size replaces the old one
             drop_size(it->second);
@@ -82,7 +88,7 @@ public:
     std::uint64_t longest() const { return longest_; }
 
 private:
-    static constexpr Id max_id() { return ~Id(0); }
+    static constexpr Id max_id() { return std::numeric_limits<Id>::max(); }
 
     void drop_size(std::uint64_t size) { sizes_.erase(sizes_.find(size)); }  // one copy, not every range of that size
 
