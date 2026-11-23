@@ -44,10 +44,28 @@ class SmallestMaxSubgroupTest(unittest.TestCase):
         self.assertEqual(make_game.smallest_max_subgroup('{"minSubgroupSize": 32, "maxSubgroupSize": 64}'), 64)
 
     def test_json_with_cpu_and_hardware_devices(self):
-        text = json.dumps([{"deviceType": 4, "deviceName": "Software", "maxSubgroupSize": 8},
-                           {"deviceType": 2, "deviceName": "Hardware", "maxSubgroupSize": 64}], indent=2)
+        text = json.dumps([{"deviceName": "Software", "deviceType": 4, "maxSubgroupSize": 8},
+                           {"deviceName": "Hardware", "deviceType": 2, "maxSubgroupSize": 64}], indent=2)
         self.assertEqual(make_game.smallest_max_subgroup(text), 8)
         self.assertEqual(make_game.smallest_max_subgroup(text, prefer_hardware=True), 64)
+
+    def test_vulkan_profiles_use_device_type_and_limits_from_the_same_capability(self):
+        def profile(name, kind, max_size):
+            properties = {"VkPhysicalDeviceProperties": {"deviceName": name, "deviceType": kind}}
+            if max_size is not None:
+                properties["VkPhysicalDeviceVulkan13Properties"] = {"maxSubgroupSize": max_size}
+            return {"capabilities": {"device": {"properties": properties}}, "profiles": {}}
+
+        cpu = profile("Software", "VK_PHYSICAL_DEVICE_TYPE_CPU", 8)
+        gpu = profile("Hardware", "VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU", 64)
+        unknown = profile("Other GPU", "VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU", None)
+        for devices in ([cpu, gpu], [gpu, cpu]):
+            with self.subTest(first=devices[0]):
+                text = json.dumps(devices, indent=2)
+                self.assertEqual(make_game.smallest_max_subgroup(text), 8)
+                self.assertEqual(make_game.smallest_max_subgroup(text, prefer_hardware=True), 64)
+        self.assertEqual(make_game.smallest_max_subgroup(json.dumps(cpu), prefer_hardware=True), 8)
+        self.assertIsNone(make_game.smallest_max_subgroup(json.dumps([gpu, unknown]), prefer_hardware=True))
 
     def test_no_subgroup_size_gives_none(self):
         self.assertIsNone(make_game.smallest_max_subgroup(""))
@@ -206,6 +224,10 @@ class DetectionGapsTest(unittest.TestCase):
         self.assertTrue(self.decide(real_format(cpu, types=("CPU",)), probe))
         unknown = "\nVkPhysicalDeviceProperties:\n\tdeviceName = Unknown GPU\n"
         self.assertTrue(self.decide(real_format(gpu, cpu, types=("DISCRETE_GPU", "CPU")) + unknown, probe))
+
+    def test_compact_json_keeps_emulation_for_a_listed_gpu_without_a_limit(self):
+        text = json.dumps([{"deviceName": "Hardware", "maxSubgroupSize": 64}, {"deviceName": "Other GPU"}])
+        self.assertTrue(self.decide(text, '{"native64": true}'))
 
     def test_mesh_compute_uses_compute_wave64_capability(self):
         text = real_format(("Compute-only GPU", 64, ["SHADER_STAGE_COMPUTE_BIT"]))

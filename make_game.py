@@ -1560,34 +1560,68 @@ def keep_recorded_fallback(flag: str, work: str) -> bool:
     return True
 
 
-# vulkaninfo prints deviceType immediately before deviceName. Include it in its own device section.
-VULKANINFO_DEVICE = re.compile(r'(?m)^([ \t]*)(?:"?deviceType"?[ \t]*[=:][ \t]*"?(\w+)"?,?[ \t]*\r?\n\1)?'
-                               r'"?deviceName"?[ \t]*[=:]')
+# In the plain-text report, deviceType precedes deviceName. Include it in its own device section.
+VULKANINFO_DEVICE = re.compile(r"(?m)^([ \t]*)(?:deviceType[ \t]*=[ \t]*(\w+)[ \t]*\r?\n\1)?"
+                               r"deviceName[ \t]*=")
 
 
-def smallest_max_subgroup(vulkaninfo_text: str, *, prefer_hardware: bool = False):
-    """The smallest reported maxSubgroupSize, or None. Prefer non-CPU devices when requested and present."""
-    size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
+def _json_subgroup_devices(document):
+    """Yield device types and limits from Profiles capabilities or flat device records."""
+    pending = [document]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, list):
+            pending.extend(node)
+        elif isinstance(node, dict):
+            props = node.get("VkPhysicalDeviceProperties", node)
+            if not isinstance(props, dict) or ("deviceName" not in props and "maxSubgroupSize" not in node):
+                pending.extend(node.values())
+                continue
+            values = [node.get("maxSubgroupSize")]
+            for key in ("VkPhysicalDeviceVulkan13Properties", "VkPhysicalDeviceSubgroupSizeControlProperties",
+                        "VkPhysicalDeviceSubgroupSizeControlPropertiesEXT"):
+                group = node.get(key)
+                if isinstance(group, dict):
+                    values.append(group.get("maxSubgroupSize"))
+            yield props.get("deviceType"), min((n for n in values if type(n) is int and n >= 0), default=None)
+
+
+def _text_subgroup_devices(vulkaninfo_text: str):
+    size = r"maxSubgroupSize[ \t]*=[ \t]*(\d+)"
     # A device's own name is the least indented one. Names nested inside layered API properties belong to it.
     names = list(VULKANINFO_DEVICE.finditer(vulkaninfo_text))
     depth = min((len(m.group(1)) for m in names), default=0)
     devices = [m for m in names if len(m.group(1)) == depth]
     if not devices:
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
-        return min(sizes) if sizes else None
-    sections = [(m.group(2), vulkaninfo_text[m.start():end])
-                for m, end in zip(devices, [m.start() for m in devices[1:]] + [len(vulkaninfo_text)])]
+        if sizes:
+            yield None, min(sizes)
+        return
+    for m, end in zip(devices, [m.start() for m in devices[1:]] + [len(vulkaninfo_text)]):
+        sizes = (int(n) for n in re.findall(size, vulkaninfo_text[m.start():end]))
+        yield m.group(2), min(sizes, default=None)
+
+
+def _vulkaninfo_subgroup_limit(text: str, prefer_hardware: bool) -> tuple[int | None, bool]:
+    """Return the minimum retained limit and whether the report identified any devices."""
+    if text.lstrip().startswith(("{", "[")):
+        try:
+            devices = list(_json_subgroup_devices(json.loads(text)))
+        except (ValueError, RecursionError):
+            devices = []
+    else:
+        devices = list(_text_subgroup_devices(text))
     if prefer_hardware:
-        cpu_types = ("PHYSICAL_DEVICE_TYPE_CPU", "VK_PHYSICAL_DEVICE_TYPE_CPU", "4")
-        sections = [(kind, section) for kind, section in sections if kind not in cpu_types] or sections
-    # A device can print its size twice. A retained device that prints none makes the minimum unknown.
-    per_device = []
-    for _, section in sections:
-        sizes = [int(n) for n in re.findall(size, section)]
-        if not sizes:
-            return None
-        per_device.append(min(sizes))
-    return min(per_device)
+        cpu_types = ("PHYSICAL_DEVICE_TYPE_CPU", "VK_PHYSICAL_DEVICE_TYPE_CPU", 4, "4")
+        devices = [(kind, size) for kind, size in devices if kind not in cpu_types] or devices
+    if any(size is None for _, size in devices):
+        return None, True
+    return min((size for _, size in devices), default=None), bool(devices)
+
+
+def smallest_max_subgroup(vulkaninfo_text: str, *, prefer_hardware: bool = False):
+    """The smallest reported maxSubgroupSize, or None. Prefer non-CPU devices when requested and present."""
+    return _vulkaninfo_subgroup_limit(vulkaninfo_text, prefer_hardware)[0]
 
 
 def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
@@ -1621,8 +1655,8 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     if exe:
         try:
             r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
-            size = smallest_max_subgroup(r.stdout, prefer_hardware=native64 is True)
-            if size is None and VULKANINFO_DEVICE.search(r.stdout):
+            size, has_devices = _vulkaninfo_subgroup_limit(r.stdout, prefer_hardware=native64 is True)
+            if size is None and has_devices:
                 log("shaders: vulkaninfo did not report a subgroup size for every relevant device: "
                     "wave64 emulation on")
                 return True, True
