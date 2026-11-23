@@ -237,6 +237,8 @@ class InstructionAST:
             return ref_pk_fmac_f16(acc, src_vals[0], src_vals[1])
         elif self.op == "v_pk_mul_f16":
             return ref_pk_mul_f16(src_vals[0], src_vals[1], clamp=self.clamp, op_sel=self.op_sel or (0, 0), op_sel_hi=self.op_sel_hi or (1, 1), neg_lo=self.neg_lo or (0, 0), neg_hi=self.neg_hi or (0, 0))
+        elif self.op == "v_pk_add_f16":
+            return ref_pk_add_f16(src_vals[0], src_vals[1], clamp=self.clamp, op_sel=self.op_sel or (0, 0), op_sel_hi=self.op_sel_hi or (1, 1), neg_lo=self.neg_lo or (0, 0), neg_hi=self.neg_hi or (0, 0))
         raise NotImplementedError(f"Unsupported op: {self.op}")
 
     def execute_simd(self, state: MachineState) -> None:
@@ -543,6 +545,13 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
         clo, chi = unpack_f16x2(res_c)
         self.assertEqual(clo, 0x3c00)
         self.assertEqual(chi, 0x3c00)
+
+    def test_v_pk_add_f16_ast_and_scalar_interpreter(self):
+        ast = InstructionAST("v_pk_add_f16", dst=0, srcs=[1, 2])
+        w_a = pack_f16x2(0x3c00, 0x4000)
+        w_b = pack_f16x2(0x4000, 0x4200)
+        val = ast.eval_scalar(w_a, w_b)
+        self.assertEqual(val, pack_f16x2(0x4200, 0x4500))
 
 if __name__ == '__main__':
     unittest.main()
