@@ -72,8 +72,13 @@ struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
 constexpr HRESULT kClassNotProvided = static_cast<HRESULT>(0x80070032);  // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
 
 std::atomic<int> g_api_refs{0};
+std::mutex g_config_mutex;
+std::string g_inline_config;
 
 HRESULT api_initialize(const char* which, ULONG gdk_ver, ULONG gs_ver, int mode, const ApiImplOptions* options) {
+    std::lock_guard<std::mutex> lock(g_config_mutex);
+    g_inline_config = options && options->is_inline && options->game_config && *options->game_config
+                          ? options->game_config : "";
     if (g_api_refs.fetch_add(1) == 0)
         std::fprintf(stderr, "[rt] xgameruntime: %s(gdk=%lu, gs=%lu, mode=%#x, options=%s) (offline)\n", which,
                      gdk_ver, gs_ver, mode & 0xFF,
@@ -94,8 +99,10 @@ HRESULT WINAPI InitializeApiImplEx2(ULONG gdk_ver, ULONG gs_ver, char mode, cons
 }
 
 HRESULT WINAPI UninitializeApiImpl() {
+    std::lock_guard<std::mutex> lock(g_config_mutex);
     int prev = g_api_refs.load();
     while (prev > 0 && !g_api_refs.compare_exchange_weak(prev, prev - 1)) {}
+    if (prev == 1) g_inline_config.clear();
     return S_OK;
 }
 
@@ -1009,10 +1016,15 @@ std::string package_config() {
     wchar_t env[MAX_PATH] = {};
     const DWORD n = GetEnvironmentVariableW(L"LEONIDA_GAME_DIR", env, MAX_PATH);
     const std::filesystem::path dir = (n > 0 && n < MAX_PATH) ? std::filesystem::path(env) : rt::fs::game_dir();
-    if (dir.empty()) return {};
-    std::ifstream f(dir / L"MicrosoftGame.Config", std::ios::binary);
-    if (!f) return {};
-    return std::string{std::istreambuf_iterator<char>(f), {}};
+    if (!dir.empty()) {
+        std::ifstream f(dir / L"MicrosoftGame.Config", std::ios::binary);
+        if (f) {
+            std::string xml{std::istreambuf_iterator<char>(f), {}};
+            if (!xml.empty()) return xml;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_config_mutex);
+    return g_inline_config;
 }
 
 std::vector<std::string> package_locales() {

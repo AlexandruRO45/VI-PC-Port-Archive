@@ -893,6 +893,49 @@ void check_run_time_load() {
                            reinterpret_cast<AnalyticsInfoFn>(rt::shims::find("xgameruntime.dll", "XSystemGetAnalyticsInfo")));
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
+    {
+        const GUID game_cls = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+        char tmp[MAX_PATH] = {};
+        GetTempPathA(sizeof(tmp), tmp);
+        const std::string dir = std::string(tmp) + "leonida_inline_config_test";
+        CreateDirectoryA(dir.c_str(), nullptr);
+        const std::string config = dir + "\\MicrosoftGame.Config";
+        DeleteFileA(config.c_str());
+        SetEnvironmentVariableA("LEONIDA_GAME_DIR", dir.c_str());
+        Options inline_options{1, TRUE, "<Game><TitleId>CAFEBABE</TitleId><Resources><Resource Language=\"fr-FR\"/></Resources></Game>"};
+        check(init_ex2(0x2410, 0, 2, &inline_options) == S_OK, "initialize with inline config");
+        void* game = get(game_cls);
+        void* package = get(package_cls);
+        using TitleId = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
+        using Locale = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
+        uint32_t id = 0;
+        char locale[32] = {};
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
+              "inline config supplies title id");
+        check(package && reinterpret_cast<Locale>(slot(package, 11))(package, sizeof(locale), locale) == S_OK &&
+                  std::strcmp(locale, "fr-FR") == 0, "inline config supplies locale");
+        if (FILE* f = std::fopen(config.c_str(), "wb")) {
+            std::fputs("<Game><TitleId>12345678</TitleId></Game>", f);
+            std::fclose(f);
+        }
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0x12345678u,
+              "disk config takes precedence over inline config");
+        if (FILE* f = std::fopen(config.c_str(), "wb")) std::fclose(f);
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
+              "empty disk config falls back to inline config");
+        DeleteFileA(config.c_str());
+        check(uninit_api() == S_OK && init_ex2(0x2410, 0, 2, nullptr) == S_OK,
+              "uninitialize and reinitialize without options");
+        id = 0;
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == E_FAIL,
+              "inline config is cleared after uninitialize");
+        if (game) release(game);
+        if (package) release(package);
+        check(uninit_api() == S_OK, "uninitialize after inline config test");
+        SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+        RemoveDirectoryA(dir.c_str());
+    }
+
     HMODULE k32 = load_w(L"kernel32.dll");
     check(k32 == GetModuleHandleW(L"kernel32.dll"), "a host module still loads from the host");
     check(reinterpret_cast<void*>(get_proc(k32, "GetTickCount")) ==
