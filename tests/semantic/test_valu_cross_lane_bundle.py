@@ -96,6 +96,19 @@ class TestReadFirstLaneOracle(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestReadFirstLaneAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        lanes = [i * 7 for i in range(64)]
+        exec_mask = 0xFF00
+        val = model_readfirstlane(lanes, exec_mask)
+        self.assertEqual(val, 8 * 7)
+
+    def test_translator_readfirstlane_ast(self):
+        prog = ["v_mov_b32_e32 v2, 999", "v_readfirstlane_b32 s4, v2", "s_endpgm"]
+        spv = support.translate_lines("cs_rfl_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
