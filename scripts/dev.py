@@ -66,13 +66,15 @@ def run_producer(relative_path: str, args: list[str]) -> int:
         print(f"error: {relative_path} is missing; use a complete Leonida checkout", file=sys.stderr)
         return 2
     try:
-        return subprocess.run(
+        code = subprocess.run(
             [sys.executable, "-I", str(producer), *args],
             cwd=Path.cwd(),
         ).returncode
     except OSError as exc:
         print(f"error: could not run {relative_path}: {exc}", file=sys.stderr)
         return 2
+    # A POSIX signal is reported as -N by subprocess, but shells report 128 + N.
+    return 128 - code if os.name == "posix" and code < 0 else code
 
 
 def guest_scene(args: list[str]) -> int:
