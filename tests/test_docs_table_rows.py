@@ -45,6 +45,31 @@ class DocsTableRowsTest(unittest.TestCase):
                     block = []
             check(block)
 
+    def test_a_long_table_cell_is_unique(self):
+        # A row whose first cell is a sentence has no key to tell it apart; two of them in one table is a merge
+        # leftover (docs/d3d12_vulkan.md carried three copies of the BVH-builder row, with 42 and 51 passes).
+        examined = 0
+        for path in DOCS:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            block = []
+            for i, line in enumerate(lines + [""], 1):
+                if line.startswith("|"):
+                    cell = line.strip().strip("|").split("|")[0].strip()
+                    if set(cell.replace(" ", "")) <= set("-:"):
+                        continue
+                    block.append((i, cell))
+                    examined += len(cell) > 60
+                    continue
+                if len(block) > 1:
+                    seen = {}
+                    for lineno, cell in block[1:]:
+                        if len(cell) > 60 and cell in seen:
+                            self.fail(f"{path.relative_to(ROOT)}:{seen[cell]} and {lineno}: "
+                                      "two rows with the same long first cell")
+                        seen[cell] = lineno
+                block = []
+        self.assertGreater(examined, 50, "the check read almost no long table cells")
+
 
 if __name__ == "__main__":
     unittest.main()
