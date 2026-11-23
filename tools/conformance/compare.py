@@ -295,15 +295,31 @@ def read_png(path):
             f"'{path}': no IDAT chunk, so there are no pixels. The file is incomplete; "
             f"re-render it"
         )
+    channels = channels_for_colour_type(colour_type, path)
+    expected_length = (width * channels + 1) * height
     try:
-        decompressed_data = zlib.decompress(compressed_data)
+        # One extra byte proves an oversized stream without allocating all its
+        # pixels. Clamp the argument for dimensions beyond Py_ssize_t's range.
+        inflater = zlib.decompressobj()
+        decompressed_data = inflater.decompress(
+            compressed_data, min(expected_length + 1, sys.maxsize))
     except zlib.error as error:
         raise ToolError(
             f"'{path}': IDAT does not decompress as zlib: {error}. "
             f"Check that the file is complete and not a partial write"
         )
 
-    channels = channels_for_colour_type(colour_type, path)
+    if len(decompressed_data) > expected_length:
+        raise ToolError(
+            f"'{path}': decompressed pixel data exceeds the expected {expected_length} bytes "
+            f"for {width}x{height} with {channels} channels (rows include one filter-type byte). "
+            f"Check the render size and bit depth"
+        )
+    if not inflater.eof:
+        raise ToolError(
+            f"'{path}': IDAT has an incomplete or truncated zlib stream. "
+            f"Check that the file is complete and not a partial write"
+        )
     pixels = unfilter_image(decompressed_data, width, height, channels, path)
     return Raster(width, height, colour_type, pixels, path)
 
