@@ -367,7 +367,8 @@ def start_server(
             os.path.join(root, "..", "extracted_models"),
         ]
         best_cand = None
-        max_count = 0
+        # -1, so a folder that exists but is empty (one the user made for a later export) still wins over none.
+        max_count = -1
         for cand in candidates:
             if os.path.isdir(cand):
                 c = sum(1 for _, _, files in os.walk(cand) for f in files if f.lower().endswith(('.glb', '.gltf')))
@@ -385,7 +386,8 @@ def start_server(
             os.path.join(root, "..", "real_vehicle_pngs"),
         ]
         best_cand = None
-        max_count = 0
+        # The count is top-level only while the listing walks subfolders, so -1 keeps such a folder served.
+        max_count = -1
         for cand in candidates:
             if os.path.isdir(cand):
                 c = sum(1 for f in os.listdir(cand) if f.lower().endswith(('.png', '.dds', '.jpg', '.webp')))
