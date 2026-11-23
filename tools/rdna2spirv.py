@@ -10292,48 +10292,43 @@ class Gen:
             else:
                 raise Unsupported(op + " source")
             ctl = self.src_u(a[2])
-            off, wid, room, fits, w, l64, h64, t, v64 = (self.tmp() for _ in range(9))
-            self.emit(f"{off} = OpBitwiseAnd %uint {ctl} {self.cu(63)}")
-            self.emit(f"{wid} = OpBitFieldUExtract %uint {ctl} {self.cu(16)} {self.cu(7)}")
+            off = self.emit_and(ctl, 63)
+            shift = self.emit_and(off, 31)
+            upper, first, second = (self.tmp() for _ in range(3))
+            self.emit(f"{upper} = OpUGreaterThanEqual %bool {off} {self.cu(32)}")
+            self.emit(f"{first} = OpSelect %uint {upper} {hi} {lo}")
+            self.emit(f"{second} = OpSelect %uint {upper} {self.cu(0)} {hi}")
+
+            # Align the field to bit zero. Insert the bottom 'shift' bits of the next
+            # word above the shifted first word. At shift zero the insert has count zero.
+            lower, remaining, aligned_lo, aligned_hi = (self.tmp() for _ in range(4))
+            self.emit(f"{lower} = OpShiftRightLogical %uint {first} {shift}")
+            self.emit(f"{remaining} = OpISub %uint {self.cu(32)} {shift}")
+            insert_at = self.emit_and(remaining, 31)
+            self.emit(f"{aligned_lo} = OpBitFieldInsert %uint {lower} {second} {insert_at} {shift}")
+            self.emit(f"{aligned_hi} = OpShiftRightLogical %uint {second} {shift}")
+
+            width, room, count, low_count, high_count = (self.tmp() for _ in range(5))
+            self.emit(f"{width} = OpBitFieldUExtract %uint {ctl} {self.cu(16)} {self.cu(7)}")
             self.emit(f"{room} = OpISub %uint {self.cu(64)} {off}")
-            self.emit(f"{fits} = OpULessThan %bool {wid} {room}")
-            self.emit(f"{w} = OpSelect %uint {fits} {wid} {room}")              # 0..64, and off + w <= 64
-            self.emit(f"{l64} = OpUConvert %ulong {lo}")
-            self.emit(f"{h64} = OpUConvert %ulong {hi}")
-            self.emit(f"{t} = OpShiftLeftLogical %ulong {h64} %c64_32")
-            self.emit(f"{v64} = OpBitwiseOr %ulong {t} {l64}")
-            # Shift the field to the top, then back down: both amounts stay in 0..63 whenever w >= 1; w = 0 is
-            # handled by the final select, so its (clamped) shifts never decide the result.
-            wz = self.tmp()
-            self.emit(f"{wz} = OpIEqual %bool {w} {self.cu(0)}")
-            w1, up, down, up64, down64, sh, field = (self.tmp() for _ in range(7))
-            self.emit(f"{w1} = OpSelect %uint {wz} {self.cu(1)} {w}")
-            ow = self.tmp()
-            self.emit(f"{ow} = OpIAdd %uint {off} {w1}")
-            self.emit(f"{up} = OpISub %uint {self.cu(64)} {ow}")
-            self.emit(f"{down} = OpISub %uint {self.cu(64)} {w1}")
-            self.emit(f"{up64} = OpUConvert %ulong {up}")
-            self.emit(f"{down64} = OpUConvert %ulong {down}")
-            self.emit(f"{sh} = OpShiftLeftLogical %ulong {v64} {up64}")
-            if op == "s_bfe_u64":
-                self.emit(f"{field} = OpShiftRightLogical %ulong {sh} {down64}")
-            else:
-                si_, ri = self.tmp(), self.tmp()
-                self.emit(f"{si_} = OpBitcast %long {sh}")
-                self.emit(f"{ri} = OpShiftRightArithmetic %long {si_} {down64}")
-                self.emit(f"{field} = OpBitcast %ulong {ri}")
-            flo, fh, fhi, rlo, rhi = (self.tmp() for _ in range(5))
-            self.emit(f"{flo} = OpUConvert %uint {field}")
-            self.emit(f"{fh} = OpShiftRightLogical %ulong {field} %c64_32")
-            self.emit(f"{fhi} = OpUConvert %uint {fh}")
-            self.emit(f"{rlo} = OpSelect %uint {wz} {self.cu(0)} {flo}")
-            self.emit(f"{rhi} = OpSelect %uint {wz} {self.cu(0)} {fhi}")
+            self.emit(f"{count} = OpExtInst %uint %glsl UMin {width} {room}")
+            self.emit(f"{low_count} = OpExtInst %uint %glsl UMin {count} {self.cu(32)}")
+            self.emit(f"{high_count} = OpISub %uint {count} {low_count}")
+            extract = "OpBitFieldUExtract" if op == "s_bfe_u64" else "OpBitFieldSExtract"
+            rlo, rhi = self.tmp(), self.tmp()
+            self.emit(f"{rlo} = {extract} %uint {aligned_lo} {self.cu(0)} {low_count}")
+            self.emit(f"{rhi} = {extract} %uint {aligned_hi} {self.cu(0)} {high_count}")
+            if op == "s_bfe_i64":
+                # For fields contained in the low dword, propagate its sign to the high dword.
+                sign, result_hi = self.tmp(), self.tmp()
+                self.emit(f"{sign} = OpBitFieldSExtract %uint {rlo} {self.cu(31)} {self.cu(1)}")
+                self.emit(f"{result_hi} = OpSelect %uint {self.tmp_bool_nz(high_count)} {rhi} {sign}")
+                rhi = result_hi
             self.store_reg("sgpr", d["r"], rlo)
             self.store_reg("sgpr", d["r"] + 1, rhi)
             orr = self.tmp()
             self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
             self.scc_nonzero(orr)
-            self.uses_psb = True        # Int64 capability and %ulong / %long come with the PSB declarations
         elif op in ("s_bfe_u32", "s_bfe_i32"):
             # src1 packs offset in bits [4:0] and width in bits [22:16].
             ctl_val = self.imm_val(a[2])

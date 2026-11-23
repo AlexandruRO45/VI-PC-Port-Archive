@@ -762,15 +762,10 @@ class PipelineAndEmissionTests(unittest.TestCase):
         g.insn(ins)
         emitted = "\n".join(g.body)
 
-        self.assertIn("OpBitwiseAnd %uint", emitted)
         self.assertIn("OpBitFieldUExtract %uint", emitted)
-        self.assertIn("OpISub %uint", emitted)
-        self.assertIn("OpULessThan %bool", emitted)
-        self.assertIn("OpSelect %uint", emitted)
-        self.assertIn("OpShiftRightLogical %ulong", emitted)
-        self.assertIn("OpBitwiseOr %uint", emitted)
         self.assertIn("OpStore %scc", emitted)
-        self.assertTrue(g.uses_psb)
+        self.assertNotIn("%ulong", emitted)
+        self.assertFalse(g.uses_psb)
 
     def test_rdna2spirv_emission_i64(self) -> None:
         g = rdna2spirv.Gen("ps")
@@ -786,10 +781,18 @@ class PipelineAndEmissionTests(unittest.TestCase):
         g.insn(ins)
         emitted = "\n".join(g.body)
 
-        self.assertIn("OpBitcast %long", emitted)
-        self.assertIn("OpShiftRightArithmetic %long", emitted)
-        self.assertIn("OpBitcast %ulong", emitted)
+        self.assertIn("OpBitFieldSExtract", emitted)
         self.assertIn("OpStore %scc", emitted)
+        self.assertNotIn("%long", emitted)
+        self.assertFalse(g.uses_psb)
+
+    def test_register_only_module_needs_no_int64_or_buffer_addresses(self):
+        for op in OPS:
+            with self.subTest(op=op):
+                run_op(op, 0x80000001_FEDCBA98, ctl(17, 35))
+                module = rdna2spirv.translate(_SRC_PATH)
+                self.assertNotIn("OpCapability Int64", module)
+                self.assertNotIn("OpCapability PhysicalStorageBufferAddresses", module)
 
     def test_rdna2spirv_rejects_invalid_operands(self) -> None:
         # Non-sgpr destination
