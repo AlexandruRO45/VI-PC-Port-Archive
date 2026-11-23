@@ -270,3 +270,32 @@ class TestSaluAndn2SaveexecB64ScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.sgpr[0], 0xFFFF0000)
         self.assertEqual(state.sgpr[1], 0x0000FFFF)
         self.assertEqual(state.scc, 1)
+
+
+class TestSaluAndn2SaveexecB64SimdDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 64-bit EXEC masking."""
+
+    def test_lane_suppression_and_reactivation(self):
+        lanes = lambda lo, hi: sum(1 << l for l in range(lo, hi))
+        # Initial active lanes: 0..31 (lower half)
+        # Initial inactive lanes: 32..63 (upper half)
+        old_exec = lanes(0, 32)
+        # Source requests all lanes 0..63
+        s0 = ALL_LANES_ACTIVE
+
+        new_exec, sdst, scc = ref_andn2_saveexec_b64(s0, old_exec)
+        # All previously active lanes (0..31) are turned off (~old_exec = 0 in lower half)
+        # All previously inactive lanes (32..63) are turned on (~old_exec = 1 in upper half)
+        self.assertEqual(new_exec, lanes(32, 64))
+        self.assertEqual(sdst, old_exec)
+        self.assertEqual(scc, 1)
+
+    def test_divergent_mask_checkerboard(self):
+        even_lanes = 0x5555555555555555
+        odd_lanes = 0xAAAAAAAAAAAAAAAA
+        # old_exec = even lanes active; s0 = ALL_LANES_ACTIVE
+        # new_exec should be odd lanes active
+        new_exec, sdst, scc = ref_andn2_saveexec_b64(ALL_LANES_ACTIVE, even_lanes)
+        self.assertEqual(new_exec, odd_lanes)
+        self.assertEqual(sdst, even_lanes)
+        self.assertEqual(scc, 1)
