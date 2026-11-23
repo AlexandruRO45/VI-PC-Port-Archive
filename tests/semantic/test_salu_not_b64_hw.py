@@ -249,5 +249,42 @@ class TestSNotB64WaveInvariance(unittest.TestCase):
             self.assertEqual(wave.read_sgpr64(0), 0xFEDCBA9876543210)
 
 
+class TestSNotB64RegisterAliasing(unittest.TestCase):
+    """Register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+
+    def test_dst_aliases_src(self):
+        val = 0x8899AABBCCDDEEFF
+        self.rf.write_sgpr64(0, val)
+        inst = SNotB64Instruction(
+            dst=Operand(RegType.SGPR, 0, size=2),
+            src=Operand(RegType.SGPR, 0, size=2),
+        )
+        res = ScalarSALUInterpreter.execute(self.rf, inst)
+        expected = ref_not_b64(val)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.read_sgpr64(0), expected)
+
+    def test_hw_translator_aliasing(self):
+        val = 0x123456789ABCDEF0
+        vlo = val & MASK32
+        vhi = (val >> 32) & MASK32
+        lines = [
+            f"s_mov_b32 s0, {vlo:#x}",
+            f"s_mov_b32 s1, {vhi:#x}",
+            "s_not_b64 s[0:1], s[0:1]",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_snot64_alias", lines)
+        words = support.mrt0_words(spv)
+        hw_res = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(hw_res, ref_not_b64(val))
+
+
 if __name__ == "__main__":
     unittest.main()
