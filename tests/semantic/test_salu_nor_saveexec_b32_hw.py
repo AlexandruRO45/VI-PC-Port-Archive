@@ -131,5 +131,104 @@ class TestSNorSaveExecOracle(unittest.TestCase):
         self.assertIn("OpFunction", spv)
         self.assertIn("OpReturn", spv)
 
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegisterKind(Enum):
+    SGPR = auto()
+    VGPR = auto()
+    EXEC_LO = auto()
+    VCC_LO = auto()
+    SCC = auto()
+    LITERAL32 = auto()
+
+
+@dataclass(frozen=True)
+class RegOperand:
+    kind: RegisterKind
+    index: int = 0
+    size_bits: int = 32
+
+    def format(self) -> str:
+        if self.kind == RegisterKind.SGPR:
+            return f"s{self.index}"
+        elif self.kind == RegisterKind.VGPR:
+            return f"v{self.index}"
+        elif self.kind == RegisterKind.EXEC_LO:
+            return "exec_lo"
+        elif self.kind == RegisterKind.VCC_LO:
+            return "vcc_lo"
+        elif self.kind == RegisterKind.SCC:
+            return "scc"
+        elif self.kind == RegisterKind.LITERAL32:
+            return f"{self.index:#x}"
+        return f"reg_{self.index}"
+
+
+@dataclass
+class SNorSaveExecB32Instruction:
+    dst: RegOperand
+    src0: RegOperand
+    opcode: str = "s_nor_saveexec_b32"
+
+    def validate(self) -> None:
+        if self.opcode != "s_nor_saveexec_b32":
+            raise ValueError(f"Invalid opcode {self.opcode}")
+        if self.dst.kind != RegisterKind.SGPR:
+            raise TypeError(f"Destination must be SGPR, got {self.dst.kind}")
+        if self.dst.size_bits != 32:
+            raise ValueError(f"Destination SGPR must be 32-bit, got {self.dst.size_bits}")
+        if self.dst.index > 105:
+            raise ValueError(f"Destination SGPR index out of range: s{self.dst.index}")
+        if self.src0.kind == RegisterKind.SGPR:
+            if self.src0.size_bits != 32 or self.src0.index > 105:
+                raise ValueError(f"Source SGPR must be a valid 32-bit SGPR: s{self.src0.index}")
+
+    def emit_assembly(self) -> str:
+        self.validate()
+        return f"{self.opcode} {self.dst.format()}, {self.src0.format()}"
+
+
+class TestSNorSaveExecAST(unittest.TestCase):
+    """Unit tests for symbolic AST representation and validation."""
+
+    def test_ast_valid_sgpr_source(self):
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=32),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=32)
+        )
+        self.assertEqual(instr.emit_assembly(), "s_nor_saveexec_b32 s6, s4")
+
+    def test_ast_valid_vcc_lo_source(self):
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=10, size_bits=32),
+            src0=RegOperand(RegisterKind.VCC_LO, size_bits=32)
+        )
+        self.assertEqual(instr.emit_assembly(), "s_nor_saveexec_b32 s10, vcc_lo")
+
+    def test_ast_valid_exec_lo_source(self):
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=8, size_bits=32),
+            src0=RegOperand(RegisterKind.EXEC_LO, size_bits=32)
+        )
+        self.assertEqual(instr.emit_assembly(), "s_nor_saveexec_b32 s8, exec_lo")
+
+    def test_ast_invalid_destination_size(self):
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=32)
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_ast_invalid_destination_kind(self):
+        instr = SNorSaveExecB32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=0, size_bits=32),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=32)
+        )
+        with self.assertRaises(TypeError):
+            instr.validate()
+
 if __name__ == "__main__":
     unittest.main()
