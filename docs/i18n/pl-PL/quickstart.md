@@ -35,6 +35,10 @@ Projekt jest na wczesnym etapie: **gra jeszcze się nie uruchamia**.
   - Aby zbudować natywny `llvm-mc.exe` z AMDGPU, uruchom `.\scripts\build_llvm_mc.ps1` w PowerShellu w głównym
     folderze repozytorium (WSL nie jest potrzebny). Skrypt wymaga `git` i narzędzi C++ z Visual Studio, ustawia
     zmienną `LLVM_MC` dla Twojego użytkownika i prosi o otwarcie nowego terminala, żeby zmienna była widoczna.
+  - Szybsza droga, jeśli używasz [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools` (jej
+    wersja dla Windowsa zawiera target AMDGPU; [`docs/testing.md`](../../testing.md) korzystała z wersji 23.1.6),
+    a następnie wskaż `LLVM_MC` na pełną ścieżkę instalowanego `llvm-mc.exe` (`where.exe llvm-mc` pokaże ją przy
+    aktywnym środowisku; w PowerShellu samo `where` to `Where-Object`).
   - Jeśli używasz WSL, zainstaluj `llvm-21` w Ubuntu i ustaw zmienną w tej samej sesji PowerShella, w której
     uruchamiasz `make_game.py`:
 
