@@ -256,7 +256,12 @@ def negative_controls(session: Session, out: Path) -> dict:
 
 
 def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
-    out.mkdir(parents=True, exist_ok=True)  # parse_args has checked that it is new or empty
+    try:
+        out.mkdir(parents=True, exist_ok=True)  # parse_args has checked that it is new or empty
+    except OSError as exc:
+        label = "temporary output directory" if temporary else "--out directory"
+        print(f"error: cannot create {label} {out}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
     session = Session(args, out)
     report: dict = {"status": "fail", "frames": FRAMES, "headless": True, "wine": args.wine, "temporary": temporary,
                     "audio_mode": "winmm" if args.play_audio else "offline", "report": str(out / "report.json")}
