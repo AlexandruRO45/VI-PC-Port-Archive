@@ -7643,6 +7643,37 @@ bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D1
     return matches(dst) && matches(src);
 }
 
+bool color_decompress_supported(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource,
+                                ID3D12Resource* src, UINT src_subresource, const leonida::ResolveRegion& region) {
+    const Resource* source = Resource::from<Resource>(src);
+    if (!source || !dst) return false;
+    const auto& state = source->device_state();
+    // DXGI backbuffers have their own COM object and are registered with this context. They can be a
+    // destination, but not a source here, because a native swapchain can lack transfer-source usage.
+    const Resource* target = Resource::from<Resource>(dst);
+    if (target ? &target->device_state() != &state : !state.context->has_resource(resource_id(dst))) return false;
+
+    const Format requested = vulkan_format(format, false);
+    const auto block = leonida::block_format(requested.format, requested.aspects);
+    if (requested.typeless || requested.rgb96 || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
+        !block.bytes || block.block != 1)
+        return false;
+    const auto& from = source->desc();
+    const auto to = target ? target->desc() : dst->GetDesc();
+    if (from.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || to.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        from.Format != format || to.Format != format || !(from.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+        from.SampleDesc.Count != to.SampleDesc.Count || src_subresource >= UINT(from.MipLevels) * from.DepthOrArraySize ||
+        dst_subresource >= UINT(to.MipLevels) * to.DepthOrArraySize)
+        return false;
+
+    const auto extent = [](const D3D12_RESOURCE_DESC& desc, UINT subresource) -> VkExtent2D {
+        const UINT mip = subresource % desc.MipLevels;
+        return {UINT(std::max<UINT64>(1, desc.Width >> mip)), std::max(1u, desc.Height >> mip)};
+    };
+    return leonida::detail::resolve_region_fits(region, extent(from, src_subresource), extent(to, dst_subresource)) &&
+           (source != target || leonida::detail::decompress_in_place_matches(region, src_subresource, dst_subresource));
+}
+
 bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
                                      ID3D12Resource* src, UINT src_subresource, const D3D12_RECT* rect,
                                      D3D12_RESOLVE_MODE mode) {

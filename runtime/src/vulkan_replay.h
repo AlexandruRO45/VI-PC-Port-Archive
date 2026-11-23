@@ -211,7 +211,8 @@ inline VkPipelineStageFlags2 vulkan_sync(std::uint32_t sync) {
         {y::render_target, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
         {y::compute_shading, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
         {y::copy, VK_PIPELINE_STAGE_2_COPY_BIT},
-        {y::resolve, VK_PIPELINE_STAGE_2_RESOLVE_BIT},
+        // Resolves that preserve the source samples use an image copy.
+        {y::resolve, VK_PIPELINE_STAGE_2_RESOLVE_BIT | VK_PIPELINE_STAGE_2_COPY_BIT},
         {y::execute_indirect, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT},
         {y::all_shading, pre_raster | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
         {y::non_pixel_shading, pre_raster | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
@@ -1796,33 +1797,57 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     return ReplayResult::success;
 }
 
-// Resolve a multisampled colour image into a single-sampled image of the same format, or (a region) one plane of a
-// depth/stencil image into the same plane of another: MIN or MAX, or AVERAGE of depth.
+inline bool resolve_region_fits(const ResolveRegion& region, VkExtent2D from, VkExtent2D to) {
+    if (const auto& rect = region.src_rect) {
+        if (rect->left < 0 || rect->top < 0 || rect->right <= rect->left || rect->bottom <= rect->top ||
+            std::uint32_t(rect->right) > from.width || std::uint32_t(rect->bottom) > from.height)
+            return false;
+        from = {std::uint32_t(rect->right - rect->left), std::uint32_t(rect->bottom - rect->top)};
+    }
+    return within(region.dst_x, from.width, to.width) && within(region.dst_y, from.height, to.height);
+}
+
+// An in-place DECOMPRESS names the same rectangle of the same subresource.
+inline bool decompress_in_place_matches(const ResolveRegion& region, std::uint32_t src, std::uint32_t dst) {
+    const auto& rect = region.src_rect;
+    return src == dst && region.dst_x == (rect ? std::uint32_t(rect->left) : 0) &&
+           region.dst_y == (rect ? std::uint32_t(rect->top) : 0);
+}
+
+// Resolve multisampled colour or depth/stencil, or decompress a colour region without changing the sample count.
 inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared& p) {
     VkImageSubresourceRange dst{}, src{};
     if (!copy_subresource(p.binding, resolve.dst_subresource, dst) ||
         !copy_subresource(p.source, resolve.src_subresource, src))
         return ReplayResult::invalid_subresource;
-    if (p.source.samples <= 1 || p.binding.samples != 1 || p.binding.volume) return ReplayResult::invalid_copy;
+    const bool decompress = resolve.decompresses();
+    const bool samples_match = decompress ? p.source.samples == p.binding.samples
+                                          : p.source.samples > 1 && p.binding.samples == 1;
+    if (!samples_match || p.binding.volume || (decompress && p.source.volume)) return ReplayResult::invalid_copy;
     const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
     VkOffset3D src_offset{}, dst_offset{};
     VkExtent3D extent{from.width, from.height, 1};
     if (const auto& region = resolve.region) {
+        if (!resolve_region_fits(*region, from, to)) return ReplayResult::invalid_copy;
         dst_offset = {std::int32_t(region->dst_x), std::int32_t(region->dst_y), 0};
         if (const auto& r = region->src_rect) {
-            if (std::uint32_t(r->right) > from.width || std::uint32_t(r->bottom) > from.height)
-                return ReplayResult::invalid_copy;
             src_offset = {r->left, r->top, 0};
             extent = {std::uint32_t(r->right - r->left), std::uint32_t(r->bottom - r->top), 1};
         }
-        if (!within(region->dst_x, extent.width, to.width) || !within(region->dst_y, extent.height, to.height))
-            return ReplayResult::invalid_copy;
     } else if (from.width != to.width || from.height != to.height) {
         return ReplayResult::invalid_copy;
     }
     if (src.aspectMask != dst.aspectMask || p.source.format != p.binding.format) return ReplayResult::unsupported;
     const auto& region = resolve.region;
-    if (src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
+    if (decompress) {
+        const BlockFormat format = block_format(p.source.format, src.aspectMask);
+        if (src.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || p.source.rgb96 || p.binding.rgb96 ||
+            !format.bytes || format.block != 1)
+            return ReplayResult::unsupported;
+        if (p.source.image == p.binding.image &&
+            !decompress_in_place_matches(*region, resolve.src_subresource, resolve.dst_subresource))
+            return ReplayResult::invalid_copy;
+    } else if (src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
         if (region && region->mode != d3d12_resolve_mode::average) return ReplayResult::unsupported;
     } else {
         // A rendering scope resolves each pixel in place, so the destination offset must be the source's.
@@ -2646,13 +2671,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
             }
         } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
-            if (!vk.resolve_image) return ReplayResult::unsupported;
+            if (!resolve_command->decompresses() && !vk.resolve_image) return ReplayResult::unsupported;
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
             if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
+            if (resolve_command->decompresses() && p.source.image != p.binding.image && !vk.copy_image)
+                return ReplayResult::unsupported;
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
                 if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) return ReplayResult::unsupported;
                 p.view = vk.image_view(p.source, p.source_range);
@@ -3479,7 +3506,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
                 }
             }
-        } else if (std::holds_alternative<ResolveSubresource>(command)) {
+        } else if (const auto* resolve = std::get_if<ResolveSubresource>(&command)) {
             // resolve_source and resolve_dest are the transfer layouts, as copy_source and copy_dest are.
             const auto [dst_id, src_id] = copy_ids(command);
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
@@ -3556,10 +3583,20 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VkImageLayout src_layout = detail::copy_layout(
                 vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+            // In-place decompression keeps the source in its resolve layout. Vulkan preserves the samples
+            // across the preceding transfer synchronization without needing a self-copy.
+            if (resolve->decompresses() && p.source.image == p.binding.image) continue;
             const VkImageLayout dst_layout = detail::copy_layout(
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
-            vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
+            if (resolve->decompresses()) {
+                // A copy preserves each sample of the source region without a Vulkan multisample resolve.
+                const VkImageCopy region{p.resolve.srcSubresource, p.resolve.srcOffset, p.resolve.dstSubresource,
+                                         p.resolve.dstOffset, p.resolve.extent};
+                vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &region);
+            } else {
+                vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
+            }
         } else if (const auto* marker = std::get_if<DebugMarker>(&command)) {
             if (!vk.insert_label || !vk.begin_label || !vk.end_label) continue;
             VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};

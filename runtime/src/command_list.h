@@ -349,6 +349,7 @@ struct CopyResource {
 
 // D3D12_RESOLVE_MODE values a region resolve replays.
 namespace d3d12_resolve_mode {
+inline constexpr std::uint32_t decompress = 0;
 inline constexpr std::uint32_t minimum = 1;
 inline constexpr std::uint32_t maximum = 2;
 inline constexpr std::uint32_t average = 3;
@@ -358,7 +359,7 @@ struct ResolveRegion {
     std::uint32_t dst_x;
     std::uint32_t dst_y;
     std::optional<Rect> src_rect;
-    std::uint32_t mode = d3d12_resolve_mode::average;  // colour: average only; stencil: minimum or maximum
+    std::uint32_t mode = d3d12_resolve_mode::average;
 };
 
 // Without a region, both subresources have the same extent. A region with no source rectangle takes the
@@ -369,6 +370,8 @@ struct ResolveSubresource {
     ResourceId src;
     std::uint32_t src_subresource;
     std::optional<ResolveRegion> region = std::nullopt;
+
+    bool decompresses() const { return region && region->mode == d3d12_resolve_mode::decompress; }
 };
 
 // Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
@@ -711,12 +714,11 @@ public:
         return append(copy);
     }
 
-    // A resource has one sample count, so it cannot be resolved into itself.
     bool resolve_subresource(const ResolveSubresource& resolve) {
-        if (!resolve.dst || !resolve.src || resolve.dst == resolve.src) return false;
+        if (!resolve.dst || !resolve.src || (resolve.dst == resolve.src && !resolve.decompresses())) return false;
         if (const auto& region = resolve.region) {
             if (region->dst_x > INT32_MAX || region->dst_y > INT32_MAX) return false;
-            if (region->mode < d3d12_resolve_mode::minimum || region->mode > d3d12_resolve_mode::average) return false;
+            if (region->mode > d3d12_resolve_mode::average) return false;
             if (const auto& r = region->src_rect;
                 r && (r->left < 0 || r->top < 0 || r->right <= r->left || r->bottom <= r->top))
                 return false;

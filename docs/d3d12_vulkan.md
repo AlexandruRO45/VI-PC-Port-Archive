@@ -2057,7 +2057,19 @@ The trace will enumerate them.
   `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer`/`vkCmdCopyImage`, using the `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
   row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;
   depth and stencil resolves → a `vkCmdBeginRendering` scope with a resolve attachment (section 3.2).
-  Partial resolve regions to another offset need a shader or a region copy.
+  Partial depth/stencil resolve regions to another offset need a shader or a region copy.
+  - Colour `ResolveSubresourceRegion(DECOMPRESS)` accepts uncompressed typed 2D colour formats, with a
+    render-target source and matching formats and sample counts. Between distinct resources it copies the
+    rectangle and all its samples at the requested offset using `vkCmdCopyImage`. The images remain in the
+    layouts associated with RESOLVE_SOURCE and RESOLVE_DEST. In-place decompression uses RESOLVE_SOURCE and
+    retains the same texels and samples with a transfer dependency, since the Vulkan view already exposes logical
+    contents. It requires the same mip, array slice and coordinates. Native D3D12 on an RTX 3090 and WARP accepted
+    `Close` for a displaced in-place call, which the layer refuses per the documented alignment rule. The native
+    probe does not submit that case. `d3d12_color_decompress_test` compares whole and shifted copies and in-place
+    resolves with 1 and 4 samples, including untouched destination pixels. The 4x test reads the results through
+    a standard average resolve of texels whose samples were initialized equally by clears.
+    A DXGI backbuffer registered on the source device is also a valid 1x destination. A native WARP probe matched
+    the copied texels and destination sentinels, and `dxgi_swapchain_test` checks the layer's backbuffer readback.
   - A placed footprint must have an `Offset` that is a multiple of 512 and a `RowPitch` that is a multiple of 256
     (`D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`, `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`). Any other is refused when it is
     recorded, so `Close` returns `E_INVALIDARG` (`CommandList::valid(const CopyLocation&)` in

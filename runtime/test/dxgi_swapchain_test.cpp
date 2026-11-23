@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -621,7 +622,7 @@ int main() {
 
     UINT64 fence_val = 0;
     auto run_clear_readback_present = [&](UINT exp_w, UINT exp_h, const float rgba[4], std::uint8_t exp_r,
-                                          std::uint8_t exp_g, std::uint8_t exp_b) -> int {
+                                          std::uint8_t exp_g, std::uint8_t exp_b, bool decompress = false) -> int {
         DXGI_SWAP_CHAIN_DESC1 cur_desc{};
         if (FAILED(sc->GetDesc1(&cur_desc)) || cur_desc.Width != exp_w || cur_desc.Height != exp_h) {
             std::fprintf(stderr, "FAIL: GetDesc1 (%ux%u) != expected (%ux%u)\n", cur_desc.Width, cur_desc.Height,
@@ -648,7 +649,27 @@ int main() {
             return fail("BackBuffer GetHeapProperties invalid");
         }
 
-        dev->CreateRenderTargetView(bb, nullptr, h_rtv);
+        const auto release = [](IUnknown* object) { object->Release(); };
+        std::unique_ptr<ID3D12Resource, decltype(release)> source(nullptr, release);
+        std::unique_ptr<ID3D12GraphicsCommandList1, decltype(release)> list1(nullptr, release);
+        if (decompress) {
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            ID3D12Resource* input = nullptr;
+            if (FAILED(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bb_desc,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                     IID_PPV_ARGS(&input)))) {
+                bb->Release();
+                return fail("CreateCommittedResource(DECOMPRESS source)");
+            }
+            source.reset(input);
+            ID3D12GraphicsCommandList1* resolve_list = nullptr;
+            if (FAILED(cl->QueryInterface(IID_PPV_ARGS(&resolve_list)))) {
+                bb->Release();
+                return fail("query DECOMPRESS command-list interface");
+            }
+            list1.reset(resolve_list);
+        }
+        dev->CreateRenderTargetView(source ? source.get() : bb, nullptr, h_rtv);
 
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
         UINT64 total_bytes = 0;
@@ -672,10 +693,23 @@ int main() {
 
         alloc->Reset();
         cl->Reset(alloc, nullptr);
-        auto b_rt = make_transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        cl->ResourceBarrier(1, &b_rt);
+        if (!source) {
+            auto b_rt = make_transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            cl->ResourceBarrier(1, &b_rt);
+        }
         cl->ClearRenderTargetView(h_rtv, rgba, 0, nullptr);
-        auto b_src = make_transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        auto output_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (source) {
+            D3D12_RESOURCE_BARRIER prepare[] = {
+                make_transition(source.get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+                make_transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RESOLVE_DEST),
+            };
+            cl->ResourceBarrier(UINT(std::size(prepare)), prepare);
+            list1->ResolveSubresourceRegion(bb, 0, 0, 0, source.get(), 0, nullptr, bb_desc.Format,
+                                            D3D12_RESOLVE_MODE_DECOMPRESS);
+            output_state = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        }
+        auto b_src = make_transition(bb, output_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cl->ResourceBarrier(1, &b_src);
         D3D12_TEXTURE_COPY_LOCATION src_loc{bb, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
         D3D12_TEXTURE_COPY_LOCATION dst_loc{};
@@ -685,7 +719,11 @@ int main() {
         cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
         auto b_pres = make_transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
         cl->ResourceBarrier(1, &b_pres);
-        cl->Close();
+        if (FAILED(cl->Close())) {
+            rb->Release();
+            bb->Release();
+            return fail(decompress ? "Close after DECOMPRESS into backbuffer" : "Close after backbuffer clear");
+        }
 
         ID3D12CommandList* lists[1] = {cl};
         queue->ExecuteCommandLists(1, lists);
@@ -819,6 +857,9 @@ int main() {
     // Frame 1: 128x128 clear to (64, 128, 255, 255), read back all 16,384 pixels, Present.
     const float blue_ish[4] = {64.0f / 255.0f, 128.0f / 255.0f, 1.0f, 1.0f};
     if (run_clear_readback_present(128, 128, blue_ish, 64, 128, 255) != 0) return 1;
+
+    const float decompressed[4] = {64.0f / 255.0f, 1.0f, 0.0f, 1.0f};
+    if (run_clear_readback_present(128, 128, decompressed, 64, 255, 0, true) != 0) return 1;
 
     // Frame 2: ResizeBuffers to explicit 37x19 on the unchanged 128x128 HWND, clear to green, read back all 703 pixels, Present.
     if (FAILED(sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers");
