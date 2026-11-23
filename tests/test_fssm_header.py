@@ -258,13 +258,20 @@ class CliTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "-1"],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
-        self.assertIn("must be 0 or more", p.stderr)
+        self.assertIn("must be at least 1", p.stderr)
         self.assertEqual(p.stdout, "")
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "nope"],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
         self.assertIn("invalid int value: 'nope'", p.stderr)
-        self.assertNotIn("non_negative", p.stderr)
+        self.assertNotIn("positive_count", p.stderr)
+
+    def test_limit_zero_is_refused(self):
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "0"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("must be at least 1", p.stderr)
+        self.assertEqual(p.stdout, "")
 
     def test_ignores_fssm_subdirectories_and_reports_read_errors_cleanly(self):
         os.makedirs(os.path.join(self.fssm_dir, "nested.fssm"))
