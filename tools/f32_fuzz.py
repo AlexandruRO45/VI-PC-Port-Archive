@@ -844,7 +844,8 @@ def omod_active(mode, op=None):
 def strip_omod(case):
     return Case(case.op, case.vals, case.srcs, case.e64, [m for m in case.out_mods if m not in OMOD], case.group,
                 case.index)
-HW_STORE = {"gfx11": "global_store_b64", "gfx10": "global_store_dwordx2"}
+# GFX12 takes GFX11's global store spellings (asm.family), so the store tail needs an entry for it.
+HW_STORE = {"gfx11": "global_store_b64", "gfx10": "global_store_dwordx2", "gfx12": "global_store_b64"}
 HW_ZERO_REG = 20          # v20 = 0, the store's address register (v0..v8 are the program's)
 
 
@@ -867,9 +868,13 @@ class Case:
         return self.op, self.vals, self.srcs, self.e64, self.out_mods
 
 
-def hw_lines(case, arch="gfx1150", guard=True):
+def hw_lines(case, arch="gfx1150", guard=True, wave=32):
     """The native kernel body: seeds, the instruction, VCC as 0/1 in v9, store v8 and v9. `guard` puts s_nop 7
-    after the instruction (the transcendental unit and SGPR/VCC writes have wait-state rules the model lacks)."""
+    after the instruction (the transcendental unit and SGPR/VCC writes have wait-state rules the model lacks).
+    `wave` spells the VCC read as the assembler takes it: v_cndmask_b32_e64's condition operand is wave-sized,
+    and AMD clang (LLVM 23) rejects vcc_lo in a wave64 kernel and vcc in a wave32 one (measured on gfx1201,
+    gfx1150 and gfx1030; v_cndmask_b32_e32 takes either). The launcher starts one thread, so the condition is
+    bit 0 of VCC either way and the kernels only ever set vcc_lo."""
     from hw_oracle import asm
     op, vals, srcs, e64, out_mods = case.args()
     out = [f"v_mov_b32 v{r}, 0x{vals[r]:x}" for r in SEED_REGS]
@@ -878,15 +883,19 @@ def hw_lines(case, arch="gfx1150", guard=True):
     out.append(line(op, vals, srcs, e64, sorted(out_mods, key=lambda m: m != "clamp")))
     if guard:
         out.append("s_nop 7")
-    out += ["v_cndmask_b32_e64 v9, 0, 1, vcc_lo", f"v_mov_b32 v{HW_ZERO_REG}, 0",
+    cond = "vcc" if wave == 64 else "vcc_lo"     # v_cndmask_b32_e64's condition operand is wave-sized
+    out += [f"v_cndmask_b32_e64 v9, 0, 1, {cond}", f"v_mov_b32 v{HW_ZERO_REG}, 0",
             f"{HW_STORE[asm.family(arch)]} v{HW_ZERO_REG}, v[8:9], s[2:3]", "s_endpgm"]
     return out
 
 
-def hw_run(oracle, cases, mode=HW_PRIMARY, guard=True):
-    """[v8, vcc] per case, or the assembler's complaint as a str."""
+def hw_run(oracle, cases, mode=HW_PRIMARY, guard=True, wave=32):
+    """[v8, vcc] per case, or the assembler's complaint as a str. On gfx1170+ the kernel descriptor has no
+    .amdhsa_ieee_mode/.amdhsa_dx10_clamp (the behaviour is fixed there and asm.mode_skip_reason would flag every
+    kernel), so the kernels assemble with the assembler's default descriptor instead."""
     from hw_oracle import asm
-    kernels = [asm.Kernel(hw_lines(c, oracle.arch, guard), 32, 1, 2, raw=True, mode=HW_MODES[mode]) for c in cases]
+    m = None if asm.is_gfx1170_or_later(oracle.arch) else HW_MODES[mode]
+    kernels = [asm.Kernel(hw_lines(c, oracle.arch, guard, wave), wave, 1, 2, raw=True, mode=m) for c in cases]
     return oracle.run(kernels, words=2)
 
 
@@ -1706,8 +1715,17 @@ def main(argv=None):
             counts, _, _ = translate_cases(cases, a.seed, show=a.show)
             rc |= bool(counts["mismatch"])
         if oracle:
-            words = hw_probe_modes(oracle)
-            print("MODE read back in the kernels: " + ", ".join(f"{n} 0x{w:x}" for n, w in words.items()))
+            from hw_oracle import asm
+            if asm.is_gfx1170_or_later(oracle.arch):
+                # The probe sets the ieee/dx10_clamp bits to prove the descriptor took; gfx1170+ has no such bits
+                # (the behaviour is fixed there), so the kernels run with the assembler's default descriptor --
+                # MODE 0x3c0, the word HW_MODES["ieee"] describes (asm.py's documented defaults).
+                words = {HW_PRIMARY: mode_word(HW_MODES["ieee"])}
+                print("MODE probe skipped: gfx1170+ fixes the float-mode bits (the kernels take the default "
+                      "descriptor)")
+            else:
+                words = hw_probe_modes(oracle)
+                print("MODE read back in the kernels: " + ", ".join(f"{n} 0x{w:x}" for n, w in words.items()))
             if a.probes:
                 cases += gen_probes(a.probes, a.seed, ops)
             model_ctx = perturbed(a.perturb) if a.perturb else None
