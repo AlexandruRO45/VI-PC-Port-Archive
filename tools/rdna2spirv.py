@@ -9208,20 +9208,25 @@ class Gen:
             self.emit(f"{sel} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             self.emit(f"{r} = OpFAdd %float {sel} {z}")
             self.dst(a[0], self.tou(self.flush_f32_mods(r, mods)))
-        elif op in ("v_min3_i32", "v_min3_u32", "v_max3_i32", "v_max3_u32"):
-            x, y, z = (self.src_u(t) for t in a[1:4])
-            f = ("S" if op.endswith("i32") else "U") + ("Min" if "min" in op else "Max")
-            m, r = self.tmp(), self.tmp()
-            self.emit(f"{m} = OpExtInst %uint %glsl {f} {x} {y}")
-            self.emit(f"{r} = OpExtInst %uint %glsl {f} {m} {z}")
-            self.dst(a[0], r)
-        elif op in ("v_med3_i32", "v_med3_u32"):
+        elif op in ("v_min3_i32", "v_min3_u32", "v_max3_i32", "v_max3_u32", "v_med3_i32", "v_med3_u32"):
+            if ins["op"].endswith(("_dpp", "_sdwa")) or mods:
+                raise Unsupported(op + " modifiers")
+            if len(a) != 4 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " operands")
+            if any(x.get("n", 1) != 1 or x.get("neg") or x.get("abs") or x.get("sext") for x in a):
+                raise Unsupported(op + " operands")
             x, y, z = (self.src_u(t) for t in a[1:4])
             s = "S" if op.endswith("i32") else "U"
-            lo, hi, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{lo} = OpExtInst %uint %glsl {s}Min {x} {y}")
-            self.emit(f"{hi} = OpExtInst %uint %glsl {s}Max {x} {y}")
-            self.emit(f"{r} = OpExtInst %uint %glsl {s}Clamp {z} {lo} {hi}")
+            if op.startswith("v_med3_"):
+                lo, hi, r = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{lo} = OpExtInst %uint %glsl {s}Min {x} {y}")
+                self.emit(f"{hi} = OpExtInst %uint %glsl {s}Max {x} {y}")
+                self.emit(f"{r} = OpExtInst %uint %glsl {s}Clamp {z} {lo} {hi}")
+            else:
+                f = s + ("Min" if "min" in op else "Max")
+                m, r = self.tmp(), self.tmp()
+                self.emit(f"{m} = OpExtInst %uint %glsl {f} {x} {y}")
+                self.emit(f"{r} = OpExtInst %uint %glsl {f} {m} {z}")
             self.dst(a[0], r)
         elif op in ("v_div_fixup_f16", "v_div_fixup_f64"):
             # Final IEEE-754 special-case fixup for division (RDNA2 ISA VOP3, S0=quot, S1=denom, S2=num):
