@@ -436,6 +436,17 @@ class MainTest(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertIn("### Windows tests under Wine 12", summary.read_text(encoding="utf-8"))
 
+    def test_a_summary_cannot_replace_the_ctest_inventory(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        alias = self.artifact / ".." / "ctest.json"
+        with mock.patch.object(rwt, "run_test", return_value=("pass", "")) as run_test:
+            code, out, err = self.run_main(entries, "--summary", str(alias))
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("--summary must not name the --tests input", err)
+        run_test.assert_not_called()
+        self.assertEqual((self.root / "ctest.json").read_bytes(), json.dumps({"tests": entries}).encode("utf-8"))
+
     def test_an_unwritable_summary_is_one_error_line(self):
         blocker = self.root / "blocker"
         blocker.write_text("not a folder", encoding="utf-8")

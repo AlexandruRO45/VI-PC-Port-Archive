@@ -31,6 +31,8 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+from report_paths import same_report_path  # noqa: E402
 
 
 def _make_parent(path: str) -> None:
@@ -286,6 +288,9 @@ def main() -> int:
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()
 
+    if args.summary and same_report_path(args.summary, args.tests):
+        print("ERROR: --summary must not name the --tests input", file=sys.stderr)
+        return 2
     tests = read_tests(args.tests)
     if tests is None:
         return 2
