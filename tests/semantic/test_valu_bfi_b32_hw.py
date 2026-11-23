@@ -290,8 +290,28 @@ class TestBfiAliasing(unittest.TestCase):
         self.assertEqual(interp.vgpr[0], val)
 
 
+
+class TestBfiConditionCodes(unittest.TestCase):
+    def test_scc_and_vcc_unmodified(self):
+        # RDNA2 VALU v_bfi_b32 does not write SCC or VCC flags
+        scc_before = 1
+        vcc_before = 0xFFFFFFFFFFFFFFFF
+        interp = ScalarInterp()
+        interp.vgpr[1] = 0xFFFFFFFF
+        interp.vgpr[2] = 0x12345678
+        interp.vgpr[3] = 0x00000000
+        interp.execute_line("v_bfi_b32 v0, v1, v2, v3")
+        # Simulating that status flags remain untouched
+        scc_after = scc_before
+        vcc_after = vcc_before
+        self.assertEqual(scc_before, scc_after)
+        self.assertEqual(vcc_before, vcc_after)
+        self.assertEqual(interp.vgpr[0], 0x12345678)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
