@@ -132,6 +132,33 @@ class ImportCallSitesTest(unittest.TestCase):
         with self.assertRaises(pe_inspect.PeFormatError):
             import_call_sites.call_sites(bytes(data))
 
+    def test_non_amd64_pe32_plus_images_are_refused(self):
+        # PE32+ describes the optional header, not the instruction set. These images retain coincidental
+        # x86 call/thunk patterns, which must not produce a plausible report for another architecture.
+        for machine in (0xAA64, 0x200, 0):  # ARM64, IA64, unknown
+            with self.subTest(machine=hex(machine)):
+                data = bytearray(self.data)
+                struct.pack_into("<H", data, 0x44, machine)
+                self.assertTrue(pe_inspect.PeImage(bytes(data)).is64)
+                with self.assertRaisesRegex(pe_inspect.PeFormatError, "x86-64"):
+                    import_call_sites.call_sites(bytes(data))
+
+    def test_cli_refuses_arm64_without_printing_a_report(self):
+        data = bytearray(self.data)
+        struct.pack_into("<H", data, 0x44, 0xAA64)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "arm64.exe")
+            with open(path, "wb") as f:
+                f.write(data)
+            for flags in ([], ["--json"]):
+                with self.subTest(flags=flags):
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        self.assertEqual(import_call_sites.main([path, *flags]), 2)
+                    self.assertEqual(out.getvalue(), "")
+                    self.assertIn("x86-64", err.getvalue())
+                    self.assertEqual(len(err.getvalue().splitlines()), 1)
+
     def test_cli_prints_counts_and_json_with_hex_rvas(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "image.exe")

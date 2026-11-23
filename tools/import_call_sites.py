@@ -58,8 +58,8 @@ def call_sites(data, wanted=None, dlls=None):
     None every import is scanned.
     """
     img = pe_inspect.PeImage(data)
-    if not img.is64:
-        raise pe_inspect.PeFormatError("only PE32+ (x86-64) images are scanned")
+    if not img.is64 or img.machine != 0x8664:
+        raise pe_inspect.PeFormatError("only PE32+ x86-64 images are scanned")
     lower_wanted = {w.lower() for w in wanted} if wanted else None
     lower_dlls = {d.lower() for d in dlls} if dlls else None
 
