@@ -532,6 +532,17 @@ class TestSMovkI32SignExtension(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0xFFFFFE0C)
 
+class TestSMovkI32Translator(unittest.TestCase):
+    def test_translator_s_movk_i32_execution(self) -> None:
+        body = [
+            "s_movk_i32 s4, 5432",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_movk_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 5432)
+
 
 if __name__ == "__main__":
     unittest.main()
