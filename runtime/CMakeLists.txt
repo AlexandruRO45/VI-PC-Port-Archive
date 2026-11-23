@@ -1197,6 +1197,12 @@ if(BUILD_TESTING)
   add_test(NAME spirv_capability COMMAND spirv_capability_test)
 endif()
 
+# CPU-only: ps_sweep_integer_fetch.h's bounded 2D integer texelFetch recognizer over hand-built SPIR-V modules.
+add_executable(ps_sweep_integer_fetch_test test/ps_sweep_integer_fetch_test.cpp)
+if(BUILD_TESTING)
+  add_test(NAME ps_sweep_integer_fetch COMMAND ps_sweep_integer_fetch_test)
+endif()
+
 # GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
 # Nothing is downloaded unless asked: set VULKAN_SDK, install the Vulkan headers, pass
 # -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time
