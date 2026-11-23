@@ -333,6 +333,9 @@ def lod_bands(child_lod: dict, lod_dist: dict, present) -> tuple[dict, dict]:
         bands["orphan_hd"] = [0.0, float(end)]
     return bands, measured
 _PACK_MAGIC = b"LPK1"
+# Header fields _write_pack stores per primitive besides the four buffer lengths: the reader hands back
+# exactly these plus the buffers it slices out of the file body.
+_PACK_HEADER_KEYS = ("index_type", "vertices", "index_count", "min", "max", "material")
 
 
 def placement_trs(rotation, scale_xy: float, scale_z: float, position):
@@ -379,20 +382,60 @@ def _write_pack(path: str, packed: list[dict]) -> int:
 
 
 def _read_pack(path: str) -> list[dict]:
+    """Read one staging pack back into packed primitives.
+
+    The file is the tool's own format, written by _write_pack earlier in the same build, but a pack can
+    reach here damaged: a packing worker killed mid-write, a disk that filled up, a header row that lost
+    its lengths. Anything that is not exactly what _write_pack would have written raises ValueError, the
+    same way a wrong magic number already does, so the CLI reports one ERROR line instead of a traceback
+    and never hands back primitives whose buffers are silently short or empty.
+    """
     with open(path, "rb") as f:
         data = f.read()
     if data[:4] != _PACK_MAGIC:
         raise ValueError(f"{path} is not a packed model")
+    if len(data) < 8:
+        raise ValueError(f"{path} is not a packed model: cut off before the header length")
     n = int.from_bytes(data[4:8], "little")
-    header = json.loads(data[8:8 + n].decode("ascii"))
+    if len(data) < 8 + n:
+        raise ValueError(f"{path} is not a packed model: header of {n} bytes runs past the "
+                         f"{len(data)} byte file")
+    try:
+        header = json.loads(data[8:8 + n].decode("ascii"))
+    except ValueError:
+        raise ValueError(f"{path} is not a packed model: header is not valid JSON") from None
+    if not isinstance(header, list):
+        raise ValueError(f"{path} is not a packed model: header is not a list "
+                         f"(found {type(header).__name__})")
     at = 8 + n
     out = []
-    for meta in header:
-        prim = {k: meta[k] for k in ("index_type", "vertices", "index_count", "min", "max", "material")}
-        for key, length in zip(("positions", "normals", "uvs", "indices"), meta["lengths"]):
+    for row, meta in enumerate(header):
+        if not isinstance(meta, dict):
+            raise ValueError(f"{path} is not a packed model: header row {row} is not an object "
+                             f"(found {type(meta).__name__})")
+        missing = [k for k in ("lengths",) + _PACK_HEADER_KEYS if k not in meta]
+        if missing:
+            raise ValueError(f"{path} is not a packed model: header row {row} is missing "
+                             f"{', '.join(missing)}")
+        lengths = meta["lengths"]
+        if not isinstance(lengths, list) or len(lengths) != 4:
+            got = f"{len(lengths)} values" if isinstance(lengths, list) else type(lengths).__name__
+            raise ValueError(f"{path} is not a packed model: header row {row} needs four buffer "
+                             f"lengths, got {got}")
+        if any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in lengths):
+            raise ValueError(f"{path} is not a packed model: header row {row} lengths must be "
+                             f"non-negative whole numbers, got {lengths}")
+        prim = {k: meta[k] for k in _PACK_HEADER_KEYS}
+        for key, length in zip(("positions", "normals", "uvs", "indices"), lengths):
+            if at + length > len(data):
+                raise ValueError(f"{path} is not a packed model: {key} of row {row} needs {length} bytes "
+                                 f"at {at}, the file ends at {len(data)}")
             prim[key] = data[at:at + length]
             at += length
         out.append(prim)
+    if at != len(data):
+        raise ValueError(f"{path} is not a packed model: its buffers end at {at}, the file is "
+                         f"{len(data)} bytes")
     return out
 
 

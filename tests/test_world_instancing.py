@@ -7,6 +7,8 @@ process workers, textures and the outcome counts. Every model, entity and textur
 
     python -I tests/test_world_instancing.py
 """
+import contextlib
+import io
 import json
 import math
 import os
@@ -16,6 +18,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -544,6 +547,130 @@ class IterPlacementsTest(unittest.TestCase):
                 rows2 = list(world_build.iter_placements(path, c2, **kw))
                 self.assertEqual(rows2, rows, kw)
                 self.assertEqual(c2, counts, kw)
+
+
+class PackReadDamageTest(unittest.TestCase):
+    """A damaged staging pack is one ERROR line, never a traceback and never silently short geometry.
+
+    _read_pack is the pack reader of the tool's own staging format (LPK1): the packing stage writes one
+    file per model, the chunk stage reads it back. Files can reach it half written (an interrupted or
+    disk-full build), so every shape it does not understand has to land on the ValueError the CLI already
+    reports, the same way a bad magic number already does.
+    """
+
+    @staticmethod
+    def _pack_path(tmp):
+        return os.path.join(tmp, "m.lpk")
+
+    def _written(self, tmp, prims=None):
+        path = self._pack_path(tmp)
+        world_build._write_pack(path, [tri_prim()] if prims is None else prims)
+        return path
+
+    @staticmethod
+    def _split(path):
+        """Return (header rows, buffer bytes) as the tool wrote them."""
+        with open(path, "rb") as f:
+            data = f.read()
+        n = int.from_bytes(data[4:8], "little")
+        return json.loads(data[8:8 + n].decode("ascii")), data[8 + n:]
+
+    @staticmethod
+    def _rewrite(path, header, blobs=b""):
+        head = json.dumps(header, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        with open(path, "wb") as f:
+            f.write(world_build._PACK_MAGIC + len(head).to_bytes(4, "little") + head + blobs)
+        return path
+
+    def _damaged(self, mutate):
+        """Write a real pack, then hand-edit its header rows with `mutate` and read it back."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._written(tmp)
+            header, blobs = self._split(path)
+            mutate(header)
+            self._rewrite(path, header, blobs)
+            with self.assertRaises(ValueError) as caught:
+                world_build._read_pack(path)
+        return str(caught.exception)
+
+    def test_header_that_is_not_a_list_of_rows_is_a_value_error(self):
+        for mutate, label in (
+            (lambda h: h.clear() or h.append(1), "a number row"),
+            (lambda h: (h.clear(), h.append(["positions"])), "a list row"),
+            (lambda h: [h.clear(), h.append("m")][0], "a string row"),
+            (lambda h: h.append({"lengths": [0]}), "a row without the geometry keys"),
+            (lambda h: h[0].pop("lengths"), "a row without lengths"),
+        ):
+            with self.subTest(row=label):
+                message = self._damaged(mutate)
+                self.assertIn("packed model", message)
+
+    def test_non_number_buffer_length_is_a_value_error(self):
+        for value in ("36", None, [36], {}):
+            with self.subTest(length=value):
+                message = self._damaged(lambda h, v=value: h[0].__setitem__("lengths", [v, 36, 24, 6]))
+                self.assertIn("lengths", message)
+
+    def test_negative_buffer_length_is_a_value_error(self):
+        message = self._damaged(lambda h: h[0].__setitem__("lengths", [-5, 36, 24, 6]))
+        self.assertIn("lengths", message)
+
+    def test_pack_cut_off_mid_buffers_is_a_value_error(self):
+        """A write that stopped early must not hand back primitives whose buffers are silently short."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._written(tmp)
+            with open(path, "rb") as f:
+                size = f.seek(0, os.SEEK_END)
+            for cut in (8, 40, size - 1):
+                with self.subTest(bytes=cut):
+                    with open(path, "r+b") as f:
+                        f.truncate(cut)
+                    with self.assertRaises(ValueError) as caught:
+                        world_build._read_pack(path)
+                    self.assertIn("packed model", str(caught.exception))
+
+    def test_pack_longer_than_its_buffers_is_a_value_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._written(tmp)
+            header, blobs = self._split(path)
+            self._rewrite(path, header, blobs + b"\0" * 4)
+            with self.assertRaises(ValueError) as caught:
+                world_build._read_pack(path)
+            self.assertIn("packed model", str(caught.exception))
+
+    def test_healthy_pack_still_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._written(tmp, [tri_prim(), tri_prim()])
+            prims = world_build._read_pack(path)
+        self.assertEqual(len(prims), 2)
+        for prim in prims:
+            self.assertEqual(sorted(prim), sorted(("positions", "normals", "uvs", "indices", "index_type",
+                                                   "vertices", "index_count", "min", "max", "material")))
+            self.assertEqual(len(prim["positions"]), 36)
+            self.assertEqual(len(prim["indices"]), 6)
+
+    def test_damaged_pack_is_one_error_line_from_the_cli(self):
+        """Through main(): a pack the chunk stage cannot read is ERROR plus a line, not a traceback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = twp.write_assets(tmp)
+            out = os.path.join(tmp, "world")
+            entities = os.path.join(tmp, "ents.jsonl")
+            twp.write_entities(entities, [twp.entity("test_box", (10, 10, 0))])
+            real = world_build._write_pack
+
+            def damaged(path, packed):
+                size = real(path, packed)
+                with open(path, "r+b") as f:
+                    f.truncate(size - 8)
+                return size
+
+            with unittest.mock.patch.object(world_build, "_write_pack", damaged):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    code = world_build.main([assets, "--out", out, "--placements", entities, "--no-textures"])
+            self.assertEqual(code, 1)
+            self.assertEqual(err.getvalue().count("ERROR:"), 1)
+            self.assertNotIn("Traceback", err.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(out, "world.json")))
 
 
 if __name__ == "__main__":
