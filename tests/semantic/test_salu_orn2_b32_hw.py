@@ -266,5 +266,24 @@ class TestSOrn2B32RegisterAliasing(unittest.TestCase):
         self.assertEqual(mach.scc, 1)
 
 
+class TestSOrn2B32ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and carry/borrow preservation."""
+
+    def test_scc_is_zero_only_when_dst_zero(self):
+        # Result is 0 if and only if s0 == 0 and s1 == 0xFFFFFFFF
+        d, scc = ref_orn2_b32(0, MASK32)
+        self.assertEqual(d, 0)
+        self.assertEqual(scc, 0)
+
+        # Any 1 bit in result makes SCC = 1
+        d, scc = ref_orn2_b32(1, MASK32)
+        self.assertEqual(d, 1)
+        self.assertEqual(scc, 1)
+
+        d, scc = ref_orn2_b32(0, MASK32 ^ 1)
+        self.assertEqual(d, 1)
+        self.assertEqual(scc, 1)
+
+
 if __name__ == '__main__':
     unittest.main()
