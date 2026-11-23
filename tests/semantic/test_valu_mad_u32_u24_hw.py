@@ -281,5 +281,20 @@ class MadU32U24ConditionCodesTests(unittest.TestCase):
         self.assertEqual(initial_scc, 1)
         self.assertEqual(initial_vcc, 0xDEADBEEFCAFEBABE)
 
+class MadU32U24ExtremeBoundariesTests(unittest.TestCase):
+    def test_max_24bit_values(self):
+        # 0xFFFFFF * 0xFFFFFF = 0xFFFFFE000001 -> low 32 bits is 0xFE000001
+        res = oracle_mad_u32_u24(0xFFFFFF, 0xFFFFFF, 0)
+        self.assertEqual(res, 0xFE000001)
+
+    def test_max_24bit_with_max_accumulator(self):
+        # 0xFE000001 + 0xFFFFFFFF = 0xFE000000 (modulo 2^32)
+        res = oracle_mad_u32_u24(0xFFFFFF, 0xFFFFFF, 0xFFFFFFFF)
+        self.assertEqual(res, 0xFE000000)
+
+    def test_zero_product_with_extremes(self):
+        self.assertEqual(oracle_mad_u32_u24(0, 0xFFFFFF, 0x7FFFFFFF), 0x7FFFFFFF)
+        self.assertEqual(oracle_mad_u32_u24(0xFFFFFF, 0, 0x80000000), 0x80000000)
+
 if __name__ == "__main__":
     unittest.main()
