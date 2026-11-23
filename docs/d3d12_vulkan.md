@@ -94,7 +94,9 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   `OMSetFrontAndBackStencilRef` (public SDK).
 - **Unknown IIDs and slots.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the
   public chain. If the game then fails, the IID and the call site identify the Xbox-specific interface to reverse.
-  Do not invent a vtable for an unknown IID: a wrong slot is worse than a clean failure.
+  Do not invent a vtable for an unknown IID: a wrong slot is worse than a clean failure. The layer's own probes
+  for a class's private tag (`Object::from`) are refused quietly: a back buffer that is not a `Resource` is not an
+  unknown interface.
 - **No host D3D12 or DXGI.** The PE loader currently lets unknown system DLLs bind to the host. `dxgi.dll` and
   `d3d12.dll` must be shimmed, not resolved from System32. Host DXGI would hand the game a desktop adapter and
   swapchain that cannot see our Vulkan device, and host D3D12 would create a second, unrelated device. This is an
@@ -3472,8 +3474,8 @@ Games and middleware call these every frame (PIX events), so they must be cheap 
   returned size, byte and reference count (RTX 3060, driver 610.88, no debug layer). Swapchain back buffers
   (`BackBufferResource` in `dxgi_com.cpp`) use the same base since D3D-451: the test runs the script on both back
   buffers of a host DXGI swapchain and of the layer's, and checks that a name and private data set on a buffer are
-  still there when `GetBuffer` hands it out again, and not on the other buffer (RX 9070 XT, driver 32.0.31044.16;
-  276 steps). Before that, `SetName` stored nothing and the other three answered `E_NOTIMPL`:
+  still there when `GetBuffer` hands it out again, not on the other buffer, and gone after `ResizeBuffers`, which
+  makes new buffers on both (RX 9070 XT, driver 32.0.31044.16; 286 steps). Before that, `SetName` stored nothing and the other three answered `E_NOTIMPL`:
   - `SetPrivateDataInterface` holds a reference until the entry is replaced (by bytes or another interface),
     removed or the object is destroyed; `GetPrivateData` returns the pointer with a reference added. A null
     interface releases the one held and stays as a pointer-sized entry that reads back as null.

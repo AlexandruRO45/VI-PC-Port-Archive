@@ -18,9 +18,14 @@ namespace rt::d3d12 {
 
 void stub(const char* method);
 
+// Set while Object::from asks an object for a class's private kTag on this thread. A refusal there is the layer
+// learning the object is not that class (a swapchain back buffer is not a Resource), not an unknown interface, so
+// QueryInterface does not log it.
+inline thread_local bool probing_private_tag = false;
+
 // IUnknown and ID3D12Object for one implementation class. QueryInterface answers the listed public interfaces
 // and the class's private Derived::kTag (which returns the implementation itself); anything else is logged with
-// its IID and refused, as docs/d3d12_vulkan.md section 3.1 asks.
+// its IID and refused, as docs/d3d12_vulkan.md section 3.1 asks, unless Object::from is asking.
 template<class Derived, class Stubs, class... Interfaces>
 class Object : public Stubs {
 public:
@@ -39,6 +44,7 @@ public:
         } else if (riid == __uuidof(IUnknown) || ((riid == __uuidof(Interfaces)) || ...)) {
             *out = static_cast<Stubs*>(this);  // one inheritance chain: every interface shares this pointer
         } else {
+            if (probing_private_tag) return E_NOINTERFACE;
             std::fprintf(stderr,
                          "[rt] d3d12: QueryInterface: unknown IID {%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
                          static_cast<unsigned long>(riid.Data1), riid.Data2, riid.Data3, riid.Data4[0], riid.Data4[1],
@@ -114,7 +120,11 @@ public:
     static T* from(IUnknown* object) {
         if (!object) return nullptr;
         void* implementation = nullptr;
-        if (FAILED(object->QueryInterface(T::kTag, &implementation))) return nullptr;
+        const bool outer = probing_private_tag;
+        probing_private_tag = true;
+        const HRESULT hr = object->QueryInterface(T::kTag, &implementation);
+        probing_private_tag = outer;
+        if (FAILED(hr)) return nullptr;
         static_cast<T*>(implementation)->Release();  // the caller holds its own reference
         return static_cast<T*>(implementation);
     }

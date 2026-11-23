@@ -311,8 +311,8 @@ bool make_swapchain(ID3D12Device* device, IDXGIFactory2* factory, HWND window, R
     return SUCCEEDED(factory->CreateSwapChainForHwnd(queue.p, window, &desc, nullptr, nullptr, &chain.p));
 }
 
-// The script on both back buffers of a swapchain of `device`, and what a name set on one is after the buffer is
-// asked for again (the same object both times, on the host).
+// The script on both back buffers of a swapchain of `device`, what a name and private data set on one are after the
+// buffer is asked for again (the same object both times, on the host), on the other buffer, and after ResizeBuffers.
 bool record_back_buffers(ID3D12Device* device, IDXGIFactory2* factory, HWND window, Record& r) {
     Ref<ID3D12CommandQueue> queue;
     Ref<IDXGISwapChain1> chain;
@@ -331,13 +331,22 @@ bool record_back_buffers(ID3D12Device* device, IDXGIFactory2* factory, HWND wind
         r.add("back buffer: SetName hr", std::uint32_t(name_guarded(buffer.p, L"back")));
         buffer->SetPrivateData(key(200), 4, "abc");
     }
-    Ref<ID3D12Resource> again;
-    if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&again.p)))) return false;
-    get(r, "back buffer asked for again: name W", again.p, kNameW, 64);
-    get(r, "back buffer asked for again: private data", again.p, key(200), 64);
-    Ref<ID3D12Resource> other;
-    if (FAILED(chain->GetBuffer(1, IID_PPV_ARGS(&other.p)))) return false;
-    get(r, "the other back buffer: name W", other.p, kNameW, 64);
+    {
+        Ref<ID3D12Resource> again;
+        if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&again.p)))) return false;
+        get(r, "back buffer asked for again: name W", again.p, kNameW, 64);
+        get(r, "back buffer asked for again: private data", again.p, key(200), 64);
+        Ref<ID3D12Resource> other;
+        if (FAILED(chain->GetBuffer(1, IID_PPV_ARGS(&other.p)))) return false;
+        get(r, "the other back buffer: name W", other.p, kNameW, 64);
+        get(r, "the other back buffer: private data", other.p, key(200), 64);
+    }
+    // ResizeBuffers (no buffer held) makes new buffers: the name and private data are gone on both devices.
+    r.add("ResizeBuffers hr", std::uint32_t(chain->ResizeBuffers(0, 32, 32, DXGI_FORMAT_UNKNOWN, 0)));
+    Ref<ID3D12Resource> resized;
+    if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&resized.p)))) return false;
+    get(r, "back buffer after ResizeBuffers: name W", resized.p, kNameW, 64);
+    get(r, "back buffer after ResizeBuffers: private data", resized.p, key(200), 64);
     return true;
 }
 
