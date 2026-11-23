@@ -447,8 +447,12 @@ on the executable, the rest is not:
   assumed: at its one call site (RVA `0x5a7605a`) `rcx` is the interface pointer, `rdx` a code address (RVA
   `0x3e41c00`, the callback), and nothing is loaded into `r8`. `XHighContrastGetMode` (slot 5) is never reached by
   the executable, which imports thunks for slots 8-13, 15, 16 and 21 only, so its `Off` = 0 stays the GDK
-  reference's first enumerator. The other speech parameter lists are still from the reference; only their argument
-  counts were measured (`tools/gdk_runtime_calls.py`).
+  reference's first enumerator. The other speech parameter lists are still from the reference, but the count each
+  slot is called with is measured (`tools/gdk_runtime_calls.py`, one thunk per slot): 8 → 2, 9 → 1, 10 → 1,
+  11 → 1, 12 → 2, 13 → 3, 15 → 2, 16 → 4, 21 → 3. All of those match the shim's signature except slot 12,
+  `XSpeechSynthesizerSetCustomVoice`, which the title calls with two arguments (the handle and the voice id) where the
+  shim declares the one-argument `speech_bad_handle` it shares with 10, 11 and 14: the second register is ignored, and
+  it is the only slot whose declared shape is shorter than the call.
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
