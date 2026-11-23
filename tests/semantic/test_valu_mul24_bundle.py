@@ -399,5 +399,14 @@ class VMadI32I24OracleTests(unittest.TestCase):
         # -5 * -10 + 2 = 52
         self.assertEqual(oracle_mad_i32_i24(-5, -10, 2), 52)
 
+class VMadI32I24AstInterpreterTests(unittest.TestCase):
+    def test_mad_i24_ast_construction(self):
+        ast = ValuInstructionAST("v_mad_i32_i24", Operand(RegKind.VGPR, 3), Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 2))
+        self.assertEqual(ast.mnemonic, "v_mad_i32_i24")
+
+    def test_mad_i24_scalar_execution(self):
+        res = oracle_mad_i32_i24(-4, 5, 1)
+        self.assertEqual(res, u32(-19))
+
 if __name__ == "__main__":
     unittest.main()
