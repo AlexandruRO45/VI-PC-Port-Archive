@@ -1,0 +1,12 @@
+[package]
+name = "bcpack_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Offline BCPack → DDS exporter for Xbox Series GTA VI texture packs (TTPF)"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "bcpack_rs"
+path = "src/main.rs"
+
+[dependencies]
