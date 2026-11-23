@@ -176,6 +176,12 @@ def main(argv=None):
     ap.add_argument("--modes", default="_64K_")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
+    # A zero or negative dimension used to reach detile and raise on the empty grid (idx.max()) or on
+    # np.mgrid's negative shape: a usage error, not a traceback, like swizzle_search's numeric options.
+    if a.width < 1:
+        ap.error("--width must be at least 1")
+    if a.height < 1:
+        ap.error("--height must be at least 1")
     if a.out is not None:
         err = validate_out_path(a.out, a.blob, same_report_path)
         if err:

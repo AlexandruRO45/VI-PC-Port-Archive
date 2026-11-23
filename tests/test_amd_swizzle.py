@@ -229,6 +229,18 @@ def test_out_directory_is_a_message_not_a_traceback(tmp_path):
     assert "Traceback" not in p.stderr
 
 
+@pytest.mark.parametrize(("width", "height"), [("0", "2"), ("2", "0"), ("-4", "2"), ("2", "-4")])
+def test_non_positive_dimensions_are_usage_errors(tmp_path, width, height):
+    # Before: a zero dimension reached detile and raised ValueError on the empty grid (idx.max()),
+    # a negative one raised on np.mgrid's shape; both exit 1 with a traceback. The check runs before
+    # load(), so no swizzle header is needed to hit it.
+    (tmp_path / "blob.bin").write_bytes(bytes(range(256)) * 64)
+    p = cli(tmp_path, "--bpe", "1", "--width", width, "--height", height)
+    assert p.returncode == 2, p.stderr
+    assert "must be at least 1" in p.stderr
+    assert "Traceback" not in p.stderr
+
+
 def test_uncompressed_feature_uses_raw_rgb_bytes():
     import numpy as np
     raw = np.arange(8, dtype=np.uint8).reshape(-1, 4)
