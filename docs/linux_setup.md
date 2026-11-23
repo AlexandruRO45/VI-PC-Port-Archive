@@ -34,7 +34,11 @@ tar -xjf "$LEO/micromamba.tar.bz2" -C "$LEO/bin" --strip-components=1 bin/microm
 ```
 
 The `latest` URL is micromamba's official download endpoint and is not pinned to a version. The archive is saved first so
-you can inspect it before extracting.
+you can inspect it before extracting. `linux-64` is the x86-64 glibc build, which is what was measured. On another
+architecture use the matching archive (for example `linux-aarch64`) from the
+[micromamba installation guide](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html);
+that guide says micromamba does not run natively on musl systems such as Alpine. Nothing else on this page was
+tested outside x86-64.
 
 ## 2. Create the environment
 
