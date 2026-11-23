@@ -746,23 +746,21 @@ std::vector<DisplayInfo> enumerate_displays() {
     return displays;
 }
 
-bool is_supported_display_format(DXGI_FORMAT fmt) noexcept {
+D3DDDIFORMAT display_surface_format(DXGI_FORMAT fmt) noexcept {
     switch (fmt) {
     case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return D3DDDIFMT_A8B8G8R8;
     case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        return true;
-    default:
-        return false;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return D3DDDIFMT_A8R8G8B8;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return D3DDDIFMT_A2B10G10R10;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return D3DDDIFMT_A16B16G16R16F;
+    default: return D3DDDIFMT_UNKNOWN;
     }
 }
 
-std::vector<DXGI_MODE_DESC> collect_modes(const DisplayInfo& info, DXGI_FORMAT fmt) {
+std::vector<DXGI_MODE_DESC> fallback_modes(const DisplayInfo& info, DXGI_FORMAT fmt) {
     std::vector<DXGI_MODE_DESC> modes;
-    if (!is_supported_display_format(fmt)) return modes;
+    if (display_surface_format(fmt) == D3DDDIFMT_UNKNOWN) return modes;
 
     std::set<std::tuple<UINT, UINT, UINT>> seen;
     auto push_mode = [&](UINT w, UINT h, UINT hz) {
@@ -810,10 +808,78 @@ constexpr DXGI_MODE_DESC from_mode_desc1(const DXGI_MODE_DESC1& m) noexcept {
     return {m.Width, m.Height, m.RefreshRate, m.Format, m.ScanlineOrdering, m.Scaling};
 }
 
+// EnumDisplaySettings exposes integer Hz. Query the WDDM source behind this monitor for
+// its original rational timings and scaling variants without loading the host DXGI factory.
+bool physical_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT flags, std::vector<DXGI_MODE_DESC1>& modes) {
+    if (!info.monitor) return false;
+    const auto surface = display_surface_format(fmt);
+    if (surface == D3DDDIFMT_UNKNOWN) return true;
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi) return false;
+    const auto open = reinterpret_cast<decltype(&D3DKMTOpenAdapterFromGdiDisplayName)>(
+        GetProcAddress(gdi, "D3DKMTOpenAdapterFromGdiDisplayName"));
+    const auto query = reinterpret_cast<decltype(&D3DKMTGetDisplayModeList)>(GetProcAddress(gdi, "D3DKMTGetDisplayModeList"));
+    const auto close = reinterpret_cast<decltype(&D3DKMTCloseAdapter)>(GetProcAddress(gdi, "D3DKMTCloseAdapter"));
+    if (!open || !query || !close) return false;
+    D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME adapter{};
+    wcscpy_s(adapter.DeviceName, info.device_name);
+    if (open(&adapter) != 0) return false;
+    struct AdapterGuard {
+        decltype(&D3DKMTCloseAdapter) close;
+        D3DKMT_CLOSEADAPTER args;
+        ~AdapterGuard() { close(&args); }
+    } guard{close, {adapter.hAdapter}};
+    D3DKMT_GETDISPLAYMODELIST request{};
+    request.hAdapter = adapter.hAdapter;
+    request.VidPnSourceId = adapter.VidPnSourceId;
+    if (query(&request) != 0 || !request.ModeCount) return false;
+    std::vector<D3DKMT_DISPLAYMODE> entries(request.ModeCount);
+    request.pModeList = entries.data();
+    if (query(&request) != 0 || request.ModeCount > entries.size()) return false;
+    for (UINT i = 0; i < request.ModeCount; ++i) {
+        const auto& entry = entries[i];
+        if (entry.Format != surface || UINT(entry.DisplayOrientation) != UINT(info.rotation) ||
+            !entry.RefreshRate.Denominator || entry.Flags.RoundedFakeMode ||
+            entry.Flags.ModePruningReason == D3DKMDT_MPR_ALLCAPS ||
+            entry.Flags.ModePruningReason == D3DKMDT_MPR_CLONE_PATH_PRUNED) continue;
+        const bool interlaced = entry.ScanLineOrdering == D3DDDI_VSSLO_INTERLACED_UPPERFIELDFIRST ||
+                                entry.ScanLineOrdering == D3DDDI_VSSLO_INTERLACED_LOWERFIELDFIRST;
+        if (interlaced && !(flags & DXGI_ENUM_MODES_INTERLACED)) continue;
+        if (entry.Flags.Stereo && !(flags & (DXGI_ENUM_MODES_STEREO | DXGI_ENUM_MODES_DISABLED_STEREO))) continue;
+        DXGI_MODE_SCALING scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+        if (entry.DisplayFixedOutput == DMDFO_CENTER) scaling = DXGI_MODE_SCALING_CENTERED;
+        if (entry.DisplayFixedOutput == DMDFO_STRETCH) {
+            if (!(flags & DXGI_ENUM_MODES_SCALING)) continue;
+            scaling = DXGI_MODE_SCALING_STRETCHED;
+        }
+        const auto scan = entry.ScanLineOrdering <= D3DDDI_VSSLO_INTERLACED_LOWERFIELDFIRST
+            ? static_cast<DXGI_MODE_SCANLINE_ORDER>(entry.ScanLineOrdering) : DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+        modes.push_back({entry.Width, entry.Height, {entry.RefreshRate.Numerator, entry.RefreshRate.Denominator},
+                         fmt, scan, scaling, BOOL(entry.Flags.Stereo)});
+    }
+    std::sort(modes.begin(), modes.end(), [](const auto& a, const auto& b) {
+        if (a.Width != b.Width) return a.Width < b.Width;
+        if (a.Height != b.Height) return a.Height < b.Height;
+        auto lhs = std::uint64_t(a.RefreshRate.Numerator) * b.RefreshRate.Denominator;
+        auto rhs = std::uint64_t(b.RefreshRate.Numerator) * a.RefreshRate.Denominator;
+        if (lhs != rhs) return lhs < rhs;
+        return std::tie(a.ScanlineOrdering, a.Scaling, a.Stereo) < std::tie(b.ScanlineOrdering, b.Scaling, b.Stereo);
+    });
+    return true;
+}
+
+std::vector<DXGI_MODE_DESC1> collect_modes(const DisplayInfo& info, DXGI_FORMAT fmt, UINT flags) {
+    std::vector<DXGI_MODE_DESC1> modes;
+    if (!physical_mode_list(info, fmt, flags, modes)) {
+        for (const auto& m : fallback_modes(info, fmt)) modes.push_back(to_mode_desc1(m));
+    }
+    return modes;
+}
+
 template <class DescT, class ConvertFn>
-HRESULT fill_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT* num_modes, DescT* out, ConvertFn convert) {
+HRESULT fill_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT flags, UINT* num_modes, DescT* out, ConvertFn convert) {
     if (!num_modes) return DXGI_ERROR_INVALID_CALL;
-    const std::vector<DXGI_MODE_DESC> modes = collect_modes(info, fmt);
+    const auto modes = collect_modes(info, fmt, flags);
     const UINT total = static_cast<UINT>(modes.size());
     if (!out) {
         *num_modes = total;
@@ -831,7 +897,7 @@ HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IU
     out = {};
     if (req.Format == DXGI_FORMAT_UNKNOWN && !concerned_device) return DXGI_ERROR_INVALID_CALL;
     const DXGI_FORMAT target_fmt = (req.Format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_B8G8R8A8_UNORM : req.Format;
-    const std::vector<DXGI_MODE_DESC> modes = collect_modes(info, target_fmt);
+    const auto modes = collect_modes(info, target_fmt, 0);
     if (modes.empty()) return DXGI_ERROR_NOT_FOUND;
 
     const UINT target_w = req.Width ? req.Width : info.current_width;
@@ -842,7 +908,7 @@ HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IU
                     : std::uint64_t(info.current_refresh_hz) * 1000ull;
 
     auto abs_diff = [](std::uint64_t a, std::uint64_t b) -> std::uint64_t { return a > b ? (a - b) : (b - a); };
-    auto score = [&](const DXGI_MODE_DESC& m) {
+    auto score = [&](const DXGI_MODE_DESC1& m) {
         const std::uint64_t area_diff = abs_diff(std::uint64_t(m.Width) * m.Height, std::uint64_t(target_w) * target_h);
         const std::uint64_t dim_diff = abs_diff(m.Width, target_w) + abs_diff(m.Height, target_h);
         const std::uint64_t m_mhz =
@@ -851,7 +917,7 @@ HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IU
         return std::make_tuple(dim_diff, area_diff, hz_diff);
     };
 
-    const DXGI_MODE_DESC* best = &modes[0];
+    const DXGI_MODE_DESC1* best = &modes[0];
     auto best_score = score(*best);
     for (std::size_t i = 1; i < modes.size(); ++i) {
         const auto s = score(modes[i]);
@@ -860,7 +926,7 @@ HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IU
             best_score = s;
         }
     }
-    out = *best;
+    out = from_mode_desc1(*best);
     return S_OK;
 }
 
@@ -923,8 +989,9 @@ public:
         fill_base_desc(*desc);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetDisplayModeList(DXGI_FORMAT fmt, UINT, UINT* num_modes, DXGI_MODE_DESC* desc) override {
-        return fill_mode_list(info_, fmt, num_modes, desc, [](const DXGI_MODE_DESC& m) { return m; });
+    HRESULT STDMETHODCALLTYPE GetDisplayModeList(DXGI_FORMAT fmt, UINT flags, UINT* num_modes, DXGI_MODE_DESC* desc) override {
+        return fill_mode_list(info_, fmt, flags & (DXGI_ENUM_MODES_SCALING | DXGI_ENUM_MODES_INTERLACED),
+                              num_modes, desc, from_mode_desc1);
     }
     HRESULT STDMETHODCALLTYPE FindClosestMatchingMode(const DXGI_MODE_DESC* mode_to_match, DXGI_MODE_DESC* closest,
                                                       IUnknown* concerned_device) override {
@@ -956,9 +1023,9 @@ public:
     }
 
     // IDXGIOutput1
-    HRESULT STDMETHODCALLTYPE GetDisplayModeList1(DXGI_FORMAT fmt, UINT, UINT* num_modes,
+    HRESULT STDMETHODCALLTYPE GetDisplayModeList1(DXGI_FORMAT fmt, UINT flags, UINT* num_modes,
                                                   DXGI_MODE_DESC1* desc) override {
-        return fill_mode_list(info_, fmt, num_modes, desc, to_mode_desc1);
+        return fill_mode_list(info_, fmt, flags, num_modes, desc, [](const DXGI_MODE_DESC1& m) { return m; });
     }
     HRESULT STDMETHODCALLTYPE FindClosestMatchingMode1(const DXGI_MODE_DESC1* mode_to_match, DXGI_MODE_DESC1* closest,
                                                        IUnknown* concerned_device) override {

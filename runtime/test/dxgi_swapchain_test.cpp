@@ -18,6 +18,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <set>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -30,6 +32,56 @@ int fail(const char* what) {
 unsigned& validation_errors() {
     static unsigned count = 0;
     return count;
+}
+
+bool same_monitor_modes(IDXGIOutput* shim, IDXGIOutput* host) {
+    using Key = std::tuple<UINT, UINT, UINT, UINT, UINT, UINT, UINT>;
+    for (UINT flags : {0u, UINT(DXGI_ENUM_MODES_SCALING)}) {
+        auto read = [flags](IDXGIOutput* output, std::multiset<Key>& keys) {
+            UINT count = 0;
+            constexpr auto format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (FAILED(output->GetDisplayModeList(format, flags, &count, nullptr))) return false;
+            std::vector<DXGI_MODE_DESC> modes(count);
+            if (count && FAILED(output->GetDisplayModeList(format, flags, &count, modes.data()))) return false;
+            for (UINT i = 0; i < count; ++i) {
+                const auto& m = modes[i];
+                keys.emplace(m.Width, m.Height, m.RefreshRate.Numerator, m.RefreshRate.Denominator, m.Format,
+                             m.ScanlineOrdering, m.Scaling);
+            }
+            return true;
+        };
+        std::multiset<Key> expected, actual;
+        if (!read(host, expected)) return false;
+        if (expected.empty()) continue;
+        if (!read(shim, actual) || actual != expected) {
+            std::fprintf(stderr, "display mode list flags=%u: shim=%zu host=%zu\n", flags, actual.size(), expected.size());
+            return false;
+        }
+    }
+    return true;
+}
+
+bool compare_attached_modes(IDXGIAdapter1* adapter, IDXGIAdapter1* host_adapter, UINT output_count) {
+    for (UINT hi = 0; ; ++hi) {
+        IDXGIOutput* host = nullptr;
+        const HRESULT hr = host_adapter->EnumOutputs(hi, &host);
+        if (hr == DXGI_ERROR_NOT_FOUND) return true;
+        if (FAILED(hr)) return false;
+        DXGI_OUTPUT_DESC target{};
+        bool matched = false;
+        if (SUCCEEDED(host->GetDesc(&target))) {
+            for (UINT i = 0; i < output_count && !matched; ++i) {
+                IDXGIOutput* output = nullptr;
+                if (FAILED(adapter->EnumOutputs(i, &output))) continue;
+                DXGI_OUTPUT_DESC desc{};
+                if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target.Monitor)
+                    matched = same_monitor_modes(output, host);
+                output->Release();
+            }
+        }
+        host->Release();
+        if (!matched) return false;
+    }
 }
 
 VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -1335,6 +1387,8 @@ int main() {
                 if (SUCCEEDED(create_host(IID_PPV_ARGS(&hfac))) && hfac) {
                     IDXGIAdapter1* hadp = nullptr;
                     if (SUCCEEDED(hfac->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&hadp))) && hadp) {
+                        if (!compare_attached_modes(adapter1, hadp, our_output_count))
+                            return fail("Physical display modes did not match host DXGI");
                         if (hadp->EnumOutputs(0, nullptr) != adapter1->EnumOutputs(0, nullptr)) {
                             hadp->Release();
                             hfac->Release();
