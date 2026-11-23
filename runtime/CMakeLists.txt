@@ -2139,19 +2139,21 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_M5_MESH_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m5_mesh_shaders)
       set(LEONIDA_M5_MESH_FILES ${LEONIDA_M5_MESH_DIR}/spirv/index.json ${LEONIDA_M5_MESH_DIR}/fssm/ms_m5.fssm
                                 ${LEONIDA_M5_MESH_DIR}/fssm/ps_m5_mesh.fssm ${LEONIDA_M5_MESH_DIR}/fssm/vs_m3.fssm
-                                ${LEONIDA_M5_MESH_DIR}/fssm/ps_m5_flat.fssm)
+                                ${LEONIDA_M5_MESH_DIR}/fssm/ps_m5_flat.fssm
+                                ${LEONIDA_M5_MESH_DIR}/fssm/cs_m5_args.fssm)
       add_custom_command(
         OUTPUT ${LEONIDA_M5_MESH_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M5_MESH_DIR}
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${LEONIDA_M5_MESH_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat
+                ${LEONIDA_M5_MESH_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat cs_m5_args
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_m5.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_mesh.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m5_args.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating ms_m5, ps_m5_mesh, vs_m3 and ps_m5_flat for the M5 mesh test"
         VERBATIM)
@@ -2164,20 +2166,22 @@ if(TARGET Vulkan::Headers)
                                         ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/ms_m5.fssm
                                         ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/ps_m5_mesh.fssm
                                         ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/vs_m3.fssm
-                                        ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/ps_m5_flat.fssm)
+                                        ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/ps_m5_flat.fssm
+                                        ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/cs_m5_args.fssm)
       add_custom_command(
         OUTPUT ${LEONIDA_M5_MESH_COMPUTE_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M5_MESH_COMPUTE_DIR}
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 "LEONIDA_MESH_COMPUTE=1" "LEONIDA_W64_EMULATE=1"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${LEONIDA_M5_MESH_COMPUTE_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat
+                ${LEONIDA_M5_MESH_COMPUTE_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat cs_m5_args
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_m5.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_mesh.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m5_args.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating ms_m5, ps_m5_mesh, vs_m3 and ps_m5_flat with --mesh-compute for the M5 mesh test"
         VERBATIM)

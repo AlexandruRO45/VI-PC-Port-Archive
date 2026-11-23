@@ -254,6 +254,7 @@ int main(int argc, char** argv) {
     if (!counts) std::printf("note: no drawIndirectCount: the count-buffer calls (I2, I3, I4) are not run\n");
 
     unsigned direct_mismatches = 0, indirect_mismatches = 0, records_drawn = 0;
+    unsigned computed_mismatches = 0, computed_records = 0;   // (d), with count buffers only
     const char* subgroup = "?";
     {
         Ref<ID3D12Device> device;
@@ -559,6 +560,94 @@ int main(int argc, char** argv) {
             EXPECT(result == leonida::ReplayResult::success);
             indirect_mismatches = check("ExecuteIndirect DISPATCH_MESH", want);
 
+            // ===== (d) arguments a compute shader writes in the same list (a GPU-culling pass) =====
+            // cs_m5_args writes N = 8 records { 1 + (k & 3), 1, 1 } and the count 6 into two UAV buffers; after a
+            // transition to INDIRECT_ARGUMENT the next command reads them. Only the barrier orders the dispatch's
+            // writes before the reads (the prepass's under --mesh-compute, the indirect draw's natively).
+            if (counts) {
+                std::vector<std::uint8_t> cs_bytes;
+                EXPECT(container_of("cs_m5_args", "cs", cs_bytes));
+                Ref<ID3D12RootSignature> cs_root;
+                {
+                    // [0] four 32-bit constants (s0..s3), [1] a table of two raw UAVs (s[4:5]).
+                    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0};
+                    D3D12_ROOT_PARAMETER params[2] = {};
+                    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                    params[0].Constants = {0, 0, 4};
+                    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                    params[1].DescriptorTable = {1, &range};
+                    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+                    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+                    root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+                    const auto blob = serialize_root_signature(root_desc);
+                    EXPECT(!blob.empty() && SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(),
+                                                                                  IID_PPV_ARGS(&cs_root.p))));
+                }
+                D3D12_COMPUTE_PIPELINE_STATE_DESC cs_desc{};
+                cs_desc.pRootSignature = cs_root.p;
+                cs_desc.CS = {cs_bytes.data(), cs_bytes.size()};
+                Ref<ID3D12PipelineState> cs_pso;
+                EXPECT(SUCCEEDED(device->CreateComputePipelineState(&cs_desc, IID_PPV_ARGS(&cs_pso.p))));
+                const auto uav_buffer = [&](Ref<ID3D12Resource>& out) {
+                    const auto desc = buffer_desc(256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                    return SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                                     IID_PPV_ARGS(&out.p)));
+                };
+                Ref<ID3D12Resource> records_cs, count_cs;
+                EXPECT(uav_buffer(records_cs) && uav_buffer(count_cs));
+                const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                           D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+                Ref<ID3D12DescriptorHeap> heap;
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+                const std::uint64_t cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
+                const std::uint64_t gpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p);
+                const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                EXPECT(cpu && gpu && step == 32);   // the shader steps 32 bytes a slot
+                D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+                raw.Format = DXGI_FORMAT_R32_TYPELESS;
+                raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                raw.Buffer.NumElements = 64;
+                raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                device->CreateUnorderedAccessView(records_cs.p, nullptr, &raw, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(cpu)});
+                device->CreateUnorderedAccessView(count_cs.p, nullptr, &raw,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(cpu + step)});
+
+                constexpr UINT written = 8, count = 6;
+                Image want_cs({0, 0, 0, 255});
+                for (unsigned k = 0; k < count; ++k)   // record k: 1 + (k & 3) groups from cell 0
+                    for (unsigned j = 0; j < 1 + (k & 3); ++j)
+                        want_cs.cell(j, [](Pixel& p) {
+                            p[0] = std::uint8_t(std::min(255u, p[0] + 16u));
+                            p[1] = std::uint8_t(std::min(255u, p[1] + 24u));
+                        });
+                EXPECT(begin(mesh_additive.p, black));
+                ID3D12DescriptorHeap* heaps[] = {heap.p};
+                list->SetDescriptorHeaps(1, heaps);
+                list->SetComputeRootSignature(cs_root.p);
+                list->SetPipelineState(cs_pso.p);
+                const std::uint32_t cs_constants[4] = {written, count, 0, 0};
+                list->SetComputeRoot32BitConstants(0, 4, cs_constants, 0);
+                list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
+                list->Dispatch(1, 1, 1);
+                const D3D12_RESOURCE_BARRIER to_indirect[2] = {
+                    transition(records_cs.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+                    transition(count_cs.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)};
+                list->ResourceBarrier(2, to_indirect);
+                list->SetPipelineState(mesh_additive.p);   // the graphics root signature and constants stay
+                set_constants(constants(0, 16, 24));
+                list->ExecuteIndirect(sig12.p, written, records_cs.p, 0, count_cs.p, 0);
+                EXPECT(end());
+                const auto computed = run(list.p);
+                if (computed != leonida::ReplayResult::success)
+                    std::fprintf(stderr, "compute-written indirect mesh replay: %d\n", int(computed));
+                EXPECT(computed == leonida::ReplayResult::success);
+                computed_mismatches = check("compute-written DISPATCH_MESH", want_cs);
+                computed_records = count;
+            }
+
             // Without drawIndirectCount, a count-buffer call cannot be replayed.
             if (!counts) {
                 EXPECT(begin(mesh_opaque.p, black));
@@ -592,12 +681,14 @@ int main(int argc, char** argv) {
 
     std::printf("mesh tier 1%s, translated wave64 mesh shader (128 threads, %s): DispatchMesh 4x2x2, 3x1x1, 1x1x1 and "
                 "an empty grid, %u mismatched pixels; ExecuteIndirect DISPATCH_MESH, %u records drawn%s, %u mismatched "
-                "pixels; wrong-kind indirect draws fail at execution\n",
+                "pixels; compute-written records: %u drawn, %u mismatched pixels; wrong-kind indirect draws fail at "
+                "execution\n",
                 mesh_compute ? " without VK_EXT_mesh_shader" : "", subgroup, direct_mismatches, records_drawn,
-                counts ? " (count buffers included)" : " (no count buffers)", indirect_mismatches);
+                counts ? " (count buffers included)" : " (no count buffers)", indirect_mismatches, computed_records,
+                computed_mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    return direct_mismatches == 0 && indirect_mismatches == 0 ? 0 : 1;
+    return direct_mismatches == 0 && indirect_mismatches == 0 && computed_mismatches == 0 ? 0 : 1;
 }
