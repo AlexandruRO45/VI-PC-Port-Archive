@@ -370,10 +370,14 @@ int main(int argc, char** argv) {
     // tail is a uniform block at set 1 (vk_pc_tail.h). Both sides of mesh-compute must read the output
     // address there: dispatch writes through it, and the generated vertex shader reads through it.
     const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    const auto first_code = read_spv(argv[1]);
+    const auto mesh_vs_code = mesh_compute ? read_spv(mesh_vs_path) : std::vector<uint32_t>{};
     if (mesh_compute) {
         const char* const mesh_stages[] = {mesh_vs_path, argv[1]};
-        for (const char* path : mesh_stages) {
-            const auto code = read_spv(path);
+        const std::vector<uint32_t>* const mesh_codes[] = {&mesh_vs_code, &first_code};
+        for (unsigned i = 0; i < 2; ++i) {
+            const char* path = mesh_stages[i];
+            const auto& code = *mesh_codes[i];
             if (code.empty()) {
                 std::fprintf(stderr, "cannot read mesh-compute shader: %s\n", path);
                 return 2;
@@ -381,9 +385,11 @@ int main(int argc, char** argv) {
             const bool shader_tail = leonida::vk_test::spirv_declares_set(
                 code.data(), code.size() * sizeof(uint32_t), leonida::vk_test::pc_tail_set);
             if (shader_tail != pc_tail) {
-                std::fprintf(stderr, "unsupported: mesh-compute shader mode does not match LEONIDA_PC_TAIL_UBO (%s)\n",
-                             path);
-                return 77;
+                std::fprintf(stderr,
+                             "configuration error: mesh-compute shader %s uses %s; LEONIDA_PC_TAIL_UBO expects %s\n",
+                             path, shader_tail ? "the tail UBO" : "legacy push constants",
+                             pc_tail ? "the tail UBO" : "legacy push constants");
+                return 2;
             }
         }
     }
@@ -523,9 +529,11 @@ int main(int argc, char** argv) {
     // shaderInt64 only when a stage has 64-bit integers. Heap and --mesh-compute addresses are 64-bit, but rdna2spirv.py
     // builds them from 32-bit pairs unless the shader also does 64-bit arithmetic (SHADER-423), so the module decides,
     // not VKH_HEAP (TEST-468).
-    bool needs_int64 = leonida::vk_test::needs_shader_int64(fs_code);
-    for (const char* p : std::initializer_list<const char*>{argv[1], mesh_vs_path, gs_path})
-        if (p && !needs_int64) needs_int64 = leonida::vk_test::needs_shader_int64(read_spv(p));
+    const auto gs_code = gs_path ? read_spv(gs_path) : std::vector<uint32_t>{};
+    const bool needs_int64 = leonida::vk_test::needs_shader_int64(fs_code) ||
+                             leonida::vk_test::needs_shader_int64(first_code) ||
+                             (mesh_compute && leonida::vk_test::needs_shader_int64(mesh_vs_code)) ||
+                             (gs_path && leonida::vk_test::needs_shader_int64(gs_code));
     if (needs_int64) {
         if (!f2q.features.shaderInt64) {
             std::fprintf(stderr, "unsupported: a stage declares Int64 and the device has no shaderInt64\n");
@@ -640,8 +648,7 @@ int main(int argc, char** argv) {
     fbi.renderPass = rp; fbi.attachmentCount = rpi.attachmentCount; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
     VkFramebuffer fb; CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
     bool tail_block = false;   // some stage reads the --pc-tail-ubo block (declares set 1)
-    auto module = [&](const char* p, VkShaderModule* m) {
-        auto code = read_spv(p);
+    auto module = [&](const std::vector<uint32_t>& code, VkShaderModule* m) {
         if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
             tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -649,8 +656,8 @@ int main(int argc, char** argv) {
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
     VkShaderModule vs, fs, csm = VK_NULL_HANDLE;
-    CHECK(module(mesh_compute ? mesh_vs_path : argv[1], &vs)); CHECK(module(argv[2], &fs));
-    if (mesh_compute) CHECK(module(argv[1], &csm));
+    CHECK(module(mesh_compute ? mesh_vs_code : first_code, &vs)); CHECK(module(fs_code, &fs));
+    if (mesh_compute) CHECK(module(first_code, &csm));
     VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -660,7 +667,7 @@ int main(int argc, char** argv) {
     uint32_t nstages = 2;
     if (gs_path) {
         VkShaderModule gsm;
-        CHECK(module(gs_path, &gsm));
+        CHECK(module(gs_code, &gsm));
         stages[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT; stages[2].module = gsm; stages[2].pName = "main";
         nstages = 3;
     }
