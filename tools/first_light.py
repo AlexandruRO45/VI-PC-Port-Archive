@@ -866,7 +866,7 @@ def load_json(
     """
     wanted = "an object" if expect is dict else "an array"
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:  # -sig: a copy re-saved by a Windows editor has a BOM
             data = json.load(f)
     except UnicodeDecodeError as e:
         raise SystemExit(f"the {kind} {path} is not valid UTF-8 ({e.reason})") from e

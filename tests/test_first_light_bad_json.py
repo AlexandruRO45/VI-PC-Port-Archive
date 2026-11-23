@@ -100,6 +100,13 @@ class CliBadJsonTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.splitlines(), ["vs a", "ps b"])
 
+    def test_list_reads_an_index_saved_with_a_bom(self):
+        # Windows PowerShell 5.1's Out-File -Encoding utf8 and Notepad's "UTF-8" start the file with EF BB BF.
+        self.bad_index(b'\xef\xbb\xbf[{"stage": "vs", "name": "a"}, {"stage": "ps", "name": "b"}]')
+        proc = self.list_cli()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), ["vs a", "ps b"])
+
 
 if __name__ == "__main__":
     unittest.main()
