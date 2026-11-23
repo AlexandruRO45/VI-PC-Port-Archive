@@ -183,6 +183,66 @@ class SummaryTests(unittest.TestCase):
             self.assertIn("one file", message)
             self.assertFalse(os.path.exists(one))
 
+    def test_limit_zero_is_a_usage_error(self):
+        """--limit 0 used to scan no listing and print an empty summary with exit 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            write_listing(tmp, "ps_table32", LISTINGS["ps_table32"])
+            write_listing(tmp, "ps_two32", LISTINGS["ps_two32"])
+            stderr = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    P.main([disasm, "--limit", "0"])
+            finally:
+                message = sys.stderr.getvalue()
+                sys.stderr = stderr
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("at least 1", message)
+
+    def test_limit_negative_is_a_usage_error(self):
+        """--limit -1 used to silently scan only the first of the two listings."""
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            write_listing(tmp, "ps_table32", LISTINGS["ps_table32"])
+            write_listing(tmp, "ps_two32", LISTINGS["ps_two32"])
+            stderr = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    P.main([disasm, "--limit", "-1"])
+            finally:
+                message = sys.stderr.getvalue()
+                sys.stderr = stderr
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("at least 1", message)
+
+    def test_limit_one_scans_only_the_first_listing(self):
+        """--limit counts listings: of the two written, only the first is scanned."""
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            write_listing(tmp, "ps_table32", LISTINGS["ps_table32"])
+            write_listing(tmp, "ps_two32", LISTINGS["ps_two32"])
+            out = os.path.join(tmp, "s.json")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    rc = P.main([disasm, "--jobs", "1", "--limit", "1", "--json", out])
+                finally:
+                    printed = sys.stdout.getvalue()
+                    sys.stdout = stdout
+            self.assertEqual(rc, 0)
+            self.assertIn("1 shaders: ps 1", printed)
+            with open(out, encoding="utf-8") as f:
+                s = json.load(f)
+            self.assertEqual(s["total"], 1)
+            self.assertEqual(s["truncated_pointers_per_shader"]["ps"], {"1": 1})
+
     def test_missing_folder(self):
         stderr = sys.stderr
         sys.stderr = io.StringIO()
