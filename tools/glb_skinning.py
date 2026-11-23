@@ -18,7 +18,7 @@ BIN chunk, 4-byte padding), then checks every skin and every mesh primitive:
 
 Missing optional fields are reported as null; they are never filled in with a
 guess. A malformed container, a file with no skin, or a skin whose
-inverseBindMatrices count differs from its joint count exits nonzero. Structural
+inverseBindMatrices count is less than its joint count exits nonzero. Structural
 problems also exit nonzero with a one-line ``ERROR:`` message.
 
 Only the standard library is used, and the input is read, never modified.
@@ -480,10 +480,11 @@ def _validate_skins(gltf, reader, warnings, errors):
                 "component_type": meta["component_type"],
                 "normalized": meta["normalized"],
             })
-            if meta["count"] != len(joints):
+            # glTF 2.0 §3.7.3.1 permits more matrices than joints.
+            if meta["count"] < len(joints):
                 errors.append(
                     f"{_skin_label(skin_index, name)}: inverseBindMatrices count "
-                    f"{meta['count']} != joint count {len(joints)}"
+                    f"{meta['count']} < joint count {len(joints)}"
                 )
             if meta["type"] != "MAT4":
                 errors.append(

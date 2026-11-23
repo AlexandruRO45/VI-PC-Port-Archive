@@ -350,11 +350,11 @@ class GlbSkinningTests(unittest.TestCase):
         self.assertIn("references node 5", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
 
-    def test_inverse_bind_matrices_count_mismatch(self):
+    def test_inverse_bind_matrices_count_too_small(self):
         report = glb_skinning.analyze_glb(make_glb(ibm_count=1))
         self.assertFalse(report["ok"])
         self.assertIn(
-            "inverseBindMatrices count 1 != joint count 2",
+            "inverseBindMatrices count 1 < joint count 2",
             "\n".join(report["errors"]),
         )
         self.assertEqual(1, report["skins"][0]["inverse_bind_matrices"]["count"])
@@ -362,7 +362,28 @@ class GlbSkinningTests(unittest.TestCase):
         path = self.write("bad_ibm.glb", make_glb(ibm_count=1))
         proc = self.run_tool(path)
         self.assertNotEqual(0, proc.returncode)
-        self.assertIn("inverseBindMatrices count 1 != joint count 2", proc.stderr)
+        self.assertIn("inverseBindMatrices count 1 < joint count 2", proc.stderr)
+
+    def test_surplus_inverse_bind_matrices_are_allowed(self):
+        for count in (3, 4):
+            with self.subTest(count=count):
+                data = make_glb(ibm_count=count)
+                report = glb_skinning.analyze_glb(data)
+                self.assertTrue(report["ok"], report["errors"])
+                skin = report["skins"][0]
+                self.assertEqual(2, skin["joint_count"])
+                self.assertEqual(count, skin["inverse_bind_matrices"]["count"])
+                path = self.write(f"surplus_{count}.glb", data)
+                proc = self.run_tool(path)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                self.assertIn(f"inverseBindMatrices {count}", proc.stdout)
+
+    def test_surplus_inverse_bind_matrices_do_not_extend_joint_indices(self):
+        joints = ((0, 0, 0, 0), (0, 1, 0, 0), (2, 1, 0, 0))
+        report = glb_skinning.analyze_glb(make_glb(joints=joints, ibm_count=3))
+        self.assertFalse(report["ok"])
+        self.assertEqual(1, report["summary"]["out_of_range_joint_count"])
+        self.assertIn("joint index 2", "\n".join(report["errors"]))
 
     def test_static_mesh_alongside_skinned_mesh_is_reported_not_failed(self):
         report = glb_skinning.analyze_glb(make_glb(add_static=True))
