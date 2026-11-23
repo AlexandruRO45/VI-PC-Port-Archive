@@ -101,8 +101,10 @@ Der Platzbedarf oben gilt für den vollständigen Build. Um den Port nur zu *sta
 `--stages check,shaders,runtime` etwa 30 GB; die Stufe `assets` (~370 GB) ist nur für die Asset-Tools da, und `--wav` kommt mit einem Mehrfachen der Ogg-Opus-Größe hinzu. `--work` und `--out` können auf
 einem anderen Laufwerk liegen. Die Runtime liest das Paket an Ort und Stelle; liegt es auf einem schreibgeschützten
 Laufwerk, brauchst du `gta6rt --overlay <beschreibbarer Ordner>` (eine Option von `gta6rt`, nicht von
-`make_game.py`). Lösche die `.s`-Dateien in `work/shaders/dxbc/disasm` nicht: Ohne sie und ohne
-`work/shaders/spirv/index.json` kann die Stufe `shaders` mit null Shadern fertig aussehen.
+`make_game.py`). Lass die `.s`-Dateien in `work/shaders/dxbc/disasm` liegen: Der nächste Lauf vergleicht sie mit der
+Liste in `disasm.done` und disassembliert die fehlenden erneut (alle, wenn `disasm.done` älter als diese Liste ist),
+und übersetzt danach alle Shader erneut. Ein `disasm`-Ordner, der ein Symlink ist, wird abgelehnt, wenn die Stufe ihn
+leeren muss.
 
 ### Aus dem Terminal (`make_game.py`)
 
