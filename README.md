@@ -95,7 +95,8 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 3. Double-click **`Build.bat`**.
 
 It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
-such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
+such as in OneDrive), Games, your home folder, the top of every drive on Windows and the usual mount points elsewhere
+(`/mnt`, `/media`, `/run/media`, `/run/media/<user>` and `/Volumes`), two folders deep. It recognises the
 version from a few file sizes, without reading anything large. If you have more than one copy it asks which one, and if it finds none it asks you to paste the
 folder. Before starting it checks that everything below is installed and that there is enough free space, and it
 lists anything missing in one go. The result goes to `Documents\Leonida`. A stopped build continues where it left

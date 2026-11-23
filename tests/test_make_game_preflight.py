@@ -769,14 +769,23 @@ class GameDiscoveryTest(unittest.TestCase):
             self.assertIn(root, roots)
         self.assertEqual([r for r in roots if r.endswith(":\\")], [])
 
+    def test_discovery_roots_include_the_current_users_media_folder(self):
+        with mock.patch.object(make_game.os, "name", "posix"), \
+             mock.patch.object(make_game, "known_folders", return_value=[]), \
+             mock.patch.dict(os.environ, {"USER": "alice"}, clear=False):
+            roots = make_game.discovery_roots(self.home)
+        self.assertEqual(roots.count(os.path.join("/run/media", "alice")), 1)
+
     def test_windows_roots_are_the_drives_that_exist(self):
         with mock.patch.object(make_game.os, "name", "nt"), \
              mock.patch.object(make_game, "known_folders", return_value=[]), \
+             mock.patch.dict(os.environ, {"USER": "alice"}, clear=False), \
              mock.patch("os.path.isdir", side_effect=lambda path: path.startswith("C:")):
             roots = make_game.discovery_roots(self.home)
         self.assertIn("C:\\", roots)
         self.assertNotIn("D:\\", roots)
         self.assertNotIn("/Volumes", roots)
+        self.assertNotIn(os.path.join("/run/media", "alice"), roots)
 
     def test_find_searches_the_platform_roots(self):
         package = os.path.join(self.home, "Volumes", "share", "GTA VI")
@@ -785,6 +794,24 @@ class GameDiscoveryTest(unittest.TestCase):
         with mock.patch.object(make_game, "discovery_roots", return_value=[root]), \
              mock.patch.object(make_game, "versions", return_value=[self.version]):
             self.assertEqual(make_game.find_dumps(), [(package, self.version)])
+
+    def test_find_searches_the_current_users_media_root(self):
+        media = os.path.join(self.home, "run", "media")
+        package = os.path.join(media, "alice", "USB", "GTA VI")
+        self.write_probes(package)
+        with mock.patch.object(make_game.os, "name", "posix"), \
+             mock.patch.object(make_game, "MEDIA_USER_ROOT", media), \
+             mock.patch.object(make_game, "VOLUME_ROOTS", (media,)), \
+             mock.patch.dict(os.environ, {"USER": "alice"}, clear=False), \
+             mock.patch.object(make_game, "known_folders", return_value=[]), \
+             mock.patch.object(make_game, "versions", return_value=[self.version]), \
+             mock.patch("os.path.expanduser", return_value=self.home):
+            self.assertEqual(make_game.find_dumps(), [(package, self.version)])
+
+        # Negative control: /run/media on its own reaches only alice/USB in two levels, not the package.
+        with mock.patch.object(make_game, "discovery_roots", return_value=[media]), \
+             mock.patch.object(make_game, "versions", return_value=[self.version]):
+            self.assertEqual(make_game.find_dumps(), [])
 
 
 class PathAndGameSelectionTest(PreflightTestBase):

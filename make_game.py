@@ -222,7 +222,8 @@ XVD_MAGIC = b"msft-xvd"
 XVD_HEADER_SIZE = 0x1000
 XVD_ENCRYPTION_DISABLED = 0x2          # VolumeFlags bit
 CONTAINER_SUFFIXES = (".xvc", ".msixvc", ".xvd")
-VOLUME_ROOTS = ("/mnt", "/media", "/run/media", "/Volumes")   # POSIX: where drives and shares are mounted
+MEDIA_USER_ROOT = "/run/media"                            # POSIX: removable media, with the user below it
+VOLUME_ROOTS = ("/mnt", "/media", MEDIA_USER_ROOT, "/Volumes")   # POSIX: where drives and shares are mounted
 
 
 def xvd_header(path: str):
@@ -301,23 +302,34 @@ def known_folders() -> list:
 
 
 def discovery_roots(home: str) -> list:
-    """Where find_dumps() starts looking. Windows: the known folders, the home folder and every drive letter. Else:
+    r"""Where find_dumps() starts looking. Windows: the known folders, the home folder and every drive letter. Else:
     the same folders plus the usual mount points, because that is where a copy on another disk or on a network share
     shows up (/Volumes is where macOS mounts both, /run/media is where Fedora and openSUSE mount removable media).
-    A Windows share path (\\server\share\...) can't be listed at all; --game takes it directly."""
+    /run/media/<user> is a root too: the user folder adds a level, so a drive at /run/media/<user>/USB/GTA VI would
+    otherwise be past the two-level limit. A Windows share path (\\server\share\...) can't be listed at all; --game
+    takes it directly."""
     roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + known_folders() + [home]
     if os.name == "nt":
         import string
         roots += [f"{d}:\\" for d in string.ascii_uppercase if os.path.isdir(f"{d}:\\")]
     else:
         roots += list(VOLUME_ROOTS)
+        user = os.environ.get("USER") or os.environ.get("LOGNAME")
+        if not user:
+            try:
+                import getpass
+                user = getpass.getuser()
+            except Exception:      # no user name available to search with; the other roots still apply
+                user = ""
+        if user and user not in (".", "..") and "/" not in user and "\\" not in user:
+            roots.append(os.path.join(MEDIA_USER_ROOT, user))
     return roots
 
 
 def find_dumps(containers: list | None = None) -> list:
     """Folders on this PC that hold a supported version: the folders discovery_roots() names (Downloads, Desktop,
     Documents under the home folder and where Windows really keeps them, the home folder, each drive on Windows, the
-    usual mount points elsewhere), up to two folder levels down.
+    usual mount points elsewhere, including /run/media/<user>), up to two folder levels down.
     Only folder names and a few file sizes are read. With a containers list, also appends (path, header) for each
     packaged container (.xvc/.msixvc/.xvd) in the folders searched, which the build can't use: only the 4 KiB header
     of a file with that suffix is read."""
