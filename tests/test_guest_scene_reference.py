@@ -90,8 +90,15 @@ class GuestSceneReferenceTest(unittest.TestCase):
             out = root / "output"
             cmd = [sys.executable, "-I", str(path), "--loader", str(bad_loader), "--guest", str(bad_loader),
                    "--shaders", str(root), "--out", str(out)]
+            loader_index = 0
             if sys.platform != "win32":
-                cmd += ["--wine", str(bad_loader)]
+                # A wine stub of its own: Session.run puts --wine first, so with the loader behind it cmd[0] is
+                # the wine path and the loader entry would never be the one compared.
+                wine = root / "invalid-wine"
+                wine.write_bytes(b"synthetic input that is not an executable")
+                wine.chmod(0o700)
+                cmd += ["--wine", str(wine)]
+                loader_index = 1
             result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
@@ -102,7 +109,7 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertIsNone(record["returncode"])
             # The runner resolves its loader/guest/shaders paths (main: args.loader.resolve()), and on macOS the
             # temp directory is reached through /var, which is a symlink to /private/var: compare the resolved path.
-            self.assertEqual(record["cmd"][0], str(bad_loader.resolve()))
+            self.assertEqual(record["cmd"][loader_index], str(bad_loader.resolve()))
             self.assertTrue(record["launch_error"])
             for stream in ("stdout", "stderr"):
                 contents = (out / "logs" / f"full.{stream}.log").read_bytes()
@@ -131,13 +138,19 @@ class GuestSceneReferenceTest(unittest.TestCase):
             out = link_root / "output"
             cmd = [sys.executable, "-I", str(path), "--loader", str(link_loader), "--guest", str(link_loader),
                    "--shaders", str(link_root), "--out", str(out)]
+            loader_index = 0
             if sys.platform != "win32":
-                cmd += ["--wine", str(link_loader)]
+                # Distinct from the loader, so cmd[0] (the wine path) cannot stand in for the loader entry.
+                real_wine = real / "invalid-wine"
+                real_wine.write_bytes(b"synthetic input that is not an executable")
+                real_wine.chmod(0o700)
+                cmd += ["--wine", str(link_root / "invalid-wine")]
+                loader_index = 1
             result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             record = json.loads((out / "logs" / "full.json").read_text(encoding="utf-8"))
             self.assertEqual(record["outcome"], "launch_failed")
-            self.assertEqual(record["cmd"][0], str(real_loader.resolve()))
+            self.assertEqual(record["cmd"][loader_index], str(real_loader.resolve()))
 
     def test_timeout_has_its_own_run_outcome(self):
         with tempfile.TemporaryDirectory() as temp:
