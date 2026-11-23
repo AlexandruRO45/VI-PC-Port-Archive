@@ -1,0 +1,17 @@
+[package]
+name = "audio_native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Optional native kernels for the AWC header and companion-table decoders of tools/rsc8_audio.py"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+panic = "abort"

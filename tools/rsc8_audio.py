@@ -44,6 +44,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anim_clips  # noqa: E402
+import _audio_native as native  # noqa: E402  optional Rust kernels; every call returns None to fall back
 from file_mode import published_mode  # noqa: E402
 
 RSC8_MAGIC = b"RSC8"
@@ -797,6 +798,9 @@ def parse_adat_header_bytes(hb, bank_offset, file_size):
             return None
     elif pos + count * 4 > hdr_sz:
         return None
+    fast = native.adat_header(hb, bank_offset, file_size, MAX_BANK_STREAMS, MAX_HEADER_BYTES)
+    if fast is not None:
+        return fast[1]
 
     streams = []
     total_tags = 0
@@ -906,6 +910,10 @@ def decode_grid20_table(blob):
     n = (len(raw) - 8) // 20
     out["entries"] = n
     out["tail_f32"], = struct.unpack_from("<f", raw, len(raw) - 4)
+    fast = native.grid20(raw)
+    if fast is not None:
+        out["position_first"], out["position_last"], out["position_increasing"], out["p_multiple_of_32"] = fast
+        return out
     prev = None
     p_ok = True
     increasing = True
@@ -950,6 +958,24 @@ def decode_index_runs(blob, grid_entries=None):
     if len(raw) < 4 or len(raw) % 4 or len(raw) > MAX_GRID20_BYTES:
         return out
     out["size_ok"] = True
+    fast = native.index_runs(raw, MAX_INDEXRUN_GROUPS)
+    if fast is False:
+        out["size_ok"] = False
+        return out
+    if fast is not None:
+        groups, matches, out["marker_ok"], hashes, values, ascending, index_max = fast
+        out["group_count_matches"] = matches
+        out["hash_single"] = len(hashes) == 1
+        out["hashes"] = hashes
+        out["groups"] = groups
+        out["values"] = values
+        out["indices_ascending"] = ascending
+        out["index_max"] = index_max
+        if grid_entries is None:
+            out["indices_within_grid"] = None
+        else:
+            out["indices_within_grid"] = True if index_max is None else index_max < grid_entries
+        return out
     vals = struct.unpack_from(f"<{len(raw) // 4}I", raw, 0)
     declared, at = vals[0], 1
     groups = 0
@@ -1022,6 +1048,18 @@ def decode_marker_records(blob, sample_count=None):
         return out
     out["size_ok"] = True
     n = len(raw) // MARKER_RECORD_BYTES
+    fast = native.markers(raw)
+    if fast is not None:
+        names, ascending, offset_max, extra_max = fast
+        out["records"] = n
+        out["names"] = names
+        out["first_name"] = _u32(raw, 0)
+        out["offsets_ascending"] = ascending
+        out["offset_max"] = offset_max
+        out["extra_max"] = extra_max
+        if sample_count is not None:
+            out["offsets_within_samples"] = offset_max <= sample_count
+        return out
     names = {}
     ascending = True
     prev = None
@@ -1472,8 +1510,11 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally, stream_id=Non
             key = f"0x{marks['first_name']:08x}"
             firsts = tally["marker_first_names"]
             firsts[key] = firsts.get(key, 0) + 1
-            records = marker_records(blob)
-            if any(value in _REGION_VALUES for _name, value, _offset, _extra in records):
+            hit = native.marker_has_value(blob, MARKER_VALUE_START, MARKER_VALUE_END)
+            records = None if hit is False else marker_records(blob)
+            if hit is None:
+                hit = any(value in _REGION_VALUES for _name, value, _offset, _extra in records)
+            if hit:
                 samples = None
                 if TAG_FORMAT in tmap:
                     fo, fs = tmap[TAG_FORMAT][0]
