@@ -357,6 +357,25 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertEqual(report["summary"]["tail_only"], 0)
         self.assertEqual(report["summary"]["fragments"], 0)
 
+    def test_carve_keeps_headerless_document_after_malformed_declared_xml(self):
+        malformed = b'<?xml version="1.0"?><Broken!></Broken>'
+        headerless = b"<Independent><Child/></Independent>"
+        rows = []
+        for off, payload in ((0x1000, malformed), (0x2000, headerless)):
+            self.write(f"{off:012x}.bin", payload)
+            rows.append({"off": off, "stored": len(payload), "size": len(payload)})
+        self.write("index.json", json.dumps({"files": rows}).encode("utf-8"))
+
+        out = os.path.join(self.root, "catalog.json")
+        result = self.run_tool(self.root, "--json", out)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        well_formed = [row for row in report["rows"] if row["well_formed"]]
+        self.assertEqual([row["root"] for row in well_formed], ["Independent"])
+        self.assertEqual(well_formed[0]["offset_hex"], "2000")
+        self.assertFalse(well_formed[0]["header"])
+
     def test_a_folder_that_cannot_be_listed_fails_the_scan(self):
         def fake_walk(root, onerror=None):
             self.assertIsNotNone(onerror, "os.walk needs onerror, or an unlistable folder is skipped")
