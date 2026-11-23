@@ -349,6 +349,12 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
 USAGE = "\n".join(__doc__.strip().splitlines()[-2:])
 
 
+def _why(error):
+    """The first line of a tool's stderr, or its exit code when it printed nothing."""
+    lines = (error.stderr or "").strip().splitlines()
+    return lines[0] if lines else f"exit {error.returncode}"
+
+
 def main(argv):
     args = argv[1:]
     if args and args[0] in ("-h", "--help"):
@@ -379,7 +385,15 @@ def main(argv):
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
-    text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    try:
+        text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    except OSError as e:
+        print(f"ERROR: cannot run {dis}: {e.strerror or e} (install SPIRV-Tools or set SPIRV_DIS)",
+              file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: {dis} refused {args[0]}: {_why(e)}", file=sys.stderr)
+        return 2
     ver = re.search(r"; Version: (\d+)\.(\d+)", text)
     version = (int(ver[1]), int(ver[2])) if ver else (1, 5)
     try:

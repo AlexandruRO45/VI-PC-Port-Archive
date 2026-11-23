@@ -398,3 +398,20 @@ def test_cli_names_a_missing_input_in_one_line(tmp_path: Path) -> None:
     assert "Traceback" not in result.stderr
     assert not output.exists()
 
+
+
+def test_cli_names_a_disassembler_that_cannot_start(tmp_path: Path) -> None:
+    """A spirv-dis that is not on PATH (or a wrong SPIRV_DIS) is one ERROR line, not a traceback."""
+    source = tmp_path / "gs.spv"
+    source.write_bytes(b"\x03\x02#\x07")            # magic only: nothing is disassembled
+    result = subprocess.run(
+        [sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+         str(source), str(tmp_path / "cs.spv")],
+        capture_output=True, text=True,
+        env=dict(os.environ, SPIRV_DIS=str(tmp_path / "no-such-spirv-dis")))
+    assert result.returncode == 2, result.stderr
+    assert result.stderr.startswith("ERROR: "), result.stderr
+    assert len(result.stderr.strip().splitlines()) == 1, result.stderr
+    assert "SPIRV_DIS" in result.stderr
+    assert "Traceback" not in result.stderr
+
