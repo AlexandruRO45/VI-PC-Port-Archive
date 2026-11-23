@@ -180,12 +180,12 @@ breadbbbb/rpf9-explorer#18 reads index buffers with more than 65,535 triangles o
 cached by the old decoder is scanned again. `tools/rpf9dump models` was run with both pins on the
 same input:
 
-| Input | Models at `e293917` | Models at `7ef5c51` | Only at `7ef5c51` | Only at `e293917` |
+| Input | Models at `e293917` | Models at `7ef5c51` | Only at `e293917` | Only at `7ef5c51` |
 |---|---:|---:|---:|---:|
-| `packs.rpf` (whole) | 26,585 | **27,484** | 899, all mid-page | 0 |
-| `pack/shared_minigame000/...` (whole) | 1,294 | **1,296** | 2, both mid-page | 0 |
+| `packs.rpf` (whole) | 26,585 | **27,484** | 0 | 899, all mid-page |
+| `pack/shared_minigame000/...` (whole) | 1,294 | **1,296** | 0 | 2, both mid-page |
 | `pack/core_restofworld/...` (whole) | 936 | **936** | 0 | 0 |
-| `levels.rpf`, bytes `0x10F0000000` + `0x60000000` | 18,946 | **18,950** | 4, all at a page start + 0x10 | 0 |
+| `levels.rpf`, bytes `0x10F0000000` + `0x60000000` | 18,946 | **18,950** | 0 | 4, all at a page start + 0x10 |
 | `levels.rpf`, bytes `0x6B0000000` + `0x40000000` | 4,712 | **4,712** | 0 | 0 |
 | `levels.rpf`, first 4 GiB | 1,230 | **1,230** | 0 | 0 |
 
