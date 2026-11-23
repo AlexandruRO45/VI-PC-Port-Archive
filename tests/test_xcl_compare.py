@@ -9,9 +9,6 @@ import os
 import sys
 import tempfile
 import unittest
-from pathlib import Path
-from types import SimpleNamespace
-from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import xcl_compare as xc  # noqa: E402
@@ -145,6 +142,10 @@ class Restart(unittest.TestCase):
         return run, skip, attempts
 
     def test_restarts_preserve_traces_but_not_title_state(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest import mock
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "tests/data/testgame").mkdir(parents=True)
