@@ -70,6 +70,9 @@ MAGIC = b"FSSM"
 TABLE_OFFSET = 0x138
 RECORD_SIZE = 8
 RECORD_KIND = 6
+MESH_EXPORT_TABLE = 0x1dc
+MESH_EXPORT_COUNT = 0x29c
+MAX_MESH_PARAMS = (MESH_EXPORT_COUNT - MESH_EXPORT_TABLE) // 6
 FLAG_FP16 = 0x10
 READ_MASK = 0x03
 READ_MOV = 0x01      # v_interp_mov_f32: flat
@@ -133,21 +136,23 @@ def interpolants(blob):
 
 def mesh_pixel_slots(mesh, pixel):
     """Match a translated mesh export to each pixel input ordinal in a supplied native pair."""
-    export_table, export_count = 0x1dc, 0x29c
-    if mesh[:4] != MAGIC or len(mesh) < export_count + 4 or pixel[:4] != MAGIC:
+    if mesh[:4] != MAGIC or len(mesh) < MESH_EXPORT_COUNT + 4 or pixel[:4] != MAGIC:
         raise ValueError("expected both native FSSM headers")
-    count = _u32(mesh, export_count)
-    if not 0 < count <= (export_count - export_table) // 6:
+    count = _u32(mesh, MESH_EXPORT_COUNT)
+    if not 0 < count <= MAX_MESH_PARAMS:
         raise ValueError("unsupported mesh export count")
     exports = {}
-    for offset in range(export_table, export_table + 6 * count, 6):
+    for offset in range(MESH_EXPORT_TABLE, MESH_EXPORT_TABLE + 6 * count, 6):
         kind, semantic, param = mesh[offset:offset + 3]
-        if kind != RECORD_KIND or semantic in exports or param in exports.values() or param >= 32:
+        if kind != RECORD_KIND or semantic in exports or param in exports.values() or param >= MAX_MESH_PARAMS:
             raise ValueError("unsupported or ambiguous mesh export record")
         exports[semantic] = param
     inputs = pixel_inputs(pixel)
-    if not inputs or len(inputs) > 32:
+    if not inputs or len(inputs) > MAX_MESH_PARAMS:
         raise ValueError("expected a pixel input table")
+    next_record = TABLE_OFFSET + len(inputs) * RECORD_SIZE
+    if next_record < len(pixel) and pixel[next_record] == RECORD_KIND:
+        raise ValueError("truncated pixel input record")
     slots = []
     for ordinal, row in enumerate(inputs):
         if row["index"] != ordinal:

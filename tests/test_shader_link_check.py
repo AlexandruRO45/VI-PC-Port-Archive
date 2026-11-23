@@ -117,7 +117,7 @@ def kinds(producer, consumer, **kwargs):
 
 
 class NativeMeshLinkTest(unittest.TestCase):
-    def fixture(self, slots=(0, 2), big_endian=False):
+    def fixture(self, slots=(0, 2), big_endian=False, exports=3):
         # Three independent export values. The middle one has the same type as its
         # neighbors, so simply matching the two modules' dense locations passes.
         ms = ModuleFixture("ms")
@@ -126,10 +126,10 @@ class NativeMeshLinkTest(unittest.TestCase):
         vector = pixel.numeric(32, 4)
         producer = bytearray(0x2a0)
         producer[:4] = b"FSSM"
-        struct.pack_into("<I", producer, 0x29c, 3)
+        struct.pack_into("<I", producer, 0x29c, exports)
         consumer = bytearray(0x138 + 8 * (len(slots) + 1))
         consumer[:4] = b"FSSM"
-        for param in range(3):
+        for param in range(exports):
             ms.variable(spv.STORAGE_OUTPUT, per_vertex, param)
             struct.pack_into("6B", producer, 0x1dc + 6 * param, 6, 21 + param, param, 0, 0, 0)
         for attr, slot in enumerate(slots):
@@ -155,6 +155,49 @@ class NativeMeshLinkTest(unittest.TestCase):
     def test_identity_is_byte_identical(self):
         ms, pixel, producer, consumer = self.fixture(slots=(0, 1, 2))
         self.assertEqual(link.link_mesh_fragment(ms, pixel, producer, consumer), (pixel, [0, 1, 2]))
+
+    def test_command_bounds_sidecar_reads_and_detects_a_33rd_record(self):
+        ms, ps, producer, consumer = self.fixture(slots=range(32), exports=32)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            mesh, pixel = folder / "m.fssm", folder / "p.fssm"
+            output = folder / "linked.spv"
+            (folder / "m.spv").write_bytes(ms)
+            (folder / "p.spv").write_bytes(ps)
+            mesh.write_bytes(producer + bytes(8192))
+            pixel.write_bytes(consumer + bytes(8192))
+            args = ["link-mesh", "--ms", str(folder / "m.spv"), "--ps", str(folder / "p.spv"),
+                    "--ms-fssm", str(mesh), "--ps-fssm", str(pixel), "--out", str(output)]
+            original_open = Path.open
+            consumed = {}
+
+            @contextlib.contextmanager
+            def track_read(path, *args, **kwargs):
+                with original_open(path, *args, **kwargs) as stream:
+                    yield stream
+                    if path in (mesh, pixel):
+                        consumed[path] = stream.tell()
+
+            with patch.object(Path, "open", track_read), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(link.main(args), 0)
+            self.assertEqual(set(consumed), {mesh, pixel})
+            self.assertLessEqual(consumed[mesh], 0x2a0)
+            self.assertLessEqual(consumed[pixel], 0x138 + 33 * 8)
+            self.assertEqual(output.read_bytes(), ps)
+
+            # Exactly 32 complete records can end at EOF; the start of another
+            # record makes an incomplete or oversized table distinguishable.
+            complete = consumer[:-8]
+            self.assertEqual(link.link_mesh_fragment(ms, ps, producer, complete)[0], ps)
+            for tail, message in ((b"\x06", "truncated pixel input"), (bytes([6]) + bytes(7), "pixel input table")):
+                with self.subTest(tail_length=len(tail)):
+                    pixel.write_bytes(complete + tail)
+                    with contextlib.redirect_stderr(io.StringIO()) as errors:
+                        self.assertEqual(link.main(args), 2)
+                    self.assertIn(message, errors.getvalue())
+                    self.assertEqual(output.read_bytes(), ps)
+            with self.assertRaisesRegex(ValueError, "FSSM headers"):
+                link.link_mesh_fragment(ms, ps, producer[:-1], complete)
 
     def test_command_keeps_inputs_and_last_good_output_on_failure(self):
         ms, ps, producer, consumer = self.fixture()

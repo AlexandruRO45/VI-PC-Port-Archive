@@ -17,7 +17,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
-from fssm_header import mesh_pixel_slots  # noqa: E402
+import fssm_header as fssm  # noqa: E402
 import spirv_interface as spv  # noqa: E402
 from spirv_interface import (Address, Declaration, InterfaceError, NumericType,  # noqa: E402
                              StageInterface, reflect_module)
@@ -285,7 +285,7 @@ def parameter_ids(declarations):
 
 
 def link_mesh_fragment(mesh_spv, pixel_spv, mesh_fssm, pixel_fssm):
-    export_slots, input_slots = mesh_pixel_slots(mesh_fssm, pixel_fssm)
+    export_slots, input_slots = fssm.mesh_pixel_slots(mesh_fssm, pixel_fssm)
     producer = reflect_module(mesh_spv, "ms")
     module = spv.Module(pixel_spv)
     if len(module.entry_points) != 1:
@@ -317,8 +317,12 @@ def link_mesh_fragment(mesh_spv, pixel_spv, mesh_fssm, pixel_fssm):
 
 def link_mesh(args):
     ensure_report_is_separate(args.out, [args.ms, args.ps, args.ms_fssm, args.ps_fssm], "linked module")
-    linked, slots = link_mesh_fragment(args.ms.read_bytes(), args.ps.read_bytes(),
-                                       args.ms_fssm.read_bytes(), args.ps_fssm.read_bytes())
+    with args.ms_fssm.open("rb", buffering=0) as f:
+        mesh_header = f.read(fssm.MESH_EXPORT_COUNT + 4)
+    with args.ps_fssm.open("rb", buffering=0) as f:
+        # Include one more record so an oversized table still fails validation.
+        pixel_header = f.read(fssm.TABLE_OFFSET + (fssm.MAX_MESH_PARAMS + 1) * fssm.RECORD_SIZE)
+    linked, slots = link_mesh_fragment(args.ms.read_bytes(), args.ps.read_bytes(), mesh_header, pixel_header)
     # Publish only after checking the complete pair. Keep the translated input available for
     # other pipelines that use the same fragment shader with a different producer.
     temporary = None
