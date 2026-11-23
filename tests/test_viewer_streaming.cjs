@@ -205,10 +205,11 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
     assert.equal(attributes.get('role'), 'alert');
 });
 
-async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }) {
+async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }, browserNavigator) {
     const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
     const helpMessages = [];
     const actions = [];
+    const linkStatus = { textContent: '' };
     const canvas = {
         addEventListener: (type, handler) => canvasEvents.set(type, handler),
         requestPointerLock,
@@ -216,7 +217,11 @@ async function freecamFixture(requestPointerLock = async () => { throw new Error
     const start = { classList: { add() {}, toggle() {} } };
     const document = {
         pointerLockElement: null,
-        getElementById: id => id === 'start' ? start : { insertAdjacentHTML: (_, message) => helpMessages.push(message) },
+        getElementById(id) {
+            if (id === 'start') return start;
+            if (id === 'camera-link-status') return linkStatus;
+            return { insertAdjacentHTML: (_, message) => helpMessages.push(message) };
+        },
         addEventListener: (type, handler) => documentEvents.set(type, handler),
     };
     const source = viewerModule.split('// ---------- freecam ----------')[1].split('// ---------- chunk streaming ----------')[0];
@@ -231,12 +236,13 @@ async function freecamFixture(requestPointerLock = async () => { throw new Error
         formatCamHash: () => '#cam=1,2,3,0,0',
         history: { replaceState: (_state, _title, hash) => actions.push(hash) },
         location: { href: 'http://localhost/#cam=1,2,3,0,0' },
-        navigator: { clipboard: { writeText: async url => actions.push(url) } },
+        navigator: browserNavigator ?? { clipboard: { writeText: async url => actions.push(url) } },
     });
     return {
         ...state,
         helpMessages,
         actions,
+        linkStatus,
         fallback: () => start.onclick(),
         lockError: () => documentEvents.get('pointerlockerror')?.(),
         lock() { document.pointerLockElement = canvas; documentEvents.get('pointerlockchange')(); },
@@ -333,6 +339,46 @@ test('browser shortcuts leave viewer actions alone and Ctrl movement remains ava
     cam.key('KeyF');
     cam.key('KeyP');
     assert.deepEqual(cam.actions, ['wireframe', '#cam=1,2,3,0,0', 'http://localhost/#cam=1,2,3,0,0']);
+});
+
+test('the camera link can be copied from the address bar when clipboard access fails', async t => {
+    for (const [name, navigator] of [
+        ['no clipboard API', {}],
+        ['permission denied', { clipboard: { async writeText() { throw new Error('denied'); } } }],
+    ]) {
+        await t.test(name, async () => {
+            const cam = await freecamFixture(undefined, navigator);
+            await cam.key('KeyP');
+            assert.deepEqual(cam.actions, ['#cam=1,2,3,0,0']);
+            assert.match(cam.linkStatus.textContent, /copy.*address bar/i);
+        });
+    }
+});
+
+test('a successful camera link copy clears a previous clipboard error', async () => {
+    const navigator = {};
+    const cam = await freecamFixture(undefined, navigator);
+    await cam.key('KeyP');
+    assert.match(cam.linkStatus.textContent, /copy.*address bar/i);
+
+    let copied;
+    navigator.clipboard = { async writeText(url) { copied = url; } };
+    await cam.key('KeyP');
+    assert.equal(copied, 'http://localhost/#cam=1,2,3,0,0');
+    assert.equal(cam.linkStatus.textContent, '');
+});
+
+test('an older camera link copy failure does not restore the hint after a newer success', async () => {
+    let rejectFirst;
+    const navigator = { clipboard: { writeText: () => new Promise((_, reject) => { rejectFirst = reject; }) } };
+    const cam = await freecamFixture(undefined, navigator);
+    const first = cam.key('KeyP');
+
+    navigator.clipboard.writeText = async () => {};
+    await cam.key('KeyP');
+    rejectFirst(new Error('denied'));
+    await first;
+    assert.equal(cam.linkStatus.textContent, '');
 });
 
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {

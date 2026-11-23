@@ -13,6 +13,7 @@
   #banner { position: fixed; top: 12px; right: 12px; max-width: 360px; background: var(--panel); border-left: 3px solid var(--warn); padding: 10px 12px; border-radius: 8px; }
   #banner.hidden { display: none; }
   #help { position: fixed; bottom: 12px; left: 12px; background: var(--panel); padding: 10px 12px; border-radius: 8px; color: var(--dim); }
+  #camera-link-status { display: block; color: var(--warn); }
   #help kbd { color: var(--fg); background: #1c2129; padding: 0 5px; border-radius: 3px; }
   #start { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.45); cursor: pointer; font-size: 15px; }
   #start.hidden { display: none; }
@@ -33,6 +34,7 @@
 <div id="help">
   <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
   <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>P</kbd> copy link to this view · <kbd>Esc</kbd> release mouse
+  <span id="camera-link-status" role="status"></span>
 </div>
 <div id="start">Click to fly</div>
 
@@ -222,6 +224,21 @@ addEventListener("mousemove", e => {
 });
 addEventListener("wheel", e => { speed = THREE.MathUtils.clamp(speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1, 3000); }, { passive: true });
 addEventListener("blur", () => { keys.clear(); dragging = false; });
+let cameraLinkCopy = 0;
+async function copyCameraLink(url) {
+  const request = ++cameraLinkCopy;
+  let message = "Copy the link from the address bar.";
+  try {
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(url);
+      message = "";
+    }
+  } catch {
+    // The camera link is already in the address bar.
+  }
+  if (request === cameraLinkCopy) document.getElementById("camera-link-status").textContent = message;
+}
+
 const world = await loadWorld();
 addEventListener("keydown", e => {
   keys.add(e.code);
@@ -233,7 +250,7 @@ addEventListener("keydown", e => {
   if (e.code === "KeyR") camera.position.fromArray(world.spawn);
   if (e.code === "KeyP" && !e.repeat) {
     history.replaceState(null, "", formatCamHash(camera.position.toArray(), yaw, pitch));
-    navigator.clipboard?.writeText(location.href).catch(() => {});
+    return copyCameraLink(location.href);
   }
 });
 addEventListener("keyup", e => keys.delete(e.code));
