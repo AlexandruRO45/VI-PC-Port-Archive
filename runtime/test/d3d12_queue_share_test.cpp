@@ -65,7 +65,8 @@ std::uint32_t pattern(std::uint32_t seed, std::uint32_t i) {
 }
 
 ComPtr<ID3D12Resource> buffer(ID3D12Device* device, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state) {
-    D3D12_HEAP_PROPERTIES properties{heap};
+    D3D12_HEAP_PROPERTIES properties{};
+    properties.Type = heap;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width = bytes;
