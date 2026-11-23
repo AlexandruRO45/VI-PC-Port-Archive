@@ -169,6 +169,9 @@ python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows
 запускает `gta6rt.exe` через `wine` или через Wine из переменной `WINE` (для Proton это его `files/bin/wine`). На
 Windows этот же флаг пропускает сборку.
 
+При бэкенде Vulkan (`LEONIDA_D3D12=vulkan`) упакованный runtime находит переведённые шейдеры в `<work>/shaders/spirv`
+по `shader_path.txt` рядом с `gta6rt.exe`. Переменная `LEONIDA_SHADERS` указывает другой каталог.
+
 ## Частые проблемы
 
 - **Скачали ZIP с GitHub**: в архиве нет подмодуля `third_party/rpf9-explorer`. Используйте
