@@ -267,6 +267,19 @@ class TestInterpP1LVF16Reference(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP1LVF16Weighting(unittest.TestCase):
+    def test_p1lv_f16_vector_weights(self):
+        code = [
+            "v_mov_b32_e32 v5, 0",
+            "v_interp_p1lv_f16 v2, v5, attr3.x",
+            "v_interp_p2_f16 v2, v1, attr3.x, v2",
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p1lv_weight", code)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
