@@ -102,10 +102,13 @@ def collect(root: str) -> list[dict]:
                 if name.endswith(SOURCE_EXTS):
                     path = os.path.join(dirpath, name)
                     rel = os.path.relpath(path, root).replace(os.sep, "/")
-                    for n in code_notes(path, rel):
+                    file_notes = code_notes(path, rel)
+                    if file_notes:
                         with open(path, encoding="utf-8", errors="replace") as f:
-                            n["classes"] = sorted(served_classes(f.read()))
-                        notes.append(n)
+                            classes = sorted(served_classes(f.read()))
+                        for n in file_notes:
+                            n["classes"] = list(classes)
+                        notes.extend(file_notes)
     docs = os.path.join(root, "docs")
     if os.path.isdir(docs):
         for name in sorted(os.listdir(docs)):

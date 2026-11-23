@@ -100,6 +100,24 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
+    def test_collect_scans_served_classes_once_per_file_with_notes(self):
+        no_notes = os.path.join(self.root, "runtime", "shims", "no_notes.cpp")
+        with open(no_notes, "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"constexpr GUID kUnused = {{0x704c3f58, 0xe629, 0x4cc2, {{0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}}}};\n")
+        calls = []
+        orig = ec.served_classes
+        def counting(source):
+            calls.append(len(source))
+            return orig(source)
+        ec.served_classes = counting
+        try:
+            notes = ec.collect(self.root)
+        finally:
+            ec.served_classes = orig
+        self.assertEqual(len(calls), 2)
+        demo = [n for n in notes if n["file"] == "runtime/shims/demo.cpp"]
+        self.assertEqual([n["classes"] for n in demo], [[SAVE_CLASS], [SAVE_CLASS]])
+
     def test_this_repository(self):
         notes = ec.collect(ROOT)
         self.assertTrue(notes)
