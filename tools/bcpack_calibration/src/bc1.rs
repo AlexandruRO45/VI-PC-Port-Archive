@@ -23,7 +23,9 @@ fn blocks(
         } else if distance <= i {
             history[(i - distance) & 255]
         } else {
-            let seed = endpoints[256 + i - distance];
+            let age = distance - i;
+            // The strict table uses ring slots. Calibrated profiles index by age.
+            let seed = endpoints[if strict { 256 - age } else { age }];
             if seed.iter().any(|&value| value < 0) {
                 return false;
             }

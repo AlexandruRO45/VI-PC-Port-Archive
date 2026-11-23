@@ -1512,7 +1512,7 @@ def prepare_bcpack() -> None:
     import bcpack_native
 
     crate = bcpack_native.CRATE
-    library = bcpack_native.LIBRARY
+    library = bcpack_native.library_path()
     cargo = shutil.which("cargo")
     if cargo is None:
         return

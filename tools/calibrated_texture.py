@@ -22,7 +22,8 @@ import ttpf_mips as ttpf
 
 @lru_cache(maxsize=1)
 def native():
-    lib = bcpack_native.library()
+    # The calibrated loader owns its cache. Clearing it must probe the library again.
+    lib = ctypes.CDLL(str(bcpack_native.library_path()))
     lib.unpack.argtypes = [
         ctypes.c_char_p,
         ctypes.c_size_t,

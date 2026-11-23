@@ -6,10 +6,6 @@ import sys
 
 
 CRATE = Path(__file__).with_name("bcpack_calibration")
-LIBRARY = CRATE / "target/release" / {
-    "win32": "bcpack_calibration.dll",
-    "darwin": "libbcpack_calibration.dylib",
-}.get(sys.platform, "libbcpack_calibration.so")
 
 _BYTE_POINTER = ctypes.c_char_p
 _BUFFER = ctypes.c_void_p
@@ -17,9 +13,17 @@ _SIZE = ctypes.c_size_t
 _MAX_NATIVE_BYTES = 16 << 20
 
 
+def library_path():
+    name = {
+        "win32": "bcpack_calibration.dll",
+        "darwin": "libbcpack_calibration.dylib",
+    }.get(sys.platform, "libbcpack_calibration.so")
+    return CRATE / "target/release" / name
+
+
 @lru_cache(maxsize=1)
 def library():
-    return ctypes.CDLL(str(LIBRARY))
+    return ctypes.CDLL(str(library_path()))
 
 
 @lru_cache(maxsize=None)
@@ -88,15 +92,20 @@ def decode_strict_mode6(raw, size, signature):
 
 
 def rebuild_calibrated_bc1(symbols, endpoints, selectors):
-    if symbols.dtype.name != "uint8" or symbols.ndim != 2 or symbols.shape[1] != 12:
-        return None
-    if not symbols.flags.c_contiguous:
-        return None
     decode = kernel("rebuild_calibrated_bc1", ctypes.c_bool,
                     _BUFFER, _SIZE, _BUFFER, _BUFFER, _BUFFER)
     if decode is None:
         return None
     count = len(symbols)
+    for array, shape, dtype in (
+        (symbols, (count, 12), "uint8"),
+        (endpoints, (256, 6), "int32"),
+        (selectors, (4, 256), "uint32"),
+    ):
+        flags = getattr(array, "flags", None)
+        if (flags is None or not flags.c_contiguous or not flags.aligned
+                or array.shape != shape or array.dtype.name != dtype or not array.dtype.isnative):
+            return None
     output = ctypes.create_string_buffer(count * 8)
     if decode(symbols.ctypes.data, count, endpoints.ctypes.data, selectors.ctypes.data, output):
         return output.raw
