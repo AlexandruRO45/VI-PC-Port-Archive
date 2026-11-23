@@ -14,6 +14,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import fssm_header  # noqa: E402
+import report_paths  # noqa: E402
 import wave32_pixel_scan as scan  # noqa: E402
 
 
@@ -171,6 +172,21 @@ class ScanTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
             scan.main(["no_such_shaders_dir_xyz"])
         self.assertNotEqual(cm.exception.code, 0)
+
+    def test_output_must_not_overwrite_a_listing(self):
+        self.assertIs(scan.same_report_path, report_paths.same_report_path)
+        with tempfile.TemporaryDirectory() as src:
+            name, text = PS_LANE_ID
+            listing_path = os.path.join(src, name)
+            with open(listing_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            for alias in (listing_path, os.path.join(src, ".", name)):
+                with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()) as err:
+                    scan.main([src, "--out", alias])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("output must not overwrite a listing it scans", err.getvalue())
+            with open(listing_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), text)
 
 
 if __name__ == "__main__":
