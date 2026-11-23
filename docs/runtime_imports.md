@@ -251,13 +251,13 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 
 ## When an unimplemented import is called
 
-The table above has no unimplemented imports, but the game executable will. A call to one used to return 0
-silently, which for an `HRESULT` function is `S_OK` with its out parameters never written; the caller then carries on
-with stale pointers and fails somewhere unrelated. `LEONIDA_UNIMPLEMENTED` chooses what the thunk does instead
+The table above has no unimplemented imports, but the game executable will. A call to one can still leave output parameters untouched; returning 0 from an unimplemented `HRESULT` function would
+falsely report `S_OK` and can make the caller continue with stale pointers. The safer `fail` policy is now the default.
+`LEONIDA_UNIMPLEMENTED` chooses what the thunk does instead
 (details in `runtime/README.md`):
 
-- `log` (default): print the name once, return 0. Unchanged.
-- `fail`: return `E_NOTIMPL` for imports known to return `HRESULT`, 0 otherwise.
+- `fail` (default): return `E_NOTIMPL` for imports known to return `HRESULT`, 0 otherwise.
+- `log`: compatibility override; print the name once and return 0, including `S_OK` for an unimplemented HRESULT import.
 - `stop`: print the import, the caller as `module+RVA` and rcx/rdx/r8/r9, then break (debugger) or exit with code 3.
 
 The `--dry-run` report ends with `unimplemented by return policy: hresult=N other=N`, so the first run against the
