@@ -934,6 +934,37 @@ class UniformVote(unittest.TestCase):
             "v_cmp_gt_u32_e32 vcc, 64, v0", "s_and_saveexec_b64 s[16:17], vcc", "s_or_b64 exec, exec, s[16:17]",
             "s_mov_b64 exec, s[12:13]", "v_add_nc_u32_e32 v7, 1, v0"], "A", [], self.narrowed_want)
 
+    def test_a_narrowed_uniform_vote_on_scc_of_the_and(self):
+        # the SCC the LLVM AND sets (vcc != 0) decides the branch instead of VCC itself: the same vote
+        self.invariant("vs_uvn_scc_and", self.NARROW + [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_scc0 2", "v_mov_b32_e32 v6, 7", "s_branch 1", "v_mov_b32_e32 v6, 5",
+            "s_mov_b64 exec, s[12:13]", "v_add_nc_u32_e32 v7, 1, v0"], "A", [], self.narrowed_want)
+
+    def test_a_narrowed_uniform_vote_on_scc_of_a_mask_compare(self):
+        # s_cmp_lg_u64 of the compare's SGPR pair against 0, then scc1 to the yes side
+        self.invariant("vs_uvn_scc_cmp", self.NARROW + [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_cmp_lg_u64 s[14:15], 0",
+            "s_cbranch_scc1 2", "v_mov_b32_e32 v6, 5", "s_branch 1", "v_mov_b32_e32 v6, 7",
+            "s_mov_b64 exec, s[12:13]", "v_add_nc_u32_e32 v7, 1, v0"], "A", [], self.narrowed_want)
+
+    def test_c_narrowed_uniform_vote_on_scc_side_restores_exec(self):
+        whole, halves = self.differs("vs_uvn_scc_widen", self.NARROW + [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_scc0 3", "v_mov_b32_e32 v6, 7", "s_mov_b64 exec, s[12:13]", "s_branch 2",
+            "s_mov_b64 exec, s[12:13]", "v_mov_b32_e32 v6, 5", "v_add_nc_u32_e32 v7, 1, v0"], "unsafe-vote-branch")
+        self.assertEqual([w[0] for w in whole[32:]], [0] * 32)
+        self.assertEqual([w[0] for w in halves[32:]], [5] * 32)
+
+    def test_c_narrowed_compare_scc_after_the_mask_is_rewritten(self):
+        # SCC is the vote on the AND's old value; s[14:15] is then rewritten from a varying compare, so the vote no
+        # longer names a uniform mask (SHADER-820) and the branch stays tier C
+        (t, reasons, _), _ = meta_of("vs_uvn_scc_rewritten", vs(self.NARROW + [
+            "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e64 s[14:15], 5, v1", "s_and_b64 s[14:15], exec, s[14:15]",
+            "v_cmp_gt_u32_e64 s[14:15], 3, v0", "s_cbranch_scc0 2", "v_mov_b32_e32 v6, 7", "s_branch 1",
+            "v_mov_b32_e32 v6, 5", "s_mov_b64 exec, s[12:13]", "v_add_nc_u32_e32 v7, 1, v0"]))
+        self.assertEqual(t, "C")
+
     def test_c_narrowed_uniform_vote_side_restores_exec(self):
         # the no side restores the EXEC saved before the narrowing: the second half (no active lane, votes no) turns
         # its lanes on and writes v6 = 5 there, which the wave (yes side) never does

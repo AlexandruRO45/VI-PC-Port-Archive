@@ -1295,7 +1295,7 @@ class Analysis:
                 return
             if g and g[0] == "vote":
                 # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
-                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, None)
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev, None, st)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0
@@ -1312,7 +1312,7 @@ class Analysis:
                     return
             ev["viol"].append(("tainted-branch", ins.get("pc"), op))
 
-    def vote(self, n, ins, op, reg, on_taken, ev, st):
+    def vote(self, n, ins, op, reg, on_taken, ev, st, scc_st=None):
         """A wave-wide vote on mask register `reg` decides the branch. EXEC's own vote is always a skip of
         lane-masked work; for any other mask the side that runs when the vote is yes must start by narrowing EXEC
         to that mask, so lanes that voted no are inert there.
@@ -1332,8 +1332,14 @@ class Analysis:
         # the branch is exact when neither side does anything EXEC does not mask nor lets EXEC grow past what it was
         # at the branch (the lanes of that half then stay off up to the join, in the wave as in the half). Its scalar
         # defs are the vote's (voted above), so a read of one past the join is stale-scalar.
-        if reg == "vcc" and st is not None and not st["t"].get("vcc", 0) and (id(ins), "vcc") not in self.stale \
-                and (st["g"].get("vcc") or ("",))[0] == UVOTEN and self.agrees(st, st["g"]["vcc"]):
+        # The same holds for s_cbranch_scc0/scc1 on the SCC of that mask (`s_and_b64 vcc, exec, s[..]`, or
+        # `s_cmp_lg/eq_u64 mask, 0`): `scc_st` is the state at the branch, and SCC's vote tag is dropped once the mask
+        # register is rewritten (SHADER-820), so the mask's tag is still the one the vote was taken on. Which side
+        # is "yes" does not matter: both must be inert.
+        vs = st if st is not None else scc_st
+        if vs is not None and reg != "exec" and not vs["t"].get(reg, 0) \
+                and (st is None or (id(ins), "vcc") not in self.stale) \
+                and (vs["g"].get(reg) or ("",))[0] == UVOTEN and self.agrees(vs, vs["g"][reg]):
             if not self.inert_sides(n) and ev is not None:
                 ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
             return
