@@ -583,5 +583,49 @@ class TestSAndn2B32ConditionCodes(unittest.TestCase):
                 self.assertEqual(scc, expected_scc)
                 self.assertEqual(scc, 1 if d != 0 else 0)
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Bitwise Invariance
+# -----------------------------------------------------------------------------
+
+class TestSAndn2B32IEEE754Bitwise(unittest.TestCase):
+    """Unit tests verifying bit-exact integer handling of IEEE 754 float patterns."""
+
+    FLOAT32_PATTERNS = {
+        "pos_zero": 0x0000_0000,
+        "neg_zero": 0x8000_0000,
+        "pos_inf": 0x7F80_0000,
+        "neg_inf": 0xFF80_0000,
+        "qnan": 0x7FC0_0000,
+        "snan": 0x7F80_0001,
+        "min_subnormal": 0x0000_0001,
+        "max_subnormal": 0x007F_FFFF,
+        "min_normal": 0x0080_0000,
+        "max_normal": 0x7F7F_FFFF,
+        "one": 0x3F80_0000,
+        "neg_one": 0xBF80_0000,
+    }
+
+    def test_float32_self_andn2_is_zero(self):
+        for name, pattern in self.FLOAT32_PATTERNS.items():
+            with self.subTest(pattern_name=name):
+                d, scc = s_andn2_b32_oracle(pattern, pattern)
+                self.assertEqual(d, 0)
+                self.assertEqual(scc, 0)
+
+    def test_float32_bitwise_exactness(self):
+        pos_zero = self.FLOAT32_PATTERNS["pos_zero"]
+        neg_zero = self.FLOAT32_PATTERNS["neg_zero"]
+        d, scc = s_andn2_b32_oracle(neg_zero, pos_zero)
+        self.assertEqual(d, 0x8000_0000)
+        self.assertEqual(scc, 1)
+
+    def test_float32_nan_and_inf_combinations(self):
+        qnan = self.FLOAT32_PATTERNS["qnan"]
+        pos_inf = self.FLOAT32_PATTERNS["pos_inf"]
+        d, scc = s_andn2_b32_oracle(qnan, pos_inf)
+        expected = (qnan & (~pos_inf & MASK32)) & MASK32
+        self.assertEqual(d, expected)
+        self.assertEqual(scc, 1 if expected != 0 else 0)
+
 if __name__ == "__main__":
     unittest.main()
