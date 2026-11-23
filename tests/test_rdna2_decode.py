@@ -63,21 +63,6 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                     for field in ("op", "args", "mods"):
                         self.assertEqual(ins[field], expected[field])
 
-    def test_hwreg_names_follow_gfx10(self):
-        # What llvm-mc 23.1.6 prints for s_getreg_b32 s1, hwreg(<id>) on each target: GFX10 numbers HW_ID1/HW_ID2
-        # 23/24 and POPS_PACKER 25, names neither 4 nor 26, XNACK_MASK (22) only before gfx1030 and
-        # SHADER_CYCLES (29) only from gfx1030.
-        for mcpu, reg_id, name in (
-            ("gfx1013", 4, "4"), ("gfx1013", 23, "HW_REG_HW_ID1"), ("gfx1013", 24, "HW_REG_HW_ID2"),
-            ("gfx1013", 25, "HW_REG_POPS_PACKER"), ("gfx1013", 26, "26"), ("gfx1013", 22, "HW_REG_XNACK_MASK"),
-            ("gfx1013", 29, "29"), ("gfx1030", 22, "22"), ("gfx1030", 29, "HW_REG_SHADER_CYCLES"),
-            ("gfx1030", 1, "HW_REG_MODE"), ("gfx1030", 23, "HW_REG_HW_ID1"),
-        ):
-            with self.subTest(mcpu=mcpu, reg_id=reg_id):
-                text, invalid = rdna2_decode.disasm_bytes(words(0xB9010000 | reg_id | 31 << 11), mcpu=mcpu)
-                self.assertEqual(invalid, 0)
-                self.assertEqual(text.split(";")[0].strip(), f"s_getreg_b32 s1, hwreg({name})")
-
     def test_image_slc_is_independent_of_sampler(self):
         for sampler in (0, 64):
             for slc in (0, 1):
@@ -121,6 +106,21 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(inv, 0)
         self.assertIn("s_cbranch_scc1 -4", text)
         self.assertIn("s_branch -20", text)
+
+    def test_hwreg_names_follow_gfx10(self):
+        # What llvm-mc 23.1.6 prints for s_getreg_b32 s1, hwreg(<id>) on each target: GFX10 numbers HW_ID1/HW_ID2
+        # 23/24 and POPS_PACKER 25, names neither 4 nor 26, XNACK_MASK (22) only before gfx1030 and
+        # SHADER_CYCLES (29) only from gfx1030.
+        for mcpu, reg_id, name in (
+            ("gfx1013", 4, "4"), ("gfx1013", 23, "HW_REG_HW_ID1"), ("gfx1013", 24, "HW_REG_HW_ID2"),
+            ("gfx1013", 25, "HW_REG_POPS_PACKER"), ("gfx1013", 26, "26"), ("gfx1013", 22, "HW_REG_XNACK_MASK"),
+            ("gfx1013", 29, "29"), ("gfx1030", 22, "22"), ("gfx1030", 29, "HW_REG_SHADER_CYCLES"),
+            ("gfx1030", 1, "HW_REG_MODE"), ("gfx1030", 23, "HW_REG_HW_ID1"),
+        ):
+            with self.subTest(mcpu=mcpu, reg_id=reg_id):
+                text, invalid = rdna2_decode.disasm_bytes(words(0xB9010000 | reg_id | 31 << 11), mcpu=mcpu)
+                self.assertEqual(invalid, 0)
+                self.assertEqual(text.split(";")[0].strip(), f"s_getreg_b32 s1, hwreg({name})")
 
     def test_s_ttracedata_imm_keeps_simm16(self):
         for word, value in ((0xBFA80000, 0x0), (0xBFA80001, 0x1),
