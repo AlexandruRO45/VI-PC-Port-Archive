@@ -159,6 +159,48 @@ jobs:
             fi
           done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
           python -m pytest "${pytest_files[@]}" -q
+  # The pytest files run on Linux in `translator-tests` and on an Apple Silicon Mac below, but never on Windows --
+  # the platform the port targets first, and the one whose path rules, numpy and Pillow builds differ. Three of
+  # these files were red on `main` there (#8779, #8782) while every job stayed green, because no job runs them
+  # here. This job runs the selection `check` and `translator-tests` split on, with the pinned dependencies
+  # installed, so a Windows-only failure turns a pull request red.
+  pytest-windows:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: tests/requirements.txt
+      - name: Install the pinned test dependencies
+        run: python -m pip install -r tests/requirements.txt
+      - name: Tests (the pytest files, Windows)
+        shell: pwsh
+        run: |
+          # The predicate the standard-library loop and `translator-tests` split test files with, read from the
+          # workflow's own PYTEST_FILE_MARKERS so the three cannot drift: one regex per line, matched the way
+          # `grep -E` does (case-sensitively), or no `__main__` block at all.
+          $markers = "(?m)$env:PYTEST_FILE_MARKERS"
+          $files = @(
+            Get-ChildItem tests -Filter 'test_*.py' -Recurse -File |
+              Where-Object { $_.FullName -notlike '*\tests\semantic\*' } |
+              Sort-Object FullName |
+              Where-Object {
+                $text = Get-Content -LiteralPath $_.FullName -Raw
+                ($text -cmatch $markers) -or -not $text.Contains('__main__')
+              } |
+              ForEach-Object { $_.FullName }
+          )
+          "pytest files: $($files.Count)"
+          $files | ForEach-Object { "== $_" }
+          # A selection of nothing would let this job pass without running a test.
+          if ($files.Count -eq 0) { throw 'no pytest file selected: PYTEST_FILE_MARKERS or the test layout changed' }
+          python -m pytest $files -q
+
   semantic-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
