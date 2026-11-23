@@ -900,7 +900,8 @@ def mesh_w64x_test(tools, spirv, name):
     if not (os.path.isfile(shader) and os.path.isfile(fs)):
         return Skip("SKIP (mesh shader: build it with scripts/run_gpu_tests.py, build.py does not)")
     env = mesh_env(spirv, name)
-    if not W64_EMULATED:
+    needs_wave64 = name == "ms_w64x_ballot" and not W64_EMULATED
+    if needs_wave64:
         env["VKH_SUBGROUP_SIZE"] = "64"
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         raw = Path(tmp) / "pixels.raw"
@@ -921,7 +922,7 @@ def mesh_w64x_test(tools, spirv, name):
     if len(data) != 64 * 64 * 16:
         return "vk_harness returned an unexpected pixel count"
     px = list(struct.iter_unpack("<4f", data))
-    if not W64_EMULATED and 64 not in [int(x) for x in re.findall(r"subgroup \d+\.\.(\d+)", r.stderr)]:
+    if needs_wave64 and not any(int(lo) <= 64 <= int(hi) for lo, hi in re.findall(r"subgroup (\d+)\.\.(\d+)", r.stderr)):
         return None   # the device has no 64-wide subgroups
     wrong = 0
     for i, pixel in enumerate(px):

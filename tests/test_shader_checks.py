@@ -980,14 +980,17 @@ class MeshGradientChecks(unittest.TestCase):
         frame = bytearray().join(struct.pack("<4f", (x + .5) / 64, (y + .5) / 64, .5, 1)
                                  for y in range(64) for x in range(64))
 
+        subgroup = 64
+
         def draw(cmd, **kwargs):
             Path(cmd[3]).write_bytes(frame)
-            return check.subprocess.CompletedProcess(cmd, 0, "", "subgroup 64..64")
+            return check.subprocess.CompletedProcess(cmd, 0, "", f"subgroup {subgroup}..{subgroup}")
 
-        with tempfile.TemporaryDirectory() as folder, patch.object(check.subprocess, "run", draw):
+        with tempfile.TemporaryDirectory() as folder, patch.object(check.subprocess, "run", draw), \
+                patch.object(check, "W64_EMULATED", False):
             for name in ("fs_passthru", "ms_w64x_ballot", "ms_wave_info_s3"):
                 Path(folder, name + ".spv").touch()
-            for name in ("ms_w64x_ballot", "ms_wave_info_s3"):
+            for name, subgroup in (("ms_w64x_ballot", 64), ("ms_wave_info_s3", 32)):
                 self.assertEqual(check.mesh_w64x_test(folder, folder, name), "")
                 for channel in range(4):
                     with self.subTest(name=name, channel=channel):
@@ -996,6 +999,8 @@ class MeshGradientChecks(unittest.TestCase):
                         struct.pack_into("<f", frame, offset, float("nan"))
                         self.assertIn("1 of 4096", check.mesh_w64x_test(folder, folder, name))
                         frame[offset:offset + 4] = saved
+            subgroup = 32
+            self.assertIsNone(check.mesh_w64x_test(folder, folder, "ms_w64x_ballot"))
 
 
 class FmaFusedChecks(unittest.TestCase):
