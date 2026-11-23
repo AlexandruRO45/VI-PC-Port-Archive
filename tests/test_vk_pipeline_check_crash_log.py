@@ -88,6 +88,8 @@ class CrashLogTest(unittest.TestCase):
     def test_results_before_a_crash_reach_the_log(self):
         code, log = self.run_to_log("crash.log", crash=CRASHER)
         self.assertNotIn(code, (0, 1, 2), "the simulated crash must end the process: " + log)
+        if os.name == "nt":   # the hook's default SIGFPE ends a Windows process as an integer divide by zero would
+            self.assertEqual(code & 0xFFFFFFFF, 0xC0000094, "exit code %#x" % (code & 0xFFFFFFFF))
         self.assertNotIn("cs pipelines:", log, "a crashed run prints no summary")
         for name in NAMES:
             if name != CRASHER:

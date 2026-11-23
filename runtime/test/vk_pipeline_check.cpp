@@ -1387,6 +1387,7 @@ int main(int argc, char** argv) {
 #else
             std::raise(sim_crash.sig);
 #endif
+            std::abort();   // never go on to the pipeline: a caught signal or a failed TerminateProcess still dies
         }
     };
 
