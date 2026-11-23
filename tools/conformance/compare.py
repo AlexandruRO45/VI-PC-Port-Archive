@@ -992,6 +992,34 @@ def match_manifest_scenes(reference, candidate):
         )
 
 
+def paths_alias(first, second):
+    """Recognise path spellings, symlinks and existing hard links to one file."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def checked_heatmap_paths(reference, candidate, reference_directory, candidate_directory):
+    """Plan every output before writing, protecting even inputs of later scenes."""
+    inputs = [reference.manifest_path, candidate.manifest_path]
+    for manifest, directory in ((reference, reference_directory), (candidate, candidate_directory)):
+        inputs.extend(scene_image_path(directory, scene.png_name) for scene in manifest.scenes)
+    paths = {}
+    for scene in reference.scenes:
+        heatmap_path = os.path.join(candidate_directory, f"{scene.name}.diff.png")
+        for input_path in inputs:
+            if paths_alias(heatmap_path, input_path):
+                raise ToolError(
+                    f"heatmap '{heatmap_path}' would overwrite input '{input_path}'. "
+                    f"Choose different scene names or image paths"
+                )
+        paths[scene.name] = heatmap_path
+    return paths
+
+
 def command_diff(arguments):
     """Run the diff mode: metrics, heatmaps, thresholds and exit code."""
     reference = load_manifest(arguments.reference)
@@ -999,6 +1027,9 @@ def command_diff(arguments):
     reference_directory = resolve_image_directory(reference, arguments.reference_dir)
     candidate_directory = resolve_image_directory(candidate, arguments.candidate_dir)
     match_manifest_scenes(reference, candidate)
+    heatmap_paths = checked_heatmap_paths(
+        reference, candidate, reference_directory, candidate_directory
+    )
 
     print(f"reference: {reference.manifest_path}")
     print(f"  renderer '{reference.renderer}', adapter '{reference.adapter}'")
@@ -1022,8 +1053,7 @@ def command_diff(arguments):
         )
         stats = compare_rasters(reference_image, candidate_image)
         heatmap = build_heatmap(reference_image, candidate_image)
-        heatmap_path = os.path.join(candidate_directory, f"{scene.name}.diff.png")
-        write_png(heatmap_path, heatmap)
+        write_png(heatmap_paths[scene.name], heatmap)
 
         violation = threshold_violation(
             stats, arguments.max_differing_percent, arguments.max_mean_delta

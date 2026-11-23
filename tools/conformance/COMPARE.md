@@ -183,7 +183,10 @@ same size as the candidate:
   `(255, 0, 0)`, and the ramp passes through purple. Alpha differences count.
 
 Heatmaps are written for passing scenes too, so a clean run leaves a complete
-visual record. Existing files are overwritten. The tool is deterministic: the
+visual record. Existing heatmaps are overwritten. Before writing any heatmap,
+the tool refuses an output that aliases either manifest or any reference or
+candidate PNG, including through links. Such a collision exits 2 and leaves all
+inputs and existing heatmaps unchanged. The tool is deterministic: the
 same inputs produce byte-identical heatmaps (verified with SHA-256 over two
 runs).
 
