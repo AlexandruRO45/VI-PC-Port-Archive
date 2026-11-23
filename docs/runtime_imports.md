@@ -273,13 +273,17 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Storage:** `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`,
   names %-encoded: the layout `tools/saves.py import` writes ([saves.md](saves.md#importing-into-the-runtime)).
   `XGameSaveFilesGetFolderWithUi*` gives `<root>\files\<configId>`.
-- **Updates:** writes and deletes are buffered. `XGameSaveSubmitUpdate` builds the container's new contents in a
-  hidden staging folder next to it and swaps it in with two folder renames, so the container is wholly old or wholly
+- **Updates:** writes and deletes are buffered. `XGameSaveSubmitUpdate` builds the container's new contents in its
+  own commit folder, `local-user\.txn\<pid>-<n>\new` (next to a file `name` recording the container), and swaps
+  it in with two folder renames, the container to `old` and `new` into its place, so the container is wholly old or wholly
   new, the "atomic updates at the container level" Microsoft's reference describes (RT-375; until then each blob was
   renamed over on its own, and a failure or crash between two renames left the container half old and half new). A
-  process that dies between the two renames leaves only the old copy, which the next `XGameSaveInitializeProvider` puts
-  back. `xgameruntime_gamesave_test` checks both: an update blocked by a blob held open changes nothing and leaves no
-  hidden folder, and a left-over old copy is restored. One write or delete per blob per update;
+  process that dies between the two renames leaves the container only in `old`, which the next `XGameSaveInitializeProvider`
+  puts back by the recorded name; it removes any other left-over commit folder. The commit folders' names are short
+  and fixed, so a container name near the 255-character limit commits like any other, and no container name (say
+  `slot.staging-1`) can be mistaken for one. `xgameruntime_gamesave_test` checks this: an update blocked by a blob held
+  open changes nothing and leaves no hidden folder, a 250-character container takes an update, and a left-over `old`
+  is restored. One write or delete per blob per update;
   an update past 16 MB (`GS_MAX_BLOB_SIZE`) is `E_GS_UPDATE_TOO_BIG`.
 - **Names:** container names follow `XGameSaveCreateContainer`'s documented rule (`E_GS_INVALID_CONTAINER_NAME`
   otherwise).

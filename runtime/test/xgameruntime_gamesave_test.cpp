@@ -314,22 +314,61 @@ int main() {
         at<Close>(save, 24)(save, up);
         at<Close>(save, 17)(save, atom);
 
-        // A commit that died between its two renames leaves only ".<name>.old-N"; opening a provider puts it back.
-        // Stale staging copies and old copies whose container exists are removed.
-        std::filesystem::create_directories(user_dir / L".crashed.old-1-1");
-        { std::ofstream(user_dir / L".crashed.old-1-1" / L"x", std::ios::binary) << "kept"; }
-        std::filesystem::create_directories(user_dir / L".atomic.staging-1-2");
-        std::filesystem::create_directories(user_dir / L".atomic.old-1-3");
+        // A container whose name is near the 255-character limit of a folder name updates like any other: the
+        // commit's own folders have short fixed names (a suffix on the container's name would not fit). The whole path
+        // is past MAX_PATH, so this provider's LEONIDA_SAVE_DIR is an extended-length "\\?\" path.
+        {
+            const std::filesystem::path xroot = L"\\\\?\\" + std::filesystem::absolute(root).wstring();
+            SetEnvironmentVariableW(L"LEONIDA_SAVE_DIR", xroot.c_str());
+            Handle lp = nullptr, lc = nullptr, lu = nullptr;
+            at<Init>(save, 3)(save, user, "SCID", false, &lp);
+            SetEnvironmentVariableW(L"LEONIDA_SAVE_DIR", root.c_str());
+            const std::filesystem::path ldir = xroot / L"local-user" / std::wstring(250, L'L');
+            std::error_code ec;
+            std::filesystem::create_directories(ldir, ec);
+            { std::ofstream(ldir / L"story", std::ios::binary) << "old"; }
+            const std::string long_name(250, 'L');
+            at<Create>(save, 16)(save, lp, long_name.c_str(), &lc);
+            at<Create>(save, 23)(save, lc, nullptr, &lu);
+            at<Write>(save, 25)(save, lu, "story", reinterpret_cast<const uint8_t*>("new"), 3);
+            check(lp && lc && lu && at<Submit>(save, 27)(save, lu) == S_OK && file_text(ldir / L"story") == "new",
+                  "an existing container with a 250-character name takes an update");
+            at<Close>(save, 24)(save, lu);
+            at<Close>(save, 17)(save, lc);
+            at<Close>(save, 6)(save, lp);
+            std::filesystem::remove_all(ldir, ec);
+        }
+
+        // A commit that died between its two renames leaves the container only in ".txn\<pid>-<n>\old"; opening a
+        // provider puts it back, by the name the commit recorded, whatever that name looks like ("slot.staging-1" and
+        // "x.old-1" are valid container names). Every other left-over commit folder is removed: one whose container
+        // is in place, one that never got to record a name.
+        const std::filesystem::path txn = user_dir / L".txn";
+        auto crashed = [&](const wchar_t* folder, const char* name, bool old, const char* blob) {
+            const std::filesystem::path t = txn / folder;
+            std::filesystem::create_directories(t / L"new");
+            if (name) std::ofstream(t / L"name", std::ios::binary) << name;
+            if (old) {
+                std::filesystem::create_directories(t / L"old");
+                std::ofstream(t / L"old" / L"x", std::ios::binary) << blob;
+            }
+        };
+        crashed(L"1-1", "slot.staging-1", true, "kept-1");
+        crashed(L"1-2", "x.old-1", true, "kept-2");
+        crashed(L"1-3", "atomic", true, "stale");    // its container exists: the stale copy goes, the container stays
+        crashed(L"1-4", nullptr, false, nullptr);    // died before recording the name: nothing was moved yet
+        crashed(L"1-5", "..", true, "never");        // not a name a commit could have recorded
         Handle reopened = nullptr;
         check(at<Init>(save, 3)(save, user, "SCID", false, &reopened) == S_OK && reopened &&
-                  file_text(user_dir / L"crashed" / L"x") == "kept" &&
-                  !std::filesystem::exists(user_dir / L".crashed.old-1-1") &&
-                  !std::filesystem::exists(user_dir / L".atomic.staging-1-2") &&
-                  !std::filesystem::exists(user_dir / L".atomic.old-1-3") && file_text(adir / L"a") == "new-a",
-              "opening a provider restores a container a crash left as its old copy, and removes stale copies");
+                  file_text(user_dir / L"slot.staging-1" / L"x") == "kept-1" &&
+                  file_text(user_dir / L"x.old-1" / L"x") == "kept-2" && file_text(adir / L"a") == "new-a" &&
+                  !std::filesystem::exists(adir / L"x") && !std::filesystem::exists(user_dir / L"..x") &&
+                  !std::filesystem::exists(txn),
+              "opening a provider restores a container a crash left as its old copy, and removes stale commits");
         at<Close>(save, 6)(save, reopened);
         std::error_code rm;
-        std::filesystem::remove_all(user_dir / L"crashed", rm);
+        std::filesystem::remove_all(user_dir / L"slot.staging-1", rm);
+        std::filesystem::remove_all(user_dir / L"x.old-1", rm);
         std::filesystem::remove_all(adir, rm);
     }
 

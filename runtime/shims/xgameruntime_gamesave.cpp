@@ -11,15 +11,17 @@
 //   <root>\local-user\<container>\<blob>      root = LEONIDA_SAVE_DIR, else %LOCALAPPDATA%\Leonida\saves
 // Container and blob names are %-encoded: [A-Za-z0-9_-] and '.' (except as the first character) stay, every other
 // UTF-8 byte becomes %XX. A container's display name is kept in "<container>\.display", which no encoded blob name
-// can collide with (an encoded name never starts with '.'). Folders starting with '.' next to the containers are the
-// staging and backup copies of an update being committed; no encoded container name starts with '.' either.
+// can collide with (an encoded name never starts with '.'). "<root>\local-user\.txn" holds the updates being
+// committed; no encoded container name starts with '.', so it is never taken for a container.
 //
-// An update buffers its writes and deletes. SubmitUpdate builds the container's new contents in a staging folder next
-// to it (".<container>.staging-N": the current blobs, then the update's writes and deletes) and swaps it in with two
-// renames, the old folder aside (".<container>.old-N") and the staging one into its place; if the second fails, the
-// old one goes back. So the container is wholly old or wholly new, the "atomic updates at the container level"
-// Microsoft's XGameSaveContainerInfo page describes. A process that dies between the two renames leaves only the old
-// copy, which opening a provider puts back (recover_containers); stale staging copies are removed there too.
+// An update buffers its writes and deletes. SubmitUpdate commits it in its own folder ".txn\<pid>-<n>": first a file
+// "name" with the container's encoded name, then "new", the container's new contents (the current blobs, then the
+// update's writes and deletes), and the swap: two renames, the container to "old" and "new" into its place; if the
+// second fails, the old one goes back. So the container is wholly old or wholly new, the "atomic updates at the
+// container level" Microsoft's XGameSaveContainerInfo page describes. The folder names are short and fixed, so a
+// container whose name is near the file system's 255-character limit commits like any other, and a container name
+// can never be read as a marker. A process that dies between the two renames leaves the container only in "old",
+// which opening a provider puts back (recover_containers); any other left-over commit folder is removed there.
 //
 // ASSUMPTION (no executable yet): the quota is 256 MB, the default Microsoft's "Debugging Game Saves" error table gives
 // for 0x80830006 E_QUOTA_EXCEEDED ("the per-user quota for the game. By default, this quota is 256 MB");
@@ -357,35 +359,35 @@ HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32
 
 // ---- Committing an update ----
 
-// The hidden folders of a commit in progress, next to the container they belong to.
+// The folder of a commit in progress: <user_dir>\.txn\<pid>-<n>, holding "name", "new" and "old".
 std::atomic<uint64_t> g_commit_serial{0};
-fs::path side_folder(const fs::path& dir, const wchar_t* kind) {
-    const std::wstring serial = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++g_commit_serial);
-    return dir.parent_path() / (L"." + dir.filename().wstring() + L"." + kind + L"-" + serial);
+fs::path commit_folder(const fs::path& user_dir) {
+    return user_dir / L".txn" /
+           (std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++g_commit_serial));
 }
 
-// After a crash: a container whose folder is gone but whose ".<name>.old-*" copy is there died between the two renames
-// of a commit, so the old copy goes back; staging copies, and old copies whose container exists, are left-overs.
+// After a crash: a commit folder whose "old" is there while its container is not died between the two renames, so
+// "old" goes back. Every commit folder left over is then removed: one without "name" (or with a name no container
+// could have) had renamed nothing yet, and with the container in place its "old" and "new" are stale.
 void recover_containers(const fs::path& user_dir) {
     std::error_code ec;
-    std::vector<fs::path> side;
-    for (fs::directory_iterator it(user_dir, ec), end; !ec && it != end; it.increment(ec))
-        if (it->is_directory(ec) && it->path().filename().wstring().rfind(L".", 0) == 0) side.push_back(it->path());
-    std::sort(side.begin(), side.end());
-    for (const fs::path& p : side) {
-        const std::wstring leaf = p.filename().wstring();
-        const size_t staging = leaf.rfind(L".staging-"), old = leaf.rfind(L".old-");
-        if (staging != std::wstring::npos && staging > 0) {
-            fs::remove_all(p, ec);
-        } else if (old != std::wstring::npos && old > 0) {
-            const fs::path dir = user_dir / leaf.substr(1, old - 1);
-            if (!fs::exists(dir, ec)) {
-                fs::rename(p, dir, ec);
-            } else {
-                fs::remove_all(p, ec);
-            }
+    const fs::path txn = user_dir / L".txn";
+    std::vector<fs::path> commits;
+    for (fs::directory_iterator it(txn, ec), end; !ec && it != end; it.increment(ec)) commits.push_back(it->path());
+    std::sort(commits.begin(), commits.end());
+    for (const fs::path& t : commits) {
+        std::string encoded, name;
+        {
+            std::ifstream f(t / L"name", std::ios::binary);
+            encoded.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
         }
+        if (decode_name(encoded, name)) {   // one spelling per name, never ".", ".." nor a path
+            const fs::path dir = user_dir / widen(encoded);
+            if (fs::is_directory(t / L"old", ec) && !fs::exists(dir, ec)) fs::rename(t / L"old", dir, ec);
+        }
+        fs::remove_all(t, ec);
     }
+    fs::remove(txn, ec);   // only if empty
 }
 
 HRESULT commit(XGameSaveUpdate* u) {
@@ -404,15 +406,19 @@ HRESULT commit(XGameSaveUpdate* u) {
     std::error_code ec;
     fs::create_directories(c->user_dir, ec);
     if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
-    const fs::path staging = side_folder(dir, L"staging"), backup = side_folder(dir, L"old");
+    const fs::path txn = commit_folder(c->user_dir), staging = txn / L"new", backup = txn / L"old";
     auto fail = [&]() {
         std::error_code ignore;
-        fs::remove_all(staging, ignore);
+        fs::remove_all(txn, ignore);
+        fs::remove(txn.parent_path(), ignore);   // only if empty
         return E_GS_OUT_OF_LOCAL_STORAGE;
     };
-    // The new contents: the container's current files, then the update's writes and deletes, then its display name.
-    fs::create_directory(staging, ec);
+    // The container's name first, so a crash at any later point can be traced back to it; then the new contents: the
+    // container's current files, the update's writes and deletes, its display name.
+    fs::create_directories(staging, ec);
     if (ec) return fail();
+    const std::string encoded = dir.filename().string();
+    if (!write_file(txn / L"name", encoded.data(), encoded.size())) return fail();
     const bool existed = fs::is_directory(dir, ec);
     if (existed) {
         for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
@@ -441,7 +447,8 @@ HRESULT commit(XGameSaveUpdate* u) {
         if (existed) fs::rename(backup, dir, restore);
         return fail();
     }
-    if (existed) fs::remove_all(backup, ec);   // a left-over backup is hidden ('.'); recover_containers removes it
+    fs::remove_all(txn, ec);   // the old copy; one left over is hidden ('.'), and recover_containers removes it
+    fs::remove(txn.parent_path(), ec);   // only if empty
     return S_OK;
 }
 
