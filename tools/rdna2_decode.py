@@ -94,11 +94,10 @@ _SDWA_SELS = {
 _SDWA_UNUSED = {0: "UNUSED_PAD", 1: "UNUSED_SEXT", 2: "UNUSED_PRESERVE"}
 _OMOD_MODS = {1: "mul:2", 2: "mul:4", 3: "div:2"}
 
-_HWREG_NAMES = {
+_HWREG_NAMES = {  # GFX10 ids, as llvm-mc names them for gfx1013 and gfx1030 (4 and 26 have no GFX10 name)
     1: "HW_REG_MODE",
     2: "HW_REG_STATUS",
     3: "HW_REG_TRAPSTS",
-    4: "HW_REG_HW_ID1",
     5: "HW_REG_GPR_ALLOC",
     6: "HW_REG_LDS_ALLOC",
     7: "HW_REG_IB_STS",
@@ -109,11 +108,12 @@ _HWREG_NAMES = {
     19: "HW_REG_TMA_HI",
     20: "HW_REG_FLAT_SCR_LO",
     21: "HW_REG_FLAT_SCR_HI",
-    22: "HW_REG_XNACK_MASK",
-    23: "HW_REG_HW_ID2",
-    24: "HW_REG_POPS_PACKER",
-    26: "HW_REG_SHADER_CYCLES",
+    23: "HW_REG_HW_ID1",
+    24: "HW_REG_HW_ID2",
+    25: "HW_REG_POPS_PACKER",
 }
+_HWREG_NAMES_GFX101 = {22: "HW_REG_XNACK_MASK"}  # gfx101x only; gfx1030 prints hwreg(22)
+_HWREG_NAMES_GFX103 = {29: "HW_REG_SHADER_CYCLES"}  # gfx1030 and later only; gfx101x prints hwreg(29)
 
 _SENDMSG_NAMES = {
     1: "MSG_INTERRUPT",
@@ -249,11 +249,12 @@ def _width(nregs: int, wave32: bool) -> int:
     return nregs
 
 
-def _format_hwreg(simm16: int) -> str:
+def _format_hwreg(simm16: int, mcpu: str = "gfx1013") -> str:
     reg_id = simm16 & 0x3F
     offset = (simm16 >> 6) & 0x1F
     size = ((simm16 >> 11) & 0x1F) + 1
-    rname = _HWREG_NAMES.get(reg_id, str(reg_id))
+    names = {**_HWREG_NAMES, **(_HWREG_NAMES_GFX103 if mcpu.startswith("gfx103") else _HWREG_NAMES_GFX101)}
+    rname = names.get(reg_id, str(reg_id))
     if offset == 0 and size == 32:
         return f"hwreg({rname})"
     return f"hwreg({rname}, {offset}, {size})"
@@ -783,12 +784,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 lit = struct.unpack_from("<I", code, pc + 4)[0]
                 nbytes = 8
             if name in ("s_setreg_b32", "s_getreg_b32"):
-                hw = {"k": "special", "t": _format_hwreg(simm16)}
+                hw = {"k": "special", "t": _format_hwreg(simm16, mcpu)}
                 reg = _sreg(sdst, 1)
                 args = [hw, reg] if name == "s_setreg_b32" else [reg, hw]
                 return finish(name, args, [], 4)
             if name == "s_setreg_imm32_b32":
-                return finish(name, [{"k": "special", "t": _format_hwreg(simm16)},
+                return finish(name, [{"k": "special", "t": _format_hwreg(simm16, mcpu)},
                                      {"k": "imm", "v": 0 if lit is None else lit}], [], nbytes)
             if name in ("s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt"):
                 return finish(name, [_sreg(sdst, 1), {"k": "imm", "v": simm16}], [], 4)
