@@ -9,7 +9,8 @@
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
 //     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
 //     Y and Z counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
-//     bottom-left quadrant (yellow). Each pixel is read back and compared.
+//     bottom-left quadrant (yellow). The same PS reads mesh export 1 through its FSSM semantic but reads VS
+//     location 0. Dense mesh linkage would produce magenta and cyan. Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
@@ -105,8 +106,17 @@ int main() {
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
 
-    const auto ms_program = fssm_program({0x4d530001, 0xbf810000});
-    const auto ps_program = fssm_program({0x50530001, 0xbf810000});
+    // The two per-vertex exports have the same SPIR-V type. The PS's only input (ordinal 0)
+    // requests semantic 22, which the MS exports at location 1 (stored PS slot 2).
+    auto ms_program = fssm_program({});
+    ms_program.resize(0x1dc);
+    ms_program.insert(ms_program.end(), {6, 21, 0, 0, 0, 0,   // semantic 21 -> param 0
+                                         6, 22, 1, 0, 0, 0}); // semantic 22 -> param 1
+    ms_program.resize(0x29c);
+    put32(ms_program, 2);
+    auto ps_program = fssm_program({});
+    ps_program.resize(0x138);
+    ps_program.insert(ps_program.end(), {6, 22, 15, 0, 0, 0, 2, 2});
     const auto vs_program = fssm_program({0x56530002, 0xbf810000});
     const auto ms_container = shader_container(ms_program), ps_container = shader_container(ps_program);
     const auto vs_container = shader_container(vs_program);
@@ -291,8 +301,8 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
                                                          D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p))));
 
-        // Tints at 0 (red stays red), 256 (green) and 512 (white: yellow stays yellow); CBVs are 256-byte aligned.
-        const float tints[3][3] = {{1, 0, 1}, {0, 1, 0}, {1, 1, 1}};
+        // Both mesh tints pass blue to expose a wrong link to the magenta export. The VS tint preserves yellow.
+        const float tints[3][3] = {{1, 0, 1}, {0, 1, 1}, {1, 1, 1}};
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         for (int i = 0; i < 3; ++i) std::memcpy(up + 256 * i, tints[i], sizeof(tints[i]));
@@ -428,13 +438,16 @@ int main() {
                              got[2], got[3], want[0], want[1], want[2], want[3]);
         }
     }
-    EXPECT(!mismatches);
+    if (mismatches) {
+        std::fprintf(stderr, "%u of %u pixels differ\n", mismatches, size * size);
+        return 1;
+    }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
     std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
-                "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
+                "implemented); sparse mesh input and a shared-PS vertex draw matched all %u pixels; wrong-kind "
                 "draws fail at execution, oversized grids at Close\n",
                 size * size);
     return 0;

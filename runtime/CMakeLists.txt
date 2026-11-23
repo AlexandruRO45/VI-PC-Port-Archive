@@ -849,6 +849,8 @@ if(BUILD_TESTING)
   add_test(NAME shader_library COMMAND shader_library_test)
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
+  add_executable(spirv_mesh_inputs_test test/spirv_mesh_inputs_test.cpp)
+  add_test(NAME spirv_mesh_inputs COMMAND spirv_mesh_inputs_test)
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
   add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)

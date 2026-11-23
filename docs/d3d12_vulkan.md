@@ -2068,15 +2068,25 @@ The trace will enumerate them.
   and strides are not dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065/07066). Creation
   is refused when the index's `max_vertices`/`max_primitives` or the workgroup size exceed the device's
   `VkPhysicalDeviceMeshShaderPropertiesEXT`.
+- For an ordinary native mesh/fragment pair the submitted FSSM tables identify which mesh export feeds each dense
+  fragment input. Each 6-byte mesh row at `0x1dc` (count at `0x29c`) gives a semantic key and export number.
+  Each 8-byte fragment row at `0x138` gives the key, ordinal and one-based export. When both tables and the
+  SPIR-V declarations agree (standalone `vec4` values, including fragment `PerVertexKHR` triangle arrays),
+  the PSO sets the fragment input locations on its own
+  copy before creating the module. Other pipelines can reuse the original fragment shader. Unrecognized sparse
+  interfaces keep the existing locations and produce a diagnostic.
 - **`DispatchMesh`:** recorded as a `Draw` with `mesh` set; the thread-group counts go in `count`/`instances`/`first`.
   It takes the same state snapshot as `DrawInstanced`: render targets, root arguments, viewport, scissor, blend
   factor, stencil references. Replay issues `vkCmdDrawMeshTasksEXT`.
   - **Recording errors** (`Close` returns `E_INVALIDARG`): a grid above 65535 per count or 2^22 groups.
   - **Not recorded:** an empty grid.
   - **Execution error** (`ReplayResult::invalid_draw`): a mesh draw with a VS pipeline, or the reverse.
-- **Tests:** `d3d12_mesh_test` checks the refusals and three draws pixel by pixel on an RX 9060 XT (RADV, under
-  Wine), validation-clean.
+- **Tests:** `d3d12_mesh_test` checks the refusals and three draws pixel by pixel. The original single-export
+  fixture passed validation on an RX 9060 XT (RADV, under Wine).
   - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.
+  - The mesh draws read the second of two differently colored exports. The VS draw reuses that fragment shader
+    and reads location zero. `spirv_mesh_inputs_test` also checks table truncation, contradictory records and an
+    ambiguous dense permutation.
   - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
     question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
 

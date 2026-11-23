@@ -27,6 +27,7 @@
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
+#include "../src/spirv_mesh_inputs.h"
 #include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
@@ -3324,6 +3325,10 @@ public:
         Stage& vs_stage = stages[0];
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
+        if (mesh && ps_stage.entry && ps_stage.entry->f16_halves.empty() &&
+            !leonida::link_mesh_inputs(vs_stage.fssm, ps_stage.fssm, vs_stage.words, ps_stage.words)) {
+            log_once("unrecognized mesh/fragment varying map; keeping translated input locations", 0);
+        }
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
