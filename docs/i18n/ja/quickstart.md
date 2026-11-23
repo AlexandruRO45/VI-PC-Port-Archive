@@ -3,7 +3,7 @@
 > [!NOTE]
 > 英語のドキュメント（[`README.md`](../../../README.md)、[`CONTRIBUTING.md`](../../../CONTRIBUTING.md)、
 > [`docs/README.md`](../../README.md)）が**正式版**です。このページは安定したセットアップとビルド手順のみを
-> まとめたもので、commit `003e781` に同期しています。日々の進捗は [`README.md`](../../../README.md)
+> まとめたもので、commit `561b65a8` に同期しています。日々の進捗は [`README.md`](../../../README.md)
 > を参照してください。
 
 ## Leonida とは
@@ -39,6 +39,10 @@ RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル
     ```powershell
     powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
     ```
+  - [conda](https://docs.conda.io/) を使う場合はこちらが速いです: `conda install -c conda-forge llvm-tools`
+    （Windows 版に AMDGPU target が含まれ、[docs/testing.md](../../testing.md) ではバージョン 23.1.6 を使用）。
+    環境を有効にしたうえで `where llvm-mc` に表示される、インストールされた `llvm-mc.exe` のフルパスを
+    `LLVM_MC` に設定します。
   - または WSL に `llvm-21` を入れて、`LLVM_MC` にコマンド全体を設定します:
     `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`
     （[docs/design.md](../../design.md#disassembling-shaders)）。
@@ -69,6 +73,16 @@ Windows が保存する場所を含む）、Games、ホームフォルダー、�
 ファイルサイズからバージョンを判定します（大きなファイルは読みません）。複数ある場合はどれを使うか確認し、
 見つからない場合はフォルダーの貼り付けを求めます。開始前に上記の前提条件と空き容量を確認し、足りないものを
 まとめて表示します。出力先は `Documents\Leonida` です。中断したビルドは続きから再開します。
+
+### ディスク容量が少ない場合
+
+上記の容量は完全なビルドに必要な量です。ポートを*起動*するだけなら、`--stages check,shaders,runtime` は
+約 30 GB で足ります。残りのほとんどを占める `assets` ステージはアセットツール専用で、`--wav` は Ogg Opus の
+数倍を追加で使います。`--work` と `--out` は別のドライブに置けます。runtime はパッケージをその場で読むため、
+読み取り専用のドライブにある場合は `gta6rt --overlay <書き込み可能なフォルダー>` が必要です（`gta6rt` の
+オプションで、`make_game.py` のものではありません）。`work/shaders/dxbc/disasm` の `.s` ファイルは消さないで
+ください。それらと `work/shaders/spirv/index.json` がないと、`shaders` ステージがシェーダー 0 個で完了した
+ように見えることがあります。
 
 ### コマンドライン（`make_game.py`）
 
