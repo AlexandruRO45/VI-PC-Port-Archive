@@ -99,7 +99,8 @@ through it.
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
-that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` relocations, binds
+that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` and `HIGHLOW` relocations
+(rejecting the other types, such as `HIGH`, `LOW` and `HIGHADJ`, which no x64 MSVC image contains), binds
 imports by name or ordinal, parses the export table, sets section protections, and registers the
 image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
 through a mapped image are dispatched and stack walks can step over its frames. The table is validated
@@ -351,6 +352,7 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
+| `delay_import_unimplemented` | at load, for each delay import that binds to an unimplemented thunk (Windows would raise `0xC06D007E`/`0xC06D007F` at its first call; [runtime_imports.md](../docs/runtime_imports.md#delay-imports-and-thread-events-where-the-loader-differs-from-windows)) | `module`, `import` (`dll!name`) |
 | `xmem_attributes` | the first `XMemAlloc` and the first `XMemFree` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (`XMemAlloc` only), `caller` (module+RVA) |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |

@@ -237,6 +237,22 @@ families are not listed. The sources are the Microsoft Learn pages for the D3D12
 (`gaming/gdk/docs/reference/system/<family>/functions/<name>`); `D3D12XboxCreateDevice` is matched by name from the
 measurement in `d3d12_vulkan.md`, because its page could not be found.
 
+### Delay imports and thread events: where the loader differs from Windows
+
+- **Delay imports are bound eagerly.** `Loader::bind_imports` (`runtime/src/pe_loader.cpp`) binds the delay-import
+  table at load time, like the import table, so `--dry-run` shows the whole import surface. A delay-loaded DLL or
+  function that nothing serves becomes an unimplemented thunk, which follows `LEONIDA_UNIMPLEMENTED` at its first
+  call (return 0 by default). On Windows the delay-load helper raises `0xC06D007E` (module not found) or
+  `0xC06D007F` (procedure not found) at that call instead, and a title can catch it and take a fallback; that fallback
+  never runs here. `--trace` writes a `delay_import_unimplemented` event (`module`, `import`) for each such import
+  when the image is loaded.
+- **Thread events reach TLS callbacks in TLS slot order.** A new thread's `DLL_THREAD_ATTACH` runs the mapped
+  modules' TLS callbacks in the order of their TLS slots (`DLL_THREAD_DETACH` in reverse). A module takes the lowest
+  free slot when it is mapped, before its imports are loaded, so the executable's callbacks run before those of the
+  DLLs it imports; a slot freed by an unloaded module goes to the next one. Windows does not document its order, so a
+  title that depends on DLL-first order would see a difference here. Mapped DLLs' `DllMain` gets no thread events
+  (`runtime/README.md`, PE loader).
+
 ## Run-time loaded modules
 
 Not every console module is reached through an import table. `libHttpClient.GDK.dll` and `XCurl.dll` both use the

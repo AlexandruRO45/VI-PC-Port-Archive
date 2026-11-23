@@ -1533,7 +1533,10 @@ void Loader::bind_imports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
 
     // Thunk tables have no length field: they end at a zero entry, so each step is checked against the image.
-    auto bind_thunks = [&](const std::string& dll, uint64_t lookup_rva, uint64_t iat_rva) {
+    // `delayed`: a delay import that binds to an unimplemented thunk is traced. Windows' delay-load helper would raise
+    // 0xC06D007E (module) or 0xC06D007F (procedure) at its first call, which a title can catch for a fallback; the
+    // thunk returns 0 instead, so the trace names each such import before any image code runs.
+    auto bind_thunks = [&](const std::string& dll, uint64_t lookup_rva, uint64_t iat_rva, bool delayed) {
         for (;; lookup_rva += sizeof(IMAGE_THUNK_DATA64), iat_rva += sizeof(IMAGE_THUNK_DATA64)) {
             require_range(m.name, lookup_rva, sizeof(IMAGE_THUNK_DATA64), m.size, "an import lookup table");
             require_range(m.name, iat_rva, sizeof(IMAGE_THUNK_DATA64), m.size, "an import address table");
@@ -1549,6 +1552,10 @@ void Loader::bind_imports(Module& m) {
             }
             at<IMAGE_THUNK_DATA64>(m.base, static_cast<uint32_t>(iat_rva))->u1.Function =
                 reinterpret_cast<uint64_t>(resolve(m, dll, name, ord, by_ord));
+            if (delayed && startup_trace::enabled() && m.imports.back().binding == Binding::Unimplemented)
+                startup_trace::event("delay_import_unimplemented",
+                                     "\"module\":" + startup_trace::quote(m.name) + ",\"import\":" +
+                                         startup_trace::quote(dll + "!" + m.imports.back().name));
         }
     };
 
@@ -1561,7 +1568,7 @@ void Loader::bind_imports(Module& m) {
             if (!d->Name) break;
             std::string dll = read_string(m.name, m.base, m.size, d->Name, "an imported DLL name");
             uint32_t lookup = d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk;
-            bind_thunks(dll, lookup, d->FirstThunk);
+            bind_thunks(dll, lookup, d->FirstThunk, false);
         }
     }
     // Delay imports are bound eagerly: simpler, and the full import surface shows up in --dry-run.
@@ -1584,7 +1591,7 @@ void Loader::bind_imports(Module& m) {
             // thunk addresses as name RVAs.
             if (!d->ImportNameTableRVA)
                 throw std::runtime_error(m.name + ": a delay-import descriptor has no name table");
-            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA);
+            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA, true);
         }
     }
 }
