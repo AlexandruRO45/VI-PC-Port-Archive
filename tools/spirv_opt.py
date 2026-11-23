@@ -541,9 +541,15 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
         alias: dict[str, str] = {}
 
         def resolve(tok: str) -> str:
+            if tok not in alias:
+                return tok
             cur = tok
+            seen = {tok}
             while cur in alias:
                 cur = alias[cur]
+                if cur in seen:
+                    raise _AliasCycle(cur)
+                seen.add(cur)
             if cur != tok:
                 alias[tok] = cur
             return cur
@@ -1017,8 +1023,22 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
     return out_lines, deleted_ids
 
 
+class _AliasCycle(Exception):
+    """An id resolves to itself. Valid SSA cannot do this: every alias names a definition that dominates its result."""
+
+
 def optimize(spvasm: str, max_passes: int = 4) -> str:
-    """Apply sound dominator-tree SPIR-V optimizations to a SPIR-V assembly module."""
+    """Apply sound dominator-tree SPIR-V optimizations to a SPIR-V assembly module.
+
+    A module whose ids alias in a cycle is not valid SSA. It comes back unchanged, for spirv-val to report.
+    """
+    try:
+        return _optimize(spvasm, max_passes)
+    except _AliasCycle:
+        return spvasm
+
+
+def _optimize(spvasm: str, max_passes: int) -> str:
     lines = spvasm.splitlines()
 
     # Scan module header for constants, integer types, immutable globals, GLSL ext sets, decorations.

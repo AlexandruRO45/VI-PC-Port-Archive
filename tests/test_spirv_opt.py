@@ -542,6 +542,28 @@ class SpirvOptTests(unittest.TestCase):
         for dead in ("%dead_grp", "%dead_only", "%dead_str", "%dead_g", "%dead_id"):
             self.assertNotIn(dead, opt)
 
+    def test_alias_cycle_returns_the_module_instead_of_hanging(self):
+        # Not valid SSA. Run in a child process so that a resolve() that loops fails on the timeout.
+        header = (
+            "OpCapability Shader\nOpMemoryModel Logical GLSL450\nOpEntryPoint GLCompute %m \"m\"\n"
+            "OpExecutionMode %m LocalSize 1 1 1\n%v = OpTypeVoid\n%fn = OpTypeFunction %v\n%u = OpTypeInt 32 0\n"
+            "%m = OpFunction %v None %fn\n%l = OpLabel\n"
+        )
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import spirv_opt; "
+            "sys.stdout.write(spirv_opt.optimize(sys.stdin.read()))"
+        )
+        for body in (
+            "%a = OpCopyObject %u %a\n%b = OpIAdd %u %a %a\n",
+            "%a = OpCopyObject %u %b\n%b = OpCopyObject %u %a\n%c = OpIAdd %u %a %b\n",
+        ):
+            with self.subTest(body=body):
+                text = header + body + "OpReturn\nOpFunctionEnd\n"
+                r = subprocess.run([sys.executable, "-I", "-c", code, TOOLS], input=text, capture_output=True,
+                                   text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, text)
+
 
 if __name__ == "__main__":
     unittest.main()
