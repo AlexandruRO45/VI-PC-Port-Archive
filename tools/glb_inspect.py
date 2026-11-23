@@ -185,8 +185,12 @@ def parse_glb(data: bytes) -> dict:
         buffers = _array(gltf.get("buffers"))
         buffer0 = _object(buffers[0]) if buffers else {}
         declared = buffer0.get("byteLength")
-        if "uri" not in buffer0 and _is_int(declared) and 0 <= declared <= bin_length:
+        if "uri" not in buffer0 and _is_int(declared) and declared >= 0:
+            if declared > bin_length:
+                raise GlbError(f"BIN chunk ({bin_length} bytes) is shorter than the embedded buffer ({declared} bytes)")
             bin_padding = bin_length - declared
+            if bin_padding > 3:
+                raise GlbError(f"BIN chunk has {bin_padding} padding bytes, expected at most 3")
 
     chunk_table = []
     for chunk_index, chunk in enumerate(chunks):

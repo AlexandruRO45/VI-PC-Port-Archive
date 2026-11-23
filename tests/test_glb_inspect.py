@@ -323,6 +323,27 @@ class GlbInspectTests(unittest.TestCase):
         self.assertEqual(chunks[1]["padding"], 1)
         self.assertEqual(chunks[2]["byte_length"], 4)
 
+    def test_embedded_buffer_length_must_match_bin_with_at_most_three_bytes_of_padding(self):
+        for declared, chunk_size, message in (
+            (8, 4, "is shorter than the embedded buffer"),
+            (3, 8, "has 5 padding bytes"),
+        ):
+            with self.subTest(declared=declared, chunk_size=chunk_size):
+                doc = {"asset": {"version": "2.0"}, "buffers": [{"byteLength": declared}]}
+                self.assert_error(glb(doc, bytes(chunk_size)), message)
+
+    def test_bin_padding_is_reported_from_the_embedded_buffer_length(self):
+        for padding in range(4):
+            with self.subTest(padding=padding):
+                doc = {"asset": {"version": "2.0"}, "buffers": [{"byteLength": 4 - padding}]}
+                chunks = glb_inspect.parse_glb(glb(doc, bytes(4)))["chunks"]
+                self.assertEqual(chunks[1]["padding"], padding)
+        for entry in ({}, {"byteLength": 8, "uri": "external.bin"}):
+            with self.subTest(entry=entry):
+                doc = {"asset": {"version": "2.0"}, "buffers": [entry]}
+                chunks = glb_inspect.parse_glb(glb(doc, bytes(4)))["chunks"]
+                self.assertIsNone(chunks[1]["padding"])
+
     def test_chunk_and_header_lengths_must_be_4_byte_aligned(self):
         payload = b'{"asset":{"version":"2.0"}}'
         self.assertEqual(len(payload) % 4, 3)
