@@ -1017,9 +1017,9 @@ public:
                     const std::uint64_t base = replay_.heap_base;
                     XdxrLayout layout;
                     layout.compute(xdxr_elements(b), b.is_tlas, xdxr_box16(b));
-                    // PERFORM_UPDATE refits the source (the destination itself when no source is given, as D3D12
-                    // allows for an in-place update); a full build otherwise.
-                    const std::uint64_t from = b.update ? base + (b.src_va ? b.src_va : b.dst_va) : 0;
+                    // Recording requires an explicit source for PERFORM_UPDATE. Equal source and destination
+                    // addresses select an in-place refit.
+                    const std::uint64_t from = b.update ? base + b.src_va : 0;
                     if (b.is_tlas) {
                         xdxr_->record_tlas(cb, layout, b.instances_va ? base + b.instances_va : 0, base + b.dst_va,
                                            base + b.scratch_va, base, from);

@@ -3038,7 +3038,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::unsupported;
                 p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
                 if (!p.accel_dst) return ReplayResult::unresolved_resource;
-                if (build->update && build->src_va) {
+                if (build->update) {
                     p.accel_src = vk.resolve_acceleration_structure(build->src_va);
                     if (!p.accel_src) return ReplayResult::unresolved_resource;
                 }
