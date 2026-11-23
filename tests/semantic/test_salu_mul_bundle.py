@@ -540,5 +540,18 @@ class TestSMulHiU32ConditionCodeAndSCC(unittest.TestCase):
             ScalarInterpreter().step(inst, state)
             self.assertEqual(state.scc, initial_scc)
 
+class TestSMulHiU32SIMDAndWaveDivergence(unittest.TestCase):
+    def test_wave_broadcast(self) -> None:
+        wave = ScalarWaveModel(wave_size=32)
+        val = ref_s_mul_hi_u32(0xFFFFFFFF, 0xFFFFFFFF)
+        lanes = wave.broadcast_result(val)
+        self.assertTrue(all(l == 0xFFFFFFFE for l in lanes))
+
+    def test_wave64_broadcast(self) -> None:
+        wave = ScalarWaveModel(wave_size=64)
+        val = ref_s_mul_hi_u32(0x80000000, 4)
+        lanes = wave.broadcast_result(val)
+        self.assertTrue(all(l == 2 for l in lanes))
+
 if __name__ == "__main__":
     unittest.main()
