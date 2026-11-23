@@ -1078,14 +1078,121 @@ def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: 
     return bytes(rgba)
 
 
-def _bc7_read_indices(bits: int, index_bits: int, is_anchor: tuple[int, ...]) -> tuple[list[int], int]:
+def _bc7_index_tables() -> tuple[tuple[bytes, ...], ...]:
+    """Expand packed LSB-first index fields to one byte per pixel: four 2-bit and two 4-bit
+    fields per byte, four 3-bit fields per 12-bit chunk."""
+    two = tuple(bytes((v >> (2 * k)) & 3 for k in range(4)) for v in range(256))
+    three = tuple(bytes((v >> (3 * k)) & 7 for k in range(4)) for v in range(4096))
+    four = tuple(bytes((v & 15, v >> 4)) for v in range(256))
+    return two, three, four
+
+
+def _bc7_expand_indices(bits: int, index_bits: int, index_tables: tuple) -> bytes:
+    """Split 16 packed LSB-first index fields (anchor bits restored) into 16 one-byte indices."""
+    if index_bits == 3:
+        t = index_tables[1]
+        return t[bits & 0xFFF] + t[(bits >> 12) & 0xFFF] + t[(bits >> 24) & 0xFFF] + t[bits >> 36]
+    table = index_tables[0] if index_bits == 2 else index_tables[2]
+    return b"".join(map(table.__getitem__, bits.to_bytes(2 * index_bits, "little")))
+
+
+def _bc7_plans() -> tuple:
+    """Per mode, the constant bit positions of the block fields (see _decode_bc7_block), so
+    the decoder does no per-block layout arithmetic."""
+    plans = []
+    for mode, (subsets, partition_bits, rotation_bits, selector_bits, color_bits, alpha_bits,
+               endpoint_pbits, shared_pbits, index_bits, index2_bits) in enumerate(_BC7_MODES):
+        rotation_shift = mode + 1 + partition_bits
+        selector_shift = rotation_shift + rotation_bits
+        position = selector_shift + selector_bits
+        endpoint_count = 2 * subsets
+        channels = []
+        for width in (color_bits,) * 3 + ((alpha_bits,) if alpha_bits else ()):
+            shifts = tuple(position + e * width for e in range(endpoint_count))
+            position += endpoint_count * width
+            channels.append((shifts, (1 << width) - 1))
+        if endpoint_pbits:
+            pbit_shifts = tuple(position + e for e in range(endpoint_count))
+            position += endpoint_count
+        elif shared_pbits:
+            pbit_shifts = tuple(position + (e >> 1) for e in range(endpoint_count))
+            position += subsets
+        else:
+            pbit_shifts = None
+        extra = 1 if pbit_shifts else 0
+        unquantize = tuple(
+            _BC7_UNQUANTIZE[(alpha_bits if channel == 3 else color_bits) + extra]
+            for channel in range(len(channels))
+        )
+        plans.append((
+            subsets, (1 << partition_bits) - 1,
+            rotation_shift, (1 << rotation_bits) - 1,
+            selector_shift, (1 << selector_bits) - 1,
+            tuple(channels), pbit_shifts, unquantize,
+            position, index_bits, index2_bits,
+        ))
+    return tuple(plans)
+
+
+def _bc7_weight_lanes() -> dict:
+    """Per index precision, constants that interpolate a whole palette with a few big-integer
+    operations. Sixteen-bit lanes hold 64 - w, w and the rounding term 32 for each weight w
+    (e0 * (64 - w) + e1 * w + 32 stays below 2**14, so lanes never carry into each other);
+    the next subset's palette sits one lane group up. Also the byte mask that each lane keeps
+    after the shift, per subset count, and the lane group's width in bits."""
+    lanes = {}
+    for bits, weights in _BC7_WEIGHTS.items():
+        count = len(weights)
+        lanes[bits] = (
+            sum((64 - w) << (16 * k) for k, w in enumerate(weights)),
+            sum(w << (16 * k) for k, w in enumerate(weights)),
+            sum(32 << (16 * k) for k in range(len(weights))),
+            tuple(sum(0xFF << (16 * k) for k in range(subsets * count)) for subsets in (1, 2, 3)),
+            16 * count,
+        )
+    return lanes
+
+
+def _bc7_layout_tables() -> tuple[dict, dict]:
+    """Per (subsets, partition): where the omitted zero MSB of each anchor index goes (highest
+    bit first) once the stored fields are packed back to back, for each index precision; and
+    the per-pixel palette offset (subset * palette stride) as an integer of 16 byte lanes."""
+    inserts = {}
+    offsets = {}
+    for subsets in (1, 2, 3):
+        for partition, (subset_of, is_anchor) in enumerate(_BC7_LAYOUTS[subsets]):
+            for index_bits in (2, 3, 4):
+                positions = []
+                end = 0
+                for anchor in is_anchor:
+                    end += index_bits - anchor
+                    if anchor:
+                        positions.append(end)
+                inserts[subsets, partition, index_bits] = tuple(reversed(positions))
+            for stride in (4, 8):
+                offsets[subsets, partition, stride] = int.from_bytes(
+                    bytes(s * stride for s in subset_of), "little")
+    return inserts, offsets
+
+
+_BC7_TABLES: tuple | None = None
+
+
+def _bc7_tables() -> tuple:
+    """The BC7 decode tables, built on first use so other formats never pay for them:
+    (mode plans, weight lanes, anchor inserts, subset offsets, index expansion tables)."""
+    global _BC7_TABLES
+    if _BC7_TABLES is None:
+        _BC7_TABLES = (_bc7_plans(), _bc7_weight_lanes(), *_bc7_layout_tables(), _bc7_index_tables())
+    return _BC7_TABLES
+
+
+def _bc7_indices(bits: int, index_bits: int, inserts: tuple[int, ...], index_tables: tuple) -> bytes:
     """Read 16 LSB-first pixel indices; anchor pixels omit their implicit zero MSB."""
-    indices = []
-    for anchor in is_anchor:
-        width = index_bits - anchor
-        indices.append(bits & ((1 << width) - 1))
-        bits >>= width
-    return indices, bits
+    bits &= (1 << (16 * index_bits - len(inserts))) - 1
+    for position in inserts:
+        bits = (bits & ((1 << position) - 1)) | ((bits >> position) << (position + 1))
+    return _bc7_expand_indices(bits, index_bits, index_tables)
 
 
 def _decode_bc7_block(block: int) -> bytes:
@@ -1093,63 +1200,41 @@ def _decode_bc7_block(block: int) -> bytes:
     if not block & 0xFF:
         return _BC7_RESERVED_BLOCK
     mode = (block & -block).bit_length() - 1
-    (subsets, partition_bits, rotation_bits, selector_bits, color_bits, alpha_bits,
-     endpoint_pbits, shared_pbits, index_bits, index2_bits) = _BC7_MODES[mode]
+    plans, weight_lanes, anchor_inserts, subset_offsets, index_tables = _BC7_TABLES or _bc7_tables()
+    (subsets, partition_mask, rotation_shift, rotation_mask, selector_shift, selector_mask,
+     channels, pbit_shifts, unquantize, index_shift, index_bits, index2_bits) = plans[mode]
 
-    # Fields are LSB-first: mode, partition, rotation, index selector, endpoints,
-    # p-bits, then the index set(s).
-    bits = block >> (mode + 1)
-    partition = bits & ((1 << partition_bits) - 1)
-    bits >>= partition_bits
-    rotation = bits & ((1 << rotation_bits) - 1)
-    bits >>= rotation_bits
-    selector = bits & ((1 << selector_bits) - 1)
-    bits >>= selector_bits
+    # Fields are LSB-first: mode, partition, rotation, index selector, endpoints (all R, then
+    # G, B and A, each ordered subset 0 end 0, subset 0 end 1, ...), p-bits, then the index
+    # set(s). _bc7_plans holds the bit position of each.
+    partition = (block >> (mode + 1)) & partition_mask
+    rotation = (block >> rotation_shift) & rotation_mask
 
-    # All R endpoints, then all G, B and A, each ordered subset 0 end 0, subset 0 end 1, ...
-    endpoint_count = 2 * subsets
-    channel_bits = (color_bits,) * 3 + ((alpha_bits,) if alpha_bits else ())
-    raw_channels = []
-    for width in channel_bits:
-        mask = (1 << width) - 1
-        values = []
-        for _ in range(endpoint_count):
-            values.append(bits & mask)
-            bits >>= width
-        raw_channels.append(values)
-
-    if endpoint_pbits:
-        pbits = [(bits >> e) & 1 for e in range(endpoint_count)]
-        bits >>= endpoint_count
-    elif shared_pbits:
-        pbits = [(bits >> (e >> 1)) & 1 for e in range(endpoint_count)]
-        bits >>= subsets
+    if pbit_shifts is None:
+        endpoints = [[unq[(block >> s) & mask] for s in shifts]
+                     for (shifts, mask), unq in zip(channels, unquantize)]
     else:
-        pbits = None
+        pbits = [(block >> s) & 1 for s in pbit_shifts]
+        endpoints = [[unq[(((block >> s) & mask) << 1) | p] for s, p in zip(shifts, pbits)]
+                     for (shifts, mask), unq in zip(channels, unquantize)]
 
-    endpoints = []
-    for width, values in zip(channel_bits, raw_channels):
-        if pbits is not None:
-            values = [(v << 1) | p for v, p in zip(values, pbits)]
-            width += 1
-        unquantize = _BC7_UNQUANTIZE[width]
-        endpoints.append([unquantize[v] for v in values])
-
-    subset_of, is_anchor = _BC7_LAYOUTS[subsets][partition]
-    color_indices, bits = _bc7_read_indices(bits, index_bits, is_anchor)
-    color_weights = alpha_weights = _BC7_WEIGHTS[index_bits]
+    bits = block >> index_shift
+    color_indices = _bc7_indices(
+        bits, index_bits, anchor_inserts[subsets, partition, index_bits], index_tables)
+    color_lanes = alpha_lanes = weight_lanes[index_bits]
     if index2_bits:
         # Modes 4 and 5: the selector swaps which index set drives colour and alpha.
-        alpha_indices, _ = _bc7_read_indices(bits, index2_bits, is_anchor)
-        alpha_weights = _BC7_WEIGHTS[index2_bits]
-        if selector:
+        alpha_indices = _bc7_indices(
+            bits >> (16 * index_bits - 1), index2_bits, anchor_inserts[1, 0, index2_bits], index_tables)
+        alpha_lanes = weight_lanes[index2_bits]
+        if (block >> selector_shift) & selector_mask:
             color_indices, alpha_indices = alpha_indices, color_indices
-            color_weights, alpha_weights = alpha_weights, color_weights
+            color_lanes, alpha_lanes = alpha_lanes, color_lanes
     else:
         if subsets > 1:
             # Address the per-subset palettes concatenated below.
-            stride = len(color_weights)
-            color_indices = [s * stride + i for s, i in zip(subset_of, color_indices)]
+            offsets = subset_offsets[subsets, partition, 4 if index_bits == 2 else 8]
+            color_indices = (int.from_bytes(color_indices, "little") + offsets).to_bytes(16, "little")
         alpha_indices = color_indices
 
     # Alpha stays 255 in modes 0-3; rotation is applied after interpolation.
@@ -1157,13 +1242,17 @@ def _decode_bc7_block(block: int) -> bytes:
     order = _BC7_ROTATIONS[rotation]
     for channel, ends in enumerate(endpoints):
         if channel == 3:
-            weights, indices = alpha_weights, alpha_indices
+            (lane_a, lane_b, lane_round, lane_masks, group), indices = alpha_lanes, alpha_indices
         else:
-            weights, indices = color_weights, color_indices
-        palette = []
-        for e0, e1 in zip(ends[0::2], ends[1::2]):
-            palette += [(e0 * (64 - w) + e1 * w + 32) >> 6 for w in weights]
-        out[order[channel]::4] = bytes(map(palette.__getitem__, indices))
+            (lane_a, lane_b, lane_round, lane_masks, group), indices = color_lanes, color_indices
+        lanes = ends[0] * lane_a + ends[1] * lane_b + lane_round
+        if subsets > 1:
+            lanes |= (ends[2] * lane_a + ends[3] * lane_b + lane_round) << group
+            if subsets > 2:
+                lanes |= (ends[4] * lane_a + ends[5] * lane_b + lane_round) << (2 * group)
+        # One byte per palette entry, zero-padded to the 256 entries a translate table needs.
+        out[order[channel]::4] = indices.translate(
+            (((lanes >> 6) & lane_masks[subsets - 1]).to_bytes(512, "little"))[::2])
     return bytes(out)
 
 
@@ -1179,30 +1268,38 @@ def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, h
     cache: dict[bytes, bytes] = {}
     from_bytes = int.from_bytes
     pos = offset
+    chunk_size = blocks_x * 16
+    # One pixel row of a block row is interleaved from the blocks' 4-pixel rows. Copy it as
+    # 32-bit pixels with four strided assignments instead of one slice per block and row.
+    strip = bytearray(blocks_x * 16)
+    strip_view = memoryview(strip)
+    strip_pixels = strip_view.cast("I")
 
     for by in range(blocks_y):
         py0 = by * 4
         max_y = height - py0
         if max_y > 4:
             max_y = 4
-        row_base = py0 * row_stride
+        chunk = bytes(data[pos : pos + chunk_size])
+        pos += chunk_size
 
-        for bx in range(blocks_x):
-            key = bytes(data[pos : pos + 16])
-            pos += 16
+        blocks = []
+        for i in range(0, chunk_size, 16):
+            key = chunk[i : i + 16]
             block_rgba = cache.get(key)
             if block_rgba is None:
                 block_rgba = _decode_bc7_block(from_bytes(key, "little"))
                 if len(cache) < _BC7_BLOCK_CACHE_LIMIT:
                     cache[key] = block_rgba
+            blocks.append(block_rgba)
+        pixels = memoryview(b"".join(blocks)).cast("I")
 
-            px0 = bx * 4
-            span = min(width - px0, 4) * 4
-            dst = row_base + px0 * 4
-            for ty in range(max_y):
-                src = ty * 16
-                out[dst : dst + span] = block_rgba[src : src + span]
-                dst += row_stride
+        dst = py0 * row_stride
+        for ty in range(max_y):
+            for x in range(4):
+                strip_pixels[x::4] = pixels[4 * ty + x :: 16]
+            out[dst : dst + row_stride] = strip_view[:row_stride]
+            dst += row_stride
 
     return bytes(out)
 
