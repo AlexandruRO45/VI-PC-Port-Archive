@@ -19,6 +19,7 @@
 // (src/runtime/common/execute.cpp at commit 53af7df77c10, GPL-3.0); this is a new implementation.
 #pragma once
 
+#include <cerrno>
 #include <functional>
 #include <memory>
 
@@ -191,6 +192,7 @@ struct Breakpoint {
     uint8_t original = 0;
     std::string label;
     std::atomic<int> hits{0};
+    std::atomic<bool> disabled{false};
 };
 inline std::mutex& break_mutex() {
     static auto* m = new std::mutex;
@@ -330,7 +332,12 @@ inline LONG handle(EXCEPTION_POINTERS* info) {
     if (r.ExceptionCode == EXCEPTION_BREAKPOINT) {
         if (Breakpoint* b = find_break(r.ExceptionAddress)) {
             // Put the byte back, run the one original instruction (trap flag), then set the int3 again.
-            write_code_byte(b->address, b->original);
+            if (b->disabled.load() || !info->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+            if (!write_code_byte(b->address, b->original)) {
+                if (!b->disabled.exchange(true))
+                    report("break_error", {"breakpoint " + b->label + " disabled: could not restore the original byte"});
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
             info->ContextRecord->Rip = reinterpret_cast<uint64_t>(b->address);
             info->ContextRecord->EFlags |= 0x100;
             rearm = b;
@@ -343,7 +350,7 @@ inline LONG handle(EXCEPTION_POINTERS* info) {
         Breakpoint* b = rearm;
         rearm = nullptr;
         info->ContextRecord->EFlags &= ~0x100u;
-        write_code_byte(b->address, 0xCC);
+        if (!b->disabled.load()) write_code_byte(b->address, 0xCC);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (r.ExceptionCode == kStackOverflow) {
@@ -367,6 +374,8 @@ inline LONG handle(EXCEPTION_POINTERS* info) {
 
 inline LONG CALLBACK veh_entry(EXCEPTION_POINTERS* info) {
     if (in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD last_error = GetLastError();
+    const int saved_errno = errno;
     in_handler = true;
     LONG result = EXCEPTION_CONTINUE_SEARCH;
 #ifdef _MSC_VER
@@ -379,6 +388,8 @@ inline LONG CALLBACK veh_entry(EXCEPTION_POINTERS* info) {
     result = handle(info);
 #endif
     in_handler = false;
+    errno = saved_errno;
+    SetLastError(last_error);
     return result;
 }
 

@@ -10,6 +10,12 @@
 // Reading the environment is separate from installing so tests can install with explicit values.
 #pragma once
 
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <type_traits>
+
 #include "boot_faults.h"
 
 namespace rt::boot_diag {
@@ -23,24 +29,44 @@ struct Settings {
 };
 
 namespace detail {
-inline bool env_text(const char* name, std::string& out) {
+inline bool env_text(const char* name, std::string& out, std::vector<std::string>* problems = nullptr) {
     char buf[1024];
     const DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
-    if (n == 0 || n >= sizeof buf) return false;
+    if (n >= sizeof buf) {
+        if (problems) problems->push_back(std::string(name) + " is too long; ignored");
+        return false;
+    }
+    if (n == 0) return false;
     out.assign(buf, n);
     return true;
 }
-// A non-negative number; false (and a problem line) if the text is set but is not one.
-inline bool env_number(const char* name, double& out, std::vector<std::string>& problems) {
+template <typename T>
+inline bool env_number(const char* name, T& out, std::vector<std::string>& problems) {
     std::string text;
-    if (!env_text(name, text)) return false;
+    if (!env_text(name, text, &problems)) return false;
+    const char* start = text.c_str();
     char* stop = nullptr;
-    const double v = std::strtod(text.c_str(), &stop);
-    if (stop == text.c_str() || *stop != 0 || v < 0) {
-        problems.push_back(std::string(name) + "='" + text + "' is not a non-negative number; ignored");
+    bool valid = false;
+    T value{};
+    errno = 0;
+    if constexpr (std::is_same_v<T, double>) {
+        value = std::strtod(start, &stop);
+        valid = std::isfinite(value) && value >= 0;
+    } else if constexpr (std::is_unsigned_v<T>) {
+        const auto parsed = std::strtoull(start, &stop, 10);
+        const auto sign = text.find_first_not_of(" \t\n\r\f\v");
+        valid = sign != std::string::npos && text[sign] != '-' && parsed <= (std::numeric_limits<T>::max)();
+        if (valid) value = static_cast<T>(parsed);
+    } else {
+        const auto parsed = std::strtoll(start, &stop, 10);
+        valid = parsed >= 0 && parsed <= (std::numeric_limits<T>::max)();
+        if (valid) value = static_cast<T>(parsed);
+    }
+    if (!valid || errno == ERANGE || stop == start || *stop != '\0') {
+        problems.push_back(std::string(name) + "='" + text + "' is invalid or out of range; ignored");
         return false;
     }
-    out = v;
+    out = value;
     return true;
 }
 }  // namespace detail
@@ -49,10 +75,10 @@ inline Settings settings_from_environment() {
     Settings s;
     double v = 0;
     if (detail::env_number("LEONIDA_DIAG", v, s.problems) && v == 0) s.enabled = false;
-    if (detail::env_number("LEONIDA_FAULTS", v, s.problems)) s.faults.fault_reports = static_cast<int>(v);
-    if (detail::env_number("LEONIDA_FIRST_CHANCE", v, s.problems)) s.faults.first_chance_limit = static_cast<int>(v);
-    if (detail::env_number("LEONIDA_WATCHDOG", v, s.problems)) s.watchdog.timeout_seconds = v;
-    if (detail::env_number("LEONIDA_THREAD_DUMP", v, s.problems)) s.watchdog.dump_at_progress = static_cast<uint64_t>(v);
+    detail::env_number("LEONIDA_FAULTS", s.faults.fault_reports, s.problems);
+    detail::env_number("LEONIDA_FIRST_CHANCE", s.faults.first_chance_limit, s.problems);
+    detail::env_number("LEONIDA_WATCHDOG", s.watchdog.timeout_seconds, s.problems);
+    detail::env_number("LEONIDA_THREAD_DUMP", s.watchdog.dump_at_progress, s.problems);
     detail::env_text("LEONIDA_BREAK", s.breakpoints);
     return s;
 }

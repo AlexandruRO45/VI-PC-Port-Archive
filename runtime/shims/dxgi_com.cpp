@@ -305,7 +305,6 @@ public:
             (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
             return DXGI_ERROR_INVALID_CALL;
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
-        rt::boot_diag::progress();  // the hang watchdog (docs/boot.md) counts a real present as alive
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
         ++present_count_;
@@ -314,6 +313,7 @@ public:
         std::uint32_t next = 0;
         if (!swapchain_.acquire_next_image(next)) return E_FAIL;
         if (waitable_) ReleaseSemaphore(waitable_, 1, nullptr);
+        rt::boot_diag::progress();
         return S_OK;
     }
 

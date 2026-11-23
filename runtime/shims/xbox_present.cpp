@@ -104,7 +104,6 @@ HRESULT XboxPresentation::GetFrameStatisticsX(std::uint64_t token, UINT type_mas
 
 HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                    const XboxPresentParameters* params) {
-    rt::boot_diag::progress();  // a frame was asked for: the hang watchdog (docs/boot.md) counts it as alive
     std::lock_guard serialise(present_mutex_);
     if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
     if (pacer_.suspended()) return from_pacer(hr::invalid_state);
@@ -125,6 +124,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         if (SUCCEEDED(result)) {
             pacer_.note_untokened_present();
             ++presents_;
+            rt::boot_diag::progress();
         }
         return result;
     }
@@ -245,6 +245,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
                                     tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
                                                                             : leonida::PresentSync::vblank);
         ++presents_;
+        rt::boot_diag::progress();
         return S_OK;
     }
 
@@ -276,6 +277,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
                                 tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
                                                                         : leonida::PresentSync::vblank);
     ++presents_;
+    rt::boot_diag::progress();
     return S_OK;
 }
 

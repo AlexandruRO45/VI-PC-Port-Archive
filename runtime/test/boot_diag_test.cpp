@@ -28,8 +28,34 @@
 #include <thread>
 #include <vector>
 
+#include <climits>
+
 #include "../shims/boot_diag_install.h"
 #include "../shims/shims.h"
+
+#ifdef LEONIDA_TEST_PRESENT_PROGRESS
+#include "../shims/xbox_present.h"
+#include "../src/vulkan_present.h"
+
+namespace {
+HRESULT blank_present_result = E_FAIL;
+}
+
+namespace rt::d3d12 {
+// Link the real XboxPresentation against a CPU-only presenter so the result is deterministic.
+WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
+    : device_(device), presenter_(std::move(presenter)) {}
+WindowPresenter::~WindowPresenter() = default;
+void WindowPresenter::set_abort(std::function<bool()>) {}
+bool WindowPresenter::tear_supported() const { return false; }
+bool WindowPresenter::last_present_tore() const { return false; }
+bool WindowPresenter::hdr_active() const { return false; }
+float WindowPresenter::display_sdr_white_nits() const { return 0; }
+HRESULT WindowPresenter::present_blank(UINT) { return blank_present_result; }
+HRESULT WindowPresenter::present(ID3D12Resource*, UINT, const D3D12_RECT*, bool) { return E_NOTIMPL; }
+HRESULT WindowPresenter::present_planes(const leonida::PresentPlanes&, UINT, bool) { return E_NOTIMPL; }
+}  // namespace rt::d3d12
+#endif
 
 namespace {
 
@@ -418,6 +444,130 @@ void test_cpp_exceptions() {
     check(all_text().empty(), "with first-chance logging off a handled throw says nothing");
 }
 
+void test_breakpoint_restore_failure() {
+    auto* page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    check(page != nullptr, "allocate a page for the breakpoint restore failure");
+    if (!page) return;
+    *page = 0x90;
+    const bool patched = add_breakpoint(page, "restore-failure");
+    check(patched, "install a breakpoint before decommitting its page");
+    if (!patched) {
+        VirtualFree(page, 0, MEM_RELEASE);
+        return;
+    }
+    const bool decommitted = VirtualFree(page, 4096, MEM_DECOMMIT) != FALSE;
+    check(decommitted, "decommit the page to make VirtualProtect fail");
+    if (!decommitted) return;
+    // Keep the address reserved until process exit since the breakpoint table retains it.
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = EXCEPTION_BREAKPOINT;
+    record.ExceptionAddress = page;
+    CONTEXT context{};
+    EXCEPTION_POINTERS info{&record, &context};
+    clear_out();
+    const LONG first = detail::veh_entry(&info);
+    const LONG next = detail::veh_entry(&info);
+    detail::rearm = nullptr;
+    check(first == EXCEPTION_CONTINUE_SEARCH && next == EXCEPTION_CONTINUE_SEARCH &&
+              !(context.EFlags & 0x100) && breakpoint_hits(page) == 0,
+          "failed byte restoration passes the exception on without stepping or counting a hit");
+    check(count_of(all_text(), "restore-failure disabled") == 1, "the breakpoint failure is logged once");
+}
+
+void test_handler_error_state() {
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = kThreadNameException;
+    record.NumberParameters = 3;
+    record.ExceptionInformation[0] = 0x1000;
+    record.ExceptionInformation[1] = 1;  // unreadable name
+    record.ExceptionInformation[2] = static_cast<DWORD>(-1);
+    CONTEXT context{};
+    EXCEPTION_POINTERS info{&record, &context};
+    constexpr DWORD sentinel = 0x12345678;
+    errno = EDOM;
+    SetLastError(sentinel);
+    const LONG result = detail::veh_entry(&info);
+    const DWORD last_error = GetLastError();
+    const int crt_error = errno;
+    check(result == EXCEPTION_CONTINUE_SEARCH && last_error == sentinel && crt_error == EDOM,
+          "a failed diagnostic read preserves the guest thread error state");
+
+    bool reported = false;
+    set_sink([](void* data, const std::string&) {
+        *static_cast<bool*>(data) = true;
+        errno = ERANGE;
+        SetLastError(ERROR_INVALID_DATA);
+    }, &reported);
+    record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+    record.NumberParameters = 2;
+    errno = EDOM;
+    SetLastError(sentinel);
+    detail::veh_entry(&info);
+    const DWORD reported_last_error = GetLastError();
+    const int reported_errno = errno;
+    set_sink(&collect, nullptr);
+    check(reported && reported_last_error == sentinel && reported_errno == EDOM,
+          "fault reporting preserves Win32 and CRT errors even if the sink changes both");
+}
+
+void test_environment_numbers() {
+    struct Variable {
+        const char* name;
+        const char* invalid;
+        const char* valid;
+        std::vector<char> saved;
+    };
+    Variable vars[] = {
+        {"LEONIDA_DIAG", "nan", "0", {}},
+        {"LEONIDA_FAULTS", "2147483648", "2147483647", {}},
+        {"LEONIDA_FIRST_CHANCE", "1.5", "12", {}},
+        {"LEONIDA_WATCHDOG", "inf", "0.25", {}},
+        {"LEONIDA_THREAD_DUMP", "18446744073709551616", "18446744073709551615", {}},
+    };
+    for (auto& var : vars) {
+        const DWORD size = GetEnvironmentVariableA(var.name, nullptr, 0);
+        var.saved.resize(size);
+        if (size) GetEnvironmentVariableA(var.name, var.saved.data(), size);
+        SetEnvironmentVariableA(var.name, var.invalid);
+    }
+    const auto invalid = settings_from_environment();
+    check(invalid.problems.size() == 5 && invalid.enabled && invalid.faults.fault_reports == 8 &&
+              invalid.faults.first_chance_limit == 0 && invalid.watchdog.timeout_seconds == 0 &&
+              invalid.watchdog.dump_at_progress == 0,
+          "non-finite, fractional and overflowing values are diagnosed and leave defaults");
+
+    for (const auto& var : vars) SetEnvironmentVariableA(var.name, var.valid);
+    const auto valid = settings_from_environment();
+    check(valid.problems.empty() && !valid.enabled && valid.faults.fault_reports == INT_MAX &&
+              valid.faults.first_chance_limit == 12 && valid.watchdog.timeout_seconds == 0.25 &&
+              valid.watchdog.dump_at_progress == UINT64_MAX,
+          "valid limits and fractional watchdog seconds are accepted exactly");
+
+    SetEnvironmentVariableA("LEONIDA_FAULTS", "12tail");
+    SetEnvironmentVariableA("LEONIDA_THREAD_DUMP", " -1");
+    const auto malformed = settings_from_environment();
+    check(malformed.problems.size() == 2 && malformed.faults.fault_reports == 8 &&
+              malformed.watchdog.dump_at_progress == 0,
+          "trailing characters and negative frame counts are diagnosed");
+    for (const auto& var : vars)
+        SetEnvironmentVariableA(var.name, var.saved.empty() ? nullptr : var.saved.data());
+}
+
+#ifdef LEONIDA_TEST_PRESENT_PROGRESS
+void test_present_progress() {
+    rt::d3d12::XboxPresentation presentation(std::make_unique<rt::d3d12::WindowPresenter>(nullptr, nullptr));
+    const auto before = detail::wd().progress.load();
+    check(presentation.PresentX(1, nullptr, nullptr) == E_INVALIDARG && detail::wd().progress.load() == before,
+          "a rejected PresentX does not advance the watchdog");
+    blank_present_result = E_FAIL;
+    check(presentation.PresentX(0, nullptr, nullptr) == E_FAIL && detail::wd().progress.load() == before,
+          "a failed backend present does not advance the watchdog");
+    blank_present_result = S_FALSE;
+    check(presentation.PresentX(0, nullptr, nullptr) == S_FALSE && detail::wd().progress.load() == before + 1,
+          "a successful backend present advances the watchdog exactly once");
+}
+#endif
+
 void test_breakpoints(World& w) {
     FaultConfig fc;
     install_fault_handlers(fc);
@@ -602,6 +752,14 @@ int main(int argc, char** argv) {
     test_names(w);
     test_faults(w);
     test_cpp_exceptions();
+    remove_fault_handlers();
+    install_fault_handlers(fc);
+    test_handler_error_state();
+    test_breakpoint_restore_failure();
+    test_environment_numbers();
+#ifdef LEONIDA_TEST_PRESENT_PROGRESS
+    test_present_progress();
+#endif
     remove_fault_handlers();
     test_breakpoints(w);
     remove_fault_handlers();
