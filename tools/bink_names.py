@@ -140,7 +140,8 @@ def load_streams(source, skip_report=None):
     """Stream rows (source, offset, size, width, height, frames) in archive order."""
     lower = source.lower()
     if os.path.isfile(source) and lower.endswith(".json"):
-        with open(source, encoding="utf-8") as fh:
+        # utf-8-sig: PowerShell 5.1 writes JSON with a UTF-8 BOM, as the other JSON readers here accept.
+        with open(source, encoding="utf-8-sig") as fh:
             doc = json.load(fh)
         if not isinstance(doc, dict) or not isinstance(doc.get("streams"), list):
             raise ValueError("expected a JSON object with a 'streams' list")
