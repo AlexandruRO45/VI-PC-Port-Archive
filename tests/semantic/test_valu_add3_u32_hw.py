@@ -522,5 +522,43 @@ class TestValuAdd3U32ConditionCodes(unittest.TestCase):
         self.assertTrue(flags.negative)
 
 
+# ---------------------------------------------------------------------------
+# Stage 7: IEEE 754 boundary extremes, integer boundaries, and bitwise limits
+# ---------------------------------------------------------------------------
+
+class TestValuAdd3U32IEEE754EdgeCases(unittest.TestCase):
+    """Stage 7: Boundary extremes, integer limits, and bit-pattern invariance for v_add3_u32."""
+
+    def test_integer_boundary_extremes(self) -> None:
+        # Max positive signed int wrap
+        self.assertEqual(oracle_add3_u32(0x7FFF_FFFF, 1, 0), 0x8000_0000)
+        self.assertEqual(oracle_add3_u32(0x7FFF_FFFF, 0x7FFF_FFFF, 2), 0)
+        # Power of two alignments
+        self.assertEqual(oracle_add3_u32(0x1000_0000, 0x2000_0000, 0x4000_0000), 0x7000_0000)
+
+    def test_float_bitpatterns_treated_as_integers(self) -> None:
+        # In RDNA2, integer instructions treat IEEE 754 float bit-patterns strictly as integers
+        pos_inf = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
+        neg_inf = struct.unpack(">I", struct.pack(">f", float("-inf")))[0]
+        qnan = struct.unpack(">I", struct.pack(">f", float("nan")))[0]
+        
+        res = oracle_add3_u32(pos_inf, neg_inf, 0)
+        expected = (pos_inf + neg_inf) & MASK32
+        self.assertEqual(res, expected)
+
+        res_trans = run_translated_add3_u32(pos_inf, neg_inf, 0)
+        self.assertEqual(res_trans, expected)
+
+    def test_double_overflow_wrap(self) -> None:
+        a = 0xFFFF_FFFF
+        b = 0xFFFF_FFFF
+        c = 0xFFFF_FFFF
+        res_oracle = oracle_add3_u32(a, b, c)
+        res_trans = run_translated_add3_u32(a, b, c)
+        self.assertEqual(res_oracle, 0xFFFF_FFFD)
+        self.assertEqual(res_trans, 0xFFFF_FFFD)
+
+
+
 if __name__ == "__main__":
     unittest.main()
