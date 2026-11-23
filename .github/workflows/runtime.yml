@@ -97,6 +97,10 @@ concurrency:
   group: runtime-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # CTest otherwise reports an empty suite without failing the job.
+  CTEST_NO_TESTS_ACTION: error
+
 jobs:
   windows:
     runs-on: windows-latest
