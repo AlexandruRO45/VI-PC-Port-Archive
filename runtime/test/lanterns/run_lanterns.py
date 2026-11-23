@@ -42,6 +42,7 @@ folder:
   stage 11: the ray-traced shadows; sheet: frame | reference / the control (one instance masked) | mask /
             the second control (two instances swap BLAS references) | frame
   stage 20: the probe card (rows POINT, LINEAR, comparison, plain depth sample; a cell per probe); sheet: card | reference
+  stage 24: the 32x24 grid (own word left, mirror word right in each cell); sheet: grid | reference
 """
 import argparse
 import array
@@ -108,6 +109,9 @@ PASS_LINES = {
          rf"depth texture {N} of {N} raw depths",
          lambda p, pn, l, ln, d, c, cn, ps, fl, r, rn: p == pn == l == ln == c == cn == r == rn == 32 and d >= 8
          and ps > 0 and fl > 0 and ps + fl == 32),
+    24: (rf"Lanterns stage 24: PASS, a 16x8 local size \(four wave32 waves, local X in v0 and local Y in v1\) on a 2x3 "
+         rf"grid: {N} of {N} positions exact, and {N} of {N} point-mirror words read through LDS after the barrier",
+         lambda a, b, c, d: a == b == c == d == 768),
 }
 
 
@@ -352,6 +356,7 @@ PANELS = {
          "sheet": [["stage11-frame.gpu", "stage11-frame.ref"], ["stage11-masked.gpu", "stage11-frame:mask"],
                    ["stage11-swapped.gpu", "stage11-frame.gpu"]]},
     20: {"main": [["stage20-probes.gpu"]], "sheet": [["stage20-probes.gpu", "stage20-probes.ref"]]},
+    24: {"main": [["stage24-grid.gpu"]], "sheet": [["stage24-grid.gpu", "stage24-grid.ref"]]},
 }
 
 

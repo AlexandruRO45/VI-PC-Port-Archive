@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8|9|10|11|20|24 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -64,6 +64,10 @@
 // sample on a 4x4 depth texture, one probe per lane (lanterns_samplers.h). Every sample must be exact; LINEAR must
 // differ from POINT where the reference says it does; the comparison must give 0 or 1, the plain sample the depth.
 //
+// Stage 24: local X and Y thread IDs. A compute shader with a 16x8 local size (four wave32 waves) on a 2x3 grid writes,
+// per lane, its own grid position and that of its point mirror in the group, read through LDS after the barrier
+// (lanterns_xy.h). Every word must be exact; with X and Y swapped the words move.
+//
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
 #include "lanterns_edges_gpu.h"
@@ -79,6 +83,7 @@
 #include "lanterns_msaa.h"
 #include "lanterns_rt_gpu.h"
 #include "lanterns_samplers_gpu.h"
+#include "lanterns_xy_gpu.h"
 #include "lanterns_textures_gpu.h"
 
 #include <algorithm>
@@ -1011,6 +1016,61 @@ int stage20(const std::filesystem::path& shader_dir, const std::filesystem::path
     return 0;
 }
 
+int stage24(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    const lanterns::Scene scene = lanterns::stage1();
+    lanterns::Shaders shaders;
+    std::vector<std::uint8_t> kernel;
+    if (!lanterns::load_shaders(shader_dir, 1, shaders) || !lanterns::load_xy_shader(shader_dir, kernel)) return 1;
+    std::vector<std::uint32_t> got;
+    {
+        lanterns::Gpu gpu;
+        lanterns::XyKernel xy;
+        if (!gpu.create(scene, shaders) || !xy.create(gpu, kernel) || !xy.run(got) || !gpu.idle()) return 1;
+    }
+    // The picture: the grid at 8x8 pixels a position, the own word as colour (x from gx, y from gy) on the left half of
+    // each cell and the mirror word on the right; red where a word is wrong.
+    unsigned own_ok = 0, mirror_ok = 0, poisoned = 0, reported = 0, y_nonzero = 0;
+    const unsigned n = lanterns::kXyWidth * lanterns::kXyHeight;
+    std::vector<Color> card(std::size_t(kWidth) * kHeight, Color{0.1f, 0.1f, 0.1f, 1}), card_ref = card;
+    const auto shade = [](std::uint32_t v) {
+        return Color{float(v % 1000) / float(lanterns::kXyWidth), float(v / 1000) / float(lanterns::kXyHeight), 0.5f, 1};
+    };
+    for (unsigned gy = 0; gy < lanterns::kXyHeight; ++gy)
+        for (unsigned gx = 0; gx < lanterns::kXyWidth; ++gx) {
+            const auto want = lanterns::xy_expect(gx, gy);
+            const std::size_t at = (std::size_t(gy) * lanterns::kXyWidth + gx) * 2;
+            for (unsigned k = 0; k < 2; ++k) {
+                const bool ok = got[at + k] == want[k];
+                (k ? mirror_ok : own_ok) += ok;
+                poisoned += got[at + k] == lanterns::kXyPoison;
+                if (!ok && reported++ < 8)
+                    std::printf("lanterns: grid (%u, %u), %s word: %u (0x%08x), expected %u\n", gx, gy, k ? "mirror" : "own",
+                                got[at + k], got[at + k], want[k]);
+                const Color shown = ok ? shade(got[at + k]) : Color{0.9f, 0.15f, 0.1f, 1};
+                for (unsigned y = 1; y < 8; ++y)
+                    for (unsigned x = 0; x < 4; ++x) {
+                        const std::size_t i = std::size_t(gy * 8 + y + 16) * kWidth + gx * 8 + k * 4 + x + 64;
+                        card[i] = shown, card_ref[i] = shade(want[k]);
+                    }
+            }
+            y_nonzero += gy % lanterns::kXyGroupY != 0 && got[at] == want[0];
+        }
+    std::printf("lanterns: %u of %u own words exact, %u of %u mirror words exact (through LDS across the group's four waves); "
+                "%u lanes with local Y > 0 placed right; %u poisoned words left\n", own_ok, n, mirror_ok, n, y_nonzero, poisoned);
+    lanterns::Reference shown_ref;
+    shown_ref.color = card_ref;
+    shown_ref.candidates.resize(card.size());
+    if (!dump(out_dir, "stage24-grid", card, shown_ref)) return 1;
+    if (own_ok != n || mirror_ok != n || poisoned) {
+        std::fprintf(stderr, "lanterns: stage 24 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 24: PASS, a 16x8 local size (four wave32 waves, local X in v0 and local Y in v1) on a 2x3 "
+                "grid: %u of %u positions exact, and %u of %u point-mirror words read through LDS after the barrier\n",
+                own_ok, n, mirror_ok, n);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1036,8 +1096,9 @@ int main(int argc, char** argv) {
     case 10: return stage10(shader_dir, out_dir);
     case 11: return stage11(shader_dir, out_dir);
     case 20: return stage20(shader_dir, out_dir);
+    case 24: return stage24(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10|11|20|24 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }

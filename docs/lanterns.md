@@ -49,6 +49,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [10](#stage-10-4x-msaa-resolved-with-resolvesubresource) | The frame drawn at 4x MSAA and resolved with `ResolveSubresource` | The 1x render differs on exactly the predicted edge pixels; `SampleMask` isolates each sample |
 | [11](#stage-11-ray-traced-shadows-through-blastlas) | One shadow ray per pixel through a TLAS over two BLASes, walked with `image_bvh_intersect_ray` | Masking one instance or swapping two BLAS references changes the predicted pixels; a stalled BVH stops at the step cap |
 | [20](#stage-20-samplers-held-as-literals) | A compute shader samples through three samplers it builds from immediates, as the console compiles static samplers | A POINT sampler made LINEAR, or the comparison bits cleared, changes the predicted samples |
+| [24](#stage-24-local-x-and-y-thread-ids) | A compute shader with a 16x8 local size reads local X and local Y | X and Y swapped moves every predicted word |
 
 ## Stage 1
 
@@ -346,6 +347,25 @@ probes exact; the comparison bits cleared (`0x3092` to `0x92`) gives the raw dep
 
 ```
 Lanterns stage 20: PASS, three samplers the shader holds as literal S#s (as the console's compiler writes static samplers): POINT 32 of 32 probes exact, LINEAR 32 of 32 (differing from POINT at 30 as predicted), LESS_EQUAL comparison 32 of 32 (12 pass, 20 fail), and a plain POINT sample of the same depth texture 32 of 32 raw depths
+```
+
+## Stage 24: local X and Y thread IDs
+
+Every earlier Lanterns compute shader has a 1-D local size. The title's compute shaders enable both local IDs and read
+local Y in v1. `cs_lanterns_xy` has a 16x8 local size (four wave32 waves, `TIDIG_COMP_CNT` 1) on a 2x3 grid of groups
+(`TGID_X` and `TGID_Y`). Each lane:
+
+- writes its grid position as gx + 1000 gy (gx = 16 group X + local X, gy = 8 group Y + local Y) to LDS entry
+  local Y * 16 + local X;
+- meets the group at `s_barrier`, reads the entry of its point mirror in the group (15 - X, 7 - Y), which another wave
+  wrote, and stores both words.
+
+How the check works. `lanterns_xy.h` gives both words for every position. All 768 positions must hold exactly their two
+words, and the output starts poisoned. Mutation that fails: local X and local Y swapped in the shader (384 of 768 own words
+right, 0 mirror words, 768 positions never written).
+
+```
+Lanterns stage 24: PASS, a 16x8 local size (four wave32 waves, local X in v0 and local Y in v1) on a 2x3 grid: 768 of 768 positions exact, and 768 of 768 point-mirror words read through LDS after the barrier
 ```
 
 ## Build and run
