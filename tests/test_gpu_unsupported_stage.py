@@ -51,9 +51,17 @@ class RunGpuTestsUnsupportedDetail(unittest.TestCase):
 
     def test_harness_and_runners_agree_on_the_exit_code(self):
         self.assertEqual(run_gpu_tests.UNSUPPORTED, check.UNSUPPORTED)
-        harness = (ROOT / "runtime" / "test" / "vk_harness.cpp").read_text()
-        for reason in ("unsupported: no VK_EXT_mesh_shader", "unsupported: no geometryShader"):
+        harness = (ROOT / "runtime" / "test" / "vk_harness.cpp").read_text(encoding="utf-8")
+        for reason in ("unsupported: no VK_EXT_mesh_shader",
+                       "unsupported: no geometryShader",
+                       "unsupported: VKH_GS cannot be combined with VKH_MESH"):
             self.assertIn(reason, harness)
+
+    def test_harness_gs_and_mesh_compute_guards(self):
+        harness = (ROOT / "runtime" / "test" / "vk_harness.cpp").read_text(encoding="utf-8")
+        self.assertIn("if (gs_path && !*gs_path) gs_path = nullptr;", harness)
+        self.assertIn("if (!fma.accepts_file(gs_path)) return 77;", harness)
+        self.assertIn("const bool fs_tested = !mesh && !mesh_compute && !gs_tested;", harness)
 
 
 

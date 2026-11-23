@@ -99,6 +99,43 @@ class BaryFallbackModule(unittest.TestCase):
         self.assertIn("OpDecorate %out_bary Location 0", gs)
         self.assertIn("OpDecorate %out30 Location 30", gs)
 
+    def test_f16_interp_fallback_reserves_unread_half_from_bary_location(self):
+        # Reading only the high half of attr14 assigns f16_half_locs[14] = (0, 1) while gen.inputs only contains
+        # location 1. Because the producer exports both halves, %bary must skip reserved location 0 and take 2.
+        lines = [
+            "v_mov_b32_e32 v10, 0",
+            "v_interp_p1lv_f16 v2, v0, attr14.x, v10 high",
+            "v_interp_p2_f16 v2, v1, attr14.x, v2 high",
+            "v_mov_b32_e32 v4, v0",
+            "v_mov_b32_e32 v5, v1",
+            "exp mrt0 v2, v4, v5, v2 done vm",
+            "s_endpgm",
+        ]
+        prev = rdna2spirv.BARY_FALLBACK, rdna2spirv.F16_HALVES
+        rdna2spirv.BARY_FALLBACK, rdna2spirv.F16_HALVES = True, True
+        try:
+            spv = support.translate_lines("ps_bary_f16_reserved", lines)
+            meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+        finally:
+            rdna2spirv.BARY_FALLBACK, rdna2spirv.F16_HALVES = prev
+        self.assertEqual(meta["f16_halves"], {"14": [0, 1]})
+        self.assertEqual(meta["inputs"], [1])
+        self.assertEqual(meta["bary_fallback_input"], {"location": 2})
+        self.assertIn("OpDecorate %bary Location 2", spv)
+        gs = bary_fallback_gs.gs_spvasm(meta["inputs"], meta["bary_fallback_input"]["location"])
+        self.assertIn("OpDecorate %out_bary Location 2", gs)
+        self.assertIn("OpDecorate %out1 Location 1", gs)
+        if shutil.which("spirv-as") and shutil.which("spirv-val"):
+            with tempfile.TemporaryDirectory() as tmp:
+                for stem, text in (("ps", spv), ("gs", gs)):
+                    asm = os.path.join(tmp, f"{stem}.spvasm")
+                    bin_path = os.path.join(tmp, f"{stem}.spv")
+                    Path(asm).write_text(text, encoding="utf-8", newline="\n")
+                    for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", bin_path],
+                                ["spirv-val", "--target-env", "vulkan1.2", bin_path]):
+                        r = subprocess.run(cmd, capture_output=True, text=True)
+                        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_same_values_from_either_source(self):
         for fallback in (False, True):
             with self.subTest(fallback=fallback):
@@ -188,9 +225,48 @@ class BaryFallbackGeometryShader(unittest.TestCase):
                 bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
             vs.update(capabilities=["ClipDistance", "CullDistance"], clip_distance_count=1, cull_distance_count=1)
             index_file.write_text(json.dumps(index), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "mixed"):
-                bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
-            self.assertEqual(list(Path(tmp).glob("*.spvasm")), [Path(path)])
+            mixed_path, = bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
+            self.assertEqual(Path(mixed_path).name, "ps.bary_gs.clip1.cull1.spvasm")
+            mixed_asm = Path(mixed_path).read_text()
+            self.assertEqual(mixed_asm.count("BuiltIn ClipDistance"), 2)
+            self.assertEqual(mixed_asm.count("BuiltIn CullDistance"), 2)
+            self.assertEqual(sorted(Path(tmp).glob("*.spvasm")), sorted([Path(path), Path(mixed_path)]))
+
+    def test_pair_forwards_mesh_compute_clip_and_cull(self):
+        ms_clip = {
+            "stage": "ms",
+            "capabilities": ["Shader"],
+            "mesh_compute": rdna2spirv.mesh_compute_layout(64, 32, 2, 0, [0]),
+        }
+        ms_both = {
+            "stage": "ms",
+            "capabilities": ["Shader"],
+            "mesh_compute": rdna2spirv.mesh_compute_layout(64, 32, 2, 3, [0]),
+        }
+        ms_native = {"stage": "ms", "capabilities": ["MeshShadingEXT"]}
+        ps = {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(
+                json.dumps({"ms_clip": ms_clip, "ms_both": ms_both, "ms_native": ms_native, "ps": ps}),
+                encoding="utf-8",
+            )
+            clip_path, = bary_fallback_gs.write_for_index(tmp, pair=("ms_clip", "ps"))
+            self.assertEqual(Path(clip_path).name, "ps.bary_gs.clip2.spvasm")
+            clip_asm = Path(clip_path).read_text()
+            self.assertEqual(clip_asm.count("BuiltIn ClipDistance"), 2)
+            self.assertNotIn("CullDistance", clip_asm)
+
+            both_path, = bary_fallback_gs.write_for_index(tmp, pair=("ms_both", "ps"))
+            self.assertEqual(Path(both_path).name, "ps.bary_gs.clip2.cull3.spvasm")
+            both_asm = Path(both_path).read_text()
+            self.assertEqual(both_asm.count("BuiltIn ClipDistance"), 2)
+            self.assertEqual(both_asm.count("BuiltIn CullDistance"), 2)
+            for vertex, emission in enumerate(both_asm.split("OpEmitVertex")[:-1]):
+                self.assertIn(f"OpStore %out_clip %clip_distances{vertex}", emission)
+                self.assertIn(f"OpStore %out_cull %cull_distances{vertex}", emission)
+
+            with self.assertRaisesRegex(ValueError, "--mesh-compute MS"):
+                bary_fallback_gs.write_for_index(tmp, pair=("ms_native", "ps"))
 
     def test_a_missing_directory_is_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,7 +300,7 @@ class BaryFallbackGeometryShader(unittest.TestCase):
     def test_assembles_and_validates(self):
         with tempfile.TemporaryDirectory() as tmp:
             asm = os.path.join(tmp, "gs.spvasm")
-            for clip, cull in ((0, 0), (1, 0), (2, 0), (3, 0), (8, 0), (0, 1), (0, 2), (0, 8)):
+            for clip, cull in ((0, 0), (1, 0), (2, 0), (3, 0), (8, 0), (0, 1), (0, 2), (0, 8), (1, 1), (2, 3), (5, 3)):
                 with open(asm, "w", encoding="utf-8", newline="\n") as f:
                     f.write(bary_fallback_gs.gs_spvasm([0, 1, 5], 6, clip, cull))
                 spv = os.path.join(tmp, "gs.spv")

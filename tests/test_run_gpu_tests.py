@@ -840,5 +840,156 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
+class MeshClipBaryTests(unittest.TestCase):
+    """Combined ms_clip_bary case under --mesh-compute + --bary-fallback with ClipDistance forwarding."""
+
+    @staticmethod
+    def _bary_frame(clipped: bool = False) -> bytes:
+        buf = bytearray()
+        for y in range(64):
+            for x in range(64):
+                if clipped and x < 32:
+                    buf += struct.pack("<4f", -1.0, -1.0, -1.0, -1.0)
+                else:
+                    u = (x + 0.5) / 64.0
+                    v = (y + 0.5) / 64.0
+                    buf += struct.pack("<4f", u, v, u / 2.0, v / 2.0)
+        return bytes(buf)
+
+    def test_with_draw_shaders_expands_mesh_clip_bary(self):
+        self.assertEqual(rgt.with_draw_shaders(["ms_clip_bary.asm"]), ["ms_clip.asm", "ps_bary.asm"])
+        self.assertEqual(
+            rgt.with_draw_shaders(["ms_clip.asm", "ms_clip_bary.asm", "ps_bary.asm"]),
+            ["ms_clip.asm", "ps_bary.asm"],
+        )
+
+    def test_check_clip_bary_verifies_clipping_and_barycentrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "ms_clip_bary.raw"
+            raw.write_bytes(self._bary_frame(clipped=True))
+            ok, detail = rgt.check_clip_bary(str(raw))
+            self.assertTrue(ok, detail)
+            self.assertIn("2048/4096 pixels covered", detail)
+
+            # Unclipped left-half frame must fail
+            raw.write_bytes(self._bary_frame(clipped=False))
+            ok, detail = rgt.check_clip_bary(str(raw))
+            self.assertFalse(ok)
+            self.assertIn("unclipped pixel", detail)
+
+            # Corrupted barycentric on right half must fail
+            bad = bytearray(self._bary_frame(clipped=True))
+            idx = (10 * 64 + 40) * 16
+            struct.pack_into("<4f", bad, idx, 40.5 / 64.0, 10.5 / 64.0, 0.0, 10.5 / 128.0)
+            raw.write_bytes(bytes(bad))
+            ok, detail = rgt.check_clip_bary(str(raw))
+            self.assertFalse(ok)
+            self.assertIn("at (40,10)", detail)
+
+            # Truncated frame must fail
+            raw.write_bytes(b"\x00" * 64)
+            ok, detail = rgt.check_clip_bary(str(raw))
+            self.assertFalse(ok)
+            self.assertIn("expected 4096 pixels", detail)
+
+    def _run_case(self, name: str, *, mesh_compute: bool, bary: bool, harness_rc: int = 0,
+                  harness_msg: str = "ok 64x64", write_frame: bool = True):
+        import check
+        calls: list[tuple[list[str], dict | None]] = []
+        pair_calls: list[tuple[str, str]] = []
+        ms_name, ps_name = rgt.MESH_BARY_CASES[name]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_build_bary(spirv_dir, pair=None):
+                if pair is None:
+                    p = Path(spirv_dir) / f"{ps_name}.bary_gs.spv"
+                    p.touch()
+                    return [str(p)]
+                pair_calls.append(pair)
+                p = Path(spirv_dir) / f"{ps_name}.bary_gs.clip1.spv"
+                p.touch()
+                return [str(p)]
+
+            def fake_build_mc(spirv_dir):
+                p = Path(spirv_dir) / f"{ms_name}.mesh_vs.spv"
+                p.touch()
+                return [str(p)]
+
+            def fake_run_cmd(cmd, env=None, gpu=True, cwd=None):
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    out_dir = Path(cmd[cmd.index("--out") + 1])
+                    (out_dir / f"{ms_name}.spv").touch()
+                    (out_dir / f"{ps_name}.spv").touch()
+                    idx = {
+                        ms_name: {
+                            "stage": "ms",
+                            **({"mesh_compute": {"slot_bytes": 4096, "max_primitives": 64,
+                                                 "clip_count": 1, "cull_count": 0}}
+                               if mesh_compute else {}),
+                        },
+                        ps_name: {
+                            "stage": "ps",
+                            "inputs": [0],
+                            **({"bary_fallback_input": {"location": 1}} if bary else {}),
+                        },
+                    }
+                    (out_dir / "index.json").write_text(json.dumps(idx), encoding="utf-8", newline="\n")
+                    return 0, ""
+                calls.append((cmd, env))
+                if harness_rc == 0 and write_frame:
+                    Path(cmd[3]).write_bytes(self._bary_frame(clipped=True))
+                return harness_rc, harness_msg
+
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+            out = io.StringIO()
+            env_patch = {"LEONIDA_BARY_FALLBACK": "1" if bary else "0",
+                         "LEONIDA_MESH_COMPUTE": "1" if mesh_compute else "0"}
+            with (patch.dict(rgt.os.environ, env_patch),
+                  patch.object(rgt, "MESH_COMPUTE", mesh_compute),
+                  patch.object(check, "MESH_COMPUTE", mesh_compute),
+                  patch.dict(sys.modules, {
+                      "bary_fallback_gs": SimpleNamespace(build_for_index=fake_build_bary),
+                      "mesh_compute_vs": SimpleNamespace(build_for_index=fake_build_mc),
+                  }),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _n: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=fake_run_cmd),
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                rc = rgt.run_suite(args, tmp)
+        return rc, out.getvalue(), calls, pair_calls
+
+    def test_combined_mesh_compute_and_bary_fallback_passes(self):
+        rc, out, calls, pair_calls = self._run_case("ms_clip_bary", mesh_compute=True, bary=True)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  ms_clip_bary", out)
+        self.assertEqual(pair_calls, [("ms_clip", "ps_bary")])
+        self.assertEqual(len(calls), 1)
+        _cmd, env = calls[0]
+        self.assertTrue(env["VKH_MESH_COMPUTE"].endswith("ms_clip.mesh_vs.spv"))
+        self.assertTrue(env["VKH_GS"].endswith("ps_bary.bary_gs.clip1.spv"))
+        self.assertEqual(env["VKH_GS_HELPER"], "1")
+        self.assertNotIn("VKH_MESH", env)
+
+    def test_bary_fallback_without_mesh_compute_skips_cleanly(self):
+        rc, out, calls, pair_calls = self._run_case("ms_clip_bary", mesh_compute=False, bary=True)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP (--bary-fallback with a mesh shader requires LEONIDA_MESH_COMPUTE=1)", out)
+        self.assertEqual(calls, [])
+        self.assertEqual(pair_calls, [])
+
+    def test_native_modes_skip_on_unsupported_device(self):
+        for mesh_compute, msg in (
+            (False, "unsupported: no VK_EXT_mesh_shader"),
+            (True, "unsupported: ps_bary.spv reads BaryCoordKHR and the device has no VK_KHR_fragment_shader_barycentric"),
+        ):
+            with self.subTest(mesh_compute=mesh_compute):
+                rc, out, calls, _ = self._run_case("ms_clip_bary", mesh_compute=mesh_compute, bary=False,
+                                                   harness_rc=77, harness_msg=msg, write_frame=False)
+                self.assertEqual(rc, 0, out)
+                self.assertIn(f"SKIP ({msg})", out)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn("VKH_GS", calls[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()

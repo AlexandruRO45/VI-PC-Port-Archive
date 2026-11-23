@@ -121,11 +121,9 @@ class TestGsSpvasm(unittest.TestCase):
 
         in_vars = [f"%in{n}" for n in expected_locs]
         out_vars = [f"%out{n}" for n in expected_locs]
-        dist_vars = []
-        if clip_count:
-            dist_vars = ["%in_clip", "%out_clip"]
-        elif cull_count:
-            dist_vars = ["%in_cull", "%out_cull"]
+        distances = [(kind, count) for kind, count in (("clip", clip_count), ("cull", cull_count)) if count]
+        both_distances = len(distances) == 2
+        dist_vars = [var for kind, _ in distances for var in (f"%in_{kind}", f"%out_{kind}")]
         expected_iface = ["%in_pos", "%out_pos", *in_vars, *out_vars, "%out_bary", *dist_vars]
         self.assertEqual(iface, expected_iface)
         self.assertEqual(set(parsed["variables"]), set(expected_iface))
@@ -141,15 +139,11 @@ class TestGsSpvasm(unittest.TestCase):
             "OpDecorate %in_pos BuiltIn Position",
             "OpDecorate %out_pos BuiltIn Position",
         ]
-        if clip_count:
+        for kind, _ in distances:
+            builtin = kind.title() + "Distance"
             expected_decs.extend([
-                "OpDecorate %in_clip BuiltIn ClipDistance",
-                "OpDecorate %out_clip BuiltIn ClipDistance",
-            ])
-        elif cull_count:
-            expected_decs.extend([
-                "OpDecorate %in_cull BuiltIn CullDistance",
-                "OpDecorate %out_cull BuiltIn CullDistance",
+                f"OpDecorate %in_{kind} BuiltIn {builtin}",
+                f"OpDecorate %out_{kind} BuiltIn {builtin}",
             ])
         expected_decs.extend(f"OpDecorate %in{n} Location {n}" for n in expected_locs)
         expected_decs.extend(f"OpDecorate %out{n} Location {n}" for n in expected_locs)
@@ -164,9 +158,7 @@ class TestGsSpvasm(unittest.TestCase):
         self.assertIn("%bary2 = OpConstantComposite %v3float %f0 %f0 %f1", parsed["lines"])
 
         # Check distance type declarations and storage classes when active.
-        if clip_count or cull_count:
-            kind = "cull" if cull_count else "clip"
-            count = clip_count or cull_count
+        for kind, count in distances:
             self.assertEqual(parsed["constants"][f"%{kind}_count"], f"%uint {count}")
             self.assertIn(f"%{kind} = OpTypeArray %float %{kind}_count", parsed["lines"])
             self.assertIn(f"%triangle_{kind} = OpTypeArray %{kind} %uint_3", parsed["lines"])
@@ -185,12 +177,12 @@ class TestGsSpvasm(unittest.TestCase):
                     f"%x{v}_{stem} = OpLoad %v4float %p{v}_{stem}",
                     f"OpStore {dst} %x{v}_{stem}",
                 ])
-            if clip_count or cull_count:
-                kind = "cull" if cull_count else "clip"
+            for kind, _ in distances:
+                val = f"%{kind}_distances{v}" if both_distances else f"%distances{v}"
                 expected_emission.extend([
                     f"%{kind}_ptr{v} = OpAccessChain %ptr_in_{kind} %in_{kind} %int_{v}",
-                    f"%distances{v} = OpLoad %{kind} %{kind}_ptr{v}",
-                    f"OpStore %out_{kind} %distances{v}",
+                    f"{val} = OpLoad %{kind} %{kind}_ptr{v}",
+                    f"OpStore %out_{kind} {val}",
                 ])
             expected_emission.append(f"OpStore %out_bary %bary{v}")
             self.assertEqual(emission, expected_emission)
@@ -243,7 +235,7 @@ class TestGsSpvasm(unittest.TestCase):
                 self._assert_valid_gs_structure(asm, [0, 2], 3, cull_count=count)
                 self.assertNotIn("ClipDistance", asm)
 
-    def test_invalid_distance_counts_and_mixed_rejected(self):
+    def test_invalid_distance_counts_rejected_and_mixed_supported(self):
         bad_values = (-10, -1, 9, 100, True, False, 1.0, "1", None)
         for bad in bad_values:
             with self.subTest(clip_count=bad):
@@ -253,10 +245,10 @@ class TestGsSpvasm(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "cull distance count"):
                     bary_fallback_gs.gs_spvasm([0], 1, cull_count=bad)
 
-        for clip_c, cull_c in ((1, 1), (2, 5), (8, 8)):
+        for clip_c, cull_c in ((1, 1), (2, 5), (5, 3), (8, 8)):
             with self.subTest(clip_count=clip_c, cull_count=cull_c):
-                with self.assertRaisesRegex(ValueError, "mixed ClipDistance and CullDistance"):
-                    bary_fallback_gs.gs_spvasm([0], 1, clip_count=clip_c, cull_count=cull_c)
+                asm = bary_fallback_gs.gs_spvasm([0, 3], 1, clip_count=clip_c, cull_count=cull_c)
+                self._assert_valid_gs_structure(asm, [0, 3], 1, clip_count=clip_c, cull_count=cull_c)
 
 
 class TestWriteForIndex(unittest.TestCase):
@@ -359,6 +351,9 @@ class TestWriteForIndex(unittest.TestCase):
     def test_pair_rejects_invalid_stages_missing_entries_and_capabilities(self):
         base_index = {
             "vs_ok": {"stage": "vs"},
+            "ms_native": {"stage": "ms"},
+            "ms_empty_mc": {"stage": "ms", "mesh_compute": {}},
+            "ms_bad_mc": {"stage": "ms", "mesh_compute": []},
             "ps_ok": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}},
             "ps_no_fb": {"stage": "ps", "inputs": [0]},
             "cs_other": {"stage": "cs"},
@@ -369,13 +364,18 @@ class TestWriteForIndex(unittest.TestCase):
                 ("missing_vs", "ps_ok"),
                 ("vs_ok", "missing_ps"),
                 ("cs_other", "ps_ok"),
+                ("ms_native", "ps_ok"),
+                ("ms_empty_mc", "ps_ok"),
+                ("ms_bad_mc", "ps_ok"),
                 ("ps_ok", "ps_ok"),
                 ("vs_ok", "vs_ok"),
                 ("vs_ok", "ps_no_fb"),
             ]
             for pair in bad_pairs:
                 with self.subTest(pair=pair):
-                    with self.assertRaisesRegex(ValueError, "requires a translated VS and a barycentric-fallback PS"):
+                    with self.assertRaisesRegex(
+                        ValueError, "requires a translated VS or --mesh-compute MS and a barycentric-fallback PS"
+                    ):
                         bary_fallback_gs.write_for_index(tmp, pair=pair)
 
             cap_cases = [
@@ -384,13 +384,21 @@ class TestWriteForIndex(unittest.TestCase):
                 (["ShaderViewportIndex", "ShaderLayer"], "ShaderLayer, ShaderViewportIndex"),
             ]
             for caps, expected_msg in cap_cases:
-                with self.subTest(caps=caps):
+                with self.subTest(stage="vs", caps=caps):
                     idx = dict(base_index, vs_bad={"stage": "vs", "capabilities": caps})
                     self._write_index(tmp, idx)
                     with self.assertRaisesRegex(ValueError, f"paired helper cannot forward {expected_msg}"):
                         bary_fallback_gs.write_for_index(tmp, pair=("vs_bad", "ps_ok"))
+                with self.subTest(stage="ms", caps=caps):
+                    idx = dict(
+                        base_index,
+                        ms_bad={"stage": "ms", "capabilities": caps, "mesh_compute": {"clip_count": 1, "cull_count": 0}},
+                    )
+                    self._write_index(tmp, idx)
+                    with self.assertRaisesRegex(ValueError, f"paired helper cannot forward {expected_msg}"):
+                        bary_fallback_gs.write_for_index(tmp, pair=("ms_bad", "ps_ok"))
 
-    def test_pair_rejects_invalid_distance_counts_and_mixed_caps(self):
+    def test_pair_rejects_invalid_distance_counts_and_supports_mixed_caps(self):
         with tempfile.TemporaryDirectory() as tmp:
             for cap, field in (("ClipDistance", "clip_distance_count"), ("CullDistance", "cull_distance_count")):
                 for bad_count in (None, 0, -1, 9, True, False, 2.0, "2"):
@@ -416,8 +424,47 @@ class TestWriteForIndex(unittest.TestCase):
                 "ps": {"stage": "ps", "bary_fallback_input": {"location": 0}},
             }
             self._write_index(tmp, mixed_idx)
-            with self.assertRaisesRegex(ValueError, "mixed ClipDistance and CullDistance"):
-                bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
+            mixed_path, = bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
+            self.assertEqual(os.path.basename(mixed_path), "ps.bary_gs.clip1.cull2.spvasm")
+            with open(mixed_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), bary_fallback_gs.gs_spvasm([], 0, clip_count=1, cull_count=2))
+
+    def test_pair_mesh_compute_producers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = {
+                "ms_plain": {"stage": "ms", "capabilities": ["Shader"], "mesh_compute": {"clip_count": 0, "cull_count": 0}},
+                "ms_clip": {"stage": "ms", "capabilities": ["Shader"], "mesh_compute": {"clip_count": 2, "cull_count": 0}},
+                "ms_cull": {"stage": "ms", "capabilities": ["Shader"], "mesh_compute": {"clip_count": 0, "cull_count": 3}},
+                "ms_both": {"stage": "ms", "capabilities": ["Shader"], "mesh_compute": {"clip_count": 2, "cull_count": 3}},
+                "ps_fb": {"stage": "ps", "inputs": [0, 3], "bary_fallback_input": {"location": 1}},
+            }
+            self._write_index(tmp, index)
+            for prod, suffix, clip_c, cull_c in (
+                ("ms_plain", ".clip0", 0, 0),
+                ("ms_clip", ".clip2", 2, 0),
+                ("ms_cull", ".cull3", 0, 3),
+                ("ms_both", ".clip2.cull3", 2, 3),
+            ):
+                with self.subTest(producer=prod):
+                    path, = bary_fallback_gs.write_for_index(tmp, pair=(prod, "ps_fb"))
+                    self.assertEqual(os.path.basename(path), f"ps_fb.bary_gs{suffix}.spvasm")
+                    with open(path, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), bary_fallback_gs.gs_spvasm([0, 3], 1, clip_count=clip_c, cull_count=cull_c))
+
+            for field in ("clip_count", "cull_count"):
+                for bad_count in (-1, 9, True, False, 2.0, "2", None):
+                    with self.subTest(field=field, bad_count=bad_count):
+                        mc = {"clip_count": 0, "cull_count": 0}
+                        mc[field] = bad_count
+                        self._write_index(
+                            tmp,
+                            {
+                                "ms_bad": {"stage": "ms", "mesh_compute": mc},
+                                "ps_fb": {"stage": "ps", "bary_fallback_input": {"location": 0}},
+                            },
+                        )
+                        with self.assertRaisesRegex(ValueError, f"missing or invalid mesh_compute {field}"):
+                            bary_fallback_gs.write_for_index(tmp, pair=("ms_bad", "ps_fb"))
 
     def test_malformed_index_json_raises(self):
         with tempfile.TemporaryDirectory() as tmp:

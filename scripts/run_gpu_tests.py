@@ -646,6 +646,49 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
     return ok, detail
 
 
+def check_clip_bary(raw_path: str) -> tuple[bool, str]:
+    """Check ms_clip + ps_bary over 64x64: left half (x < 32) clipped to clear (-1), right half (x >= 32)
+    covered (2048/4096 pixels) with attr0.xy = (u, v) and raw barycentrics (i, j) = (u/2, v/2) within 1e-4."""
+    px = read_raw_rgba32f(raw_path)
+    if problem := frame_problem(px):
+        return False, problem
+    covered = 0
+    bad = 0
+    first = ""
+    for i, pixel in enumerate(px):
+        r, g, b, a = pixel
+        x, y = i % 64, i // 64
+        is_clear = (r == -1.0 and g == -1.0 and b == -1.0 and a == -1.0)
+        if not is_clear:
+            covered += 1
+        if x < 32:
+            if not is_clear:
+                if not bad:
+                    first = f"unclipped pixel at ({x},{y}): got ({r:.4f},{g:.4f},{b:.4f},{a:.4f})"
+                bad += 1
+        else:
+            u = (x + 0.5) / 64.0
+            v = (y + 0.5) / 64.0
+            expected = (u, v, u / 2.0, v / 2.0)
+            if is_clear or any(abs(got - want) > 1e-4 for got, want in zip(pixel, expected)):
+                if not bad:
+                    first = f"at ({x},{y}): got {pixel}, expected {expected}"
+                bad += 1
+    ok = (bad == 0 and covered == 2048)
+    detail = (f"{covered}/4096 pixels covered (expected 2048), barycentrics match" if ok
+              else f"covered={covered}/2048; {first}")
+    return ok, detail
+
+
+# Combined clipped mesh + raw-barycentric GPU test: draws ms_clip with ps_bary.
+# Under LEONIDA_MESH_COMPUTE=1 + LEONIDA_BARY_FALLBACK=1 this exercises compute-emulated mesh -> generated VS ->
+# paired pass-through bary GS (forwarding ClipDistance) -> bary-fallback PS on devices without VK_EXT_mesh_shader
+# or VK_KHR_fragment_shader_barycentric (e.g. NVIDIA Pascal). Each entry is (mesh_fixture, ps_fixture).
+MESH_BARY_CASES = {
+    "ms_clip_bary": ("ms_clip", "ps_bary"),
+}
+
+
 # Fixtures run by another harness, which needs what these tools do not have (a D3D12 device, the layer's root
 # arguments and code base). They are still assembled and translated here, so a translator regression shows, but no
 # checker runs them: the test program that owns them judges them.
@@ -673,9 +716,22 @@ DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
-    build = list(asm_files)
+    build = []
     for f in asm_files:
-        extra = DRAWN_WITH.get(shader_source(os.path.splitext(f)[0]))
+        name = os.path.splitext(f)[0]
+        if name in MESH_BARY_CASES:
+            ms_name, ps_name = MESH_BARY_CASES[name]
+            for dep in (f"{ms_name}.asm", f"{ps_name}.asm"):
+                if dep not in build:
+                    build.append(dep)
+            continue
+        if f not in build:
+            build.append(f)
+    for f in asm_files:
+        name = os.path.splitext(f)[0]
+        if name in MESH_BARY_CASES:
+            continue
+        extra = DRAWN_WITH.get(shader_source(name))
         if extra and extra not in build:
             build.append(extra)
     if TEXTURE_MIP_TEST + ".asm" in asm_files:
@@ -819,7 +875,9 @@ def run_suite(a, work: str) -> int:
     no_validate = explicit_no_validate or (assembler == "python" and shutil.which("spirv-val") is None)
     disasm_src = getattr(a, "disasm_dir", None)
 
-    asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
+    asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")}
+                       | {n + ".asm" for n in CLIP_CASES}
+                       | {n + ".asm" for n in MESH_BARY_CASES})
     # The wave64 pixel fixtures of runtime/test/shaders/w64_graphics.py (tiers A-C, #1541) are checked by that
     # runner, not here: they need a 64-wide fragment subgroup or the halves-aware lowering it drives.
     asm_files = [f for f in asm_files if f[:-4] not in W64_GRAPHICS_ONLY]
@@ -946,6 +1004,20 @@ def run_suite(a, work: str) -> int:
         with open(idx_path, encoding="utf-8") as source:
             index = json.load(source)
 
+    paired_bary_gs: dict[str, str] = {}
+    if bary_fallback() and MESH_COMPUTE:
+        import bary_fallback_gs
+        for fname in asm_files:
+            case_name = os.path.splitext(fname)[0]
+            spec = MESH_BARY_CASES.get(case_name)
+            if spec:
+                ms_name, ps_name = spec
+                if ms_name in index and ps_name in index:
+                    built = bary_fallback_gs.build_for_index(spirv_dir, pair=(ms_name, ps_name))
+                    if built:
+                        paired_bary_gs[case_name] = built[0]
+                        print("bary fallback GS (paired):", os.path.basename(built[0]))
+
     ext = ".exe" if os.name == "nt" else ""
     vk_compute = os.path.join(a.build, "vk_compute_test" + ext)
     vk_store = os.path.join(a.build, "vk_store_test" + ext)
@@ -961,6 +1033,37 @@ def run_suite(a, work: str) -> int:
             # is no .spv (the f16 fallback is on by default where PerVertexKHR doesn't compile: MoltenVK).
             results.append((name, None, "SKIP (computed I/J pairs need PerVertexKHR inputs: "
                                         "no --bary-fallback / --f16-interp-fallback)"))
+            continue
+        if name in MESH_BARY_CASES:
+            ms_name, ps_name = MESH_BARY_CASES[name]
+            ms_spv = os.path.join(spirv_dir, f"{ms_name}.spv")
+            ps_spv = os.path.join(spirv_dir, f"{ps_name}.spv")
+            if not os.path.isfile(ms_spv) or not os.path.isfile(ps_spv):
+                missing_spvs = ", ".join(p for p in (f"{ms_name}.spv", f"{ps_name}.spv")
+                                         if not os.path.isfile(os.path.join(spirv_dir, p)))
+                results.append((name, False, f"missing {missing_spvs} (translation failed)"))
+                continue
+            if bary_fallback() and not MESH_COMPUTE:
+                results.append((name, None, "SKIP (--bary-fallback with a mesh shader requires LEONIDA_MESH_COMPUTE=1)"))
+                continue
+            sg = index.get(ms_name, {}).get("subgroup_size")
+            ms_gfx_env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
+            env = mesh_env(spirv_dir, ms_name, ms_gfx_env)
+            if bary_fallback():
+                gs_spv = paired_bary_gs.get(name)
+                if not gs_spv or not os.path.isfile(gs_spv):
+                    results.append((name, False, f"missing bary fallback GS for {ms_name}+{ps_name}"))
+                    continue
+                env = dict(env, VKH_GS=gs_spv, VKH_GS_HELPER="1")
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, ms_spv, ps_spv, raw], env=env)
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                ok, detail = check_clip_bary(raw)
+                results.append((name, ok, detail))
             continue
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))

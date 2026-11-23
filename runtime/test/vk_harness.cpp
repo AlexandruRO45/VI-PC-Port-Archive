@@ -316,6 +316,10 @@ int main(int argc, char** argv) {
                      argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         return 77;
     }
+    // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders. VKH_SUBGROUP_SIZE then
+    // applies to it, unless VKH_GS_HELPER=1 says the GS only feeds the pixel shader under test.
+    const char* gs_path = std::getenv("VKH_GS");
+    if (gs_path && !*gs_path) gs_path = nullptr;
     // OpFmaKHR (rdna2spirv.py --fma khr) needs VK_KHR_shader_fma; a module of ANY stage that needs it is refused
     // (argv[1] is the vertex shader, or the mesh shader run as compute under VKH_MESH_COMPUTE).
     leonida::vk_test::ShaderFma fma;
@@ -323,6 +327,7 @@ int main(int argc, char** argv) {
     if (!fma.accepts(fs_code.data(), fs_code.size() * 4, argv[2])) return 77;
     if (!fma.accepts_file(argv[1])) return 77;
     if (!fma.accepts_file(std::getenv("VKH_MESH_COMPUTE"))) return 77;
+    if (!fma.accepts_file(gs_path)) return 77;
     std::vector<const char*> enable;
     void* chain = nullptr;
     if (fma.supported()) {
@@ -383,6 +388,17 @@ int main(int argc, char** argv) {
     }
     // VKH_MESH=1: the first shader is a mesh shader (VK_EXT_mesh_shader), drawn with vkCmdDrawMeshTasksEXT(1,1,1).
     const bool mesh = !mesh_compute && (group_readback || std::getenv("VKH_MESH") != nullptr);
+    const char* count_opt = std::getenv("VKH_GS_PRIMITIVES");
+    const bool count_gs = count_opt && std::strcmp(count_opt, "1") == 0;
+    if (count_gs && (!gs_path || mesh || mesh_compute)) {
+        std::fprintf(stderr, "VKH_GS_PRIMITIVES=1 requires a VS/GS/FS draw with VKH_GS\n");
+        return 1;
+    }
+    if (mesh && gs_path) {
+        std::fprintf(stderr, "unsupported: VKH_GS cannot be combined with VKH_MESH (mesh shader pipelines have no "
+                             "geometry stage; use VKH_MESH_COMPUTE)\n");
+        return 77;
+    }
     VkPhysicalDeviceMeshShaderFeaturesEXT meshf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     if (mesh) {
         // Query the feature, not just the extension. 77: the device cannot run this test (as vk_compute_test and
@@ -475,15 +491,6 @@ int main(int argc, char** argv) {
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     dci.pNext = chain;
-    // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders. VKH_SUBGROUP_SIZE then
-    // applies to it, unless VKH_GS_HELPER=1 says the GS only feeds the pixel shader under test.
-    const char* gs_path = std::getenv("VKH_GS");
-    const char* count_opt = std::getenv("VKH_GS_PRIMITIVES");
-    const bool count_gs = count_opt && std::strcmp(count_opt, "1") == 0;
-    if (count_gs && (!gs_path || !*gs_path || mesh || mesh_compute)) {
-        std::fprintf(stderr, "VKH_GS_PRIMITIVES=1 requires a VS/GS/FS draw with VKH_GS\n");
-        return 1;
-    }
     if (gs_path && !f2q.features.geometryShader) {   // MoltenVK: Metal has no geometry stage
         std::fprintf(stderr, "unsupported: no geometryShader\n");
         return 77;
@@ -657,22 +664,24 @@ int main(int argc, char** argv) {
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
     reqSg.requiredSubgroupSize = req_sg;
+    // VKH_GS_HELPER=1: the geometry shader only feeds the pixel shader under test (the --bary-fallback
+    // pass-through), so the size still goes to the fragment stage. Under VKH_MESH_COMPUTE, VKH_SUBGROUP_SIZE
+    // belongs to the compute mesh stage (cpipe below), not the fragment stage.
+    const bool gs_tested = gs_path && !std::getenv("VKH_GS_HELPER");
+    const bool fs_tested = !mesh && !mesh_compute && !gs_tested;
     if (req_sg > 0 && f13q.subgroupSizeControl &&
         req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize) {
-        // VKH_GS_HELPER=1: the geometry shader only feeds the pixel shader under test (the --bary-fallback
-        // pass-through), so the size still goes to the fragment stage.
-        const bool gs_tested = gs_path && !std::getenv("VKH_GS_HELPER");
         if (mesh && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT))
             stages[0].pNext = &reqSg;
         else if (gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_GEOMETRY_BIT))
             stages[2].pNext = &reqSg;
-        else if (!mesh && !gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
+        else if (fs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
             stages[1].pNext = &reqSg;
         // A device with one subgroup size runs every stage at it, required or not (AMD GCN: 64, with only COMPUTE
         // in requiredSubgroupSizeStages), so the fragment stage of a plain draw already has the size asked for.
-        const bool fixed = !mesh && !gs_tested && sgProps.minSubgroupSize == sgProps.maxSubgroupSize;
+        const bool fixed = fs_tested && sgProps.minSubgroupSize == sgProps.maxSubgroupSize;
         if (stages[1].pNext == &reqSg || fixed) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
-    } else if (req_sg > 0) {
+    } else if (req_sg > 0 && fs_tested) {
         std::fprintf(stderr, "fragment subgroup size: %u not available\n", req_sg);
     }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};

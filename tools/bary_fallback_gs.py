@@ -12,8 +12,8 @@ BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
 
     python -I tools/bary_fallback_gs.py <spirv dir> --pair VS PS
 
-The paired helper forwards a VS ClipDistance or CullDistance array. The suffix identifies the kind and length.
-Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
+The paired helper forwards a VS or --mesh-compute MS producer's ClipDistance and/or CullDistance arrays. The suffix
+identifies the kind(s) and length(s). Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
 Usage: `python -I tools/bary_fallback_gs.py --help` lists the options.
 """
 import argparse
@@ -40,16 +40,13 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
         raise ValueError("clip distance count must be an integer from 0 to 8")
     if type(cull_count) is not int or not 0 <= cull_count <= 8:
         raise ValueError("cull distance count must be an integer from 0 to 8")
-    if clip_count and cull_count:
-        raise ValueError("paired helper cannot forward mixed ClipDistance and CullDistance")
-    count = clip_count or cull_count
-    kind = "cull" if cull_count else "clip"
-    builtin = kind.title() + "Distance"
-    distance_iface = [f"%in_{kind}", f"%out_{kind}"] if count else []
+    distances = [(kind, count) for kind, count in (("clip", clip_count), ("cull", cull_count)) if count]
+    both_distances = len(distances) == 2
+    distance_iface = [var for kind, _ in distances for var in (f"%in_{kind}", f"%out_{kind}")]
     iface = " ".join(["%in_pos", "%out_pos", *ins, *outs, "%out_bary", *distance_iface])
     lines = [
         "OpCapability Geometry",
-        *([f"OpCapability {builtin}"] if count else []),
+        *[f"OpCapability {kind.title()}Distance" for kind, _ in distances],
         "OpMemoryModel Logical GLSL450",
         f'OpEntryPoint Geometry %main "main" {iface}',
         "OpExecutionMode %main Triangles",
@@ -58,8 +55,9 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
         "OpExecutionMode %main OutputVertices 3",
         "OpDecorate %in_pos BuiltIn Position",
         "OpDecorate %out_pos BuiltIn Position",
-        *([f"OpDecorate %in_{kind} BuiltIn {builtin}", f"OpDecorate %out_{kind} BuiltIn {builtin}"]
-          if count else []),
+        *[dec for kind, _ in distances
+          for dec in (f"OpDecorate %in_{kind} BuiltIn {kind.title()}Distance",
+                      f"OpDecorate %out_{kind} BuiltIn {kind.title()}Distance")],
         *[f"OpDecorate %in{n} Location {n}" for n in locations],
         *[f"OpDecorate %out{n} Location {n}" for n in locations],
         f"OpDecorate %out_bary Location {int(bary_location)}",
@@ -76,12 +74,14 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
         "%ptr_in_v4 = OpTypePointer Input %v4float",
         "%ptr_out_v4 = OpTypePointer Output %v4float",
         "%ptr_out_v3 = OpTypePointer Output %v3float",
-        *([f"%{kind}_count = OpConstant %uint {count}",
-           f"%{kind} = OpTypeArray %float %{kind}_count",
-           f"%triangle_{kind} = OpTypeArray %{kind} %uint_3",
-           f"%ptr_in_triangle_{kind} = OpTypePointer Input %triangle_{kind}",
-           f"%ptr_in_{kind} = OpTypePointer Input %{kind}",
-           f"%ptr_out_{kind} = OpTypePointer Output %{kind}"] if count else []),
+        *[line for kind, count in distances for line in (
+            f"%{kind}_count = OpConstant %uint {count}",
+            f"%{kind} = OpTypeArray %float %{kind}_count",
+            f"%triangle_{kind} = OpTypeArray %{kind} %uint_3",
+            f"%ptr_in_triangle_{kind} = OpTypePointer Input %triangle_{kind}",
+            f"%ptr_in_{kind} = OpTypePointer Input %{kind}",
+            f"%ptr_out_{kind} = OpTypePointer Output %{kind}",
+        )],
         "%f0 = OpConstant %float 0",
         "%f1 = OpConstant %float 1",
         "%bary0 = OpConstantComposite %v3float %f1 %f0 %f0",
@@ -93,8 +93,10 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
         *[f"{v} = OpVariable %ptr_in_arr Input" for v in ins],
         *[f"{v} = OpVariable %ptr_out_v4 Output" for v in outs],
         "%out_bary = OpVariable %ptr_out_v3 Output",
-        *([f"%in_{kind} = OpVariable %ptr_in_triangle_{kind} Input", f"%out_{kind} = OpVariable %ptr_out_{kind} Output"]
-          if count else []),
+        *[line for kind, _ in distances for line in (
+            f"%in_{kind} = OpVariable %ptr_in_triangle_{kind} Input",
+            f"%out_{kind} = OpVariable %ptr_out_{kind} Output",
+        )],
         "%main = OpFunction %void None %fn",
         "%entry = OpLabel",
     ]
@@ -103,9 +105,10 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
             p, x = f"%p{v}_{src[1:]}", f"%x{v}_{src[1:]}"
             lines += [f"{p} = OpAccessChain %ptr_in_v4 {src} %int_{v}", f"{x} = OpLoad %v4float {p}",
                       f"OpStore {dst} {x}"]
-        if count:
+        for kind, _ in distances:
+            val = f"%{kind}_distances{v}" if both_distances else f"%distances{v}"
             lines += [f"%{kind}_ptr{v} = OpAccessChain %ptr_in_{kind} %in_{kind} %int_{v}",
-                      f"%distances{v} = OpLoad %{kind} %{kind}_ptr{v}", f"OpStore %out_{kind} %distances{v}"]
+                      f"{val} = OpLoad %{kind} %{kind}_ptr{v}", f"OpStore %out_{kind} {val}"]
         lines += [f"OpStore %out_bary %bary{v}", "OpEmitVertex"]
     lines += ["OpEndPrimitive", "OpReturn", "OpFunctionEnd"]
     return "\n".join(lines) + "\n"
@@ -129,24 +132,40 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
         for name, entry in ((vertex, producer), (pixel, consumer)):
             if not isinstance(entry, dict):
                 raise ValueError(f"{index_path}: index entry {name!r} must be a JSON object")
-        if producer.get("stage") != "vs" or consumer.get("stage") != "ps" or not consumer.get("bary_fallback_input"):
-            raise ValueError("--pair requires a translated VS and a barycentric-fallback PS from the index")
+        mesh_compute = producer.get("mesh_compute") if producer.get("stage") == "ms" else None
+        is_msc = isinstance(mesh_compute, dict) and bool(mesh_compute)
+        if ((producer.get("stage") != "vs" and not is_msc)
+                or consumer.get("stage") != "ps" or not consumer.get("bary_fallback_input")):
+            raise ValueError("--pair requires a translated VS or --mesh-compute MS and a barycentric-fallback PS from the index")
         caps = set(producer.get("capabilities", []))
         unsupported = caps & {"ShaderLayer", "ShaderViewportIndex"}
         if unsupported:
             raise ValueError("paired helper cannot forward " + ", ".join(sorted(unsupported)))
-        def distance_count(kind):
-            if kind.title() + "Distance" not in caps:
-                return 0
-            field = f"{kind}_distance_count"
-            count = producer.get(field)
-            if type(count) is not int or not 1 <= count <= 8:
-                raise ValueError(f"missing or invalid VS {field}; regenerate the translation index")
-            return count
+        if is_msc:
+            def distance_count(kind):
+                field = f"{kind}_count"
+                count = mesh_compute.get(field, 0)
+                if type(count) is not int or not 0 <= count <= 8:
+                    raise ValueError(f"missing or invalid mesh_compute {field}; regenerate the translation index")
+                return count
+        else:
+            def distance_count(kind):
+                if kind.title() + "Distance" not in caps:
+                    return 0
+                field = f"{kind}_distance_count"
+                count = producer.get(field)
+                if type(count) is not int or not 1 <= count <= 8:
+                    raise ValueError(f"missing or invalid VS {field}; regenerate the translation index")
+                return count
 
         clip_count = distance_count("clip")
         cull_count = distance_count("cull")
-        suffix = f".cull{cull_count}" if cull_count else f".clip{clip_count}"
+        if clip_count and cull_count:
+            suffix = f".clip{clip_count}.cull{cull_count}"
+        elif cull_count:
+            suffix = f".cull{cull_count}"
+        else:
+            suffix = f".clip{clip_count}"
         names = [pixel]
     for name in names:
         meta = index[name]
