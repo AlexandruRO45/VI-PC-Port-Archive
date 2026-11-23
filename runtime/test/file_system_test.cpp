@@ -238,6 +238,26 @@ void run_checks(const std::filesystem::path& root) {
               attributes_ex_w && delete_w && delete_a,
           "the file API resolves through the registry under kernel32/kernelbase and the api sets");
 
+    // Drive roots omit dot entries, while a real subfolder keeps them.
+    {
+        const auto fixture = root / "root_listing";
+        const auto fixture_package = fixture / "package";
+        const auto fixture_overlay = fixture / "overlay";
+        write_path(fixture_package / "one.txt", "one");
+        write_path(fixture_package / "sub" / "two.txt", "two");
+        rt::fs::configure(fixture_package, fixture_overlay);
+        const auto root_names = list(first_w, next_w, find_close, L"GAME:\\*");
+        const auto actual_count = std::distance(std::filesystem::directory_iterator(fixture_package),
+                                                std::filesystem::directory_iterator{});
+        check(root_names.size() == static_cast<size_t>(actual_count) && !contains(root_names, L".") &&
+                  !contains(root_names, L".."),
+              "GAME root lists exactly the real entries without dot entries");
+        const auto sub_names = list(first_w, next_w, find_close, L"GAME:\\sub\\*");
+        check(count(sub_names, L".") == 1 && count(sub_names, L"..") == 1,
+              "a GAME subfolder retains both dot entries");
+        rt::fs::configure(package, overlay);
+    }
+
     // A read of a package file, through the mixed-case prefix and through forward slashes.
     {
         HANDLE h = create_w(L"GAME:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1110,8 +1130,7 @@ void run_checks(const std::filesystem::path& root) {
               "on a fresh overlay GetFileAttributesW(T:\\) is a folder, and making it leaves the last error alone");
         fresh_overlay();
         const std::vector<std::wstring> t_names = list(first_w, next_w, find_close, L"T:\\*");
-        check(t_names.size() == 2 && count(t_names, L".") == 1 && count(t_names, L"..") == 1,
-              "on a fresh overlay FindFirstFileW(T:\\*) lists the empty root as . and ..");
+        check(t_names.empty(), "on a fresh overlay FindFirstFileW(T:\\*) lists no entries");
         fresh_overlay();
         check(mkdir_w(L"T:\\shadercache", nullptr) != FALSE,
               "on a fresh overlay CreateDirectoryW(T:\\shadercache) succeeds");

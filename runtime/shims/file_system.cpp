@@ -588,6 +588,8 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         do {
             if (overlay_root && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
+            const bool drive_root = dirs.empty() || (dirs.size() == 1 && same_name(dirs[0].c_str(), kScratchDir));
+            if (dot && drive_root) continue;
             if (!overlay_root && !dot && entry_deleted(found.cFileName)) continue;
             if (seen.insert(found.cFileName).second) out.push_back(found);
         } while (::FindNextFileW(h, &found));
