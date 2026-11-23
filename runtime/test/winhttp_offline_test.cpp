@@ -351,6 +351,23 @@ int main() {
                       WINHTTP_INVALID_STATUS_CALLBACK &&
                   GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
               "WinHttpSetStatusCallback on a NULL handle fails with ERROR_WINHTTP_INCORRECT_HANDLE_TYPE");
+        DWORD_PTR null_context = 0;
+        DWORD null_size = sizeof(null_context);
+        SetLastError(0);
+        check(query_option(nullptr, WINHTTP_OPTION_CONTEXT_VALUE, &null_context, &null_size) == FALSE &&
+                  GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+              "WinHttpQueryOption on a NULL handle fails with ERROR_WINHTTP_INCORRECT_HANDLE_TYPE");
+        SetLastError(0);
+        check(query_option(nullptr, WINHTTP_OPTION_CONTEXT_VALUE, &null_context, nullptr) == FALSE &&
+                  GetLastError() == ERROR_INVALID_PARAMETER,
+              "but a missing length is still ERROR_INVALID_PARAMETER first");
+        SetLastError(0);
+        check(set_timeouts(nullptr, 1000, 1000, 1000, 1000) == FALSE &&
+                  GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+              "WinHttpSetTimeouts on a NULL handle fails with ERROR_WINHTTP_INCORRECT_HANDLE_TYPE");
+        SetLastError(0);
+        check(set_timeouts(nullptr, -5, 0, 0, 0) == FALSE && GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+              "even with a timeout it would refuse");
 
         // Wrong handles.
         SetLastError(0);

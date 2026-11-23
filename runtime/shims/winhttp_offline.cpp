@@ -321,6 +321,7 @@ BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR headers, DWORD length
 // ERROR_WINHTTP_INCORRECT_HANDLE_TYPE); 0 and -1 (infinite) are accepted; any other negative value, in any of the
 // four, fails with ERROR_INVALID_PARAMETER.
 BOOL WINAPI set_timeouts(HINTERNET handle, int resolve, int connect, int send, int receive) {
+    if (!handle) return fail(ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
     DWORD error = 0;
     Handle* h = acquire(handle, true, false, true, error);
     if (!h) return fail(error);
@@ -355,6 +356,7 @@ BOOL WINAPI set_option(HINTERNET handle, DWORD option, LPVOID buffer, DWORD leng
 
 BOOL WINAPI query_option(HINTERNET handle, DWORD option, LPVOID buffer, LPDWORD length) {
     if (!length) return fail(ERROR_INVALID_PARAMETER);
+    if (!handle) return fail(ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
     DWORD error = 0;
     Handle* h = acquire(handle, true, true, true, error);
     if (!h) return fail(error);
