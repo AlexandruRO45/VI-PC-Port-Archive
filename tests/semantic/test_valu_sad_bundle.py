@@ -498,5 +498,26 @@ class TestVSadHiU8HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_sad_hi_u8(0x04030201, 0x01010101, 10), 0x0006000A)
 
 
+def ref_msad_u8(s0: int, s1: int, s2: int) -> int:
+    """Reference mathematical oracle for RDNA2 v_msad_u8 (masked SAD)."""
+    diffs = [
+        abs(((s0 >> (8 * i)) & 0xFF) - ((s1 >> (8 * i)) & 0xFF))
+        if ((s1 >> (8 * i)) & 0xFF) != 0 else 0
+        for i in range(4)
+    ]
+    return ((s2 & MASK32) + sum(diffs)) & MASK32
+
+
+class TestVMsadU8Reference(unittest.TestCase):
+    """Reference oracle unit tests for v_msad_u8."""
+
+    def test_reference_canonical_masking(self):
+        # S1 has bytes [1, 0, 1, 0] -> bytes 1 and 3 are masked out
+        self.assertEqual(ref_msad_u8(0x04030201, 0x00010001, 10), 12)
+
+    def test_reference_all_zero_mask(self):
+        self.assertEqual(ref_msad_u8(0xFFFFFFFF, 0x00000000, 50), 50)
+
+
 if __name__ == "__main__":
     unittest.main()
