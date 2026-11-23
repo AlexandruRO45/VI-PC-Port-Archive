@@ -6275,7 +6275,21 @@ class Gen:
                 self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {words[0]} {words[1]}")
                 self.emit(f"{r} = OpBitcast %double {v2}")
             elif op == "v_ldexp_f64":
-                self.emit(f"{r} = OpExtInst %double %glsl Ldexp {rd64(a[1])} {self.as_int(self.src_u(a[2]))}")
+                # magic code
+                n = self.as_int(self.src_u(a[2]))
+                neg, kk, k, nk, hb, hu, pv, pd, r1 = (self.tmp() for _ in range(9))
+                self.emit(f"{neg} = OpSNegate %int {n}")
+                self.emit(f"{kk} = OpExtInst %int %glsl SMax {neg} {self.as_int(self.cu(0))}")
+                self.emit(f"{k} = OpExtInst %int %glsl SMin {kk} {self.as_int(self.cu(1022))}")
+                self.emit(f"{nk} = OpIAdd %int {n} {k}")
+                self.emit(f"{r1} = OpExtInst %double %glsl Ldexp {rd64(a[1])} {nk}")
+                self.emit(f"{hb} = OpISub %int {self.as_int(self.cu(1023))} {k}")
+                self.emit(f"{hu} = OpBitcast %uint {hb}")
+                sh = self.tmp()
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {hu} {self.cu(20)}")
+                self.emit(f"{pv} = OpCompositeConstruct %v2uint_d {self.cu(0)} {sh}")
+                self.emit(f"{pd} = OpBitcast %double {pv}")
+                self.emit(f"{r} = OpFMul %double {r1} {pd}")
             elif op == "v_fract_f64":
                 fr, one = self.tmp(), self.tmp()
                 self.emit(f"{fr} = OpExtInst %double %glsl Fract {rd64(a[1])}")
@@ -6317,7 +6331,13 @@ class Gen:
             self.emit(f"{value} = OpBitcast %double {pair}")
             rounding = {"v_trunc_f64": "Trunc", "v_ceil_f64": "Ceil",
                         "v_rndne_f64": "RoundEven", "v_floor_f64": "Floor"}
-            self.emit(f"{result} = OpExtInst %double %glsl {rounding[op]} {value}")
+            if op == "v_ceil_f64":
+                ng, fl = self.tmp(), self.tmp()
+                self.emit(f"{ng} = OpFNegate %double {value}")
+                self.emit(f"{fl} = OpExtInst %double %glsl Floor {ng}")
+                self.emit(f"{result} = OpFNegate %double {fl}")
+            else:
+                self.emit(f"{result} = OpExtInst %double %glsl {rounding[op]} {value}")
             result = self.clamp_mods_f64(result, mods)
             words = self.tmp()
             self.emit(f"{words} = OpBitcast %v2uint_d {result}")
