@@ -1082,6 +1082,13 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game_log_file COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_log_file.cmake")
+    if(NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME run_tiny_game_log_detached COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_log_detached.py" "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
+      endif()
+    endif()
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
     add_test(NAME run_tiny_game_abort_exit_codes COMMAND tiny_game_abort_test

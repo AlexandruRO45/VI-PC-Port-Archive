@@ -70,7 +70,13 @@ bool append_output_to(const std::wstring& path) {
     FILE* file = nullptr;
     if (_wfreopen_s(&file, path.c_str(), L"a", stdout) != 0 || !file) return false;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::fflush(stderr);
+    // A detached Windows process can have a stderr stream with no CRT descriptor (-2).
+    // Give it a descriptor before duplicating stdout so both streams share one log position.
+    if (_fileno(stderr) < 0) {
+        if (_wfreopen_s(&file, L"NUL", L"w", stderr) != 0) return false;
+    } else {
+        std::fflush(stderr);
+    }
     if (_dup2(_fileno(stdout), _fileno(stderr)) != 0) return false;
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     SetStdHandle(STD_OUTPUT_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stdout))));
