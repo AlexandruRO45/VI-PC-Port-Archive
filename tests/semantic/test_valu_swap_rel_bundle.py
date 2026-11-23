@@ -188,6 +188,17 @@ class TestSwapRelTranslator(unittest.TestCase):
         self.assertIn("OpLogicalAnd", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSwapPCOracle(unittest.TestCase):
+    def test_oracle_swappc(self):
+        new_pc, link = model_swappc(0x1000, 0x8000)
+        self.assertEqual(new_pc, 0x8000)
+        self.assertEqual(link, 0x1004)
+
+    def test_translator_swappc_rejection_in_cs(self):
+        prog = ["s_swappc_b64 s[0:1], s[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("cs_swappc_oracle", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
