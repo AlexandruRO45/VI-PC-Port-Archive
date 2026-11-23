@@ -4,7 +4,7 @@
   - SGPR high halves, f16 abs/neg/ordered-vs-unordered NaN.
 
 Usage:
-  python -I tools/probe_gfx1036_vcmp16.py
+  python -I tools/probe_gfx1036_vcmp16.py [--build DIR]   # DIR holds vk_compute_test (default runtime/build)
 
 Needs a native RDNA2 GPU (the probe asks for LEONIDA_VK_DEVICE=radeon), a built
 runtime/build/vk_compute_test (cmake --build runtime/build --target vk_compute_test) and spirv-as on
@@ -23,11 +23,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests", "semantic"))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 
 from support import STUB_DXBC, rdna2spirv
 import spirv_mini_interp as si
+from check import CONFIG_DIRS, EXE, resolve_build_dir
 
-VK_COMPUTE_TEST = os.path.join(ROOT, "runtime", "build", "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+VK_COMPUTE_TEST = os.path.join(ROOT, "runtime", "build", "vk_compute_test" + EXE)
+
+
+def find_vk_compute_test(build):
+    name = "vk_compute_test" + EXE
+    return os.path.join(resolve_build_dir(build, [name]), name)
 
 # Half-precision bit constants
 H_ZERO = 0x0000      # +0.0
@@ -340,10 +347,14 @@ def test_f16_nan_and_modifiers(wave_size=32):
 
 
 def main(argv=None):
+    global VK_COMPUTE_TEST
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  epilog="Needs an RDNA2 GPU, a built runtime/build/vk_compute_test and spirv-as "
                                         "on PATH; no game files. Run it alone: it wants the GPU to itself.")
-    ap.parse_args(argv)
+    ap.add_argument("--build", metavar="DIR", default=os.path.join(ROOT, "runtime", "build"),
+                    help="CMake build folder holding vk_compute_test; its " + ", ".join(CONFIG_DIRS) +
+                         " subfolders are searched too (default: runtime/build)")
+    VK_COMPUTE_TEST = find_vk_compute_test(os.path.abspath(ap.parse_args(argv).build))
     # The probe writes a temporary module per case, so a missing tool would stop it a dozen tracebacks deep.
     if not shutil.which("spirv-as"):
         print("ERROR: spirv-as is not on PATH (SPIRV-Tools, or the Vulkan SDK's bin)", file=sys.stderr)
