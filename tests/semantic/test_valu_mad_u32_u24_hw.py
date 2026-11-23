@@ -262,5 +262,24 @@ class MadU32U24RegisterAliasingTests(unittest.TestCase):
         execute_scalar_mad_u32_u24(state, ast)
         self.assertEqual(state.get_vgpr(0), (3 * 3) + 3)
 
+class MadU32U24ConditionCodesTests(unittest.TestCase):
+    def test_scc_and_vcc_isolation(self):
+        initial_scc = 1
+        initial_vcc = 0xDEADBEEFCAFEBABE
+        state = ScalarRegisterState()
+        state.set_vgpr(0, 10)
+        state.set_vgpr(1, 10)
+        state.set_vgpr(2, 10)
+        ast = InstructionAST(
+            "v_mad_u32_u24",
+            Operand(RegKind.VGPR, 3),
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+            Operand(RegKind.VGPR, 2),
+        )
+        execute_scalar_mad_u32_u24(state, ast)
+        self.assertEqual(initial_scc, 1)
+        self.assertEqual(initial_vcc, 0xDEADBEEFCAFEBABE)
+
 if __name__ == "__main__":
     unittest.main()
