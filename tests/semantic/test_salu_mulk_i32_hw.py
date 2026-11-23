@@ -234,5 +234,24 @@ class TestMulkScalarInterpreter(unittest.TestCase):
         self.assertEqual(words, [interp.sgprs[0], interp.sgprs[1], interp.sgprs[2], interp.sgprs[3]])
 
 
+class TestMulkSimdInteraction(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for s_mulk_i32."""
+
+    def test_simd_broadcast_and_vector_cndmask(self):
+        lines = [
+            "s_mov_b32 s0, 100",
+            "s_mulk_i32 s0, 3",
+            "s_mov_b32 s1, 200",
+            "s_mulk_i32 s1, -2",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_cndmask_b32 v2, v0, v1, vcc",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mulk_ps(lines, "ps_mulk_simd_cndmask")
+        self.assertEqual(words[0], 300)
+        self.assertEqual(words[1], (-400) & MASK32)
+
+
 if __name__ == '__main__':
     unittest.main()
