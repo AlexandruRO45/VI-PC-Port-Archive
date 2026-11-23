@@ -62,14 +62,22 @@ def _s32(u):
 # ---------------------------------------------------------------------------
 
 def _parse_spv(asm):
-    """Parse SPIR-V assembly into constants, global/function var layouts, and labeled basic blocks."""
+    """Parse SPIR-V assembly into constants, global/function var layouts, and labeled basic blocks.
+
+    Structured wave64 emulation (--wave64-emulate plus a structured plan) outlines its cross-lane helper
+    blocks as single-block functions that %main calls with OpFunctionCall. This interpreter has no call
+    stack, so inline those helpers into their call sites while parsing: one call site, one sequential
+    instruction stream, exactly what the invocation would execute anyway.
+    """
     consts = {}
     types = {}
     ptr_elem = {}
     gvars = {}       # %name -> (storage_class, elem_type)
     fvars = []       # [(%name, elem_type, init_id_or_None)]
     blocks = {}      # %label -> [(res, op, args), ...]
+    funcs = {}       # %name -> {"params": [...], "body": [(res, op, args), ...]}
     cur = None
+    cur_fn = None
     in_main = False
 
     for raw in asm.splitlines():
@@ -83,14 +91,18 @@ def _parse_spv(asm):
             res, op, args = None, toks[0], toks[1:]
 
         if op == "OpFunction":
+            cur_fn = res
             in_main = (res == "%main")
+            funcs[cur_fn] = {"params": [], "body": []}
+            cur = None
             continue
         if op == "OpFunctionEnd":
+            cur_fn = None
             in_main = False
             cur = None
             continue
 
-        if not in_main:
+        if cur_fn is None:
             if op == "OpTypeInt":
                 types[res] = ("int", int(args[0]), int(args[1]))
             elif op == "OpTypeBool":
@@ -126,17 +138,68 @@ def _parse_spv(asm):
                 gvars[res] = (sc, elem)
             continue
 
+        if op == "OpFunctionParameter":
+            funcs[cur_fn]["params"].append(res)
+            continue
         if op == "OpLabel":
             cur = res
-            blocks[cur] = []
+            if in_main:
+                blocks[cur] = []
             continue
         if op == "OpVariable":
+            if not in_main:
+                raise NotImplementedError(f"OpVariable in helper function {cur_fn}")
             _, elem = ptr_elem[args[0]]
             init = args[2] if len(args) > 2 else None
             fvars.append((res, elem, init))
             continue
-        if cur is not None:
+        funcs[cur_fn]["body"].append((res, op, args))
+        if in_main and cur is not None:
             blocks[cur].append((res, op, args))
+
+    call_seq = 0
+
+    def subst(tok, mapping):
+        return mapping.get(tok, tok)
+
+    def inline(insns, depth=0):
+        """Expand OpFunctionCall results into the stream; helpers are single-block with one OpReturnValue."""
+        nonlocal call_seq
+        out = []
+        for res, op, args in insns:
+            if op != "OpFunctionCall":
+                out.append((res, op, args))
+                continue
+            if depth >= 16:
+                raise NotImplementedError("OpFunctionCall nested too deeply")
+            ret_ty, fname, *call_args = args
+            fn = funcs.get(fname)
+            if fn is None or len(fn["params"]) != len(call_args):
+                raise NotImplementedError(f"OpFunctionCall {fname} {call_args}")
+            call_seq += 1
+            mapping = dict(zip(fn["params"], call_args))
+            body = []
+            for fres, fop, fargs in fn["body"]:
+                if fop == "OpLabel":
+                    continue
+                if fop == "OpReturnValue":
+                    if res:
+                        body.append((res, "OpCopyObject", [ret_ty, subst(fargs[0], mapping)]))
+                    break
+                if fop == "OpReturn":
+                    break
+                if fop == "OpVariable":
+                    raise NotImplementedError(f"OpVariable in helper function {fname}")
+                new_res = None
+                if fres:
+                    new_res = f"%fc{call_seq}_{fres[1:]}"
+                    mapping[fres] = new_res
+                body.append((new_res, fop, [subst(a, mapping) for a in fargs]))
+            out.extend(inline(body, depth + 1))
+        return out
+
+    for label in blocks:
+        blocks[label] = inline(blocks[label])
 
     def make_zero(ty_id):
         ty = types.get(ty_id)
@@ -1023,7 +1086,11 @@ class DivergentLoopBallotTests(unittest.TestCase):
             with self.subTest(mode=label):
                 spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate)
                 if emulate:
-                    self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+                    # Structured plans (inline_all / structured_hybrid) are the emulation's current form;
+                    # their call-site helpers are inlined by _parse_spv, and the per-lane checks below are
+                    # what matters, so both emulation shapes are valid here.
+                    self.assertIn(gen.control_flow,
+                                  ("emulated wave64 rounds", "emulated wave64 structured"))
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):
