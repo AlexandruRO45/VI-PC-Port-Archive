@@ -1829,7 +1829,17 @@ sets them, and it does so twice.
 
 `amd_fidelityfx_upscaler_xbox.dll` does neither. Its 29 `RTS0` parts carry `Flags = 0`, and no instruction in it uses
 the constant `0x3000000`. So the bits are not a property of every console root signature; this builder adds them. The
-game executable is not in the package, so whether its root signatures carry them is open.
+retail executable's root signatures do not carry them either (#7140): its direct call passes a 1.1 description with
+`Flags = 0x80` (`LOCAL_ROOT_SIGNATURE`), and its root-signature decoder reads `Flags` as a zero-extended 16-bit value.
+
+The mask stays unconditional, because it can't touch a public flag: it clears bits 24-31
+(`kXboxRootSignatureFlagHighByte`, `runtime/shims/d3d12_xs_rootsig.h`), and every public
+`D3D12_ROOT_SIGNATURE_FLAGS` value is in bits 0-11 (the highest is `SAMPLER_HEAP_DIRECTLY_INDEXED`, `0x800`). So it is
+safe on every descriptor and blob, whatever built it. `root_sig_public_flags_test` pins this:
+
+- the helpers keep every flag value in `[0, 0xFFFF]`;
+- the shims' serializers give the host's blob byte for byte for each public flag;
+- a blob with `0x03000080` comes back as `0x80`.
 
 **Version 1.2 on older runtimes.** The in-box `d3d12.dll` of Windows 10 (measured on 22H2, 10.0.19045, without the
 Agility SDK) and of Windows 11 23H2 (#361) serializes root signatures only up to 1.1. On Windows 10 it rejects even an

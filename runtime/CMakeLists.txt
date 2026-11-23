@@ -161,6 +161,19 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     target_compile_options(root_sig_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(root_sig_test PRIVATE /OPT:NOREF)
 
+    # The flag mask keeps every public root-signature flag: helpers over [0, 0xFFFF], the shims against the host
+    # serializer and deserializer (#7140).
+    add_executable(root_sig_public_flags_test
+      test/root_sig_public_flags_test.cpp
+      shims/registry.cpp
+      shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_link_libraries(root_sig_public_flags_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY})
+    target_compile_definitions(root_sig_public_flags_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(root_sig_public_flags_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(root_sig_public_flags_test PRIVATE /OPT:NOREF)
+
     # RTS0 parser oracle: synthetic descriptors only, serialized by the real PC
     # d3d12.dll and parsed back by rt::rootsig::parse_rts0. A layout mismatch
     # fails here with the blob bytes, never silently in a draw.
@@ -844,6 +857,9 @@ if(BUILD_TESTING)
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
+  endif()
+  if(TARGET root_sig_public_flags_test)
+    add_test(NAME root_sig_public_flags COMMAND root_sig_public_flags_test)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
