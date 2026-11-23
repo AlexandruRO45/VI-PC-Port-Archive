@@ -150,7 +150,12 @@ Current limits, by design:
   measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
-  address.
+  address. `XMemAllocDefault`/`XMemFreeDefault` share that heap. `XMemVirtualAlloc` accepts the attribute word,
+  drops the console's `PAGE_GRAPHICS_*` and write-combine protection bits, commits 2 MiB guest pages 2 MiB-aligned,
+  and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. Physical pages
+  (`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`) are
+  64 KiB pages of pagefile-backed sections, mapped one view per page into the placeholder that a reserve-only
+  64 KiB-page `XMemVirtualAlloc` becomes, with that reservation's protection. `XMemIsToolsMemAvailable` is `FALSE`.
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
   `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
   open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path
@@ -340,7 +345,9 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
-| `xmem_attributes` | the first `XMemAlloc` and the first `XMemFree` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (`XMemAlloc` only), `caller` (module+RVA) |
+| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault` and `XMemFreeDefault` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (the allocators only), `caller` (module+RVA) |
+| `xmem_virtual_alloc` | the first `XMemVirtualAlloc` for each distinct (type, attributes, protect) | `api`, `type`, `attributes`, `protect`, `size`, `caller` |
+| `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |

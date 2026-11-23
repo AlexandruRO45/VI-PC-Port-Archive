@@ -89,6 +89,28 @@ bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))`
 returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
 and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
 
+Seven more `xmem.dll` imports follow argument shapes measured locally at a title's call sites (the comments in
+`runtime/shims/xmem.cpp` give each shape):
+
+- `XMemAllocDefault` and `XMemFreeDefault` take `XMemAlloc`'s and `XMemFree`'s arguments and share their heap.
+- `XMemAllocatePhysicalPages(attributes, UINT64* count, UINT64* pages)` returns a `BOOL` and the count it allocated.
+  Each call is one pagefile-backed section of `count` 64 KiB pages. A page number is a 4 KiB frame number: a
+  non-zero multiple of 16 below 2^25, which is what the measured title assumes when it packs them. `0` means "unmap".
+- `XMemMapPhysicalPages(address, UINT64 count, pages)` returns the address. A null page array unmaps.
+  `XMemMapPhysicalPagesScatter(addresses, UINT32 count, pages)` returns a `BOOL`, and a `0` entry unmaps.
+  `XMemFreePhysicalPages(UINT64 count, pages)` returns a `BOOL`. Every page is its own view, mapped with
+  `MapViewOfFile3` into a 64 KiB placeholder, so a page keeps its contents across remaps and can be mapped twice.
+- The windows are reserve-only 64 KiB-page `XMemVirtualAlloc` regions. The shim reserves them as placeholders and
+  keeps their protection, which mapped pages get (AWE's rule). The measured title also reserves a placeholder with
+  `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both
+  through. **ASSUMPTION:** nothing commits into a window with `kernel32!VirtualAlloc`, which a placeholder refuses.
+- `XMemVirtualAlloc` used to refuse any nonzero attribute word and 2 MiB pages. All 23 measured calls pass a
+  nonzero word and five commit 2 MiB pages. The word is now accepted and traced (`xmem_virtual_alloc`). 2 MiB
+  regions are aligned through `VirtualAlloc2`. The console's `PAGE_GRAPHICS_*` bits and `PAGE_WRITECOMBINE` are
+  dropped from the protection, because the D3D12 layer reads this memory on the CPU.
+- `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
+  on an out-of-memory path, after an allocation has already failed.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.
