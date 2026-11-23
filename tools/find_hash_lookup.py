@@ -21,6 +21,9 @@ import struct
 import sys
 from collections import Counter, defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 
 
@@ -112,16 +115,6 @@ def rank(data, hashes, window=48, top=15):
     }
 
 
-def same_path(first, second):
-    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("exe")
@@ -134,7 +127,7 @@ def main(argv=None):
     if a.json:
         if os.path.isdir(a.json):
             ap.error(f"--json {a.json} is a folder, not a file")
-        if same_path(a.json, a.exe):
+        if same_report_path(a.json, a.exe):
             ap.error(f"--json {a.json} would overwrite the input {a.exe}")
     try:
         hashes = [(h, parse_hash(h)) for h in (a.hash or ["player_story000_00", "cs_mandy"])]
