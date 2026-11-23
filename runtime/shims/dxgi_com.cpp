@@ -1393,9 +1393,12 @@ public:
         assoc_hwnd_ = hwnd;
         return S_OK;
     }
+    // Host-measured (Windows 11, RTX 3080, driver 621.24): a null pointer is DXGI_ERROR_INVALID_CALL, and the window
+    // reported is null even after MakeWindowAssociation gave the factory one, whatever its flags. Wine's dxgi answers
+    // the same. The window MakeWindowAssociation records stays in assoc_hwnd_ and is not reported.
     HRESULT STDMETHODCALLTYPE GetWindowAssociation(HWND* hwnd) override {
-        if (!hwnd) return E_INVALIDARG;
-        *hwnd = assoc_hwnd_;
+        if (!hwnd) return DXGI_ERROR_INVALID_CALL;
+        *hwnd = nullptr;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE CreateSwapChain(IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) override {

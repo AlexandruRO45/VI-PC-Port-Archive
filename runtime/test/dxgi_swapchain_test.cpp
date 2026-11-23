@@ -493,6 +493,37 @@ int main() {
         }
     }
 
+    // GetWindowAssociation: a null pointer is DXGI_ERROR_INVALID_CALL, and the window it reports is null even after
+    // MakeWindowAssociation gave it one (host-measured on Windows 11; Wine's dxgi does the same). Compared with the
+    // host dxgi.dll when there is one.
+    {
+        if (factory->GetWindowAssociation(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("GetWindowAssociation(nullptr) should be DXGI_ERROR_INVALID_CALL");
+        HWND associated = hwnd;
+        if (FAILED(factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_WINDOW_CHANGES)) ||
+            factory->GetWindowAssociation(&associated) != S_OK || associated != nullptr)
+            return fail("GetWindowAssociation should report no window, as the host does");
+        if (const HMODULE host_dxgi = LoadLibraryW(L"dxgi.dll")) {
+            using CreateFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
+            const auto create_host =
+                reinterpret_cast<CreateFactory1Fn>(GetProcAddress(host_dxgi, "CreateDXGIFactory1"));
+            IDXGIFactory1* host = nullptr;
+            if (create_host && SUCCEEDED(create_host(IID_PPV_ARGS(&host))) && host) {
+                HWND host_associated = hwnd;
+                const HRESULT host_null = host->GetWindowAssociation(nullptr);
+                const HRESULT host_made = host->MakeWindowAssociation(hwnd, DXGI_MWA_NO_WINDOW_CHANGES);
+                const HRESULT host_get = host->GetWindowAssociation(&host_associated);
+                host->Release();
+                if (host_null != DXGI_ERROR_INVALID_CALL || FAILED(host_made) || host_get != S_OK ||
+                    host_associated != associated) {
+                    FreeLibrary(host_dxgi);
+                    return fail("GetWindowAssociation did not match host dxgi.dll");
+                }
+            }
+            FreeLibrary(host_dxgi);
+        }
+    }
+
     D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
     ID3D12CommandQueue* queue = nullptr;
     ID3D12CommandAllocator* alloc = nullptr;
