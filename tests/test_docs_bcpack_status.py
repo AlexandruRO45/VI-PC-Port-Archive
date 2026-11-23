@@ -29,14 +29,25 @@ ROW = re.compile(
 )
 
 
+def _status_rows(text):
+    """codec -> match, refusing a second row for the same codec instead of overwriting it."""
+    rows = {}
+    for match in ROW.finditer(text):
+        codec = match.group(1)
+        if codec in rows:
+            raise ValueError(f"duplicate status row for {codec}")
+        rows[codec] = match
+    return rows
+
+
 def parse_status_rows(text):
     """codec -> (confirmed count, provisional count) for the simple-codec status rows."""
-    return {m.group(1): (int(m.group(2)), int(m.group(3))) for m in ROW.finditer(text)}
+    return {codec: (int(m.group(2)), int(m.group(3))) for codec, m in _status_rows(text).items()}
 
 
 def parse_status_notes(text):
     """codec -> notes cell for the same rows, so prose claims can be pinned too."""
-    return {m.group(1): m.group(4).strip() for m in ROW.finditer(text)}
+    return {codec: m.group(4).strip() for codec, m in _status_rows(text).items()}
 
 
 def provisional_keys_from_note(note):
@@ -56,6 +67,16 @@ class DocsBcpackStatus(unittest.TestCase):
         ])
         self.assertEqual(parse_status_rows(text), {"BC1": (252, 3)})
         self.assertEqual(parse_status_notes(text), {"BC1": "note one"})
+
+    def test_duplicate_status_rows_are_rejected_instead_of_overwritten(self):
+        text = "\n".join([
+            "| BC1 | `tools/bcpack_tables.py` | 248 confirmed / 7 provisional | old note |",
+            "| BC1 | `tools/bcpack_tables.py` | 252 confirmed / 3 provisional | newer note |",
+        ])
+        with self.assertRaisesRegex(ValueError, "duplicate status row.*BC1"):
+            parse_status_rows(text)
+        with self.assertRaisesRegex(ValueError, "duplicate status row.*BC1"):
+            parse_status_notes(text)
 
     def test_provisional_note_parser(self):
         self.assertEqual(
