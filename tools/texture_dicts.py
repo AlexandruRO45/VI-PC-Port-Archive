@@ -16,10 +16,10 @@ Reads an ``make_game.py`` export folder (``<work>/assets``), listing folders wit
 embedded rows carry a stored ``Hash``. Those stored values are compared as they are (a name that is not eight hex
 digits, in a hand-written file, is hashed with joaat). Each distinct material reference (``Id64``) is then an exact
 64-bit key match (pool ``AssetKey`` or embedded ``Key``), else a 32-bit name-hash candidate (embedded or dictionary
-``Hash``; not proof of the same asset, and ambiguous when the hash is on more than one distinct texture, see
-``texture_identity``), else unresolved; the three add up to the total, and per-source counts (which can overlap) are
-listed too. A manifest whose ``Count`` is above the rows it holds is reported as export coverage (failed rows can be
-left out); more rows than ``Count`` is a problem.
+``Hash``; not proof of the same asset; ambiguous when the hash is on more than one distinct texture, uncertain when
+its one metadata group holds several keyless rows, see ``texture_identity``), else unresolved; the three add up to
+the total, and per-source counts (which can overlap) are listed too. A manifest whose ``Count`` is above the rows it
+holds is reported as export coverage (failed rows can be left out); more rows than ``Count`` is a problem.
 
     python -I tools/texture_dicts.py <export dir> [--json FILE]
 
@@ -67,8 +67,9 @@ def load_object(path):
 
 
 def texture_identity(t):
-    """What makes two dictionary or embedded rows the same texture: the same 64-bit ``Key``, or, without a key, the
-    same format and size. The same texture embedded in several models is one texture, not an ambiguous hash."""
+    """Which rows count as one texture: the same 64-bit ``Key`` (one texture embedded in several models is one
+    texture), or, without a key, one metadata group of the same format and size. Keyless rows in one group can still
+    be different textures, so a candidate whose only group holds several keyless rows is reported as uncertain."""
     k = key64(t.get("Key"))
     if k:
         return ("key", k)
@@ -171,7 +172,7 @@ def census(export):
 
     # texture dictionaries: stored hashes, and how many entries carry each (more than one = an ambiguous candidate)
     dict_hashes = {}                  # archive -> set of 32-bit hashes
-    textures_per_hash = {}            # stored hash -> distinct textures carrying it (see texture_identity)
+    textures_per_hash = {}            # stored hash -> Counter(texture_identity -> rows)
     for arc in archives(export):
         m = os.path.join(export, arc, "textures", "manifest.json")
         if not os.path.isfile(m):
@@ -185,7 +186,7 @@ def census(export):
             hv, _ = stored_hash(t, name_key=None)
             if hv is not None:
                 hashes.add(hv)
-                textures_per_hash.setdefault(hv, set()).add(texture_identity(t))
+                textures_per_hash.setdefault(hv, Counter())[texture_identity(t)] += 1
             formats[str(t.get("Format"))] += 1
             name = t.get("Name")
             if isinstance(name, str) and name:
@@ -252,7 +253,7 @@ def census(export):
                 hv, _ = stored_hash(t)
                 if hv is not None:
                     emb_hashes.add(hv)
-                    textures_per_hash.setdefault(hv, set()).add(texture_identity(t))
+                    textures_per_hash.setdefault(hv, Counter())[texture_identity(t)] += 1
             for mat in objects(item.get("Materials"), f"{arc}/models Materials"):
                 for t in objects(mat.get("Textures"), f"{arc}/models material Textures"):
                     bindings += 1
@@ -299,8 +300,13 @@ def summarise(refs, sources, bindings, no_key, models):
             part["exact 64-bit key"] += 1
         elif emb_cand or dict_cand:
             part["32-bit name-hash candidate only"] += 1
-            if any(len(textures_per_hash.get(h, ())) > 1 for h in emb_cand | dict_cand) or len(emb_cand | dict_cand) > 1:
+            groups = Counter()
+            for h in emb_cand | dict_cand:
+                groups.update(textures_per_hash.get(h, ()))
+            if len(groups) > 1:
                 part["  of which ambiguous (hash on more than one texture)"] += 1
+            elif any(ident[0] != "key" and rows > 1 for ident, rows in groups.items()):
+                part["  of which uncertain (several keyless rows of one format and size)"] += 1
         else:
             part["unresolved"] += 1
         if dict_cand:  # most references have no candidate: skip the per-archive loop (shdann, #4980)
@@ -308,7 +314,7 @@ def summarise(refs, sources, bindings, no_key, models):
                 if dict_cand & hs:
                     by_dict_archive[arc] += 1
     order = ("exact 64-bit key", "32-bit name-hash candidate only", "  of which ambiguous (hash on more than one texture)",
-             "unresolved")
+             "  of which uncertain (several keyless rows of one format and size)", "unresolved")
     src_order = ("pool key", "embedded key", "pool and embedded key", "embedded name hash", "dictionary name hash")
     return {"models": models, "bindings": bindings, "bindings_without_key": no_key, "distinct_references": len(refs),
             "resolution": {c: part.get(c, 0) for c in order},

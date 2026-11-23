@@ -81,6 +81,7 @@ class CensusTests(unittest.TestCase):
             # F02 (embedded stored Hash); E01 nowhere. The partition adds up; the per-source counts overlap (BB).
             self.assertEqual(s["resolution"], {"exact 64-bit key": 4, "32-bit name-hash candidate only": 2,
                                                "  of which ambiguous (hash on more than one texture)": 0,
+                                               "  of which uncertain (several keyless rows of one format and size)": 0,
                                                "unresolved": 1})
             self.assertEqual(s["by_source"], {"pool key": 3, "embedded key": 1, "pool and embedded key": 0,
                                               "embedded name hash": 1, "dictionary name hash": 2})
@@ -121,6 +122,22 @@ class CensusTests(unittest.TestCase):
             s = td.census(exp)["references"]["lv"]
             self.assertEqual(s["resolution"]["32-bit name-hash candidate only"], 1)
             self.assertEqual(s["resolution"]["  of which ambiguous (hash on more than one texture)"], 1)
+
+    def test_keyless_rows_of_one_format_and_size_are_uncertain(self):
+        # whattheflop on #4980: two keyless rows with the same hash, format and size can be different textures
+        row = {"Name": "x", "Hash": "11111111", "Format": "BC1_UNORM", "Width": 4, "Height": 4, "Key": None}
+        ref = {"Name": "r", "Materials": [{"Textures": [{"Id64": "00000000000000B2", "Name": "11111111"}]}]}
+        for rows, uncertain in ((1, 0), (2, 1)):
+            with tempfile.TemporaryDirectory() as tmp:
+                exp = os.path.join(tmp, "assets")
+                dump(os.path.join(exp, "lv", "textures", "manifest.json"), {"Count": rows, "Items": [
+                    {"Offset": 4096 * i, "Textures": [dict(row, Index=0)]} for i in range(rows)]})
+                dump(os.path.join(exp, "lv", "models", "manifest.json"), {"Count": 1, "Items": [ref]})
+                res = td.census(exp)["references"]["lv"]["resolution"]
+                self.assertEqual(res["32-bit name-hash candidate only"], 1, rows)
+                self.assertEqual(res["  of which ambiguous (hash on more than one texture)"], 0, rows)
+                self.assertEqual(res["  of which uncertain (several keyless rows of one format and size)"], uncertain,
+                                 rows)
 
     def test_one_texture_embedded_in_two_models_is_not_ambiguous(self):
         # tedin7 on #4980: rows were counted, so one texture embedded twice looked like two textures

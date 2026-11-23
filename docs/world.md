@@ -393,7 +393,8 @@ Hash-only or opaque:
   `joaat(Name)` for all 1,013), and none of the 418,714 distinct material texture keys in all ten `rpf9dump models`
   manifests (20,781,927 bindings) has the hash of a `levels.rpf` dictionary entry. Of those keys, **296,789** match
   exactly by 64-bit key (296,785 a texture-pool `AssetKey`, 137 an embedded texture's `Key`, 133 both), **8** only
-  by a 32-bit name hash in a dictionary (2 of them ambiguous: the hash is on more than one distinct texture), and
+  by a 32-bit name hash in a dictionary (2 of them ambiguous: the hash is on more than one distinct texture; none
+  rests on several keyless rows of one format and size, which could still be different textures), and
   **121,917** (29.1%) match nothing. Name-hash candidates are not proof of the same asset; overall 50 keys share a
   hash with a dictionary entry (38 in `core_restofworld`'s dictionaries, 12 in `textures.rpf`'s), and 42 of those
   also match a pool key exactly. So the material textures that resolve exactly come from the loose RDS5 pools (46
