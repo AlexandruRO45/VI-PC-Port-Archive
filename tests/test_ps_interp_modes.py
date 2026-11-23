@@ -365,6 +365,26 @@ class ShaderRowTest(unittest.TestCase):
             row = ps_interp_modes.shader_row(dx, None, None)
         self.assertEqual([(i["rw"], i["name"]) for i in row["inputs"]], [(3, "TEXCOORD0"), (0, "")])
 
+    def test_zero_cols_element_matches_register_isg1_entries(self):
+        elems = [struct.pack("<II6B2B", 0, 0, 1, 1, 0x40, 0, 3, 2, 0, 0)]
+        runtime = b"\0" * 24 + bytes([0, 0, 0, 0, 1, 0, 0, 0]) + b"\0" * 12
+        psv_payload = (struct.pack("<I", len(runtime)) + runtime
+                       + struct.pack("<I", 0) + struct.pack("<I", 4) + b"\0\0\0\0"
+                       + struct.pack("<I", 1) + struct.pack("<I", 0)
+                       + struct.pack("<I", 16) + b"".join(elems))
+        names = [b"TEXCOORD0\0"]
+        isg_payload = (struct.pack("<II", 1, 8)
+                       + struct.pack("<6I", 0, 8 + 32, 0, 0, 3, 1)
+                       + bytes([0x3, 0x3, 0, 0, 0, 0, 0, 0])
+                       + b"".join(names))
+        c = dxbc_container({b"PSV0": psv_payload, b"ISG1": isg_payload})
+        with tempfile.TemporaryDirectory() as tmp:
+            dx = os.path.join(tmp, "zerocols.dxbc")
+            with open(dx, "wb") as f:
+                f.write(c)
+            row = ps_interp_modes.shader_row(dx, None, None)
+        self.assertEqual([(i["rw"], i["name"]) for i in row["inputs"]], [(3, "TEXCOORD0")])
+
 
 class TallyTest(unittest.TestCase):
     def test_census_counts_modes_and_pairs(self):

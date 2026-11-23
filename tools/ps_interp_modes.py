@@ -279,7 +279,8 @@ def pair_class(rows, table, usage, ij):
                     SYSTEM_KINDS inputs) from the system VGPRs after the pair.
     flat_only     - interpolation reads only Constant rows (P0 semantics): any enabled pair
                     gives the same value
-    raw_bary      - reads barycentric I/J registers directly without v_interp
+    raw_bary      - caller-supplied nonempty ij without non-mov v_interp usage (disasm_facts()
+                    itself only populates ij on non-mov v_interp_* lines)
     none          - no v_interp and no barycentric read (system inputs only)
     """
     read = [r for r in rows if r["rw"]]
