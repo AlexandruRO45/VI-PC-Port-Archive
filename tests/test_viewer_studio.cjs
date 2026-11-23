@@ -113,3 +113,47 @@ test('switching models in clay mode disposes the old model\'s geometry, material
     assert.deepEqual(modelB.parts.map(part => part.disposed), [false, false, false]);
     assert.equal(studio.run('clayMaterial.disposed'), false);
 });
+
+test('EU mode shows no Russian: every I18N key is applied, and the strings that had none now have one', () => {
+    const studio = loadStudio();
+    studio.context.localStorage.setItem = () => {};
+    for (const id of ['tab-btn-models', 'tab-btn-textures']) {
+        studio.elements.set(id, Object.assign(fakeElement(), { childNodes: [{ nodeValue: '' }] }));
+    }
+    studio.context.fixture = {
+        models: Array.from({ length: 101 }, (_, i) => ({ name: `m${i}.glb`, folder: 'f', size: 4, url: '/models/m.glb',
+            category: i ? 'Транспорт (Vehicles)' : undefined })),
+        categories: { 'Транспорт (Vehicles)': 100 },
+        textures: Array.from({ length: 81 }, (_, i) => ({ name: `t${i}.png`, format: 'PNG Image', size: 4, preview: '/x.png' })),
+    };
+    studio.run(`allModels = fixture.models; modelCategories = fixture.categories;
+        allTextures = fixture.textures; texturesState = 'loaded'; setLanguage('eu');`);
+    const cyrillic = /[\u0400-\u04ff]/;
+    const seen = new Set();
+    const texts = el => {
+        if (!el || seen.has(el)) return [];
+        seen.add(el);
+        return [el.innerText, el.innerHTML, el.placeholder, ...(el.childNodes || []).map(n => n.nodeValue),
+            ...(el.children || []).flatMap(texts)].filter(text => typeof text === 'string' && text);
+    };
+    const shown = [...studio.elements.values()].flatMap(texts);
+    assert.deepEqual(shown.filter(text => cyrillic.test(text)), []);
+    for (const [id, text] of [['t-stat-model', 'Model:'], ['btn-reset-camera', 'Reset Camera'],
+        ['t-tex-heading', 'Texture Gallery (DDS & PNG)'], ['tex-count', '81 textures found']]) {
+        assert.equal(studio.elements.get(id).innerText, text);
+    }
+    const listText = shown.join('\n');
+    for (const text of ['All (101)', 'Vehicles (100)', 'Miscellaneous', 'Show all (1 more)']) {
+        assert.ok(listText.includes(text), `missing ${text}`);
+    }
+
+    studio.run(`texSearchQuery = 'nothing matches'; modelSearchQuery = 'nothing matches';
+        renderTexturesGrid(); renderAccordionList(); texturesState = 'error'; updateTexCount();`);
+    assert.match(studio.elements.get('textures-grid').innerHTML, /No textures found/);
+    assert.match(studio.elements.get('model-list').innerHTML, /No models found/);
+    assert.equal(studio.elements.get('tex-count').innerText, 'Could not load the textures');
+
+    studio.run(`texSearchQuery = ''; modelSearchQuery = ''; setLanguage('ru');`);
+    assert.equal(studio.elements.get('t-stat-model').innerText, 'Модель:');
+    assert.equal(studio.elements.get('tex-count').innerText, 'Ошибка загрузки текстур');
+});

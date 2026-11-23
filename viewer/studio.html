@@ -407,14 +407,14 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
         <button class="tool-btn" id="btn-shade-normals" onclick="setShadingMode('normals')">Нормали</button>
         <button class="tool-btn" id="btn-wireframe" onclick="toggleWireframe()">Сетка</button>
         <button class="tool-btn" id="btn-autorotate" onclick="toggleAutoRotate()">Вращение</button>
-        <button class="tool-btn" onclick="resetCamera()">Сброс камеры</button>
+        <button class="tool-btn" id="btn-reset-camera" onclick="resetCamera()">Сброс камеры</button>
       </div>
       <div id="stats-overlay">
-        <div>Модель: <b id="stat-name">—</b></div>
-        <div>Категория: <b id="stat-category">—</b></div>
-        <div>Полигонов (треугольников): <b id="stat-triangles">0</b></div>
-        <div>Вершин: <b id="stat-vertices">0</b></div>
-        <div>Размер файла: <b id="stat-size">—</b></div>
+        <div><span id="t-stat-model">Модель:</span> <b id="stat-name">—</b></div>
+        <div><span id="t-stat-category">Категория:</span> <b id="stat-category">—</b></div>
+        <div><span id="t-stat-triangles">Полигонов (треугольников):</span> <b id="stat-triangles">0</b></div>
+        <div><span id="t-stat-vertices">Вершин:</span> <b id="stat-vertices">0</b></div>
+        <div><span id="t-stat-size">Размер файла:</span> <b id="stat-size">—</b></div>
       </div>
     </div>
   </section>
@@ -423,7 +423,7 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
   <section id="textures-view" class="view-panel">
     <div class="tex-controls">
       <div>
-        <h2 style="font-size: 16px; font-weight: 700; color: var(--accent-pink);">Галерея текстур (DDS & PNG)</h2>
+        <h2 id="t-tex-heading" style="font-size: 16px; font-weight: 700; color: var(--accent-pink);">Галерея текстур (DDS & PNG)</h2>
         <span id="tex-count" style="font-size: 12px; color: var(--text-muted);">Загрузка...</span>
       </div>
       <div class="tex-search">
@@ -475,6 +475,11 @@ const I18N = {
     texNotFound: "Текстуры не найдены",
     modelsNotFound: "Ничего не найдено",
     modalTitle: "Просмотр текстуры",
+    texLoading: "Загрузка...",
+    texLoadError: "Ошибка загрузки текстур",
+    showMore: "Показать ещё {n}...",
+    showAll: "Показать все ({n} ещё)",
+    modelLoadError: "Не удалось загрузить 3D модель: ",
     catNames: {
       "Оружие (Weapons)": "Оружие",
       "Транспорт (Vehicles)": "Транспорт",
@@ -508,6 +513,11 @@ const I18N = {
     texNotFound: "No textures found",
     modelsNotFound: "No models found",
     modalTitle: "Texture Preview",
+    texLoading: "Loading...",
+    texLoadError: "Could not load the textures",
+    showMore: "Show {n} more...",
+    showAll: "Show all ({n} more)",
+    modelLoadError: "Could not load the 3D model: ",
     catNames: {
       "Оружие (Weapons)": "Weapons",
       "Транспорт (Vehicles)": "Vehicles",
@@ -539,11 +549,33 @@ function applyTranslations() {
   document.getElementById('btn-shade-normals').innerText = t.shadeNormals;
   document.getElementById('btn-wireframe').innerText = t.wireframe;
   document.getElementById('btn-autorotate').innerText = t.autoRotate;
+  document.getElementById('btn-reset-camera').innerText = t.resetCamera;
+  document.getElementById('t-stat-model').innerText = t.statModel;
+  document.getElementById('t-stat-category').innerText = t.statCategory;
+  document.getElementById('t-stat-triangles').innerText = t.statTriangles;
+  document.getElementById('t-stat-vertices').innerText = t.statVertices;
+  document.getElementById('t-stat-size').innerText = t.statSize;
+  document.getElementById('t-tex-heading').innerText = t.texHeading;
+  updateTexCount();
   document.getElementById('tex-search-input').placeholder = t.texSearchPlaceholder;
   document.getElementById('modal-title').innerText = t.modalTitle;
 
+  renderCategoryChips(modelCategories);
   renderAccordionList();
   renderTexturesGrid();
+}
+
+// Category names come from gallery.py in Russian with an English gloss; show the current language's name.
+function categoryLabel(cat) {
+  return I18N[currentLang].catNames[cat] || cat;
+}
+
+function updateTexCount() {
+  const t = I18N[currentLang];
+  const el = document.getElementById('tex-count');
+  if (texturesState === 'loaded') el.innerText = `${allTextures.length} ${t.texCountSuffix}`;
+  else if (texturesState === 'error') el.innerText = t.texLoadError;
+  else el.innerText = t.texLoading;
 }
 
 let allModels = [];
@@ -551,6 +583,8 @@ let allTextures = [];
 let activeCategory = 'ALL';
 let modelSearchQuery = '';
 let texSearchQuery = '';
+let modelCategories = {};
+let texturesState = 'idle'; // 'idle' | 'loaded' | 'error'
 
 let scene, camera, renderer, controls;
 let currentMesh = null;
@@ -767,7 +801,7 @@ function loadModel(url, name, category, size) {
     if (loadId !== modelLoadId) return;
     bar.style.transform = 'scaleX(0)';
     console.error('Error loading model:', err);
-    alert('Не удалось загрузить 3D модель: ' + name);
+    alert(I18N[currentLang].modelLoadError + name);
   });
 }
 
@@ -778,7 +812,8 @@ async function loadModels() {
     allModels = data.models || [];
     document.getElementById('badge-models').innerText = allModels.length;
 
-    renderCategoryChips(data.categories || {});
+    modelCategories = data.categories || {};
+    renderCategoryChips(modelCategories);
     renderAccordionList();
 
     if (allModels.length > 0) {
@@ -795,15 +830,15 @@ function renderCategoryChips(categories) {
   container.innerHTML = '';
 
   const allChip = document.createElement('div');
-  allChip.className = 'filter-chip active';
-  allChip.innerText = `Все (${allModels.length})`;
+  allChip.className = 'filter-chip' + (activeCategory === 'ALL' ? ' active' : '');
+  allChip.innerText = `${I18N[currentLang].allCategories} (${allModels.length})`;
   allChip.onclick = () => selectCategory('ALL', allChip);
   container.appendChild(allChip);
 
   Object.entries(categories).forEach(([cat, count]) => {
     const chip = document.createElement('div');
-    chip.className = 'filter-chip';
-    chip.innerText = `${cat} (${count})`;
+    chip.className = 'filter-chip' + (activeCategory === cat ? ' active' : '');
+    chip.innerText = `${categoryLabel(cat)} (${count})`;
     chip.onclick = () => selectCategory(cat, chip);
     container.appendChild(chip);
   });
@@ -836,14 +871,14 @@ function renderAccordionList() {
   });
 
   if (filtered.length === 0) {
-    container.innerHTML = '<div style="padding: 16px; color: var(--text-muted); font-size: 12px; text-align: center;">Ничего не найдено</div>';
+    container.innerHTML = `<div style="padding: 16px; color: var(--text-muted); font-size: 12px; text-align: center;">${escapeHtml(I18N[currentLang].modelsNotFound)}</div>`;
     return;
   }
 
   // Group by category
   const groups = {};
   filtered.forEach(m => {
-    const cat = m.category || 'Прочее';
+    const cat = m.category || 'Прочее (Miscellaneous)';
     groups[cat] = groups[cat] || [];
     groups[cat].push(m);
   });
@@ -855,7 +890,7 @@ function renderAccordionList() {
     const header = document.createElement('div');
     header.className = 'cat-header';
     header.innerHTML = `
-      <span>${escapeHtml(cat)} <span class="badge">${list.length}</span></span>
+      <span>${escapeHtml(categoryLabel(cat))} <span class="badge">${list.length}</span></span>
       <span class="arrow">▼</span>
     `;
 
@@ -892,7 +927,7 @@ function renderAccordionList() {
       const moreBtn = document.createElement('button');
       moreBtn.className = 'tool-btn';
       moreBtn.style.marginTop = '6px';
-      moreBtn.innerText = `Показать ещё ${list.length - limit}...`;
+      moreBtn.innerText = I18N[currentLang].showMore.replace('{n}', list.length - limit);
       moreBtn.onclick = () => {
         moreBtn.remove();
         appendItems(list.slice(limit));
@@ -917,11 +952,13 @@ async function loadTextures() {
     const data = await res.json();
     allTextures = data.textures || [];
     document.getElementById('badge-textures').innerText = allTextures.length;
-    document.getElementById('tex-count').innerText = `${allTextures.length} текстур найдено`;
+    texturesState = 'loaded';
+    updateTexCount();
     renderTexturesGrid();
   } catch (e) {
     console.error('Failed to load textures:', e);
-    document.getElementById('tex-count').innerText = 'Ошибка загрузки текстур';
+    texturesState = 'error';
+    updateTexCount();
   }
 }
 
@@ -937,7 +974,7 @@ function renderTexturesGrid() {
   const filtered = allTextures.filter(t => !texSearchQuery || t.name.toLowerCase().includes(texSearchQuery));
 
   if (filtered.length === 0) {
-    grid.innerHTML = '<div style="grid-column: 1/-1; padding: 30px; text-align: center; color: var(--text-muted);">Текстуры не найдены</div>';
+    grid.innerHTML = `<div style="grid-column: 1/-1; padding: 30px; text-align: center; color: var(--text-muted);">${escapeHtml(I18N[currentLang].texNotFound)}</div>`;
     return;
   }
 
@@ -967,7 +1004,7 @@ function renderTexturesGrid() {
     loadMore.style.gridColumn = '1 / -1';
     loadMore.style.textAlign = 'center';
     loadMore.style.padding = '20px';
-    loadMore.innerHTML = `<button class="tab-btn" style="margin: 0 auto;">Показать все (${filtered.length - 80} ещё)</button>`;
+    loadMore.innerHTML = `<button class="tab-btn" style="margin: 0 auto;">${escapeHtml(I18N[currentLang].showAll.replace('{n}', filtered.length - 80))}</button>`;
     loadMore.onclick = () => {
       loadMore.remove();
       filtered.slice(80).forEach(t => {
