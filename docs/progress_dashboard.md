@@ -29,7 +29,7 @@ are read directly; there is no need to re-save them as UTF-8.
 | Shader corpus | `--work <work>`: counts per stage from `<work>/shaders/dxbc/index.json` and `<work>/shaders/spirv/index.json` | shaders, aggregated per stage |
 | Pull requests into main | `--github`: every pull request into `main` of the main repository (`--repo`, default `ItsNotRexed/Leonida`), grouped by the item ID its title names (`D3D-86: …`, `… (SHADER-339)`) | pull request |
 | D3D12 layer | `--github`: the `D3D-` table of [#313](https://github.com/ItsNotRexed/Leonida/issues/313), read through `gh` and checked against the merged and open pull requests | item |
-| CI on main | `--github`: the latest completed run of each workflow on `main` | workflow |
+| CI on main | `--github`: the latest completed run of each workflow on `main`; success is VERIFIED, failure or timeout is FAILED, and conclusions without a pass/fail verdict (such as cancelled or skipped) are UNKNOWN. The original conclusion and any newer pending run remain visible | workflow |
 
 Every run with `--github` reads the pull requests again, so a merge into `main` shows up on the next run as
 IMPLEMENTED, even before a tracking table (such as #313's PR column) is edited. A pull request closed without merging is

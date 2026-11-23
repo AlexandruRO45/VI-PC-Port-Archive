@@ -278,6 +278,36 @@ class GpuLog(unittest.TestCase):
 
 
 class Github(unittest.TestCase):
+    def collect_ci(self, runs):
+        def fake_gh(args, timeout=60):
+            return runs if args[:2] == ["run", "list"] else []
+
+        col = pd.Collector()
+        with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", return_value="gh"):
+            pd.collect_github(col, "o/r", None)
+        return {c["name"]: c for c in col.components if c["panel"] == "ci"}
+
+    @staticmethod
+    def ci_run(name, conclusion, status="completed"):
+        return {"workflowName": name, "conclusion": conclusion, "status": status,
+                "headSha": "a" * 40, "createdAt": "2026-11-22T10:00:00Z", "url": "https://example.invalid/run"}
+
+    def test_ci_conclusions_distinguish_failures_from_missing_verdicts(self):
+        expected = {"success": "verified", "failure": "failed", "timed_out": "failed",
+                    "cancelled": "unknown", "skipped": "unknown", "neutral": "unknown",
+                    "stale": "unknown", "action_required": "unknown", "future_conclusion": "unknown"}
+        got = self.collect_ci([self.ci_run(conclusion, conclusion) for conclusion in expected])
+        self.assertEqual({name: c["status"] for name, c in got.items()}, expected)
+        for conclusion, component in got.items():
+            self.assertIn(conclusion, component["detail"])
+            self.assertEqual(component["url"], "https://example.invalid/run")
+
+    def test_ci_cancelled_latest_run_does_not_reuse_an_older_success(self):
+        runs = [self.ci_run("CI", "", "queued"), self.ci_run("CI", "cancelled"), self.ci_run("CI", "success")]
+        component = self.collect_ci(runs)["CI"]
+        self.assertEqual(component["status"], "unknown")
+        self.assertEqual(component["detail"], "cancelled on aaaaaaaaaa; a newer run is queued")
+
     def test_d3d_states(self):
         self.assertEqual(pd.d3d_state("@a", "#291 merged, #819, #831 on main", "")[0], "partial")
         self.assertEqual(pd.d3d_state("@a", "#1489 merged, #907 closed", "")[0], "implemented")
