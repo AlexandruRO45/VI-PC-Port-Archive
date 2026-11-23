@@ -1,7 +1,7 @@
 """Inspect a PE image (exe or dll) for porting work.
 
 Usage:
-    python -I pe_inspect.py <image> [--game-dir DIR] [--out DIR]
+    python -I pe_inspect.py <image> [--game-dir DIR] [--dependencies] [--out DIR]
 
 Writes <out>/<file>.json and <out>/<file>.md, where <file> is the image's full file name (game.exe.json,
 game.dll.md), so an exe and a dll with the same stem get separate reports. Images with the same file name from
@@ -10,6 +10,9 @@ given twice with the same import search folder is inspected once. Reads the file
 
 The report also lists run-time load candidates: DLL names the image holds as ASCII or UTF-16 strings without
 importing them, where a LoadLibrary* the import table doesn't show would point (docs/runtime_imports.md).
+With --dependencies it also follows normal and delay imports through the selected directory and checks which
+named and ordinal imports those local images declare. The result describes files on disk; the actual bindings
+chosen by shims and Windows are available from the loader's --dry-run.
 
 Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
@@ -24,7 +27,8 @@ import os
 import re
 import struct
 import sys
-from collections import Counter
+from collections import Counter, deque
+from html import escape
 
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 
@@ -177,7 +181,7 @@ class PeImage:
     def word(self, at: int) -> int:
         return struct.unpack_from("<Q" if self.is64 else "<I", self.data, at)[0]
 
-    def thunk_names(self, lookup_rva: int) -> list[str]:
+    def thunk_names(self, lookup_rva: int, *, strict: bool = False) -> list[str]:
         """Names (or '#ordinal') of one lookup table, which is terminated by a zero entry."""
         ordinal_flag = 1 << (63 if self.is64 else 31)
         out = []
@@ -188,23 +192,31 @@ class PeImage:
                 break
             value = self.word(at)
             if not value:
-                break
+                return out
             if value & ordinal_flag:
                 out.append(f"#{value & 0xFFFF}")
                 continue
             name = self.string_at(value + 2)  # skip the 2-byte hint
+            if strict and not name:
+                raise PeFormatError("an import thunk has an unreadable name")
             out.append(name if name is not None else "?")
+        if strict:
+            raise PeFormatError("an import lookup table has no readable terminator")
         return out
 
 
-def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[dict]:
+def _imports(img: PeImage, kind: str, index: int, delay: bool = False, *, strict: bool = False) -> list[dict]:
     rva, size = img.directory(index)
+    if strict and size and not rva:
+        raise PeFormatError(f"the {kind} import directory has no RVA")
     if not rva or not size:
         return []
 
     entries = []
+    symbol_count = 0
     step = 32 if delay else 20
-    for i in range(min(size // step, MAX_ENTRIES)):
+    # The runtime uses the zero descriptor to end the table. Some linkers omit it from the directory size.
+    for i in range(MAX_ENTRIES if strict else min(size // step, MAX_ENTRIES)):
         base = img.offset(rva + i * step, step)
         if base is None:
             break
@@ -212,62 +224,85 @@ def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[d
             (attributes, dll_rva, _handle, iat_rva, int_rva, _bound, _unload,
              _stamp) = struct.unpack_from("<IIIIIIII", img.data, base)
             if not dll_rva:
-                break
+                return entries
             # dlattrRva (0x1) is set on every descriptor Windows writes; without it the fields are virtual
             # addresses, which the linker uses for 32-bit images. Convert them so both kinds read the same here.
             if not attributes & 1:
+                if strict and img.is64:
+                    raise PeFormatError("a PE32+ delay-import descriptor has no RVA attribute")
                 dll_rva = dll_rva - img.image_base
                 iat_rva = iat_rva - img.image_base
                 int_rva = int_rva - img.image_base
+            if strict and (int_rva <= 0 or iat_rva <= 0):
+                raise PeFormatError("a delay-import descriptor has no name or address table")
         else:
             oft, _stamp, _forwarder, dll_rva, iat_rva = struct.unpack_from("<IIIII", img.data, base)
             int_rva = oft
             if not dll_rva:
-                break
-        if dll_rva < 0:
-            continue
+                return entries
         dll = img.string_at(dll_rva)
-        if dll is None:
-            continue
         lookup = int_rva if int_rva > 0 else iat_rva
-        entries.append({"dll": dll, "kind": kind, "functions": img.thunk_names(lookup) if lookup > 0 else []})
+        if strict and (not dll or lookup <= 0 or iat_rva <= 0):
+            raise PeFormatError(f"a {kind} import descriptor has an unreadable DLL name or table")
+        if dll is not None:
+            functions = img.thunk_names(lookup, strict=strict) if lookup > 0 else []
+            symbol_count += len(functions)
+            if strict and symbol_count > 4 * MAX_ENTRIES:
+                raise PeFormatError(f"the {kind} import table exceeds the inspection limit")
+            entries.append({"dll": dll, "kind": kind, "functions": functions})
+    if strict:
+        raise PeFormatError(f"the {kind} import directory has no readable terminator")
     return entries
 
 
-def _exports(img: PeImage) -> list[str]:
+def _exports(img: PeImage, *, strict: bool = False, include_named_ordinals: bool = False) -> list[str]:
     rva, size = img.directory(DIR_EXPORT)
+    if strict and size and (not rva or size < 40):
+        raise PeFormatError("invalid export directory")
     if not rva or size < 40:
         return []
     at = img.offset(rva, 40)
     if at is None:
         start = img.offset(rva)
-        if start is not None and start + 40 > len(img.data):
+        if strict or (start is not None and start + 40 > len(img.data)):
             raise PeFormatError("truncated export directory")
         return []
     (_chars, _stamp, _major, _minor, _name, base, functions, name_count, addr_functions,
      addr_names, addr_ordinals) = struct.unpack_from("<IIHHIIIIIII", img.data, at)
+    if strict and max(functions, name_count) > MAX_ENTRIES:
+        raise PeFormatError("export table exceeds the inspection limit")
 
     def has_export_at(index: int) -> bool:
         if index >= functions:
+            if strict:
+                raise PeFormatError("an export name refers past the address table")
             return False
         # A zero RVA marks an unused slot. An RVA inside the export directory is a valid forwarder.
         slot = img.offset(addr_functions + index * 4, 4)
-        return slot is not None and struct.unpack_from("<I", img.data, slot)[0] != 0
+        if slot is None or not addr_functions:
+            if strict:
+                raise PeFormatError("unreadable export address table")
+            return False
+        return struct.unpack_from("<I", img.data, slot)[0] != 0
 
     named, names = set(), []
     for i in range(min(name_count, MAX_ENTRIES)):
         name_at = img.offset(addr_names + i * 4, 4)
         ord_at = img.offset(addr_ordinals + i * 2, 2)
-        if name_at is None or ord_at is None:
+        if name_at is None or ord_at is None or not addr_names or not addr_ordinals:
+            if strict:
+                raise PeFormatError("unreadable export name table")
             break
         index = struct.unpack_from("<H", img.data, ord_at)[0]
         if not has_export_at(index):
             continue
         symbol = img.string_at(struct.unpack_from("<I", img.data, name_at)[0])
+        if strict and not symbol:
+            raise PeFormatError("an export has an unreadable name")
         names.append(symbol if symbol is not None else "?")
         named.add(index)
     for i in range(min(functions, MAX_ENTRIES)):
-        if i not in named and has_export_at(i):
+        if (include_named_ordinals or i not in named) and has_export_at(i):
             names.append(f"#{base + i}")
     return names
 
@@ -378,16 +413,81 @@ def classify_dll(name: str, game_dir: str | None) -> str:
     return "shim"
 
 
-def inspect(path: str, game_dir: str | None) -> dict:
+def dependency_graph(path: str, game_dir: str, root: PeImage) -> dict:
+    """Walk the static import table of each reachable local image once, in shortest-chain order."""
+    candidates: dict[str, list[str]] = {}
+    with os.scandir(game_dir) as files:
+        for file in files:
+            if file.is_file(follow_symlinks=False):
+                candidates.setdefault(file.name.lower(), []).append(file.name)
+
+    root_name = os.path.basename(path)
+    candidates[root_name.lower()] = [root_name]
+    modules = {root_name: {"name": root_name, "chain": [root_name], "status": "ok"}}
+    edges = []
+    exports: dict[str, set[str]] = {}
+    pending = deque([root_name])
+    while pending:
+        name = pending.popleft()
+        node = modules[name]
+        try:
+            if name == root_name:
+                image = root
+            else:
+                with open(os.path.join(game_dir, name), "rb") as f:
+                    image = PeImage(f.read())
+            if (image.machine, image.is64) != (root.machine, root.is64):
+                node.update(status="machine_mismatch", machine=MACHINES.get(image.machine, hex(image.machine)))
+                continue
+            imports = _imports(image, "normal", DIR_IMPORT, strict=True)
+            imports += _imports(image, "delay", DIR_DELAY_IMPORT, delay=True, strict=True)
+            exports[name] = set(_exports(image, strict=True, include_named_ordinals=True))
+        except (PeFormatError, OSError, struct.error) as e:
+            detail = e.strerror if isinstance(e, OSError) else None
+            node.update(status="unreadable", error=detail or str(e))
+            continue
+        for imp in imports:
+            dll = imp["dll"]
+            edge = {"from": name, **imp, "target": None, "status": "not_in_package", "missing_exports": []}
+            edges.append(edge)
+            # Static import names are file names. Never join a path supplied by an image to the package directory.
+            if dll in (".", "..") or any(c in dll for c in "/\\:") or not dll.isprintable():
+                edge["status"] = "invalid_name"
+                continue
+            matches = candidates.get(dll.lower(), [])
+            if not matches:
+                if classify_dll(dll, None) == "system":
+                    edge["status"] = "host_candidate"
+                continue
+            if len(matches) > 1:
+                edge.update(status="ambiguous", candidates=sorted(matches))
+                continue
+            target = edge["target"] = matches[0]
+            if target not in modules:
+                modules[target] = {"name": target, "chain": node["chain"] + [target], "status": "ok"}
+                pending.append(target)
+
+    for edge in edges:
+        target = edge["target"]
+        if target is None:
+            continue
+        edge["status"] = modules[target]["status"]
+        if target in exports:
+            missing = sorted(set(edge["functions"]) - exports[target])
+            edge.update(status="missing_exports" if missing else "declared", missing_exports=missing)
+    return {"modules": list(modules.values()), "imports": edges}
+
+
+def inspect(path: str, game_dir: str | None, *, dependencies: bool = False) -> dict:
     """The report for one image. A file cut off inside a table raises PeFormatError like any other bad image;
     the struct.error it used to raise escaped main() and stopped a multi-file run at that file."""
     try:
-        return _inspect(path, game_dir)
+        return _inspect(path, game_dir, dependencies=dependencies)
     except struct.error as e:
         raise PeFormatError(f"truncated or corrupt table: {e}") from None
 
 
-def _inspect(path: str, game_dir: str | None) -> dict:
+def _inspect(path: str, game_dir: str | None, *, dependencies: bool = False) -> dict:
     with open(path, "rb") as f:
         img = PeImage(f.read())
     sections = []
@@ -415,7 +515,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
     pdata_rva, pdata_size = img.directory(DIR_EXCEPTION)
     reloc_rva, reloc_size = img.directory(DIR_BASERELOC)
 
-    return {
+    report = {
         "file": os.path.basename(path),
         "size": os.path.getsize(path),
         "machine": MACHINES.get(img.machine, hex(img.machine)),
@@ -435,6 +535,9 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "tls_callbacks": _tls_callbacks(img),
         "runtime_load_candidates": loads,
     }
+    if dependencies:
+        report["dependency_graph"] = dependency_graph(path, game_dir or os.path.dirname(os.path.abspath(path)), img)
+    return report
 
 
 def to_markdown(r: dict) -> str:
@@ -456,6 +559,28 @@ def to_markdown(r: dict) -> str:
     out += ["", "| dll | kind | resolves | functions |", "|---|---|---|---|"]
     for imp in sorted(r["imports"], key=lambda i: (i["where"] != "shim", i["dll"].lower())):
         out.append(f"| {imp['dll']} | {imp['kind']} | {imp['where']} | {len(imp['functions'])} |")
+    if graph := r.get("dependency_graph"):
+        modules = {node["name"]: node for node in graph["modules"]}
+        edges = graph["imports"]
+        out += ["", "## Package import graph", "",
+                f"{len(modules)} image(s), including the entry image, and {len(edges)} import descriptor(s).", "",
+                "Findings describe the files on disk. Use the loader's `--dry-run` to see shim and host bindings.", ""]
+        findings = []
+        for node in modules.values():
+            if node["status"] == "unreadable":
+                chain = " → ".join(node["chain"])
+                findings.append(f"- {escape(chain)} — unreadable ({escape(node['error'])})")
+        for imp in edges:
+            status = imp["status"]
+            if status in ("declared", "host_candidate", "unreadable"):
+                continue
+            chain = " → ".join(modules[imp["from"]]["chain"] + [imp["target"] or imp["dll"]])
+            detail = ", ".join(imp["missing_exports"]) or ", ".join(imp.get("candidates", []))
+            if status == "machine_mismatch":
+                detail = modules[imp["target"]]["machine"]
+            label = f"{imp['kind']}, {status.replace('_', ' ')}"
+            findings.append(f"- {escape(chain)} — {label}" + (f" ({escape(detail)})" if detail else ""))
+        out += findings or ["No local dependency findings."]
     loads = r.get("runtime_load_candidates", [])
     if loads:
         out += ["", "## Run-time load candidates", "",
@@ -488,6 +613,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="+")
     ap.add_argument("--game-dir")
+    ap.add_argument("--dependencies", action="store_true", help="follow and check local PE dependencies")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
     missing = [img for img in a.image if not os.path.exists(img)]
@@ -514,7 +640,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         seen_paths.add(key)
         try:
-            r = inspect(img, search_dir)
+            r = inspect(img, search_dir, dependencies=a.dependencies)
         except (PeFormatError, OSError) as e:
             print(f"{img}: not a PE image ({e})", file=sys.stderr)
             rc = 1
@@ -534,7 +660,9 @@ def main(argv: list[str] | None = None) -> int:
         json_path = stem + ".json"
         md_path = stem + ".md"
         collision = None
-        for other in a.image:
+        graph = r.get("dependency_graph", {})
+        local_inputs = [os.path.join(search_dir, node["name"]) for node in graph.get("modules", [])[1:]]
+        for other in [*a.image, *local_inputs]:
             if same_output_path(other, json_path):
                 collision = json_path
                 break

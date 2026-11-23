@@ -1,5 +1,5 @@
 # Day-one report for the game executable: PE inspection, encryption check, import surface and a loader dry run.
-# Reads the exe only; no game code runs.
+# Reads the exe and its package dependencies; no guest code runs.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [string]$GameDir = (Split-Path $Exe -Parent)
@@ -20,8 +20,8 @@ $size = (Get-Item $Exe).Length
 $hash = (Get-FileHash $Exe -Algorithm SHA256).Hash.ToLower()
 "sha256 $hash  size $size" | Tee-Object (Join-Path $out "hash.txt")
 
-Write-Host "`n== PE inspection"
-python -I (Join-Path $root "tools\pe_inspect.py") $Exe --game-dir $GameDir --out $out
+Write-Host "`n== PE inspection and package dependency graph"
+python -I (Join-Path $root "tools\pe_inspect.py") $Exe --game-dir $GameDir --dependencies --out $out
 if ($LASTEXITCODE -ne 0) { throw "pe_inspect failed" }
 
 Write-Host "`n== GDK runtime classes and slots called through xgameruntime.lib (read from the file)"

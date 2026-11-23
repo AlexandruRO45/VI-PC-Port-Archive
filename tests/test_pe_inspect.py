@@ -11,10 +11,13 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -174,6 +177,125 @@ def with_exports(slots: list[int], names: dict[int, str], base: int = 10, is64: 
         text += len(name) + 1
     assert img.offset(EXPORT_FUNCS) is not None
     return bytes(buf)
+
+
+def package_image(imports=(), delay_imports=(), *, exports=None) -> bytearray:
+    """Use the shared PE header fixture, with independent import descriptors for the package graph."""
+    buf = bytearray(exports if exports is not None else build_image(with_directories=False))
+    for directory, start, step, entries in (
+        (pe_inspect.DIR_IMPORT, 0x1100, 20, imports),
+        (pe_inspect.DIR_DELAY_IMPORT, 0x1500, 32, delay_imports),
+    ):
+        struct.pack_into("<II", buf, 0x58 + 112 + directory * 8, start if entries else 0, len(entries) * step)
+        for i, (dll, symbols) in enumerate(entries):
+            names = start + 0x60 + i * 0x80
+            lookup = names + 0x20
+            iat = lookup + 0x20
+            hints = iat + 0x20
+            if directory == pe_inspect.DIR_IMPORT:
+                descriptor = struct.pack("<5I", lookup, 0, 0, names, iat)
+            else:
+                descriptor = struct.pack("<8I", 1, names, 0, iat, lookup, 0, 0, 0)
+            place(buf, start + i * step, descriptor)
+            place(buf, names, dll.encode() + b"\0")
+            thunks = []
+            for symbol in symbols:
+                if isinstance(symbol, int):
+                    thunks.append((1 << 63) | symbol)
+                else:
+                    data = b"\0\0" + symbol.encode() + b"\0"
+                    place(buf, hints, data)
+                    thunks.append(hints)
+                    hints += len(data)
+            place(buf, lookup, struct.pack(f"<{len(thunks) + 1}Q", *thunks, 0))
+        place(buf, start + len(entries) * step, bytes(step))
+    return buf
+
+
+class PackageDependenciesTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.package = Path(tmp.name) / "package"
+        self.package.mkdir()
+        self.out = Path(tmp.name) / "report"
+
+    def write(self, name, image):
+        path = self.package / name
+        path.write_bytes(image)
+        return path
+
+    def run_report(self, image, *, check=True):
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(TOOLS_DIR, "pe_inspect.py"), str(image),
+             "--game-dir", str(self.package), "--dependencies", "--out", str(self.out)],
+            capture_output=True, text=True, timeout=20,
+        )
+        if check:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_cli_follows_delay_and_normal_edges_through_a_cycle(self):
+        app = self.write("demo.exe", package_image([("eNGINE.dll", ["Start", 7])]))
+        self.write("Engine.DLL", package_image(
+            [("renderer.dll", ["draw"])],
+            exports=with_exports([0x1000], {0: "Start"}, base=7),
+        ))
+        self.write("renderer.dll", package_image(
+            [("Engine.dll", ["start"])], [("optional.dll", ["Present"])],
+            exports=with_exports([FORWARDER], {0: "draw"}),
+        ))
+        self.write("other.dll", b"unrelated file")
+
+        self.run_report(app)
+        report = json.loads((self.out / "demo.exe.json").read_text(encoding="utf-8"))
+        graph = report["dependency_graph"]
+        self.assertEqual([node["name"] for node in graph["modules"]], ["demo.exe", "Engine.DLL", "renderer.dll"])
+        self.assertEqual(graph["modules"][-1]["chain"], ["demo.exe", "Engine.DLL", "renderer.dll"])
+        self.assertEqual([(edge["kind"], edge["status"], edge["missing_exports"]) for edge in graph["imports"]],
+                         [("normal", "declared", []), ("normal", "declared", []),
+                          ("normal", "missing_exports", ["start"]), ("delay", "not_in_package", [])])
+        self.assertEqual(graph["imports"][0]["functions"], ["Start", "#7"])
+        markdown = (self.out / "demo.exe.md").read_text(encoding="utf-8")
+        self.assertIn("demo.exe → Engine.DLL → renderer.dll → optional.dll — delay, not in package", markdown)
+        self.assertIn("normal, missing exports (start)", markdown)
+        self.assertNotIn("dependency_graph", pe_inspect.inspect(str(app), str(self.package)))
+
+    def test_incomplete_dll_is_distinct_from_a_missing_export_or_wrong_machine(self):
+        app = self.write("demo.exe", package_image(
+            [("broken.dll", ["Run"]), ("wrong.dll", ["Run"])], [("hole.dll", [11])],
+        ))
+        broken = package_image(exports=with_exports([0x1000], {0: "Run"}))
+        self.write("broken.dll", broken[:TEXT_RAW + EXPORT_FUNCS - TEXT_RVA + 2])
+        self.write("wrong.dll", build_image(is64=False, with_directories=False))
+        self.write("hole.dll", package_image(exports=with_exports([0x1000, 0], {0: "Run"})))
+
+        graph = pe_inspect.inspect(str(app), str(self.package), dependencies=True)["dependency_graph"]
+        self.assertEqual([edge["status"] for edge in graph["imports"]],
+                         ["unreadable", "machine_mismatch", "missing_exports"])
+        self.assertEqual(graph["modules"][1]["error"], "unreadable export address table")
+        self.assertEqual(graph["modules"][2]["machine"], "x86")
+        self.assertEqual(graph["imports"][2]["missing_exports"], ["#11"])
+
+    def test_a_host_candidate_is_recorded_without_reading_it(self):
+        app = self.write("demo.exe", package_image([("host.dll", ["Run"])]))
+        host = self.package.parent / "host"
+        host.mkdir()
+        (host / "host.dll").write_bytes(b"not a PE image")
+        with patch.object(pe_inspect, "SYSTEM32", str(host)):
+            graph = pe_inspect.inspect(str(app), str(self.package), dependencies=True)["dependency_graph"]
+        self.assertEqual([node["name"] for node in graph["modules"]], ["demo.exe"])
+        self.assertEqual(graph["imports"][0]["status"], "host_candidate")
+
+    def test_report_cannot_overwrite_a_traversed_dependency(self):
+        app = self.write("demo.exe", package_image([("demo.exe.json", ["Run"])]))
+        dependency = self.write("demo.exe.json", package_image(exports=with_exports([0x1000], {0: "Run"})))
+        before = dependency.read_bytes()
+        self.out = self.package
+        result = self.run_report(app, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("would overwrite input file", result.stderr)
+        self.assertEqual(dependency.read_bytes(), before)
 
 
 class PeInspectTest(unittest.TestCase):

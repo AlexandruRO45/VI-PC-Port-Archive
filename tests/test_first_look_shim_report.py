@@ -49,16 +49,19 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
                 )
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertTrue((reports / "fixture.exe.gdk_calls.json").is_file(), run.stdout)
-                imports = json.loads((reports / "fixture.exe.json").read_text("utf-8"))["imports"]
-                return {entry["dll"].lower() for entry in imports if entry["where"] == "shim"}
+                report = json.loads((reports / "fixture.exe.json").read_text("utf-8"))
+                shim_dlls = {entry["dll"].lower() for entry in report["imports"] if entry["where"] == "shim"}
+                demo_edges = [entry["status"] for entry in report["dependency_graph"]["imports"]
+                              if entry["dll"] == "demo.dll"]
+                return shim_dlls, demo_edges
 
-            self.assertEqual(run_first_look(), {"demo.dll"})
+            self.assertEqual(run_first_look(), ({"demo.dll"}, ["not_in_package", "not_in_package"]))
             self.assertIn("demo.dll", todo.read_text().lower())
             (root / "demo.dll").touch()
-            self.assertEqual(run_first_look(), set())
+            self.assertEqual(run_first_look(), (set(), ["unreadable", "unreadable"]))
             self.assertEqual(todo.read_bytes(), b"")
             todo.unlink()
-            self.assertEqual(run_first_look(), set())
+            self.assertEqual(run_first_look(), (set(), ["unreadable", "unreadable"]))
             self.assertEqual(todo.read_bytes(), b"")
 
 
