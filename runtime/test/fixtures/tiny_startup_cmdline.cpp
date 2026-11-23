@@ -57,6 +57,17 @@ extern "C" __declspec(dllexport) bool __cdecl startup_cmdline_matches(const Snap
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_captured = capture(g_startup);
+        if (g_captured && g_startup.argc == 2) {
+            if (std::strcmp(g_startup.argv[1], "trace-fault") == 0) {
+                SetErrorMode(SEM_NOGPFAULTERRORBOX);
+                RaiseException(0xe0006378, 0, 0, nullptr);
+            }
+            if (std::strcmp(g_startup.argv[1], "trace-wait") == 0) {
+                std::fputs("inside synthetic DllMain\n", stderr);
+                std::fflush(stderr);
+                Sleep(30000);
+            }
+        }
         if (std::strstr(GetCommandLineA(), "fail-init")) return FALSE;
     }
     return TRUE;

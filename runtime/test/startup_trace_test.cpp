@@ -21,6 +21,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -219,6 +220,14 @@ void test_trace(const fs::path& dir) {
         reinterpret_cast<VoidFn>(m.base + caller_rva(0))(nullptr);  // second call: no second event
         reinterpret_cast<VoidFn>(m.base + caller_rva(1))(kDebugText);
         reinterpret_cast<VoidFn>(m.base + caller_rva(1))(kAnsiText);
+        // The writer must capture the caller's thread, even while another producer writes events.
+        auto record_thread = [] {
+            for (int i = 0; i < 8; ++i)
+                rt::startup_trace::event("thread_probe", "\"caller_tid\":" + std::to_string(GetCurrentThreadId()));
+        };
+        std::thread other(record_thread);
+        record_thread();
+        other.join();
         raise_bad_dbg_print();
         OutputDebugStringA("after_bad_dbg_print");
         OutputDebugStringW(L"wide probe \u00e9\u4e2d");  // its ANSI fallback must not be a second, lossy line
@@ -238,6 +247,17 @@ void test_trace(const fs::path& dir) {
 
     const std::string* map = find_line(lines, "map");
     check(has(map, "\"module\":" + mod + "\"") && has(map, "\"size\":\"0x2000\""), "map names the image and its size");
+
+    int probes = 0;
+    for (const auto& line : lines) {
+        const auto pos = line.find("\"caller_tid\":");
+        if (pos == std::string::npos) continue;
+        ++probes;
+        const auto tid = std::stoul(line.substr(pos + std::strlen("\"caller_tid\":")));
+        check(line.find("\"tid\":" + std::to_string(tid) + ",") != std::string::npos,
+              "thread probe records the emitting thread");
+    }
+    check(probes == 16, "both producers flushed every probe");
 
     int unimplemented = 0;
     for (auto& l : lines) unimplemented += l.find("\"kind\":\"unimplemented_call\"") != std::string::npos;

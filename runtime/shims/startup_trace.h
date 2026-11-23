@@ -12,6 +12,10 @@
 //        "stack":["a.dll+0x4a00","a.dll+0x2210"]}
 //   {"seq":8,"t":0.030,"kind":"exit","code":0}
 //
+// Every record has the emitting Windows thread ID (tid). Matching phase_id values pair dllmain_enter/dllmain,
+// tls_callback/tls_callback_return and game_entry/game_entry_return on that thread. Only an actual return closes
+// a phase: a game that calls exit() from its entry can have a final exit event and an outstanding game_entry.
+//
 // The exception handler is vectored, logs and returns EXCEPTION_CONTINUE_SEARCH: it never changes what the process
 // does. OutputDebugStringA/W raise DBG_PRINTEXCEPTION_C / DBG_PRINTEXCEPTION_WIDE_C when no debugger is attached, so
 // the same handler records their text without a shim.
@@ -44,6 +48,7 @@ inline std::mutex& mutex() {
 }
 inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
+inline std::atomic<uint64_t> next_phase_id{1};
 inline std::chrono::steady_clock::time_point start;
 inline void* veh = nullptr;
 inline thread_local bool in_handler = false;
@@ -100,9 +105,20 @@ inline void event(const char* kind, const std::string& fields = {}) {
     const std::lock_guard lock(detail::mutex());
     if (!detail::file) return;
     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - detail::start).count();
-    std::fprintf(detail::file, "{\"seq\":%llu,\"t\":%.6f,\"kind\":\"%s\"%s%s}\n", ++detail::seq, t, kind,
+    std::fprintf(detail::file, "{\"seq\":%llu,\"t\":%.6f,\"tid\":%lu,\"kind\":\"%s\"%s%s}\n", ++detail::seq, t, GetCurrentThreadId(), kind,
                  fields.empty() ? "" : ",", fields.c_str());
     std::fflush(detail::file);
+}
+
+// Keep the legacy tls_callback entry and dllmain result kinds for older readers.
+inline uint64_t enter(const char* kind, const std::string& fields) {
+    const auto id = detail::next_phase_id.fetch_add(1, std::memory_order_relaxed);
+    event(kind, "\"phase_id\":" + std::to_string(id) + "," + fields);
+    return id;
+}
+
+inline void returned(const char* kind, uint64_t id, const std::string& fields = {}) {
+    event(kind, "\"phase_id\":" + std::to_string(id) + (fields.empty() ? "" : "," + fields));
 }
 
 namespace detail {
