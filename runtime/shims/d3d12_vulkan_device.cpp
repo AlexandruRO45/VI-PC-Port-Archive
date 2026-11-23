@@ -30,6 +30,7 @@
 #include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
+#include "../src/shader_path_text.h"
 #include "../src/vulkan13_features.h"
 
 #include <vulkan/vulkan_win32.h>
@@ -546,7 +547,8 @@ std::filesystem::path configured_shader_directory() {
     const auto config = std::filesystem::path(exe).parent_path() / L"shader_path.txt";
     std::ifstream file(config, std::ios::binary);
     if (!file) return {};
-    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    const std::string text = leonida::normalize_shader_path_text(
+        std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()});
     if (text.empty() || text.find('\0') != std::string::npos) return {};
 
     // make_game records an absolute Unix path on Linux. Resolve it inside the running Wine prefix.
