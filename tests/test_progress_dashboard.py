@@ -121,20 +121,20 @@ class GpuLog(unittest.TestCase):
         "cs_bounds            ok",
         "ps_texoff            SKIP (VK_KHR_maintenance8 missing)",
         "cs_bpermute32        lane 3: got 0x00000000, want 0x00000007",
-        "2 of 3 pass, 1 skipped",
+        "1 of 3 pass, 1 skipped",
     ])
 
     def test_lines_and_summary(self):
         rows, summary = pd.parse_gpu_log(self.LOG)
         self.assertEqual([(n, r) for n, r, _ in rows], [("cs_bounds", "pass"), ("ps_texoff", "skip"), ("cs_bpermute32", "fail")])
         self.assertIn("want 0x00000007", rows[2][2])
-        self.assertEqual(summary, (2, 3, 1))
+        self.assertEqual(summary, (1, 3, 1))
 
     def test_collect_gpu_reads_utf8_and_bom_marked_logs(self):
         log_text = "\r\n".join((
             f"{'cs_first':20} ok",
             f"{'ps_skip':20} SKIP (fixture)",
-            f"{'cs_fail':20} écart",
+            f"{'case_fail':20} écart",
             "1 of 3 pass, 1 skipped",
         ))
         encodings = (("utf-8", b""), ("utf-8", codecs.BOM_UTF8),
@@ -148,11 +148,81 @@ class GpuLog(unittest.TestCase):
                     col = pd.Collector()
                     pd.collect_gpu(col, [log])
                     self.assertEqual([(c["name"], c["status"]) for c in col.components],
-                                     [("cs_first", "verified"), ("ps_skip", "unknown"), ("cs_fail", "failed")])
+                                     [("cs_first", "verified"), ("ps_skip", "unknown"), ("case_fail", "failed")])
                     self.assertEqual(col.components[-1]["detail"], "écart")
                     self.assertEqual((col.sources[0]["status"], col.sources[0]["records"]), ("ok", 3))
                     metric = next(m for m in col.metrics if m["id"] == "gpu.current")
                     self.assertEqual((metric["numerator"], metric["denominator"], metric["value"]), (1, 2, 0.5))
+
+    def test_utf16le_diagnostics_only_has_no_gpu_results(self):
+        diagnostics = "\r\n".join((
+            f"{'vk_harness':20} selected the default adapter",
+            f"{'driver':20} pipeline cache unavailable",
+            f"{'cs_pipeline_cache':20} périphérique prêt",
+        ))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(pd, "last_commit_time", return_value=None):
+            log = os.path.join(tmp, "gpu.log")
+            with open(log, "wb") as f:
+                f.write(codecs.BOM_UTF16_LE + diagnostics.encode("utf-16-le"))
+            col = pd.Collector()
+            pd.collect_gpu(col, [log])
+            self.assertEqual(col.sources[0]["records"], 0)
+            self.assertEqual(col.sources[0]["note"], "no check.py summary found")
+            self.assertEqual(col.components, [])
+            self.assertFalse(any(m["id"] == "gpu.current" for m in col.metrics))
+
+    def test_zero_test_summary_with_an_aligned_diagnostic(self):
+        text = f"{'cs_pipeline_cache':20} shutting down\n0 of 0 pass, 0 skipped"
+        self.assertEqual(pd.parse_gpu_log(text), ([], (0, 0, 0)))
+
+    def test_stage_prefixed_diagnostic_before_summary_is_not_a_fourth_result(self):
+        lines = [f"{'cs_bounds':20} ok", f"{'ps_texoff':20} SKIP (fixture)",
+                 f"{'vs_clip_param4':20} unexpected pixel"]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(pd, "last_commit_time", return_value=None):
+            log = os.path.join(tmp, "gpu.log")
+            for position in range(len(lines) + 1):
+                with self.subTest(position=position):
+                    report = lines.copy()
+                    report.insert(position, f"{'cs_pipeline_cache':20} flushing entries")
+                    report.append("1 of 3 pass, 1 skipped")
+                    with open(log, "w", encoding="utf-16") as f:
+                        f.write("\n".join(report))
+                    col = pd.Collector()
+                    pd.collect_gpu(col, [log])
+                    self.assertEqual([(c["name"], c["status"]) for c in col.components],
+                                     [("cs_bounds", "verified"), ("ps_texoff", "unknown"), ("vs_clip_param4", "failed")])
+                    self.assertEqual(col.components[-1]["detail"], "unexpected pixel")
+                    self.assertEqual(col.sources[0]["records"], 3)
+                    metric = next(m for m in col.metrics if m["id"] == "gpu.current")
+                    self.assertEqual((metric["numerator"], metric["denominator"], metric["value"]), (1, 2, 0.5))
+
+    def test_inconsistent_summary_contributes_no_gpu_results_or_metric(self):
+        rows = [f"{'cs_bounds':20} ok", f"{'ps_texoff':20} SKIP (fixture)", f"{'vs_clip_param4':20} mismatch"]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(pd, "last_commit_time", return_value=None):
+            log = os.path.join(tmp, "gpu.log")
+            for footer in ("1 of 2 pass, 1 skipped", "1 of 4 pass, 1 skipped",
+                           "2 of 3 pass, 1 skipped", "1 of 3 pass, 0 skipped"):
+                with self.subTest(footer=footer):
+                    with open(log, "w", encoding="utf-8") as f:
+                        f.write("\n".join([*rows, footer]))
+                    col = pd.Collector()
+                    pd.collect_gpu(col, [log])
+                    self.assertEqual((col.sources[0]["status"], col.sources[0]["records"]), ("invalid", 0))
+                    self.assertEqual(col.components, [])
+                    self.assertFalse(any(m["id"] == "gpu.current" for m in col.metrics))
+
+    def test_aligned_diagnostics_do_not_hide_shader_failures(self):
+        lines = [
+            f"{'vk_harness':20} selected the default adapter",
+            f"{'cs_bounds':20} exit 1: device lost",
+            f"{'driver':20} resetting the queue",  # continuation from check.py's failure()
+            f"{'ps_texture_grad_cl_a16':20} unexpected pixel",
+            "0 of 2 pass, 0 skipped",
+            f"{'cs_pipeline_cache':20} shutting down",
+        ]
+        rows, _ = pd.parse_gpu_log("\n".join(lines))
+        self.assertEqual(rows, [("cs_bounds", "fail", "exit 1: device lost"),
+                                ("ps_texture_grad_cl_a16", "fail", "unexpected pixel")])
 
     def test_panel_groups_by_gpu_label(self):
         with tempfile.TemporaryDirectory() as tmp:

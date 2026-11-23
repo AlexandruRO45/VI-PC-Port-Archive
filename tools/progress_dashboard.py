@@ -40,6 +40,10 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
+sys.path.insert(0, SHADER_DIR)
+from shader_fixtures import fixture_names  # noqa: E402
+
 TEMPLATE = os.path.join(ROOT, "tools", "progress_dashboard.html")
 LOGO = os.path.join(ROOT, "assets", "logo.png")
 SCHEMA = "leonida.progress/1"
@@ -446,14 +450,16 @@ def parse_gpu_log(text):
     """[(shader test, result, detail)] from the output of runtime/test/shaders/check.py (one line per test,
     "<name> ok", "<name> SKIP (why)" or "<name> <what came back>", then "N of M pass, K skipped")."""
     rows, summary = [], None
+    report_end = 0
     for line in text.splitlines():
-        m = GPU_SUMMARY.match(line.strip())
+        m = GPU_SUMMARY.fullmatch(line.strip())
         if m:
             summary = tuple(int(x) for x in m.groups())
+            report_end = len(rows)
             continue
         m = GPU_LINE.match(line.rstrip())
         # check.py prints f"{name:20} {result}": the result starts right after the name padded to 20 columns,
-        # which tells result lines from the other lines it prints (the build folder it picked, warnings)
+        # but a runtime diagnostic (including a continuation of a failure) can have the same alignment.
         if not m or not re.fullmatch(r"[A-Za-z0-9_.]+", m.group(1)) or m.start(2) != max(len(m.group(1)), 20) + 1:
             continue
         name, rest = m.group(1), m.group(2).strip()
@@ -463,7 +469,22 @@ def parse_gpu_log(text):
             rows.append((name, "skip", rest))
         else:
             rows.append((name, "fail", scrub(rest)))
-    return rows, summary
+    # check.py closes even an all-failed run with a summary. Without it, an aligned diagnostic
+    # is indistinguishable from a fixture failure. Ignore any unconfirmed trailing lines.
+    if summary is None or summary[1] == 0:
+        return [], summary
+    rows = rows[:report_end]
+    def agrees_with_summary(candidates):
+        return summary == (sum(result == "pass" for _, result, _ in candidates), len(candidates),
+                           sum(result == "skip" for _, result, _ in candidates))
+
+    if agrees_with_summary(rows):
+        return rows, summary
+    # A diagnostic can look exactly like a failed shader. Recover a noisy report only if
+    # the named fixtures from the shader builder account for the entire summary.
+    known = fixture_names(SHADER_DIR)
+    fixtures = [row for row in rows if row[0] in known]
+    return (fixtures if agrees_with_summary(fixtures) else []), summary
 
 
 def collect_gpu(col, logs):
@@ -480,8 +501,10 @@ def collect_gpu(col, logs):
         rows, summary = parse_gpu_log(read_gpu_log(path))
         label = label or os.path.splitext(os.path.basename(path))[0]
         note = None
-        if summary and summary[1] != len(rows):
-            note = f"summary says {summary[1]} tests, {len(rows)} lines parsed"
+        if summary is None:
+            note = "no check.py summary found"
+        elif summary[1] and not rows:
+            note = "fixture results do not match the check.py summary"
         col.source("gpu_log", path, "ok" if rows else "invalid", len(rows), note=note)
         ran = os.path.getmtime(path)
         for name, res, detail in rows:

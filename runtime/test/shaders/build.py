@@ -48,6 +48,7 @@ RSRC2, GROUP = 0x8088, (64, 1, 1)
 NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header  # noqa: E402
+from shader_fixtures import CLIP_CASES, fixture_names  # noqa: E402
 
 
 def asm_mattr(path):
@@ -61,9 +62,6 @@ def asm_mattr(path):
         if m:
             return m.group(1)
     return None
-
-
-CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
 def asm_fssm_fields(path):
@@ -185,7 +183,7 @@ def main():
     if os.environ.get("LEONIDA_SPIRV_TOOLS"):
         os.environ["PATH"] = os.environ["LEONIDA_SPIRV_TOOLS"] + os.pathsep + os.environ.get("PATH", "")
     out = Path(sys.argv[1])
-    available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
+    available = sorted(fixture_names(HERE))
     names = sys.argv[2:] or available
     # mullit_readback.py uses the CPU semantic fixture as an explicit build target.
     unknown = sorted(set(names) - set(available) - {"ps_mullit"})

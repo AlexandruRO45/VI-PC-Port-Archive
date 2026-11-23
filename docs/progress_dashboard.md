@@ -30,7 +30,10 @@ Each source is optional. A missing one is listed under "Sources" on the page; it
 | CI on main | `--github`: the latest completed run of each workflow on `main` | workflow |
 
 `--gpu-log` accepts UTF-8 with or without a byte-order mark and UTF-16 with a byte-order mark, including logs
-saved with `>` in Windows PowerShell 5.1.
+saved with `>` in Windows PowerShell 5.1. Keep the final `N of M pass, K skipped` line when saving a run.
+Without it the dashboard marks the source as invalid and omits its results, since a diagnostic can have the
+same layout as a shader failure. If extra lines resemble results, the dashboard checks the names against the
+shader builder's fixtures. It counts the run only when the total, passes and skips all match the summary.
 
 Every run with `--github` reads the pull requests again, so a merge into `main` shows up on the next run as
 IMPLEMENTED, even before a tracking table (such as #313's PR column) is edited. A pull request closed without merging is
