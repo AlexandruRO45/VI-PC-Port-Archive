@@ -973,6 +973,24 @@ class LaneSelectTests(CfRefTestCase):
         self.assertEqual(res["exports"][20][0], 77)
         self.assertEqual(res["exports"][21][0], 121)
 
+    def test_wave64_lane_select_masks_with_63(self):
+        items = lane_id_prologue(64) + [
+            "v_add_nc_u32 v1, 100, v0",
+            "s_mov_b32 s5, 77",
+            "v_cmp_gt_u32_e32 vcc, 4, v0",          # lanes 0..3
+            "s_and_saveexec_b64 s[6:7], vcc",
+            "v_readlane_b32 s0, v1, 45",            # lane 45, off: still read
+            "v_writelane_b32 v1, s5, 100",          # 100 & 63 = lane 36 (wave32 would take lane 4)
+            "v_readlane_b32 s1, v1, 36",
+            "s_or_b64 exec, exec, s[6:7]",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        res = self.run_items(items, wave=64)
+        self.assertEqual((res["sgpr"][0], res["sgpr"][1]), (145, 77))
+        self.assertEqual(res["exports"][36][0], 77)
+        self.assertEqual(res["exports"][4][0], 104)
+
 
 if __name__ == "__main__":
     unittest.main()

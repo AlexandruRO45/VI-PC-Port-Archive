@@ -84,7 +84,8 @@ OFF_LANE = ("gt", "u32", 4, 0)      # lanes 0..3 only
 LANE_CASES = {
     "v_writelane of an inactive lane": [("if", OFF_LANE, False, [("lanes", "write", 20, 8, 11), ("probe", 3)])],
     "v_readlane of an inactive lane": [("if", OFF_LANE, False, [("lanes", "read", 20, 2, 10), ("probe", 3)])],
-    "lane select past the wave wraps": [("if", OFF_LANE, True, [("lanes", "write", 84, 9, 12)])],
+    # 100 is lane 4 in wave32 (& 31) and lane 36 in wave64 (& 63); both are off in OFF_LANE.
+    "lane select past the wave wraps": [("if", OFF_LANE, True, [("lanes", "write", 100, 9, 11)])],
     "SGPR lane select in a loop": [("vloop", (0, 3, False), None, [("lanes", "read", "s11", 1, 10),
                                                                    ("lanes", "write", "s10", 9, 13), ("probe", 4)])],
 }
