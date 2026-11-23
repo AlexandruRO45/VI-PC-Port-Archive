@@ -648,19 +648,24 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
     return ("match", "", expected, actual) if equivalent(expected, actual, output_kind(lines)) else ("mismatch", "word comparison", expected, actual)
 
 
-def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=None, include_known=False):
+def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=None, include_known=False,
+           initial_actual=None, return_actual=False):
     """Greedy instruction deletion minimizer, retaining only instructions needed for the mismatch."""
     current = list(lines)
+    current_actual = initial_actual
     original_kind = output_kind(lines)
     def reduce(tmp, context):
+        nonlocal current_actual
         i = 0
         while i < len(current):
             trial = current[:i] + current[i + 1:]
             try:
-                status, _, trial_expected, _ = run_one(trial, "ps_f64_shrink", tmp, oracle, context, include_known)
-                if (trial and status == "mismatch" and trial_expected == expected
+                status, _, trial_expected, trial_actual = run_one(
+                    trial, "ps_f64_shrink", tmp, oracle, context, include_known)
+                if (trial and status == "mismatch" and trial_expected == expected and trial_actual is not None
                         and output_kind(trial) == original_kind):
                     current[:] = trial
+                    current_actual = trial_actual
                     continue
             except GPUUnavailable:
                 raise
@@ -670,10 +675,12 @@ def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=
         return current
     if tmpdir is not None:
         context = gpu_ctx if gpu_ctx is not None else prepare_gpu(gpu, tmpdir) if oracle == "gpu" else None
-        return reduce(tmpdir, context)
-    with tempfile.TemporaryDirectory(prefix="f64-shrink-") as tmp:
-        context = gpu_ctx if gpu_ctx is not None else prepare_gpu(gpu, tmp) if oracle == "gpu" else None
-        return reduce(tmp, context)
+        reduced = reduce(tmpdir, context)
+    else:
+        with tempfile.TemporaryDirectory(prefix="f64-shrink-") as tmp:
+            context = gpu_ctx if gpu_ctx is not None else prepare_gpu(gpu, tmp) if oracle == "gpu" else None
+            reduced = reduce(tmp, context)
+    return (reduced, current_actual) if return_actual else reduced
 
 
 def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, known=False, all_failures=False,
@@ -706,8 +713,10 @@ def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, kn
             if status == "skip": skips[reason] += 1
             else: counts[status] += 1
             if status == "mismatch":
-                reduced = shrink(lines, want, oracle, gpu, gpu_ctx, tmp, bool(known_case))
-                failures.append((reduced, want, got, reason))
+                reduced, reduced_actual = shrink(
+                    lines, want, oracle, gpu, gpu_ctx, tmp, bool(known_case),
+                    initial_actual=got, return_actual=True)
+                failures.append((reduced, want, reduced_actual, reason))
             if status == "mismatch" and not all_failures: break
     return counts, skips, failures
 
