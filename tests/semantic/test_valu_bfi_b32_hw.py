@@ -191,6 +191,65 @@ class TestBfiInterpreter(unittest.TestCase):
         self.assertEqual(interp.vgpr[4], 0xAA112233)
 
 
+
+class SimdWavefront:
+    def __init__(self, size: int = 32):
+        self.size = size
+        self.lanes = [ScalarInterp() for _ in range(size)]
+        self.exec_mask: int = (1 << size) - 1
+
+    def step_bfi(self, dst: int, src0: int, src1: int, src2: int):
+        for lane_idx in range(self.size):
+            if (self.exec_mask >> lane_idx) & 1:
+                m = self.lanes[lane_idx].vgpr[src0]
+                f = self.lanes[lane_idx].vgpr[src1]
+                b = self.lanes[lane_idx].vgpr[src2]
+                self.lanes[lane_idx].vgpr[dst] = ref_bfi_b32(m, f, b)
+
+
+class TestBfiSIMD(unittest.TestCase):
+    def test_simd_wave32_all_active(self):
+        wave = SimdWavefront(32)
+        for i in range(32):
+            wave.lanes[i].vgpr[1] = 1 << i  # individual mask bit
+            wave.lanes[i].vgpr[2] = 0xFFFFFFFF
+            wave.lanes[i].vgpr[3] = 0x00000000
+        wave.step_bfi(0, 1, 2, 3)
+        for i in range(32):
+            self.assertEqual(wave.lanes[i].vgpr[0], 1 << i)
+
+    def test_simd_divergence_exec_mask(self):
+        wave = SimdWavefront(32)
+        wave.exec_mask = 0x55555555  # only even lanes active
+        for i in range(32):
+            wave.lanes[i].vgpr[0] = 0xDEADBEEF  # initial destination
+            wave.lanes[i].vgpr[1] = 0xFFFFFFFF
+            wave.lanes[i].vgpr[2] = 0x12345678
+            wave.lanes[i].vgpr[3] = 0x00000000
+        wave.step_bfi(0, 1, 2, 3)
+        for i in range(32):
+            if i % 2 == 0:
+                self.assertEqual(wave.lanes[i].vgpr[0], 0x12345678)
+            else:
+                self.assertEqual(wave.lanes[i].vgpr[0], 0xDEADBEEF)
+
+    def test_simd_wave64_masking(self):
+        wave = SimdWavefront(64)
+        wave.exec_mask = 0x00000000FFFFFFFF  # lower 32 lanes only
+        for i in range(64):
+            wave.lanes[i].vgpr[0] = 0xBAADF00D
+            wave.lanes[i].vgpr[1] = 0xFFFFFFFF
+            wave.lanes[i].vgpr[2] = 0x77777777
+            wave.lanes[i].vgpr[3] = 0x00000000
+        wave.step_bfi(0, 1, 2, 3)
+        for i in range(64):
+            if i < 32:
+                self.assertEqual(wave.lanes[i].vgpr[0], 0x77777777)
+            else:
+                self.assertEqual(wave.lanes[i].vgpr[0], 0xBAADF00D)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
