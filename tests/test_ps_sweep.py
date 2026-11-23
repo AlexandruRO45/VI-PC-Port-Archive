@@ -145,6 +145,12 @@ class Classification(unittest.TestCase):
         # the same non-finite value at the same component matches
         self.assertEqual(self.classify([inf, nan, 1.0], [inf, nan, 1.0]), ("OK on both", ""))
 
+    def test_not_translated_is_its_own_class(self):
+        rec = {"code": ps_sweep.NOT_TRANSLATED, "reason": "not translated"}
+        ok = {"code": 0, "reason": ""}
+        self.assertEqual(ps_sweep.classify_pair(rec, ok, "x", "y"), ("not translated", ""))
+        self.assertEqual(ps_sweep.classify_pair(ok, rec, "x", "y"), ("not translated", ""))
+
     def test_failures_and_timeouts(self):
         self.assertEqual(self.classify([0.5], [0.5], 0, 77), ("fails on one GPU", "b: missing device feature"))
         self.assertEqual(self.classify([0.5], [0.5], 4, 0), ("fails on one GPU", "a: exit 4"))

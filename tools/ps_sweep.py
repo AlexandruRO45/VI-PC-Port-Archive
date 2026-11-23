@@ -33,6 +33,7 @@ import sys
 import time
 
 W = H = 32
+NOT_TRANSLATED = -1   # result code of a sampled shader that is not in the --spirv index
 TOLERANCE = 1e-3
 
 
@@ -141,7 +142,11 @@ def cmd_run(a):
     for i, s in enumerate(sample):
         if i < a.lo or i >= hi or i in done or (a.only and i not in a.only):
             continue
-        meta = ps[s["name"]]
+        meta = ps.get(s["name"])
+        if meta is None:   # the translation in --spirv refused it (e.g. --bary-fallback and a computed I/J pair)
+            with open(log, "a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps({"i": i, "code": NOT_TRANSLATED, "reason": "not translated", "targets": 0, "sec": 0}) + "\n")
+            continue
         raw = os.path.join(out_dir, f"{i}.raw")
         if os.path.exists(raw):
             os.unlink(raw)
@@ -193,6 +198,8 @@ def written_stats(vals):
 def classify_pair(rec_a, rec_b, raw_a, raw_b, tol=TOLERANCE):
     """The class of one shader from its two result records and output files."""
     code_a, code_b = rec_a["code"], rec_b["code"]
+    if NOT_TRANSLATED in (code_a, code_b):
+        return "not translated", ""
     if 3 in (code_a, code_b):
         return "timeout", ""
     if code_a == 0 and code_b == 0:
