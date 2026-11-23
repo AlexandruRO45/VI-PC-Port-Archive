@@ -181,6 +181,33 @@ class Cli(unittest.TestCase):
                 smoke.translate(d, d, 32768)
             self.assertIn("XboxBvhBuilder.dll", str(e.exception))
 
+    def _run_main(self, extra):
+        """main() with the GPU pieces stubbed: vk_compute_test found, one passing program, no --checked."""
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as d:
+            passing = [{"name": "P", "status": "pass", "words_changed": 3, "detail": ""}]
+            with mock.patch.object(smoke, "find_vk_compute_test", return_value=Path(d) / "vkc"), \
+                    mock.patch.object(smoke, "smoke", return_value=passing):
+                return smoke.main(["--spirv", d, "--build", d, *extra])
+
+    def test_json_nested_path(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "missing" / "parents" / "report.json"
+            code = self._run_main(["--json", str(target)])
+            self.assertEqual(code, 0)
+            doc = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(doc["results"][0]["name"], "P")
+
+    def test_json_directory_is_an_error_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as d:
+            code = self._run_main(["--json", d])
+            self.assertEqual(code, 2)
+
+    def test_json_empty_is_an_error(self):
+        code = self._run_main(["--json", "   "])
+        self.assertEqual(code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,42 @@ def heap_image(table_qword, heap_bytes):
     return table + bytes(heap_bytes - len(table))
 
 
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, report):
+    """Create missing parent directories and write `report` as LF-terminated JSON, or return an error string."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"cannot create directory for --json {path}: {e.strerror or e}"
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    return None
+
 def changed_words(initial, after):
     """How many 32-bit words of the heap differ from the initial image."""
     n = min(len(initial), len(after)) // 4
@@ -273,6 +309,11 @@ def main(argv=None):
         ap.error(f"--heap-bytes must be a multiple of 4 and at least {TABLE_QWORDS * 8}")
     if not 0 <= a.table_qword < 1 << 64:
         ap.error("--table-qword must fit in 64 bits")
+    if a.json is not None:
+        err = validate_json_path(a.json)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     vkc = find_vk_compute_test(a.build)
     if a.spirv:
         spirv = Path(a.spirv)
@@ -301,9 +342,11 @@ def main(argv=None):
             print(f"checked {r['name']:20} {r['status']:10} {r['detail']}")
         print(f"checked: {sum(r['status'] == 'pass' for r in checked)} of {len(checked)} write exactly what they should")
     if a.json:
-        Path(a.json).write_text(json.dumps({"max_shared_memory": a.max_shared_memory, "table_qword": a.table_qword,
-                                            "heap_bytes": a.heap_bytes, "results": results, "checked": checked},
-                                           indent=1), encoding="utf-8", newline="\n")
+        err = write_json_report(a.json, {"max_shared_memory": a.max_shared_memory, "table_qword": a.table_qword,
+                                         "heap_bytes": a.heap_bytes, "results": results, "checked": checked})
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     ok = counts.get("pass", 0) == len(results) and all(r["status"] == "pass" for r in checked)
     return 0 if ok else 1
 
