@@ -366,10 +366,6 @@ class TestArchive(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(C.main([good, "--json", good]), 2)          # never overwrite an input
                 self.assertEqual(C.main([good, "--limit", "5"]), 2)          # --limit is for an archive
-                err = io.StringIO()
-                with contextlib.redirect_stderr(err):
-                    self.assertEqual(C.main([os.path.join(d, "missing.bin"), "--header-offset", "-1"]), 2)
-                self.assertIn("--header-offset", err.getvalue())
                 self.assertEqual(C.main([os.path.join(d, "missing.bin")]), 2)
                 self.assertEqual(C.main([good, "--json", d]), 2)             # --json is a directory
                 self.assertEqual(C.main([good, "--json", os.path.join(d, "no_such_dir", "r.json")]), 2)

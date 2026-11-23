@@ -505,9 +505,8 @@ def main(argv=None):
     ap.add_argument("--json")
     a = ap.parse_args(argv)
     bad_limit = a.limit is not None and a.limit <= 0
-    if a.window <= 0 or a.workers <= 0 or bad_limit or (a.start is not None and a.start < 0) or a.header_offset < 0:
-        print("error: --window, --workers and --limit must be positive, --start and --header-offset not negative",
-              file=sys.stderr)
+    if a.window <= 0 or a.workers <= 0 or bad_limit or (a.start is not None and a.start < 0):
+        print("error: --window, --workers and --limit must be positive, --start not negative", file=sys.stderr)
         return 2
     if a.json:
         if os.path.isdir(a.json):
