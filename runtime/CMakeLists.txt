@@ -460,6 +460,11 @@ if(BUILD_TESTING)
   find_package(Threads REQUIRED)
   target_link_libraries(large_module_gate_test PRIVATE Threads::Threads)
   add_test(NAME large_module_gate COMMAND large_module_gate_test)
+  # Cross-queue Wait-before-Signal coordinator (runtime/src/queue_holds.h): pure stdlib + Threads, no Vulkan device.
+  add_executable(queue_holds_test test/queue_holds_test.cpp)
+  target_include_directories(queue_holds_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(queue_holds_test PRIVATE Threads::Threads)
+  add_test(NAME queue_holds COMMAND queue_holds_test)
   # vk_pipeline_check's isolate summary stage set: pure stdlib, no Vulkan device.
   add_executable(pipeline_summary_test test/pipeline_summary_test.cpp)
   add_test(NAME pipeline_summary COMMAND pipeline_summary_test)
