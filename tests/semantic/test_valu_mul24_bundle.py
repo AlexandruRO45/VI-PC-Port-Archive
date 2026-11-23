@@ -202,5 +202,25 @@ class VMulI32I24TranslatorTests(unittest.TestCase):
         val = mrt0_words(spv)[0]
         self.assertEqual(val, u32(-200))
 
+# -----------------------------------------------------------------------------
+# Opcode 3: v_mul_hi_u32_u24
+# -----------------------------------------------------------------------------
+def oracle_mul_hi_u32_u24(s0: int, s1: int) -> int:
+    """Reference mathematical oracle for v_mul_hi_u32_u24."""
+    u0 = s0 & MASK24
+    u1 = s1 & MASK24
+    prod = u0 * u1
+    return (prod >> 32) & MASK32
+
+
+class VMulHiU32U24OracleTests(unittest.TestCase):
+    def test_mul_hi_u24_small_product_zero(self):
+        # 100 * 200 = 20000 -> fits in 32 bits, high 32 bits are 0
+        self.assertEqual(oracle_mul_hi_u32_u24(100, 200), 0)
+
+    def test_mul_hi_u24_large_product(self):
+        # 0xFFFFFF * 0xFFFFFF = 0x0000FFFFE0000001 -> high 32 bits are 0x0000FFFF
+        self.assertEqual(oracle_mul_hi_u32_u24(0xFFFFFF, 0xFFFFFF), 0x0000FFFF)
+
 if __name__ == "__main__":
     unittest.main()
