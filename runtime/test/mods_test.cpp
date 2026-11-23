@@ -158,7 +158,7 @@ int main() {
 
     check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
 
-    for (const char* invalid : {"\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80"}) {
+    for (const char* invalid : {"\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xc2\xff"}) {
         check(!parse_mod("{\"name\":\"" + std::string(invalid) + "\"}", "m", mod, error) &&
                   error == "mod.json is not a JSON object", "invalid raw UTF-8 mod names are refused");
     }

@@ -68,7 +68,8 @@ int test_json_raw_utf8() {
         "\x80", "\xbf", "\xc0\xaf", "\xc1\xbf", "\xc2", "\xc2" "x", "\xc2\\n", std::string("\xc2\0", 2),
         "\xe0\x80\x80", "\xe0\x9f\xbf", "\xed\xa0\x80", "\xed\xbf\xbf", "\xe2\x82",
         "\xe2" "A\xac", "\xe2\x82" "A", "\xf0\x80\x80\x80", "\xf0\x8f\xbf\xbf", "\xf0\x90\x80",
-        "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xf8\x88\x80\x80\x80", "\xfc\x84\x80\x80\x80\x80", "\xff"
+        "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xf8\x88\x80\x80\x80", "\xfc\x84\x80\x80\x80\x80", "\xff",
+        "\xc2\xc0", "\xc2\xff", "\xe2\x82\xc0", "\xf0\x90\x80\xc0", "\xc2\x80\x80", "\xfe"
     };
     for (const auto& bytes : invalid) {
         const std::string quoted = "\"" + bytes + "\"";
@@ -80,7 +81,9 @@ int test_json_raw_utf8() {
     // Boundaries on both sides of each restricted second-byte range, plus common text and a noncharacter.
     for (const std::string bytes : {"\x7f", "\xc2\x80", "\xdf\xbf", "\xe0\xa0\x80", "\xed\x9f\xbf",
                                     "\xee\x80\x80", "\xef\xbf\xbf", "\xf0\x90\x80\x80", "\xf4\x8f\xbf\xbf",
-                                    "\xc3\xa9", "\xe6\x9d\xb1", "\xf0\x9f\x98\x80"}) {
+                                    "\xc3\xa9", "\xe6\x9d\xb1", "\xf0\x9f\x98\x80",
+                                    "\xc4\x80", "\xde\xbf", "\xe1\x80\x80", "\xec\xbf\xbf",
+                                    "\xf1\x80\x80\x80", "\xf3\xbf\xbf\xbf"}) {
         const std::string decoded = "a" + bytes + "z";
         Json value, object;
         CHECK(JsonReader("\"" + decoded + "\"").parse(value) && value.string == decoded);
@@ -98,6 +101,9 @@ int test_json_raw_utf8() {
     Json mixed;
     CHECK(JsonReader("\"\xc3\xa9\\u0041\xf0\x9f\x98\x80\\n\"").parse(mixed));
     CHECK(mixed.string == "\xc3\xa9" "A\xf0\x9f\x98\x80\n");
+    Json adjacent;
+    CHECK(JsonReader("\"\xc3\xa9\xf0\x9f\x98\x80\"").parse(adjacent));
+    CHECK(adjacent.string == "\xc3\xa9\xf0\x9f\x98\x80");
     return 0;
 }
 
