@@ -58,6 +58,23 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertTrue(wanted)
         self.assertEqual(wanted - listed, set(), "in CMake's gta6rt sources but not in the cl.exe fallback")
 
+    def test_every_dynamic_crt_program_gets_the_timed_wait_source(self):
+        """#3796: CMakeLists.txt adds src/crt_timed_wait.cpp to every executable and DLL it builds against the
+        dynamic CRT, gta6rt included; a /MT target links the whole STL statically and CMake leaves it alone. The
+        fallback has to pass the source on each /MD cl line too, or its binaries keep msvcprt.lib's timed wait
+        that on Wine 9 holds the mutex for the whole timeout (measured 2000 ms for a 2 s wait that should wake
+        in 0.3 ms), and the loader's task-queue waits stall there."""
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn("target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)", cmake)
+        lines = [line for line in self.body.splitlines() if re.search(r"(^|\s)cl ", line)]
+        self.assertTrue(lines)
+        for line in lines:
+            with self.subTest(program=re.search(r"/Fe:(\S+)", line).group(1)):
+                if "/MT" in line.split():
+                    self.assertNotIn("crt_timed_wait.cpp", line, "a /MT target links the STL statically")
+                else:
+                    self.assertIn("crt_timed_wait.cpp", line, "a /MD target keeps msvcprt.lib's timed wait")
+
     def test_every_test_source_it_compiles_exists(self):
         sources = re.findall(r'"\$src\\test\\([A-Za-z0-9_]+\.cpp)"', self.body)
         self.assertTrue(sources)
