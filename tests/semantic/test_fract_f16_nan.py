@@ -26,6 +26,19 @@ class FractF16NanTests(unittest.TestCase):
                                  [hex(0x13570000 | plain), hex(0x24680000 | neg), hex(0x369A0000 | ab),
                                   hex(0x12340000 | clamped)])
 
+    def test_fract_f16_nan_modifiers_and_constants(self) -> None:
+        # mul:2 leaves a NaN unchanged (and is ignored for the others: f16 omod, docs/design.md); |x| clamp gives +0
+        # for a NaN and an infinity; the constant 0x7c01 under clamp gives +0, the constant 0xfe11 comes back as is.
+        fixture = Path(__file__).with_name("fixtures") / "ps_fract_f16_nan_mods.asm"
+        module = translate_lines(fixture.stem, fixture.read_text(encoding="ascii").splitlines())
+        for source, (omod, abs_clamp) in {0x7C01: (0x7C01, 0), 0xFE11: (0xFE11, 0), 0x7C00: (0xFE00, 0),
+                                          0x3E00: (0x3800, 0x3800)}.items():
+            with self.subTest(source=hex(source)):
+                words = mrt0_words(module, push_constants=[source] + [0] * 31)
+                self.assertEqual([hex(w) for w in words],
+                                 [hex(0x13570000 | omod), hex(0x24680000 | abs_clamp), hex(0x369A0000),
+                                  hex(0x1234FE11)])
+
 
 if __name__ == "__main__":
     unittest.main()
