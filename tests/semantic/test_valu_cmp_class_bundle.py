@@ -705,3 +705,40 @@ class TestCmpxClassF16ASTAndScalar(unittest.TestCase):
     def test_scalar_predicated_execution_hardware(self):
         val_hw, _ = run_cmp_shader("f16", 0x0000, CLASS_NEG_NORMAL, is_cmpx=True, test_id="ast_scalar_pred")
         self.assertEqual(val_hw, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmpx_class_f16 SIMD Divergence & Active Mask Narrowing
+# ------------------------------------------------------------------------------
+
+def step_cmpx_class_f16_simd(wave: SIMDWaveClassLogic, insn: VCmpxClassF16Instruction):
+    mask = insn.mask.value if isinstance(insn.mask, LiteralOperand) else wave.vgprs[insn.mask.index][0]
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.vgprs[insn.src0.index][lane] & 0xFFFF
+            if not ref_cmp_class_f16(s0, mask):
+                wave.exec_mask &= ~(1 << lane)
+
+
+class TestCmpxClassF16SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_and_exec_narrowing_hardware(self):
+        wave = SIMDWaveClassLogic(wave_size=32)
+        wave.vgprs[1][0] = 0x3C00  # matches +normal
+        wave.vgprs[1][1] = 0x0000  # mismatches +normal
+
+        insn = VCmpxClassF16Instruction(
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        step_cmpx_class_f16_simd(wave, insn)
+
+        val_lane0, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=True, test_id="simd_l0")
+        val_lane1, _ = run_cmp_shader("f16", 0x0000, CLASS_POS_NORMAL, is_cmpx=True, test_id="simd_l1")
+        self.assertEqual(val_lane0, 1)
+        self.assertEqual(val_lane1, 0)
+        self.assertEqual(wave.exec_mask & 1, 1)
+        self.assertEqual((wave.exec_mask >> 1) & 1, 0)
+
+    def test_cascaded_cmpx_narrowing_hardware(self):
+        val_cascade, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=True, test_id="cascade")
+        self.assertEqual(val_cascade, 1)
