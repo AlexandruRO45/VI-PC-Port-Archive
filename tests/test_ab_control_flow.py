@@ -881,13 +881,24 @@ class PipelineExecutionTest(unittest.TestCase):
 
     @patch("subprocess.run")
     def test_main_cli_pipeline_success(self, mock_run) -> None:
-        self.assert_pipeline_outcome(mock_run, 64 * 64 * 16, "identical")
+        self.assert_pipeline_outcome(mock_run, 64 * 64 * 16, "identical MRT0: non-clear")
 
     @patch("subprocess.run")
     def test_main_rejects_identical_truncated_images(self, mock_run) -> None:
         self.assert_pipeline_outcome(mock_run, 16, "dispatch form failed to run")
 
-    def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str) -> None:
+    @patch("subprocess.run")
+    def test_clear_mrt0_with_unobserved_export(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES, "identical MRT0: clear-only; unobserved MRT2",
+                                     targets=(0, 2), pixel=AB.CLEAR)
+
+    @patch("subprocess.run")
+    def test_only_unbound_target(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES,
+                                     "identical MRT0 clear-difference mask: empty; unobserved MRT1",
+                                     targets=(1,), pixel=AB.CLEAR)
+
+    def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str, targets=(0,), pixel=bytes(16)) -> None:
         import json
 
         # Prepare synthetic index
@@ -925,11 +936,12 @@ class PipelineExecutionTest(unittest.TestCase):
             elif "spirv-val" in cmd:
                 return SimpleNamespace(returncode=0, stdout="pass")
             elif "rdna2spirv.py" in str(args):
-                # Write placeholder spvasm with %out_mrt0
+                # Write the synthetic output declarations.
                 out_dir = args[args.index("--out") + 1]
                 os.makedirs(out_dir, exist_ok=True)
                 with open(os.path.join(out_dir, "ps_test.spvasm"), "w", encoding="utf-8") as f:
-                    f.write("OpCapability Shader\n%out_mrt0 = OpVariable %po Output\n")
+                    for target in targets:
+                        f.write(f"%out_mrt{target} = OpVariable %po Output\n")
                 with open(os.path.join(out_dir, "ps_test.spv"), "wb") as f:
                     f.write(b"fake_spv")
                 return SimpleNamespace(returncode=0, stdout="1 pass spirv-val\n")
@@ -937,7 +949,7 @@ class PipelineExecutionTest(unittest.TestCase):
                 # Harness call
                 raw_path = args[3]
                 with open(raw_path, "wb") as f:
-                    f.write(bytes(image_size))
+                    f.write(pixel * (image_size // len(pixel)))
                 return SimpleNamespace(returncode=0, stdout="OK")
 
         mock_run.side_effect = side_effect

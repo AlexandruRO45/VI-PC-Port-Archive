@@ -11,12 +11,12 @@ What the comparison needs to mean anything, each learned from a run that looked 
   - Every pixel input has to be defined. The vertex shader made here writes all 32 locations; with the game's
     pass-through one, which writes location 0 only, a shader that uses another input as a buffer index reads
     from wherever the driver's leftover value points, differently in each form.
-  - A shader that exports no colour is compared by which pixels it keeps: the colour of those is undefined.
+  - Without an MRT0 export, compare only the mask of MRT0 pixels differing from the clear value.
   - Shaders with loops go to a software driver first (--harness with a Linux build under Mesa llvmpipe). One
     that never ends is killed after --timeout there; on a real GPU it resets the driver. Feed the ones that
     finish back with --names.
-The heap is zeros, so most images are a single colour: this shows the two forms take the same path to the same
-result, not that the result is right. Outcomes go to <out dir>/outcomes.tsv.
+The heap is zeros. Equal MRT0 readbacks can result from different execution paths. The harness binds only
+MRT0. The rows in <out dir>/outcomes.tsv distinguish clear-only matches and list unobserved colour targets.
 Usage: `python -I tools/ab_control_flow.py --help` lists the options.
 """
 import argparse
@@ -270,11 +270,15 @@ def main(argv=None):
         if "1 pass spirv-val" not in r1.stdout or "1 pass spirv-val" not in r2.stdout:
             note(name, "a translation is invalid")
             continue
-        # A shader that exports no colour (depth-only passes with an alpha test) leaves the colour of the pixels
-        # it keeps undefined: garbage on a GPU, different every run. What it does decide is which pixels survive,
-        # so compare that: a killed pixel still holds the clear colour.
-        colour = "%out_mrt0" in open(os.path.join(new, name + ".spvasm"), encoding="utf-8").read()
-        res["exports no colour: compared by surviving pixels"] += not colour
+        targets = []
+        for directory in (loopdir, new):
+            with open(os.path.join(directory, name + ".spvasm"), encoding="utf-8") as assembly:
+                targets.append(set(re.findall(r"%out_mrt(\d+)\b", assembly.read())))
+        if targets[0] != targets[1]:
+            note(name, "DIFFERENT colour target declarations")
+            differ.append(name)
+            continue
+        colour = "0" in targets[0]
         images = []
         for tag, spirv in (("old", os.path.join(loopdir, name + ".spv")),
                            ("new", os.path.join(new, name + ".spv"))):
@@ -300,14 +304,23 @@ def main(argv=None):
                     break
             images.append(got)
         outcome = classify_result(True, images[0], images[1])
-        note(name, outcome)
         if outcome in ("DIFFERENT", "ONLY ONE FORM TERMINATES"):
             differ.append(name)
         elif outcome == "identical":
             image = images[1][0]
-            step = 16 if colour else 1
+            if colour:
+                clear_only = image == CLEAR * (READBACK_BYTES // len(CLEAR))
+                outcome = "identical MRT0: clear-only" if clear_only else "identical MRT0: non-clear"
+            else:
+                outcome = ("identical MRT0 clear-difference mask: nonempty" if any(image)
+                           else "identical MRT0 clear-difference mask: empty")
+            step = len(CLEAR) if colour else 1
             res["identical and not all one colour"] += len(
                 set(image[i:i + step] for i in range(0, len(image), step))) > 1
+        unbound = sorted(int(target) for target in targets[0] if target != "0")
+        if unbound:
+            outcome += "; unobserved " + ", ".join(f"MRT{n}" for n in unbound)
+        note(name, outcome)
     print(dict(res))
     for name in differ[:8]:
         print("   differs:", name[:70])
