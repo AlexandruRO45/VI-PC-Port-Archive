@@ -69,6 +69,10 @@ def run_add_f64(a_bits, b_bits, *, setup=None, operands="v[0:1], v[2:3]", mode=N
 
 
 class AddF64PrecisionAndSpecialsTests(unittest.TestCase):
+    def test_decimal_above_f16_midpoint_keeps_binary64_rounding(self):
+        result, _ = run_add_f64(0, 0, operands="1.000488281250000000000001e0, 0.0")
+        self.assertEqual(result, 0x3ff0020000000000)
+
     def test_precision_beyond_f32(self):
         cases = [
             (float(2**24), 1.0, float(2**24 + 1)),

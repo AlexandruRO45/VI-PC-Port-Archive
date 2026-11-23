@@ -70,7 +70,7 @@ def _imm_u32(a):
         v = a["v"] & 0xFFFFFFFF
     elif a["k"] == "fimm":
         try:
-            v = struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+            v = struct.unpack("<I", struct.pack("<f", a.get("narrow_v", a["v"])))[0]
         except OverflowError:   # a double no float32 holds is not a constant this can name
             return None
     else:

@@ -413,7 +413,7 @@ class Machine:
         elif kind == "imm":
             value = arg["v"] & MASK32
         elif kind == "fimm":
-            value = float_to_bits(arg["v"])
+            value = float_to_bits(arg.get("narrow_v", arg["v"]))
         elif kind == "special":
             value = self._read_special(arg["t"])
         else:
@@ -436,7 +436,7 @@ class Machine:
         elif kind == "imm":
             bits = arg["v"] & MASK32  # integer inline constants are bit patterns; float ones parse as "fimm"
         elif kind == "fimm":
-            bits = float_to_bits(arg["v"])
+            bits = float_to_bits(arg.get("narrow_v", arg["v"]))
         elif kind == "special":
             bits = self._read_special(arg["t"])
         else:
@@ -478,7 +478,7 @@ class Machine:
             if arg["v"] < 0:
                 mask |= MASK32 << 32
         elif kind == "fimm":
-            mask = float_to_bits(arg["v"])
+            mask = float_to_bits(arg.get("narrow_v", arg["v"]))
         else:
             raise Unsupported(arg.get("t", kind), self.pc, "condition operand is not modelled")
         return (mask >> lane) & 1

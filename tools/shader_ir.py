@@ -13,6 +13,7 @@ import os
 import re
 import sys
 from collections import Counter
+from decimal import Decimal
 
 ENC = re.compile(r";\s*encoding:\s*\[([^\]]*)\]")
 HDR = re.compile(r"^;\s*(\S+)\s+code 0x([0-9a-f]+)\.\.0x([0-9a-f]+)")
@@ -43,6 +44,8 @@ def operand(tok):
     neg = t.startswith("-")
     core = t[1:] if neg else t
     absm = len(core) > 2 and core.startswith("|") and core.endswith("|")
+    if neg and core.startswith(("-", "+")):
+        return {"k": "raw", "t": t}
     if absm:
         core = core[1:-1]
     # Fast path for the commonest operand, a single register (v3, s12): the same dict _REG builds below, and
@@ -131,15 +134,23 @@ def operand(tok):
             return out
         return {"k": "imm", "v": -v if neg else v}
     if _FLOAT.fullmatch(core):
-        value = float(core)
+        spelling = core if absm else t
+        value = float(spelling)
         if not math.isfinite(value):
             return {"k": "raw", "t": t}
-        if absm:
-            out = {"k": "fimm", "v": value, "abs": True}
-            if neg:
-                out["neg"] = True
-            return out
-        return {"k": "fimm", "v": value * (-1 if neg else 1), "abs": False}
+        out = {"k": "fimm", "v": value, "abs": absm}
+        if absm and neg:
+            out["neg"] = True
+        # A binary32 midpoint has at most 25 significant bits (a binary16 midpoint
+        # at most 12). Only there can rounding through binary64 change the result.
+        if value and (math.frexp(value)[0] * (1 << 25)).is_integer():
+            exact = Decimal(spelling)
+            if exact != value:
+                # For narrower consumers, stay on the decimal's side of a tie.
+                # Binary64 instructions still use the correctly rounded value above.
+                direction = math.inf if exact > value else -math.inf
+                out["narrow_v"] = math.nextafter(value, direction)
+        return out
     if core.startswith("hwreg(") or core.startswith("sendmsg(") or core.startswith("vmcnt(") or \
             core.startswith("expcnt(") or core.startswith("lgkmcnt(") or core.startswith("vscnt(") or \
             core.startswith("depctr") or core.startswith("instid") or core.startswith("quad_perm") or \

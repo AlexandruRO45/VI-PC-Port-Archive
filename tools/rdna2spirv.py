@@ -216,7 +216,8 @@ class Unsupported(Exception):
     pass
 
 
-def f32_immediate_bits(value):
+def f32_immediate_bits(operand):
+    value = operand.get("narrow_v", operand["v"])
     try:
         return struct.unpack("<I", struct.pack("<f", value))[0]
     except OverflowError:
@@ -432,7 +433,7 @@ class Gen:
         elif k == "imm":
             v = self.cu(a["v"])
         elif k == "fimm":
-            v = self.cu(f32_immediate_bits(a["v"]))
+            v = self.cu(f32_immediate_bits(a))
         elif k == "special" and a["t"] in ("vcc_lo", "vcc"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
@@ -542,7 +543,7 @@ class Gen:
         (gfx1036: v_add_f16_sdwa d, 1.0, v src0_sel:WORD_1 reads +0.0)."""
         if s["k"] == "fimm":
             try:
-                v = self.cu(struct.unpack("<H", struct.pack("<e", s["v"]))[0])
+                v = self.cu(struct.unpack("<H", struct.pack("<e", s.get("narrow_v", s["v"])))[0])
             except OverflowError:
                 raise Unsupported("f16 inline constant out of range") from None
             return self.sdwa_src(v, s) if "sdwa_sel" in s else v
@@ -5374,7 +5375,7 @@ class Gen:
             if s["k"] == "imm":
                 bits = s["v"] & 0xFFFFFFFF
             elif s["k"] == "fimm":
-                bits = f32_immediate_bits(s["v"])
+                bits = f32_immediate_bits(s)
             if bits is not None:
                 if sel is None:
                     is_nan = (bits & 0x7F800000) == 0x7F800000 and bits & 0x7FFFFF
@@ -5778,7 +5779,7 @@ class Gen:
             src = a[1]
             const = (src["v"] & 0xFFFFFFFF) if src["k"] == "imm" else None
             if src["k"] == "fimm":
-                const = f32_immediate_bits(src["v"])
+                const = f32_immediate_bits(src)
             # an SGPR that isn't a mask (a constant, say) gives each lane its own bit, as a constant does (mask_src)
             val = None if const is not None else (self.mask_src(src, wide=False) if src["k"] == "sgpr"
                                                   else self.src_u(src))
