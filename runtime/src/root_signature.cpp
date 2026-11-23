@@ -51,6 +51,11 @@ PackResult pack(const RootSignature& sig) {
 StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
     StagePackResult out;
     out.stage = stage;
+    if (stage != Stage::Vertex && stage != Stage::Pixel && stage != Stage::Geometry &&
+        stage != Stage::Compute && stage != Stage::Mesh) {
+        out.error = "unknown pipeline stage";
+        return out;
+    }
     out.base = stage_base(stage);
     out.end_sgpr = out.base;
     if (sig.params.size() > 64) {
@@ -63,6 +68,10 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
     first.reserve(sig.params.size());
     for (size_t i = 0; i < sig.params.size(); ++i) {
         const RootParameter& p = sig.params[i];
+        if (p.type != ParamType::Constants && p.type != ParamType::Descriptor && p.type != ParamType::Table) {
+            out.error = "unknown root parameter type";
+            return out;
+        }
         if (p.type == ParamType::Constants && p.num_values == 0) {
             out.error = "root constant parameter needs at least 1 dword";
             return out;
@@ -111,7 +120,7 @@ public:
     Reader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
 
     [[nodiscard]] bool u32(uint32_t& v) {
-        if (pos_ + 4 > size_) return false;
+        if (size_ < 4 || pos_ > size_ - 4) return false;
         v = static_cast<uint32_t>(data_[pos_]) |
             (static_cast<uint32_t>(data_[pos_ + 1]) << 8) |
             (static_cast<uint32_t>(data_[pos_ + 2]) << 16) |
@@ -360,10 +369,11 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
         }
         RootParameter p;
         p.visibility = static_cast<Visibility>(vis);
+        const size_t base = static_cast<size_t>(poff);
         if (dtype == 1) {
             p.type = ParamType::Constants;
-            if (!u32_at(poff, p.shader_register) || !u32_at(poff + 4, p.register_space) ||
-                !u32_at(poff + 8, p.num_values)) {
+            if (!u32_at(base, p.shader_register) || !u32_at(base + 4, p.register_space) ||
+                !u32_at(base + 8, p.num_values)) {
                 out.error = "truncated RTS0 constants payload";
                 return out;
             }
@@ -371,15 +381,15 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
             p.type = ParamType::Descriptor;
             uint32_t dflags = 0;
             const size_t need = flags_v11 ? 12 : 8;
-            if (poff > size || need > size - static_cast<size_t>(poff)) {
+            if (base > size || need > size - base) {
                 out.error = "truncated RTS0 descriptor payload";
                 return out;
             }
-            if (!u32_at(poff, p.descriptor_register) || !u32_at(poff + 4, p.descriptor_space)) {
+            if (!u32_at(base, p.descriptor_register) || !u32_at(base + 4, p.descriptor_space)) {
                 out.error = "truncated RTS0 descriptor payload";
                 return out;
             }
-            if (flags_v11 && !u32_at(poff + 8, dflags)) {
+            if (flags_v11 && !u32_at(base + 8, dflags)) {
                 out.error = "truncated RTS0 descriptor flags";
                 return out;
             }
@@ -389,7 +399,7 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
             // Table payload: {u32 num_ranges, u32 ranges_offset}; the ranges sit at ranges_offset (from the payload
             // start), like every other table in RTS0. Measured against the PC serializer (root_signature_oracle_test).
             uint32_t nranges = 0, ranges_off = 0;
-            if (!u32_at(poff, nranges) || !u32_at(static_cast<size_t>(poff) + 4, ranges_off)) {
+            if (!u32_at(base, nranges) || !u32_at(base + 4, ranges_off)) {
                 out.error = "truncated RTS0 table payload";
                 return out;
             }
@@ -471,7 +481,7 @@ DecodeResult parse_rts0(const uint8_t* data, size_t size) {
     // DXBC container walk (mirrors input_signature in tools/rdna2spirv.py):
     // +28: chunk count, +32: chunk offsets, each chunk is FourCC + u32 size.
     auto at = [&](size_t off, uint32_t& v) {
-        if (off + 4 > size) return false;
+        if (size < 4 || off > size - 4) return false;
         v = static_cast<uint32_t>(data[off]) | (static_cast<uint32_t>(data[off + 1]) << 8) |
             (static_cast<uint32_t>(data[off + 2]) << 16) | (static_cast<uint32_t>(data[off + 3]) << 24);
         return true;
@@ -487,28 +497,25 @@ DecodeResult parse_rts0(const uint8_t* data, size_t size) {
     }
     for (uint32_t k = 0; k < nchunks; ++k) {
         uint32_t off = 0;
-        // NOTE: off and payload_size are u32; promote to size_t BEFORE adding
-        // or a hostile container wraps the check and turns it into an OOB read.
+        // NOTE: off and payload_size are u32; use subtraction against size
+        // so a hostile container cannot wrap the check into an OOB read.
         if (!at(32 + 4 * static_cast<size_t>(k), off) ||
-            static_cast<size_t>(off) + 8 > size) {
+            size < 8 || static_cast<size_t>(off) > size - 8) {
             out.error = "truncated DXBC chunk table";
             return out;
         }
-        if (data[off] == 'R' && data[off + 1] == 'T' && data[off + 2] == 'S' && data[off + 3] == '0') {
-            uint32_t payload_size = 0;
-            if (static_cast<size_t>(off) + 8 > size) {
-                out.error = "truncated RTS0 chunk header";
-                return out;
-            }
-            payload_size = static_cast<uint32_t>(data[off + 4]) |
-                           (static_cast<uint32_t>(data[off + 5]) << 8) |
-                           (static_cast<uint32_t>(data[off + 6]) << 16) |
-                           (static_cast<uint32_t>(data[off + 7]) << 24);
-            if (static_cast<size_t>(off) + 8 + payload_size > size) {
+        const size_t chunk_off = static_cast<size_t>(off);
+        if (data[chunk_off] == 'R' && data[chunk_off + 1] == 'T' &&
+            data[chunk_off + 2] == 'S' && data[chunk_off + 3] == '0') {
+            const uint32_t payload_size = static_cast<uint32_t>(data[chunk_off + 4]) |
+                                          (static_cast<uint32_t>(data[chunk_off + 5]) << 8) |
+                                          (static_cast<uint32_t>(data[chunk_off + 6]) << 16) |
+                                          (static_cast<uint32_t>(data[chunk_off + 7]) << 24);
+            if (static_cast<size_t>(payload_size) > size - chunk_off - 8) {
                 out.error = "RTS0 chunk overruns its container";
                 return out;
             }
-            return parse_rts0_payload(data + off + 8, payload_size);
+            return parse_rts0_payload(data + chunk_off + 8, payload_size);
         }
     }
     out.error = "no RTS0 chunk in DXBC container";

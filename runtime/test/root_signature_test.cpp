@@ -462,6 +462,35 @@ int main() {
         RootSignature many;
         many.params.assign(65, table());
         check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
+
+        RootSignature bad_param;
+        RootParameter invalid;
+        invalid.type = static_cast<ParamType>(0xffffffffu);
+        invalid.num_values = 1;
+        bad_param.params = {invalid, table()};
+        const StagePackResult bad_r = pack_stage(bad_param, Stage::Compute);
+        check(!bad_r.ok && bad_r.error.find("unknown") != std::string::npos && bad_r.first_sgpr.empty(),
+              "pack_stage: invalid parameter enum cannot produce a successful zero-cost layout");
+
+        RootSignature valid_sig;
+        valid_sig.params = {table()};
+        const StagePackResult bad_stage = pack_stage(valid_sig, static_cast<Stage>(0xffffffffu));
+        check(!bad_stage.ok && bad_stage.error.find("unknown") != std::string::npos && bad_stage.base == 0,
+              "pack_stage: unknown pipeline stage is rejected");
+
+        // Constants entry whose offset would wrap uint32_t when +4/+8 is added must be rejected.
+        std::vector<uint8_t> wrap_rts0;
+        put_u32(wrap_rts0, 2);   // version 1.1
+        put_u32(wrap_rts0, 1);   // 1 param
+        put_u32(wrap_rts0, 24);  // params offset
+        put_u32(wrap_rts0, 0);   // 0 samplers
+        put_u32(wrap_rts0, 0);
+        put_u32(wrap_rts0, 0);
+        put_u32(wrap_rts0, 1);           // Constants
+        put_u32(wrap_rts0, 0);           // visibility
+        put_u32(wrap_rts0, 0xfffffffcu); // poff + 4 wraps to 0 in u32
+        check(!parse_rts0(wrap_rts0.data(), wrap_rts0.size()).ok,
+              "RTS0 constants offset near UINT32_MAX is rejected");
     }
 
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);
