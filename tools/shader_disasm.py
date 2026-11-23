@@ -149,8 +149,12 @@ def code_range(b: bytes):
 
 
 def one(path, out, mcpu, backend="llvm-mc"):
-    with open(path, "rb") as f:
-        b = f.read()
+    try:
+        with open(path, "rb") as f:
+            b = f.read()
+    except OSError as e:
+        FAILED.append((path, e.strerror or str(e)))
+        return "failed"
     start, end, how = code_range(b)
     if end is None:
         return "no s_endpgm"
@@ -186,7 +190,8 @@ def one(path, out, mcpu, backend="llvm-mc"):
     return "clean" if bad == 0 else "invalid words"
 
 
-def main():
+def main(argv=None):
+    FAILED.clear()
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--unpack-index", help="disassemble only the FSSMs listed in this unpack index")
@@ -197,7 +202,7 @@ def main():
                     help="disassembler backend: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if os.path.isfile(a.src):
         if a.unpack_index:
             ap.error("--unpack-index requires an FSSM directory")

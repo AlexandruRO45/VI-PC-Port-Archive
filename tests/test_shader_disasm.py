@@ -6,15 +6,19 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 
     python -I tests/test_shader_disasm.py
 """
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "shader_disasm.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import shader_disasm  # noqa: E402
 
 # Two instructions: s_nop 0 then s_endpgm. The probe sends only the s_endpgm, so a fake tool can tell the
 # one-instruction probe from the real shader by the input it receives.
@@ -468,6 +472,45 @@ class DisasmOutputCollisionTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assert_unchanged(inp, data)
         self.assertTrue(os.path.isfile(os.path.join(self.dir, "foo.s")))
+
+
+class FailedStateAndReadErrorTests(unittest.TestCase):
+    def test_main_clears_stale_failed_entries_between_calls(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "fssm")
+            out = os.path.join(d, "disasm")
+            os.makedirs(src)
+            with open(os.path.join(src, "good.fssm"), "wb") as f:
+                f.write(fssm())
+            shader_disasm.FAILED.append(("stale.fssm", "old failure"))
+            rc = shader_disasm.main([src, "--out", out, "--backend", "python", "--jobs", "1"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(shader_disasm.FAILED, [])
+
+    def test_unreadable_fssm_reports_clean_error_via_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "fssm")
+            out = os.path.join(d, "disasm")
+            os.makedirs(src)
+            bad = os.path.join(src, "bad.fssm")
+            with open(bad, "wb") as f:
+                f.write(fssm())
+            real_open = open
+
+            def failing_open(path, mode="r", *args, **kwargs):
+                if os.path.abspath(path) == os.path.abspath(bad) and "r" in mode:
+                    raise PermissionError(13, "Permission denied", path)
+                return real_open(path, mode, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch("builtins.open", side_effect=failing_open):
+                with mock.patch("sys.stderr", err):
+                    with self.assertRaises(SystemExit) as stop:
+                        shader_disasm.main([src, "--out", out, "--backend", "python", "--jobs", "1"])
+        self.assertEqual(stop.exception.code, 1)
+        self.assertIn("bad.fssm", err.getvalue())
+        self.assertIn("Permission denied", err.getvalue())
+        shader_disasm.FAILED.clear()
 
 
 if __name__ == "__main__":
