@@ -40,6 +40,7 @@ import os
 import re
 import sys
 from collections import Counter
+from functools import lru_cache
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import lane_masks  # noqa: E402
@@ -129,6 +130,7 @@ def partial_write(ins, op):
     return not (name in VOP2_INT16 and "_e64" not in op)
 
 
+@lru_cache(maxsize=1024)
 def base_op(op):
     for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
         if op.endswith(suffix):
@@ -140,9 +142,11 @@ def _regs(a):
     """Register keys an operand names: ("s", n), ("v", n), "vcc", "exec", "scc", "m0"."""
     k = a.get("k")
     if k == "sgpr":
-        return [("s", a["r"] + i) for i in range(a.get("n", 1))]
+        n = a.get("n", 1)
+        return [("s", a["r"])] if n == 1 else [("s", a["r"] + i) for i in range(n)]
     if k == "vgpr":
-        return [("v", a["r"] + i) for i in range(a.get("n", 1))]
+        n = a.get("n", 1)
+        return [("v", a["r"])] if n == 1 else [("v", a["r"] + i) for i in range(n)]
     if k == "vlist":
         return [("v", r) for r in a["r"]]
     if k == "slist":
@@ -200,55 +204,32 @@ OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64", "s_and_sa
           "s_andn2_saveexec_b64", "s_andn2_wrexec_b64")
 
 
-def operands(ins):
-    """(dests, srcs, implicit defs, implicit uses): operand dicts, and register keys the text does not show."""
-    op, a = base_op(ins["op"]), ins["args"]
-    mods = ins.get("mods") or []
-    defs, uses = [], []
+@lru_cache(maxsize=1024)
+def _op_class(op):
+    """What `operands` decides from the opcode name alone, computed once per distinct (base) opcode: (kind, static defs,
+    static uses, vcc read when exactly two sources, vcc read when no source names it, carry-style dest pair)."""
     if op.startswith(NO_DEST) and not op.startswith(("s_cmp", "s_bitcmp", "v_cmpx")) or op in ("s_endpgm", "s_barrier"):
-        dests, srcs = [], list(a)
+        kind = 0
     elif op.startswith(("s_cmp", "s_bitcmp")):
-        dests, srcs = [], list(a)
-        defs.append("scc")
+        kind = 1
     elif op.startswith("v_cmpx"):
-        dests, srcs = [], list(a)
-        defs.append("exec")
+        kind = 2
     elif op.startswith("v_cmp"):
-        if len(a) == 2:
-            dests, srcs = [], list(a)
-            defs.append("vcc")
-        else:
-            dests, srcs = [a[0]], list(a[1:])
+        kind = 3
     elif op.startswith("buffer_atomic") or op.startswith(("global_atomic", "flat_atomic")):
-        dests = [a[0]] if "glc" in mods and a else []
-        srcs = list(a)
+        kind = 4
     elif op.startswith("ds_"):
-        returns = op.startswith(("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append")) \
-            or "_rtn" in op
-        dests, srcs = ([a[0]], list(a[1:])) if returns and a else ([], list(a))
-    elif op == "v_swap_b32" and len(a) >= 2:
-        dests, srcs = [a[0], a[1]], [a[0], a[1]]
-    elif a:
-        if op in RMW_DEST:
-            dests, srcs = [a[0]], [a[0], *a[1:]]
-        else:
-            dests, srcs = [a[0]], list(a[1:])
-        if op.startswith("v_") and len(a) > 2 and (
-                "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
-                and a[1].get("k") in ("sgpr", "special", "slist"):
-            dests, srcs = [a[0], a[1]], list(a[2:])
+        kind = 5
+    elif op == "v_swap_b32":
+        kind = 6
     else:
-        dests, srcs = [], []
-    if any(op.startswith(p) for p in SAVEEXEC):
+        kind = 7
+    defs = ["scc"] if kind == 1 else ["exec"] if kind == 2 else []
+    if op.startswith(SAVEEXEC):
         defs += ["exec", "scc"]
     if op.startswith("s_") and not op.startswith(SCC_LESS) and "scc" not in defs and not op.startswith("s_cbranch"):
         defs.append("scc")
-    if op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
-              "v_addc_co_u32", "v_subb_co_u32", "v_subbrev_co_u32",
-              "v_cndmask_b32", "v_addc_u32", "v_subb_u32") and len(srcs) == 2:
-        uses.append("vcc")
-    if op in ("v_div_fmas_f32", "v_div_fmas_f64") and "vcc" not in [r for x in srcs for r in _regs(x)]:
-        uses.append("vcc")
+    uses = []
     if op in ("s_cselect_b32", "s_cselect_b64", "s_addc_u32", "s_subb_u32", "s_cmov_b32", "s_cmov_b64",
               "s_cmovk_i32", "s_cbranch_scc0", "s_cbranch_scc1"):
         uses.append("scc")
@@ -256,6 +237,51 @@ def operands(ins):
         uses.append("vcc")
     if op in MOVREL_OPS:
         uses.append("m0")
+    carry = op.startswith("v_") and ("_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32",
+                                                            "v_div_scale_f64"))
+    return (kind, tuple(defs), tuple(uses),
+            op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32", "v_addc_co_u32", "v_subb_co_u32",
+                   "v_subbrev_co_u32", "v_cndmask_b32", "v_addc_u32", "v_subb_u32"),
+            op in ("v_div_fmas_f32", "v_div_fmas_f64"), carry, op in RMW_DEST)
+
+
+def operands(ins):
+    """(dests, srcs, implicit defs, implicit uses): operand dicts, and register keys the text does not show."""
+    op, a = base_op(ins["op"]), ins["args"]
+    kind, defs0, uses0, vcc2, vcc_fmas, carry, rmw = _op_class(op)
+    defs, uses = list(defs0), list(uses0)
+    if kind == 0:
+        dests, srcs = [], list(a)
+    elif kind == 1 or kind == 2:
+        dests, srcs = [], list(a)
+    elif kind == 3:
+        if len(a) == 2:
+            dests, srcs = [], list(a)
+            defs.append("vcc")
+        else:
+            dests, srcs = [a[0]], list(a[1:])
+    elif kind == 4:
+        mods = ins.get("mods") or []
+        dests = [a[0]] if "glc" in mods and a else []
+        srcs = list(a)
+    elif kind == 5:
+        returns = op.startswith(("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append"))             or "_rtn" in op
+        dests, srcs = ([a[0]], list(a[1:])) if returns and a else ([], list(a))
+    elif kind == 6 and len(a) >= 2:
+        dests, srcs = [a[0], a[1]], [a[0], a[1]]
+    elif a:
+        if rmw:
+            dests, srcs = [a[0]], [a[0], *a[1:]]
+        else:
+            dests, srcs = [a[0]], list(a[1:])
+        if carry and len(a) > 2 and a[1].get("k") in ("sgpr", "special", "slist"):
+            dests, srcs = [a[0], a[1]], list(a[2:])
+    else:
+        dests, srcs = [], []
+    if vcc2 and len(srcs) == 2:
+        uses.insert(0, "vcc")
+    if vcc_fmas and "vcc" not in [r for x in srcs for r in _regs(x)]:
+        uses.insert(0, "vcc")
     return dests, srcs, defs, uses
 
 
@@ -436,8 +462,8 @@ class Analysis:
             if op != "v_movreld_b32":
                 src_base = dst_base if op == "v_swaprel_b32" else (a[1]["r"] if a[1].get("k") == "vgpr" else 0)
                 read.extend(("v", vr) for vr in self.vgprs if vr >= src_base)
-        rk = frozenset().union(*[st["r"].get(r, frozenset()) for r in read])
-        bs = frozenset().union(*[st["b"].get(r, frozenset()) for r in read])
+        rk = frozenset().union(*[st["r"].get(r, frozenset()) for r in read]) if st["r"] else frozenset()
+        bs = frozenset().union(*[st["b"].get(r, frozenset()) for r in read]) if st["b"] else frozenset()
         self.transfer(n, i, ins, st, ev)
         if dyn_v:
             for vr in sorted(set(self.vgprs) | {dst_base}):
@@ -454,6 +480,10 @@ class Analysis:
                 if r == "exec":
                     continue
                 t = st["t"].get(r, 0)
+                if not t & (RNK | BASE):         # neither tag survives: both entries go
+                    st["r"].pop(r, None)
+                    st["b"].pop(r, None)
+                    continue
                 for key, bit, own, inherited in (("r", RNK, self.new_rank, rk), ("b", BASE, self.new_base, bs)):
                     toks = (inherited | ({own} if own is not None else frozenset())) if t & bit else frozenset()
                     if toks:
