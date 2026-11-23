@@ -202,6 +202,20 @@ class TestReadLaneTranslator(unittest.TestCase):
         self.assertIn("OpBitwiseAnd", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestWriteLaneOracle(unittest.TestCase):
+    def test_oracle_write(self):
+        lanes = [0] * 64
+        out = model_writelane(lanes, 999, 5)
+        self.assertEqual(out[5], 999)
+        self.assertEqual(out[4], 0)
+        self.assertEqual(out[6], 0)
+
+    def test_translator_writelane_oracle(self):
+        prog = ["s_mov_b32 s1, 999", "s_mov_b32 s2, 5", "v_writelane_b32 v0, s1, s2", "s_endpgm"]
+        spv = support.translate_lines("cs_wl_oracle", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpSelect", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
