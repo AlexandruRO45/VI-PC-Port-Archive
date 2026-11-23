@@ -357,5 +357,52 @@ class TestValuMax3U32RegisterAliasing(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & MASK32, 120)
 
+# ---------------------------------------------------------------------------
+# Stage 6: Condition codes, status flags, and bounds checks
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class Max3StatusFlags:
+    zero: bool
+    negative: bool
+    winner_index: int
+
+
+def compute_max3_status_flags(src0: int, src1: int, src2: int) -> Max3StatusFlags:
+    u0 = src0 & MASK32
+    u1 = src1 & MASK32
+    u2 = src2 & MASK32
+    m = max(u0, u1, u2)
+    zero = (m == 0)
+    negative = bool((m >> 31) & 1)
+    if m == u0:
+        winner = 0
+    elif m == u1:
+        winner = 1
+    else:
+        winner = 2
+    return Max3StatusFlags(zero=zero, negative=negative, winner_index=winner)
+
+
+class TestValuMax3U32ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes, status flags, and bounds for v_max3_u32."""
+
+    def test_zero_flag(self) -> None:
+        flags = compute_max3_status_flags(0, 0, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertEqual(flags.winner_index, 0)
+
+    def test_negative_sign_bit_determination(self) -> None:
+        flags = compute_max3_status_flags(10, 20, 0x8000_0000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertEqual(flags.winner_index, 2)
+
+    def test_winner_index_resolution(self) -> None:
+        self.assertEqual(compute_max3_status_flags(100, 50, 25).winner_index, 0)
+        self.assertEqual(compute_max3_status_flags(50, 100, 25).winner_index, 1)
+        self.assertEqual(compute_max3_status_flags(25, 50, 100).winner_index, 2)
+
 if __name__ == "__main__":
     unittest.main()
