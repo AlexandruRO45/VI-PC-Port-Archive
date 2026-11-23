@@ -250,6 +250,52 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(row["indices"], 4)
         self.assertEqual(row["triangles"], 0)
 
+    def test_count_field_skips_null_aliases_and_empty_meshes_return_none(self):
+        issues = []
+        self.assertIsNone(CC._mesh_count([], CC.VERTEX_KEYS, "vertex count", issues))
+        self.assertEqual(issues, [])
+        row = CC.model_row({
+            "name": "null_aliases",
+            "vertex_count": None,
+            "vertices": 9,
+            "triangle_count": None,
+            "triangles": 3,
+            "index_count": None,
+            "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8],
+        }, "model.json")
+        self.assertEqual((row["vertices"], row["triangles"], row["indices"], row["issues"]),
+                         (9, 3, 9, []))
+
+    def test_malformed_totals_do_not_fall_back_and_mesh_issues_are_not_duplicated(self):
+        row = CC.model_row({
+            "name": "bad_model_totals",
+            "vertex_count": -1,
+            "triangle_count": "bad",
+            "index_count": -3,
+            "meshes": [{"vertex_count": 6, "triangle_count": 2, "index_count": 6}],
+        }, "model.json")
+        self.assertIsNone(row["vertices"])
+        self.assertIsNone(row["triangles"])
+        self.assertIsNone(row["indices"])
+        self.assertIn("vertex count is not a non-negative integer", row["issues"])
+        self.assertIn("triangle count is not a non-negative integer", row["issues"])
+        self.assertIn("index count is not a non-negative integer", row["issues"])
+
+        mesh_row = CC.model_row({
+            "name": "bad_mesh_triangle_and_entry",
+            "meshes": [
+                {"vertex_count": 3, "triangle_count": -1, "index_count": 6},
+                {"vertex_count": 3, "index_count": "bad"},
+                "not-an-object",
+            ],
+        }, "model.json")
+        self.assertIsNone(mesh_row["vertices"])
+        self.assertIsNone(mesh_row["triangles"])
+        self.assertIsNone(mesh_row["indices"])
+        self.assertEqual(mesh_row["issues"].count("mesh 0 triangle count is not a non-negative integer"), 1)
+        self.assertEqual(mesh_row["issues"].count("mesh 1 index count is not a non-negative integer"), 1)
+        self.assertEqual(mesh_row["issues"].count("mesh 2 is not an object"), 1)
+
     def test_optional_index_count_is_counted_when_an_input_supplies_it(self):
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td) / "one"

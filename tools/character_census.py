@@ -249,32 +249,41 @@ def _text_field(obj, keys, label: str, issues: list) -> str | None:
     return None
 
 
+def _has_field(obj: dict, keys) -> bool:
+    return any(key in obj and obj[key] is not None for key in keys)
+
+
+def _add_issue(issues: list, message: str) -> None:
+    if message not in issues:
+        issues.append(message)
+
+
 def _count_field(obj, keys, label: str, issues: list, *, list_len: bool = False) -> int | None:
     for key in keys:
-        if key not in obj:
+        if key not in obj or obj[key] is None:
             continue
         value = obj[key]
-        if value is None:
-            return None
         if list_len and isinstance(value, list):
             return len(value)
         result = count(value)
         if result is None:
-            issues.append(f"{label} is not a non-negative integer")
+            _add_issue(issues, f"{label} is not a non-negative integer")
         return result
     return None
 
 
 def _mesh_count(meshes: list, keys, label: str, issues: list, *, list_len: bool = False):
+    if not meshes:
+        return None
     total = 0
     complete = True
     for index, mesh in enumerate(meshes):
         if not isinstance(mesh, dict):
-            issues.append(f"mesh {index} is not an object")
+            _add_issue(issues, f"mesh {index} is not an object")
             complete = False
             continue
         value = _count_field(mesh, keys, f"mesh {index} {label}", issues, list_len=list_len)
-        if value is None and keys == TRIANGLE_KEYS:
+        if value is None and keys == TRIANGLE_KEYS and not _has_field(mesh, TRIANGLE_KEYS):
             indices = _count_field(mesh, INDEX_KEYS, f"mesh {index} index count", issues, list_len=True)
             if indices is not None:
                 value = indices // 3
@@ -554,13 +563,13 @@ def model_row(model: dict, source: str, issues: list | None = None) -> dict:
     row["kind"] = _kind(model, row, issues)
 
     vertices = _count_field(model, VERTEX_KEYS, "vertex count", issues)
-    if vertices is None and meshes:
+    if vertices is None and not _has_field(model, VERTEX_KEYS) and meshes:
         vertices = _mesh_count(meshes, VERTEX_KEYS, "vertex count", issues)
     triangles = _count_field(model, TRIANGLE_KEYS, "triangle count", issues)
-    if triangles is None and meshes:
+    if triangles is None and not _has_field(model, TRIANGLE_KEYS) and meshes:
         triangles = _mesh_count(meshes, TRIANGLE_KEYS, "triangle count", issues)
     indices = _count_field(model, INDEX_KEYS, "index count", issues, list_len=True)
-    if indices is None and meshes:
+    if indices is None and not _has_field(model, INDEX_KEYS) and meshes:
         indices = _mesh_count(meshes, INDEX_KEYS, "index count", issues, list_len=True)
     if vertices is None:
         issues.append("missing vertex count")
