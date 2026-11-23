@@ -118,18 +118,21 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
         except OSError as err:
             pytest.skip(f"hard links unavailable: {err}")
     elif output_kind == "folding-volume-case":
-        output = tmp_path / "INDEX.JSON"
+        output = tmp_path / ".." / tmp_path.name / "INDEX.JSON"
 
     probe = mock.Mock(return_value=True)
-    ctx = (mock.patch.multiple(report_paths, path_key=mock.Mock(side_effect=str),
-                               same_name_on_folding_volume=probe)
+    ctx = (mock.patch.multiple(report_paths, _resolved_key=mock.Mock(side_effect=str),
+                               _same_resolved_name=probe)
            if output_kind == "folding-volume-case" else contextlib.nullcontext())
-    with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
-               if output_kind == "folding-volume-case" else contextlib.nullcontext()):
+    # Windows realpath can recover the on-disk spelling; preserve case here to exercise the fallback on any host.
+    paths = (mock.patch.multiple(os.path, realpath=mock.Mock(side_effect=os.path.abspath),
+                                 samefile=mock.Mock(side_effect=OSError("not same")))
+             if output_kind == "folding-volume-case" else contextlib.nullcontext())
+    with ctx, paths:
         with pytest.raises(SystemExit) as exc:
             usc.main([str(index), "--json", str(output)])
     if output_kind == "folding-volume-case":
-        probe.assert_called_once()
+        probe.assert_called_once_with(str(index), str(tmp_path / "INDEX.JSON"))
 
     assert exc.value.code == 2
     assert "--json must not overwrite the input index" in capsys.readouterr().err
