@@ -744,6 +744,21 @@ def self_test():
     return all(tests) and caught
 
 
+BUILD_CONFIGS = ("", "RelWithDebInfo", "Release", "MinSizeRel", "Debug")
+
+
+def default_gpu_harness(root=ROOT):
+    """Locate vk_harness in runtime/build or a CMake multi-config subdirectory."""
+    name = "vk_harness" + (".exe" if os.name == "nt" else "")
+    build = os.path.join(root, "runtime", "build")
+    for config in BUILD_CONFIGS:
+        directory = os.path.join(build, config) if config else build
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            return path
+    return os.path.join(build, name)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--sweep", dest="sweep", action="store_true", default=True)
@@ -778,8 +793,7 @@ def main(argv=None):
             print(f"hardware oracle unavailable: {exc}", file=sys.stderr); return 77
         print(f"hardware oracle: {getattr(hw, 'device', 'AMD GPU')}")
     if args.oracle == "gpu":
-        ext = ".exe" if os.name == "nt" else ""
-        gpu = args.exe or os.path.join(ROOT, "runtime", "build", "vk_harness" + ext)
+        gpu = args.exe or default_gpu_harness()
     try:
         counts, skips, failures = run_batch(ops, args.programs, args.seed, args.max_ops, args.sweep,
                                             not args.no_literals, args.known, args.all_failures,

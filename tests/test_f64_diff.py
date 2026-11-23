@@ -388,5 +388,33 @@ class F64DiffTests(unittest.TestCase):
         self.assertIn("minimal program:", stdout.getvalue())
 
 
+    def test_default_gpu_harness_finds_cmake_config_subdirs(self):
+        ext = ".exe" if os.name == "nt" else ""
+        name = "vk_harness" + ext
+        with tempfile.TemporaryDirectory() as root:
+            fallback = os.path.join(root, "runtime", "build", name)
+            self.assertEqual(fd.default_gpu_harness(root), fallback)
+            os.makedirs(os.path.join(root, "runtime", "build", "RelWithDebInfo", name))
+            self.assertEqual(fd.default_gpu_harness(root), fallback)
+
+            def touch(*parts):
+                path = os.path.join(root, "runtime", "build", *parts)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path, "wb").close()
+                return path
+
+            dbg = touch("Debug", name)
+            self.assertEqual(fd.default_gpu_harness(root), dbg)
+            msr = touch("MinSizeRel", name)
+            self.assertEqual(fd.default_gpu_harness(root), msr)
+            rel = touch("Release", name)
+            self.assertEqual(fd.default_gpu_harness(root), rel)
+            os.rmdir(os.path.join(root, "runtime", "build", "RelWithDebInfo", name))
+            rwdi = touch("RelWithDebInfo", name)
+            self.assertEqual(fd.default_gpu_harness(root), rwdi)
+            flat = touch(name)
+            self.assertEqual(fd.default_gpu_harness(root), flat)
+
+
 if __name__ == "__main__":
     unittest.main()
