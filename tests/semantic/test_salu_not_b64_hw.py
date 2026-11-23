@@ -153,5 +153,62 @@ class TestSNotB64AST(unittest.TestCase):
             Operand(RegType.SGPR, -1, size=2)
 
 
+class ScalarRegisterFile:
+    def __init__(self):
+        self.sgprs = [0] * 106
+        self.scc = 0
+
+    def read_sgpr64(self, idx: int) -> int:
+        lo = self.sgprs[idx] & MASK32
+        hi = self.sgprs[idx + 1] & MASK32
+        return (hi << 32) | lo
+
+    def write_sgpr64(self, idx: int, val64: int) -> None:
+        self.sgprs[idx] = val64 & MASK32
+        self.sgprs[idx + 1] = (val64 >> 32) & MASK32
+
+
+class ScalarSALUInterpreter:
+    @staticmethod
+    def execute(rf: ScalarRegisterFile, inst: SNotB64Instruction) -> int:
+        val = rf.read_sgpr64(inst.src.index)
+        res, scc = ref_not_b64_scc(val)
+        rf.write_sgpr64(inst.dst.index, res)
+        rf.scc = scc
+        return res
+
+
+class TestSNotB64ScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar instruction interpreter and execution model."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+
+    def test_scalar_execution_nonzero(self):
+        val = 0x123456789ABCDEF0
+        self.rf.write_sgpr64(2, val)
+        inst = SNotB64Instruction(
+            dst=Operand(RegType.SGPR, 0, size=2),
+            src=Operand(RegType.SGPR, 2, size=2),
+        )
+        res = ScalarSALUInterpreter.execute(self.rf, inst)
+        expected = ref_not_b64(val)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.read_sgpr64(0), expected)
+        self.assertEqual(self.rf.scc, 1)
+
+    def test_scalar_execution_zero_scc(self):
+        val = MASK64
+        self.rf.write_sgpr64(2, val)
+        inst = SNotB64Instruction(
+            dst=Operand(RegType.SGPR, 0, size=2),
+            src=Operand(RegType.SGPR, 2, size=2),
+        )
+        res = ScalarSALUInterpreter.execute(self.rf, inst)
+        self.assertEqual(res, 0)
+        self.assertEqual(self.rf.read_sgpr64(0), 0)
+        self.assertEqual(self.rf.scc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
