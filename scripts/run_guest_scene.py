@@ -305,8 +305,19 @@ def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
                 tail = log.read_bytes().decode("utf-8", "replace").splitlines()[-40:]
                 print(f"--- last {len(tail)} lines of {log} ---", *tail, sep="\n", file=sys.stderr)
     finally:
-        report["outputs"] = {d.name: {"tree_sha256": tree_hash(files), "files": files} for d in sorted(out.iterdir())
-                             if d.is_dir() and d.name != "logs" for files in [tree_files(d)]}
+        outputs = report["outputs"] = {}
+        for directory in sorted(out.iterdir()):
+            if directory.name == "logs" or not directory.is_dir():
+                continue
+            try:
+                files = tree_files(directory)
+            except OSError as e:
+                error = f"{directory.name}: could not hash outputs: {e}"
+                outputs[directory.name] = {"error": error}
+                report["status"] = "fail"
+                report.setdefault("error", error)
+            else:
+                outputs[directory.name] = {"tree_sha256": tree_hash(files), "files": files}
         write_new(out / "report.json", json.dumps(report, indent=2, sort_keys=True).encode())
     print(f"{report['status'].upper()}: {report.get('error', 'all guest scene checks passed')}")
     if not temporary:

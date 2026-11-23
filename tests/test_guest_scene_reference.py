@@ -1,6 +1,8 @@
 """Fixed reference points for the synthetic guest's renderer and input trace (no GPU)."""
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import struct
@@ -117,6 +119,41 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertEqual(session.runs["full"]["outcome"], "timed_out")
             self.assertIsNone(session.runs["full"]["returncode"])
             self.assertNotIn("launch_error", session.runs["full"])
+
+    def test_output_read_failure_preserves_run_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            loader = root / "loader.py"
+            loader.write_text(
+                "from pathlib import Path\n"
+                "Path('unreadable.txt').write_bytes(b'synthetic output')\n"
+                "raise SystemExit(7)\n",
+                encoding="ascii", newline="\n",
+            )
+            inputs = root / "shaders"
+            inputs.mkdir()
+            out = root / "output"
+            args = argparse.Namespace(wine=sys.executable, loader=loader, guest=loader, shaders=inputs,
+                                      play_audio=False)
+            read_bytes = Path.read_bytes
+
+            def read(file):
+                if file == out / "full" / "unreadable.txt":
+                    raise PermissionError("synthetic output read failure")
+                return read_bytes(file)
+
+            with (mock.patch.object(Path, "read_bytes", read),
+                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+                self.assertEqual(runner.execute(args, out, temporary=False), 1)
+
+            report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "fail")
+            self.assertEqual(report["error"], "full: exit code 7")
+            self.assertEqual(report["runs"]["full"]["returncode"], 7)
+            self.assertIn("synthetic output read failure", report["outputs"]["full"]["error"])
+            self.assertEqual(
+                report["outputs"]["package"]["files"]["scene.bin"], runner.sha256(runner.scene_bytes())
+            )
 
 
 if __name__ == "__main__":
