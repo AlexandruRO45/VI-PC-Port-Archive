@@ -63,6 +63,24 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                     for field in ("op", "args", "mods"):
                         self.assertEqual(ins[field], expected[field])
 
+    def test_buffer_tfe_counts_the_status_dword(self):
+        # TFE writes a status dword after the data, so llvm-mc 23.1.6 prints one more VGPR for a MUBUF load or
+        # store with tfe set (each row is what it prints for these bytes); without tfe the range is unchanged.
+        for hexcode, asm in (
+            ("c0000ce00000803f", "buffer_load_format_xyzw v[0:4], off, s[0:3], s63 offset:192 tfe"),
+            ("000038e000018080", "buffer_load_dwordx4 v[1:5], off, s[0:3], 0 tfe"),
+            ("00000ce200018080", "buffer_load_format_d16_xyzw v[1:3], off, s[0:3], 0 tfe"),
+            ("000090e000018080", "buffer_load_short_d16 v[1:2], off, s[0:3], 0 tfe"),
+            ("000070e000018080", "buffer_store_dword v[1:2], off, s[0:3], 0 tfe"),
+            ("000070e000010080", "buffer_store_dword v1, off, s[0:3], 0"),
+            ("000030e000010080", "buffer_load_dword v1, off, s[0:3], 0"),
+        ):
+            with self.subTest(asm=asm):
+                ins, = rdna2_decode.decode_bytes(bytes.fromhex(hexcode))["insns"]
+                expected = shader_ir.parse_line(asm)
+                for field in ("op", "args", "mods"):
+                    self.assertEqual(ins[field], expected[field])
+
     def test_image_slc_is_independent_of_sampler(self):
         for sampler in (0, 64):
             for slc in (0, 1):

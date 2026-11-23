@@ -1105,6 +1105,10 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         for fn, nr, _ in spec:
             w = _width(nr, wave32)
             if fn == "VDATA":
+                # TFE adds a status dword after the data, so llvm-mc prints one more VGPR (v[0:4] for an xyzw
+                # load, v[1:2] for a dword store). An atomic with TFE is an invalid encoding to llvm-mc.
+                if tfe and not name.startswith("buffer_atomic"):
+                    w += 1
                 args.append(_vreg(vdata, w))
             elif fn == "VADDR":
                 if not offen and not idxen:
