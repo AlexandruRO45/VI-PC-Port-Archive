@@ -76,6 +76,16 @@ class TestPackB32F16Reference(unittest.TestCase):
         res = run_ps_pack(0x0000, 0x0000, name="ps_pack_ref_zero")
         self.assertEqual(res, 0x0000_0000)
 
+class TestPackB32F16LowHalf(unittest.TestCase):
+    def test_low_half_masking(self):
+        # High bits of inputs must be ignored by default (low half selected)
+        res = run_ps_pack(0xDEAD_1234, 0xBEEF_5678, name="ps_pack_low_mask")
+        self.assertEqual(res, 0x5678_1234)
+
+    def test_low_half_ones(self):
+        res = run_ps_pack(0xFFFF, 0xFFFF, name="ps_pack_low_ones")
+        self.assertEqual(res, 0xFFFF_FFFF)
+
 
 if __name__ == "__main__":
     unittest.main()
