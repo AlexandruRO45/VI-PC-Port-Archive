@@ -3,6 +3,10 @@ partition invariance").
 
     python3 -I runtime/test/shaders/w64_graphics.py <build dir with spirv/> [tools dir] [name ...]
 
+`tools dir` defaults to runtime/build. A multi-config CMake generator (Visual Studio, Xcode) puts vk_harness in
+runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by itself (TEST-1764), and a harness that was
+not built is one error line instead of a FileNotFoundError traceback.
+
 A wave64 pixel shader is exact on 32-wide subgroups when its outputs do not change if the wave is cut into two
 32-lane halves. The test draws each ps_w64_* fixture with the fragment stage's required subgroup size set to 64 (one
 hardware wave, the reference) and to 32 (the halves) through VKH_SUBGROUP_SIZE of vk_harness, and compares:
@@ -48,6 +52,16 @@ from pathlib import Path
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77
 W = H = 64
+CONFIG_DIRS = ("RelWithDebInfo", "Release")   # where a multi-config CMake generator puts vk_harness
+
+
+def harness_dir(build):
+    """The folder holding vk_harness: `build` itself (Ninja, Makefiles), or the RelWithDebInfo/Release subfolder a
+    Visual Studio build puts it in. None when it was not built."""
+    for folder in (build, *(os.path.join(build, c) for c in CONFIG_DIRS)):
+        if os.path.isfile(os.path.join(folder, "vk_harness" + EXE)):
+            return folder
+    return None
 
 
 class Skip(str):
@@ -454,8 +468,15 @@ def main(argv):
     if not argv:
         sys.exit(__doc__)
     spirv = os.path.join(argv[0], "spirv")
-    tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
-    start = 2 if len(argv) > 1 and os.path.isdir(argv[1]) else 1
+    given = len(argv) > 1 and os.path.isdir(argv[1])
+    tools = argv[1] if given else os.path.join(os.path.dirname(__file__), "..", "..", "build")
+    start = 2 if given else 1
+    built = harness_dir(tools)
+    if built is None:
+        print(f"w64_graphics: vk_harness{EXE} not found in {os.path.abspath(tools)} (its {', '.join(CONFIG_DIRS)} "
+              "subfolders were searched too); build runtime/test with cmake first", file=sys.stderr)
+        return 1
+    tools = built
     requested = argv[start:]
     unknown = [a for a in requested if a not in FIXTURES]
     if unknown:
