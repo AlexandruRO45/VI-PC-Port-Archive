@@ -1004,6 +1004,47 @@ int main() {
         stale_ptr_buf->Release();
         placed_heap->Release();
 
+        // A valid ARRAY_OF_POINTERS TLAS build must not abort command-list preparation before subsequent commands
+        // in the same list (a copy recorded after it must still run on the GPU).
+        auto post_desc = make_buf_desc(256);
+        ID3D12Resource* post_up = nullptr;
+        ID3D12Resource* post_rb = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &post_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&post_up))) ||
+            FAILED(dev->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &post_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&post_rb))))
+            return fail("CreateCommittedResource(post-TLAS copy buffers)");
+        const UINT32 post_pattern = 0xCAFEBABEu;
+        post_up->Map(0, nullptr, &p);
+        std::memcpy(p, &post_pattern, sizeof(post_pattern));
+        post_up->Unmap(0, nullptr);
+        post_rb->Map(0, nullptr, &p);
+        std::memset(p, 0, sizeof(UINT32));
+        post_rb->Unmap(0, nullptr);
+
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->BuildRaytracingAccelerationStructure(&tlas_ptr_build, 0, nullptr);
+        cl->ResourceBarrier(1, &uav_b);
+        cl->CopyBufferRegion(post_rb, 0, post_up, 0, sizeof(UINT32));
+        if (FAILED(cl->Close())) return fail("post-TLAS copy Close");
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, 3);
+        if (!wait_fence(fence, 3)) return fail("wait_fence(post-TLAS copy)");
+        post_rb->Map(0, nullptr, &p);
+        const UINT32 post_got = *static_cast<const UINT32*>(p);
+        post_rb->Unmap(0, nullptr);
+        if (post_got != post_pattern) {
+            std::fprintf(stderr, "FAIL: copy after ARRAY_OF_POINTERS TLAS build expected 0x%08x, got 0x%08x\n",
+                         post_pattern, post_got);
+            return 1;
+        }
+        std::printf("  [PASS] CopyBufferRegion after ARRAY_OF_POINTERS TLAS build ran (0x%08x)\n", post_got);
+        post_rb->Release();
+        post_up->Release();
+
         inst_ptr_buf->Release();
         inst_buf->Release();
         tlas_ptr_buf->Release();

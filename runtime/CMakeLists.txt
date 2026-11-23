@@ -2963,6 +2963,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # Commands and query checks after a KHR ARRAY_OF_POINTERS TLAS build must still prepare and emit (no GPU or game data).
+    add_executable(replay_khr_tlas_pointers_test test/replay_khr_tlas_pointers_test.cpp)
+    target_link_libraries(replay_khr_tlas_pointers_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_khr_tlas_pointers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_khr_tlas_pointers COMMAND replay_khr_tlas_pointers_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
