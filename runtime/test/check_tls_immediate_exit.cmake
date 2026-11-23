@@ -1,9 +1,11 @@
 # PE TLS DLL_PROCESS_DETACH on immediate-termination paths (_exit, _Exit, quick_exit, ExitProcess).
-# Runs tls_immediate_exit natively and through `gta6rt --run` and verifies both emit tls_attach, main, and
-# tls_detach=0x42 (without running atexit) and return the expected exit code.
+# Runs tls_immediate_exit natively and through `gta6rt --run`. Both must attach, run main, and return the
+# expected exit code without running atexit. Native Windows may omit EXE TLS detach; when present it must
+# see 0x42, and the mapped launch always requires detach with that value.
 get_filename_component(guest_dir "${GUEST}" DIRECTORY)
 get_filename_component(guest_name "${GUEST}" NAME)
 
+set(expect_native_no_detach "tls_attach;main")
 set(expect_seq "tls_attach;main;tls_detach=0x42")
 set(code__exit 8)
 set(code__Exit 9)
@@ -33,9 +35,10 @@ foreach(mode _exit _Exit quick_exit ExitProcess)
     RESULT_VARIABLE run_code OUTPUT_VARIABLE run_out ERROR_VARIABLE run_err)
   guest_lines("${native_out}" native_lines)
   guest_lines("${run_out}" run_lines)
-  if(NOT native_code STREQUAL code_${mode} OR NOT native_lines STREQUAL expect_seq)
+  if(NOT native_code STREQUAL code_${mode} OR
+     (NOT native_lines STREQUAL expect_native_no_detach AND NOT native_lines STREQUAL expect_seq))
     string(CONCAT native_diff "[${mode}] native run differs from the expected sequence"
-      "\n  expected (${code_${mode}}): ${expect_seq}\n  native   (${native_code}): ${native_lines}")
+      "\n  expected (${code_${mode}}): ${expect_native_no_detach}, optionally followed by tls_detach=0x42\n  native   (${native_code}): ${native_lines}")
     if(RUNNER)
       message(STATUS "${native_diff}\n  (the host CRT/loader differs from Windows; not a gta6rt failure)")
     else()
