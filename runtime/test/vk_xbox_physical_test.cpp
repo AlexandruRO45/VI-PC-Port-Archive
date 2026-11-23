@@ -222,6 +222,30 @@ int main() {
         EXPECT(dirty.size() == 1 && dirty[0] == phys[1]);
     }
 
+    // --- Coarse reservations (2 MiB and 4 MiB page pools; from aidity's aa03123b6) -------------------------------
+    for (const std::uint64_t alignment : {2ull << 20, 4ull << 20}) {
+        PhysicalPageStore aligned_store(1);
+        auto* base = static_cast<std::uint8_t*>(aligned_store.reserve(64, nullptr, alignment));
+        EXPECT(base && reinterpret_cast<std::uintptr_t>(base) % alignment == 0);
+        std::vector<PhysicalPage> page;
+        EXPECT(aligned_store.allocate(1, page));
+        if (base && !page.empty()) {
+            EXPECT(aligned_store.map(base, page));
+            base[0] = 0x36;
+            EXPECT(aligned_store.data(page[0])[0] == 0x36 && aligned_store.dirty(page[0]));
+            SetLastError(0);
+            EXPECT(!aligned_store.reserve(1, base + kPageSize, alignment));  // fixed address not on the alignment
+            EXPECT(GetLastError() == ERROR_INVALID_PARAMETER);
+            EXPECT(base[0] == 0x36);
+        }
+        EXPECT(!aligned_store.reserve(1, nullptr, 0));
+        EXPECT(!aligned_store.reserve(1, nullptr, kPageSize + 1));
+        EXPECT(!aligned_store.reserve(1, nullptr, kPageSize / 2));
+    }
+    // A fixed address inside a 64 KiB page is refused rather than rounded down to a different base (an address in a
+    // range Windows does not hand out by default, so the old code's rounded reservation would succeed there).
+    EXPECT(!store.reserve(1, reinterpret_cast<void*>(std::uintptr_t(0x5A0000001000ull))));
+
     // --- CPU write -> GPU read through the arena -----------------------------------------------------------------
     for (std::uint32_t i = 0; i < 4; ++i) std::memset(r1 + i * kPageSize, int(0x40 + i), kPageSize);
     const auto dirty = store.take_dirty();

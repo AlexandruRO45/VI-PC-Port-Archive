@@ -118,10 +118,24 @@ public:
     }
 
     // Placeholder reservation for `pages` 64 KiB pages; the title's mappings go here. Returns the base, or nullptr.
-    void* reserve(std::uint32_t pages, void* at = nullptr) {
+    // `alignment` (a power of two, at least 64 KiB) serves the console's 2 MiB and 4 MiB page pools; a fixed `at`
+    // must already be aligned to it.
+    void* reserve(std::uint32_t pages, void* at = nullptr, std::uint64_t alignment = kPageSize) {
         if (!ok() || !pages) return nullptr;
+        if (alignment < kPageSize || (alignment & (alignment - 1)) ||
+            (at && reinterpret_cast<std::uintptr_t>(at) % alignment)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.Alignment = alignment;
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        const bool constrain = !at && alignment > kPageSize;  // a fixed address is checked above instead
         void* base = virtual_alloc2_(nullptr, at, std::uint64_t(pages) * kPageSize,
-                                     MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+                                     MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                                     constrain ? &parameter : nullptr, constrain ? 1 : 0);
         if (!base) return nullptr;
         std::unique_lock lock(mutex_);
         Region region;
