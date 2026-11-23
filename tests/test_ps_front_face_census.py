@@ -59,6 +59,14 @@ class FrontFaceTests(unittest.TestCase):
         self.assertEqual(result["unresolved"], 1)
         self.assertEqual(result["resolved_reader"], 0)
 
+    def test_store_address_is_read(self):
+        for instruction in ("flat_store_dword v[4:5], v0", "flat_store_dword v[3:4], v0",
+                            "scratch_store_dword v4, v0, off"):
+            with self.subTest(instruction=instruction):
+                result = self.run_cache([instruction, "s_endpgm"])
+                self.assertEqual(result["resolved_reader"], 1)
+                self.assertEqual(result["shaders_per_read_kind"], {instruction.split()[0]: 1})
+
     def test_possible_partial_write(self):
         result = self.run_cache(["s_and_saveexec_b64 s[0:1], vcc", "v_mov_b32 v4, 1",
                                  "s_mov_b64 exec, s[0:1]", "v_cmp_ne_u32_e32 vcc, 0, v4"])

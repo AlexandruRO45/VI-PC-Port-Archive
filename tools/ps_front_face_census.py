@@ -81,6 +81,14 @@ def first_uses(info, native, reg):
             unresolved.add("unknown flow or addressing")
             continue
         source, dest = isa.reg_reads_writes([ins])
+        # Flat and scratch stores consume the complete address operand.
+        if op.startswith(("flat_store_", "scratch_store_")) and args:
+            address = args[0]
+            if address["k"] == "vgpr":
+                source.update(range(address["r"], address["r"] + address.get("n", 1)))
+            elif address["k"] == "vlist":
+                source.update(address["r"])
+            dest.clear()
         if reg in source:
             kind = op
             if op.startswith("v_cmp"):
