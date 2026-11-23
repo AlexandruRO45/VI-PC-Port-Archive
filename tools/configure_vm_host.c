@@ -41,4 +41,3 @@ int wmain(int argc, wchar_t **argv) {
     FreeLibrary(dll);
     return failed;
 }
-
