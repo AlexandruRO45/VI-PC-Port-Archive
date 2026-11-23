@@ -905,6 +905,8 @@ struct TileRange {
 #endif
 class VulkanContext {
 public:
+    static constexpr std::uint64_t kRetireWaitSliceNs = 100'000'000;
+
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
@@ -1068,6 +1070,10 @@ public:
     ~VulkanContext() {
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
+        if (vk.vkDestroySemaphore) {
+            for (const auto& [sem, state] : progress_waits_)
+                if (state.destroy_when_done) vk.vkDestroySemaphore(device_, sem, nullptr);
+        }
         for (const auto& [key, framebuffer] : resolve_framebuffers_)
             vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
         for (const auto& [key, pass] : resolve_passes_) vk.vkDestroyRenderPass(device_, pass, nullptr);
@@ -1425,24 +1431,63 @@ public:
     // Waits (not for the device: for the queues' timelines) until every submission up to `ticket` is done, then
     // returns the completed ticket. For a caller whose list of retired objects has grown past what it will hold.
     std::uint64_t wait_retire_ticket(std::uint64_t ticket) {
-        std::vector<std::pair<VkSemaphore, std::uint64_t>> pending;
+        std::vector<VkSemaphore> semaphores;
+        std::vector<std::uint64_t> values;
         {
             std::lock_guard lock(submit_mutex_);
             if (is_device_lost()) return 0;
-            pending = retire_tickets_.pending_through(ticket);
-        }
-        if (!pending.empty()) {
-            std::vector<VkSemaphore> semaphores;
-            std::vector<std::uint64_t> values;
+            const auto pending = retire_tickets_.pending_through(ticket);
             for (const auto& [semaphore, value] : pending) {
-                semaphores.push_back(semaphore);
-                values.push_back(value);
+                std::size_t idx = 0;
+                for (; idx < semaphores.size(); ++idx)
+                    if (semaphores[idx] == semaphore) break;
+                if (idx == semaphores.size()) {
+                    semaphores.push_back(semaphore);
+                    values.push_back(value);
+                } else if (value > values[idx]) {
+                    values[idx] = value;
+                }
             }
+            for (VkSemaphore sem : semaphores) ++progress_waits_[sem].waiters;
+        }
+        if (!semaphores.empty()) {
+            struct WaiterGuard {
+                VulkanContext& ctx;
+                const std::vector<VkSemaphore>& sems;
+                ~WaiterGuard() {
+                    std::vector<VkSemaphore> to_destroy;
+                    {
+                        std::lock_guard lock(ctx.submit_mutex_);
+                        for (VkSemaphore sem : sems) {
+                            const auto it = ctx.progress_waits_.find(sem);
+                            if (it == ctx.progress_waits_.end()) continue;
+                            if (--it->second.waiters == 0) {
+                                if (it->second.destroy_when_done) to_destroy.push_back(sem);
+                                ctx.progress_waits_.erase(it);
+                            }
+                        }
+                    }
+                    if (ctx.vk.vkDestroySemaphore) {
+                        for (VkSemaphore sem : to_destroy) ctx.vk.vkDestroySemaphore(ctx.device_, sem, nullptr);
+                    }
+                }
+            } guard{*this, semaphores};
+
             VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
             wait.semaphoreCount = std::uint32_t(semaphores.size());
             wait.pSemaphores = semaphores.data();
             wait.pValues = values.data();
-            vk.vkWaitSemaphores(device_, &wait, UINT64_MAX);  // outside submit_mutex_: a signal may need it
+            for (;;) {  // outside submit_mutex_: a signal may need it; bounded slice wakes on device loss
+                if (is_device_lost()) return 0;
+                const VkResult res = vk.vkWaitSemaphores(device_, &wait, kRetireWaitSliceNs);
+                if (res == VK_SUCCESS) break;
+                if (res == VK_TIMEOUT) continue;
+                if (res == VK_ERROR_DEVICE_LOST) {
+                    mark_device_lost();
+                    return 0;
+                }
+                break;
+            }
         }
         return completed_retire_ticket();
     }
@@ -1628,6 +1673,24 @@ private:
     alignas(64) std::mutex views_mutex_;
     alignas(64) std::mutex submit_mutex_;
     RetireTickets<VkSemaphore> retire_tickets_;
+    struct ProgressWaitState {
+        std::size_t waiters = 0;
+        bool destroy_when_done = false;
+    };
+    void destroy_or_defer_progress_semaphore(VkSemaphore semaphore) {
+        if (!semaphore) return;
+        bool destroy_now = true;
+        {
+            std::lock_guard lock(submit_mutex_);
+            const auto it = progress_waits_.find(semaphore);
+            if (it != progress_waits_.end() && it->second.waiters > 0) {
+                it->second.destroy_when_done = true;
+                destroy_now = false;
+            }
+        }
+        if (destroy_now && vk.vkDestroySemaphore) vk.vkDestroySemaphore(device_, semaphore, nullptr);
+    }
+    std::unordered_map<VkSemaphore, ProgressWaitState> progress_waits_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
@@ -1808,6 +1871,7 @@ public:
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
+        bool lost = false;
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
@@ -1815,9 +1879,10 @@ public:
             if (idle_result == VK_SUCCESS) {
                 if (progress_) context_.retire_queue_idle_locked(progress_);
             } else {
-                context_.mark_device_lost();
+                lost = true;
             }
         }
+        if (lost) context_.mark_device_lost();
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
@@ -1830,7 +1895,7 @@ public:
             if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
-        if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
+        if (progress_) context_.destroy_or_defer_progress_semaphore(progress_);
         destroy_khr_stages(khr_stage_pool_);
         for (auto& slot : buffers_) {
             destroy_khr_stages(slot.khr_instances);
