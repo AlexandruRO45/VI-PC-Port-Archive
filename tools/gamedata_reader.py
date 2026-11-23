@@ -270,8 +270,8 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
             continue
         try:
             tag, _, value = reader.read(doc["data"])
-        except (ET.ParseError, LookupError, ValueError) as e:
-            # Unsupported encodings and malformed content arrays fail outside ET.ParseError too.
+        except (ET.ParseError, LookupError, ValueError, RecursionError) as e:
+            # Encodings, content arrays and conversion depth can fail even when the XML is well-formed.
             failed[str(e).split(":")[0]] += 1
             continue
         read += 1

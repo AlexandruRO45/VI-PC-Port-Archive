@@ -257,6 +257,60 @@ class Dispatch(unittest.TestCase):
             R.TYPE_HANDLERS.clear(); R.TYPE_HANDLERS.update(saved_t)
 
 
+class ConversionDepth(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.deep = os.path.join(self.tmp.name, "deep.xml")
+        self.shallow = os.path.join(self.tmp.name, "shallow.xml")
+        self.out = os.path.join(self.tmp.name, "out")
+        # Exceed the interpreter's recursion limit with real XML, without changing that limit.
+        # Reader conversion uses several Python frames per node; ElementTree parsing itself succeeds.
+        depth = max(2000, sys.getrecursionlimit() + 100)
+        self.deep_xml = b'<CDeep>' + b'<node>' * depth + b'<x value="1"/>' + b'</node>' * depth + b'</CDeep>'
+        for path, data in ((self.deep, self.deep_xml),
+                           (self.shallow, b'<CShallow><node><x value="2"/></node></CShallow>')):
+            with open(path, "wb") as f:
+                f.write(data)
+
+    def assert_shallow_export(self):
+        names = os.listdir(self.out)
+        self.assertEqual(len(names), 1)
+        self.assertTrue(names[0].startswith("CShallow_"))
+        with open(os.path.join(self.out, names[0]), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"node": {"x": 2}})
+
+    def test_run_counts_depth_failure_and_exports_later_shallow_document(self):
+        self.assertEqual(ET.fromstring(self.deep_xml).tag, "CDeep")
+        shallow = R.run([self.shallow])
+        self.assertEqual((shallow["documents"], shallow["not_well_formed"]), (1, 0))
+        summary = R.run([self.deep, self.shallow], out_dir=self.out)
+        self.assertEqual((summary["documents"], summary["roots"], summary["not_well_formed"]), (1, 1, 1))
+        self.assertEqual(summary["per_root_documents"], {"CShallow": 1})
+        self.assertEqual(sum(summary["parse_errors"].values()), 1)
+        self.assertTrue(any("recursion" in error for error in summary["parse_errors"]))
+        self.assert_shallow_export()
+
+    def test_cli_continues_after_depth_failure(self):
+        result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"),
+                                 self.deep, self.shallow, "--out", self.out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 documents read, 1 roots, 1 not well-formed", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assert_shallow_export()
+
+    def test_cli_all_depth_failures_keep_existing_failure_status(self):
+        result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"),
+                                 self.deep, self.deep, "--out", self.out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("0 documents read, 0 roots, 2 not well-formed", result.stdout)
+        self.assertIn("ERROR: no document could be read; 2 not well-formed", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(self.out))
+
+
 class Run(unittest.TestCase):
     BAD_DOCUMENTS = (
         ("truncated array", b'<CBroken><v content="vec3v_array">1 2 3 4</v></CBroken>'),
