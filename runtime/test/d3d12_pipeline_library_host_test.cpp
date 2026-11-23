@@ -381,11 +381,16 @@ int main(int argc, char** argv) {
             int mismatches = 0, skipped = 0;
             for (std::size_t i = 0; i < ours.values.size(); ++i) {
                 const bool own_format = ours.names[i].find("[own format]") != std::string::npos;
-                if (theirs.values[i] == kFaulted || own_format) {
+                const bool last_byte_flipped = ours.names[i].rfind("create: its own blob, last byte flipped", 0) == 0;
+                const bool host_tolerates_trailing_padding = last_byte_flipped &&
+                    ((ours.names[i].find("(output)") != std::string::npos && theirs.values[i] == 1) ||
+                     (ours.names[i].find("(output)") == std::string::npos && theirs.values[i] == S_OK));
+                if (theirs.values[i] == kFaulted || own_format || host_tolerates_trailing_padding) {
                     std::printf("pipeline library %s: ours 0x%llx host 0x%llx (%s; not compared)\n",
                                 ours.names[i].c_str(), static_cast<unsigned long long>(ours.values[i]),
                                 static_cast<unsigned long long>(theirs.values[i]),
-                                own_format ? "each device's own format" : "the host faults");
+                                host_tolerates_trailing_padding ? "host permits flipped trailing padding in its own format"
+                                : own_format ? "each device's own format" : "the host faults");
                     ++skipped;
                     continue;
                 }

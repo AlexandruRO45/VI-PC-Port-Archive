@@ -2038,7 +2038,9 @@ Pipeline creation:
   - The library is a device child, not a pageable object: `QueryInterface(ID3D12Pageable)` is `E_NOINTERFACE`.
   - `LoadComputePipeline`/`LoadGraphicsPipeline`/`LoadPipeline` with a null output are `E_INVALIDARG`, as is an
     unknown or empty name. `Serialize` with a buffer smaller than `GetSerializedSize()` is `E_INVALIDARG`. The
-    serialized size and bytes are each device's own (the host's empty library is 900 bytes, the layer's 16).
+    serialized size and bytes are each device's own (the host's empty library is 900 bytes on NVIDIA, 872 on AMD;
+    the layer's 16). Flipping the last byte of its own empty library is rejected on NVIDIA and accepted on AMD
+    due to trailing padding in AMD's serialized format; the test reports this difference without failing.
   - Not compared: the calls the host runtime faults on (`Serialize(nullptr, n)`, `StorePipeline` with a null PSO,
     `Load*` with a null name or description); the layer answers `E_INVALIDARG` for each.
 
