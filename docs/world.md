@@ -558,6 +558,9 @@ python -I tests\test_world_index.py
 python -I tests\test_world_names.py
 ```
 
+`--out` writes the JSON report; without it the tool prints only the summary, so a run started in the checkout
+leaves no `reports/` folder behind.
+
 For a 76 GB archive always bound the run with `--start/--limit`; the tool records the window in its summary.
 A 0x7a resource split beyond the first continuation, or a map whose entity block lives in a graphics page, is
 reported with fewer entities or as `meta` rather than guessed.
