@@ -27,8 +27,9 @@ Usage:
     python -I tools/image_fuzz.py --oracle hw [--programs N] [--seed S] [--negative-control]
     python -I tools/image_fuzz.py --self-test
 
-Exit code: 0 when every case matches, 1 on a mismatch, 2 on a setup or harness error, 77 when --oracle hw was asked
-for and the hardware oracle's tools or GPU are missing. Nothing here reads game files.
+Exit code: 0 when every case matches, 1 on a mismatch, 2 on a setup or harness error (and when every translator
+case was skipped, so nothing was compared), 77 when --oracle hw was asked for and the hardware oracle's tools or
+GPU are missing. Nothing here reads game files.
 """
 import argparse
 import os
@@ -673,7 +674,14 @@ def main() -> int:
                 summary += (f"; {unorm8_near} R8G8B8A8_UNORM components one ulp from the exact c / 255 "
                             "(the driver's conversion)")
             print("translator: " + summary)
-            code = 1 if failed else 0
+            if failed:
+                code = 1
+            elif not passed and skipped:
+                # Nothing was compared (same exit as f64_diff / wave_diff when every program is skipped).
+                print("no program ran: every one was skipped")
+                code = 2
+            else:
+                code = 0
         if hw_oracle:
             if a.negative_control:
                 return max(code, negative_control(hw_oracle, cases, a))

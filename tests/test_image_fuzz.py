@@ -376,6 +376,25 @@ def test_self_test_runs():
     assert "self-test: ok" in r.stdout
 
 
+def test_all_skipped_translator_run_exits_2(monkeypatch, tmp_path, capsys):
+    # Same exit as f64_diff / wave_diff: nothing was compared, so exit 0 would look like a clean pass.
+    monkeypatch.setattr(imf, "run_translator", lambda *_a, **_k: (0, 0, 3, {}))
+    monkeypatch.setattr(imf, "find_test_program", lambda build, name: str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--programs", "1", "--work", str(tmp_path / "w")])
+    assert imf.main() == 2
+    out = capsys.readouterr().out
+    assert "no program ran: every one was skipped" in out
+    assert "3 skipped" in out
+
+
+def test_a_translator_run_that_compares_still_exits_0(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(imf, "run_translator", lambda *_a, **_k: (2, 0, 1, {0: True, 1: True}))
+    monkeypatch.setattr(imf, "find_test_program", lambda build, name: str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--programs", "1", "--work", str(tmp_path / "w")])
+    assert imf.main() == 0
+    assert "no program ran: every one was skipped" not in capsys.readouterr().out
+
+
 def build_dir_main_uses(monkeypatch, argv):
     """The build folder main() hands run_case for `argv`, with run_case stubbed to a pass."""
     seen = []
