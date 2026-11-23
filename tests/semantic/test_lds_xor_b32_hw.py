@@ -182,6 +182,41 @@ class ScalarLDSInterpreter:
             self.write_vgpr(inst.vdst.index, old_val)
         return old_val, new_val
 
+class SIMDWavefrontInterpreter:
+    """SIMD wavefront interpreter simulating multi-lane execution under EXEC masking."""
+
+    def __init__(self, wave_size: int = 32, capacity_dwords: int = DEFAULT_LDS_DWORDS) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64: {wave_size}")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.storage: LDSStorage = LDSStorage(capacity_dwords)
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+
+    def set_exec_mask(self, mask: int) -> None:
+        max_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & max_mask
+
+    def set_lane_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.vgprs[lane][reg_idx & 0xFF] = u32(val)
+
+    def get_lane_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx & 0xFF]
+
+    def step(self, inst: Instruction) -> list[tuple[int, int] | None]:
+        results: list[tuple[int, int] | None] = []
+        for lane in range(self.wave_size):
+            if not bool(self.exec_mask & (1 << lane)):
+                results.append(None)
+                continue
+            addr = self.get_lane_vgpr(lane, inst.vaddr.index)
+            data = self.get_lane_vgpr(lane, inst.vdata.index)
+            old_val, new_val = self.storage.atomic_xor(addr, data, inst.offset)
+            if inst.opcode == Opcode.DS_XOR_RTN_B32 and inst.vdst is not None:
+                self.set_lane_vgpr(lane, inst.vdst.index, old_val)
+            results.append((old_val, new_val))
+        return results
+
 class TestLdsXorB32Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -275,6 +310,60 @@ class TestLdsXorB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(new, 0xFFFFFFFF)
         self.assertEqual(self.interp.read_vgpr(5), 0xF0F0F0F0)
         self.assertEqual(self.interp.storage.read_dword(10), 0xFFFFFFFF)
+
+class TestLdsXorB32SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergent_lanes(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        # Each lane writes to its own dword: lane * 4
+        for lane in range(32):
+            simd.storage.write_dword(lane, 0x00000000)
+            simd.set_lane_vgpr(lane, 1, lane * 4)
+            simd.set_lane_vgpr(lane, 2, 1 << lane)
+
+        inst = Instruction(Opcode.DS_XOR_B32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 2))
+        results = simd.step(inst)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertEqual(simd.storage.read_dword(lane), 1 << lane)
+
+    def test_exec_mask_isolation(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.storage.write_dword(0, 0x55555555)
+        for lane in range(32):
+            simd.set_lane_vgpr(lane, 1, 0)
+            simd.set_lane_vgpr(lane, 2, 0xFFFFFFFF)
+            simd.set_lane_vgpr(lane, 5, 0xDEADBEEF)
+
+        # Only lane 0 is active
+        simd.set_exec_mask(0x00000001)
+        inst = Instruction(
+            Opcode.DS_XOR_RTN_B32,
+            vdst=Register(RegKind.VGPR, 5),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        simd.step(inst)
+
+        # Lane 0 received old value
+        self.assertEqual(simd.get_lane_vgpr(0, 5), 0x55555555)
+        # Disabled lanes must retain original register contents
+        for lane in range(1, 32):
+            self.assertEqual(simd.get_lane_vgpr(lane, 5), 0xDEADBEEF)
+
+    def test_multi_lane_contention_same_address(self) -> None:
+        # All 32 lanes atomic XOR to address 0
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.storage.write_dword(0, 0x00000000)
+        for lane in range(32):
+            simd.set_lane_vgpr(lane, 1, 0)
+            simd.set_lane_vgpr(lane, 2, 1 << lane)
+
+        inst = Instruction(Opcode.DS_XOR_B32, vaddr=Register(RegKind.VGPR, 1), vdata=Register(RegKind.VGPR, 2))
+        simd.step(inst)
+        # Final result must be bitwise OR/XOR of all 1 << lane = 0xFFFFFFFF
+        self.assertEqual(simd.storage.read_dword(0), 0xFFFFFFFF)
 
 if __name__ == "__main__":
     unittest.main()
