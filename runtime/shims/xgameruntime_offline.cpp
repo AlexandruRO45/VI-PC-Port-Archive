@@ -643,6 +643,46 @@ HRESULT STDMETHODCALLTYPE launcher_query_interface(void*, REFIID iid, void** out
     return answer(&g_launcher_object, &kLauncherClass, &kLauncherClass + 1, iid, out);
 }
 
+// ======================= XAppCaptureImpl =======================
+
+constexpr char kAppCaptureName[] = "XAppCaptureImpl";
+constexpr GUID kAppCaptureClass = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+const GUID kAppCaptureInterfaces[] = {
+    kAppCaptureClass,                                                                  // IXAppCaptureImpl
+    {0x3a949778, 0x772e, 0x4799, {0xbd, 0xea, 0x0a, 0x66, 0x39, 0xe9, 0x6b, 0xaa}},    // IXAppCaptureImpl2
+    {0x2bbca60a, 0x619c, 0x4fe1, {0x81, 0x2e, 0xfb, 0x5c, 0x1d, 0xbd, 0xcf, 0x51}},    // IXAppCaptureImpl3
+    {0x22e672d7, 0xb4e3, 0x406c, {0xbd, 0x50, 0x8f, 0x0d, 0x25, 0x23, 0x6f, 0x9e}},    // IXAppCaptureImpl4
+};
+
+template <int Slot> HRESULT STDMETHODCALLTYPE app_capture_offline(void* self) {
+    return offline_failure<kAppCaptureName, Slot>(self);
+}
+
+HRESULT STDMETHODCALLTYPE app_capture_query_interface(void*, REFIID iid, void** out);
+const void* const kAppCaptureVtable[] = {
+    FN(app_capture_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(app_capture_offline<3>),             // 3  XAppCaptureTakeDiagnosticScreenshot
+    FN(app_capture_offline<4>),             // 4  XAppCaptureRecordDiagnosticClip
+    FN(app_capture_offline<5>),             // 5  XAppCaptureTakeScreenshot
+    FN(app_capture_offline<6>),             // 6  XAppCaptureOpenScreenshotStream
+    FN(app_capture_offline<7>),             // 7  XAppCaptureReadScreenshotStream
+    FN(app_capture_offline<8>),             // 8  XAppCaptureCloseScreenshotStream
+    FN(app_capture_offline<9>),             // 9  XAppCaptureEnableRecord
+    FN(app_capture_offline<10>),            // 10 XAppCaptureDisableRecord
+    FN(app_capture_offline<11>),            // 11 XAppCaptureGetVideoCaptureSettings (2)
+    FN(app_capture_offline<12>),            // 12 XAppCaptureRecordTimespan (2)
+    FN(app_capture_offline<13>),            // 13 XAppCaptureReadLocalStream (2)
+    FN(app_capture_offline<14>),            // 14 XAppCaptureCloseLocalStream (2)
+    FN(app_capture_offline<15>),            // 15 XAppCaptureStartUserRecord (3)
+    FN(app_capture_offline<16>),            // 16 XAppCaptureStopUserRecord (3)
+    FN(app_capture_offline<17>),            // 17 XAppCaptureCancelUserRecord (4)
+};
+static_assert(std::size(kAppCaptureVtable) == 18, "IUnknown + IXAppCaptureImpl4's 15 methods");
+ClassObject g_app_capture_object{kAppCaptureVtable};
+HRESULT STDMETHODCALLTYPE app_capture_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_app_capture_object, std::begin(kAppCaptureInterfaces), std::end(kAppCaptureInterfaces), iid, out);
+}
+
 #undef FN
 
 }  // namespace
@@ -677,6 +717,10 @@ bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void*
     }
     if (class_id == kLauncherClass) {
         *hr = launcher_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kAppCaptureClass) {
+        *hr = app_capture_query_interface(nullptr, interface_id, out);
         return true;
     }
     return false;

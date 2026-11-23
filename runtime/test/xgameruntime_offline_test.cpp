@@ -1,5 +1,5 @@
-// XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and XLauncherImpl
-// through QueryApiImpl, called the way xgameruntime.lib's thunks
+// XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl, XLauncherImpl
+// and XAppCaptureImpl through QueryApiImpl, called the way xgameruntime.lib's thunks
 // call them: QueryApiImpl with the class id (or an interface id), one vtable slot with `this` first. Slots follow
 // xgameruntime-docs' layout; arguments follow the public GDK reference. No game data; nothing online.
 #include <windows.h>
@@ -246,6 +246,22 @@ int main() {
     void* none = reinterpret_cast<void*>(1);
     check(query(&kLauncherClass, other, &none) == E_NOINTERFACE && none == nullptr,
           "XLauncherImpl refuses an interface id it doesn't implement");
+
+    // ---- XAppCapture ----
+    constexpr GUID kAppCaptureClass = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+    constexpr GUID kAppCapture4 = {0x22e672d7, 0xb4e3, 0x406c, {0xbd, 0x50, 0x8f, 0x0d, 0x25, 0x23, 0x6f, 0x9e}};
+    void* cap = nullptr;
+    void* cap4 = nullptr;
+    check(query(&kAppCaptureClass, kAppCaptureClass, &cap) == S_OK && cap &&
+              query(&kAppCaptureClass, kAppCapture4, &cap4) == S_OK && cap4 == cap,
+          "XAppCaptureImpl for its class id and IXAppCaptureImpl4");
+    if (!cap) return 1;
+    check(at<NoArgs>(cap, 5)(cap) == E_FAIL, "slot 5 (XAppCaptureTakeScreenshot) returns E_FAIL offline");
+    GUID cap_other = kAppCaptureClass;
+    cap_other.Data1 ^= 1;
+    void* cap_none = reinterpret_cast<void*>(1);
+    check(query(&kAppCaptureClass, cap_other, &cap_none) == E_NOINTERFACE && cap_none == nullptr,
+          "XAppCaptureImpl refuses an interface id it doesn't implement");
 
     std::printf("xgameruntime_offline_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
