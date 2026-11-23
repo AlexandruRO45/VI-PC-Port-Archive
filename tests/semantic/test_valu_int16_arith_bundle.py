@@ -232,6 +232,14 @@ class TestVSubI16Interpreter(unittest.TestCase):
         self.assertEqual(res, 0x8000)
         self.assertEqual(state.vgpr[1], 0x8000)
 
+class TestVSubI16EdgeCases(unittest.TestCase):
+    def test_self_subtraction(self):
+        self.assertEqual(ref_v_sub_i16(0x1234, 0x1234), 0)
+        self.assertEqual(ref_v_sub_i16(0x8000, 0x8000), 0)
+
+    def test_underflow_wrap(self):
+        self.assertEqual(ref_v_sub_i16(0x8000, 1), 0x7FFF)  # -32768 - 1 = 32767 (wrap)
+
 
 if __name__ == "__main__":
     unittest.main()
