@@ -361,9 +361,10 @@ Target read_target(const std::wstring& path) {
     if (deleted(r.overlay, parts)) return fail(ERROR_FILE_NOT_FOUND);
 
     Target t;
-    // The name is in neither tree. In a folder only the overlay has (T:\, or one the title made) the package path
+    // The overlay does not have the name. In a folder only the overlay has (T:\, or one the title made) the package
     // has no folder either, and the host would answer ERROR_PATH_NOT_FOUND for a name that is merely missing from
-    // an existing folder. The overlay path gets Windows' ERROR_FILE_NOT_FOUND, as a write-open of the name does.
+    // an existing folder: the overlay path gets Windows' ERROR_FILE_NOT_FOUND, as a write-open of the name does.
+    // A name in a folder the package has, present there or not, still goes to the package path.
     if (!r.overlay.empty() && !parts.empty()) {
         const std::vector<std::wstring> folder = parent_of(parts);
         if (std::filesystem::is_directory(join(r.overlay, folder), ec) && !view(r, folder).in_package) {
