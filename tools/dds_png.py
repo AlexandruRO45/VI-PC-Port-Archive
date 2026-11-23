@@ -3,6 +3,7 @@
 Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
 (BGRA8, RGBA8, BGRX8, RGBX8, R10G10B10A2_UNORM, and arbitrary 32-bit RGB/RGBA bitmasks), the
 legacy 24-bit RGB layouts (BGR8/RGB8, e.g. the D3DFMT_R8G8B8 byte order),
+packed 16-bit B5G6R5, B5G5R5A1 and B4G4R4A4 (including legacy opaque X variants),
 and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
 BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
@@ -86,9 +87,12 @@ _DXGI_MAP: dict[int, str] = {
     82: "BC5",
     83: "BC5",
     84: "BC5_SNORM",
+    85: "B5G6R5",
+    86: "B5G5R5A1",
     97: "BC7",
     98: "BC7",
     99: "BC7",
+    115: "B4G4R4A4",
 }
 
 _SRGB_DXGI_FORMATS = frozenset((29, 72, 75, 78, 91, 93, 99))
@@ -110,6 +114,16 @@ _RGB24_LAYOUTS: dict[tuple[int, int, int, int], str] = {
     (0x00FF0000, 0x0000FF00, 0x000000FF, 0x00000000): "BGR8",
     (0x000000FF, 0x0000FF00, 0x00FF0000, 0x00000000): "RGB8",
 }
+
+# Microsoft DirectXTex DDS.h: DDSPF_R5G6B5, A1R5G5B5, X1R5G5B5, A4R4G4B4 and X4R4G4B4.
+_PACKED16_LAYOUTS: dict[tuple[int, int, int, int], str] = {
+    (0xF800, 0x07E0, 0x001F, 0): "B5G6R5",
+    (0x7C00, 0x03E0, 0x001F, 0x8000): "B5G5R5A1",
+    (0x7C00, 0x03E0, 0x001F, 0): "B5G5R5X1",
+    (0x0F00, 0x00F0, 0x000F, 0xF000): "B4G4R4A4",
+    (0x0F00, 0x00F0, 0x000F, 0): "B4G4R4X4",
+}
+_PACKED16_MASKS = {fmt: masks for masks, fmt in _PACKED16_LAYOUTS.items()}
 
 _R5_TO_8 = tuple((i << 3) | (i >> 2) for i in range(32))
 _G6_TO_8 = tuple((i << 2) | (i >> 4) for i in range(64))
@@ -227,6 +241,8 @@ def _parse_header_internal(
                 fmt = _DXGI_MAP.get(dxgi_format)
             if fmt is None:
                 raise DdsError(f"Unsupported DXGI format: {dxgi_format}")
+            if fmt in _PACKED16_MASKS:
+                masks = _PACKED16_MASKS[fmt]
             data_offset = DDS_DX10_HEADER_SIZE
             alpha_mode = struct.unpack_from("<I", data, 144)[0] & DDS_ALPHA_MODE_MASK
         else:
@@ -236,9 +252,9 @@ def _parse_header_internal(
             if fmt is None:
                 raise DdsError(f"Unsupported DDS FourCC: {fourcc!r}")
     elif pf_flags & DDPF_RGB:
-        if rgb_bit_count not in (24, 32):
+        if rgb_bit_count not in (16, 24, 32):
             raise DdsError(
-                f"Unsupported uncompressed RGB bit count: {rgb_bit_count} (only 24- and 32-bit supported)"
+                f"Unsupported uncompressed RGB bit count: {rgb_bit_count} (only 16-, 24- and 32-bit supported)"
             )
         if not (pf_flags & DDPF_ALPHAPIXELS):
             a_mask = 0
@@ -247,7 +263,11 @@ def _parse_header_internal(
         for m in (r_mask, g_mask, b_mask, a_mask):
             _validate_mask(m)
         masks = (r_mask, g_mask, b_mask, a_mask)
-        if rgb_bit_count == 24:
+        if rgb_bit_count == 16:
+            fmt = _PACKED16_LAYOUTS.get(masks)
+            if fmt is None:
+                raise DdsError("Unsupported 16-bit RGB bitmask layout")
+        elif rgb_bit_count == 24:
             fmt = _RGB24_LAYOUTS.get(masks)
             if fmt is None:
                 raise DdsError(
@@ -278,16 +298,18 @@ def parse_dds_header(data: bytes) -> dict:
     return info
 
 
-def _decode_uncompressed_32(
+def _decode_uncompressed_rgb(
     payload: memoryview,
     width: int,
     height: int,
     fmt: str,
     masks: tuple[int, int, int, int] | None,
     pitch: int,
+    pixel_bytes: int = 4,
 ) -> bytes:
+    """Decode packed 16- or 32-bit RGB/RGBA pixels with normalized channel scaling."""
     pixel_count = width * height
-    row_bytes = width * 4
+    row_bytes = width * pixel_bytes
     pitch = pitch or row_bytes
     if pitch < row_bytes:
         raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
@@ -300,7 +322,7 @@ def _decode_uncompressed_32(
     else:
         src = b"".join(payload[start : start + row_bytes] for start in range(0, height * pitch, pitch))
 
-    if masks is None or masks in _CANONICAL_MASKS:
+    if pixel_bytes == 4 and (masks is None or masks in _CANONICAL_MASKS):
         if fmt == "RGBA8":
             return src
         if fmt == "RGBX8":
@@ -323,10 +345,11 @@ def _decode_uncompressed_32(
     b_shift, b_max = _validate_mask(masks[2])
     a_shift, a_max = _validate_mask(masks[3])
 
-    out = bytearray(len(src))
+    out = bytearray(pixel_count * 4)
     # Fast path when all non-zero masks are byte-aligned 8-bit lanes.
     if (
-        (r_max in (0, 255) and (r_shift & 7) == 0)
+        pixel_bytes == 4
+        and (r_max in (0, 255) and (r_shift & 7) == 0)
         and (g_max in (0, 255) and (g_shift & 7) == 0)
         and (b_max in (0, 255) and (b_shift & 7) == 0)
         and (a_max in (0, 255) and (a_shift & 7) == 0)
@@ -349,7 +372,7 @@ def _decode_uncompressed_32(
     b_half = b_max >> 1
     a_half = a_max >> 1
     dst = 0
-    for (px,) in struct.iter_unpack("<I", src):
+    for (px,) in struct.iter_unpack("<H" if pixel_bytes == 2 else "<I", src):
         out[dst] = (((px >> r_shift) & r_max) * 255 + r_half) // r_max if r_max else 0
         out[dst + 1] = (((px >> g_shift) & g_max) * 255 + g_half) // g_max if g_max else 0
         out[dst + 2] = (((px >> b_shift) & b_max) * 255 + b_half) // b_max if b_max else 0
@@ -1028,10 +1051,13 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     fmt = str(info["format"])
     offset = int(info["data_offset"])  # type: ignore[arg-type]
 
-    if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
+    packed16 = fmt in _PACKED16_MASKS
+    if packed16 or fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+        rgba = _decode_uncompressed_rgb(
+            memoryview(data)[offset:], width, height, fmt, masks, pitch, pixel_bytes=2 if packed16 else 4,
+        )
     elif fmt in _RGB24_LAYOUTS.values():
         assert masks is not None
         flags = struct.unpack_from("<I", data, 8)[0]

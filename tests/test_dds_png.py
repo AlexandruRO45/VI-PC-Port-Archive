@@ -348,8 +348,8 @@ class HeaderTests(unittest.TestCase):
             dds.parse_dds_header(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"XXXX"))
         self.assertIn("FourCC", str(ctx.exception))
 
-    def test_rejects_non_24_or_32_bit_rgb(self):
-        for bit_count in (8, 16):
+    def test_rejects_unsupported_rgb_bit_counts(self):
+        for bit_count in (8, 64):
             with self.subTest(bit_count=bit_count):
                 with self.assertRaises(dds.DdsError) as ctx:
                     dds.parse_dds_header(
@@ -394,6 +394,97 @@ class HeaderTests(unittest.TestCase):
                            masks=(0x00FF00FF, 0x0000FF00, 0x000000FF, 0))
             )
         self.assertIn("Non-contiguous", str(ctx.exception))
+
+
+class Packed16Tests(unittest.TestCase):
+    # Microsoft DirectXTex DDS.h: R5G6B5, A1R5G5B5 and A4R4G4B4.
+    CASES = (
+        (85, "B5G6R5", (0xF800, 0x07E0, 0x001F, 0),
+         (0xF800, 0x07E0, 0x001F, 0x8410, 0x1863),
+         ((255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255),
+          (132, 130, 132, 255), (25, 12, 25, 255))),
+        (86, "B5G5R5A1", (0x7C00, 0x03E0, 0x001F, 0x8000),
+         (0xFC00, 0x03E0, 0x801F, 0xFFFF, 0x4210),
+         ((255, 0, 0, 255), (0, 255, 0, 0), (0, 0, 255, 255),
+          (255, 255, 255, 255), (132, 132, 132, 0))),
+        (115, "B4G4R4A4", (0x0F00, 0x00F0, 0x000F, 0xF000),
+         (0xFF00, 0x00F0, 0x800F, 0xFFFF, 0x1234),
+         ((255, 0, 0, 255), (0, 255, 0, 0), (0, 0, 255, 136),
+          (255, 255, 255, 255), (34, 51, 68, 17))),
+    )
+
+    def headers(self, dxgi, masks):
+        yield dict(flags=DDPF_RGB | (DDPF_ALPHAPIXELS if masks[3] else 0),
+                   bit_count=16, masks=masks)
+        yield dict(flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi)
+
+    def test_legacy_and_dx10_channels_and_normalized_scaling(self):
+        for dxgi, fmt, masks, words, expected in self.CASES:
+            for header in self.headers(dxgi, masks):
+                with self.subTest(format=fmt, header=header):
+                    data = dds_buffer(len(words), 1, struct.pack("<5H", *words), **header)
+                    self.assertEqual(dds.parse_dds_header(data)["format"], fmt)
+                    w, h, rgba = dds.decode_dds(data)
+                    self.assertEqual((w, h), (5, 1))
+                    self.assertEqual(pixels(rgba), list(expected))
+
+    def test_legacy_x_variants_ignore_unused_alpha_bits(self):
+        for _, fmt, masks, words, expected in self.CASES[1:]:
+            with self.subTest(format=fmt):
+                data = dds_buffer(5, 1, struct.pack("<5H", *words), flags=DDPF_RGB,
+                                  bit_count=16, masks=masks)
+                self.assertEqual(pixels(dds.decode_dds(data)[2]),
+                                 [(*rgba[:3], 255) for rgba in expected])
+
+    def test_unsupported_16_bit_masks_are_refused(self):
+        for masks in ((0x00FF0000, 0x0000FF00, 0x000000FF, 0),
+                      (0x000F, 0x00F0, 0x0F00, 0xF000)):
+            with self.subTest(masks=masks), self.assertRaisesRegex(dds.DdsError, "16-bit RGB bitmask"):
+                dds.parse_dds_header(dds_buffer(1, 1, b"\x00\x00", flags=DDPF_RGB | DDPF_ALPHAPIXELS,
+                                                bit_count=16, masks=masks))
+
+    def test_row_padding_and_payload_bounds(self):
+        for dxgi, fmt, masks, words, expected in self.CASES:
+            for header in self.headers(dxgi, masks):
+                with self.subTest(format=fmt, header=header):
+                    payload = struct.pack("<H", words[0]) + b"\xaa\xbb" + struct.pack("<H", words[1])
+                    data = dds_buffer(1, 2, payload, pitch=4, **header)
+                    self.assertEqual(dds.decode_dds(data), (1, 2, bytes(expected[0] + expected[1])))
+                    with self.assertRaisesRegex(dds.DdsError, "Truncated"):
+                        dds.decode_dds(dds_buffer(1, 2, payload[:-1], pitch=4, **header))
+                    with self.assertRaisesRegex(dds.DdsError, "pitch"):
+                        dds.decode_dds(dds_buffer(1, 2, payload, pitch=1, **header))
+
+    def test_zero_or_unflagged_pitch_is_tightly_packed(self):
+        for dxgi, _, _, words, expected in self.CASES:
+            header = dict(flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi)
+            payload = struct.pack("<2H", *words[:2])
+            data = bytearray(dds_buffer(1, 2, payload, pitch=0, **header))
+            self.assertEqual(pixels(dds.decode_dds(data)[2]), list(expected[:2]))
+            struct.pack_into("<I", data, 8, 0)  # a stale pitch field without DDSD_PITCH
+            struct.pack_into("<I", data, 20, 100)
+            self.assertEqual(pixels(dds.decode_dds(data)[2]), list(expected[:2]))
+
+    def test_dx10_alpha_modes_are_applied(self):
+        data = dds_buffer(1, 1, struct.pack("<H", 0x8888), flags=DDPF_FOURCC,
+                          fourcc=b"DX10", dxgi=115, alpha_mode=2)
+        self.assertEqual(dds.decode_dds(data), (1, 1, bytes((255, 255, 255, 136))))
+        data = dds_buffer(1, 1, struct.pack("<H", 0x1234), flags=DDPF_FOURCC,
+                          fourcc=b"DX10", dxgi=115, alpha_mode=3)
+        self.assertEqual(dds.decode_dds(data), (1, 1, bytes((34, 51, 68, 255))))
+
+    def test_png_and_cli_preview(self):
+        for dxgi, _, _, words, expected in self.CASES:
+            with self.subTest(dxgi=dxgi), tempfile.TemporaryDirectory() as folder:
+                src = os.path.join(folder, "input.dds")
+                dst = os.path.join(folder, "output.png")
+                with open(src, "wb") as handle:
+                    handle.write(dds_buffer(1, 1, struct.pack("<H", words[0]),
+                                            flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi))
+                self.assertEqual(dds.main([src, dst]), 0)
+                with open(dst, "rb") as handle:
+                    chunks = png_chunks(handle.read())
+                self.assertEqual(zlib.decompress(chunks[1][1]), b"\x00" + bytes(expected[0]))
 
 
 class UncompressedTests(unittest.TestCase):
