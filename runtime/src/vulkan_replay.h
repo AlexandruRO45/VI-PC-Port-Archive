@@ -4090,7 +4090,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
                                         &set0, 0, nullptr);
             }
-            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            // The geometry fallback's draw VS reads the record, meta and primitive count past the block
+            // (SHADER-1092); the pipeline's layout declares exactly this many bytes. Every other draw pushes
+            // the block.
+            if (!draw->tail_words) {
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            } else {
+                std::vector<std::uint8_t> push_bytes(sizeof(data) + std::size_t(4) * draw->tail_words);
+                std::memcpy(push_bytes.data(), &data, sizeof(data));
+                std::memcpy(push_bytes.data() + sizeof(data), draw->tail.data(),
+                            std::size_t(4) * draw->tail_words);
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0,
+                                 std::uint32_t(push_bytes.size()), push_bytes.data());
+            }
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
             const Viewport& v = draw->viewport;
