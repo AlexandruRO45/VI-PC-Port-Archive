@@ -271,6 +271,51 @@ class MalformedIndexTest(unittest.TestCase):
         self.assertIn("ps_bad: invalid graphics interface locations", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_deeply_nested_index_json_is_one_error_not_a_traceback(self):
+        deep = "[" * 2000 + "]" * 2000
+        p = self.run_tool(deep)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("cannot read", p.stderr)
+        self.assertIn("index.json", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            with patch.object(spirv_stubs.json, "load", side_effect=RecursionError("maximum recursion depth exceeded")):
+                with self.assertRaises(SystemExit) as cm:
+                    spirv_stubs.main([tmp])
+            self.assertIn("cannot read", str(cm.exception))
+
+    def test_direct_builders_reject_bool_float_and_out_of_range_locations(self):
+        for bad in ([True], [False], [1.5], [-1], [0x100000000]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    spirv_stubs.stub_name("vs", bad)
+                with self.assertRaises(ValueError):
+                    spirv_stubs.build_vs_stub(bad)
+                with self.assertRaises(ValueError):
+                    spirv_stubs.build_ps_stub(bad)
+                with self.assertRaises(ValueError):
+                    spirv_stubs.build_ps_stub([0], flat_locations=bad)
+
+    def test_generate_for_index_updates_symlink_target_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stubs_dir = os.path.join(tmp, "stubs")
+            os.makedirs(stubs_dir)
+            real_target = os.path.join(tmp, "real_vs_0.spv")
+            with open(real_target, "wb") as f:
+                f.write(b"stale")
+            link_path = os.path.join(stubs_dir, "vs_0.spv")
+            try:
+                os.symlink(real_target, link_path)
+            except OSError as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            written = spirv_stubs.generate_for_index(tmp, {"ps_a": {"stage": "ps", "inputs": [0]}})
+            self.assertEqual(written, ["vs_0.spv"])
+            self.assertTrue(os.path.islink(link_path))
+            with open(real_target, "rb") as f:
+                self.assertEqual(f.read(), spirv_stubs.build_vs_stub([0]))
+
 
 class IndexEncodingTest(unittest.TestCase):
     def test_index_saved_with_a_utf8_bom_is_read(self):

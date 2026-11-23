@@ -69,16 +69,25 @@ def _encode_str(text):
     return list(struct.unpack(f"<{len(raw) // 4}I", raw))
 
 
+def _normalize_locations(locations):
+    out = set()
+    for x in locations:
+        if type(x) is not int or not 0 <= x <= 0xFFFFFFFF:
+            raise ValueError(f"invalid Location: {x!r}")
+        out.add(x)
+    return sorted(out)
+
+
 def stub_name(kind, locations):
     """Canonical filename for a stub of kind ('vs' or 'ps') matching sorted unique `locations`."""
-    locs = sorted({int(x) for x in locations})
+    locs = _normalize_locations(locations)
     suffix = "_".join(str(x) for x in locs) if locs else "empty"
     return f"{kind}_{suffix}.spv"
 
 
 def build_vs_stub(out_locations=()):
     """Minimal Vertex SPIR-V 1.0 module writing BuiltIn Position=(0,0,0,1) and vec4(0) to each Location."""
-    locs = sorted({int(x) for x in out_locations})
+    locs = _normalize_locations(out_locations)
     nid = 1
 
     def alloc():
@@ -135,8 +144,8 @@ def build_vs_stub(out_locations=()):
 
 def build_ps_stub(in_locations=(), flat_locations=()):
     """Minimal Fragment SPIR-V 1.0 module reading each Location as vec4 and writing Location 0."""
-    locs = sorted({int(x) for x in in_locations})
-    flat = {int(x) for x in flat_locations}
+    locs = _normalize_locations(in_locations)
+    flat = set(_normalize_locations(flat_locations))
     nid = 1
 
     def alloc():
@@ -260,18 +269,20 @@ def generate_for_index(spirv_dir, index):
         fname = stub_name(kind, locs)
         data = build_vs_stub(locs) if kind == "vs" else build_ps_stub(locs)
         target = os.path.join(stubs_dir, fname)
+        dest = os.path.realpath(target)
+        dest_dir = os.path.dirname(dest) or stubs_dir
         # A sibling file inherits the output directory's permissions.
-        staged = os.path.join(stubs_dir, f".stub-{uuid.uuid4().hex}.tmp")
+        staged = os.path.join(dest_dir, f".stub-{uuid.uuid4().hex}.tmp")
         stream = open(staged, "xb")
         try:
             with stream as f:
                 f.write(data)
             if os.name == "posix":
                 try:
-                    shutil.copymode(target, staged)
+                    shutil.copymode(dest, staged)
                 except FileNotFoundError:
                     pass
-            _replace_stub(staged, target)
+            _replace_stub(staged, dest)
         except BaseException:
             try:
                 os.remove(staged)
@@ -296,7 +307,7 @@ def main(argv=None):
     try:
         with open(idx_path, encoding="utf-8-sig") as f:
             index = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         sys.exit(f"cannot read {idx_path}: {e}")
     if not isinstance(index, dict):
         sys.exit(f"cannot read {idx_path}: expected a JSON object of shader -> metadata entries")
