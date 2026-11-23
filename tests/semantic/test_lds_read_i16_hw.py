@@ -540,5 +540,47 @@ class TestLdsReadI16SIMD(unittest.TestCase):
         self.assertEqual(mem.get(8), 0xFFFF8000)
 
 
+
+class TestLdsReadI16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register preservation and operand aliasing."""
+
+    def test_unrelated_vgprs_preserved(self) -> None:
+        interp = ScalarLDSInterpreter(capacity_dwords=1024)
+        for r in range(256):
+            interp.write_reg_u32(RegKind.VGPR, r, 0xCAFE0000 | r)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        interp.lds.write_dword(0x10, 0x7FFF)
+
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 5),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0x7FFF)
+        for r in range(256):
+            if r == 5:
+                self.assertEqual(interp.read_reg_u32(RegKind.VGPR, r), 0x7FFF)
+            elif r == 1:
+                self.assertEqual(interp.read_reg_u32(RegKind.VGPR, r), 0x10)
+            else:
+                self.assertEqual(interp.read_reg_u32(RegKind.VGPR, r), 0xCAFE0000 | r)
+
+    def test_vdst_vaddr_aliased(self) -> None:
+        # ds_read_i16 v1, v1: v1 is read as address, then overwritten with sign-extended result
+        interp = ScalarLDSInterpreter(capacity_dwords=1024)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0x20)
+        interp.lds.write_dword(0x20, 0xFFFF)  # -1
+
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 1),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 0xFFFFFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
