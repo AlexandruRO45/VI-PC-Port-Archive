@@ -473,6 +473,29 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("not the output of ctest", err)
 
+    def test_invalid_fixture_property_types_are_rejected_before_launch(self):
+        setup = ctest_entry("setup", self.command("bad.py"), {"FIXTURES_SETUP": ["example"]})
+        consumer = ctest_entry("consumer", self.command("ok.py"), {"FIXTURES_REQUIRED": ["example"]})
+        for field, value in (
+            ("FIXTURES_SETUP", "example"),
+            ("FIXTURES_REQUIRED", "example"),
+            ("FIXTURES_SETUP", 7),
+            ("FIXTURES_REQUIRED", None),
+            ("FIXTURES_SETUP", [["example"]]),
+        ):
+            with self.subTest(field=field, value=value):
+                entry = setup if field == "FIXTURES_SETUP" else consumer
+                malformed = ctest_entry(entry["name"], entry["command"], {field: value})
+                entries = [consumer, malformed] if field == "FIXTURES_SETUP" else [malformed, setup]
+                with mock.patch.object(rwt, "run_test", wraps=rwt.run_test) as launch:
+                    code, out, err = self.run_main(entries, "--require", "consumer")
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn(f"invalid CTest {field} for {entry['name']}", err)
+                self.assertIn("ctest.json", err)
+                self.assertNotIn("Traceback", err)
+                launch.assert_not_called()
+
     def test_malformed_command_and_property_rows_are_rejected_before_launch(self):
         for fields in (
             {"command": "D:/win/root/artifact/ok.py"},

@@ -269,6 +269,14 @@ def read_tests(path: str) -> list[dict] | None:
     if not isinstance(tests, list) or not all(valid_test_row(t) for t in tests):
         print(f"ERROR: {path} is not the output of ctest --show-only=json-v1", file=sys.stderr)
         return None
+    for test in tests:
+        props = properties(test)
+        for name in ("FIXTURES_SETUP", "FIXTURES_REQUIRED"):
+            fixtures = props.get(name, [])
+            if not isinstance(fixtures, list) or any(not isinstance(fixture, str) for fixture in fixtures):
+                print(f"ERROR: {path}: invalid CTest {name} for {test['name']}: expected a list of strings",
+                      file=sys.stderr)
+                return None
     return tests
 
 
