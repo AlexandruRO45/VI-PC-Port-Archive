@@ -58,3 +58,36 @@ input can be analyzed, there is no JSON summary. The summary describes the
 recorded events, and the exit status reports the analysis result.
 
 You can also run `python -I tools/boot_trace.py` with the same arguments.
+
+## Run a synthetic guest scene
+
+Use the existing headless runner with a loader and guest built on Windows
+with Vulkan, static SDL3 and `LEONIDA_GUEST_SCENE=ON`. Supply the synthetic
+M1.5 shader fixture root containing `spirv/`. See the
+[runtime instructions](../runtime/README.md#a-600-frame-headless-guest-scene)
+for the build, fixture and Wine setup.
+
+```powershell
+python -I scripts/dev.py guest-scene --help
+python -I scripts/dev.py guest-scene --loader "build/gta6rt.exe" --guest "build/tiny_guest_draw.exe" --shaders "m15 shaders" --out "scene run" --negative-controls
+```
+
+Pass `--out PATH` or `--out=PATH` with a new or empty directory. Relative
+paths are interpreted from the directory where you run the CLI, including
+when you invoke `scripts/dev.py` by its full path from another directory.
+
+The CLI forwards the runner's exit code and diagnostics. Exit code `0`
+means the scene checks passed. Exit code `1` can indicate a scene check
+failure or a failure before the runner can write a report, such as an
+output directory it cannot create. Exit code `2` indicates a usage or
+prerequisite error.
+
+When the runner writes `report.json`, it prints the path. Open that file
+for the scene result and per-run details. For example, if the full run
+starts and the loader exits with an error, `runs.full.returncode` records
+the loader's exit code while the CLI returns the runner's exit code.
+The output directory also holds any logs, frame records and PPM images
+the runner produced. If the runner rejects an occupied directory, any
+report already there belongs to an earlier run.
+
+You can also invoke `python -I scripts/run_guest_scene.py` directly.
