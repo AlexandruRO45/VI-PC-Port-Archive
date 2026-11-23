@@ -88,10 +88,13 @@ int main() {
             status = cv.wait_until(lock, deadline);
             ++attempts;
         } while (status == std::cv_status::no_timeout && attempts < 1000);
-        const long long waited = ms_since(start);
-        std::printf("  unnotified 200 ms wait took %lld ms (wait_until calls = %d)\n", waited, attempts);
+        const auto finished = Clock::now();
+        const auto elapsed = finished - start;
+        std::printf("  unnotified 200 ms wait took %.6f ms (wait_until calls = %d)\n",
+                    std::chrono::duration<double, std::milli>(elapsed).count(), attempts);
         check(status == std::cv_status::timeout, "an unnotified wait reports a timeout");
-        check(waited >= 150 && waited < 2000, "an unnotified wait lasts about its timeout");
+        check(finished >= deadline, "an unnotified wait reaches its original deadline");
+        check(elapsed < std::chrono::seconds(2), "an unnotified wait finishes in under two seconds");
         check(lock.owns_lock(), "the mutex is held again after the timeout");
         bool other_got_it = true;
         std::thread probe([&] { other_got_it = mutex.try_lock(); if (other_got_it) mutex.unlock(); });
