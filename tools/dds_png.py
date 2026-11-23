@@ -177,6 +177,8 @@ _BC7_UNQUANTIZE = {
 _BC7_ROTATIONS = ((0, 1, 2, 3), (3, 1, 2, 0), (0, 3, 2, 1), (0, 1, 3, 2))
 _BC7_RESERVED_BLOCK = bytes(64)
 _BC7_BLOCK_CACHE_LIMIT = 4096
+# Blocks decoded and copied per batch in _decode_bc7; bounds its temporary storage by width.
+_BC7_BATCH_BLOCKS = 16
 
 
 def _bc7_partition_layouts() -> tuple:
@@ -1268,39 +1270,55 @@ def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, h
     cache: dict[bytes, bytes] = {}
     from_bytes = int.from_bytes
     pos = offset
-    chunk_size = blocks_x * 16
-    # One pixel row of a block row is interleaved from the blocks' 4-pixel rows. Copy it as
-    # 32-bit pixels with four strided assignments instead of one slice per block and row.
-    strip = bytearray(blocks_x * 16)
-    strip_view = memoryview(strip)
-    strip_pixels = strip_view.cast("I")
+    # A block row is decoded in batches of at most _BC7_BATCH_BLOCKS blocks, so the temporary
+    # storage stays bounded however wide the texture is. A batch's pixel rows are interleaved from
+    # the blocks' 4-pixel rows: copy them as 32-bit pixels with four strided assignments instead
+    # of one slice per block and row, and only for the rows the image uses.
+    batch_blocks = min(blocks_x, _BC7_BATCH_BLOCKS)
+    strip = bytearray(batch_blocks * 16)
+    strip_pixels = memoryview(strip).cast("I")
+    strip_bytes = memoryview(strip)
 
     for by in range(blocks_y):
         py0 = by * 4
         max_y = height - py0
         if max_y > 4:
             max_y = 4
-        chunk = bytes(data[pos : pos + chunk_size])
-        pos += chunk_size
+        row_dst = py0 * row_stride
+        for bx0 in range(0, blocks_x, batch_blocks):
+            count = blocks_x - bx0
+            if count > batch_blocks:
+                count = batch_blocks
+            chunk = bytes(data[pos : pos + count * 16])
+            pos += count * 16
 
-        blocks = []
-        for i in range(0, chunk_size, 16):
-            key = chunk[i : i + 16]
-            block_rgba = cache.get(key)
-            if block_rgba is None:
-                block_rgba = _decode_bc7_block(from_bytes(key, "little"))
-                if len(cache) < _BC7_BLOCK_CACHE_LIMIT:
-                    cache[key] = block_rgba
-            blocks.append(block_rgba)
-        pixels = memoryview(b"".join(blocks)).cast("I")
+            blocks = []
+            for i in range(0, count * 16, 16):
+                key = chunk[i : i + 16]
+                block_rgba = cache.get(key)
+                if block_rgba is None:
+                    block_rgba = _decode_bc7_block(from_bytes(key, "little"))
+                    if len(cache) < _BC7_BLOCK_CACHE_LIMIT:
+                        cache[key] = block_rgba
+                blocks.append(block_rgba)
+            pixels = memoryview(b"".join(blocks)).cast("I")
 
-        dst = py0 * row_stride
-        for ty in range(max_y):
-            for x in range(4):
-                strip_pixels[x::4] = pixels[4 * ty + x :: 16]
-            out[dst : dst + row_stride] = strip_view[:row_stride]
-            dst += row_stride
+            # The last block of a row can reach past the image; copy only the columns inside it.
+            x0 = bx0 * 16
+            span = count * 16
+            if x0 + span > row_stride:
+                span = row_stride - x0
+            lanes = strip_pixels[: count * 4]
+            dst = row_dst + x0
+            for ty in range(max_y):
+                for x in range(4):
+                    lanes[x::4] = pixels[4 * ty + x :: 16]
+                out[dst : dst + span] = strip_bytes[:span]
+                dst += row_stride
 
+    # Drop the batch buffers before the final copy, so the peak there is just the output twice.
+    del cache, strip, strip_pixels, strip_bytes
+    chunk = blocks = pixels = lanes = None
     return bytes(out)
 
 

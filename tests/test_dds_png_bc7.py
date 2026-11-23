@@ -11,6 +11,7 @@ import importlib.util
 import os
 import random
 import struct
+import tracemalloc
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -242,6 +243,31 @@ class Bc7ImageTests(unittest.TestCase):
                  (1, 17), (33, 17), (130, 6), (4, 33), (31, 31), (64, 8)]
         for index, (width, height) in enumerate(sizes):
             self.check(width, height, seed=100 + index)
+
+    def test_rows_wider_than_one_batch(self):
+        # A block row is decoded in batches; cross the batch edge with whole, partial and
+        # image-clipped last batches, for one-row and multi-row images.
+        batch = dds._BC7_BATCH_BLOCKS
+        for index, (width, height) in enumerate([
+                (4 * batch, 1), (4 * batch + 1, 1), (4 * batch + 4, 3), (4 * (2 * batch) - 3, 5),
+                (4 * (3 * batch + 1) - 1, 2), (1030, 9)]):
+            self.check(width, height, seed=200 + index, duplicate=0.3)
+
+    def test_wide_one_row_decode_memory_stays_bounded(self):
+        # A 16384 x 1 image keeps one pixel row of its block row, so the decoder must not hold
+        # the block row's other three: output twice (about 131 KB) plus a small constant.
+        width = 16384
+        block = bytes([1]) + bytes(15)
+        payload = block * (width // 4)
+        dds._decode_bc7(block, 0, 4, 4)
+        tracemalloc.start()
+        try:
+            got = dds._decode_bc7(payload, 0, width, 1)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(got, reference_block(int.from_bytes(block, "little"))[:16] * (width // 4))
+        self.assertLess(peak, 140_000)
 
     def test_repeated_blocks_use_the_block_cache_correctly(self):
         self.check(64, 64, seed=1, duplicate=0.8)
