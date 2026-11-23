@@ -14,10 +14,12 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+
 
 CASES = {
     # Minimal compute using the subgroup lane id (valid everywhere).
@@ -185,7 +187,15 @@ def vulkan_matrix():
         r = run(["vulkaninfo", "-j"], cwd=d)
         if r is None or r.returncode != 0:
             return m
+        summary = run(["vulkaninfo", "--summary"], cwd=d)
+        if summary is not None and summary.returncode == 0 and isinstance(summary.stdout, str):
+            seen_gpus = {"0"}
+            for idx in re.findall(r"(?m)^GPU(\d+)\s*:", summary.stdout):
+                if idx not in seen_gpus:
+                    seen_gpus.add(idx)
+                    run(["vulkaninfo", f"-j={idx}"], cwd=d)
         files = sorted(glob.glob(os.path.join(d, "VP_VULKANINFO_*.json")))
+
         for path in files:
             try:
                 with open(path, encoding="utf-8") as f:

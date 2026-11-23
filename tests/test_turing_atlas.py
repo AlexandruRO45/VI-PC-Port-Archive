@@ -115,6 +115,42 @@ class VulkanMatrixTests(unittest.TestCase):
         self.assertEqual(matrix["vulkaninfo"], "ok")
         self.assertEqual(matrix["device"]["name"], "Native Discrete GPU")
 
+    def test_enumerates_gpus_from_summary_when_plain_j_only_writes_gpu0(self):
+        llvmpipe = report()
+        llvmpipe["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"].update({
+            "deviceName": "llvmpipe (LLVM 19.1.0, 256 bits)",
+            "vendorID": 0x10005,
+            "deviceType": "VK_PHYSICAL_DEVICE_TYPE_CPU",
+        })
+        dgpu = report()
+        dgpu["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"].update({
+            "deviceName": "Discrete GPU 1",
+            "vendorID": 0x10DE,
+            "deviceType": "VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU",
+        })
+        calls = []
+
+        def run(cmd, cwd):
+            calls.append(tuple(cmd))
+            if cmd == ["vulkaninfo", "-j"]:
+                Path(cwd, "VP_VULKANINFO_llvmpipe.json").write_text(json.dumps(llvmpipe), encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd == ["vulkaninfo", "--summary"]:
+                out = "Devices:\n========\nGPU0:\n\tdeviceName = llvmpipe\nGPU1:\n\tdeviceName = Discrete GPU 1\n"
+                return subprocess.CompletedProcess(cmd, 0, out, "")
+            if cmd == ["vulkaninfo", "-j=1"]:
+                Path(cwd, "VP_VULKANINFO_dgpu1.json").write_text(json.dumps(dgpu), encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+
+        with patch.object(turing_atlas.shutil, "which", return_value="vulkaninfo"):
+            with patch.object(turing_atlas, "run", run):
+                matrix = turing_atlas.vulkan_matrix()
+        self.assertEqual(matrix["vulkaninfo"], "ok")
+        self.assertEqual(matrix["device"]["name"], "Discrete GPU 1")
+        self.assertEqual(calls, [("vulkaninfo", "-j"), ("vulkaninfo", "--summary"), ("vulkaninfo", "-j=1")])
+
+
 
 
 class ValidationGateTests(unittest.TestCase):
