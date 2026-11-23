@@ -804,6 +804,14 @@ class _Wave:
                 raise UnsupportedConstruct("nested OpCompositeInsert")
             v[int(a[3])] = self.raw(lane, a[1])
             return tuple(v)
+        if op == "OpBitcast" and a[0] in m.ptr_types:
+            cls, pointee = m.ptr_types[a[0]]
+            src = m.types[m.id_type[a[1]]]
+            if cls != "PhysicalStorageBuffer" or src[0] != "vec" or src[2] != 2 or m.types[src[1]][:2] != ("int", 32):
+                raise UnsupportedConstruct("OpBitcast to pointer requires a two-word physical address")
+            lo, hi = self.val(lane, a[1])
+            lane.pointers[res] = ("psb", (lo & MASK) | ((hi & MASK) << 32), pointee)
+            return None
         if op == "OpBitcast":
             k, v = m.types[a[0]], self.val(lane, a[1])
             if k[0] == "float" and isinstance(v, int) and not isinstance(v, bool):

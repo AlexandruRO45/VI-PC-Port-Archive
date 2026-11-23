@@ -463,9 +463,8 @@ class AtomicNaturalAlignment(unittest.TestCase):
         for body, mask_const in cases:
             with self.subTest(insn=body[-1]):
                 spv = translate(body)
-                self.assertIn("OpUConvert %uint", spv)
-                self.assertIn("OpBitwiseAnd %uint", spv)
-                self.assertIn(mask_const, spv)
+                self.assertRegex(spv, rf"(%\w+) = OpBitwiseAnd %uint %\w+ {mask_const}\s+"
+                                      rf"%\w+ = OpIEqual %bool \1 %c0\b")
 
 
 if __name__ == "__main__":

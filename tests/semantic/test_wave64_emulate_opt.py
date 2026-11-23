@@ -441,6 +441,13 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 vals[res] = v
             elif op == "OpCompositeConstruct":
                 vals[res] = tuple(vals[x] for x in a[1:])
+            elif op == "OpBitcast" and ptr_types.get(a[0], (None,))[0] == "PhysicalStorageBuffer":
+                src = types[id_t[a[1]]]
+                if src[0] != "vec" or src[2] != 2 or types[src[1]][:2] != ("int", 32):
+                    raise NotImplementedError(f"OpBitcast {line}")
+                lo, hi = vals[a[1]]
+                ptrs[res] = ("psb", (lo & MASK32) | ((hi & MASK32) << 32))
+                vals[res] = ptrs[res]
             elif op == "OpConvertUToPtr":
                 ptrs[res] = ("psb", vals[a[1]])
                 vals[res] = ptrs[res]
@@ -1324,11 +1331,12 @@ class StructuredEmulationTests(unittest.TestCase):
             i2 = next(i for i, l in enumerate(lines) if l.strip().startswith("%blk2 = OpLabel"))
             i3 = next(i for i, l in enumerate(lines) if l.strip().startswith("%blk3 = OpLabel"))
             blk2_to_end = lines[i2:]
-            store_idx = next(i for i, l in enumerate(blk2_to_end)
-                             if "OpStore" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
-            i3_rel = i3 - i2
-            load_idx = next(i for i, l in enumerate(blk2_to_end[i3_rel:], i3_rel)
-                            if "OpLoad %uint" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
+            # Follow the access-chain result to the actual physical memory operation.
+            pointers = {line.split()[0] for line in blk2_to_end if " = OpAccessChain %_ptr_PSB_uint " in line}
+            store_idx = next(i for i, line in enumerate(blk2_to_end[:i3 - i2])
+                             if line.strip().startswith("OpStore ") and line.split()[1] in pointers)
+            load_idx = next(i for i, line in enumerate(blk2_to_end[i3 - i2:], i3 - i2)
+                            if " = OpLoad %uint " in line and line.split()[4] in pointers)
             self.assertTrue(any("OpControlBarrier" in l for l in blk2_to_end[store_idx:load_idx]),
                             f"missing OpControlBarrier between blk2 buffer_store and blk3 buffer_load ({expected_mode})")
             for rev in (False, True):
