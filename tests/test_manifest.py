@@ -354,6 +354,17 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(p_verify.returncode, 0, p_verify.stderr)
         self.assertIn("OK", p_verify.stdout)
 
+    def test_cli_verify_accepts_utf8_bom(self):
+        created = self.run_cli("create", self.pkg, "--out", self.out_manifest)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        with open(self.out_manifest, "r+b") as f:
+            content = f.read()
+            f.seek(0)
+            f.write(b"\xef\xbb\xbf" + content)
+        verified = self.run_cli("verify", self.pkg, "--manifest", self.out_manifest)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(verified.stdout.strip(), "OK")
+
     def test_in_tree_manifest_is_ignored_on_create_and_verify(self):
         manifest_path = os.path.join(self.pkg, "reports", "manifest.json")
         for _ in range(2):

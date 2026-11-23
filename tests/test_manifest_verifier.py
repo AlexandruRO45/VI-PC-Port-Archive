@@ -628,6 +628,15 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertEqual(res.stdout.strip(), "OK")
 
+    def test_cli_verify_accepts_utf8_bom(self) -> None:
+        with open(self.manifest_path, "r+b") as f:
+            content = f.read()
+            f.seek(0)
+            f.write(b"\xef\xbb\xbf" + content)
+        res = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--json")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(json.loads(res.stdout)["matched_count"], len(SYNTHETIC_SIZES))
+
     def test_cli_verify_subcommand_syntax(self) -> None:
         res = self.run_cli("verify", self.game_dir, "--manifest", self.manifest_path)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)

@@ -152,6 +152,8 @@ textures; the original RPF paths still require the missing executable/key.
 
 `tools/manifest.py` is independent of RPF: it hashes a directory tree and verifies it later, with `--jobs` on
 both paths. It is used to check exported assets without keeping a second copy.
+Both it and `tools/manifest_verifier.py` can read UTF-8 JSON manifests with or without a leading
+byte-order mark, such as those saved by Windows PowerShell 5.1.
 
 `tools/rpf9_names.py` is the lightweight lookup pass: it walks the same data area, inflates a bounded prefix
 of each zlib stream and indexes the measured `name.#dr`/`#ft`/`#dd` spellings with their archive offsets. It
