@@ -158,3 +158,69 @@ class TestDsSwizzleB32Oracle(unittest.TestCase):
         res = ref_swizzle_wave(src, dst_old, off, 0xFFFFFFFF)
         self.assertEqual(res[0:4], [1, 2, 3, 0])
         self.assertEqual(res[4:8], [5, 6, 7, 4])
+
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+class SwizzleKind(Enum):
+    QUAD_PERM = auto()
+    BITMASK_PERM = auto()
+    SWAP = auto()
+    REVERSE = auto()
+    BROADCAST = auto()
+    NUMERIC = auto()
+
+
+@dataclass(frozen=True)
+class DsSwizzleB32AST:
+    vdst_idx: int
+    vsrc_idx: int
+    kind: SwizzleKind
+    offset16: int
+    args: tuple[int, ...] = ()
+    pattern: str = ""
+
+    def to_assembly(self) -> str:
+        if self.kind == SwizzleKind.SWAP:
+            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(SWAP,{self.args[0]})"
+        elif self.kind == SwizzleKind.REVERSE:
+            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(REVERSE,{self.args[0]})"
+        elif self.kind == SwizzleKind.BROADCAST:
+            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(BROADCAST,{self.args[0]},{self.args[1]})"
+        elif self.kind == SwizzleKind.QUAD_PERM:
+            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(QUAD_PERM,{','.join(str(x) for x in self.args)})"
+        elif self.kind == SwizzleKind.BITMASK_PERM:
+            return f'ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(BITMASK_PERM,"{self.pattern}")'
+        else:
+            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:{self.offset16:#x}"
+
+
+class TestDsSwizzleB32AST(unittest.TestCase):
+    def test_ast_swap_assembly(self) -> None:
+        ast = DsSwizzleB32AST(
+            vdst_idx=0,
+            vsrc_idx=1,
+            kind=SwizzleKind.SWAP,
+            offset16=encode_swap(1),
+            args=(1,),
+        )
+        self.assertEqual(ast.to_assembly(), "ds_swizzle_b32 v0, v1 offset:swizzle(SWAP,1)")
+
+    def test_ast_quad_perm_assembly(self) -> None:
+        ast = DsSwizzleB32AST(
+            vdst_idx=2,
+            vsrc_idx=3,
+            kind=SwizzleKind.QUAD_PERM,
+            offset16=encode_quad_perm(3, 2, 1, 0),
+            args=(3, 2, 1, 0),
+        )
+        self.assertEqual(ast.to_assembly(), "ds_swizzle_b32 v2, v3 offset:swizzle(QUAD_PERM,3,2,1,0)")
+
+    def test_ast_numeric_offset(self) -> None:
+        ast = DsSwizzleB32AST(
+            vdst_idx=5,
+            vsrc_idx=6,
+            kind=SwizzleKind.NUMERIC,
+            offset16=0x801F,
+        )
+        self.assertEqual(ast.to_assembly(), "ds_swizzle_b32 v5, v6 offset:0x801f")
