@@ -340,7 +340,7 @@ def run_tool(cmd, **kwargs):
     """subprocess.run(check=True) for a SPIRV-Tools helper. One that cannot be started, or that rejects its
     input, is one ERROR line and exit 2 instead of a traceback (as tools/spirv_metal_set0.py does)."""
     try:
-        return subprocess.run(cmd, check=True, **kwargs)
+        done = subprocess.run(cmd, check=True, **kwargs)
     except subprocess.CalledProcessError as e:
         said = next((line.strip() for line in (e.stderr or "").splitlines() if line.strip()), "")
         print(f"ERROR: {cmd[0]} failed with exit status {e.returncode}" + (f": {said}" if said else ""),
@@ -350,6 +350,11 @@ def run_tool(cmd, **kwargs):
         print(f"ERROR: {cmd[0]}: {e.strerror or e} (SPIRV-Tools must be on PATH, or set SPIRV_DIS / SPIRV_AS)",
               file=sys.stderr)
         raise SystemExit(2) from None
+    if kwargs.get("capture_output") and isinstance(done.stderr, str) and done.stderr:
+        # a helper that succeeds but warns: its stderr used to reach the terminal before capture_output,
+        # keep it visible, the ERROR path above already quotes what a failing helper said
+        sys.stderr.write(done.stderr)
+    return done
 
 
 def main(argv):

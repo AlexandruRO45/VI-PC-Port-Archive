@@ -339,3 +339,19 @@ def test_cli_failing_helper_reports_its_stderr(tmp_path, gs_module, tool, env):
     assert f"{tool} says no" in r.stderr
     assert not (tmp_path / "out.spv").exists()
     assert not layout.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the fake helper is a POSIX executable script")
+@pytest.mark.skipif(not shutil.which("spirv-dis"), reason="needs spirv-dis to produce the assembly input")
+def test_cli_successful_helper_keeps_its_warnings_visible(tmp_path, gs_module):
+    # capture_output must not swallow a warning from a helper that exits 0: the tool passed such
+    # stderr straight through before, a run that works should still show what the helper said
+    helper = tmp_path / "fake-spirv-as"
+    helper.write_text("#!/bin/sh\necho 'fake: just a warning' >&2\ntouch \"$5\"\nexit 0\n", encoding="utf-8")
+    helper.chmod(0o755)
+    out = tmp_path / "out.spv"
+    r = _run_cli(gs_module, out, {"SPIRV_AS": str(helper)})
+    assert r.returncode == 0, r.stderr
+    assert "fake: just a warning" in r.stderr
+    assert "ERROR:" not in r.stderr
+    assert out.exists()
