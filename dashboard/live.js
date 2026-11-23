@@ -852,20 +852,24 @@ function renderClock() {
   const now = Date.now();
   const nextMs = sync.last + syncEvery() - now;
   const next = nextMs > 90000 ? mmss(nextMs) : `${Math.max(0, Math.ceil(nextMs / 1000))} s`;
+  // Short, so the menu keeps its room in the top bar; the longer explanation is the tooltip.
   let cls = '';
   let text;
-  if (sync.running) text = 'Updating…';
-  else if (!sync.last) text = 'Connecting to GitHub…';
-  else if (document.hidden) text = building() ? 'Loading in the background' : 'Paused in the background';
-  else if (attention() === 'idle') { cls = 'stale'; text = `Idle · next update in ${next} · move the mouse for every minute`; }
-  else if ((blockedUntil.core || 0) > now) { cls = 'stale'; text = `Waiting for GitHub · live again at ${hhmm(blockedUntil.core)}`; }
-  else if (anyStale) { cls = 'stale'; text = `Partly cached · data from ${hhmm(staleSince)} · next in ${next}`; }
-  else if (sync.failed) { cls = 'err'; text = `Partly offline · retry in ${next}`; }
-  else text = `Live · updated ${ago(sync.last)} · next in ${next}`;
+  let tip = '';
+  if (sync.running) { text = 'Updating…'; tip = 'Asking GitHub for what changed'; }
+  else if (!sync.last) { text = 'Connecting…'; tip = 'Connecting to GitHub'; }
+  else if (document.hidden) text = building() ? 'Loading' : 'Paused';
+  else if (attention() === 'idle') { cls = 'stale'; text = `Idle, next: ${next}`; tip = 'Nobody is using the page, so it updates less often. Move the mouse for every minute.'; }
+  else if ((blockedUntil.core || 0) > now) { cls = 'stale'; text = `Waiting until ${hhmm(blockedUntil.core)}`; tip = "GitHub's hourly limit is used up; live again at that time."; }
+  else if (anyStale) { cls = 'stale'; text = `Cached, next: ${next}`; tip = `Part of the data is from ${hhmm(staleSince)}, saved by this browser.`; }
+  else if (sync.failed) { cls = 'err'; text = `Offline, retry: ${next}`; tip = 'Part of the last update failed; it tries again.'; }
+  else { text = `Live, next: ${next}`; tip = `Updated ${ago(sync.last)}`; }
   const dot = $('#liveDot');
   const dotClass = 'dot' + (cls ? ' ' + cls : '');
   if (dot.className !== dotClass) dot.className = dotClass;
-  setText($('#liveTxt'), text);
+  const txt = $('#liveTxt');
+  setText(txt, text);
+  if (txt.title !== tip) txt.title = tip;
 }
 
 function renderRate() {
