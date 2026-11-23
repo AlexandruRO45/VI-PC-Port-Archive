@@ -146,11 +146,22 @@ def _encode_string_words(text: str) -> list[int]:
     return list(struct.unpack(f"<{len(raw) // 4}I", raw))
 
 
-def _parse_int(tok: str, lineno: int) -> int:
+def _int_value(tok: str) -> int | None:
+    """The value of an integer literal as SPIRV-Tools reads it (base 0), or None when tok is not one.
+
+    Shared with the OpSwitch type pre-scan, which runs before any line is parsed and so cannot raise.
+    """
     try:
         return int(tok, 0)
-    except ValueError as exc:
-        raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}") from exc
+    except ValueError:
+        return None
+
+
+def _parse_int(tok: str, lineno: int) -> int:
+    val = _int_value(tok)
+    if val is None:
+        raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}")
+    return val
 
 
 def _int_literal(tok: str, width: int, signed: bool, lineno: int) -> int:
@@ -275,6 +286,23 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
     # Only OpSwitch needs a value's result type, to choose the case literal width.
     track_switch_types = "OpSwitch" in text
+    # A switch can name a selector whose defining instruction is textually later (a continue
+    # block, for instance). id_to_type below only knows declarations already seen, so collect
+    # the symbol links up front as a fallback for that case.
+    switch_result_types: dict[str, str] = {}   # %result -> %result_type
+    switch_type_widths: dict[str, tuple] = {}  # %type -> ('int', width, signed)
+    if track_switch_types:
+        for raw in text.splitlines():
+            line = raw.split(";", 1)[0].strip()
+            m = re.match(r"(%\S+)\s*=\s*OpTypeInt\s+(\S+)\s+(\S+)", line)
+            if m:
+                width, signed = _int_value(m.group(2)), _int_value(m.group(3))
+                if width is not None and signed is not None:
+                    switch_type_widths[m.group(1)] = ("int", width, signed)
+                continue
+            m = re.match(r"(%\S+)\s*=\s*\S+\s+(%\S+)", line)
+            if m:
+                switch_result_types[m.group(1)] = m.group(2)
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
 
     def get_id(tok: str, lineno: int) -> int:
@@ -505,8 +533,11 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         if opname == "OpExtInst" and arg_idx < len(toks):
             cur_ext_table = ext_imports.get(get_id(toks[arg_idx], lineno))
         elif opname == "OpSwitch" and arg_idx < len(toks):
-            sel_id = get_id(toks[arg_idx], lineno)
+            sel_tok = toks[arg_idx]
+            sel_id = get_id(sel_tok, lineno)
             sel_ti = type_info.get(id_to_type.get(sel_id))
+            if sel_ti is None and sel_tok in switch_result_types:
+                sel_ti = switch_type_widths.get(switch_result_types[sel_tok])
             if sel_ti and sel_ti[0] == "int" and (sel_ti[1] <= 32 or sel_ti[1] == 64):
                 switch_type = (sel_ti[1], bool(sel_ti[2]))
 

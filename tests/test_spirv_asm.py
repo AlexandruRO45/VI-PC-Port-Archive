@@ -177,6 +177,42 @@ class SpirvAsmUnitTests(unittest.TestCase):
         self.assertEqual(len(spv64), len(spv) + 8)  # one extra word per case literal
         _validate(spv64)
 
+    def test_switch_selector_defined_after_the_switch_keeps_64bit_literals(self) -> None:
+        # The selector's defining instruction sits in a block textually after the switch, so
+        # id_to_type has not seen it yet: the case literals must still be two words each. The width
+        # comes from the pre-scan, which reads it with the normal integer parser, so the decimal and
+        # hexadecimal spellings of the width have to encode identically.
+        for width in ("64", "0x40"):
+            with self.subTest(width=width):
+                asm = f'''OpCapability Shader
+OpCapability Int64
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%ulong = OpTypeInt {width} 0
+%c64 = OpConstant %ulong 0x100000001
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpSwitch %late %def 0 %case0 0x100000001 %case1
+%case0 = OpLabel
+OpBranch %merge
+%case1 = OpLabel
+OpBranch %merge
+%def = OpLabel
+OpBranch %merge
+%late = OpIAdd %ulong %c64 %c64
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+'''
+                spv = spirv_asm.assemble(asm, target_env="vulkan1.2")
+                words = struct.unpack(f"<{len(spv) // 4}I", spv)
+                at = next(i for i, w in enumerate(words) if (w & 0xFFFF) == 251)  # OpSwitch
+                self.assertEqual(words[at] >> 16, 9)  # header + selector + default + 2 cases x (2 words + label)
+                self.assertEqual(words[at + 6:at + 8], (1, 1))  # low and high halves of 0x100000001
+
     def test_subword_integer_literals_use_the_declared_signedness(self) -> None:
         for width, signed, token, expected in (
             (8, 1, "0x80", 0xFFFFFF80),
