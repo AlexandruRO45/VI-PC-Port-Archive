@@ -181,17 +181,20 @@ def read_table(runtime_dir: str) -> dict[str, set[str]]:
     return table
 
 
-def image_imports(path: str) -> list[tuple[str, str, str]]:
-    """(dll, function, 'import' or 'delay') for every named import of one PE image."""
+def image_imports(path: str) -> tuple[list[tuple[str, str, str]], int]:
+    """(dll, function, 'import' or 'delay') for every named import of one PE image, and the number of imports by
+    ordinal, which this tool does not match (the table names functions)."""
     with open(path, "rb") as f:
         img = pe_inspect.PeImage(f.read())
-    out = []
+    out, ordinals = [], 0
     for kind, index, delay in (("import", 1, False), ("delay", 13, True)):
         for entry in pe_inspect._imports(img, kind, index, delay):
             for fn in entry["functions"]:
-                if fn and not fn.startswith("#") and fn != "?":
+                if fn and fn.startswith("#"):
+                    ordinals += 1
+                elif fn and fn != "?":
                     out.append((entry["dll"], fn, kind))
-    return out
+    return out, ordinals
 
 
 def contract(dll: str) -> str | None:
@@ -279,12 +282,13 @@ def main(argv=None) -> int:
         report, total = [], 0
         for path in args.images:
             try:
-                imports = image_imports(path)
+                imports, ordinals = image_imports(path)
             except pe_inspect.PeFormatError as e:
                 raise SourceError("%s is not a PE image: %s" % (path, e)) from None
             found, shimmed = bypasses(imports, table)
             total += len(found)
-            report.append({"image": os.path.basename(path), "imports": len(imports), "shimmed": shimmed,
+            report.append({"image": os.path.basename(path), "imports": len(imports), "ordinal_imports": ordinals,
+                           "shimmed": shimmed,
                            "bypass": [{"dll": d, "function": f, "kind": k, "registered": r, "version_alias": a}
                                       for d, f, k, r, a in found]})
         if args.json:
@@ -296,8 +300,8 @@ def main(argv=None) -> int:
                     print("bypass  %s  %s!%s%s  (shim under: %s%s)" % (
                         r["image"], b["dll"], b["function"], " [delay]" if b["kind"] == "delay" else "",
                         ", ".join(b["registered"]), "; version alias" if b["version_alias"] else ""))
-                print("summary: %s: %d imports, %d through a shim, %d bypass one"
-                      % (r["image"], r["imports"], r["shimmed"], len(r["bypass"])))
+                print("summary: %s: %d named imports (%d by ordinal, not matched), %d through a shim, %d bypass one"
+                      % (r["image"], r["imports"], r["ordinal_imports"], r["shimmed"], len(r["bypass"])))
         return 1 if total else 0
     except (OSError, SourceError) as e:
         print("ERROR: %s" % e, file=sys.stderr)

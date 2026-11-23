@@ -52,9 +52,11 @@ host's function. Which versions an image actually names is only known from its i
 `check` on the package's 16 DLLs (1.0.2.1): 1,334 named imports, 133 through a shim, **0 bypasses**. The DLLs import
 these functions only under names the table registers.
 
-The executable is not in the package available here, so its imports are unmeasured. #6715 counts 53 of its imports
-through a shim and 432 bound to the host. `check` tells how many of the 432 are shimmed functions under another name.
-It prints only DLL and function names, as `gta6rt --dry-run` does:
+The executable was checked independently in this pull request's thread (`Kev-Ball`, CachyOS, own copy whose size and
+SHA-256 match `docs/runtime_imports.md`, at `cff3ea0d`): 563 named imports and 24 by ordinal, 53 through a shim,
+**0 bypasses**: none of the executable's imports names a shimmed function under another DLL or contract version
+today. `check` keeps that true as shims are added, and prints only DLL and function names, as `gta6rt --dry-run`
+does:
 
 ```powershell
 python -I tools/shim_aliases.py check "D:\path\to\game_scarlett_master.exe"
@@ -77,6 +79,6 @@ here. Until then, a bypass `check` reports is fixed by adding the version to the
 - The parser reads `SHIM_TABLE(...)` bodies and function-like macros, not the C preprocessor in full. A row built
   from a variable or a generated table would be missed. `tests/test_shim_aliases.py` checks rows known to be in
   `runtime/shims` so that a missed format shows up as a failure.
-- Ordinal imports are not matched (the table names functions).
+- Ordinal imports are not matched (the table names functions); `check` counts them separately in its summary.
 - A bypass is not proof of a bug. Some functions may be shimmed under one name on purpose. The report says where the
   host's code runs instead.

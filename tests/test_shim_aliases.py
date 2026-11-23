@@ -192,17 +192,17 @@ class Check(Fixture):
         self.assertIn("bypass  game.exe  kernel32.dll!SharedFn  (shim under: kernelbase.dll)", lines)
         self.assertIn("bypass  game.exe  api-ms-win-core-file-l1-2-0.dll!CreateFileW [delay]  (shim under: "
                       "api-ms-win-core-file-l1-1-0.dll, kernel32.dll)", lines)
-        self.assertIn("summary: game.exe: 6 imports, 1 through a shim, 4 bypass one", lines)
+        self.assertIn("summary: game.exe: 6 named imports (1 by ordinal, not matched), 1 through a shim, 4 bypass one", lines)
 
     def test_no_bypass_exits_0_and_json(self):
         img = self.image("clean.dll", [("kernel32.dll", ["CreateFileW", "ExitProcess"]), ("xmem.dll", ["XMemAlloc"])])
         code, out, _ = run(["--runtime", self.runtime, "check", img])
         self.assertEqual(code, 0)
-        self.assertIn("summary: clean.dll: 3 imports, 3 through a shim, 0 bypass one", out)
+        self.assertIn("summary: clean.dll: 3 named imports (0 by ordinal, not matched), 3 through a shim, 0 bypass one", out)
         p = subprocess.run([sys.executable, "-I", TOOL, "--runtime", self.runtime, "check", img, "--json"],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(json.loads(p.stdout), [{"image": "clean.dll", "imports": 3, "shimmed": 3, "bypass": []}])
+        self.assertEqual(json.loads(p.stdout), [{"image": "clean.dll", "imports": 3, "ordinal_imports": 0, "shimmed": 3, "bypass": []}])
 
     def test_unreadable_inputs_exit_2(self):
         text = os.path.join(self.dir, "notes.txt")
