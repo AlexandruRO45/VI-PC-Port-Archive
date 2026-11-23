@@ -939,11 +939,12 @@ default BC1/BC3/BC4/BC5 rank/history tables (extendable or replaceable via `--hi
 | BC6H | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; external JSON supplies class 1/2/3 entries |
 | BC7 | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; 286 signature ranks (10 inferred-only refused in strict mode); partial-depth endpoints (`>= 4` bits) mid-range filled in provisional mode |
 
-`tools/bcpack.py` and `tools/ttpf_mips.py` run in **strict mode by default**: any chunk
-referencing an unconfirmed/unknown built-in history entry or inferred BC7 signature raises
-`BcpackProvisionalError`. Pass `--history <path>` for locally calibrated history tables
-(`tools/bcpack_history_calib.py`) and `--allow-provisional` to opt in to
-provisional/last-resort entries (inspectable via `bcpack.decode_with_info`).
+`tools/ttpf_mips.py`'s `check` and `export` run in **strict mode by default**, and `tools/bcpack.py`'s
+`decode`/`decode_with_info` do the same: any chunk referencing an unconfirmed/unknown built-in history
+entry or inferred BC7 signature raises `BcpackProvisionalError`. Pass `--history <path>` (or the
+`history=` keyword) for locally calibrated history tables (`tools/bcpack_history_calib.py`) and
+`--allow-provisional` (or `allow_provisional=True`) to opt in to provisional/last-resort entries
+(inspectable via `bcpack.decode_with_info`).
 
 ### 5. Validation on the 57-pool corpus
 
