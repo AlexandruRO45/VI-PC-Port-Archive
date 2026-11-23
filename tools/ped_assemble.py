@@ -1069,6 +1069,134 @@ def part_to_dict(part: MeshPart) -> dict:
     return out
 
 
+_GLB_ATTRIBUTE_TYPES = {
+    "POSITION": ("VEC3",),
+    "NORMAL": ("VEC3",),
+    "TEXCOORD_0": ("VEC2",),
+    "COLOR_0": ("VEC3", "VEC4"),
+    "JOINTS_0": ("VEC4",),
+    "WEIGHTS_0": ("VEC4",),
+    "JOINTS_1": ("VEC4",),
+    "WEIGHTS_1": ("VEC4",),
+}
+
+
+def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
+    """Refuse a GLB document `read_glb_parts` cannot walk, with one message instead of a traceback.
+
+    Checks only what the reader dereferences: the tables it indexes, the accessors its primitives name (their
+    type, and that their bytes are inside the BIN chunk) and the material fields it converts.
+    """
+    def bad(detail: str) -> PedAssembleError:
+        return PedAssembleError(f"{path}: malformed GLB: {detail}")
+
+    def is_index(value: object) -> bool:
+        return type(value) is int and value >= 0
+
+    def number(value: object, what: str) -> None:
+        try:
+            float(value)
+        except (TypeError, ValueError):
+            raise bad(f"{what} must be a number, got {value!r}") from None
+
+    if not isinstance(doc, dict):
+        raise bad("the JSON chunk must be an object")
+    tables = {}
+    for name in ("nodes", "meshes", "materials", "skins", "accessors", "bufferViews"):
+        table = doc.get(name, [])
+        if not isinstance(table, list):
+            raise bad(f"{name} must be a list")
+        tables[name] = table
+    nodes, meshes, materials = tables["nodes"], tables["meshes"], tables["materials"]
+    accessors, views = tables["accessors"], tables["bufferViews"]
+
+    def check_accessor(index: object, what: str, allowed: tuple[str, ...]) -> None:
+        if not is_index(index) or index >= len(accessors):
+            raise bad(f"{what} names accessor {index!r} (GLB has {len(accessors)})")
+        acc = accessors[index]
+        if not isinstance(acc, dict):
+            raise bad(f"accessors[{index}] must be an object")
+        view_index = acc.get("bufferView")
+        if view_index is None:
+            raise bad(f"accessors[{index}] has no bufferView (sparse and empty accessors are not supported)")
+        if not is_index(view_index) or view_index >= len(views):
+            raise bad(f"accessors[{index}] names bufferView {view_index!r} (GLB has {len(views)})")
+        view = views[view_index]
+        if not isinstance(view, dict):
+            raise bad(f"bufferViews[{view_index}] must be an object")
+        ctype, atype, count = acc.get("componentType"), acc.get("type"), acc.get("count")
+        if type(ctype) is not int or ctype not in COMPONENT_STRUCT:
+            raise bad(f"accessors[{index}] has unsupported componentType {ctype!r}")
+        if not isinstance(atype, str) or atype not in TYPE_COMPONENTS:
+            raise bad(f"accessors[{index}] has unsupported type {atype!r}")
+        if atype not in allowed:
+            raise bad(f"{what} is accessor {index} of type {atype}, expected {' or '.join(allowed)}")
+        if not is_index(count):
+            raise bad(f"accessors[{index}] has invalid count {count!r}")
+        offsets = (view.get("byteOffset", 0), acc.get("byteOffset", 0))
+        stride = view.get("byteStride")
+        if not all(is_index(v) for v in offsets) or not (stride is None or is_index(stride)):
+            raise bad(f"accessors[{index}] has an invalid byteOffset or byteStride")
+        elem_bytes = COMPONENT_STRUCT[ctype][1] * TYPE_COMPONENTS[atype]
+        if count and sum(offsets) + (count - 1) * (stride or elem_bytes) + elem_bytes > len(bin_chunk):
+            raise bad(f"accessors[{index}] ({what}) runs past the BIN chunk ({len(bin_chunk)} bytes)")
+
+    for i, mesh in enumerate(meshes):
+        if not isinstance(mesh, dict):
+            raise bad(f"meshes[{i}] must be an object")
+        primitives = mesh.get("primitives", [])
+        if not isinstance(primitives, list):
+            raise bad(f"meshes[{i}].primitives must be a list")
+        for pi, prim in enumerate(primitives):
+            where = f"meshes[{i}].primitives[{pi}]"
+            if not isinstance(prim, dict):
+                raise bad(f"{where} must be an object")
+            attrs = prim.get("attributes", {})
+            if not isinstance(attrs, dict):
+                raise bad(f"{where}.attributes must be an object")
+            if "POSITION" not in attrs:
+                continue
+            for name, allowed in _GLB_ATTRIBUTE_TYPES.items():
+                if name in attrs:
+                    check_accessor(attrs[name], f"{where}.{name}", allowed)
+            if "indices" in prim:
+                check_accessor(prim["indices"], f"{where}.indices", ("SCALAR",))
+            if "material" not in prim:
+                continue
+            material_index = prim["material"]
+            if type(material_index) is not int:
+                raise bad(f"{where}.material must be an index, got {material_index!r}")
+            if not 0 <= material_index < len(materials):
+                continue                                    # the reader leaves such a part without a material
+            material = materials[material_index]
+            if not isinstance(material, dict):
+                raise bad(f"materials[{material_index}] must be an object")
+            pbr = material.get("pbrMetallicRoughness", {})
+            if not isinstance(pbr, dict):
+                raise bad(f"materials[{material_index}].pbrMetallicRoughness must be an object")
+            factor = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+            if not isinstance(factor, list) or len(factor) < 4:
+                raise bad(f"materials[{material_index}] baseColorFactor must be a list of 4 numbers")
+            for value in factor[:4]:
+                number(value, f"materials[{material_index}] baseColorFactor")
+            for owner, key in ((pbr, "metallicFactor"), (pbr, "roughnessFactor"), (material, "alphaCutoff")):
+                if key in owner:
+                    number(owner[key], f"materials[{material_index}] {key}")
+
+    for i, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            raise bad(f"nodes[{i}] must be an object")
+        if "mesh" not in node:
+            continue
+        if not is_index(node["mesh"]) or node["mesh"] >= len(meshes):
+            raise bad(f"nodes[{i}] names mesh {node['mesh']!r} (GLB has {len(meshes)})")
+        translation = node.get("translation", (0.0, 0.0, 0.0))
+        if not isinstance(translation, (list, tuple)) or len(translation) != 3:
+            raise bad(f"nodes[{i}].translation must be a list of 3 numbers")
+        for value in translation:
+            number(value, f"nodes[{i}].translation")
+
+
 def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
     acc = doc["accessors"][acc_idx]
     bv = doc["bufferViews"][acc["bufferView"]]
@@ -1169,11 +1297,15 @@ def read_glb_parts(path: str) -> list[MeshPart]:
         payload = data[pos:pos + chunk_len]
         pos += chunk_len
         if chunk_type == CHUNK_TYPE_JSON:
-            doc = json.loads(payload.decode("utf-8"))
+            try:
+                doc = json.loads(payload.decode("utf-8"))
+            except ValueError as exc:                       # UnicodeDecodeError and JSONDecodeError
+                raise PedAssembleError(f"{path}: malformed GLB: the JSON chunk does not parse ({exc})") from None
         elif chunk_type == CHUNK_TYPE_BIN:
             bin_chunk = payload
     if doc is None:
         raise PedAssembleError(f"{path}: GLB has no JSON chunk")
+    _check_glb_document(doc, bin_chunk, path)
 
     stem = os.path.splitext(os.path.basename(path))[0]
     nodes = doc.get("nodes", [])
