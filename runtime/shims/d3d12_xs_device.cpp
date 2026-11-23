@@ -1342,31 +1342,35 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
-    // The console takes larger shader-visible CBV/SRV/UAV heaps than a PC device: the retail executable asks for
-    // 1,245,184 descriptors, and the PC runtime refuses a heap over the device's MaxViewDescriptorHeapSize
-    // (D3D12_OPTIONS19; 1,000,000 below resource binding tier 3, and an RTX 5060 Ti reports no more) with
-    // E_INVALIDARG; the title then reads the null heap. ASSUMPTION: the title does not use descriptors past the PC
-    // limit before it renders, so the heap is made at the limit rather than refused. Logged once.
+    void* created = nullptr;
+    HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+
+    // The console takes larger shader-visible CBV/SRV/UAV heaps than a native PC device: the retail executable asks
+    // for 1,245,184 descriptors, and the native runtime refuses a heap over MaxViewDescriptorHeapSize (D3D12_OPTIONS19;
+    // 1,000,000 on an RTX 5060 Ti and, measured by Envyre in #7821, on a tier 3 RTX 4070 Ti SUPER) with E_INVALIDARG;
+    // the title then reads the null heap. Only then is the heap made again at that limit: a device that makes the
+    // full heap (the Vulkan device has no such limit) keeps it, since a write past a cap would land outside the heap.
+    // ASSUMPTION: on a native device the title does not use descriptors past the limit before it renders. Logged once.
     D3D12_DESCRIPTOR_HEAP_DESC capped{};
-    if (desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+    if (hr == E_INVALIDARG && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
         (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) {
         UINT limit = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
         D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19{};
         if (SUCCEEDED(self->real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &options19, sizeof(options19))) &&
-            options19.MaxViewDescriptorHeapSize > limit)
+            options19.MaxViewDescriptorHeapSize != 0)
             limit = options19.MaxViewDescriptorHeapSize;
         if (desc->NumDescriptors > limit) {
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true, std::memory_order_relaxed))
-                std::fprintf(stderr, "[rt] d3d12_xs: slot 14 shader-visible CBV/SRV/UAV heap of %u descriptors capped "
-                                     "to the device limit %u (logged once)\n", desc->NumDescriptors, limit);
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 14 shader-visible CBV/SRV/UAV heap of %u descriptors refused; "
+                                     "made at the device limit %u (logged once)\n", desc->NumDescriptors, limit);
             capped = *desc;
             capped.NumDescriptors = limit;
             desc = &capped;
+            created = nullptr;
+            hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
         }
     }
-    void* created = nullptr;
-    HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
     if (FAILED(hr) || !created) {
         static std::atomic<int> refused_logs{0};
         if (desc && FAILED(hr) && refused_logs.fetch_add(1, std::memory_order_relaxed) < 8)

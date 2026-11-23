@@ -87,6 +87,7 @@ struct Mock {
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
+    unsigned view_heap_limit;  // device: refuses a larger shader-visible CBV/SRV/UAV heap (0: no limit), as native D3D12
     Mock* last_child;        // device: the object its last creation or open made
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
@@ -198,7 +199,12 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
             case 14:                                                         // CreateDescriptorHeap(desc, riid, out)
-                if (a1) m->array[14][0] = reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1)->NumDescriptors;
+                if (const auto* d = reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1)) {
+                    m->array[14][m->calls[14] > 1 ? 1 : 0] = d->NumDescriptors;   // first and latest request
+                    if (m->view_heap_limit && d->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+                        (d->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && d->NumDescriptors > m->view_heap_limit)
+                        return static_cast<std::uint32_t>(E_INVALIDARG);
+                }
                 break;
             default: break;
         }
@@ -941,28 +947,42 @@ static void no_dialogs() {
     SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 }
 
-// Slot 14: a shader-visible CBV/SRV/UAV heap past the PC device's limit (the mock reports none, so 1,000,000) is
-// made at the limit; a CPU-only heap of the same size is passed as asked.
+// Slot 14: the title's 1,245,184-descriptor shader-visible CBV/SRV/UAV heap. A device that makes it (the Vulkan
+// device has no limit) keeps the full size. A device that refuses it, as native D3D12 does past
+// MaxViewDescriptorHeapSize (the mock reports none, so 1,000,000), gets a second request at that limit. CPU-only
+// heaps and heaps within the limit are passed through once, as asked.
 int check_view_heap_cap() {
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    void* made = nullptr;
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1245184,
+                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, 0, false);   // no view-heap limit
+        EXPECT(device);
+        raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+        EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 1245184);   // not capped when the device takes it
+        EXPECT(release(device) == 0);
+    }
     Mock* mock = nullptr;
     void* device = make_device(mock, 0, false);
     EXPECT(device);
-    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1245184,
-                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
-    void* made = nullptr;
+    mock->view_heap_limit = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
-    EXPECT(mock->calls[14] == 1 && mock->array[14][0] == D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2);
+    EXPECT(mock->calls[14] == 2 && mock->array[14][0] == 1245184 &&
+           mock->array[14][1] == D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2);   // refused, then at the limit
     EXPECT(heap.NumDescriptors == 1245184);   // the title's description is left as it was
+    mock->calls[14] = 0;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
-    EXPECT(mock->calls[14] == 2 && mock->array[14][0] == 1245184);
+    EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 1245184);   // CPU-only: no limit, one request
+    mock->calls[14] = 0;
     heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
-    EXPECT(mock->calls[14] == 3 && mock->array[14][0] == 4096);   // within the limit: unchanged
+    EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 4096);   // within the limit: one request, unchanged
     EXPECT(release(device) == 0);
-    std::printf("%s: a shader-visible view heap past the PC limit is made at the limit; others pass as asked\n",
-                g_label);
+    std::printf("%s: a view heap the device refuses past its limit is made again at the limit; one it takes is kept "
+                "at full size\n", g_label);
     return 0;
 }
 
