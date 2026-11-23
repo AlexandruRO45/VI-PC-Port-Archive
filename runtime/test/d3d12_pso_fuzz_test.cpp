@@ -1,7 +1,8 @@
 // Differential graphics-state fuzzer: one seeded random program clears a colour target and an optional depth-stencil
 // target, then draws triangles through PSOs with random blend state (factors, ops, write masks, OMSetBlendFactor),
 // depth-stencil state (functions, stencil ops, masks, front and back faces, OMSetStencilRef) and rasterizer state
-// (cull mode, winding, constant depth bias, depth clip), on the layer and on the host's D3D12 on the same GPU. Every byte of the colour target
+// (cull mode, winding, constant depth bias, depth clip), under a random viewport (offset, size, depth range) and
+// scissor, on the layer and on the host's D3D12 on the same GPU. Every byte of the colour target
 // and of every depth-stencil plane is read back and compared.
 // Each triangle has one depth (its three vertices share z) and one colour (flat, from the first vertex, as D3D12 and
 // Vulkan both provoke), and its vertices sit on pixel corners, so neither interpolation nor sub-pixel rounding can
@@ -116,6 +117,8 @@ struct Draw {
     D3D12_RASTERIZER_DESC raster{};
     float blend_factor[4]{};
     UINT stencil_ref = 0;
+    D3D12_VIEWPORT viewport{0, 0, float(kSize), float(kSize), 0.0f, 1.0f};
+    D3D12_RECT scissor{0, 0, LONG(kSize), LONG(kSize)};
     std::vector<Triangle> triangles;
 };
 
@@ -235,6 +238,23 @@ Program generate(std::uint64_t seed, const Support& sup) {
         rs.DepthBiasClamp = 0.0f;
         rs.SlopeScaledDepthBias = 0.0f;
         rs.DepthClipEnable = pick(4) != 0;
+        // A viewport elsewhere than the whole target (its y flip, a depth range) and a scissor, some of the time.
+        // Offsets and sizes are whole pixels and the depth range is in 64ths, so vertices stay on pixel corners or
+        // half-pixels and depths stay exact.
+        if (pick(2)) {
+            constexpr float sizes[] = {8.0f, 16.0f, 24.0f, 32.0f, 48.0f};
+            draw.viewport.Width = sizes[pick(UINT(std::size(sizes)))];
+            draw.viewport.Height = sizes[pick(UINT(std::size(sizes)))];
+            draw.viewport.TopLeftX = float(int(pick(41)) - 16);
+            draw.viewport.TopLeftY = float(int(pick(41)) - 16);
+            const UINT a = pick(65), b = pick(65);
+            draw.viewport.MinDepth = float(std::min(a, b)) / 64.0f;
+            draw.viewport.MaxDepth = float(std::max(a, b)) / 64.0f;
+        }
+        if (pick(3) == 0) {
+            const LONG x0 = LONG(pick(kSize)), y0 = LONG(pick(kSize));
+            draw.scissor = {x0, y0, x0 + 1 + LONG(pick(kSize - UINT(x0))), y0 + 1 + LONG(pick(kSize - UINT(y0)))};
+        }
         const UINT triangles = 1 + pick(3);
         for (UINT t = 0; t < triangles; ++t) {
             Triangle tri{};
@@ -281,8 +301,11 @@ void print_program(const Program& p) {
                         s.StencilReadMask, s.StencilWriteMask, s.FrontFace.StencilFailOp, s.FrontFace.StencilDepthFailOp,
                         s.FrontFace.StencilPassOp, s.FrontFace.StencilFunc, s.BackFace.StencilFailOp,
                         s.BackFace.StencilDepthFailOp, s.BackFace.StencilPassOp, s.BackFace.StencilFunc);
-        std::printf("; cull %d %s bias %d clip %d\n", int(d.raster.CullMode), d.raster.FrontCounterClockwise ? "ccw" : "cw",
-                    d.raster.DepthBias, d.raster.DepthClipEnable);
+        std::printf("; cull %d %s bias %d clip %d; viewport %g,%g %gx%g depth %g..%g; scissor %ld,%ld-%ld,%ld\n",
+                    int(d.raster.CullMode), d.raster.FrontCounterClockwise ? "ccw" : "cw", d.raster.DepthBias,
+                    d.raster.DepthClipEnable, d.viewport.TopLeftX, d.viewport.TopLeftY, d.viewport.Width,
+                    d.viewport.Height, d.viewport.MinDepth, d.viewport.MaxDepth, d.scissor.left, d.scissor.top,
+                    d.scissor.right, d.scissor.bottom);
         for (const Triangle& t : d.triangles)
             std::printf("    tri (%d,%d) (%d,%d) (%d,%d) z %g colour (%g %g %g %g)\n", t.px[0], t.py[0], t.px[1],
                         t.py[1], t.px[2], t.py[2], t.z, t.color[0], t.color[1], t.color[2], t.color[3]);
@@ -415,10 +438,6 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
                                                           : D3D12_CLEAR_FLAG_DEPTH,
                                     p.clear_depth, p.clear_stencil, 0, nullptr);
     list->SetGraphicsRootSignature(root.p);
-    const D3D12_VIEWPORT viewport{0, 0, float(kSize), float(kSize), 0.0f, 1.0f};
-    const D3D12_RECT scissor{0, 0, LONG(kSize), LONG(kSize)};
-    list->RSSetViewports(1, &viewport);
-    list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, has_depth ? &dsv : nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     const D3D12_VERTEX_BUFFER_VIEW vbv{vertices->GetGPUVirtualAddress(), UINT(vb_bytes), sizeof(Vertex)};
@@ -427,6 +446,8 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
     for (size_t i = 0; i < p.draws.size(); ++i) {
         const Draw& d = p.draws[i];
         list->SetPipelineState(psos[i].p);
+        list->RSSetViewports(1, &d.viewport);
+        list->RSSetScissorRects(1, &d.scissor);
         list->OMSetBlendFactor(d.blend_factor);
         list->OMSetStencilRef(d.stencil_ref);
         const UINT count = UINT(d.triangles.size()) * 3;
