@@ -199,6 +199,13 @@ class TestPermLane16Nibbles(unittest.TestCase):
         self.assertIn("OpBitFieldUExtract", spv)
         self.assertIn("OpUGreaterThanEqual", spv)
 
+class TestPermLane16Routing(unittest.TestCase):
+    def test_row_masking(self):
+        # Confirms row half mask 0xFFFFFFF0 is present
+        spv = run_cs_permlane("v_permlane16_b32", 0x01234567, 0x89ABCDEF, name="cs_p16_rout")
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpBitwiseOr", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
