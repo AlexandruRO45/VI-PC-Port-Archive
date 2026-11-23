@@ -43,26 +43,32 @@ class DumpWords(unittest.TestCase):
 
 
 class PackedFormatFixture(unittest.TestCase):
-    def test_filtered_suite_counts_a_packed_store_mismatch(self):
-        name = "cs_fmt_1010102"
-        with tempfile.TemporaryDirectory() as tmp:
-            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+    def test_filtered_suite_reports_format_readback_results(self):
+        mismatch = "word 15: expected 0xffe00003, got 0xe00003ff"
+        unsupported = rgt.Skip("shader feature unavailable")
+        fixtures = (
+            ("cs_fmt_1010102", "fmt_1010102_test", mismatch, 1, "0/1 passed"),
+            ("cs_fmt_all", "fmt_all_test", mismatch, 1, "0/1 passed"),
+            ("cs_fmt_all", "fmt_all_test", unsupported, 0, "0/1 passed, 1 skipped"),
+        )
+        for name, checker, problem, status, summary in fixtures:
+            with self.subTest(name=name, result=problem), tempfile.TemporaryDirectory() as tmp:
+                args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
 
-            def translate(_cmd, env=None, gpu=True):
-                (Path(tmp) / "spirv" / f"{name}.spv").touch()
-                return 0, ""
+                def translate(_cmd, env=None, gpu=True):
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return 0, ""
 
-            output = io.StringIO()
-            problem = "word 15: expected 0xffe00003, got 0xe00003ff"
-            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
-                  patch.object(rgt, "spirv_as"),
-                  patch.object(rgt, "run_cmd", side_effect=translate),
-                  patch.object(rgt, "fmt_1010102_test", return_value=problem) as check_fmt,
-                  contextlib.redirect_stdout(output)):
-                self.assertEqual(rgt.run_suite(args, tmp), 1)
-            check_fmt.assert_called_once()
-            self.assertIn(problem, output.getvalue())
-            self.assertIn("0/1 passed", output.getvalue())
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"),
+                      patch.object(rgt, "run_cmd", side_effect=translate),
+                      patch.object(rgt, checker, return_value=problem) as check_fmt,
+                      contextlib.redirect_stdout(output)):
+                    self.assertEqual(rgt.run_suite(args, tmp), status)
+                check_fmt.assert_called_once()
+                self.assertIn(problem, output.getvalue())
+                self.assertIn(summary, output.getvalue())
 
 
 class FrameReadbackTest(unittest.TestCase):

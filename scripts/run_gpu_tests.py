@@ -25,8 +25,8 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
-                   fmt_xy_xyz_test, tbuffer_store_test)
+from check import (FMT_ALL_WORDS, Skip, clip_test, fmt_1010102_test, fmt_all_test, fmt_d16_xyz_test,
+                   fmt_int_narrow_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test)
 from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
@@ -959,6 +959,11 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_fmt_1010102":
             problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
+        elif name == "cs_fmt_all":
+            problem = fmt_all_test(a.build, spirv_dir, cs_env)
+            ok = None if isinstance(problem, Skip) else not problem
+            count = len(FMT_ALL_WORDS)
+            results.append((name, ok, problem or f"{count}/{count} dumped words exact"))
         elif name == "cs_fmt_sint32":
             problem = fmt_sint32_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
