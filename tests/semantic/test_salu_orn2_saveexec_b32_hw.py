@@ -316,3 +316,23 @@ class TestSaluOrn2SaveexecB32RegisterAliasing(unittest.TestCase):
         self.assertEqual(new_exec, 0)
         self.assertEqual(state.exec_lo, 0)
         self.assertEqual(scc, 0)
+
+
+class TestSaluOrn2SaveexecB32ConditionCodes(unittest.TestCase):
+    """Test suite for condition codes, status flags, and SCC generation."""
+
+    def test_scc_set_when_new_exec_nonzero(self):
+        new_exec, _, scc = ref_orn2_saveexec_b32(0x1, ALL_LANES_ACTIVE_32)
+        self.assertEqual(new_exec, 1)
+        self.assertEqual(scc, 1)
+
+    def test_scc_cleared_when_new_exec_zero(self):
+        new_exec, _, scc = ref_orn2_saveexec_b32(0, ALL_LANES_ACTIVE_32)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+
+    def test_scc_set_when_old_exec_zero(self):
+        # old_exec == 0 -> ~0 == ALL_LANES_ACTIVE_32 -> new_exec != 0
+        new_exec, _, scc = ref_orn2_saveexec_b32(0, ALL_LANES_INACTIVE_32)
+        self.assertEqual(new_exec, ALL_LANES_ACTIVE_32)
+        self.assertEqual(scc, 1)
