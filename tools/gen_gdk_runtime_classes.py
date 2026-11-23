@@ -15,6 +15,8 @@ only: ids, inheritance and method names in order. No text is copied.
   IXUserGamertagImpl); each interface lists its own chain, so each starts at slot 3.
 
 tools/gdk_runtime_calls.py reads the output. Standard library only.
+
+--out: the folder is created when it is missing; a path that cannot be written is one line on stderr and exit 1.
 """
 from __future__ import annotations
 
@@ -133,9 +135,14 @@ def main(argv: list[str] | None = None) -> int:
     problems = check(table["classes"], table["interfaces"])
     for p in problems:
         print(f"warning: {p}", file=sys.stderr)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(table, f, indent=1, sort_keys=True)
-        f.write("\n")
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(table, f, indent=1, sort_keys=True)
+            f.write("\n")
+    except OSError as e:
+        print(f"cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 1
     print(f"{len(table['classes'])} classes, {len(table['interfaces'])} interfaces -> {a.out}")
     return 0
 
