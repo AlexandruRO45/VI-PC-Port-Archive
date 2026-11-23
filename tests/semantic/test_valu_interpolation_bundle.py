@@ -325,5 +325,34 @@ class TestInterpP2F32ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[2], f32_to_bits(6.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p2_f32 SIMD & Full Triangle Interpolation
+# ------------------------------------------------------------------------------
+
+class SIMDWaveInterpP2F32:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step(self, insn: VInterpP2F32Instruction, p0: float, p2: float):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                j_coord = bits_to_f32(self.vgprs[insn.src0.index][lane])
+                accum = bits_to_f32(self.vgprs[insn.accum.index][lane])
+                self.vgprs[insn.dst.index][lane] = ref_interp_p2_f32(j_coord, p0, p2, accum, clamp=insn.clamp)
+
+
+class TestInterpP2F32SIMDAndCentroid(unittest.TestCase):
+    def test_centroid_interpolation(self):
+        # i = 1/3, j = 1/3, k = 1/3
+        p0, p1, p2 = 3.0, 6.0, 9.0  # centroid is (3 + 6 + 9)/3 = 6.0
+        i_coord = 1.0 / 3.0
+        j_coord = 1.0 / 3.0
+        p1_acc = bits_to_f32(ref_interp_p1_f32(i_coord, p0, p1))
+        res = ref_interp_p2_f32(j_coord, p0, p2, p1_acc)
+        self.assertEqual(res, f32_to_bits(6.0))
+
+
 if __name__ == '__main__':
     unittest.main()
