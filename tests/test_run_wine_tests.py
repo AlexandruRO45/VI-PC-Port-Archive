@@ -493,6 +493,26 @@ class MainTest(unittest.TestCase):
                 drive.assert_not_called()
                 launch.assert_not_called()
 
+    def test_invalid_output_regex_types_fail_before_launch(self):
+        cases = (
+            ("bad_pass", "PASS_REGULAR_EXPRESSION", 7),
+            ("bad_fail", "FAIL_REGULAR_EXPRESSION", ["unmatched", None]),
+            ("bad_skip", "SKIP_REGULAR_EXPRESSION", False),
+        )
+        entries = [ctest_entry(name, self.command("ok.py"), {field: value}) for name, field, value in cases]
+        entries.append(ctest_entry("ok", self.command("ok.py"), {"PASS_REGULAR_EXPRESSION": []}))
+
+        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+            code, out, err = self.run_main(entries, "--require", "bad_pass", "--require", "ok")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        for name, field, _ in cases:
+            self.assertIn(f"[FAIL] {name}\n    invalid CTest {field}", out)
+        self.assertIn("[PASS] ok", out)
+        self.assertIn("1 passed, 3 failed, 0 skipped", out)
+        launch.assert_called_once()
+
     def test_an_unbuilt_test_without_a_command_is_valid_inventory(self):
         code, out, err = self.run_main([{"name": "unbuilt"}], "--require", "unbuilt")
         self.assertEqual(code, 1)

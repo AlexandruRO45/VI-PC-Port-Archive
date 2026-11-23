@@ -182,6 +182,12 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
             return "fail", "invalid CTest TIMEOUT"
         if ctest_timeout > 0:
             timeout = min(timeout, ctest_timeout)
+    for name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
+        patterns = props.get(name, [])
+        if not isinstance(patterns, str) and (
+            not isinstance(patterns, list) or any(not isinstance(pattern, str) for pattern in patterns)
+        ):
+            return "fail", f"invalid CTest {name}: expected a string or list of strings"
     start = time.monotonic()
     try:
         proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
