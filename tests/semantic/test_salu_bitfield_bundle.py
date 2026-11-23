@@ -200,5 +200,34 @@ class TestSBfeU32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_bfe_u32(0xDEADBEEF, 16 | (16 << 16)), 0xDEAD)
 
 
+def ref_bfe_i32(src0: int, ctl: int) -> tuple[int, int]:
+    """Reference mathematical oracle for RDNA2 s_bfe_i32. Returns (dst, scc)."""
+    offset = ctl & 31
+    width = (ctl >> 16) & 0x7F
+    w = min(width, 32 - offset)
+    if w == 0:
+        val = 0
+    else:
+        raw = ((src0 & MASK32) >> offset) & ((1 << w) - 1)
+        sign_bit = 1 << (w - 1)
+        val = ((raw ^ sign_bit) - sign_bit) & MASK32
+    scc = 1 if val != 0 else 0
+    return val, scc
+
+
+class TestSBfeI32Reference(unittest.TestCase):
+    """Reference oracle unit tests for s_bfe_i32."""
+
+    def test_reference_positive_field(self):
+        val, scc = ref_bfe_i32(0x00000070, 4 | (4 << 16))
+        self.assertEqual(val, 7)
+        self.assertEqual(scc, 1)
+
+    def test_reference_negative_field_sign_extended(self):
+        val, scc = ref_bfe_i32(0x000000F0, 4 | (4 << 16))
+        self.assertEqual(val, MASK32)
+        self.assertEqual(scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
