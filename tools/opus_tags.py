@@ -237,7 +237,7 @@ def main(argv=None) -> int:
     try:
         names, ambiguous = load_names(a.names, a.source)
         dialogue, langs = load_dialogue(a.dialogue) if a.dialogue else ({}, [])
-    except (OSError, KeyError, ValueError) as e:
+    except (OSError, KeyError, ValueError, csv.Error) as e:
         print(f"opus_tags: error: cannot read a CSV: {e}", file=sys.stderr)
         return 2
     try:

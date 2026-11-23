@@ -320,6 +320,22 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
         self.assertIn("SUBTITLE=Move. Now.", self.tags("story", "bank_01", "0ABCDEF1.ogg"))
 
+    def test_cli_reports_an_oversized_csv_field_before_tagging(self):
+        field = "x" * (csv.field_size_limit() + 1)
+        for option, header, row in [("--names", "bank,stream_id,name", f"bank_02,1fffffff,{field}"),
+                                    ("--dialogue", "wave,text_en", f"door_slam_03,{field}")]:
+            with self.subTest(option=option):
+                oversized = Path(self.tmp.name) / "oversized.csv"
+                oversized.write_text(f"{header}\n{row}\n", encoding="utf-8", newline="\n")
+                inputs = {"--names": self.names, "--dialogue": self.dialogue, option: str(oversized)}
+                args = [arg for pair in inputs.items() for arg in pair]
+                result = subprocess.run([sys.executable, "-I", TOOL, self.opus, *args],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn("field larger than field limit", result.stderr)
+                self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), [])
+
     def test_cli_reports_a_clashing_id(self):
         clash = os.path.join(self.tmp.name, "clash_cli.csv")
         write_csv(clash, NAMES, [
