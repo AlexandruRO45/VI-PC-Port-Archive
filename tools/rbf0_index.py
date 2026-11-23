@@ -119,7 +119,9 @@ def parse_rbf0(data, string_limit=None):
                     raise RbfError("text tag is not FD FF", at)
                 n = struct.unpack("<I", take(4, "text length"))[0]
                 raw = take(n, "text")
-                if stack and not stack[-1][2]:
+                if not stack:
+                    raise RbfError("text outside an element", at)
+                if not stack[-1][2]:
                     if stack[-1][1] < stack[-1][0]:
                         attr_mismatches += 1
                     stack[-1][2] = True
@@ -171,9 +173,11 @@ def parse_rbf0(data, string_limit=None):
                     strings.append(text)
             else:
                 raise RbfError(f"unknown record type {kind:#04x}", at)
+            if not stack:
+                raise RbfError("value outside an element", at)
             values += 1
             types[TYPE_NAMES.get(kind, f"{kind:#04x}")] += 1
-            if stack and stack[-1][1] < stack[-1][0]:
+            if stack[-1][1] < stack[-1][0]:
                 stack[-1][1] += 1
     except RbfError as exc:
         status = "truncated" if exc.truncated else "bad"
