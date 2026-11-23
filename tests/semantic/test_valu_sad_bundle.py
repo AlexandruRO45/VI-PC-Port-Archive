@@ -236,5 +236,28 @@ class TestVSadU16Reference(unittest.TestCase):
         self.assertEqual(ref_sad_u16(0x12345678, 0x12345678, 100), 100)
 
 
+def step_scalar_sad_u16(state: ValuState, instr: Instruction) -> None:
+    if instr.opcode != "v_sad_u16":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    s0 = state.read_u32(instr.src0)
+    s1 = state.read_u32(instr.src1)
+    s2 = state.read_u32(instr.src2)
+    res = ref_sad_u16(s0, s1, s2)
+    state.write_u32(instr.dst.index_or_val, res)
+
+
+class TestVSadU16ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_sad_u16."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ValuState()
+        state.write_u32(1, 0x00200064)
+        state.write_u32(2, 0x00100032)
+        state.write_u32(3, 5)
+        instr = Instruction("v_sad_u16", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_scalar_sad_u16(state, instr)
+        self.assertEqual(state.vgprs[0], 71)
+
+
 if __name__ == "__main__":
     unittest.main()
