@@ -433,5 +433,18 @@ class VMax3I32OracleTests(unittest.TestCase):
         int_max = 0x7FFFFFFF
         self.assertEqual(ref_max3_i32(int_min, 0, int_max), int_max)
 
+class VMax3I32AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_max3_i32."""
+
+    def test_ast_emission(self):
+        node = Valu3AstNode("v_max3_i32", "v0", "v1", "v2", "v3")
+        self.assertEqual(node.emit_asm(), "v_max3_i32 v0, v1, v2, v3")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v1": u32(-10), "v2": 42, "v3": 17}
+        res = ref_max3_i32(regs["v1"], regs["v2"], regs["v3"])
+        regs["v0"] = res
+        self.assertEqual(regs["v0"], 42)
+
 if __name__ == "__main__":
     unittest.main()
