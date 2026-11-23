@@ -370,8 +370,12 @@ class TestCli(unittest.TestCase):
             self.assertEqual(len(doc["unmatched_list_entries"]), 1)
 
     def test_missing_input(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(names_mod.main(["/nonexistent.rpf", "--mount", "/nonexistent.xml"]), 2)
+        # Paths inside a fresh temporary directory: a bare "/nonexistent.rpf" can exist (on Windows it is
+        # \nonexistent.rpf on the current drive), and then the rc-2 check passes or fails for the wrong reason.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, xml = os.path.join(tmp, "missing.rpf"), os.path.join(tmp, "missing.xml")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(names_mod.main([archive, "--mount", xml]), 2)
 
     def test_refuses_to_overwrite_input(self):
         with tempfile.TemporaryDirectory() as tmp:

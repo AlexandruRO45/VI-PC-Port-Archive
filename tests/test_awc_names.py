@@ -336,8 +336,12 @@ class TestCli(unittest.TestCase):
                 self.assertIn("awc_names: error:", err.getvalue())
 
     def test_missing_input(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
+        # Paths inside a fresh temporary directory: a bare "/nonexistent" can exist (on Windows it is
+        # \nonexistent on the current drive), and then the rc-2 check passes or fails for the wrong reason.
+        with tempfile.TemporaryDirectory() as tmp:
+            banks, words = os.path.join(tmp, "missing"), os.path.join(tmp, "missing.txt")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(A.main([banks, "--words", words]), 2)
 
     @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
     def test_locked_words_input_reports_rc_2_without_traceback(self):
