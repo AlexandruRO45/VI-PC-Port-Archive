@@ -727,5 +727,38 @@ class VSubF16OracleTests(unittest.TestCase):
         self.assertEqual(out[0] & 0xFFFF, 0x0000)
 
 
+class VSubF16AstInterpreterTests(unittest.TestCase):
+    """AST modeling, scalar simulation, and high-half preservation for v_sub_f16."""
+
+    def test_ast_emission_and_execution(self):
+        node = ValuSubAstNode("v_sub_f16", "v2", "v0", "v1")
+        self.assertEqual(node.emit_asm(), "v_sub_f16 v2, v0, v1")
+        out = run_prog([
+            "v_mov_b32 v0, 0x4900",  # 10.0
+            "v_mov_b32 v1, 0x4300",  # 3.5
+            node.emit_asm(),
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0x4680)  # 6.5
+
+    def test_high_half_preservation_e32(self):
+        out = run_prog([
+            "v_mov_b32 v0, 0x5A5A0000",
+            "v_mov_b32 v1, 0x4500",  # 5.0
+            "v_mov_b32 v2, 0x4000",  # 2.0
+            "v_sub_f16 v0, v1, v2",
+        ])
+        self.assertEqual(out[0] >> 16, 0x5A5A)
+        self.assertEqual(out[0] & 0xFFFF, 0x4200)
+
+    def test_register_aliasing_dst_equals_src0(self):
+        out = run_prog([
+            "v_mov_b32 v0, 0x4500",  # 5.0
+            "v_mov_b32 v1, 0x4000",  # 2.0
+            "v_sub_f16 v0, v0, v1",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0x4200)
+
+
 if __name__ == "__main__":
     unittest.main()
