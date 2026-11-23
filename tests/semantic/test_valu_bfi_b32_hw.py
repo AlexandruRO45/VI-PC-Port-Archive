@@ -137,5 +137,60 @@ class TestBfiAST(unittest.TestCase):
         self.assertEqual(inst.format_asm(), "v_bfi_b32 v0, s0, v1, s2")
 
 
+
+class ScalarInterp:
+    def __init__(self):
+        self.vgpr = [0] * 64
+        self.sgpr = [0] * 64
+
+    def parse_reg(self, token: str) -> int:
+        token = token.strip()
+        if token.startswith("0x") or token.isdigit() or (token.startswith("-") and token[1:].isdigit()):
+            return int(token, 0) & MASK32
+        if token.startswith("v"):
+            return self.vgpr[int(token[1:])]
+        if token.startswith("s"):
+            return self.sgpr[int(token[1:])]
+        raise ValueError(f"Unknown token: {token}")
+
+    def execute_line(self, line: str) -> None:
+        parts = line.replace(",", " ").split()
+        if not parts:
+            return
+        op = parts[0]
+        if op == "v_bfi_b32":
+            dst_idx = int(parts[1][1:])
+            src0 = self.parse_reg(parts[2])
+            src1 = self.parse_reg(parts[3])
+            src2 = self.parse_reg(parts[4])
+            self.vgpr[dst_idx] = ref_bfi_b32(src0, src1, src2)
+
+
+class TestBfiInterpreter(unittest.TestCase):
+    def test_interpreter_basic(self):
+        interp = ScalarInterp()
+        interp.vgpr[1] = 0x0000FFFF
+        interp.vgpr[2] = 0x12345678
+        interp.vgpr[3] = 0xABCDEF00
+        interp.execute_line("v_bfi_b32 v0, v1, v2, v3")
+        self.assertEqual(interp.vgpr[0], 0xABCD5678)
+
+    def test_interpreter_constant_mask(self):
+        interp = ScalarInterp()
+        interp.vgpr[2] = 0xFFFFFFFF
+        interp.vgpr[3] = 0x00000000
+        interp.execute_line("v_bfi_b32 v0, 0x000000FF, v2, v3")
+        self.assertEqual(interp.vgpr[0], 0x000000FF)
+
+    def test_interpreter_sgpr(self):
+        interp = ScalarInterp()
+        interp.sgpr[0] = 0xFF000000
+        interp.vgpr[1] = 0xAA000000
+        interp.vgpr[2] = 0x00112233
+        interp.execute_line("v_bfi_b32 v4, s0, v1, v2")
+        self.assertEqual(interp.vgpr[4], 0xAA112233)
+
+
 if __name__ == "__main__":
     unittest.main()
+
