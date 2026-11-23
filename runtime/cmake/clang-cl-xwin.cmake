@@ -34,6 +34,18 @@ foreach(_tool C_COMPILER:clang-cl CXX_COMPILER:clang-cl LINKER:lld-link AR:llvm-
   endif()
 endforeach()
 
+# CMake runs CMAKE_MT after each link to merge manifests, so a host without llvm-mt fails at link time with a bare
+# "MT: command ... no such file or directory". Homebrew's LLVM formula does not install llvm-mt, so name the tool
+# here, at configure time, where the fix is obvious.
+find_program(_leonida_mt NAMES "${CMAKE_MT}" NO_CACHE)
+if(NOT _leonida_mt)
+  message(FATAL_ERROR
+    "CMAKE_MT (${CMAKE_MT}) was not found. The cross-build links with lld-link and then runs llvm-mt to merge "
+    "manifests; Homebrew's LLVM formula does not install llvm-mt. Install LLVM from your distribution or pass "
+    "-DCMAKE_MT=<path to llvm-mt>.")
+endif()
+set(CMAKE_MT "${_leonida_mt}" CACHE FILEPATH "llvm-mt used to merge manifests" FORCE)
+
 set(_xwin_compile "--target=x86_64-pc-windows-msvc /winsysroot \"${XWIN_DIR}\"")
 set(CMAKE_C_FLAGS_INIT "${_xwin_compile}")
 set(CMAKE_CXX_FLAGS_INIT "${_xwin_compile}")

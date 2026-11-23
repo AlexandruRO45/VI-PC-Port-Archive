@@ -202,6 +202,10 @@ WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/wind
 Use a recent xwin: 0.10.0 lays out SDK 10.0.26100 with the command above, while 0.6.5 stops with "unable to find
 x86_64 headers for Win11SDK_10.0.26100".
 
+CMake runs `llvm-mt` after each link to merge manifests, and Homebrew's LLVM formula on Linux does not install it.
+The toolchain file stops at configure time when it is missing; install LLVM from your distribution and pass
+`-DCMAKE_MT=<path to llvm-mt>`, or put `llvm-mt` on `PATH`.
+
 On a machine without a display (a server, a container, WSL without WSLg), Wine has no graphics driver to create a
 Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (VkResult -3)` and, with
 `WINEDEBUG=+vulkan`, "Failed to load Wine graphics driver supporting Vulkan". Run the tests under a virtual X server,
