@@ -537,10 +537,13 @@ With more than one GPU, pick one through the Vulkan loader, for example
 Two GPUs of one vendor share one driver, so the loader cannot tell them apart (an RTX 5070 Ti next to an RTX 3060,
 say; without a choice the runtime and every test take the same one: a native driver over Microsoft's Dozen, discrete
 over integrated, the first on a tie, `vulkan_device_rank` in `runtime/src/vulkan_device_filter.h`).
-`LEONIDA_VK_DEVICE` names the GPU by part of its name, without case: `LEONIDA_VK_DEVICE=5070` or
-`LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`) and the layer's standalone device read it,
-and a value that matches no device fails the run instead of testing
-another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
+`LEONIDA_VK_DEVICE` matches a case-insensitive substring of `deviceName` from `vulkaninfo --summary`.
+For an RTX 5070, use `LEONIDA_VK_DEVICE=5070`. Mesa can report an AMD APU by its processor name, so
+`radeon` may miss it. For a name ending in `(RADV RAPHAEL_MENDOCINO)`, use
+`LEONIDA_VK_DEVICE=RAPHAEL_MENDOCINO`.
+The D3D12 tests (`vk_test_device.h`) and the layer's standalone device read this filter. A value that matches
+no device fails the run. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12
+adapter the same way.
 Unset, the host side is the adapter behind the layer's Vulkan device (`runtime/test/host_adapter.h`; `d3d12_buffer_tiles`
 by the layer's `GetAdapterLuid()`), so on a PC with two GPUs the layer is compared with its own GPU's driver.
 The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
