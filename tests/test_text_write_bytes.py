@@ -104,7 +104,7 @@ class RawBytes(unittest.TestCase):
         console.write_line("started")
         console.write_line("done")
         console.close()   # the log is only read back once it is closed; the cleanup close is then a no-op
-        self.assertNotIn(b"\r\n", self.read(log))
+        self.assertEqual(self.read(log), b"started\ndone\n")
 
 
 if __name__ == "__main__":
