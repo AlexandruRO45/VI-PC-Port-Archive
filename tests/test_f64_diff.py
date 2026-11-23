@@ -2,7 +2,6 @@
 import contextlib
 import io
 import os
-import random
 import subprocess
 import sys
 import tempfile
@@ -86,16 +85,25 @@ class F64DiffTests(unittest.TestCase):
         self.assertIn("implementation-defined", reason)
         self.assertIsNone(actual)
 
-    def test_div_fixup_nan_s0_is_skipped_by_default_and_runs_with_known(self):
-        setup, body, _, _ = fd.make_case(random.Random(1), "v_div_fixup_f64", known_case="div-fixup-nan-s0")
-        lines = setup + body
+    def test_div_fixup_reference_matches_the_translator_at_the_measured_edges(self):
+        # FUZZ-82. v_div_fixup_f64 lowers to integer words only, so the CPU interpreter runs the translator's own
+        # output here. (S0, S1, S2): NaN S2 and NaN S1 pass unquieted, exp(S2) - exp(S1) = -1075 still passes S0 and
+        # -1076 underflows, there is no overflow cutoff (+2046 passes S0), and NaN(S0) of an ordinary division gives a
+        # signed infinity (no longer a known divergence: the translator follows the measured rule).
+        self.assertNotIn("div-fixup-nan-s0", fd.KNOWN_DIVERGENCES)
+        cases = [(self.THREE, self.ONE, self.SNAN), (self.THREE, self.SNAN, self.ONE),
+                 (self.THREE, 1076 << 52, 1 << 52), (self.THREE, 1077 << 52, 1 << 52),
+                 (self.THREE, 1, 2046 << 52), (self.QNAN, self.ONE, self.TWO)]
         with tempfile.TemporaryDirectory() as tmp:
-            skipped = fd.run_one(lines, "ps_f64_fixup_default", tmp)
-            self.assertEqual(skipped[0], "skip")
-            self.assertIn("div-fixup-nan-s0", skipped[1])
-            known = fd.run_one(lines, "ps_f64_fixup_known", tmp, include_known=True)
-        # the translator now gives the ISA's signed infinity for NaN(S0) too (#4536 was written when it kept the NaN)
-        self.assertEqual(known[0], "match")
+            for i, (s0, s1, s2) in enumerate(cases):
+                lines = []
+                for reg, bits in zip((12, 14, 16), (s0, s1, s2)):
+                    lines += [f"v_mov_b32 v{reg}, 0x{bits & 0xFFFFFFFF:08x}", f"v_mov_b32 v{reg + 1}, 0x{bits >> 32:08x}"]
+                lines.append("v_div_fixup_f64 v[8:9], v[12:13], v[14:15], v[16:17]")
+                with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                    status, reason, expected, actual = fd.run_one(lines, f"ps_f64_fixup_edge_{i}", tmp)
+                    self.assertEqual(status, "match", reason)
+                    self.assertEqual(expected[:2], actual[:2])   # bit for bit, NaN payloads included
 
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
@@ -122,7 +130,7 @@ class F64DiffTests(unittest.TestCase):
         normal = self.command("--ops", "v_add_f64", "--programs", "0")
         known = self.command("--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures")
         self.assertNotIn("KNOWN_DIVERGENCE", normal.stdout)
-        # the known NaN(S0) case runs and, since the translator follows the ISA there, matches
+        # the known cases run with --known and none of them reproduces a mismatch on main
         self.assertEqual(known.returncode, 0, known.stdout)
         self.assertNotIn("MISMATCH:", known.stdout)
 
@@ -201,9 +209,9 @@ class F64DiffTests(unittest.TestCase):
             ("sign_out_negative_from_s1", three, self.NEG2, one, three | self.NZ),
             ("sign_out_positive_both_negative", self.NEG3, self.NEG2, self.NEG1, three),
             ("sign_out_clears_s0_sign", self.NEG3, one, one, three),
-            ("nan_s2_quiets_s2", one, one, self.SNAN, 0x7FF8000000000001),
+            ("nan_s2_passes_unquieted", one, one, self.SNAN, self.SNAN),         # IEEE=0: no quieting
             ("nan_s2_beats_nan_s1", one, self.SNAN, qn2, qn2),
-            ("nan_s1_quiets_s1", one, self.SNAN, one, 0x7FF8000000000001),
+            ("nan_s1_passes_unquieted", one, self.SNAN, one, self.SNAN),
             ("nan_s2_beats_zero_over_zero", one, self.PZ, qn2, qn2),
             ("zero_over_zero", one, self.PZ, self.NZ, 0xFFF8000000000000),
             ("inf_over_inf", one, self.PINF, self.NINF, 0xFFF8000000000000),
@@ -214,15 +222,46 @@ class F64DiffTests(unittest.TestCase):
             ("inf_over_y", one, self.NEG2, self.NINF, self.PINF),
             ("nan_s0_to_signed_inf_isa_rule", self.QNAN, one, one, self.PINF),
             ("nan_s0_to_signed_inf_negative", self.QNAN, self.NEG2, one, self.NINF),
-            ("underflow_edge_still_passes_s0", three, e(1075), e(1), three),
-            ("underflow_to_zero", three, e(1076), e(1), self.PZ),
-            ("underflow_beats_nan_s0", self.QNAN, e(1076), e(1), self.PZ),
-            ("overflow_edge_still_passes_s0", three, e(1), e(1024), three),
-            ("overflow_to_inf", three, e(1), e(1025), self.PINF),
+            # exp(S2) - exp(S1): measured underflow cutoff <= -1076, and no overflow cutoff at all
+            ("underflow_edge_minus_1075_still_passes_s0", three, e(1076), e(1), three),
+            ("underflow_to_zero_at_minus_1076", three, e(1077), e(1), self.PZ),
+            ("underflow_to_negative_zero", three, e(1077) | self.NZ, e(1), self.NZ),
+            ("underflow_beats_nan_s0", self.QNAN, e(1077), e(1), self.PZ),
+            ("exponent_difference_1024_passes_s0", three, e(1), e(1025), three),
+            ("largest_exponent_difference_passes_s0", three, 1, e(2046), three),
         ]
         for name, s0, s1, s2, want in table:
             with self.subTest(case=name):
                 self.assertEqual(fd.fixup(s0, s1, s2), want)
+
+    def test_div_fmas_table(self):
+        # (S0, S1, S2, VCC): with VCC set the exact fma is scaled by 2^128 when |S2| >= 2.0 and by 2^-128 otherwise,
+        # then rounded once (docs/design.md, v_div_fmas row, measured on RDNA2 gfx1036).
+        table = [
+            ("vcc_clear_plain_fma", 0x3FF8000000000000, self.TWO, 0x3FD0000000000000, False, 0x400A0000_00000000),
+            ("scale_up_at_s2_two", self.ONE, self.ONE, self.TWO, True, 0x48080000_00000000),        # 3 * 2^128
+            ("scale_up_negative_s2", self.ONE, self.ONE, self.NEG2, True, 0xC7F00000_00000000),     # -1 * 2^128
+            ("scale_down_below_two", self.PZ, self.ONE, 0x3FFFFFFF_FFFFFFFF, True, 0x37FFFFFF_FFFFFFFF),
+            ("scale_down_at_one", self.ONE, self.ONE, self.ONE, True, 0x38000000_00000000),          # 2 * 2^-128
+            # 1.25 * 2^-945 + 2^-1004, times 2^-128, is (2.5 + 2^-58) * 2^-1074: one rounding gives 3 * 2^-1074;
+            # rounding the fma first would leave an exact tie that rounds to even, 2 * 2^-1074.
+            ("subnormal_result_single_rounding", 0x04E40000_00000000, self.ONE, 0x01300000_00000000, True, 3),
+            ("overflow_after_scale_up", 0x7FEFFFFF_FFFFFFFF, self.ONE, self.TWO, True, self.PINF),
+            ("tiny_negative_rounds_to_negative_zero", 0x80000000_00000001, self.ONE, self.PZ, True, self.NZ),
+            ("negative_zeros_keep_their_sign", self.NZ, self.ONE, self.NZ, True, self.NZ),
+            ("mixed_zero_signs_give_positive_zero", self.NZ, self.ONE, self.PZ, False, self.PZ),
+            ("exact_cancellation_is_positive_zero", self.ONE, self.NEG1, self.ONE, True, self.PZ),
+        ]
+        for name, s0, s1, s2, vcc, want in table:
+            with self.subTest(case=name):
+                self.assertEqual(fd.div_fmas(s0, s1, s2, vcc), want)
+
+    def test_div_fmas_program_reads_vcc_and_skips_non_finite_operands(self):
+        set_vcc = "v_cmp_eq_i32_e32 vcc_lo, 0, 0"
+        self.assertEqual(fd.ref_program([set_vcc, "v_div_fmas_f64 v[8:9], 1.0, 1.0, 2.0"])[:2], [0, 0x48080000])
+        self.assertEqual(fd.ref_program(["v_div_fmas_f64 v[8:9], 1.0, 1.0, 2.0"])[:2], [0, 0x40080000])
+        with self.assertRaises(fd.SkipCase):
+            fd.ref_program([set_vcc, "v_mov_b32 v13, 0x7ff00000", "v_div_fmas_f64 v[8:9], v[12:13], 1.0, 2.0"])
 
     def test_frexp_table(self):
         half = 0x3FE0000000000000

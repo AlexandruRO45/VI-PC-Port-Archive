@@ -57,7 +57,6 @@ KNOWN_DIVERGENCES = {
     "f64-omod": "SHADER-721: f64 output modifiers; owned by @fiestorra.",
     "double-neg-abs": "TEST-912 (#4172): spirv_mini_interp rounds binary64 OpFNegate/FAbs through binary32, changing values as well as NaN payloads.",
     "fclamp-nan-zero": "FClamp NaN and signed-zero results are driver-dependent after f64 clamp/omod.",
-    "div-fixup-nan-s0": "RDNA2 ISA maps NaN(S0) to signed infinity; current translator preserves the NaN payload.",
 }
 
 
@@ -210,16 +209,32 @@ def compare(cond, a, b):
 
 
 def fixup(s0, s1, s2):
+    """v_div_fixup_f64 (S0 quotient, S1 denominator, S2 numerator) in the game MODE (IEEE=0, denorm16_64=3), as
+    measured on RDNA2 gfx1036 (docs/design.md, v_div_fixup row): a NaN S2 or S1 passes through unquieted, 0/0 and
+    inf/inf give the canonical negative quiet NaN, the underflow cutoff is exp(S2) - exp(S1) <= -1076, there is no
+    exponent-difference overflow check, and a NaN S0 gives a signed infinity."""
     sign = (s1 ^ s2) & 0x8000000000000000
-    if is_nan(s2): return s2 | (1 << 51)
-    if is_nan(s1): return s1 | (1 << 51)
+    if is_nan(s2): return s2
+    if is_nan(s1): return s1
     z1, z2, i1, i2 = is_zero(s1), is_zero(s2), is_inf(s1), is_inf(s2)
     if (z1 and z2) or (i1 and i2): return 0xFFF8000000000000
     e1, e2 = (s1 >> 52) & 0x7FF, (s2 >> 52) & 0x7FF
     ediff = e2 - e1
-    if i1 or z2 or ediff < -1074: return sign
-    if z1 or i2 or ediff >= 1024 or is_nan(s0): return sign | EXP
+    if i1 or z2 or ediff <= -1076: return sign
+    if z1 or i2 or is_nan(s0): return sign | EXP
     return (s0 & 0x7FFFFFFFFFFFFFFF) | sign
+
+
+def div_fmas(s0, s1, s2, vcc):
+    """v_div_fmas_f64 on finite operands, rounded once to nearest even (docs/design.md, v_div_fmas row, measured on
+    RDNA2 gfx1036): fma(S0, S1, S2) with VCC clear; with VCC set, the exact fma scaled by 2^128 when exp(S2) > 1023
+    (|S2| >= 2.0) and by 2^-128 otherwise, before that one rounding, so subnormal results single-round."""
+    exact = to_fraction(s0) * to_fraction(s1) + to_fraction(s2)
+    if vcc:
+        exact *= Fraction(2) ** (128 if (s2 >> 52) & 0x7FF > 1023 else -128)
+    # IEEE 754-2019 6.3: an exact zero is -0 only when the product and S2 are zeros that are both negative.
+    negative_zero = (is_zero(s0) or is_zero(s1)) and is_zero(s2) and bool((s0 ^ s1) >> 63) and bool(s2 >> 63)
+    return round_fraction(exact, 0, negative_zero)
 
 
 def frexp(bits):
@@ -343,13 +358,6 @@ def ref_program(lines, include_known=False):
                 d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(out)
         elif op == "v_div_fixup_f64":
             args = [read_source(t, vgpr, sgpr) for t in a[:3]]
-            s0, s1, s2 = args
-            ediff = ((s2 >> 52) & 0x7FF) - ((s1 >> 52) & 0x7FF)
-            normal_division = (not is_nan(s1) and not is_inf(s1) and not is_zero(s1)
-                               and not is_nan(s2) and not is_inf(s2) and not is_zero(s2)
-                               and -1074 <= ediff < 1024)
-            if not include_known and is_nan(s0) and normal_division:
-                raise SkipCase(f"KNOWN_DIVERGENCE div-fixup-nan-s0: {KNOWN_DIVERGENCES['div-fixup-nan-s0']}")
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(fixup(*args))
         elif op == "v_frexp_mant_f64":
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(frexp(read_source(a[0], vgpr, sgpr))[0])
@@ -374,9 +382,7 @@ def ref_program(lines, include_known=False):
             x, y, z = (read_source(t, vgpr, sgpr) for t in a)
             if any(is_nan(t) or is_inf(t) for t in (x, y, z)):
                 raise SkipCase("non-finite v_div_fmas_f64 operands are not judged")
-            exact = to_fraction(x) * to_fraction(y) + to_fraction(z)
-            if vcc: exact *= 1 << 64
-            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(round_fraction(exact))
+            d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(div_fmas(x, y, z, vcc))
         else:
             raise HarnessError(f"reference does not implement {op}")
     return [vgpr.get(r, 0) & M32 for r in range(8, 12)]
@@ -545,11 +551,7 @@ def make_case(rng, op, allow_literal=True, known_case=None):
         if known_case == "fclamp-nan-zero": left, right = "0x7ff80001", "1.0"
         body_lines.append(f"{op} v[8:9], {left}, {right}{suffix}")
     elif op == "v_div_fixup_f64":
-        if known_case == "div-fixup-nan-s0":
-            setup_lines += ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x7ff80000"]
-            body_lines.append(f"{op} v[8:9], v[12:13], 1.0, 2.0")
-        else:
-            body_lines.append(f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}")
+        body_lines.append(f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}")
     elif op == "v_div_fmas_f64":
         # VCC is initialized true so the f64 scaled FMA path is exercised deterministically.
         body_lines += ["v_cmp_eq_i32_e32 vcc_lo, 0, 0", f"{op} v[8:9], {gen_source(rng, 0, allow_literal, bus)}, {gen_source(rng, 1, allow_literal, bus)}, {gen_source(rng, 2, allow_literal, bus)}"]
@@ -681,8 +683,7 @@ def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, kn
     sequence = [(op, True, None) for op in ops] if sweep else []
     sequence += [(rng.choice(ops), False, None) for _ in range(programs)]
     if known:
-        sequence += [("v_div_fixup_f64" if label == "div-fixup-nan-s0" else "v_add_f64", True, label)
-                     for label in KNOWN_DIVERGENCES]
+        sequence += [("v_add_f64", True, label) for label in KNOWN_DIVERGENCES]
     cases = []
     for idx, (op, is_sweep, known_case) in enumerate(sequence):
         setup_lines, body_lines, _, _ = make_case(rng, op, allow_literal, known_case)

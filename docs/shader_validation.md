@@ -1366,11 +1366,20 @@ implementation-defined for binary64; the GPU oracle therefore counts `v_rsq_f64`
 `v_sqrt_f64` as unjudged skips instead of requiring bit-exact results. This was confirmed on an NVIDIA RTX 4070 with
 `shaderFloat64`: `v_rsq_f64 3.25` produced matching high 32 bits but zero low 32 bits, unlike the exact reference.
 
+The division fixup and scaled FMA references follow the `v_div_fixup_f64` and `v_div_fmas_f64` rows of
+`docs/design.md`, which were measured on RDNA2 (FUZZ-82). For the fixup, a NaN `S1` or `S2` passes through unquieted
+under `IEEE=0`, and the underflow cutoff is `exp(S2) - exp(S1) <= -1076`. There is no exponent-difference overflow
+check, and a NaN `S0` gives a signed infinity. For the scaled FMA with `VCC` set, the exact `fma(S0, S1, S2)` is
+scaled by `2^128` when `|S2| >= 2.0` and by `2^-128` otherwise, then rounded once, so subnormal results single-round.
+The reference had kept the ISA document's quieting and `+1024` overflow cutoff and an unconditional `2^64` scale.
+`--oracle gpu --no-literals` therefore reported 7 mismatches on main (`KubickNubick`, RTX 4080 and a gfx1036 iGPU)
+that came from the fuzzer, not the translator. `tests/test_f64_diff.py` checks both references against hand-written
+tables, and checks the fixup at the measured edges against the translator's own output on the CPU interpreter.
+
 Known divergence probes are excluded and counted by default, then reinserted with `--known`: binary64 output modifiers
-(SHADER-721), binary64 `OpFNegate`/`FAbs` that the CPU interpreter rounds through binary32 (TEST-912, #4172),
-driver-dependent NaN or signed-zero clamp results, and `v_div_fixup_f64` with a NaN `S0` and an ordinary finite
-division. The latter follows the RDNA2 ISA reference (`NaN(S0) -> signed infinity`), while the current translator
-preserves the NaN payload. Therefore `--known` can intentionally return 1 when this known mismatch is reproduced;
+(SHADER-721), binary64 `OpFNegate`/`FAbs` that the CPU interpreter rounds through binary32 (TEST-912, #4172), and
+driver-dependent NaN or signed-zero clamp results. A `v_div_fixup_f64` with a NaN `S0` is no longer one of them: the
+translator and the reference both give the signed infinity. `--known` returns 1 if a known mismatch is reproduced;
 the minimized case is printed. `--oracle gpu` translates the same
 fragment shader and runs it through `runtime/build/vk_harness`, comparing the raw RGBA32F output words. It assembles
 the fragment module with `spirv-as` and the full-screen vertex shader with the Vulkan SDK's `glslc`; use `--exe PATH`
