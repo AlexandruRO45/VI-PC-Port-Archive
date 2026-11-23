@@ -341,5 +341,38 @@ class TestSMulHiI32ASTAndSignExtensions(unittest.TestCase):
         )
         self.assertEqual(inst.disasm(), f"s_mul_hi_i32 s0, s1, {hex(u32(-5))}")
 
+GLOBAL_ORACLE_MAP[Opcode.S_MUL_HI_I32] = ref_s_mul_hi_i32
+
+
+class TestSMulHiI32ScalarInterpreter(unittest.TestCase):
+    def test_step_execution(self) -> None:
+        state = ScalarMachineState()
+        state.write_sgpr(0, u32(-1))
+        state.write_sgpr(1, 5)
+        inst = ASTInstruction(
+            Opcode.S_MUL_HI_I32,
+            ASTOperand.sgpr(2),
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(1),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(state.sgprs[2], 0xFFFFFFFF)
+
+    def test_step_positive_overflow(self) -> None:
+        state = ScalarMachineState()
+        state.write_sgpr(0, 0x40000000)
+        state.write_sgpr(1, 4)
+        inst = ASTInstruction(
+            Opcode.S_MUL_HI_I32,
+            ASTOperand.sgpr(2),
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(1),
+        )
+        # 0x40000000 * 4 = 0x100000000 -> high 32 bits is 1
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 1)
+        self.assertEqual(state.sgprs[2], 1)
+
 if __name__ == "__main__":
     unittest.main()
