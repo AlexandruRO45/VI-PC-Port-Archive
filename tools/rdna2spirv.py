@@ -371,6 +371,8 @@ class Gen:
         self.body.append("         " + s)
         if s.endswith("= OpLabel"):
             self.desc_cache.reg_ptrs = {}
+        elif s.startswith("OpStore %active "):
+            self.desc_cache.reg_ptrs.pop("active", None)
         if self.emulate:
             if s.startswith(("OpStore %vcc ", "OpStore %active ")):
                 reg, val = s.split()[1:3]
@@ -1268,8 +1270,14 @@ class Gen:
 
     # ---- EXEC (this lane's active bit) ----
     def active_b(self):
-        b = self.tmp()
-        self.emit(f"{b} = OpLoad %bool %active")
+        """This lane's EXEC bit. One load serves a basic block until the next store to %active (emit forgets it)."""
+        ptrs = self.desc_cache.reg_ptrs
+        if ptrs.get("body") is not self.body:
+            ptrs = self.desc_cache.reg_ptrs = {"body": self.body}
+        b = ptrs.get("active")
+        if b is None:
+            b = ptrs["active"] = self.tmp()
+            self.emit(f"{b} = OpLoad %bool %active")
         return b
 
     def exec_value(self):

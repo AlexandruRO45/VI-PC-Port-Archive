@@ -46,5 +46,26 @@ class OnePointerPerBlock(unittest.TestCase):
         self.assertEqual(words, [61, 55, 50, 10])
 
 
+def active_loads(asm):
+    return len(re.findall(r"= OpLoad %bool %active\b", asm))
+
+
+class OneActiveLoadPerExecState(unittest.TestCase):
+    """Every VALU write needs this lane's EXEC bit. One load of %active serves the writes until EXEC changes."""
+    WRITES = ["v_mov_b32 v7, 5", "v_add_nc_u32 v8, v7, v7", "v_mul_lo_u32 v9, v7, v8", "v_mov_b32 v10, v9",
+              "v_mov_b32 v11, v8", "v_mov_b32 v12, v7", "v_mov_b32 v13, v7"]
+
+    def test_straight_line_loads_active_once(self):
+        asm = translate(self.WRITES)
+        self.assertEqual(active_loads(asm), 1)
+        self.assertEqual(support.mrt0_words(asm), [50, 10, 5, 5])
+
+    def test_exec_write_in_between_loads_again(self):
+        lines = self.WRITES[:3] + ["s_mov_b32 exec_lo, 1"] + self.WRITES[3:]
+        asm = translate(lines)
+        self.assertGreater(active_loads(asm), active_loads(translate(self.WRITES)))
+        self.assertEqual(support.mrt0_words(asm), [50, 10, 5, 5])
+
+
 if __name__ == "__main__":
     unittest.main()
