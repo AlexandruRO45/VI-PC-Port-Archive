@@ -778,7 +778,8 @@ The only UI-adjacent evidence is content-manifest XML and text; there is no UI c
 
 `tools/content_definitions.py` reads the three measured XML roots:
 `CDataFileMgr__ContentChangeSetDef`, `CDataFileMgr__ContentDef` and `SSetupData`.
-It accepts local XML files or an existing `rpf9_carve.py` directory and prints only aggregate counts:
+It accepts local XML files or an existing `rpf9_carve.py` directory and prints only aggregate counts, plus one
+`ERROR` line for each input it cannot read or parse (the counts say `failed_inputs`, not which one it was):
 
 ```powershell
 python -I tools/content_definitions.py <work>/carve/story000_restofworld
