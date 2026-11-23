@@ -64,7 +64,8 @@ struct StderrCapture {
     int saved = -1;
     explicit StderrCapture(const std::filesystem::path& file) : path(file) {
         std::fflush(stderr);
-        std::FILE* out = std::fopen(path.string().c_str(), "wb");
+        std::FILE* out = nullptr;
+        if (fopen_s(&out, path.string().c_str(), "wb") != 0) out = nullptr;
         saved = _dup(2);
         if (out && saved >= 0) _dup2(_fileno(out), 2);
         if (out) std::fclose(out);
