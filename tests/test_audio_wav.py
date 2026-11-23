@@ -710,6 +710,19 @@ class AudioWavCliTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("--jobs must be at least 1", p.stderr)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
+    def test_cli_rejects_non_executable_ffmpeg_before_creating_output(self):
+        src = os.path.join(self.dir, "opus")
+        out = os.path.join(self.dir, "out")
+        write_fake_opus_inputs(src, names=("x.ogg", "y.ogg"))
+        ffmpeg = write_fake_ffmpeg(self.dir)
+        os.chmod(ffmpeg, 0o644)
+        result = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out, "--ffmpeg", ffmpeg],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.splitlines(), [f"ERROR: ffmpeg is not executable: {ffmpeg}"])
+        self.assertFalse(os.path.exists(out))
+
     def test_cli_rejects_out_file(self):
         out_file = os.path.join(self.dir, "out_file")
         with open(out_file, "wb") as f:
