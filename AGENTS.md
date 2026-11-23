@@ -103,11 +103,11 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
 ## Delegation and context
 
 For multi-step work, delegate recon and bounded edits, and keep planning, judgment and final review with the
-orchestrator. Ask for a compact map, not file dumps. Give each helper a bounded brief: goal, files, constraints,
-acceptance check and report shape. Parallelize independent reads; do not parallelize edits to the same files.
+delegating agent. Ask for a compact map, not file dumps. Give each subagent a bounded brief: goal, files,
+constraints, acceptance check and report shape. Parallelize independent reads; do not parallelize edits to the same
+files.
 
-A helper's report is not verification. Run the checks in this file, keep long logs on disk, and report the exact
-commands, exit codes and counts. Before a pull request is opened, post the claim required by `CONTRIBUTING.md` and
-fill in the pull request template.
+A subagent's report is not verification. For a code change, run the checks in this file, keep long logs on disk, and
+report the exact commands, exit codes and counts. Follow the claim and pull request rules above.
 
 Stop and surface on security, data loss, irreversible operations, or a conflict with a claimed item.
