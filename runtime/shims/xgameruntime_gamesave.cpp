@@ -17,10 +17,15 @@
 // An update buffers its writes and deletes; SubmitUpdate writes every new blob to "<blob>~", then renames each over
 // its blob and removes the deleted ones, so a failed write leaves the container as it was.
 //
-// ASSUMPTION (no executable yet): the quota is a fixed 1 GiB (the GDK says the per-user quota "is not a fixed size");
-// a blob name is at most 256 bytes (GS_MAX_BLOB_NAME_SIZE is not on the public pages); GetContainerInfo of a
-// container that does not exist returns S_OK without calling the callback; ReadBlobData with blobNames = nullptr
-// reads every blob of the container. syncOnDemand is accepted and ignored: nothing syncs offline.
+// ASSUMPTION: the quota is a fixed 1 GiB (the GDK says the per-user quota "is not a fixed size"); a blob name is at
+// most 256 bytes (GS_MAX_BLOB_NAME_SIZE is not on the public pages). syncOnDemand is accepted and ignored: nothing
+// syncs offline.
+//
+// GetContainerInfo of a container that does not exist returns S_OK without calling the callback. The retail
+// executable's one caller relies on that: it clears a flag that its callback sets, takes a callback that did not run
+// as "no container", and treats a failing HRESULT as an error. ReadBlobData with blobNames = nullptr reads every blob
+// of the container; no caller in the executable reaches it (its sync read names one blob, and its async read is not
+// started without at least one name).
 #include <windows.h>
 
 #include <algorithm>

@@ -389,9 +389,14 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
 - **Reads:** `XGameSaveReadBlobData` fills the title's buffer with the `XGameSaveBlob` array, then each blob's bytes
   and name, which the array points into; a buffer too small is `E_GS_PROVIDED_BUFFER_TOO_SMALL`, a missing blob
   `E_GS_BLOB_NOT_FOUND`. The async read's result size (`XAsyncGetResultSize`) is the buffer it needs.
-- **ASSUMPTION:** a fixed 1 GiB quota, blob names of at most 256 bytes, `blobNames = nullptr` reads every blob,
-  and `XGameSaveGetContainerInfo` of a missing container returns `S_OK` without a callback. `syncOnDemand` is
-  ignored: nothing syncs offline.
+- **ASSUMPTION:** a fixed 1 GiB quota and blob names of at most 256 bytes. `syncOnDemand` is ignored: nothing
+  syncs offline.
+- **Measured on the retail executable** (static read of its `XGameSave` callers, nothing run):
+  `XGameSaveGetContainerInfo` of a missing container returns `S_OK` without a callback, which is what the title's
+  one caller expects. It clears a flag that its callback sets, takes a callback that did not run as "no container",
+  and treats a failing `HRESULT` as an error. `blobNames = nullptr` reads every blob, but no caller reaches it: the
+  sync read names one blob and checks that one comes back, and the async read is not started without at least one
+  name.
 
 `xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`.
 
