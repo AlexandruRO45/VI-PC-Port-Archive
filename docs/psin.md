@@ -507,8 +507,10 @@ code 2). Leave it out to index every container.
   then has the same `schema` entry, `{structs, enums, lsch, lenm, reason}`, also when the walk stopped before
   reaching the sections (a truncated stream): `lsch`/`lenm` say whether each was decoded and `reason` why
   not ("" when both were); text mode prints the reason as a `schema:` line.
-- `collect(src)` scans a single file or every `.bin` in a carve directory; non-PSIN files are
-  skipped.
+- `collect(src)` scans a single file or every `.bin` in a carve directory; non-PSIN files in a
+  folder are skipped. A single-file argument that decodes as no PSIN container is one
+  `ERROR: <path>: not a PSIN container` line and exit code 2, so an uncarved archive or an empty
+  file is not reported as "0 PSIN files".
 - Text output prints one line per container and a tag summary; `--json` writes `{files, summary}`.
 - The parser validates the first-section offset, each tag's printable range, each section size and
   the exact EOF; a 64 KiB split is reported as incomplete rather than guessed.
