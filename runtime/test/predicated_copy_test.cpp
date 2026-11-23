@@ -77,6 +77,25 @@ int main(){
     EXPECT(prepare(statistics,resolve,vk,result,true)==ReplayResult::success && prepared==before+1);
     EXPECT(result.statistics_segment_count==2);
     EXPECT(result.commands[2].statistics_end==0 && result.commands[2].statistics_begin==1);
+    // D3D-518: Mesa ANV may run an ordinary buffer copy as a compute pass counted by the statistics query around it.
+    // With split_statistics_around_buffer_transfers the segment ends around the copy; without it, nothing changes.
+    CommandList plain_statistics;
+    EXPECT(plain_statistics.begin_query({1,d3d12_query::pipeline_statistics,0}));
+    EXPECT(plain_statistics.copy_buffer({2,0,1,0,1}));
+    EXPECT(plain_statistics.end_query({1,d3d12_query::pipeline_statistics,0})&&plain_statistics.close());
+    EXPECT(prepare(plain_statistics,resolve,vk,result,true)==ReplayResult::success);
+    EXPECT(result.statistics_segment_count==0&&!result.commands[1].transfer_split);
+    EXPECT(result.commands[1].statistics_end==detail::PreparedQuery::no_segment);
+    vk.split_statistics_around_buffer_transfers=true;
+    EXPECT(prepare(plain_statistics,resolve,vk,result,true)==ReplayResult::success);
+    EXPECT(result.commands[1].transfer_split&&result.statistics_segment_count==2);
+    EXPECT(result.commands[1].statistics_end==0&&result.commands[1].statistics_begin==1);
+    EXPECT(result.queries[0].statistics_begin==0&&result.queries[1].statistics_end==1);
+    EXPECT(result.queries[1].statistics_first==0&&result.queries[1].statistics_count==2);
+    // Without a statistics segment pool (statistics_helpers false) the copy is not split and stays supported.
+    EXPECT(prepare(plain_statistics,resolve,vk,result)==ReplayResult::success);
+    EXPECT(!result.commands[1].transfer_split&&result.statistics_segment_count==0);
+    vk.split_statistics_around_buffer_transfers=false;
     // Readback visibility follows the actual producer, including mixed command lists.
     destination.host_readable = false;
     EXPECT(check({2,0,1,0,1})==ReplayResult::success && !result.wrote_readback && !result.readback_src_stages);
@@ -95,5 +114,5 @@ int main(){
     PredicatedBufferCopier missing(+[](VkDevice,const char*)->PFN_vkVoidFunction{return nullptr;},VK_NULL_HANDLE,{});
     std::vector<PredicatedCopyDispatch> jobs;
     EXPECT(!missing.batch()->prepare(source.buffer,destination.buffer,0,0,1,jobs));
-    std::puts("predicated copy preparation: capability, routing, 64-bit offsets, bounds, overflow, overlap, zero size, failure and statistics-query controls passed");
+    std::puts("predicated copy preparation: capability, routing, 64-bit offsets, bounds, overflow, overlap, zero size, failure, statistics-query and ANV transfer-split (D3D-518) controls passed");
 }

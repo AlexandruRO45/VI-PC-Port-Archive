@@ -95,6 +95,10 @@ int main() {
     EXPECT(std::memcmp(dst_data,expected.data(),bytes)!=0); // expected includes the not-yet-executed copies
     for(std::size_t i=0;i<bytes;++i) EXPECT(static_cast<unsigned char*>(dst_data)[i]==static_cast<unsigned char>(13*i+173));
     context.configure_predicated_copy(d.device_proc,limits);
+    // D3D-518: the device layer sets this on Mesa ANV, whose plain copy after the helper dispatch otherwise lands in the
+    // statistics query below as a compute blorp (CS invocations 32 on an Arc A770, Mesa 25.2.8). Set here on every
+    // driver, so the split itself is checked everywhere: the 11 counters must stay 0 and the copies exact either way.
+    context.set_split_statistics_around_buffer_transfers(true);
     const auto real_submit=context.vk.vkQueueSubmit;
     context.vk.vkQueueSubmit=+[](VkQueue,std::uint32_t,const VkSubmitInfo*,VkFence)->VkResult{return VK_ERROR_OUT_OF_HOST_MEMORY;};
     const auto rejected=queue.execute({&pointer,1});

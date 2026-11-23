@@ -4376,6 +4376,18 @@ public:
             const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                 info.get_instance_proc ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2")
                                        : nullptr);
+            // Mesa ANV may run buffer copies, fills and updates as compute passes that pipeline-statistics queries
+            // count (D3D-518, measured on an Arc A770 with Mesa 25.2.8); the replay splits statistics around them.
+            if (get_props2) {
+                VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+                VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+                get_props2(info.physical, &props);
+                if (driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
+                    state_.context->set_split_statistics_around_buffer_transfers(true);
+                    log_once("pipeline-statistics queries split around buffer transfers (Mesa ANV); driver",
+                             int(driver.driverID));
+                }
+            }
             if (family.timestampValidBits && get_props2) {
                 VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};

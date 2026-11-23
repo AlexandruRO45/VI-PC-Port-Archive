@@ -2703,6 +2703,18 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   results still match and all 11 statistics counters are zero. Without a statistics pool (single-list `replay()` or
   a queue without the summation helper), these three commands are refused before helper scratch allocation or
   recording. The resolve fallback is unchanged: only resolves needing dispatches are refused there.
+- **Driver compute passes for buffer transfers** (D3D-518). Mesa ANV before Xe2 (Gfx < 20) records
+  `vkCmdCopyBuffer`, `vkCmdFillBuffer` and `vkCmdUpdateBuffer` as compute blorps when the command buffer is already in
+  GPGPU mode (after any dispatch, a helper's included) or on a compute queue (`anv_blorp_batch_init`,
+  `anv_cmd_buffer_blorp_uses_compute`), and their invocations land in the application's `CSInvocations`: a 17-byte
+  copy after a dispatch counted 32 on an Arc A770 with Mesa 25.2.8, the same copy alone 0 (#166). The device layer
+  sets `split_statistics_around_buffer_transfers` on `VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`, and a split statistics
+  query then also ends its segment around ordinary buffer copies, `AtomicCopyBufferUINT(64)` copies,
+  `WriteBufferImmediate` and buffer UAV clears, as around the helpers above. Xe2 and later keep render-queue
+  transfers on the 3D pipeline, where only the cost of the extra segments applies. Without a statistics pool these
+  commands are not split and stay supported. Texture copies and clears on an ANV compute queue are not split yet.
+  `predicated_copy_test` checks the planning; `vk_predicated_copy_test` sets the flag on every driver and
+  failed on the A770 without it (CS invocations 32), passes with it.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 - **Timestamp resolves on MoltenVK.** On Apple GPUs, MoltenVK delays every `vkCmdWriteTimestamp` to the end of

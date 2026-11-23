@@ -1071,6 +1071,12 @@ public:
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
     void set_order_timestamp_copies(bool order) { order_timestamp_copies_ = order; }
+    // True on Mesa ANV, whose buffer copies, fills and updates may run as compute passes counted by pipeline-statistics
+    // queries (ReplayFunctions::split_statistics_around_buffer_transfers, D3D-518). Set before any queue uses it.
+    void set_split_statistics_around_buffer_transfers(bool split) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.split_statistics_around_buffer_transfers = split;
+    }
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.

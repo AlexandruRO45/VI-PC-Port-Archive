@@ -889,6 +889,12 @@ struct ReplayFunctions {
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
+    // Mesa ANV before Xe2 (Gfx < 20) records vkCmdCopyBuffer, vkCmdFillBuffer and vkCmdUpdateBuffer as compute
+    // blorps when the command buffer is already in GPGPU mode (after a dispatch, a helper's included) or on a compute
+    // queue, and their invocations land in an active pipeline-statistics query, which D3D12 transfers never touch.
+    // Set, a split statistics query also ends its segment around buffer copies, fills and immediate writes the way
+    // it does around helper dispatches (D3D-162, D3D-518; docs/d3d12_vulkan.md).
+    bool split_statistics_around_buffer_transfers = false;
 };
 
 enum class ReplayResult {
@@ -956,6 +962,9 @@ struct Prepared {
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
     VkImageView resolve_view = VK_NULL_HANDLE;
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
+    // A buffer copy, fill or immediate write that a driver may run as a compute pass: with
+    // ReplayFunctions::split_statistics_around_buffer_transfers, the statistics segment ends around it (D3D-518).
+    bool transfer_split = false;
                                // (or a copy of an rgb96 texture: repacked by the same pass)
     std::uint32_t rgb96_row_words = 0;    // an rgb96 footprint: words between its rows and between its slices
     std::uint32_t rgb96_slice_words = 0;
@@ -2198,7 +2207,7 @@ inline void plan_statistics_segments(PreparedList& out) {
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
         if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                      p.counted_dispatch.indirect))
+                      p.counted_dispatch.indirect || p.transfer_split))
             inner.push_back({&p.statistics_end, &p.statistics_begin});
         if (next_query == out.queries.size() || out.queries[next_query].command != i) continue;
         auto& query = out.queries[next_query++];
@@ -2249,7 +2258,7 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
             // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
             // segment before it and open a new one after, the way resolves do.
             if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                                    p.counted_dispatch.indirect)) {
+                                    p.counted_dispatch.indirect || p.transfer_split)) {
                 p.statistics_end = current;
                 current = out.statistics_segment_count++;
                 p.statistics_begin = current;
@@ -2378,6 +2387,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         auto& p = out.commands[i];
+        // Buffer transfers outside any rendering scope; a predicated copy already splits as a helper dispatch.
+        p.transfer_split = vk.split_statistics_around_buffer_transfers && statistics_helpers &&
+                           (std::holds_alternative<CopyBuffer>(command) ||
+                            std::holds_alternative<AtomicCopyBuffer>(command) ||
+                            std::holds_alternative<WriteImmediate>(command) ||
+                            (std::holds_alternative<ClearUnorderedAccess>(command) &&
+                             std::get<ClearUnorderedAccess>(command).view.buffer));
         const auto bind = [&](ResourceId id) {
             const ResourceBinding* binding = resolve(id);
             if (binding) p.binding = *binding;
@@ -3328,6 +3344,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 constexpr VkAccessFlags transfer = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
                 detail::memory_barrier(vk, command_buffer, state.access, state.stages, transfer,
                                        VK_PIPELINE_STAGE_TRANSFER_BIT);
+                end_statistics();  // D3D-518
                 for (std::size_t f = 0; f < p.fills.size(); ++f) {
                     if (f)  // rectangles may overlap
                         detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -3335,6 +3352,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     detail::emit_buffer_fill(vk, command_buffer, p.binding.buffer, p.element, p.fills[f][0],
                                              p.fills[f][1], p.fill_scratch, p.fill_scratch_offset);
                 }
+                begin_statistics();
                 detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        state.access, state.stages);
                 continue;
@@ -3377,8 +3395,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
             } else if (!p.buffer_copies.empty()) {
+                end_statistics();  // D3D-518: no-ops unless transfer_split gave this copy segment ends
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
+                begin_statistics();
             } else if (p.staged) {
                 // Depth <-> colour, or a block-compressed copy no one extent fits: the source into the scratch, then
                 // the scratch into the destination. The destination's copy_layout comes after the scratch write, so
@@ -3605,7 +3625,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // SetPredication's predicated list). Suspend conditional rendering around vkCmdUpdateBuffer because
             // Intel's Windows Vulkan driver suppresses it after PredicateReducer::capture's compute dispatch.
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
+            end_statistics();  // D3D-518
             vk.update_buffer(command_buffer, p.write_buffer, p.write_offset, 4, &write->value);
+            begin_statistics();
             if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
         } else if (std::holds_alternative<AtomicCopyBuffer>(command)) {
             // Every earlier write, to the dependent resources among others, finishes and is visible before the copy.
@@ -3614,7 +3636,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+            end_statistics();  // D3D-518
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
+            begin_statistics();
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
             if (ind->count_buffer && ind->kind != IndirectKind::dispatch) {
