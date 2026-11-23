@@ -335,6 +335,45 @@ class TestCli(unittest.TestCase):
                 self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
                 self.assertIn("awc_names: error:", err.getvalue())
 
+    def test_malformed_banks_json_fields(self):
+        rpf_documents = [
+            {"bank_count": 1, "streams": {}},
+            {"bank_count": 1, "streams": [1]},
+            {"bank_count": 1, "streams": [{"bank": None, "stream": "1234"}]},
+            {"bank_count": 1, "streams": [{"bank": "audio.awc", "stream": []}]},
+            {"bank_count": 1, "streams": [{"bank": "audio.awc", "stream": "not-hex"}]},
+        ]
+        inventory_documents = [
+            [{"Path": None, "Streams": []}],
+            [{"Path": "audio.awc", "Streams": {}}],
+            [{"Path": "audio.awc", "Streams": [1]}],
+            [{"Path": "audio.awc", "Streams": [{"Id": True}]}],
+            [{"Path": "audio.awc", "Streams": [{"Id": "not-hex"}]}],
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), json.dumps(["x"]))
+            for index, doc in enumerate(rpf_documents + inventory_documents):
+                with self.subTest(document=doc):
+                    banks = write(os.path.join(tmp, f"banks_{index}.json"), json.dumps(doc))
+                    err = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                        self.assertEqual(A.main(["--words", words, banks]), 2)
+                    self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                    self.assertIn("awc_names: error:", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+
+    def test_valid_banks_json_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = write(os.path.join(tmp, "rpf.json"), json.dumps({
+                "bank_count": 1,
+                "streams": [{"bank": "nested/audio.awc", "stream": "20000001"}],
+            }))
+            inventory = write(os.path.join(tmp, "inventory.json"), json.dumps({
+                "Banks": [{"Path": "nested/audio", "Streams": [{"Id": "20000001"}]}],
+            }))
+            self.assertEqual(A.load_banks(rpf), {"nested/audio": [1]})
+            self.assertEqual(A.load_banks(inventory), {"nested/audio": [1]})
+
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)

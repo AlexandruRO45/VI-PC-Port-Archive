@@ -108,21 +108,50 @@ def load_banks(source: str) -> dict:
         with open(source, encoding="utf-8") as fh:
             doc = json.load(fh)
         if isinstance(doc, dict) and "bank_count" in doc and "streams" in doc:
+            if not isinstance(doc["streams"], list):
+                raise ValueError("expected 'streams' to be a list")
             grouped = collections.defaultdict(list)
-            for row in doc["streams"]:
-                bank = row["bank"]
+            for index, row in enumerate(doc["streams"]):
+                if not isinstance(row, dict):
+                    raise ValueError(f"stream {index} must be an object")
+                bank = row.get("bank")
+                stream = row.get("stream")
+                if not isinstance(bank, str):
+                    raise ValueError(f"stream {index} bank must be a string")
+                if not isinstance(stream, str):
+                    raise ValueError(f"stream {index} stream must be a hexadecimal string")
                 # Match the export folder used by awc_opus, including nested bank paths.
                 label = os.path.splitext(bank)[0] if bank.lower().endswith(".awc") else bank
-                grouped[label].append(int(row["stream"], 16) & M29)
+                try:
+                    grouped[label].append(int(stream, 16) & M29)
+                except ValueError:
+                    raise ValueError(f"stream {index} stream must be a hexadecimal string") from None
             return dict(grouped)
         banks = doc.get("Banks", doc) if isinstance(doc, dict) else doc
         if not isinstance(banks, list):
             raise ValueError("expected a list of banks")
         out = {}
-        for bank in banks:
+        for bank_index, bank in enumerate(banks):
             if not isinstance(bank, dict):
                 raise ValueError(f"expected each bank to be an object, got {type(bank).__name__}")
-            out[bank["Path"]] = [int(s["Id"], 16) & M29 for s in bank.get("Streams") or []]
+            path = bank.get("Path")
+            streams = bank.get("Streams", [])
+            if not isinstance(path, str):
+                raise ValueError(f"bank {bank_index} Path must be a string")
+            if streams is None:  # rpf9dump uses null for a bank whose stream table was unreadable
+                streams = []
+            if not isinstance(streams, list):
+                raise ValueError(f"bank {bank_index} Streams must be a list")
+            ids = []
+            for stream_index, stream in enumerate(streams):
+                if not isinstance(stream, dict) or not isinstance(stream.get("Id"), str):
+                    raise ValueError(f"bank {bank_index} stream {stream_index} Id must be a hexadecimal string")
+                try:
+                    ids.append(int(stream["Id"], 16) & M29)
+                except ValueError:
+                    raise ValueError(
+                        f"bank {bank_index} stream {stream_index} Id must be a hexadecimal string") from None
+            out[path] = ids
         return out
     if os.path.isfile(source):
         return {os.path.splitext(os.path.basename(source))[0]: bank_ids(source)}
