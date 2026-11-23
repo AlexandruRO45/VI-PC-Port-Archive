@@ -192,12 +192,10 @@ def assert_one_error_line(result, *fragments):
     assert result.stdout == ""
 
 
-@pytest.mark.parametrize("kind", ["missing", "folder", "empty", "not-json", "not-utf8", "nested-too-deep"])
+@pytest.mark.parametrize("kind", ["missing", "empty", "not-json", "not-utf8", "nested-too-deep"])
 def test_cli_unreadable_index_is_one_error_line(tmp_path, kind):
     index = tmp_path / "index.json"
-    if kind == "folder":
-        index.mkdir()
-    elif kind != "missing":
+    if kind != "missing":
         index.write_bytes({"empty": b"", "not-json": b"{not json", "not-utf8": b"\xff\xfe{}",
                            "nested-too-deep": b"[" * 100000}[kind])
     report = tmp_path / "report.json"
@@ -208,6 +206,17 @@ def test_cli_unreadable_index_is_one_error_line(tmp_path, kind):
     assert not report.exists()
 
 
+def test_cli_folder_index_is_one_error_line(tmp_path):
+    # A folder used to be reported through the open() failure: Windows said "Permission denied" (which reads
+    # like an ACL problem) and Linux said "Is a directory". The message now names the input.
+    index = tmp_path / "index.json"
+    index.mkdir()
+    report = tmp_path / "report.json"
+
+    result = run_cli(index, "--json", report)
+
+    assert_one_error_line(result, "is a folder, not a JSON index", str(index))
+    assert not report.exists()
 WRONG_SHAPES = [
     ([], "expected a JSON object of shader -> metadata entries"),
     ("text", "expected a JSON object of shader -> metadata entries"),

@@ -108,6 +108,10 @@ def load_index(path):
 
     utf-8-sig: a BOM left by a Windows editor is not a JSON error.
     """
+    if os.path.isdir(path):
+        # A folder opens with EACCES on Windows ("Permission denied", which reads like an ACL problem)
+        # and EISDIR elsewhere. Name the input that is wrong instead of passing the OS's mode message on.
+        raise ValueError(f"{path} is a folder, not a JSON index")
     try:
         with open(path, encoding="utf-8-sig") as f:
             index = json.load(f)
