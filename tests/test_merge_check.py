@@ -283,6 +283,15 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(code_issue, 0)
         self.assertEqual(r_issue["merges"], [])
 
+    def test_a_squash_subject_with_a_unicode_line_separator_is_one_history_record(self):
+        self.pr_branch("squashed", "main", "\n" + PARAGRAPH)
+        self.squash_merge(25, "squashed", "docs: clarify the header\u2028and its parameters")
+        merged_sha = self.git("rev-parse", "--short=12", "main")
+
+        code, [result] = self.run_check("25=squashed")
+        self.assertEqual((code, result["verdict"], result["merges"]),
+                         (1, "already-merged", [merged_sha]))
+
     def test_a_follow_up_commit_after_a_multi_commit_squash_merge_is_clean(self):
         base = self.git("rev-parse", "main")
         self.git("checkout", "-q", "-b", "sq3", base)
