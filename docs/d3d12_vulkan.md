@@ -2656,7 +2656,11 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   released fence stays until then); the fences it waits on are not kept. A fence released while operations wait
   for it lets them go on, as the host runtime does (D3D-496): the released fence's wait is taken off each held
   operation, which then runs in queue order once its other waits are met, and a `Wait` for it not yet attached to
-  a batch counts as reached (case "fence released while a batch waits", layer and host). Its semaphore is not
+  a batch counts as reached (case "fence released while a batch waits", layer and host). This also holds when the
+  last reference goes inside a release, as the pin of a Signal one queue has just submitted while another queue
+  waits on the fence: every queue forgets the fence before it is erased, so none is submitted still waiting on it
+  (`queue_holds_pump_release_test`; the waits of D3D-496 case 1 were otherwise never met on the GPU and stalled
+  that queue for good under load). Its semaphore is not
   destroyed at once (D3D-486): it goes through the deferred-deletion tickets once every submission made before the
   release has completed, so nothing pending uses a destroyed semaphore (case "fences released while queues use
   them", layer and host); the pipeline states and root signatures of its lists (copied from the
