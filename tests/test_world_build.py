@@ -870,6 +870,22 @@ class GlbWriterTest(unittest.TestCase):
             self.assertEqual(summary["total_bytes"], len(disk_data))
             self.assertEqual(len(summary["json"]["images"]), 1)
 
+    def test_written_bounds_match_packed_vertices_across_primitives(self):
+        prims = [
+            {"positions": [(x, 0, 0), (0, y, 0), (0, 0, z)], "indices": [0, 1, 2]}
+            for x, y, z in [(-0.1, 0.2, -0.3), (0.4, -0.5, 0.6)]
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "chunk.glb")
+            stats = glb_writer.write_glb(path, prims)
+            with open(path, "rb") as handle:
+                gltf, payload = parse_and_validate_glb(handle.read())
+        points = []
+        for prim in gltf["meshes"][0]["primitives"]:
+            points.extend(read_accessor_floats(gltf, payload, prim["attributes"]["POSITION"]))
+        axes = list(zip(*points))
+        self.assertEqual(stats["bounds"], [min(a) for a in axes] + [max(a) for a in axes])
+
     def test_untextured_glb_has_no_images_and_valid_clay_material(self):
         prims = glb_writer.parse_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", is_path=False)
         glb_data = glb_writer.build_glb(prims, materials=None)

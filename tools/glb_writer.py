@@ -927,9 +927,14 @@ def _build_glb_with_stats(
     gltf_primitives: list[dict] = []
     total_verts = 0
     total_tris = 0
+    lo = [math.inf] * 3
+    hi = [-math.inf] * 3
 
     for prim in non_empty:
         packed = pack_primitive(prim)
+        for axis in range(3):
+            lo[axis] = min(lo[axis], packed["min"][axis])
+            hi[axis] = max(hi[axis], packed["max"][axis])
         total_verts += packed["vertices"]
         total_tris += packed["index_count"] // 3
         attributes, idx_acc = _append_packed(bin_buf, buffer_views, accessors, packed)
@@ -984,15 +989,13 @@ def _build_glb_with_stats(
     bin_hdr = struct.pack("<II", len(bin_buf), CHUNK_TYPE_BIN)
     glb_bytes = b"".join((header, json_hdr, json_bytes, bin_hdr, bytes(bin_buf)))
 
-    bounds = compute_bounds(non_empty)
-    assert bounds is not None
     stats = {
         "bytes": len(glb_bytes),
         "triangles": total_tris,
         "vertices": total_verts,
         "primitives": len(non_empty),
         "textures": len(table.textures),
-        "bounds": bounds,
+        "bounds": lo + hi,
     }
     return glb_bytes, stats
 
