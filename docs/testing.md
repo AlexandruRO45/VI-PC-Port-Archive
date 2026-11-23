@@ -673,4 +673,34 @@ python -I tools/pc_checker.py --cli --check --json
 
 `--cpu`, `--gpu` and `--ram` override the detected values when a VM or a remote session hides them. Its scores are
 rough estimates made for this tool, not benchmarks, so put the detected model names in the #166 entry, not the score.
-`python -I tests/test_pc_checker.py` checks the parsing and the comparison with the window mocked.
+`python -I tests/test_pc_checker.py` checks the parsing and the comparison with the window mocked. Set
+`LEONIDA_SKIP_SPEC_CHECK` to make `SpecChecker.warn_if_weak` return without showing the popup.
+
+## Switches the tools and the runtime tests read
+
+`tests/test_docs_env_vars.py` requires every `LEONIDA_*` / `GTA6RT_*` string in `runtime/`, `tools/`, `scripts/` and
+`make_game.py` to appear in some document. The loader switches live in `runtime/README.md`. These are the ones the
+tools and the runtime tests read, and that a person or a test harness sets:
+
+| Variable | What it does |
+|---|---|
+| `LEONIDA_ARGV_SEQUENCE` | Set, `runtime/test/fixtures/tiny_argv_modes.cpp` walks the CRT argv modes and prints each snapshot. Unset, it only prints the entry snapshot. |
+| `LEONIDA_AUDIO_TRACE` | `1` makes `bink_audio_test` print a line before each `BinkDoFrame`. |
+| `LEONIDA_AUDIO_NO_SLEEP` | `1` makes `bink_audio_test` skip the sleep between frames. |
+| `LEONIDA_BVH_WARP` | `1` makes `bvh_builder_test` create the PC device on WARP. On a hardware adapter the test already does that unless `LEONIDA_BVH_HARDWARE=1`. |
+| `LEONIDA_BVH_FLAG` | `1` passes the flag argument through to the XboxBvhBuilder constructor in `bvh_builder_test`. |
+| `LEONIDA_D3D49_DUMP` | Set, `d3d12_private_data_test` prints the host runtime's private-data record and exits. |
+| `LEONIDA_D3D49_VERBOSE` | Set, `d3d12_heap_properties_test` prints each compared call instead of only the mismatches. |
+| `LEONIDA_FSR_WARP` | `1` makes `fsr_dispatch_test` create the PC device on WARP. |
+| `LEONIDA_MOVIE_FRAME` | Frame index `d3d12_boot_movie_test` decodes first. It has to be a frame of that movie. |
+| `LEONIDA_ORACLE_DUMP` | Set, `root_signature_oracle_test` prints the whole blob as little-endian u32 words before parsing it. |
+| `LEONIDA_QUEUE_PROXY_JOBS` | How many differential queue-proxy children run at once (1–64). Unset, half the logical processors, clamped to 1–8. |
+| `LEONIDA_QUEUE_PROXY_ISOLATE_ALL` | Set, every queue-proxy differential case runs in a child process, not only the faulting and residency ones. |
+| `LEONIDA_RT136_A`, `LEONIDA_RT136_B`, `LEONIDA_RT136_C` | Names `process_cmdline_test` puts in the environment to check that `__getmainargs` and `__wgetmainargs` see a variable set before the first call and variables set after `set_command_line`. |
+| `LEONIDA_SCENE_MODE` | Guest-scene fixture: `full` (frames 0..599, checkpoint after 299), `save` (frames 0..299) or `resume` (frames 300..599 from `checkpoint.bin`). |
+| `LEONIDA_SCENE_AUDIO` | `winmm` plays the guest scene's audio through the host. Any other value, including the runner's `offline`, writes PCM and does not play it. |
+| `LEONIDA_SPIRV_TOOLS` | Directory `runtime/test/shaders/build.py` puts at the front of `PATH` before it runs `spirv-as` and `spirv-val`. CMake sets it so the Visual Studio generator does not have to pass a whole `PATH`. |
+| `LEONIDA_TLS_GA_PATCH` | `0` turns off the loader's rewrite of a `/GA` executable's slot-0 TLS reads. Unset, or any other value, leaves the rewrite on (`runtime/src/pe_loader.cpp`). |
+| `LEONIDA_TOOLS_DIR` | Directory the probes and the semantic tests import instead of the `tools/` next to the script. |
+| `LEONIDA_USER_DATA_SHIFT` | Whole number from 0 to 27. `runtime/test/shaders/compute_fixture.py` moves a fixture's scalar user-data registers up by that many (a D3D12 compute test uses 4, where the root arguments start). Unset means 0. |
+| `LEONIDA_VK_HARNESS` | Path to `vk_harness`. `tools/first_light.py` uses it when `--harness` is omitted and the usual build folders do not have the binary. |
