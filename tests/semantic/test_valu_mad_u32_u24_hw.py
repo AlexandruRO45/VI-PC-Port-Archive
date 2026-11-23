@@ -218,5 +218,49 @@ class MadU32U24SimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.lanes[i].get_vgpr(3), 0xDEADBEEF)  # Inactive lanes unchanged
 
+class MadU32U24RegisterAliasingTests(unittest.TestCase):
+    def test_dst_aliases_src0(self):
+        state = ScalarRegisterState()
+        state.set_vgpr(0, 7)
+        state.set_vgpr(1, 6)
+        state.set_vgpr(2, 2)
+        ast = InstructionAST(
+            "v_mad_u32_u24",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+            Operand(RegKind.VGPR, 2),
+        )
+        execute_scalar_mad_u32_u24(state, ast)
+        self.assertEqual(state.get_vgpr(0), (7 * 6) + 2)
+
+    def test_dst_aliases_src2(self):
+        state = ScalarRegisterState()
+        state.set_vgpr(0, 5)
+        state.set_vgpr(1, 4)
+        state.set_vgpr(2, 100)
+        ast = InstructionAST(
+            "v_mad_u32_u24",
+            Operand(RegKind.VGPR, 2),
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+            Operand(RegKind.VGPR, 2),
+        )
+        execute_scalar_mad_u32_u24(state, ast)
+        self.assertEqual(state.get_vgpr(2), (5 * 4) + 100)
+
+    def test_all_operands_alias(self):
+        state = ScalarRegisterState()
+        state.set_vgpr(0, 3)
+        ast = InstructionAST(
+            "v_mad_u32_u24",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 0),
+        )
+        execute_scalar_mad_u32_u24(state, ast)
+        self.assertEqual(state.get_vgpr(0), (3 * 3) + 3)
+
 if __name__ == "__main__":
     unittest.main()
