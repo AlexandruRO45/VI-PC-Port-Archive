@@ -153,6 +153,39 @@ class Api(unittest.TestCase):
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
 
+    def test_rebar_advisory_for_8gb_gpu_when_disabled(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, rebar=False)
+        self.assertIn("Resizable BAR is disabled", report.rebar_note)
+        self.assertIn("Resizable BAR is disabled", report.as_text())
+
+    def test_no_rebar_advisory_when_enabled(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, rebar=True)
+        self.assertEqual(report.rebar_note, "")
+        self.assertNotIn("Resizable BAR is disabled", report.as_text())
+
+    def test_no_rebar_advisory_for_16gb_gpu(self):
+        c = pc.SpecChecker(XBOX)
+        report = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 4080 (16 GB VRAM)", 32, rebar=False)
+        self.assertEqual(report.rebar_note, "")
+
+    def test_detect_rebar_from_nvidia_smi(self):
+        from unittest import mock
+        smi_out_on = "BAR1 Memory Usage\n    Total                                          : 8192 MiB\n"
+        with mock.patch("shutil.which", return_value="nvidia-smi"), \
+             mock.patch.object(pc, "_run", return_value=smi_out_on):
+            active, size = pc.detect_rebar()
+            self.assertTrue(active)
+            self.assertEqual(size, 8192)
+
+        smi_out_off = "BAR1 Memory Usage\n    Total                                          : 256 MiB\n"
+        with mock.patch("shutil.which", return_value="nvidia-smi"), \
+             mock.patch.object(pc, "_run", return_value=smi_out_off):
+            active, size = pc.detect_rebar()
+            self.assertFalse(active)
+            self.assertEqual(size, 256)
+
 
 if __name__ == "__main__":
     unittest.main()
