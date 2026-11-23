@@ -1570,10 +1570,19 @@ def run_suite(a, work: str) -> int:
                 raw2 = os.path.join(raw_dir, f"{name}.u16.raw")
                 runs.append(("u16 indices", raw2, dict(env, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16",
                                                         VKH_GS_COUNT="3")))
-                raw2f = os.path.join(raw_dir, f"{name}.u16_first.raw")
-                runs.append(("u16 indices from first 3", raw2f,
-                             dict(env, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16", VKH_GS_COUNT="3",
-                                  VKH_GS_FIRST="3")))
+                # The base-vertex run (VKH_GS_FIRST is the push constants' member 8, D3D's BaseVertexLocation):
+                # the real triangle sits at vertices n..n+2 behind a degenerate copy at 0..n-1, so indices
+                # 0,1,2 plus base n draw it, while a scatter that dropped the base would draw the zero-area
+                # copy and fail the gradient check.
+                n = len(VS_TRI_OUTPUTS)
+                base = os.path.join(work, "gs_tri_base.bin")
+                with open(base, "wb") as f:
+                    for v in [VS_TRI_OUTPUTS[0]] * n + list(VS_TRI_OUTPUTS):
+                        f.write(struct.pack("<8f", *v))
+                raw2f = os.path.join(raw_dir, f"{name}.u16_base.raw")
+                runs.append((f"u16 indices, base vertex {n}", raw2f,
+                             dict(env, VKH_GS_LINEAR=base, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16",
+                                  VKH_GS_COUNT="3", VKH_GS_FIRST=str(n))))
                 # A permuted u32 index run (LukeOsland1's fixture from #7696): the linear buffer's first three
                 # slots hold a degenerate triangle, so a scatter that ignored the index buffer would draw it and
                 # fail the gradient check -- only following indices (1, 3, 0) restores the real one.
