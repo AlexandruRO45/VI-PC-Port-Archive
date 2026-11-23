@@ -5,6 +5,9 @@
 Every byte here is built by the test: synthetic fragment system pages inside a synthetic RPF9-style archive
 made of page-aligned zlib streams. No game file, value or name is used.
 """
+import contextlib
+import errno
+import io
 import json
 import os
 import struct
@@ -13,6 +16,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "fragment_children.py")
@@ -288,6 +292,53 @@ class TestCommandLine(unittest.TestCase):
             self.assertTrue(os.path.exists(records))
             with open(prior, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "previous report\n")
+
+    def test_records_write_error_names_the_records_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive(fragment()))
+            records = os.path.join(tmp, "records.jsonl")
+            real_open = open
+
+            class BadWrite:
+                name = records
+
+                def write(self, data):
+                    raise OSError(errno.ENOSPC, "No space left on device")
+
+                def flush(self):
+                    pass
+
+                def close(self):
+                    pass
+
+            def fake_open(name, mode="r", *args, **kwargs):
+                if os.path.abspath(name) == os.path.abspath(records) and "w" in mode:
+                    return BadWrite()
+                return real_open(name, mode, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch("builtins.open", side_effect=fake_open), contextlib.redirect_stderr(err):
+                rc = fc.main([path, "--records", records])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot write", err.getvalue())
+            self.assertIn(records, err.getvalue())
+            self.assertNotIn(path + ":", err.getvalue())
+
+    def test_archive_read_error_names_the_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive(fragment()))
+            records = os.path.join(tmp, "records.jsonl")
+            err = io.StringIO()
+            with mock.patch.object(fc, "scan_range", side_effect=OSError(errno.EIO, "I/O error", path)), \
+                    contextlib.redirect_stderr(err):
+                rc = fc.main([path, "--records", records])
+            self.assertEqual(rc, 2)
+            self.assertIn(path, err.getvalue())
+            self.assertNotIn("cannot write", err.getvalue())
 
 
 if __name__ == "__main__":

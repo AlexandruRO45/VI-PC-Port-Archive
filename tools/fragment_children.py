@@ -283,12 +283,23 @@ def scan_range(path, start, end, records, log=None):
             count(stats, rec)
             pos = max(pos, got[1])   # resume after the pages this resource consumed
             if records is not None:
-                records.write(json.dumps(dict(rec, at=at), separators=(",", ":")) + "\n")
-                records.flush()
+                try:
+                    records.write(json.dumps(dict(rec, at=at), separators=(",", ":")) + "\n")
+                    records.flush()
+                except OSError as exc:
+                    _label_write_error(exc, getattr(records, "name", None))
+                    raise
             if log and stats["fragments"] % 5000 == 0:
                 log(f"  {os.path.basename(path)} @{page:#x}: {stats['fragments']} fragments, "
                     f"{time.time() - t0:.0f}s")
     return stats
+
+
+def _label_write_error(exc, path):
+    """A write/close error carries no filename; name the records file so main() can label it."""
+    if exc.filename is None:
+        exc.filename = path
+    return exc
 
 
 def worker(args):
@@ -298,7 +309,11 @@ def worker(args):
         return scan_range(path, start, end, handle)
     finally:
         if handle:
-            handle.close()
+            try:
+                handle.close()
+            except OSError as exc:
+                _label_write_error(exc, records_path)
+                raise
 
 
 def split_ranges(start, end, jobs):
@@ -316,7 +331,11 @@ def scan_archive(path, start=0, end=None, jobs=1, records=None, log=None):
             merge(total, scan_range(path, start, end, handle, log))
         finally:
             if handle:
-                handle.close()
+                try:
+                    handle.close()
+                except OSError as exc:
+                    _label_write_error(exc, records)
+                    raise
         return total
     ranges = split_ranges(start, end, jobs)
     if records:
@@ -330,7 +349,11 @@ def scan_archive(path, start=0, end=None, jobs=1, records=None, log=None):
             with open(records, "w", encoding="utf-8", newline="\n") as out:
                 for i in range(len(work)):
                     with open(os.path.join(workdir, f"{i}.jsonl"), encoding="utf-8") as fh:
-                        out.write(fh.read())
+                        try:
+                            out.write(fh.read())
+                        except OSError as exc:
+                            _label_write_error(exc, records)
+                            raise
         return total
     work = [(path, lo, hi, None) for lo, hi in ranges]
     with multiprocessing.Pool(len(work)) as pool:
