@@ -363,7 +363,7 @@ class TestSaluPackB32BoundariesAliasingAndNegativeControls(unittest.TestCase):
         bad_lines = [
             "s_pack_hl_b32_b16 s0, s2, s3",
         ]
-        with self.assertRaises(Exception):
+        with self.assertRaises(rdna2spirv.Unsupported):
             run_assembly_lines(bad_lines)
 
 
