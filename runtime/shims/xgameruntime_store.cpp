@@ -31,6 +31,7 @@
 #include <ctime>
 #include <iterator>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <XAsync.h>
@@ -92,6 +93,7 @@ static_assert(sizeof(kOfflineSku) <= SKU_ID_SIZE, "fits licensableSku");
 
 std::mutex g_mutex;
 std::unordered_set<const void*> g_contexts, g_licenses, g_queries;
+std::unordered_map<uint64_t, const void*> g_context_tokens, g_license_tokens;
 uint64_t g_next_token = 1;
 
 template <class T> T* new_handle(std::unordered_set<const void*>& set) {
@@ -105,10 +107,20 @@ bool live(const std::unordered_set<const void*>& set, const void* h) {
     std::lock_guard<std::mutex> lock(g_mutex);
     return set.count(h) != 0;
 }
-template <class T> void close_handle(std::unordered_set<const void*>& set, T* h) {
+template <class T>
+void close_handle(std::unordered_set<const void*>& set, T* h,
+                  std::unordered_map<uint64_t, const void*>* tokens = nullptr) {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!h || set.erase(h) == 0) return;   // closed already, or not ours
+        if (tokens) {
+            for (auto it = tokens->begin(); it != tokens->end();) {
+                if (it->second == h)
+                    it = tokens->erase(it);
+                else
+                    ++it;
+            }
+        }
     }
     delete h;
 }
@@ -199,7 +211,9 @@ HRESULT STDMETHODCALLTYPE store_create_context(void*, XUserHandle, XStoreContext
 }
 
 // 4: void XStoreCloseContextHandle(XStoreContextHandle storeContextHandle)
-void STDMETHODCALLTYPE store_close_context(void*, XStoreContextHandle h) { close_handle(g_contexts, h); }
+void STDMETHODCALLTYPE store_close_context(void*, XStoreContextHandle h) {
+    close_handle(g_contexts, h, &g_context_tokens);
+}
 
 // Product queries (5-14, 77-78): every one completes with an empty query: no products, no further pages.
 // 5: XStoreQueryAssociatedProductsAsync(context, XStoreProductKind, uint32_t maxItemsToRetrievePerPage, XAsyncBlock*)
@@ -269,7 +283,9 @@ HRESULT STDMETHODCALLTYPE store_acquire_package_result(void*, XAsyncBlock* async
 bool STDMETHODCALLTYPE store_is_license_valid(void*, XStoreLicenseHandle h) { return live(g_licenses, h); }
 
 // 23: void XStoreCloseLicenseHandle(XStoreLicenseHandle storeLicenseHandle)
-void STDMETHODCALLTYPE store_close_license(void*, XStoreLicenseHandle h) { close_handle(g_licenses, h); }
+void STDMETHODCALLTYPE store_close_license(void*, XStoreLicenseHandle h) {
+    close_handle(g_licenses, h, &g_license_tokens);
+}
 
 // 24: HRESULT XStoreCanAcquireLicenseForStoreIdAsync(context, const char* storeProductId, XAsyncBlock*)
 // 26: HRESULT XStoreCanAcquireLicenseForPackageAsync(context, const char* packageIdentifier, XAsyncBlock*)
@@ -339,16 +355,50 @@ HRESULT STDMETHODCALLTYPE store_query_package_identifier(void*, const char* stor
 
 // 66: HRESULT XStoreRegisterGameLicenseChanged(context, XTaskQueueHandle, void* context, callback, token*)
 // 68: HRESULT XStoreRegisterPackageLicenseLost(licenseHandle, XTaskQueueHandle, void* context, callback, token*)
-// Nothing changes offline: the token is handed out, the callback is never called.
-HRESULT STDMETHODCALLTYPE store_register(void*, void* handle, XTaskQueueHandle, void*, LicenseChangedCallback callback,
-                                         XTaskQueueRegistrationToken* token) {
+// Nothing changes offline: the token is handed out for a live handle of the right kind, the callback is never called.
+HRESULT register_callback(const std::unordered_set<const void*>& set,
+                          std::unordered_map<uint64_t, const void*>& tokens, const void* handle,
+                          LicenseChangedCallback callback, XTaskQueueRegistrationToken* token) {
     if (!handle || !callback || !token) return E_INVALIDARG;
     std::lock_guard<std::mutex> lock(g_mutex);
-    token->token = g_next_token++;
+    if (set.count(handle) == 0) return E_INVALIDARG;
+    const uint64_t id = g_next_token++;
+    tokens.emplace(id, handle);
+    token->token = id;
     return S_OK;
 }
-// 67, 69: bool ...Unregister...(handle, XTaskQueueRegistrationToken token, bool wait): never pending, so true.
-bool STDMETHODCALLTYPE store_unregister(void*, void*, XTaskQueueRegistrationToken, bool) { return true; }
+// 67, 69: bool ...Unregister...(handle, XTaskQueueRegistrationToken token, bool wait).
+// Per the GDK reference, false means "wait was false and the unregistration is still pending"; nothing is ever
+// pending offline, so both return true (matching xgameruntime_user.cpp's XUserUnregisterForChangeEvent: a title
+// polling with wait = false would otherwise spin). Still erase matching tokens so the map does not grow unbounded.
+bool unregister_callback(const std::unordered_set<const void*>& set,
+                         std::unordered_map<uint64_t, const void*>& tokens, const void* handle,
+                         XTaskQueueRegistrationToken token) {
+    if (!handle || token.token == 0) return true;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (set.count(handle) == 0) return true;
+    auto it = tokens.find(token.token);
+    if (it != tokens.end() && it->second == handle) tokens.erase(it);
+    return true;
+}
+HRESULT STDMETHODCALLTYPE store_register_game_license_changed(void*, XStoreContextHandle handle, XTaskQueueHandle, void*,
+                                                              LicenseChangedCallback callback,
+                                                              XTaskQueueRegistrationToken* token) {
+    return register_callback(g_contexts, g_context_tokens, handle, callback, token);
+}
+bool STDMETHODCALLTYPE store_unregister_game_license_changed(void*, XStoreContextHandle handle,
+                                                             XTaskQueueRegistrationToken token, bool) {
+    return unregister_callback(g_contexts, g_context_tokens, handle, token);
+}
+HRESULT STDMETHODCALLTYPE store_register_package_license_lost(void*, XStoreLicenseHandle handle, XTaskQueueHandle, void*,
+                                                              LicenseChangedCallback callback,
+                                                              XTaskQueueRegistrationToken* token) {
+    return register_callback(g_licenses, g_license_tokens, handle, callback, token);
+}
+bool STDMETHODCALLTYPE store_unregister_package_license_lost(void*, XStoreLicenseHandle handle,
+                                                             XTaskQueueRegistrationToken token, bool) {
+    return unregister_callback(g_licenses, g_license_tokens, handle, token);
+}
 
 // ---- The object ----
 
@@ -455,10 +505,10 @@ const void* const kStoreVtable[] = {
     FN(offline_failure<63>),                 // 63 XStoreDownloadAndInstallPackagesResultCount
     FN(offline_failure<64>),                 // 64 XStoreDownloadAndInstallPackagesResult
     FN(store_query_package_identifier),      // 65 XStoreQueryPackageIdentifier
-    FN(store_register),                      // 66 XStoreRegisterGameLicenseChanged
-    FN(store_unregister),                    // 67 XStoreUnregisterGameLicenseChanged
-    FN(store_register),                      // 68 XStoreRegisterPackageLicenseLost
-    FN(store_unregister),                    // 69 XStoreUnregisterPackageLicenseLost
+    FN(store_register_game_license_changed), // 66 XStoreRegisterGameLicenseChanged
+    FN(store_unregister_game_license_changed), // 67 XStoreUnregisterGameLicenseChanged
+    FN(store_register_package_license_lost), // 68 XStoreRegisterPackageLicenseLost
+    FN(store_unregister_package_license_lost), // 69 XStoreUnregisterPackageLicenseLost
     FN(unknown_slot<70>),                    // 70 XStoreIsAvailabilityPurchasable (2; no documented signature)
     FN(offline_failure<71>),                 // 71 XStoreAcquireLicenseForDurablesAsync (3)
     FN(offline_failure<72>),                 // 72 XStoreAcquireLicenseForDurablesResult (3)

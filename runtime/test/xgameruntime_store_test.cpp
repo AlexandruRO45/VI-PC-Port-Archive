@@ -156,8 +156,29 @@ int main() {
     check(at<Register>(store, 68)(store, package_license, nullptr, nullptr, on_change, &token) == S_OK &&
               token.token != 0 && at<Unregister>(store, 69)(store, package_license, token, false),
           "license-lost registration hands out a token; unregistering is never pending");
+    check(at<Unregister>(store, 69)(store, package_license, token, false),
+          "double-unregistering a license-lost token still returns true (never pending)");
+    XTaskQueueRegistrationToken bogus_token{0};
+    check(at<Unregister>(store, 69)(store, package_license, bogus_token, false),
+          "unregistering a zero license-lost token returns true (never pending)");
+    check(at<Register>(store, 68)(store, context, nullptr, nullptr, on_change, &token) == E_INVALIDARG,
+          "XStoreRegisterPackageLicenseLost refuses a context handle");
+    check(at<Register>(store, 66)(store, package_license, nullptr, nullptr, on_change, &token) == E_INVALIDARG,
+          "XStoreRegisterGameLicenseChanged refuses a license handle");
+    check(at<Register>(store, 68)(store, reinterpret_cast<Handle>(0x1234), nullptr, nullptr, on_change, &token) ==
+              E_INVALIDARG,
+          "XStoreRegisterPackageLicenseLost refuses a bogus handle");
+
+    XTaskQueueRegistrationToken leaked_license_token{};
+    check(at<Register>(store, 68)(store, package_license, nullptr, nullptr, on_change, &leaked_license_token) == S_OK &&
+              leaked_license_token.token != 0,
+          "second license-lost registration succeeds");
     at<Close>(store, 23)(store, package_license);
     check(!at<IsValid>(store, 22)(store, package_license), "a closed license is not valid");
+    check(at<Register>(store, 68)(store, package_license, nullptr, nullptr, on_change, &token) == E_INVALIDARG,
+          "XStoreRegisterPackageLicenseLost refuses a closed license handle");
+    check(at<Unregister>(store, 69)(store, package_license, leaked_license_token, false),
+          "XStoreUnregisterPackageLicenseLost on a closed license handle returns true (never pending)");
 
     // ---- product queries are empty ----
     async = XAsyncBlock{};
@@ -175,12 +196,34 @@ int main() {
     check(at<NoArgs>(store, 49)(store) == E_FAIL, "XStoreShowPurchaseUIAsync is not available offline");
     check(at<NoArgs>(store, 46)(store) == E_NOTIMPL, "an undocumented slot answers E_NOTIMPL");
 
-    check(at<Register>(store, 66)(store, context, nullptr, nullptr, on_change, &token) == S_OK &&
-              at<Unregister>(store, 67)(store, context, token, true),
-          "license-changed registration");
+    Handle context2 = nullptr;
+    check(at<CreateContext>(store, 3)(store, nullptr, &context2) == S_OK && context2,
+          "second XStoreCreateContext");
+    check(at<Register>(store, 66)(store, context, nullptr, nullptr, on_change, &token) == S_OK && token.token != 0,
+          "license-changed registration hands out a token");
+    check(at<Unregister>(store, 67)(store, context2, token, true),
+          "XStoreUnregisterGameLicenseChanged with another context returns true (never pending)");
+    check(at<Unregister>(store, 67)(store, context, token, true),
+          "XStoreUnregisterGameLicenseChanged accepts the owning context's token");
+    check(at<Unregister>(store, 67)(store, context, token, false),
+          "double-unregistering a license-changed token returns true (never pending)");
+    check(at<Unregister>(store, 67)(store, nullptr, token, false),
+          "XStoreUnregisterGameLicenseChanged with null context returns true (never pending)");
+    check(at<Register>(store, 66)(store, reinterpret_cast<Handle>(0x1234), nullptr, nullptr, on_change, &token) ==
+              E_INVALIDARG,
+          "XStoreRegisterGameLicenseChanged refuses a bogus handle");
+    at<Close>(store, 4)(store, context2);
     check(g_callbacks == 0, "no callback ran: nothing changes offline");
+    XTaskQueueRegistrationToken closed_ctx_token{};
+    check(at<Register>(store, 66)(store, context, nullptr, nullptr, on_change, &closed_ctx_token) == S_OK &&
+              closed_ctx_token.token != 0,
+          "license-changed registration before close succeeds");
     at<Close>(store, 4)(store, context);
     at<Close>(store, 4)(store, context);   // twice: ignored
+    check(at<Register>(store, 66)(store, context, nullptr, nullptr, on_change, &token) == E_INVALIDARG,
+          "XStoreRegisterGameLicenseChanged refuses a closed context handle");
+    check(at<Unregister>(store, 67)(store, context, closed_ctx_token, false),
+          "XStoreUnregisterGameLicenseChanged on a closed context returns true (never pending)");
     check(rt::shims::xgameruntime_store_open_handles() == 0, "every handle the test opened is closed");
 
     std::printf("xgameruntime_store_test: %d checks, %d failures\n", g_checks, g_failures);
