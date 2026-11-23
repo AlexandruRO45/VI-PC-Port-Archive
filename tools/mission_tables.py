@@ -363,7 +363,7 @@ def parse_blob(blob, name="<memory>"):
                     blocks, _fill = psin_data.block_table(blob, first_section)
                 except (ValueError, struct.error):
                     blocks = []
-    end = first_section if first_section >= RECORD_SIZE else len(blob)
+    end = first_section
     elements = scan_elements(blob, end)
     chunks = find_chunks(blob, end, elements)
     table_blocks = record_blocks(blob, blocks) if blocks else []
@@ -552,6 +552,17 @@ def main(argv=None):
     if not os.path.exists(args.src):
         print(f"ERROR: {args.src}: no such file or folder", file=sys.stderr)
         return 2
+    if os.path.isfile(args.src):
+        # A lone argument is the inflated PSIN file; the bare carved streams are what a folder holds.
+        try:
+            with open(args.src, "rb") as handle:
+                magic = handle.read(4)
+        except OSError as error:
+            print(f"ERROR: {args.src}: {error}", file=sys.stderr)
+            return 2
+        if magic != b"PSIN":
+            print(f"ERROR: {args.src}: not a PSIN container", file=sys.stderr)
+            return 2
     try:
         files = collect(args.src, args.limit)
     except OSError as error:

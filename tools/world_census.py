@@ -36,6 +36,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from report_paths import same_report_path  # noqa: E402
 import world_index as WI
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -516,7 +517,7 @@ def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_en
                 idx = bisect.bisect_right(max_end, cursor)
                 while idx < len(segments) and segments[idx][0] < a:
                     s0, s1, kind = segments[idx]
-                    if s1 <= pos:
+                    if s1 <= pos or (cursor > scan_start and s0 < cursor):
                         idx += 1
                         continue
                     start = max(pos, s0)
@@ -785,16 +786,6 @@ def job_count(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
@@ -815,7 +806,7 @@ def main(argv=None):
     except SourceChanged as e:
         print(str(e), file=sys.stderr)
         return 1
-    if head[:4] != b"9FPR":
+    if len(head) < 8 or head[:4] != b"9FPR":  # the header ends with the u32 data start at +4
         print("not an RPF9 archive", file=sys.stderr)
         return 2
     data_start = struct.unpack_from("<I", head, 4)[0]
@@ -825,14 +816,14 @@ def main(argv=None):
     if start < data_start or start >= end:
         print("bad scan range", file=sys.stderr)
         return 2
-    if same_output_path(a.archive, a.out):
+    if same_report_path(a.archive, a.out):
         print("error: --out must not overwrite the input archive", file=sys.stderr)
         return 2
     if os.path.isfile(a.out):
         print(f"error: --out {a.out} is a file, not a directory", file=sys.stderr)
         return 2
     for report in ("summary.json", "maps.json"):
-        if same_output_path(a.archive, os.path.join(a.out, report)):
+        if same_report_path(a.archive, os.path.join(a.out, report)):
             print(f"error: --out reports would overwrite input archive: {a.archive}", file=sys.stderr)
             return 2
     try:
