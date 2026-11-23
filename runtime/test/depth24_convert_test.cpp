@@ -562,10 +562,8 @@ int main() {
             }
             std::printf("depth24: shared-buffer offsets (CopyResource, RGBA8, depth24 and rgb96 CopyTexture) ok\n");
 
-            // Host-readback barrier observation across logical queue kinds: compute-converted depth24 and rgb96
-            // readbacks must emit COMPUTE_SHADER_BIT / MEMORY_WRITE_BIT -> HOST_BIT / HOST_READ_BIT on direct and
-            // compute queues (and stay within queue_supported_stages on copy queues), and a host_readable buffer UAV
-            // clear must emit a TRANSFER_BIT / TRANSFER_WRITE_BIT -> HOST_BIT / HOST_READ_BIT barrier.
+            // RGB96 readbacks use a compute-capable physical queue for all three logical queue kinds. Check that
+            // the host-readback barrier covers the compute writes. Also verify D24 and buffer UAV clear barriers.
             real_barrier2 = context.vk.vkCmdPipelineBarrier2;
             EXPECT(real_barrier2 != nullptr);
             context.vk.vkCmdPipelineBarrier2 = observe_host;
@@ -614,14 +612,8 @@ int main() {
                 host_src_access = 0;
                 EXPECT(typed.execute({&rgb96_ptr, 1}) == ReplayResult::success);
                 EXPECT(typed.idle() && host_barriers == 1);
-                EXPECT((host_src_stages & ~VulkanQueue::queue_supported_stages(kind)) == 0);
-                if (kind == VulkanQueue::QueueKind::copy) {
-                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
-                    EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                } else {
-                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-                    EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
-                }
+                EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
                 for (std::uint32_t y = 0; y < rgb96_h; ++y)
                     for (std::uint32_t x = 0; x < rgb96_w; ++x)
                         for (std::uint32_t c = 0; c < 3; ++c)
