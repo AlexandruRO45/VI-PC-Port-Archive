@@ -802,5 +802,24 @@ class VSubF16SimdBoundaryTests(unittest.TestCase):
         self.assertEqual(out_sat_low[0] & 0xFFFF, 0x0000)
 
 
+class VSubF16TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution, op_sel modes, and negative mutation controls for v_sub_f16."""
+
+    def test_op_sel_vop3_translator(self):
+        # v1 has 4.0 in high half (0x44000000), v2 has 1.5 in low half (0x00003E00)
+        # op_sel:[1, 0, 0] selects high half of v1 and low half of v2: 4.0 - 1.5 = 2.5 (0x4100)
+        out = run_prog([
+            "v_mov_b32 v1, 0x44000000",
+            "v_mov_b32 v2, 0x00003E00",
+            "v_sub_f16 v0, v1, v2 op_sel:[1, 0, 0]",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0x4100)
+
+    def test_negative_mutation_rejection(self):
+        prog = ["v_sub_f16 v0, v1, v2 omod:2", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_lines("ps_neg_sub_f16", prog)
+
+
 if __name__ == "__main__":
     unittest.main()
