@@ -45,6 +45,36 @@ class DocsTableRowsTest(unittest.TestCase):
                     block = []
             check(block)
 
+    def test_row_has_as_many_cells_as_its_header(self):
+        """GFM splits cells on every pipe that is not escaped, even inside a code span, so an unescaped `a | b`
+        in a cell renders two cells and shifts the row's columns."""
+        def cells_in(line):
+            count, backslashes = 0, 0
+            for ch in line:
+                if ch == "\\":
+                    backslashes += 1
+                    continue
+                if ch == "|" and not backslashes % 2:
+                    count += 1
+                backslashes = 0
+            return count
+
+        for path in DOCS:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            header = None
+            for i, line in enumerate(lines, 1):
+                if not line.startswith("|"):
+                    header = None
+                    continue
+                cells = cells_in(line)
+                if header is None:
+                    header = (cells, i)
+                elif cells != header[0]:
+                    self.fail(
+                        f"{path.relative_to(ROOT)}:{i}: {cells - 1} cells in a table whose header at "
+                        f"{header[1]} has {header[0] - 1}; escape a literal pipe as \\|"
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
