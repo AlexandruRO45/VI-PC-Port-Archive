@@ -2,7 +2,7 @@
 // pulls its own vertices and a G-buffer PS) and reads every target back.
 //
 //   vk_gbuffer <scene.bin> <vs.spv> <ps.spv> --link L0,L1,.. [--size W H] [--cam x y z yaw pitch] [--fov deg]
-//              [--dump prefix]
+//              [--dump prefix] [--shadow shadow_vs.spv [--sun azimuth elevation]]
 //
 // The pair (chosen by tools/gbuffer.py) reads user SGPRs, not vertex buffers. The VS:
 //   s8  table A: +0x6e0 V# frame constants (0x52c: 1.0 turns off a depth bias), +0x1780 V# a 12-byte record store
@@ -19,7 +19,13 @@
 //       the vertex id selects the index.
 // The PS: s8 table A (+0x6e0 frame constants, +0xac0 V# of a dword table indexed by s14 that picks the T#),
 // s9 table B (+0x20 V# material bytes, +0x60 viewport constants), s15 the T# table, s16 + 0x520 the S#.
-// Its targets: mrt0..3 R8G8B8A8_UNORM, mrt4 R16G16_SFLOAT (docs/gbuffer.md).
+// Its targets: mrt0..3 R8G8B8A8_UNORM, mrt4 R16G16_SFLOAT (docs/gbuffer_sandbox.md).
+//
+// --shadow first draws every prop into a 2048^2 D32 map from an orthographic sun with a depth-only VS: s9 a
+// table with a V# at +0x40 (object rows, shared with the pair) and +0x60 (view-projection at 0x160), s11/s12 the
+// base of a float3 position stream whose header dword 0 is offset << 7 | stride << 3; it reads the position at
+// SV_VertexID, so the draw is indexed. Each covered G-buffer pixel is then moved back to world space and tested
+// against the map (normal offset, depth bias) and counted as lit, shadowed or facing away.
 //
 // The game links a PS input to a VS output by semantic (SPI_PS_INPUT_CNTL); the translator numbers VS outputs
 // by param and PS inputs by attribute, so --link gives, per PS attribute, the VS param it reads, and the PS's
@@ -102,6 +108,63 @@ void decode_normal(const uint8_t* p, float n[3]) {
     n[0] = x / l; n[1] = y / l; n[2] = z / l;
 }
 
+// Inverse of a 4x4 row-major matrix (false when singular).
+bool invert4(const float m[16], float out[16]) {
+    float inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (det == 0 || !std::isfinite(det)) return false;
+    for (int i = 0; i < 16; ++i) out[i] = inv[i] / det;
+    return true;
+}
+
+// [x y z 1] * m (row vectors, the layout the shaders load), as clip x y z w.
+void xform(const float m[16], const float p[3], float c[4]) {
+    for (int j = 0; j < 4; ++j) c[j] = p[0] * m[j] + p[1] * m[4 + j] + p[2] * m[8 + j] + m[12 + j];
+}
+
+// An orthographic sun view-projection (D3D clip, z 0..1) over a world box; sun = unit vector towards the sun.
+void sun_projection(const float sun[3], const float lo[3], const float hi[3], float m[16]) {
+    const float f[3] = {-sun[0], -sun[1], -sun[2]};   // the light travels along f
+    float up[3] = {0, 0, 1};
+    if (std::fabs(f[2]) > 0.99f) { up[0] = 0; up[1] = 1; up[2] = 0; }
+    float r[3] = {up[1] * f[2] - up[2] * f[1], up[2] * f[0] - up[0] * f[2], up[0] * f[1] - up[1] * f[0]};
+    const float rl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    for (float& v : r) v /= rl;
+    const float u[3] = {f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0]};
+    const float c[3] = {(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2};
+    float ext[3] = {0, 0, 0};   // half extents of the box along r, u, f
+    for (int k = 0; k < 8; ++k) {
+        const float q[3] = {(k & 1 ? hi[0] : lo[0]) - c[0], (k & 2 ? hi[1] : lo[1]) - c[1], (k & 4 ? hi[2] : lo[2]) - c[2]};
+        ext[0] = std::max(ext[0], std::fabs(q[0] * r[0] + q[1] * r[1] + q[2] * r[2]));
+        ext[1] = std::max(ext[1], std::fabs(q[0] * u[0] + q[1] * u[1] + q[2] * u[2]));
+        ext[2] = std::max(ext[2], std::fabs(q[0] * f[0] + q[1] * f[1] + q[2] * f[2]));
+    }
+    for (float& e : ext) e = std::max(e, 0.01f) * 1.01f;
+    for (int i = 0; i < 3; ++i) {
+        m[i * 4 + 0] = r[i] / ext[0]; m[i * 4 + 1] = u[i] / ext[1]; m[i * 4 + 2] = f[i] / (2 * ext[2]); m[i * 4 + 3] = 0;
+    }
+    m[12] = -(c[0] * r[0] + c[1] * r[1] + c[2] * r[2]) / ext[0];
+    m[13] = -(c[0] * u[0] + c[1] * u[1] + c[2] * u[2]) / ext[1];
+    m[14] = 0.5f - (c[0] * f[0] + c[1] * f[1] + c[2] * f[2]) / (2 * ext[2]);
+    m[15] = 1;
+}
+
 float half_to_float(uint16_t h) {
     const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
     const float v = e == 0 ? std::ldexp(float(m), -24) : e == 31 ? INFINITY : std::ldexp(float(m | 1024), int(e) - 25);
@@ -113,7 +176,7 @@ float half_to_float(uint16_t h) {
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_gbuffer scene.bin vs.spv ps.spv --link L0,L1,.. [--size W H] [--cam x y z yaw pitch] "
-                             "[--fov deg] [--dump prefix]\n");
+                             "[--fov deg] [--dump prefix] [--shadow shadow_vs.spv [--sun azimuth elevation]]\n");
         return 2;
     }
     Scene scene;
@@ -121,6 +184,8 @@ int main(int argc, char** argv) {
     uint32_t W = 640, H = 360;
     std::vector<uint32_t> link;
     const char* dump = nullptr;
+    const char* shadow_path = nullptr;
+    float sun_az = 135, sun_el = 50;   // degrees: azimuth from +x towards +y, elevation over the horizon
     Camera cam{};
     cam.pos[0] = scene.center[0] - 40; cam.pos[1] = scene.center[1] - 40; cam.pos[2] = scene.center[2] + 25;
     cam.yaw = 0.785398f; cam.pitch = -0.35f;
@@ -133,6 +198,8 @@ int main(int argc, char** argv) {
             }
         }
         else if (!std::strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
+        else if (!std::strcmp(argv[i], "--shadow") && i + 1 < argc) shadow_path = argv[++i];
+        else if (!std::strcmp(argv[i], "--sun") && i + 2 < argc) { sun_az = float(std::atof(argv[++i])); sun_el = float(std::atof(argv[++i])); }
         else if (!std::strcmp(argv[i], "--size") && i + 2 < argc) { W = std::atoi(argv[++i]); H = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--fov") && i + 1 < argc) cam.fov = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--cam") && i + 5 < argc) {
@@ -145,6 +212,8 @@ int main(int argc, char** argv) {
     auto vs_code = read_spv(argv[2]), ps_code = read_spv(argv[3]);
     if (vs_code.empty() || ps_code.empty()) { std::fprintf(stderr, "cannot read the shaders\n"); return 2; }
     if (!relink_inputs(ps_code, link)) { std::fprintf(stderr, "cannot relink the PS inputs\n"); return 2; }
+    std::vector<uint32_t> shadow_code;
+    if (shadow_path && (shadow_code = read_spv(shadow_path)).empty()) { std::fprintf(stderr, "cannot read the shadow VS\n"); return 2; }
     std::fprintf(stderr, "scene: %zu draws, %zu meshes, %zu textures, %zu triangles\n", scene.draws.size(),
                  scene.meshes.size(), scene.textures.size(), scene.indices.size() / 3);
 
@@ -224,6 +293,7 @@ int main(int argc, char** argv) {
     LD(vkGetBufferMemoryRequirements); LD(vkBindBufferMemory); LD(vkMapMemory); LD(vkGetBufferDeviceAddress);
     LD(vkCreateSampler); LD(vkCreateDescriptorSetLayout); LD(vkCreateDescriptorPool); LD(vkAllocateDescriptorSets);
     LD(vkUpdateDescriptorSets); LD(vkCmdBindDescriptorSets); LD(vkCmdPushConstants); LD(vkCmdPipelineBarrier);
+    LD(vkCmdBindIndexBuffer); LD(vkCmdDrawIndexed);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
     VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
     auto memtype = [&](uint32_t bits, VkMemoryPropertyFlags want) {
@@ -276,6 +346,17 @@ int main(int argc, char** argv) {
         }
         stream_va[m] = uint32_t(at); at += (0x80 + uint64_t(me.vertex_count) * 20 + 255) & ~uint64_t(255);
         index_va[m] = uint32_t(at); at += (uint64_t(me.index_count) * 4 + 255) & ~uint64_t(255);
+    }
+    // Shadow VS: a float3 position stream per mesh and a 0x80-byte table per draw (+0x40 object, +0x60 sun view).
+    const uint32_t light_va = 0x4600;
+    std::vector<uint32_t> fstream_va(nmesh);
+    uint32_t shadow_b = 0;
+    if (shadow_path) {
+        for (uint32_t m = 0; m < nmesh; ++m) {
+            fstream_va[m] = uint32_t(at);
+            at += (0x80 + uint64_t(scene.meshes[m].vertex_count) * 12 + 255) & ~uint64_t(255);
+        }
+        shadow_b = uint32_t(at); at += uint64_t(ndraw) * 0x80;
     }
     if (at + 0x1000 > 0xFFFFFFFFull) { std::fprintf(stderr, "scene too large for a 32-bit heap\n"); return 2; }
     const VkDeviceSize heap_bytes = at + 0x1000;
@@ -357,6 +438,36 @@ int main(int argc, char** argv) {
         std::memcpy(heap_u32(index_va[m]), scene.indices.data() + me.first_index, size_t(me.index_count) * 4);
         uint32_t* iv = heap_u32(index_vsharp_va + m * 0x20);
         iv[0] = index_va[m]; iv[1] = 4u << 16; iv[2] = me.index_count; iv[3] = 0x11014facu;   // R32_UINT, stride 4
+    }
+    float sun[3] = {std::cos(sun_el * 3.14159265f / 180) * std::cos(sun_az * 3.14159265f / 180),
+                    std::cos(sun_el * 3.14159265f / 180) * std::sin(sun_az * 3.14159265f / 180),
+                    std::sin(sun_el * 3.14159265f / 180)};
+    float light_m[16] = {};
+    if (shadow_path) {
+        float wlo[3] = {1e30f, 1e30f, 1e30f}, whi[3] = {-1e30f, -1e30f, -1e30f};
+        for (uint32_t m = 0; m < nmesh; ++m) {
+            const Mesh& me = scene.meshes[m];
+            const float* v = scene.vertices.data() + size_t(me.first_vertex) * 8;
+            uint32_t* hdr = heap_u32(fstream_va[m]);
+            hdr[0] = (0x80u << 7) | (12u << 3);
+            float* fp = heap_f32(fstream_va[m] + 0x80);
+            for (uint32_t i = 0; i < me.vertex_count; ++i) for (int k = 0; k < 3; ++k) fp[i * 3 + k] = v[i * 8 + k];
+        }
+        for (uint32_t d = 0; d < ndraw; ++d) {
+            const Draw& dr = scene.draws[d];
+            const Mesh& me = scene.meshes[dr.mesh];
+            const float* v = scene.vertices.data() + size_t(me.first_vertex) * 8;
+            for (uint32_t i = 0; i < me.vertex_count; ++i)
+                for (int k = 0; k < 3; ++k) {
+                    const float w = v[i * 8] * dr.rows[0][k] + v[i * 8 + 1] * dr.rows[1][k] + v[i * 8 + 2] * dr.rows[2][k] + dr.rows[3][k];
+                    wlo[k] = std::min(wlo[k], w); whi[k] = std::max(whi[k], w);
+                }
+            const uint32_t sb = shadow_b + d * 0x80;
+            vsharp(sb + 0x40, object_va + d * 0x80, 0x40);
+            vsharp(sb + 0x60, light_va, 0x1a0);
+        }
+        sun_projection(sun, wlo, whi, light_m);
+        std::memcpy(heap_f32(light_va + 0x160), light_m, 64);
     }
     view_projection(cam, float(W) / float(H), heap_f32(view_va + 0x160));
     std::memcpy(heap_f32(view_va + 0x1a0), heap_f32(view_va + 0x160), 64);   // previous = current: still camera
@@ -470,6 +581,46 @@ int main(int argc, char** argv) {
     gpi.layout = pl; gpi.renderPass = rp;
     VkPipeline pipe; CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe));
 
+    // Shadow map: the shadow VS alone into a D32 target (no fragment shader; it exports only depth).
+    constexpr uint32_t SM = 2048;
+    VkImage smimg = VK_NULL_HANDLE; VkImageView smview = VK_NULL_HANDLE;
+    VkRenderPass smrp = VK_NULL_HANDLE; VkFramebuffer smfb = VK_NULL_HANDLE; VkPipeline smpipe = VK_NULL_HANDLE;
+    VkBuffer ibuf = VK_NULL_HANDLE, smrb = VK_NULL_HANDLE; void* ibufp = nullptr; void* smrbp = nullptr;
+    const VkRect2D smsc{{0, 0}, {SM, SM}};
+    if (shadow_path) {
+        CHECK(make_image(SM, SM, dfmt, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT, &smimg, &smview));
+        VkAttachmentDescription sad{};
+        sad.format = dfmt; sad.samples = VK_SAMPLE_COUNT_1_BIT; sad.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        sad.storeOp = VK_ATTACHMENT_STORE_OP_STORE; sad.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        sad.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; sad.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        sad.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        VkSubpassDescription ssd{}; ssd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        VkAttachmentReference sdar{0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}; ssd.pDepthStencilAttachment = &sdar;
+        VkSubpassDependency sdep{0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+        VkRenderPassCreateInfo srpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        srpi.attachmentCount = 1; srpi.pAttachments = &sad; srpi.subpassCount = 1; srpi.pSubpasses = &ssd;
+        srpi.dependencyCount = 1; srpi.pDependencies = &sdep;
+        CHECK(vkCreateRenderPass(dev, &srpi, nullptr, &smrp));
+        VkFramebufferCreateInfo sfbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        sfbi.renderPass = smrp; sfbi.attachmentCount = 1; sfbi.pAttachments = &smview; sfbi.width = SM; sfbi.height = SM; sfbi.layers = 1;
+        CHECK(vkCreateFramebuffer(dev, &sfbi, nullptr, &smfb));
+        VkShaderModule svs; CHECK(module(shadow_code, &svs));
+        VkPipelineShaderStageCreateInfo sst{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        sst.stage = VK_SHADER_STAGE_VERTEX_BIT; sst.module = svs; sst.pName = "main";
+        VkViewport svp{0, float(SM), float(SM), -float(SM), 0, 1};
+        VkPipelineViewportStateCreateInfo svps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        svps.viewportCount = 1; svps.pViewports = &svp; svps.scissorCount = 1; svps.pScissors = &smsc;
+        VkPipelineColorBlendStateCreateInfo scb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo sgpi = gpi;
+        sgpi.stageCount = 1; sgpi.pStages = &sst; sgpi.pViewportState = &svps; sgpi.pColorBlendState = &scb; sgpi.renderPass = smrp;
+        CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &sgpi, nullptr, &smpipe));
+        CHECK(make_buffer(std::max<VkDeviceSize>(4, scene.indices.size() * 4), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &ibuf, &ibufp));
+        std::memcpy(ibufp, scene.indices.data(), scene.indices.size() * 4);
+        CHECK(make_buffer(VkDeviceSize(SM) * SM * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &smrb, &smrbp));
+    }
+
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpi.queueFamilyIndex = qi;
     VkCommandPool pool; CHECK(vkCreateCommandPool(dev, &cpi, nullptr, &pool));
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cai.commandPool = pool; cai.commandBufferCount = 1;
@@ -494,6 +645,27 @@ int main(int argc, char** argv) {
         vkCmdCopyBufferToImage(cmd, up, timg[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
         barrier(timg[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
+    if (shadow_path) {
+        VkClearValue sclear{}; sclear.depthStencil = {1, 0};
+        VkRenderPassBeginInfo sbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        sbi.renderPass = smrp; sbi.framebuffer = smfb; sbi.renderArea = smsc; sbi.clearValueCount = 1; sbi.pClearValues = &sclear;
+        vkCmdBeginRenderPass(cmd, &sbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, smpipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
+        vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT32);
+        uint32_t spc[push_words] = {};
+        spc[32] = uint32_t(heap_base); spc[33] = uint32_t(heap_base >> 32);
+        for (uint32_t d = 0; d < ndraw; ++d) {
+            const uint32_t m = scene.draws[d].mesh;
+            spc[9] = shadow_b + d * 0x80;
+            spc[11] = fstream_va[m];   // s12 (high address bits) stays 0
+            vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, push_bytes, spc);
+            vkCmdDrawIndexed(cmd, scene.meshes[m].index_count, 1, scene.meshes[m].first_index, 0, 0);   // SV_VertexID = index
+        }
+        vkCmdEndRenderPass(cmd);
+        VkBufferImageCopy sc2{}; sc2.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}; sc2.imageExtent = {SM, SM, 1};
+        vkCmdCopyImageToBuffer(cmd, smimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, smrb, 1, &sc2);
     }
     VkClearValue clear[NT + 1]{}; clear[NT].depthStencil = {1, 0};
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -552,6 +724,51 @@ int main(int argc, char** argv) {
     }
     std::printf("vk_gbuffer: draws=%u pixels=%u covered=%zu shaded=%zu albedo_colours=%zu normals_facing=%zu "
                 "motion_still=%zu motion_max=%.3f\n", ndraw, W * H, covered, written, albedo.size(), facing, still, motion_max);
+    // Shadow test: each covered pixel back to world space (inverse view-projection), then into the sun's map.
+    std::vector<uint8_t> lit_img;
+    if (shadow_path) {
+        const float* smz = static_cast<const float*>(smrbp);
+        size_t map_texels = 0;
+        for (size_t i = 0; i < size_t(SM) * SM; ++i) map_texels += smz[i] < 1;
+        float inv[16];
+        if (!invert4(heap_f32(view_va + 0x160), inv)) { std::fprintf(stderr, "singular view-projection\n"); return 1; }
+        // World size of one map texel: the map spans 2 / |column j| metres along x (j = 0) and y (j = 1); the
+        // larger side is used. The depth bias is 2 texels in world units, mapped by |column 2| into map depth.
+        auto col = [&](int j) {
+            return std::sqrt(light_m[j] * light_m[j] + light_m[4 + j] * light_m[4 + j] + light_m[8 + j] * light_m[8 + j]);
+        };
+        const float texel = 2 / std::min(col(0), col(1)) / SM;
+        const float bias = 2 * texel * col(2);
+        size_t lit = 0, shadowed = 0, away = 0, outside = 0;
+        lit_img.assign(size_t(W) * H * 4, 0);
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                const size_t i = size_t(y) * W + x;
+                if (!(dz[i] < 1)) continue;
+                const float ndc[3] = {(x + 0.5f) / W * 2 - 1, 1 - (y + 0.5f) / H * 2, dz[i]};
+                float h[4]; xform(inv, ndc, h);
+                const float wp[3] = {h[0] / h[3], h[1] / h[3], h[2] / h[3]};
+                float nn[3]; decode_normal(t1 + i * 4, nn);
+                const float ndl = nn[0] * sun[0] + nn[1] * sun[1] + nn[2] * sun[2];
+                // Normal offset of 1.5 texels against self-shadowing on surfaces the sun grazes.
+                float op[3];
+                for (int k = 0; k < 3; ++k) op[k] = wp[k] + nn[k] * texel * 1.5f;
+                float lc[4]; xform(light_m, op, lc);
+                const float sx = (lc[0] * 0.5f + 0.5f) * SM, sy = (0.5f - lc[1] * 0.5f) * SM;
+                bool in_shadow = false;
+                // Written positively so a NaN coordinate counts as outside instead of indexing the map.
+                if (!(sx >= 0 && sy >= 0 && sx < SM && sy < SM && lc[2] >= 0 && lc[2] <= 1)) ++outside;
+                else in_shadow = lc[2] > smz[size_t(sy) * SM + size_t(sx)] + bias;
+                float k;
+                if (!(ndl > 0)) { ++away; k = 0; }   // also a NaN normal
+                else if (in_shadow) { ++shadowed; k = 0; }
+                else { ++lit; k = ndl; }
+                const float shade = 0.3f + 0.7f * k;
+                for (int c = 0; c < 3; ++c) lit_img[i * 4 + c] = uint8_t(std::lround(t0[i * 4 + c] * shade));
+            }
+        std::printf("vk_gbuffer: shadow map_texels=%zu lit=%zu shadowed=%zu away=%zu outside=%zu\n", map_texels, lit, shadowed,
+                    away, outside);
+    }
     if (dump) {
         std::vector<uint8_t> img(size_t(W) * H * 4);
         const std::string pre = dump;
@@ -562,6 +779,7 @@ int main(int argc, char** argv) {
         }
         ok = ok && write_ppm((pre + "_normal.ppm").c_str(), img.data(), W, H, false);
         ok = ok && write_ppm((pre + "_mrt2.ppm").c_str(), t2, W, H, false);
+        if (!lit_img.empty()) ok = ok && write_ppm((pre + "_lit.ppm").c_str(), lit_img.data(), W, H, false);
         ok = ok && write_ppm((pre + "_mrt3.ppm").c_str(), static_cast<const uint8_t*>(rbp[3]), W, H, false);
         if (!ok) { std::fprintf(stderr, "cannot write %s_*.ppm\n", dump); return 1; }
     }

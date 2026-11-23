@@ -2,7 +2,7 @@
 """G-buffer sandbox: placed props through a translated deferred material pair, every target read back.
 
     python -I tools/gbuffer.py --work <work> --entities <entities.jsonl> --models <assets> --textures <ttpf out> \
-        [--center X Y] [--radius M] [--max-props N] [--dump PREFIX]
+        [--center X Y] [--radius M] [--max-props N] [--dump PREFIX] [--shadow]
 
 It packs the props around --center with tools/sandbox_scene.py, picks a deferred VS/PS pair from
 <work>/shaders/spirv/index.json and runs runtime/build/vk_gbuffer, which fills the tables the pair reads (see its
@@ -15,7 +15,9 @@ links them by semantic, so the link is computed from the two DXBC signatures and
 
 Prints counts and PASS/FAIL only: exit 0 when the PS shaded the covered pixels, the albedo shows texture detail,
 the decoded normals face the camera and the motion vectors of the still camera are zero; 77 when the package, the
-pair or a GPU is missing. Standard library only.
+pair or a GPU is missing. With --shadow it also picks a depth-only VS by layout, draws a sun shadow map with it for
+two opposite suns and needs lit and shadowed pixels under each, with counts that differ between them.
+Standard library only.
 """
 import argparse
 import json
@@ -45,6 +47,16 @@ PS_LAYOUT = (rf"\bs_load_dwordx4 {REG}, s\[8:9\], 0x6e0\b", rf"\bs_load_dwordx4 
              rf"\bs_load_dwordx4 {REG}, s\[20:21\], 0x60\b", rf"\bs_buffer_load_dword s\d+, {REG}, s14\b",
              r"\bs_mov_b32 s18, s15\b", rf"\bs_load_dwordx8 {REG}, s\[18:19\], s\d+\b",
              rf"\bs_load_dwordx4 {REG}, s\[16:17\], 0x520\b")
+SHADOW_USER = [("ptr32_lo", 9), ("const32", 11), ("const32", 12)]
+SHADOW_LAYOUT = (r"\bs_mov_b32 s4, s9\b",
+                 rf"\bs_load_dwordx4 {REG}, s\[4:5\], 0x40\b",
+                 rf"\bs_load_dwordx4 {REG}, s\[4:5\], 0x60\b",
+                 r"\bs_or_b32 s\d+, s12, 0x10000\b",
+                 r"\bs_mov_b32 s\d+, s11\b",
+                 r"\bs_mov_b32 s\d+, 0x11014fac\b",
+                 rf"\bbuffer_load_dwordx3 v\[\d+:\d+\], v\d+, {REG}, 0 offen\b",
+                 rf"\bs_buffer_load_dwordx16 {REG}, {REG}, 0x160\b")
+SUNS = ((135.0, 50.0), (315.0, 50.0))   # azimuth, elevation in degrees: two opposite suns
 
 
 def _user(entry):
@@ -74,6 +86,45 @@ def ps_matches(entry, text):
     return (entry.get("stage") == "ps" and entry.get("bindings") == [0, 1, 2] and _user(entry) == PS_USER
             and text.count("image_sample") == 1 and _exports(text, "mrt") == list(range(5))
             and all(re.search(p, text) for p in PS_LAYOUT))
+
+
+def shadow_vs_matches(entry, text):
+    """A depth-only VS: SV_VertexID in, a float3 position stream from s11/s12, object rows at s9 + 0x40 and a
+    view-projection at s9 + 0x60 -> 0x160; exports pos0 and one param."""
+    sig = [(e.get("semantic"), e.get("semantic_index")) for e in entry.get("input_signature") or []]
+    return (entry.get("stage") == "vs" and not entry.get("bindings") and _user(entry) == SHADOW_USER
+            and sig == [("SV_VertexID", 0)] and "image_" not in text and _exports(text, "param") == [0]
+            and _exports(text, "pos") == [0]
+            and all(re.search(p, text) for p in SHADOW_LAYOUT))
+
+
+def pick_shadow_vs(shaders_dir):
+    """The first matching shadow VS (.spv path) in name order, or None."""
+    spirv = os.path.join(shaders_dir, "spirv")
+    disasm = os.path.join(shaders_dir, "dxbc", "disasm")
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for n in sorted(index):
+        if (index[n].get("stage") == "vs" and os.path.isfile(os.path.join(spirv, n + ".spv"))
+                and shadow_vs_matches(index[n], _listing(disasm, n))):
+            return os.path.join(spirv, n + ".spv")
+    return None
+
+
+def check_shadow(runs):
+    """(ok, message) from the shadow counts of the SUNS runs: each has a non-empty map, lit pixels and at least 1 %
+    of the tested pixels shadowed, and the opposite suns' lit counts differ by at least 10 % of the tested pixels
+    (the faces they light swap)."""
+    def tested(r):
+        return sum(int(r.get(k, 0)) for k in ("lit", "shadowed", "away", "outside"))
+    ok = len(runs) == len(SUNS) and all(r.get("lit", 0) > 0 and r.get("map_texels", 0) > 0
+                                        and r.get("shadowed", 0) * 100 >= tested(r) > 0 for r in runs)
+    ok = ok and abs(runs[0]["lit"] - runs[1]["lit"]) * 10 >= max(tested(r) for r in runs)
+    return ok, "; ".join(f"sun {a:g}/{e:g}: {int(r.get('lit', 0))} lit, {int(r.get('shadowed', 0))} shadowed, "
+                         f"{int(r.get('away', 0))} facing away" for (a, e), r in zip(SUNS, runs))
 
 
 def dxbc_signature(path, tags):
@@ -177,6 +228,8 @@ def main(argv=None):
     ap.add_argument("--build", default=os.path.join(HERE, "..", "runtime", "build"))
     ap.add_argument("--scene", help="scene file to write (default: a temporary file)")
     ap.add_argument("--dump", help="also write the targets as PREFIX_*.ppm (keep them in the work folder)")
+    ap.add_argument("--shadow", action="store_true",
+                    help="also draw a sun shadow map with the game's depth-only VS and test the G-buffer against it")
     a = ap.parse_args(argv)
 
     tool = find_tool(a.build)
@@ -186,6 +239,10 @@ def main(argv=None):
                                  "no matching translated shader pair" if not pair else "no entities file"))
         return 77
     vs, ps, lk = pair
+    shadow_vs = pick_shadow_vs(os.path.join(a.work, "shaders")) if a.shadow else None
+    if a.shadow and not shadow_vs:
+        print("unsupported: no matching translated shadow VS")
+        return 77
     tmp = None
     scene = a.scene
     if not scene:
@@ -208,15 +265,23 @@ def main(argv=None):
         x, y, z = stats["center"]
         cmd = [tool, scene, vs, ps, "--link", ",".join(map(str, lk)), "--size", "640", "360",
                "--cam", str(x - 40), str(y - 40), str(z + 25), "45", "-20"]
-        if a.dump:
-            cmd += ["--dump", a.dump]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        lines = (r.stdout + r.stderr).strip().splitlines()
-        if r.returncode:
-            print(lines[-1] if lines else "vk_gbuffer failed")
-            return r.returncode
-        counts = next((parse_counts(s) for s in lines if s.startswith("vk_gbuffer:")), {})
+        runs = []
+        for k, (az, el) in enumerate(SUNS if shadow_vs else SUNS[:1]):
+            extra = ["--shadow", shadow_vs, "--sun", str(az), str(el)] if shadow_vs else []
+            if a.dump and not k:   # only the first sun dumps; the G-buffer is the same for both
+                extra += ["--dump", a.dump]
+            r = subprocess.run(cmd + extra, capture_output=True, text=True)
+            lines = (r.stdout + r.stderr).strip().splitlines()
+            if r.returncode:
+                print(lines[-1] if lines else "vk_gbuffer failed")
+                return r.returncode
+            runs.append(lines)
+        counts = next((parse_counts(s) for s in runs[0] if s.startswith("vk_gbuffer: draws")), {})
         ok, msg = check_counts(counts, stats["textured_draws"] > 0)
+        if shadow_vs:
+            sruns = [next((parse_counts(s) for s in lines if s.startswith("vk_gbuffer: shadow")), {}) for lines in runs]
+            sok, smsg = check_shadow(sruns)
+            ok, msg = ok and sok, msg + "; " + smsg
         print(("PASS: " if ok else "FAIL: ") + msg)
         return 0 if ok else 1
     finally:

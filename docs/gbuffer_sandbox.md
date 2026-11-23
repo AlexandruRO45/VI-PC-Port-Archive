@@ -74,24 +74,54 @@ Prepare the work folder as in [sandbox.md](sandbox.md) §4, then:
 ```sh
 cmake --build runtime/build --target vk_gbuffer
 python -I tools/gbuffer.py --work <work> --entities <work>/entities.jsonl --models <work>/assets \
-    --textures <work>/ttpf_maps --textures <work>/ttpf_terrain [--center X Y] [--dump <work>/gb]
+    --textures <work>/ttpf_maps --textures <work>/ttpf_terrain [--center X Y] [--dump <work>/gb] [--shadow]
 ```
+
+`--shadow` adds a sun shadow pass (§5). With `--dump`, `<prefix>_lit.ppm` (first sun) is a preview: albedo × (0.3 + 0.7 ·
+N·L · visibility).
 
 It needs `VK_KHR_fragment_shader_barycentric`, `shaderDrawParameters`, `bufferDeviceAddress`, descriptor
 indexing and `shaderInt64` (exit 77 without them). It also needs
 shaders translated after the 16-bit interpolant fix of 2026-11-22. An older translation reads the packed f16
 normal as one smooth float, and `normals_facing` falls to a few percent of `covered`.
 
-## 5. Measured
+## 5. Sun shadow pass
+
+`--shadow` draws every prop into a 2048² D32 map from an orthographic sun with the game's depth-only VS, then
+tests each covered G-buffer pixel against it.
+
+**Which VS.** `pick_shadow_vs` takes the first VS in name order with: SV_VertexID as the only input, no bindings,
+user SGPRs `[ptr32_lo 9, const32 11, const32 12]`, no image instructions, exports pos0 and param0 only, and every
+pattern in `SHADOW_LAYOUT`. In the current corpus two VS match. Both do the same transform.
+
+**Tables.** s9 points to a table with a V# at +0x40 for the object rows (r0, r1, r2 at 0x00–0x20, translation at
+0x30) and a V# at +0x60 for the view, with the view-projection at 0x160. These are the same object and view
+layouts as the G-buffer VS, so the object CB is shared. s11/s12 hold the stream base. The header dword 0 gives the
+offset (bits 7+) and the stride (bits 3–6). The VS reads float3 positions at offset + stride · SV_VertexID, so the
+tool draws indexed with the mesh's index buffer. There is no fragment shader.
+
+**Test.** Each covered pixel goes back to world space through the inverse view-projection. It is offset 1.5 map
+texels along its normal, against self-shadowing, and compared with the map at a depth bias of 2 texels in world
+units. A non-finite position counts as `outside`. A pixel is
+`away` when N·L ≤ 0, `shadowed` when the map is nearer, and `lit` otherwise.
+
+**PASS** (with `--shadow`): for both suns (azimuth/elevation 135°/50° and 315°/50°) the map is non-empty, `lit`
+> 0 and `shadowed` ≥ 1 % of the tested pixels. The two `lit` counts differ by at least 10 % of the tested pixels,
+because opposite suns light opposite faces.
+
+## 6. Measured
 
 | | |
 |---|---|
 | test scene (as in sandbox.md) | 150 props, 446 draws, 442 textured, 107 textures |
 | 640×360 | 114,503 pixels covered (the same as `vk_sandbox --check` at that camera), 114,503 shaded, 7,325 albedo colours, 98,778 normals facing the camera, 114,503 still motion vectors (largest 0.003 px) |
+| `--shadow`, sun 135°/50° | 82,784 lit, 10,529 shadowed, 21,190 facing away |
+| `--shadow`, sun 315°/50° | 13,420 lit, 17,164 shadowed, 83,919 facing away |
 | synthetic cube | each face decodes to its own rotated normal, and the near faces win the depth test |
 
-## 6. Limits and next
+## 7. Limits and next
 
-* There is no lighting pass yet. The next step is to feed these targets to the deferred lighting shaders.
+* The shadow test and the N·L preview run on the CPU. The game's own shadow-mask and deferred lighting shaders are
+  the next step.
 * One pair draws every prop. A prop's own material program comes from the executable's table (#2519).
 * Positions are repacked from the exported model, not read from the game's own vertex buffers.
