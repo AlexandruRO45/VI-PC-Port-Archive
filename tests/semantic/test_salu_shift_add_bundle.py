@@ -169,6 +169,22 @@ class TestSLshl2AddU32OverflowAndSCC(unittest.TestCase):
         res, scc = ref_s_lshl_add_u32(2, 0x3FFFFFFF, 3)
         self.assertEqual((res, scc), (0xFFFFFFFF, 0))
 
+class TestSLshl2AddU32Translator(unittest.TestCase):
+    def test_translator_s_lshl2_add_u32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0x40000000",
+            "s_lshl2_add_u32 s5, s4, 42",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v1, s5",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+            "v_add_nc_u32_e32 v31, 4, v30",
+            "v_mov_b32_e32 v2, s6",
+            "buffer_store_dword v2, v31, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_lshl2_add")
+        for l in range(32):
+            self.assertEqual(results[l], 42)
+
 
 if __name__ == "__main__":
     unittest.main()
