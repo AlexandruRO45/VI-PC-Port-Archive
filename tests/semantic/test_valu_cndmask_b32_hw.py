@@ -16,8 +16,8 @@ Verification layers:
   5. In-place operand preservation and register aliasing verification.
   6. Condition code / status flag neutrality (SCC / VCC preservation).
   7. IEEE 754 boundary extremes, signed zeros, subnormals, and NaNs.
-  8. Syntax rejection, negative control gates, and fault injection / mutation testing.
-  9. Real SPIR-V translation and execution via rdna2spirv and spirv_mini_interp.
+  8. Negative controls, syntax rejection, and mutation detection (inverted condition, bitwise AND substitution).
+  9. Real SPIR-V translation and execution via rdna2spirv and spirv_mini_interp across e32, e64, literals, and sign modifiers.
 
 Zero game data, standard library Python only, Python 3.9+ compatible.
 """
@@ -31,6 +31,8 @@ import struct
 import sys
 import unittest
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -48,6 +50,7 @@ from support import STUB_DXBC, mrt0_words, translate_lines  # noqa: E402
 
 MASK32: int = 0xFFFFFFFF
 MASK64: int = 0xFFFFFFFFFFFFFFFF
+_TRANSLATE_ID: int = 0
 
 
 def u32(val: int) -> int:
@@ -63,7 +66,9 @@ def ref_v_cndmask_b32(src0: int, src1: int, cond_bit: int) -> int:
 
 
 def run_valu_cndmask_ps(src0_val: int, src1_val: int, cond_bit: int) -> int:
-    """Execute v_cndmask_b32 in a fragment shader via translate_lines."""
+    """Execute v_cndmask_b32_e64 in a fragment shader via translate_lines."""
+    global _TRANSLATE_ID
+    _TRANSLATE_ID += 1
     lines = [
         f"s_mov_b32 s0, {src0_val & MASK32:#x}",
         f"s_mov_b32 s1, {src1_val & MASK32:#x}",
@@ -75,7 +80,27 @@ def run_valu_cndmask_ps(src0_val: int, src1_val: int, cond_bit: int) -> int:
         "exp mrt0 v0, v1, v2, v3 done vm",
         "s_endpgm",
     ]
-    spv = translate_lines("ps_cndmask_b32", lines)
+    spv = translate_lines(f"ps_cndmask_b32_{_TRANSLATE_ID}", lines)
+    words = mrt0_words(spv)
+    return words[0]
+
+
+def run_valu_cndmask_e32_ps(src0_val: int, src1_val: int, vcc_bit: int) -> int:
+    """Execute v_cndmask_b32_e32 (implicit VCC mask) in a fragment shader."""
+    global _TRANSLATE_ID
+    _TRANSLATE_ID += 1
+    lines = [
+        f"s_mov_b32 vcc_lo, {1 if vcc_bit else 0}",
+        f"v_mov_b32 v1, {src0_val & MASK32:#x}",
+        f"v_mov_b32 v2, {src1_val & MASK32:#x}",
+        "v_cndmask_b32_e32 v0, v1, v2",
+        "v_mov_b32 v1, 0",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines(f"ps_cndmask_e32_{_TRANSLATE_ID}", lines)
     words = mrt0_words(spv)
     return words[0]
 
@@ -89,6 +114,12 @@ class TestValuCndmaskB32Oracle(unittest.TestCase):
         self.assertEqual(ref_v_cndmask_b32(src0, src1, 0), src0)
         self.assertEqual(ref_v_cndmask_b32(src0, src1, 1), src1)
 
+        # Cross-check through translated execution in both e64 and e32
+        self.assertEqual(run_valu_cndmask_ps(src0, src1, 0), src0)
+        self.assertEqual(run_valu_cndmask_ps(src0, src1, 1), src1)
+        self.assertEqual(run_valu_cndmask_e32_ps(src0, src1, 0), src0)
+        self.assertEqual(run_valu_cndmask_e32_ps(src0, src1, 1), src1)
+
     def test_hardware_translator_execution(self) -> None:
         cases = [
             (0xAAAAAAAA, 0x55555555, 0, 0xAAAAAAAA),
@@ -101,6 +132,18 @@ class TestValuCndmaskB32Oracle(unittest.TestCase):
         for s0, s1, cond, exp in cases:
             with self.subTest(s0=hex(s0), s1=hex(s1), cond=cond):
                 self.assertEqual(run_valu_cndmask_ps(s0, s1, cond), exp)
+                self.assertEqual(run_valu_cndmask_e32_ps(s0, s1, cond), exp)
+
+    def test_e32_implicit_vcc_selection(self) -> None:
+        """Verify e32 form reads implicit VCC mask correctly across distinct patterns."""
+        pairs = [
+            (0xCAFEBABE, 0xDEADBEEF),
+            (0x00000001, 0x80000000),
+            (0x12340000, 0x00005678),
+        ]
+        for s0, s1 in pairs:
+            self.assertEqual(run_valu_cndmask_e32_ps(s0, s1, 0), s0)
+            self.assertEqual(run_valu_cndmask_e32_ps(s0, s1, 1), s1)
 
 # --- Section 2: Symbolic AST Opcode Definitions and Typed Expressions ---
 
@@ -192,11 +235,43 @@ class TestValuCndmaskB32AST(unittest.TestCase):
         self.assertEqual(inst.src0.reg_idx, 1)
         self.assertEqual(inst.src1.reg_idx, 2)
 
+        # Cross-check through translator
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        lines = [
+            "s_mov_b32 vcc_lo, 1",
+            "v_mov_b32 v1, 100",
+            "v_mov_b32 v2, 200",
+            "v_cndmask_b32 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines(f"ps_cndmask_ast_vop2_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpSelect", spv)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 200)
+
     def test_ast_parse_vop3(self) -> None:
         inst = parse_instruction("v_cndmask_b32_e64 v0, s0, s1, s[2:3]")
         self.assertEqual(inst.encoding, OpcodeEncoding.VOP3)
         self.assertEqual(inst.src0.kind, OperandKind.SGPR)
         self.assertEqual(inst.mask.kind, OperandKind.SGPR)
+
+        # Cross-check through translator
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        lines = [
+            "s_mov_b32 s0, 300",
+            "s_mov_b32 s1, 400",
+            "s_mov_b64 s[2:3], 0",
+            "v_cndmask_b32_e64 v0, s0, s1, s[2:3]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines(f"ps_cndmask_ast_vop3_{_TRANSLATE_ID}", lines)
+        self.assertIn("OpSelect", spv)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 300)
 
     def test_ast_rejection(self) -> None:
         with self.assertRaises(ValueError):
@@ -242,10 +317,16 @@ class TestValuCndmaskB32ScalarInterpreter(unittest.TestCase):
             expected = 0x22222222 * (i + 1) if (i % 2 == 1) else 0x11111111 * (i + 1)
             self.assertEqual(lane.vgprs[0], expected & MASK32)
 
+        # Cross-check lane 0 (vcc=0 -> src0) and lane 1 (vcc=1 -> src1) via translated execution
+        self.assertEqual(run_valu_cndmask_e32_ps(0x11111111, 0x22222222, 0), 0x11111111)
+        self.assertEqual(run_valu_cndmask_e32_ps(0x22222222, 0x44444444, 1), 0x44444444)
+
 # --- Section 4: SIMD Multi-Lane Divergence and EXEC Masking ---
 
 def run_valu_cndmask_simd_ps(cond_mask: int) -> List[int]:
     """Execute v_cndmask_b32 across multiple lanes in a fragment shader."""
+    global _TRANSLATE_ID
+    _TRANSLATE_ID += 1
     lines = [
         "s_mov_b32 s0, 0x11111111",
         "s_mov_b32 s1, 0x22222222",
@@ -257,7 +338,7 @@ def run_valu_cndmask_simd_ps(cond_mask: int) -> List[int]:
         "exp mrt0 v0, v1, v2, v3 done vm",
         "s_endpgm",
     ]
-    spv = translate_lines("ps_cndmask_simd", lines)
+    spv = translate_lines(f"ps_cndmask_simd_{_TRANSLATE_ID}", lines)
     return mrt0_words(spv)
 
 
@@ -274,10 +355,24 @@ class TestValuCndmaskB32SimdExecution(unittest.TestCase):
         self.assertEqual(words_bit0_off[0], 0x11111111)
         self.assertEqual(words_bit0_off[1], 0x22222222)
 
+    def test_lane_mask_polarity_and_sgpr_pair(self) -> None:
+        """Verify 64-bit mask polarity selection across SGPR mask registers."""
+        # When mask low bit is 1, v0 gets src1 (0x22222222), v1 gets src0 (0x11111111)
+        res_on = run_valu_cndmask_simd_ps(cond_mask=0x5555555555555555)
+        self.assertEqual(res_on[0], 0x22222222)
+        self.assertEqual(res_on[1], 0x11111111)
+
+        # When mask low bit is 0, v0 gets src0 (0x11111111), v1 gets src1 (0x22222222)
+        res_off = run_valu_cndmask_simd_ps(cond_mask=0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(res_off[0], 0x11111111)
+        self.assertEqual(res_off[1], 0x22222222)
+
 # --- Section 5: Register Aliasing and In-Place Operand Preservation ---
 
 def run_valu_cndmask_inplace_ps(init_val: int, other_val: int, cond_bit: int) -> int:
     """Execute in-place v_cndmask_b32 v0, v0, s1 (or v_cndmask_b32 v0, s0, v0)."""
+    global _TRANSLATE_ID
+    _TRANSLATE_ID += 1
     lines = [
         f"v_mov_b32 v0, {init_val & MASK32:#x}",
         f"s_mov_b32 s1, {other_val & MASK32:#x}",
@@ -289,7 +384,7 @@ def run_valu_cndmask_inplace_ps(init_val: int, other_val: int, cond_bit: int) ->
         "exp mrt0 v0, v1, v2, v3 done vm",
         "s_endpgm",
     ]
-    spv = translate_lines("ps_cndmask_inplace", lines)
+    spv = translate_lines(f"ps_cndmask_inplace_{_TRANSLATE_ID}", lines)
     return mrt0_words(spv)[0]
 
 
@@ -304,10 +399,47 @@ class TestValuCndmaskB32RegisterAliasing(unittest.TestCase):
         # When cond=1, v0 updates to other_val
         self.assertEqual(run_valu_cndmask_inplace_ps(init_val, other_val, cond_bit=1), other_val)
 
+    def test_inplace_dst_aliases_src1(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        s0_val = 0x11112222
+        v0_val = 0x33334444
+        lines = [
+            f"s_mov_b32 s0, {s0_val:#x}",
+            f"v_mov_b32 v0, {v0_val:#x}",
+            "s_mov_b64 s[2:3], 0",
+            "v_cndmask_b32_e64 v0, s0, v0, s[2:3]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines(f"ps_cndmask_alias_src1_0_{_TRANSLATE_ID}", lines)
+        self.assertEqual(mrt0_words(spv)[0], s0_val)
+
+        _TRANSLATE_ID += 1
+        lines[2] = "s_mov_b64 s[2:3], 1"
+        spv1 = translate_lines(f"ps_cndmask_alias_src1_1_{_TRANSLATE_ID}", lines)
+        self.assertEqual(mrt0_words(spv1)[0], v0_val)
+
+    def test_all_operands_identical(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        val = 0xDEADBEEF
+        lines = [
+            f"v_mov_b32 v0, {val:#x}",
+            "s_mov_b64 s[2:3], 1",
+            "v_cndmask_b32_e64 v0, v0, v0, s[2:3]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines(f"ps_cndmask_alias_all_{_TRANSLATE_ID}", lines)
+        self.assertEqual(mrt0_words(spv)[0], val)
+
 # --- Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation ---
 
 def run_valu_cndmask_scc_ps(cond_bit: int, initial_scc: int) -> Tuple[int, int]:
     """Verify SCC is preserved unmodified across v_cndmask_b32."""
+    global _TRANSLATE_ID
+    _TRANSLATE_ID += 1
     lines = [
         f"s_mov_b32 s0, {1 if initial_scc else 0}",
         "s_cmp_eq_u32 s0, 1",  # set SCC
@@ -322,7 +454,7 @@ def run_valu_cndmask_scc_ps(cond_bit: int, initial_scc: int) -> Tuple[int, int]:
         "exp mrt0 v0, v1, v2, v3 done vm",
         "s_endpgm",
     ]
-    spv = translate_lines("ps_cndmask_scc", lines)
+    spv = translate_lines(f"ps_cndmask_scc_{_TRANSLATE_ID}", lines)
     words = mrt0_words(spv)
     return words[0], words[1]
 
@@ -339,6 +471,25 @@ class TestValuCndmaskB32ConditionCodes(unittest.TestCase):
                     self.assertEqual(res, exp_res)
                     self.assertEqual(out_scc, scc)
 
+    def test_vcc_neutrality_under_sgpr_mask(self) -> None:
+        """Verify VCC remains intact when an explicit SGPR mask is used in e64."""
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        lines = [
+            "s_mov_b32 vcc_lo, 0x12345678",
+            "s_mov_b64 s[0:1], 1",
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 20",
+            "v_cndmask_b32_e64 v0, v1, v2, s[0:1]",
+            "v_mov_b32 v3, vcc_lo",
+            "exp mrt0 v0, v3, 0, 0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines(f"ps_cndmask_vcc_neutral_{_TRANSLATE_ID}", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 20)
+        self.assertEqual(words[1], 0x12345678)
+
 # --- Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling ---
 
 class TestValuCndmaskB32IEEE754BitPatterns(unittest.TestCase):
@@ -349,11 +500,15 @@ class TestValuCndmaskB32IEEE754BitPatterns(unittest.TestCase):
             (0x7FC00000, 0x7F800000),  # qNaN, +inf
             (0xFFC00000, 0x80000000),  # -qNaN, -0.0
             (0x00000001, 0x7F7FFFFF),  # min subnormal, max normal
+            (0x80000000, 0x00000000),  # -0.0, +0.0
+            (0x7F800000, 0xFF800000),  # +inf, -inf
         ]
         for f0, f1 in nan_cases:
             with self.subTest(f0=hex(f0), f1=hex(f1)):
                 self.assertEqual(run_valu_cndmask_ps(f0, f1, 0), f0)
                 self.assertEqual(run_valu_cndmask_ps(f0, f1, 1), f1)
+                self.assertEqual(run_valu_cndmask_e32_ps(f0, f1, 0), f0)
+                self.assertEqual(run_valu_cndmask_e32_ps(f0, f1, 1), f1)
 
 # --- Section 8: Negative Controls, Syntax Rejection, and Mutation Detection ---
 
@@ -385,6 +540,81 @@ class TestValuCndmaskB32NegativeAndMutations(unittest.TestCase):
             return s1 & cond
 
         self.assertNotEqual(mutant_and(0x11111111, 0x22222222, 1), ref_v_cndmask_b32(0x11111111, 0x22222222, 1))
+
+    def test_mutation_opselect_arms_swap_detector(self) -> None:
+        """Verify that translated execution strictly discriminates OpSelect {y} {x} order."""
+        # When cond=1, result MUST be src1 and NOT src0
+        actual_1 = run_valu_cndmask_ps(0xAAAAAAAA, 0x55555555, cond_bit=1)
+        self.assertEqual(actual_1, 0x55555555)
+        self.assertNotEqual(actual_1, 0xAAAAAAAA)
+
+        # When cond=0, result MUST be src0 and NOT src1
+        actual_0 = run_valu_cndmask_ps(0xAAAAAAAA, 0x55555555, cond_bit=0)
+        self.assertEqual(actual_0, 0xAAAAAAAA)
+        self.assertNotEqual(actual_0, 0x55555555)
+
+    def test_e64_source_sign_modifiers_translated(self) -> None:
+        """Verify that e64 source modifiers (negation / absolute value) invert or clear sign bits."""
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        lines = [
+            "s_mov_b32 s0, 0x00000005",   # +5
+            "s_mov_b32 s1, 0x8000000A",   # -10
+            "s_mov_b64 s[2:3], 0",
+            # With cond=0: selects -s0 (sign bit set on 5 -> 0x80000005)
+            "v_cndmask_b32_e64 v0, -s0, |s1|, s[2:3]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines(f"ps_cndmask_mods_0_{_TRANSLATE_ID}", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0x80000005)
+
+        _TRANSLATE_ID += 1
+        lines[2] = "s_mov_b64 s[2:3], 1"
+        # With cond=1: selects |s1| (sign bit cleared on -10 -> 0x0000000A)
+        spv1 = translate_lines(f"ps_cndmask_mods_1_{_TRANSLATE_ID}", lines)
+        words1 = mrt0_words(spv1)
+        self.assertEqual(words1[0], 0x0000000A)
+
+    def test_literal_and_sgpr_operand_combinations_translated(self) -> None:
+        """Verify various operand combinations: literal constants, SGPRs, and VGPRs."""
+        global _TRANSLATE_ID
+        # Combo 1: src0 literal 0x12345678, src1 VGPR 0x87654321
+        _TRANSLATE_ID += 1
+        lines1 = [
+            "v_mov_b32 v1, 0x87654321",
+            "s_mov_b64 s[0:1], 1",
+            "v_cndmask_b32_e64 v0, 0x12345678, v1, s[0:1]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv1 = translate_lines(f"ps_cndmask_lit_src0_{_TRANSLATE_ID}", lines1)
+        self.assertEqual(mrt0_words(spv1)[0], 0x87654321)
+
+        # Combo 2: src0 VGPR 0x12345678, src1 literal 0x87654321 with cond=0
+        _TRANSLATE_ID += 1
+        lines2 = [
+            "v_mov_b32 v1, 0x12345678",
+            "s_mov_b64 s[0:1], 0",
+            "v_cndmask_b32_e64 v0, v1, 0x87654321, s[0:1]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv2 = translate_lines(f"ps_cndmask_lit_src1_{_TRANSLATE_ID}", lines2)
+        self.assertEqual(mrt0_words(spv2)[0], 0x12345678)
+
+        # Combo 3: inline constants 0 and 1
+        _TRANSLATE_ID += 1
+        lines3 = [
+            "s_mov_b64 s[0:1], 1",
+            "v_cndmask_b32_e64 v0, 0, 1, s[0:1]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv3 = translate_lines(f"ps_cndmask_inline_{_TRANSLATE_ID}", lines3)
+        self.assertEqual(mrt0_words(spv3)[0], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
