@@ -484,6 +484,8 @@ int main() {
 
     HWND hwnd = create_test_window(128, 128);
     if (!hwnd) return fail("CreateWindowExW");
+    // Wine on X11 can report a hidden window's swapchain out of date after ResizeBuffers.
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
     IDXGIFactory4* factory = nullptr;
     if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&factory))) || !factory)
