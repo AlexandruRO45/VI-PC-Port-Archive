@@ -354,7 +354,7 @@ def _trailing_siblings(
     try:
         wrap = ET.fromstring(b"<_recover>" + span + b"</_recover>")
         sections = reader.children(list(wrap))
-    except (ET.ParseError, ValueError):
+    except (ET.ParseError, ValueError, RecursionError):
         return {}, body_end
     if not isinstance(sections, dict):
         # Direct unkeyed <Item>s belong in the prefix item list rather than sections={"$items": ...}.
@@ -426,7 +426,7 @@ def _recover_prefix_items(
     for start_pos, end_pos in candidates:
         try:
             items.append(reader.convert(ET.fromstring(body[start_pos:end_pos])))
-        except (ET.ParseError, ValueError):
+        except (ET.ParseError, ValueError, RecursionError):
             pass
     return items
 

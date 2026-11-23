@@ -552,6 +552,29 @@ class Run(unittest.TestCase):
         self.assertEqual(r3.returncode, 1, r3.stderr)
         self.assertIn("no document could be read", r3.stderr)
 
+    def test_recover_skips_deeply_nested_fragment_without_aborting_batch(self):
+        # Complete deeply nested fragments in a truncated payload must not raise RecursionError out of --recover.
+        batch_dir = os.path.join(self.tmp.name, "deep_recover")
+        os.makedirs(batch_dir)
+        deep_item = b"<Item>" * 400 + b'<v value="1"/>' + b"</Item>" * 400
+        with open(os.path.join(batch_dir, "01_deep_trunc.xml"), "wb") as f:
+            # Unclosed outer <Item> ensures iterparse hits ET.ParseError before converting the deep child.
+            f.write(b'<CRoot><Item><Item><v value="1"/></Item>' + deep_item + b"<Item><x value=")
+        with open(os.path.join(batch_dir, "02_shallow.xml"), "wb") as f:
+            f.write(b'<CRoot><ok value="1"/></CRoot>')
+
+        summary = R.run([batch_dir], recover=True)
+        self.assertEqual(summary["documents"], 1)
+        self.assertEqual(summary["recovered_documents"], 1)
+        self.assertEqual(summary["recovered_items"], 1)
+        self.assertEqual(summary["not_well_formed"], 1)
+
+        # Deep trailing sibling section + normal item: skips the deep section without crashing, keeps the item.
+        deep_sec = b"<Sec>" + b"<Node>" * 400 + b'<x value="1"/>' + b"</Node>" * 400 + b"</Sec>"
+        _, secs, items = R.recover_fragments(b'<Item><v value="7"/></Item>' + deep_sec + b"</CRoot>", root_hint="CRoot")
+        self.assertEqual(secs, {})
+        self.assertEqual(items, [{"v": 7}])
+
 
 if __name__ == "__main__":
     unittest.main()
