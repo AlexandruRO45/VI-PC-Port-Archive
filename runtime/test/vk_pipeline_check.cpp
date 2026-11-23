@@ -53,6 +53,7 @@
 #include "pipeline_summary.h"
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
+#include "../src/vulkan_bindless.h"
 
 #include <algorithm>
 #include <array>
@@ -1319,20 +1320,42 @@ int main(int argc, char** argv) {
         return {};
     };
 
-    // Resource contract (docs/design.md): set 0, runtime-sized arrays as large bindless arrays.
-    std::vector<VkDescriptorSetLayoutBinding> b;
-    auto add = [&](uint32_t bind, VkDescriptorType t, uint32_t cnt) {
-        b.push_back({bind, t, cnt, VK_SHADER_STAGE_ALL, nullptr});
-    };
-    add(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096); add(1, VK_DESCRIPTOR_TYPE_SAMPLER, 1024);
-    add(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1); add(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024);
-    add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
-    add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
-    for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
-    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
+    // Resource contract (docs/design.md): set 0, runtime-sized arrays as large bindless arrays. Built as the runtime
+    // builds it (create_bindless in shims/d3d12_vulkan_device.cpp): leonida::bindless's bindings, update-after-bind
+    // and partially bound where the device has them, and sized by size_bindings() from the device's limits. Fixed
+    // counts (4096 sampled images, 1024 samplers, 4352 storage images, every stage) are far past the plain limits of
+    // Intel's Windows driver (Xe-LP: 200 sampled and 16 storage images per stage), which then crashed on or refused
+    // pipelines the runtime creates (TEST-1971). The multisampled bindings stay off, as they were here.
+    leonida::BindlessFeatures bindless{};
+    bindless.update_after_bind = f12.descriptorBindingSampledImageUpdateAfterBind &&
+                                 f12.descriptorBindingStorageImageUpdateAfterBind &&
+                                 f12.descriptorBindingStorageBufferUpdateAfterBind;
+    bindless.partially_bound = f12.descriptorBindingPartiallyBound;
+    {
+        // Its own query: VkPhysicalDeviceVulkan12Properties may not share a chain with the float-controls struct above.
+        VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &p12};
+        VkPhysicalDeviceProperties2 limits2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
+        vkGetPhysicalDeviceProperties2(pd, &limits2);
+        const auto layout_support = reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(
+            vkGetDeviceProcAddr(dev, "vkGetDescriptorSetLayoutSupport"));
+        // As the runtime: past maxPerSetDescriptors the driver is asked, except MoltenVK, whose answer is too strict.
+        std::function<bool(const leonida::BindlessFeatures&)> layout_supported;
+        if (p12.driverID == VK_DRIVER_ID_MOLTENVK)
+            layout_supported = [](const leonida::BindlessFeatures&) { return true; };
+        else if (layout_support)
+            layout_supported = [&](const leonida::BindlessFeatures& candidate) {
+                const leonida::bindless::SetLayout candidate_layout(candidate);
+                VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
+                layout_support(dev, &candidate_layout.info, &support);
+                return support.supported == VK_TRUE;
+            };
+        if (!leonida::bindless::size_bindings(bindless, limits2.properties.limits, p11, p12, layout_supported))
+            std::fprintf(stderr, "note: the device's descriptor limits are below the bindless set's default sizes\n");
+    }
+    const leonida::bindless::SetLayout set0(bindless);
     VkDescriptorSetLayout dsl;
-    if (VkResult r = vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl)) { std::fprintf(stderr, "layout %d\n", r); return 1; }
+    if (VkResult r = vkCreateDescriptorSetLayout(dev, &set0.info, nullptr, &dsl)) { std::fprintf(stderr, "layout %d\n", r); return 1; }
     // Set 1 of --pc-tail-ubo shaders (docs/design.md): dynamic uniform block at binding 0 holding heap/code base.
     const VkDescriptorSetLayoutBinding tail_binding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                                                     VK_SHADER_STAGE_ALL, nullptr};
