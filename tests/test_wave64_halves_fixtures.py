@@ -217,3 +217,19 @@ def test_a_fixture_without_cross_row_channels_is_judged_in_full_on_a_narrow_stag
     # the probe cannot run: skipped as before
     r = _narrow_stage(tmp_path, monkeypatch, name, good, None)
     assert isinstance(r, w64_graphics.Skip) and "could not measure" in r
+
+
+def test_reference_comparison_skips_the_channels_a_narrow_stage_does_not_judge(tmp_path, monkeypatch):
+    name = "ps_w64_a_bpermute"                                   # r2 reads lane L ^ 16
+    good = [w64_graphics.FIXTURES[name][1](i) for i in range(64 * 64)]
+    garbage = [(a, b, 4456512, d) for a, b, c, d in good]       # only r2 wrong, as on a 16-live-lane stage
+    ref = tmp_path / "ref"
+    ref.mkdir()
+    (ref / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in good))
+    monkeypatch.setenv("W64G_REF", str(ref))
+    r = _narrow_stage(tmp_path, monkeypatch, name, garbage, 16)
+    assert isinstance(r, w64_graphics.Skip) and "r2" in r        # r2 is not compared with the reference either
+    # a within-row channel that differs from the reference is still a failure
+    bad = [(a + 1, b, c, d) for a, b, c, d in good]
+    r = _narrow_stage(tmp_path, monkeypatch, name, bad, 16)
+    assert not isinstance(r, w64_graphics.Skip) and r

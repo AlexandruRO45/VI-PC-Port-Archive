@@ -354,9 +354,11 @@ def expected_problem(name, words, heap, ignore=()):
     return ""
 
 
-def comparable(name, words, heap):
-    """What two draws of the same fixture must share when the shader is partition invariant."""
-    stable = [tuple(0 if g is None else v for g, v in zip(FIXTURES[name][1](i), w)) for i, w in enumerate(words)]
+def comparable(name, words, heap, ignore=()):
+    """What two draws of the same fixture must share when the shader is partition invariant. `ignore`: the output
+    channels not judged (a narrow fragment stage), dropped from both sides."""
+    stable = [tuple(0 if g is None or c in ignore else v for c, (g, v) in enumerate(zip(FIXTURES[name][1](i), w)))
+              for i, w in enumerate(words)]
     if name.endswith("_b_ballot_atomic"):
         return stable, sorted(heap[64:64 + heap[0]]), heap[0]
     return stable, None, None
@@ -433,7 +435,7 @@ def check(tools, spirv, name):
                     if not partition_dependent(name, ref_words, words):
                         return "tier C but the run equals the 64-lane reference: the detector is wrong"
                     compared = True
-                elif not name.endswith("_b_ballot_atomic") and comparable(name, ref_words, None) != comparable(name, words, None):
+                elif not name.endswith("_b_ballot_atomic") and comparable(name, ref_words, None, ignore) != comparable(name, words, None, ignore):
                     return "the run differs from the 64-lane reference"
         if tier == "C" and not compared:
             return Skip("SKIP (tier C needs a device that can require both 64 and 32, or W64G_REF)")
