@@ -51,8 +51,10 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import zlib
 from typing import Iterable, Iterator
 
@@ -60,6 +62,8 @@ from typing import Iterable, Iterator
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import odrp_7a  # noqa: E402
 import psin_data  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path, path_key  # noqa: E402
 import world_names  # noqa: E402
 
@@ -1375,9 +1379,41 @@ def _check_out_path(out_path: str, inputs: list[str]) -> str | None:
 
 
 def _write_json(path: str, payload: object) -> None:
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(payload, fh, indent=1)
-        fh.write("\n")
+    """Publish a complete regular file, or write directly to a non-regular destination.
+
+    Parent directories are not created: `_check_out_path` already requires the folder to exist.
+    """
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(payload, fh, indent=1)
+            fh.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".ped_catalogues-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def _cmd_census(args: argparse.Namespace) -> int:

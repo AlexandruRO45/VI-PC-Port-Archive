@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -775,6 +776,18 @@ class PedCataloguesTests(unittest.TestCase):
                 rep = json.load(fh)
             self.assertEqual(rep["catalogues"], 1)
             self.assertEqual(rep["presets"], 5)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "report.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(previous)
+            with mock.patch.object(pc, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    pc._write_json(path, {"catalogues": 0})
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), previous)
 
 
 if __name__ == "__main__":
