@@ -19,17 +19,24 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WINDOW = 3     # lines between the two (1 = neighbours)
 OPENING = 40   # characters, after the indentation, that must match
 LIST_ITEM = re.compile(r"^(?:[-*+]|\d+[.)])\s")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def repeated_lines(text):
     """[(line a, line b)] for prose lines within WINDOW lines whose first OPENING characters are equal."""
-    found, in_fence, seen = [], False, {}
+    found, fence, seen = [], None, {}
     for n, line in enumerate(text.split("\n"), 1):
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
+        marker = FENCE.match(line)
+        if fence is not None:
+            if (marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+                    and not marker[2].strip()):
+                fence = None
+            continue
+        if marker and not (marker[1][0] == "`" and "`" in marker[2]):
+            fence = marker[1]
             continue
         s = line.strip()
-        if in_fence or len(s) < OPENING or s[0] in "|#>" or LIST_ITEM.match(s):
+        if len(s) < OPENING or s[0] in "|#>" or LIST_ITEM.match(s):
             continue
         key = s[:OPENING]
         if key in seen and n - seen[key] <= WINDOW:
@@ -49,6 +56,23 @@ def markdown_files():
 
 
 class RepeatedLines(unittest.TestCase):
+    def test_fenced_code_is_not_prose(self):
+        a = "This repeated example line is long enough to trigger the prose checker."
+        for opening, inner, closing in [
+            ("~~~text", "```", "~~~"),
+            ("````markdown", "```", "````"),
+            ("~~~text", "~~", "~~~~"),
+            ("```text", "```not a closing fence", "````"),
+            ("   ~~~text", "~~~not a closing fence", "   ~~~"),
+        ]:
+            with self.subTest(opening=opening, inner=inner):
+                text = "\n".join([opening, inner, a, a, closing, a, a])
+                self.assertEqual(repeated_lines(text), [(6, 7)])
+
+    def test_backtick_in_info_string_does_not_open_a_fence(self):
+        a = "This repeated prose line is long enough to trigger the prose checker."
+        self.assertEqual(repeated_lines("\n".join(["```invalid`info", a, a])), [(2, 3)])
+
     def test_checker_flags_neighbouring_repeats_only(self):
         a = "The disassembly count is unchanged: the same 42 programs have no invalid word, and"
         text = "\n".join([
