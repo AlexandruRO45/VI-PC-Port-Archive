@@ -185,7 +185,7 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   Radeon RX 9070, Windows 11, `--max-shared-memory 32768`, package 1.0.2.1). With these inputs only seven change any
   heap word (`InitHeaders`, `InitPartitionedHeaders`, `LoadInstances`, `LoadProceduralGeometry`, `LoadTriangles`,
   `PT_BeginPass`, `PT_WriteInstances`); the others leave early. So this alone shows that the translated programs
-  run cleanly, not that their output is right. **Twelve are checked byte for byte** (`--checked`), the ones whose
+  run cleanly, not that their output is right. **Seventeen cases are checked byte for byte** (`--checked`), the ones whose
   effect reads straight off their code. `RadixReset`, `ResetKDOP`, `ResetToIndexBuffer`, `CopyCounters` and
   `ResetCounterValues` get their root-table fields (an output address, a count of 20, a value or a source), and the
   tool compares all 20 entries they write and the bytes after them, which must stay untouched. `PrefixSum64` to
@@ -194,7 +194,12 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   barrier for the three largest), and the tool runs each at the wave size `index.json` records (`VKC_SUBGROUP_SIZE`).
   On `main` the wave64 ones fail at element 128 or 256: their upper half adds the lower half's total through a VOP3
   lane mask printed as `s6` for `s[6:7]`, which the translator read as `s6` alone. #3910 fixes that, and with it all
-  twelve match exactly (7 of 12 without). Negative controls: with the translator made to skip `v_add_nc_u32`,
+  twelve of them match exactly (7 without). `InitHeaders` fills a 64-byte BVH header for each of three 40-byte records
+  (three of the record's fields, the empty bounds as +-FLT_MAX, a fourth field, -1, the last two fields, `0x7f7f7f`)
+  and an empty box where a record has a bounds address; a fourth record past the count and the bytes past each header
+  stay untouched. `GetBVHCompactedSize` runs in its three modes (the mode at table+0x20), mode 2 with a negative and a
+  non-negative first header word: `(n + 1) << 6`, plus `(8 * K + 0x137) & ~0xff` and K in mode 2, and `(n + 1) << 2`
+  and `n + 1` in mode 3. All five match, so all seventeen cases do with #3910. Negative controls: with the translator made to skip `global_store_dwordx4`, `InitHeaders` writes nothing, and with it skipping `s_addk_i32`, both mode-2 cases are `0x100` short; with it skipping `v_add_nc_u32`,
   `ResetToIndexBuffer` fails (entries hold `base+4i` and zeros); with it skipping `ds_swizzle_b32`, `PrefixSum64` fails
   from element 2 on. So the check sees a wrong translation. Two things found on the way:
   * the wave64 bitonic sorts (`BitonicPreSort64CS`, `BitonicInnerSort64CS`) declare 32,780 bytes of workgroup memory
@@ -213,7 +218,7 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
 ## 6. Tool and tests
 
 `tools/bvh_gpu_smoke.py --game-dir <package> [--max-shared-memory N] [--checked] [--json report.json]` reproduces the
-GPU run above: the extraction and translation of §4, then two dispatches per program, and with `--checked` the twelve
+GPU run above: the extraction and translation of §4, then two dispatches per program, and with `--checked` the seventeen
 byte-exact cases. Its report holds module names, statuses
 and counts only. `tests/test_bvh_gpu_smoke.py` checks the heap image, the word count and the judging of runs with a
 fake `vk_compute_test`, and the checked cases' inputs and judging (a fake that does what each case describes passes,

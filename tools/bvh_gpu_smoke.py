@@ -195,6 +195,74 @@ def _prefix_case(n):
     return [(0x0, 8, PREFIX_DATA), (0x8, 8, SUMS), (0x10, 4, 1)], expect, setup
 
 
+# ---- InitHeaders and GetBVHCompactedSize ----
+
+FMAX, NFMAX = 0x7F7FFFFF, 0xFF7FFFFF      # +FLT_MAX and -FLT_MAX: the empty bounds
+REC, HDR, BND = 0x8000, 0xA000, 0xC000     # records, the headers they point at, the optional bounds
+RECORDS, HEADER_COUNT = 4, 3              # one record past the count, which must stay untouched
+
+
+def _record_words(i):
+    """The six 32-bit fields after record i's two addresses (record bytes 16..39)."""
+    return [0x01000000 * (i + 1) + 0x10 * k + i for k in range(6)]
+
+
+def _headers_setup(heap):
+    """RECORDS 40-byte records at REC: the header's address, the bounds' address (0 for record 1: none), six fields."""
+    for i in range(RECORDS):
+        struct.pack_into("<QQ6I", heap, REC + 40 * i, HDR + 0x100 * i, 0 if i == 1 else BND + 0x40 * i, *_record_words(i))
+
+
+def _headers_expect(heap):
+    """For each of the first HEADER_COUNT records, the 64-byte header (fields 0, 1, 2; empty bounds; field 3; -1;
+    fields 4, 5; 0x7f7f7f) and, where the record has a bounds address, its empty box; nothing for the record past the
+    count, and nothing past a header's 64 bytes."""
+    problems = []
+    for i in range(RECORDS):
+        f = _record_words(i)
+        hdr = bytes(heap[HDR + 0x100 * i: HDR + 0x100 * i + 64])
+        want = struct.pack("<16I", f[0], 0, f[1], f[2], FMAX, FMAX, FMAX, NFMAX, NFMAX, NFMAX, 0, f[3],
+                           0xFFFFFFFF, f[4], f[5], 0x7F7F7F) if i < HEADER_COUNT else bytes([FILL]) * 64
+        if hdr != want:
+            problems.append(f"header {i}: {hdr.hex()} != {want.hex()}")
+        if bytes(heap[HDR + 0x100 * i + 64: HDR + 0x100 * (i + 1)]) != bytes([FILL]) * (0x100 - 64):
+            problems.append(f"bytes past header {i} changed")
+        box = bytes(heap[BND + 0x40 * i: BND + 0x40 * i + 24])
+        want_box = struct.pack("<6I", FMAX, FMAX, FMAX, NFMAX, NFMAX, NFMAX) if i < HEADER_COUNT and i != 1 \
+            else bytes([FILL]) * 24
+        if box != want_box:
+            problems.append(f"bounds {i}: {box.hex()} != {want_box.hex()}")
+    return problems
+
+
+OUT, OUT3, HP = 0x2000, 0x2100, 0x3000        # outputs and the header GetBVHCompactedSize reads
+
+
+def _compacted_case(mode, h0):
+    """GetBVHCompactedSize in `mode` (table+0x20) for a header at table+0x18 whose words 0, 1 and 3 are h0, H4, H12.
+    Mode 1 writes ((H4 + 1) << 6) as a u64 at table+0x0; mode 2 adds (8 * K + 0x137) & ~0xff to it, K = H12 when h0
+    is not negative and 0 when it is, and writes K as a u64 at table+0x0 + 8; mode 3 writes (H4 + 1) << 2 at
+    table+0x8 and H4 + 1 at table+0x10."""
+    H4, H12 = 37, 9
+
+    def setup(heap):
+        struct.pack_into("<4I", heap, HP, h0 & 0xFFFFFFFF, H4, 0, H12)
+
+    def expect(heap):
+        n = H4 + 1
+        if mode == 1:
+            want = {OUT: struct.pack("<Q", n << 6), OUT + 8: bytes([FILL]) * 8}
+        elif mode == 2:
+            k = H12 if h0 >= 0 else 0
+            want = {OUT: struct.pack("<Q", (n << 6) + ((8 * k + 0x137) & 0xFFFFFF00)), OUT + 8: struct.pack("<Q", k)}
+        else:
+            want = {OUT3: struct.pack("<I", n << 2), OUT3 + 0x80: struct.pack("<I", n), OUT: bytes([FILL]) * 8}
+        return [f"{at:#x}: {bytes(heap[at:at + len(w)]).hex()} != {w.hex()}" for at, w in want.items()
+                if bytes(heap[at:at + len(w)]) != w]
+
+    return [(0x0, 8, OUT), (0x8, 8, OUT3), (0x10, 8, OUT3 + 0x80), (0x18, 8, HP), (0x20, 4, mode)], expect, setup
+
+
 def _source_pattern(i):
     return struct.pack("<4I", 0x10000 + 4 * i, 0x20000 + 4 * i, 0x30000 + 4 * i, 0x40000 + 4 * i)
 
@@ -217,6 +285,13 @@ CHECKED = {
     "ResetCounterValues": ([(0x8, 8, DST), (0x14, 4, COUNT), (0x18, 4, 0xC0FFEE11)],
                            lambda h: _expect_entries(h, DST, 16, COUNT, lambda i: struct.pack("<4I", *[0xC0FFEE11] * 4))),
     **{f"PrefixSum{n}": _prefix_case(n) for n in (64, 128, 256, 512, 1024, 2048, 4096)},
+    # one header per record (40-byte stride at table+0x0, count at +0x10), and an empty box where a record has bounds
+    "InitHeaders": ([(0x0, 8, REC), (0x10, 4, HEADER_COUNT)], _headers_expect, _headers_setup),
+    # the size of a compacted BVH, three ways (mode at table+0x20); one program, so "name:case"
+    "GetBVHCompactedSize:mode1": _compacted_case(1, 5),
+    "GetBVHCompactedSize:mode2": _compacted_case(2, 5),
+    "GetBVHCompactedSize:mode2-negative": _compacted_case(2, -5),
+    "GetBVHCompactedSize:mode3": _compacted_case(3, 5),
 }
 
 
@@ -235,16 +310,18 @@ def run_checked(spirv_dir, vkc, *, heap_bytes, validation, timeout, runner=run_p
     with tempfile.TemporaryDirectory(prefix="bvh_gpu_checked_") as tmp:
         tmp = Path(tmp)
         for name, (fields, expect, *setup) in CHECKED.items():
-            spv = Path(spirv_dir) / (name + ".spv")
+            program = name.split(":")[0]          # "Program:case" runs one program with several inputs
+            spv = Path(spirv_dir) / (program + ".spv")
             if not spv.is_file():
                 results.append({"name": name, "status": "missing", "detail": f"{spv.name} not translated"})
                 continue
-            init, dump = tmp / (name + ".in"), tmp / (name + ".out")
+            stem = name.replace(":", "-")         # a ":" in a Windows file name is an NTFS stream, not a name
+            init, dump = tmp / (stem + ".in"), tmp / (stem + ".out")
             heap = bytearray(checked_heap(fields, heap_bytes))
             for prepare in setup:
                 prepare(heap)
             init.write_bytes(bytes(heap))
-            status, detail = runner(vkc, spv, init, dump, heap_bytes // 4, validation, timeout, waves.get(name))
+            status, detail = runner(vkc, spv, init, dump, heap_bytes // 4, validation, timeout, waves.get(program))
             if status == "ok":
                 problems = expect(dump.read_bytes()) if dump.is_file() else ["no heap dump"]
                 status, detail = ("pass", "") if not problems else ("mismatch", "; ".join(problems[:3]))

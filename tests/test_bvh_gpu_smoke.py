@@ -115,9 +115,30 @@ class Checked(unittest.TestCase):
         """A fake runner that does what each case says the program does: all pass; one wrong word: mismatch."""
         def ideal(spv, heap):
             name = Path(spv).stem
-            fields = {off: val for off, _, val in smoke.CHECKED[name][0]}
+            fields = {off: val for off, _, val in smoke.CHECKED[name][0]} if name in smoke.CHECKED else {}
             n = smoke.COUNT
-            if name == "RadixReset":
+            q = lambda at: struct.unpack_from("<Q", heap, at)[0]
+            d = lambda at: struct.unpack_from("<I", heap, at)[0]
+            if name == "InitHeaders":     # read from the table, as the program does
+                for i in range(d(0x10)):
+                    rec = q(0) + 40 * i
+                    f = struct.unpack_from("<6I", heap, rec + 16)
+                    struct.pack_into("<16I", heap, q(rec), f[0], 0, f[1], f[2], *[smoke.FMAX] * 3, *[smoke.NFMAX] * 3,
+                                     0, f[3], 0xFFFFFFFF, f[4], f[5], 0x7F7F7F)
+                    if q(rec + 8):
+                        struct.pack_into("<6I", heap, q(rec + 8), *[smoke.FMAX] * 3, *[smoke.NFMAX] * 3)
+            elif name == "GetBVHCompactedSize":
+                mode, hp = d(0x20), q(0x18)
+                h0, h4, h12 = struct.unpack_from("<i", heap, hp)[0], d(hp + 4), d(hp + 12)
+                if mode == 1:
+                    struct.pack_into("<Q", heap, q(0), (h4 + 1) << 6)
+                elif mode == 2:
+                    k = h12 if h0 >= 0 else 0
+                    struct.pack_into("<QQ", heap, q(0), ((h4 + 1) << 6) + ((8 * k + 0x137) & 0xFFFFFF00), k)
+                elif mode == 3:
+                    struct.pack_into("<I", heap, q(8), (h4 + 1) << 2)
+                    struct.pack_into("<I", heap, q(0x10), h4 + 1)
+            elif name == "RadixReset":
                 for i in range(n):
                     heap[fields[0] + 16 * i: fields[0] + 16 * (i + 1)] = bytes(16)
             elif name == "ResetKDOP":
@@ -144,15 +165,18 @@ class Checked(unittest.TestCase):
             def run(vkc, spv, init, dump, heap_words, validation, timeout, subgroup=None):
                 heap = bytearray(Path(init).read_bytes())
                 ideal(spv, heap)
-                if corrupt:   # one wrong byte in the case's output (prefix sums scan in place at PREFIX_DATA)
-                    heap[(smoke.PREFIX_DATA if Path(spv).stem.startswith("PrefixSum") else smoke.DST) + 4] ^= 1
+                if corrupt:   # one wrong byte in a region each case checks
+                    stem = Path(spv).stem
+                    at = smoke.PREFIX_DATA if stem.startswith("PrefixSum") else smoke.HDR if stem == "InitHeaders" \
+                        else smoke.DST
+                    heap[at + 4] ^= 1
                 Path(dump).write_bytes(bytes(heap))
                 return "ok", ""
             return run
 
         with tempfile.TemporaryDirectory() as d:
-            for name in smoke.CHECKED:
-                (Path(d) / (name + ".spv")).write_bytes(b"\x03\x02\x23\x07")
+            for program in {name.split(":")[0] for name in smoke.CHECKED}:   # one file per program
+                (Path(d) / (program + ".spv")).write_bytes(b"\x03\x02\x23\x07")
             good = smoke.run_checked(d, "vkc", heap_bytes=1 << 18, validation=False, timeout=5, runner=runner_for(False))
             self.assertEqual({r["name"]: r["status"] for r in good}, {n: "pass" for n in smoke.CHECKED})
             bad = smoke.run_checked(d, "vkc", heap_bytes=1 << 18, validation=False, timeout=5, runner=runner_for(True))
