@@ -5,6 +5,7 @@
 #include <memory>
 #include <new>
 
+#include "cpuinfo.h"
 #include "shims.h"
 
 namespace {
@@ -22,37 +23,50 @@ DWORD read_cpu_sets(std::unique_ptr<unsigned char[]>& data, ULONG& bytes, HANDLE
     }
 }
 
-DWORD copy_cpu_sets(SYSTEM_CPU_SET_INFORMATION* output, ULONG capacity, ULONG& written,
-                    HANDLE process, ULONG flags) {
-    std::unique_ptr<unsigned char[]> data;
-    ULONG bytes = 0;
-    const DWORD error = read_cpu_sets(data, bytes, process, flags);
-    if (error != ERROR_SUCCESS) return error;
+}  // namespace
 
-    // Wine 9 can enumerate more CPU sets than its processor groups can address.
-    // Keep the host IDs and metadata for usable sets and size the result after filtering.
-    const WORD groups = GetMaximumProcessorGroupCount();
+DWORD rt::cpuinfo::filter_cpu_sets(unsigned char* data, ULONG bytes, WORD groups,
+                                  decltype(&GetMaximumProcessorCount) processor_count, ULONG& written) {
     ULONG kept = 0;
     for (ULONG offset = 0; offset < bytes;) {
         constexpr size_t header_size = offsetof(SYSTEM_CPU_SET_INFORMATION, CpuSet);
         SYSTEM_CPU_SET_INFORMATION entry{};
         if (bytes - offset < header_size) return ERROR_INVALID_DATA;
-        std::memcpy(&entry, data.get() + offset, header_size);
+        std::memcpy(&entry, data + offset, header_size);
         if (entry.Size < header_size || entry.Size > bytes - offset) return ERROR_INVALID_DATA;
         bool usable = true;
         if (entry.Type == CpuSetInformation) {
             if (entry.Size < sizeof(entry)) return ERROR_INVALID_DATA;
-            std::memcpy(&entry, data.get() + offset, sizeof(entry));
+            std::memcpy(&entry, data + offset, sizeof(entry));
             usable = entry.CpuSet.Group < groups &&
-                     entry.CpuSet.LogicalProcessorIndex < GetMaximumProcessorCount(entry.CpuSet.Group);
+                     entry.CpuSet.LogicalProcessorIndex < processor_count(entry.CpuSet.Group);
         }
         if (usable) {
-            std::memmove(data.get() + kept, data.get() + offset, entry.Size);
+            std::memmove(data + kept, data + offset, entry.Size);
             kept += entry.Size;
         }
         offset += entry.Size;
     }
 
+    written = kept;
+    return ERROR_SUCCESS;
+}
+
+namespace {
+
+DWORD copy_cpu_sets(SYSTEM_CPU_SET_INFORMATION* output, ULONG capacity, ULONG& written,
+                    HANDLE process, ULONG flags) {
+    std::unique_ptr<unsigned char[]> data;
+    ULONG bytes = 0;
+    DWORD error = read_cpu_sets(data, bytes, process, flags);
+    if (error != ERROR_SUCCESS) return error;
+
+    // Wine 9 can enumerate more CPU sets than its processor groups can address.
+    // Keep the host IDs and metadata for usable sets and size the result after filtering.
+    ULONG kept = 0;
+    error = rt::cpuinfo::filter_cpu_sets(data.get(), bytes, GetMaximumProcessorGroupCount(),
+                                        &GetMaximumProcessorCount, kept);
+    if (error != ERROR_SUCCESS) return error;
     written = kept;
     if (!output || capacity < kept) return ERROR_INSUFFICIENT_BUFFER;
     if (kept) std::memcpy(output, data.get(), kept);
