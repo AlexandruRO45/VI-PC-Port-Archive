@@ -48,6 +48,33 @@ from pathlib import Path
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77
 W = H = 64
+# Match check.py's multi-configuration CMake build-directory selection.
+TEST_PROGRAMS = ("vk_harness",)
+CONFIG_DIRS = ("RelWithDebInfo", "Release", "Debug", "MinSizeRel")
+
+
+def complete_build_dirs(build, programs):
+    """Build folders containing every required test program."""
+    return [d for d in (build, *(os.path.join(build, c) for c in CONFIG_DIRS))
+            if all(os.path.isfile(os.path.join(d, n)) for n in programs)]
+
+
+def resolve_build_dir(build, programs):
+    """Find the newest complete build, preferring the flat Ninja directory."""
+    found = complete_build_dirs(build, programs)
+    if not found or found[0] == build:
+        return build
+    return max(found, key=lambda d: max(os.path.getmtime(os.path.join(d, n)) for n in programs))
+
+
+def pick_build_dir(build, programs):
+    """Resolve the build directory and report the configuration selected."""
+    chosen = resolve_build_dir(build, programs)
+    if chosen != build:
+        names = [os.path.basename(d) for d in complete_build_dirs(build, programs)]
+        print(f"test programs: {chosen}" + (f" (newest of {', '.join(names)})" if len(names) > 1 else ""))
+    return chosen
+
 
 
 class Skip(str):
@@ -454,8 +481,13 @@ def main(argv):
     if not argv:
         sys.exit(__doc__)
     spirv = os.path.join(argv[0], "spirv")
-    tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
-    start = 2 if len(argv) > 1 and os.path.isdir(argv[1]) else 1
+    if len(argv) > 1 and os.path.isdir(argv[1]):
+        build = argv[1]
+        start = 2
+    else:
+        build = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "build"))
+        start = 1
+    tools = pick_build_dir(os.path.abspath(build), tuple(t + EXE for t in TEST_PROGRAMS))
     requested = argv[start:]
     unknown = [a for a in requested if a not in FIXTURES]
     if unknown:
