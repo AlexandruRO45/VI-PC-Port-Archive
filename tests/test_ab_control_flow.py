@@ -1095,5 +1095,27 @@ class PipelineExecutionTest(unittest.TestCase):
         self.assertEqual(content, f"ps_test\t{expected}\n")
 
 
+class HelpTextTest(unittest.TestCase):
+    """`--help` is the tool's only option documentation: its docstring sends the reader there (`Usage: ... --help`
+    lists the options), so the page has to say what the tool is and what each argument is for."""
+
+    def test_help_names_the_tool_and_describes_every_argument(self):
+        result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "ab_control_flow.py"), "--help"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = " ".join(result.stdout.split())  # argparse wraps each column
+        # The description is the docstring's first line, so the two cannot drift apart.
+        self.assertIn(" ".join(AB.__doc__.splitlines()[0].split()), text)
+        for argument_help in (
+            "repository root",
+            "<work>/shaders",
+            "outcomes.tsv",
+            "pixel shaders to pick from the corpus (default: 150)",
+            "seconds before a shader with loops is killed",
+        ):
+            with self.subTest(help=argument_help):
+                self.assertIn(argument_help, text)
+
+
 if __name__ == "__main__":
     unittest.main()
