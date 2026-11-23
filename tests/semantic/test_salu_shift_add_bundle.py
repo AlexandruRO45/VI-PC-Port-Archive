@@ -360,6 +360,19 @@ class TestSPackLlB32B16HalfWords(unittest.TestCase):
                 got = ref_s_pack_ll_b32_b16(a, b)
                 self.assertEqual(got, (b << 16) | a)
 
+class TestSPackLlB32B16Translator(unittest.TestCase):
+    def test_translator_s_pack_ll_b32_b16_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0x1234",
+            "s_mov_b32 s5, 0x5678",
+            "s_pack_ll_b32_b16 s6, s4, s5",
+            "v_mov_b32_e32 v1, s6",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_pack_ll")
+        for l in range(32):
+            self.assertEqual(results[l], 0x56781234)
+
 
 if __name__ == "__main__":
     unittest.main()
