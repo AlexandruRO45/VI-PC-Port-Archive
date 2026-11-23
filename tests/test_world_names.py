@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -449,6 +450,27 @@ class CliTest(unittest.TestCase):
             with open(report, encoding="utf-8") as handle:
                 result = json.load(handle)
             self.assertEqual(result["maps"]["name_resolved"], 1)
+
+    def test_an_unreadable_manifest_tree_is_an_error_not_a_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "locked")
+            os.mkdir(bad)
+            out = os.path.join(tmp, "names.json")
+            real = os.scandir
+
+            def scandir(path):
+                if os.fspath(path) == bad:
+                    raise PermissionError(13, "Permission denied", bad)
+                return real(path)
+
+            err = io.StringIO()
+            with (mock.patch("os.scandir", side_effect=scandir),
+                  contextlib.redirect_stderr(err),
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(WN.main(["build", "--manifest", bad, "--out", out]), 1)
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertIn(os.path.basename(bad), err.getvalue())
+            self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":
