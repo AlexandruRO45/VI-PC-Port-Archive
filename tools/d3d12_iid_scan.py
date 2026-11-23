@@ -144,14 +144,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--header", help="d3d12.h to read the IIDs from (default: newest Windows SDK)")
     ap.add_argument("--json", help="also write the result here")
     args = ap.parse_args(argv)
+    header = args.header or default_header()
     if args.json:
         # The report is written last, after every input has been read, so an aliased input would
         # silently be replaced by it. Refuse the alias before anything is opened.
-        for what, other in (("--header", args.header), *(("an input image", p) for p in args.images)):
+        for what, other in (("the header", header), *(("an input image", p) for p in args.images)):
             if other and same_report_path(args.json, other):
                 print(f"ERROR: --json would overwrite {what}: {other}", file=sys.stderr)
                 return 2
-    header = args.header or default_header()
     if not header or not os.path.isfile(header):
         print("ERROR: d3d12.h not found; pass --header", file=sys.stderr)
         return 2

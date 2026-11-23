@@ -240,6 +240,59 @@ class IidScan(unittest.TestCase):
         with open(self.header, "rb") as f:
             self.assertEqual(f.read(), before)
 
+    def auto_header_env(self):
+        sdk_root = os.path.join(self.tmp.name, "sdk")
+        header = os.path.join(sdk_root, "Windows Kits", "10", "Include", "10.0.99999.0", "um", "d3d12.h")
+        os.makedirs(os.path.dirname(header))
+        with open(header, "w", encoding="utf-8", newline="\n") as f:
+            f.write(HEADER)
+        env = os.environ.copy()
+        env["ProgramFiles(x86)"] = sdk_root
+        return header, env
+
+    def test_cli_json_over_the_auto_detected_header_is_refused(self):
+        header, env = self.auto_header_env()
+        dll = self.image("auto.dll", pe32plus({}, QUEUE.bytes_le))
+        with open(header, "rb") as f:
+            before = f.read()
+        alias = os.path.join(self.tmp.name, "header-alias.json")
+        for target in (header, alias):
+            with self.subTest(target=target):
+                if target == alias:
+                    try:
+                        os.link(header, alias)
+                    except OSError as e:
+                        self.skipTest(f"hard links unavailable: {e}")
+                # Restore the synthetic input for each negative control on an unfixed tool.
+                with open(header, "wb") as f:
+                    f.write(before)
+                p = subprocess.run(
+                    [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"),
+                     dll, "--json", target], env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("--json would overwrite", p.stderr)
+                self.assertEqual(p.stdout, "")
+                with open(header, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_cli_auto_detected_header_with_separate_report_still_works(self):
+        header, env = self.auto_header_env()
+        dll = self.image("auto-ok.dll", pe32plus({}, QUEUE.bytes_le))
+        with open(header, "rb") as f:
+            before = f.read()
+        report = os.path.join(self.tmp.name, "auto-report.json")
+        p = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"),
+             dll, "--json", report], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["header"], "d3d12.h")
+        self.assertEqual(data["iids"], 2)
+        self.assertEqual(data["images"][0]["found"], ["ID3D12CommandQueue"])
+        with open(header, "rb") as f:
+            self.assertEqual(f.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
