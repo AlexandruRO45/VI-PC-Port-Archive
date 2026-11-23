@@ -60,7 +60,14 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]\n"); return 2; }
+    const bool packed_load = argc == 3 && !std::strcmp(argv[2], "load-d16");
+    const bool load_mode = packed_load || (argc == 3 && !std::strcmp(argv[2], "load"));
+    const bool words_mode = argc == 3 && !std::strcmp(argv[2], "words");
+    const bool signed_zero = argc == 3 && !std::strcmp(argv[2], "signed-zero");
+    if (argc != 2 && !load_mode && !words_mode && !signed_zero) {
+        std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]\n");
+        return 2;
+    }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -111,12 +118,6 @@ int main(int argc, char** argv) {
     f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-    // "load" mode (cs_imgload.asm): the sint image receives the sum of the two texels read back with image_load.
-    const bool packed_load = argc > 2 && !std::strcmp(argv[2], "load-d16");
-    const bool load_mode = packed_load || (argc > 2 && !std::strcmp(argv[2], "load"));
-    // "words" mode: the two images filled as for "load"; the shader's results are whatever it leaves in them.
-    const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
-    const bool signed_zero = argc > 2 && !std::strcmp(argv[2], "signed-zero");
     if (signed_zero) {
         LOADI(vkGetPhysicalDeviceProperties2);
         VkPhysicalDeviceFloatControlsProperties controls{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
