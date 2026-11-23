@@ -111,6 +111,25 @@ class TestSwapAST(unittest.TestCase):
         self.assertIn("OpCopyObject", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSwapDivergence(unittest.TestCase):
+    def test_self_swap(self):
+        a, b = model_swap(0xCAFE, 0xCAFE)
+        self.assertEqual(a, 0xCAFE)
+        self.assertEqual(b, 0xCAFE)
+
+    def test_translator_swap_divergence(self):
+        prog = [
+            "s_mov_b32 exec_lo, 0x55555555",
+            "s_mov_b32 exec_hi, 0xAAAAAAAA",
+            "v_mov_b32_e32 v4, 111",
+            "v_mov_b32_e32 v5, 222",
+            "v_swap_b32 v4, v5",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_swap_div", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCopyObject", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
