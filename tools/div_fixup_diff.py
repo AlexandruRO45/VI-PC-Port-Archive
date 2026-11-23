@@ -844,30 +844,31 @@ def _run(counts, items, tag):
     return failure
 
 
-def run_sweep(seed, ops=None):
-    counts = _new_counts()
-    items = []
+def sweep_items(seed, ops=None):
+    """(label, lines, ops) of the sweep, yielded one at a time so a run holds one program's text."""
     for case in sweep_cases(ops):
         op, kinds = case
         for rep in range(SWEEP_REPEAT):
             tag = f"{op}:{'/'.join(kinds)}:{rep}"
             rng = random.Random(f"{seed}:{tag}")
-            items.append((f"sweep {tag} (seed {seed})", sweep_program(case, rng), [op]))
-    return counts, _run(counts, items, "sw")
+            yield f"sweep {tag} (seed {seed})", sweep_program(case, rng), [op]
+
+
+def run_sweep(seed, ops=None):
+    counts = _new_counts()
+    return counts, _run(counts, sweep_items(seed, ops), "sw")
 
 
 def grid_items(ops=None):
-    """(label, lines, ops) of the edge grid: four cases per program, two for f64."""
+    """(label, lines, ops) of the edge grid: four cases per program, two for f64, yielded one at a time."""
     rng = random.Random("div_fixup_diff:grid-programs")
-    items = []
     cases = grid_cases(ops)
     for op in ops or OPS:
         mine = [c for c in cases if c[0] == op]
         n = 2 if FMT[op].width == 64 else GRID_PER_PROGRAM
         for i in range(0, len(mine), n):
             chunk = mine[i:i + n]
-            items.append((f"edge grid {op} program {i // n}", grid_program(chunk, rng), [op] * len(chunk)))
-    return items
+            yield f"edge grid {op} program {i // n}", grid_program(chunk, rng), [op] * len(chunk)
 
 
 def run_grid(ops=None):
@@ -875,14 +876,17 @@ def run_grid(ops=None):
     return counts, _run(counts, grid_items(ops), "gr")
 
 
-def run_suite(programs, seed, max_ops=6, ops=None):
-    counts = _new_counts()
+def suite_items(programs, seed, max_ops=6, ops=None):
+    """(label, lines, ops) of the random programs, yielded one at a time."""
     rng = random.Random(f"suite:{seed}")
-    items = []
     for i in range(programs):
         lines, used = program(rng, rng.randint(1, max_ops), ops)
-        items.append((f"program {i} (seed {seed})", lines, used))
-    return counts, _run(counts, items, "rn")
+        yield f"program {i} (seed {seed})", lines, used
+
+
+def run_suite(programs, seed, max_ops=6, ops=None):
+    counts = _new_counts()
+    return counts, _run(counts, suite_items(programs, seed, max_ops, ops), "rn")
 
 
 REJECTED = (

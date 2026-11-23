@@ -273,6 +273,24 @@ class Translated(unittest.TestCase):
         self.assertEqual((failure, counts["skip"], counts["mismatch"]), (None, {}, 0))
         self.assertGreater(counts["events"]["v_div_fixup_f32"]["exponent cutoff"], 30)
 
+    def test_each_program_is_checked_before_the_next_is_made(self):
+        # a run holds one program's text at a time, not the whole --programs list
+        made, seen = [], []
+        real = d.program, d.sweep_program, d.grid_program, d.run_one
+
+        def count(f):
+            return lambda *a: made.append(1) or f(*a)
+        try:
+            d.program, d.sweep_program, d.grid_program = (count(f) for f in real[:3])
+            d.run_one = lambda lines, name, tmp, events: seen.append(len(made)) or ("match", None)
+            d.run_suite(5, 1)
+            d.run_sweep(1, ["v_div_fixup_f16"])
+            d.run_grid(["v_div_fixup_f64"])
+        finally:
+            d.program, d.sweep_program, d.grid_program, d.run_one = real
+        self.assertGreater(len(seen), 5 + 2 * 36)
+        self.assertEqual(seen, list(range(1, len(seen) + 1)))
+
     def test_measured_rows_through_the_translator(self):
         for insn, v1, v2, v3, want in mf.MEASURED[::6]:
             line = insn.replace("v4,", "v8,").replace("v1", "v12").replace("v2", "v13").replace("v3", "v14")
