@@ -17,10 +17,8 @@ PackResult pack(const RootSignature& sig) {
             out.error = "unknown root parameter type";
             return out;
         }
-        if (p.type == ParamType::Constants && p.num_values == 0) {
-            out.error = "root constant parameter needs at least 1 dword";
-            return out;
-        }
+        // A constant parameter of 0 values is valid (the host serializer warns, CreateRootSignature answers S_OK):
+        // it takes no dwords, so it gets no provenance entry and the parameters after it pack as if it were absent.
         const uint32_t dwords = p.type == ParamType::Table          ? 2
                                 : p.type == ParamType::Descriptor   ? 2
                                                                     : p.num_values;
@@ -63,15 +61,12 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
     first.reserve(sig.params.size());
     for (size_t i = 0; i < sig.params.size(); ++i) {
         const RootParameter& p = sig.params[i];
-        if (p.type == ParamType::Constants && p.num_values == 0) {
-            out.error = "root constant parameter needs at least 1 dword";
-            return out;
-        }
         cost += param_cost(p.type, p.num_values);
         if (cost > kMaxD3d12Cost) {
             out.error = "root signature exceeds the 64-dword D3D12 cost limit";
             return out;
         }
+        // 0 for a constant parameter of 0 values, which then shares its first SGPR with the next parameter.
         const uint64_t dwords = stage_dwords(p.type, p.num_values);
         if (next + dwords > kMaxUserSgprs) {
             // The console moves this parameter and every later one to the spill array behind s[0:1]; that array's

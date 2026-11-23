@@ -131,6 +131,36 @@ int main() {
         check(!r.ok && r.error.find("64-dword") != std::string::npos,
               "65 constants refused by cost limit");
     }
+    // 64 constants are within the cost limit, as on the host: only the unmodelled spill past 32 user dwords refuses
+    // them here, and that is what the error says.
+    {
+        RootSignature sig;
+        sig.params = {consts(64)};
+        const PackResult r = pack(sig);
+        check(!r.ok && r.error.find("64-dword") == std::string::npos && r.error.find("spill") != std::string::npos,
+              "64 constants pass the cost limit (refused only as a spill)");
+        const StagePackResult c = pack_stage(sig, Stage::Compute);
+        check(!c.ok && c.error.find("64-dword") == std::string::npos && c.error.find("spill") != std::string::npos,
+              "pack_stage: 64 constants pass the cost limit (refused only as a spill)");
+        sig.params = {consts(32), consts(0), consts(32)};
+        check(pack(sig).error.find("spill") != std::string::npos, "32 + 0 + 32 constants cost 64, not more");
+    }
+    // A constant parameter of 0 values is valid on the host (the serializer warns, CreateRootSignature answers
+    // S_OK). It takes no dwords and no cost: the parameters around it pack as if it were absent.
+    {
+        RootSignature sig;
+        sig.params = {consts(0), consts(2), consts(0), view(), consts(0)};
+        const PackResult r = pack(sig);
+        check(r.ok && r.dword_count == 2 + 2 && r.d3d12_cost == 2 + 2, "zero-value constants pack to no dwords");
+        check(r.provenance.size() == 4 && r.provenance[0].param_index == 1 && r.provenance[1].param_index == 1 &&
+                  r.provenance[2].param_index == 3 && r.provenance[2].sub_index == 0 &&
+                  r.provenance[3].param_index == 3 && r.provenance[3].sub_index == 1,
+              "zero-value constants leave no provenance; their neighbours keep their dwords");
+        RootSignature alone;
+        alone.params = {consts(0)};
+        const PackResult a = pack(alone);
+        check(a.ok && a.dword_count == 0 && a.d3d12_cost == 0, "a lone zero-value constant parameter packs");
+    }
     // A count that wraps a 32-bit sum (1 + 0xFFFFFFFF) is still refused, not packed past dwords[32].
     {
         rt::rootsig::RootSignature sig;
@@ -187,6 +217,19 @@ int main() {
               "RTS0 model matches hand-built blob");
         const PackResult r = pack(d.sig);
         check(r.ok && r.dword_count == 3 + 2, "parsed RTS0 packs to 5 dwords");
+    }
+    // The same blob with 0 values in its constant parameter: parsed and packed, the CBV taking the first dwords.
+    {
+        std::vector<uint8_t> payload = build_payload();
+        payload[56] = 0;  // the constants' value count (payload at 48: register, space, count)
+        const DecodeResult d = parse_rts0(payload.data(), payload.size());
+        check(d.ok && d.sig.params.size() == 2 && d.sig.params[0].num_values == 0,
+              "RTS0 with a zero-value constant parameter parses");
+        const PackResult r = pack(d.sig);
+        check(r.ok && r.dword_count == 2 && r.provenance[0].param_index == 1, "zero-value RTS0 packs the CBV at 0");
+        const StagePackResult c = pack_stage(d.sig, Stage::Compute);
+        check(c.ok && c.first_sgpr.size() == 2 && c.first_sgpr[0] == 4 && c.first_sgpr[1] == 4 && c.end_sgpr == 6,
+              "pack_stage: zero-value RTS0 puts the CBV at s4");
     }
 
     // RTS0 controls: unknown version, wild offsets and truncation fail loudly.
@@ -451,9 +494,19 @@ int main() {
 
     // pack_stage keeps pack()'s validation.
     {
+        // Zero-value constants are accepted (the host takes them) and take no SGPRs: the next parameter starts where
+        // they would have.
         RootSignature zero;
         zero.params = {consts(0)};
-        check(!pack_stage(zero, Stage::Compute).ok, "pack_stage: zero-value constants rejected");
+        const StagePackResult lone = pack_stage(zero, Stage::Compute);
+        check(lone.ok && lone.first_sgpr.size() == 1 && lone.first_sgpr[0] == 4 && lone.end_sgpr == 4,
+              "pack_stage: zero-value constants accepted");
+        zero.params = {consts(1), consts(0), table(), consts(0), consts(26)};
+        const StagePackResult mixed = pack_stage(zero, Stage::Compute);
+        check(mixed.ok && mixed.first_sgpr.size() == 5 && mixed.first_sgpr[0] == 4 && mixed.first_sgpr[1] == 5 &&
+                  mixed.first_sgpr[2] == 5 && mixed.first_sgpr[3] == 6 && mixed.first_sgpr[4] == 6 &&
+                  mixed.end_sgpr == 32 && mixed.d3d12_cost == 1 + 1 + 26,
+              "pack_stage: zero-value constants between others fill compute exactly, offsets unchanged");
         // Every parameter takes at least as many SGPRs as it costs, so the 32-SGPR budget refuses before the
         // 64-dword cost limit can; an over-cost signature is refused all the same.
         RootSignature costly;

@@ -114,7 +114,8 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 // Packs root parameters in order. Static samplers consume no dwords.
 // Fails (ok == false) when the signature needs more than 32 user SGPRs
 // (spill layout unknown: refuse, do not guess) or exceeds the 64-dword
-// D3D12 cost limit, or holds more than 64 root parameters.
+// D3D12 cost limit, or holds more than 64 root parameters. A constant
+// parameter of 0 values takes no dwords, as on the host.
 [[nodiscard]] PackResult pack(const RootSignature& sig);
 
 // The console layout of root arguments in a stage's user SGPRs (docs/d3d12_vulkan.md section 3.5, D3D-448).
@@ -174,8 +175,8 @@ struct StagePackResult {
     uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
 };
 
-// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
-// constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
+// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters or the
+// 64-dword cost limit, and on any parameter that would spill. A constant parameter of 0 values takes no SGPRs.
 [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.
