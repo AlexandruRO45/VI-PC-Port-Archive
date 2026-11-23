@@ -388,8 +388,16 @@ class NamesTest(unittest.TestCase):
             self.assertIn(f"output {arc} is the input archive", p.stderr)
             self.assertNotIn(repr(arc), p.stderr)   # a repr would quote the path and double every backslash
 
-    def test_write_error_names_the_report_path_as_given_DISABLED(self):
-        pass
+    def test_write_error_names_the_report_path_as_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            make_archive(arc)
+            out_dir = os.path.join(tmp, "outdir")
+            os.mkdir(out_dir)                      # a directory the report cannot replace
+            p = self.run_tool(arc, out_dir, "--quiet")
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn(f"cannot write report {out_dir}:", p.stderr)
+            self.assertNotIn(repr(out_dir), p.stderr)
 
     def test_publish_creates_nested_parent_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

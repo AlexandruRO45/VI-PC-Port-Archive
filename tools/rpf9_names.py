@@ -263,7 +263,7 @@ def main(argv=None):
     try:
         publish_report(out_abs, rows, summary)
     except OSError as exc:
-        print(f"ERROR: cannot write report {a.out!r}: {exc.strerror or exc}", file=sys.stderr)
+        print(f"ERROR: cannot write report {a.out}: {exc.strerror or exc}", file=sys.stderr)
         return 2
     if not a.quiet:
         print(json.dumps(summary, indent=1))
