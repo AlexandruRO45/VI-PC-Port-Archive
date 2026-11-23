@@ -1013,20 +1013,33 @@ async function openModal(texture) {
     if (!response.ok) return;
     const info = await response.json();
     if (version !== modalVersion) return;
-    const indices = {mip: 0, layer: 0};
+    const volume = info.dimension === '3d';
+    const axis = volume ? 'z' : 'layer';
+    const indices = {mip: 0, [axis]: 0};
+    let sliceInput;
     const dimensions = document.createElement('span');
     function updatePreview() {
       const scale = 2 ** indices.mip;
+      if (sliceInput) {
+        const lastSlice = Math.max(1, Math.floor(info.depth / scale)) - 1;
+        indices.z = Math.min(indices.z, lastSlice);
+        sliceInput.max = lastSlice;
+        sliceInput.value = indices.z;
+        sliceInput.disabled = lastSlice === 0;
+      }
       dimensions.textContent = Math.max(1, Math.floor(info.width / scale)) + ' × ' +
                                Math.max(1, Math.floor(info.height / scale));
       image.src = texture.ddsPreview + '?' + new URLSearchParams(indices);
     }
-    for (const [key, count] of [['mip', info.mip_count], ['layer', info.array_size]]) {
+    const axisLabel = volume ? (currentLang === 'ru' ? 'Срез Z ' : 'Z slice ') :
+                               (currentLang === 'ru' ? 'Слой ' : 'Layer ');
+    for (const [key, count] of [['mip', info.mip_count], [axis, volume ? info.depth : info.array_size]]) {
       if (count <= 1) continue;
       const label = document.createElement('label');
-      label.textContent = key === 'mip' ? 'Mip ' : (currentLang === 'ru' ? 'Слой ' : 'Layer ');
+      label.textContent = key === 'mip' ? 'Mip ' : axisLabel;
       const input = document.createElement('input');
       input.type = 'number';
+      if (key === 'z') sliceInput = input;
       input.min = 0;
       input.max = count - 1;
       input.value = 0;

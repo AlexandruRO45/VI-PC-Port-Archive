@@ -274,12 +274,12 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                 mime = "application/json"
             else:
                 pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=True,
-                                               max_num_fields=2)
+                                               max_num_fields=3)
                 selection = {}
                 for key, value in pairs:
-                    if (key not in ("mip", "layer") or key in selection or
+                    if (key not in ("mip", "layer", "z") or key in selection or
                             not value.isascii() or not value.isdecimal()):
-                        raise ValueError("Expected a single unsigned index per mip or layer")
+                        raise ValueError("Expected a single unsigned index per selector")
                     selection[key] = int(value)
                 payload = dds_png.dds_file_to_png_bytes(path, max_size=1024, **selection)
                 mime = "image/png"

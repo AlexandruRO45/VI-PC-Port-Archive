@@ -135,3 +135,30 @@ test('DDS inspector selects a mip and layer and clears controls for ordinary ima
     assert.equal(image.src, '/b.png');
     assert.equal(controls.children.length, 0);
 });
+
+test('volume slices shrink with the selected mip', async () => {
+    const { context, elements, run } = loadStudio();
+    const info = {dimension: '3d', width: 9, height: 3, depth: 5, mip_count: 3, array_size: 1};
+    context.fetch = async () => ({ok: true, json: async () => info});
+    await run("openModal({name:'v', preview:'/v.png', ddsPreview:'/api/dds/v.dds'})");
+    const [mip, slice, dimensions] = elements.get('dds-controls').children;
+    const z = slice.children[0];
+    const image = elements.get('modal-img');
+    function select(input, value) {
+        Object.assign(input, {value: String(value), valueAsNumber: value, validity: {valid: true}});
+        input.onchange();
+    }
+    assert.equal(z.max, 4);
+    select(z, 4);
+    assert.equal(image.src, '/api/dds/v.dds?mip=0&z=4');
+    select(mip.children[0], 1);
+    assert.equal(z.max, 1);
+    assert.equal(z.value, 1);
+    assert.equal(dimensions.textContent, '4 \u00d7 1');
+    assert.equal(image.src, '/api/dds/v.dds?mip=1&z=1');
+    select(mip.children[0], 2);
+    assert.equal(z.disabled, true);
+    assert.equal(image.src, '/api/dds/v.dds?mip=2&z=0');
+    select(mip.children[0], 0);
+    assert.equal(z.disabled, false);
+});

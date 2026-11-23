@@ -257,6 +257,32 @@ class TestGalleryServer(unittest.TestCase):
                 get(url + "?" + query)
             self.assertEqual(caught.exception.code, 400)
 
+    def test_volume_z_selection(self) -> None:
+        # Tight R16_FLOAT rows. Each 3x2 plane has a different pixel pattern.
+        hdr = bytearray(_make_1x1_rgba_dds()[:128])
+        struct.pack_into("<IIIII", hdr, 8, 0x80100F, 2, 3, 6, 3)
+        struct.pack_into("<I", hdr, 28, 1)
+        struct.pack_into("<I4s", hdr, 80, 4, b"DX10")
+        struct.pack_into("<II", hdr, 108, 0x1008, 0x200000)
+        data = hdr + struct.pack("<5I", 54, 4, 0, 1, 0)
+        patterns = [(0, 1, 2, 3, 4, 0), (4, 3, 2, 1, 0, 4), (2, 0, 1, 4, 3, 1)]
+        red = (0, 64, 128, 191, 255)
+        for pattern in patterns:
+            data.extend(struct.pack("<6e", *(v / 4 for v in pattern)))
+        with open(os.path.join(self.textures_dir, "volume.dds"), "wb") as f:
+            f.write(data)
+        url = "/api/dds/volume.dds"
+        for z, pattern in enumerate(patterns):
+            rgba = bytes(c for v in pattern for c in (red[v], 0, 0, 255))
+            expected = gallery.dds_png.encode_png(3, 2, rgba)
+            status, _, png = _raw_get(self.port, f"{url}?mip=0&z={z}")
+            self.assertEqual((status, png), (200, expected))
+            if z == 0:
+                self.assertEqual(_raw_get(self.port, url)[2], expected)
+        for query in ("z=3", "layer=1&z=0", "z=-1", "z=1&z=2", "mip=1&z=0"):
+            with self.subTest(query=query):
+                self.assertEqual(_raw_get(self.port, url + "?" + query)[0], 400)
+
     def test_endpoints(self) -> None:
         base = f"http://127.0.0.1:{self.port}"
 
