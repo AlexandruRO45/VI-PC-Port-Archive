@@ -3,7 +3,7 @@
     python -I scripts/bench_wave64.py [--build DIR] [--llvm-mc PATH] [--groups N] [--reps N] [--procs N] [--shader NAME]
 
 Three configurations: AMD with its native 64-wide subgroup (no flag), AMD with --wave64-emulate, NVIDIA with
---wave64-emulate (the GPU is chosen with VK_LOADER_DRIVERS_SELECT='*amd*' / '*nv*'). Each runs `procs` processes of
+--wave64-emulate (the GPU is chosen with VK_LOADER_DRIVERS_SELECT='*amd*,*radeon*' / '*nv*'). Each runs `procs` processes of
 vk_compute_test with VKC_BENCH=`reps` timed dispatches of `groups` workgroups; the table gives the median over all
 dispatches, the spread of the per-process medians (other programs share the GPU, so look at it), the number of
 translated segments (static: blocks + continuation segments; every continuation segment is one more workgroup barrier
@@ -20,7 +20,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD_PY = os.path.join(ROOT, "runtime", "test", "shaders", "build.py")
-CONFIGS = [("AMD native", "*amd*", False), ("AMD --wave64-emulate", "*amd*", True),
+CONFIGS = [("AMD native", "*amd*,*radeon*", False), ("AMD --wave64-emulate", "*amd*,*radeon*", True),
            ("NVIDIA --wave64-emulate", "*nv*", True)]
 
 
@@ -36,13 +36,14 @@ def build(work, name, emulate, llvm_mc):
     return os.path.join(out, "spirv", name + ".spv")
 
 
-def segments(spv):
-    """(segments, continuation segments) of an emulated module: the cases of the scheduler's OpSwitch."""
-    text = open(spv[:-4] + ".spvasm", encoding="utf-8").read()
-    m = re.search(r"OpSwitch %pcv %sw_default ([^\n]+)", text)
-    if not m:
+def segments(spv: str) -> tuple[int, int] | None:
+    """Count scheduler cases and continuations, including inner switches in a partitioned dispatch."""
+    with open(spv[:-4] + ".spvasm", encoding="utf-8") as source:
+        text = source.read()
+    tables = re.findall(r"^[ \t]*OpSwitch %pcv %(?:sw_default|swm\d+) ([^\n]+)", text, re.MULTILINE)
+    if not tables:
         return None
-    cases = [int(x) for x in re.findall(r"(\d+) %blk\d+", m.group(1))]
+    cases = sorted(int(case) for table in tables for case in re.findall(r"(\d+) %blk\d+", table))
     blocks = next((i for i, c in enumerate(cases) if c != i), len(cases))   # blocks 0..n-1, then "done" = n, then segments
     return len(cases), len(cases) - blocks
 
@@ -52,7 +53,10 @@ def run(tools, spv, groups, reps, driver, emulate):
     args = [os.path.join(tools, "vk_compute_test" + (".exe" if os.name == "nt" else "")), spv, str(groups), "dump"]
     if not emulate:
         args.append("--require-wave64")
-    r = subprocess.run(args, env=env, capture_output=True, text=True)
+    try:
+        r = subprocess.run(args, env=env, capture_output=True, text=True)
+    except OSError as e:
+        return None, f"{args[0]}: {e}", None
     out = r.stdout + r.stderr
     m = re.search(r"bench ms: median=([\d.]+) min=([\d.]+) max=([\d.]+)", out)
     h = re.search(r"bench out fnv1a: (\w+)", out)
@@ -123,4 +127,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

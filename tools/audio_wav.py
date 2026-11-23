@@ -128,8 +128,11 @@ def ogg_output_samples(path: str) -> int:
 
 def collect(src: str):
     """([(input, relative output stem)], number of .ogg/.opus files that are not Ogg Opus)."""
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
     files, not_opus = [], 0
-    for root, dirs, names in os.walk(src):
+    for root, dirs, names in os.walk(src, onerror=scan_failed):
         dirs.sort()
         for name in sorted(names):
             if not name.lower().endswith(EXTS):
@@ -325,7 +328,7 @@ def plan_outputs(items, src, out, ffmpeg):
         for group in groups.values():
             repaired.update(native_collisions(group, named, target, unprobed))
         repaired.update(unprobed)
-    counters, digests = {}, {}
+    counters, digests, dest_digests = {}, {}, {}
 
     def holds_own_audio(i, stem):
         """True if stem.wav is free or already holds input i's decoded audio."""
@@ -339,15 +342,20 @@ def plan_outputs(items, src, out, ffmpeg):
             elif len(digests) % 100 == 0:
                 print(f"  Checked {len(digests)} input recordings...", flush=True)
             digests[i] = audio_digest(ffmpeg, path, source=True)
-        if digests[i] and os.path.isfile(dst) and audio_digest(ffmpeg, dst, source=False) == digests[i]:
-            return True
+        if digests[i] and os.path.isfile(dst):
+            if dst not in dest_digests:
+                dest_digests[dst] = audio_digest(ffmpeg, dst, source=False)
+            if dest_digests[dst] == digests[i]:
+                return True
         print(f"  Keeping {dst}: its audio could not be verified for {path}.", file=sys.stderr)
         return False
 
     def allocate(i, base):
         """Give input i the first unreserved name of base, base~2, ... that is free or holds its audio."""
         base_key = key(base)
-        stem, n = base, counters.get(base_key, 2)
+        first = counters.get(base_key, 2)
+        stem, n = (base, 2) if first == 2 else (f"{base}~{first}", first + 1)
+        skipped_unreserved = False
         while True:
             candidate = key(stem)
             if candidate not in reserved:
@@ -355,9 +363,10 @@ def plan_outputs(items, src, out, ffmpeg):
                     raise OSError(f"cannot distinguish names in a read-only directory and verify {stem}.wav")
                 if holds_own_audio(i, stem):
                     break
-                reserved[candidate] = i
+                skipped_unreserved = True
             stem, n = f"{base}~{n}", n + 1
-        counters[base_key] = n
+        if not skipped_unreserved:
+            counters[base_key] = n
         reserved[candidate] = i
         named[i] = (named[i][0], stem)
 
@@ -447,7 +456,11 @@ def main(argv=None) -> int:
         not_opus = 0
         default_out = os.path.dirname(src)
     elif os.path.isdir(src):
-        items, not_opus = collect(src)
+        try:
+            items, not_opus = collect(src)
+        except OSError as exc:
+            error(f"cannot scan {exc.filename or src}: {exc.strerror or exc}")
+            return 2
         default_out = os.path.join(src, "wav")
     else:
         error(f"source not found: {a.src}")
