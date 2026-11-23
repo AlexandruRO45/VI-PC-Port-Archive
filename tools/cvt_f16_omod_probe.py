@@ -89,7 +89,8 @@ MODS: tuple[str, ...] = (
 # name -> (kernel-descriptor MODE dict, runtime s_setreg RTZ flag, model parameters)
 MODES: dict[str, dict] = {
     "rne_d0_i0": {
-        "descriptor": {"round16_64": 0, "denorm16_64": 0, "dx10_clamp": 1, "ieee": 0},
+        "descriptor": {"round16_64": 0, "denorm16_64": 0, "dx10_clamp": 1, "ieee": 0,
+                       "denorm32": 0, "round32": 0, "fp16_overflow": 0},
         "setreg_rtz": False,
         "rtz": False,
         "denorm_keep": False,
@@ -97,7 +98,8 @@ MODES: dict[str, dict] = {
         "dx10_clamp": True,
     },
     "rtz_d0_i0": {
-        "descriptor": {"round16_64": 3, "denorm16_64": 0, "dx10_clamp": 1, "ieee": 0},
+        "descriptor": {"round16_64": 3, "denorm16_64": 0, "dx10_clamp": 1, "ieee": 0,
+                       "denorm32": 0, "round32": 0, "fp16_overflow": 0},
         "setreg_rtz": False,
         "rtz": True,
         "denorm_keep": False,
@@ -105,7 +107,8 @@ MODES: dict[str, dict] = {
         "dx10_clamp": True,
     },
     "rtz_d3_i0": {
-        "descriptor": {"round16_64": 3, "denorm16_64": 3, "dx10_clamp": 1, "ieee": 0},
+        "descriptor": {"round16_64": 3, "denorm16_64": 3, "dx10_clamp": 1, "ieee": 0,
+                       "denorm32": 0, "round32": 0, "fp16_overflow": 0},
         "setreg_rtz": False,
         "rtz": True,
         "denorm_keep": True,
@@ -113,7 +116,8 @@ MODES: dict[str, dict] = {
         "dx10_clamp": True,
     },
     "rtz_d0_i1": {
-        "descriptor": {"round16_64": 3, "denorm16_64": 0, "dx10_clamp": 1, "ieee": 1},
+        "descriptor": {"round16_64": 3, "denorm16_64": 0, "dx10_clamp": 1, "ieee": 1,
+                       "denorm32": 0, "round32": 0, "fp16_overflow": 0},
         "setreg_rtz": False,
         "rtz": True,
         "denorm_keep": False,
@@ -121,7 +125,8 @@ MODES: dict[str, dict] = {
         "dx10_clamp": True,
     },
     "dyn_rtz_d0_i0": {
-        "descriptor": {"round16_64": 0, "denorm16_64": 0, "dx10_clamp": 1, "ieee": 0},
+        "descriptor": {"round16_64": 0, "denorm16_64": 0, "dx10_clamp": 1, "ieee": 0,
+                       "denorm32": 0, "round32": 0, "fp16_overflow": 0},
         "setreg_rtz": True,
         "rtz": True,
         "denorm_keep": False,

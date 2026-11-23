@@ -241,8 +241,39 @@ through the kernel driver (`libdrm_amdgpu`), so nothing sits between the instruc
     a process ran the first one's commands, every time; `tests/test_hw_oracle.py` runs 300 distinct kernels to
     catch that.
 
+Float MODE is stated, never defaulted. The kernel descriptor carries seven fields (`tools/hw_oracle/asm.py`,
+`MODE_FIELDS`): the 32-bit and 16/64-bit rounding and denormal fields, IEEE, DX10_CLAMP and `fp16_overflow` (RSRC1
+bit 26). `Kernel(mode=...)` writes them into the descriptor of wrapped and raw kernels alike, and
+`Oracle.run(..., strict=True)` raises `asm.ModeNotExplicit` when a program with an f16/f32/f64 instruction leaves any
+field out, instead of measuring whatever the assembler default was. `asm.MODE_DEFAULTS` spells out that default (IEEE
+1, DX10_CLAMP 1, f32 denormals flushed, f16/f64 denormals kept, round to nearest, an f16 overflow giving infinity) and
+`asm.MODE_GAME` the state inferred for the game (IEEE 0, `FLOAT_MODE` 0xC0). `salu_diff`, `pk16_diff`,
+`int_hw_probe` and `fmisc_diff` run their hardware kernels through `strict=True`. The other float probes
+(`f32_fuzz`, `fma_mix_probe`, `mad_denorm_probe`, `pknorm_probe`, `cvt_f16_omod_probe`, `f16_trans_sweep`,
+`interp_hw_probe`, `vinterp_hw_probe`) also state every field now, without passing `strict=True` yet; the one left
+out is `valu_fuzz.py`'s f16 family, whose kernels still carry no mode.
+
+Measured on the Ryzen 5 9600X iGPU (`gfx1036`, Linux 7.3.5, Mesa 27.0.0-devel, clang 23.1.5, 2026-11-23), every
+field stated: `v_cmp_eq_f16` reads the smallest f16 denormal (0x0001 / 0x8001) as a zero of its sign when
+`denorm16_64` is 0 or 2 (`eq(den, +0)` = 1, `eq(-den, +0)` = 1, `lt(-den, +0)` = 0) and keeps it when the field is 1
+or 3 (`0, 0, 1`), so bit 0 of the field chooses and bit 1 does not; `v_add_f16(0x7c01, 1.0)` returns 0x7c01 under
+IEEE 0 and 0x7e01 under IEEE 1 (`v_add_f32(0x7f800001, 1.0)`: 0x7f800001 / 0x7fc00001); `v_fract_f32(-1e-10)` is
+0x3f7fffff and `v_fract_f16` of a kept denormal is 0x3bff, not 1.0; `v_add_f16(65504, 65504)` is 0x7c00 with
+`fp16_overflow` clear and 0x7bff with it set. All four rows are hardware tests in `tests/test_hw_oracle.py`
+(`test_v_cmp_f16_flushes_a_denormal_by_bit_0_of_denorm16_64`,
+`test_an_f16_snan_passes_through_with_ieee_off_and_is_quieted_with_it_on`,
+`test_v_fract_clamps_to_the_largest_float_below_one`, `test_fp16_overflow_of_the_kernel_descriptor_reaches_the_hardware`);
+the mode checker is covered by CPU tests there. The first two were not expressible in `probe_gfx1036_vcmp16.py`: it
+runs the translated SPIR-V through a Vulkan dispatch and does not vary the float mode, and a compare writes a
+predicate, so quieting cannot be seen in its result (`v_cmp_class_f16` still reports 0x7c01 as a signalling NaN
+under IEEE 1, so it is not a way around that). `tools/f16_trans_sweep.py` already covers IEEE quieting of f16
+transcendentals: on this iGPU `v_exp_f16(0x7d00)` is 0x7d00 with IEEE 0 and 0x7f00 with IEEE 1 (`snan_quieted` 1022
+of 1022), wave32 = wave64.
+
 How it works: each program becomes one kernel (`tools/hw_oracle/asm.py`: load the output pointer, run the program,
-store `v[8:11]`), 500 kernels per code object. The code object needs an `.amdgpu_metadata` block; without it the HIP
+store `v[8:11]`), 500 kernels per code object. A raw (`Kernel(raw=True)`) or wrapped kernel carries the float mode of
+`Kernel(mode=...)`; a plain list of lines has none and is only allowed where the program has no float instruction.
+The code object needs an `.amdgpu_metadata` block; without it the HIP
 runtime fails the load with error 209 (`hipErrorNoBinaryForGpu`), which looks like a wrong GPU. The launcher starts
 one workgroup of one thread per kernel and pre-fills the buffer with `0xDEAD0000`, so a kernel that did not write
 shows up as a mismatch. A program the assembler rejects is counted as a skip, not a pass.

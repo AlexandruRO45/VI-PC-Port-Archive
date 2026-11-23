@@ -70,7 +70,8 @@ NEG_INF = 0xFF800000           # -inf
 QNAN = 0x7FC00000              # canonical quiet NaN
 SNAN = 0x7F800001              # signalling NaN
 
-GAME_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3, "round32": 0, "round16_64": 0}
+GAME_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3, "round32": 0, "round16_64": 0,
+             "fp16_overflow": 0}
 MODES = (
     ("game", GAME_MODE),
     ("ieee1", dict(GAME_MODE, ieee=1)),

@@ -688,7 +688,7 @@ def hw_prepare(oracle, programs):
             out[i] = why
         else:
             todo.append(i)
-    for i, r in zip(todo, oracle.run([programs[i] for i in todo])):
+    for i, r in zip(todo, oracle.run([programs[i] for i in todo], strict=True)):
         out[i] = r
     return out
 

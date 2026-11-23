@@ -799,6 +799,70 @@ class OnHardware(unittest.TestCase):
         kernel = asm.Kernel(lines, wave=32, threads=1024, words=8192, raw=True)
         self.assertEqual(self.oracle.run([kernel]), [[0xABCD0001] * 8192])
 
+    def test_fp16_overflow_of_the_kernel_descriptor_reaches_the_hardware(self):
+        # RSRC1 bit 26: clear, 65504 + 65504 overflows to +inf (0x7c00); set, it saturates to 0x7bff. The
+        # assembler's default is clear. Measured on gfx1036 with the Linux launcher, 2026-11-23.
+        program = ["v_mov_b32 v1, 0x7bff", "v_add_f16 v8, v1, v1",
+                   "v_mov_b32 v9, 0", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"]
+        mode = asm.mode_defaults(self.oracle.arch)
+        got = self.oracle.run([asm.Kernel(program, mode=dict(mode, fp16_overflow=v))
+                               for v in (0, 1)], strict=True)
+        self.assertEqual([w[0] & 0xFFFF for w in got], [0x7C00, 0x7BFF])
+
+    def test_v_cmp_f16_flushes_a_denormal_by_bit_0_of_denorm16_64(self):
+        # The smallest f16 denormal (+0x0001 / -0x8001) against +0: modes 0 and 2 flush it to a signed zero
+        # (eq is true, -0 is not below +0), modes 1 and 3 keep it (eq is false, -denormal < +0).
+        program = ["v_mov_b32 v1, 0x0001", "v_mov_b32 v2, 0x8001", "v_mov_b32 v3, 0x0000",
+                   "v_cmp_eq_f16_e64 s4, v1, v3", "v_cmp_eq_f16_e64 s5, v2, v3",
+                   "v_cmp_lt_f16_e64 s6, v2, v3", "v_mov_b32 v8, s4", "v_mov_b32 v9, s5",
+                   "v_mov_b32 v10, s6", "v_mov_b32 v11, 0",
+                   "v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"]
+        base = asm.mode_defaults(self.oracle.arch)
+        got = []
+        for field in range(4):
+            words = self.oracle.run([asm.Kernel(program, words=4, raw=True,
+                                                mode=dict(base, denorm16_64=field))], strict=True)[0]
+            got.append(words[:3])
+        self.assertEqual(got, [[1, 1, 0], [0, 0, 1], [1, 1, 0], [0, 0, 1]])
+
+    def test_an_f16_snan_passes_through_with_ieee_off_and_is_quieted_with_it_on(self):
+        # 0x7c01 is a signalling NaN, 0x7e01 the quieted one (bit 9). v_add_f16 returns the payload unchanged
+        # under IEEE 0 and sets bit 9 under IEEE 1.
+        base = asm.mode_defaults(self.oracle.arch)
+        if "ieee" not in base:
+            self.skipTest("this GPU fixes the IEEE behaviour")
+        program = ["v_mov_b32 v1, 0x00007c01", "v_mov_b32 v2, 0x00003c00",
+                   "v_add_f16 v8, v1, v2", "v_mov_b32 v9, 0", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0",
+                   "v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"]
+        got = self.oracle.run([asm.Kernel(program, words=4, raw=True, mode=dict(base, ieee=v))
+                               for v in (0, 1)], strict=True)
+        self.assertEqual([w[0] & 0xFFFF for w in got], [0x7C01, 0x7E01])
+
+    def test_v_fract_clamps_to_the_largest_float_below_one(self):
+        # fract(-1e-10) rounds to 1.0 and comes back as 0x3f7fffff; f16 does the same with 0x3bff for a denormal.
+        program = ["v_mov_b32 v1, 0xae6e6b28", "v_mov_b32 v2, 0x3fc00000",
+                   "v_mov_b32 v3, 0x00008001", "v_mov_b32 v4, 0x00003e00",
+                   "v_fract_f32 v8, v1", "v_fract_f32 v9, v2",
+                   "v_fract_f16 v10, v3", "v_fract_f16 v11, v4",
+                   "v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"]
+        got = self.oracle.run([asm.Kernel(program, words=4, raw=True, mode=asm.mode_defaults(self.oracle.arch))],
+                              strict=True)[0]
+        self.assertEqual(got[0], 0x3F7FFFFF)
+        self.assertEqual(got[1], 0x3F000000)
+        self.assertEqual(got[2] & 0xFFFF, 0x3BFF)
+        self.assertEqual(got[3] & 0xFFFF, 0x3800)
+
+    def test_strict_refuses_a_float_program_that_states_no_mode(self):
+        with self.assertRaises(asm.ModeNotExplicit) as caught:
+            self.oracle.run([asm.Kernel(["v_add_f32 v8, v1, v2"])], strict=True)
+        self.assertIn("v_add_f32", str(caught.exception))
+        self.assertIn("ieee", str(caught.exception))
+        # the same program with every field is accepted, and an integer program needs none
+        self.assertIsInstance(self.oracle.run([asm.Kernel(["v_add_f32 v8, v1, v2"],
+                                                           mode=asm.mode_defaults(self.oracle.arch))],
+                                              strict=True)[0], list)
+        self.assertIsInstance(self.oracle.run([PROG], strict=True)[0], list)
+
     def test_runs_a_program_and_reports_a_rejected_one(self):
         bad = ["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]     # two literals: the assembler refuses it
         good, rejected = self.oracle.run([PROG, bad])
@@ -859,6 +923,70 @@ class KernelResources(unittest.TestCase):
         text, _, _ = asm.module_text([PROG], "gfx1036")
         self.assertIn(".amdhsa_next_free_vgpr 16", text)                # a plain program keeps the old ones
         self.assertIn(".amdhsa_next_free_sgpr 32", text)
+
+
+class ModeExplicitness(unittest.TestCase):
+    """asm.float_opcodes / mode_missing / check_explicit_modes and Kernel(mode=) on wrapped kernels: no hardware."""
+
+    def test_float_opcodes_are_recognised_by_their_type(self):
+        lines = ["v_add_f32 v8, v1, v2", "v_cmp_eq_f16_e64 s4, v1, v2 ; a comment",
+                 "v_cvt_pknorm_u16_f32 v1, v2", "v_pk_mad_f16 v1, v2, v3, v4",
+                 "v_fma_mixlo_f16 v1, v2, v3, v4", "v_mad_i16 v1, v2, v3, v4",
+                 "v_pk_mad_u16 v1, v2, v3, v4", "v_sad_u32 v1, v2, v3, v4",
+                 "v_cmp_class_f32_e64 s4, v1, 1", "global_store_b128 v0, v[8:11], s[2:3]"]
+        self.assertEqual(asm.float_opcodes(lines),
+                         ["v_add_f32", "v_cmp_eq_f16_e64", "v_cvt_pknorm_u16_f32", "v_pk_mad_f16",
+                          "v_fma_mixlo_f16", "v_cmp_class_f32_e64"])
+
+    def test_mode_missing_names_the_fields_left_out(self):
+        all_fields = set(asm.MODE_FIELDS)
+        for arch in ("gfx1036", "gfx1150"):
+            self.assertEqual(asm.mode_missing(asm.MODE_DEFAULTS, arch), [])
+            self.assertEqual(asm.mode_missing({"ieee": 0}, arch), sorted(all_fields - {"ieee"}))
+            self.assertEqual(asm.mode_missing(None, arch), sorted(all_fields))
+        # gfx1170+ fixes IEEE and DX10_CLAMP: they are neither required nor encodable there
+        self.assertEqual(asm.mode_missing({k: v for k, v in asm.MODE_DEFAULTS.items()
+                                           if k not in ("ieee", "dx10_clamp")}, "gfx1201"), [])
+        self.assertEqual(asm.mode_defaults("gfx1201"),
+                         {k: v for k, v in asm.MODE_DEFAULTS.items() if k not in ("ieee", "dx10_clamp")})
+        self.assertEqual(asm.mode_defaults("gfx1036"), asm.MODE_DEFAULTS)
+        self.assertEqual(asm.mode_missing({"fp16_overflow": 0}, "gfx1201"),
+                         ["denorm16_64", "denorm32", "round16_64", "round32"])
+
+    def test_check_explicit_modes_finds_the_programs_that_state_nothing(self):
+        full = asm.Kernel(["v_add_f32 v8, v1, v2"], mode=asm.MODE_DEFAULTS)
+        partial = asm.Kernel(["v_add_f32 v8, v1, v2"], mode={"ieee": 0, "dx10_clamp": 1, "denorm32": 0})
+        integer = asm.Kernel(["v_add_u32 v8, v1, v2"], mode=None)
+        self.assertEqual(asm.check_explicit_modes([full, integer], "gfx1036"), [])
+        problems = asm.check_explicit_modes([full, partial, ["v_fract_f32 v8, v1"]], "gfx1036")
+        self.assertEqual([i for i, _ in problems], [1, 2])
+        self.assertIn("denorm16_64", problems[0][1])
+        self.assertIn("v_fract_f32", problems[1][1])
+
+    def test_the_mode_of_a_wrapped_kernel_reaches_its_descriptor(self):
+        k = asm.Kernel(["v_add_f32 v8, v1, v2"], mode=asm.MODE_DEFAULTS)
+        text, _, _ = asm.module_text([k], "gfx1036")
+        self.assertIn(".amdhsa_ieee_mode 1", text)
+        self.assertIn(".amdhsa_float_denorm_mode_16_64 3", text)
+        self.assertIn(".amdhsa_fp16_overflow 0", text)
+        # a kernel that states nothing emits none of them, as before
+        plain, _, _ = asm.module_text([asm.Kernel(["v_add_f32 v8, v1, v2"])], "gfx1036")
+        self.assertNotIn(".amdhsa_ieee_mode", plain)
+        self.assertNotIn(".amdhsa_fp16_overflow", plain)
+        # and gfx1170+ still refuses the two fixed fields through the wrapped path
+        with self.assertRaises(asm.ModeUnavailable):
+            asm.module_text([asm.Kernel(["v_add_f32 v8, v1, v2"], mode=asm.MODE_DEFAULTS)], "gfx1201")
+
+    def test_the_run_path_raises_before_assembling(self):
+        o = object.__new__(runner.Oracle)
+        o.arch = "gfx1036"
+
+        def no_assemble(*_a, **_k):
+            self.fail("a program without explicit modes must not reach the assembler")
+
+        o._run_chunk = no_assemble
+        with self.assertRaises(asm.ModeNotExplicit):
+            o.run([["v_add_f32 v8, v1, v2"]], strict=True)
 
 
 class WrappedKernelsOnHardware(unittest.TestCase):

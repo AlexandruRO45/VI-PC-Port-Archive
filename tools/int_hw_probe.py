@@ -846,8 +846,10 @@ def run_hw(cases, arch=None, waves=(32, 64)):
         device = oracle.device
         per_wave = {}
         for wave in waves:
-            kernels = [asm.Kernel(case.lines(wave=wave), wave=wave, threads=1, words=4) for case in cases]
-            res = oracle.run(kernels, words=4)
+            mode = asm.mode_defaults(oracle.arch)
+            kernels = [asm.Kernel(case.lines(wave=wave), wave=wave, threads=1, words=4, mode=mode)
+                       for case in cases]
+            res = oracle.run(kernels, words=4, strict=True)
             per_wave[wave] = {case.name: r for case, r in zip(cases, res)}
         return device, per_wave
     finally:

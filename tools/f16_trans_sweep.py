@@ -46,11 +46,16 @@ OPS = ("v_exp_f16", "v_log_f16", "v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_sin_
 # f32 denormals flushed and IEEE off is the state docs/design.md infers for the game's shaders; the f16 denormal
 # field is the open question, so both settings are run, then IEEE on, then f16 rounding toward zero.
 MODES = {
-    "keep16": {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3},
-    "flush16": {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 0},
-    "ieee_keep16": {"ieee": 1, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3},
-    "ieee_flush16": {"ieee": 1, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 0},
-    "keep16_rtz": {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3, "round16_64": 3},
+    "keep16": {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+               "round32": 0, "round16_64": 0, "fp16_overflow": 0},
+    "flush16": {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 0,
+                "round32": 0, "round16_64": 0, "fp16_overflow": 0},
+    "ieee_keep16": {"ieee": 1, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+                    "round32": 0, "round16_64": 0, "fp16_overflow": 0},
+    "ieee_flush16": {"ieee": 1, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 0,
+                     "round32": 0, "round16_64": 0, "fp16_overflow": 0},
+    "keep16_rtz": {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+                   "round32": 0, "round16_64": 3, "fp16_overflow": 0},
 }
 
 THREADS = 1024

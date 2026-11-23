@@ -309,9 +309,17 @@ class Oracle:
                               f"{os.path.dirname(self.exe)} (Windows Security, Virus & threat protection) and rerun") from None
         return r.returncode, r.stdout, r.stderr
 
-    def run(self, programs, words=4):
+    def run(self, programs, words=4, strict=False):
         """Run each program (a list of lines). Returns one entry per program: a list of `words` ints, or a str
-        explaining why it could not run (assembler rejection, or a MODE field this architecture cannot set)."""
+        explaining why it could not run (assembler rejection, or a MODE field this architecture cannot set).
+        strict=True refuses to run at all when a program holds a float instruction but does not state every float
+        MODE field (asm.MODE_FIELDS, less the fields the architecture fixes): the run raises asm.ModeNotExplicit
+        instead of quietly using the assembler's defaults."""
+        if strict:
+            problems = asm.check_explicit_modes(programs, self.arch)
+            if problems:
+                more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+                raise asm.ModeNotExplicit(problems[0][1] + more)
         results = [None] * len(programs)
         for i, p in enumerate(programs):
             why = asm.mode_skip_reason(p.mode, self.arch) if isinstance(p, asm.Kernel) else None

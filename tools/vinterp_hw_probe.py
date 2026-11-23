@@ -58,7 +58,8 @@ import spirv_mini_interp  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 SENTINEL_HI = 0x5A5A0000
-GAME_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3, "round32": 0, "round16_64": 0}
+GAME_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3, "round32": 0, "round16_64": 0,
+             "fp16_overflow": 0}
 RTZ16_MODE = dict(GAME_MODE, round16_64=3)
 FLUSH16_MODE = dict(GAME_MODE, denorm16_64=0)
 

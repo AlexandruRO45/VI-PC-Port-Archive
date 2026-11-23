@@ -71,7 +71,9 @@ class Kernel:
     """One program to run. lines: the instructions. raw=False wraps them (output pointer load, v[8:11] store);
     raw=True means the lines already end with their own stores and s_endpgm and only get the output pointer in
     s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64. mode: the float MODE the kernel
-    starts with (raw kernels only), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults.
+    starts with (wrapped and raw alike), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults.
+    A float program must state every field (MODE_DEFAULTS / MODE_GAME, or mode_defaults(arch), plus its overrides)
+    for Oracle.run(..., strict=True); a probe that leaves one out then fails instead of measuring a default.
     On gfx1170+ the assembler rejects the ieee and dx10_clamp directives, so requesting those fields raises
     ModeUnavailable while the denormal and rounding fields still work.
     lds: bytes of LDS the kernel allocates (.amdhsa_group_segment_fixed_size and the metadata's
@@ -95,7 +97,9 @@ class Kernel:
 
 # Float MODE the kernel descriptor starts a wave with, as .amdhsa_* directives. The assembler's defaults (checked on
 # gfx1150 by reading the register back, see docs/shader_validation.md): IEEE 1, DX10_CLAMP 1, f32 denormals
-# flushed (denorm_mode_32 = 0), f16/f64 denormals kept (3), all rounding to nearest even (0).
+# flushed (denorm_mode_32 = 0), f16/f64 denormals kept (3), all rounding to nearest even (0), an f16 overflow giving
+# infinity (fp16_overflow = 0; RSRC1 bit 26, measured on gfx1036: 65504 + 65504 is 0x7c00 with the bit clear and
+# 0x7bff with it set).
 MODE_FIELDS = {
     "ieee": ".amdhsa_ieee_mode",
     "dx10_clamp": ".amdhsa_dx10_clamp",
@@ -103,7 +107,19 @@ MODE_FIELDS = {
     "denorm16_64": ".amdhsa_float_denorm_mode_16_64",
     "round32": ".amdhsa_float_round_mode_32",
     "round16_64": ".amdhsa_float_round_mode_16_64",
+    "fp16_overflow": ".amdhsa_fp16_overflow",
 }
+
+# Every field at the assembler's default: what a Kernel(mode=None), and therefore a probe that leaves the mode out,
+# has always run under. Spelled out so a float program that is checked for explicit modes can request exactly that
+# state and still pass.
+MODE_DEFAULTS = {"ieee": 1, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+                 "round32": 0, "round16_64": 0, "fp16_overflow": 0}
+# The float mode inferred for the game's shaders (docs/fspx.md: COMPUTE_PGM_RSRC1 FLOAT_MODE 0xC0, so f16/f64
+# denormals kept, IEEE off, DX10_CLAMP on, round to nearest). fp16_overflow is not decoded from the game's
+# descriptor; the value here is the assembler default, and a probe that measures f16 overflow must override it.
+MODE_GAME = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+             "round32": 0, "round16_64": 0, "fp16_overflow": 0}
 # AMD clang (rocm-sdk-core 10.0.0) rejects these two directives on gfx1170 and later; the hardware keeps its
 # fixed IEEE/DX10_CLAMP behaviour there, so a run that asks for either field is a skip, not an assembler failure.
 _MODE_FIELDS_GONE_ON_GFX1170 = ("ieee", "dx10_clamp")
@@ -143,6 +159,63 @@ def mode_skip_reason(mode, arch):
             "is unsupported on gfx1170+ (the behaviour is fixed there)")
 
 
+class ModeNotExplicit(Exception):
+    """A float instruction runs in a kernel that did not set every float MODE field explicitly."""
+
+
+# A mnemonic that names an f16, f32 or f64 type: v_add_f32, v_cmp_eq_f16, v_cvt_f32_f16, v_pk_mad_f16,
+# v_fma_mixlo_f16, v_cvt_pknorm_u16_f32, v_mul_legacy_f32. RDNA has no scalar float ALU, so this covers every
+# instruction whose result or predicate the float mode can change. Integer ops (v_add_u32, v_mad_i16, v_pk_mad_u16,
+# s_* and the memory ops) do not match.
+_FLOAT_MNEMONIC = re.compile(r"_f(?:16|32|64)(?:_|$)")
+
+
+def float_opcodes(lines):
+    """The float instructions among `lines` (a line may carry a ; comment)."""
+    out = []
+    for line in lines:
+        op = line.split(";", 1)[0].strip().partition(" ")[0]
+        if _FLOAT_MNEMONIC.search(op):
+            out.append(op)
+    return out
+
+
+def _fixed_mode_fields(arch):
+    """Whether this architecture fixes the IEEE and DX10_CLAMP behaviour (gfx1170+, GFX11.7 and GFX12)."""
+    fam = family(arch)
+    return fam == "gfx12" or (fam == "gfx11" and int(arch[5], 16) >= 7)
+
+
+def mode_missing(mode, arch):
+    """The float MODE fields a kernel on this architecture must set but does not. On gfx1170+ the IEEE and DX10_CLAMP
+    behaviour is fixed, so those two are not required there (and cannot be encoded, see mode_skip_reason)."""
+    required = {k for k in MODE_FIELDS if not (_fixed_mode_fields(arch) and k in _MODE_FIXED)}
+    return sorted(required - set(mode or {}))
+
+
+def mode_defaults(arch):
+    """MODE_DEFAULTS less the fields this architecture fixes: a complete mode for strict=True on any GPU."""
+    return {k: v for k, v in MODE_DEFAULTS.items() if not (_fixed_mode_fields(arch) and k in _MODE_FIXED)}
+
+
+def check_explicit_modes(programs, arch):
+    """(index, reason) for every program whose float instructions run under a mode it did not state. A plain program
+    (a list of lines, not a Kernel) has no mode at all, which counts as stating nothing. A float program with a
+    complete mode yields none."""
+    problems = []
+    for i, p in enumerate(programs):
+        lines = p.lines if isinstance(p, Kernel) else p
+        ops = float_opcodes(lines)
+        if not ops:
+            continue
+        missing = mode_missing(p.mode if isinstance(p, Kernel) else None, arch)
+        if missing:
+            problems.append((i, f"kernel {i} runs {', '.join(sorted(set(ops)))} without stating the float MODE "
+                                f"field(s) {', '.join(missing)}; pass them explicitly (MODE_DEFAULTS or MODE_GAME "
+                                "plus the fields under test)"))
+    return problems
+
+
 # The global memory instructions GFX11 renamed, under their GFX10 names. A raw kernel body is written with the
 # GFX11 ones (crosslane_fuzz stores with global_store_b32); a GFX10 assembler only takes the old spelling.
 _GFX10_NAMES = {f"global_{kind}_b{bits}": f"global_{kind}_dword{suffix}"
@@ -176,10 +249,9 @@ def register_counts(lines, vgprs, sgprs):
     return min(max(vgprs, v), 256), min(max(sgprs, s), 104)
 
 
-def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
-    """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
-    fam = family(arch)
-    vgprs, sgprs = register_counts(lines, vgprs, sgprs)
+def _mode_directives(mode, arch):
+    """The .amdhsa_* float MODE directives of one kernel, or raise ModeUnavailable on an architecture that cannot
+    encode one of the requested fields."""
     if int(arch[3:], 16) >= 0x1170:
         unsupported = sorted(set(mode or {}) & set(_MODE_FIELDS_GONE_ON_GFX1170))
         if unsupported:
@@ -188,7 +260,14 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgpr
                 f"{fields} cannot be set on {arch}: AMD clang rejects .amdhsa_ieee_mode and .amdhsa_dx10_clamp "
                 "on gfx1170+, and the hardware keeps its fixed behaviour there; only denormal and rounding "
                 "mode fields are available")
-    modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
+    return "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
+
+
+def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
+    """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
+    fam = family(arch)
+    vgprs, sgprs = register_counts(lines, vgprs, sgprs)
+    modes = _mode_directives(mode, arch)
     load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
     if fam == "gfx10":
         lines = [gfx10_spelling(ln) for ln in lines]
@@ -214,13 +293,15 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgpr
 """
 
 
-def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32, lds=0):
+def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32, lds=0, mode=None):
     """Assembly for one kernel. The descriptor takes the wave size, the register counts (raised to the registers
-    the lines name, register_counts) and the LDS size (the group segment: without it a Linux launcher has nothing
-    to program COMPUTE_PGM_RSRC2.LDS_SIZE from). It used to be fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036
-    v16 and up read back 0 and a Kernel(wave=64) ran as wave32 (the lane ids of a full EXEC had 32 lanes)."""
+    the lines name, register_counts), the LDS size (the group segment: without it a Linux launcher has nothing
+    to program COMPUTE_PGM_RSRC2.LDS_SIZE from) and the float MODE. It used to be fixed at wave32, 16 VGPRs and
+    32 SGPRs: on gfx1036 v16 and up read back 0 and a Kernel(wave=64) ran as wave32 (the lane ids of a full EXEC
+    had 32 lanes)."""
     fam = family(arch)
     vgprs, sgprs = register_counts(lines, vgprs, sgprs)
+    modes = _mode_directives(mode, arch)
     load = "s_load_dwordx2" if fam == "gfx10" else "s_load_b64"
     store = "global_store_dwordx4" if fam == "gfx10" else "global_store_b128"
     body = "\n".join("  " + line for line in lines)
@@ -243,7 +324,7 @@ def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32, lds=0):
   .amdhsa_next_free_sgpr {sgprs}
   .amdhsa_group_segment_fixed_size {lds}
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
-  .amdhsa_system_vgpr_workitem_id 0
+  .amdhsa_system_vgpr_workitem_id 0{modes}
 .end_amdhsa_kernel
 .text
 """
@@ -274,7 +355,7 @@ def module_text(programs, arch, prefix="k", wave=32):
         if isinstance(prog, Kernel):
             vg, sg = register_counts(prog.lines, prog.vgprs, prog.sgprs)
             text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, vg, sg) if prog.raw
-                    else kernel_text(name, prog.lines, arch, prog.wave, vg, sg, prog.lds))
+                    else kernel_text(name, prog.lines, arch, prog.wave, vg, sg, prog.lds, prog.mode))
         else:
             vg, sg = register_counts(prog, 16, 32)
             text = kernel_text(name, prog, arch, wave, vg, sg)

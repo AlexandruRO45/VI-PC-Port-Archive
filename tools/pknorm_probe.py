@@ -58,7 +58,8 @@ NEAR_TIES = {
     "v_cvt_pknorm_i16_f32": (0x38400180, 0x38E001C0, 0x39300160, 0x3C004101, 0x3C014103, 0x3C024105),
     "v_cvt_pknorm_u16_f32": (0x37C000C0, 0x386000E0, 0x38B000B0, 0x3B008081, 0x3B028083, 0x3B048085),
 }
-GAME_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3, "round32": 0, "round16_64": 0}
+GAME_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3, "round32": 0, "round16_64": 0,
+             "fp16_overflow": 0}
 MODES = (
     ("game", GAME_MODE),
     ("ieee1", dict(GAME_MODE, ieee=1)),

@@ -559,7 +559,10 @@ def translated(lines, name="ps_fmisc"):
 # The float MODE the hardware kernels start with: the one docs/design.md infers for the game's shaders (IEEE off,
 # DX10_CLAMP on, f32 denormals flushed; tools/f32_fuzz.py's "flush"). The assembler's compute default has IEEE on,
 # under which the hardware ignores omod (measured: v_fract_f32_e64 v4, -v16 mul:2 with v16 = 0.5 gives 0.5).
-HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0}
+# Every field is stated: this tool only runs f32 ops, so the f16/f64 denormal and rounding fields and
+# fp16_overflow (RSRC1 bit 26) cannot change a result, and they keep the assembler's defaults.
+HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+           "round32": 0, "round16_64": 0, "fp16_overflow": 0}
 
 
 def hw_kernel(lines, wave=32):
@@ -672,7 +675,7 @@ def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=Non
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
-    hw = oracle.run([hw_kernel(p, wave) for p in progs]) if "hw" in backends else [None] * programs
+    hw = oracle.run([hw_kernel(p, wave) for p in progs], strict=True) if "hw" in backends else [None] * programs
     vk_failures = []
     if "vk" in backends:
         import vk_fuzz_run
@@ -814,7 +817,7 @@ def main(argv=None):
         backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)])[0]) if oracle else None)
+            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)], strict=True)[0]) if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")

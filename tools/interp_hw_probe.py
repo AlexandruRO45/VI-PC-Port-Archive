@@ -252,7 +252,8 @@ def main(argv=None):
         seeds = [int(s) for s in args.seeds.split(",")]
     except ValueError:
         ap.error("--seeds takes integers separated by commas")
-    mode = {"denorm32": args.denorm32}
+    mode = {"ieee": 1, "dx10_clamp": 1, "denorm32": args.denorm32, "denorm16_64": 3,
+            "round32": 0, "round16_64": 0, "fp16_overflow": 0}
     try:
         o = runner.open_oracle(arch=args.arch)
     except runner.Unavailable as e:

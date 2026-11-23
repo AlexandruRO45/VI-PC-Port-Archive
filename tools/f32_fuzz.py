@@ -818,11 +818,17 @@ def translator_verdict(case, want, got):
 # Float MODE a kernel starts with. "flush" is the state inferred for the game's pixel shaders (docs/design.md: the
 # corpus writes only MODE.FP_ROUND and carries omod on 102,365 float instructions, so IEEE is off; f32 denormals
 # flushed). The other three change one thing each, to answer what the hardware does there.
+# Every field is stated: the four that no mode varies (f16/f64 denormals kept, round to nearest, an f16 overflow
+# giving infinity) keep the assembler's defaults, but a run never depends on that silently.
 HW_MODES = {
-    "flush": {"ieee": 0, "dx10_clamp": 1, "denorm32": 0},     # MODE 0x1c0
-    "keep": {"ieee": 0, "dx10_clamp": 1, "denorm32": 3},      # 0x1f0: f32 denormals kept
-    "no_dx10": {"ieee": 0, "dx10_clamp": 0, "denorm32": 0},   # 0x0c0: DX10_CLAMP off
-    "ieee": {"ieee": 1, "dx10_clamp": 1, "denorm32": 0},      # 0x3c0: the assembler default for a compute kernel
+    "flush": {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+              "round32": 0, "round16_64": 0, "fp16_overflow": 0},     # MODE 0x1c0
+    "keep": {"ieee": 0, "dx10_clamp": 1, "denorm32": 3, "denorm16_64": 3,
+             "round32": 0, "round16_64": 0, "fp16_overflow": 0},      # 0x1f0: f32 denormals kept
+    "no_dx10": {"ieee": 0, "dx10_clamp": 0, "denorm32": 0, "denorm16_64": 3,
+                "round32": 0, "round16_64": 0, "fp16_overflow": 0},   # 0x0c0: DX10_CLAMP off
+    "ieee": {"ieee": 1, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+             "round32": 0, "round16_64": 0, "fp16_overflow": 0},      # 0x3c0: the assembler default
 }
 HW_PRIMARY = "flush"
 

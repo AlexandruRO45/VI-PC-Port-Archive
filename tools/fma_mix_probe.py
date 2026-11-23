@@ -286,7 +286,8 @@ def run_vulkan(build, cases=CASES):
 
 # ---- the native instruction on an AMD GPU ----
 
-HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3, "round16_64": 0}
+HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0, "denorm16_64": 3,
+           "round32": 0, "round16_64": 0, "fp16_overflow": 0}
 
 
 def hw_lines(case):

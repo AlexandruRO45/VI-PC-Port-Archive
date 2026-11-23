@@ -456,7 +456,7 @@ def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=Non
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
-    hw = oracle.run([hw_kernel(p, wave) for p in progs]) if "hw" in backends else [None] * programs
+    hw = oracle.run([hw_kernel(p, wave) for p in progs], strict=True) if "hw" in backends else [None] * programs
     if "vk" in backends:
         import vk_fuzz_run
         counts["vk"], counts["vk_failures"] = vk_fuzz_run.judge(progs, hw, vk_fuzz_run.exact_verdict, wave=wave,
@@ -581,7 +581,7 @@ def main(argv=None):
         backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)])[0]) if oracle else None)
+            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)], strict=True)[0]) if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
