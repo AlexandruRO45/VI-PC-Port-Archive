@@ -942,6 +942,13 @@ private:
             copy.imageExtent = {extent_.width, extent_.height, 1};
             fn.copy_image_to_buffer(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture_buffer_, 1,
                                     &copy);
+            // read_back() host-copies capture_buffer_ after the frame fence: make the transfer writes visible to
+            // host reads, as the backend's readback path does (vulkan_backend.h).
+            VkMemoryBarrier host_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                                &host_read, 0, nullptr, 0, nullptr);
             layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             access = VK_ACCESS_TRANSFER_READ_BIT;
         }
