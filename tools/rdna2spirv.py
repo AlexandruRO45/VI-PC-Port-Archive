@@ -1314,7 +1314,7 @@ class Gen:
         else:
             raise Unsupported("ds_swizzle " + kind)
         v, r = self.src_u(a[1]), self.tmp()
-        self.g_shuffle(r, v, src)
+        self.g_shuffle(r, v, src, zero_inactive=True)  # a source lane off in EXEC gives 0 (as ds_bpermute)
         self.dst(a[0], r)
 
     def buffer_load(self, op, a, mods):
@@ -3382,6 +3382,20 @@ class Gen:
         """r = v of lane `src` of this wave (OpGroupNonUniformShuffle; emulated: any lane 0-63). zero_inactive:
         a source lane that is off in EXEC gives 0 (ds_bpermute)."""
         if not self.emulate:
+            if zero_inactive:
+                # As ds_bpermute_b32: redirect an EXEC-off source to the calling lane, then mask the result to 0
+                # (bitwise, so no ternary moves the ballot and shuffle into divergent control flow in MSL).
+                lane, z, bal, ex, safe, sh, mask = (self.tmp() for _ in range(7))
+                self.sub_lane(lane)
+                self.emit(f"{z} = OpSelect %uint {self.active_b()} {v} {self.cu(0)}")
+                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
+                self.emit(f"{safe} = OpSelect %uint {ex} {src} {lane}")
+                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {safe}")
+                self.emit(f"{mask} = OpSelect %uint {ex} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                self.emit(f"{r} = OpBitwiseAnd %uint {sh} {mask}")
+                self.uses_subgroup = self.uses_ballot = True
+                return
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {src}")
             return
         if zero_inactive:
