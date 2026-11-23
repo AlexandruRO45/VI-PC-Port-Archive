@@ -181,5 +181,66 @@ class TestMax3I32AST(unittest.TestCase):
             LiteralOperand(-0x8000_0001)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachine:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.scc: int = 0
+
+    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
+        if isinstance(op, LiteralOperand):
+            return op.value & MASK32
+        elif op.op_type == OperandType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.op_type == OperandType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        raise TypeError(f"Unknown operand type: {type(op)}")
+
+    def write_vgpr(self, index: int, val32: int):
+        self.vgprs[index] = val32 & MASK32
+
+    def step(self, insn: VMax3I32Instruction):
+        val_s0 = self.read_operand(insn.src0)
+        val_s1 = self.read_operand(insn.src1)
+        val_s2 = self.read_operand(insn.src2)
+        result = ref_max3_i32(val_s0, val_s1, val_s2, clamp=insn.clamp)
+        self.write_vgpr(insn.dst.index, result)
+
+
+class TestMax3I32ScalarInterpreter(unittest.TestCase):
+    def setUp(self):
+        self.machine = ScalarMachine()
+
+    def test_scalar_execution_basic(self):
+        self.machine.vgprs[1] = 0xFFFF_FFF6  # -10
+        self.machine.vgprs[2] = 0xFFFF_FFFB  # -5
+        self.machine.vgprs[3] = 0xFFFF_FFEC  # -20
+        insn = VMax3I32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[0], 0xFFFF_FFFB)
+
+    def test_scalar_with_sgpr_and_literal(self):
+        self.machine.sgprs[4] = 10
+        self.machine.vgprs[2] = 20
+        lit = LiteralOperand(-30)
+        insn = VMax3I32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 5),
+            src0=RegisterOperand(OperandType.SGPR, 4),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=lit,
+        )
+        self.machine.step(insn)
+        self.assertEqual(self.machine.vgprs[5], 20)
+
+
 if __name__ == '__main__':
     unittest.main()
