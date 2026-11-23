@@ -856,8 +856,9 @@ def judge_fma_fused(words, khr):
     if khr:
         for i, (got, want) in enumerate(zip(words, FMA_FUSED)):
             if got != want:
-                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} (OpFmaKHR)"
-        return True, "8/8 fused exact (OpFmaKHR)"
+                return False, (f"word {i}: got {got:#010x}, want fused {want:#010x} "
+                               "(single-rounded FMA: OpFmaKHR or --fma exact)")
+        return True, "8/8 fused exact (single-rounded FMA: OpFmaKHR or --fma exact)"
     if words[7] != FMA_FUSED[7]:
         return False, f"word 7 (f16): got {words[7]:#010x}, want {FMA_FUSED[7]:#010x}"
     n_split = 0
