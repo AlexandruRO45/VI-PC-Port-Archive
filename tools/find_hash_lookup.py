@@ -14,9 +14,14 @@ Standard library only. No game data is written: the report holds RVAs and counts
 """
 import argparse
 import json
+import os
 import struct
 import sys
 from collections import Counter, defaultdict
+
+# `python -I` implies `-P`, so the script's directory is not on sys.path; the sibling modules are next to it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 
@@ -118,6 +123,9 @@ def main(argv=None):
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--json", help="also write the report here")
     a = ap.parse_args(argv)
+    if a.json and (os.path.isdir(a.json) or same_report_path(a.exe, a.json)):
+        print(f"ERROR: --json must not name the scanned image or a folder: {a.json}", file=sys.stderr)
+        return 2
     try:
         hashes = [(h, parse_hash(h)) for h in (a.hash or ["player_story000_00", "cs_mandy"])]
     except ValueError as e:
