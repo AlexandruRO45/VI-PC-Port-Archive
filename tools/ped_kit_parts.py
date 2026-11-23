@@ -7,10 +7,13 @@ import sqlite3
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from report_paths import same_report_path
 from world_names import hash64
 
+ModelSource = tuple[str, int, int]  # models.archive, models.offset, models.drawable
 
-def _one(db: sqlite3.Connection, sql: str, params: tuple, label: str):
+
+def _one(db: sqlite3.Connection, sql: str, params: tuple, label: str, *, ambiguity_hint: str = ""):
     try:
         rows = db.execute(sql, params).fetchmany(2)
     except sqlite3.Error as exc:
@@ -18,7 +21,7 @@ def _one(db: sqlite3.Connection, sql: str, params: tuple, label: str):
     if not rows:
         raise ValueError(f"{label}: no match in the parts index")
     if len(rows) > 1:
-        raise ValueError(f"{label}: ambiguous matches in the parts index")
+        raise ValueError(f"{label}: ambiguous matches in the parts index{ambiguity_hint}")
     return rows[0]
 
 
@@ -31,11 +34,23 @@ def _existing_export(value: str, suffix: str, label: str) -> Path:
     return path
 
 
-def component_path(db: sqlite3.Connection, drawable_hash: int, *, textured: bool = False) -> Path:
+def component_path(
+    db: sqlite3.Connection, drawable_hash: int, *, textured: bool = False, source: ModelSource | None = None
+) -> Path:
     """Return the decoded model.json for one uniquely identified, skinned GLB export."""
     key = f"{drawable_hash:016X}"
     label = f"drawable {key}"
-    model_id, indexed_name = _one(db, "SELECT id, name FROM models WHERE murmur64 = ?", (key,), label)
+    query = "SELECT id, name FROM models WHERE murmur64 = ?"
+    if source is None:
+        model_id, indexed_name = _one(
+            db, query, (key,), label,
+            ambiguity_hint=f". Use --model-source {key} ARCHIVE OFFSET DRAWABLE from the models table.",
+        )
+    else:
+        model_id, indexed_name = _one(
+            db, query + " AND archive = ? AND offset = ? AND drawable = ?",
+            (key, *source), f"{label} at requested source",
+        )
     glb_file, = _one(db, """
         SELECT DISTINCT glb_path FROM model_exports
         WHERE model_id = ? AND glb_status = 'ready' AND glb_path IS NOT NULL
@@ -75,6 +90,17 @@ def component_path(db: sqlite3.Connection, drawable_hash: int, *, textured: bool
     ):
         raise ValueError(f"{label}: decoded model.json contains no skinned mesh")
     return sidecar
+
+
+def protect_model_exports(db: sqlite3.Connection, drawable_hash: int, output: Path) -> None:
+    """Keep an existing GLB for any physical variant of this drawable intact."""
+    key = f"{drawable_hash:016X}"
+    paths = db.execute("""
+        SELECT DISTINCT e.glb_path FROM models AS m JOIN model_exports AS e ON e.model_id = m.id
+        WHERE m.murmur64 = ? AND e.glb_path IS NOT NULL
+    """, (key,))
+    if any(same_report_path(output, path) for path, in paths):
+        raise ValueError(f"output would replace an indexed GLB for drawable {key}")
 
 
 def texture_path(db: sqlite3.Connection, asset_key: int) -> Path:

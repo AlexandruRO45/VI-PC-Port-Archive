@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 from pathlib import Path
+import re
 import sqlite3
 import sys
 
@@ -32,7 +33,10 @@ def _protect_component(output: Path, sidecar: Path) -> None:
             raise ValueError(f"output would replace a component input: {name}")
 
 
-def export_kit(catalogue: Path, kit_id: int, index: Path, skeleton: Path, output: Path) -> dict:
+def export_kit(
+    catalogue: Path, kit_id: int, index: Path, skeleton: Path, output: Path, *,
+    model_sources: dict[int, ped_kit_parts.ModelSource] | None = None,
+) -> dict:
     """Resolve one catalogue selection against a read-only parts index and write a standalone GLB."""
     if output.suffix.lower() != ".glb":
         raise ValueError("output must have a .glb extension")
@@ -60,6 +64,10 @@ def export_kit(catalogue: Path, kit_id: int, index: Path, skeleton: Path, output
             raise ValueError(f"ambiguous selections for drawable {member.drawable_hash:016X} within one kit")
     if not selections:
         raise ValueError(f"kit 0x{kit_id:08x} has no drawable to export")
+    model_sources = model_sources or {}
+    for key in model_sources:
+        if key not in selections:
+            raise ValueError(f"--model-source drawable {key:016X} is not selected by kit 0x{kit_id:08x}")
 
     components = []
     appearances = []
@@ -68,9 +76,13 @@ def export_kit(catalogue: Path, kit_id: int, index: Path, skeleton: Path, output
         db.execute("PRAGMA trusted_schema=OFF")
         db.execute("BEGIN")  # use one snapshot for geometry and texture lookups
         for drawable, (albedo, normal, _extra) in selections.items():
-            sidecar = ped_kit_parts.component_path(db, drawable, textured=bool(albedo or normal))
+            sidecar = ped_kit_parts.component_path(
+                db, drawable, textured=bool(albedo or normal), source=model_sources.get(drawable)
+            )
             if output.exists():
                 _protect_component(output, sidecar)
+                if drawable in model_sources:
+                    ped_kit_parts.protect_model_exports(db, drawable, output)
             components.append(str(sidecar))
             for key in (albedo, normal):
                 if key and key not in images:
@@ -87,6 +99,31 @@ def export_kit(catalogue: Path, kit_id: int, index: Path, skeleton: Path, output
     return {"drawables": len(components), "textures": len(images), "triangles": stats["triangles"]}
 
 
+def _source_coordinate(text: str, field: str, minimum: int) -> int:
+    if not re.fullmatch(r"-?[0-9]+|0[xX][0-9a-fA-F]+", text):
+        raise ValueError(f"--model-source {field} must be a decimal or 0x-prefixed integer")
+    value = int(text, 16 if text.lower().startswith("0x") else 10)
+    if not minimum <= value <= 0x7fffffffffffffff:
+        raise ValueError(f"--model-source {field} must fit a signed 64-bit integer and be >= {minimum}")
+    return value
+
+
+def _model_sources(rows: list[list[str]]) -> dict[int, ped_kit_parts.ModelSource]:
+    sources = {}
+    for hash_text, archive, offset, drawable in rows:
+        if not re.fullmatch(r"(?:0[xX])?[0-9a-fA-F]{16}", hash_text):
+            raise ValueError("--model-source HASH must be 16 hexadecimal digits, optionally prefixed with 0x")
+        key = int(hash_text, 16)
+        if key in sources:
+            raise ValueError(f"duplicate --model-source for drawable {key:016X}")
+        sources[key] = (
+            archive,
+            _source_coordinate(offset, "OFFSET", 0),
+            _source_coordinate(drawable, "DRAWABLE", -1),
+        )
+    return sources
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("catalogue", type=Path, help="standalone PSIN or 0DRP ped catalogue")
@@ -94,9 +131,15 @@ def main(argv=None) -> int:
     parser.add_argument("--index", type=Path, required=True, help="SQLite database produced by viewer_parts_index.py")
     parser.add_argument("--skeleton", type=Path, required=True, help="decoded master skeleton directory or model.json")
     parser.add_argument("--out", type=Path, required=True, help="output skinned GLB")
+    parser.add_argument(
+        "--model-source", action="append", nargs=4, default=[], metavar=("HASH", "ARCHIVE", "OFFSET", "DRAWABLE"),
+        help="select an indexed physical model for a kit drawable (repeatable, exact archive key)",
+    )
     args = parser.parse_args(argv)
     try:
-        stats = export_kit(args.catalogue, args.id, args.index, args.skeleton, args.out)
+        stats = export_kit(
+            args.catalogue, args.id, args.index, args.skeleton, args.out, model_sources=_model_sources(args.model_source)
+        )
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"ped_kit_glb: {exc}", file=sys.stderr)
         return 2
