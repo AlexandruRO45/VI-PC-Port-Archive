@@ -58,7 +58,8 @@ Usage:
     python -I tools/sampler_source_census.py <work>/shaders/dxbc/disasm --expect-none other_base
         (exit 1 if an instruction falls in a listed class)
 
-A missing folder, an unreadable carve index and an unwritable --json each give one ERROR line and exit 2.
+A missing folder, an unreadable carve index, a --json that would overwrite an input the run reads and an
+unwritable --json each give one ERROR line and exit 2.
 """
 import argparse
 import json
@@ -72,6 +73,7 @@ import heap_index_census as hic  # noqa: E402
 import pool_workers  # noqa: E402
 import shader_ir  # noqa: E402
 import shader_meta  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 CLASSES = ("user_sgprs", "user_pointer", "literal", "other_base", "undetermined")
 ENDS = ("s_endpgm", "s_setpc_b64")           # no fall-through and no successor the listing names
@@ -594,11 +596,39 @@ def main(argv=None):
     if not os.path.isdir(args.disasm):
         print(f"ERROR: {args.disasm} is not a folder", file=sys.stderr)
         return 2
+    if args.json:
+        # The census is written last, after every listing and container has been read, so a report landing on
+        # the carve index or on one of the listings would silently destroy what the run just used.
+        index_path = os.path.join(os.path.dirname(os.path.abspath(args.disasm)), "index.json")
+        if same_report_path(args.json, index_path):
+            print(f"ERROR: --json would overwrite the carve index: {args.json}", file=sys.stderr)
+            return 2
+        disasm = os.path.realpath(args.disasm)
+        target = os.path.realpath(os.path.abspath(args.json))
+        try:
+            inside = os.path.commonpath([disasm, target]) == disasm
+        except ValueError:  # paths on different Windows drives
+            inside = False
+        if inside:
+            print(f"ERROR: --json must not write inside the disasm folder it reads: {args.json}", file=sys.stderr)
+            return 2
     try:
         stages = hic.stage_index(args.disasm)
     except (OSError, ValueError, KeyError, TypeError) as e:
         print(f"ERROR: cannot read the carve index next to {args.disasm}: {e}", file=sys.stderr)
         return 2
+    if args.json:
+        # Besides the carve index, the census reads each shader's listing, DXBC container and FSSM header. A
+        # report landing on one of those (or a hard link to it) would destroy an input the run just used, so
+        # refuse those names too.
+        parent = os.path.dirname(os.path.abspath(args.disasm))
+        for name in stages:
+            for path in (os.path.join(os.path.abspath(args.disasm), name + ".s"),
+                         os.path.join(parent, name + ".dxbc"),
+                         os.path.join(parent, "fssm", name + ".fssm")):
+                if same_report_path(args.json, path):
+                    print(f"ERROR: --json would overwrite an input the census reads: {path}", file=sys.stderr)
+                    return 2
     out = census(args.disasm, args.limit, args.jobs, stages)
     print_report(out)
     if args.json:
