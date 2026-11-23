@@ -145,7 +145,8 @@ def assemble(m, size, first, total):
         while pos < size and m[pos] == 0 and gap < MAX_GAP:
             pos += 1
             gap += 1
-        if gap >= MAX_GAP or not ZHDR.match(m, pos):
+        # At most MAX_GAP zero bytes: when the loop stops at the cap on another zero, ZHDR fails here.
+        if not ZHDR.match(m, pos):
             raise ValueError(
                 "only %d of %d declared bytes are in contiguous streams"
                 % (len(data), total)

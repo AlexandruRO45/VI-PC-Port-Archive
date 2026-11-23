@@ -61,12 +61,12 @@ def build_cache():
     return bytes(data)
 
 
-def build_archive(cache, drop_tail=False, tail=True):
+def build_archive(cache, drop_tail=False, tail=True, gap=5):
     body = bytearray()
     body += zlib.compress(b"noise" * 100)
     body += b"\x00"
     body += zlib.compress(cache[:SPLIT])
-    body += b"\x00" * 5
+    body += b"\x00" * gap
     if not drop_tail:
         body += zlib.compress(cache[SPLIT:])
         if tail:
@@ -142,6 +142,22 @@ class PsocacheExtractTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("of %d declared bytes" % CACHE_SIZE, p.stderr)
         self.assertNotIn("Traceback", p.stderr)
+
+    def test_up_to_one_mib_of_padding_between_streams(self):
+        # docs/pso_cache.md: the following streams are appended across "up to 1 MiB of zero padding".
+        with open(self.archive, "wb") as f:
+            f.write(build_archive(self.cache, gap=1 << 20))
+        p = run(self.archive, self.out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(self.out, "rb") as f:
+            self.assertEqual(f.read(), self.cache)
+        os.remove(self.out)
+        with open(self.archive, "wb") as f:
+            f.write(build_archive(self.cache, gap=(1 << 20) + 1))
+        p = run(self.archive, self.out)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("of %d declared bytes" % CACHE_SIZE, p.stderr)
+        self.assertFalse(os.path.exists(self.out))
 
     def test_output_outside_the_temp_directory_is_refused(self):
         outside = os.path.join(ROOT, "psocache_should_not_exist.bin")
