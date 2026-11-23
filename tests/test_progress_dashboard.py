@@ -151,6 +151,8 @@ class GpuLog(unittest.TestCase):
                                      [("cs_first", "verified"), ("ps_skip", "unknown"), ("cs_fail", "failed")])
                     self.assertEqual(col.components[-1]["detail"], "écart")
                     self.assertEqual((col.sources[0]["status"], col.sources[0]["records"]), ("ok", 3))
+                    metric = next(m for m in col.metrics if m["id"] == "gpu.current")
+                    self.assertEqual((metric["numerator"], metric["denominator"], metric["value"]), (1, 2, 0.5))
 
     def test_panel_groups_by_gpu_label(self):
         with tempfile.TemporaryDirectory() as tmp:
