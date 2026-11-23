@@ -101,6 +101,21 @@ class TestSLshlB32AST(unittest.TestCase):
         expr_zero = SLshlB32Expr(0, 10)
         self.assertEqual(expr_zero.eval(), (0, 0))
 
+class TestSLshlB32SCCAndMask(unittest.TestCase):
+    def test_scc_condition_code(self) -> None:
+        # Shift off all bits
+        res, scc = ref_s_lshl_b32(0x00000001, 31)
+        self.assertEqual((res, scc), (0x80000000, 1))
+        # High bit shifted out by another bit
+        res, scc = ref_s_lshl_b32(0x80000000, 1)
+        self.assertEqual((res, scc), (0, 0))
+
+    def test_shift_counts_boundary(self) -> None:
+        for sh in range(32):
+            res, scc = ref_s_lshl_b32(1, sh)
+            self.assertEqual(res, 1 << sh)
+            self.assertEqual(scc, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
