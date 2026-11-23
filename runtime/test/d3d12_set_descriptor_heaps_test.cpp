@@ -328,7 +328,9 @@ bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours) {
     CHECK(rt::d3d12::bound_descriptor_heap_bases(list.p, got_cbv, got_smp));
     CHECK(got_cbv == 0 && got_smp == 0);
 
-    // Direct heap indexing root-signature flags are preserved on RootArgumentLayout.
+    // Direct heap indexing root-signature flags are preserved on RootArgumentLayout. The heap-direct bits came with
+    // Shader Model 6.6 and Windows 10's built-in d3d12.dll predates them: it refuses to serialize them, so there this
+    // block is skipped instead of failing (root_signature_oracle probes for the same thing).
     D3D12_ROOT_PARAMETER p{};
     p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p.Constants = {0, 0, 2};
@@ -338,11 +340,15 @@ bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours) {
                           D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
     rs_desc.Desc_1_0 = {1, &p, 0, nullptr, di_flags};
     const auto blob = d3d12test::serialize_root_signature(rs_desc);
-    CHECK(!blob.empty());
-    Ptr<ID3D12RootSignature> root;
-    CHECK(SUCCEEDED(ours.device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p))));
-    const rt::d3d12::RootArgumentLayout* layout = rt::d3d12::root_signature_layout(root.p);
-    CHECK(layout && (layout->flags & di_flags) == di_flags);
+    if (blob.empty()) {
+        std::printf("SKIP: direct heap indexing root-signature flags: the host d3d12.dll can't serialize them "
+                    "(e.g. Windows 10)\n");
+    } else {
+        Ptr<ID3D12RootSignature> root;
+        CHECK(SUCCEEDED(ours.device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p))));
+        const rt::d3d12::RootArgumentLayout* layout = rt::d3d12::root_signature_layout(root.p);
+        CHECK(layout && (layout->flags & di_flags) == di_flags);
+    }
 
     CHECK(!rt::d3d12::bound_descriptor_heap_bases(nullptr, got_cbv, got_smp));
     return true;
