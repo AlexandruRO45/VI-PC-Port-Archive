@@ -92,6 +92,20 @@ class BufferStoreProbeTests(unittest.TestCase):
             self.assertNotIn(b"\r\n", raw)
             self.assertEqual(json.loads(raw.decode("utf-8"))["arch"], "gfx1035")
 
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with unittest.mock.patch.object(probe, "replace_retry",
+                                            side_effect=OSError(13, "Permission denied")):
+                err = probe.write_json_report(path, {"new": True})
+            self.assertIsNotNone(err)
+            self.assertIn("Permission denied", err)
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
     def test_write_json_oserror_returns_1_without_traceback(self):
         fake_oracle = unittest.mock.MagicMock(arch="gfx1035")
         fake_norm = {name: {"inst": {"exact": [0], "inputs": [0]}} for name, *_ in probe.NORM_FORMATS}
@@ -104,7 +118,8 @@ class BufferStoreProbeTests(unittest.TestCase):
                  unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"), \
                  unittest.mock.patch.object(probe, "probe_norm", return_value=fake_norm), \
                  unittest.mock.patch.object(probe, "probe_two_comp", return_value=fake_two), \
-                 unittest.mock.patch("builtins.open", side_effect=OSError("disk full")), \
+                 unittest.mock.patch.object(probe, "replace_retry",
+                                           side_effect=OSError(28, "disk full")), \
                  redirect_stdout(out), redirect_stderr(err):
                 rc = probe.main(["--waves", "32", "--json", out_path])
             self.assertEqual(rc, 1)

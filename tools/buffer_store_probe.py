@@ -20,14 +20,19 @@ import argparse
 import itertools
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 # (name, GFX10 format code, kind, x channel bits)
 NORM_FORMATS = (
@@ -325,16 +330,43 @@ def validate_json_path(path):
 
 
 def write_json_report(path, data):
-    """Create missing parent directories and write `data` as LF-terminated JSON, or return an error string."""
+    """Stage a complete report (or write a non-regular destination); return an error string on failure."""
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         try:
             os.makedirs(parent, exist_ok=True)
         except OSError as e:
             return f"cannot create directory for --json {path}: {e.strerror or e}"
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(data, f, indent=2)
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    try:
+        if mode is not None and not stat.S_ISREG(mode):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, indent=2)
+            return None
+        if mode is not None:
+            # Retain the direct writer's permission check without truncating the report.
+            os.close(os.open(destination, os.O_WRONLY))
+
+        staged = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", delete=False,
+            dir=parent, prefix=".buffer_store_probe-", suffix=".tmp",
+        )
+        try:
+            with staged:
+                json.dump(data, staged, indent=2)
+            if os.name != "nt":
+                os.chmod(staged.name, published_mode(destination))
+            replace_retry(staged.name, destination)
+        finally:
+            try:
+                os.unlink(staged.name)
+            except FileNotFoundError:
+                pass
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
     return None
