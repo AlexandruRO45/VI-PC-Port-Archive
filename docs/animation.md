@@ -924,6 +924,9 @@ state-machine and motion-tree hierarchy (**1,616** containers across the 324 res
 - A 64 MiB sample of `data.rpf` (6,359 streams, 3 XML-ish) yielded no animation catalog. Its strict keyword
   hits are dialogue or model/decal names; the five `ycd#` hits are part of a model hash table, not a container
   header.
+  Over the **whole** of `data.rpf` (28,509 streams, all inflated; 10 of them XML-ish) the answer is the same: no
+  stream contains `<ClipSet`, `<AnimData`, `ClipDictionary`, `.ycd`, `<Clips>` or `animdict`, and the only
+  animation-like string is `ycd#`, once in each of 13 streams, all of them `0DRP` resource pages rather than text.
 
 ## Likely format family
 
