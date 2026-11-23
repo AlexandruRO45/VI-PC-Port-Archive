@@ -49,6 +49,7 @@ from concurrent.futures import ProcessPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pool_workers  # noqa: E402
 import rdna2spirv  # noqa: E402
+import shader_ir  # noqa: E402
 import shader_meta  # noqa: E402
 
 STAGES = ("vs", "ps", "cs", "gs", "hs", "ds", "ms", "as")
@@ -294,7 +295,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("src", help="folder of .s listings (<work>/shaders/disasm)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--limit", type=shader_ir.positive_int,
+                    help="scan only the first N listings, sorted by name (N >= 1)")
     ap.add_argument("--json", help="write the summary here")
     ap.add_argument("--index-out", help="write {number: {stage, user_sgpr_reads}} for tools/user_sgpr_census.py")
     a = ap.parse_args(argv)
