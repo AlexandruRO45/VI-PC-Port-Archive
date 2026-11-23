@@ -17,6 +17,9 @@
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 //   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
 //             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
+//   slot 127  CreateCommittedResource3 (heap, flags, desc1, layout, clear, session, castable count/list, riid, out) ->
+//             PC ID3D12Device10::CreateCommittedResource3 (PC slot 76), with the Xbox layout word replaced and the
+//             Xbox flag bits dropped (RT-5 stop 15, docs/retail_boot_chain.md). E_NOTIMPL when the PC device lacks it.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
@@ -59,6 +62,7 @@
 
 #include <d3d12.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace rt::d3d12_xs {
@@ -102,6 +106,27 @@ void* device_proxy_primary(void* device);
 bool is_heap_proxy(const void* heap);
 ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap);
 
+// Console D3D12 descriptor heaps allocate their backing through XMem (allocator ID 0x80 = eXALLOCAllocatorId_D3D in
+// bits 16..23, object type 4 in the low 14 bits). A title that intercepts this allocation via __XMemAllocationHooks__
+// returns its own virtual address and expects GetCPUDescriptorHandleForHeapStart() to return that address.
+inline constexpr std::uint64_t kXmemDescriptorHeapAttributes = (0x80ULL << 16) | 4ULL;
+using DescriptorHeapBackingAlloc = void* (*)(std::size_t byte_size, std::uint64_t attributes);
+using DescriptorHeapBackingFree = void (*)(void* ptr, std::uint64_t attributes);
+// Committed resources take their memory through the same hooks. Measured locally at a title's call sites: around its
+// first full-screen render targets (device slot 127) the title installs an allocation hook that takes only allocations
+// whose page-size field (bits 14..15) is 2, bump-allocates them from an arena of a fixed size, and then asserts that
+// little of the arena is left unused, so a resource the hook never sees fails the check. The object type of a resource
+// allocation is not measured and is left 0; the allocator ID is the D3D one above.
+inline constexpr std::uint64_t kXmemCommittedResourceAttributes = (0x80ULL << 16) | (2ULL << 14);
+// Installs (or clears when both are null) the backing allocator consulted by CreateDescriptorHeap (slot 14) and by
+// CreateCommittedResource3 (slot 127).
+void set_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
+// Installs the default bridge (used by D3D12XboxCreateDevice) only when no explicit allocator has been set.
+void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
+// Translates a CPU descriptor handle from a title-backed descriptor heap to the underlying PC/Vulkan heap handle.
+// Returns `handle` unchanged when it does not fall inside any active custom-backed heap.
+D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+
 // Number of PC vtable slots the proxy forwards (detected from the interfaces the PC device supports).
 unsigned device_proxy_slot_count(const void* device);
 
@@ -109,8 +134,9 @@ unsigned device_proxy_slot_count(const void* device);
 ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70 and 76. Slot 10 is intentionally false: the
+// proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU
+// descriptor handle translation), 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
+// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76 and 127. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
