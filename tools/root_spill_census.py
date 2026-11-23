@@ -132,7 +132,7 @@ def main(argv=None):
         for other in (a.index, a.carve):
             if other and same_report_path(other, a.json):
                 ap.error("--json must not overwrite an input index")
-    with open(a.index, encoding="utf-8") as f:
+    with open(a.index, encoding="utf-8-sig") as f:  # an index saved with a UTF-8 BOM is still JSON
         index = json.load(f)
     if not isinstance(index, dict):
         ap.error(f"{a.index} is not a translator index (expected a JSON object)")
