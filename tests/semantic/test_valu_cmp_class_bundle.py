@@ -291,3 +291,29 @@ class TestCmpClassF16SIMDAndProperties(unittest.TestCase):
         val_norm_nomatch, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_ZERO | CLASS_NEG_ZERO, is_cmpx=False, test_id="norm_part")
         self.assertEqual(val_zero_match, 1)
         self.assertEqual(val_norm_nomatch, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f16 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestCmpClassF16NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 256)
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.SGPR, 106)
+
+    def test_boundary_extremes_hardware(self):
+        # Min subnormal f16: 0x0001 (+denorm)
+        val_denorm, _ = run_cmp_shader("f16", 0x0001, CLASS_POS_DENORM, is_cmpx=False, test_id="min_denorm")
+        self.assertEqual(val_denorm, 1)
+
+        # Max subnormal f16: 0x03FF (+denorm)
+        val_max_denorm, _ = run_cmp_shader("f16", 0x03FF, CLASS_POS_DENORM, is_cmpx=False, test_id="max_denorm")
+        self.assertEqual(val_max_denorm, 1)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        _, spv = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=False, test_id="lowering")
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpLogicalOr", spv)
