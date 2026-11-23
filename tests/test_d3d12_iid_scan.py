@@ -149,6 +149,37 @@ class IidScan(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("ERROR", p.stderr)
 
+    def test_cli_json_in_a_missing_directory_is_one_error_line(self):
+        dll = self.image("f.dll", b"MZ")
+        nested = os.path.join(self.tmp.name, "nodir", "r.json")
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
+                            "--header", self.header, "--json", nested], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("cannot write", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(nested))
+
+    def test_cli_readonly_json_is_one_error_line(self):
+        dll = self.image("g.dll", b"MZ")
+        ro = os.path.join(self.tmp.name, "ro.json")
+        with open(ro, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.chmod(ro, 0o444)
+        try:
+            try:
+                with open(ro, "a", encoding="utf-8"):
+                    pass
+                self.skipTest("the file is still writable (running as root, or Windows)")
+            except OSError:
+                pass
+            p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,
+                                "--header", self.header, "--json", ro], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("cannot write", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+        finally:
+            os.chmod(ro, 0o644)
+
 
 if __name__ == "__main__":
     unittest.main()
