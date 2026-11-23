@@ -319,6 +319,20 @@ class WorldIndexTest(unittest.TestCase):
         self.assertIn("ERROR:", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
+    def test_empty_file_is_an_error_not_an_empty_index(self):
+        # A 0-byte file is neither an RPF9 archive nor a carved 0x7a resource, and the other RPF9
+        # scanners (anim_index, rbf0_index, rpf9_carve, restofworld_index) print "<path>: empty
+        # file" and fail. world_index wrote files:1, resources:0 and exited 0, so a build script
+        # pointing at an empty or truncated file read the report as a valid empty world.
+        path = os.path.join(self.dir, "empty.rpf")
+        open(path, "wb").close()
+        out = os.path.join(self.dir, "empty.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out]), 2)
+        self.assertIn("empty file", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
     def test_rpf_scan_survives_a_damaged_candidate_continuation(self):
         blob = make_resource()
         partial = blob[:0x150]
