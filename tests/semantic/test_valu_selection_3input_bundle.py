@@ -114,5 +114,25 @@ class VMin3F32AstInterpreterTests(unittest.TestCase):
         regs["v0"] = res
         self.assertAlmostEqual(bits_to_f32(regs["v0"]), 1.5)
 
+class VMin3F32SimdBoundaryTests(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_min3_f32."""
+
+    def test_simd_divergent_lanes(self):
+        lanes = 64
+        src0 = [f32_to_bits(float(i)) for i in range(lanes)]
+        src1 = [f32_to_bits(float(lanes - i)) for i in range(lanes)]
+        src2 = [f32_to_bits(32.0) for _ in range(lanes)]
+        out = [ref_min3_f32_bits(s0, s1, s2) for s0, s1, s2 in zip(src0, src1, src2)]
+        for i in range(lanes):
+            expected = min(float(i), float(lanes - i), 32.0)
+            self.assertAlmostEqual(bits_to_f32(out[i]), expected)
+
+    def test_infinity_and_subnormals(self):
+        pos_inf = 0x7F800000
+        neg_inf = 0xFF800000
+        subnorm = 0x00000001
+        self.assertEqual(ref_min3_f32_bits(pos_inf, 0, subnorm), 0)
+        self.assertEqual(ref_min3_f32_bits(pos_inf, neg_inf, subnorm), neg_inf)
+
 if __name__ == "__main__":
     unittest.main()
