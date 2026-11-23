@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from report_paths import same_report_path
 from world_names import hash64
 
 
@@ -86,3 +88,16 @@ def texture_path(db: sqlite3.Connection, asset_key: int) -> Path:
         WHERE asset_key = ? AND status = 'ready' AND dds_path IS NOT NULL
     """, (key,), f"{label} ready TTPF DDS")
     return _existing_export(value, ".dds", label)
+
+
+def protect_indexed_glbs(db: sqlite3.Connection, output: Path) -> None:
+    """Refuse to replace indexed source geometry, including sources outside the kit."""
+    # The producer stores resolved, normcase paths. Check a direct match before probing
+    # other paths, which may be on offline volumes. Hard links still need samefile.
+    paths = db.execute("""
+        SELECT DISTINCT glb_path FROM model_exports WHERE glb_path IS NOT NULL
+        ORDER BY glb_path = ? DESC
+    """, (os.path.normcase(os.path.realpath(output)),))
+    for path, in paths:
+        if same_report_path(output, path):
+            raise ValueError(f"output would replace an indexed GLB: {path}")

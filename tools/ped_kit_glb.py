@@ -67,6 +67,8 @@ def export_kit(catalogue: Path, kit_id: int, index: Path, skeleton: Path, output
     with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("PRAGMA trusted_schema=OFF")
         db.execute("BEGIN")  # use one snapshot for geometry and texture lookups
+        if output.exists():
+            ped_kit_parts.protect_indexed_glbs(db, output)
         for drawable, (albedo, normal, _extra) in selections.items():
             sidecar = ped_kit_parts.component_path(db, drawable, textured=bool(albedo or normal))
             if output.exists():
@@ -106,4 +108,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # A redirected Windows console may not encode the output path.
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     raise SystemExit(main())
