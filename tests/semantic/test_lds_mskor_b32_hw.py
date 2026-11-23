@@ -516,5 +516,83 @@ class TestDSMskorB32BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res & exp_mask, new_exp)
 
 
+class TestDSMskorB32NegativeAndMutation(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            OffsetImmediate(-1)
+        with self.assertRaises(ValueError):
+            OffsetImmediate(0x10000)
+
+    def test_syntax_rejection_invalid_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            VGPR(256)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetMutant(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMskorInstruction) -> Tuple[Optional[int], int]:
+                no_off = DSMskorInstruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vmask=inst.vmask,
+                    vdata=inst.vdata,
+                    vdst=inst.vdst,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off)
+
+        lds = LDSMemory(num_dwords=1024)
+        lds.write_dword(0x10, 0x11111111)
+        lds.write_dword(0x20, 0x22222222)
+        state = ScalarThreadState(lds)
+        state.rf.set_vgpr(VGPR(1), 0x10)
+        state.rf.set_vgpr(VGPR(2), 0xFFFFFFFF)
+        state.rf.set_vgpr(VGPR(3), 0x99999999)
+
+        inst = DSMskorInstruction(
+            opcode=DSOpcode.DS_MSKOR_B32,
+            vaddr=VGPR(1),
+            vmask=VGPR(2),
+            vdata=VGPR(3),
+            offset=OffsetImmediate(0x10),
+        )
+        DroppedOffsetMutant().execute(state, inst)
+        self.assertEqual(lds.read_dword(0x10), 0x99999999)
+        self.assertEqual(lds.read_dword(0x20), 0x22222222)
+
+
+class TestDSMskorB32TranslatorIntegration(unittest.TestCase):
+    """Hardware translator integration: tools/rdna2spirv.py and spirv_mini_interp."""
+
+    TABLE = (  # (M, mask, data, want)
+        (0x12345678, 0x00FF0000, 0x00AA0000, 0x12AA5678),
+        (0xFFFFFFFF, 0x0F0F0F0F, 0x00000000, 0xF0F0F0F0),
+        (0x00000000, 0x0F0F0F0F, 0x0F0F0F0F, 0x0F0F0F0F),
+        (0xCAFEBABE, 0xFFFF0000, 0xDEAD0000, 0xDEADBABE),
+    )
+
+    def test_translator_one_operation_table(self) -> None:
+        for m, msk, d, want in self.TABLE:
+            for op in ("ds_mskor_rtn_b32", "ds_mskor_b32"):
+                with self.subTest(op=op, m=hex(m), msk=hex(msk), d=hex(d)):
+                    rtns, fin = L.run_chain([(op, 0x40, 0, (msk, d))], {0x40: m})
+                    expected_rtn = m if "_rtn_" in op else 0xDEAD
+                    self.assertEqual(rtns, [expected_rtn])
+                    self.assertEqual(fin, {0x40: want})
+
+    def test_translator_offset_addressing(self) -> None:
+        init = {0x40: 0x11111111, 0x54: 0x12345678}
+        rtns, fin = L.run_chain([("ds_mskor_rtn_b32", 0x40, 0x14, (0x0000FFFF, 0x0000AAAA))], init)
+        self.assertEqual(rtns, [0x12345678])
+        self.assertEqual(fin, {0x54: 0x1234AAAA})
+
+    def test_translator_rejects_malformed_syntax(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("bad_syntax", ["ds_mskor_b32 v1, v2"])
+
+
 if __name__ == "__main__":
     unittest.main()
