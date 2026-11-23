@@ -232,9 +232,9 @@ public:
         pi.pImageIndices = &image_index;
         std::lock_guard lock(submit_mutex_);
         if (!maintenance1_) {
-            // Without present fences, finish queued rendering before presenting. This avoids giving
-            // the presentation engine a semaphore that cannot be safely retired on resize or teardown.
-            if (fn_.queue_wait_idle(queue_) != VK_SUCCESS) return false;
+            // The offscreen blit's fence already covers all writes to the native image. A directly
+            // rendered image still needs the idle wait when no present fence can retire a semaphore.
+            if (!is_offscreen() && fn_.queue_wait_idle(queue_) != VK_SUCCESS) return false;
             const VkResult r = fn_.queue_present(queue_, &pi);
             return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
         }
@@ -297,9 +297,18 @@ public:
     }
 
 private:
+    bool submit_and_wait_for_blit(const VkSubmitInfo& submit) {
+        {
+            std::lock_guard lock(submit_mutex_);
+            if (fn_.queue_submit(queue_, 1, &submit, blit_fence_) != VK_SUCCESS) return false;
+        }
+        // Work on another queue may be needed to reach this fence. The swapchain owns the command
+        // buffer and fence, so their completion does not require the device-wide submission lock.
+        return fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    }
+
     bool transition_image_layout(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout) {
         if (!blit_cmd_ || !blit_fence_ || !img) return false;
-        std::lock_guard lock(submit_mutex_);
         if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS ||
             fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS)
             return false;
@@ -322,8 +331,7 @@ private:
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers = &blit_cmd_;
-        return fn_.queue_submit(queue_, 1, &si, blit_fence_) == VK_SUCCESS &&
-               fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        return submit_and_wait_for_blit(si);
     }
 
     void destroy_offscreen() {
@@ -417,7 +425,6 @@ private:
         // Transition newly created offscreen backbuffers to GENERAL so presenting an untouched buffer
         // never violates blit_to_swapchain's GENERAL -> TRANSFER_SRC_OPTIMAL transition.
         if (blit_cmd_ && blit_fence_ && !offscreen_images_.empty()) {
-            std::lock_guard lock(submit_mutex_);
             if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS ||
                 fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS) {
                 destroy_offscreen();
@@ -450,8 +457,7 @@ private:
             VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             si.commandBufferCount = 1;
             si.pCommandBuffers = &blit_cmd_;
-            if (fn_.queue_submit(queue_, 1, &si, blit_fence_) != VK_SUCCESS ||
-                fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+            if (!submit_and_wait_for_blit(si)) {
                 destroy_offscreen();
                 return false;
             }
@@ -464,7 +470,6 @@ private:
             acquired_index_ >= images_.size())
             return false;
         const VkImage dst_image = images_[acquired_index_];
-        std::lock_guard lock(submit_mutex_);
         if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS) return false;
         if (fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS) return false;
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -542,8 +547,7 @@ private:
         }
         si.commandBufferCount = 1;
         si.pCommandBuffers = &blit_cmd_;
-        if (fn_.queue_submit(queue_, 1, &si, blit_fence_) != VK_SUCCESS) return false;
-        return fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        return submit_and_wait_for_blit(si);
     }
 
     bool rebuild(std::uint32_t width, std::uint32_t height, VkFormat preferred_format, std::uint32_t buffer_count) {

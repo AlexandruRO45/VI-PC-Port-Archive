@@ -9,8 +9,10 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
 #include "vulkan_loader.h"
+#include "window_station.h"
 #include "../src/vulkan_device_filter.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -27,8 +29,8 @@ int fail(const char* what) {
     return 1;
 }
 
-unsigned& validation_errors() {
-    static unsigned count = 0;
+std::atomic<unsigned>& validation_errors() {
+    static std::atomic<unsigned> count{0};
     return count;
 }
 
@@ -63,6 +65,82 @@ bool wait_fence(ID3D12Fence* fence, UINT64 value) {
     const DWORD w = WaitForSingleObject(ev, 5000);
     CloseHandle(ev);
     return w == WAIT_OBJECT_0;
+}
+
+PFN_vkGetInstanceProcAddr test_instance_proc = nullptr;
+PFN_vkGetDeviceProcAddr test_device_proc = nullptr;
+PFN_vkWaitForFences test_wait_for_fences = nullptr;
+thread_local HANDLE present_wait_started = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL observe_fence_wait(VkDevice device, std::uint32_t count, const VkFence* fences,
+                                                 VkBool32 all, std::uint64_t timeout) {
+    if (present_wait_started) SetEvent(present_wait_started);
+    return test_wait_for_fences(device, count, fences, all, timeout);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL observe_device_proc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkWaitForFences") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(observe_fence_wait);
+    return test_device_proc(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL observe_instance_proc(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkGetDeviceProcAddr") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(observe_device_proc);
+    return test_instance_proc(instance, name);
+}
+
+bool check_present_allows_other_queue(VkDevice device, VkQueue blocked, IDXGISwapChain3* swapchain,
+                                      ID3D12CommandQueue* independent, ID3D12Fence* completion) {
+    const auto create = reinterpret_cast<PFN_vkCreateSemaphore>(test_device_proc(device, "vkCreateSemaphore"));
+    const auto destroy = reinterpret_cast<PFN_vkDestroySemaphore>(test_device_proc(device, "vkDestroySemaphore"));
+    const auto submit = reinterpret_cast<PFN_vkQueueSubmit>(test_device_proc(device, "vkQueueSubmit"));
+    const auto signal = reinterpret_cast<PFN_vkSignalSemaphore>(test_device_proc(device, "vkSignalSemaphore"));
+    const auto wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(test_device_proc(device, "vkDeviceWaitIdle"));
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    VkSemaphore gate = VK_NULL_HANDLE;
+    if (create(device, &info, nullptr, &gate) != VK_SUCCESS) return false;
+
+    const HANDLE started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const HANDLE submitted = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const std::uint64_t value = 1;
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.waitSemaphoreValueCount = 1;
+    timeline.pWaitSemaphoreValues = &value;
+    VkSubmitInfo wait{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+    wait.waitSemaphoreCount = 1;
+    wait.pWaitSemaphores = &gate;
+    wait.pWaitDstStageMask = &stage;
+    bool progressed = false;
+    if (started && submitted && submit(blocked, 1, &wait, VK_NULL_HANDLE) == VK_SUCCESS) {
+        HRESULT presented = E_FAIL, signalled = E_FAIL;
+        std::thread presenter([&] {
+            present_wait_started = started;
+            presented = swapchain->Present(0, 0);
+        });
+        const bool waiting = WaitForSingleObject(started, 2000) == WAIT_OBJECT_0;
+        std::thread other_queue([&] {
+            signalled = independent->Signal(completion, value);
+            SetEvent(submitted);
+        });
+        const bool other_submitted = WaitForSingleObject(submitted, 2000) == WAIT_OBJECT_0;
+        VkSemaphoreSignalInfo release{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        release.semaphore = gate;
+        release.value = value;
+        const VkResult released = signal(device, &release);
+        presenter.join();
+        other_queue.join();
+        const VkResult drained = wait_idle(device);
+        progressed = waiting && other_submitted && released == VK_SUCCESS && SUCCEEDED(presented) &&
+                     drained == VK_SUCCESS && SUCCEEDED(signalled) && wait_fence(completion, value);
+    }
+    if (submitted) CloseHandle(submitted);
+    if (started) CloseHandle(started);
+    destroy(device, gate, nullptr);
+    return progressed;
 }
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) { return DefWindowProcW(hwnd, msg, wp, lp); }
@@ -308,6 +386,11 @@ int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, 
 }
 
 int main() {
+    if (!has_interactive_window_station()) {
+        // The host answers DXGI_ERROR_NOT_CURRENTLY_AVAILABLE to every CreateSwapChainForHwnd there: nothing to compare.
+        std::printf("SKIP: the process has no interactive window station\n");
+        return 77;  // ctest skips
+    }
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
     if (!gipa) {
         std::printf("SKIP: vulkan-1.dll not available\n");
@@ -455,6 +538,9 @@ int main() {
 
     VkDevice vk_dev = VK_NULL_HANDLE;
     if (create_dev(physical, &dci, nullptr, &vk_dev) != VK_SUCCESS) return fail("vkCreateDevice");
+    test_instance_proc = gipa;
+    test_device_proc = gdpa;
+    test_wait_for_fences = reinterpret_cast<PFN_vkWaitForFences>(gdpa(vk_dev, "vkWaitForFences"));
     const auto destroy_dev = reinterpret_cast<PFN_vkDestroyDevice>(gdpa(vk_dev, "vkDestroyDevice"));
     const auto wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(gdpa(vk_dev, "vkDeviceWaitIdle"));
     VkQueue vk_queue = VK_NULL_HANDLE;
@@ -462,7 +548,7 @@ int main() {
     get_queue(vk_dev, family, 0, &vk_queue);
 
     rt::d3d12::VulkanDeviceInfo info{};
-    info.get_instance_proc = gipa;
+    info.get_instance_proc = observe_instance_proc;
     info.instance = instance;
     info.physical = physical;
     info.device = vk_dev;
@@ -554,6 +640,24 @@ int main() {
     IDXGISwapChain3* sc = nullptr;
     if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return fail("QI IDXGISwapChain3");
     sc1->Release();
+
+    if (queue_count > 1) {
+        ID3D12CommandQueue* independent = nullptr;
+        ID3D12Fence* completion = nullptr;
+        VkQueue rendering_handle = VK_NULL_HANDLE, independent_handle = VK_NULL_HANDLE;
+        std::uint32_t ignored_family = 0;
+        if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&independent))) ||
+            FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion))) ||
+            !rt::d3d12::get_direct_vulkan_queue(queue, rendering_handle, ignored_family) ||
+            !rt::d3d12::get_direct_vulkan_queue(independent, independent_handle, ignored_family) ||
+            rendering_handle == independent_handle)
+            return fail("create distinct D3D12 queues for blocked Present test");
+        const bool progressed = check_present_allows_other_queue(vk_dev, rendering_handle, sc, independent, completion);
+        completion->Release();
+        independent->Release();
+        if (!progressed) return fail("unrelated queue could not submit while Present waited on its blit fence");
+        std::puts("independent Vulkan queue submitted while Present waited on its blit fence");
+    }
 
     // DXGI reports the BufferCount the app created with, never a larger native/Vulkan image count (D3D-389).
     {
@@ -1999,7 +2103,7 @@ int main() {
     destroy_inst(instance, nullptr);
 
     if (validation_errors() != 0) {
-        std::fprintf(stderr, "FAIL: %u Vulkan validation errors\n", validation_errors());
+        std::fprintf(stderr, "FAIL: %u Vulkan validation errors\n", validation_errors().load());
         return 1;
     }
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
