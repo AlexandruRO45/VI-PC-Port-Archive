@@ -94,8 +94,6 @@ _SDWA_SELS = {
 _SDWA_UNUSED = {0: "UNUSED_PAD", 1: "UNUSED_SEXT", 2: "UNUSED_PRESERVE"}
 _OMOD_MODS = {1: "mul:2", 2: "mul:4", 3: "div:2"}
 
-_DS_2ADDR = tuple(f"ds_{op}{st}_" for op in ("read2", "write2", "wrxchg2") for st in ("", "st64"))
-
 _HWREG_NAMES = {
     1: "HW_REG_MODE",
     2: "HW_REG_STATUS",
@@ -314,6 +312,9 @@ def _format_dpp16_ctrl(ctrl: int) -> str:
     if 0x160 <= ctrl <= 0x16F:
         return f"row_xmask:{ctrl - 0x160}"
     return f"dpp_ctrl:0x{ctrl:x}"
+
+
+_DS_2ADDR = tuple(f"ds_{op}{st}_" for op in ("read2", "write2", "wrxchg2") for st in ("", "st64"))
 
 
 def _format_ds_swizzle(offset16: int) -> str:
