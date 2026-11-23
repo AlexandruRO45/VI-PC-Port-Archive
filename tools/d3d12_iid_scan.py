@@ -13,9 +13,11 @@ positive control: they match the objects the image is known to create.
 It prints interface names and counts only, no bytes of the image.
 
 Usage:
-    python -I tools/d3d12_iid_scan.py <image> [<image> ...] [--header PATH/d3d12.h] [--json OUT]
+    python -I tools/d3d12_iid_scan.py <image> [<image> ...] [--header PATH/d3d12.h] [--no-builtin] [--json OUT]
 
-Without --header it takes d3d12.h from the newest Windows SDK under "Windows Kits\10\Include".
+Without --header it reads d3d12.h from the newest Windows SDK under "Windows Kits\10\Include" and adds any built-in
+console/D3D12 IIDs from tools/d3d12_xs_surface.py (such as ID3D12ConsDmaCommandList), falling back to the built-in
+table alone when no SDK header is installed (pass --no-builtin to require a header).
 It also lists what each image imports from d3d12_xs.dll and warns when one of those imports could be IID data (an
 IID_* name, or an ordinal in the GUID range 23-115), because an IID taken from there would not show up here.
 """
@@ -56,6 +58,19 @@ def read_iids(header: str) -> dict[str, uuid.UUID]:
     with open(header, encoding="utf-8", errors="replace") as f:
         text = f.read()
     return {name: uuid.UUID(guid) for guid, name in MIDL.findall(text)}
+
+
+def builtin_iids() -> dict[str, uuid.UUID]:
+    """Built-in ID3D12* IIDs from tools/d3d12_xs_surface.py (standard + Xbox console interfaces)."""
+    import d3d12_xs_surface
+
+    out: dict[str, uuid.UUID] = {}
+    for source in (d3d12_xs_surface.STANDARD_GUIDS, d3d12_xs_surface.CONSOLE_IIDS):
+        for name, guid in source.items():
+            clean = name[4:] if name.startswith("IID_") else name
+            if clean.startswith("ID3D12"):
+                out[clean] = uuid.UUID(bytes_le=struct.pack("<IHH8B", *guid))
+    return out
 
 
 def d3d12_xs_imports(data: bytes) -> list[str] | None:
@@ -142,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("images", nargs="+")
     ap.add_argument("--header", help="d3d12.h to read the IIDs from (default: newest Windows SDK)")
+    ap.add_argument("--no-builtin", action="store_true",
+                    help="do not use the built-in ID3D12 IID table from d3d12_xs_surface.py")
     ap.add_argument("--json", help="also write the result here")
     args = ap.parse_args(argv)
     if args.json:
@@ -152,18 +169,25 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"ERROR: --json would overwrite {what}: {other}", file=sys.stderr)
                 return 2
     header = args.header or default_header()
-    if not header or not os.path.isfile(header):
+    if header and os.path.isfile(header):
+        try:
+            sdk_iids = read_iids(header)
+        except OSError as e:
+            print(f"ERROR: cannot read {header}: {e.strerror or e}", file=sys.stderr)
+            return 2
+        if not sdk_iids:
+            print(f"ERROR: no ID3D12 MIDL_INTERFACE declarations in {header}", file=sys.stderr)
+            return 2
+        iids = sdk_iids if (args.header or args.no_builtin) else {**builtin_iids(), **sdk_iids}
+        header_label = os.path.basename(header)
+        print(f"{len(iids)} ID3D12 IIDs from {header}")
+    elif args.header or args.no_builtin:
         print("ERROR: d3d12.h not found; pass --header", file=sys.stderr)
         return 2
-    try:
-        iids = read_iids(header)
-    except OSError as e:
-        print(f"ERROR: cannot read {header}: {e.strerror or e}", file=sys.stderr)
-        return 2
-    if not iids:
-        print(f"ERROR: no ID3D12 MIDL_INTERFACE declarations in {header}", file=sys.stderr)
-        return 2
-    print(f"{len(iids)} ID3D12 IIDs from {header}")
+    else:
+        iids = builtin_iids()
+        header_label = "builtin"
+        print(f"{len(iids)} ID3D12 IIDs from built-in table (d3d12_xs_surface.py)")
     results = []
     for path in args.images:
         try:
@@ -184,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         try:
             with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"header": os.path.basename(header), "iids": len(iids), "images": results}, f, indent=2)
+                json.dump({"header": header_label, "iids": len(iids), "images": results}, f, indent=2)
                 f.write("\n")
         except OSError as e:
             print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)

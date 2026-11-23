@@ -1,4 +1,6 @@
 """tools/d3d12_iid_scan.py on a hand-written header and hand-built PE images (no game files, no SDK needed)."""
+import contextlib
+import io
 import json
 import os
 import struct
@@ -6,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -239,6 +242,41 @@ class IidScan(unittest.TestCase):
         self.assertIn("--json would overwrite", p.stderr)
         with open(self.header, "rb") as f:
             self.assertEqual(f.read(), before)
+
+    def test_builtin_iids_covers_focus_and_console_interface(self):
+        iids = scan.builtin_iids()
+        self.assertGreaterEqual(len(iids), 29)
+        for name in scan.FOCUS:
+            self.assertIn(name, iids)
+        self.assertIn("ID3D12ConsDmaCommandList", iids)
+        self.assertTrue(all(isinstance(v, uuid.UUID) for v in iids.values()))
+
+    def test_cli_falls_back_to_builtin_iids_without_header(self):
+        builtin = scan.builtin_iids()
+        dll = self.image("builtin.dll", pe32plus({}, QUEUE.bytes_le + builtin["ID3D12ConsDmaCommandList"].bytes_le))
+        out = os.path.join(self.tmp.name, "builtin.json")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(scan, "default_header", return_value=None):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = scan.main([dll, "--json", out])
+        self.assertEqual(rc, 0, stderr.getvalue())
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["header"], "builtin")
+        self.assertEqual(data["iids"], len(builtin))
+        found = data["images"][0]["found"]
+        self.assertIn("ID3D12CommandQueue", found)
+        self.assertIn("ID3D12ConsDmaCommandList", found)
+        self.assertIs(data["images"][0]["focus"]["ID3D12CommandQueue"], True)
+
+    def test_cli_no_builtin_without_sdk_fails_cleanly(self):
+        dll = self.image("nobuiltin.dll", b"MZ")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(scan, "default_header", return_value=None):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = scan.main([dll, "--no-builtin"])
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: d3d12.h not found", stderr.getvalue())
 
 
 if __name__ == "__main__":
