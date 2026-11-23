@@ -987,7 +987,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
-                      "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
+                      "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_structured", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
                       "cs_mask_vgpr_exec"):
@@ -1067,6 +1067,8 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
                 "cs_w64x_andn2_exec": [1, 16, 32, 4144, 2052, 3, 8, 1544],   # s_andn2_saveexec/wrexec_b64 (.asm header)
                 "cs_w64x_saveexec_b64": [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171],   # .asm header
+                # a cross-lane exchange inside a wave-wide branch (the structured emulation plan, .asm header)
+                "cs_w64x_structured": [100, 100, 7, 2, 8, 8, 16, 16],
                 "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],     # wave32: needs 32 lanes
                 # SHADER-91: s_barrier sites in different wave-uniform branches meet (cs_barrier_divergent.asm)
                 "cs_barrier_divergent": [127, 126, 125, 124, 123, 122, 121, 120],
