@@ -140,5 +140,17 @@ class VCvtPkrtzF16F32AstTests(unittest.TestCase):
         self.assertEqual(ast.src0.index, 1)
         self.assertEqual(ast.src1.index, 2)
 
+def interpret_cvt_pkrtz_f16_f32(src0_val: int, src1_val: int) -> int:
+    return ref_cvt_pkrtz_f16_f32(src0_val, src1_val)
+
+
+class VCvtPkrtzF16F32ScalarInterpreterTests(unittest.TestCase):
+    def test_scalar_execution(self):
+        s0 = f32_to_bits(1.5)
+        s1 = f32_to_bits(-2.5)
+        res = interpret_cvt_pkrtz_f16_f32(s0, s1)
+        expected = (ref_f32_to_f16_rtz(-2.5) << 16) | ref_f32_to_f16_rtz(1.5)
+        self.assertEqual(res, expected)
+
 if __name__ == '__main__':
     unittest.main()
