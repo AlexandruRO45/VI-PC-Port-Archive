@@ -465,8 +465,8 @@ class ConstantsAndLiteralsOpSelTests(unittest.TestCase):
             ("i16_opsel_const", ["v_cmp_lt_i16_e64 s4, v1, -1 op_sel:[0,1]", "v_cndmask_b32_e64 v0, 0, 1, s4", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]),
             ("cmpx_f16_wave64", ["v_cmpx_lt_f16_e64 v1, v2 op_sel:[1,0]", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]),
         ]
-          if not shutil.which("spirv-as") or not shutil.which("spirv-val"):
-        self.skipTest("spirv-as or spirv-val not in PATH")
+        if not shutil.which("spirv-as") or not shutil.which("spirv-val"):
+            self.skipTest("spirv-as or spirv-val not in PATH")
       
         with tempfile.TemporaryDirectory() as tmp:
             for tag, lines in cases:
