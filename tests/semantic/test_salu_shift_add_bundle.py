@@ -82,6 +82,22 @@ class TestSLshl1AddU32Oracle(unittest.TestCase):
         # 0x80000000 << 1 + 5 = 0x100000005 -> res 5, scc 1
         self.assertEqual(ref_s_lshl_add_u32(1, 0x80000000, 5), (5, 1))
 
+class SLshl1AddU32Expr(ASTNode):
+    def __init__(self, src0: int, src1: int) -> None:
+        self.src0 = src0
+        self.src1 = src1
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_lshl_add_u32(1, self.src0, self.src1)
+
+
+class TestSLshl1AddU32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SLshl1AddU32Expr(100, 20)
+        self.assertEqual(expr.eval(), (220, 0))
+        expr_ovf = SLshl1AddU32Expr(0x80000000, 1)
+        self.assertEqual(expr_ovf.eval(), (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
