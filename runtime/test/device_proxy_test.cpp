@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
     // the call must be refused (E_NOTIMPL), not land on a null pointer past the end of the table.
     {
         using ConsoleFn = HRESULT(WINAPI*)(void*, UINT64, UINT64, UINT64, UINT64, UINT64, UINT64);
-        for (unsigned slot : {128u, 133u, 255u}) {
+        for (unsigned slot : {128u, 134u, 255u}) {
             check(proxy_vtbl[slot] != nullptr, "the proxy table has an entry for a console slot past 128");
             void* out = nullptr;
             const HRESULT console_hr = reinterpret_cast<ConsoleFn>(proxy_vtbl[slot])(
