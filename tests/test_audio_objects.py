@@ -99,6 +99,18 @@ class AudioObjectsTest(unittest.TestCase):
         _, s = self.run_join()
         self.assertEqual(s["with_one_entry"], 0)
 
+    def test_unequal_v_words_are_reported(self):
+        # value_repeated compares the words at +16 and +20; an entry whose two V words differ must say so.
+        self.write("000000001000.bin", self.records_stream())
+        odd = b"".join(entry(a, 0xC0000000 + i) if i % 2 else
+                       struct.pack("<6I", 0x800, 0, 2, a, 0xC0000000 + i, 0xD0000000 + i)
+                       for i, (_, a, _) in enumerate(RECS))
+        self.write("000000002000.bin", bytes(12) + odd + bytes(12))
+        rows, s = self.run_join()
+        self.assertEqual(s["with_one_entry"], 4)
+        self.assertEqual(s["value_repeated"], 2)
+        self.assertEqual([r["value_repeated"] for r in rows], [False, True, False, True])
+
     def test_shared_values_are_counted(self):
         self.write("000000001000.bin", self.records_stream())
         shared = b"".join(entry(a, 0xE0000000) for _, a, _ in RECS)

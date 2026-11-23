@@ -265,13 +265,17 @@ On the measured package:
 
 - **1,589 of 1,589** records have exactly one entry; none has zero or two. The two `V` words are equal
   in all 1,589.
-- The entries sit in two streams, 1,357 and 232, one after another with no gap. The table continues
-  across the stream boundary: the first stream's last entry ends at its last byte and the second
-  stream starts with the next entry's flags.
+- The music entries sit in two streams, 1,357 and 232, inside a table of same-shape 24-byte entries
+  (flags a multiple of `0x800`, `kind` <= 15, the two `V` words equal) that has no gap: between the
+  first and last music entry, the first stream holds 2,468 such entries and the second 401, so 1,111
+  and 169 of them (1,280 in all) are keyed by something other than a music record's hash A. Every
+  distance between neighbouring music entries is a multiple of 24 bytes, the largest 2,136. The table
+  continues across the stream boundary: the first stream's last music entry ends at its last byte and
+  the second stream's first one is at offset 0.
 - `flags` is `0x800` on 1,563 entries; the rest are other multiples of `0x800` up to `0x6000`.
   `kind` is 2 on 1,561, 0 on 27 and 4 on 1. The `+4` word takes three values.
-- 1,515 of 1,587 neighbouring entries have ascending record ids, so the table broadly follows the
-  record order.
+- 1,515 of 1,587 neighbouring music entries (up to 89 slots apart) have ascending record ids, so the
+  music entries broadly follow the record order.
 - 1,350 distinct `V` values: 158 are shared, by up to 10 entries. No `V` equals a record's hash A or
   hash B.
 
@@ -291,8 +295,8 @@ or another encoding:
 - **A content-id table.** No word in the content-id band `0x2822`-`0x29A6` lies within four words of
   a record's hash A or hash B. The config does not store a content id next to the record it means, so
   the per-range base above stays the only link from a content id to a record.
-- **The hash-A table as a playlist.** Its order follows the record ids (1,515 of 1,587 neighbours
-  ascending), and no entry field has anywhere near one value per station for the 19 descriptors:
+- **The hash-A table as a playlist.** Its music entries follow the record ids (1,515 of 1,587
+  neighbouring music entries ascending, with other entries between them), and no entry field has anywhere near one value per station for the 19 descriptors:
   `+4` takes 3 values, `kind` 3, `flags` 8 and `V` 1,350.
 
 So the VCRR anchor is still the only measured station-to-record mapping. The other stations need a

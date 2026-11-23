@@ -11,9 +11,10 @@ little-endian u32:
     +16  value V    not decoded; it is not a record's hash A or hash B
     +20  value V    the same word again
 
-The entries follow one another with no gap, and a table can continue from one carved stream into the next:
-an entry ends exactly at a stream's end and the following stream starts with the next entry's flags. The
-entries broadly follow ascending record id and a V value can be shared by several entries. Looked for as
+The table has no gap, but its music entries are interleaved with other entries of the same shape that hold
+something other than a music record's hash A; it can continue from one carved stream into the next (an entry
+ends exactly at a stream's end and the following stream starts with the next entry's flags). The music entries
+broadly follow ascending record id and a V value can be shared by several entries. Looked for as
 direct u32 lists, the config does not list the music records by these values; indirect references or other
 encodings were not ruled out. See docs/radio_stations.md ("Hash A entries") for the counts on the measured
 package.
