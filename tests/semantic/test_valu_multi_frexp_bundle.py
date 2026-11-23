@@ -163,5 +163,51 @@ class VFrexpExpI16F16OracleTests(unittest.TestCase):
         # NaN -> 0
         self.assertEqual(oracle_frexp_exp_i16_f16(0x7E00), 0)
 
+class RegKind(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class ValuInstructionAST:
+    mnemonic: str
+    dst: Operand
+    src0: Operand
+    src1: Operand | None = None
+    src2: Operand | None = None
+
+
+class WavefrontSimdState:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.exec_mask: int = (1 << lane_count) - 1
+        self.vgprs = [[0] * 64 for _ in range(lane_count)]
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int):
+        self.vgprs[lane][reg_idx] = val & MASK32
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx] & MASK32
+
+class VFrexpExpI16F16AstInterpreterTests(unittest.TestCase):
+    def test_frexp_exp_f16_ast_construction(self):
+        ast = ValuInstructionAST("v_frexp_exp_i16_f16", Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 1))
+        self.assertEqual(ast.mnemonic, "v_frexp_exp_i16_f16")
+        self.assertEqual(ast.dst.index, 0)
+        self.assertEqual(ast.src0.index, 1)
+
+    def test_frexp_exp_f16_scalar_execution(self):
+        # -1.0 (0xBC00) -> exp = 1
+        res = oracle_frexp_exp_i16_f16(0xBC00)
+        self.assertEqual(res, 1)
+
 if __name__ == "__main__":
     unittest.main()
