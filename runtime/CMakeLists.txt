@@ -2211,6 +2211,7 @@ if(TARGET Vulkan::Headers)
       add_test(NAME vk_bindless_ps_imgatomic COMMAND vk_bindless_test ${LEONIDA_BINDLESS_DIR}/spirv/vs_ids.spv
                ${LEONIDA_BINDLESS_DIR}/spirv/ps_imgatomic.spv)
       set_tests_properties(vk_bindless_ps_tex vk_bindless_ps_imgatomic PROPERTIES SKIP_RETURN_CODE 77)
+      leonida_utf8_code_page(vk_bindless_test)
 
       # M2: a textured quad. vs_m2.asm and ps_m2.asm (the PS samples a T#/S# it loads from two descriptor tables) go
       # through the same build; the test creates the heaps, the SRV, the sampler and the root signature through the
