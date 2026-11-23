@@ -796,7 +796,7 @@ int main() {
                     const float got = sampled[i * 4 + c];
                     const float exp_v = want.float32[c];
                     const float tol = std::max(1e-6f, std::fabs(exp_v) * 1e-5f);
-                    if (std::fabs(got - exp_v) > tol) {
+                    if (!(std::fabs(got - exp_v) <= tol)) {
                         std::fprintf(stderr, "bindless sample texel %u ch %u: got %g, want %g (word 0x%08x)\n",
                                      i, c, got, exp_v, want_word);
                         return 1;
