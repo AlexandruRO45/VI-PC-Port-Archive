@@ -106,6 +106,36 @@ class Evaluate(unittest.TestCase):
         self.assertTrue(rows[1][4])
 
 
+class CliProfiles(unittest.TestCase):
+    def invoke(self, *args):
+        import subprocess
+        return subprocess.run(
+            [sys.executable, "-I", pc.__file__, *args, "--cpu", "AMD Ryzen 9 7950X",
+             "--gpu", "NVIDIA GeForce RTX 4090", "--ram", "64"],
+            capture_output=True, timeout=30,
+        )
+
+    def test_out_of_range_profiles_are_usage_errors(self):
+        for mode in (("--cli",), ("--check", "--json")):
+            for profile in (0, len(pc.PROFILES) + 1):
+                with self.subTest(mode=mode, profile=profile):
+                    result = self.invoke(*mode, "--profile", str(profile))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertIn(b"--profile", result.stderr)
+
+    def test_valid_and_default_profiles_in_json(self):
+        import json
+        for profile, name in enumerate(pc.PROFILES, 1):
+            with self.subTest(profile=profile):
+                result = self.invoke("--check", "--json", "--profile", str(profile))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["profile"], name)
+        default = self.invoke("--check", "--json")
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertEqual(json.loads(default.stdout)["profile"], next(iter(pc.PROFILES)))
+
+
 class Api(unittest.TestCase):
     GOOD = ("AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 32)
     WEAK = ("Intel Core i3-10100F", "NVIDIA GeForce GTX 1650", 8)
