@@ -288,6 +288,14 @@ readable `.spv`, every entry has to be reached, and in containers with more than
 payload may be the indexed program. Without `LEONIDA_SHADERS` it prints `SKIP` (CTest reports it as skipped).
 It prints counts only; on the 1.0.2.1 corpus all 26,503 containers resolve.
 
+The Vulkan device bounds the host memory of its compute-pipeline compiles (`src/compile_gate.h`, tested by
+`compile_gate_test`). A large module can take about a kilobyte of host commit per byte of SPIR-V while the driver
+compiles it, and the retail title starts many at once on its job threads, so unbounded they can exhaust a 16-32 GB
+machine and the driver fails them. Each compile waits until its estimated weight (1 KiB per byte of SPIR-V, at least
+64 MiB) fits in a budget: half the free physical memory at the first compile, at least 2 GiB. A compile is always
+admitted when none is in flight, and waiters go in arrival order. `LEONIDA_COMPILE_BUDGET_MIB=<MiB>` sets the budget;
+`0` turns the gate off. The first wait logs the budget once.
+
 ## Current limits
 
 `gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its

@@ -23,6 +23,7 @@
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/compile_gate.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
@@ -66,6 +67,19 @@ constexpr UINT kDescriptorSize = descriptor_size;
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
 constexpr VkDeviceSize kArenaReserved = 64 * 1024;
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
+
+// One gate for every device in the process: the driver's compile memory comes out of the same host commit. The
+// budget is read once, on the first compute compile, from LEONIDA_COMPILE_BUDGET_MIB or the free physical memory.
+leonida::CompileGate& compute_compile_gate() {
+    static leonida::CompileGate gate([] {
+        MEMORYSTATUSEX status{sizeof(status)};
+        const std::uint64_t available = GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
+        char env[32] = {};
+        const DWORD got = GetEnvironmentVariableA("LEONIDA_COMPILE_BUDGET_MIB", env, sizeof(env));
+        return leonida::compile_budget(got > 0 && got < sizeof(env) ? env : nullptr, available);
+    }());
+    return gate;
+}
 
 // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
 // game's shaders arrive as SPIR-V from the offline translator, and the only DXIL path (the BVH builder) is lowered
@@ -3852,9 +3866,23 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
-            return E_FAIL;
+        {
+            // The title creates these on several job threads at once; the gate keeps the driver's compile memory
+            // inside a budget (src/compile_gate.h, LEONIDA_COMPILE_BUDGET_MIB).
+            const leonida::CompileGate::Ticket ticket =
+                compute_compile_gate().enter(leonida::compile_weight(module_info.codeSize));
+            if (ticket.waited()) {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: compute compiles wait for a %llu MiB host-memory budget "
+                                 "(LEONIDA_COMPILE_BUDGET_MIB; 0 turns the gate off)\n",
+                                 static_cast<unsigned long long>(compute_compile_gate().budget() >> 20));
+            }
+            if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                            &pipeline_.pipeline) != VK_SUCCESS)
+                return E_FAIL;
+        }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
