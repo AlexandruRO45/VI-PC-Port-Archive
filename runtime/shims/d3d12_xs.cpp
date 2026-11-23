@@ -240,10 +240,21 @@ static_assert(sizeof(d3d12_xs_guid_entries) / sizeof(d3d12_xs_guid_entries[0]) =
 static ::rt::shims::Table d3d12_xs_guid_table(d3d12_xs_guid_entries,
                                               sizeof(d3d12_xs_guid_entries) / sizeof(d3d12_xs_guid_entries[0]));
 
+// D3D12ConfigureVirtualMemoryX: a console virtual-memory configuration call. A PC has one memory pool and no
+// title/system partition, so there is nothing to configure; the arguments are ignored and S_OK is returned.
+HRESULT WINAPI D3D12ConfigureVirtualMemoryX() {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX ignored (PC has no title/system memory "
+                             "partition)\n");
+    return S_OK;
+}
+
 SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&serialize_root_signature)},
     {"d3d12_xs.dll", "D3D12SerializeRootSignature", reinterpret_cast<void*>(&serialize_root_signature_legacy)},
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&D3D12ConfigureVirtualMemoryX)},
 );
