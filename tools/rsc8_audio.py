@@ -1547,13 +1547,19 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
     return records, summary
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; an audio scan must not report an
+    # incomplete directory as complete. main() turns the OSError into one error line and exit 2.
+    raise exc
+
+
 def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, curves=False):
     """Scan a directory of `.awc` banks and/or standalone `.rsc8` files."""
     t0 = time.time()
     summary = _new_summary("directory", path)
     records = []
     files = []
-    for root, _, names in os.walk(path):
+    for root, _, names in os.walk(path, onerror=_walk_error):
         for name in sorted(names):
             low = name.lower()
             if low.endswith((".awc", ".rsc8")):

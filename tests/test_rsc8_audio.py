@@ -606,6 +606,32 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("output must not overwrite the source file", result.stderr)
 
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the scan used to report the
+        # remaining banks and exit 0, hiding the incomplete directory.
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.awc"), "wb") as f:
+                f.write(bank)
+            sub = os.path.join(tmp, "sub")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "b.awc"), "wb") as f:
+                f.write(bank)
+            os.chmod(sub, 0o000)
+            try:
+                try:
+                    os.listdir(sub)
+                    self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+                except OSError:
+                    pass
+                result = subprocess.run([sys.executable, "-I", TOOL, tmp, "--quiet"],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+            finally:
+                os.chmod(sub, 0o755)
+
     def test_window_edges_inside_a_bank(self):
         """--start/--limit inside a bank: adat_bytes stays within the span, and RSC8 headers in a bank that
         started before the window are not reported as outside ADAT."""
