@@ -1480,6 +1480,34 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+void** get_vtable();
+
+// Device slot 26, ID3D12Device::GetCustomHeapProperties(node_mask, heap_type), returns a 20-byte D3D12_HEAP_PROPERTIES,
+// so the value comes back through a hidden pointer. The PC (MSVC) order is (this, return buffer, node_mask, heap_type),
+// which is what the generic forwarder passes on. The retail title calls it as (return buffer, this, node_mask,
+// heap_type) (docs/retail_boot_chain.md 3.1), so `this` is in the second register and the first points at a buffer
+// that is not a proxy. Both orders are answered, told apart by which register holds a device proxy, and the return
+// buffer is handed back in rax as the PC method does. Neither register a proxy: not a call this slot can serve.
+std::uint64_t proxy_get_custom_heap_properties(DeviceProxy* first, std::uint64_t second, std::uint64_t node_mask,
+                                               std::uint64_t heap_type) {
+    auto is_proxy = [](const void* p) {
+        return p && *static_cast<void* const*>(p) == static_cast<void*>(get_vtable());
+    };
+    DeviceProxy* device = nullptr;
+    void* buffer = nullptr;
+    if (is_proxy(first)) {
+        device = first;
+        buffer = reinterpret_cast<void*>(second);
+    } else if (is_proxy(reinterpret_cast<const void*>(second))) {
+        device = reinterpret_cast<DeviceProxy*>(second);
+        buffer = first;
+    }
+    if (!device || !buffer) return 0;
+    *static_cast<D3D12_HEAP_PROPERTIES*>(buffer) = device->real->GetCustomHeapProperties(
+        static_cast<UINT>(node_mask), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(heap_type)));
+    return reinterpret_cast<std::uint64_t>(buffer);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1498,6 +1526,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 9) {
         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 26) {
+        return proxy_get_custom_heap_properties(self, a1, a2, a3);
     } else if constexpr (Slot == 36) {
         return hr_to_u64(proxy_create_fence(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                             reinterpret_cast<void**>(a4)));
@@ -1704,7 +1734,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
         slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 75 || slot == 76)
         return true;

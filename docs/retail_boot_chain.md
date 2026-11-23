@@ -20,7 +20,7 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 | 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 |
 | 5 | Fatal assert when `DStorageGetFactory` returns null | #4348 |
 | 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Local stand-in, §2 |
-| 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Local, §3.1 |
+| 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | §3.1: `proxy_get_custom_heap_properties` in `d3d12_xs_device.cpp` answers both orders (`xs_proxy_mock`, `check_heap_properties`) |
 | 8 | Device slot 48 is forwarded to the PC slot 48 and fails | Local, §3.2 |
 | 9 | Device slot 73 is forwarded to the PC slot 73; the title then reads through a null list | #2490's list proxy plus local routing, §3.3 |
 | 10 | An `XMemVirtualAlloc` reserve of about 185 MiB with type `0x42000`, attribute 7 and `PAGE_NOACCESS` is refused with `ERROR_INVALID_PARAMETER`. `0x40000` is `MEM_RESERVE_PLACEHOLDER` on the PC, which `VirtualAlloc` refuses and only `VirtualAlloc2` accepts; stop 11 supports the same reading on the console | Local: reserve it with `VirtualAlloc2(MEM_RESERVE \| MEM_RESERVE_PLACEHOLDER)` |
@@ -64,8 +64,8 @@ Device slot 26 (`GetCustomHeapProperties`, which returns a `D3D12_HEAP_PROPERTIE
 `(return buffer, this, node_mask, heap_type)`: the first register holds the return buffer, the second the device
 proxy. The PC MSVC method expects `(this, return buffer, …)`. A proxy thunk can tell the two apart: in the swapped
 call the `this` register does not point at the proxy, and the second argument does. Calling the real method with
-the two exchanged and returning the buffer pointer gets past it. Other struct-returning slots probably follow the
-same rule; only slot 26 was reached.
+the two exchanged and returning the buffer pointer gets past it: the device proxy's slot 26 now does exactly that,
+and still answers the PC order. Other struct-returning slots probably follow the same rule; only slot 26 was reached.
 
 ### 3.2 Device slot 48 creates a command queue
 

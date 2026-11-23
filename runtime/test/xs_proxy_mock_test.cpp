@@ -194,6 +194,14 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1 == kFenceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a2, a3));
                 if (a1 == kResourceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::resource, a2, a3));
                 return static_cast<std::uint32_t>(E_INVALIDARG);
+            case 26: {  // GetCustomHeapProperties: the PC order is (this, return buffer, node_mask, heap_type)
+                auto* props = reinterpret_cast<D3D12_HEAP_PROPERTIES*>(a1);
+                if (!props) return 0;
+                *props = D3D12_HEAP_PROPERTIES{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                                               D3D12_MEMORY_POOL_L0, static_cast<UINT>(a2) | 0x100u,
+                                               static_cast<UINT>(a3) | 0x200u};  // nodes carry what was asked for
+                return a1;
+            }
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
@@ -767,6 +775,51 @@ int check_xbox_slots() {
 #endif
 }
 
+// ---- 7b. Device slot 26 (GetCustomHeapProperties) takes its return buffer first on the console ----
+
+// The method returns a 20-byte D3D12_HEAP_PROPERTIES, so the value comes back through a hidden pointer. The PC (MSVC)
+// order is (this, buffer, node_mask, heap_type); the retail title calls (buffer, this, node_mask, heap_type)
+// (docs/retail_boot_chain.md 3.1). Both must write the same properties through to the buffer and return it.
+int check_heap_properties() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, true);
+    EXPECT(device && xs::device_slot_overridden(26));
+
+    for (const std::uint32_t heap_type : {1u, 2u, 3u}) {
+        const std::uint32_t node_mask = heap_type + 4;
+        D3D12_HEAP_PROPERTIES pc{}, console{};
+        std::memset(&pc, 0xCD, sizeof(pc));
+        std::memset(&console, 0xCD, sizeof(console));
+        const std::uint64_t pc_result = raw(device, 26, word(&pc), node_mask, heap_type);
+        EXPECT(pc_result == word(&pc));
+        const auto slot26 = reinterpret_cast<SlotFn>((*reinterpret_cast<void* const* const*>(device))[26]);
+        const std::uint64_t console_result = slot26(&console, word(device), node_mask, heap_type, 0, 0, 0, 0, 0, 0, 0,
+                                                     0, 0, 0, 0);
+        EXPECT(console_result == word(&console));
+        EXPECT(pc.Type == D3D12_HEAP_TYPE_CUSTOM && pc.MemoryPoolPreference == D3D12_MEMORY_POOL_L0);
+        EXPECT(pc.CreationNodeMask == (node_mask | 0x100u) && pc.VisibleNodeMask == (heap_type | 0x200u));
+        EXPECT(std::memcmp(&pc, &console, sizeof(pc)) == 0);
+    }
+    EXPECT(mock->calls[26] == 6);
+
+    // A call with neither register a proxy is not this slot's to serve: nothing is written and the buffer is not
+    // returned.
+    D3D12_HEAP_PROPERTIES untouched{};
+    std::memset(&untouched, 0xCD, sizeof(untouched));
+    D3D12_HEAP_PROPERTIES other{};
+    std::memset(&other, 0xCD, sizeof(other));
+    const auto none = reinterpret_cast<SlotFn>((*reinterpret_cast<void* const* const*>(device))[26]);
+    EXPECT(none(&untouched, word(&other), 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == 0);
+    EXPECT(mock->calls[26] == 6);
+    unsigned char want[sizeof(untouched)];
+    std::memset(want, 0xCD, sizeof(want));
+    EXPECT(std::memcmp(&untouched, want, sizeof(want)) == 0 && std::memcmp(&other, want, sizeof(want)) == 0);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: device slot 26 answers the PC and the console argument order\n", g_label);
+    return 0;
+}
+
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
 int run_env_slots(bool valid) {
@@ -948,7 +1001,7 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_heap_properties())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
