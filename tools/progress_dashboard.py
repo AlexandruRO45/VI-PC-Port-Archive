@@ -372,6 +372,8 @@ def group_of_test(name):
 def parse_junit(xml):
     """[(name, result, seconds, detail)] from CTest (--output-junit) or pytest (--junitxml) XML."""
     root = xml if isinstance(xml, ET.Element) else ET.fromstring(xml)
+    if root.tag not in ("testsuite", "testsuites"):
+        raise ValueError(f"expected JUnit root testsuite or testsuites, got {root.tag!r}")
     suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
     out = []
     for suite in suites:
@@ -459,12 +461,12 @@ def collect_ctest(col, args):
             continue
         try:
             root = ET.parse(path).getroot()
+            rows = parse_junit(root)
         except (ET.ParseError, LookupError, ValueError) as e:
             col.source("junit", path, "invalid", note=str(e))
             continue
         # CTest writes a single testsuite with a disabled count and hostname. pytest wraps its suite in testsuites.
         is_ctest = root.tag == "testsuite" and {"disabled", "hostname"} <= root.attrib.keys()
-        rows = parse_junit(root)
         sets.append(("junit:" + os.path.basename(path), path, rows, is_ctest))
         col.source("junit", path, "ok", len(rows))
     for label, path, rows, is_ctest in sets:
