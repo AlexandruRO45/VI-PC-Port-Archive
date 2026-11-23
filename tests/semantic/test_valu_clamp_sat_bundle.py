@@ -175,6 +175,36 @@ class TestValuAddF32ClampOracle(unittest.TestCase):
         hw = run_binary_f32("v_add_f32", 0.4, 0.3, omod="mul:2", clamp=True)
         self.assertAlmostEqual(hw, 1.0, places=6)
 
+class TestValuAddF32AST(unittest.TestCase):
+    """Stage 2: Symbolic AST and typed modifier definitions for v_add_f32."""
+
+    def test_ast_add_compilation_clamp(self):
+        lines = [
+            "v_mov_b32 v0, 0x3f000000",
+            "v_mov_b32 v1, 0x3f000000",
+            "v_add_f32_e64 v2, v0, v1 clamp",
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(next_test_id("ps_ast_add"), lines)
+        self.assertIn("OpFAdd", spv)
+        self.assertIn("FClamp", spv)
+        words = support.mrt0_words(spv)
+        self.assertAlmostEqual(bits_to_f32(words[0]), 1.0, places=6)
+
+    def test_ast_add_compilation_omod_mul4(self):
+        lines = [
+            "v_mov_b32 v0, 0x3e800000",  # 0.25
+            "v_mov_b32 v1, 0x00000000",
+            "v_add_f32_e64 v2, v0, v1 mul:4",
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(next_test_id("ps_ast_add_mul4"), lines)
+        self.assertIn("OpFMul", spv)
+        words = support.mrt0_words(spv)
+        self.assertAlmostEqual(bits_to_f32(words[0]), 1.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
