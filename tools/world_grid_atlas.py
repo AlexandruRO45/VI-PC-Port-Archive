@@ -195,8 +195,12 @@ def align(scores: list) -> list:
 def linear_fit(xs: list, ys: list) -> dict:
     """Least-squares y = slope * x + intercept, with Pearson r."""
     n = len(xs)
+    if n != len(ys):
+        raise ValueError(f"x and y lengths differ ({n} != {len(ys)})")
     if n < 2:
         raise ValueError("a fit needs at least two points")
+    if not (all(math.isfinite(x) for x in xs) and all(math.isfinite(y) for y in ys)):
+        raise ValueError("a fit requires finite x and y values")
     mx, my = math.fsum(xs) / n, math.fsum(ys) / n
     sxx = math.fsum((x - mx) ** 2 for x in xs)
     syy = math.fsum((y - my) ** 2 for y in ys)
@@ -204,7 +208,7 @@ def linear_fit(xs: list, ys: list) -> dict:
     if sxx == 0:
         raise ValueError("all x values are equal")
     slope = sxy / sxx
-    r = sxy / math.sqrt(sxx * syy) if syy else 0.0
+    r = max(-1.0, min(1.0, sxy / math.sqrt(sxx * syy))) if syy else 0.0
     return {"slope": slope, "intercept": my - slope * mx, "r": r, "n": n}
 
 
