@@ -32,7 +32,7 @@ def _translate_cs(body: list[str]) -> str:
 
 class SadClampTests(unittest.TestCase):
     def test_sad_clamp_emits_unsigned_saturation(self):
-        for op in ("v_sad_u8", "v_sad_hi_u8", "v_sad_u16"):
+        for op in ("v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_msad_u8"):
             with self.subTest(op=op):
                 spv = _translate_cs([
                     "v_mov_b32 v1, 0xffffffff",
