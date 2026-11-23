@@ -73,10 +73,34 @@ function Remove-DirectoryRobust([string]$path) {
 if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     if (Test-Path -LiteralPath $src) { Remove-DirectoryRobust $src }
     New-Item -ItemType Directory -Force $Temp | Out-Null
+    $remote = "https://github.com/llvm/llvm-project"
+    $tag = "llvmorg-$Version"
+    # git can't shallow-clone an annotated tag: --branch fetches the tag object, and current git then stops with
+    # "refs/tags/<tag> ... is not a commit!" (git 2.56). Resolve the tag's commit and fetch that one; the tag is
+    # recreated locally, so the version check below still applies.
+    $refs = & git ls-remote --tags $remote "refs/tags/$tag*"
+    if ($LASTEXITCODE -ne 0 -or -not $refs) { throw "git ls-remote of $tag failed." }
+    $exact = "refs/tags/$tag"
+    $peeled = $refs | Where-Object { ($_ -split '\s+')[1] -eq "$exact^{}" } | Select-Object -First 1
+    $plain = $refs | Where-Object { ($_ -split '\s+')[1] -eq $exact } | Select-Object -First 1
+    $commit = if ($peeled) { ($peeled -split '\s+')[0] } elseif ($plain) { ($plain -split '\s+')[0] } else { $null }
+    if (-not $commit) { throw "$tag was not found in $remote." }
+    New-Item -ItemType Directory -Force $src | Out-Null
     # core.longpaths: some llvm/docs paths are about 150 characters, so with a -Temp of about 100 characters the
     # sparse checkout fails with "Filename too long" (Windows' 260-character limit). Set in the clone's config only.
-    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse --config core.longpaths=true https://github.com/llvm/llvm-project $src
-    if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
+    & git -C $src init --quiet
+    if ($LASTEXITCODE -ne 0) { throw "git init of $src failed." }
+    & git -C $src config core.longpaths true
+    & git -C $src remote add origin $remote
+    if ($LASTEXITCODE -ne 0) { throw "git remote add failed." }
+    # A partial clone keeps the download small: file contents are fetched on demand for the sparse paths.
+    & git -C $src config remote.origin.promisor true
+    & git -C $src config remote.origin.partialclonefilter blob:none
+    & git -C $src fetch --quiet --depth 1 origin $commit
+    if ($LASTEXITCODE -ne 0) { throw "git fetch of $tag ($commit) failed." }
+    & git -C $src tag -f $tag $commit
+    & git -C $src reset --hard --quiet FETCH_HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git checkout of $tag failed." }
     # libc: LLVM 23 configures only with its shared headers (llvm/CMakeLists.txt, "LLVM libc is not found").
     & git -C $src sparse-checkout set llvm cmake third-party libc
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
