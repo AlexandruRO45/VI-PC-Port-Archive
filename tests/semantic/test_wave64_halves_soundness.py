@@ -384,5 +384,35 @@ class SoundnessRegressions(unittest.TestCase):
         ], "B", reasons=[], idioms=["readfirstlane-uniform"])
 
 
+NARROW_LANE_1 = ["v_cmp_eq_u32_e32 vcc, 1, v0", "s_and_saveexec_b64 s[12:13], vcc"]   # v0 = the lane number
+RESTORE_12 = ["s_or_b64 exec, exec, s[12:13]"]
+
+
+class NarrowedWrites(unittest.TestCase):
+    """A VGPR written under a narrowed EXEC keeps, in the lanes that are off, what it held when EXEC narrowed: once
+    EXEC widens again, those lanes read it back (@shdann's finding, #4571). The narrowed write used to replace the
+    register's taint, so a partition-dependent value it covered only in some lanes passed as tier A."""
+    assert_tier_c_and_diverges = SoundnessRegressions.assert_tier_c_and_diverges
+
+    def test_a_lane_id_covered_in_one_lane(self):
+        self.assert_tier_c_and_diverges("vs_narrowed_lane_id", ["v_mbcnt_lo_u32_b32 v6, -1, 0",
+                                        "v_mbcnt_hi_u32_b32 v6, -1, v6"] + NARROW_LANE_1 + ["v_mov_b32_e32 v6, 0"] +
+                                        RESTORE_12, contains=["lane-id"])
+
+    def test_a_readlane_covered_in_one_lane(self):
+        self.assert_tier_c_and_diverges("vs_narrowed_readlane", ["v_readlane_b32 s6, v0, 5", "v_mov_b32_e32 v6, s6"] +
+                                        NARROW_LANE_1 + ["v_mov_b32_e32 v6, 0"] + RESTORE_12, contains=["cross-lane"])
+
+    def test_a_lane_count_covered_in_one_lane(self):
+        self.assert_tier_c_and_diverges("vs_narrowed_bcnt", ["s_bcnt1_i32_b64 s6, exec", "v_mov_b32_e32 v6, s6"] +
+                                        NARROW_LANE_1 + ["v_mov_b32_e32 v6, 0"] + RESTORE_12, contains=["lane-count"])
+
+    def test_a_clean_value_stays_tier_a(self):
+        lines = vs(["v_mov_b32_e32 v6, 7"] + NARROW_LANE_1 + ["v_mov_b32_e32 v6, 0"] + RESTORE_12)
+        (tier, reasons, _), asm = meta_of("vs_narrowed_clean", lines)
+        self.assertEqual(tier, "A", f"vs_narrowed_clean: got {tier}, reasons={reasons}")
+        self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)))
+
+
 if __name__ == "__main__":
     unittest.main()
