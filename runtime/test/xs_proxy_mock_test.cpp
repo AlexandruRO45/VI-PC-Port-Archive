@@ -1435,6 +1435,99 @@ int check_slot70_placed_buffer() {
     return 0;
 }
 
+// ---- 8c. Device slot 70: typed and structured buffer views ----
+//
+// The retail boot also makes typed R16_UINT buffer views (768 and 6144 bytes). A typed view counts in elements of its
+// format's size, a structured one in elements of its stride; shapes outside those keep the null view.
+
+RawShape buffer_view_shape(std::uint64_t va, std::uint64_t width, DXGI_FORMAT format, UINT stride = 0) {
+    RawShape shape = raw_shape(va, width);
+    shape.view.view.Format = format;
+    shape.view.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    shape.view.view.Buffer.StructureByteStride = stride;
+    return shape;
+}
+
+int check_slot70_typed_buffer() {
+    constexpr std::uint64_t kVa = 0x7f1000000000ull, kSize = 0x10000;
+    constexpr std::uint64_t kLayoutUndefined = 0xFFFFFFFFu;
+    const std::uint64_t destination = 0x7000;
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    const D3D12_RESOURCE_DESC desc = placed_buffer_desc(kSize);
+    void* placed = nullptr;
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&desc), kLayoutUndefined, 0, word(&kResourceIid), word(&placed))) ==
+           S_OK && placed);
+    unsigned views = mock->calls[18];
+
+    // The measured typed shape: R16_UINT over 768 bytes at +0x100, and over 6144 bytes at +0x2000.
+    RawShape shape = buffer_view_shape(kVa + 0x100, 768, DXGI_FORMAT_R16_UINT);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(placed) && mock->args[18][2] == destination);
+    EXPECT(mock->srv.Format == DXGI_FORMAT_R16_UINT && mock->srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
+           mock->srv.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE && mock->srv.Buffer.StructureByteStride == 0 &&
+           mock->srv.Buffer.FirstElement == 0x80 && mock->srv.Buffer.NumElements == 384 &&
+           mock->srv.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    shape = buffer_view_shape(kVa + 0x2000, 6144, DXGI_FORMAT_R16_UINT);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(placed) &&
+           mock->srv.Format == DXGI_FORMAT_R16_UINT && mock->srv.Buffer.FirstElement == 0x1000 &&
+           mock->srv.Buffer.NumElements == 3072);
+    // Other typed formats count in their own element size; a width past the buffer is cut at its end.
+    shape = buffer_view_shape(kVa + 0x40, 0x100, DXGI_FORMAT_R32G32B32A32_FLOAT);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == ++views && mock->srv.Format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
+           mock->srv.Buffer.FirstElement == 4 && mock->srv.Buffer.NumElements == 0x10);
+    shape = buffer_view_shape(kVa + kSize - 8, 0x100, DXGI_FORMAT_R8_UNORM);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == ++views && mock->srv.Format == DXGI_FORMAT_R8_UNORM &&
+           mock->srv.Buffer.FirstElement == kSize - 8 && mock->srv.Buffer.NumElements == 8);
+    // A structured view: elements of the stride, no format.
+    shape = buffer_view_shape(kVa + 0x30, 0x60, DXGI_FORMAT_UNKNOWN, 12);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == ++views && mock->args[18][0] == word(placed) && mock->srv.Format == DXGI_FORMAT_UNKNOWN &&
+           mock->srv.Buffer.StructureByteStride == 12 && mock->srv.Buffer.FirstElement == 4 &&
+           mock->srv.Buffer.NumElements == 8 && mock->srv.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE);
+    // The raw shape is unchanged.
+    shape = raw_shape(kVa + 0x40, 0x100);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == ++views && mock->srv.Format == DXGI_FORMAT_R32_TYPELESS &&
+           (mock->srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) && mock->srv.Buffer.FirstElement == 0x10 &&
+           mock->srv.Buffer.NumElements == 0x40);
+
+    // The null view: an address that is not a whole number of elements, a typeless or a block-compressed format, a
+    // structured view with a format, a raw view in another format, an address no buffer holds, and a buffer
+    // description with a texture view.
+    const RawShape refused[] = {
+        buffer_view_shape(kVa + 0x101, 768, DXGI_FORMAT_R16_UINT),
+        buffer_view_shape(kVa + 0x100, 768, DXGI_FORMAT_R16_TYPELESS),
+        buffer_view_shape(kVa + 0x100, 768, DXGI_FORMAT_BC1_UNORM),
+        buffer_view_shape(kVa + 0x30, 0x60, DXGI_FORMAT_R32_UINT, 12),
+        [&] {
+            RawShape s = raw_shape(kVa + 0x40, 0x100);
+            s.view.view.Format = DXGI_FORMAT_R32_UINT;
+            return s;
+        }(),
+        buffer_view_shape(kVa + kSize + 0x100, 768, DXGI_FORMAT_R16_UINT),
+        [&] {
+            RawShape s = buffer_view_shape(kVa + 0x100, 768, DXGI_FORMAT_R16_UINT);
+            s.view.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            return s;
+        }(),
+    };
+    for (const RawShape& s : refused) {
+        raw(device, 70, word(&s.resource), word(&s.view), destination);
+        EXPECT(mock->calls[18] == ++views && is_null_view(mock));
+    }
+    EXPECT(reinterpret_cast<Mock*>(placed)->refs == 1 && mock->calls[70] == 0);
+    EXPECT(release(placed) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: device slot 70 writes a typed or structured view of a placed buffer (R16_UINT as measured)\n",
+                g_label);
+    return 0;
+}
+
 // ---- 9. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -1879,7 +1972,8 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_slot70() || check_slot70_raw_buffer() ||
-        check_slot70_placed_buffer() || check_descriptor_heap_hooks() || check_committed_resource3_x() ||
+        check_slot70_placed_buffer() || check_slot70_typed_buffer() || check_descriptor_heap_hooks() ||
+        check_committed_resource3_x() ||
         check_committed_resource3_xmem_hook())
         return 1;
     if (check_placed_resource_x()) return 1;

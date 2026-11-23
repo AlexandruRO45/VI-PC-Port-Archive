@@ -8,13 +8,14 @@
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
 //   slot 70   (texture words, view desc, destination handle), no return value: a shader-resource view from raw words
 //             and a GPU address, with no resource (retail boot chain stop 14). The PC slot 70 is CreatePlacedResource1.
-//             A measured shape (PR 7066, eugen1763): a raw buffer SRV. arg1 starts with a desktop D3D12_RESOURCE_DESC
-//             (buffer), arg2 with a desktop D3D12_SHADER_RESOURCE_VIEW_DESC (R32_TYPELESS, BUFFER, RAW) followed at
-//             once by a D3D12_GPU_VIRTUAL_ADDRESS, the console VA a slot-133 call registered. When the VA is inside a
-//             buffer a slot-133 call placed (the proxy remembers each one by its range, whatever address the PC
-//             resource behind it has), or else inside one the device's resource provider knows, the destination
-//             gets a raw view of it (PC CreateShaderResourceView with that resource). Any other shape, or an
-//             unknown VA, gets the PC null view (CreateShaderResourceView with no resource) and the call returns.
+//             arg1 starts with a desktop D3D12_RESOURCE_DESC (Xbox layout word and flag bits kept), arg2 with a desktop
+//             D3D12_SHADER_RESOURCE_VIEW_DESC followed at once by a D3D12_GPU_VIRTUAL_ADDRESS. A buffer view (raw
+//             R32_TYPELESS as measured by PR 7066, eugen1763; typed, R16_UINT on the retail boot; or structured) names
+//             the buffer that holds the VA: one a slot-133 call placed (the proxy remembers each by its range, whatever
+//             address the PC resource behind it has), or else one the device's resource provider knows; the
+//             destination gets a raw, typed or structured view of that range. Any other shape (texture views among
+//             them), or an unknown VA, gets the PC null view (CreateShaderResourceView with no resource) with one log
+//             line per reason, and the call returns.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 //   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
 //             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
@@ -96,7 +97,7 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
 using ResourceByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64_t va, std::uint64_t bytes,
                                                 std::uint64_t* start, std::uint64_t* size);
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither. Without a provider slot
-// 70 writes only the null view.
+// 70 finds only the buffers slot 133 placed.
 bool set_device_resource_provider(void* device, ResourceByVaProvider provider);
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
 void* device_proxy_from_dxgi_device(void* dxgi_device);
