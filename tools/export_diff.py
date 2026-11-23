@@ -7,8 +7,8 @@ of the translated module with a model of the packing rules in docs/design.md ("I
   * tools/rdna2spirv.py through tests/semantic/support.py: the translated SPIR-V's OpDecorate lines and arrays
 
 Shapes: a pixel shader's declared SV_Target set (consecutive, sparse or none, with or without an OSG1), `exp mrtK`
-in any order, compressed or not, and an optional `exp mrtz` (x on or off, compressed or not); a vertex shader's
-declared SV_ClipDistance/SV_CullDistance components (up to 9 + 4, in elements of 1 to 4 components), its misc
+in any order (plain, with gated components, or compressed) and an optional `exp mrtz` (x on or off, compressed or
+not); a vertex shader's declared SV_ClipDistance/SV_CullDistance components (up to 9 + 4, in elements of 1 to 4 components), its misc
 system values (RenderTargetArrayIndex, ViewportArrayIndex, ShadingRate), `exp pos0..pos3` with any on/off component
 pattern and `exp paramN` for a few N.
 
@@ -73,7 +73,7 @@ def osg1_dxbc(elements):
 
 # ---- the model: pixel-shader exports ---------------------------------------------------------------------------------
 PsShape = namedtuple("PsShape", "targets has_osg1")             # declared SV_Target registers in order; an OSG1 at all
-PsExport = namedtuple("PsExport", "kind index depth_x compr")   # kind "mrt" | "mrtz"
+PsExport = namedtuple("PsExport", "kind index depth_x compr comps", defaults=[()])   # kind "mrt" | "mrtz"; comps: EN gates
 PsPrediction = namedtuple("PsPrediction", "locations refusals")  # %out_* -> Location | "FragDepth"; expected refusals
 
 
@@ -215,8 +215,14 @@ def export_line(e):
         if e.kind == "mrtz":
             x = "v0" if e.depth_x else "off"
             return f"exp mrtz {x}, off, off, off" + (" compr" if e.compr else "")
-        # Compressed exports list each of the two registers twice, one slot per 16-bit half.
-        operands = ("v0, v0, v1, v1 compr") if e.compr else "v0, v1, v2, v3"
+        # Compressed exports list each of the two registers twice, one slot per 16-bit half; an uncompressed export
+        # may gate its components (EN bits): an off slot keeps the previous export.
+        if e.compr:
+            operands = "v0, v0, v1, v1 compr"
+        elif e.comps:
+            operands = ", ".join(f"v{c}" if on else "off" for c, on in enumerate(e.comps))
+        else:
+            operands = "v0, v1, v2, v3"
         return f"exp mrt{e.index} {operands}"
     operands = ", ".join(f"v{c}" if on else "off" for c, on in enumerate(e.comps))
     return f"exp {'pos' if e.kind == 'pos' else 'param'}{e.index} {operands}"
@@ -276,7 +282,14 @@ def generate(seed, index):
     has_osg1 = rng.random() > 0.15
     targets = sorted(rng.sample(range(8), rng.randint(1, 8))) if has_osg1 and rng.random() > 0.1 else []
     indices = list(range(len(targets))) if targets else sorted(rng.sample(range(8), rng.randint(1, 8)))
-    exports = [PsExport("mrt", k, False, rng.random() < 0.3) for k in indices]
+    exports = []
+    for k in indices:
+        if rng.random() < 0.3:
+            exports.append(PsExport("mrt", k, False, True))
+        elif rng.random() < 0.3:
+            exports.append(PsExport("mrt", k, False, False, _components(rng, False)))
+        else:
+            exports.append(PsExport("mrt", k, False, False))
     if rng.random() < 0.5:
         exports.append(PsExport("mrtz", 0, rng.random() < 0.5, rng.random() < 0.5))
     rng.shuffle(exports)

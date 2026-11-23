@@ -214,6 +214,13 @@ class HarnessTest(unittest.TestCase):
                                      [self.E("mrt", 0, False, False), self.E("mrt", 1, False, False)])
         self.assertEqual(export_diff.run_case(case)[0], "skip")
 
+    def test_partial_mrt_matches_translator(self):
+        # EN gates each component of a colour export: the output is still declared at its location.
+        case = export_diff.make_case("ps_partial_mrt", "ps", export_diff.PsShape([], False),
+                                     [self.E("mrt", 0, False, False, (1, 0, 1, 0))])
+        self.assertIn("exp mrt0 v0, off, v2, off done vm", case.listing)
+        self.assertEqual(export_diff.run_case(case)[0], "match")
+
     def test_vs_probe_matches_translator(self):
         svs = [export_diff.Osg1Element(2, 0, 0, 0x3, 0), export_diff.Osg1Element(3, 0, 1, 0x1, 0),
                export_diff.Osg1Element(4, 0, 2, 0x1, 0)]
