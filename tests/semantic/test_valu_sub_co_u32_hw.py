@@ -274,5 +274,69 @@ class TestValuSubCoU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(diff, 70)
         self.assertEqual(borrow, 0)
 
+# ---------------------------------------------------------------------------
+# Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking
+# ---------------------------------------------------------------------------
+
+class SIMDWavefront:
+    """SIMD Wavefront multi-lane model with 32-bit or 64-bit EXEC masking."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: int | None = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self.mask_limit = (1 << wave_size) - 1
+        self.exec_mask = self.mask_limit if exec_mask is None else (exec_mask & self.mask_limit)
+
+    def execute(self, src0_lanes: list[int], src1_lanes: list[int]) -> tuple[list[int], int]:
+        diff_lanes: list[int] = [0] * self.wave_size
+        vcc_mask = 0
+
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                diff, borrow = oracle_sub_co_u32(src0_lanes[lane], src1_lanes[lane])
+                diff_lanes[lane] = diff
+                if borrow:
+                    vcc_mask |= (1 << lane)
+            else:
+                diff_lanes[lane] = 0
+
+        return diff_lanes, vcc_mask
+
+
+class TestValuSubCoU32SIMDDivergence(unittest.TestCase):
+    """Stage 4: SIMD multi-lane divergence and EXEC masking for v_sub_co_u32."""
+
+    def test_wave32_all_active(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        s0 = [lane * 10 for lane in range(32)]
+        s1 = [5 for _ in range(32)]
+
+        diffs, vcc = wave.execute(s0, s1)
+        # Lane 0: 0 - 5 => borrow
+        self.assertEqual(diffs[0], (0 - 5) & MASK32)
+        self.assertEqual(vcc & 1, 1)
+        # Lane 1+: >= 10 - 5 => no borrow
+        for lane in range(1, 32):
+            self.assertEqual(diffs[lane], lane * 10 - 5)
+            self.assertEqual((vcc >> lane) & 1, 0)
+
+    def test_wave64_divergence_masking(self) -> None:
+        # Alternating even lanes enabled
+        mask = 0x5555_5555_5555_5555
+        wave = SIMDWavefront(wave_size=64, exec_mask=mask)
+        s0 = [0] * 64
+        s1 = [1] * 64
+
+        diffs, vcc = wave.execute(s0, s1)
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(diffs[lane], MASK32)
+                self.assertEqual((vcc >> lane) & 1, 1)
+            else:
+                self.assertEqual(diffs[lane], 0)
+                self.assertEqual((vcc >> lane) & 1, 0)
+        self.assertEqual(vcc, mask)
+
 if __name__ == "__main__":
     unittest.main()
