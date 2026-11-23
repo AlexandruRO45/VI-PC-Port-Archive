@@ -8,6 +8,9 @@
 //             Signal) and then producer first; the readback must be exact.
 //   deferred  a CPU Signal that has to wait behind a queue Signal the GPU has not reached, and a queue that waits
 //             for the CPU value: the queue must run once the CPU value lands (on one VkQueue or two).
+//   release   a fence released right after the GPU passed the queue Signal its deferred CPU Signal waited behind,
+//             while another queue holds a batch for the CPU value: the batch runs, and under the validation layer
+//             the semaphore is not destroyed under it.
 //   stress    4 threads, 9 queues (3 per type), each thread copying a buffer through 3 queues per iteration with
 //             a CPU-gated producer; every iteration's readback must be exact.
 // With LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1 and LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1 every GPU looks like the UHD 770 (one
@@ -256,6 +259,52 @@ bool deferred_cpu_signal(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE ta, D3D12
     return true;
 }
 
+// A fence released just after the GPU passed queue a's Signal of 1, while the CPU's Signal of 2 is still deferred
+// behind it and queue b holds a batch that waits for 2. Either the fence wait thread or the release applies the CPU
+// value; the fence reached 2 before it was released, so b's batch must run (as on D3D12, where the CPU Signal lands at
+// once), and the semaphore must outlive that batch (VUID-vkDestroySemaphore-semaphore-05149, formerly -01137, under
+// the validation layer). Every iteration's readback must hold the copy, never the sentinel the CPU left there.
+bool release_while_held(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, int iterations) {
+    arm(std::string("fence released while a batch waits for its deferred CPU Signal, ") + type_name(type),
+        30000 + ULONGLONG(iterations) * 200);
+    constexpr std::uint32_t sentinel = 0xdeadbeefu;
+    auto a = make_queue(device, type), b = make_queue(device, type);
+    auto upload = buffer(device, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    CHECK(a && b && upload && readback && fill(upload.Get(), 7));
+    int dropped = 0;
+    for (int i = 0; i < iterations; ++i) {
+        std::uint32_t* mapped = nullptr;
+        CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+        for (UINT w = 0; w < words; ++w) mapped[w] = sentinel;
+        readback->Unmap(0, nullptr);
+        auto gate = make_fence(device), f = make_fence(device), done = make_fence(device);
+        CopyList copy;
+        CHECK(gate && f && done && copy.make(device, type, readback.Get(), false, upload.Get(), false));
+        CHECK(SUCCEEDED(a->Wait(gate.Get(), 1)));
+        CHECK(SUCCEEDED(a->Signal(f.Get(), 1)));
+        CHECK(SUCCEEDED(f->Signal(2)));  // deferred: a's Signal of 1 is not on the GPU yet
+        CHECK(SUCCEEDED(b->Wait(f.Get(), 2)));
+        copy.execute(b.Get());
+        CHECK(SUCCEEDED(b->Signal(done.Get(), 1)));
+        CHECK(SUCCEEDED(gate->Signal(1)));
+        const ULONGLONG give_up = GetTickCount64() + 5000;
+        while (f->GetCompletedValue() < 1)
+            CHECK(GetTickCount64() < give_up);
+        f.Reset();  // the release, as soon as the GPU has passed a's Signal
+        wait_for(done.Get(), 1);  // b's Signal comes after its batch
+        CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+        bool copied = true;
+        for (UINT w = 0; w < words; ++w) copied &= mapped[w] == pattern(7, w);
+        const D3D12_RANGE none{0, 0};
+        readback->Unmap(0, &none);
+        dropped += !copied;
+    }
+    std::printf("%s: %d of %d batches ran\n", current_case.load(), iterations - dropped, iterations);
+    CHECK(dropped == 0);
+    return true;
+}
+
 // 4 threads copy a buffer through 3 of 9 queues (3 per type) per iteration, the producer held until the thread's
 // CPU gate opens; submissions are in dependency order, so no thread waits for another.
 bool stress(ID3D12Device* device, int iterations) {
@@ -324,7 +373,8 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--iterations") && i + 1 < argc) {
             iterations = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: d3d12_queue_share_test [--case many|deferred|stress|all] [--iterations N]\n");
+            std::fprintf(stderr, "usage: d3d12_queue_share_test [--case many|deferred|release|stress|all] "
+                                 "[--iterations N]\n");
             return 2;
         }
     }
@@ -350,6 +400,8 @@ int main(int argc, char** argv) {
     if (which == "all" || which == "deferred")
         for (const auto ta : types)
             for (const auto tb : types) ok &= deferred_cpu_signal(device.Get(), ta, tb);
+    if (which == "all" || which == "release")
+        for (const auto type : types) ok &= release_while_held(device.Get(), type, iterations);
     if (which == "all" || which == "stress") ok &= stress(device.Get(), iterations);
     deadline = 0;
     std::puts(ok ? "PASS" : "FAIL");

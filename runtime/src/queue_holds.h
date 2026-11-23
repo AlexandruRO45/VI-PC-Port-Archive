@@ -34,8 +34,9 @@ public:
     struct Holder {
         // Releases the held operations at the front of the queue whose waits are satisfied. True if any was.
         virtual bool release_ready() = 0;
-        // Drops the held operations that wait on `semaphore` (its fence is gone), reporting each.
-        virtual void discard_waiting_on(Semaphore semaphore) = 0;
+        // Drops the held operations that wait on `semaphore` for a value above `reached` (its fence is gone and will
+        // never get there), reporting each. Those whose value was reached stay and run.
+        virtual void discard_waiting_on(Semaphore semaphore, std::uint64_t reached) = 0;
 
     protected:
         ~Holder() = default;
@@ -46,16 +47,22 @@ public:
         fences_[semaphore] = initial;
     }
 
-    // The fence is released: held batches waiting on it can never run, so they are dropped and reported.
+    // The fence is released: held batches waiting on it for a value no Signal reached can never run, so they are
+    // dropped and reported; those whose value was reached (a Signal submitted, or the CPU's set) run. The caller
+    // keeps the semaphore alive until what they submit has finished (VulkanFence).
     void remove_fence(Semaphore semaphore) {
+        std::uint64_t reached = 0;
         {
             std::lock_guard lock(mutex_);
-            fences_.erase(semaphore);
+            if (const auto it = fences_.find(semaphore); it != fences_.end()) {
+                reached = it->second;
+                fences_.erase(it);
+            }
         }
         if (held_.load(std::memory_order_acquire) == 0) return;
         {
             std::lock_guard pump(pump_mutex_);
-            for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
+            for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore, reached);
         }
         pump_ready();
     }

@@ -1119,7 +1119,15 @@ public:
         : context_(context), fence_(context, initial), flags_(flags), highest_(initial) {}
 
     // As in D3D12, releasing the fence completes the waits still pending on it (ALL counts it as one fence).
-    ~Fence() override { context_.cancel_fence_waits(fence_.semaphore()); }
+    // A CPU Signal the fence wait thread has already taken out of the queue may still be running: it is waited for,
+    // so that it applies the value before the release decides which held batches can still run (QueueHolds), and
+    // never signals a semaphore that is gone. Not on that thread itself (a callback that released the last
+    // reference), where the callbacks run one after the other.
+    ~Fence() override {
+        context_.cancel_fence_waits(fence_.semaphore());
+        if (in_fence_callback()) return;
+        for (int left = held_->load(); left != 0; left = held_->load()) held_->wait(left);
+    }
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
@@ -1152,12 +1160,15 @@ public:
         leonida::VulkanContext* context = &context_;
         const VkSemaphore semaphore = fence_.semaphore();
         context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
+            in_fence_callback() = true;
             std::uint64_t now = 0;
             context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now);
             if (now >= queued && now < value) {
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
                 info.value = value;
+                // The fence's release runs this too (its cancel): the value was reached before the release, so the
+                // queues holding for it run, and the semaphore outlives their submissions (VulkanFence).
                 if (context->vk.vkSignalSemaphore(context->device(), &info) == VK_SUCCESS) {
                     // Only now: a queue Wait released earlier could reach the GPU ahead of the queue Signal this one
                     // waits behind, on the same VkQueue when D3D12 queues share one, and never make progress.
@@ -1165,7 +1176,9 @@ public:
                     context->holds().pump_ready();
                 }
             }
+            in_fence_callback() = false;
             held->fetch_sub(1);
+            held->notify_all();
         });
         return S_OK;
     }
@@ -1210,6 +1223,11 @@ private:
     std::mutex claim_mutex_;
     UINT64 highest_;     // the highest value claimed, from either side
     UINT64 queued_ = 0;  // the highest value a queue will signal
+    static bool& in_fence_callback() {
+        static thread_local bool running = false;
+        return running;
+    }
+
     std::shared_ptr<std::atomic<int>> held_ = std::make_shared<std::atomic<int>>(0);  // CPU signals not applied yet
 };
 

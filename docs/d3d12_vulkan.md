@@ -2262,7 +2262,10 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   destroyed with held operations reports them once (stderr: `queue destroyed with N held operation(s) never
   submitted: waits for a fence value (V) that no Signal reached`) and goes on without waiting; a fence nobody signals
   holds back only the queues that wait for it (and those that wait for what they would have signaled), never the
-  others; a fence released while operations wait for it drops them and says so; a Signal value that is not above
+  others; a fence released while operations wait for it drops those whose value no Signal reached and says so (a
+  value that was reached, by a submitted Signal or the CPU, still lets them run; the `VkSemaphore` is destroyed only
+  once the work submitted before the release has finished, and a held CPU Signal the fence wait thread is applying
+  at that moment is waited for, not raced); a Signal value that is not above
   the fence's (Vulkan timelines only increase) is still dropped with a note, as before. Failures of a held
   `ExecuteCommandLists` (what the call would have returned) are printed when it is released, not returned from the
   call. Not covered: sparse `UpdateTileMappings` while a queue holds work still submits at once, and the resources a
@@ -2313,7 +2316,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   and on lavapipe, under the validation layer with synchronization validation: `d3d12_queue_share_test` passes
   with no setting, with one queue per family, with one queue in all and on lavapipe (36 queues, a buffer copied
   exactly through all of them consumer first and producer first, 9 deferred CPU Signal cases, 4 threads on 9 queues:
-  2,000 iterations with all 9 on one `VkQueue` of the RTX 5080, 80,000 on lavapipe), 0 validation messages; on main
+  2,000 iterations with all 9 on one `VkQueue` of the RTX 5080, 80,000 on lavapipe; a fence released right after
+  the GPU passed the queue Signal its deferred CPU Signal waited behind, 900 times per mode, the held batch running
+  every time), 0 validation messages; on main
   it fails at the 27th queue on the RTX 5080 and at the 2nd on lavapipe, and the first deferred case hangs. The layer
   half of `d3d12_queue_handover_test` runs its 371 cases exact in all four (on lavapipe main ran 0: one queue).
 - `SetEventOnCompletion(value, hEvent)`: a small wait thread calls `vkWaitSemaphores` and `SetEvent`. Reuse one

@@ -391,6 +391,7 @@ public:
         buffer,
         device_memory,
         acceleration_structure,
+        semaphore,
     };
 
     struct Item {
@@ -474,6 +475,9 @@ public:
                 if (vk.vkDestroyAccelerationStructureKHR)
                     vk.vkDestroyAccelerationStructureKHR(
                         device, reinterpret_cast<VkAccelerationStructureKHR>(item.handle), nullptr);
+                break;
+            case Kind::semaphore:
+                vk.vkDestroySemaphore(device, reinterpret_cast<VkSemaphore>(item.handle), nullptr);
                 break;
             }
         }
@@ -1415,8 +1419,10 @@ public:
     }
     ~VulkanFence() {
         if (!semaphore_) return;
-        context_.holds().remove_fence(semaphore_);  // batches held on it can never run: dropped and reported
-        context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
+        context_.holds().remove_fence(semaphore_);  // held batches it can no longer release: dropped and reported
+        // Submitted batches can still wait on it or signal it (a queue Wait the release let run, a Signal ahead):
+        // destroyed once the work submitted so far has finished (VUID-vkDestroySemaphore-semaphore-05149).
+        context_.defer_destroy(DeferredDeletionQueue::Kind::semaphore, semaphore_);
     }
     VulkanFence(const VulkanFence&) = delete;
     VulkanFence& operator=(const VulkanFence&) = delete;
@@ -2134,11 +2140,14 @@ private:
         return released;
     }
 
-    // Holder: the fence is released, so what waits on it can never run.
-    void discard_waiting_on(VkSemaphore semaphore) override {
+    // Holder: the fence is released, so what waits on it for a value it never reached can never run.
+    void discard_waiting_on(VkSemaphore semaphore, std::uint64_t reached) override {
         std::lock_guard state(state_mutex_);
         for (auto it = held_.begin(); it != held_.end();) {
-            if (std::find(it->waits.begin(), it->waits.end(), semaphore) == it->waits.end()) {
+            bool never = false;  // waits on the fence for a value it never reached
+            for (std::size_t i = 0; i < it->waits.size(); ++i)
+                never |= it->waits[i] == semaphore && it->wait_values[i] > reached;
+            if (!never) {
                 ++it;
                 continue;
             }
