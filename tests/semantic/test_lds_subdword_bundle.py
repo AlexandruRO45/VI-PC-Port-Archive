@@ -79,5 +79,73 @@ class TestDsReadU8Oracle(unittest.TestCase):
         self.assertEqual(self.lds.read_u8(4, offset=6), 0x42)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_u8 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+class OperandType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    op_type: OperandType
+    index: int
+
+    def __post_init__(self):
+        if self.op_type == OperandType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range: {self.index}")
+
+    @property
+    def name(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclass
+class DSReadU8Instruction:
+    dst: RegisterOperand
+    addr: RegisterOperand
+    offset: int = 0
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR or self.addr.op_type != OperandType.VGPR:
+            raise TypeError("Operands of ds_read_u8 must be VGPRs")
+
+
+class ScalarMachineDS:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.lds: LDSMemory = LDSMemory()
+
+    def step_read_u8(self, insn: DSReadU8Instruction):
+        addr = self.vgprs[insn.addr.index]
+        res = self.lds.read_u8(addr, insn.offset)
+        self.vgprs[insn.dst.index] = res
+
+
+class TestDsReadU8ASTAndScalar(unittest.TestCase):
+    def test_ast(self):
+        insn = DSReadU8Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            addr=RegisterOperand(OperandType.VGPR, 1),
+            offset=4,
+        )
+        self.assertEqual(insn.dst.name, "v2")
+        self.assertEqual(insn.offset, 4)
+
+    def test_scalar_execution(self):
+        machine = ScalarMachineDS()
+        machine.lds.write_u8(20, 0x7E)
+        machine.vgprs[1] = 16
+        insn = DSReadU8Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            addr=RegisterOperand(OperandType.VGPR, 1),
+            offset=4,
+        )
+        machine.step_read_u8(insn)
+        self.assertEqual(machine.vgprs[2], 0x7E)
+
+
 if __name__ == '__main__':
     unittest.main()
