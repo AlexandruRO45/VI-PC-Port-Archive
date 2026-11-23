@@ -14,12 +14,16 @@ The report mode lists each interface's methods and which names are not overridde
 given sources; it is a name-based coverage aid for the D3D12 layer, not a compiler check.
 """
 import argparse
+import errno
 import json
 import os
 import re
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_with_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402  one spelling comparison for every report pair
 
 INTERFACE = re.compile(
@@ -136,15 +140,42 @@ def coverage(interfaces, leaves, sources):
 
 
 def write_if_changed(path, text):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    dest = os.path.abspath(path)
+    if os.path.isdir(dest) or path.endswith((os.sep, "/")) or (os.altsep and path.endswith(os.altsep)):
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), path)
+    encoded = text.encode("utf-8")
     try:
-        with open(path, encoding="utf-8") as f:
-            if f.read() == text:
+        with open(dest, "rb") as f:
+            if f.read() == encoded:
                 return
     except OSError:
         pass
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    mode = published_mode(dest)
+    fd, tmp = tempfile.mkstemp(prefix=".gen_d3d12_stubs_", suffix=".tmp", dir=parent)
+    stream = None
+    try:
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        with stream:
+            stream.write(text)
+        os.chmod(tmp, mode)
+        replace_with_retry(tmp, dest)
+    except BaseException:
+        if stream is None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def same_path(first, second):

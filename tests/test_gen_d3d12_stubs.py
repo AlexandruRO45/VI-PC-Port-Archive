@@ -518,5 +518,128 @@ class ReportPathCollisions(unittest.TestCase):
             self.assertEqual(json.load(f)[0]["implemented"], 1)   # still a report, not a header
 
 
+class WriteIfChangedStagingTests(unittest.TestCase):
+    """write_if_changed stages atomically with published_mode/replace_retry and tolerates corrupt bytes."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+
+    def test_applies_published_mode_without_flipping_umask_and_uses_replace_retry(self):
+        import file_mode
+        dest = os.path.join(self.dir, "stubs.h")
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def record_chmod(path, mode):
+            chmod_calls.append((os.path.abspath(path), mode))
+            return real_chmod(path, mode)
+
+        with mock.patch.object(gen, "published_mode", wraps=gen.published_mode) as pub, \
+                mock.patch.object(gen, "replace_with_retry", wraps=gen.replace_with_retry) as rep, \
+                mock.patch.object(gen.os, "chmod", side_effect=record_chmod), \
+                mock.patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+            gen.write_if_changed(dest, "// hello\n")
+
+        self.assertEqual(pub.call_count, 1)
+        self.assertEqual(rep.call_count, 1)
+        self.assertEqual(len(chmod_calls), 1)
+        staged_path, staged_mode = chmod_calls[0]
+        self.assertNotEqual(staged_path, os.path.abspath(dest))
+        self.assertEqual(staged_mode, file_mode.published_mode(dest))
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), b"// hello\n")
+        self.assertEqual(os.listdir(self.dir), ["stubs.h"])
+
+    def test_mid_write_failure_preserves_existing_file_and_cleans_staging(self):
+        dest = os.path.join(self.dir, "stubs.h")
+        original = b"// previous header\n"
+        with open(dest, "wb") as f:
+            f.write(original)
+
+        real_fdopen = gen.os.fdopen
+
+        class FailingStream:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._inner.close()
+                return False
+
+            def write(self, data):
+                self._inner.write(data[:4])
+                raise OSError("disk full")
+
+        err = io.StringIO()
+        with mock.patch.object(gen.os, "fdopen", side_effect=lambda *a, **kw: FailingStream(real_fdopen(*a, **kw))), \
+                contextlib.redirect_stderr(err):
+            ok = gen.write_report(dest, "// replacement header\n")
+
+        self.assertFalse(ok)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(os.listdir(self.dir), ["stubs.h"])
+
+    def test_failed_replace_cleans_read_only_staging_file(self):
+        dest = os.path.join(self.dir, "readonly.h")
+        original = b"// keep\n"
+        with open(dest, "wb") as f:
+            f.write(original)
+        os.chmod(dest, 0o444)
+        self.addCleanup(lambda: os.path.exists(dest) and os.chmod(dest, 0o600))
+
+        with mock.patch.object(gen, "replace_with_retry", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                gen.write_if_changed(dest, "// updated\n")
+
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(os.listdir(self.dir), ["readonly.h"])
+
+    def test_non_utf8_existing_file_is_rewritten_without_unicode_error(self):
+        dest = os.path.join(self.dir, "corrupt.h")
+        with open(dest, "wb") as f:
+            f.write(b"\xff\xfe\x80\x81")
+        self.assertTrue(gen.write_report(dest, "// clean\n"))
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), b"// clean\n")
+        self.assertEqual(os.listdir(self.dir), ["corrupt.h"])
+
+    def test_stale_crlf_file_is_rewritten_to_lf_and_identical_lf_keeps_mtime(self):
+        dest = os.path.join(self.dir, "eol.h")
+        with open(dest, "wb") as f:
+            f.write(b"// line1\r\n// line2\r\n")
+        gen.write_if_changed(dest, "// line1\n// line2\n")
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), b"// line1\n// line2\n")
+        mtime = os.stat(dest).st_mtime_ns
+        gen.write_if_changed(dest, "// line1\n// line2\n")
+        self.assertEqual(os.stat(dest).st_mtime_ns, mtime)
+
+    def test_directory_destination_raises_without_creating_staging_files(self):
+        folder = os.path.join(self.dir, "out_dir")
+        os.makedirs(folder)
+        before = sorted(os.listdir(self.dir))
+        with self.assertRaises(IsADirectoryError):
+            gen.write_if_changed(folder, "// nope\n")
+        self.assertEqual(sorted(os.listdir(self.dir)), before)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_posix_mode_bits_preserved_for_new_and_replaced_files(self):
+        import file_mode
+        dest = os.path.join(self.dir, "modes.h")
+        gen.write_if_changed(dest, "// v1\n")
+        self.assertEqual(os.stat(dest).st_mode & 0o777, file_mode.new_file_mode(self.dir))
+        os.chmod(dest, 0o640)
+        gen.write_if_changed(dest, "// v2\n")
+        self.assertEqual(os.stat(dest).st_mode & 0o777, 0o640)
+
+
 if __name__ == "__main__":
     unittest.main()
