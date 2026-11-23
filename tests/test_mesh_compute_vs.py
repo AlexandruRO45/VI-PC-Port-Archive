@@ -120,6 +120,8 @@ class PythonAssembler(unittest.TestCase):
             self.assertEqual(seen, ["spirv-val"])
 
     def test_same_binary_as_spirv_as(self):
+        # Word 2 of the header is the generator, the assembler's own ID (0 from tools/spirv_asm.py, 0x00070000 from
+        # spirv-as), so it is left out, as in tests/test_spirv_asm.py. Every other word must be the same.
         if not HAVE_SPIRV_TOOLS:
             self.skipTest("spirv-as / spirv-val not on PATH")
         with tempfile.TemporaryDirectory() as py_dir, tempfile.TemporaryDirectory() as tools_dir:
@@ -127,7 +129,9 @@ class PythonAssembler(unittest.TestCase):
                 write_index(d, {name: {"mesh_compute": lay} for name, lay in self.LAYOUTS.items()})
             for a, b in zip(vs.build_for_index(py_dir, assembler="python"), vs.build_for_index(tools_dir), strict=True):
                 with open(a, "rb") as fa, open(b, "rb") as fb:
-                    self.assertEqual(fa.read(), fb.read())
+                    python_spv, tools_spv = fa.read(), fb.read()
+                self.assertEqual(len(python_spv), len(tools_spv))
+                self.assertEqual(python_spv[:8] + python_spv[12:], tools_spv[:8] + tools_spv[12:])
 
     def test_unknown_assembler_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -825,6 +825,8 @@ class TestBuildWithPythonAssembler(unittest.TestCase):
             self.assertEqual(seen, ["spirv-val", "spirv-val"])
 
     def test_same_binary_as_spirv_as(self):
+        # Word 2 of the header is the generator, the assembler's own ID (0 from tools/spirv_asm.py, 0x00070000 from
+        # spirv-as), so it is left out, as in tests/test_spirv_asm.py. Every other word must be the same.
         if not (shutil.which("spirv-as") and shutil.which("spirv-val")):
             self.skipTest("spirv-as / spirv-val not on PATH")
         with tempfile.TemporaryDirectory() as py_dir, tempfile.TemporaryDirectory() as tools_dir:
@@ -833,7 +835,9 @@ class TestBuildWithPythonAssembler(unittest.TestCase):
                 json.dump(self.INDEX, f)
             tools_built = bary_fallback_gs.build_for_index(tools_dir)
             for a, b in zip(python_built, tools_built, strict=True):
-                self.assertEqual(Path(a).read_bytes(), Path(b).read_bytes())
+                python_spv, tools_spv = Path(a).read_bytes(), Path(b).read_bytes()
+                self.assertEqual(len(python_spv), len(tools_spv))
+                self.assertEqual(python_spv[:8] + python_spv[12:], tools_spv[:8] + tools_spv[12:])
 
     def test_unknown_assembler_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
