@@ -12,6 +12,9 @@ An index.json saved with a UTF-8 BOM (Windows PowerShell 5.1, old Notepad) is re
 Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
       <carve dir> holds one folder per archive (<work>/carve), or is one archive's folder (<work>/carve/common).
+      --archives is the comma-separated list of folders harvested fully. Spaces around a comma are not part of
+      a name, and a name that is not a carved folder is an error: a typo used to exit 0 with that archive's
+      names left out. Folders left off the list still contribute only their PSO and RBF blobs.
     python -I hashdict.py --lookup <hashes.json> 0x28cca8df ...
 """
 import argparse
@@ -39,6 +42,9 @@ META_HEADS = ("5053494e", "52424630")                # PSIN, RBF0
 NEW_STREAM_HEADS = META_HEADS + ("3c3f786d6c", "efbbbf3c3f786d6c")
 # A stream whose inflated size is a non-zero multiple of this continues in the next one (docs/page_directory.md).
 CONTINUATION_BLOCK = 65536
+# Folders harvested fully when --archives is left off. A carve that has only some of them is still a run:
+# the ones that are not there are skipped. Naming one that is not there, on the command line, is an error.
+DEFAULT_ARCHIVES = "common,data,script,pack_story000_story000_script,textures"
 
 
 def joaat(s: str) -> int:
@@ -71,11 +77,71 @@ def _raise_scan_error(error):
     raise error
 
 
+def archive_names(text):
+    """Folder names from a comma-separated --archives list. Spaces around a comma are not part of a name."""
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def resolve_archives(requested, available):
+    """Map requested names onto carved folder names.
+
+    One folder whose name differs only by case matches (a Windows carve keeps the case it was created with, and
+    `COMMON` is that folder). Two folders that differ only by case match only the exact spelling, so neither is
+    picked for the other. Returns (resolved, missing, ambiguous).
+    """
+    folded = {}
+    for name in available:
+        folded.setdefault(name.casefold(), []).append(name)
+    resolved, missing, ambiguous = [], [], []
+    for name in requested:
+        matches = folded.get(name.casefold(), [])
+        exact = [found for found in matches if found == name]
+        if exact:
+            resolved.append(exact[0])
+        elif len(matches) == 1:
+            resolved.append(matches[0])
+        elif len(matches) > 1:
+            ambiguous.append(name)
+        else:
+            missing.append(name)
+    return resolved, missing, ambiguous
+
+
+def archives_harvested_fully(text, carve, archives):
+    """The carved folders `--archives` harvests fully, or None after printing why the list is refused.
+
+    `text` is None when the flag was left off: that is the default list, and a name that is not in this carve
+    is skipped, because a carve of only some of those archives is a normal run. A list from the command line
+    that names nothing, or a folder that is not here, is an error: the run used to exit 0 and leave that
+    archive's names out of the dictionary.
+    """
+    requested = archive_names(DEFAULT_ARCHIVES if text is None else text)
+    available = [name for name, folder in archives if os.path.isfile(os.path.join(folder, "index.json"))]
+    resolved, missing, ambiguous = resolve_archives(requested, available)
+    if text is None:
+        return set(resolved)
+    if not requested:
+        print("ERROR: --archives names no archive", file=sys.stderr)
+        return None
+    if not missing and not ambiguous:
+        return set(resolved)
+    detail = []
+    if missing:
+        detail.append(f"no index.json for {', '.join(missing)} in {carve}")
+    if ambiguous:
+        detail.append(f"{', '.join(ambiguous)} matches more than one folder")
+    print(f"ERROR: --archives: {'; '.join(detail)}", file=sys.stderr)
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve", nargs="?")
     ap.add_argument("--out", default="hashes.json")
-    ap.add_argument("--archives", default="common,data,script,pack_story000_story000_script,textures")
+    ap.add_argument("--archives", default=None,
+                    help="comma-separated archive folders to harvest fully "
+                         f"(default: {DEFAULT_ARCHIVES}). Spaces around commas are ignored; "
+                         "a name with no carved folder is an error")
     ap.add_argument("--extra", nargs="*", default=[])
     ap.add_argument("--min", type=int, default=3)
     ap.add_argument("--lookup", nargs="+", metavar="VALUE", help="dictionary path followed by one or more hashes")
@@ -118,6 +184,10 @@ def main():
         archives = [(os.path.basename(os.path.normpath(os.path.abspath(a.carve))), a.carve)]
     else:
         archives = [(d, os.path.join(a.carve, d)) for d in sorted(os.listdir(a.carve))]
+    # Before the harvest: a typo or a space after a comma used to exit 0 with that archive's names missing.
+    full = archives_harvested_fully(a.archives, a.carve, archives)
+    if full is None:
+        return 2
     # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
     # samefile also catches a case-only difference on Windows and macOS's default volume.
     if os.path.exists(a.out):
@@ -140,7 +210,6 @@ def main():
     except OSError:
         output_stat = None
     strings = set()
-    full = set(a.archives.split(","))
     missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
     for arch, arch_dir in archives:
         p = os.path.join(arch_dir, "index.json")

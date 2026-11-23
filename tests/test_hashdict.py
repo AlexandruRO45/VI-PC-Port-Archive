@@ -673,5 +673,79 @@ class OutputPathTest(unittest.TestCase):
                     self.assertEqual(f.read(), before)
 
 
+class ArchiveListTest(unittest.TestCase):
+    """--archives used to split on commas only, so "common, data" and a typo both exited 0 with names missing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.carve = os.path.join(self.tmp.name, "carve")
+        self.out = os.path.join(self.tmp.name, "hashes.json")
+
+    def archive(self, name, token):
+        folder = os.path.join(self.carve, name)
+        os.makedirs(folder)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": [{"off": 0, "head": "00000000", "type": "bin"}]}, f)
+        with open(os.path.join(folder, f"{0:012x}.bin"), "wb") as f:
+            f.write(token + b"\x00")
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, self.carve, "--out", self.out, *args],
+                              capture_output=True, text=True)
+
+    def test_a_space_after_a_comma_still_harvests_the_archive(self):
+        self.archive("common", b"ordinary_common_asset")
+        self.archive("data", b"spaced_list_asset")
+        p = self.run_tool("--archives", "common, data")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(self.out, encoding="utf-8") as f:
+            found = set(json.load(f).values())
+        self.assertIn("spaced_list_asset", found)
+        self.assertIn("ordinary_common_asset", found)
+
+    def test_an_unknown_archive_is_an_error_and_writes_nothing(self):
+        self.archive("common", b"ordinary_common_asset")
+        p = self.run_tool("--archives", "commmon")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("no index.json for commmon", p.stderr)
+        self.assertIn(self.carve, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_archive_name_matches_ignoring_case_when_only_one_folder_folds(self):
+        self.archive("common", b"ordinary_common_asset")
+        p = self.run_tool("--archives", "COMMON")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertIn("ordinary_common_asset", set(json.load(f).values()))
+
+    def test_an_empty_archive_list_is_an_error(self):
+        self.archive("common", b"ordinary_common_asset")
+        p = self.run_tool("--archives", " , ")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("names no archive", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_the_default_list_skips_archives_that_were_not_carved(self):
+        # data, script and the rest of the default list are not in this carve; that is still a successful run.
+        self.archive("common", b"ordinary_common_asset")
+        p = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertIn("ordinary_common_asset", set(json.load(f).values()))
+
+    def test_two_folders_that_differ_only_by_case_match_only_the_exact_spelling(self):
+        resolved, missing, ambiguous = hashdict.resolve_archives(
+            ["common", "DATA", "COMMON"], ["common", "Common", "data"])
+        self.assertEqual(resolved, ["common", "data"])
+        self.assertEqual(missing, [])
+        self.assertEqual(ambiguous, ["COMMON"])
+
+
 if __name__ == "__main__":
     unittest.main()
