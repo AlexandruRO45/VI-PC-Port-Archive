@@ -137,6 +137,42 @@ class ExportTest(unittest.TestCase):
             nto.publish_obj(out, SAMPLE_GEOMETRY, 0)
             self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
 
+    def test_out_under_regular_file_is_rejected_before_scanning_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "input.rpf"
+            archive.write_bytes(b"")
+            blocker = Path(directory) / "blocker.txt"
+            blocker.write_text("keep\n", encoding="utf-8", newline="\n")
+            stderr = io.StringIO()
+            with mock.patch.object(nto, "navmesh_resources",
+                                   side_effect=AssertionError("archive should not be scanned")), \
+                    contextlib.redirect_stderr(stderr):
+                rc = nto.main([str(archive), "--tile", "0", "--out", str(blocker / "sub" / "tile.obj")])
+            self.assertEqual(rc, 2)
+            self.assertIn("not a directory", stderr.getvalue())
+            self.assertEqual(blocker.read_text(encoding="utf-8"), "keep\n")
+
+    def test_transient_windows_sharing_refusal_retries_and_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "tile.obj"
+            attempts = []
+            real_replace = os.replace
+
+            def flaky_replace(src, dst):
+                attempts.append((src, dst))
+                if len(attempts) == 1:
+                    err = PermissionError("sharing violation")
+                    err.winerror = 32
+                    raise err
+                return real_replace(src, dst)
+
+            with mock.patch("replace_retry.os.replace", side_effect=flaky_replace), \
+                    mock.patch("replace_retry.time.sleep"):
+                nto.publish_obj(out, SAMPLE_GEOMETRY, 0)
+            self.assertEqual(len(attempts), 2)
+            self.assertTrue(out.is_file())
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["tile.obj"])
+
 
 if __name__ == "__main__":
     unittest.main()

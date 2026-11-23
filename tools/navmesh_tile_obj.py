@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode
 from navmesh_nodes import navmesh_resources, tile_geometry
+from replace_retry import replace as replace_retry
 from report_paths import same_report_path
 
 
@@ -47,7 +48,7 @@ def publish_obj(dest, geometry, ordinal):
             temp = Path(out.name)
             write_obj(out, geometry, ordinal)
         os.chmod(temp, published_mode(dest))
-        os.replace(temp, dest)
+        replace_retry(temp, dest)
         temp = None
     finally:
         if temp is not None:
@@ -71,6 +72,9 @@ def main(argv=None):
             raise ValueError("--out aliases the archive")
         if args.out.is_dir():
             raise ValueError(f"--out is a directory: {args.out}")
+        for parent in args.out.parents:
+            if (parent.exists() or parent.is_symlink()) and not parent.is_dir():
+                raise ValueError(f"--out parent is not a directory: {parent}")
         with closing(navmesh_resources(args.archive)) as resources:
             for ordinal, tile in enumerate(resources):
                 if ordinal == args.tile:
