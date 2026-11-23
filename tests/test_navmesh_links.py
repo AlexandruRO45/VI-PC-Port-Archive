@@ -320,6 +320,40 @@ class NavmeshLinksTest(unittest.TestCase):
         self.assertEqual(winding, {c: {"opposite": 2, "same": 2, "ambiguous": 2}
                                    for c in ("same_direction", "reversed")})
 
+    def test_coplanar_winding_cli(self):
+        a, b, c = (0, 2, 2), (0, 4, 2), (0, 4, 6)
+        opened = (0xffffffff, 0xffff, 0, 0)
+        rings = ([a, b, (0, 3, 4)], [a, b, (0, 3, 0)], [a, b, c, (0, 3, 4)],
+                 [a, b, (2, 3, 3)], [a, b, (2, 3, 3), (0, 2, 4)],
+                 [a, b, b], [a, b], [a, b, (0, 5, 2)], [a, b, (0, 2, 4), (0, 5, 4)])
+        tiles = []
+        for right in rings:
+            points = [a, b, c] + right
+            edges = [(42, 1, 0, 0), opened, opened, (42, 0, 0, 0)] + [opened] * (len(right) - 1)
+            tile = bytearray(build_tile(flags=1, sector=42, n_verts=len(points),
+                                        poly_sizes=(3, len(right)), edges=edges)[0])
+            struct.pack_into("<3f", tile, 0x60, 3, 4, 7)
+            start = nd.split_array(tile, 0x70, 6, len(points))[0][0]
+            for i, point in enumerate(points):
+                struct.pack_into("<3H", tile, start + 6 * i, *point)
+            tiles.append(tile)
+        # The vertical YZ pair survives a collapsed X axis. Losing Y collapses its shared edge.
+        for extents in ((0, 4, 7), (3, 0, 7), (3, 4, float("nan")), (3, 4, -1)):
+            tile = bytearray(tiles[0])
+            struct.pack_into("<3f", tile, 0x60, *extents)
+            tiles.append(tile)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pairs.rpf")
+            make_rpf(path, tiles)
+            baseline = nl.scan(path, relative_winding=True)
+            proc = subprocess.run([sys.executable, "-I", TOOL, path, "--coplanar-winding"],
+                                  capture_output=True, check=True)
+        report = json.loads(proc.stdout)
+        counts = report["endpoint_agreement"].pop("coplanar_winding")
+        self.assertEqual(report, baseline)
+        self.assertEqual(counts, {"same": 4, "opposite": 2, "coincident": 2,
+                                  "different_planes": 2, "undefined_ring": 16})
+
     def test_projected_ring_geometry(self):
         concave = [(0, 0), (4, 0), (2, 1), (4, 3), (0, 3)]
         self.assertEqual(nl._xy_winding(concave), 1)

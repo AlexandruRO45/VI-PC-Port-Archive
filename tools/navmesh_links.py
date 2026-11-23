@@ -108,6 +108,45 @@ def _xy_winding(points):
     return (area > 0) - (area < 0)
 
 
+def _plane_ring(points):
+    """Return a canonical plane normal, winding sign and undirected corner cycle."""
+    if len(points) < 3 or len(set(points)) != len(points):
+        return None
+    a, b = points[:2]
+    dx, dy, dz = (v - u for u, v in zip(a, b))
+    for c in points[2:]:
+        ex, ey, ez = (v - u for u, v in zip(a, c))
+        normal = (dy * ez - dz * ey, dz * ex - dx * ez, dx * ey - dy * ex)
+        if any(normal):
+            break
+    else:
+        return None
+    if any(sum(n * (v - u) for n, v, u in zip(normal, point, a)) for point in points):
+        return None
+    axis = next(i for i, n in enumerate(normal) if n)
+    divisor = math.gcd(*normal) * (1 if normal[axis] > 0 else -1)
+    plane = tuple(n // divisor for n in normal)
+    projected = [(p[(axis + 1) % 3], p[(axis + 2) % 3]) for p in points]
+    sign = _xy_winding(projected)
+    if not sign:
+        return None
+    corners = [p for i, p in enumerate(projected)
+               if _turn(projected[i - 1], p, projected[(i + 1) % len(points)])]
+    boundary = frozenset(tuple(sorted((p, corners[i - 1]))) for i, p in enumerate(corners))
+    return plane, sign, boundary
+
+
+def _plane_relation(left, right):
+    if left is None or right is None:
+        return "undefined_ring"
+    # The exact shared edge supplies a common point, so parallel planes coincide.
+    if left[0] != right[0]:
+        return "different_planes"
+    if left[2] == right[2]:
+        return "coincident"
+    return "same" if left[1] == right[1] else "opposite"
+
+
 def _endpoint_counts(b, tables, sector, polygon_count, totals):
     """Compare each slot under both cyclic boundary conventions within this tile."""
     vertices, indices, edges, polygons = tables
@@ -123,6 +162,20 @@ def _endpoint_counts(b, tables, sector, polygon_count, totals):
         xy = [struct.unpack_from("<HH", vertex) for vertex in coords]
         valid_xy = all(math.isfinite(v) and v > 0 for v in nd._f32s(b, 0x60, 2))
         signs = []
+    coplanar = totals.get("coplanar_winding")
+    if coplanar is not None:
+        rings = []
+        planes = {}
+        extents = nd._f32s(b, 0x60, 3)
+        valid_xyz = all(math.isfinite(v) and v >= 0 for v in extents)
+
+        def plane(index):
+            if index not in planes:
+                points = [tuple(v if extent else 0 for v, extent in zip(struct.unpack("<3H", raw), extents))
+                          for raw in rings[index]]
+                planes[index] = _plane_ring(points) if valid_xyz else None
+            return planes[index]
+
     position = source = self_refs = unlinked = invalid = 0
     for offset, count in polygons:
         for i in range(count):
@@ -131,6 +184,8 @@ def _endpoint_counts(b, tables, sector, polygon_count, totals):
                 return
             end = position + (span & 15)
             ring = [coords[index] for index in ring_indices[position:end]]
+            if coplanar is not None:
+                rings.append(ring)
             if winding is not None:
                 signs.append(_xy_winding([xy[index] for index in ring_indices[position:end]])
                              if valid_xy else 0)
@@ -172,6 +227,8 @@ def _endpoint_counts(b, tables, sector, polygon_count, totals):
                 product = signs[source] * signs[target]
                 relation = "ambiguous" if product == 0 else "same" if product > 0 else "opposite"
                 winding[category][relation] += n
+                if coplanar is not None and category == "same_direction" and relation == "ambiguous":
+                    coplanar[_plane_relation(plane(source), plane(target))] += n
 
 
 def verify_tile(b, stats):
@@ -445,7 +502,9 @@ def _iter_resources(path, start=0, limit=None):
                 yield bytes(buf)
 
 
-def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=False, relative_winding=False):
+def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=False, relative_winding=False,
+         coplanar_winding=False):
+    relative_winding = relative_winding or coplanar_winding
     stats = new_stats()
     if endpoint_agreement or relative_winding:
         stats["endpoint_agreement"] = {
@@ -457,6 +516,9 @@ def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=Fal
             category: dict.fromkeys(("same", "opposite", "ambiguous"), 0)
             for category in ("reversed", "same_direction")
         }
+    if coplanar_winding:
+        stats["endpoint_agreement"]["coplanar_winding"] = dict.fromkeys(
+            ("same", "opposite", "different_planes", "coincident", "undefined_ring"), 0)
     if reciprocity:
         stats["reciprocity"] = dict.fromkeys(
             ("tiles_counted", "same_tile", "excess_directed", "invalid_targets", "unlinked"), 0)
@@ -506,6 +568,8 @@ def main(argv=None):
                     help="Count same-tile directed edges in excess of their reverse multiplicity")
     ap.add_argument("--endpoint-agreement", action="store_true",
                     help="Compare incoming and outgoing boundary endpoints for same-tile edges")
+    ap.add_argument("--coplanar-winding", action="store_true",
+                    help="Also classify XY-ambiguous same-direction slots using coplanar 3D rings")
     ap.add_argument("--relative-winding", action="store_true",
                     help="Include endpoint agreement and compare polygon XY winding for unique outgoing matches")
     args = ap.parse_args(argv)
@@ -536,7 +600,8 @@ def main(argv=None):
                     return 2
 
     doc = scan(args.input, start=args.start, limit=args.limit, reciprocity=args.reciprocity,
-               endpoint_agreement=args.endpoint_agreement, relative_winding=args.relative_winding)
+               endpoint_agreement=args.endpoint_agreement, relative_winding=args.relative_winding,
+               coplanar_winding=args.coplanar_winding)
     if args.out is not None:
         parent = os.path.dirname(os.path.abspath(args.out))
         if parent:

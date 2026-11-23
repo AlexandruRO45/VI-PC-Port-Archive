@@ -570,10 +570,40 @@ are authoring/build-time inputs to that partition:
   | Same direction | 61,128 | 592 | 9,614,904 |
   | Reversed | 448,891,156 | 11,896 | 110,534 |
 
-  Across the whole archive, only 592 same-direction slots have demonstrably opposite winding. Of the
+  Across the whole archive, only 592 same-direction slots have demonstrably opposite XY winding. Of the
   61,720 same-direction slots with classifiable rings, 61,128 have the same winding. The remaining
   9,614,904 slots admit no conclusion from this projection. Reversed slots overwhelmingly join rings
   of the same winding.
+
+  Pass `--coplanar-winding` to examine the 9,614,904 XY-ambiguous same-direction directed slots.
+  The three unsigned words per vertex at `+0x70` give tile-space XYZ. Positive per-axis scaling and
+  translation preserve coplanarity and the relative orientation of rings in a common plane. A zero
+  extent collapses that axis. The test requires finite, nonnegative extents. It finds a plane from
+  three noncollinear ring points and verifies all remaining points against it with integer arithmetic.
+  Dropping an axis with a nonzero normal component maps that plane one-to-one onto a coordinate plane,
+  where the existing simple-ring and signed-area tests apply. Two parallel planes containing the same
+  edge coincide, so both rings use the same projection. For different planes the relative sign can
+  depend on the viewing direction.
+
+  A private census over all 27,644 tiles classified each ring separately. For planar rings with
+  distinct vertices, the segment checks stop at the first boundary defect in vertex order. When the
+  two rings have different conditions, the first listed below takes precedence. Each reciprocal
+  pair contributes two directed slots.
+
+  | First applicable 3D condition | Directed slots |
+  |---|---:|
+  | Fewer than three vertices | 6,375,984 |
+  | Repeated XYZ vertex in a ring | 84 |
+  | All vertices collinear | 1,100,732 |
+  | Adjacent segments double back in a planar ring | 89,984 |
+  | Nonadjacent segments intersect or touch in a planar ring | 738,318 |
+  | Nonplanar ring | 596,656 |
+  | Both rings simple and planar | 713,146 |
+
+  Among the 713,146 slots with two simple planar rings, 713,102 join different planes. The coplanar
+  group contains 20 slots of equal winding, 20 of opposite winding and 4 with coincident boundaries.
+  The coincidence test ignores extra vertices along straight sides. The remaining 8,901,758 slots
+  have at least one undefined ring. These counts describe polygon geometry only.
 
 - `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
   ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
