@@ -222,5 +222,66 @@ class TestVFloorF32AST(unittest.TestCase):
         with self.assertRaises(ValueError):
             instr.validate()
 
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class LaneRegisterState:
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def read_operand(self, op: RegOperand) -> int:
+        if op.kind == RegisterKind.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.kind == RegisterKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        elif op.kind == RegisterKind.LITERAL32:
+            return op.index & MASK32
+        raise NotImplementedError(f"Unsupported operand kind: {op.kind}")
+
+    def write_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter executing v_floor_f32 for a single lane."""
+
+    @staticmethod
+    def step(instr: VFloorF32Instruction, state: LaneRegisterState) -> None:
+        instr.validate()
+        s0_val = state.read_operand(instr.src0)
+        res = v_floor_f32_oracle(s0_val)
+        state.write_vgpr(instr.dst.index, res)
+
+
+class TestVFloorF32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter execution."""
+
+    def setUp(self):
+        self.state = LaneRegisterState()
+
+    def test_interpreter_step_basic(self):
+        # 1.5 (0x3FC00000) -> 1.0 (0x3F800000)
+        self.state.vgprs[1] = 0x3FC0_0000
+
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=2),
+            src0=RegOperand(RegisterKind.VGPR, index=1)
+        )
+        ScalarInterpreter.step(instr, self.state)
+        self.assertEqual(self.state.vgprs[2], 0x3F80_0000)
+
+    def test_interpreter_step_with_sgpr_source(self):
+        # -0.5 (0xBF000000) -> -1.0 (0xBF800000)
+        self.state.sgprs[10] = 0xBF00_0000
+
+        instr = VFloorF32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=4),
+            src0=RegOperand(RegisterKind.SGPR, index=10)
+        )
+        ScalarInterpreter.step(instr, self.state)
+        self.assertEqual(self.state.vgprs[4], 0xBF80_0000)
+
 if __name__ == "__main__":
     unittest.main()
