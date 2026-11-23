@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterable, Iterator
+from operator import itemgetter, truediv
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
@@ -55,6 +56,11 @@ DEFAULT_SAMPLER = {
     "wrapT": 10497,     # REPEAT
 }
 
+_GET0 = itemgetter(0)
+_GET1 = itemgetter(1)
+_GET2 = itemgetter(2)
+_GETTERS = (_GET0, _GET1, _GET2)
+_NEGATIVE_ZERO = array.array("d", [-0.0]).tobytes()
 _NEEDS_BYTESWAP = sys.byteorder != "little"
 _UINT16_CODE = "H" if array.array("H").itemsize == 2 else None
 _UINT32_CODE = "I" if array.array("I").itemsize == 4 else ("L" if array.array("L").itemsize == 4 else None)
@@ -83,11 +89,11 @@ def _normalize3(nx: float, ny: float, nz: float) -> tuple[float, float, float]:
     return (_clean_zero(nx / length), _clean_zero(ny / length), _clean_zero(nz / length))
 
 
-def _compute_smooth_normals(
+def _smooth_normal_sums_scalar(
     positions: list[tuple[float, float, float]],
     indices: Iterable[int],
-) -> list[tuple[float, float, float]]:
-    """Compute area-weighted smooth vertex normals with (0, 1, 0) fallback."""
+) -> tuple[list[float], list[float], list[float]]:
+    """``_smooth_normal_sums`` one triangle at a time: the reference, and the path for malformed positions."""
     n = len(positions)
     ax = [0.0] * n
     ay = [0.0] * n
@@ -119,12 +125,113 @@ def _compute_smooth_normals(
         ax[i2] += cx
         ay[i2] += cy
         az[i2] += cz
+    return ax, ay, az
 
-    normals: list[tuple[float, float, float]] = []
-    append = normals.append
-    for i in range(n):
-        append(_normalize3(ax[i], ay[i], az[i]))
-    return normals
+
+def _smooth_normal_sums(
+    positions: list[tuple[float, float, float]],
+    indices: Iterable[int],
+    *,
+    finite_positions: bool = False,
+) -> tuple[list[float], list[float], list[float]]:
+    """Area-weighted (unnormalized) face-normal sums per vertex, as x, y and z columns.
+
+    The arithmetic, and its order per vertex, is ``_smooth_normal_sums_scalar``'s, on x, y and z columns
+    of the positions so each coordinate is one list lookup. ``finite_positions`` says every coordinate is
+    already known to fit a float32 (``pack_primitive`` has packed them): no cross product of such
+    positions can overflow, so the per-triangle finiteness test is skipped.
+    """
+    try:
+        px = list(map(_GET0, positions))
+        py = list(map(_GET1, positions))
+        pz = list(map(_GET2, positions))
+    except (IndexError, TypeError):
+        # A malformed position must only fail when a triangle uses it.
+        return _smooth_normal_sums_scalar(positions, indices)
+    n = len(positions)
+    ax = [0.0] * n
+    ay = [0.0] * n
+    az = [0.0] * n
+    index_iter = iter(indices)
+    for i0, i1, i2 in zip(index_iter, index_iter, index_iter):
+        x0 = px[i0]
+        y0 = py[i0]
+        z0 = pz[i0]
+        e1x = px[i1] - x0
+        e1y = py[i1] - y0
+        e1z = pz[i1] - z0
+        e2x = px[i2] - x0
+        e2y = py[i2] - y0
+        e2z = pz[i2] - z0
+        cx = e1y * e2z - e1z * e2y
+        cy = e1z * e2x - e1x * e2z
+        cz = e1x * e2y - e1y * e2x
+        # Zero for finite components, NaN as soon as one is infinite or NaN.
+        if not finite_positions and cx * 0.0 + cy * 0.0 + cz * 0.0 != 0.0:
+            continue
+        ax[i0] += cx
+        ay[i0] += cy
+        az[i0] += cz
+        ax[i1] += cx
+        ay[i1] += cy
+        az[i1] += cz
+        ax[i2] += cx
+        ay[i2] += cy
+        az[i2] += cz
+    return ax, ay, az
+
+
+_FLOAT_MIN = sys.float_info.min
+
+
+def _normalize_columns(xs, ys, zs) -> tuple:
+    """``_normalize3`` over x, y and z columns, returned as three float columns.
+
+    The common case (every length finite and at least the smallest normal float) runs as C-level passes;
+    anything else goes through ``_normalize3`` one vertex at a time.
+    """
+    try:
+        # hypot is infinite or NaN when any input is, so a finite sum means finite inputs and lengths.
+        lengths = array.array("d", map(math.hypot, xs, ys, zs))
+        usable = len(lengths) > 0 and math.isfinite(sum(lengths)) and min(lengths) >= _FLOAT_MIN
+    except OverflowError:
+        usable = False
+    if usable:
+        columns = []
+        for column in (xs, ys, zs):
+            out = array.array("d", map(truediv, column, lengths))
+            if _NEGATIVE_ZERO in out.tobytes():
+                # _clean_zero: ``or 0.0`` turns -0.0 into 0.0 and passes every other value through.
+                out = array.array("d", [v or 0.0 for v in out])
+            columns.append(out)
+        return tuple(columns)
+    out_x: list[float] = []
+    out_y: list[float] = []
+    out_z: list[float] = []
+    for nx, ny, nz in zip(xs, ys, zs):
+        x, y, z = _normalize3(nx, ny, nz)
+        out_x.append(x)
+        out_y.append(y)
+        out_z.append(z)
+    return out_x, out_y, out_z
+
+
+def _float_column(values, index: int) -> array.array | list[float]:
+    """``float(v[index])`` for every ``v`` of ``values``, as a float64 array (a list when an item needs ``float()``)."""
+    getter = _GETTERS[index]
+    try:
+        return array.array("d", map(getter, values))
+    except TypeError:
+        return list(map(float, map(getter, values)))
+
+
+def _compute_smooth_normals(
+    positions: list[tuple[float, float, float]],
+    indices: Iterable[int],
+) -> list[tuple[float, float, float]]:
+    """Compute area-weighted smooth vertex normals with (0, 1, 0) fallback."""
+    ax, ay, az = _smooth_normal_sums(positions, indices)
+    return list(zip(*_normalize_columns(ax, ay, az)))
 
 
 def _resolve_obj_index(token: str, count: int) -> int | None:
@@ -541,13 +648,36 @@ def compute_bounds(primitives: list[dict]) -> list[float] | None:
     maxy = -math.inf
     maxz = -math.inf
     found = False
+    isfinite = math.isfinite
 
     for prim in primitives:
-        for pos in prim.get("positions") or ():
+        positions = prim.get("positions") or ()
+        if not isinstance(positions, (list, tuple)):
+            positions = list(positions)
+        if not positions:
+            continue
+        try:
+            if min(map(len, positions)) >= 3:
+                xs = array.array("d", map(_GET0, positions))
+                ys = array.array("d", map(_GET1, positions))
+                zs = array.array("d", map(_GET2, positions))
+                # A sum is finite only when every term is finite.
+                if isfinite(sum(xs)) and isfinite(sum(ys)) and isfinite(sum(zs)):
+                    found = True
+                    minx = min(minx, min(xs))
+                    miny = min(miny, min(ys))
+                    minz = min(minz, min(zs))
+                    maxx = max(maxx, max(xs))
+                    maxy = max(maxy, max(ys))
+                    maxz = max(maxz, max(zs))
+                    continue
+        except (TypeError, ValueError, OverflowError):
+            pass
+        for pos in positions:
             if len(pos) < 3:
                 continue
             x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
-            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            if not (isfinite(x) and isfinite(y) and isfinite(z)):
                 continue
             found = True
             if x < minx:
@@ -575,19 +705,22 @@ def compute_bounds(primitives: list[dict]) -> list[float] | None:
     ]
 
 
+def _f32_array_bytes(arr: array.array) -> tuple[bytes, array.array]:
+    # float32 values are finite exactly when their (float64) sum is: the sum cannot overflow.
+    if not math.isfinite(sum(arr)):
+        raise GlbError("non-finite float32 vertex attribute")
+    if _NEEDS_BYTESWAP:
+        swapped = array.array(_FLOAT32_CODE, arr)
+        swapped.byteswap()
+        return swapped.tobytes(), arr
+    return arr.tobytes(), arr
+
+
 def _pack_f32(values: list[tuple[float, ...]], components: int) -> tuple[bytes, array.array]:
-    if any(len(item) != components for item in values):
+    if values and set(map(len, values)) != {components}:
         raise GlbError(f"expected {components} floats per vertex")
     if _FLOAT32_CODE is not None:
-        arr = array.array(_FLOAT32_CODE, itertools.chain.from_iterable(values))
-        if not all(map(math.isfinite, arr)):
-            raise GlbError("non-finite float32 vertex attribute")
-        raw = arr
-        if _NEEDS_BYTESWAP:
-            swapped = array.array(_FLOAT32_CODE, arr)
-            swapped.byteswap()
-            return swapped.tobytes(), raw
-        return raw.tobytes(), raw
+        return _f32_array_bytes(array.array(_FLOAT32_CODE, itertools.chain.from_iterable(values)))
 
     flat: list[float] = []
     for item in values:
@@ -601,6 +734,17 @@ def _pack_f32(values: list[tuple[float, ...]], components: int) -> tuple[bytes, 
     if not all(map(math.isfinite, unpacked)):
         raise GlbError("non-finite float32 vertex attribute")
     return packed, array.array("d", unpacked)
+
+
+def _pack_f32_columns(columns: tuple) -> bytes:
+    """``_pack_f32`` of the rows made from equally long ``columns`` (lists or float arrays)."""
+    if _FLOAT32_CODE is not None:
+        count = len(columns)
+        flat = array.array(_FLOAT32_CODE, bytes(4 * count * len(columns[0])))
+        for index, column in enumerate(columns):
+            flat[index::count] = array.array(_FLOAT32_CODE, column)
+        return _f32_array_bytes(flat)[0]
+    return _pack_f32(list(zip(*columns)), len(columns))[0]
 
 
 def _pack_indices(indices: list[int], vert_count: int) -> tuple[bytes, int]:
@@ -672,12 +816,11 @@ def pack_primitive(prim: dict) -> dict:
     idx_bytes, idx_comp_type = _pack_indices(indices, vert_count)
     normals_in = prim.get("normals")
     if normals_in is None or len(normals_in) == 0:
-        normals = _compute_smooth_normals(positions, indices)
+        normal_columns = _normalize_columns(*_smooth_normal_sums(positions, indices, finite_positions=True))
     elif len(normals_in) == vert_count:
-        normals = [
-            _normalize3(float(n[0]), float(n[1]), float(n[2]))
-            for n in normals_in
-        ]
+        normal_columns = _normalize_columns(
+            _float_column(normals_in, 0), _float_column(normals_in, 1), _float_column(normals_in, 2),
+        )
     else:
         raise GlbError(
             f"normals length ({len(normals_in)}) does not match positions length ({vert_count})"
@@ -685,7 +828,8 @@ def pack_primitive(prim: dict) -> dict:
     xs = pos_f32[0::3]
     ys = pos_f32[1::3]
     zs = pos_f32[2::3]
-    nrm_bytes, _ = _pack_f32(normals, 3)
+    nrm_bytes = _pack_f32_columns(normal_columns)
+    del normal_columns
     uv_bytes = b""
     uvs_in = prim.get("uvs")
     if uvs_in is not None and len(uvs_in) > 0:
@@ -693,14 +837,22 @@ def pack_primitive(prim: dict) -> dict:
             raise GlbError(
                 f"uvs length ({len(uvs_in)}) does not match positions length ({vert_count})"
             )
-        clean_uvs = [
-            (
-                _clean_zero(float(uv[0])) if math.isfinite(float(uv[0])) else 0.0,
-                _clean_zero(float(uv[1])) if math.isfinite(float(uv[1])) else 0.0,
-            )
-            for uv in uvs_in
-        ]
-        uv_bytes, _ = _pack_f32(clean_uvs, 2)
+        us = _float_column(uvs_in, 0)
+        vs = _float_column(uvs_in, 1)
+        try:
+            all_finite = math.isfinite(sum(us)) and math.isfinite(sum(vs))
+        except OverflowError:
+            all_finite = False
+        if all_finite:
+            # All finite: only -0.0 needs cleaning (``or 0.0`` turns it into 0.0, other values pass through).
+            if _NEGATIVE_ZERO in array.array("d", us).tobytes():
+                us = [u or 0.0 for u in us]
+            if _NEGATIVE_ZERO in array.array("d", vs).tobytes():
+                vs = [v or 0.0 for v in vs]
+        else:
+            us = [_clean_zero(u) if math.isfinite(u) else 0.0 for u in us]
+            vs = [_clean_zero(v) if math.isfinite(v) else 0.0 for v in vs]
+        uv_bytes = _pack_f32_columns((us, vs))
     material = prim.get("material", "")
     return {
         "positions": pos_bytes,
@@ -982,7 +1134,7 @@ def _build_glb_with_stats(
     header = struct.pack("<4sII", GLB_MAGIC, GLB_VERSION, total_length)
     json_hdr = struct.pack("<II", len(json_bytes), CHUNK_TYPE_JSON)
     bin_hdr = struct.pack("<II", len(bin_buf), CHUNK_TYPE_BIN)
-    glb_bytes = b"".join((header, json_hdr, json_bytes, bin_hdr, bytes(bin_buf)))
+    glb_bytes = b"".join((header, json_hdr, json_bytes, bin_hdr, bin_buf))
 
     bounds = compute_bounds(non_empty)
     assert bounds is not None
@@ -1103,17 +1255,106 @@ def _quat_matrix(q) -> list[list[float]]:
 def instance_bounds(box_min, box_max, translation, rotation, scale) -> list[float]:
     """Exact axis-aligned bounds of the box [box_min, box_max] after scale, rotation (unit x, y, z, w) and
     translation, the order glTF applies a node's TRS in."""
-    r = _quat_matrix(rotation)
-    m = [[r[i][j] * float(scale[j]) for j in range(3)] for i in range(3)]
-    c = [(float(box_min[j]) + float(box_max[j])) * 0.5 for j in range(3)]
-    h = [(float(box_max[j]) - float(box_min[j])) * 0.5 for j in range(3)]
-    out_min, out_max = [], []
-    for i in range(3):
-        ci = m[i][0] * c[0] + m[i][1] * c[1] + m[i][2] * c[2] + float(translation[i])
-        hi = abs(m[i][0]) * h[0] + abs(m[i][1]) * h[1] + abs(m[i][2]) * h[2]
-        out_min.append(ci - hi)
-        out_max.append(ci + hi)
-    return out_min + out_max
+    # The arithmetic is _quat_matrix's, unrolled, in the same order.
+    x, y, z, w = map(float, rotation)
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    xw = x * w
+    yw = y * w
+    zw = z * w
+    s0 = float(scale[0])
+    s1 = float(scale[1])
+    s2 = float(scale[2])
+    m00 = (1 - 2 * (yy + zz)) * s0
+    m01 = 2 * (xy - zw) * s1
+    m02 = 2 * (xz + yw) * s2
+    m10 = 2 * (xy + zw) * s0
+    m11 = (1 - 2 * (xx + zz)) * s1
+    m12 = 2 * (yz - xw) * s2
+    m20 = 2 * (xz - yw) * s0
+    m21 = 2 * (yz + xw) * s1
+    m22 = (1 - 2 * (xx + yy)) * s2
+    b0, b1, b2 = float(box_min[0]), float(box_min[1]), float(box_min[2])
+    e0, e1, e2 = float(box_max[0]), float(box_max[1]), float(box_max[2])
+    c0 = (b0 + e0) * 0.5
+    c1 = (b1 + e1) * 0.5
+    c2 = (b2 + e2) * 0.5
+    h0 = (e0 - b0) * 0.5
+    h1 = (e1 - b1) * 0.5
+    h2 = (e2 - b2) * 0.5
+    t0 = m00 * c0 + m01 * c1 + m02 * c2 + float(translation[0])
+    t1 = m10 * c0 + m11 * c1 + m12 * c2 + float(translation[1])
+    t2 = m20 * c0 + m21 * c1 + m22 * c2 + float(translation[2])
+    d0 = abs(m00) * h0 + abs(m01) * h1 + abs(m02) * h2
+    d1 = abs(m10) * h0 + abs(m11) * h1 + abs(m12) * h2
+    d2 = abs(m20) * h0 + abs(m21) * h1 + abs(m22) * h2
+    return [t0 - d0, t1 - d1, t2 - d2, t0 + d0, t1 + d1, t2 + d2]
+
+
+def _grow_instance_bounds(box_min, box_max, transforms, lo: list[float], hi: list[float]) -> None:
+    """Fold ``instance_bounds`` of every (translation, rotation, scale) float triple of ``transforms`` into lo/hi.
+
+    The arithmetic is ``instance_bounds``'s, with the box terms computed once for all instances.
+    """
+    b0, b1, b2 = float(box_min[0]), float(box_min[1]), float(box_min[2])
+    e0, e1, e2 = float(box_max[0]), float(box_max[1]), float(box_max[2])
+    c0 = (b0 + e0) * 0.5
+    c1 = (b1 + e1) * 0.5
+    c2 = (b2 + e2) * 0.5
+    h0 = (e0 - b0) * 0.5
+    h1 = (e1 - b1) * 0.5
+    h2 = (e2 - b2) * 0.5
+    lo0, lo1, lo2 = lo
+    hi0, hi1, hi2 = hi
+    for (tx, ty, tz), (x, y, z, w), (s0, s1, s2) in transforms:
+        xx = x * x
+        yy = y * y
+        zz = z * z
+        xy = x * y
+        xz = x * z
+        yz = y * z
+        xw = x * w
+        yw = y * w
+        zw = z * w
+        m00 = (1 - 2 * (yy + zz)) * s0
+        m01 = 2 * (xy - zw) * s1
+        m02 = 2 * (xz + yw) * s2
+        m10 = 2 * (xy + zw) * s0
+        m11 = (1 - 2 * (xx + zz)) * s1
+        m12 = 2 * (yz - xw) * s2
+        m20 = 2 * (xz - yw) * s0
+        m21 = 2 * (yz + xw) * s1
+        m22 = (1 - 2 * (xx + yy)) * s2
+        t0 = m00 * c0 + m01 * c1 + m02 * c2 + tx
+        t1 = m10 * c0 + m11 * c1 + m12 * c2 + ty
+        t2 = m20 * c0 + m21 * c1 + m22 * c2 + tz
+        d0 = abs(m00) * h0 + abs(m01) * h1 + abs(m02) * h2
+        d1 = abs(m10) * h0 + abs(m11) * h1 + abs(m12) * h2
+        d2 = abs(m20) * h0 + abs(m21) * h1 + abs(m22) * h2
+        v = t0 - d0
+        if v < lo0:
+            lo0 = v
+        v = t1 - d1
+        if v < lo1:
+            lo1 = v
+        v = t2 - d2
+        if v < lo2:
+            lo2 = v
+        v = t0 + d0
+        if v > hi0:
+            hi0 = v
+        v = t1 + d1
+        if v > hi1:
+            hi1 = v
+        v = t2 + d2
+        if v > hi2:
+            hi2 = v
+    lo[:] = (lo0, lo1, lo2)
+    hi[:] = (hi0, hi1, hi2)
 
 
 def build_instanced_glb(
@@ -1185,7 +1426,7 @@ def build_instanced_glb(
             q = [v / n for v in q]
             if sc[0] * sc[1] * sc[2] <= 0:
                 raise GlbError("instance scale must have a positive determinant; mirror the mesh instead")
-            if not all(math.isfinite(v) for v in t + sc):
+            if not all(map(math.isfinite, t + sc)):
                 raise GlbError("instance translation and scale must be finite")
             ts.append(t)
             rs.append(q)
@@ -1208,18 +1449,15 @@ def build_instanced_glb(
         else:
             for t, q, sc in zip(ts, rs, ss):
                 node: dict = {"mesh": mesh_idx}
+                # ``or 0.0`` is _clean_zero for finite values: -0.0 becomes 0.0, everything else is unchanged.
                 if any(t):
-                    node["translation"] = [_clean_zero(v) for v in t]
+                    node["translation"] = [v or 0.0 for v in t]
                 if q != [0.0, 0.0, 0.0, 1.0]:
-                    node["rotation"] = [_clean_zero(v) for v in q]
+                    node["rotation"] = [v or 0.0 for v in q]
                 if sc != [1.0, 1.0, 1.0]:
-                    node["scale"] = [_clean_zero(v) for v in sc]
+                    node["scale"] = [v or 0.0 for v in sc]
                 nodes.append(node)
-        for t, q, sc in bounds_transforms:
-            b = instance_bounds(box_min, box_max, t, q, sc)
-            for k in range(3):
-                lo[k] = min(lo[k], b[k])
-                hi[k] = max(hi[k], b[k + 3])
+        _grow_instance_bounds(box_min, box_max, bounds_transforms, lo, hi)
     if not nodes:
         raise GlbError("cannot build GLB: no mesh with primitives and instances")
     bin_pad = (-len(bin_buf)) % 4
@@ -1245,7 +1483,7 @@ def build_instanced_glb(
     glb_bytes = b"".join((
         struct.pack("<4sII", GLB_MAGIC, GLB_VERSION, total_length),
         struct.pack("<II", len(json_bytes), CHUNK_TYPE_JSON), json_bytes,
-        struct.pack("<II", len(bin_buf), CHUNK_TYPE_BIN), bytes(bin_buf),
+        struct.pack("<II", len(bin_buf), CHUNK_TYPE_BIN), bin_buf,
     ))
     return glb_bytes, {
         "bytes": len(glb_bytes),
