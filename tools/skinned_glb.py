@@ -550,7 +550,9 @@ class PaletteResolver:
         self.own_skeleton = own
         self.own_by_name = {}
         self.by_hash: dict[int, tuple[str, str]] = {}
-        for bone in own:
+        for index, bone in enumerate(own):
+            if not isinstance(bone, dict):
+                raise SkinError(f"component skeleton bone at index {index} must be an object")
             name = bone.get("name")
             if isinstance(name, str) and name:
                 self.own_by_name.setdefault(name, bone)

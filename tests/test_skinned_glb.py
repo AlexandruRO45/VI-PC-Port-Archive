@@ -718,6 +718,18 @@ class SkinnedGlbTest(unittest.TestCase):
                 self.assertEqual(result.stderr.splitlines(), ["error: skeleton bone at index 1 must be an object"])
                 self.assertFalse(os.path.exists(os.path.join(self.root, "out.glb")))
 
+    def test_cli_rejects_non_object_component_skeleton_entries(self):
+        for index, invalid in enumerate(([1, 2], None, 7, "bone")):
+            with self.subTest(invalid=invalid):
+                root = self._case_root(f"component_bone_{index}")
+                skeleton = _skeleton_dir(root)
+                component = _component(root, own_skeleton=[_skeleton()[0], invalid])
+                result = self._run_cli(skeleton, component)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.splitlines(),
+                                 ["error: component skeleton bone at index 1 must be an object"])
+                self.assertFalse(os.path.exists(os.path.join(self.root, "out.glb")))
+
     def test_cli_bad_component_json_is_one_error_line(self):
         for name, data in self.BAD_JSON.items():
             with self.subTest(name):
