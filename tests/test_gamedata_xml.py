@@ -370,6 +370,22 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("blocked", err.getvalue())
 
+    def test_report_preflight_keeps_the_one_line_error_for_an_unlistable_folder(self):
+        def fail(targets):
+            raise PermissionError(13, "permission denied", os.path.join(self.root, "blocked"))
+            yield  # pragma: no cover
+
+        report = os.path.join(self.root, "report.json")
+        err = io.StringIO()
+        with mock.patch.object(g, "input_files", fail), \
+                mock.patch.object(sys, "argv", ["gamedata_xml.py", self.root, "--json", report]), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = g.main()
+        self.assertEqual(rc, 2)
+        self.assertIn("permission denied", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertFalse(os.path.exists(report), "a failed scan must not write a report")
+
     def test_unwritable_csv_or_json_is_one_error_line(self):
         doc = self.write("alpha.xml", ALPHA)
         blocker = self.write("blocker", b"x")

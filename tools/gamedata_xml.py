@@ -688,10 +688,18 @@ def main() -> int:
             continue
         if os.path.isdir(path):
             parser.error(f"{flag} is a directory: {path}")
-        if report_needs_input_check(path, args.targets):
-            for source in input_files(args.targets):
-                if same_report_path(path, source):
-                    parser.error(f"{flag} would overwrite the input {source}")
+        try:
+            if report_needs_input_check(path, args.targets):
+                for source in input_files(args.targets):
+                    if same_report_path(path, source):
+                        parser.error(f"{flag} would overwrite the input {source}")
+        except OSError as exc:
+            # The report preflight lists the targets too, so an unlistable folder fails here
+            # before the scan and must keep the scan's one-line error contract.
+            where = getattr(exc, "filename", None) or args.targets[0]
+            print(f"ERROR: cannot read {where}: {getattr(exc, 'strerror', None) or exc!r}",
+                  file=sys.stderr)
+            return 2
 
     rows = []
     mode = document_mode(args.targets)
