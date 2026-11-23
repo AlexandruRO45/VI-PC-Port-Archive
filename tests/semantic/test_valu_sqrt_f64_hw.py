@@ -685,5 +685,67 @@ class TestValuSqrtF64ConditionCodes(unittest.TestCase):
         self.assertIn("OpCapability Float64", spv)
 
 
+# ---------------------------------------------------------------------------
+# Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling
+# ---------------------------------------------------------------------------
+
+class TestValuSqrtF64IEEE754EdgeCases(unittest.TestCase):
+    """Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling for v_sqrt_f64."""
+
+    def test_positive_and_negative_zero(self) -> None:
+        res_pos = oracle_sqrt_f64(POS_ZERO_BITS)
+        self.assertEqual(res_pos, POS_ZERO_BITS)
+
+        res_neg = oracle_sqrt_f64(NEG_ZERO_BITS)
+        self.assertEqual(res_neg, NEG_ZERO_BITS)
+
+    def test_positive_infinity(self) -> None:
+        res_inf = oracle_sqrt_f64(POS_INF_BITS)
+        self.assertEqual(res_inf, POS_INF_BITS)
+
+    def test_negative_infinity_returns_nan(self) -> None:
+        res = oracle_sqrt_f64(NEG_INF_BITS)
+        self.assertTrue(is_nan_bits(res))
+
+    def test_negative_normals_return_nan(self) -> None:
+        neg_val = f64_to_bits(-4.0)
+        res = oracle_sqrt_f64(neg_val)
+        self.assertTrue(is_nan_bits(res))
+
+    def test_qnan_and_snan_payloads(self) -> None:
+        qnan_in = CANONICAL_QNAN | 0x1234
+        res_qnan = oracle_sqrt_f64(qnan_in)
+        self.assertTrue(is_nan_bits(res_qnan))
+
+        snan_in = 0x7FF0_0000_0000_1234  # signaling NaN (quiet bit 0)
+        res_snan = oracle_sqrt_f64(snan_in)
+        self.assertTrue(is_qnan_bits(res_snan))
+
+    def test_subnormals(self) -> None:
+        subnormal = 0x0000_0000_0000_0004
+        val = bits_to_f64(subnormal)
+        res_bits = oracle_sqrt_f64(subnormal)
+        self.assertAlmostEqual(bits_to_f64(res_bits), math.sqrt(val), places=12)
+
+    def test_max_and_min_finite_doubles(self) -> None:
+        max_f64_bits = 0x7FEF_FFFF_FFFF_FFFF  # ~1.7976931348623157e+308
+        res_max = bits_to_f64(oracle_sqrt_f64(max_f64_bits))
+        self.assertAlmostEqual(res_max, math.sqrt(bits_to_f64(max_f64_bits)), places=5)
+
+        min_norm_bits = 0x0010_0000_0000_0000  # ~2.2250738585072014e-308
+        res_min = bits_to_f64(oracle_sqrt_f64(min_norm_bits))
+        self.assertAlmostEqual(res_min, math.sqrt(bits_to_f64(min_norm_bits)), places=12)
+
+    def test_translated_shader_ieee754_parity(self) -> None:
+        lo, hi, out_f = run_translated_sqrt_f64(0, 0)
+        self.assertEqual((lo, hi), (0, 0))
+
+        lo, hi, out_f = run_translated_sqrt_f64(0, 0x80000000)
+        self.assertEqual((lo, hi), (0, 0x80000000))
+
+        lo, hi, out_f = run_translated_sqrt_f64(0, 0x7ff00000)
+        self.assertEqual((lo, hi), (0, 0x7ff00000))
+
+
 if __name__ == "__main__":
     unittest.main()
