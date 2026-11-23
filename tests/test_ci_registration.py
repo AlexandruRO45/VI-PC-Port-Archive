@@ -23,7 +23,9 @@ drift) and fails on the three ways a test goes missing without CI turning red --
   ``node --test tests/test_*.cjs`` command never runs.
 
 It also runs the ``check`` loop itself, taken from the workflow, under bash on a synthetic tree: the loop has
-to run every file and then fail, since stopping at the first failure hides the files sorted after it.
+to run every file and then fail, since stopping at the first failure hides the files sorted after it. And a file
+whose tests skip until ``tools/bcpack_calibration`` is built has to be run, after the build, by the ``check`` step
+that builds it: the loops run it before any job builds the library, so there it only skips.
 
 Only the tracked test files and the workflow are read; no game files, no build tools, no pytest. The loop check
 needs bash (Git for Windows' on Windows) and skips without it, except on a GitHub runner.
@@ -297,6 +299,56 @@ def stdlib_loop_jobs_with_spirv_tools(workflow):
             and re.search(r"apt-get\s+install[^\n]*\bspirv-tools\b", job)]
 
 
+NATIVE_STEP = "Build the calibrated BCPack reader and test the texture pipeline"
+# What loads tools/bcpack_calibration's release build: bcpack._native_unpack() and calibrated_texture.native().
+NATIVE_LOADERS = ("_native_unpack", "native")
+
+
+def _called_name(call):
+    return call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", None)
+
+
+def native_gated_files(root, files):
+    """tests/test_*.py files with a skip that waits for tools/bcpack_calibration to be built.
+
+    Either a skipIf / skipUnless whose condition loads the library, or a ``try`` that loads it with a
+    ``skipTest`` (or ``raise SkipTest``) in its handler. A file that only mocks the loader skips nothing.
+    """
+    def loads(node):
+        return any(isinstance(n, ast.Call) and _called_name(n) in NATIVE_LOADERS for n in ast.walk(node))
+
+    def skips(handler):
+        return any((isinstance(n, ast.Call) and _called_name(n) == "skipTest")
+                   or (isinstance(n, ast.Raise) and n.exc is not None and "SkipTest" in ast.unparse(n.exc))
+                   for n in ast.walk(handler))
+
+    gated = []
+    for rel in files:
+        if not re.fullmatch(r"tests/test_[^/]*\.py", rel):
+            continue
+        for node in ast.walk(ast.parse(read(root, rel))):
+            if isinstance(node, ast.Call) and _called_name(node) in ("skipIf", "skipUnless") and node.args \
+                    and loads(node.args[0]):
+                gated.append(rel)
+                break
+            if isinstance(node, ast.Try) and any(loads(s) for s in node.body) and any(skips(h) for h in node.handlers):
+                gated.append(rel)
+                break
+    return gated
+
+
+def native_step_runs(root):
+    """The tests/test_*.py files the native-library step runs after its cargo build of tools/bcpack_calibration."""
+    lines = [re.sub(r"(^|\s)#.*", "", line) for line in step_script(root, NATIVE_STEP).splitlines()]
+    built = [i for i, line in enumerate(lines)
+             if re.search(r"\bcargo\s+build\b.*tools/bcpack_calibration/Cargo\.toml", line)]
+    if not built:
+        raise AssertionError(f"the '{NATIVE_STEP}' step in ci.yml no longer builds tools/bcpack_calibration; update "
+                             "tests/test_ci_registration.py together with the workflow")
+    run = re.compile(r"\bpython3?\s+-I\s+(tests/test_[\w.-]+\.py)")
+    return [rel for line in lines[built[0] + 1:] for rel in run.findall(line)]
+
+
 def has_main_guard(source):
     """A real ``if __name__ == "__main__":`` block that runs something.
 
@@ -530,6 +582,70 @@ class RepositoryRegistrationTest(unittest.TestCase):
                     discovered = f"({module}.Case.test_ok)" in result.stderr
                     self.assertEqual(job_of(tmp, f"{semantic}/{case}", rules) == "semantic", discovered, result.stderr)
             self.assertIn("Ran 2 tests", result.stderr)
+
+
+class NativeLibraryStepTest(unittest.TestCase):
+    """A test that skips until tools/bcpack_calibration is built runs where the check job builds it.
+
+    The standard-library loops run every file before any job builds the library, so there such a test skips and
+    the loop stays green; the step that builds it is the only place it can run.
+    """
+
+    def test_the_step_that_builds_the_library_runs_every_test_that_waits_for_it(self):
+        gated = native_gated_files(ROOT, claimed_test_files(ROOT))
+        for expected in ("tests/test_bcpack_native.py", "tests/test_calibrated_texture.py",
+                         "tests/test_ttpf_assets.py"):
+            self.assertIn(expected, gated)         # the scan still sees the skips it is there to find
+        missing = [rel for rel in gated if rel not in native_step_runs(ROOT)]
+        self.assertEqual(missing, [], f"these files skip unless tools/bcpack_calibration is built, and the "
+                         f"'{NATIVE_STEP}' step in ci.yml builds it but does not run them, so no job runs their "
+                         "native tests: " + ", ".join(missing))
+
+    def test_the_scan_finds_both_kinds_of_skip_and_only_runs_after_the_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".github", "workflows"))
+            os.makedirs(os.path.join(tmp, "tests", "semantic"))
+
+            def write(rel, text):
+                with open(os.path.join(tmp, rel), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+
+            write(WORKFLOW, "jobs:\n  check:\n    steps:\n"
+                  f"      - name: {NATIVE_STEP}\n        shell: bash\n        run: |\n"
+                  "          python -I tests/test_before.py\n"
+                  "          cargo build --release --manifest-path tools/bcpack_calibration/Cargo.toml\n"
+                  "          python -I tests/test_decorated.py\n"
+                  "          # python -I tests/test_handler.py\n"
+                  "      - name: Next\n        run: python -I tests/test_handler.py\n")
+            write("tests/test_decorated.py", "import unittest\nimport bcpack\n"
+                  "@unittest.skipIf(bcpack._native_unpack() is None, 'not built')\n"
+                  "class T(unittest.TestCase):\n    def test_x(self):\n        pass\n")
+            write("tests/test_handler.py", "import unittest\n"
+                  "class T(unittest.TestCase):\n    def test_x(self):\n        try:\n"
+                  "            import calibrated_texture\n            calibrated_texture.native()\n"
+                  "        except OSError as exc:\n            raise unittest.SkipTest(str(exc))\n")
+            write("tests/test_before.py", "import unittest\nfrom calibrated_texture import native\n"
+                  "class T(unittest.TestCase):\n    def test_x(self):\n        try:\n            native()\n"
+                  "        except OSError as exc:\n            self.skipTest(str(exc))\n")
+            # loads a mock, skips nothing: it runs everywhere
+            write("tests/test_mocked.py", "import unittest\nfrom unittest import mock\nimport calibrated_texture\n"
+                  "class T(unittest.TestCase):\n    def test_x(self):\n"
+                  "        with mock.patch.object(calibrated_texture, 'native'):\n"
+                  "            calibrated_texture.native()\n")
+            write("tests/semantic/test_elsewhere.py", "import unittest\nimport bcpack\n"
+                  "@unittest.skipUnless(bcpack._native_unpack(), 'not built')\n"
+                  "class T(unittest.TestCase):\n    def test_x(self):\n        pass\n")
+            files = ["tests/semantic/test_elsewhere.py", "tests/test_before.py", "tests/test_decorated.py",
+                     "tests/test_handler.py", "tests/test_mocked.py"]
+
+            self.assertEqual(native_gated_files(tmp, files),
+                             ["tests/test_before.py", "tests/test_decorated.py", "tests/test_handler.py"])
+            # before the build, commented out, or in the next step: none of those runs with the library built
+            self.assertEqual(native_step_runs(tmp), ["tests/test_decorated.py"])
+            write(WORKFLOW, f"jobs:\n  check:\n    steps:\n      - name: {NATIVE_STEP}\n        run: |\n"
+                  "          python -I tests/test_decorated.py\n")
+            with self.assertRaises(AssertionError):
+                native_step_runs(tmp)
 
 
 class StdlibLoopTest(unittest.TestCase):

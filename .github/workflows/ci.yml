@@ -106,7 +106,7 @@ jobs:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
         run: python -I tests/test_rpf9dump_exit_codes.py
       # The standard-library loops run these files before any job builds tools/bcpack_calibration, so the tests that
-      # need the library skip there and run only here.
+      # need the library skip there and run only here. tests/test_ci_registration.py checks that this step runs all.
       - name: Build the calibrated BCPack reader and test the texture pipeline
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
