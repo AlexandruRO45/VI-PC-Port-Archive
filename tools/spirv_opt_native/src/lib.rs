@@ -2494,5 +2494,3 @@ OpFunctionEnd
         assert_eq!(unsafe { spirv_opt_optimize(s.as_ptr(), s.len(), 4, std::ptr::null_mut(), &mut n) }, -1);
     }
 }
-
-

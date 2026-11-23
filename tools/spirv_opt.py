@@ -1031,11 +1031,11 @@ def _native_optimize(spvasm, max_passes):
     if not _NATIVE:
         _NATIVE.append(_load_native())
     fn = _NATIVE[0]
-    if fn is None or type(spvasm) is not str or not isinstance(max_passes, int):
+    if fn is None or type(spvasm) is not str or type(max_passes) is not int:
         return None
     if not -(1 << 63) <= max_passes < (1 << 63):
         return None
-    return fn(spvasm, int(max_passes))
+    return fn(spvasm, max_passes)
 
 
 def _load_native():

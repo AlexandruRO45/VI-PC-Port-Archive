@@ -524,6 +524,18 @@ class Fallback(unittest.TestCase):
         self.assertIsNone(spirv_opt._native_optimize("", 4.0))
         self.assertIsNone(spirv_opt._native_optimize("", 1 << 70))
 
+    def test_int_subclass_pass_count_matches_python(self):
+        class Passes(int):
+            def __int__(self):
+                return 0
+
+        # range() uses __index__, so Python runs 3 passes; int(Passes(3)) would give the port 0.
+        texts = [t for t in _random_modules(7, 20) if _python(t, 3) != _python(t, 0)]
+        self.assertTrue(texts)
+        for text in texts:
+            self.assertIsNone(spirv_opt._native_optimize(text, Passes(3)))
+            self.assertEqual(_hooked(text, Passes(3)), _python(text, Passes(3)))
+
 
 if __name__ == "__main__":
     unittest.main()
