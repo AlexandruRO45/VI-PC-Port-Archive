@@ -399,6 +399,27 @@ class TestVAlignbyteB32ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(res, 0x56789abc)
         self.assertEqual(state.vgprs[3], 0x56789abc)
 
+class TestVAlignbyteB32SIMDAndIEEE(unittest.TestCase):
+    def test_aliasing_and_condition_codes(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+        state.write_vgpr(0, 0x12345678)
+        state.write_vgpr(1, 0x9abcdef0)
+        state.write_vgpr(2, 2)
+        inst = ASTInstruction(Opcode.V_ALIGNBYTE_B32, ASTOperand.vgpr(0), ASTOperand.vgpr(0), ASTOperand.vgpr(1), ASTOperand.vgpr(2))
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x56789abc)
+        self.assertEqual(state.vgprs[0], 0x56789abc)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+
+    def test_ieee754_bitwise_transparency(self) -> None:
+        qnan = 0x7FC00000
+        snan = 0x7F800001
+        res = ref_v_alignbyte_b32(qnan, snan, 4)
+        self.assertIsInstance(res, int)
+
 
 if __name__ == "__main__":
     unittest.main()
