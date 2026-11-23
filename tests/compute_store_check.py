@@ -1685,8 +1685,14 @@ LDS_QWORD_UPDATES = {
 }
 
 
-LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in ("ds_add_u64", "ds_sub_u64", "ds_rsub_u64", "ds_and_b64", "ds_or_b64")
-                     for stem, width in [op.rsplit("_", 1)]}
+LDS_QWORD_RETURNS = {
+    f"{stem}_rtn_{width}": op
+    for op in (
+        "ds_add_u64", "ds_sub_u64", "ds_rsub_u64", "ds_and_b64", "ds_or_b64",
+        "ds_xor_b64", "ds_min_i64", "ds_max_i64", "ds_min_u64", "ds_max_u64",
+    )
+    for stem, width in [op.rsplit("_", 1)]
+}
 
 
 def lds_qword_program(op):
@@ -1950,6 +1956,15 @@ def lds_controls():
             variant(high, ("offset:2", "offset:1")), 32, **LDS_BINDING)
     rejects("Unverified private LDS write", aot.lower,
             variant(high, ("ds_write_b32 v5, v6", "s_nop 0")), 32, **LDS_BINDING)
+
+    expected_returns = {
+        "ds_add_rtn_u64", "ds_sub_rtn_u64", "ds_rsub_rtn_u64",
+        "ds_and_rtn_b64", "ds_or_rtn_b64", "ds_xor_rtn_b64",
+        "ds_min_rtn_i64", "ds_max_rtn_i64", "ds_min_rtn_u64", "ds_max_rtn_u64",
+    }
+    assert set(LDS_QWORD_RETURNS) == expected_returns
+    for name in expected_returns:
+        aot.lower(lds_qword_program(name), 32, **LDS_QWORD_RETURN_BINDING)
 
     ret = lds_qword_program("ds_add_rtn_u64")
     instruction = "ds_add_rtn_u64 v[18:19], v5, v[18:19] offset:8"
@@ -2233,12 +2248,16 @@ def ds_mutants(name, lines, binding, source):
             changed = variant(lines, (f"{name} v10, v5", f"{name.replace('i8', 'u8')} v10, v5"))
             yield aot.lower(changed, 32, **binding), 0
     elif name in LDS_QWORD_RETURNS:
+        base = LDS_QWORD_RETURNS[name]
         # Substitute the post-update word pair for the returned pre-update pair.
         changed = variant(lines, ("v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v12, v10"),
                           ("v_mov_b32_e32 v13, v19", "v_mov_b32_e32 v13, v11"))
         ref = lds_qword_reference(name, 2)
         word = next(i for i in range(len(ref)) if i % 4 >= 2 and ref[i] != ref[i - 2])
         yield aot.lower(changed, 32, **binding), word
+        if base in ("ds_min_u64", "ds_max_u64"):
+            wrong_name = name.replace("_u64", "_i64")
+            yield aot.lower(variant(lines, (name, wrong_name)), 32, **binding), 0
     elif name in LDS_QWORD_UPDATES:
         if name == "ds_add_u64":
             wrong = source.replace(" + uint(", " + 0u * uint(")

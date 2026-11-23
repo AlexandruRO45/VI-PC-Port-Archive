@@ -2566,10 +2566,16 @@ Run these variants with `ctest --preset dev --no-tests=error -R
 '^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
 
 
-The five returning qword operations use the same updates and copy the
-old pair into the destination. The fixture aliases the destination with
-the data pair and exports all four dwords for one and two groups. Replacing
-the returned pair with the post-update pair must fail the CPU comparison.
+The ten returning qword operations (`ds_add_rtn_u64`, `ds_sub_rtn_u64`,
+`ds_rsub_rtn_u64`, `ds_and_rtn_b64`, `ds_or_rtn_b64`, `ds_xor_rtn_b64`,
+`ds_min_rtn_i64`, `ds_max_rtn_i64`, `ds_min_rtn_u64` and `ds_max_rtn_u64`)
+use the same updates and copy the old pair into the destination. The fixture
+aliases the destination with the data pair and exports all four dwords for one
+and two groups. Replacing the returned pair with the post-update pair must
+fail the CPU comparison, and using the signed comparison for
+`ds_min_rtn_u64` or `ds_max_rtn_u64` must mismatch word 0. These fixtures use
+the private LDS gfx1030 profile (wave32,
+`+wavefrontsize32,-wavefrontsize64`), not gfx1013.
 
 The private LDS f32 profile requires `--lds-f32-mode normal-rne` as a
 caller guarantee that interpreted operands and results are normal binary32

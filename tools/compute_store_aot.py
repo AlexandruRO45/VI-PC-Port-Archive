@@ -627,8 +627,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                  r"(?(ret)v\[(?P<dst_first>\d+):(?P<dst_last>\d+)\], )"
                                  r"v(?P<addr>\d+), v\[(?P<src_first>\d+):(?P<src_last>\d+)\]"
                                  r"(?: offset:(?P<offset>0|8))?", line))
-              and ((op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64")
-                   or not m["ret"] and op in ("xor_b64", "min_i64", "max_i64", "min_u64", "max_u64"))):
+              and (op := m[1] + m[3]) in (
+                  "add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64",
+                  "xor_b64", "min_i64", "max_i64", "min_u64", "max_u64")):
             addr, first, last = (int(m[key]) for key in ("addr", "src_first", "src_last"))
             destination = tuple(int(m[key]) for key in ("dst_first", "dst_last")) if m["ret"] else None
             slot = int(m["offset"] or 0) // 4
