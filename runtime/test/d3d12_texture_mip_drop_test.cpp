@@ -108,8 +108,19 @@ int main() {
     const auto desc2d = tex2d_desc(16, 16, 4, DXGI_FORMAT_R8G8B8A8_UNORM);
     EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc2d,
                                                      D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex2d.p))));
+    // D3D12 GetDesc() preserves the application's declared description
     EXPECT(tex2d->GetDesc().MipLevels == 4);
     EXPECT(tex2d->GetDesc().Width == 16);
+
+    // 1b. Strict Mip-Drop Verification: GetResourceAllocationInfo must report reduced memory
+    // for a droppable sampled texture vs a protected render-target texture of identical dimensions.
+    // (Fails on main where drop is ignored; passes here where physical allocation is ~75% smaller).
+    const auto desc_droppable = tex2d_desc(256, 256, 8, DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto desc_protected = desc_droppable;
+    desc_protected.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const auto alloc_droppable = device->GetResourceAllocationInfo(0, 1, &desc_droppable);
+    const auto alloc_protected = device->GetResourceAllocationInfo(0, 1, &desc_protected);
+    EXPECT(alloc_droppable.SizeInBytes < alloc_protected.SizeInBytes);
 
     // 2. 3D Volume Texture (8x8x4, 3 mips): with drop 1, width=4, height=4, depth=2.
     Ref<ID3D12Resource> tex3d;
