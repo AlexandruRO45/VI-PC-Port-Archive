@@ -33,7 +33,8 @@ NAMES = [
 
 # The modules whose name a reviewer would expect here: a rename must not turn the loop below into a
 # test of nothing.
-EXPECTED = ("anim_index", "audio_config", "awc_names", "hashdict", "mission_tables", "world_names")
+EXPECTED = ("anim_index", "audio_config", "awc_names", "find_hash_lookup", "hashdict", "mission_tables",
+            "world_names")
 
 
 def string_hash_copies():

@@ -79,7 +79,8 @@ The swap needs one function in the executable: the archetype lookup by name hash
 `fwArchetypeManager::GetArchetypeFromHashKey`). `scripts/first_look.ps1` already ranks candidates with
 `tools/find_hash_lookup.py` (report `hash_lookup.json`): it finds where the code loads `0xE472B687` and
 `0xD7C0CDFF`, takes the functions called right after, and orders them by how many direct callers the
-whole image has. Run it alone with `python -I tools/find_hash_lookup.py <exe>`. What it automates:
+whole image has. Run it alone with `python -I tools/find_hash_lookup.py <exe>`; a `--hash` name is hashed as
+`tools/hashdict.py` does (lower-cased latin-1 bytes). What it automates:
 
 1. **Constant search.** The player model id `0xE472B687` should appear as an immediate in the code that
    sets up the story player. Its callers pass it to the lookup (or to a function that does).

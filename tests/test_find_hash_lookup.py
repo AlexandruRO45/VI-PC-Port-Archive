@@ -69,6 +69,18 @@ class FindHashLookupTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             fhl.parse_hash("0x123456789")
 
+    def test_joaat_hashes_latin_1_bytes_like_hashdict(self):
+        # Synthetic names. "é" is the byte 0xE9 (one character, one byte), not the UTF-8 pair 0xC3 0xA9.
+        self.assertEqual(fhl.joaat("Café"), fhl.joaat("caf" + chr(0xE9)))
+        h = 0
+        for c in bytes([0x63, 0x61, 0x66, 0xE9]):   # "caf" + latin-1 "é"
+            h = (h + c) & 0xFFFFFFFF
+            h = (h + (h << 10)) & 0xFFFFFFFF
+            h ^= h >> 6
+        h = (h + (h << 3)) & 0xFFFFFFFF
+        h ^= h >> 11
+        self.assertEqual(fhl.joaat("Café"), (h + (h << 15)) & 0xFFFFFFFF)
+
     def test_the_lookup_ranks_first(self):
         data, lookup, decoy = image()
         report = fhl.rank(data, [("player_story000_00", fhl.joaat("player_story000_00")),
