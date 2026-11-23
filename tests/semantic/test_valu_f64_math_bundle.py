@@ -197,5 +197,37 @@ class VAddF64TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_add_f64", ["v_add_f64"])
 
+# -----------------------------------------------------------------------------
+# Opcode 2: v_mul_f64
+# -----------------------------------------------------------------------------
+def oracle_mul_f64(a_bits: int, b_bits: int) -> int:
+    """Reference mathematical oracle for v_mul_f64."""
+    if is_nan_u64(a_bits) or is_nan_u64(b_bits):
+        return F64_QNAN
+    fa = u64_to_f64(a_bits)
+    fb = u64_to_f64(b_bits)
+    if (fa == 0.0 and math.isinf(fb)) or (fb == 0.0 and math.isinf(fa)):
+        return F64_QNAN
+    try:
+        res = fa * fb
+        if res == 0.0:
+            neg = (a_bits >> 63) ^ (b_bits >> 63)
+            return F64_NEG_ZERO if neg else F64_POS_ZERO
+        return f64_to_u64(res)
+    except OverflowError:
+        neg = (a_bits >> 63) ^ (b_bits >> 63)
+        return F64_NEG_INF if neg else F64_POS_INF
+
+
+class VMulF64OracleTests(unittest.TestCase):
+    def test_mul_basic(self):
+        self.assertEqual(oracle_mul_f64(f64_to_u64(3.0), f64_to_u64(4.0)), f64_to_u64(12.0))
+
+    def test_mul_identity(self):
+        self.assertEqual(oracle_mul_f64(f64_to_u64(42.5), F64_POS_ONE), f64_to_u64(42.5))
+
+    def test_mul_sign_rules(self):
+        self.assertEqual(oracle_mul_f64(F64_NEG_ONE, f64_to_u64(5.0)), f64_to_u64(-5.0))
+
 if __name__ == "__main__":
     unittest.main()
