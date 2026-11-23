@@ -281,6 +281,27 @@ class TestSSubU32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0xFFFFFFFF)
 
+def ref_s_addc_u32(src0: int, src1: int, cin: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_addc_u32 -> (res, cout)."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    c = cin & 1
+    total = s0 + s1 + c
+    res = total & MASK32
+    cout = 1 if total >= 0x100000000 else 0
+    return res, cout
+
+
+class TestSAddcU32Oracle(unittest.TestCase):
+    def test_with_carry_in_zero(self) -> None:
+        self.assertEqual(ref_s_addc_u32(10, 20, 0), (30, 0))
+        self.assertEqual(ref_s_addc_u32(0xFFFFFFFF, 0, 0), (0xFFFFFFFF, 0))
+
+    def test_with_carry_in_one(self) -> None:
+        self.assertEqual(ref_s_addc_u32(10, 20, 1), (31, 0))
+        self.assertEqual(ref_s_addc_u32(0xFFFFFFFF, 0, 1), (0, 1))
+        self.assertEqual(ref_s_addc_u32(0xFFFFFFFF, 1, 1), (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
