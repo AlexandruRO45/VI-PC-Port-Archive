@@ -155,6 +155,7 @@ int main() {
     char pre_location[8] = "present", pre_session[8] = "present";
     size_t pre_used = 99;
     auto check_uninitialized = [&]() {
+        check(at<RegisterProperties>(streaming, 6)(streaming, 0, nullptr, nullptr, nullptr, nullptr) == not_initialized, "properties registration requires initialization");
         check(at<Dimensions>(streaming, 8)(streaming, 0, &pre_width, &pre_height) == not_initialized, "dimensions require initialization");
         check(at<Location>(streaming, 16)(streaming, sizeof(pre_location), pre_location) == not_initialized, "location requires initialization");
         check(at<Session>(streaming, 32)(streaming, 0, sizeof(pre_session), pre_session, &pre_used) == not_initialized, "session requires initialization");

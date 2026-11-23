@@ -336,7 +336,7 @@ static_assert((static_cast<uint32_t>(E_GAMESTREAMING_NOT_INITIALIZED) & 0xFF) ==
 // Public GDK signatures: the client ID is passed through but no client exists offline.
 HRESULT STDMETHODCALLTYPE streaming_register_properties(void*, uint64_t, XTaskQueueHandle, void*,
                                                         void*, XTaskQueueRegistrationToken*) {
-    return E_GAMESTREAMING_CLIENT_NOT_CONNECTED;
+    return g_streaming_initialized.load() ? E_GAMESTREAMING_CLIENT_NOT_CONNECTED : E_GAMESTREAMING_NOT_INITIALIZED;
 }
 HRESULT STDMETHODCALLTYPE streaming_dimensions(void*, uint64_t, uint32_t* width, uint32_t* height) {
     if (width) *width = 0;
