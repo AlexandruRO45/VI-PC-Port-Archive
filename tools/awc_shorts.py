@@ -144,7 +144,7 @@ def main(argv=None) -> int:
                     print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     if io_failed:
         return 1
-    rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))
+    rows.sort(key=lambda r: (r["bank"].lower(), r["bank"], r["stream"]))
     catalog = os.path.join(a.out, "shorts.csv")
     try:
         with tempfile.TemporaryDirectory(dir=a.out, prefix=".shorts-") as staging:

@@ -221,6 +221,24 @@ class ShortsTest(unittest.TestCase):
                 channels, _ = ogg_head_and_last_granule(f.read())
             self.assertEqual(channels, expected)
 
+    def test_case_distinct_banks_keep_catalog_order_across_workers(self):
+        self.write("Music.awc", 0x78, 480000)
+        if os.path.exists(os.path.join(self.tmp.name, "music.awc")):
+            self.skipTest("requires case-sensitive bank names")
+        self.write("music.awc", 0xFC, 480000)
+        args = [self.tmp.name, self.out, "--jobs"]
+        catalog = os.path.join(self.out, "shorts.csv")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shorts.main([*args, "1"]), 0)
+            with open(catalog, "rb") as f:
+                serial = f.read()
+            # Use real workers, collecting the two banks in the opposite order.
+            import awc_shorts
+            with mock.patch.object(awc_shorts, "as_completed", side_effect=reversed):
+                self.assertEqual(awc_shorts.main([*args, "2"]), 0)
+        with open(catalog, "rb") as f:
+            self.assertEqual(f.read(), serial)
+
     def check_truncated_bank_skipped(self, tool, jobs):
         os.mkdir(os.path.join(self.tmp.name, "banks"))
         self.write(os.path.join("banks", "good.awc"), 0xFC, 480000)

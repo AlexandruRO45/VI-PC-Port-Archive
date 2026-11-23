@@ -14,6 +14,8 @@ packet channel count, packet count and relative path. For a directory scan, `<ba
 path relative to the source directory, without the `.awc` extension. For example, a nested
 `left/shared.awc` has a `bank` value of `left/shared`. Existing files are overwritten, and malformed
 banks are reported and skipped.
+The catalog is ordered by bank name (case-insensitive, then exact spelling) and stream ID, regardless of
+worker completion order. Duplicate stream IDs within a bank retain their channel order.
 
 ## Duration and channels
 
