@@ -1095,5 +1095,41 @@ class PipelineExecutionTest(unittest.TestCase):
         self.assertEqual(content, f"ps_test\t{expected}\n")
 
 
+class DefaultHarnessTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = self.tmp.name
+        self.ext = ".exe" if os.name == "nt" else ""
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def touch(self, *parts):
+        path = os.path.join(self.repo, "runtime", "build", *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").close()
+        return path
+
+    def test_fallback_and_ignores_directories(self):
+        expected = os.path.join(self.repo, "runtime", "build", "vk_texture_test" + self.ext)
+        self.assertEqual(AB.default_harness(self.repo, False), expected)
+        os.makedirs(os.path.join(self.repo, "runtime", "build", "RelWithDebInfo", "vk_texture_test" + self.ext))
+        self.assertEqual(AB.default_harness(self.repo, False), expected)
+        msr = self.touch("MinSizeRel", "vk_texture_test" + self.ext)
+        self.assertEqual(AB.default_harness(self.repo, False), msr)
+
+    def test_finds_in_cmake_config_subdirs_in_priority_order(self):
+        for all_attachments, base in ((False, "vk_texture_test"), (True, "vk_ps_sweep")):
+            name = base + self.ext
+            dbg = self.touch("Debug", name)
+            self.assertEqual(AB.default_harness(self.repo, all_attachments), dbg)
+            rel = self.touch("Release", name)
+            self.assertEqual(AB.default_harness(self.repo, all_attachments), rel)
+            rwdi = self.touch("RelWithDebInfo", name)
+            self.assertEqual(AB.default_harness(self.repo, all_attachments), rwdi)
+            flat = self.touch(name)
+            self.assertEqual(AB.default_harness(self.repo, all_attachments), flat)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -199,6 +199,23 @@ def positive_int(text):
     return value
 
 
+BUILD_CONFIGS = ("", "RelWithDebInfo", "Release", "MinSizeRel", "Debug")
+
+
+def default_harness(repo, all_attachments):
+    """Locate vk_ps_sweep or vk_texture_test in runtime/build or a CMake multi-config subdirectory."""
+    name = "vk_ps_sweep" if all_attachments else "vk_texture_test"
+    if os.name == "nt":
+        name += ".exe"
+    build = os.path.join(repo, "runtime", "build")
+    for config in BUILD_CONFIGS:
+        directory = os.path.join(build, config) if config else build
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            return path
+    return os.path.join(build, name)
+
+
 def render_targets(forms, name, harness, vs, out, runs, timeout, observed, declared, all_attachments):
     """Collect repeated readbacks by attachment, retaining only the mask for undeclared MRT0."""
     count = observed[-1] + 1
@@ -293,10 +310,7 @@ def main(argv=None):
     except OSError as e:
         ap.error(f"cannot create {new}: {e.strerror or e}")
     # The texture test's harness: it binds a heap, a descriptor table, a fallback texture and a sampler.
-    exe = "vk_ps_sweep" if a.all_attachments else "vk_texture_test"
-    if os.name == "nt":
-        exe += ".exe"
-    harness = a.harness or os.path.join(a.repo, "runtime", "build", exe)
+    harness = a.harness or default_harness(a.repo, a.all_attachments)
     try:
         vs = test_vertex_shader(a.out)
     except (OSError, subprocess.CalledProcessError) as e:
