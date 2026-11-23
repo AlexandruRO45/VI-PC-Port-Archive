@@ -252,11 +252,12 @@ def parse_resource(b, collect=None):
     em = structs[ENTITY][1]
     mm = structs[MAPDATA][1]
     # The aggregates below read these members as fixed shapes: position and the four extents are three floats, the
-    # archetype name and the LOD level are hashed or used as keys. A schema that declares another type is a
-    # different layout, and indexing or hashing that value would fail, so reject it as unvalidated (#5601).
-    for key in ("archetypeName", "lodLevel"):
-        m = em.get(FIELD[key])
-        if m is not None and m[1] in (0x32, 0x33, 0x34):
+    # archetype name and the 64-bit archetype key are formatted as integer hashes and the LOD level is a lookup
+    # key. A schema that declares a float or a vector there is a different layout, and indexing, hashing or
+    # formatting that value would fail, so reject it as unvalidated (#5601).
+    for field in (FIELD["archetypeName"], FIELD["lodLevel"], ARCHETYPE_KEY):
+        m = em.get(field)
+        if m is not None and m[1] in (0x21, 0x32, 0x33, 0x34):
             return None
     for key in ("position", "streamingExtentsMin", "streamingExtentsMax",
                 "entitiesExtentsMin", "entitiesExtentsMax"):
