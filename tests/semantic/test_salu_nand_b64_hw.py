@@ -359,5 +359,21 @@ class TestSaluNandB64ConditionCodes(unittest.TestCase):
         self.assertEqual(state.scc, 0)
 
 
+class TestSaluNandB64IEEE754(unittest.TestCase):
+    """Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_float_pattern_preservation(self) -> None:
+        qnan64 = 0x7FF8000000000000
+        snan64 = 0x7FF0000000000001
+        res, _ = ref_nand_b64(qnan64, snan64)
+        expected = u64(~(qnan64 & snan64))
+        self.assertEqual(res, expected)
+
+    def test_subnormal_no_ftz(self) -> None:
+        subnormal = 0x0000000000000001
+        res, _ = ref_nand_b64(subnormal, subnormal)
+        self.assertEqual(res, u64(~subnormal))
+
+
 if __name__ == "__main__":
     unittest.main()
