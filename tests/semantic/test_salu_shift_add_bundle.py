@@ -208,6 +208,16 @@ class TestSLshl3AddU32AST(unittest.TestCase):
         expr = SLshl3AddU32Expr(8, 4)
         self.assertEqual(expr.eval(), (68, 0))
 
+class TestSLshl3AddU32OverflowAndSCC(unittest.TestCase):
+    def test_scc_trigger(self) -> None:
+        res, scc = ref_s_lshl_add_u32(3, 0x1FFFFFFF, 8)
+        self.assertEqual(scc, 1)
+
+    def test_exact_limit(self) -> None:
+        # 0x1FFFFFFF << 3 = 0xFFFFFFF8; + 7 = 0xFFFFFFFF -> scc 0
+        res, scc = ref_s_lshl_add_u32(3, 0x1FFFFFFF, 7)
+        self.assertEqual((res, scc), (0xFFFFFFFF, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
