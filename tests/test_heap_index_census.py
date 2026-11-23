@@ -191,6 +191,26 @@ class HeapIndexCensus(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("ps sfi0=res+smp: 1 shaders", p.stdout)
 
+    def test_cli_still_refuses_a_carve_index_it_cannot_parse(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        index = os.path.join(self.work.root, "index.json")
+        with open(index, "w", encoding="utf-8", newline="\n") as f:
+            f.write("not json\n")
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "heap_index_census.py"),
+                            self.work.disasm], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("cannot read the carve index", p.stderr)
+        self.assertEqual(p.stderr.count("\n"), 1, p.stderr)
+
+    def test_cli_still_refuses_a_carve_index_row_without_stage(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        with open(os.path.join(self.work.root, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"file": "ps_heap.dxbc"}], f)
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "heap_index_census.py"),
+                            self.work.disasm], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("cannot read the carve index", p.stderr)
+
     def test_cli_json_over_the_carve_index_is_refused(self):
         self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
         index = os.path.join(self.work.root, "index.json")
