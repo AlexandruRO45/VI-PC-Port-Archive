@@ -1037,7 +1037,9 @@ class PixelShaders(unittest.TestCase):
     """TEST-722: run every runtime/test/shaders/ps_w64_*.asm fixture on spirv_wave_interp (wave 64 vs 2x32)."""
 
     def test_ps_w64_fixtures(self):
-        sys.path.insert(0, os.path.join(HERE, "..", "..", "runtime", "test", "shaders"))
+        shaders = os.path.join(HERE, "..", "..", "runtime", "test", "shaders")
+        sys.path.insert(0, shaders)
+        self.addCleanup(sys.path.remove, shaders)
         import w64_graphics as wg
 
         ps_names = sorted(n for n in wg.FIXTURES if n.startswith("ps_w64_"))
