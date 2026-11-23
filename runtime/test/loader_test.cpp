@@ -1266,10 +1266,32 @@ void test_packaged_loader_directories() {
     HMODULE expected = load(L"testshim.dll");
     if (expected && packaged(L"testshim.dll", 0) == expected) pass("packaged loader returns owned shim");
     else failed("packaged loader returns owned shim", "wrong handle");
+    for (const wchar_t* name : {L"..\\testshim.dll", L"sub/../testshim.dll", L"C:\\testshim.dll",
+                                L"\\testshim.dll", L"/testshim.dll"}) {
+        SetLastError(0);
+        if (!packaged(name, 0) && GetLastError() == ERROR_INVALID_PARAMETER)
+            pass("packaged loader rejects invalid paths");
+        else failed("packaged loader rejects invalid paths", "wrong result or error");
+    }
     SetLastError(0);
-    if (!packaged(L"version.dll", 0) && GetLastError() == ERROR_MOD_NOT_FOUND)
+    if (!packaged(L"sub\\testshim.dll", 0) && GetLastError() == ERROR_MOD_NOT_FOUND)
+        pass("packaged loader refuses unsupported relative directory");
+    else failed("packaged loader refuses unsupported relative directory", "wrong result or error");
+    try {
+        write_image_as(make_image(), "packaged_fixture.dll");
+        rt::Loader loader(g_dir);
+        HMODULE bundled = packaged(L"packaged_fixture.dll", 0);
+        if (bundled && bundled == load(L"packaged_fixture.dll")) pass("packaged loader maps bundled fixture");
+        else failed("packaged loader maps bundled fixture", "wrong handle");
+    } catch (const std::exception& e) {
+        failed("packaged loader maps bundled fixture", e.what());
+    }
+    HMODULE host = LoadLibraryW(L"version.dll");
+    SetLastError(0);
+    if (host && !packaged(L"version.dll", 0) && GetLastError() == ERROR_MOD_NOT_FOUND)
         pass("packaged loader refuses host module");
     else failed("packaged loader refuses host module", "host module loaded or wrong error");
+    if (host) FreeLibrary(host);
     auto game = g_dir / L"dll_game";
     auto overlay = g_dir / L"dll_overlay";
     std::filesystem::create_directories(game / L"x");

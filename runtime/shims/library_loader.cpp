@@ -207,6 +207,26 @@ HMODULE WINAPI load_packaged_library(LPCWSTR name, DWORD reserved) {
         return nullptr;
     }
     if (name) {
+        std::wstring path(name);
+        if ((!path.empty() && (path[0] == L'\\' || path[0] == L'/')) || path.find(L':') != path.npos) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        size_t start = 0;
+        while (start < path.size()) {
+            const size_t end = path.find_first_of(L"\\/", start);
+            if (path.substr(start, end - start) == L"..") {
+                SetLastError(ERROR_INVALID_PARAMETER);
+                return nullptr;
+            }
+            if (end == path.npos) break;
+            start = end + 1;
+        }
+        // The bundled loader is keyed by basename and cannot honor a relative directory.
+        if (path.find_first_of(L"\\/") != path.npos) {
+            SetLastError(ERROR_MOD_NOT_FOUND);
+            return nullptr;
+        }
         bool handled = false;
         HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), 0, handled)
                                          : load_bundled_w(name, 0, handled);
