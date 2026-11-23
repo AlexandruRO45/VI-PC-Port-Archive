@@ -36,6 +36,9 @@ import struct
 import sys
 from collections import Counter
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path
+
 KNOWN_VERSIONS = {1: "1.0", 2: "1.1", 3: "1.2"}
 TYPE_NAMES = {0: "table", 1: "constants", 2: "cbv", 3: "srv", 4: "uav"}
 # D3D12_SHADER_VISIBILITY. ALL is 0, so anything else is a stage-specific parameter; compute has no value of its own
@@ -296,11 +299,20 @@ def main(argv=None):
     ap.add_argument("--disasm", help="a tools/fspx_unpack.py --disasm folder; adds each program's reads")
     a = ap.parse_args(argv)
     if a.json:
-        try:
-            if os.path.samefile(a.root, a.json):
-                ap.error("--json must not be the input folder")
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            pass
+        if os.path.isdir(a.json):
+            ap.error(f"--json {a.json} is a folder, not a file")
+        if os.path.exists(a.json) and os.path.isdir(a.root):
+            for path in glob.glob(os.path.join(glob.escape(a.root), "*.dxbc")):
+                if same_report_path(a.json, path):
+                    ap.error(f"--json {a.json} would overwrite input file {path}")
+                name = os.path.basename(path)[:-5]
+                state_path = os.path.join(a.root, "fspx", name + ".json")
+                if os.path.exists(state_path) and same_report_path(a.json, state_path):
+                    ap.error(f"--json {a.json} would overwrite input file {state_path}")
+                if a.disasm and os.path.isdir(a.disasm):
+                    asm_path = os.path.join(a.disasm, name + ".s")
+                    if os.path.exists(asm_path) and same_report_path(a.json, asm_path):
+                        ap.error(f"--json {a.json} would overwrite input file {asm_path}")
     if not os.path.isdir(a.root):
         ap.error(f"not a folder: {a.root}")
     if a.disasm and not os.path.isdir(a.disasm):
@@ -329,9 +341,14 @@ def main(argv=None):
     for line in errors:
         print(f"error: {line}", file=sys.stderr)
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"rows": rows, "summary": summary}, fh, indent=1, sort_keys=True)
-            fh.write("\n")
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"rows": rows, "summary": summary}, fh, indent=1, sort_keys=True)
+                fh.write("\n")
+        except OSError as e:
+            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 1 if errors else 0
 
 

@@ -271,6 +271,71 @@ class TestCensus(unittest.TestCase):
                 self.assertEqual(len(lines), 1, r.stderr)
                 self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
 
+    def test_json_creates_missing_parent_folder(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        out = os.path.join(self.tmp.name, "reports", "sub", "census.json")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", out],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isfile(out))
+
+    def test_json_refuses_a_folder(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        other_dir = os.path.join(self.tmp.name, "other_folder")
+        os.makedirs(other_dir)
+        for target in (self.tmp.name, other_dir):
+            with self.subTest(target=target):
+                r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", target],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2)
+                self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_refuses_to_overwrite_an_input_file(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        inp = os.path.join(self.tmp.name, "sig.dxbc")
+        with open(inp, "rb") as fh:
+            before = fh.read()
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", inp],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("would overwrite input file", r.stderr)
+        with open(inp, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+        state = os.path.join(self.tmp.name, "fspx", "sig.json")
+        with open(state, "rb") as fh:
+            state_before = fh.read()
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", state],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("would overwrite input file", r.stderr)
+        with open(state, "rb") as fh:
+            self.assertEqual(fh.read(), state_before)
+
+    def test_json_in_root_folder_can_be_written_twice(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        out = os.path.join(self.tmp.name, "census.json")
+        r1 = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", out],
+                            capture_output=True, text=True)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertTrue(os.path.isfile(out))
+        # Running a second time with the report in root must overwrite earlier output and exit 0
+        r2 = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", out],
+                            capture_output=True, text=True)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+
+    def test_json_failed_write_is_one_error_line(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        blocker = os.path.join(self.tmp.name, "not_a_dir")
+        with open(blocker, "wb") as fh:
+            fh.write(b"file")
+        out = os.path.join(blocker, "out.json")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", out],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("error: cannot write", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
