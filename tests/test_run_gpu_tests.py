@@ -546,6 +546,11 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL  cs_fma_fused", out)
 
+    def test_recorded_glsl_mode_ignores_stale_exact_env(self):
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_mode="glsl", fma_env="exact")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("5/7 split", out)
+
     def test_khr_fused_passes_and_exit_77_skips(self):
         import check
         rc, out = self.run_fma(0, dump(check.FMA_FUSED), fma_env="khr")

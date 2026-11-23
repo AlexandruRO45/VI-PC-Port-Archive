@@ -881,10 +881,13 @@ def fma_fused_test(tools, spirv):
     # --fma exact also guarantees single rounding (built from NoContraction ops), but records no KHR capability.
     # Without the index field a fresh shell cannot tell it from the default GLSL Fma (TEST-1147).
     mode = shader_fma_mode(spirv, "cs_fma_fused")
-    strict = (mode in ("khr", "exact")
-              or "shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
-              # An older index has no mode field: honor the environment as the only remaining signal.
-              or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
+    if mode:
+        # A recorded mode is authoritative: a stale LEONIDA_FMA from the build shell must not override it.
+        strict = mode in ("khr", "exact")
+    else:
+        # An older index has no mode field: capability and environment are the only remaining signals.
+        strict = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
+                  or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
                     env=dict(os.environ, **FMA_FUSED_ENV))
     if code == UNSUPPORTED:

@@ -977,9 +977,12 @@ def run_suite(a, work: str) -> int:
                 # --fma exact has no KHR capability, so capability/env alone used to accept split words here.
                 meta = index.get("cs_fma_fused") or {}
                 mode = meta.get("fma") or ""
-                strict = (mode in ("khr", "exact")
-                          or "shaderFmaFloat32" in (meta.get("features") or ())
-                          or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
+                if mode:
+                    # The recorded mode wins over a stale LEONIDA_FMA, as in check.py.
+                    strict = mode in ("khr", "exact")
+                else:
+                    strict = ("shaderFmaFloat32" in (meta.get("features") or ())
+                              or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
                 ok, detail = judge_fma_fused(dump_words(msg), khr=strict)
                 results.append((name, ok, detail))
         elif name == "cs_wavemask":

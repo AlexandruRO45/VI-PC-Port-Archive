@@ -1023,6 +1023,13 @@ class FmaFusedChecks(unittest.TestCase):
         self.assertIn("word 0", problem)
         self.assertNotIn("LEONIDA_FMA=khr", check.judge_fma_fused(self.RADV_SPLIT, khr=True)[1])
 
+    def test_recorded_mode_overrides_stale_environment(self):
+        # When index.json records the mode it is authoritative; a leftover LEONIDA_FMA from the build shell
+        # must not switch a glsl build to strict judging (or an exact build back to lenient).
+        self.assertEqual(self.run_fma(self.RADV_SPLIT, fma_mode="glsl", env_fma="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, fma_mode="exact", env_fma="glsl")
+        self.assertIn("word 0", problem)
+
     def test_older_index_still_honors_exact_env(self):
         # An index written before the fma field existed can only be judged strictly via the environment.
         self.assertEqual(self.run_fma(check.FMA_FUSED, env_fma="exact"), "")
