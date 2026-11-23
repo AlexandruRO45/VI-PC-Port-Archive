@@ -657,6 +657,22 @@ slot-19 and levels slot-11 vectors for all of them. Where the face-normal column
 disagree with the vertex normals, as for tag `0x21`. The tangent matches the `0x21` tangent (`cos > 0.99`)
 for only 10-17% of vertices, so it is a different frame, the one for a second texture-coordinate stream.
 
+Over the whole game the tag appears in six slots, and slot 2 is different:
+
+| Slot | Blocks | Vertices | Unit | w = 3 / 0 | Perpendicular to face | Best `0x28` stream: along u, w side |
+| --- | ---: | ---: | --- | --- | --- | --- |
+| 11 | 81,642 | 285,665,717 | 100.0% | 229,672,431 / 55,993,286 | 89.0% | slot 4: 94.2%, 99.5% |
+| 18 | 15,075 | 34,768,370 | 100% | 31,667,656 / 3,100,714 | 93.5% | slot 14: 86.5%, 99.2% |
+| 19 | 16,082 | 39,099,210 | 100.0% | 34,232,324 / 4,866,886 | 71.7% | slot 15: 91.4%, 99.0% |
+| 5 | 92 | 251,617 | 100% | 226,525 / 25,092 | 90.4% | slot 3: 98.3%, 99.8% |
+| 2 | 32,505 | 20,516,661 | 100.0% | 0 / 20,516,661 | **0.4%** | none |
+| 10 | 35 | 17,826 | 0% | 0 / 17,826 | — | — |
+
+In slots 5, 11, 18 and 19 the reading above holds over the whole game. **In slot 2, where other blocks keep the
+`0x21` normal, tag `0x27` is the vertex normal itself:** w is always 0, the vector is perpendicular to the face in
+only 0.4% of cases, and read as unorm10 xyz (`v * 2/1023 - 1`) it scores a block-weighted median of **1.0** on the
+face-normal check (`unorm10_xyz`). The 35 slot-10 blocks hold constant non-unit words and are not read here.
+
 **Tag `0x26` (slot 1) is four bytes with an alpha-like byte 3.** Byte 3 is 255 on 62.4% of the 137.9 million
 vertices and 0 on 17.2%; each of bytes 0-2 is constant within a block in 36,544 to 38,854 blocks. The bytes
 change smoothly over edges (block-weighted median edge/random difference ratio 0.18 to 0.27), as a colour or
