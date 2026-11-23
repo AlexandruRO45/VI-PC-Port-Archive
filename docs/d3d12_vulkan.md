@@ -261,7 +261,11 @@ What is implemented (all of it testable without the game):
   destination subresource, because it resolves through Metal's store action, which has no render area. Measured
   with a raw Vulkan program (a 4x D32 attachment, render area (2,1) 5x4 of 8x6, `MIN`, `MAX` and `SAMPLE_ZERO`,
   store `NONE` or `STORE`): MoltenVK writes all 48 destination texels, KosmicKrisp only the 20 inside. No device
-  property reports it, so nothing is gated. The format is the depth
+  property reports it, so nothing is gated. The barrier that moves the destination into the attachment layout also names
+  `MEMORY_READ`. Mesa ANV with HiZ (Arc A770, Mesa 25.2.8) otherwise drops the resolve into a destination that
+  the band copy has just read. With the attachment accesses alone, which is what Vulkan requires, all 20 texels kept
+  the clear value in a raw Vulkan program that passes synchronization validation; adding any `MEMORY_*` access, or
+  `INTEL_DEBUG=nohiz`, fixes it. `vk_command_replay` part I failed on that GPU before this change (8 of 20 texels). The format is the depth
   format or the plane's own (`R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`, and the D32S8 pair, untested).
   What the PC runtime accepts was measured on an RTX 5070 (driver 621.24) and on WARP: `MIN` and `MAX` of either
   plane by either format, and `AVERAGE` of the depth plane by its own format only (its `Close` fails for `AVERAGE`

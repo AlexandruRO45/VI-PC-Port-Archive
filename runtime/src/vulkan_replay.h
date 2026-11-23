@@ -3524,8 +3524,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                 detail::round_trip(vk, command_buffer, p.source, source_pieces, source_attachment, source_state,
                                    attachment_access, attachment_stages, [&] {
+                    // MEMORY_READ on the destination: Mesa ANV on an Arc A770 (Mesa 25.2.8, HiZ) drops the depth
+                    // resolve into a target that a transfer read just before (keep_around_resolve's bands) when the
+                    // barrier into the attachment layout names only attachment accesses, which Vulkan says is enough.
+                    // Any MEMORY_* access avoids it; INTEL_DEBUG=nohiz too (docs/d3d12_vulkan.md).
                     detail::round_trip(vk, command_buffer, p.binding, dest_pieces, dest_attachment, dest_state,
-                                       attachment_access, attachment_stages, [&] {
+                                       attachment_access | VK_ACCESS_MEMORY_READ_BIT, attachment_stages, [&] {
                         VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
                         info.imageView = p.view;
                         info.imageLayout = source_attachment;
