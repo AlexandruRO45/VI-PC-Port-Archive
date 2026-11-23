@@ -135,6 +135,22 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertEqual(report["summary"]["span"], 2 * 0x80)
         self.assertEqual(report["summary"]["page_counts"], {"2": 2})
 
+    def test_explicit_recursive_prefix_does_not_rescan_directories(self):
+        nav = load_tool_module()
+        folder = os.path.join(self.root, "carve")
+        leaf = os.path.join(folder, "tiles", "nested", "tiles")
+        os.makedirs(leaf)
+        with open(os.path.join(leaf, "page.bin"), "wb") as f:
+            f.write(page())
+        scans = []
+        for pattern in ("*.bin", "**/*.bin", "**/tiles/**/*.bin"):
+            with mock.patch.object(os, "scandir", wraps=os.scandir) as calls:
+                rows, summary = nav.scan_directory(folder, pattern)
+            self.assertEqual(summary["streams"], 1)
+            self.assertEqual(rows[0]["source"], os.path.join("tiles", "nested", "tiles", "page.bin"))
+            scans.append(calls.call_count)
+        self.assertEqual(scans[1], scans[0])
+
     def test_directory_with_glob_metacharacters_in_its_name(self):
         # Before: os.path.join(root, "**", pattern) fed a root like "carve[1]" straight to glob, which read
         # the "[1]" as a character class and matched nothing -- the index came back empty.
