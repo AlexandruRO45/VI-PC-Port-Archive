@@ -269,10 +269,16 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
         hint = doc.get("root_hint")
         if root_filter and hint != root_filter:
             continue
+        stats, types = reader.stats.copy(), reader.types.copy()
         try:
             tag, _, value = reader.read(doc["data"])
         except (ET.ParseError, LookupError, ValueError) as e:
             # Unsupported encodings and malformed content arrays fail outside ET.ParseError too.
+            # Streaming can count fields before encountering the error.
+            reader.stats.clear()
+            reader.stats.update(stats)
+            reader.types.clear()
+            reader.types.update(types)
             failed[str(e).split(":")[0]] += 1
             continue
         read += 1

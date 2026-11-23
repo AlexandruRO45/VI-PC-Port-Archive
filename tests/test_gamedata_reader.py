@@ -298,6 +298,29 @@ class Run(unittest.TestCase):
                 self.assertEqual(s["per_root_documents"], {"COther": 1})
                 self.assertEqual(sum(s["parse_errors"].values()), 1)
 
+    def test_summary_excludes_fields_from_rejected_documents(self):
+        good = os.path.join(self.dir, "c.xml")
+        rejected = []
+        for name, tail in (
+            ("malformed.xml", b'<broken></CBroken>'),
+            ("bad_array.xml", b'<v content="vec3v_array">1 2 3 4</v></CBroken>'),
+        ):
+            path = os.path.join(self.tmp.name, name)
+            with open(path, "wb") as f:
+                f.write(b'<CBroken><field type="CPartial"><x value="1"/></field>' + tail)
+            rejected.append(path)
+
+        expected = R.run([good, good])
+        reader = R.Reader()
+        stats, types = reader.stats, reader.types
+        summary = R.run([good, *rejected, good], reader=reader)
+        self.assertEqual(summary["documents"], 2)
+        self.assertEqual(summary["not_well_formed"], 2)
+        for key in ("per_root_documents", "elements_by_convention", "type_classes", "typed_elements"):
+            self.assertEqual(summary[key], expected[key], key)
+        self.assertIs(reader.stats, stats)
+        self.assertIs(reader.types, types)
+
     def test_cli_continues_after_conversion_and_encoding_errors(self):
         bad = os.path.join(self.tmp.name, "bad.xml")
         good = os.path.join(self.dir, "c.xml")
