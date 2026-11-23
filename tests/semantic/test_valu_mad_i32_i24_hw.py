@@ -467,5 +467,48 @@ class TestMadI32I24BitPatternBoundaries(unittest.TestCase):
         self.assertEqual(ref_mad_i32_i24(0x3F80_0000, 2, 0), 0xFF00_0000)
 
 
+# ==============================================================================
+# Negative Controls, Rejection, and Translator Hardware Execution
+# ==============================================================================
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import support
+import rdna2spirv
+
+
+class TestMadI32I24RejectionAndHardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection_negative_controls(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 300)
+        with self.assertRaises(ValueError):
+            LiteralOperand(0x1_0000_0000)
+
+    def test_hardware_translator_execution(self):
+        """Validates that tools/rdna2spirv.py translates v_mad_i32_i24 and matches expected results."""
+        cases = [
+            (2, 3, 4, "v_mad_i32_i24 v0, v1, v2, v3", 10),
+            (0x00FFFFFE, 3, 4, "v_mad_i32_i24 v0, v1, v2, v3", 0xFFFF_FFFE),
+            (0x55FFFFFE, 3, 4, "v_mad_i32_i24 v0, v1, v2, v3", 0xFFFF_FFFE),
+            (0x007FFFFF, 2, 0, "v_mad_i32_i24 v0, v1, v2, v3", 16777214),
+            (0x00800000, 2, 0, "v_mad_i32_i24 v0, v1, v2, v3", 0xFF00_0000),
+            (0x007FFFFF, 0x007FFFFF, 0, "v_mad_i32_i24 v0, v1, v2, v3", 0xFF00_0001),
+            (2, 3, 4, "v_mad_i32_i24 v0, v1, v2, v3 clamp", 10),
+        ]
+        for s0, s1, s2, asm, expected in cases:
+            prog = [
+                f"v_mov_b32 v1, {s0:#x}",
+                f"v_mov_b32 v2, {s1:#x}",
+                f"v_mov_b32 v3, {s2:#x}",
+                asm,
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_mad_i32_i24_hw", prog)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], expected, f"Failed on {asm}: got {words[0]:#x}, expected {expected:#x}")
+
+
 if __name__ == '__main__':
     unittest.main()
