@@ -444,5 +444,25 @@ class SPackLlB32B16TranslatorTests(unittest.TestCase):
         val = mrt0_words(spv)[0]
         self.assertEqual(val, 0xEF015678)
 
+# -----------------------------------------------------------------------------
+# Opcode 6: s_pack_hh_b32_b16
+# -----------------------------------------------------------------------------
+def oracle_pack_hh_b32_b16(s0: int, s1: int) -> int:
+    """Reference mathematical oracle for s_pack_hh_b32_b16: D = {S1[31:16], S0[31:16]}."""
+    lo = (s0 >> 16) & 0xFFFF
+    hi = s1 & 0xFFFF0000
+    return (hi | lo) & MASK32
+
+
+class SPackHhB32B16OracleTests(unittest.TestCase):
+    def test_pack_hh_basic(self):
+        # s0 = 0x12345678, s1 = 0xABCDEF01 -> {0xabcd, 0x1234} = 0xABCD1234
+        res = oracle_pack_hh_b32_b16(0x12345678, 0xABCDEF01)
+        self.assertEqual(res, 0xABCD1234)
+
+    def test_pack_hh_zero_high_halves(self):
+        res = oracle_pack_hh_b32_b16(0x0000FFFF, 0x0000FFFF)
+        self.assertEqual(res, 0)
+
 if __name__ == "__main__":
     unittest.main()
