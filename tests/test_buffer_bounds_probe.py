@@ -4,9 +4,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROBE = os.path.join(REPO, "tools", "buffer_bounds_probe.py")
+sys.path.insert(0, os.path.join(REPO, "tools"))
+import buffer_bounds_probe  # noqa: E402
 
 
 class BufferBoundsProbeTests(unittest.TestCase):
@@ -57,6 +60,21 @@ class BufferBoundsProbeTests(unittest.TestCase):
                if not k.startswith("LEONIDA_HW_") and k != "LEONIDA_AMD_CLANG"}
         env["LEONIDA_AMD_CLANG"] = os.path.join(REPO, "does_not_exist_clang")
         return env
+
+
+class WriteJsonReportPreserveTest(unittest.TestCase):
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(buffer_bounds_probe, "replace_retry",
+                                   side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    buffer_bounds_probe.write_json_report(path, {"new": True})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

@@ -23,12 +23,17 @@ Exit codes:
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 # Raw output V# in s[0:3]; the probed data starts 0x100 bytes into the buffer.
 OUT_V_W3 = 0x31016FAC
@@ -243,13 +248,45 @@ def main():
           f"{wave_diff} wave32/wave64 differences")
     if args.json_out:
         try:
-            with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(report, f, indent=2)
+            write_json_report(args.json_out, report)
         except OSError as exc:
             print(f"ERROR: cannot write {args.json_out}: {getattr(exc, 'strerror', None) or exc}",
                   file=sys.stderr)
             return 2
     return 1 if gfx11_diff or wave_diff else 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=2)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".buffer_bounds_probe-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=2)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
