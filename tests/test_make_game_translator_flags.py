@@ -183,7 +183,8 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None):
+    def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
+                 denorm_preserve=True):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -197,6 +198,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
+                mock.patch("make_game.runtime_gpu_denorm_preserve", return_value=denorm_preserve), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -267,6 +269,35 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(max_push_constants=None), ((), ()))
         self.assertEqual(self.run_main("--pc-tail-ubo", max_push_constants=256), (("--pc-tail-ubo",),) * 2)
 
+    def test_no_denorm_preserve_follows_the_device(self):
+        """On by itself where shaderDenormPreserveFloat16 is false, off where true or unknown, asked for explicitly
+        on everywhere; it never turns off SignedZeroInfNanPreserve or its own property."""
+        self.assertEqual(self.run_main(denorm_preserve=False), (("--no-denorm-preserve",),) * 2)
+        self.assertEqual(self.run_main(denorm_preserve=True), ((), ()))
+        self.assertEqual(self.run_main(denorm_preserve=None), ((), ()))
+        self.assertEqual(self.run_main("--no-denorm-preserve", denorm_preserve=True),
+                         (("--no-denorm-preserve",),) * 2)
+
+    def test_denorm_preserve_env_override_beats_the_device_probe(self):
+        """LEONIDA_DENORM_PRESERVE_FALLBACK=1/0 has the same precedence in make_game.py as in the two runners."""
+        with mock.patch.dict(os.environ, {"LEONIDA_DENORM_PRESERVE_FALLBACK": "1"}):
+            self.assertEqual(self.run_main(denorm_preserve=True), (("--no-denorm-preserve",),) * 2)
+        with mock.patch.dict(os.environ, {"LEONIDA_DENORM_PRESERVE_FALLBACK": "0"}):
+            self.assertEqual(self.run_main(denorm_preserve=False), ((), ()))
+        with mock.patch.dict(os.environ, {"LEONIDA_DENORM_PRESERVE_FALLBACK": "0"}):
+            self.assertEqual(self.run_main("--no-denorm-preserve", denorm_preserve=False),
+                             (("--no-denorm-preserve",),) * 2)
+
+    def test_runtime_gpu_denorm_preserve_parses_probe(self):
+        for raw, want in (({"shader_denorm_preserve_float16": True}, True),
+                          ({"shader_denorm_preserve_float16": False}, False),
+                          ({}, None),
+                          ({"shader_denorm_preserve_float16": 0}, False),
+                          ({"shader_denorm_preserve_float16": "false"}, True),
+                          ({"shader_denorm_preserve_float16": None}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertEqual(make_game.runtime_gpu_denorm_preserve(), want)
+
     def test_runtime_gpu_max_push_constants_parses_probe(self):
         for raw, want in (({"max_push_constants_size": 128}, 128),
                           ({"max_push_constants_size": 256}, 256),
@@ -312,6 +343,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
+                mock.patch("make_game.runtime_gpu_denorm_preserve", return_value=True), \
                 mock.patch("make_game.preflight"), \
                 mock.patch.object(make_game, "py", fake_py), \
                 mock.patch.object(make_game, "need", lambda *a: None), \

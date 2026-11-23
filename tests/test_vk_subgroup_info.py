@@ -69,6 +69,8 @@ class FakeDevice:
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
     fragment_shader_barycentric: bool = True
+    signed_zero_inf_nan_preserve_float32: bool = True
+    denorm_preserve_float16: bool = True
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
@@ -208,6 +210,11 @@ class FakeVulkan:
                 sg.requiredSubgroupSizeStages = dev.required_subgroup_size_stages
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES:
                 ctypes.c_uint32.from_address(node_addr + 16).value = dev.driver_id
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES:
+                ctypes.c_uint32.from_address(node_addr + vk_info.FC_SIGNED_ZERO_INF_NAN_F32).value = int(
+                    dev.signed_zero_inf_nan_preserve_float32)
+                ctypes.c_uint32.from_address(node_addr + vk_info.FC_DENORM_PRESERVE_F16).value = int(
+                    dev.denorm_preserve_float16)
         if not found_subgroup:
             raise AssertionError("SubgroupProperties missing from vkGetPhysicalDeviceProperties2 pNext chain")
         if not found_sg:
@@ -357,6 +364,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.F13_SIZE, 80)
         self.assertEqual(vk_info.BARY_FEATURES_SIZE, 24)
         self.assertEqual(vk_info.DRIVER_PROPS_SIZE, 536)
+        self.assertEqual(vk_info.FLOAT_CONTROLS_PROPS_SIZE, 88)
         self.assertEqual(vk_info.QUEUE_FAMILY_SIZE, 24)
 
     def test_feature_and_property_offsets(self):
@@ -370,6 +378,8 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.PROPS_DEVICE_ID, 12)
         self.assertEqual(vk_info.PROPS_DEVICE_TYPE, 16)
         self.assertEqual(vk_info.PROPS_DEVICE_NAME, 20)
+        self.assertEqual(vk_info.FC_SIGNED_ZERO_INF_NAN_F32, 28)
+        self.assertEqual(vk_info.FC_DENORM_PRESERVE_F16, 36)
 
     def test_ctypes_structure_layouts(self):
         sg = vk_info.SubgroupSizeControl(
@@ -799,6 +809,8 @@ class QueryTest(unittest.TestCase):
                     "per_vertex_inputs": True,
                     "barycentric_fallback": False,
                     "max_push_constants_size": 256,
+                    "shader_signed_zero_inf_nan_preserve_float32": True,
+                    "shader_denorm_preserve_float16": True,
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
@@ -812,6 +824,15 @@ class QueryTest(unittest.TestCase):
             with self.subTest(limit=limit):
                 res, _vk = self._run_query(FakeDevice(max_push_constants_size=limit))
                 self.assertEqual(res["max_push_constants_size"], limit)
+
+    def test_float_controls_properties(self):
+        """The two properties the runners use to drop individual float-control capabilities (SHADER-526)."""
+        for sz, denorm in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(signed_zero=sz, denorm=denorm):
+                res, _vk = self._run_query(FakeDevice(signed_zero_inf_nan_preserve_float32=sz,
+                                                      denorm_preserve_float16=denorm))
+                self.assertEqual(res["shader_signed_zero_inf_nan_preserve_float32"], sz)
+                self.assertEqual(res["shader_denorm_preserve_float16"], denorm)
 
     def test_per_vertex_inputs(self):
         """PerVertexKHR needs fragmentShaderBarycentric, and MoltenVK can't compile it to MSL either way."""

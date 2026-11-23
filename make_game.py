@@ -1422,7 +1422,8 @@ def fspx_key_clash(spirv: str):
 WAVE64_MODES = ("auto", "on", "off")
 
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
-FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
+FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--no-denorm-preserve", "no_denorm_preserve"),
+                  ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
 
@@ -1572,6 +1573,12 @@ def runtime_gpu_max_push_constants():
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
     v = runtime_gpu_info().get("max_push_constants_size")
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
+def runtime_gpu_denorm_preserve():
+    """shaderDenormPreserveFloat16 as tools/vk_subgroup_info.py answers for the runtime's GPU, or None."""
+    v = runtime_gpu_info().get("shader_denorm_preserve_float16")
+    return None if v is None else bool(v)
 
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
@@ -2566,6 +2573,9 @@ def main() -> int:
                     help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
                          "devices whose vk_pipeline_check skips a shader without "
                          "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16")
+    ap.add_argument("--no-denorm-preserve", action="store_true",
+                    help="translate without DenormPreserve 16, for devices whose shaderDenormPreserveFloat16 is "
+                         "false (MoltenVK, llvmpipe); SignedZeroInfNanPreserve and its own device property stay")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "
@@ -2685,6 +2695,20 @@ def main() -> int:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
+    if "shaders" in stages and not a.no_denorm_preserve:
+        # Same override as the two test runners: 1 forces the narrow fallback on, 0 forces it off ahead of the
+        # device probe. Without it the build entry point would disagree with build.py/run_gpu_tests.py.
+        override = (os.environ.get("LEONIDA_DENORM_PRESERVE_FALLBACK") or "").strip().lower()
+        if override in ("1", "true", "yes", "on"):
+            a.no_denorm_preserve = True
+        elif override not in ("0", "false", "no", "off"):
+            denorm16 = runtime_gpu_denorm_preserve()
+            if denorm16 is False:
+                log("shaders: the GPU the runtime would use reports shaderDenormPreserveFloat16 = false: "
+                    "translating with --no-denorm-preserve")
+                a.no_denorm_preserve = True
+            elif denorm16 is None:
+                a.no_denorm_preserve = keep_recorded_fallback("--no-denorm-preserve", work)
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     overlap = True
     a.jobs = leonida_tui.clamp_jobs(a.jobs)

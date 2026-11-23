@@ -840,5 +840,22 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
+class DenormPreserveFallback(unittest.TestCase):
+    """The narrow fallback: only DenormPreserve 16 is dropped, and only where the device lacks the property."""
+
+    def test_env_override_wins_over_the_device(self):
+        for value, want in (("1", True), ("0", False), ("true", True), ("off", False)):
+            with self.subTest(value=value), patch.dict(rgt.os.environ,
+                                                       {"LEONIDA_DENORM_PRESERVE_FALLBACK": value}), \
+                    patch.object(rgt, "_device_denorm_f16", return_value=True):
+                self.assertEqual(rgt.denorm_preserve_fallback(), want)
+
+    def test_unset_follows_the_device_property(self):
+        for prop, want in ((True, False), (False, True), (None, False)):
+            with self.subTest(prop=prop), patch.dict(rgt.os.environ, {}, clear=True), \
+                    patch.object(rgt, "_device_denorm_f16", return_value=prop):
+                self.assertEqual(rgt.denorm_preserve_fallback(), want)
+
+
 if __name__ == "__main__":
     unittest.main()

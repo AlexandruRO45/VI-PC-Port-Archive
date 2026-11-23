@@ -327,6 +327,35 @@ def f16_interp_fallback() -> bool:
     return _device_per_vertex() is False
 
 
+_DENORM_F16 = []
+
+
+def denorm_preserve_fallback() -> bool:
+    """LEONIDA_DENORM_PRESERVE_FALLBACK=1 (or 0): translate without DenormPreserve 16 where the device reports
+    shaderDenormPreserveFloat16 false (MoltenVK, llvmpipe). Unset, it follows tools/vk_subgroup_info.py. Signed
+    zero, NaN and inf keep their own property and are left alone."""
+    v = (os.environ.get("LEONIDA_DENORM_PRESERVE_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_denorm_f16() is False
+
+
+def _device_denorm_f16():
+    """shaderDenormPreserveFloat16 from tools/vk_subgroup_info.py for the device the tests run on (cached)."""
+    if not _DENORM_F16:
+        answer = None
+        try:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
+                               capture_output=True, text=True, timeout=60)
+            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("shader_denorm_preserve_float16")
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+        _DENORM_F16.append(None if answer is None else bool(answer))
+    return _DENORM_F16[0]
+
+
 _PER_VERTEX = []
 _BARYCENTRIC_FALLBACK = []
 
@@ -909,6 +938,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--bary-fallback")
         if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
             cmd.append("--f16-interp-fallback")
+        if denorm_preserve_fallback():   # no DenormPreserve 16 where the device lacks the property
+            cmd.append("--no-denorm-preserve")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py

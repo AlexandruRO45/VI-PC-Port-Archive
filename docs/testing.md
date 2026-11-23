@@ -478,6 +478,18 @@ without it they're skipped, which is expected, not a failure. To test the fallba
 **for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
 (`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
 
+## Devices without shaderDenormPreserveFloat16
+
+Every translated module declares `SignedZeroInfNanPreserve 32` and `DenormPreserve 16` so the driver keeps NaN, inf,
+`-0` and f16 denormals as RDNA2 computes them. These are separate device properties: MoltenVK and llvmpipe report
+`shaderSignedZeroInfNanPreserveFloat32 = true` but `shaderDenormPreserveFloat16 = false`, so only the second
+capability is invalid there. `run_gpu_tests.py`, `build.py` and `make_game.py` ask `tools/vk_subgroup_info.py` for the
+property and translate with `--no-denorm-preserve` when it is false: the module then declares only
+`SignedZeroInfNanPreserve 32`, and its index entry lists only `shaderSignedZeroInfNanPreserveFloat32`. This keeps a
+validation run of the suite clean without giving up the signed-zero and NaN behaviour that the other tests rely on.
+`LEONIDA_DENORM_PRESERVE_FALLBACK=1` or `0` forces the narrow fallback on or off (`build.py` uses it only when it is
+`1`); `--no-float-controls` remains the wider switch that drops both capabilities.
+
 ## Fused multiply-add: GLSL Fma or OpFmaKHR
 
 `cs_fma_fused` checks that `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32` (and one `v_fma_f16`) round once, on

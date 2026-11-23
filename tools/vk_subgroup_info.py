@@ -64,6 +64,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR = 1000314007
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES = 1000197000
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA = 6
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
@@ -82,6 +83,9 @@ RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x143
 GFX90C_DEVICE_IDS = (0x15E7, 0x1636, 0x1638, 0x164C)
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
+FLOAT_CONTROLS_PROPS_SIZE = 88   # VkPhysicalDeviceFloatControlsProperties: 16 + two enums + 16 x VkBool32
+FC_SIGNED_ZERO_INF_NAN_F32 = 28  # shaderSignedZeroInfNanPreserveFloat32: 16 + 2 enums + one VkBool32
+FC_DENORM_PRESERVE_F16 = 36      # shaderDenormPreserveFloat16: 16 + 2 enums + four VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
@@ -271,6 +275,8 @@ def query(*, stage_caps=False) -> dict:
             subgroup.pNext = ctypes.addressof(sg)
             drv = block(DRIVER_PROPS_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES)
             sg.pNext = ctypes.addressof(drv)
+            fc = block(FLOAT_CONTROLS_PROPS_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES)
+            set_next(drv, fc)
             props = block(16 + PROPS_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2)
             set_next(props, subgroup)
             vk.vkGetPhysicalDeviceProperties2(d, props)
@@ -322,7 +328,8 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          bool(u32(fc, FC_SIGNED_ZERO_INF_NAN_F32)), bool(u32(fc, FC_DENORM_PRESERVE_F16)))
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -331,7 +338,7 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver, signed_zero_f32, denorm_f16) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -355,6 +362,8 @@ def query(*, stage_caps=False) -> dict:
             "per_vertex_inputs": per_vertex,
             "barycentric_fallback": barycentric_fallback(vendor, device, driver),
             "max_push_constants_size": max_push_constants_size,
+            "shader_signed_zero_inf_nan_preserve_float32": signed_zero_f32,
+            "shader_denorm_preserve_float16": denorm_f16,
             "vendor_id": vendor,
             "device_id": device,
             "driver_id": driver,

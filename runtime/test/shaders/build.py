@@ -44,6 +44,26 @@ sys.path.insert(0, TOOLS)
 import mc_command  # noqa: E402
 
 MC = mc_command.mc_command()
+
+
+def denorm_preserve_fallback():
+    """LEONIDA_DENORM_PRESERVE_FALLBACK=1/0, else the device's shaderDenormPreserveFloat16 property.
+
+    A device without it (MoltenVK, llvmpipe) makes every module that declares DenormPreserve 16 invalid usage;
+    the shaders still run, but a validation run of the suite would fail. Signed zero/NaN/inf keep their own property.
+    """
+    v = (os.environ.get("LEONIDA_DENORM_PRESERVE_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        value = json.loads(r.stdout.strip().splitlines()[-1]).get("shader_denorm_preserve_float16")
+        return value is False
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
 RSRC2, GROUP = 0x8088, (64, 1, 1)
 # Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
 NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
@@ -195,6 +215,8 @@ def translate_tests(work, names):
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")
+    if denorm_preserve_fallback():   # no DenormPreserve 16 where the device lacks the property
+        cmd.append("--no-denorm-preserve")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).

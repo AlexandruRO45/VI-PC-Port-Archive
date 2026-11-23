@@ -854,6 +854,21 @@ def test_float_controls_declared(stage, make_shader):
     assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16"]
 
 
+def test_no_denorm_preserve_keeps_signed_zero(make_shader, monkeypatch):
+    """--no-denorm-preserve, for a device whose shaderDenormPreserveFloat16 is false (MoltenVK): only the 16-bit
+    DenormPreserve capability and mode go away; signed zero/NaN/inf keep their own device property, so their
+    capability, mode and index entry stay."""
+    monkeypatch.setattr(rdna2spirv, "NO_DENORM_PRESERVE", True)
+    shader = make_shader(FLOAT_CONTROLS_CS, name="cs_no_denorm_preserve")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "OpCapability SignedZeroInfNanPreserve" in spv
+    assert "OpExecutionMode %main SignedZeroInfNanPreserve 32" in spv
+    assert "DenormPreserve" not in spv
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32"]
+
+
 def test_no_float_controls_leaves_them_out(make_shader, monkeypatch):
     """--no-float-controls (FLOAT_CONTROLS = False), for a driver without the properties: no capability, no
     execution mode, no index entry, and the module still validates."""

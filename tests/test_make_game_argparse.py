@@ -153,7 +153,8 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         with patch.object(sys, "argv", base_argv):
             with patch("make_game.below_normal"):
                 with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
-                    with patch("make_game.preflight"):
+                    with patch("make_game.runtime_gpu_denorm_preserve", return_value=True), \
+                         patch("make_game.preflight"):
                         with patch("make_game.log"):
                             with patch("make_game.shaders") as mock_shaders:
                                 with patch("make_game.assets") as mock_assets:
@@ -234,7 +235,8 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                 patch("make_game.wave64_settings", return_value=(False, True)):
             with patch("make_game.below_normal"):
                 with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
-                    with patch("make_game.preflight"):
+                    with patch("make_game.runtime_gpu_denorm_preserve", return_value=True), \
+                         patch("make_game.preflight"):
                         with patch("make_game.log"):
                             with patch("make_game.pipeline_check_exe", return_value="vk_pipeline_check"):
                                 with patch("make_game.shaders", manager.shaders):
@@ -328,7 +330,8 @@ class JobsHandlingTest(unittest.TestCase):
                                         patch("make_game.wave64_settings", return_value=(True, True)) as probe, \
                                         patch("make_game.runtime_gpu_per_vertex", return_value=None), \
                                         patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
-                                        patch("make_game.runtime_gpu_max_push_constants", return_value=None):
+                                        patch("make_game.runtime_gpu_max_push_constants", return_value=None), \
+                                        patch("make_game.runtime_gpu_denorm_preserve", return_value=True):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
                                     probe.assert_called_once_with("auto", mesh_compute=False)

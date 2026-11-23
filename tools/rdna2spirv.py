@@ -72,6 +72,7 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
+NO_DENORM_PRESERVE = False  # True (--no-denorm-preserve): drop only DenormPreserve 16; keep signed zero/NaN/inf
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
 # counts, each lane's vertex and each lane's primitive into this workgroup's slot of a buffer whose device address is
@@ -14669,7 +14670,9 @@ def assemble(gen):
         # +0, RTX 3090 and RTX 4070 SUPER; docs/design.md, "Float controls").
         # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks the properties in "float_controls"
         # (shaderSignedZeroInfNanPreserveFloat64 too for a module that uses Float64, SHADER-597).
-        caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
+        caps.append("SignedZeroInfNanPreserve")
+        if not NO_DENORM_PRESERVE:
+            caps.append("DenormPreserve")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_fma_khr:
@@ -14711,7 +14714,8 @@ def assemble(gen):
             # SHADER-597: the same for doubles (Vulkan guarantees neither -0 nor NaN/inf for f64 without it), only
             # in modules that declare Float64; --no-float-controls leaves it out with the other modes.
             hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 64")
-        hdr.append("OpExecutionMode %main DenormPreserve 16")
+        if not NO_DENORM_PRESERVE:
+            hdr.append("OpExecutionMode %main DenormPreserve 16")
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -17946,6 +17950,9 @@ def main():
                     help="don't declare SignedZeroInfNanPreserve or DenormPreserve (for a driver whose "
                          "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16 is false); NaN, inf, "
                          "-0 and f16 denormals are then not guaranteed")
+    ap.add_argument("--no-denorm-preserve", action="store_true",
+                    help="drop only DenormPreserve 16 where the device reports shaderDenormPreserveFloat16 false; "
+                         "SignedZeroInfNanPreserve, NaN, inf and -0 keep their own (separate) device property")
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
@@ -18022,6 +18029,8 @@ def main():
     STRUCTURED = not a.dispatch_loop
     global FLOAT_CONTROLS
     FLOAT_CONTROLS = not a.no_float_controls
+    global NO_DENORM_PRESERVE
+    NO_DENORM_PRESERVE = a.no_denorm_preserve
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
