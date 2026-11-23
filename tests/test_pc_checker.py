@@ -154,5 +154,33 @@ class Api(unittest.TestCase):
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
 
 
+class CpuTopology(unittest.TestCase):
+    def test_detect_cpu_cores(self):
+        cores, threads = pc.detect_cpu_cores()
+        self.assertIsInstance(threads, int)
+        self.assertGreater(threads, 0)
+        if cores is not None:
+            self.assertIsInstance(cores, int)
+            self.assertGreater(cores, 0)
+            self.assertLessEqual(cores, threads)
+
+    def test_clean_name_strips_core_spec(self):
+        self.assertEqual(pc.clean_name("Intel CC150 (8 cores / 16 threads)"), "Intel CC150")
+        self.assertEqual(pc.clean_name("AMD Ryzen 7 3700X (8 cores)"), "AMD Ryzen 7 3700X")
+        self.assertEqual(pc.clean_name("Core i5-12400F (6 physical cores / 12 logical threads)"), "Core i5-12400F")
+
+    def test_evaluate_with_cpu_topology_8cores(self):
+        head, sub, rows = pc.evaluate(XBOX, "Intel Core i5-12400F", "NVIDIA GeForce RTX 3070", 32,
+                                      cpu_cores=8, cpu_threads=16)
+        self.assertEqual(rows[0][3], "Intel Core i5-12400F (8 cores / 16 threads)")
+        self.assertIn("8-core CPU meets console thread budget", sub)
+
+    def test_evaluate_with_cpu_topology_sub_6_cores(self):
+        head, sub, rows = pc.evaluate(XBOX, "Intel Core i5-12400F", "NVIDIA GeForce RTX 3070", 32,
+                                      cpu_cores=4, cpu_threads=8)
+        self.assertEqual(rows[0][3], "Intel Core i5-12400F (4 cores / 8 threads)")
+        self.assertIn("4 physical cores detected", sub)
+
+
 if __name__ == "__main__":
     unittest.main()

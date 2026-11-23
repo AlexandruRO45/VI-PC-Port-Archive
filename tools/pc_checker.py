@@ -361,22 +361,30 @@ def _join(items):
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def evaluate(profile_name: str, cpu: str, gpu: str, ram):
+def evaluate(profile_name: str, cpu: str, gpu: str, ram, cpu_cores: int | None = None,
+             cpu_threads: int | None = None):
     """Compare the hardware with a profile. Returns (headline, subtitle, rows)."""
     p = PROFILES[profile_name]
     cs = [cpu_score(n) for n in p["cpu_ref"]]
     gs = [gpu_score(n) for n in p["gpu_ref"]]
-    cpu_s, cpu_exact = cpu_lookup(cpu)
+    cpu_clean = clean_name(cpu)
+    cpu_s, cpu_exact = cpu_lookup(cpu_clean)
     gpu_s, gpu_exact = gpu_lookup(gpu)
+    cpu_display = cpu.strip()
+    if cpu_cores is not None:
+        if cpu_threads is not None and cpu_threads != cpu_cores:
+            cpu_display = f"{cpu_clean} ({cpu_cores} cores / {cpu_threads} threads)"
+        else:
+            cpu_display = f"{cpu_clean} ({cpu_cores} cores)"
     rows = [
-        ("CPU", _judge(cpu_s, min(cs), max(cs), CPU_TOL), p["cpu_text"], cpu.strip(),
+        ("CPU", _judge(cpu_s, min(cs), max(cs), CPU_TOL), p["cpu_text"], cpu_display,
          cpu_s is not None and not cpu_exact),
         ("GPU", _judge(gpu_s, min(gs), max(gs), GPU_TOL), p["gpu_text"], gpu.strip(),
          gpu_s is not None and not gpu_exact),
         ("RAM", _judge_ram(ram, p["ram"]), p["ram_text"], f"{ram} GB" if ram else "", False),
     ]
     weak = [r[0] for r in rows if r[1] == BELOW]
-    unknown = [r[3] or r[0] for r in rows if r[1] == UNKNOWN]
+    unknown = [d for d, s in (("CPU", cpu_s), ("GPU", gpu_s), ("RAM", ram_s)) if s is None]
     if weak:
         verb = "is" if len(weak) == 1 else "are"
         return ("Probably not enough",
@@ -385,7 +393,13 @@ def evaluate(profile_name: str, cpu: str, gpu: str, ram):
         return ("Can't tell yet",
                 f"Not recognised: {_join(unknown)}. Pick it from the list to compare.",
                 rows)
-    return ("Looks good", p["subtitle"], rows)
+    subtitle = p["subtitle"]
+    if profile_name == "Xbox Series X" and cpu_cores is not None:
+        if cpu_cores < 6:
+            subtitle += f" (Note: {cpu_cores} physical cores detected; Xbox Series titles target 7 dedicated worker threads)"
+        elif cpu_cores >= 8:
+            subtitle += " (8-core CPU meets console thread budget)"
+    return ("Looks good", subtitle, rows)
 
 
 def result_as_text(profile_name, headline, sub, rows):
@@ -416,6 +430,7 @@ def clean_name(name: str) -> str:
     s = re.sub(r"\((?:r|tm)\)|[®™]", "", name, flags=re.I)
     s = re.sub(r"@.*$", "", s)
     s = re.sub(r"\b\d+-core processor\b|\bprocessor\b|\bcpu\b", "", s, flags=re.I)
+    s = re.sub(r"\s*\(\s*\d+\s*(?:physical\s*)?cores?(?:\s*/\s*\d+\s*(?:logical\s*)?threads?)?\s*\)", "", s, flags=re.I)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -438,6 +453,63 @@ def detect_cpu() -> str:
     except Exception:
         pass
     return clean_name(platform.processor() or "")
+
+
+def detect_cpu_cores() -> tuple[int | None, int | None]:
+    """(physical_cores, logical_threads). None when unknown."""
+    threads = os.cpu_count()
+    cores = None
+    try:
+        if sys.platform == "win32":
+            class SYSTEM_LOGICAL_PROCESSOR_INFORMATION(ctypes.Structure):
+                class _DUMMYUNIONNAME(ctypes.Union):
+                    class _PROCESSORCORE(ctypes.Structure):
+                        _fields_ = [("Flags", ctypes.c_byte)]
+                    _fields_ = [
+                        ("ProcessorCore", _PROCESSORCORE),
+                        ("NodeNumber", ctypes.c_ulong),
+                        ("Reserved", ctypes.c_ulonglong * 2),
+                    ]
+                _fields_ = [
+                    ("ProcessorMask", ctypes.c_size_t),
+                    ("Relationship", ctypes.c_uint),
+                    ("_union", _DUMMYUNIONNAME),
+                ]
+            buf_len = ctypes.c_ulong(0)
+            ctypes.windll.kernel32.GetLogicalProcessorInformation(None, ctypes.byref(buf_len))
+            if buf_len.value > 0:
+                elem_size = ctypes.sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION)
+                count = buf_len.value // elem_size
+                buf = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION * count)()
+                if ctypes.windll.kernel32.GetLogicalProcessorInformation(buf, ctypes.byref(buf_len)):
+                    c = sum(1 for item in buf if item.Relationship == 0)
+                    if c > 0:
+                        cores = c
+        elif sys.platform == "darwin":
+            out_c = _run(["sysctl", "-n", "hw.physicalcpu"])
+            if out_c and out_c.isdigit():
+                cores = int(out_c)
+            out_t = _run(["sysctl", "-n", "hw.logicalcpu"])
+            if out_t and out_t.isdigit():
+                threads = int(out_t)
+        else:
+            core_ids = set()
+            cur_phys, cur_core = None, None
+            with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip().lower()
+                    if line.startswith("physical id"):
+                        cur_phys = line.split(":", 1)[1].strip()
+                    elif line.startswith("core id"):
+                        cur_core = line.split(":", 1)[1].strip()
+                        if cur_phys is not None and cur_core is not None:
+                            core_ids.add((cur_phys, cur_core))
+                            cur_phys, cur_core = None, None
+            if core_ids:
+                cores = len(core_ids)
+    except Exception:
+        pass
+    return (cores, threads)
 
 
 def _win_vram_map() -> dict:
@@ -571,7 +643,9 @@ def detect_all() -> dict:
         gpu = clean_name(best[1])
         if best[2]:
             gpu += f" ({best[2]} GB VRAM)"
-    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb()}
+    cores, threads = detect_cpu_cores()
+    return {"cpu": detect_cpu(), "cpu_cores": cores, "cpu_threads": threads,
+            "gpu": gpu, "ram": detect_ram_gb()}
 
 
 # ----------------------------------------------------------------------------
@@ -632,14 +706,17 @@ class SpecChecker:
         if self.profile not in PROFILES:
             raise ValueError(f"unknown profile {self.profile!r}; use one of {list(PROFILES)}")
 
-    def check(self, cpu=None, gpu=None, ram=None) -> Report:
+    def check(self, cpu=None, gpu=None, ram=None, cpu_cores=None, cpu_threads=None) -> Report:
         """Anything left as None is detected from this PC."""
         if cpu is None or gpu is None or ram is None:
             info = detect_all()
             cpu = info["cpu"] if cpu is None else cpu
+            cpu_cores = info.get("cpu_cores") if cpu_cores is None else cpu_cores
+            cpu_threads = info.get("cpu_threads") if cpu_threads is None else cpu_threads
             gpu = info["gpu"] if gpu is None else gpu
             ram = info["ram"] if ram is None else ram
-        headline, summary, rows = evaluate(self.profile, cpu, gpu, ram)
+        headline, summary, rows = evaluate(self.profile, cpu, gpu, ram, cpu_cores=cpu_cores,
+                                           cpu_threads=cpu_threads)
         return Report(self.profile, headline, summary, [Check(*r) for r in rows])
 
     def warn_if_weak(self, report=None) -> bool:
@@ -944,8 +1021,11 @@ def run_cli(args):
     cpu = args.cpu or info.get("cpu", "")
     gpu = args.gpu or info.get("gpu", "")
     ram = args.ram or info.get("ram")
-    print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | RAM: {ram or '?'} GB\n")
-    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram)))
+    cores = info.get("cpu_cores")
+    threads = info.get("cpu_threads")
+    cores_str = f" ({cores}C/{threads}T)" if cores and threads else ""
+    print(f"PC -> CPU: {cpu or '?'}{cores_str} | GPU: {gpu or '?'} | RAM: {ram or '?'} GB\n")
+    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram, cpu_cores=cores, cpu_threads=threads)))
 
 
 def main():
