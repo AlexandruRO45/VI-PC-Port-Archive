@@ -302,7 +302,7 @@ Additional corpus-wide properties across all 20,046 decoded LODs and 5,751 LOD 0
 ## CLI usage (`tools/smh_groom.py`)
 
 `tools/smh_groom.py` uses only the Python standard library (`python -I`) and reuses the binary glTF 2.0 container
-primitives from `tools/glb_writer.py`. Synthetic unit tests live in `tests/test_smh_groom.py`.
+primitives from `tools/glb_writer.py`. Synthetic unit tests live in `tests/test_smh_groom.py` and `tests/test_smh_groom_fast_paths.py` (the GLB export fast paths against the plain per-element code).
 
 ```powershell
 # Inspect a carved .smh file or an archive member at a byte offset

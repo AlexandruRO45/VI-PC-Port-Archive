@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import array
 import collections
+import itertools
 import json
 import math
 import mmap
@@ -962,15 +963,21 @@ def generate_strands(
 
         cur_x, cur_y, cur_z = prev_x, prev_y, prev_z
         strand_pts: list[tuple[float, float, float]] = [(cur_x, cur_y, cur_z)]
+        s_append = strand_pts.append
         remaining = target
         total_used = 0.0
         live_nodes = 1
 
-        for k in range(1, ppg):
-            q0, q1, q2 = p0_list[k], p1_list[k], p2_list[k]
-            nx = b0 * q0[0] + b1 * q1[0] + b2 * q2[0]
-            ny = b0 * q0[1] + b1 * q1[1] + b2 * q2[1]
-            nz = b0 * q0[2] + b1 * q1[2] + b2 * q2[2]
+        for (q0x, q0y, q0z), (q1x, q1y, q1z), (q2x, q2y, q2z) in zip(
+            p0_list[1:ppg], p1_list[1:ppg], p2_list[1:ppg]
+        ):
+            if not remaining > 0.0:
+                # Trimmed (or NaN) from here on: ``remaining`` never grows back, so every later node
+                # repeats the tip point and nothing else changes.
+                break
+            nx = b0 * q0x + b1 * q1x + b2 * q2x
+            ny = b0 * q0y + b1 * q1y + b2 * q2y
+            nz = b0 * q0z + b1 * q1z + b2 * q2z
 
             dx = nx - prev_x
             dy = ny - prev_y
@@ -981,19 +988,20 @@ def generate_strands(
             if seg_len < eps_len:
                 seg_len = eps_len
 
-            if remaining > 0.0:
-                use = seg_len if remaining >= seg_len else remaining
-                if use < 1e-9:
-                    use = 0.0
-                if use > 0.0:
-                    scale = use / seg_len
-                    cur_x += dx * scale
-                    cur_y += dy * scale
-                    cur_z += dz * scale
-                    total_used += use
-                    live_nodes += 1
-                remaining -= seg_len
-            strand_pts.append((cur_x, cur_y, cur_z))
+            use = seg_len if remaining >= seg_len else remaining
+            if use < 1e-9:
+                use = 0.0
+            if use > 0.0:
+                scale = use / seg_len
+                cur_x += dx * scale
+                cur_y += dy * scale
+                cur_z += dz * scale
+                total_used += use
+                live_nodes += 1
+            remaining -= seg_len
+            s_append((cur_x, cur_y, cur_z))
+        if len(strand_pts) < ppg:
+            strand_pts.extend([(cur_x, cur_y, cur_z)] * (ppg - len(strand_pts)))
 
         u0, v0 = uvs[g0]
         u1, v1 = uvs[g1]
@@ -1022,10 +1030,37 @@ def _convert_up(
     points: Iterable[tuple[float, float, float]],
     up_axis: str = "z",
 ) -> list[tuple[float, float, float]]:
+    # ``v or 0.0`` is ``_clean_zero(v)`` without the call: -0.0 and 0.0 are falsy and give +0.0, every other
+    # float (NaN and the infinities included) is returned as the same object.
     if up_axis == "y":
-        return [(_clean_zero(x), _clean_zero(y), _clean_zero(z)) for x, y, z in points]
+        return [(x or 0.0, y or 0.0, z or 0.0) for x, y, z in points]
     # RAGE Z-up -> glTF Y-up: (x, z, -y).
-    return [(_clean_zero(x), _clean_zero(z), _clean_zero(-y)) for x, y, z in points]
+    return [(x or 0.0, z or 0.0, -y or 0.0) for x, y, z in points]
+
+
+def _convert_normals(
+    normals: Iterable[tuple[float, float, float]],
+    up_axis: str = "z",
+) -> list[tuple[float, float, float]]:
+    """``_convert_up`` followed by ``glb_writer._normalize3`` on every vector, with a fast path.
+
+    A length that is at least ``sys.float_info.min`` and finite proves all three components are finite
+    (``hypot`` of a NaN or infinity is never finite), so such vectors skip ``_normalize3``'s checks and
+    take its plain ``component / length`` branch; everything else is handed to ``_normalize3`` itself.
+    """
+    hypot = math.hypot
+    tiny = sys.float_info.min
+    inf = math.inf
+    fallback = glb_writer._normalize3
+    out: list[tuple[float, float, float]] = []
+    append = out.append
+    for x, y, z in _convert_up(normals, up_axis):
+        length = hypot(x, y, z)
+        if tiny <= length < inf:
+            append((x / length or 0.0, y / length or 0.0, z / length or 0.0))
+        else:
+            append(fallback(x, y, z))
+    return out
 
 
 def _polyline_frames(
@@ -1036,21 +1071,25 @@ def _polyline_frames(
     sides: list[tuple[float, float, float]] = []
     ups: list[tuple[float, float, float]] = []
     hypot = math.hypot
-    for j in range(k):
-        if k == 1:
-            tx, ty, tz = 0.0, 0.0, 1.0
-        elif j == 0:
-            tx = poly[1][0] - poly[0][0]
-            ty = poly[1][1] - poly[0][1]
-            tz = poly[1][2] - poly[0][2]
-        elif j == k - 1:
-            tx = poly[j][0] - poly[j - 1][0]
-            ty = poly[j][1] - poly[j - 1][1]
-            tz = poly[j][2] - poly[j - 1][2]
-        else:
-            tx = 0.5 * (poly[j + 1][0] - poly[j - 1][0])
-            ty = 0.5 * (poly[j + 1][1] - poly[j - 1][1])
-            tz = 0.5 * (poly[j + 1][2] - poly[j - 1][2])
+    s_append = sides.append
+    u_append = ups.append
+
+    # Tangent directions first: forward difference at the root, backward at the tip, half the central
+    # difference in between, and +Z for a one-node polyline.
+    if k == 0:
+        return sides, ups
+    if k == 1:
+        tangents = [(0.0, 0.0, 1.0)]
+    else:
+        (x0, y0, z0), (x1, y1, z1) = poly[0], poly[1]
+        tangents = [(x1 - x0, y1 - y0, z1 - z0)]
+        t_append = tangents.append
+        for (ax, ay, az), (bx, by, bz) in zip(poly, poly[2:]):
+            t_append((0.5 * (bx - ax), 0.5 * (by - ay), 0.5 * (bz - az)))
+        (x0, y0, z0), (x1, y1, z1) = poly[k - 2], poly[k - 1]
+        t_append((x1 - x0, y1 - y0, z1 - z0))
+
+    for tx, ty, tz in tangents:
         norm = hypot(tx, ty, tz)
         if norm > 1e-9:
             inv = 1.0 / norm
@@ -1073,12 +1112,17 @@ def _polyline_frames(
             sx, sy, sz = 1.0, 0.0, 0.0
 
         # up = cross(tangent, side)
-        ux = ty * sz - tz * sy
-        uy = tz * sx - tx * sz
-        uz = tx * sy - ty * sx
-        sides.append((sx, sy, sz))
-        ups.append((ux, uy, uz))
+        s_append((sx, sy, sz))
+        u_append((ty * sz - tz * sy, tz * sx - tx * sz, tx * sy - ty * sx))
     return sides, ups
+
+
+def _segment_limit(live: list[int] | None, idx: int, k: int) -> int:
+    """Number of drawn segments of polyline ``idx``: ``live[idx] - 1`` clamped to ``0..k - 1``."""
+    seg_limit = (live[idx] - 1) if live is not None else (k - 1)
+    if seg_limit > k - 1:
+        seg_limit = k - 1
+    return seg_limit if seg_limit > 0 else 0
 
 
 def build_tubes(
@@ -1109,15 +1153,14 @@ def build_tubes(
     v_append = verts.append
     n_append = normals.append
     i_extend = indices.extend
+    # Index offsets of segments 0..seg_limit-1 of one tube, relative to its first vertex. They depend only
+    # on ``seg_limit`` (at most ``k`` distinct values), so each list is computed once.
+    patterns: dict[int, list[int]] = {}
 
     for idx, poly in enumerate(polylines):
         base_poly = idx * k * sides
         side_vecs, up_vecs = _polyline_frames(poly)
-        for j in range(k):
-            px, py, pz = poly[j]
-            sx, sy, sz = side_vecs[j]
-            ux, uy, uz = up_vecs[j]
-            rad = tapers[j]
+        for (px, py, pz), (sx, sy, sz), (ux, uy, uz), rad in zip(poly, side_vecs, up_vecs, tapers):
             for ca, sa in ring_trig:
                 rx = ca * sx + sa * ux
                 ry = ca * sy + sa * uy
@@ -1125,19 +1168,24 @@ def build_tubes(
                 v_append((px + rx * rad, py + ry * rad, pz + rz * rad))
                 n_append((rx, ry, rz))
 
-        seg_limit = (live[idx] - 1) if live is not None else (k - 1)
-        if seg_limit > k - 1:
-            seg_limit = k - 1
-        for j in range(max(seg_limit, 0)):
-            ring0 = base_poly + j * sides
-            ring1 = ring0 + sides
-            for s in range(sides):
-                s_next = (s + 1) % sides
-                a = ring0 + s
-                b = ring0 + s_next
-                c = ring1 + s
-                d = ring1 + s_next
-                i_extend((a, b, c, b, d, c))
+        seg_limit = _segment_limit(live, idx, k)
+        pattern = patterns.get(seg_limit)
+        if pattern is None:
+            pattern = patterns[seg_limit] = []
+            for j in range(seg_limit):
+                ring0 = j * sides
+                ring1 = ring0 + sides
+                for s in range(sides):
+                    s_next = (s + 1) % sides
+                    a = ring0 + s
+                    b = ring0 + s_next
+                    c = ring1 + s
+                    d = ring1 + s_next
+                    pattern.extend((a, b, c, b, d, c))
+        if base_poly:
+            i_extend([base_poly + i for i in pattern])
+        else:
+            i_extend(pattern)
 
     return verts, normals, indices
 
@@ -1166,27 +1214,29 @@ def build_ribbons(
     v_append = verts.append
     n_append = normals.append
     i_extend = indices.extend
+    patterns: dict[int, list[int]] = {}
 
     for idx, poly in enumerate(polylines):
         base_poly = idx * k * 2
         side_vecs, up_vecs = _polyline_frames(poly)
-        for j in range(k):
-            px, py, pz = poly[j]
-            sx, sy, sz = side_vecs[j]
-            up = up_vecs[j]
-            hw = half_tapers[j]
+        for (px, py, pz), (sx, sy, sz), up, hw in zip(poly, side_vecs, up_vecs, half_tapers):
             v_append((px - sx * hw, py - sy * hw, pz - sz * hw))
             n_append(up)
             v_append((px + sx * hw, py + sy * hw, pz + sz * hw))
             n_append(up)
 
-        seg_limit = (live[idx] - 1) if live is not None else (k - 1)
-        if seg_limit > k - 1:
-            seg_limit = k - 1
-        for j in range(max(seg_limit, 0)):
-            r0 = base_poly + j * 2
-            r1 = r0 + 2
-            i_extend((r0, r0 + 1, r1, r0 + 1, r1 + 1, r1))
+        seg_limit = _segment_limit(live, idx, k)
+        pattern = patterns.get(seg_limit)
+        if pattern is None:
+            pattern = patterns[seg_limit] = []
+            for j in range(seg_limit):
+                r0 = j * 2
+                r1 = r0 + 2
+                pattern.extend((r0, r0 + 1, r1, r0 + 1, r1 + 1, r1))
+        if base_poly:
+            i_extend([base_poly + i for i in pattern])
+        else:
+            i_extend(pattern)
 
     return verts, normals, indices
 
@@ -1203,16 +1253,180 @@ def build_lines(
     indices: list[int] = []
     v_extend = verts.extend
     i_extend = indices.extend
+    patterns: dict[int, list[int]] = {}
     for idx, poly in enumerate(polylines):
         base = idx * k
         v_extend(poly)
-        seg_limit = (live[idx] - 1) if live is not None else (k - 1)
-        if seg_limit > k - 1:
-            seg_limit = k - 1
-        for j in range(max(seg_limit, 0)):
-            a = base + j
-            i_extend((a, a + 1))
+        seg_limit = _segment_limit(live, idx, k)
+        pattern = patterns.get(seg_limit)
+        if pattern is None:
+            pattern = patterns[seg_limit] = []
+            for j in range(seg_limit):
+                pattern.extend((j, j + 1))
+        if base:
+            i_extend([base + i for i in pattern])
+        else:
+            i_extend(pattern)
     return verts, indices
+
+
+def _tube_floats(
+    polylines: list[list[tuple[float, float, float]]],
+    live: list[int] | None = None,
+    *,
+    radius: float = 0.0004,
+    tip: float = 0.25,
+    sides: int = 3,
+    z_up: bool = True,
+) -> tuple[list[float], list[float], list[int]]:
+    """``build_tubes`` fused with the glTF up-axis conversion and normal normalisation.
+
+    Returns flat ``x, y, z, ...`` position and normal float lists plus the indices. The values are exactly
+    what ``_convert_up(verts, up)`` and ``_convert_normals(normals, up)`` give for ``build_tubes``' output,
+    without building and re-walking the intermediate tuple lists.
+    """
+    if not polylines or sides < 3:
+        return [], [], []
+    k = len(polylines[0])
+    if k < 2:
+        return [], [], []
+
+    ring_trig = [
+        (math.cos(s * (2.0 * math.pi / sides)), math.sin(s * (2.0 * math.pi / sides)))
+        for s in range(sides)
+    ]
+    denom = float(k - 1)
+    tapers = [(1.0 - (1.0 - tip) * (j / denom)) * radius for j in range(k)]
+
+    pos: list[float] = []
+    nrm: list[float] = []
+    indices: list[int] = []
+    p_extend = pos.extend
+    n_extend = nrm.extend
+    i_extend = indices.extend
+    hypot = math.hypot
+    tiny = sys.float_info.min
+    inf = math.inf
+    fallback = glb_writer._normalize3
+    patterns: dict[int, list[int]] = {}
+
+    for idx, poly in enumerate(polylines):
+        base_poly = idx * k * sides
+        side_vecs, up_vecs = _polyline_frames(poly)
+        for (px, py, pz), (sx, sy, sz), (ux, uy, uz), rad in zip(poly, side_vecs, up_vecs, tapers):
+            for ca, sa in ring_trig:
+                rx = ca * sx + sa * ux
+                ry = ca * sy + sa * uy
+                rz = ca * sz + sa * uz
+                vx = px + rx * rad
+                vy = py + ry * rad
+                vz = pz + rz * rad
+                if z_up:
+                    p_extend((vx or 0.0, vz or 0.0, -vy or 0.0))
+                    cx = rx or 0.0
+                    cy = rz or 0.0
+                    cz = -ry or 0.0
+                else:
+                    p_extend((vx or 0.0, vy or 0.0, vz or 0.0))
+                    cx = rx or 0.0
+                    cy = ry or 0.0
+                    cz = rz or 0.0
+                length = hypot(cx, cy, cz)
+                if tiny <= length < inf:
+                    n_extend((cx / length or 0.0, cy / length or 0.0, cz / length or 0.0))
+                else:
+                    n_extend(fallback(cx, cy, cz))
+
+        seg_limit = _segment_limit(live, idx, k)
+        pattern = patterns.get(seg_limit)
+        if pattern is None:
+            pattern = patterns[seg_limit] = []
+            for j in range(seg_limit):
+                ring0 = j * sides
+                ring1 = ring0 + sides
+                for s in range(sides):
+                    s_next = (s + 1) % sides
+                    a = ring0 + s
+                    b = ring0 + s_next
+                    c = ring1 + s
+                    d = ring1 + s_next
+                    pattern.extend((a, b, c, b, d, c))
+        i_extend(map(base_poly.__add__, pattern) if base_poly else pattern)
+
+    return pos, nrm, indices
+
+
+def _ribbon_floats(
+    polylines: list[list[tuple[float, float, float]]],
+    live: list[int] | None = None,
+    *,
+    width: float = 0.0008,
+    tip: float = 0.25,
+    z_up: bool = True,
+) -> tuple[list[float], list[float], list[int]]:
+    """``build_ribbons`` fused with the glTF up-axis conversion and normal normalisation (see ``_tube_floats``)."""
+    if not polylines:
+        return [], [], []
+    k = len(polylines[0])
+    if k < 2:
+        return [], [], []
+
+    half_w = 0.5 * width
+    denom = float(k - 1)
+    half_tapers = [(1.0 - (1.0 - tip) * (j / denom)) * half_w for j in range(k)]
+
+    pos: list[float] = []
+    nrm: list[float] = []
+    indices: list[int] = []
+    p_extend = pos.extend
+    n_extend = nrm.extend
+    i_extend = indices.extend
+    hypot = math.hypot
+    tiny = sys.float_info.min
+    inf = math.inf
+    fallback = glb_writer._normalize3
+    patterns: dict[int, list[int]] = {}
+
+    for idx, poly in enumerate(polylines):
+        base_poly = idx * k * 2
+        side_vecs, up_vecs = _polyline_frames(poly)
+        for (px, py, pz), (sx, sy, sz), (ux, uy, uz), hw in zip(poly, side_vecs, up_vecs, half_tapers):
+            ax = px - sx * hw
+            ay = py - sy * hw
+            az = pz - sz * hw
+            bx = px + sx * hw
+            by = py + sy * hw
+            bz = pz + sz * hw
+            if z_up:
+                p_extend((ax or 0.0, az or 0.0, -ay or 0.0, bx or 0.0, bz or 0.0, -by or 0.0))
+                cx = ux or 0.0
+                cy = uz or 0.0
+                cz = -uy or 0.0
+            else:
+                p_extend((ax or 0.0, ay or 0.0, az or 0.0, bx or 0.0, by or 0.0, bz or 0.0))
+                cx = ux or 0.0
+                cy = uy or 0.0
+                cz = uz or 0.0
+            length = hypot(cx, cy, cz)
+            if tiny <= length < inf:
+                nx = cx / length or 0.0
+                ny = cy / length or 0.0
+                nz = cz / length or 0.0
+            else:
+                nx, ny, nz = fallback(cx, cy, cz)
+            n_extend((nx, ny, nz, nx, ny, nz))
+
+        seg_limit = _segment_limit(live, idx, k)
+        pattern = patterns.get(seg_limit)
+        if pattern is None:
+            pattern = patterns[seg_limit] = []
+            for j in range(seg_limit):
+                r0 = j * 2
+                r1 = r0 + 2
+                pattern.extend((r0, r0 + 1, r1, r0 + 1, r1 + 1, r1))
+        i_extend(map(base_poly.__add__, pattern) if base_poly else pattern)
+
+    return pos, nrm, indices
 
 
 def _pack_scalar_indices(indices: list[int], vert_count: int) -> tuple[bytes, int]:
@@ -1241,16 +1455,46 @@ def _pack_scalar_indices(indices: list[int], vert_count: int) -> tuple[bytes, in
     return struct.pack(f"<{len(indices)}I", *indices), comp_type
 
 
-def _pack_vec3(values: list[tuple[float, float, float]]) -> tuple[bytes, list[float], list[float]]:
-    raw_bytes, floats = glb_writer._pack_f32(values, 3)
+def _pack_flat_f32(flat: Iterable[float]) -> tuple[bytes, array.array]:
+    """Pack a flat ``x, y, z, x, y, z, ...`` float iterable as float32 -> ``(raw bytes, float32 values)``.
+
+    Same bytes and the same ``GlbError`` for non-finite data as ``glb_writer._pack_f32`` on the vec3 list.
+    """
+    if _FLOAT32_CODE is None:
+        flat = list(flat)
+        return glb_writer._pack_f32(list(zip(flat[0::3], flat[1::3], flat[2::3])), 3)
+    arr = array.array(_FLOAT32_CODE, flat)
+    # float32 values are all finite exactly when their float64 sum is: the sum of at most a few million
+    # values below 3.4e38 cannot overflow, while an infinity or NaN makes it non-finite.
+    if not math.isfinite(sum(arr)):
+        raise glb_writer.GlbError("non-finite float32 vertex attribute")
+    if _NEEDS_BYTESWAP:
+        swapped = array.array(_FLOAT32_CODE, arr)
+        swapped.byteswap()
+        return swapped.tobytes(), arr
+    return arr.tobytes(), arr
+
+
+def _pack_vec3_bytes(values: list[tuple[float, float, float]]) -> tuple[bytes, array.array]:
+    if all(map((3).__eq__, map(len, values))):
+        return _pack_flat_f32(itertools.chain.from_iterable(values))
+    return glb_writer._pack_f32(values, 3)  # raises the matching ``GlbError``
+
+
+def _vec3_bounds(floats: array.array) -> tuple[list[float], list[float]]:
     xs = floats[0::3]
     ys = floats[1::3]
     zs = floats[2::3]
     return (
-        raw_bytes,
         [_clean_zero(min(xs)), _clean_zero(min(ys)), _clean_zero(min(zs))],
         [_clean_zero(max(xs)), _clean_zero(max(ys)), _clean_zero(max(zs))],
     )
+
+
+def _pack_vec3(values: list[tuple[float, float, float]]) -> tuple[bytes, list[float], list[float]]:
+    raw_bytes, floats = _pack_vec3_bytes(values)
+    vmin, vmax = _vec3_bounds(floats)
+    return raw_bytes, vmin, vmax
 
 
 def to_glb(
@@ -1314,18 +1558,17 @@ def to_glb(
             gltf_materials.append(mat)
         return part_mat_index[part]
 
-    def append_primitive(
+    def emit_primitive(
         part: int,
-        verts: list[tuple[float, float, float]],
-        normals: list[tuple[float, float, float]] | None,
+        pos_bytes: bytes,
+        vmin: list[float],
+        vmax: list[float],
+        vert_count: int,
+        nrm_bytes: bytes | None,
         indices: list[int],
-        mode: int = MODE_TRIANGLES,
-        double_sided: bool = False,
+        mode: int,
+        double_sided: bool,
     ) -> None:
-        if not verts or not indices:
-            return
-        conv_verts = _convert_up(verts, up)
-        pos_bytes, vmin, vmax = _pack_vec3(conv_verts)
         pos_bv = glb_writer._append_buffer_view(
             bin_buf, buffer_views, pos_bytes, target=glb_writer.TARGET_ARRAY_BUFFER,
         )
@@ -1333,17 +1576,13 @@ def to_glb(
         accessors.append({
             "bufferView": pos_bv,
             "componentType": glb_writer.COMPONENT_FLOAT,
-            "count": len(conv_verts),
+            "count": vert_count,
             "type": "VEC3",
             "min": vmin,
             "max": vmax,
         })
         attributes: dict[str, int] = {"POSITION": pos_acc}
-        if normals is not None and len(normals) == len(conv_verts):
-            conv_nrm = [
-                glb_writer._normalize3(*n) for n in _convert_up(normals, up)
-            ]
-            nrm_bytes, _ = glb_writer._pack_f32(conv_nrm, 3)
+        if nrm_bytes is not None:
             nrm_bv = glb_writer._append_buffer_view(
                 bin_buf, buffer_views, nrm_bytes, target=glb_writer.TARGET_ARRAY_BUFFER,
             )
@@ -1351,12 +1590,12 @@ def to_glb(
             accessors.append({
                 "bufferView": nrm_bv,
                 "componentType": glb_writer.COMPONENT_FLOAT,
-                "count": len(conv_nrm),
+                "count": vert_count,
                 "type": "VEC3",
             })
             attributes["NORMAL"] = nrm_acc
 
-        idx_bytes, idx_comp = _pack_scalar_indices(indices, len(conv_verts))
+        idx_bytes, idx_comp = _pack_scalar_indices(indices, vert_count)
         idx_bv = glb_writer._append_buffer_view(
             bin_buf, buffer_views, idx_bytes, target=glb_writer.TARGET_ELEMENT_ARRAY_BUFFER,
         )
@@ -1374,6 +1613,40 @@ def to_glb(
             "mode": mode,
             "extras": {"shaderIndex": part, "part": PART_NAMES[part]},
         })
+
+    def append_primitive(
+        part: int,
+        verts: list[tuple[float, float, float]],
+        normals: list[tuple[float, float, float]] | None,
+        indices: list[int],
+        mode: int = MODE_TRIANGLES,
+        double_sided: bool = False,
+    ) -> None:
+        if not verts or not indices:
+            return
+        conv_verts = _convert_up(verts, up)
+        pos_bytes, vmin, vmax = _pack_vec3(conv_verts)
+        nrm_bytes = None
+        if normals is not None and len(normals) == len(conv_verts):
+            nrm_bytes, _ = _pack_vec3_bytes(_convert_normals(normals, up))
+        emit_primitive(part, pos_bytes, vmin, vmax, len(conv_verts), nrm_bytes, indices, mode, double_sided)
+
+    def append_flat_primitive(
+        part: int,
+        pos: list[float],
+        nrm: list[float],
+        indices: list[int],
+        double_sided: bool = False,
+    ) -> None:
+        """``append_primitive`` for triangle geometry already converted to flat, up-axis-corrected floats."""
+        if not pos or not indices:
+            return
+        pos_bytes, floats = _pack_flat_f32(pos)
+        vmin, vmax = _vec3_bounds(floats)
+        nrm_bytes = _pack_flat_f32(nrm)[0] if len(nrm) == len(pos) else None
+        emit_primitive(
+            part, pos_bytes, vmin, vmax, len(pos) // 3, nrm_bytes, indices, MODE_TRIANGLES, double_sided,
+        )
 
     def append_polylines(
         part: int,
@@ -1436,11 +1709,11 @@ def to_glb(
                     "extras": {"shaderIndex": part, "part": PART_NAMES[part]},
                 })
         elif geometry == "ribbons":
-            verts, nrms, idx = build_ribbons(polylines, live, width=radius * 2.0)
-            append_primitive(part, verts, nrms, idx, mode=MODE_TRIANGLES, double_sided=True)
+            pos, nrm, idx = _ribbon_floats(polylines, live, width=radius * 2.0, z_up=up == "z")
+            append_flat_primitive(part, pos, nrm, idx, double_sided=True)
         else:
-            verts, nrms, idx = build_tubes(polylines, live, radius=radius)
-            append_primitive(part, verts, nrms, idx, mode=MODE_TRIANGLES)
+            pos, nrm, idx = _tube_floats(polylines, live, radius=radius, z_up=up == "z")
+            append_flat_primitive(part, pos, nrm, idx)
 
     if scalp:
         roots = [guide[0] for guide in groom.positions]
