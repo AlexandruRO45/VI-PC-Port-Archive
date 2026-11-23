@@ -73,6 +73,24 @@ int main(int argc, char** argv) {
         std::fflush(stderr);
         std::_Exit(1);
     }
+
+    // D3D-481: a CPU Signal held behind a queue Signal the GPU has not reached is applied by the fence
+    // dispatcher. The applied signal must still release a queue whose batch waited on that value.
+    Ref<ID3D12Fence> gate2, f2, done2;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate2.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f2.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done2.p)))) return 1;
+    const bool armed = SUCCEEDED(direct_a->Wait(gate2.p, 1)) &&
+        SUCCEEDED(direct_a->Signal(f2.p, 10)) &&   // held behind the gate; claims queue value 10
+        SUCCEEDED(f2->Signal(20)) &&               // CPU signal held behind it, applied when f2 reaches 10
+        SUCCEEDED(direct_b->Wait(f2.p, 20)) &&
+        SUCCEEDED(direct_b->Signal(done2.p, 1)) && // held until a Signal for 20 is submitted
+        SUCCEEDED(gate2->Signal(1));
+    if (!armed || !wait_for(done2.p, 1)) {
+        std::fputs("a queue waiting on a held CPU signal stayed held\n", stderr);
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
     std::puts("copy/compute and direct/direct Wait-before-Signal completed");
     return 0;
 }

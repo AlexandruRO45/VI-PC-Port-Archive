@@ -1158,7 +1158,12 @@ public:
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
                 info.value = value;
-                context->vk.vkSignalSemaphore(context->device(), &info);
+                if (context->vk.vkSignalSemaphore(context->device(), &info) == VK_SUCCESS) {
+                    // A queue holding a batch on this value releases only on a submitted Signal, not on the
+                    // semaphore reaching it, so the applied CPU signal must record and pump like every other.
+                    context->holds().signaled(semaphore, value);
+                    context->holds().pump_ready();
+                }
             }
             held->fetch_sub(1);
         });
