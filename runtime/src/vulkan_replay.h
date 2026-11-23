@@ -1003,6 +1003,7 @@ struct Prepared {
     VkFramebuffer resolve_framebuffer = VK_NULL_HANDLE;
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
                                // (or a copy of an rgb96 texture: repacked by the same pass)
+    bool has_xdxr = false;     // XDXR build, copy or postbuild: runs internal compute dispatches
     std::uint32_t rgb96_row_words = 0;    // an rgb96 footprint: words between its rows and between its slices
     std::uint32_t rgb96_slice_words = 0;
     Depth24Job depth24;                    // the whole copy: where its scratch floats are
@@ -2343,7 +2344,7 @@ inline void plan_statistics_segments(PreparedList& out) {
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
         if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                      p.counted_dispatch.indirect)) {
+                      p.counted_dispatch.indirect || p.has_xdxr)) {
             inner.push_back({&p.statistics_end, &p.statistics_begin, -1});
             splits = true;
         }
@@ -2430,7 +2431,7 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
             // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
             // segment before it and open a new one after, the way resolves do.
             if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                                    p.counted_dispatch.indirect)) {
+                                    p.counted_dispatch.indirect || p.has_xdxr)) {
                 p.statistics_end = current;
                 current = open();
                 p.statistics_begin = current;
@@ -3031,8 +3032,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
-            if (vk.xdxr_check) {
-                if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
+            if (vk.xdxr_check || vk.xdxr_record) {
+                if (!vk.xdxr_check || !vk.xdxr_record || (statistics_active && !statistics_helpers) ||
+                    !vk.xdxr_check(*build))
+                    return ReplayResult::unsupported;
+                p.has_xdxr = true;
             } else {
                 if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
                     return ReplayResult::unsupported;
@@ -3050,7 +3054,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
             // the destination's room bounds the copy, as the size is only known to the GPU.
-            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1) return ReplayResult::unsupported;
+            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1 || (statistics_active && !statistics_helpers))
+                return ReplayResult::unsupported;
             std::uint64_t room = ~std::uint64_t(0);
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
@@ -3058,17 +3063,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             std::uint64_t source = ~std::uint64_t(0);
             if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return ReplayResult::unresolved_resource;
             p.xdxr_bytes = std::min(room, source);
+            p.has_xdxr = true;
         } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
             // The KHR path never wrote postbuild values; it keeps skipping them rather than failing the list.
             if (!vk.xdxr_postbuild) {
                 p.skip = true;
             } else {
-                if (!vk.buffer_at || (info->type != 0 && info->type != 3)) return ReplayResult::unsupported;
+                if (!vk.buffer_at || (info->type != 0 && info->type != 3) ||
+                    (statistics_active && !statistics_helpers))
+                    return ReplayResult::unsupported;
                 std::uint64_t room = 8 * info->sources.size();
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
                 if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
                 if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
+                p.has_xdxr = true;
             }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
@@ -3950,13 +3959,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
+            end_statistics();
             vk.xdxr_record(command_buffer, *xdxr_build);
+            begin_statistics();
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
+            end_statistics();
             vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+            begin_statistics();
         } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
                    postbuild && !p.skip) {
+            end_statistics();
             for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
                 vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
+            begin_statistics();
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.

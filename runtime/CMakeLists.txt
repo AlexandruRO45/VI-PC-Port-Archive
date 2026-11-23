@@ -1584,6 +1584,14 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_xdxr_rt_check PROPERTIES FIXTURES_REQUIRED d3d12_xdxr_cases SKIP_RETURN_CODE 77)
     endif()
 
+    # Pipeline-statistics queries must split around XDXR compute passes (D3D-162).
+    add_executable(d3d12_xdxr_statistics_test test/d3d12_xdxr_statistics_test.cpp)
+    target_link_libraries(d3d12_xdxr_statistics_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_xdxr_statistics_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_xdxr_statistics_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_xdxr_statistics COMMAND d3d12_xdxr_statistics_test)
+    set_tests_properties(d3d12_xdxr_statistics PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
     add_executable(d3d12_gcl8_test test/d3d12_gcl8_test.cpp)
     target_link_libraries(d3d12_gcl8_test PRIVATE gta6rt_d3d12_com)
@@ -2963,6 +2971,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # XDXR build/copy/postbuild passes split active pipeline-statistics queries (D3D-162), with CPU mocks (no GPU or game data).
+    add_executable(replay_xdxr_statistics_test test/replay_xdxr_statistics_test.cpp)
+    target_link_libraries(replay_xdxr_statistics_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_xdxr_statistics_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_xdxr_statistics COMMAND replay_xdxr_statistics_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
