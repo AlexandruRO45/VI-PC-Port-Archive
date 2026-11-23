@@ -3,7 +3,7 @@
 > [!NOTE]
 > İngilizce dokümantasyon ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) ve
 > [`docs/README.md`](../../README.md)) **yetkili kaynaktır**. Bu rehber yalnızca kararlı kurulum ve derleme
-> yönergelerini kapsar (`f85582e` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
+> yönergelerini kapsar (`0db7fed5` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
 > [`README.md`](../../../README.md) dosyasına bakın.
 
 ## Leonida Nedir?
@@ -34,8 +34,11 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
 - **AMDGPU hedefli** [LLVM 21+](https://github.com/llvm/llvm-project/releases) (`llvm-mc`):
   - Resmi Windows LLVM kurulumu AMDGPU hedefini **içermez**.
   - AMDGPU destekli yerel `llvm-mc.exe` derlemek için depo kök dizininde PowerShell'den `.\scripts\build_llvm_mc.ps1`
-    betiğini çalıştırın (`git` ve aşağıdaki Visual Studio C++ araçları gerekir). Betik kullanıcınız için `LLVM_MC`
-    ortam değişkenini ayarlar; geçerli olması için yeni bir terminal açın.
+    betiğini çalıştırın (`git` ve aşağıdaki Visual Studio C++ araçları gerekir; yaklaşık 20–40 dakika sürer). Betik
+    kullanıcınız için `LLVM_MC` ortam değişkenini ayarlar; geçerli olması için yeni bir terminal açın.
+  - [conda](https://docs.conda.io/) kullanıyorsanız daha hızlı bir yol: `conda install -c conda-forge llvm-tools`
+    (Windows derlemesi AMDGPU hedefini içerir), ardından `LLVM_MC` değişkenini kurulan `llvm-mc.exe` tam yoluna
+    ayarlayın (ortam etkinken `where llvm-mc` komutu yolu gösterir).
   - Alternatif olarak WSL (Ubuntu) içinde `llvm-21` kurup `make_game.py` çalıştıracağınız PowerShell oturumunda
     `LLVM_MC` değişkenini tam komut olarak ayarlayın:
 
@@ -61,7 +64,7 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
    ```
 3. **`Build.bat`** dosyasına çift tıklayın.
 
-Betik oyun kopyanızı kendisi arar (İndirilenler, Masaüstü, Belgeler, Games, kullanıcı klasörünüz ve her sürücünün kök
+Betik oyun kopyanızı kendisi arar (İndirilenler, Masaüstü, Belgeler — OneDrive dahil Windows'un tuttuğu konumlar —, Games, kullanıcı klasörünüz ve her sürücünün kök
 dizininden iki seviye derine kadar). Büyük dosyaları okumadan yalnızca birkaç dosya boyutundan sürümü tanır. Birden
 fazla kopya bulursa hangisini kullanacağınızı, hiç bulamazsa klasör yolunu yapıştırmanızı ister. Başlamadan önce
 gereksinimleri ve boş disk alanını denetleyip eksikleri tek seferde listeler. Çıktı `Documents\Leonida` klasörüne
@@ -71,7 +74,9 @@ yazılır; yarım kalan bir derleme kaldığı yerden devam eder.
 
 ```powershell
 python -I make_game.py --find                          # bilgisayarda bulunan kopyaları listele
+python -I make_game.py --pick                          # klasör seçici ile oyun klasörünü seç
 python -I make_game.py --check                         # kopyayı doğrula, derleme yapma
+python -I make_game.py --check --full-check            # her dosyanın SHA-256 özetini de karşılaştır (yavaş)
 python -I make_game.py --game "D:\paket\yolu" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # yalnızca seçili aşamaları çalıştır
 python -I make_game.py --game "D:\paket\yolu" --wav    # Opus akışlarını ayrıca PCM WAV'a çöz (büyük boyut)
@@ -80,9 +85,18 @@ python -I make_game.py --wave64-emulate off            # auto (varsayılan), on 
 
 Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
 
+- **Düşük disk alanı:** ~350 GB değeri tam derleme içindir. Yalnızca portu *çalıştırmak* için
+  `--stages check,shaders,runtime` yaklaşık 30 GB gerektirir; `assets` aşaması (~300 GB) yalnızca varlık araçları
+  içindir (`--wav` Ogg Opus boyutunun birkaç katını ekler). `--work` ve `--out` başka bir sürücüde olabilir.
+  Çalışma zamanı paketi yerinde eşler; salt okunur bir paket sürücüsü için `gta6rt --overlay <yazılabilir klasör>`
+  kullanın (`--overlay` bir `gta6rt` seçeneğidir, `make_game.py` seçeneği değildir). `work/shaders/dxbc/disasm`
+  altındaki `.s` dosyalarını silmeyin.
 - **`--wave64-emulate`**: Wave64 compute ve mesh shader'larını her subgroup genişliğinde birebir çalışacak şekilde
   çevirir. NVIDIA ve Intel GPU'lar 32 şeritli subgroup kullandığı için buna ihtiyaç duyar. Varsayılan `auto` modu
-  `vulkaninfo` çıktısına bakar ve tüm GPU'lar yerel 64 şeritli subgroup bildirmediği sürece emülasyonu otomatik açar.
+  `vulkaninfo` çıktısına bakar ve herhangi bir GPU 64 şeritli subgroup desteklemiyorsa veya boyut bilinmiyorsa
+  emülasyonu açar (`--mesh-compute` ile yalnızca compute desteği yeterlidir). AMD Windows sürücüsünde RDNA1 ve RDNA2
+  desteklediğinde yerel wave64 kullanılır (öykünülmüş LDS kodunda sürücü çökmesini önlemek için, `#857`). Zorlamak için
+  `--wave64-emulate on` veya `--wave64-emulate off` kullanın.
 - **`--work`**: En az 350 GB boş alana sahip bir sürücü seçin. En uzun adım shader çevirisidir ve varsayılan olarak
   CPU iş parçacıklarının yarısını kullanır (`--jobs` ile değiştirilebilir).
 - **`--wav`**: Varsayılan olarak kapalıdır; 16-bit PCM WAV dosyaları Ogg Opus'tan birkaç kat daha büyüktür.
