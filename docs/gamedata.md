@@ -723,7 +723,7 @@ are (GTA V reads them as a value pair blended by strength), and how `controlValu
 |---|---:|---:|---:|---|---:|---:|---:|
 | `common.rpf` | 6.6 MB | 954 | 50.2 MB | XML/config, text, `MHIU`, `PAMH`, `SPS1Z` | 844 streams | 0 | 0 |
 | `data.rpf` | 481.5 MB | 28,509 | 1,403.3 MB | models/GPU pages, 1,263 `RBF0`, 2,281 `PSIN`, 3,132 resource pages | 0 | 1,263 | 2,281 |
-| `script.rpf` | 4.4 MB | 714 | 5.0 MB | 671 `PSIN` plus binary | 0 | 0 | 671 |
+| `script.rpf` | 4.4 MB | 1,057 | 6.2 MB | 1,012 `PSIN` plus binary | 0 | 0 | 1,012 |
 
 There is **no XML, `RBF0` or `PSIN` duplication** between them: `common.rpf` contains no `RBF0`/`PSIN`, and
 `data.rpf`/`script.rpf` have no XML documents at all — no stream starts as XML and no inflated stream contains

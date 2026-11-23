@@ -7,8 +7,11 @@ the original names are unavailable; PSIN is identified by its own magic.
 
 ## Where it appears
 
-- `script.rpf` carve: **671 streams** start with `PSIN`. **670 are complete**; one is
-  the first 64 KiB of a larger record (its first-section offset points past the carved block).
+- `script.rpf` carve: **1,012 streams** start with `PSIN`. **1,009 are complete**; the other three are the
+  first 64 KiB of a larger record (their first-section offset points past the carved block). The earlier
+  671 / 670 figures came from the carver that advanced by the 1 MiB read request, which counted skipped
+  regions as part of the preceding stream (the same superseded bug `gamedata.md` records for `common.rpf`:
+  781 -> 954 streams). This is the 1,012 the "Corpus" section below already reports.
 - `data.rpf` carve: **2,281 streams** start with `PSIN` (the same project's carve also reports 1,263
   `RBF0` and 3,132 resource pages). The project's existing `ArchiveReader`/`PsinMetadata` path
   validates **1,045 complete PSIN records** in `data.rpf` and **1,012** in `script.rpf` after joining
@@ -41,16 +44,16 @@ Sections start at the offset in the header and run to the end of the file. Each 
 | +4 | 4 | big-endian **total** size, including this 8-byte header |
 
 The next section starts at `offset + size`; the last section ends at EOF. A section with size 8 is
-empty. The measured tag counts over the 670 complete `script.rpf` records are:
+empty. The measured tag counts over the 1,009 complete `script.rpf` records are:
 
 | Tag | Count | Measured payload |
 |---|---:|---|
-| `LSCH` | 670 | 464-544 bytes; the type schema (structs and members), decoded below |
-| `LENM` | 670 | the schema's enums and their values, decoded below |
-| `LSNS` | 670 | block table and 16-byte records; layout decoded below, record contents opaque |
-| `LGID` | 670 | empty (8-byte section) |
-| `LRSC` | 670 | starts with `0DRP` + version 122; resource page directory link |
-| `CHKS` | 670 | file size and a 32-bit checksum |
+| `LSCH` | 1,009 | 464-544 bytes; the type schema (structs and members), decoded below (3,879 structs, 25,763 members) |
+| `LENM` | 1,009 | the schema's enums and their values, decoded below (1,009 enums, 6,054 values) |
+| `LSNS` | 1,009 | block table and 16-byte records (52-19,412 bytes, 56,382 records); layout decoded below, record contents opaque |
+| `LGID` | 1,009 | empty (8-byte section) |
+| `LRSC` | 1,009 | starts with `0DRP` + version 122; resource page directory link |
+| `CHKS` | 1,009 | file size and a 32-bit checksum |
 
 The `LSCH` sizes on the measured set are 472-552 bytes including the 8-byte header. `LRSC` is the
 link to the resource-page world: its payload begins `30 44 52 50` (`0DRP`), then a little-endian 122,
