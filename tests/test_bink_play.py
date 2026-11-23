@@ -1,4 +1,6 @@
 """tools/bink_play.py: name matching and the name-table cache. Synthetic names only, no game files."""
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -19,6 +21,27 @@ NAMES = [
 
 
 class ListTest(unittest.TestCase):
+    def test_missing_name_is_rejected_before_creating_the_cache(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = Path(folder)
+            (game / "streams.csv").write_text("source,offset,size,width,height,frames\n"
+                                              "sample,32,64,16,16,2\n", encoding="utf-8", newline="\n")
+            (game / "mount.xml").write_text("<filename>$(common)/movies/synthetic.bk2</filename>",
+                                            encoding="utf-8", newline="\n")
+            cache_root = game / "appdata"
+            env = {**os.environ, "LOCALAPPDATA": str(cache_root)}
+            cmd = [sys.executable, "-I", str(ROOT / "tools" / "bink_play.py"),
+                   "--game-dir", folder, "--archive", "streams.csv", "--mount", "mount.xml"]
+
+            invalid = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn("name a movie, or use --list", invalid.stderr)
+            self.assertFalse(cache_root.exists(), invalid.stderr)
+
+            listing = subprocess.run([*cmd, "--list"], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(listing.returncode, 0, listing.stderr)
+            self.assertIn("synthetic.bk2  16x16, 2 frames", listing.stdout)
+
     def test_filter_accepts_both_path_separators_and_ignores_case(self):
         from io import StringIO
 

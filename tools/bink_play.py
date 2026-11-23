@@ -131,6 +131,8 @@ def main(argv=None):
     ap.add_argument("--list", action="store_true", help="list the names, filtered by NAME if given")
     ap.add_argument("--no-cache", action="store_true", help="name the streams again and keep nothing")
     a = ap.parse_args(argv)
+    if not a.list and not a.name:
+        ap.error("name a movie, or use --list")
     if not a.game_dir:
         ap.error("no game folder: pass --game-dir or set LEONIDA_GAME_DIR")
     game = Path(a.game_dir)
@@ -147,8 +149,6 @@ def main(argv=None):
             if w in path.lower():
                 print(f"{path}  {width}x{height}, {frames} frames")
         return 0
-    if not a.name:
-        ap.error("name a movie, or use --list")
     hit, candidates = pick(names, a.name)
     if hit is None:
         if not candidates:
