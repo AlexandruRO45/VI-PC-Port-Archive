@@ -88,7 +88,8 @@ SAVEEXEC = ("s_and_saveexec_b", "s_or_saveexec_b", "s_xor_saveexec_b", "s_andn2_
             "s_and_wrexec_b", "s_andn2_wrexec_b", "s_andn1_wrexec_b")
 RMW_DEST = (
     "v_fmac_f32", "v_fmac_f16", "v_mac_f32", "v_mac_legacy_f32", "v_pk_fmac_f16",
-    "v_dot2c_f32_f16", "v_dot2c_f32_bf16", "v_dot2c_i32_i16", "v_dot4c_i32_i8", "v_dot8c_i32_i4",
+    "v_dot2c_f32_f16", "v_dot2c_f32_bf16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_i32_i8",
+    "v_dot4c_u32_u8", "v_dot8c_i32_i4", "v_dot8c_u32_u4",
     "s_addk_i32", "s_mulk_i32", "s_cmovk_i32", "s_cmov_b32", "s_cmov_b64",
     "s_bitset0_b32", "s_bitset0_b64", "s_bitset1_b32", "s_bitset1_b64",
 )
@@ -378,7 +379,8 @@ class Analysis:
         x = a["x"] if a["x"] == b["x"] else ("j", blk)
         self.tok.setdefault(x, (None, None, False))
         u = a["u"] & b["u"]
-        ua = (a["ua"] & b["ua"]) if a["x"] == b["x"] else u
+        ua = (a["ua"] & b["ua"]) if a["x"] == b["x"] else (
+            u if self.ancestor(("e",), a["x"]) and self.ancestor(("e",), b["x"]) else frozenset())
         return {"t": t, "g": g, "x": x, "xg": a["xg"] if a["xg"] == b["xg"] else None, "f": a["f"] and b["f"],
                 "u": u, "ua": ua, "l": {k: v for k, v in a["l"].items() if b["l"].get(k) == v},
                 "r": self.union_map(a["r"], b["r"]), "b": self.union_map(a["b"], b["b"])}
@@ -774,7 +776,9 @@ class Analysis:
         if op == "v_readfirstlane_b32" and len(a) == 2:
             tv = self.rd(st, ins, a[1])
             vr = a[1]["r"] if a[1].get("k") == "vgpr" else None
-            if vr is not None and vr in st["u"]:
+            # Full-wave launch uniformity only holds at st["f"] (empty halves under narrowed EXEC read lane 0;
+            # non-subset widened EXEC activates lanes that never ran launch writes).
+            if vr is not None and st["f"] and vr in st["u"]:
                 idiom("readfirstlane-uniform")
                 put(a[0], tv)
             elif vr is not None and vr in st["ua"]:
@@ -795,7 +799,7 @@ class Analysis:
         if op == "v_readlane_b32" and len(a) == 3:
             vr = a[1]["r"] if a[1].get("k") == "vgpr" else None
             tl = self.rd(st, ins, a[2])
-            if vr is not None and vr in st["u"]:
+            if vr is not None and vr in st["u"] and self.ancestor(("e",), st["x"]):
                 # Every lane holds the same value in v[vr], so the selected lane index (even if derived from
                 # first-lane, lane-count, or lane-id) cannot change the result across 32-lane halves.
                 idiom("readlane-uniform")
@@ -1059,7 +1063,7 @@ class Analysis:
                         if T.get(r, 0) & ACT_RFL and not (g and g[0] == "act_rfl" and self.ancestor(g[1], st["x"])):
                             good = False
                 tj = tj & ~ACT_RFL if good else tj | X
-            if tj & X:
+            if tj:
                 uniform = False
                 uniform_active = False
             tag = None
@@ -1198,7 +1202,7 @@ class Analysis:
                     and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
-                st["ua"] = st["u"]
+                st["ua"] = st["u"] if self.ancestor(("e",), mg[1]) else frozenset()
                 if op == "s_or_b64":                            # s_mov_b64 leaves SCC as it was
                     T["scc"] = X
                     st["g"]["scc"] = ("vote", "exec")
@@ -1213,7 +1217,7 @@ class Analysis:
                 st["x"] = site
                 self.tok[site] = (None, None, False)
                 st["xg"], st["f"] = None, False
-                st["ua"] = st["u"]
+                st["ua"] = frozenset()
                 if mt & ~0:
                     for b, name in NAMES.items():
                         if mt & b and not (b & ELECT):
@@ -1226,7 +1230,7 @@ class Analysis:
         st["x"] = site
         self.tok[site] = (None, None, False)
         st["xg"], st["f"] = None, False
-        st["ua"] = st["u"]
+        st["ua"] = frozenset()
 
     def ancestor(self, anc, tok):
         seen = set()
@@ -1255,7 +1259,7 @@ class Analysis:
         self.tok[site] = (old if narrowing else None, xg, st["f"] and False)
         st["x"], st["xg"], st["f"] = site, xg, False
         if not narrowing:
-            st["ua"] = st["u"]
+            st["ua"] = frozenset()
 
     def branch(self, n, ins, op, st, ev):
         T = st["t"]
