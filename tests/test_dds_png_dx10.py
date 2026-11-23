@@ -6,6 +6,7 @@ import importlib.util
 import os
 import struct
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -97,6 +98,17 @@ class Rgba16UnormTests(unittest.TestCase):
         red = dds.decode_dds(_dx10(256, 256, 56, struct.pack("<65536H", *codes)))[2][0::4]
         rgba16 = dds.decode_dds(_dx10(256, 64, 11, struct.pack("<65536H", *codes)))[2]
         self.assertEqual(rgba16, red)
+
+    def test_big_endian_path_matches(self):
+        # The native 16-bit view only runs on little-endian hosts; the struct path must give the same bytes.
+        tight = bytes(range(256)) * 4  # 4x16, pitch 64
+        padded = b"".join(tight[y * 64:(y + 1) * 64] + b"pad!" for y in range(16))
+        for payload, pitch in ((tight, 0), (padded, 68)):
+            data = _dx10(8, 16, 11, payload, pitch=pitch)
+            native = dds.decode_dds(data)
+            with mock.patch.object(dds.sys, "byteorder", "big"):
+                portable = dds.decode_dds(data)
+            self.assertEqual(native, portable)
 
     def test_png_keeps_alpha(self):
         png = dds.dds_to_png_bytes(_dx10(1, 1, 11, struct.pack("<4H", 65535, 0, 0, 32768)))

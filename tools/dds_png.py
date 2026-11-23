@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from functools import cache
+from itertools import chain
 import json
 import math
 import os
@@ -1109,6 +1110,13 @@ def _decode_rgba16_unorm(payload: memoryview, width: int, height: int, pitch: in
         raise DdsError(f"Truncated RGBA16_UNORM payload: {len(payload)} bytes (need {expected})")
 
     lut = _unorm16_to_u8_lut()
+    if sys.byteorder == "little":
+        # Map a native 16-bit view of the stored bytes: no tuple of Python ints per row.
+        if pitch == row_bytes:
+            return bytes(map(lut.__getitem__, payload[:expected].cast("H")))
+        rows = (payload[start:start + row_bytes].cast("H") for start in range(0, height * pitch, pitch))
+        return bytes(map(lut.__getitem__, chain.from_iterable(rows)))
+
     unpack_row = struct.Struct(f"<{width * 4}H").unpack_from
     rgba = bytearray(width * height * 4)
     for y in range(height):
