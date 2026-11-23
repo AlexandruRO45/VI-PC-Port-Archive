@@ -295,6 +295,29 @@ class TestCensus(unittest.TestCase):
         with open(target, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), original)
 
+    def test_json_must_not_overwrite_a_scanned_disasm_listing(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        disasm = os.path.join(self.tmp.name, "disasm")
+        os.makedirs(disasm)
+        target = os.path.join(disasm, "sig.s")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("s_endpgm\n")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--disasm", disasm, "--json", target],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("overwrite an input", r.stderr)
+        with open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "s_endpgm\n")
+
+    def test_json_must_not_be_the_disasm_folder(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        disasm = os.path.join(self.tmp.name, "disasm")
+        os.makedirs(disasm)
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--disasm", disasm, "--json", disasm],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--disasm folder", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -228,11 +228,14 @@ def dxbc_paths(root):
     return sorted(glob.glob(os.path.join(glob.escape(root), "*.dxbc")))
 
 
-def scanned_inputs(root):
-    """Every file census() reads: each container above and its fspx/<name>.json sidecar (the sidecar is optional)."""
+def scanned_inputs(root, disasm=None):
+    """Every file census() reads: each container, its fspx/<name>.json sidecar, and optional <disasm>/<name>.s."""
     for path in dxbc_paths(root):
+        name = os.path.basename(path)[:-5]
         yield path
-        yield os.path.join(root, "fspx", os.path.basename(path)[:-5] + ".json")
+        yield os.path.join(root, "fspx", name + ".json")
+        if disasm:
+            yield os.path.join(disasm, name + ".s")
 
 
 def census(root, disasm=None):
@@ -301,17 +304,20 @@ def summarize(rows):
     }
 
 
-def json_output_problem(root, out):
-    """Why `--json` `out` must not be written, checked before any census work: it is the input folder or one of
-    the .dxbc containers / fspx sidecars census() reads, so the report would replace the user's data ("" when it
-    may be written). samefile catches a hard link, a symlink or a case-only spelling the name test would miss."""
-    try:
-        if os.path.samefile(root, out):
-            return "--json must not be the input folder"
-    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-        pass
+def json_output_problem(root, out, disasm=None):
+    """Why `--json` `out` must not be written, checked before any census work: it is an input folder or one of
+    the .dxbc containers, fspx sidecars, or disasm listings census() reads, so the report would replace the user's
+    data ("" when it may be written). samefile catches a hard link, a symlink or a case-only spelling."""
+    for folder, label in ((root, "the input folder"), (disasm, "the --disasm folder")):
+        if not folder:
+            continue
+        try:
+            if os.path.samefile(folder, out):
+                return f"--json must not be {label}"
+        except OSError:
+            pass
     if os.path.exists(out):          # a not-yet-written output cannot already be one of the inputs census reads
-        for path in scanned_inputs(root):
+        for path in scanned_inputs(root, disasm):
             if os.path.isfile(path):
                 try:
                     if os.path.samefile(out, path):
@@ -328,7 +334,7 @@ def main(argv=None):
     ap.add_argument("--disasm", help="a tools/fspx_unpack.py --disasm folder; adds each program's reads")
     a = ap.parse_args(argv)
     if a.json:
-        problem = json_output_problem(a.root, a.json)
+        problem = json_output_problem(a.root, a.json, a.disasm)
         if problem:
             ap.error(problem)
     if not os.path.isdir(a.root):
