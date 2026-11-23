@@ -365,5 +365,20 @@ class TestVCvtNormU16F16SIMDAndIEEE(unittest.TestCase):
         res_neginf = ref_v_cvt_norm_u16_f16(0xFC00)
         self.assertEqual(res_neginf & 0xFFFF, 0)
 
+class TestVCvtNormU16F16Translation(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        lines = [
+            "v_mov_b32 v0, 0x3c00",
+            "v_cvt_norm_u16_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_v_cvt_norm_u16_f16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, 0xFFFF)
+
 if __name__ == "__main__":
     unittest.main()
