@@ -1689,6 +1689,48 @@ void run_checks(const std::filesystem::path& root) {
               "free space, name, size, move-with-progress and replace refuse GAME: paths into the overlay's folders");
     }
 
+    // ReplaceFileW with a read-only package file (replaced or replacement) fails as the host fails a read-only host
+    // file, and the title's view is unchanged: the overlay copy keeps the read-only bit (#5946 keeps it for deletes).
+    {
+        const auto replace_ro = resolve<ReplaceFileWFn>("kernel32.dll", "ReplaceFileW");
+        auto host_ro_error = [&](bool replaced_ro) {
+            const std::filesystem::path h = root / "ro_host";
+            write_path(h / "a.txt", "old");
+            write_path(h / "b.txt", "new");
+            const std::filesystem::path ro = h / (replaced_ro ? "a.txt" : "b.txt");
+            ::SetFileAttributesW(ro.c_str(), FILE_ATTRIBUTE_READONLY);
+            const DWORD e = error_of([&] {
+                ::ReplaceFileW((h / "a.txt").c_str(), (h / "b.txt").c_str(), nullptr, 0, nullptr, nullptr);
+            });
+            ::SetFileAttributesW(ro.c_str(), FILE_ATTRIBUTE_NORMAL);
+            return e;
+        };
+        auto read_view = [&](const wchar_t* name) {
+            const HANDLE h = create_w(name, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return std::string("<missing>");
+            std::string text = read_handle(h);
+            ::CloseHandle(h);
+            return text;
+        };
+        for (int which = 0; which < 2; ++which) {
+            const std::wstring dir = which ? L"ro_src" : L"ro_dst";
+            write_path(package / dir / "target.txt", "old");
+            write_path(package / dir / "new.txt", "new");
+            const std::filesystem::path ro = package / dir / (which ? "new.txt" : "target.txt");
+            ::SetFileAttributesW(ro.c_str(), FILE_ATTRIBUTE_READONLY);
+            const std::wstring t = L"GAME:\\" + dir + L"\\target.txt", n = L"GAME:\\" + dir + L"\\new.txt";
+            const DWORD host = host_ro_error(which == 0);
+            SetLastError(0);
+            const BOOL ok = replace_ro(t.c_str(), n.c_str(), nullptr, 0, nullptr, nullptr);
+            const DWORD err = ok ? 0 : GetLastError();
+            check(host == ERROR_ACCESS_DENIED && !ok && err == host && read_view(t.c_str()) == "old" &&
+                      read_view(n.c_str()) == "new",
+                  which ? "a read-only package replacement fails ReplaceFileW as on the host, nothing replaced"
+                        : "a read-only package file to replace fails ReplaceFileW as on the host, nothing replaced");
+            ::SetFileAttributesW(ro.c_str(), FILE_ATTRIBUTE_NORMAL);
+        }
+    }
+
     check_replace_marker_failure(root);
 }
 

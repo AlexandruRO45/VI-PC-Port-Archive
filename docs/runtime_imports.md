@@ -171,6 +171,8 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   host's errors (`ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND`, `ERROR_ACCESS_DENIED`,
   `ERROR_UNABLE_TO_REMOVE_REPLACED`; CTest `file_system` compares them), the replaced file checked before the
   replacement as the host does; a mix of console and host paths fails with `ERROR_NOT_SAME_DEVICE`, as `MoveFile*` does.
+  A read-only package file, replaced or replacement, fails with `ERROR_ACCESS_DENIED` and nothing is replaced, as a
+  read-only host file does: its overlay copy keeps the read-only bit.
 - Not mapped yet: `CreateFile3` (Windows 11 24H2 and later), `CreateHardLink*`, `CreateSymbolicLink*`,
   `FindFirstChangeNotification*`/`ReadDirectoryChangesW` (handle-based, but opened by path) and `SetCurrentDirectory*`
   with a console path (a title's current folder on `GAME:` would need relative paths resolved against it).
