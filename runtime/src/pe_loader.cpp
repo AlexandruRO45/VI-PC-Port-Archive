@@ -627,6 +627,7 @@ void install_on_existing_threads(Module& m) {
     };
     struct Candidates {
         std::vector<Candidate> list;
+        std::vector<HANDLE> cursors;  // handles NtGetNextThread needs as the next call's cursor, not install candidates
         HANDLE snapshot = INVALID_HANDLE_VALUE;
         void close() {
             if (snapshot != INVALID_HANDLE_VALUE) {
@@ -636,15 +637,17 @@ void install_on_existing_threads(Module& m) {
             for (const Candidate& c : list)
                 if (c.handle) CloseHandle(c.handle);
             list.clear();
+            for (HANDLE handle : cursors) CloseHandle(handle);
+            cursors.clear();
         }
         ~Candidates() { close(); }
     } found;
     std::vector<Candidate>& candidates = found.list;
     const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
 
-    // Only this process's threads: NtGetNextThread returns a handle for each, and every handle is kept as both the
-    // candidate and the cursor for the next call. The calling thread is skipped below because install_thread_block
-    // already gave it the module's copy. A call that fails part way falls back to Toolhelp.
+    // Only this process's threads: NtGetNextThread returns a handle for each. The calling thread's handle is only
+    // the cursor for the next call (install_thread_block already gave it the module's copy); every other handle is
+    // an install candidate. A call that fails part way falls back to Toolhelp.
     struct ThreadHandle {
         explicit ThreadHandle(HANDLE handle) : value(handle) {}
         ThreadHandle(const ThreadHandle&) = delete;
@@ -659,7 +662,7 @@ void install_on_existing_threads(Module& m) {
         }
         HANDLE value = nullptr;
     };
-    bool complete = false;
+    bool complete = false, saw_thread = false;
     if (const NextThreadFn next = next_thread_fn()) {
         HANDLE current = nullptr;
         LONG status = 0;
@@ -670,32 +673,36 @@ void install_on_existing_threads(Module& m) {
                 if (thread) CloseHandle(thread);
                 break;
             }
-            // The local owner closes the returned handle if the candidate vector cannot grow. A handle with no
-            // readable thread id makes the walk incomplete: the calling thread would not be recognised and skipped.
+            // The local owner closes the returned handle if a vector cannot grow. A handle with no readable thread
+            // id makes the walk incomplete: the calling thread would not be recognised and would become a candidate.
             ThreadHandle owner{thread};
             const DWORD id = GetThreadId(thread);
             if (!id) {
                 status = 0;
                 break;
             }
-            candidates.push_back({id, thread});
+            saw_thread = true;
+            if (id == self) {
+                found.cursors.push_back(thread);
+            } else {
+                candidates.push_back({id, thread});
+            }
             owner.release();
             current = thread;
         }
         // A process always has its calling thread, so a walk that ended with no thread at all is treated as
         // unavailable and retried through Toolhelp.
-        complete = status == kStatusNoMoreEntries && !candidates.empty();
+        complete = status == kStatusNoMoreEntries && saw_thread;
         if (!complete) found.close();
     }
-    // TH32CS_SNAPTHREAD lists the threads of every process; the loop keeps this one's. The fallback opens a handle
-    // per thread even for the calling thread, which the install loop then skips.
+    // TH32CS_SNAPTHREAD lists the threads of every process; the loop keeps this one's.
     if (!complete) {
         found.snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (found.snapshot == INVALID_HANDLE_VALUE) return;
         THREADENTRY32 entry{};
         entry.dwSize = sizeof entry;
         for (BOOL more = Thread32First(found.snapshot, &entry); more; more = Thread32Next(found.snapshot, &entry)) {
-            if (entry.th32OwnerProcessID != process) continue;
+            if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
             candidates.push_back({entry.th32ThreadID, nullptr});  // the slot first, so the handle always has an owner
             candidates.back().handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
         }
@@ -706,7 +713,7 @@ void install_on_existing_threads(Module& m) {
         ExistingThreadsLock lock;
         ExistingThreads& state = existing_threads();
         for (const Candidate& c : candidates) {
-            if (!c.handle || c.id == self) continue;
+            if (!c.handle) continue;
             if (std::find(state.ended.begin(), state.ended.end(), c.id) != state.ended.end()) continue;
             void*** vector = running_thread_tls_vector(c.handle);
             void** slots = nullptr;
