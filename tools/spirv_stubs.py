@@ -3,13 +3,14 @@
     python3 -I tools/spirv_stubs.py <spirv dir>
 
 Emits binary SPIR-V 1.0 directly with the standard library (no external spirv-as needed) into
-<spirv dir>/stubs/. Stubs are deduplicated by their sorted location signature:
+<spirv dir>/stubs/. Stubs are deduplicated by their complete interface signature:
 
     vs_empty.spv, vs_0_1.spv, ...   Vertex shader writing BuiltIn Position and vec4(0) to each Location
     ps_empty.spv, ps_0_1.spv, ...   Fragment shader reading each Location as vec4 and writing Location 0
+    vs_0_bary1.spv, ...            Vertex shader also writing the fallback vec3 at Location 1
 
-Every inter-stage varying emitted by tools/rdna2spirv.py is a 32-bit vec4 float, so a single stub per
-unique location set matches every shader with that interface.
+Ordinary varyings are vec4 floats. A --bary-fallback pixel shader additionally needs the vec3 input
+named by bary_fallback_input; its partner is distinct from one with only the ordinary locations.
 """
 import json
 import os
@@ -69,16 +70,24 @@ def _encode_str(text):
     return list(struct.unpack(f"<{len(raw) // 4}I", raw))
 
 
-def stub_name(kind, locations):
-    """Canonical filename for a stub of kind ('vs' or 'ps') matching sorted unique `locations`."""
+def stub_name(kind, locations, bary_location=None):
+    """Canonical filename for ordinary locations plus an optional fallback vec3 output."""
     locs = sorted({int(x) for x in locations})
     suffix = "_".join(str(x) for x in locs) if locs else "empty"
+    if bary_location is not None:
+        suffix += f"_bary{bary_location}"
     return f"{kind}_{suffix}.spv"
 
 
-def build_vs_stub(out_locations=()):
-    """Minimal Vertex SPIR-V 1.0 module writing BuiltIn Position=(0,0,0,1) and vec4(0) to each Location."""
+def build_vs_stub(out_locations=(), bary_location=None):
+    """Minimal Vertex module writing Position, ordinary vec4s, and an optional fallback vec3.
+
+    These partners only check pipeline compilation. They do not implement the
+    per-vertex barycentric weights needed when drawing through the fallback GS.
+    """
     locs = sorted({int(x) for x in out_locations})
+    if bary_location in locs:
+        raise ValueError("barycentric location overlaps an ordinary vec4 output")
     nid = 1
 
     def alloc():
@@ -100,8 +109,15 @@ def build_vs_stub(out_locations=()):
     out_vars = [(loc, alloc()) for loc in locs]
     id_main = alloc()
     id_entry = alloc()
+    if bary_location is not None:
+        id_v3 = alloc()
+        id_ptr_bary = alloc()
+        id_bary_val = alloc()
+        id_out_bary = alloc()
 
     iface = [id_out_pos] + [vid for _, vid in out_vars]
+    if bary_location is not None:
+        iface.append(id_out_bary)
     words = [SPIRV_MAGIC, SPIRV_VERSION_1_0, 0, nid, 0]
     words += _inst(OP_CAPABILITY, CAP_SHADER)
     words += _inst(OP_MEMORY_MODEL, ADDR_LOGICAL, MEM_GLSL450)
@@ -109,25 +125,36 @@ def build_vs_stub(out_locations=()):
     words += _inst(OP_DECORATE, id_out_pos, DEC_BUILTIN, BUILTIN_POSITION)
     for loc, vid in out_vars:
         words += _inst(OP_DECORATE, vid, DEC_LOCATION, loc)
+    if bary_location is not None:
+        words += _inst(OP_DECORATE, id_out_bary, DEC_LOCATION, bary_location)
 
     words += _inst(OP_TYPE_VOID, id_void)
     words += _inst(OP_TYPE_FUNCTION, id_fn, id_void)
     words += _inst(OP_TYPE_FLOAT, id_float, 32)
     words += _inst(OP_TYPE_VECTOR, id_v4, id_float, 4)
     words += _inst(OP_TYPE_POINTER, id_ptr_out, STORAGE_OUTPUT, id_v4)
+    if bary_location is not None:
+        words += _inst(OP_TYPE_VECTOR, id_v3, id_float, 3)
+        words += _inst(OP_TYPE_POINTER, id_ptr_bary, STORAGE_OUTPUT, id_v3)
     words += _inst(OP_CONSTANT, id_float, id_f0, 0x00000000)
     words += _inst(OP_CONSTANT, id_float, id_f1, 0x3F800000)
     words += _inst(OP_CONSTANT_COMPOSITE, id_v4, id_pos_val, id_f0, id_f0, id_f0, id_f1)
     words += _inst(OP_CONSTANT_COMPOSITE, id_v4, id_zero_v4, id_f0, id_f0, id_f0, id_f0)
+    if bary_location is not None:
+        words += _inst(OP_CONSTANT_COMPOSITE, id_v3, id_bary_val, id_f1, id_f0, id_f0)
     words += _inst(OP_VARIABLE, id_ptr_out, id_out_pos, STORAGE_OUTPUT)
     for _, vid in out_vars:
         words += _inst(OP_VARIABLE, id_ptr_out, vid, STORAGE_OUTPUT)
+    if bary_location is not None:
+        words += _inst(OP_VARIABLE, id_ptr_bary, id_out_bary, STORAGE_OUTPUT)
 
     words += _inst(OP_FUNCTION, id_void, id_main, 0, id_fn)
     words += _inst(OP_LABEL, id_entry)
     words += _inst(OP_STORE, id_out_pos, id_pos_val)
     for _, vid in out_vars:
         words += _inst(OP_STORE, vid, id_zero_v4)
+    if bary_location is not None:
+        words += _inst(OP_STORE, id_out_bary, id_bary_val)
     words += _inst(OP_RETURN)
     words += _inst(OP_FUNCTION_END)
     return struct.pack(f"<{len(words)}I", *words)
@@ -207,18 +234,29 @@ def _interface_locations(meta, field, legacy_field=None):
 
 
 def required_stubs_for_meta(meta):
-    """Return list of (kind, tuple(sorted_locations)) partner stubs needed for one index.json entry."""
+    """Return (kind, sorted ordinary locations, optional barycentric location) partner stubs."""
     stage = meta.get("stage", "")
     if stage == "ps":
-        return [("vs", _interface_locations(meta, "inputs"))]
+        locs = _interface_locations(meta, "inputs")
+        bary = meta.get("bary_fallback_input")
+        bary_location = None
+        if bary is not None:
+            if not isinstance(bary, dict) or type(bary.get("location")) is not int:
+                raise ValueError("bary_fallback_input requires an integer location")
+            bary_location = bary["location"]
+            if not 0 <= bary_location <= 0xFFFFFFFF:
+                raise ValueError("bary_fallback_input.location must be an unsigned 32-bit integer")
+            if bary_location in locs:
+                raise ValueError("bary_fallback_input.location overlaps an ordinary vec4 input")
+        return [("vs", locs, bary_location)]
     if stage == "vs":
-        return [("ps", _interface_locations(meta, "outputs"))]
+        return [("ps", _interface_locations(meta, "outputs"), None)]
     if stage == "ms":
-        return [("ps", _interface_locations(meta, "params"))]
+        return [("ps", _interface_locations(meta, "params"), None)]
     if stage == "gs":
         return [
-            ("vs", _interface_locations(meta, "gs_input_locations", "gs_inputs")),
-            ("ps", _interface_locations(meta, "gs_output_locations", "gs_outputs")),
+            ("vs", _interface_locations(meta, "gs_input_locations", "gs_inputs"), None),
+            ("ps", _interface_locations(meta, "gs_output_locations", "gs_outputs"), None),
         ]
     return []
 
@@ -248,7 +286,7 @@ def generate_for_index(spirv_dir, index):
                 raise ValueError(f"{name}: invalid graphics interface locations: {e}") from e
     # Validate the entire requested set before writing any stubs: negative or
     # oversized locations cannot be encoded as SPIR-V unsigned literals.
-    for kind, locs in needed:
+    for kind, locs, _ in needed:
         if any(not 0 <= loc <= 0xFFFFFFFF for loc in locs):
             raise ValueError(f"invalid Location in {kind} partner stub: {locs}")
     if not needed:
@@ -256,9 +294,9 @@ def generate_for_index(spirv_dir, index):
     stubs_dir = os.path.join(spirv_dir, "stubs")
     os.makedirs(stubs_dir, exist_ok=True)
     written = []
-    for kind, locs in sorted(needed):
-        fname = stub_name(kind, locs)
-        data = build_vs_stub(locs) if kind == "vs" else build_ps_stub(locs)
+    for kind, locs, bary_location in sorted(needed, key=lambda s: (s[0], s[1], -1 if s[2] is None else s[2])):
+        fname = stub_name(kind, locs, bary_location)
+        data = build_vs_stub(locs, bary_location) if kind == "vs" else build_ps_stub(locs)
         target = os.path.join(stubs_dir, fname)
         # A sibling file inherits the output directory's permissions.
         staged = os.path.join(stubs_dir, f".stub-{uuid.uuid4().hex}.tmp")

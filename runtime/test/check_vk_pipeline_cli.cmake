@@ -87,3 +87,28 @@ foreach(bytes -1 1.5 4294967296)
     message(FATAL_ERROR "pc_tail.bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
   endif()
 endforeach()
+
+# A fallback input must name a real uint32 location, including location zero.
+# Invalid metadata must fail before loading Vulkan.
+foreach(bary "true" "0" "[]" "{}" "{\"location\":null}" "{\"location\":true}"
+             "{\"location\":\"0\"}" "{\"location\":-1}" "{\"location\":1.5}" "{\"location\":4294967296}")
+  file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"stage\":\"ps\",\"bary_fallback_input\":${bary}}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "bary_fallback_input.*at byte [0-9]+")
+    message(FATAL_ERROR "bary_fallback_input=${bary}: expected a malformed index, got ${code}\n${log}")
+  endif()
+endforeach()
+
+# Valid objects (and a null optional input) must reach a later field.
+# Deliberately invalid lds_bytes keeps these parsing controls independent of a GPU.
+foreach(bary "null" "{\"location\":0}" "{\"location\":2}" "{\"location\":4294967295}"
+             "{\"extra\":{\"nested\":[1,2]},\"location\":0}")
+  file(WRITE "${TEST_DIR}/index.json"
+       "{\"example\":{\"stage\":\"ps\",\"bary_fallback_input\":${bary},\"lds_bytes\":-1}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "expected unsigned 32-bit lds_bytes at byte [0-9]+")
+    message(FATAL_ERROR "bary_fallback_input=${bary}: expected to reach lds_bytes, got ${code}\n${log}")
+  endif()
+endforeach()

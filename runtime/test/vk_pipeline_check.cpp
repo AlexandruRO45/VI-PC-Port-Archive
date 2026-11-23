@@ -74,6 +74,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -112,6 +113,7 @@ struct ShaderMeta {
     std::vector<std::string> features;
     std::vector<std::string> float_controls;   // VkPhysicalDeviceFloatControlsProperties members that must be true
     std::vector<uint32_t> inputs;
+    std::optional<uint32_t> bary_fallback_location;
     std::vector<uint32_t> outputs;
     std::vector<uint32_t> params;
     std::vector<uint32_t> gs_inputs;
@@ -331,6 +333,30 @@ struct JsonParser {
         if (!error) fail("unterminated pc_tail object");
         return bytes;
     }
+    std::optional<uint32_t> parse_bary_fallback_location() {
+        ws();
+        if (s.compare(i, 4, "null") == 0) { i += 4; return {}; }
+        if (!consume('{')) { fail("expected object for bary_fallback_input"); return {}; }
+        std::optional<uint32_t> location;
+        auto closed = [&] {
+            if (!location) fail("missing bary_fallback_input.location");
+            return location;
+        };
+        while (!error && i < s.size()) {
+            if (consume('}')) return closed();
+            const size_t before = i;
+            std::string k = parse_string();
+            if (error) return location;
+            if (!consume(':')) { fail("expected ':' in bary_fallback_input"); return location; }
+            if (k == "location") location = parse_strict_u32("expected unsigned 32-bit bary_fallback_input.location");
+            else skip_value();
+            if (error) return location;
+            if (consume('}')) return closed();
+            if (!consume(',') || i == before) { fail("expected ',' or '}' in bary_fallback_input"); return location; }
+        }
+        if (!error) fail("unterminated bary_fallback_input object");
+        return location;
+    }
     ShaderMeta parse_meta() {
         ShaderMeta m;
         if (!consume('{')) { skip_value(); return m; }
@@ -375,6 +401,7 @@ struct JsonParser {
             else if (k == "features") m.features = parse_str_array();
             else if (k == "float_controls") m.float_controls = parse_str_array();
             else if (k == "inputs") m.inputs = parse_u32_array();
+            else if (k == "bary_fallback_input") m.bary_fallback_location = parse_bary_fallback_location();
             else if (k == "outputs") m.outputs = parse_u32_array();
             else if (k == "params") m.params = parse_u32_array();
             else if (k == "gs_inputs") m.gs_inputs = parse_u32_array();
@@ -431,7 +458,8 @@ std::map<std::string, ShaderMeta> read_index(const std::string& path, std::strin
     return {};
 }
 
-std::string stub_filename(const char* kind, const std::vector<uint32_t>& raw_locs) {
+std::string stub_filename(const char* kind, const std::vector<uint32_t>& raw_locs,
+                          std::optional<uint32_t> bary_location = {}) {
     std::vector<uint32_t> locs = raw_locs;
     std::sort(locs.begin(), locs.end());
     locs.erase(std::unique(locs.begin(), locs.end()), locs.end());
@@ -444,6 +472,7 @@ std::string stub_filename(const char* kind, const std::vector<uint32_t>& raw_loc
             out += std::to_string(locs[i]);
         }
     }
+    if (bary_location) out += "_bary" + std::to_string(*bary_location);
     out += ".spv";
     return out;
 }
@@ -1713,7 +1742,7 @@ int main(int argc, char** argv) {
                     bool use_vertex_input = true;
 
                     if (stage == "ps") {
-                        std::string vs_fn = stub_filename("vs", meta.inputs);
+                        std::string vs_fn = stub_filename("vs", meta.inputs, meta.bary_fallback_location);
                         VkShaderModule vs_mod = load_stub(vs_fn);
                         if (!vs_mod) {
                             skip_reason = "missing stub " + vs_fn;
