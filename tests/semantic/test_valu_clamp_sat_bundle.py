@@ -387,6 +387,24 @@ class TestValuSubF32NegativeControls(unittest.TestCase):
         self.assertAlmostEqual(raw, -0.6, places=6)
         self.assertNotEqual(clamped, raw)
 
+class TestValuMulF32ClampOracle(unittest.TestCase):
+    """Stage 13: Reference mathematical oracle for v_mul_f32 clamp and omod."""
+
+    def test_mul_clamp_saturation(self):
+        # 2.0 * 2.0 = 4.0 -> clamped to 1.0
+        hw = run_binary_f32("v_mul_f32", 2.0, 2.0, clamp=True)
+        self.assertAlmostEqual(hw, 1.0, places=6)
+
+    def test_mul_clamp_negative(self):
+        # -1.5 * 0.5 = -0.75 -> clamped to 0.0
+        hw = run_binary_f32("v_mul_f32", -1.5, 0.5, clamp=True)
+        self.assertAlmostEqual(hw, 0.0, places=6)
+
+    def test_mul_omod_mul4(self):
+        # (0.5 * 0.25) * 4.0 = 0.5
+        hw = run_binary_f32("v_mul_f32", 0.5, 0.25, omod="mul:4")
+        self.assertAlmostEqual(hw, 0.5, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
