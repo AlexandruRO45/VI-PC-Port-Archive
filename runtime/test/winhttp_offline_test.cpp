@@ -251,6 +251,11 @@ int main() {
               "host credentials reject the offline request handle");
         check(host_schemes && !host_schemes(request, &host_supported, &host_first, &host_target) &&
                   GetLastError() == ERROR_INVALID_HANDLE, "host auth schemes reject the offline request handle");
+        const auto host_detect_proxy = reinterpret_cast<DetectProxyFn>(GetProcAddress(host, "WinHttpDetectAutoProxyConfigUrl"));
+        LPWSTR host_url = nullptr;
+        // Zero flags are rejected before native WinHTTP can attempt DHCP or DNS discovery.
+        check(host_detect_proxy && !host_detect_proxy(0, &host_url) && GetLastError() == ERROR_INVALID_PARAMETER &&
+                  !host_url, "host auto proxy rejects zero discovery flags without discovery");
         if (host) FreeLibrary(host);
         if (credentials && schemes && detect_proxy) {
             check(credentials(request, WINHTTP_AUTH_TARGET_SERVER, WINHTTP_AUTH_SCHEME_BASIC, L"user", L"", nullptr),
@@ -273,8 +278,14 @@ int main() {
             check(!schemes(session, &supported, &first, &target) && GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
                   "auth schemes require a request");
             LPWSTR url = nullptr;
-            check(!detect_proxy(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url) &&
-                      GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url, "auto proxy detection fails offline");
+            const bool offline_proxy = !detect_proxy(0, &url) &&
+                GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url;
+            check(offline_proxy, "auto proxy takes the offline path for zero flags");
+            // Do not request DHCP if the negative control indicates delegation to native WinHTTP.
+            if (offline_proxy) {
+                check(!detect_proxy(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url) &&
+                          GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url, "auto proxy detection fails offline");
+            }
         }
         check(add_headers(request, L"X-Test: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
               "request headers are accepted");
