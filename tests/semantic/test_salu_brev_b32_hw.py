@@ -180,5 +180,122 @@ class TestSaluBrevB32Oracle(unittest.TestCase):
                 self.assertEqual(hw_res, ref_s_brev_b32(c))
 
 
+class OpcodeClass(enum.Enum):
+    SOP1 = enum.auto()  # Scalar One-Operand Instruction (e.g. s_brev_b32)
+    SOP2 = enum.auto()  # Scalar Two-Operand Instruction (e.g. s_and_b32)
+
+
+class OperandKind(enum.Enum):
+    SGPR = enum.auto()
+    IMM_INT = enum.auto()
+    LITERAL32 = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class OperandAST:
+    kind: OperandKind
+    raw: str
+    value: int
+    reg_idx: Optional[int] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: OperandAST
+    src0: OperandAST
+    opcode_class: OpcodeClass = OpcodeClass.SOP1
+    modifies_scc: bool = False
+
+
+def parse_operand(op_str: str) -> OperandAST:
+    raw = op_str.strip()
+    if raw.startswith("s") and raw[1:].isdigit():
+        idx = int(raw[1:])
+        if idx > 105:
+            raise ValueError(f"SGPR index out of architectural range 0..105: {raw}")
+        return OperandAST(kind=OperandKind.SGPR, raw=raw, value=0, reg_idx=idx)
+    if raw.startswith("v"):
+        raise ValueError(f"Vector register {raw} illegal in scalar instruction operand")
+    try:
+        val = int(raw, 0)
+    except ValueError as e:
+        raise ValueError(f"Invalid operand syntax: {raw}") from e
+    if -16 <= val <= 64:
+        return OperandAST(kind=OperandKind.IMM_INT, raw=raw, value=val & MASK32)
+    return OperandAST(kind=OperandKind.LITERAL32, raw=raw, value=val & MASK32)
+
+
+def parse_salu_instruction(line: str) -> InstructionAST:
+    clean = line.split(";")[0].strip()
+    if not clean:
+        raise ValueError("Empty instruction line")
+    parts = clean.split(None, 1)
+    mnemonic = parts[0]
+    if mnemonic != "s_brev_b32":
+        raise ValueError(f"Unexpected mnemonic: {mnemonic}")
+    if len(parts) < 2:
+        raise ValueError(f"Missing operands for {mnemonic}")
+    operands = [op.strip() for op in parts[1].split(",")]
+    if len(operands) != 2:
+        raise ValueError(f"s_brev_b32 requires exactly 2 operands (dst, src0), got {len(operands)}")
+    dst = parse_operand(operands[0])
+    if dst.kind != OperandKind.SGPR:
+        raise ValueError(f"Destination must be an SGPR, got {dst.kind}")
+    src0 = parse_operand(operands[1])
+    return InstructionAST(
+        mnemonic=mnemonic,
+        dst=dst,
+        src0=src0,
+        opcode_class=OpcodeClass.SOP1,
+        modifies_scc=False,
+    )
+
+
+class TestSaluBrevB32AST(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions tests."""
+
+    def test_ast_parse_sgpr_operand(self) -> None:
+        inst = parse_salu_instruction("s_brev_b32 s5, s10")
+        self.assertEqual(inst.mnemonic, "s_brev_b32")
+        self.assertEqual(inst.dst.kind, OperandKind.SGPR)
+        self.assertEqual(inst.dst.reg_idx, 5)
+        self.assertEqual(inst.src0.kind, OperandKind.SGPR)
+        self.assertEqual(inst.src0.reg_idx, 10)
+        self.assertEqual(inst.opcode_class, OpcodeClass.SOP1)
+        self.assertFalse(inst.modifies_scc)
+
+    def test_ast_parse_literal_operand(self) -> None:
+        inst = parse_salu_instruction("s_brev_b32 s0, 0x12345678")
+        self.assertEqual(inst.dst.reg_idx, 0)
+        self.assertEqual(inst.src0.kind, OperandKind.LITERAL32)
+        self.assertEqual(inst.src0.value, 0x12345678)
+
+    def test_ast_parse_inline_immediate_operand(self) -> None:
+        inst = parse_salu_instruction("s_brev_b32 s1, 0")
+        self.assertEqual(inst.dst.reg_idx, 1)
+        self.assertEqual(inst.src0.kind, OperandKind.IMM_INT)
+        self.assertEqual(inst.src0.value, 0)
+
+        inst_neg = parse_salu_instruction("s_brev_b32 s2, -1")
+        self.assertEqual(inst_neg.src0.kind, OperandKind.IMM_INT)
+        self.assertEqual(inst_neg.src0.value, 0xFFFFFFFF)
+
+    def test_ast_rejection_invalid_syntax(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_brev_b32")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_brev_b32 s0")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_brev_b32 s0, s1, s2")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_brev_b32 v0, s1")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_brev_b32 s0, v1")
+        with self.assertRaises(ValueError):
+            parse_salu_instruction("s_brev_b32 s106, s0")
+
+
 if __name__ == "__main__":
     unittest.main()
+
