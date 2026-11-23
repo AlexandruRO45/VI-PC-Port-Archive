@@ -127,7 +127,10 @@ PASS_LINES = {
     25: (rf"Lanterns stage 25: PASS, {N} frames at 3840x2160 identical to the first \(hash [0-9a-f]{{16}}\), {N} draws "
          rf"and {N} dispatches per frame on 3 queues, frame 1 exact against the CPU reference at every certain pixel, "
          rf"{N} lattice checks exact",
-         lambda frames, draws, dispatches, checks: frames >= 2 and draws >= 8 and dispatches >= 1),
+         # The frame's shape is fixed (6880 draws, 88 dispatches); the default run is 60 frames with a lattice check
+         # every 20 and --soak 10,000 with one every 1,000, so a smaller load or no checks fails.
+         lambda frames, draws, dispatches, checks: frames >= 60 and draws == 6880 and dispatches == 88
+         and checks >= 3),
     24: (rf"Lanterns stage 24: PASS, a 16x8 local size \(four wave32 waves, local X in v0 and local Y in v1\) on a 2x3 "
          rf"grid: {N} of {N} positions exact, and {N} of {N} point-mirror words read through LDS after the barrier",
          lambda a, b, c, d: a == b == c == d == 768),
