@@ -941,9 +941,9 @@ streams found with `tools/restofworld_index.py`'s `find_rage_textures` / `is_pg_
    all 924 `core_restofworld` model resources (936 drawables across 926 system and 1,020 graphics streams)
    and the single `story000_restofworld` drawable dictionary (3 drawables) without the TOC. Archive path
    names and external texture-dictionary links still need the TOC or hash matching.
-7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths;
-   decoding vertex values still requires component types, final-stream widths and a way to
-   locate the owning geometry when only a graphics page is available. (Texture identification is
+7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths with
+   `tools/analyze_4240_full.py`; decoding vertex values still requires component types, final-stream
+   widths and a way to locate the owning geometry when only a graphics page is available. (Texture identification is
    resolved above under **Textures (`ASSET-148`)**: embedded `0x980` descriptors in `zero-prefix`
    CPU-segment streams plus the companion `ttdb/*.ttpf` pools.)
 8. Runtime consumers for the XML content-definition records read by `tools/content_definitions.py`
