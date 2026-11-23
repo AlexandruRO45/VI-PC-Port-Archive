@@ -2737,9 +2737,6 @@ statistics list and case 10's occlusion pair (no GPU).
 
 Not implemented yet:
 
-- **Overlapping queries in the single-list `replay()` helper.** It has no segment pool, so a list whose occlusion
-  kinds or statistics queries overlap each other is refused there with `ReplayResult::unsupported`; the batched
-  path above replays them.
 - Mesh-shader statistics (`PIPELINE_STATISTICS1`, D3D-132), and stream-output statistics that count real
   primitives (they wait for stream output itself). (`GetClockCalibration` is implemented: see section 4.4,
   "Fences, queues and frames in flight".)
