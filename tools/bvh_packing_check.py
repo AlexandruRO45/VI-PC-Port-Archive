@@ -94,7 +94,11 @@ def _inside(value, comp, box, wide):
 
 
 def _root_equal(value, bound, comp, wide):
+    if math.isnan(value) or math.isnan(bound):
+        return False
     if wide:
+        if math.isinf(value) or math.isinf(bound):
+            return False
         return abs(value - bound) <= FLOAT_TOL * max(abs(bound), 1e-30)
     want = R.half_down(bound) if comp < 3 else R.half_up(bound)
     return R.float_to_half(value) == want
@@ -277,8 +281,11 @@ def check_stream(buf, at=0):
             got = comps.get(comp, [])
             if len(got) == kids and kids:
                 vals = [v for _, v in got]
-                union = min(vals) if comp < 3 else max(vals)
                 st["root_components_stored"] += 1
+                if any(math.isnan(v) for v in vals):
+                    res.fail("root_union_not_bounds")
+                    continue
+                union = min(vals) if comp < 3 else max(vals)
                 if _root_equal(union, box[comp], comp, wide):
                     st["root_components_equal"] += 1
                 else:
@@ -408,21 +415,28 @@ def scan_window(args):
                     tally.kinds[kind] += 1
                 if kind == "bvh4-chunk":
                     # Join the continuation streams that follow, up to the declared end.
-                    parts, have, q = [data], len(data), pos
+                    parts, have, q, joined = [data], len(data), pos, []
                     while have < row["declared_bytes"]:
                         nxt = I.ZHDR.search(m, q, size)
-                        more = _inflate(m, nxt.start(), size) if nxt else None
+                        if not nxt:
+                            break
+                        more = _inflate(m, nxt.start(), size)
                         if more is None:
+                            q = nxt.start() + 1
+                            continue
+                        more_kind = I.classify(more[0][:I.HEAD], len(more[0]))["kind"]
+                        if more_kind in ("bvh4", "bvh4-chunk", "descriptor", "instance208"):
                             break
                         parts.append(more[0])
                         have += len(more[0])
-                        tally.kinds["continuation"] += 1
-                        tally.consumed.add(nxt.start())
+                        joined.append(nxt.start())
                         q = nxt.start() + more[1]
                     data = b"".join(parts)
                     if have < row["declared_bytes"]:
                         tally.add(s, _short())
                         continue
+                    tally.kinds["continuation"] += len(joined)
+                    tally.consumed.update(joined)
                     tally.kinds["bvh4-chunk-joined"] += 1
                     pos = q
                     kind = "bvh4"
@@ -486,8 +500,9 @@ def main(argv=None):
     ap.add_argument("--json")
     a = ap.parse_args(argv)
     bad_limit = a.limit is not None and a.limit <= 0
-    if a.window <= 0 or a.workers <= 0 or bad_limit or (a.start is not None and a.start < 0):
-        print("error: --window, --workers and --limit must be positive, --start not negative", file=sys.stderr)
+    if a.window <= 0 or a.workers <= 0 or bad_limit or (a.start is not None and a.start < 0) or a.header_offset < 0:
+        print("error: --window, --workers and --limit must be positive, --start and --header-offset not negative",
+              file=sys.stderr)
         return 2
     if a.json:
         if os.path.isdir(a.json):
