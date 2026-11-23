@@ -283,6 +283,60 @@ OpFunctionEnd
         self.assertIn("%rec_msl = OpFunction", out)
         self.assertIn("= OpFunctionCall %void %rec_msl %p_smp_msl", out)
 
+    def test_cloned_helper_preserves_direct_and_group_decorations(self):
+        spv = """\
+OpCapability Shader
+OpCapability RuntimeDescriptorArray
+OpExtension "SPV_EXT_descriptor_indexing"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %images0 %images3 %foreign_images
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %images0 DescriptorSet 0
+OpDecorate %images0 Binding 0
+OpDecorate %images3 DescriptorSet 0
+OpDecorate %images3 Binding 3
+OpDecorate %foreign_images DescriptorSet 1
+OpDecorate %foreign_images Binding 0
+OpDecorate %idx NonUniform
+OpDecorate %grp RelaxedPrecision
+%grp = OpDecorationGroup
+OpGroupDecorate %grp %idx
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%img2d = OpTypeImage %float 2D 0 0 0 1 Unknown
+%rt_img = OpTypeRuntimeArray %img2d
+%ptr_img = OpTypePointer UniformConstant %rt_img
+%elem_img_ptr = OpTypePointer UniformConstant %img2d
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%fn_void = OpTypeFunction %void
+%fn_img = OpTypeFunction %void %ptr_img
+%images0 = OpVariable %ptr_img UniformConstant
+%images3 = OpVariable %ptr_img UniformConstant
+%foreign_images = OpVariable %ptr_img UniformConstant
+%helper = OpFunction %void None %fn_img
+%p_img = OpFunctionParameter %ptr_img
+%h_entry = OpLabel
+%idx = OpIAdd %uint %zero %one
+%ip = OpAccessChain %elem_img_ptr %p_img %idx
+OpReturn
+OpFunctionEnd
+%main = OpFunction %void None %fn_void
+%m_entry = OpLabel
+%c0 = OpFunctionCall %void %helper %images0
+%c3 = OpFunctionCall %void %helper %images3
+%cf = OpFunctionCall %void %helper %foreign_images
+OpReturn
+OpFunctionEnd
+"""
+        out = m.rewrite(spv, self.counts)
+        _assert_valid_calls_and_types(self, out)
+        for idx_id in ("%idx", "%idx_msl", "%idx_msl_1"):
+            self.assertIn(f"OpDecorate {idx_id} NonUniform", out)
+        grp_line = next(ln for ln in out.splitlines() if ln.startswith("OpGroupDecorate %grp "))
+        self.assertEqual(set(grp_line.split()[2:]), {"%idx", "%idx_msl", "%idx_msl_1"})
+
 
 if __name__ == "__main__":
     unittest.main()

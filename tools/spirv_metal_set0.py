@@ -111,6 +111,7 @@ def _specialize_helper_calls(out, retype, used_ids):
 
     extra_fntys = []
     clones = {}
+    cloned_ids = {}
     cloned_blocks = []
     updated_orig = {}
     worklist = deque()
@@ -161,6 +162,8 @@ def _specialize_helper_calls(out, retype, used_ids):
                     m_def = re.match(r"\s*(%\S+) = ", cln)
                     if m_def:
                         id_map[m_def.group(1)] = _fresh_id(f"{m_def.group(1)}_msl", used_ids)
+                for orig_id, new_id in id_map.items():
+                    cloned_ids.setdefault(orig_id, []).append(new_id)
                 clone_lines = [f"{fn['indent']}{clone_fn} = OpFunction {fn['ret']} {fn['ctrl']} {ft_new}"]
                 p_idx = 0
                 for cln in fn["lines"][1:]:
@@ -192,7 +195,18 @@ def _specialize_helper_calls(out, retype, used_ids):
             result.extend(updated_orig[fn_id])
             idx = end
         else:
-            result.append(out[idx])
+            ln = out[idx]
+            m_dec = re.match(r"^(\s*OpDecorate )(%\S+)(\s+.*)$", ln)
+            m_grp = re.match(r"^\s*OpGroupDecorate %\S+(.*)$", ln)
+            if m_dec and m_dec.group(2) in cloned_ids:
+                result.append(ln)
+                for cid in cloned_ids[m_dec.group(2)]:
+                    result.append(f"{m_dec.group(1)}{cid}{m_dec.group(3)}")
+            elif m_grp:
+                extra = [cid for t in m_grp.group(1).split() for cid in cloned_ids.get(t, ())]
+                result.append(f"{ln} {' '.join(extra)}" if extra else ln)
+            else:
+                result.append(ln)
             idx += 1
     for blk in cloned_blocks:
         result.extend(blk)
