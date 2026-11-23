@@ -353,5 +353,75 @@ class SaluNandB32InterpreterTests(unittest.TestCase):
             interp.exec_line("s_invalid_op s0, s1, s2")
 
 
+class WaveState:
+    """Models SIMD vector state for 32/64 lanes controlled by scalar execution masks."""
+
+    def __init__(self, num_lanes: int = 32) -> None:
+        self.num_lanes = num_lanes
+        self.exec_mask: int = (1 << num_lanes) - 1
+        self.vgprs: list[list[int]] = [[0] * num_lanes for _ in range(64)]
+
+    def apply_vector_add(self, dst: int, src0: int, src1: int) -> None:
+        """Executes vector addition only on active lanes per exec_mask."""
+        for lane in range(self.num_lanes):
+            if (self.exec_mask >> lane) & 1:
+                self.vgprs[dst][lane] = (self.vgprs[src0][lane] + self.vgprs[src1][lane]) & MASK32
+
+
+class SaluNandB32SimdDivergenceTests(unittest.TestCase):
+    """Multi-lane SIMD divergence verification for mask updates via s_nand_b32."""
+
+    def test_wave32_divergence_mask_generation(self):
+        """Verify s_nand_b32 correctly updates active lane masks for divergent branching."""
+        interp = ScalarInterpreter()
+        cond_a = 0b11110000111100001111000011110000
+        cond_b = 0b11001100110011001100110011001100
+        interp.sgprs[0] = cond_a
+        interp.sgprs[1] = cond_b
+        interp.exec_line("s_nand_b32 s2, s0, s1")
+
+        expected_mask = ref_nand_b32(cond_a, cond_b)
+        self.assertEqual(interp.sgprs[2], expected_mask)
+
+        wave = WaveState(num_lanes=32)
+        wave.exec_mask = interp.sgprs[2]
+        for lane in range(32):
+            wave.vgprs[0][lane] = 10
+            wave.vgprs[1][lane] = 20
+
+        wave.apply_vector_add(dst=2, src0=0, src1=1)
+
+        for lane in range(32):
+            lane_active = (expected_mask >> lane) & 1
+            expected_val = 30 if lane_active else 0
+            self.assertEqual(wave.vgprs[2][lane], expected_val)
+
+    def test_wave64_halves_independence(self):
+        """Verify Wave64 low (0-31) and high (32-63) halves operate independently."""
+        interp = ScalarInterpreter()
+        mask_lo = 0xAAAAAAAA
+        mask_hi = 0x55555555
+        interp.vcc_lo = mask_lo
+        interp.vcc_hi = mask_hi
+        interp.sgprs[0] = 0xFFFFFFFF
+        interp.sgprs[1] = 0x00000000
+
+        interp.exec_line("s_nand_b32 vcc_lo, vcc_lo, s0")
+        self.assertEqual(interp.vcc_lo, (~mask_lo) & MASK32)
+        self.assertEqual(interp.vcc_hi, mask_hi)
+
+        interp.exec_line("s_nand_b32 vcc_hi, vcc_hi, s1")
+        self.assertEqual(interp.vcc_hi, MASK32)
+
+    def test_all_active_and_all_inactive_boundaries(self):
+        """Verify convergence when all lanes are active or all lanes are inactive."""
+        all_lanes = 0xFFFFFFFF
+        none_lanes = 0x00000000
+
+        self.assertEqual(ref_nand_b32(all_lanes, all_lanes), none_lanes)
+        self.assertEqual(ref_nand_b32(all_lanes, none_lanes), all_lanes)
+        self.assertEqual(ref_nand_b32(none_lanes, none_lanes), all_lanes)
+
+
 if __name__ == "__main__":
     unittest.main()
