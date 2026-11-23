@@ -145,5 +145,93 @@ class TestVLdexpF32Oracle(unittest.TestCase):
         got = VLdexpF32Oracle.execute_and_verify(one, 2)
         self.assertEqual(got, 0x4080_0000)
 
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    imm_val: int = 0
+
+    def format(self) -> str:
+        if self.kind == RegKind.VGPR:
+            return f"v{self.index}"
+        elif self.kind == RegKind.SGPR:
+            return f"s{self.index}"
+        elif self.kind == RegKind.IMM:
+            return f"{self.imm_val:#x}"
+        return f"reg_{self.index}"
+
+
+@dataclass
+class VLdexpF32Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    opcode: str = "v_ldexp_f32"
+
+    def validate(self) -> None:
+        if self.opcode != "v_ldexp_f32":
+            raise ValueError(f"Invalid opcode: {self.opcode}")
+        if self.dst.kind != RegKind.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.kind}")
+        if not (0 <= self.dst.index <= 255):
+            raise ValueError(f"Destination VGPR out of bounds: v{self.dst.index}")
+        for src, name in ((self.src0, "src0"), (self.src1, "src1")):
+            if src.kind == RegKind.VGPR and not (0 <= src.index <= 255):
+                raise ValueError(f"{name} VGPR out of bounds: v{src.index}")
+            elif src.kind == RegKind.SGPR and not (0 <= src.index <= 105):
+                raise ValueError(f"{name} SGPR out of bounds: s{src.index}")
+
+    def emit_assembly(self) -> str:
+        self.validate()
+        return f"{self.opcode} {self.dst.format()}, {self.src0.format()}, {self.src1.format()}"
+
+
+class TestVLdexpF32AST(unittest.TestCase):
+    """Unit tests for symbolic AST representation and validation."""
+
+    def test_ast_valid_vgpr_operands(self):
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.VGPR, index=2),
+        )
+        self.assertEqual(instr.emit_assembly(), "v_ldexp_f32 v0, v1, v2")
+
+    def test_ast_valid_sgpr_scale(self):
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.SGPR, index=4),
+        )
+        self.assertEqual(instr.emit_assembly(), "v_ldexp_f32 v0, v1, s4")
+
+    def test_ast_reject_sgpr_destination(self):
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.SGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.VGPR, index=2),
+        )
+        with self.assertRaises(TypeError):
+            instr.validate()
+
+    def test_ast_reject_out_of_bounds_vgpr(self):
+        instr = VLdexpF32Instruction(
+            dst=Operand(RegKind.VGPR, index=256),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.VGPR, index=2),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
 if __name__ == "__main__":
     unittest.main()
