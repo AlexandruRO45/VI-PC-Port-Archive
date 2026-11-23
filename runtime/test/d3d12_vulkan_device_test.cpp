@@ -2452,8 +2452,22 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     if (o15.TriangleFanSupported || o15.DynamicIndexBufferStripCutSupported) fail("OPTIONS15 unexpected support");
     if (o16.DynamicDepthBiasSupported || o16.GPUUploadHeapSupported) fail("OPTIONS16 unexpected support");
     if (o18.RenderPassesValid) fail("OPTIONS18 unexpected support");
-    if (o19.MismatchingOutputDimensionsSupported || (o19.SupportedSampleCountsWithNoOutputs & ~0x3Fu) != 0 ||
-        (o19.SupportedSampleCountsWithNoOutputs & 1u) == 0 || o19.PointSamplingAddressesNeverRoundUp ||
+    constexpr UINT kTirSampleCounts =
+        VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
+    UINT expected_no_output_samples = 0;
+    if (info.physical && info.get_instance_proc) {
+        if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+            VkPhysicalDeviceProperties props{};
+            get_props(info.physical, &props);
+            expected_no_output_samples =
+                static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kTirSampleCounts);
+        }
+    }
+    if (o19.MismatchingOutputDimensionsSupported || (o19.SupportedSampleCountsWithNoOutputs & ~kTirSampleCounts) != 0 ||
+        (o19.SupportedSampleCountsWithNoOutputs & 1u) == 0 ||
+        (expected_no_output_samples != 0 && o19.SupportedSampleCountsWithNoOutputs != expected_no_output_samples) ||
+        o19.PointSamplingAddressesNeverRoundUp ||
         o19.RasterizerDesc2Supported || o19.NarrowQuadrilateralLinesSupported ||
         o19.AnisoFilterWithPointMipSupported != (info.sampler_anisotropy ? TRUE : FALSE) ||
         o19.MaxSamplerDescriptorHeapSize != D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE ||
@@ -2719,11 +2733,19 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "MismatchingOutputDimensionsSupported", a.MismatchingOutputDimensionsSupported,
                                 b.MismatchingOutputDimensionsSupported);
-                     if (b.SupportedSampleCountsWithNoOutputs != 0 &&
+                     // DirectX-Specs (VulkanOn12.md, "Sample-frequency MSAA with no render targets bound"): drivers
+                     // that do not implement DDI 0102's query get the runtime fallback 0x1 (never 0), while DDI 0102+
+                     // FL 11.1+ drivers report at least 0b11101 (0x1d). Intel Iris Xe on Windows driver 31.0.101.4032
+                     // reports 0x1 on D3D12 while its Vulkan driver supports 0x1d (verified against Vulkan limits above).
+                     if (b.SupportedSampleCountsWithNoOutputs > 1u &&
                          (a.SupportedSampleCountsWithNoOutputs & ~b.SupportedSampleCountsWithNoOutputs) != 0 &&
                          mismatches++ < 32)
                          std::fprintf(stderr, "%s.SupportedSampleCountsWithNoOutputs: ours 0x%x not subset of host 0x%x\n",
                                       n, a.SupportedSampleCountsWithNoOutputs, b.SupportedSampleCountsWithNoOutputs);
+                     else if (b.SupportedSampleCountsWithNoOutputs == 1u && a.SupportedSampleCountsWithNoOutputs > 1u)
+                         std::printf("%s.SupportedSampleCountsWithNoOutputs: host reported pre-DDI-0102 fallback 0x1; "
+                                     "ours 0x%x verified against Vulkan limits\n",
+                                     n, a.SupportedSampleCountsWithNoOutputs);
                      check_bool(n, "PointSamplingAddressesNeverRoundUp", a.PointSamplingAddressesNeverRoundUp,
                                 b.PointSamplingAddressesNeverRoundUp);
                      check_bool(n, "RasterizerDesc2Supported", a.RasterizerDesc2Supported, b.RasterizerDesc2Supported);
