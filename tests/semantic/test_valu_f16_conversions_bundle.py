@@ -190,6 +190,17 @@ class TestVCvtF32F16SIMD(unittest.TestCase):
             f32_bits = ref_v_cvt_f32_f16(f16_inputs[l])
             self.assertAlmostEqual(bits_to_float(f32_bits), f16_bits_to_float(f16_inputs[l]), places=4)
 
+class TestVCvtF32F16Translator(unittest.TestCase):
+    def test_translator_cvt_f32_f16_execution(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0x3c00",  # 1.0h
+            "v_cvt_f32_f16_e32 v2, v1",
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_cvt_f32_f16")
+        for l in range(32):
+            self.assertEqual(results[l], 0x3F800000)
+
 
 if __name__ == "__main__":
     unittest.main()
