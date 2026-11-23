@@ -268,6 +268,7 @@ def build_synthetic_awc(stream_specs):
         o76 = hdr_sz + len(data_buf)
         fmt = bytearray(32)
         struct.pack_into("<I", fmt, 0, spec.get("samples", 89600))
+        struct.pack_into("<I", fmt, 12, spec.get("frames", 0))
         struct.pack_into("<H", fmt, 8, spec.get("rate", 48000))
         fmt[28] = spec.get("codec", 0x0B)
         fmt[29] = spec.get("channels", 1)
@@ -521,6 +522,18 @@ class AwcAndArchiveScanTest(unittest.TestCase):
         self.assertTrue(all(r["valid"] for r in res["records"]))
         self.assertEqual(res["records"][0]["audio_codec"], 0x0B)
         self.assertAlmostEqual(res["records"][0]["audio_duration"], 89600 / 48000.0, places=5)
+
+    def test_stereo_opus_duration_uses_the_per_channel_frame_count(self):
+        # docs/audio.md: the 0x76 +0 count is the interleaved sample count and +0x0C the per-channel Opus frame
+        # count (what tools/awc_opus.py exports from), so a stereo stream is not twice as long as its frames.
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=100)
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": clip, "samples": 96000, "rate": 48000, "codec": 0x0B,
+             "channels": 2, "frames": 48000},
+        ])
+        rec = rsc8_audio.decode_awc_bank(bank)["records"][0]
+        self.assertEqual(rec["audio_channels"], 2)
+        self.assertAlmostEqual(rec["audio_duration"], 48000 / 48000.0, places=5)
 
     def test_progress_does_not_interrupt_the_json_summary(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -67,6 +67,7 @@ TAG_SEEKTABLE = 0xA3
 TAG_LOUDNESS = 0xB2
 TAG_MARKER = 0xBD
 TAG_INDEXRUN = 0xD9  # undocumented grouped index runs into the 0x5a entries; decode_index_runs()
+CODEC_OPUS = 0x0B    # docs/audio.md: 48 kHz Opus, whose 0x76 +0 sample count is interleaved across channels
 # The most common cue-name hash of a `0xbd` record, not a magic: it is the first word of 88,082 of the
 # 420,168 `0xbd` tags in `audio.rpf` (decode_marker_records()). The old name is kept for callers.
 MARKER_NAME_COMMON = 0xE5C74063
@@ -1320,7 +1321,17 @@ def _decode_companion_tags(read_slice, bank_offset, tag_map):
                 comp["audio_codec"] = codec
                 comp["audio_channels"] = ch
                 if sr > 0:
-                    comp["audio_duration"] = round(samples / float(sr), 6)
+                    # docs/audio.md: the +0 count is interleaved across the packet channels for Opus and
+                    # +0x0C holds the per-channel frame count (the field tools/awc_opus.py reads), so +0 read
+                    # as a frame count reported twice the duration on a stereo stream.
+                    frames = samples
+                    if codec == CODEC_OPUS and len(fb) >= 16:
+                        per_channel = _u32(fb, 12)
+                        if per_channel and per_channel * max(1, ch) == samples:
+                            frames = per_channel
+                        elif ch > 1:
+                            frames = samples // ch
+                    comp["audio_duration"] = round(frames / float(sr), 6)
     if TAG_MARKER in tag_map:
         mo, ms = tag_map[TAG_MARKER][0]
         if 0 < ms <= MAX_MARKER_BYTES:
