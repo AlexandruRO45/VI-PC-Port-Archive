@@ -4,3 +4,4 @@ EXPORTS
     mxcsr_after
     mxcsr_badload
     mxcsr_fault
+    mxcsr_denormals
