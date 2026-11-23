@@ -1,6 +1,7 @@
 // Lanterns: the GPU side (lanterns_gpu.h). Borrowed pieces, all from this repository under its licence: the
 // D3D12XboxCreateDevice import (tiny_frame's, #3488), and from test/d3d12_translated_draw_test.cpp (M1.5) the heap-handle calls
-// through slots 9/10, the V# encoding and the upload-to-DEFAULT copies.
+// through slots 9/10, the V# encoding and the upload-to-DEFAULT copies; the compute root signature's shape (constants,
+// then a UAV table at s[4:5]) follows test/d3d12_m4_compute_test.cpp (M4).
 #include "lanterns_gpu.h"
 
 #include "lanterns_d3d12.h"
@@ -32,16 +33,22 @@ Geometry flatten(const Scene& scene) {
     }
     for (const Draw& draw : scene.draws) {
         g.first_instance.push_back(std::uint32_t(g.instances.size()));
-        g.instances.insert(g.instances.end(), draw.instances.begin(), draw.instances.end());
+        if (!draw.gpu_instances)
+            g.instances.insert(g.instances.end(), draw.instances.begin(), draw.instances.end());
     }
     return g;
 }
 
-constexpr std::uint64_t kReadbackBytes = std::uint64_t(kPitch) * kHeight;   // the image
+constexpr std::uint64_t kImageBytes = std::uint64_t(kPitch) * kHeight;
+constexpr std::uint64_t kStateBytes = kParticles * sizeof(Particle), kInstanceBytes = kParticles * sizeof(Instance);
+// The readback buffer: the image, then the compute outputs (the state and the instance records).
+constexpr std::uint64_t kOffState = kImageBytes, kOffInstances = kOffState + kStateBytes,
+                        kReadbackBytes = kOffInstances + kInstanceBytes;
+constexpr unsigned kComputeSlots = 2;   // the compute table: state, instance records
 
 }  // namespace
 
-bool load_shaders(const std::filesystem::path& dir, Shaders& out) {
+bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out) {
     out.vs = read_file(dir / "vs_lanterns.dxbc");
     out.ps_lit = read_file(dir / "ps_lanterns_lit.dxbc");
     out.ps_floor = read_file(dir / "ps_lanterns_floor.dxbc");
@@ -49,6 +56,10 @@ bool load_shaders(const std::filesystem::path& dir, Shaders& out) {
     out.ps_lit_w64 = read_file(dir / "ps_lanterns_lit_w64.dxbc");
     CHECK(out.vs.size() > 64 && out.ps_lit.size() > 64 && out.ps_floor.size() > 64);
     CHECK(out.vs_w64.size() > 64 && out.ps_lit_w64.size() > 64);
+    if (stage == 3) {
+        out.cs_rise = read_file(dir / "cs_lanterns_rise.dxbc");
+        CHECK(out.cs_rise.size() > 64);
+    }
     // The lookup control (create_pipelines): the VS's FSSM program (fssm_unpack.py's copy) in a container the guest
     // writes itself (d3d12_test_shaders.h), once as it is and once with one byte of the program's name changed (so
     // another FSSM hash). One writer for both, so the hash is the only difference between them.
@@ -73,8 +84,10 @@ bool Gpu::create(const Scene& scene, const Shaders& shaders) {
         std::fprintf(stderr, "lanterns: D3D12XboxCreateDevice failed (hr=0x%08lx)\n", static_cast<unsigned long>(created));
         return false;
     }
+    compute_ = !shaders.cs_rise.empty();
     geometry_ = flatten(scene);
     CHECK(create_pipelines(shaders));
+    if (compute_) CHECK(create_compute(shaders));
     CHECK(create_resources(scene));
     CHECK(fill_descriptors(scene));
     return initialize(scene);
@@ -155,6 +168,27 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     return true;
 }
 
+bool Gpu::create_compute(const Shaders& shaders) {
+    // [0] four 32-bit constants (s0..s3), [1] a table of two UAVs (s[4:5]), as M4's compute root signature.
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, kComputeSlots, 0, 0, 0};
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, 4};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable = {1, &range};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const auto blob = serialize_root_signature(root_desc);
+    CHECK(!blob.empty());
+    CHECK(SUCCEEDED(device_->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&compute_root_.p))));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = compute_root_.p;
+    desc.CS = {shaders.cs_rise.data(), shaders.cs_rise.size()};
+    CHECK(SUCCEEDED(device_->CreateComputePipelineState(&desc, IID_PPV_ARGS(&compute_pso_.p))));
+    return true;
+}
+
 bool Gpu::create_resources(const Scene& scene) {
     const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT, {}, {}, 0, 0};
     const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD, {}, {}, 0, 0};
@@ -163,12 +197,13 @@ bool Gpu::create_resources(const Scene& scene) {
     const std::uint64_t ib_bytes = align(geometry_.indices.size() * sizeof(std::uint16_t), 4);
     const std::uint64_t inst_bytes = std::max<std::uint64_t>(geometry_.instances.size() * sizeof(Instance), 256);
     // Upload layout: vertices, indices, instances, the camera's 64 bytes (the root CBV reads them in place: root views
-    // are 64-bit console VAs, docs/d3d12_vulkan.md 3.3).
+    // are 64-bit console VAs, docs/d3d12_vulkan.md 3.3), then the particles' first state.
     upload_vb_ = 0;
     upload_ib_ = align(upload_vb_ + vb_bytes, 256);
     upload_inst_ = align(upload_ib_ + ib_bytes, 256);
     upload_cbv_ = align(upload_inst_ + inst_bytes, 256);
-    const std::uint64_t upload_bytes = upload_cbv_ + 256;
+    upload_particles_ = upload_cbv_ + 256;
+    const std::uint64_t upload_bytes = upload_particles_ + kStateBytes;
     const auto make_buffer = [&](const D3D12_HEAP_PROPERTIES& heap, std::uint64_t bytes, D3D12_RESOURCE_STATES state,
                                  Ref<ID3D12Resource>& out, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
         const auto desc = buffer_desc(bytes, flags);
@@ -180,6 +215,12 @@ bool Gpu::create_resources(const Scene& scene) {
     CHECK(make_buffer(default_heap, inst_bytes, D3D12_RESOURCE_STATE_COPY_DEST, instance_buffer_));
     CHECK(make_buffer(upload_heap, upload_bytes, D3D12_RESOURCE_STATE_GENERIC_READ, upload_));
     CHECK(make_buffer(readback_heap, kReadbackBytes, D3D12_RESOURCE_STATE_COPY_DEST, readback_));
+    if (compute_) {
+        CHECK(make_buffer(default_heap, kStateBytes, D3D12_RESOURCE_STATE_COPY_DEST, particle_state_,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+        CHECK(make_buffer(default_heap, kInstanceBytes, D3D12_RESOURCE_STATE_COMMON, particle_instances_,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    }
 
     D3D12_RESOURCE_DESC tex{};
     tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -204,7 +245,7 @@ bool Gpu::create_resources(const Scene& scene) {
     const D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 32,
                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&srv_heap_.p))));
-    CHECK(scene.meshes.size() + scene.draws.size() <= 32);
+    CHECK(scene.meshes.size() + scene.draws.size() + kComputeSlots <= 32);
     const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap_.p))));
     const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -221,15 +262,28 @@ bool Gpu::create_resources(const Scene& scene) {
                                                IID_PPV_ARGS(&list_.p))));
     CHECK(list_->Close() == S_OK);
     CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_.p))));
+    if (compute_) {
+        queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        CHECK(SUCCEEDED(device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&compute_queue_.p))));
+        CHECK(SUCCEEDED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                                                        IID_PPV_ARGS(&compute_allocator_.p))));
+        CHECK(SUCCEEDED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, compute_allocator_.p, nullptr,
+                                                   IID_PPV_ARGS(&compute_list_.p))));
+        CHECK(compute_list_->Close() == S_OK);
+        CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&compute_fence_.p))));
+    }
     return true;
 }
 
-// The descriptor tables: slot m holds mesh m's V#, slot (meshes + d) draw d's instance V#. Raw V# bytes, written through the CPU handle as the title writes them.
+// The descriptor tables: slot m holds mesh m's V#, slot (meshes + d) draw d's instance V#, then the compute shader's
+// two V#s (state, instance records). Raw V# bytes, written through the CPU handle as the title writes them.
 bool Gpu::fill_descriptors(const Scene& scene) {
     srv_cpu_ = heap_cpu(srv_heap_.p);
     srv_gpu_ = heap_gpu(srv_heap_.p);
     srv_step_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     CHECK(srv_cpu_ && srv_gpu_ >= 0x10000 && srv_step_ >= 16);
+    // cs_lanterns_rise.asm loads its second V# 0x20 bytes after the first, as M4's shaders do.
+    CHECK(!compute_ || srv_step_ == 32);
     const auto put = [&](std::size_t index, const std::array<std::uint32_t, 4>& v) {
         std::memcpy(reinterpret_cast<void*>(srv_cpu_ + index * srv_step_), v.data(), 16);
     };
@@ -240,7 +294,19 @@ bool Gpu::fill_descriptors(const Scene& scene) {
     for (std::size_t d = 0; d < draws; ++d) {
         const Draw& draw = scene.draws[d];
         const auto count = std::uint32_t(draw.instances.size());
-        put(meshes + d, make_vsharp(inst + geometry_.first_instance[d] * sizeof(Instance), sizeof(Instance), count));
+        if (draw.gpu_instances) {
+            CHECK(compute_ && count == kParticles);
+            put(meshes + d, make_vsharp(particle_instances_->GetGPUVirtualAddress(), sizeof(Instance), count));
+        } else {
+            put(meshes + d, make_vsharp(inst + geometry_.first_instance[d] * sizeof(Instance), sizeof(Instance), count));
+        }
+    }
+    if (compute_) {
+        // The compute table: [state, instance records].
+        srv_compute_slot_ = meshes + draws;
+        put(srv_compute_slot_, make_vsharp(particle_state_->GetGPUVirtualAddress(), sizeof(Particle), kParticles));
+        put(srv_compute_slot_ + 1,
+            make_vsharp(particle_instances_->GetGPUVirtualAddress(), sizeof(Instance), kParticles));
     }
     return true;
 }
@@ -254,6 +320,8 @@ bool Gpu::initialize(const Scene& scene) {
     if (!geometry_.instances.empty())
         std::memcpy(up + upload_inst_, geometry_.instances.data(), geometry_.instances.size() * sizeof(Instance));
     std::memcpy(up + upload_cbv_, scene.view_projection.data(), sizeof(scene.view_projection));
+    const auto particles = initial_particles();
+    std::memcpy(up + upload_particles_, particles.data(), kStateBytes);
 
     CHECK(SUCCEEDED(allocator_->Reset()));
     CHECK(SUCCEEDED(list_->Reset(allocator_.p, nullptr)));
@@ -263,11 +331,15 @@ bool Gpu::initialize(const Scene& scene) {
     if (!geometry_.instances.empty())
         list_->CopyBufferRegion(instance_buffer_.p, 0, upload_.p, upload_inst_,
                                 geometry_.instances.size() * sizeof(Instance));
-    const std::vector<D3D12_RESOURCE_BARRIER> barriers = {
+    std::vector<D3D12_RESOURCE_BARRIER> barriers = {
         transition(vertex_buffer_.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         transition(index_buffer_.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER),
         transition(instance_buffer_.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         transition(target_.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+    if (compute_) {
+        list_->CopyBufferRegion(particle_state_.p, 0, upload_.p, upload_particles_, kStateBytes);
+        barriers.push_back(transition(particle_state_.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON));
+    }
     list_->ResourceBarrier(UINT(barriers.size()), barriers.data());
     CHECK(list_->Close() == S_OK);
     ID3D12CommandList* lists[] = {list_.p};
@@ -277,11 +349,14 @@ bool Gpu::initialize(const Scene& scene) {
     return true;
 }
 
-bool Gpu::submit_frame(const Scene& scene, bool depth_test) {
+bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_compute) {
     CHECK(SUCCEEDED(allocator_->Reset()));
     CHECK(SUCCEEDED(list_->Reset(allocator_.p, nullptr)));
-    const std::vector<D3D12_RESOURCE_BARRIER> before = {
+    std::vector<D3D12_RESOURCE_BARRIER> before = {
         transition(target_.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+    if (compute_)
+        before.push_back(transition(particle_instances_.p, D3D12_RESOURCE_STATE_COMMON,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
     list_->ResourceBarrier(UINT(before.size()), before.data());
     list_->ClearRenderTargetView(rtv_, kClear.data(), 0, nullptr);
     list_->ClearDepthStencilView(dsv_, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -307,8 +382,13 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test) {
         list_->DrawIndexedInstanced(geometry_.index_count[draw.mesh], UINT(draw.instances.size()),
                                     geometry_.first_index[draw.mesh], 0, 0);
     }
-    const std::vector<D3D12_RESOURCE_BARRIER> to_copy = {
+    std::vector<D3D12_RESOURCE_BARRIER> to_copy = {
         transition(target_.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+    if (compute_) {
+        to_copy.push_back(transition(particle_instances_.p, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     D3D12_RESOURCE_STATE_COPY_SOURCE));
+        to_copy.push_back(transition(particle_state_.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+    }
     list_->ResourceBarrier(UINT(to_copy.size()), to_copy.data());
     D3D12_TEXTURE_COPY_LOCATION dst{};
     dst.pResource = readback_.p;
@@ -318,14 +398,24 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test) {
     src.pResource = target_.p;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (compute_) {
+        list_->CopyBufferRegion(readback_.p, kOffState, particle_state_.p, 0, kStateBytes);
+        list_->CopyBufferRegion(readback_.p, kOffInstances, particle_instances_.p, 0, kInstanceBytes);
+    }
+    std::vector<D3D12_RESOURCE_BARRIER> back;
+    if (compute_)
+        for (ID3D12Resource* r : {particle_instances_.p, particle_state_.p})
+            back.push_back(transition(r, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
+    if (!back.empty()) list_->ResourceBarrier(UINT(back.size()), back.data());
     CHECK(list_->Close() == S_OK);
+    if (wait_compute) CHECK(compute_ && SUCCEEDED(queue_->Wait(compute_fence_.p, wait_compute)));
     ID3D12CommandList* lists[] = {list_.p};
     queue_->ExecuteCommandLists(1, lists);
     CHECK(SUCCEEDED(queue_->Signal(fence_.p, ++fence_value_)));
     return true;
 }
 
-bool Gpu::finish_frame(std::vector<Color>& pixels) {
+bool Gpu::finish_frame(std::vector<Color>& pixels, Readback* readback) {
     CHECK(wait_fence(fence_, fence_value_));
     void* mapped = nullptr;
     CHECK(SUCCEEDED(readback_->Map(0, nullptr, &mapped)));
@@ -333,12 +423,59 @@ bool Gpu::finish_frame(std::vector<Color>& pixels) {
     pixels.resize(std::size_t(kWidth) * kHeight);
     for (unsigned y = 0; y < kHeight; ++y)
         std::memcpy(pixels.data() + std::size_t(y) * kWidth, bytes + y * kPitch, kWidth * sizeof(Color));
+    if (readback) {
+        const auto take = [&](auto& out, std::uint64_t offset, std::size_t count) {
+            out.resize(count);
+            std::memcpy(out.data(), bytes + offset, count * sizeof(out[0]));
+        };
+        take(readback->state, kOffState, kParticles);
+        take(readback->instances, kOffInstances, kParticles);
+    }
     readback_->Unmap(0, nullptr);
+    return true;
+}
+
+bool Gpu::submit_compute(unsigned steps, std::uint64_t& signalled) {
+    CHECK(compute_);
+    // The allocator is reused: the previous compute submission must be done (it signalled compute_value_).
+    CHECK(wait_fence(compute_fence_, compute_value_));
+    CHECK(SUCCEEDED(compute_allocator_->Reset()));
+    CHECK(SUCCEEDED(compute_list_->Reset(compute_allocator_.p, compute_pso_.p)));
+    const std::vector<ID3D12Resource*> written = {particle_state_.p, particle_instances_.p};
+    std::vector<D3D12_RESOURCE_BARRIER> to_uav, back_to_common;
+    for (ID3D12Resource* r : written) {
+        to_uav.push_back(transition(r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        back_to_common.push_back(transition(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON));
+    }
+    compute_list_->ResourceBarrier(UINT(to_uav.size()), to_uav.data());
+    compute_list_->SetComputeRootSignature(compute_root_.p);
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.p};
+    compute_list_->SetDescriptorHeaps(1, heaps);
+    const UINT constants[4] = {UINT(kTop), UINT(kRange), kParticles, 0};
+    compute_list_->SetComputeRoot32BitConstants(0, 4, constants, 0);
+    // The compute V#s follow the graphics ones (fill_descriptors); the table's first slot is the state.
+    const std::uint64_t first = srv_gpu_ + srv_compute_slot_ * srv_step_;
+    compute_list_->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{first});
+    D3D12_RESOURCE_BARRIER uav[2] = {};
+    uav[0].Type = uav[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav[0].UAV.pResource = particle_state_.p;
+    uav[1].UAV.pResource = particle_instances_.p;
+    for (unsigned k = 0; k < steps; ++k) {
+        compute_list_->Dispatch(kParticles / 64, 1, 1);
+        compute_list_->ResourceBarrier(2, uav);   // the next step reads what this one wrote
+    }
+    compute_list_->ResourceBarrier(UINT(back_to_common.size()), back_to_common.data());
+    CHECK(compute_list_->Close() == S_OK);
+    ID3D12CommandList* lists[] = {compute_list_.p};
+    compute_queue_->ExecuteCommandLists(1, lists);
+    CHECK(SUCCEEDED(compute_queue_->Signal(compute_fence_.p, ++compute_value_)));
+    signalled = compute_value_;
     return true;
 }
 
 bool Gpu::idle() {
     CHECK(wait_fence(fence_, fence_value_));
+    if (compute_) CHECK(wait_fence(compute_fence_, compute_value_));
     return true;
 }
 

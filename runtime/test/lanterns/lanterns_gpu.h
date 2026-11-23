@@ -4,6 +4,7 @@
 #pragma once
 
 #include "../d3d12_test_shaders.h"
+#include "lanterns_particles.h"
 #include "lanterns_scene.h"
 
 #include <array>
@@ -18,12 +19,19 @@ using d3d12test::Ref;
 
 // The containers the guest hands to the pipelines, read from the folder fssm_pack.py wrote.
 struct Shaders {
-    std::vector<std::uint8_t> vs, ps_lit, ps_floor, unknown_vs, rebuilt_vs, vs_w64, ps_lit_w64;
+    std::vector<std::uint8_t> vs, ps_lit, ps_floor, unknown_vs, rebuilt_vs, vs_w64, ps_lit_w64, cs_rise;
 };
-bool load_shaders(const std::filesystem::path& dir, Shaders& out);
+// stage 1: graphics only; 3: plus cs_lanterns_rise.
+bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out);
+
+// What a frame's readback holds besides the pixels (stage 3).
+struct Readback {
+    std::vector<Particle> state;
+    std::vector<Instance> instances;   // what cs_lanterns_rise wrote
+};
 
 // The scene's meshes as one vertex array and one 16-bit index array (each face fanned), with where each mesh starts,
-// and every draw's instances.
+// and the uploaded instances of the draws that do not take theirs from the compute shader.
 struct Geometry {
     std::vector<Vertex> vertices;
     std::vector<std::uint16_t> indices;
@@ -35,13 +43,17 @@ struct Geometry {
 class Gpu {
 public:
     // Device, pipelines, buffers, and an initial direct-queue submission that copies the uploads into the DEFAULT
-    // buffers.
+    // buffers (and the particles' first state, when the shaders include the compute shader).
     bool create(const Scene& scene, const Shaders& shaders);
-    // Records and submits one frame on the direct queue.
-    bool submit_frame(const Scene& scene, bool depth_test);
-    // Waits for the last frame and reads back its pixels.
-    bool finish_frame(std::vector<Color>& pixels);
-    // Waits until the queue is idle (before the objects are released).
+    // Records and submits one frame on the direct queue. With wait_compute != 0 the queue first waits for the
+    // compute fence to reach that value (which may be signalled by a submission made after this one).
+    bool submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_compute = 0);
+    // Waits for the last frame and reads back its pixels (and, if asked, the particle state and instance records).
+    bool finish_frame(std::vector<Color>& pixels, Readback* readback = nullptr);
+    // Submits `steps` dispatches of cs_lanterns_rise on the compute queue and signals the fence.
+    bool submit_compute(unsigned steps, std::uint64_t& signalled);
+    std::uint64_t next_compute_value() const { return compute_value_ + 1; }
+    // Waits until both queues are idle (before the objects are released).
     bool idle();
     // For the passes that record on the same device and direct queue (lanterns_edges_gpu.cpp).
     ID3D12Device* device() const { return device_.p; }
@@ -49,6 +61,7 @@ public:
 
 private:
     bool create_pipelines(const Shaders& shaders);
+    bool create_compute(const Shaders& shaders);
     void bind_draw(const Scene& scene, std::size_t d);
     bool create_resources(const Scene& scene);
     bool initialize(const Scene& scene);
@@ -56,21 +69,25 @@ private:
 
     // Declared first, released last: everything below is a child of the device.
     Ref<ID3D12Device> device_;
-    Ref<ID3D12RootSignature> root_;
+    Ref<ID3D12RootSignature> root_, compute_root_;
     Ref<ID3D12PipelineState> pso_[2][2];   // [floor][depth test]
     Ref<ID3D12PipelineState> pso_w64_[2];  // [depth test]: the wave64 pair, for the draws marked wave64
+    Ref<ID3D12PipelineState> compute_pso_;
     Ref<ID3D12Resource> vertex_buffer_, index_buffer_, instance_buffer_, upload_, readback_, target_, depth_;
+    Ref<ID3D12Resource> particle_state_, particle_instances_;
     Ref<ID3D12DescriptorHeap> srv_heap_, rtv_heap_, dsv_heap_;
-    Ref<ID3D12CommandQueue> queue_;
-    Ref<ID3D12CommandAllocator> allocator_;
-    Ref<ID3D12GraphicsCommandList> list_;
-    Ref<ID3D12Fence> fence_;
+    Ref<ID3D12CommandQueue> queue_, compute_queue_;
+    Ref<ID3D12CommandAllocator> allocator_, compute_allocator_;
+    Ref<ID3D12GraphicsCommandList> list_, compute_list_;
+    Ref<ID3D12Fence> fence_, compute_fence_;
     Geometry geometry_;
-    std::uint64_t upload_vb_ = 0, upload_ib_ = 0, upload_inst_ = 0, upload_cbv_ = 0;
+    bool compute_ = false;
+    std::uint64_t upload_vb_ = 0, upload_ib_ = 0, upload_inst_ = 0, upload_cbv_ = 0, upload_particles_ = 0;
     std::uint64_t srv_cpu_ = 0, srv_gpu_ = 0;
     UINT srv_step_ = 0;
+    std::uint64_t srv_compute_slot_ = 0;   // the compute table's first slot (after the graphics V#s)
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_{}, dsv_{};
-    UINT64 fence_value_ = 0;
+    UINT64 fence_value_ = 0, compute_value_ = 0;
 };
 
 }  // namespace lanterns

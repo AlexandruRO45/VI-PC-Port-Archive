@@ -41,6 +41,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | Stage | What it adds | Control |
 |---|---|---|
 | [1](#stage-1) | Five indexed, instanced draws with a depth buffer | Depth test off changes the predicted pixels |
+| [3](#stage-3-compute-on-a-second-queue) | A compute queue moves the points of light; the frame waits on its fence | Point states and records equal the CPU's; the points move the predicted pixels |
 
 ## Stage 1
 
@@ -132,6 +133,38 @@ Each check was made to fail on purpose, and each fix in it was shown to matter:
 - A stale `wineserver`: seen on another Linux setup, where 20 of 20 launches hung without the stop and 20 of 20 passed
   with it. On the test machine two back-to-back runs passed either way, so here it rests on the runner's test with a
   fake `wineserver` on `PATH`.
+
+## Stage 3: compute on a second queue
+
+A compute shader, `cs_lanterns_rise.asm` (wave32), runs on a COMPUTE queue. It moves 256 points of light in integer
+fixed point, so the CPU can repeat every step exactly. It writes their instance records into a DEFAULT buffer with UAV
+access. The direct queue waits on the compute fence and draws the points as a sixth `DrawIndexedInstanced`, whose
+instance V# points at that buffer.
+
+- Frame 1: the compute work (24 steps) is submitted, then the frame.
+- Frame 2: the frame is submitted first. It waits for a fence value that a later compute submission (24 more steps)
+  signals, so the layer must hold the direct queue until then.
+
+What it adds to stage 1:
+
+- A compute pipeline from an FSSM container. The thread-group size and `COMPUTE_PGM_RSRC2` come from the FSSM header.
+- A compute root signature with four root constants and a table of two UAVs, as in `d3d12_m4_compute_test`.
+- `Dispatch` on a compute queue, and `Wait`/`Signal` across the two queues.
+- A draw whose instance data is what the compute shader wrote.
+
+How the check works:
+
+- The point states and the instance records are read back. They must equal the CPU's simulation of the same steps,
+  word for word.
+- Both frames are checked as in stage 1: certain pixels exact, uncertain pixels one of their candidates.
+- Between frame 1 and frame 2 the points must change exactly the certain pixels the reference predicts.
+- Control: a third frame without the `Wait`, submitted before its compute work. It is reported, not required, because
+  a layer may order the queues by itself. On the test machine the result varies from run to run: the previous frame's state,
+  or a mix of the two (16,183 and 16,546 certain pixels differed from the new state in two runs).
+
+```
+Lanterns stage 3: PASS, 97675 and 97664 of 98304 pixels exact, 256 points exact after 24 and 48 compute steps, points moved 14839 pixels
+```
 
 ## Build and run
 

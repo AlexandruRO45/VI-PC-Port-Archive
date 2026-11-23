@@ -146,6 +146,7 @@ struct Draw {
     std::array<float, 12> model;    // rows: local = M * (x, y, z, 1)
     std::array<float, 4> tint;
     bool wave64 = false;            // drawn with the wave64 pair (vs_lanterns_w64, ps_lanterns_lit_w64)
+    bool gpu_instances = false;     // the instance V# reads what a compute shader wrote (stage 3), not uploaded data
 };
 
 inline std::array<float, 12> rotation_y(double degrees) {

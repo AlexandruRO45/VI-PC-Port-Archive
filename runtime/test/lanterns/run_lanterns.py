@@ -28,6 +28,8 @@ PNGs (sRGB-encoded from the linear float target), lanterns-stage<N>.png and lant
 folder:
   stage 1: the GPU frame with the depth test; sheet: GPU | CPU reference / GPU without depth (the negative control) |
            mask of the depth frame: certain and exact (grey), certain and wrong (red), uncertain (yellow)
+  stage 3: frames 1 and 2 side by side (the points rise); sheet: frame 2 | its reference / the control frame without
+           the Wait | mask of frame 2
 """
 import argparse
 import array
@@ -58,6 +60,8 @@ PASS_LINES = {
         rf"centres on shared edges each drawn once",
         lambda exact, edge, moved, fan, centres: exact + edge == 98304 and moved >= 1000 and fan == 98304
         and centres >= 500),
+    3: (rf"Lanterns stage 3: PASS, {N} and {N} of 98304 pixels exact, 256 points exact after 24 and 48 compute steps, "
+        rf"points moved {N} pixels", lambda a, b, moved: 0 < a <= 98304 and 0 < b <= 98304 and moved >= 50),
 }
 
 
@@ -285,6 +289,8 @@ PANELS = {
     1: {"main": [["stage1-depth.gpu"]],
         "sheet": [["stage1-depth.gpu", "stage1-depth.ref"], ["stage1-nodepth.gpu", "stage1-depth:mask"],
                   ["stage1-edges.gpu", "stage1-edges.ref"]]},
+    3: {"main": [["stage3-frame1.gpu", "stage3-frame2.gpu"]],
+        "sheet": [["stage3-frame2.gpu", "stage3-frame2.ref"], ["stage3-control.gpu", "stage3-frame2:mask"]]},
 }
 
 

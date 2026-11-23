@@ -46,7 +46,7 @@ elseif(LEONIDA_TEST_LANTERNS)
     set(_lanterns_asm ${_lanterns_src}/shaders/vs_lanterns.asm ${_lanterns_src}/shaders/ps_lanterns_lit.asm
                       ${_lanterns_src}/shaders/ps_lanterns_floor.asm ${_lanterns_src}/shaders/vs_lanterns_w64.asm
                       ${_lanterns_src}/shaders/ps_lanterns_lit_w64.asm ${_lanterns_src}/shaders/vs_lanterns_edges.asm
-                      ${_lanterns_src}/shaders/ps_lanterns_edges.asm)
+                      ${_lanterns_src}/shaders/ps_lanterns_edges.asm ${_lanterns_src}/shaders/cs_lanterns_rise.asm)
     get_filename_component(_lanterns_spirv_tools ${LEONIDA_SPIRV_AS} DIRECTORY)
     file(TO_NATIVE_PATH "${_lanterns_spirv_tools}" _lanterns_spirv_tools)
     add_custom_command(
