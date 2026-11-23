@@ -27,6 +27,9 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
   fixtures. A test that needs a shader builds its input by hand or reads it from the user's work folder.
   `python -I scripts/check_no_game_data.py <path> ...` reads the first bytes of the files you name, so it catches a
   renamed file the extension check in CI misses.
+- **Nothing read out of the executable**, in docs, tests, pull requests or comments: no addresses, offsets, RVAs,
+  hashes, sizes, strings, call-site lists, disassembly or traces that quote it. Export and import names, public SDK
+  type names, vtable slot numbers, flag values and counts are fine (as in `docs/retail_boot_chain.md`).
 - **No keys, decryption or protection workarounds.** If a format turns out to be encrypted, write that down in
   `docs/design.md` and stop there.
 - **Nothing online**: no Xbox Live or Rockstar services or domains.

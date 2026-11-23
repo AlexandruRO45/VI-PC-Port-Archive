@@ -5,6 +5,9 @@ Thanks for helping. A few rules keep the project safe to host:
 - **No game data, ever.** That covers archives, the executable, carved files, shaders (DXBC, FSSM, disassembly,
   SPIR-V), textures, models, audio, videos, and reports or logs that quote them. `.gitignore` blocks the common
   types; check `git status` before you commit anyway.
+- **Nothing read out of the executable**: no addresses, offsets, RVAs, hashes, sizes, strings, call-site lists,
+  disassembly or traces that quote it. Export and import names, public SDK type names, vtable slot numbers, flag
+  values and counts are fine.
 - **No keys, decryption or protection workarounds**, and no links to where to get them. The tools only read files
   that are already plain on disk.
 - Short excerpts needed to explain a format (a few header bytes, one instruction sequence) are fine in docs and
