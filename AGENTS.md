@@ -110,8 +110,10 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
   are the texture and model tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
-  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `world_grid_atlas.py`,
-  `tex_headers.py` and `skinned_glb.py` (which fall back to the standard library when numpy is absent).
+  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py` and `calibrated_texture.py` require numpy at import time,
+  `world_grid_atlas.py` imports numpy and Pillow inside its image helpers (its pure-Python helpers and tests run on the
+  standard library alone), and only `tex_headers.py` and `skinned_glb.py` fall back to the standard library when numpy
+  is absent.
 - A text file a tool writes names its line ending - `open(path, "w", encoding="utf-8", newline="\n")` - so the same
   input gives the same bytes on every platform; `tests/test_text_write_line_endings.py` catches a writer that forgets.
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
