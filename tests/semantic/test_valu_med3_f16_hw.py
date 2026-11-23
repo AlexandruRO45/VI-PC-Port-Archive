@@ -462,5 +462,43 @@ class TestVMed3F16ConditionCodes(unittest.TestCase):
         self.assertEqual(self.flags.scc, 1)
         self.assertEqual(self.flags.vcc, 0xFFFFFFFF_FFFFFFFF)
 
+# Append boundary extremes, subnormals, and NaN handling
+class TestVMed3F16BoundaryExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormals_ordering(self) -> None:
+        # Denormals: 0x0001 (smallest positive denormal) and 0x0002
+        d1 = 0x0001
+        d2 = 0x0002
+        zero = F16_POS_ZERO
+        self.assertEqual(v_med3_f16_oracle(zero, d1, d2), d1)
+
+    def test_signed_zeros_distinction(self) -> None:
+        # -0.0 < +0.0
+        neg_zero = F16_NEG_ZERO
+        pos_zero = F16_POS_ZERO
+        self.assertEqual(v_med3_f16_oracle(neg_zero, pos_zero, neg_zero), neg_zero)
+        self.assertEqual(v_med3_f16_oracle(neg_zero, pos_zero, pos_zero), pos_zero)
+
+    def test_infinities(self) -> None:
+        neg_inf = F16_NEG_INF
+        pos_inf = F16_POS_INF
+        one = F16_ONE
+        self.assertEqual(v_med3_f16_oracle(neg_inf, one, pos_inf), one)
+
+    def test_single_nan_with_infinities(self) -> None:
+        nan = F16_QNAN
+        neg_inf = F16_NEG_INF
+        pos_inf = F16_POS_INF
+        # When NaN is present, min3 returns the minimum non-NaN, which is -inf
+        self.assertEqual(v_med3_f16_oracle(nan, neg_inf, pos_inf), neg_inf)
+
+    def test_signalling_nan_detection(self) -> None:
+        snan = 0x7C01  # Signalling NaN
+        c2 = 0x4000
+        c3 = 0x4200
+        self.assertTrue(is_nan_f16(snan))
+        self.assertEqual(v_med3_f16_oracle(snan, c2, c3), c2)
+
 if __name__ == "__main__":
     unittest.main()
