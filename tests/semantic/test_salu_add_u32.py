@@ -569,5 +569,107 @@ class SaluAddU32IEEE754BitPatternsTests(unittest.TestCase):
         self.assertEqual(res, 0x80000000)
         self.assertEqual(scc, 0)
 
+
+# --- Section 8: Hardware Translator Integration Tests ---
+
+def _run_ps_add_u32(lines: list[str]) -> tuple[int, int]:
+    """Assemble pixel shader instructions, translate with rdna2spirv, execute via mini-interpreter.
+
+    Returns (result, scc).
+    """
+    full_lines = list(lines) + [
+        "exp mrt0 v0, v1, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_salu_add_u32", full_lines)
+    words = mrt0_words(spv)
+    return words[0], words[1]
+
+
+def run_op_s_add_u32(s0: int, s1: int, preset_scc: int = 0) -> tuple[int, int]:
+    """Execute s_add_u32 through rdna2spirv translation and return (sum, scc)."""
+    lines = [
+        f"s_mov_b32 s2, {s0 & MASK32:#x}",
+        f"s_mov_b32 s3, {s1 & MASK32:#x}",
+        f"s_cmp_eq_u32 {1 if preset_scc else 0}, 1",
+        "s_add_u32 s0, s2, s3",
+        "s_cselect_b32 s1, 1, 0",
+        "v_mov_b32 v0, s0",
+        "v_mov_b32 v1, s1",
+    ]
+    return _run_ps_add_u32(lines)
+
+
+class SaluAddU32TranslatorIntegrationTests(unittest.TestCase):
+    """Commit 8: Hardware translator integration tests."""
+
+    def test_translator_basic_addition(self) -> None:
+        res, scc = run_op_s_add_u32(100, 200)
+        self.assertEqual(res, 300)
+        self.assertEqual(scc, 0)
+
+    def test_translator_carry_generation(self) -> None:
+        res, scc = run_op_s_add_u32(0xFFFFFFFF, 1)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 1)
+
+        res2, scc2 = run_op_s_add_u32(0x80000000, 0x80000000)
+        self.assertEqual(res2, 0)
+        self.assertEqual(scc2, 1)
+
+    def test_translator_inline_immediates(self) -> None:
+        lines = [
+            "s_mov_b32 s2, 50",
+            "s_add_u32 s0, s2, 15",
+            "s_cselect_b32 s1, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ]
+        res, scc = _run_ps_add_u32(lines)
+        self.assertEqual(res, 65)
+        self.assertEqual(scc, 0)
+
+    def test_translator_literal_constants(self) -> None:
+        lines = [
+            "s_mov_b32 s2, 0x10000000",
+            "s_add_u32 s0, s2, 0x20000000",
+            "s_cselect_b32 s1, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ]
+        res, scc = _run_ps_add_u32(lines)
+        self.assertEqual(res, 0x30000000)
+        self.assertEqual(scc, 0)
+
+    def test_translator_register_aliasing(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x40000000",
+            "s_add_u32 s0, s0, s0",
+            "s_cselect_b32 s1, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ]
+        res, scc = _run_ps_add_u32(lines)
+        self.assertEqual(res, 0x80000000)
+        self.assertEqual(scc, 0)
+
+    def test_translator_matches_reference_oracle(self) -> None:
+        sample_vectors = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (42, 58),
+            (0x7FFFFFFF, 1),
+            (0xFFFFFFFF, 1),
+            (0xFFFFFFFF, 0xFFFFFFFF),
+            (0xCAFEBABE, 0x12345678),
+        ]
+        for a, b in sample_vectors:
+            with self.subTest(a=hex(a), b=hex(b)):
+                exp_res, exp_scc = ref_s_add_u32(a, b)
+                got_res, got_scc = run_op_s_add_u32(a, b)
+                self.assertEqual(got_res, exp_res)
+                self.assertEqual(got_scc, exp_scc)
+
 if __name__ == "__main__":
     unittest.main()
