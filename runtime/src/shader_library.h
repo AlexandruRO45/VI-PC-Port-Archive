@@ -897,9 +897,20 @@ private:
             if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
                 for (const auto& [key, val] : fh->object) {
                     if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
-                    char* end = nullptr;
-                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
-                    if (!end || *end != '\0') continue;
+                    std::uint64_t param = 0;
+                    bool ok = true;
+                    for (char c : key) {
+                        if (c < '0' || c > '9') {
+                            ok = false;
+                            break;
+                        }
+                        param = param * 10 + std::uint64_t(c - '0');
+                        if (param > 0xffffffffu) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
                 }
             }
