@@ -211,6 +211,7 @@ bool same_footprints(ID3D12Device11* device, const D3D12_RESOURCE_DESC* desc, UI
 struct Edge {
     const char* name;
     HRESULT got, want;  // `want` is the PC runtime's answer, measured on an RTX 4090 (driver 621.14)
+    bool needs_relaxed_casting = false;
 };
 
 // The edge cases of the newer arguments, run on any ID3D12Device10: ours, or the host's PC runtime to compare
@@ -474,7 +475,7 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
         {"CreateReservedResource2, mismatched texel-size castable format",
          r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, wide_cast), E_INVALIDARG},
         {"CreateReservedResource2, valid castable format on texture",
-         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, srgb_cast), S_OK},
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, srgb_cast), S_OK, true},
         {"CreateReservedResource2, castable count with null list",
          r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 2, nullptr), S_OK},
         {"CreateCommandQueue1, null description", null_queue, E_INVALIDARG},
@@ -546,13 +547,26 @@ int main() {
             return 1;
         }
         if (have_host) {
+            // A host without relaxed format casting refuses every castable list, so those answers are not comparable.
+            D3D12_FEATURE_DATA_D3D12_OPTIONS12 host12{};
+            const bool host_casts = SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &host12,
+                                                                        sizeof(host12))) &&
+                                    host12.RelaxedFormatCastingSupported;
             const std::vector<Edge> theirs = edge_answers(host.p, host.p, host.p);
+            int uncompared = 0;
             for (std::size_t i = 0; i < ours.size(); ++i) {
+                if (ours[i].needs_relaxed_casting && !host_casts) {
+                    ++uncompared;
+                    continue;
+                }
                 if (ours[i].got == theirs[i].got) continue;
                 std::fprintf(stderr, "%s: ours %08lx, host runtime %08lx\n", ours[i].name, ours[i].got,
                              theirs[i].got);
                 return 1;
             }
+            if (uncompared)
+                std::printf("host has no relaxed format casting: %d castable edge case(s) checked against their "
+                            "recorded answers only\n", uncompared);
         } else {
             std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
         }
