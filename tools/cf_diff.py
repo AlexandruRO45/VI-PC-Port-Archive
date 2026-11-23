@@ -619,8 +619,8 @@ def main(argv=None):
     if not argv:
         ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
-    if a.programs < 1:
-        ap.error("--programs must be at least 1")
+    if a.programs <= 0 or a.depth <= 0:
+        ap.error("--programs and --depth must be at least 1")
     if a.spirv_val:
         missing = [t for t in ("spirv-as", "spirv-val") if not shutil.which(t)]
         if missing:

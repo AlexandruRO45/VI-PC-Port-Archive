@@ -9,7 +9,14 @@ import subprocess
 import sys
 import tempfile
 
-import pytest
+try:
+    import pytest
+except ImportError:
+    import site
+    user_site = getattr(site, "getusersitepackages", lambda: None)()
+    if user_site and user_site not in sys.path:
+        sys.path.append(user_site)
+    import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "cf_diff.py")
@@ -43,7 +50,21 @@ def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
         cf_diff.main(["--programs", count])
     assert exc.value.code == 2
     captured = capsys.readouterr()
-    assert "--programs must be at least 1" in captured.err
+    assert "--programs and --depth must be at least 1" in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("depth", ["0", "-1"])
+def test_non_positive_depth_is_a_usage_error(depth, capsys, monkeypatch):
+    def unexpected_suite(*args, **kwargs):
+        pytest.fail("started a suite with non-positive depth")
+
+    monkeypatch.setattr(cf_diff, "run_suite", unexpected_suite)
+    with pytest.raises(SystemExit) as exc:
+        cf_diff.main(["--depth", depth])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "--programs and --depth must be at least 1" in captured.err
     assert captured.out == ""
 
 
@@ -148,6 +169,27 @@ def test_no_arguments_prints_usage():
     assert "Traceback" not in proc.stderr
 
 
+@pytest.mark.parametrize("opt", ["--programs", "--depth"])
+@pytest.mark.parametrize("val", ["0", "-1"])
+def test_non_positive_args_exit_code_2_without_traceback(opt, val):
+    proc = subprocess.run([sys.executable, "-I", TOOL, opt, val], capture_output=True, text=True, timeout=5)
+    assert proc.returncode == 2
+    assert "--programs and --depth must be at least 1" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_both_args_non_positive_exit_code_2_without_traceback():
+    proc = subprocess.run(
+        [sys.executable, "-I", TOOL, "--programs", "0", "--depth", "-1"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert proc.returncode == 2
+    assert "--programs and --depth must be at least 1" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
 def test_generator_covers_every_shape():
     kinds = set()
 
@@ -169,3 +211,8 @@ def test_saveexec_variants_match(op_name, wave):
     body = [("saveexec", FEW_LANES, op_name, "s_cbranch_scc0", [("probe", 13), ("op", "v_add_nc_u32 v9, 1, v9")])]
     status, detail = cf_diff.run_case(f"ps_saveexec_{op_name}", body, wave, structured=True)
     assert status == "match", detail
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+
