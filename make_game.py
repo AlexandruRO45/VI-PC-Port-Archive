@@ -2203,7 +2203,12 @@ def wine_launcher(out: str, work: str, image: str) -> str:
 here=$(dirname "$(readlink -f "$0")")
 if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
     game=$(cat "$here/game_path.txt" && printf .) || exit 1
-    cd "${{game%.}}" || exit 1
+    # A hand-edited game_path.txt usually ends in a newline (CRLF from a Windows editor); the path does not.
+    game=${{game%.}}
+    game=${{game%"
+"}}
+    game=${{game%"$(printf '\r')"}}
+    cd "$game" || exit 1
     image={shlex.quote(image)}
     if [ ! -f "./$image" ]; then
         printf 'Missing game executable: %s/%s\\n' "$PWD" "$image" >&2

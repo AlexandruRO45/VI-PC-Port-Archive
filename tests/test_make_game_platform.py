@@ -272,6 +272,14 @@ class RuntimePackagingTest(unittest.TestCase):
         result = subprocess.check_output([launcher, "--run", "other.exe", "--", "two words"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[:2], [self.root, ["--run", "other.exe", "--", "two words"]])
 
+        # The game folder moved and game_path.txt was edited by hand: editors end the line, the path does not.
+        for ending in ("\n", "\r\n"):
+            with self.subTest(ending=repr(ending)):
+                with open(os.path.join(self.out, "game_path.txt"), "w", encoding="utf-8", newline="") as f:
+                    f.write(self.game + ending)
+                result = subprocess.check_output([launcher, "--dry-run"], cwd=self.root, env=env)
+                self.assertEqual(json.loads(result)[0], self.game)
+
         work = os.path.join(self.out, "Shader cache '$HOME'")
         make_game.runtime(self.game, self.out, {"expected_exe": image}, self.build, work=work)
         moved = self.out + " moved"
