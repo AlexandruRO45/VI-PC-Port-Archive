@@ -1119,6 +1119,15 @@ class CliTests(unittest.TestCase):
             self.assertEqual(err.getvalue(), f"ERROR: {src}: does not exist\n")
             self.assertFalse(os.path.exists(dst))
 
+    def test_cli_reports_folder_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dst = os.path.join(tmp, "out.png")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(dds.main([tmp, dst]), 2)
+            self.assertEqual(err.getvalue(), f"ERROR: {tmp} is not a file\n")
+            self.assertFalse(os.path.exists(dst))
+
     def test_cli_rejects_negative_max_size(self):
         payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
         with tempfile.TemporaryDirectory() as tmp:
