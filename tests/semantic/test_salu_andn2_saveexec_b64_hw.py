@@ -111,3 +111,99 @@ class TestSaluAndn2SaveexecB64Oracle(unittest.TestCase):
         self.assertEqual(new_exec, 0)
         self.assertEqual(sdst, exec_val)
         self.assertEqual(scc, 0)
+
+
+class Opcode(Enum):
+    S_ANDN2_SAVEEXEC_B64 = auto()
+
+
+class OperandKind(Enum):
+    SGPR = auto()
+    EXEC = auto()
+    VCC = auto()
+    LITERAL64 = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    index: int = 0
+    count: int = 2
+    value: int = 0
+
+    @classmethod
+    def sgpr(cls, index: int, count: int = 2) -> ASTOperand:
+        if count != 2:
+            raise ValueError(f"s_andn2_saveexec_b64 requires 64-bit register pair (count=2), got {count}")
+        if index < 0 or index > 104 or (index + count) > 106:
+            raise ValueError(f"SGPR index out of range: s[{index}:{index + count - 1}]")
+        if index % 2 != 0:
+            raise ValueError(f"SGPR pair must be 64-bit aligned (even index), got s{index}")
+        return cls(kind=OperandKind.SGPR, index=index, count=count)
+
+    @classmethod
+    def exec_mask(cls) -> ASTOperand:
+        return cls(kind=OperandKind.EXEC, count=2)
+
+    @classmethod
+    def vcc(cls) -> ASTOperand:
+        return cls(kind=OperandKind.VCC, count=2)
+
+    @classmethod
+    def literal64(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.LITERAL64, count=2, value=u64(val))
+
+    @classmethod
+    def inline_const(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.INLINE_CONST, count=2, value=u64(val))
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.S_ANDN2_SAVEEXEC_B64:
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if self.dst.kind not in (OperandKind.SGPR, OperandKind.EXEC):
+            raise TypeError(f"Destination must be SGPR pair or EXEC, got {self.dst.kind}")
+        if self.dst.count != 2:
+            raise ValueError(f"Destination must be 64-bit (2 registers), got {self.dst.count}")
+        if self.src0.count != 2:
+            raise ValueError(f"Source must be 64-bit operand, got {self.src0.count}")
+
+
+class TestSaluAndn2SaveexecB64AST(unittest.TestCase):
+    """Test suite for AST opcode definitions and operand validation."""
+
+    def test_ast_construction_valid_operands(self):
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_SAVEEXEC_B64,
+            dst=ASTOperand.sgpr(4, 2),
+            src0=ASTOperand.sgpr(6, 2),
+        )
+        inst.validate()
+        self.assertEqual(inst.opcode, Opcode.S_ANDN2_SAVEEXEC_B64)
+        self.assertEqual(inst.dst.kind, OperandKind.SGPR)
+        self.assertEqual(inst.dst.index, 4)
+        self.assertEqual(inst.src0.index, 6)
+
+    def test_ast_rejects_unaligned_sgpr_pair(self):
+        with self.assertRaises(ValueError):
+            ASTOperand.sgpr(5, 2)
+
+    def test_ast_rejects_single_sgpr(self):
+        with self.assertRaises(ValueError):
+            ASTOperand.sgpr(4, 1)
+
+    def test_ast_rejects_invalid_dst_kind(self):
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_SAVEEXEC_B64,
+            dst=ASTOperand.literal64(0x123),
+            src0=ASTOperand.sgpr(6, 2),
+        )
+        with self.assertRaises(TypeError):
+            inst.validate()
