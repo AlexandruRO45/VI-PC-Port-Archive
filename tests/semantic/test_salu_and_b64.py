@@ -476,5 +476,46 @@ class SaluAndB64ConditionCodesTests(unittest.TestCase):
         state.step_s_and_b64("s[0:1]", 1, 1 << 63)
         self.assertEqual(state.scc, 0)
 
+class SaluAndB64Ieee754Tests(unittest.TestCase):
+    """IEEE 754 float bit pattern preservation (no canonicalization, no FTZ/DAZ)."""
+
+    def test_float64_zeros_and_signs(self) -> None:
+        pos_zero = struct.unpack("<Q", struct.pack("<d", +0.0))[0]
+        neg_zero = struct.unpack("<Q", struct.pack("<d", -0.0))[0]
+        self.assertEqual(pos_zero, 0x00000000_00000000)
+        self.assertEqual(neg_zero, 0x80000000_00000000)
+
+        abs_mask = 0x7FFFFFFF_FFFFFFFF
+        self.assertEqual(ref_s_and_b64(neg_zero, abs_mask), pos_zero)
+        self.assertEqual(ref_scc(ref_s_and_b64(neg_zero, abs_mask)), 0)
+
+    def test_float64_special_values_masking(self) -> None:
+        pos_inf = struct.unpack("<Q", struct.pack("<d", float("inf")))[0]
+        neg_inf = struct.unpack("<Q", struct.pack("<d", float("-inf")))[0]
+        q_nan = struct.unpack("<Q", struct.pack("<d", float("nan")))[0]
+
+        exp_mask = 0x7FF00000_00000000
+        self.assertEqual(ref_s_and_b64(pos_inf, exp_mask), exp_mask)
+        self.assertEqual(ref_s_and_b64(neg_inf, exp_mask), exp_mask)
+        self.assertEqual(ref_s_and_b64(q_nan, exp_mask), exp_mask)
+
+        mant_mask = 0x000FFFFF_FFFFFFFF
+        self.assertEqual(ref_s_and_b64(pos_inf, mant_mask), 0)
+        self.assertEqual(ref_scc(ref_s_and_b64(pos_inf, mant_mask)), 0)
+
+    def test_packed_float32_pair_extraction(self) -> None:
+        """A 64-bit register holding two 32-bit floats."""
+        f_lo = struct.unpack("<I", struct.pack("<f", 1.5))[0]
+        f_hi = struct.unpack("<I", struct.pack("<f", -2.5))[0]
+        packed = (f_hi << 32) | f_lo
+
+        lo_only = ref_s_and_b64(packed, 0x00000000_FFFFFFFF)
+        self.assertEqual(lo_only, f_lo)
+        self.assertEqual(ref_scc(lo_only), 1)
+
+        hi_only = ref_s_and_b64(packed, 0xFFFFFFFF_00000000)
+        self.assertEqual(hi_only, f_hi << 32)
+        self.assertEqual(ref_scc(hi_only), 1)
+
 if __name__ == "__main__":
     unittest.main()
