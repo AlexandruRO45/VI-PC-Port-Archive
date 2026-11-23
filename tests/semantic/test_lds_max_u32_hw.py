@@ -512,5 +512,46 @@ class TestLdsMaxU32RegisterAliasing(unittest.TestCase):
             self.assertEqual(self.interp.read_vgpr(reg), 0x1000 + reg)
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation Tests
+# ---------------------------------------------------------------------------
+
+class TestLdsMaxU32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition code tracking and VCC/SCC isolation."""
+
+    def test_condition_codes_zero(self) -> None:
+        cc = compute_lds_condition_codes(0)
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.positive)
+
+    def test_condition_codes_negative(self) -> None:
+        # High bit set in unsigned value
+        cc = compute_lds_condition_codes(0x80000000)
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.negative)
+        self.assertFalse(cc.positive)
+
+    def test_condition_codes_positive(self) -> None:
+        cc = compute_lds_condition_codes(12345)
+        self.assertFalse(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertTrue(cc.positive)
+
+    def test_vcc_and_scc_isolation(self) -> None:
+        interp = ScalarLdsInterpreter(size_dwords=1024)
+        interp.vcc = 0xCAFEBABE11223344
+        interp.scc = 1
+        interp.lds.write_dword(0, 10)
+        interp.write_vgpr(0, 0)
+        interp.write_vgpr(1, 20)
+
+        inst = Instruction(Opcode.DS_MAX_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        interp.step(inst)
+
+        self.assertEqual(interp.vcc, 0xCAFEBABE11223344)
+        self.assertEqual(interp.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
