@@ -1,4 +1,4 @@
-"""Every relative Markdown link and heading anchor in the repository resolves.
+"""Every relative Markdown link, reference definition and heading anchor in the repository resolves.
 
     python -I tests/test_docs_links.py
 
@@ -21,6 +21,9 @@ FENCE = re.compile(r"```.*?```", re.S)
 LINK = re.compile(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^)\s]+))(?:\s+\"[^\"]*\")?\)")
 HTML = re.compile(r'(?:href|src)\s*=\s*"([^"]+)"')
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$", re.M)
+# A reference-style definition at the start of a line: `[label]: target` or `[label]: <target> "title"`. Its target is
+# checked like an inline link's, so a page that links with `[text][label]` cannot hide a broken target.
+REFDEF = re.compile(r"^ {0,3}\[([^\]]+)\]:\s*(?:<([^>]+)>|(\S+))", re.M)
 EXTERNAL = ("http://", "https://", "mailto:", "tel:", "data:")
 
 
@@ -51,9 +54,10 @@ def anchors(path):
 
 
 def links(text):
-    """Markdown link/image targets and HTML href/src values, fenced code excluded."""
+    """Markdown link/image targets, reference definitions and HTML href/src values, fenced code excluded."""
     text = strip_fences(text)
     found = [m.group(1) or m.group(2) for m in LINK.finditer(text)]
+    found.extend(m.group(2) or m.group(3) for m in REFDEF.finditer(text))
     found.extend(HTML.findall(text))
     return found
 
