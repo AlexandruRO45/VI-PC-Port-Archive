@@ -394,5 +394,34 @@ class TestDSReadI16ConditionCodes(unittest.TestCase):
         self.assertEqual(self.flags.vcc, 0xFFFFFFFF_FFFFFFFF)
 
 
+class TestDSReadI16BoundaryExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_ieee754_half_precision_patterns(self) -> None:
+        # In shaders, 16-bit float bit patterns are frequently loaded with ds_read_i16 / ds_read_u16
+        patterns = {
+            "pos_zero": (0x0000, 0x00000000),
+            "neg_zero": (0x8000, 0xFFFF8000),
+            "pos_inf": (0x7C00, 0x00007C00),
+            "neg_inf": (0xFC00, 0xFFFFFC00),
+            "qnan": (0x7E00, 0x00007E00),
+            "snan": (0x7D00, 0x00007D00),
+            "subnormal_min": (0x0001, 0x00000001),
+            "subnormal_neg": (0x8001, 0xFFFF8001),
+        }
+        for name, (raw16, expected32) in patterns.items():
+            with self.subTest(pattern=name, raw=hex(raw16)):
+                self.lds.write_u16(0x40, raw16)
+                self.state.rf.set_vgpr(VGPR(1), 0x40)
+                inst = DSReadInstruction(DSOpcode.DS_READ_I16, vdst=VGPR(5), vaddr=VGPR(1))
+                val = self.interp.execute(self.state, inst)
+                self.assertEqual(val, expected32)
+
+
 if __name__ == "__main__":
     unittest.main()
