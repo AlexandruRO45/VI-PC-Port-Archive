@@ -848,7 +848,14 @@ def run_hw(cases, arch=None, waves=(32, 64)):
         for wave in waves:
             kernels = [asm.Kernel(case.lines(wave=wave), wave=wave, threads=1, words=4) for case in cases]
             res = oracle.run(kernels, words=4)
-            per_wave[wave] = {case.name: r for case, r in zip(cases, res)}
+            if len(res) != len(cases):
+                raise RuntimeError(f"wave{wave} oracle returned {len(res)} result(s) for {len(cases)} kernel(s)")
+            wave_map = {}
+            for case, r in zip(cases, res):
+                if r is None or (isinstance(r, list) and len(r) < 4):
+                    raise RuntimeError(f"wave{wave} oracle returned invalid result for {case.name}: {r!r}")
+                wave_map[case.name] = r
+            per_wave[wave] = wave_map
         return device, per_wave
     finally:
         oracle.close()
@@ -944,6 +951,9 @@ def main(argv=None):
         except runner.Unavailable as e:
             print(f"hardware oracle unavailable: {e}", file=sys.stderr)
             return 77
+        except RuntimeError as e:
+            print(f"harness error: {e}", file=sys.stderr)
+            return 2
         print(f"hardware oracle: {hw_device} (waves: {','.join(str(w) for w in waves)})")
 
     mismatches = 0

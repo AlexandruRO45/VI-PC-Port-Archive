@@ -69,6 +69,20 @@ class IntHwProbeTests(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("no GPU", err.getvalue())
 
+    def test_short_or_none_hw_oracle_results_exit_2_and_close_oracle(self):
+        for bad_res in ([], [[1, 2, 3, 4]], [None, [1, 2, 3, 4], [1, 2, 3, 4]], [[1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4]]):
+            with self.subTest(bad_res=bad_res):
+                fake = unittest.mock.MagicMock()
+                fake.device = "Fake GPU"
+                fake.run.return_value = bad_res
+                err = io.StringIO()
+                with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=fake), \
+                     redirect_stderr(err):
+                    rc = probe.main(["--oracle", "hw", "--group", "salu_bfe_past31", "--wave", "32"])
+                self.assertEqual(rc, 2)
+                self.assertIn("harness error:", err.getvalue())
+                fake.close.assert_called_once()
+
     def test_known_divergence_vs_strict_and_json_output(self):
         # Mock hardware oracle returning the measured gfx1035 words for valu_cvt_flr_rpi.
         measured = {
