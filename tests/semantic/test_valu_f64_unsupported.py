@@ -8,8 +8,8 @@ VOP2 / VOP3 instructions that it still raises `Unsupported` for, so a shader tha
 This file replaces test_valu_{mul,fma,fract,minmax}_f64.py, which built their own register file and binary64
 arithmetic and never reached `rdna2spirv`, so they passed whether or not the instruction was translated. When one of
 these gets a lowering, delete its entry here and give it a test that runs the translated shader (see
-test_valu_sqrt_f64.py). `v_ldexp_f64` and the f64 <-> 32-bit integer conversions are left out on purpose: lowerings
-for them are open.
+test_valu_sqrt_f64.py). `v_ldexp_f64` is left out on purpose: a lowering
+for it is open (the f64 <-> 32-bit integer conversions are lowered on main, test_valu_cvt_int_f64.py).
 
 Standard library only: no GPU, no LLVM, no game data.
 """
@@ -30,8 +30,6 @@ REFUSED = [
     "v_min_f64 v[4:5], v[0:1], v[2:3]",
     "v_max_f64 v[4:5], v[0:1], v[2:3]",
     "v_cvt_f64_f32 v[4:5], v0",
-    "v_cvt_f64_i32 v[4:5], v0",
-    "v_cvt_f64_u32 v[4:5], v0",
 ]
 
 

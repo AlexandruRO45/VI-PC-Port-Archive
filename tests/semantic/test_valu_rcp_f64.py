@@ -65,7 +65,7 @@ MODS = [
 
 
 def close(got, want):
-    return same(got, want) if False else (same(got, want) or ulp_distance(got, want) <= 1)
+    return same(got, want) or ulp_distance(got, want) <= 1
 
 
 class RcpF64(unittest.TestCase):

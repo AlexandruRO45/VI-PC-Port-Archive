@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 sys.path.insert(0, HERE)
 from f64_ref import (DBL_MAX, MIN_NORMAL, MIN_SUBNORMAL, NEG_INF, NEG_ZERO, POS_INF, POS_ZERO, QNAN, bits,  # noqa: E402
-                     is_nan, run, same, ulp_distance, value)
+                     is_nan, run, same, value)
 
 OP = "v_sqrt_f64"
 
@@ -64,7 +64,7 @@ MODS = [
 
 
 def close(got, want):
-    return same(got, want) if True else (same(got, want) or ulp_distance(got, want) <= 0)
+    return same(got, want)
 
 
 class SqrtF64(unittest.TestCase):
