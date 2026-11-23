@@ -1851,6 +1851,13 @@ deserializer.
 
 Things that can invalidate this simple model, all **Open**:
 
+- **Local root-signature serialization.** For an empty 1.1 descriptor with `LOCAL_ROOT_SIGNATURE` (`0x80`),
+  the host serializer preserves the flag in an `RTS0` chunk. The shim returns that host blob, as checked by
+  [#7234](https://github.com/ItsNotRexed/Leonida/pull/7234). A static read of the title's local-root-signature
+  path found that the caller searches the returned container for a `PRIV` chunk holding the console description.
+  A blob containing only `RTS0` would fail that lookup if the path runs. Whether the title reaches it during
+  boot remains unverified. [Consumer report in #7140](https://github.com/ItsNotRexed/Leonida/issues/7140#issuecomment-7108830255)
+
 - **Shader visibility.** The layer starts with one global block in root-parameter order and treats visibility as
   access control, not as a per-stage reordering. If the console driver instead omits invisible parameters per
   stage, a VS and a PS would need different values at the same push-constant offsets, which Vulkan cannot express
