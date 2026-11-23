@@ -111,17 +111,10 @@ class CliTests(unittest.TestCase):
     TOOL = os.path.join(ROOT, "tools", "f32_fuzz.py")
 
     def test_no_arguments_prints_usage(self):
-        r = subprocess.run([sys.executable, "-I", self.TOOL], capture_output=True, text=True, timeout=5)
-        self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn("usage:", r.stderr)
-        self.assertNotIn("Traceback", r.stderr)
-
-
-class CliTests(unittest.TestCase):
-    TOOL = os.path.join(ROOT, "tools", "f32_fuzz.py")
-
-    def test_no_arguments_prints_usage(self):
-        r = subprocess.run([sys.executable, "-I", self.TOOL], capture_output=True, text=True, timeout=5)
+        # 60 s, as the other fuzzer tests allow: f32_fuzz.py sets sys.dont_write_bytecode and imports rdna2spirv before
+        # it parses its arguments, so with no cached .pyc (a fresh checkout, CI, any change to rdna2spirv.py) printing
+        # usage first compiles the whole translator, about 6.6 s on a Ryzen 7 9800X3D, and a 5 s limit failed there.
+        r = subprocess.run([sys.executable, "-I", self.TOOL], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("usage:", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
