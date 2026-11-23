@@ -95,6 +95,19 @@ def _banks(src: str):
     return [(src, os.path.splitext(os.path.basename(src))[0])]
 
 
+def _resolved_folder_uses_catalog(target: str, catalog: str, output_root: str) -> bool:
+    """A linked parent can bring the catalog into the target's resolved directory tree."""
+    folder = os.path.realpath(target)
+    while os.path.normcase(folder) != output_root:
+        if same_report_path(folder, catalog):
+            return True
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("src", help=".awc file or directory scanned recursively for *.awc")
@@ -123,11 +136,12 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"awc_shorts: cannot create {a.out}: {e}", file=sys.stderr)
         return 1
+    output_root = os.path.normcase(os.path.realpath(a.out))
     destinations = {}
     for path, bank in banks:
         target = os.path.join(a.out, bank)
         top_level = os.path.join(a.out, bank.split("/", 1)[0])
-        if same_report_path(top_level, catalog):
+        if same_report_path(top_level, catalog) or _resolved_folder_uses_catalog(target, catalog, output_root):
             print(f"awc_shorts: error: exporting {path} would use catalog {catalog} as a folder", file=sys.stderr)
             return 2
         key = path_key(target)

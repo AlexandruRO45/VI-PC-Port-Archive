@@ -173,6 +173,44 @@ class ShortsTest(unittest.TestCase):
                     self.assertIn(os.path.join(out, "shorts.csv"), result.stderr)
                     self.assertEqual(os.listdir(out), [])
 
+    def test_linked_bank_folders_cannot_occupy_the_catalog_path(self):
+        tool = os.path.join(ROOT, "tools", "awc_shorts.py")
+        cases = (("shorts.csv.awc", True), (os.path.join("shorts.csv", "nested.awc"), True),
+                 ("ordinary.awc", False))
+        for bank, rejected in cases:
+            with self.subTest(bank=bank), tempfile.TemporaryDirectory(dir=self.tmp.name) as tmp:
+                src = os.path.join(tmp, "banks")
+                bank_path = os.path.join(src, "alias", bank)
+                os.makedirs(os.path.dirname(bank_path))
+                with open(bank_path, "wb") as f:
+                    f.write(build_music_bank(0x78, 480000))
+                out = os.path.join(tmp, "out")
+                os.mkdir(out)
+                alias = os.path.join(out, "alias")
+                if os.name == "nt":
+                    link = subprocess.run(["cmd", "/c", "mklink", "/J", alias, out], capture_output=True)
+                    if link.returncode:
+                        self.skipTest("directory junctions are unavailable")
+                    unlink = os.rmdir
+                else:
+                    os.symlink(out, alias)
+                    unlink = os.unlink
+                try:
+                    result = subprocess.run([sys.executable, "-I", tool, src, out, "--jobs", "2"],
+                                            capture_output=True, text=True, errors="replace", timeout=60)
+                    catalog = os.path.join(out, "shorts.csv")
+                    if rejected:
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn(bank_path, result.stderr)
+                        self.assertIn(catalog, result.stderr)
+                        self.assertEqual(os.listdir(out), ["alias"])
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertTrue(os.path.isfile(catalog))
+                        self.assertTrue(os.path.isfile(os.path.join(out, "ordinary", "00001234.ogg")))
+                finally:
+                    unlink(alias)
+
     def test_rejects_nonpositive_job_counts(self):
         for jobs in ("0", "-1"):
             with self.subTest(jobs=jobs):
