@@ -569,6 +569,16 @@ class TestReportErrors(unittest.TestCase):
             self.assertIn("row 2", err.getvalue())
             self.assertFalse(os.path.exists(out))
 
+    def test_json_source_saved_with_a_utf8_bom_is_read(self):
+        # Windows PowerShell 5.1 writes text files with a UTF-8 BOM (Set-Content, Out-File); the index is still
+        # the one the user meant, as world_build.py and world_names.py already read such input.
+        row = {"source": "a.rpf", "offset": 0, "size": 0x100, "width": 1280, "height": 720, "frames": 100}
+        with tempfile.TemporaryDirectory() as tmp:
+            bom = os.path.join(tmp, "index-bom.json")
+            with open(bom, "wb") as fh:
+                fh.write(b"\xef\xbb\xbf" + json.dumps({"streams": [row]}).encode("utf-8"))
+            self.assertEqual(names_mod.load_streams(bom), [row])
+
     def test_rejects_invalid_stream_numbers_and_keeps_zero_offset(self):
         base = {"source": "a.rpf", "offset": 0, "size": 1, "width": 1, "height": 1, "frames": 1}
         with tempfile.TemporaryDirectory() as tmp:
