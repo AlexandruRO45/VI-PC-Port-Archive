@@ -3825,18 +3825,28 @@ public:
     }
 
 private:
+    static void log_fma_refusal_once(const std::string& name, const char* stage_name, const std::string& reason) {
+        static std::mutex mutex;
+        static std::set<std::string> seen;
+        const std::string msg = name + " (" + stage_name + ") " + reason;
+        const std::lock_guard lock(mutex);
+        if (seen.insert(msg).second) std::fprintf(stderr, "[rt] d3d12: %s\n", msg.c_str());
+    }
+
     bool check_stage_fma_entry(const leonida::ShaderEntry& entry, const char* stage_name) const {
         std::string reason;
-        if (leonida::check_shader_fma_support(entry, device_.info.shader_fma, &reason)) return true;
-        std::fprintf(stderr, "[rt] d3d12: %s (%s) %s\n", entry.name.c_str(), stage_name, reason.c_str());
+        if (leonida::check_shader_fma_support(entry, device_.info.shader_fma, device_.info.shader_fma_float64, &reason))
+            return true;
+        log_fma_refusal_once(entry.name, stage_name, reason);
         return false;
     }
 
     bool check_stage_fma_spirv(const leonida::ShaderEntry& entry, const char* stage_name,
                                std::span<const std::uint32_t> words) const {
         std::string reason;
-        if (leonida::check_shader_fma_support(words, device_.info.shader_fma, &reason)) return true;
-        std::fprintf(stderr, "[rt] d3d12: %s (%s) %s\n", entry.name.c_str(), stage_name, reason.c_str());
+        if (leonida::check_shader_fma_support(words, device_.info.shader_fma, device_.info.shader_fma_float64, &reason))
+            return true;
+        log_fma_refusal_once(entry.name, stage_name, reason);
         return false;
     }
 
@@ -9229,8 +9239,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
 
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
-    // Translated shaders built with `rdna2spirv.py --fma khr` need it (index capability FMAKHR, feature
-    // shaderFmaFloat32); when it is missing they must not be created, so use `--fma glsl` there.
+    // Translated shaders built with `rdna2spirv.py --fma khr` need it (index capability FMAKHR, features
+    // shaderFmaFloat32 / shaderFmaFloat64); when a width is missing those pipelines are refused, so use `--fma glsl`.
     VkPhysicalDeviceShaderFmaFeaturesKHR shader_fma{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
     if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
             return std::strcmp(e.extensionName, VK_KHR_SHADER_FMA_EXTENSION_NAME) == 0;
@@ -9238,7 +9248,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &shader_fma};
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
         info.shader_fma = shader_fma.shaderFmaFloat32 == VK_TRUE;
-        if (info.shader_fma) {
+        info.shader_fma_float64 = shader_fma.shaderFmaFloat64 == VK_TRUE;
+        if (info.shader_fma || info.shader_fma_float64) {
             shader_fma.pNext = *v13.next();
             *v13.next() = &shader_fma;
         }
@@ -9366,7 +9377,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 #endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
-    if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+    if (info.shader_fma || info.shader_fma_float64) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
     if (info.shader_subgroup_clock || info.shader_device_clock)
         device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);

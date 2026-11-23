@@ -633,11 +633,13 @@ int main() {
         CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {99, kind7.data(), 24}}).empty());
     }
 
-    // VK_KHR_shader_fma metadata parsing (`features`, `capabilities`) and SPIR-V OpCapability FMAKHR guard.
+    // VK_KHR_shader_fma metadata parsing (`features`, `capabilities`) and SPIR-V OpCapability FMAKHR width guard.
     {
         const auto caps_dir = scratch.path() / "fma_caps";
         std::filesystem::create_directories(caps_dir);
         const std::string h_fma_feat = sha256_hex(bytes("fma-by-feature"));
+        const std::string h_fma64_feat = sha256_hex(bytes("fma64-by-feature"));
+        const std::string h_fma_both = sha256_hex(bytes("fma-both-widths"));
         const std::string h_fma_cap = sha256_hex(bytes("fma-by-capability"));
         const std::string h_fma_no_op = sha256_hex(bytes("fma-flag-without-op"));
         {
@@ -645,50 +647,117 @@ int main() {
             index << "{\"cs_fma_feat\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << h_fma_feat
                   << "\", \"fma\": \"khr\", \"features\": [\"shaderInt64\", \"shaderFmaFloat32\", 42, \"\"], "
                      "\"capabilities\": [\"Shader\", \"Int64\"]},\n"
+                     " \"cs_fma64_feat\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << h_fma64_feat
+                  << "\", \"fma\": \"khr\", \"features\": [\"shaderFloat64\", \"shaderFmaFloat64\"], "
+                     "\"capabilities\": [\"Shader\", \"Float64\", \"FMAKHR\"]},\n"
+                     " \"cs_fma_both\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << h_fma_both
+                  << "\", \"fma\": \"khr\", \"features\": [\"shaderFmaFloat32\", \"shaderFmaFloat64\"], "
+                     "\"capabilities\": [\"Shader\", \"Float64\", \"FMAKHR\"]},\n"
                      " \"ps_fma_cap\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h_fma_cap
                   << "\", \"capabilities\": [\"Shader\", \"FMAKHR\"]},\n"
                      " \"cs_fma_no_op\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << h_fma_no_op
                   << "\", \"fma\": \"khr\", \"features\": [\"shaderInt64\"], \"capabilities\": [\"Shader\"]}}";
         }
         ShaderLibrary caps_lib;
-        CHECK(caps_lib.load(caps_dir.string(), &error) && caps_lib.size() == 3);
+        CHECK(caps_lib.load(caps_dir.string(), &error) && caps_lib.size() == 5);
         const ShaderEntry* e_feat = caps_lib.find("cs", h_fma_feat);
+        const ShaderEntry* e_f64 = caps_lib.find("cs", h_fma64_feat);
+        const ShaderEntry* e_both = caps_lib.find("cs", h_fma_both);
         const ShaderEntry* e_cap = caps_lib.find("ps", h_fma_cap);
         const ShaderEntry* e_noop = caps_lib.find("cs", h_fma_no_op);
-        CHECK(e_feat && e_cap && e_noop);
-        CHECK(e_feat->features.size() == 2 && e_feat->features[1] == "shaderFmaFloat32" && e_feat->needs_shader_fma());
-        CHECK(e_cap->capabilities.size() == 2 && e_cap->capabilities[1] == "FMAKHR" && e_cap->needs_shader_fma());
+        CHECK(e_feat && e_f64 && e_both && e_cap && e_noop);
+        CHECK(e_feat->features.size() == 2 && e_feat->features[1] == "shaderFmaFloat32" &&
+              e_feat->needs_shader_fma_float32() && !e_feat->needs_shader_fma_float64() && e_feat->needs_shader_fma());
+        CHECK(!e_f64->needs_shader_fma_float32() && e_f64->needs_shader_fma_float64() && e_f64->needs_shader_fma());
+        CHECK(e_both->needs_shader_fma_float32() && e_both->needs_shader_fma_float64() && e_both->needs_shader_fma());
+        CHECK(e_cap->capabilities.size() == 2 && e_cap->capabilities[1] == "FMAKHR" &&
+              e_cap->needs_shader_fma_float32() && !e_cap->needs_shader_fma_float64() && e_cap->needs_shader_fma());
         CHECK(!e_noop->needs_shader_fma());
 
         // Without VK_KHR_shader_fma (e.g. Pascal / GTX 1070), FMAKHR entries are rejected with an actionable message;
-        // entries with only "fma": "khr" and no shaderFmaFloat32 / FMAKHR are accepted.
+        // entries with only "fma": "khr" and no shaderFmaFloat32 / shaderFmaFloat64 / FMAKHR are accepted.
         std::string reason;
-        CHECK(!check_shader_fma_support(*e_feat, false, &reason) && reason.find("VK_KHR_shader_fma") != std::string::npos);
+        CHECK(!check_shader_fma_support(*e_feat, false, false, &reason) &&
+              reason.find("shaderFmaFloat32") != std::string::npos);
         reason.clear();
-        CHECK(!check_shader_fma_support(*e_cap, false, &reason) && reason.find("--fma glsl") != std::string::npos &&
-              reason.find("--fma exact") != std::string::npos);
-        CHECK(check_shader_fma_support(*e_noop, false, &reason));
+        CHECK(!check_shader_fma_support(*e_cap, false, false, &reason) &&
+              reason.find("--fma glsl") != std::string::npos && reason.find("--fma exact") != std::string::npos);
+        CHECK(check_shader_fma_support(*e_noop, false, false, &reason));
 
-        // Enabling shader_fma_float32 allows FMAKHR shaders.
-        CHECK(check_shader_fma_support(*e_feat, true, &reason));
-        CHECK(check_shader_fma_support(*e_cap, true, &reason));
+        // Width-specific gating: f32-only device accepts f32 entries and rejects f64 entries (pointing at --fma glsl,
+        // since f64 has no --fma exact form); f64-only device accepts f64 entries and rejects f32 entries.
+        CHECK(check_shader_fma_support(*e_feat, true, false, &reason));
+        CHECK(check_shader_fma_support(*e_cap, true, false, &reason));
+        reason.clear();
+        CHECK(!check_shader_fma_support(*e_f64, true, false, &reason) &&
+              reason.find("shaderFmaFloat64") != std::string::npos && reason.find("--fma glsl") != std::string::npos &&
+              reason.find("--fma exact") == std::string::npos);
+        CHECK(!check_shader_fma_support(*e_both, true, false, &reason));
+        CHECK(check_shader_fma_support(*e_f64, false, true, &reason));
+        CHECK(!check_shader_fma_support(*e_feat, false, true, &reason));
+        CHECK(!check_shader_fma_support(*e_both, false, true, &reason));
+        CHECK(check_shader_fma_support(*e_both, true, true, &reason));
 
-        // Direct SPIR-V scanning catches unindexed OpCapability FMAKHR (6030) and safely ignores malformed streams.
+        // Direct SPIR-V scanning stops at the first non-OpCapability instruction (SPIR-V §2.4 logical layout),
+        // catches unindexed OpCapability FMAKHR (6030) with f32/f64 width detection, and ignores malformed streams.
         const std::vector<std::uint32_t> spv_plain = {0x07230203u, 0x00010500u, 0u, 2u, 0u, (2u << 16) | 17u, 1u};
         const std::vector<std::uint32_t> spv_fma = {0x07230203u, 0x00010500u, 0u, 2u, 0u, (2u << 16) | 17u, 1u,
                                                     (2u << 16) | 17u, kSpvCapabilityFmaKhr};
+        const std::vector<std::uint32_t> spv_after_cap_block = {
+            0x07230203u,      0x00010500u, 0u, 2u, 0u,
+            (2u << 16) | 17u, 1u,                    // OpCapability Shader
+            (3u << 16) | 14u, 0u,          1u,       // OpMemoryModel Logical GLSL450 (ends OpCapability block)
+            (2u << 16) | 17u, kSpvCapabilityFmaKhr,  // must not be reached after OpMemoryModel
+        };
+        const std::vector<std::uint32_t> spv_f32_op = {
+            0x07230203u,      0x00010500u, 0u, 20u, 0u,
+            (2u << 16) | 17u, 1u,
+            (2u << 16) | 17u, kSpvCapabilityFmaKhr,
+            (3u << 16) | 22u, 1u,          32u,            // OpTypeFloat %1 32
+            (6u << 16) | 4427u, 1u,        2u, 3u, 4u, 5u, // OpFmaKHR %1 %2 %3 %4 %5
+        };
+        const std::vector<std::uint32_t> spv_f64_op = {
+            0x07230203u,      0x00010500u, 0u, 20u, 0u,
+            (2u << 16) | 17u, 1u,
+            (2u << 16) | 17u, 10u,                         // OpCapability Float64
+            (2u << 16) | 17u, kSpvCapabilityFmaKhr,
+            (3u << 16) | 22u, 1u,          64u,            // OpTypeFloat %1 64
+            (6u << 16) | 4427u, 1u,        2u, 3u, 4u, 5u, // OpFmaKHR %1 %2 %3 %4 %5
+        };
+        const std::vector<std::uint32_t> spv_vec_both = {
+            0x07230203u,      0x00010500u, 0u, 30u, 0u,
+            (2u << 16) | 17u, kSpvCapabilityFmaKhr,
+            (3u << 16) | 22u, 1u,          32u,
+            (3u << 16) | 22u, 2u,          64u,
+            (4u << 16) | 23u, 3u,          2u, 2u,          // OpTypeVector %3 %2 2 (v2f64)
+            (6u << 16) | 4427u, 1u,        4u, 10u, 11u, 12u,
+            (6u << 16) | 4427u, 3u,        5u, 10u, 11u, 12u,
+        };
         const std::vector<std::uint32_t> spv_malformed = {0x07230203u, 0x00010500u, 0u, 2u, 0u, 0u};
         const std::vector<std::uint32_t> spv_truncated = {0x07230203u, 0x00010500u, 0u, 2u, 0u, (4u << 16) | 17u, 1u};
         CHECK(!spirv_declares_capability(spv_plain, kSpvCapabilityFmaKhr));
         CHECK(spirv_declares_capability(spv_fma, kSpvCapabilityFmaKhr));
+        CHECK(!spirv_declares_capability(spv_after_cap_block, kSpvCapabilityFmaKhr));
         CHECK(!spirv_declares_capability(spv_malformed, kSpvCapabilityFmaKhr));
         CHECK(!spirv_declares_capability(spv_truncated, kSpvCapabilityFmaKhr));
-        CHECK(check_shader_fma_support(spv_plain, false, &reason));
+        CHECK(check_shader_fma_support(spv_plain, false, false, &reason));
         reason.clear();
-        CHECK(!check_shader_fma_support(spv_fma, false, &reason) && reason.find("VK_KHR_shader_fma") != std::string::npos);
-        CHECK(check_shader_fma_support(spv_fma, true, &reason));
-        CHECK(check_shader_fma_support(spv_malformed, false, &reason));
-        CHECK(check_shader_fma_support(spv_truncated, false, &reason));
+        CHECK(!check_shader_fma_support(spv_fma, false, false, &reason) &&
+              reason.find("VK_KHR_shader_fma") != std::string::npos);
+        CHECK(check_shader_fma_support(spv_fma, true, false, &reason));
+        CHECK(!check_shader_fma_support(spv_fma, false, true, &reason));
+        CHECK(check_shader_fma_support(spv_f32_op, true, false, &reason));
+        CHECK(!check_shader_fma_support(spv_f32_op, false, true, &reason));
+        reason.clear();
+        CHECK(!check_shader_fma_support(spv_f64_op, true, false, &reason) &&
+              reason.find("shaderFmaFloat64") != std::string::npos && reason.find("--fma glsl") != std::string::npos &&
+              reason.find("--fma exact") == std::string::npos);
+        CHECK(check_shader_fma_support(spv_f64_op, false, true, &reason));
+        CHECK(!check_shader_fma_support(spv_vec_both, true, false, &reason));
+        CHECK(!check_shader_fma_support(spv_vec_both, false, true, &reason));
+        CHECK(check_shader_fma_support(spv_vec_both, true, true, &reason));
+        CHECK(check_shader_fma_support(spv_malformed, false, false, &reason));
+        CHECK(check_shader_fma_support(spv_truncated, false, false, &reason));
 
         std::filesystem::remove_all(caps_dir);
     }

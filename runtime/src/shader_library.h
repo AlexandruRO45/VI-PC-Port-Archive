@@ -723,17 +723,34 @@ struct ShaderEntry {
     std::vector<std::string> features;
     std::vector<std::string> capabilities;
 
-    // True when the index records OpFmaKHR / VK_KHR_shader_fma (shaderFmaFloat32 or capability FMAKHR).
-    // Note: the index's "fma": "khr" flag is not checked because a shader with no f32 FMA ops emits neither.
-    bool needs_shader_fma() const {
-        return std::find(features.begin(), features.end(), "shaderFmaFloat32") != features.end() ||
-               std::find(capabilities.begin(), capabilities.end(), "FMAKHR") != capabilities.end();
+    bool has_feature(const char* name) const {
+        return std::find(features.begin(), features.end(), name) != features.end();
     }
+
+    bool has_capability(const char* name) const {
+        return std::find(capabilities.begin(), capabilities.end(), name) != capabilities.end();
+    }
+
+    // True when the index records f32 OpFmaKHR / VK_KHR_shader_fma (shaderFmaFloat32, or untyped FMAKHR without
+    // shaderFmaFloat64). Note: "fma": "khr" alone is not checked because a shader with no FMA ops emits neither.
+    bool needs_shader_fma_float32() const {
+        if (has_feature("shaderFmaFloat32")) return true;
+        return has_capability("FMAKHR") && !has_feature("shaderFmaFloat64");
+    }
+
+    // True when the index records f64 OpFmaKHR / VK_KHR_shader_fma (shaderFmaFloat64).
+    bool needs_shader_fma_float64() const { return has_feature("shaderFmaFloat64"); }
+
+    // True when the index records any OpFmaKHR / VK_KHR_shader_fma width (shaderFmaFloat32, shaderFmaFloat64, or
+    // capability FMAKHR).
+    bool needs_shader_fma() const { return needs_shader_fma_float32() || needs_shader_fma_float64(); }
 };
 
 inline constexpr std::uint32_t kSpvCapabilityFmaKhr = 6030;  // SPV_KHR_fma / OpCapability FMAKHR
 
 // True when the binary SPIR-V module declares `capability` via OpCapability (opcode 17).
+// Per SPIR-V §2.4 logical layout, all OpCapability instructions come first, so scanning stops at the first
+// non-OpCapability instruction (O(1) on large translated modules).
 inline bool spirv_declares_capability(std::span<const std::uint32_t> words, std::uint32_t capability) {
     constexpr std::uint32_t magic = 0x07230203;
     constexpr std::uint16_t op_capability = 17;
@@ -742,37 +759,84 @@ inline bool spirv_declares_capability(std::span<const std::uint32_t> words, std:
         const std::uint32_t count = words[at] >> 16;
         const std::uint16_t op = static_cast<std::uint16_t>(words[at] & 0xffff);
         if (count == 0 || at + count > words.size()) return false;
-        if (op == op_capability && count == 2 && words[at + 1] == capability) return true;
+        if (op != op_capability) return false;
+        if (count == 2 && words[at + 1] == capability) return true;
         at += count;
     }
     return false;
 }
 
-// Checks whether `entry`'s index metadata (`features`, `capabilities`) requires VK_KHR_shader_fma (OpFmaKHR /
-// shaderFmaFloat32) when the device does not have it enabled. Returns true when supported; otherwise sets `reason`
-// (if non-null) to an actionable diagnostic and returns false.
-inline bool check_shader_fma_support(const ShaderEntry& entry, bool shader_fma_float32,
-                                     std::string* reason = nullptr) {
-    if (entry.needs_shader_fma() && !shader_fma_float32) {
-        if (reason)
-            *reason = "needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32), which the device does not have enabled; "
-                      "retranslate with --fma glsl or --fma exact";
-        return false;
+// Float widths used by OpFmaKHR (opcode 4427) results in a binary SPIR-V module: OpTypeFloat (22) gives scalar
+// float widths, OpTypeVector (23) inherits its component width, and OpFmaKHR word 1 names its result type.
+inline void spirv_fma_widths(std::span<const std::uint32_t> words, bool& need_f32, bool& need_f64) {
+    need_f32 = false;
+    need_f64 = false;
+    constexpr std::uint32_t magic = 0x07230203;
+    if (words.size() < 5 || words[0] != magic) return;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> widths;  // float/vec type id -> bit width
+    const auto width_of = [&](std::uint32_t id) -> std::uint32_t {
+        for (const auto& [t, w] : widths)
+            if (t == id) return w;
+        return 0;
+    };
+    for (std::size_t at = 5; at < words.size();) {
+        const std::uint32_t count = words[at] >> 16;
+        const std::uint16_t op = static_cast<std::uint16_t>(words[at] & 0xffff);
+        if (count == 0 || at + count > words.size()) break;
+        if (op == 22 && count >= 3) {
+            widths.emplace_back(words[at + 1], words[at + 2]);
+        } else if (op == 23 && count >= 4) {
+            if (const std::uint32_t w = width_of(words[at + 2])) widths.emplace_back(words[at + 1], w);
+        } else if (op == 4427 && count >= 3) {
+            if (width_of(words[at + 1]) == 64)
+                need_f64 = true;
+            else
+                need_f32 = true;
+        }
+        at += count;
     }
-    return true;
 }
 
-// Checks whether a SPIR-V module declares OpCapability FMAKHR (6030) when the device does not have VK_KHR_shader_fma
-// enabled (catches modules whose index.json omitted `features` / `capabilities`).
-inline bool check_shader_fma_support(std::span<const std::uint32_t> words, bool shader_fma_float32,
-                                     std::string* reason = nullptr) {
-    if (!shader_fma_float32 && spirv_declares_capability(words, kSpvCapabilityFmaKhr)) {
-        if (reason)
+inline bool check_shader_fma_widths(bool need_f32, bool need_f64, bool has_f32, bool has_f64,
+                                    std::string* reason = nullptr) {
+    const bool miss_f32 = need_f32 && !has_f32;
+    const bool miss_f64 = need_f64 && !has_f64;
+    if (!miss_f32 && !miss_f64) return true;
+    if (reason) {
+        if (miss_f32 && miss_f64) {
+            *reason = "needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32 and shaderFmaFloat64), which the device "
+                      "does not have enabled; retranslate with --fma glsl";
+        } else if (miss_f64) {
+            *reason = "needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat64), which the device does not have enabled; "
+                      "retranslate with --fma glsl";
+        } else {
             *reason = "needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32), which the device does not have enabled; "
                       "retranslate with --fma glsl or --fma exact";
-        return false;
+        }
     }
-    return true;
+    return false;
+}
+
+// Checks whether `entry`'s index metadata (`features`, `capabilities`) requires VK_KHR_shader_fma widths
+// (shaderFmaFloat32 / shaderFmaFloat64) that the device does not have enabled. Returns true when supported;
+// otherwise sets `reason` (if non-null) to an actionable diagnostic and returns false.
+inline bool check_shader_fma_support(const ShaderEntry& entry, bool shader_fma_float32,
+                                     bool shader_fma_float64 = false, std::string* reason = nullptr) {
+    return check_shader_fma_widths(entry.needs_shader_fma_float32(), entry.needs_shader_fma_float64(),
+                                   shader_fma_float32, shader_fma_float64, reason);
+}
+
+// Checks whether a SPIR-V module declares OpCapability FMAKHR (6030) and uses OpFmaKHR widths (f32 / f64) that the
+// device does not have enabled (catches modules whose index.json omitted `features` / `capabilities`).
+inline bool check_shader_fma_support(std::span<const std::uint32_t> words, bool shader_fma_float32,
+                                     bool shader_fma_float64 = false, std::string* reason = nullptr) {
+    if (shader_fma_float32 && shader_fma_float64) return true;
+    if (!spirv_declares_capability(words, kSpvCapabilityFmaKhr)) return true;
+    bool need_f32 = false;
+    bool need_f64 = false;
+    spirv_fma_widths(words, need_f32, need_f64);
+    if (!need_f32 && !need_f64) need_f32 = true;  // FMAKHR declared without OpFmaKHR: default to shaderFmaFloat32
+    return check_shader_fma_widths(need_f32, need_f64, shader_fma_float32, shader_fma_float64, reason);
 }
 
 class ShaderLibrary {
