@@ -16,20 +16,49 @@ void test_timer_resolution() {
         std::fprintf(stderr, "FAIL: unexpected period_ms\n");
         ++failures;
     }
+    timer.reset();
+    if (timer.active()) {
+        std::fprintf(stderr, "FAIL: timer resolution active after reset\n");
+        ++failures;
+    }
 }
 
 void test_priority_configuration() {
+    // Unset or empty preserves current priority
+    _putenv_s("LEONIDA_PROCESS_PRIORITY", "");
+    DWORD initial = GetPriorityClass(GetCurrentProcess());
+    DWORD p0 = leonida::configure_process_priority();
+    if (p0 != initial) {
+        std::fprintf(stderr, "FAIL: expected unchanged priority when unset\n");
+        ++failures;
+    }
+
     _putenv_s("LEONIDA_PROCESS_PRIORITY", "normal");
     DWORD p1 = leonida::configure_process_priority();
-    if (p1 != NORMAL_PRIORITY_CLASS) {
+    if (p1 != NORMAL_PRIORITY_CLASS || GetPriorityClass(GetCurrentProcess()) != NORMAL_PRIORITY_CLASS) {
         std::fprintf(stderr, "FAIL: expected NORMAL_PRIORITY_CLASS\n");
         ++failures;
     }
 
     _putenv_s("LEONIDA_PROCESS_PRIORITY", "above_normal");
     DWORD p2 = leonida::configure_process_priority();
-    if (p2 != ABOVE_NORMAL_PRIORITY_CLASS) {
+    if (p2 != ABOVE_NORMAL_PRIORITY_CLASS || GetPriorityClass(GetCurrentProcess()) != ABOVE_NORMAL_PRIORITY_CLASS) {
         std::fprintf(stderr, "FAIL: expected ABOVE_NORMAL_PRIORITY_CLASS\n");
+        ++failures;
+    }
+
+    _putenv_s("LEONIDA_PROCESS_PRIORITY", "below_normal");
+    DWORD p3 = leonida::configure_process_priority();
+    if (p3 != BELOW_NORMAL_PRIORITY_CLASS || GetPriorityClass(GetCurrentProcess()) != BELOW_NORMAL_PRIORITY_CLASS) {
+        std::fprintf(stderr, "FAIL: expected BELOW_NORMAL_PRIORITY_CLASS\n");
+        ++failures;
+    }
+
+    // Invalid string preserves current priority
+    _putenv_s("LEONIDA_PROCESS_PRIORITY", "invalid_typo");
+    DWORD p_invalid = leonida::configure_process_priority();
+    if (p_invalid != BELOW_NORMAL_PRIORITY_CLASS || GetPriorityClass(GetCurrentProcess()) != BELOW_NORMAL_PRIORITY_CLASS) {
+        std::fprintf(stderr, "FAIL: expected unchanged priority on invalid env string\n");
         ++failures;
     }
 

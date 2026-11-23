@@ -256,6 +256,7 @@ int wmain(int argc, wchar_t** argv) {
         // handlers would run against a game that has stopped) and whose last word decides the exit status.
         // ExitProcess also skips atexit, so the TLS clone cleanup registered there is run here instead.
         rt::cleanup_tls_clones();
+        timer_scope.reset();
         ExitProcess(static_cast<UINT>(code));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

@@ -28,11 +28,17 @@ public:
     }
 
     ~ScopedTimerResolution() {
+        reset();
+    }
+
+    void reset() {
         if (active_ && time_end_) {
             time_end_(period_ms_);
+            active_ = false;
         }
         if (winmm_) {
             FreeLibrary(winmm_);
+            winmm_ = nullptr;
         }
     }
 
@@ -56,20 +62,30 @@ private:
 // single-thread frequency scaling and are vulnerable to preemption by background OS tasks
 // (indexing, updates, telemetry). Elevating process priority to ABOVE_NORMAL prevents OS
 // worker threads from starving the main title/render thread while avoiding real-time lockups.
-// Configurable via LEONIDA_PROCESS_PRIORITY ("normal", "above_normal", "high").
+// Configurable via LEONIDA_PROCESS_PRIORITY ("normal", "above_normal", "high", "below_normal", "idle").
+// When unset or invalid, preserves the existing process priority class.
 inline DWORD configure_process_priority() {
     char env[32] = {};
     std::size_t env_len = 0;
     const errno_t err = getenv_s(&env_len, env, "LEONIDA_PROCESS_PRIORITY");
-    DWORD prio = ABOVE_NORMAL_PRIORITY_CLASS;
-    if (err == 0 && env_len > 1) {
-        if (!_stricmp(env, "normal")) prio = NORMAL_PRIORITY_CLASS;
-        else if (!_stricmp(env, "high")) prio = HIGH_PRIORITY_CLASS;
-        else if (!_stricmp(env, "above_normal")) prio = ABOVE_NORMAL_PRIORITY_CLASS;
-        else if (!_stricmp(env, "idle") || !_stricmp(env, "below_normal")) prio = BELOW_NORMAL_PRIORITY_CLASS;
+    if (err != 0 || env_len <= 1) {
+        return GetPriorityClass(GetCurrentProcess());
     }
-    SetPriorityClass(GetCurrentProcess(), prio);
-    return prio;
+
+    DWORD prio = 0;
+    if (!_stricmp(env, "normal")) prio = NORMAL_PRIORITY_CLASS;
+    else if (!_stricmp(env, "above_normal")) prio = ABOVE_NORMAL_PRIORITY_CLASS;
+    else if (!_stricmp(env, "high")) prio = HIGH_PRIORITY_CLASS;
+    else if (!_stricmp(env, "below_normal")) prio = BELOW_NORMAL_PRIORITY_CLASS;
+    else if (!_stricmp(env, "idle")) prio = IDLE_PRIORITY_CLASS;
+    else {
+        return GetPriorityClass(GetCurrentProcess());
+    }
+
+    if (SetPriorityClass(GetCurrentProcess(), prio)) {
+        return prio;
+    }
+    return GetPriorityClass(GetCurrentProcess());
 }
 
 }  // namespace leonida
