@@ -645,17 +645,22 @@ class Scene:
     their vertices rounded to float32 and its inverse transform. Both are computed the first time an instance is
     tested, so an instance no ray reaches (masked out) is never rounded or inverted, as before."""
 
-    def __init__(self, scene):
+    def __init__(self, scene, keep=True):
         self.instances = list(scene)
+        self.keep = keep   # False: one ray only, so round each triangle as it is tested and keep nothing
         self._rounded = {}
         self._inverse = {}
 
     def triangles(self, idx):
+        if not self.keep:
+            return ([[f32(c) for c in p] for p in t] for t in self.instances[idx][2])
         if idx not in self._rounded:
             self._rounded[idx] = [[[f32(c) for c in p] for p in t] for t in self.instances[idx][2]]
         return self._rounded[idx]
 
     def inverse(self, idx):
+        if not self.keep:
+            return invert_affine(self.instances[idx][0])
         if idx not in self._inverse:
             self._inverse[idx] = invert_affine(self.instances[idx][0])
         return self._inverse[idx]
@@ -666,7 +671,7 @@ def brute_force(scene, org, d, tmax=INF, mask=0xFF):
     ``scene`` is a list of (transform or None, mask, triangles); the result names the scene index as instance.
     A caller tracing many rays through one scene passes a Scene, which keeps the per-scene work out of the ray loop."""
     if not isinstance(scene, Scene):
-        scene = Scene(scene)
+        scene = Scene(scene, keep=False)   # a single ray: no cache to pay for (memory stays as small as before)
     best = None
     for idx, (m, imask, _) in enumerate(scene.instances):
         if m is not None and not imask & mask:

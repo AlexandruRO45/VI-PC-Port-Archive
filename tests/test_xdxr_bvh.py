@@ -486,6 +486,19 @@ class BruteForceScene(unittest.TestCase):
                 hits += want is not None
         self.assertGreater(hits, 20)
 
+    def test_a_single_ray_on_a_plain_list_keeps_no_rounded_copy(self):
+        # one call on a plain list cannot reuse a cache, so it must not build one: memory stays flat in the
+        # triangle count (found by @shdann: 17 MB for 30,000 triangles when every rounded triangle was kept)
+        import tracemalloc
+        raw = [(None, 0xFF, [TRI] * 30000)]
+        tracemalloc.start()
+        try:
+            self.assertIsNone(X.brute_force(raw, [2.0, 2.0, -1.0], [0.0, 0.0, 1.0]))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 256 * 1024)
+
     def test_an_instance_the_mask_excludes_is_not_inverted(self):
         singular = [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 1, 0]]
         scene = X.Scene([(None, 0x01, [TRI]), (singular, 0x02, [TRI])])
