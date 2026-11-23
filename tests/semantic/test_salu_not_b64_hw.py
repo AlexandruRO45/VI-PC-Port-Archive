@@ -100,5 +100,58 @@ class TestSNotB64Reference(unittest.TestCase):
                 self.assertEqual(hw_res, ref_res)
 
 
+class RegType(enum.Enum):
+    SGPR = 1
+    SPECIAL = 2
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    size: int = 2
+    name: str = ""
+
+    def __post_init__(self):
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 104):
+            raise ValueError(f"SGPR index out of range [0, 104] for pair: {self.index}")
+        if self.size != 2:
+            raise ValueError(f"Operand size must be 2 for 64-bit operation, got {self.size}")
+
+
+@dataclasses.dataclass(frozen=True)
+class SNotB64Instruction:
+    dst: Operand
+    src: Operand
+
+    def __post_init__(self):
+        if self.dst.size != 2 or self.src.size != 2:
+            raise TypeError("Both destination and source must be 64-bit operands")
+
+
+class TestSNotB64AST(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instantiation_valid(self):
+        inst = SNotB64Instruction(
+            dst=Operand(RegType.SGPR, 0, size=2),
+            src=Operand(RegType.SGPR, 2, size=2),
+        )
+        self.assertEqual(inst.dst.index, 0)
+        self.assertEqual(inst.dst.size, 2)
+        self.assertEqual(inst.src.index, 2)
+        self.assertEqual(inst.src.size, 2)
+
+    def test_ast_validation_rejects_single_word(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 0, size=1)
+
+    def test_ast_validation_rejects_out_of_range_index(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 105, size=2)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, -1, size=2)
+
+
 if __name__ == "__main__":
     unittest.main()
