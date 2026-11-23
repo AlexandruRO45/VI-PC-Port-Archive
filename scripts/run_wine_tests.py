@@ -233,7 +233,11 @@ def positive_seconds(text: str) -> float:
 
 
 def wine_command(text: str) -> list[str]:
-    """--wine: split into a command the way a shell would, refusing blank or malformed values up front."""
+    """--wine: split into a command the way a shell would, refusing blank or malformed values up front. A value that
+    names an existing file is one program, spaces and all: Proton's Wine sits under folders such as
+    "steamapps/common/Proton 9.0/files/bin/wine", and $WINE is set to that path unquoted."""
+    if text.strip() and os.path.isfile(text.strip()):
+        return [text.strip()]
     try:
         parts = shlex.split(text)
     except ValueError as e:

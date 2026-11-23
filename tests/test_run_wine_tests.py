@@ -544,6 +544,18 @@ class MainTest(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             rwt.wine_command("   ")
 
+    def test_an_existing_wine_path_with_spaces_is_one_program(self):
+        # Proton's Wine: <steamapps>/common/Proton 9.0/files/bin/wine, given unquoted in $WINE.
+        with tempfile.TemporaryDirectory() as tmp:
+            wine = os.path.join(tmp, "Proton 9.0", "files", "bin", "wine")
+            os.makedirs(os.path.dirname(wine))
+            Path(wine).write_text("", encoding="utf-8")
+            self.assertEqual(rwt.wine_command(wine), [wine])
+            self.assertEqual(rwt.wine_command(f"  {wine}\n"), [wine])
+            # A path that does not exist is still a command line.
+            self.assertEqual(rwt.wine_command("no-such-folder/Proton 8.0/wine"),
+                             ["no-such-folder/Proton", "8.0/wine"])
+
 
 if __name__ == "__main__":
     unittest.main()
