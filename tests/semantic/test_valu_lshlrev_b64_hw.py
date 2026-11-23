@@ -229,5 +229,36 @@ class TestLshlrevSimdInteraction(unittest.TestCase):
         self.assertEqual(words[1], 0)
 
 
+class TestLshlrevRegisterPreservation(unittest.TestCase):
+    """Commit 5: register aliasing and in-place operand preservation for v_lshlrev_b64."""
+
+    def test_in_place_shift_aliasing(self):
+        # Destination v[0:1] is identical to source v[0:1]
+        lines = [
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 0x00000002",
+            "v_lshlrev_b64 v[0:1], 2, v[0:1]",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_lshlrev_ps(lines, "ps_lshlrev_alias")
+        val64 = 0x00000002_12345678
+        exp_lo, exp_hi = v_lshlrev_b64_oracle(2, val64)
+        self.assertEqual(words[0], exp_lo)
+        self.assertEqual(words[1], exp_hi)
+
+    def test_preservation_of_unrelated_vgprs(self):
+        lines = [
+            "v_mov_b32 v0, 0xAAAA",
+            "v_mov_b32 v1, 0xBBBB",
+            "v_mov_b32 v2, 0xCCCC",
+            "v_mov_b32 v3, 0xDDDD",
+            "v_lshlrev_b64 v[2:3], 1, v[2:3]",
+        ]
+        words = run_lshlrev_ps(lines, "ps_lshlrev_preserve")
+        self.assertEqual(words[0], 0xAAAA)
+        self.assertEqual(words[1], 0xBBBB)
+
+
 if __name__ == '__main__':
     unittest.main()
