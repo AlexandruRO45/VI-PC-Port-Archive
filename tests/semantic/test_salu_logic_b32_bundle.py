@@ -252,6 +252,24 @@ class TestSOrB32Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x1f3f5f7f)
 
+def ref_s_xor_b32(s0: int, s1: int) -> tuple[int, int]:
+    res = u32(s0 ^ s1)
+    scc = 1 if res != 0 else 0
+    return res, scc
+
+GLOBAL_ORACLE_MAP[Opcode.S_XOR_B32] = ref_s_xor_b32
+
+
+class TestSXorB32Oracle(unittest.TestCase):
+    def test_oracle_truth_table(self) -> None:
+        res, scc = ref_s_xor_b32(0x12345678, 0x0F0F0F0F)
+        self.assertEqual(res, 0x1d3b5977)
+        self.assertEqual(scc, 1 if res != 0 else 0)
+
+    def test_oracle_zero_inputs(self) -> None:
+        res, scc = ref_s_xor_b32(0, 0)
+        self.assertEqual(scc, 1 if res != 0 else 0)
+
 
 if __name__ == "__main__":
     unittest.main()
