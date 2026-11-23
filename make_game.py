@@ -1560,22 +1560,30 @@ def keep_recorded_fallback(flag: str, work: str) -> bool:
     return True
 
 
-def smallest_max_subgroup(vulkaninfo_text: str):
-    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
+# vulkaninfo prints deviceType immediately before deviceName. Include it in its own device section.
+VULKANINFO_DEVICE = re.compile(r'(?m)^([ \t]*)(?:"?deviceType"?[ \t]*[=:][ \t]*"?(\w+)"?,?[ \t]*\r?\n\1)?'
+                               r'"?deviceName"?[ \t]*[=:]')
+
+
+def smallest_max_subgroup(vulkaninfo_text: str, *, prefer_hardware: bool = False):
+    """The smallest reported maxSubgroupSize, or None. Prefer non-CPU devices when requested and present."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
-    # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
-    # MoltenVK's Metal device, in both the text and the --json output) belong to the device above them.
-    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]', vulkaninfo_text))
+    # A device's own name is the least indented one. Names nested inside layered API properties belong to it.
+    names = list(VULKANINFO_DEVICE.finditer(vulkaninfo_text))
     depth = min((len(m.group(1)) for m in names), default=0)
-    starts = [m.start() for m in names if len(m.group(1)) == depth]
-    if not starts:
+    devices = [m for m in names if len(m.group(1)) == depth]
+    if not devices:
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
         return min(sizes) if sizes else None
-    # One section per device (a 1.3 device can print the size twice, in two property structs): one value each,
-    # and a device that prints none makes the answer unknown rather than being left out of the smallest.
+    sections = [(m.group(2), vulkaninfo_text[m.start():end])
+                for m, end in zip(devices, [m.start() for m in devices[1:]] + [len(vulkaninfo_text)])]
+    if prefer_hardware:
+        cpu_types = ("PHYSICAL_DEVICE_TYPE_CPU", "VK_PHYSICAL_DEVICE_TYPE_CPU", "4")
+        sections = [(kind, section) for kind, section in sections if kind not in cpu_types] or sections
+    # A device can print its size twice. A retained device that prints none makes the minimum unknown.
     per_device = []
-    for a, b in zip(starts, starts[1:] + [len(vulkaninfo_text)]):
-        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[a:b])]
+    for _, section in sections:
+        sizes = [int(n) for n in re.findall(size, section)]
         if not sizes:
             return None
         per_device.append(min(sizes))
@@ -1586,8 +1594,9 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     """Return whether to translate with emulation and whether to reuse emulated shaders. A wave64 compute or mesh
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
     size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA1/2
-    under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
-    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
+    under the AMD Windows driver. Elsewhere it turns emulation on unless the retained Vulkan devices report
+    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64. Ignore CPU Vulkan devices
+    alongside other devices only when the runtime probe confirms native wave64 for the required stages."""
     if mode == "on":
         return True, False
     if mode == "off":
@@ -1612,7 +1621,11 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     if exe:
         try:
             r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
-            size = smallest_max_subgroup(r.stdout)
+            size = smallest_max_subgroup(r.stdout, prefer_hardware=native64 is True)
+            if size is None and VULKANINFO_DEVICE.search(r.stdout):
+                log("shaders: vulkaninfo did not report a subgroup size for every relevant device: "
+                    "wave64 emulation on")
+                return True, True
         except (OSError, subprocess.SubprocessError):
             size = None
     if size is None:

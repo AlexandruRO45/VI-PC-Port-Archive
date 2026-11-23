@@ -43,6 +43,12 @@ class SmallestMaxSubgroupTest(unittest.TestCase):
     def test_json_output(self):
         self.assertEqual(make_game.smallest_max_subgroup('{"minSubgroupSize": 32, "maxSubgroupSize": 64}'), 64)
 
+    def test_json_with_cpu_and_hardware_devices(self):
+        text = json.dumps([{"deviceType": 4, "deviceName": "Software", "maxSubgroupSize": 8},
+                           {"deviceType": 2, "deviceName": "Hardware", "maxSubgroupSize": 64}], indent=2)
+        self.assertEqual(make_game.smallest_max_subgroup(text), 8)
+        self.assertEqual(make_game.smallest_max_subgroup(text, prefer_hardware=True), 64)
+
     def test_no_subgroup_size_gives_none(self):
         self.assertIsNone(make_game.smallest_max_subgroup(""))
         self.assertIsNone(make_game.smallest_max_subgroup("ERROR: vkCreateInstance failed\n"))
@@ -101,11 +107,18 @@ VkPhysicalDeviceVulkan13Properties:
 """
 
 
-def real_format(*devices):
+def real_format(*devices, types=()):
     """vulkaninfo's text as a real run prints it (excerpt): per device its name and the 1.3 properties block with
     the required-stage list. devices: (name, maxSubgroupSize, [stage names])."""
-    return "\n".join(REAL_FORMAT_BLOCK.format(name=n, size=s, n=len(st), stages="\n".join("\t\t" + x for x in st))
-                     for n, s, st in devices)
+    blocks = []
+    for index, (name, size, stages) in enumerate(devices):
+        block = REAL_FORMAT_BLOCK.format(name=name, size=size, n=len(stages),
+                                         stages="\n".join("\t\t" + stage for stage in stages))
+        if types:
+            block = block.replace("\tdeviceName", f"\tdeviceType        = PHYSICAL_DEVICE_TYPE_{types[index]}\n"
+                                  "\tdeviceName")
+        blocks.append(block)
+    return "\n".join(blocks)
 
 
 ALL = ["SHADER_STAGE_FRAGMENT_BIT", "SHADER_STAGE_COMPUTE_BIT", "SHADER_STAGE_TASK_BIT_EXT",
@@ -172,6 +185,27 @@ class DetectionGapsTest(unittest.TestCase):
 
     def test_64_wide_and_confirmed_by_the_runtime_check_leaves_it_off(self):
         self.assertFalse(self.decide(real_format(("A", 64, ALL)), '{"native64": true}'))
+
+    def test_cpu_icd_does_not_override_confirmed_native_wave64(self):
+        gpu, cpu = ("Hardware", 64, ALL), ("Software", 8, ALL)
+        for devices, types in (((gpu, cpu), ("DISCRETE_GPU", "CPU")), ((cpu, gpu), ("CPU", "DISCRETE_GPU"))):
+            with self.subTest(types=types):
+                text = real_format(*devices, types=types)
+                self.assertFalse(self.decide(text, '{"native64": true}'))
+                self.assertTrue(self.decide(text, '{"native64": false}'))
+                self.assertTrue(self.decide(text, '{}'))
+                self.assertFalse(self.decide(text, '{"native64": false, "native64_compute": true}',
+                                             mesh_compute=True))
+
+    def test_hardware_minimum_and_cpu_only_fallback_stay_conservative(self):
+        gpu, cpu = ("Hardware", 64, ALL), ("Software", 8, ALL)
+        narrow = ("Narrow GPU", 32, ALL)
+        probe = '{"native64": true}'
+        mixed = real_format(gpu, cpu, narrow, types=("DISCRETE_GPU", "CPU", "INTEGRATED_GPU"))
+        self.assertTrue(self.decide(mixed, probe))
+        self.assertTrue(self.decide(real_format(cpu, types=("CPU",)), probe))
+        unknown = "\nVkPhysicalDeviceProperties:\n\tdeviceName = Unknown GPU\n"
+        self.assertTrue(self.decide(real_format(gpu, cpu, types=("DISCRETE_GPU", "CPU")) + unknown, probe))
 
     def test_mesh_compute_uses_compute_wave64_capability(self):
         text = real_format(("Compute-only GPU", 64, ["SHADER_STAGE_COMPUTE_BIT"]))

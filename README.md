@@ -149,7 +149,8 @@ python -I make_game.py --wave64-emulate off            # auto (default), on or o
 (see "Wave64 emulation" in [docs/design.md](docs/design.md)). NVIDIA and Intel GPUs have 32-wide subgroups and need
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns emulation on if any GPU lacks 64-wide
 subgroups or its subgroup size is unknown. It also checks whether the runtime's GPU can run compute and mesh
-shaders 64-wide. With `--mesh-compute`, only compute subgroup support is needed.
+shaders 64-wide. When that probe confirms native wave64, CPU Vulkan devices such as Mesa llvmpipe are ignored if
+other devices are present. With `--mesh-compute`, only compute subgroup support is needed.
 
 On AMD's Windows driver, `auto` uses native wave64 on RDNA1 and RDNA2 when the runtime's GPU supports it, even
 if another GPU is 32-wide or `vulkaninfo` is unavailable. That driver can crash on emulated LDS code (#857).
