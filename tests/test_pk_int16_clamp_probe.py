@@ -128,6 +128,25 @@ class PkInt16ClampProbeTests(unittest.TestCase):
                 rc_err = probe.main(["--ops", "v_pk_mul_lo_u16", "--waves", "32"])
         self.assertEqual(rc_err, 2)
 
+    def test_result_count_mismatch_is_a_harness_error(self):
+        # A lost kernel surfaced as a KeyError traceback (zip dropped the tail) and an extra one was ignored,
+        # so the run's counts could cover fewer kernels than --ops/--waves asked for. Both are harness errors now.
+        results = _expected_results_for(["v_pk_mul_lo_u16"], [32])
+        meta = [(32, "v_pk_mul_lo_u16", False), (32, "v_pk_mul_lo_u16", True)]
+        for label, wrong in (("short", results[:-1]), ("extra", results + [results[0]])):
+            with self.subTest(label):
+                with self.assertRaisesRegex(RuntimeError, "results for 2 kernels"):
+                    probe.evaluate_results(["v_pk_mul_lo_u16"], [32], meta, wrong)
+                oracle = _mock_oracle(wrong)
+                out = io.StringIO()
+                with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), \
+                        redirect_stdout(out):
+                    rc = probe.main(["--ops", "v_pk_mul_lo_u16", "--waves", "32"])
+                self.assertEqual(rc, 2)
+                self.assertIn("harness error: the hardware runner returned", out.getvalue())
+                self.assertNotIn("Traceback", out.getvalue())
+                oracle.close.assert_called_once()
+
     def test_unavailable_non_gfx10_and_cli_errors(self):
         with unittest.mock.patch.object(hw_runner, "open_oracle", side_effect=hw_runner.Unavailable("no gpu")):
             with redirect_stdout(io.StringIO()):
