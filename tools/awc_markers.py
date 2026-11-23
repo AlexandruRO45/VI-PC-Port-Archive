@@ -13,7 +13,9 @@ rsc8_audio.decode_marker_records, which checks one tag, where this tool reports 
 An archive is walked for `ADAT` banks with rsc8_audio.parse_adat_at_file, the same header parser and the same bank
 set as rsc8_audio.scan_rpf, but each parsed bank is jumped over, so only the headers, the gaps between banks and the
 marker tags are read (under a minute for the 28.5 GB audio.rpf on an NVMe drive). A directory is scanned
-recursively for *.awc. An unreadable bank or directory fails the scan without publishing partial counts.
+recursively for *.awc. A named file that holds no bank is refused with exit 2 before `--out` is written, as
+`awc_manifest.py` does; an empty directory scan stays a valid zero-bank answer. An unreadable bank or directory
+fails the scan without publishing partial counts.
 
 Banks are reported in two groups: `streamed_music` (the bank has a 0x48 descriptor) and `other`. A chunk is compared
 with the length of its own stream in 48 kHz frames: for streamed music the descriptor channel with the stream's id
@@ -209,6 +211,12 @@ def main(argv=None) -> int:
     except OSError as error:
         print(f"awc_markers: error: cannot read {error.filename or a.src}: {error.strerror or error}", file=sys.stderr)
         return 1
+    if not report["banks"] and not os.path.isdir(a.src):
+        # A named file that parsed as no bank is a wrong path or format, not an empty result (awc_manifest.py /
+        # awc_shorts.py refuse the same input). A directory scan keeps reporting 0 banks because an empty folder
+        # is a valid answer.
+        print(f"awc_markers: error: {a.src}: holds no AWC bank", file=sys.stderr)
+        return 2
     if a.out:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=2)

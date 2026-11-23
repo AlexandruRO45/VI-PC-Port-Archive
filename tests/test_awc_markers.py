@@ -276,6 +276,26 @@ class ScanTest(unittest.TestCase):
         self.assertEqual((report["banks"], report["streamed_music"]["events"], report["other"]["chunks"]), (1, 1, 0))
         self.assertIsNone(report["other"]["events_per_chunk"])
 
+    def test_named_file_that_is_not_a_bank_is_refused(self):
+        # awc_manifest.py / awc_shorts.py refuse the same input (exit 2, "holds no AWC bank"): a wrong path or
+        # format must not read as an empty success. A directory with no bank in it stays a valid, empty answer.
+        path = os.path.join(self.tmp.name, "notes.bin")
+        with open(path, "wb") as f:
+            f.write(b"not an AWC bank")
+        out = os.path.join(self.tmp.name, "should-not-exist.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(awc_markers.main([path, "--out", out]), 2)
+        self.assertIn("holds no AWC bank", err.getvalue())
+        self.assertIn(path, err.getvalue())
+        self.assertFalse(os.path.exists(out), "a refused run must not write --out")
+
+        empty = os.path.join(self.tmp.name, "empty")
+        os.makedirs(empty)
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as text:
+            self.assertEqual(awc_markers.main([empty]), 0)
+        self.assertIn("0 banks, 0 streams", text.getvalue())
+
     def test_runs_under_python_dash_i(self):
         path = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
         proc = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True, timeout=120)
