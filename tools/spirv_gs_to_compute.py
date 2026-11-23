@@ -296,9 +296,9 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             continue
         for v in list(in_slot) + list(out_vars) + sorted(gone - set(in_slot) - set(out_vars)):
             if re.search(rf"{re.escape(v)}\b", s):
-                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)(?:\s+.*)?$", s)
+                m2 = re.fullmatch(rf"OpStore ({re.escape(v)}) %\w+(?:\s+.*)?", s)
                 if v in out_vars and m2:
-                    s = f"OpStore {out_vars[v]} {m2.group(1)}"
+                    s = s[:m2.start(1)] + out_vars[v] + s[m2.end(1):]
                     break
                 raise Unsupported(f"unhandled use of {v}: {s}")
         if s == "OpEmitVertex":

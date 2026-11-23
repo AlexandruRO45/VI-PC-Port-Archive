@@ -332,7 +332,7 @@ def test_builtin_load_and_output_store_with_memory_operands():
     assert "%prim_id" not in out and "%inv_id" not in out
     assert "%pid = OpCopyObject %uint %gsc_prim" in out
     assert "%iid = OpCopyObject %uint " in out
-    assert "OpStore %gsc_out0 %v" in out
+    assert "OpStore %gsc_out0 %v Aligned 16" in out
     if HAVE_SPIRV:
         res = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", os.devnull],
                              input=out, text=True, capture_output=True)
@@ -341,6 +341,18 @@ def test_builtin_load_and_output_store_with_memory_operands():
     bad_gs = gs.replace("%pid = OpLoad %uint %prim_id Aligned 4", "OpCopyMemory %prim_id %inv_id")
     with pytest.raises(gsc.Unsupported, match="%prim_id"):
         gsc.rewrite(bad_gs)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs SPIRV-Tools on PATH")
+def test_capture_preserves_combined_output_store_operands(tmp_path):
+    original = PHI_GS.replace("OpStore %out_pos %v", "OpStore %out_pos %v Volatile|Aligned 16")
+    rewritten, _ = gsc.rewrite(original)
+    for file, text in (("gs.spv", original), ("cs.spv", rewritten)):
+        module = tmp_path / file
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", module],
+                       input=text, text=True, check=True)
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", module], check=True)
+    assert "OpStore %gsc_out0 %v Volatile|Aligned 16" in rewritten
 
 
 @pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
