@@ -5,6 +5,9 @@
 Every input is written here by hand (Markdown tables, JUnit XML, a CTest log, a fake work folder whose shader names
 are sentinels). No game files, no GPU, no network: the GitHub path is fed synthetic gh output.
 """
+from contextlib import redirect_stderr
+import errno
+import io
 import json
 import os
 import subprocess
@@ -486,6 +489,17 @@ class Outputs(unittest.TestCase):
             self.assertIn(b"--tests did not match any test files", result.stderr)
             with open(cached, "rb") as f:
                 self.assertEqual(f.read(), previous)
+
+    def test_test_discovery_error_is_reported_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            locked = os.path.join(ROOT, "tests", "locked")
+            error = PermissionError(errno.EACCES, "Permission denied", locked)
+            stderr = io.StringIO()
+            with mock.patch.object(pd, "ci_test_files", side_effect=error), redirect_stderr(stderr):
+                self.assertEqual(pd.main(["--out", out, "--run-tests"]), 2)
+            self.assertEqual(stderr.getvalue().splitlines(), [f"error discovering tests: {locked}: Permission denied"])
+            self.assertFalse(os.path.exists(out))
 
     def test_missing_logo_leaves_no_image(self):
         old = pd.LOGO

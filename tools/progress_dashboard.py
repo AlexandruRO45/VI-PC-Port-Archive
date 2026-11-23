@@ -1018,7 +1018,12 @@ def main(argv=None):
         print(f"--work {args.work} is not a folder", file=sys.stderr)
         return 2
     if args.run_tests:
-        args.test_files = [f for f in ci_test_files() if not args.tests or re.search(args.tests, f)]
+        try:
+            files = ci_test_files()
+        except OSError as exc:
+            print(f"error discovering tests: {exc.filename or ''}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
+        args.test_files = [f for f in files if not args.tests or re.search(args.tests, f)]
         if args.tests and not args.test_files:
             ap.error("--tests did not match any test files")
     os.makedirs(out_dir, exist_ok=True)
