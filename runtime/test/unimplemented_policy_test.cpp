@@ -273,8 +273,13 @@ void test_touch_input_fallback() {
     using Fn = HRESULT (*)(uint64_t, bool*);
     auto fn = reinterpret_cast<Fn>(rt::shims::make_unimplemented_thunk(
         "xgameruntime.dll", "XGameStreamingIsTouchInputEnabled"));
+    auto other_fn = reinterpret_cast<Fn>(rt::shims::make_unimplemented_thunk(
+        "synthetic.dll", "XGameStreamingIsTouchInputEnabled"));
     for (auto policy : {UnimplementedPolicy::Log, UnimplementedPolicy::Fail}) {
         rt::shims::set_unimplemented_policy(policy);
+        bool sentinel = true;
+        other_fn(42, &sentinel);
+        check(sentinel, "unrelated DLL leaves touch output unchanged");
         bool enabled = true;
         const HRESULT result = fn(42, &enabled);
         const std::string tag = policy == UnimplementedPolicy::Fail ? "touch fail" : "touch log";
