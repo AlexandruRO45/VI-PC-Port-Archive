@@ -344,5 +344,74 @@ class TestSOrSaveExecScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.exec_mask, 0x1111_2222_3333_4444 | 0x5555_6666_7777_8888)
         self.assertEqual(self.state.scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# -----------------------------------------------------------------------------
+
+class SIMDMultiLaneDivergenceModel:
+    """Models multi-lane execution in Wave64 / Wave32 environments."""
+
+    @staticmethod
+    def active_lanes_from_mask(mask: int, wave_size: int = 64) -> Set[int]:
+        return {lane for lane in range(wave_size) if (mask & (1 << lane)) != 0}
+
+    @staticmethod
+    def mask_from_active_lanes(lanes: Set[int]) -> int:
+        return sum(1 << l for l in lanes if 0 <= l < 64)
+
+    @staticmethod
+    def simulate_divergent_branch_reconvergence(
+        initial_exec: int,
+        then_branch_mask: int,
+        else_branch_mask: int
+    ) -> Tuple[int, int, int]:
+        """Simulate conditional branch divergence where inactive lanes re-activate.
+
+        In RDNA2 control flow, s_or_saveexec_b64 is used to re-enable lanes
+        that were previously turned off by a divergent branch.
+        """
+        new_exec, saved_exec, scc = s_or_saveexec_b64_oracle(else_branch_mask, then_branch_mask)
+        return new_exec, saved_exec, scc
+
+
+class TestSOrSaveExecSIMDDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and lane-re-activation."""
+
+    def test_divergent_lane_re_activation(self):
+        # Initial: only even lanes active (0, 2, 4, ... 62)
+        even_mask = 0x5555_5555_5555_5555
+        # Else branch: odd lanes (1, 3, 5, ... 63)
+        odd_mask = 0xAAAA_AAAA_AAAA_AAAA
+
+        new_exec, saved_exec, scc = SIMDMultiLaneDivergenceModel.simulate_divergent_branch_reconvergence(
+            ALL64, even_mask, odd_mask
+        )
+        self.assertEqual(saved_exec, even_mask)
+        self.assertEqual(new_exec, ALL64)
+        self.assertEqual(scc, 1)
+
+        active_lanes = SIMDMultiLaneDivergenceModel.active_lanes_from_mask(new_exec)
+        self.assertEqual(len(active_lanes), 64)
+
+    def test_wave32_compatibility_half_mask(self):
+        # Wave32 uses lower 32 lanes; upper 32 bits remain 0
+        w32_s0 = 0x0000_0000_0000_F0F0
+        w32_exec = 0x0000_0000_0000_0F0F
+        new_exec, d, scc = s_or_saveexec_b64_oracle(w32_s0, w32_exec)
+        self.assertEqual(new_exec, 0x0000_0000_0000_FFFF)
+        self.assertEqual(d, w32_exec)
+        self.assertEqual(scc, 1)
+        # Ensure high 32 bits remain zero
+        self.assertEqual(new_exec >> 32, 0)
+
+    def test_sparse_multi_lane_patterns(self):
+        # Only lanes 0, 31, 32, 63
+        boundary_s0 = (1 << 0) | (1 << 31)
+        boundary_exec = (1 << 32) | (1 << 63)
+        new_exec, d, scc = s_or_saveexec_b64_oracle(boundary_s0, boundary_exec)
+        self.assertEqual(new_exec, (1 << 0) | (1 << 31) | (1 << 32) | (1 << 63))
+        self.assertEqual(d, boundary_exec)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
