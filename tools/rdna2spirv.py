@@ -12871,6 +12871,12 @@ class Gen:
         else:
             for i, comp in enumerate(comps):
                 self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
+            if "tfe" in mods or "lwe" in mods:
+                # tfe/lwe: a status word is written into the VGPR right after the last data
+                # component (vdata[data_count]). A shader reading it must not get a stale value.
+                status = self.tmp()
+                self.emit(f"{status} = OpConstant %uint 0")
+                self.dst({"k": "vgpr", "r": vdata["r"] + ncomp, "n": 1}, status)
 
     # image atomic -> SPIR-V op (guarded inside `if (active)` so inactive lanes skip the access)
     IMG_ATOMICS = {"image_atomic_umin": "OpAtomicUMin", "image_atomic_umax": "OpAtomicUMax",
