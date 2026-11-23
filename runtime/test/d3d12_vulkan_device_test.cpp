@@ -3065,6 +3065,16 @@ bool host_ray_tracing(ID3D12Device* host) {
            o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
 }
 
+// A VIDEO_ENCODE command allocator needs a video encoder. A host without one (WARP) refuses it with E_INVALIDARG, and
+// a VIDEO_ENCODE queue too, where the layer creates the allocator (#2297). So the answers are compared only on a host
+// that can create such a queue (TEST-1019).
+bool host_has_video_encode(ID3D12Device* host) {
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    desc.Type = D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE;
+    Ref<ID3D12CommandQueue> queue;
+    return SUCCEEDED(host->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue.p)));
+}
+
 // Windows 10's runtime (no ID3D12Device10) still checks a buffer's initial state and refuses a HARDWARE_PROTECTED
 // heap, where newer runtimes and the layer accept them (measured on Windows 10 22H2 build 19045.5737). For a case
 // marked windows10_refuses only that pair is excused: the layer's S_OK against the host's E_INVALIDARG, on a host
@@ -3955,7 +3965,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command allocator: type video encode", [](ID3D12Device* d) {
              return command_allocator(d, D3D12_COMMAND_LIST_TYPE(6));
-         }},
+         }, host_has_video_encode},
         {"command allocator: type 7", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(7)); }},
         {"command allocator: type 99", [](ID3D12Device* d) {
              return command_allocator(d, D3D12_COMMAND_LIST_TYPE(99));
