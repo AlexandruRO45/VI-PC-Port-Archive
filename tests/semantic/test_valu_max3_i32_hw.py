@@ -435,5 +435,48 @@ class TestMax3I32BitPatternBoundaries(unittest.TestCase):
         self.assertEqual(ref_max3_i32(0x8000_0000, -1, -100), 0xFFFF_FFFF)
 
 
+# ==============================================================================
+# Negative Controls, Rejection, and Translator Hardware Execution
+# ==============================================================================
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import support
+import rdna2spirv
+
+
+class TestMax3I32RejectionAndHardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection_negative_controls(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, 300)
+        with self.assertRaises(ValueError):
+            LiteralOperand(0x1_0000_0000)
+
+    def test_hardware_translator_execution(self):
+        """Validates that tools/rdna2spirv.py translates v_max3_i32 and matches expected results."""
+        cases = [
+            (-5, 10, -2, "v_max3_i32 v0, v1, v2, v3", 10),
+            (-10, -5, -20, "v_max3_i32 v0, v1, v2, v3", 0xFFFF_FFFB),
+            (0x8000_0000, 0, 0x7FFF_FFFF, "v_max3_i32 v0, v1, v2, v3", 0x7FFF_FFFF),
+            (-1, -1, -1, "v_max3_i32 v0, v1, v2, v3", 0xFFFF_FFFF),
+            (100, 200, 300, "v_max3_i32 v0, v1, v2, v3", 300),
+            (-50, -10, -20, "v_max3_i32 v0, v1, v2, v3", 0xFFFF_FFF6),
+            (0, -100, 50, "v_max3_i32 v0, v1, v2, v3", 50),
+        ]
+        for s0, s1, s2, asm, expected in cases:
+            prog = [
+                f"v_mov_b32 v1, {s0:#x}",
+                f"v_mov_b32 v2, {s1:#x}",
+                f"v_mov_b32 v3, {s2:#x}",
+                asm,
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_max3_i32_hw", prog)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], expected, f"Failed on {asm}: got {words[0]:#x}, expected {expected:#x}")
+
+
 if __name__ == '__main__':
     unittest.main()
