@@ -8302,6 +8302,37 @@ class Gen:
             self.uses_psb = True        # needs Int64 (declared with the PSB types)
             self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, rlo)
             self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
+        elif op == "v_mul_lo_u64":
+            # 64-bit integer product VALU (GFX10/RDNA2):
+            # v_mul_lo_u64: D = (S0 * S1) & 0xFFFFFFFFFFFFFFFF (low 64 bits of 64-bit product)
+            if a[0].get("n") != 2 and not (a[0]["k"] == "special" and a[0].get("t") == "null"):
+                raise Unsupported(op + " operands")
+            (x0, x1) = self.src64_data(a[1], op, allow_vgpr=True)
+            (y0, y1) = self.src64_data(a[2], op, allow_vgpr=True)
+            lx, hx, tx, x = (self.tmp() for _ in range(4))
+            ly, hy, ty, y = (self.tmp() for _ in range(4))
+            self.emit(f"{lx} = OpUConvert %ulong {x0}")
+            self.emit(f"{hx} = OpUConvert %ulong {x1}")
+            self.emit(f"{tx} = OpShiftLeftLogical %ulong {hx} %c64_32")
+            self.emit(f"{x} = OpBitwiseOr %ulong {tx} {lx}")
+            self.emit(f"{ly} = OpUConvert %ulong {y0}")
+            self.emit(f"{hy} = OpUConvert %ulong {y1}")
+            self.emit(f"{ty} = OpShiftLeftLogical %ulong {hy} %c64_32")
+            self.emit(f"{y} = OpBitwiseOr %ulong {ty} {ly}")
+            res = self.tmp()
+            self.emit(f"{res} = OpIMul %ulong {x} {y}")
+            rlo, hs, rhi = (self.tmp() for _ in range(3))
+            self.emit(f"{rlo} = OpUConvert %uint {res}")
+            self.emit(f"{hs} = OpShiftRightLogical %ulong {res} %c64_32")
+            self.emit(f"{rhi} = OpUConvert %uint {hs}")
+            self.uses_psb = True        # needs Int64 and %ulong (declared with PSB types)
+            if a[0]["k"] == "vgpr":
+                self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, rlo)
+                self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
+            elif a[0]["k"] == "special" and a[0].get("t") == "null":
+                pass
+            else:
+                raise Unsupported(op + " operands")
         elif op == "v_fmac_f16":
             # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
             sel, dhi = self.opsel_bits(mods, 3)
