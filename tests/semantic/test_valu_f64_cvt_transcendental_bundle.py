@@ -282,6 +282,26 @@ class VCvtF64I32AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 0, res)
         self.assertEqual(wave.get_f64(0, 0), f64_to_u64(-2.0))
 
+class VCvtF64I32SimdIeeeTests(unittest.TestCase):
+    def test_cvt_f64_i32_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x0000FFFF
+        for i in range(32):
+            wave.set_f64(i, 0, 0x1111222233334444)
+            if (wave.exec_mask >> i) & 1:
+                val = i - 16
+                wave.set_f64(i, 0, oracle_cvt_f64_i32(val & MASK32))
+        for i in range(16):
+            self.assertEqual(wave.get_f64(i, 0), f64_to_u64(float(i - 16)))
+        for i in range(16, 32):
+            self.assertEqual(wave.get_f64(i, 0), 0x1111222233334444)
+
+    def test_cvt_f64_i32_exactness(self):
+        # 53 mantissa bits accurately hold all 32-bit signed integers
+        for val in (-1000000, -1, 0, 1, 1000000):
+            res_bits = oracle_cvt_f64_i32(val & MASK32)
+            self.assertEqual(u64_to_f64(res_bits), float(val))
+
 
 if __name__ == "__main__":
     unittest.main()
