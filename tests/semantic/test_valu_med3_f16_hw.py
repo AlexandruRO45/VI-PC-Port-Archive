@@ -311,5 +311,85 @@ class TestVMed3F16ScalarInterpreter(unittest.TestCase):
         # High half should be 0x4000, low half preserved as 0x5678
         self.assertEqual(res, 0x40005678)
 
+# Append SIMD multi-lane interpreter
+class SIMDState:
+    """Architectural SIMD state for Wave32 / Wave64."""
+
+    def __init__(self, num_lanes: int = 32, exec_mask: Optional[int] = None) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {num_lanes}")
+        self.num_lanes = num_lanes
+        self.exec_mask = ((1 << num_lanes) - 1) if exec_mask is None else exec_mask
+        self.lanes: List[ScalarRegisterFile] = [ScalarRegisterFile() for _ in range(num_lanes)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool(self.exec_mask & (1 << lane))
+
+
+class SIMDVALUInterpreter:
+    """SIMD multi-lane instruction interpreter executing under EXEC mask."""
+
+    def __init__(self) -> None:
+        self.scalar_interp = ScalarVALUInterpreter()
+
+    def execute(self, state: SIMDState, inst: VMed3F16Instruction) -> List[int]:
+        out = []
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                res = self.scalar_interp.execute(state.lanes[lane], inst)
+            else:
+                res = state.lanes[lane].get_vgpr(inst.dst)
+            out.append(res)
+        return out
+
+
+class TestVMed3F16SIMD(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergent_lanes(self) -> None:
+        # Alternating mask (even lanes active)
+        mask = 0x55555555
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        for i in range(32):
+            state.lanes[i].set_vgpr(VGPR(0), 0xAAAAAAAA)
+            state.lanes[i].set_vgpr(VGPR(1), 0x00003C00)
+            state.lanes[i].set_vgpr(VGPR(2), 0x00004000)
+            state.lanes[i].set_vgpr(VGPR(3), 0x00004200)
+
+        inst = VMed3F16Instruction(
+            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
+            op_sel=(0, 0, 0, 0)
+        )
+        interp = SIMDVALUInterpreter()
+        results = interp.execute(state, inst)
+
+        for i in range(32):
+            if i % 2 == 0:
+                self.assertEqual(results[i], 0xAAAA4000)
+            else:
+                self.assertEqual(results[i], 0xAAAAAAAA)
+
+    def test_wave64_exec_masking(self) -> None:
+        # High 32 lanes active only
+        mask = 0xFFFFFFFF00000000
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        for i in range(64):
+            state.lanes[i].set_vgpr(VGPR(0), 0x11111111)
+            state.lanes[i].set_vgpr(VGPR(1), 0x00003C00)
+            state.lanes[i].set_vgpr(VGPR(2), 0x00004000)
+            state.lanes[i].set_vgpr(VGPR(3), 0x00004200)
+
+        inst = VMed3F16Instruction(
+            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
+            op_sel=(0, 0, 0, 0)
+        )
+        interp = SIMDVALUInterpreter()
+        results = interp.execute(state, inst)
+
+        for i in range(32):
+            self.assertEqual(results[i], 0x11111111)
+        for i in range(32, 64):
+            self.assertEqual(results[i], 0x11114000)
+
 if __name__ == "__main__":
     unittest.main()
