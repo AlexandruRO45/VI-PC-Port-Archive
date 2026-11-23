@@ -432,5 +432,31 @@ class TestSFf1I32B64Bounds(unittest.TestCase):
         self.assertEqual(ref_ff1_i32_b64((1 << 48) | (1 << 4)), 4)
 
 
+def run_hw_ff1_i32_b64(src0: int) -> int:
+    lo = src0 & MASK32
+    hi = (src0 >> 32) & MASK32
+    lines = [
+        f"s_mov_b32 s0, {lo:#x}",
+        f"s_mov_b32 s1, {hi:#x}",
+        "s_ff1_i32_b64 s2, s[0:1]",
+        "v_mov_b32 v0, s2",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_ff1_i32_b64_hw", lines)
+    return support.mrt0_words(spv)[0]
+
+
+class TestSFf1I32B64HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for s_ff1_i32_b64."""
+
+    def test_translator_scan_cases(self):
+        self.assertEqual(run_hw_ff1_i32_b64(0), MASK32)
+        self.assertEqual(run_hw_ff1_i32_b64(1), 0)
+        self.assertEqual(run_hw_ff1_i32_b64(1 << 32), 32)
+        self.assertEqual(run_hw_ff1_i32_b64(1 << 55), 55)
+        self.assertEqual(run_hw_ff1_i32_b64(1 << 63), 63)
+
+
 if __name__ == "__main__":
     unittest.main()
