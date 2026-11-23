@@ -96,6 +96,22 @@ The thunk keeps the Win64 argument registers and the return address intact (it i
 reaches a shared stub that saves them, so a floating-point caller still reads 0.0 from xmm0 and a debugger can unwind
 through it.
 
+### Stepping over guest asserts: `LEONIDA_SKIP_ASSERTS`
+
+Off by default. `LEONIDA_SKIP_ASSERTS=N` with N > 0 installs a vectored exception handler (last in the chain) that
+steps over the first N `int3` breakpoints raised by guest code: "guest code" here means outside every loaded module
+(the mapped images, guest allocations and the runtime's generated thunks), at a byte that is `0xCC`. Each one is
+logged as `[rt] assert skipped: int3 in guest code at <module+RVA, or the address> (LEONIDA_SKIP_ASSERTS)` and
+execution resumes at the next byte. A breakpoint in a loaded host module, a fault that is not an `int3`, and any
+`int3` after the N-th continue the exception search as before. Being a vectored handler it runs before a guest
+`__try` that would catch the `int3` itself.
+
+Hypothesis: a console devkit continues past a failed assert, and some of the retail title's asserts are tuning checks
+rather than faults (see [retail_boot_chain.md](../docs/retail_boot_chain.md)), so this is a way to see what comes
+after, not a fix. A debugging aid for the title's own asserts; it does not touch any protection or anti-debug check.
+`LEONIDA_SKIP_INT3` (with `--trace`) is the unbounded diagnostic variant. Test: `guest_asserts_test` (a real `int3`
+on `VirtualAlloc`'d executable memory).
+
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
@@ -108,13 +124,11 @@ are deduped by basename, so an import graph that reaches the same DLL twice maps
 key uses the filesystem's native path representation with ASCII case folded; it does not require a
 Windows filename to fit the ANSI code page. A lossless legacy narrow filename alias retains the existing
 bytewise case behavior for narrow API and import-name lookups. `Module::name`, mapped address labels,
-and path diagnostics use UTF-8. The `LoadLibrary*`/`GetModuleHandle*` shims look a wide name up by its native
-basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, `load_runtime_module_w`), and
-module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
-compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
+and path diagnostics use UTF-8. This does not add Unicode case folding or change the separately defined
+`LoadLibrary`/`GetModuleHandle` API conversions.
 
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
-reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
+reuse, existing ACP aliases, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
 and `--run`, including a Unicode parent directory and an ACP-named imported DLL. It checks strict UTF-8
 trace names and unchanged fixture bytes. Both tests use only locally built synthetic images.
@@ -136,25 +150,6 @@ clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
 
-An executable (an image without `IMAGE_FILE_DLL`, the game's EXE under `--run`, `--init` and `--dry-run`) gets
-module TLS index 0 instead, as Windows gives the process EXE. MSVC code built with `/GA` relies on that: it reads
-`ThreadLocalStoragePointer[0]` directly and never loads `_tls_index`. A `thread_local int v = 42;` EXE built
-`/O2 /GA /MD` printed `tls_index=0 value=42` natively but `tls_index=6 value=0` under `gta6rt --run` when it got a
-helper's index. Index 0 belongs to `gta6rt.exe` itself (measured: Windows gives it to the process EXE, the trace event
-below names it, and `gta6rt.exe` has a 1398-byte TLS template when measured and no TLS callbacks), and all of its own
-TLS reads go through `_tls_index`. So `gta6rt.exe` moves off index 0 once, at start (`rt::reserve_tls_index0()`,
-called from a CRT initializer that runs before any of gta6rt's own static initializers): it writes one more clone of the
-helper, `leonida_tls_host_<pid>_home.dll`, whose TLS directory covers a copy of `gta6rt.exe`'s template (the
-helper carries a 16 KiB array for it), swaps slots 0 and that clone's index on the calling thread and writes the
-clone's index into `gta6rt.exe`'s `_tls_index`. Every thread the OS starts from then on has a fresh copy of
-`gta6rt.exe`'s TLS at that index from its first instruction, so nothing has to run on a new thread first, including
-code that runs in an earlier DLL's `DLL_THREAD_ATTACH`. Slot 0 then holds a block nothing reads, which the executable's
-template copy replaces on the loading thread, on threads started later, and, from `load()` itself, on threads that
-were already running, exactly as a DLL's copy replaces a helper's; the OS frees both slots at thread exit. The move cannot be made
-later: MSVC keeps the address of a TLS slot in a frame across calls (`zlib_inflate` in `shader_library.h` does), so
-a thread that already runs gta6rt's code cannot be moved wherever it is stopped. The startup trace records the move at
-the first executable (`tls_index0`). DLLs keep the helper indices and work next to the executable as before.
-
 Current limits, by design:
 
 - `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own
@@ -170,19 +165,7 @@ Current limits, by design:
   title's callback on, gets its copy from `load()` itself, the way Windows gives one to running threads for a DLL it
   loads: a block, no `DLL_THREAD_ATTACH`, `DLL_THREAD_DETACH` when it ends, and `~Loader` takes the block back.
   `install_tls_for_thread()` and `uninstall_tls_for_thread()` are no-ops on such a thread. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
-  called `load()`. As on Windows, a new thread gets every module's copy before any TLS callback runs, and the
-  executable's callbacks come after the DLLs' ones, for attach and for detach.
-- One executable holds index 0 at a time, and only after `reserve_tls_index0()` has run at process start. An
-  executable mapped without it (the reservation failed, the `Loader` is used without it, or another executable
-  holds index 0) gets a helper index and a `[rt] loader: ... does not get module TLS index 0` line on stderr: its
-  `/GA` code would read and write the TLS in slot 0, which is `gta6rt.exe`'s own or the other executable's, so
-  `--run` and `--init` refuse it with an error and exit code 1, and a `Loader` user must not run its code.
-- Threads that ran gta6rt's code before the reservation keep nothing of their TLS: they find a fresh copy at the new
-  index. In gta6rt only the main thread has run its code by then, and its TLS moves with it.
-- The home clone stays loaded until the process ends (freeing it would free `gta6rt.exe`'s TLS blocks), and a mapped
-  image's file cannot be deleted, so its file stays in `%TEMP%` until the next run's clean-up of dead processes'
-  clones deletes it. The clones for mapped DLLs are deleted at exit as before. A `gta6rt.exe` whose TLS
-  outgrows the helper's 16 KiB array is refused the move.
+  called `load()`.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -194,12 +177,7 @@ Current limits, by design:
   measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
-  address. `XMemAllocDefault`/`XMemFreeDefault` share that heap. `XMemVirtualAlloc` accepts the attribute word,
-  drops the console's `PAGE_GRAPHICS_*` protection bits, commits 2 MiB guest pages 2 MiB-aligned,
-  and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. Physical pages
-  (`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`) are
-  64 KiB pages of pagefile-backed sections, mapped one view per page into the placeholder that a reserve-only
-  64 KiB-page `XMemVirtualAlloc` becomes, with that reservation's protection. `XMemIsToolsMemAvailable` is `FALSE`.
+  address.
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
   `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
   open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path
@@ -272,8 +250,7 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   and found by FSSM hash; three draws into a float target, compared bit for bit. Needs `llvm-mc` (`LLVM_MC`) and the
   Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
-  translator-style index, root arguments through the GPU address arena, and two dispatches. A second program is
-  found the same way in `<shaders>/bvh/index.json`, where the BVH builder's programs go (`docs/embedded_shaders.md`).
+  translator-style index, root arguments through the GPU address arena, and two dispatches.
 - `d3d12_fspx_compute_test` — compute PSOs from synthetic FSPX programs (`docs/fspx.md`): an `ACCC` container
   through slot 62 and a bare kind-6 program, found by `fspx_code_sha256` in `<shaders>/fspx/index.json`, one
   dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
@@ -386,13 +363,11 @@ from the ANSI code page.
 | `kind` | When | Fields |
 |---|---|---|
 | `trace_open` | first line | `pid` |
-| `tls_index0` | the first executable is mapped with module TLS index 0, which gta6rt freed at start (once per process) | `owner` (the image that held index 0, `gta6rt.exe`), `moved_to` (the index its block moved to) |
 | `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
-| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
-| `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
+| `xmem_attributes` | the first `XMemAlloc` and the first `XMemFree` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (`XMemAlloc` only), `caller` (module+RVA) |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
