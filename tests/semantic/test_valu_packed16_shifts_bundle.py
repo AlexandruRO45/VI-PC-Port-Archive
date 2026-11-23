@@ -295,5 +295,21 @@ class TestVPkAshrrevI16SIMDAndEdgeCases(unittest.TestCase):
         self.assertEqual(state.scc, 1)
         self.assertEqual(state.vcc, 0xFFFFFFFFFFFFFFFF)
 
+class TestVPkAshrrevI16Translation(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available in this Python environment")
+        lines = [
+            "v_mov_b32 v0, 0x00020002",
+            "v_mov_b32 v1, 0xfff0fff0",
+            "v_pk_ashrrev_i16 v2, v0, v1",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_v_pk_ashrrev_i16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFCFFFC)
+
 if __name__ == "__main__":
     unittest.main()
