@@ -17,11 +17,24 @@ PROMPTS = ("Depends on:", "AI-assisted:")
 
 
 def missing_prompts(template):
-    """The prompts of PROMPTS that no line of `template` starts with."""
-    return [p for p in PROMPTS if not re.search("^" + re.escape(p), template, re.M)]
+    """The prompts of PROMPTS that no visible line of `template` starts with."""
+    visible = re.sub(r"<!--.*?-->", lambda m: "\n" * m[0].count("\n"), template, flags=re.S)
+    return [p for p in PROMPTS if not re.search("^" + re.escape(p), visible, re.M)]
 
 
 class PullRequestTemplateTest(unittest.TestCase):
+    def test_prompts_inside_a_comment_are_missing(self):
+        template = "<!--\nDepends on: #42\nAI-assisted: yes\n-->\n"
+        self.assertEqual(missing_prompts(template), ["Depends on:", "AI-assisted:"])
+
+    def test_prompt_after_a_multiline_comment_starts_its_own_line(self):
+        template = "Instructions <!--\nDepends on: #42\n-->AI-assisted: yes\n"
+        self.assertEqual(missing_prompts(template), ["Depends on:"])
+
+    def test_comments_after_visible_prompts_are_allowed(self):
+        template = "Depends on: <!-- #N -->\nAI-assisted: <!-- yes or no -->\n"
+        self.assertEqual(missing_prompts(template), [])
+
     def test_template_has_both_prompts(self):
         with open(os.path.join(ROOT, TEMPLATE), encoding="utf-8") as f:
             self.assertEqual(missing_prompts(f.read()), [])
