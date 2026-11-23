@@ -430,5 +430,19 @@ class SPackLlB32B16SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(state.scc, 1)
         self.assertEqual(res, 0x00020001)
 
+class SPackLlB32B16TranslatorTests(unittest.TestCase):
+    def test_pack_ll_translation_and_execution(self):
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0xABCDEF01",
+            "s_pack_ll_b32_b16 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pack_ll_exec", lines)
+        val = mrt0_words(spv)[0]
+        self.assertEqual(val, 0xEF015678)
+
 if __name__ == "__main__":
     unittest.main()
