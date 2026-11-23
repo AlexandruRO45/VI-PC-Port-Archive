@@ -276,8 +276,7 @@ def cpu_lookup(name: str):
         r"(x3d|xt|x|gt|ge|g|f|hx|hs|h|u)?\b", s)
     if m:
         tier, num, suf = int(m[1]), m[2], m[3] or ""
-        sufkey = "x3d" if suf == "x3d" else ("x" if suf in ("x", "xt") else "")
-        key = f"r{tier}-{num}{sufkey}"
+        key = f"r{tier}-{num}{suf}"
         if key in CPU_EXPLICIT:
             return CPU_EXPLICIT[key], True
         base = _pick(AMD_BASE, int(num[0]))[tier]

@@ -50,9 +50,17 @@ class GpuScore(unittest.TestCase):
 
 class CpuScore(unittest.TestCase):
     def test_explicit(self):
-        self.assertEqual(pc.cpu_score("AMD Ryzen 5 5600"), 100)
+        self.assertEqual(pc.cpu_lookup("AMD Ryzen 5 5600"), (100, True))
+        self.assertEqual(pc.cpu_lookup("AMD Ryzen 5 5600X"), (104, True))
         self.assertEqual(pc.cpu_score("Intel(R) Core(TM) i5-12400F"), 102)
-        self.assertEqual(pc.cpu_score("AMD Ryzen 7 5800X3D 8-Core"), 140)
+        self.assertEqual(pc.cpu_lookup("AMD Ryzen 7 5800X3D 8-Core"), (140, True))
+
+    def test_ryzen_variant_without_exact_score_uses_its_estimate(self):
+        for model, expected in (("5 5600U", 55), ("5 5600G", 95), ("7 5800XT", 122.72)):
+            with self.subTest(model=model):
+                score, exact = pc.cpu_lookup(f"AMD Ryzen {model}")
+                self.assertFalse(exact)
+                self.assertAlmostEqual(score, expected)
 
     def test_estimated(self):
         self.assertAlmostEqual(pc.cpu_score("Intel Core i7-11700K"), 103 * 1.06)
@@ -75,6 +83,12 @@ class Evaluate(unittest.TestCase):
         head, sub, _ = pc.evaluate(XBOX, "Intel Core i3-10100F", "NVIDIA GeForce GTX 1650", 8)
         self.assertEqual(head, "Probably not enough")
         self.assertIn("The CPU, GPU and RAM are weaker than Xbox Series X", sub)
+
+    def test_5600u_falls_below_reference_with_other_parts_in_range(self):
+        head, _, rows = pc.evaluate(XBOX, "AMD Ryzen 5 5600U", "NVIDIA GeForce RTX 3070", 32)
+        self.assertEqual(head, "Probably not enough")
+        self.assertEqual([row[1] for row in rows], [pc.BELOW, pc.IN_RANGE, pc.IN_RANGE])
+        self.assertTrue(rows[0][4])
 
     def test_above(self):
         head, _, rows = pc.evaluate(XBOX, "AMD Ryzen 7 9800X3D", "NVIDIA GeForce RTX 4090", 64)
