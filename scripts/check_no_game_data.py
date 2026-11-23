@@ -272,7 +272,19 @@ def display(path):
 
 
 def main(argv):
-    paths = argv or tracked_files(os.getcwd())
+    if argv:
+        paths = argv
+    else:
+        try:
+            paths = tracked_files(os.getcwd())
+        except subprocess.CalledProcessError as e:  # not a git checkout: one error line, not a traceback
+            lines = (e.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+            reason = lines[-1] if lines else f"git ls-files exited with {e.returncode}"
+            print(f"check_no_game_data: {os.getcwd()}: {reason}", file=sys.stderr)
+            return 2
+        except OSError as e:  # git is not installed
+            print(f"check_no_game_data: {os.getcwd()}: cannot run git: {e.strerror or e}", file=sys.stderr)
+            return 2
     found = check(paths)
     for path, name in found:
         print(f"{display(path)}: {name}")

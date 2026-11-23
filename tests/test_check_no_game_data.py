@@ -171,8 +171,8 @@ PASSED_ARCHIVES = [
 ]
 
 
-def run(args, cwd=None):
-    return subprocess.run([sys.executable, "-I", SCRIPT, *args], cwd=cwd, capture_output=True, text=True)
+def run(args, cwd=None, env=None):
+    return subprocess.run([sys.executable, "-I", SCRIPT, *args], cwd=cwd, capture_output=True, text=True, env=env)
 
 
 class CheckNoGameData(unittest.TestCase):
@@ -261,6 +261,24 @@ class CheckNoGameData(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("renamed.txt: FSSM shader", result.stdout)
         self.assertNotIn("untracked.bin", result.stdout)
+
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_default_mode_outside_a_git_checkout_is_one_error_line(self):
+        # The default mode lists the tracked files; in a folder that is no checkout (the ceiling keeps git from
+        # looking above the parent) or with no git at all, git's own reason is the one error line, not a traceback.
+        ceiling = {**os.environ, "GIT_CEILING_DIRECTORIES": os.path.dirname(self.dir)}
+        no_git = {**os.environ, "PATH": os.path.join(self.dir, "empty-path")}
+        for what, env, reason in (("not a checkout", ceiling, "not a git repository"),
+                                  ("no git to run", no_git, "cannot run git")):
+            with self.subTest(what=what):
+                result = run([], cwd=self.dir, env=env)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                self.assertIn("check_no_game_data:", result.stderr)
+                self.assertIn(self.dir, result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":
